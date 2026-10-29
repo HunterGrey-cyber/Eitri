@@ -2,7 +2,8 @@
 //!
 //! Three requests reach the window before nvim hears of them: the quit chord (the key monitor sees it before the
 //! menu does), the menu's Quit item (by pointer, or by whatever chord it carries), and the window's close button.
-//! While a turn runs or a message is queued, each is held and a question is put; the answer `Quit` sends the
+//! While a turn runs, a message is queued or a tab has background work left running, each is held and a question is
+//! put; the answer `Quit` sends the
 //! request on its way, through the path it would have taken. A quit nvim decides for itself (`:qa`) asks nothing
 //! here, as on Linux; nor does AppKit's own `terminate:` (the Dock's Quit, a logout, a script's `quit app`),
 //! which never passes through the window.
@@ -46,15 +47,27 @@ pub enum QuitAfter {
 /// (another turn, perhaps) through unasked.
 pub const PASS_FOR: Duration = Duration::from_secs(2);
 
-/// What is at work, as the question says it: `1 running, 2 queued`. `None` when nothing is.
-pub fn at_work(running: usize, queued: usize) -> Option<String> {
-    window_close_prompt(running, queued)?;
+/// What is at work, as the window's close question counts it: turns running (a waiting question counts as one),
+/// messages queued, and tabs with live background work, which quitting stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AtWork {
+    pub running: usize,
+    pub queued: usize,
+    pub background: usize,
+}
+
+/// What is at work, as the question says it: `1 running, 2 queued, 1 with background tasks`. `None` when nothing is.
+pub fn at_work(work: AtWork) -> Option<String> {
+    window_close_prompt(work.running, work.queued, work.background)?;
     let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} running"));
+    if work.running > 0 {
+        parts.push(format!("{} running", work.running));
     }
-    if queued > 0 {
-        parts.push(format!("{queued} queued"));
+    if work.queued > 0 {
+        parts.push(format!("{} queued", work.queued));
+    }
+    if work.background > 0 {
+        parts.push(format!("{} with background tasks", work.background));
     }
     Some(parts.join(", "))
 }
@@ -68,7 +81,7 @@ pub struct QuitGate {
 }
 
 impl QuitGate {
-    pub fn request(&mut self, source: QuitSource, running: usize, queued: usize, now: Instant) -> QuitDecision {
+    pub fn request(&mut self, source: QuitSource, work: AtWork, now: Instant) -> QuitDecision {
         if source == QuitSource::CloseButton {
             if let Some(until) = self.pass_close_until.take() {
                 if now < until {
@@ -79,7 +92,7 @@ impl QuitGate {
         if self.asking.is_some() {
             return QuitDecision::AlreadyAsking;
         }
-        match at_work(running, queued) {
+        match at_work(work) {
             None => QuitDecision::Proceed,
             Some(what) => {
                 self.asking = Some(source);
@@ -90,11 +103,11 @@ impl QuitGate {
 
     /// The quit chord, `repeat` when it is the key's auto-repeat. A repeat never asks a second question: while
     /// one is open, or when the press it repeats was held, it is dropped.
-    pub fn request_chord(&mut self, repeat: bool, running: usize, queued: usize, now: Instant) -> QuitDecision {
+    pub fn request_chord(&mut self, repeat: bool, work: AtWork, now: Instant) -> QuitDecision {
         if repeat && (self.asking.is_some() || self.chord_held) {
             return QuitDecision::AlreadyAsking;
         }
-        let decision = self.request(QuitSource::Key, running, queued, now);
+        let decision = self.request(QuitSource::Key, work, now);
         self.chord_held = decision != QuitDecision::Proceed;
         decision
     }
@@ -259,6 +272,14 @@ mod tests {
         );
     }
 
+    fn w(running: usize, queued: usize) -> AtWork {
+        AtWork {
+            running,
+            queued,
+            background: 0,
+        }
+    }
+
     fn at(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
     }
@@ -268,10 +289,10 @@ mod tests {
         let now = Instant::now();
         let mut gate = QuitGate::default();
         for source in [QuitSource::Key, QuitSource::Menu, QuitSource::CloseButton] {
-            assert_eq!(gate.request(source, 0, 0, now), QuitDecision::Proceed, "{source:?}");
+            assert_eq!(gate.request(source, w(0, 0), now), QuitDecision::Proceed, "{source:?}");
         }
-        assert_eq!(gate.request_chord(false, 0, 0, now), QuitDecision::Proceed);
-        assert_eq!(gate.request_chord(true, 0, 0, now), QuitDecision::Proceed);
+        assert_eq!(gate.request_chord(false, w(0, 0), now), QuitDecision::Proceed);
+        assert_eq!(gate.request_chord(true, w(0, 0), now), QuitDecision::Proceed);
         assert!(!gate.is_asking());
     }
 
@@ -280,35 +301,47 @@ mod tests {
         let now = Instant::now();
         let mut gate = QuitGate::default();
         assert_eq!(
-            gate.request_chord(false, 1, 2, now),
+            gate.request_chord(false, w(1, 2), now),
             QuitDecision::Ask {
                 what: "1 running, 2 queued".into()
             }
         );
         assert_eq!(
-            gate.request(QuitSource::CloseButton, 1, 0, now),
+            gate.request(QuitSource::CloseButton, w(1, 0), now),
             QuitDecision::AlreadyAsking
         );
-        assert_eq!(gate.request(QuitSource::Menu, 1, 0, now), QuitDecision::AlreadyAsking);
+        assert_eq!(
+            gate.request(QuitSource::Menu, w(1, 0), now),
+            QuitDecision::AlreadyAsking
+        );
         assert_eq!(gate.answer(false, now), None);
         assert!(!gate.is_asking());
         // Asked again next time: a cancelled answer is not remembered.
-        assert!(matches!(gate.request_chord(false, 1, 0, now), QuitDecision::Ask { .. }));
+        assert!(matches!(
+            gate.request_chord(false, w(1, 0), now),
+            QuitDecision::Ask { .. }
+        ));
     }
 
     #[test]
     fn a_held_or_doubled_quit_chord_never_gets_past_the_question() {
         let now = Instant::now();
         let mut gate = QuitGate::default();
-        assert!(matches!(gate.request_chord(false, 1, 0, now), QuitDecision::Ask { .. }));
+        assert!(matches!(
+            gate.request_chord(false, w(1, 0), now),
+            QuitDecision::Ask { .. }
+        ));
         // The key's repeats, and a second press, while the question is open.
-        assert_eq!(gate.request_chord(true, 1, 0, now), QuitDecision::AlreadyAsking);
-        assert_eq!(gate.request_chord(false, 1, 0, now), QuitDecision::AlreadyAsking);
+        assert_eq!(gate.request_chord(true, w(1, 0), now), QuitDecision::AlreadyAsking);
+        assert_eq!(gate.request_chord(false, w(1, 0), now), QuitDecision::AlreadyAsking);
         // Cancelled while the key is still down: its repeats ask nothing more.
         assert_eq!(gate.answer(false, now), None);
-        assert_eq!(gate.request_chord(true, 1, 0, now), QuitDecision::AlreadyAsking);
+        assert_eq!(gate.request_chord(true, w(1, 0), now), QuitDecision::AlreadyAsking);
         // A fresh press asks again.
-        assert!(matches!(gate.request_chord(false, 1, 0, now), QuitDecision::Ask { .. }));
+        assert!(matches!(
+            gate.request_chord(false, w(1, 0), now),
+            QuitDecision::Ask { .. }
+        ));
     }
 
     #[test]
@@ -316,7 +349,7 @@ mod tests {
         let now = Instant::now();
         for source in [QuitSource::Key, QuitSource::Menu] {
             let mut gate = QuitGate::default();
-            let _ = gate.request(source, 0, 1, now);
+            let _ = gate.request(source, w(0, 1), now);
             assert_eq!(gate.answer(true, now), Some(QuitAfter::SendQuitKey));
             assert_eq!(gate.answer(true, now), None, "one answer per question");
         }
@@ -326,15 +359,15 @@ mod tests {
     fn quit_from_the_close_button_closes_again_once_without_asking() {
         let start = Instant::now();
         let mut gate = QuitGate::default();
-        let _ = gate.request(QuitSource::CloseButton, 1, 0, start);
+        let _ = gate.request(QuitSource::CloseButton, w(1, 0), start);
         assert_eq!(gate.answer(true, start), Some(QuitAfter::CloseAgain));
         assert_eq!(
-            gate.request(QuitSource::CloseButton, 1, 0, at(start, 10)),
+            gate.request(QuitSource::CloseButton, w(1, 0), at(start, 10)),
             QuitDecision::Proceed
         );
         // Only that one close: nvim may have refused it (an unsaved buffer), and the next one asks.
         assert!(matches!(
-            gate.request(QuitSource::CloseButton, 1, 0, at(start, 20)),
+            gate.request(QuitSource::CloseButton, w(1, 0), at(start, 20)),
             QuitDecision::Ask { .. }
         ));
     }
@@ -346,7 +379,7 @@ mod tests {
         let _ = gate.close_again(start);
         let later = start + PASS_FOR + Duration::from_millis(1);
         assert!(matches!(
-            gate.request(QuitSource::CloseButton, 1, 0, later),
+            gate.request(QuitSource::CloseButton, w(1, 0), later),
             QuitDecision::Ask { .. }
         ));
     }
@@ -356,13 +389,50 @@ mod tests {
         let now = Instant::now();
         let mut gate = QuitGate::default();
         let _ = gate.close_again(now);
-        assert!(matches!(gate.request_chord(false, 1, 0, now), QuitDecision::Ask { .. }));
+        assert!(matches!(
+            gate.request_chord(false, w(1, 0), now),
+            QuitDecision::Ask { .. }
+        ));
     }
 
     #[test]
     fn what_is_at_work_reads_like_the_linux_question() {
-        assert_eq!(at_work(0, 0), None);
-        assert_eq!(at_work(2, 0).as_deref(), Some("2 running"));
-        assert_eq!(at_work(0, 1).as_deref(), Some("1 queued"));
+        assert_eq!(at_work(w(0, 0)), None);
+        assert_eq!(at_work(w(2, 0)).as_deref(), Some("2 running"));
+        assert_eq!(at_work(w(0, 1)).as_deref(), Some("1 queued"));
+        let background = AtWork {
+            background: 1,
+            ..AtWork::default()
+        };
+        assert_eq!(at_work(background).as_deref(), Some("1 with background tasks"));
+    }
+
+    /// A turn that ended with a shell, monitor or workflow still running leaves nothing running or queued; quitting
+    /// would still stop that work, so the quit asks, as the Linux window's close does.
+    #[test]
+    fn background_work_left_by_a_finished_turn_asks_before_quitting() {
+        let now = Instant::now();
+        let work = AtWork {
+            background: 2,
+            ..AtWork::default()
+        };
+        for source in [QuitSource::Key, QuitSource::Menu, QuitSource::CloseButton] {
+            let mut gate = QuitGate::default();
+            assert_eq!(
+                gate.request(source, work, now),
+                QuitDecision::Ask {
+                    what: "2 with background tasks".into()
+                },
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            tabs_window_prompt(work),
+            Some("close window? 2 with background tasks (y/n)".to_string())
+        );
+    }
+
+    fn tabs_window_prompt(work: AtWork) -> Option<String> {
+        window_close_prompt(work.running, work.queued, work.background)
     }
 }

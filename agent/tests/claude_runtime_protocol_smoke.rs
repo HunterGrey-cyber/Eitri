@@ -50,6 +50,9 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // `accept_unsupported_cli: false` preserves the value sent by clients
             // that predate this field.
             accept_unsupported_cli: false,
+            // Keep `per_task_stop` false until the application can stop an individual
+            // background task.
+            per_task_stop: false,
         }),
         // Leave model, effort and output format at their defaults. With both prompt fields absent,
         // the Agent SDK uses its minimal system prompt.
@@ -60,9 +63,17 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
         output_format: None,
         // `await_account_identity` is unexercised here.
         await_account_identity: false,
+        // Set `client_interactions.questions` so the assertion below checks that
+        // the generated message carries its field value.
+        client_interactions: Some(claude_runtime_protocol::v1::ClientInteractions { questions: true }),
     };
     assert_eq!(request.cwd, "/tmp/example");
+    assert_eq!(
+        request.client_interactions,
+        Some(claude_runtime_protocol::v1::ClientInteractions { questions: true })
+    );
     let policy = request.policy.unwrap();
+    assert!(!policy.per_task_stop);
     assert!(policy.provider_permission_prompts);
     assert_eq!(
         policy.cli_permission_mode(),

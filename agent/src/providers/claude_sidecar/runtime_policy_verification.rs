@@ -1,5 +1,5 @@
 // agent/src/providers/claude_sidecar/runtime_policy_verification.rs
-//! Every test in this file spends real Claude tokens. Use a test Claude profile.
+//! The ignored tests in this file spend real Claude tokens. Use a test Claude profile.
 //! Capture the CLI version with the results, since runtime behavior depends on the build
 //! and the test launcher neither pins nor reports it.
 //!
@@ -152,8 +152,9 @@ fn trace(label: &str, events: &[AgentDomainEvent]) {
 ///
 /// Corroborating, and deliberately not asserted on: under the control the provider also logs
 /// `hook_started`/`hook_response` notices -- the operator's own `UserPromptSubmit` hooks running
-/// inside a spawned session. `ProviderNotice` is diagnostics-only by design (`translate.rs`) and
-/// never becomes a domain event, so it can be read in `--nocapture` output but not asserted.
+/// inside a spawned session. Those `ProviderNotice`s are diagnostics only (`translate.rs` reads only
+/// the `no_turn_in_progress` one) and never become domain events, so they can be read in
+/// `--nocapture` output but not asserted.
 #[test]
 #[ignore]
 fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
@@ -227,6 +228,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         control.claude_code_prompt,
         requested_cli_mode(&control.capabilities),
         ProjectTrust::Trusted,
+        control.question_policy(),
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -312,6 +314,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         false,
         ProjectTrust::Trusted,
         requested_cli_mode(&opted_out.capabilities),
+        opted_out.question_policy(),
     );
     let session_id = opted_out.open_session(request).expect("opt-out session");
     opted_out
@@ -413,6 +416,7 @@ fn ask_arm(cwd: &Scratch, ask: &str, user_settings: bool, project: ProjectTrust,
         user_settings,
         project,
         requested_cli_mode(&provider.capabilities),
+        provider.question_policy(),
     );
     let session_id = provider
         .open_session(request)
@@ -458,4 +462,52 @@ fn model_of(events: &[AgentDomainEvent]) -> Option<String> {
         AgentDomainEvent::SessionOpened { model, .. } => Some(model.clone()),
         _ => None,
     })
+}
+
+/// Opting in changes only the interaction field; the peer and host must both be ready.
+#[test]
+fn questions_opt_in_requires_capability_and_host_readiness() {
+    use prost::Message as _;
+    for capable in [false, true] {
+        for client_implements in [false, true, CLIENT_IMPLEMENTS_QUESTIONS] {
+            for resume in [None, Some("previous-session".to_string())] {
+                for streaming in [StreamingPreference::Complete, StreamingPreference::Partial] {
+                    let baseline = build_create_request(
+                        "/project".into(),
+                        streaming,
+                        resume.clone(),
+                        false,
+                        true,
+                        true,
+                        crate::RequestedCliMode::Auto,
+                        ProjectTrust::Trusted,
+                        QuestionPolicy::default(),
+                    );
+                    let mut request = build_create_request(
+                        "/project".into(),
+                        streaming,
+                        resume.clone(),
+                        false,
+                        true,
+                        true,
+                        crate::RequestedCliMode::Auto,
+                        ProjectTrust::Trusted,
+                        QuestionPolicy {
+                            capable,
+                            client_implements,
+                        },
+                    );
+                    assert_eq!(
+                        request.client_interactions.as_ref().map(|config| config.questions),
+                        (capable && client_implements).then_some(true)
+                    );
+                    if capable && client_implements {
+                        assert_ne!(request.encode_to_vec(), baseline.encode_to_vec());
+                    }
+                    request.client_interactions = None;
+                    assert_eq!(request.encode_to_vec(), baseline.encode_to_vec());
+                }
+            }
+        }
+    }
 }

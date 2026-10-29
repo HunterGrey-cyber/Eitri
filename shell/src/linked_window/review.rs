@@ -1509,6 +1509,7 @@ mod tests {
             "p1",
             ViewId::BASE,
             FirstTurn {
+                typed_by_person: true,
                 wire: "hello".into(),
                 typed: "hello".into(),
             },
@@ -1554,6 +1555,7 @@ mod tests {
             "p1",
             ViewId::BASE,
             FirstTurn {
+                typed_by_person: true,
                 wire: "hello".into(),
                 typed: "hello".into(),
             },

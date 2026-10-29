@@ -42,6 +42,12 @@ pub struct HandoffFacts<'a> {
     /// `None` when no turn is running. Read from the projection, which is where the only
     /// authoritative answer lives.
     pub active_turn_id: Option<&'a str>,
+    /// Claude Code is working where this panel cannot show it: a terminal would open a second writer
+    /// on the session it is still using.
+    pub cli_unseen_busy: bool,
+    pub background: Option<&'a str>,
+    pub background_count: u32,
+    pub question_waiting: bool,
     /// The cwd the provider reported for this session, when it has reported one.
     pub reported_cwd: Option<&'a str>,
     /// Whether the conversation is still live, as the projection reports its status.
@@ -82,6 +88,13 @@ pub enum HandoffRefusal {
     /// The conversation has never taken a turn, so no Claude session id exists to resume.
     NoProviderSessionId,
     TurnInProgress,
+    /// Claude Code runs a turn this panel never saw start.
+    WorkingUnseen,
+    BackgroundTasks {
+        summary: String,
+        count: u32,
+    },
+    QuestionWaiting,
     /// An id that exists but cannot be turned into a command. Carried through from `agent` rather
     /// than reshaped, so the reason shown is the real one.
     Unusable(ResumeCommandError),
@@ -99,6 +112,15 @@ impl HandoffRefusal {
             HandoffRefusal::TurnInProgress => {
                 "A turn is still running. Let it finish, or press Stop, before continuing in a terminal.".to_string()
             }
+            HandoffRefusal::WorkingUnseen => {
+                "Claude Code is working where this panel cannot show it. Let it finish before continuing in a terminal."
+                    .to_string()
+            }
+            HandoffRefusal::BackgroundTasks { summary, count } => format!(
+                "{summary} {} running in the background: stop them in /tasks or wait",
+                if *count == 1 { "is" } else { "are" }
+            ),
+            HandoffRefusal::QuestionWaiting => "answer or cancel Claude's question first".to_string(),
             HandoffRefusal::Unusable(e) => e.to_string(),
         }
     }
@@ -120,8 +142,23 @@ pub fn prepare_handoff(
     let Some(provider_session_id) = facts.provider_session_id.filter(|id| !id.trim().is_empty()) else {
         return Err(HandoffRefusal::NoProviderSessionId);
     };
+    if facts.question_waiting {
+        return Err(HandoffRefusal::QuestionWaiting);
+    }
+    if facts.background_count > 0 {
+        return Err(HandoffRefusal::BackgroundTasks {
+            summary: facts
+                .background
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{} tasks", facts.background_count)),
+            count: facts.background_count,
+        });
+    }
     if facts.active_turn_id.is_some() {
         return Err(HandoffRefusal::TurnInProgress);
+    }
+    if facts.cli_unseen_busy {
+        return Err(HandoffRefusal::WorkingUnseen);
     }
     match facts.liveness {
         // Both, on purpose. A dead conversation is the case a terminal helps most with, so ending
@@ -151,9 +188,58 @@ mod tests {
         HandoffFacts {
             provider_session_id: Some("1857dcd5-973b-46a2"),
             active_turn_id: None,
+            cli_unseen_busy: false,
+            background: None,
+            background_count: 0,
+            question_waiting: false,
             reported_cwd: Some("/home/user/project"),
             liveness: ConversationLiveness::Live,
         }
+    }
+
+    #[test]
+    fn handoff_refused_with_background_tasks() {
+        let refusal = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                background: Some("2 shells"),
+                background_count: 2,
+                ..ready()
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.message(),
+            "2 shells are running in the background: stop them in /tasks or wait"
+        );
+        let refusal = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                background: Some("1 shell"),
+                background_count: 1,
+                ..ready()
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.message(),
+            "1 shell is running in the background: stop them in /tasks or wait"
+        );
+    }
+
+    #[test]
+    fn handoff_refused_while_a_question_waits() {
+        let refusal = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                question_waiting: true,
+                active_turn_id: Some("turn"),
+                ..ready()
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(refusal, HandoffRefusal::QuestionWaiting);
+        assert_eq!(refusal.message(), "answer or cancel Claude's question first");
     }
 
     #[test]
@@ -175,6 +261,10 @@ mod tests {
             Some(HandoffFacts {
                 provider_session_id: None,
                 active_turn_id: None,
+                cli_unseen_busy: false,
+                background: None,
+                background_count: 0,
+                question_waiting: false,
                 reported_cwd: None,
                 liveness: ConversationLiveness::Live,
             }),
@@ -203,6 +293,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(refusal, HandoffRefusal::TurnInProgress);
+    }
+
+    #[test]
+    fn handoff_refused_while_claude_code_works_unseen() {
+        let refusal = prepare_handoff(
+            &project(),
+            Some(HandoffFacts {
+                cli_unseen_busy: true,
+                ..ready()
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(refusal, HandoffRefusal::WorkingUnseen);
+        assert!(
+            refusal
+                .message()
+                .starts_with("Claude Code is working where this panel cannot show it"),
+            "{}",
+            refusal.message()
+        );
     }
 
     /// The provider's own reported cwd wins. It is where Claude actually stored the session, which

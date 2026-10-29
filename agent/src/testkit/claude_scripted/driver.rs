@@ -9,12 +9,13 @@
 //! | verb | argument |
 //! |------|----------|
 //! | `send` | text, or `{text, typed}` |
-//! | `steer`, `queue`, `slash` | text |
+//! | `steer` | text, or `{text, typed}` |
+//! | `queue`, `slash` | text |
 //! | `interrupt`, `approve_sweep`, `close`, `resume` | anything |
 //! | `answer_card` | `{tool, allow}` (allow defaults to true) |
 //! | `open_gate` | gate name |
 //! | `release` | hold name |
-//! | `stop_task`, `task_output` | task id |
+//! | `stop_task`, `task_output` | task id; `task_output` also `{task, refused?, min_bytes?, contains?}`: the host must refuse, with that text in the refusal, or the output it returns must be at least `min_bytes` long and hold `contains` |
 //! | `set_per_task_stop` | bool |
 //! | `answer_question` | `{picks: [[option...]...], other?: [text\|null...], notes?: [text\|null...], refused?: text}` |
 //! | `decline_question` | `{kind: "cancel"\|"chat"}`, with `picks`, `other` and `notes` as the answers so far (chat only) and `refused?` |
@@ -79,7 +80,12 @@ impl std::error::Error for DriverError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RosterEntry {
     pub task: String,
+    /// The task's kind in the roster's words (`shell`, `monitor`, `local_agent`, `workflow`, `other`).
+    pub kind: String,
+    /// The task's status in the roster's words (`running`, `stopping`, `completed`, `stopped`, ...).
     pub status: String,
+    /// Whether the task is ambient: listed, but never counted as work left running.
+    pub ambient: bool,
 }
 
 /// How a pending question is declined.
@@ -113,8 +119,9 @@ pub const QUESTION_TOOL: &str = "AskUserQuestion";
 pub trait Host {
     /// Sends a prompt. `typed` marks it as typed by the person; a host without `human_origin` fails it.
     fn send(&mut self, text: &str, typed: bool) -> Result<(), DriverError>;
-    /// Puts a message into the running turn.
-    fn steer(&mut self, text: &str) -> Result<(), DriverError>;
+    /// Puts a message into the running turn. `typed` marks it as typed by the person; a host without
+    /// `human_origin` fails it.
+    fn steer(&mut self, text: &str, typed: bool) -> Result<(), DriverError>;
     /// Sends a prompt while the CLI may be busy; the CLI queues it.
     fn queue(&mut self, text: &str) -> Result<(), DriverError>;
     fn interrupt(&mut self) -> Result<(), DriverError>;
@@ -378,6 +385,28 @@ fn clip(text: &str, chars: usize) -> String {
     out
 }
 
+/// What a `task_output` the host answered must hold when the scenario states it: at least `min_bytes` bytes and the
+/// text `contains`. Only the length is reported, never the output.
+fn check_task_output(task: &str, output: &str, arg: &Value) -> Result<(), Failure> {
+    if let Some(min) = arg.get("min_bytes").and_then(Value::as_u64) {
+        if (output.len() as u64) < min {
+            return Err(Failure::text(format!(
+                "`task_output` of {task} returned {} bytes, and the scenario expects at least {min}",
+                output.len()
+            )));
+        }
+    }
+    if let Some(want) = arg.get("contains").and_then(Value::as_str) {
+        if !output.contains(want) {
+            return Err(Failure::text(format!(
+                "`task_output` of {task} returned {} bytes that do not hold the text the scenario expects",
+                output.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn text_arg(value: &Value, key: &str) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
@@ -530,7 +559,10 @@ impl<'a> Driver<'a> {
                 let typed = arg["typed"].as_bool().unwrap_or(false);
                 Ok(self.host.send(&need("text")?, typed)?)
             }
-            "steer" => Ok(self.host.steer(&need("text")?)?),
+            "steer" => {
+                let typed = arg["typed"].as_bool().unwrap_or(false);
+                Ok(self.host.steer(&need("text")?, typed)?)
+            }
             "queue" => Ok(self.host.queue(&need("text")?)?),
             "slash" => Ok(self.host.slash(&need("command")?)?),
             "interrupt" => Ok(self.host.interrupt()?),
@@ -554,7 +586,22 @@ impl<'a> Driver<'a> {
                 Ok(())
             }
             "stop_task" => Ok(self.host.stop_task(&need("task")?)?),
-            "task_output" => self.host.task_output(&need("task")?).map(drop).map_err(Failure::from),
+            "task_output" => {
+                // `refused` names the text the host's refusal holds: a task whose kind has no output to read.
+                let task = need("task")?;
+                let refused = arg.get("refused").and_then(Value::as_str);
+                match (self.host.task_output(&task), refused) {
+                    (Ok(output), None) => check_task_output(&task, &output, arg),
+                    (Ok(_), Some(want)) => Err(Failure::text(format!(
+                        "`task_output` was taken, and the scenario expects a refusal holding `{want}`"
+                    ))),
+                    (Err(DriverError::Failed(why)), Some(want)) if why.contains(want) => Ok(()),
+                    (Err(DriverError::Failed(why)), Some(want)) => Err(Failure::text(format!(
+                        "`task_output` was refused with `{why}`, which does not hold `{want}`"
+                    ))),
+                    (Err(e), _) => Err(e.into()),
+                }
+            }
             "set_per_task_stop" => {
                 let on = arg
                     .as_bool()
@@ -1096,7 +1143,7 @@ fn question_action_of(verb: &str, arg: &Value) -> Result<QuestionAction, Failure
             other => {
                 return Err(Failure::text(format!(
                     "`decline_question` kind is cancel or chat, not {other:?}"
-                )))
+                )));
             }
         }),
     };
@@ -1113,7 +1160,7 @@ fn question_action_of(verb: &str, arg: &Value) -> Result<QuestionAction, Failure
         _ => {
             return Err(Failure::text(format!(
                 "`{verb}` `refused` is the text the refusal holds"
-            )))
+            )));
         }
     };
     let answers = answers_of(verb, arg)?;
@@ -1237,6 +1284,8 @@ mod tests {
         interaction: bool,
         /// A question answer is refused with this text.
         refuse: Option<String>,
+        /// What a task's output reads as.
+        output: String,
     }
 
     impl Fake {
@@ -1250,6 +1299,7 @@ mod tests {
                 roster: Vec::new(),
                 interaction: false,
                 refuse: None,
+                output: "tail".into(),
             }
         }
         fn note(&self, text: impl Into<String>) {
@@ -1265,7 +1315,10 @@ mod tests {
             self.note(format!("send {text}"));
             Ok(())
         }
-        fn steer(&mut self, text: &str) -> Result<(), DriverError> {
+        fn steer(&mut self, text: &str, typed: bool) -> Result<(), DriverError> {
+            if typed {
+                return Err(DriverError::CapabilityMissing("human_origin"));
+            }
             self.note(format!("steer {text}"));
             Ok(())
         }
@@ -1319,6 +1372,15 @@ mod tests {
         }
         fn capabilities(&self) -> BTreeSet<&'static str> {
             self.caps.clone()
+        }
+        fn task_output(&mut self, task: &str) -> Result<String, DriverError> {
+            if !self.caps.contains("task_output") {
+                return Err(DriverError::CapabilityMissing("task_output"));
+            }
+            self.note(format!("task_output {task}"));
+            self.refuse
+                .clone()
+                .map_or(Ok(self.output.clone()), |why| Err(DriverError::Failed(why)))
         }
         fn roster(&self) -> Result<Vec<RosterEntry>, DriverError> {
             if self.caps.contains("background_tasks") {
@@ -1621,7 +1683,9 @@ mod tests {
         host.interaction = true;
         host.roster = vec![RosterEntry {
             task: "bg1".into(),
+            kind: "shell".into(),
             status: "running".into(),
+            ambient: false,
         }];
         host.cards.borrow_mut().push(Answered {
             request: Request {
@@ -2047,6 +2111,42 @@ mod tests {
         host.refuse = None;
         let err = drive(&mut host, &endpoint, &run, late).unwrap_err();
         assert!(err.contains("expects a refusal"), "{err}");
+    }
+
+    #[test]
+    fn a_task_output_that_states_what_it_must_hold_fails_when_the_value_does_not() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.caps.insert("task_output");
+        let stated = json!([{"task_output": {"task": "t1", "min_bytes": 40, "contains": "MARK"}}]);
+        host.output = String::new();
+        let err = drive(&mut host, &endpoint, &run, stated.clone()).unwrap_err();
+        assert!(err.contains("returned 0 bytes") && err.contains("at least 40"), "{err}");
+        host.output = "x".repeat(40);
+        let err = drive(&mut host, &endpoint, &run, stated.clone()).unwrap_err();
+        assert!(err.contains("do not hold the text"), "{err}");
+        assert!(!err.contains("xxxx"), "the output itself is not repeated: {err}");
+        host.output = format!("{}MARK", "x".repeat(40));
+        drive(&mut host, &endpoint, &run, stated).unwrap();
+        // A task_output that states nothing takes whatever the host returned.
+        host.output = String::new();
+        drive(&mut host, &endpoint, &run, json!([{"task_output": "t1"}])).unwrap();
+    }
+
+    #[test]
+    fn a_task_output_passes_only_on_the_refusal_it_names() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.caps.insert("task_output");
+        drive(&mut host, &endpoint, &run, json!([{"task_output": "t1"}])).unwrap();
+        let refused = json!([{"task_output": {"task": "t1", "refused": "no readable output"}}]);
+        let err = drive(&mut host, &endpoint, &run, refused.clone()).unwrap_err();
+        assert!(err.contains("expects a refusal"), "{err}");
+        host.refuse = Some("task_output: no readable output for background task t1".into());
+        drive(&mut host, &endpoint, &run, refused).unwrap();
+        let other = json!([{"task_output": {"task": "t1", "refused": "not found"}}]);
+        let err = drive(&mut host, &endpoint, &run, other).unwrap_err();
+        assert!(err.contains("does not hold `not found`"), "{err}");
+        let err = drive(&mut host, &endpoint, &run, json!([{"task_output": "t1"}])).unwrap_err();
+        assert!(err.contains("no readable output"), "{err}");
     }
 
     #[test]

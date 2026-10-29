@@ -1,0 +1,4 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Use the skill"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"msg-a1","content":[{"type":"tool_use","id":"first","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"skill","isMeta":true,"promptSource":"sdk","message":{"role":"user","content":"Skill instructions"}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"msg-a2","content":[{"type":"tool_use","id":"second","name":"Bash","input":{"command":"true"}}]}}

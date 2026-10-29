@@ -5,7 +5,9 @@
 //! Reads `<dir>/script.json` (see `testkit::claude_scripted::script::ScriptFile`) and again whenever that file
 //! changes, writes the port it listens on to `<dir>/port`, and logs every request to `<dir>/requests.jsonl` and
 //! `<dir>/endpoint.jsonl`. `--addr` defaults to `127.0.0.1:0`; `--census` turns on census mode. It runs until it is
-//! killed.
+//! killed. Empty regular files in `<dir>/release/<name>` release a scripted HTTP hold once per name; they remain
+//! as evidence. `<dir>/held/<name>` exists while that hold is active. Both directories are private and polled
+//! every 50 ms; names contain only ASCII letters, digits, underscores and hyphens.
 //!
 //! `eitri-claude-scripted scrub <run dir> <staging dir>` writes the scrubbed form of a run directory's tap
 //! logs, request log with bodies and CLI transcript into the staging directory, with a `manifest.json` that
@@ -74,10 +76,17 @@ fn main() {
     };
     let model = ScriptedModel::start(addr.as_str(), script).unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
     model.watch_script(&script_path);
+    let mut released = std::collections::BTreeSet::new();
+    model
+        .poll_control_files(&mut released)
+        .unwrap_or_else(|e| fail(&format!("hold control files: {e}")));
     let port = format!("{}\n", model.addr().port());
     agent::private_fs::write_private(&dir.join("port"), port.as_bytes())
         .unwrap_or_else(|e| fail(&format!("port file: {e}")));
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        model
+            .poll_control_files(&mut released)
+            .unwrap_or_else(|e| fail(&format!("hold control files: {e}")));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

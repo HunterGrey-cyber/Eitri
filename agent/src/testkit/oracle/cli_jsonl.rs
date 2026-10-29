@@ -3,10 +3,20 @@
 //! The rules, each from lines the pinned CLI (2.1.311) was recorded writing:
 //!
 //! - **A turn opens at a `user` line** whose content is a string or text blocks (not only `tool_result`
-//!   blocks) and that is neither `isMeta` nor `isCompactSummary`. Its origin is `origin.kind` when the line
-//!   has one, `task_notification` when the content is a `<task-notification>` envelope, `human` when
-//!   `promptSource` is one a person's words carry, else `unknown`. A slash command's echo
-//!   (`<command-name>`) opens a turn whose user text is the command as typed.
+//!   blocks) and that is not `isCompactSummary`. Its origin is `origin.kind` when the line has one,
+//!   `task_notification` when the content is a `<task-notification>` envelope, `scheduled` when the line
+//!   carries the scheduler's mark (`wakeupSource`, `modelScheduledOrigin`), `human` when `promptSource` is
+//!   one a person's words carry, else `unknown`. An `isMeta` line opens a turn only when it is the prompt the
+//!   CLI filed for a turn it started itself (a fired wake-up, another session's message it took off its
+//!   queue while idle: recorded with origin `peer` or a `wakeupSource`, and with the CLI's `turnPosition`
+//!   stamp of a turn's start); any other meta line is skipped. A slash command's echo (`<command-name>`, or
+//!   `<command-message>` before it for a skill or prompt command; the CLI writes it with no `promptSource`, and
+//!   a line that has one is a message whatever its text starts with) opens a turn whose user text is the command
+//!   as typed (`/x args`), and a bash-mode input (`<bash-input>`) one whose text is `!` and the command; what
+//!   either printed (`<local-command-stdout>`, `<bash-stdout>`) is skipped, and so is a line naming the call
+//!   that wrote it (`sourceToolUseID`, the CLI's "tool message"). No recording holds a bash-mode line, a
+//!   `<command-message>`-first echo or a tool message: those shapes are the CLI's own code that writes and
+//!   classifies them, and the bash and tool-message lines are counted as unrecorded.
 //! - **A turn runs to the next opener or the end of the file.** The CLI writes one `assistant` line per
 //!   content block and fills `stop_reason` on each, so a turn's last block is known only by what follows
 //!   it; `turn_duration` is not written in SDK sessions, and one that is followed by anything but an
@@ -25,13 +35,20 @@
 //!   continued reply, or between a tool result and the next call).
 //! - A subagent's transcript (`<session>/subagents/agent-<id>.jsonl`, named by its `.meta.json`) is nested
 //!   under the Agent call that started it.
+//! - **An `AskUserQuestion` call's result is followed by a question entry**, built from the call's input and
+//!   the result alone ([`question_key`]): the number of questions the input asked, the ones the line's
+//!   `toolUseResult.answers` names, and an end read from the result: `declined` for the CLI's rejection
+//!   text or its declined row, `chat` for its clarify text or its more-questions rows, `cancelled` for an
+//!   interruption or for the failed permission request of a stream that closed while the question waited,
+//!   `answered` for a structured result with answers, `other` for anything else. Only that
+//!   key is kept; the questions, options, answers and notes are not.
 //!
 //! Every other line is skipped and counted. A line of a kind the pinned CLI was never recorded writing is
 //! never decoded, and is counted as unrecorded as well, so a new shape shows up in the counts instead of
 //! being misread. Shapes of a recorded kind that no recording holds yet (the result of a tool call cut short
 //! to deliver a message) are counted as unrecorded and give no entry of their own.
 
-use super::{CliForm, Entry, Inconsistency, InputKind, Origin, Pos, Turn, Via};
+use super::{CliForm, Entry, Inconsistency, InputKind, Origin, Pos, QuestionEnd, QuestionKey, Turn, Via};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader};
@@ -75,6 +92,29 @@ pub const HUMAN_PROMPT_SOURCES: &[&str] = &["typed", "suggestion_accepted", "que
 
 /// The text the CLI writes as a user line when a reply was interrupted.
 pub const INTERRUPTED_TEXT: &str = "[Request interrupted by user]";
+
+/// The tool whose calls are Claude's questions to the person.
+pub const QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// How the CLI's results of a question call begin when the person turned the questions down: its rejection
+/// of any tool call, and the row it draws for a declined question set.
+pub const QUESTION_DECLINED_PREFIXES: &[&str] = &[
+    "The user doesn't want to proceed with this tool use. The tool use was rejected",
+    "User declined to answer questions",
+];
+
+/// How the CLI's results of a question call begin when the person chose to answer in the chat: the text the
+/// model receives, and the rows the CLI draws.
+pub const QUESTION_CHAT_PREFIXES: &[&str] = &[
+    "The user wants to clarify these questions.",
+    "User asked Claude for more questions!",
+    "User asked Claude for more questions (so far):",
+];
+
+/// The CLI's result of a call whose permission request was still open when the stream it went out on
+/// closed: the session that showed the question ended while it waited.
+pub const QUESTION_STREAM_CLOSED: &str =
+    "Tool permission request failed: AbortError: Tool permission stream closed before response received";
 
 /// How the result of a tool call the CLI cut short to deliver a message begins.
 pub const ENDED_TO_DELIVER_PREFIX: &str = "[Tool call did not complete: the turn was ended to deliver";
@@ -133,6 +173,25 @@ fn flag(line: &Value, key: &str) -> bool {
     line.get(key).and_then(Value::as_bool) == Some(true)
 }
 
+/// The scheduler's marks on the prompt of a turn it started: the wake-up that fired, or its own flag.
+fn scheduled_mark(line: &Value) -> bool {
+    line.get("wakeupSource").and_then(Value::as_str).is_some() || flag(line, "modelScheduledOrigin")
+}
+
+/// Whether a meta user line is the prompt of a turn the CLI started for itself. The CLI files that prompt as a
+/// meta line (a fired wake-up, another session's message taken off its queue while idle) carrying what started
+/// it: an origin other than a person's, or the scheduler's mark. The recordings also show the CLI's stamp of a
+/// turn's start (`turnPosition`) on those lines, which is not read: a meta line with neither (a skill's
+/// expansion, a command's caveat, a reminder, a fire the scheduler did not mark) stays a note inside the
+/// running turn, as the restore reader reads it.
+fn meta_line_opens_a_turn(line: &Value) -> bool {
+    match line.pointer("/origin/kind").and_then(Value::as_str) {
+        Some("human") => false,
+        Some(_) => true,
+        None => scheduled_mark(line),
+    }
+}
+
 fn bump(map: &mut std::collections::BTreeMap<String, usize>, key: impl Into<String>) {
     *map.entry(key.into()).or_default() += 1;
 }
@@ -149,6 +208,8 @@ struct Reader {
     pending_turn_duration: Option<Pos>,
     /// Blocks already read per assistant `message.id`.
     seen_blocks: HashMap<String, HashSet<String>>,
+    /// The input of each question call whose result has not been read, by tool-use id.
+    asks: HashMap<String, Value>,
 }
 
 impl Reader {
@@ -160,6 +221,7 @@ impl Reader {
             pending_compaction: None,
             pending_turn_duration: None,
             seen_blocks: HashMap::new(),
+            asks: HashMap::new(),
         }
     }
 
@@ -233,7 +295,10 @@ impl Reader {
     }
 
     fn user_line(&mut self, form: &mut CliForm, line: &Value, pos: Pos) {
-        if flag(line, "isMeta") {
+        // A meta line opens a turn when it is the prompt the CLI filed for a turn of its own: a wake-up, a
+        // scheduled task or another session's message it took off its queue while idle. Every other meta line
+        // is a note of the CLI's inside a turn.
+        if flag(line, "isMeta") && !meta_line_opens_a_turn(line) {
             bump(&mut form.skipped, "user:isMeta");
             return;
         }
@@ -267,12 +332,24 @@ impl Reader {
         if !results.is_empty() && text.is_some() {
             bump(&mut form.unrecorded, "user:text_and_tool_result");
         }
+        // The structured result belongs to the line's one result; a line of several gives none of them one.
+        let structured = match results.len() {
+            1 => line.get("toolUseResult"),
+            _ => None,
+        };
         for block in results {
-            self.tool_result(form, block, pos);
+            self.tool_result(form, block, structured, pos);
         }
         let Some(text) = text else {
             return;
         };
+        // The CLI's own reader calls a line naming the call that wrote it a tool's message, whatever its
+        // text: a skill the model ran. No recording holds one.
+        if line.get("sourceToolUseID").is_some() {
+            bump(&mut form.skipped, "user:tool-message");
+            bump(&mut form.unrecorded, "user:tool-message");
+            return;
+        }
         if text.starts_with(INTERRUPTED_TEXT.trim_end_matches(']')) {
             // Only the plain form was recorded; another wording of it (an interruption during a tool
             // call) is still the end of the turn, never a new turn, and is counted.
@@ -286,8 +363,26 @@ impl Reader {
             bump(&mut form.skipped, "user:local-command-output");
             return;
         }
-        let command = command_text(&text);
+        // What a bash-mode command printed, in the line after its input. No recording holds bash mode.
+        if text.starts_with("<bash-stdout>") || text.starts_with("<bash-stderr>") {
+            bump(&mut form.skipped, "user:bash-output");
+            bump(&mut form.unrecorded, "user:bash-output");
+            return;
+        }
+        // A command's echo carries no `promptSource`; a line that has one is a message, whatever its text starts with.
+        let echo = line.get("promptSource").is_none();
+        let command = command_text(&text).filter(|_| echo).or_else(|| {
+            let input = bash_input(&text).filter(|_| echo)?;
+            bump(&mut form.unrecorded, "user:bash-input");
+            Some(input)
+        });
         let origin = self.origin(form, line, &text);
+        // A subagent's transcript opens with the prompt its Agent call gave, which names no producer.
+        if origin == Origin::Unknown && command.is_none() && !self.sidechain_file {
+            // An opener nothing names: no recording holds one, so its `promptSource` is counted.
+            let source = line.get("promptSource").and_then(Value::as_str).unwrap_or("none");
+            bump(&mut form.unrecorded, format!("user:opener/promptSource/{source}"));
+        }
         let via = match origin {
             Origin::TaskNotification | Origin::Scheduled => Via::TaskNotification,
             Origin::Peer => Via::Peer,
@@ -316,11 +411,12 @@ impl Reader {
                         Origin::TaskNotification
                     }
                 }
+                // Recorded on the meta line of a turn another session's message started.
+                "peer" => Origin::Peer,
                 other => {
                     bump(&mut form.unrecorded, format!("user:origin/{other}"));
                     match other {
                         "human" => Origin::Human,
-                        "peer" => Origin::Peer,
                         _ => Origin::Unknown,
                     }
                 }
@@ -329,13 +425,16 @@ impl Reader {
         if text.starts_with("<task-notification>") {
             return Origin::TaskNotification;
         }
+        if scheduled_mark(line) {
+            return Origin::Scheduled;
+        }
         match line.get("promptSource").and_then(Value::as_str) {
             Some(source) if HUMAN_PROMPT_SOURCES.contains(&source) => Origin::Human,
             _ => Origin::Unknown,
         }
     }
 
-    fn tool_result(&mut self, form: &mut CliForm, block: &Value, pos: Pos) {
+    fn tool_result(&mut self, form: &mut CliForm, block: &Value, structured: Option<&Value>, pos: Pos) {
         let id = block
             .get("tool_use_id")
             .and_then(Value::as_str)
@@ -346,7 +445,23 @@ impl Reader {
             bump(&mut form.unrecorded, "user:tool_result/ended_to_deliver");
         }
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-        self.mid_turn(form, Entry::ToolResult { id, is_error, content }, pos);
+        // The first result of a question call settles it; a later one with the same id is a plain result.
+        let question = self
+            .asks
+            .remove(&id)
+            .map(|input| question_key(&input, &content, structured));
+        self.mid_turn(
+            form,
+            Entry::ToolResult {
+                id: id.clone(),
+                is_error,
+                content,
+            },
+            pos,
+        );
+        if let Some(key) = question {
+            self.mid_turn(form, Entry::Question { id, key }, pos);
+        }
     }
 
     fn assistant_line(&mut self, form: &mut CliForm, line: &Value, pos: Pos) {
@@ -391,11 +506,15 @@ impl Reader {
                 Some("text") => Entry::Assistant {
                     text: block.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
                 },
-                Some("tool_use") => Entry::ToolUse {
-                    id: block.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                    name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                    input: block.get("input").cloned().unwrap_or(Value::Null),
-                },
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    if name == QUESTION_TOOL {
+                        self.asks.insert(id.clone(), input.clone());
+                    }
+                    Entry::ToolUse { id, name, input }
+                }
                 Some(kind @ ("thinking" | "redacted_thinking")) => {
                     bump(&mut form.unrecorded, format!("assistant:block/{kind}"));
                     Entry::Thinking {
@@ -568,11 +687,56 @@ impl Reader {
     }
 }
 
-/// A slash command's echo (`<command-name>/x</command-name> … <command-args>y</command-args>`) as typed:
-/// `/x y`.
+/// A question call's key, from its input and its result: how many questions the input asked, the indexes of
+/// those the structured result's `answers` names, and the end the result says.
+pub fn question_key(input: &Value, content: &Value, structured: Option<&Value>) -> QuestionKey {
+    let asked: Vec<Option<&str>> = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|questions| {
+            questions
+                .iter()
+                .map(|q| q.get("question").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let answers = structured
+        .and_then(|result| result.get("answers"))
+        .and_then(Value::as_object);
+    let answered = answers
+        .map(|answers| {
+            asked
+                .iter()
+                .enumerate()
+                .filter(|(_, question)| question.is_some_and(|q| answers.contains_key(q)))
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = super::normalise::result_text(content);
+    let text = text.trim_start();
+    let end = if QUESTION_DECLINED_PREFIXES.iter().any(|p| text.starts_with(p)) {
+        QuestionEnd::Declined
+    } else if QUESTION_CHAT_PREFIXES.iter().any(|p| text.starts_with(p)) {
+        QuestionEnd::Chat
+    } else if text.starts_with(INTERRUPTED_TEXT.trim_end_matches(']')) || text.starts_with(QUESTION_STREAM_CLOSED) {
+        QuestionEnd::Cancelled
+    } else if answers.is_some() {
+        QuestionEnd::Answered
+    } else {
+        QuestionEnd::Other
+    };
+    QuestionKey::new(asked.len(), answered, end)
+}
+
+/// A slash command's echo (`<command-name>/x</command-name> … <command-args>y</command-args>`, or with the
+/// `<command-message>` first, as the CLI writes it for a skill or a prompt command) as typed: `/x y`.
 fn command_text(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("<command-name>")?;
-    let name = &rest[..rest.find("</command-name>")?];
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return None;
+    }
+    let rest = &text[text.find("<command-name>")? + "<command-name>".len()..];
+    let name = rest[..rest.find("</command-name>")?].trim();
     let args = text
         .find("<command-args>")
         .and_then(|start| {
@@ -585,6 +749,12 @@ fn command_text(text: &str) -> Option<String> {
     } else {
         format!("{name} {args}")
     })
+}
+
+/// A bash-mode input (`<bash-input>ls</bash-input>`) as typed: `!ls`.
+fn bash_input(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("<bash-input>")?;
+    Some(format!("!{}", rest[..rest.find("</bash-input>")?].trim()))
 }
 
 fn read_subagents(form: &mut CliForm, dir: &Path) -> io::Result<()> {
@@ -791,6 +961,74 @@ mod tests {
         assert!(form.unrecorded.is_empty(), "{:?}", form.unrecorded);
     }
 
+    /// A session in the terminal's form: a turn that ends (its `turn_duration`), then the meta prompt the CLI
+    /// files when it takes something off its queue while idle, and the calls the model makes for it.
+    fn woken_by(meta_line: &str) -> String {
+        [
+            r#"{"type":"user","isSidechain":false,"promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m1","content":[{"type":"text","text":"started"}]}}"#,
+            r#"{"type":"system","isSidechain":false,"subtype":"turn_duration","durationMs":5}"#,
+            meta_line,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m2","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"true"}}]}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m3","content":[{"type":"text","text":"done"}]}}"#,
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn the_meta_prompt_of_a_turn_another_session_s_message_started_opens_that_turn() {
+        let form = read_texts(&[&woken_by(
+            r#"{"type":"user","isSidechain":false,"isMeta":true,"promptSource":"system","turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":2},"origin":{"kind":"peer","name":"worker","body":"report"},"message":{"role":"user","content":"Another Claude session sent a message:\nreport"}}"#,
+        )]);
+        assert_eq!(
+            kinds(&form),
+            vec![
+                vec!["user", "assistant"],
+                vec!["user", "tool_use", "tool_result", "assistant"]
+            ]
+        );
+        assert_eq!(form.turns[1].origin, Origin::Peer);
+        assert!(matches!(&form.turns[1].entries[0], Entry::User { via: Via::Peer, .. }));
+        assert!(form.inconsistencies.is_empty(), "{:?}", form.inconsistencies);
+        assert!(
+            form.unrecorded.get("user:origin/peer").is_none(),
+            "{:?}",
+            form.unrecorded
+        );
+        assert_eq!(form.skipped.get("user:isMeta"), None);
+    }
+
+    #[test]
+    fn the_meta_prompt_of_a_fired_wake_up_opens_a_scheduled_turn() {
+        let form = read_texts(&[&woken_by(
+            r#"{"type":"user","isSidechain":false,"isMeta":true,"promptSource":"system","wakeupSource":"loop_wakeup","message":{"role":"user","content":"check the build"}}"#,
+        )]);
+        assert_eq!(form.turns.len(), 2);
+        assert_eq!(form.turns[1].origin, Origin::Scheduled);
+        assert!(
+            matches!(&form.turns[1].entries[0], Entry::User { text, via: Via::TaskNotification } if text == "check the build")
+        );
+        assert!(form.inconsistencies.is_empty(), "{:?}", form.inconsistencies);
+    }
+
+    #[test]
+    fn a_meta_line_that_names_no_cause_stays_a_note_of_the_running_turn() {
+        for line in [
+            r#"{"type":"user","isSidechain":false,"isMeta":true,"message":{"role":"user","content":"a reminder"}}"#,
+            r#"{"type":"user","isSidechain":false,"isMeta":true,"promptSource":"system","turnOrigin":"scheduled","message":{"role":"user","content":"unmarked"}}"#,
+            r#"{"type":"user","isSidechain":false,"isMeta":true,"origin":{"kind":"human"},"message":{"role":"user","content":"expansion"}}"#,
+        ] {
+            let form = read_texts(&[&woken_by(line)]);
+            assert_eq!(
+                kinds(&form),
+                vec![vec!["user", "assistant", "tool_use", "tool_result", "assistant"]],
+                "{line}"
+            );
+            assert_eq!(form.skipped.get("user:isMeta"), Some(&1), "{line}");
+        }
+    }
+
     #[test]
     fn an_interruption_in_other_words_ends_the_turn_and_is_counted() {
         let text = [
@@ -831,6 +1069,133 @@ mod tests {
         );
     }
 
+    fn ask_input() -> Value {
+        serde_json::json!({"questions": [
+            {"question": "First?", "header": "One", "options": [{"label": "a"}, {"label": "b"}]},
+            {"question": "Second?", "header": "Two", "options": [{"label": "c"}, {"label": "d"}]},
+            {"question": "Third?", "header": "Three", "options": [{"label": "e"}, {"label": "f"}]},
+        ]})
+    }
+
+    #[test]
+    fn a_question_key_counts_the_questions_and_names_the_answered_ones_in_order() {
+        let structured = serde_json::json!({"answers": {"Third?": "e", "First?": "a", "Not asked?": "x"}});
+        let key = question_key(&ask_input(), &Value::String("anything".into()), Some(&structured));
+        assert_eq!(key, QuestionKey::new(3, vec![0, 2], QuestionEnd::Answered));
+    }
+
+    #[test]
+    fn a_question_result_s_text_says_how_it_ended() {
+        let end = |text: &str| question_key(&ask_input(), &Value::String(text.into()), None).end;
+        assert_eq!(
+            end("The user doesn't want to proceed with this tool use. The tool use was rejected (eg. ...)"),
+            QuestionEnd::Declined
+        );
+        assert_eq!(end("User declined to answer questions"), QuestionEnd::Declined);
+        assert_eq!(
+            end("The user wants to clarify these questions.\n    This means ..."),
+            QuestionEnd::Chat
+        );
+        assert_eq!(end("User asked Claude for more questions!"), QuestionEnd::Chat);
+        assert_eq!(
+            end("[Request interrupted by user for tool use]"),
+            QuestionEnd::Cancelled
+        );
+        assert_eq!(
+            end("Tool permission request failed: AbortError: Tool permission stream closed before response received"),
+            QuestionEnd::Cancelled,
+            "a question whose session closed while it waited was ended by no person"
+        );
+        assert_eq!(
+            end("Tool permission request failed: Error: something else"),
+            QuestionEnd::Other
+        );
+        assert_eq!(
+            end("Something the reader has no rule for"),
+            QuestionEnd::Other,
+            "an unknown result with no structured answers ends as other, so a call no record restored shows"
+        );
+        let blocks = serde_json::json!([{"type": "text", "text": "User declined to answer questions"}]);
+        assert_eq!(
+            question_key(&ask_input(), &blocks, None).end,
+            QuestionEnd::Declined,
+            "a result written as text blocks reads as its text"
+        );
+    }
+
+    #[test]
+    fn a_rejection_is_declined_even_beside_structured_answers() {
+        let structured = serde_json::json!({"answers": {"First?": "a"}});
+        let key = question_key(
+            &ask_input(),
+            &Value::String("User declined to answer questions".into()),
+            Some(&structured),
+        );
+        assert_eq!(key, QuestionKey::new(3, vec![0], QuestionEnd::Declined));
+    }
+
+    #[test]
+    fn a_question_input_without_questions_counts_none() {
+        let key = question_key(&serde_json::json!({}), &Value::Null, None);
+        assert_eq!(key, QuestionKey::new(0, Vec::new(), QuestionEnd::Other));
+    }
+
+    fn question_lines(results: &[&str]) -> String {
+        let mut lines = vec![
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#
+                .to_owned(),
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m1","content":[{"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{"questions":[{"question":"First?"}]}},{"type":"tool_use","id":"run","name":"Bash","input":{"command":"x"}}]}}"#
+                .to_owned(),
+        ];
+        lines.extend(results.iter().map(|line| (*line).to_owned()));
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_question_entry_follows_its_call_s_first_result_only() {
+        let text = question_lines(&[
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask","content":"done"}]},"toolUseResult":{"answers":{"First?":"a"}}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"run","content":"ok"}]},"toolUseResult":{"answers":{"First?":"a"}}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask","content":"again"}]}}"#,
+        ]);
+        let form = read_texts(&[&text]);
+        assert_eq!(
+            kinds(&form),
+            vec![vec![
+                "user",
+                "tool_use",
+                "tool_use",
+                "tool_result",
+                "question",
+                "tool_result",
+                "tool_result"
+            ]],
+            "another tool's result makes no question, and a second result of the same call makes no second one"
+        );
+        assert_eq!(
+            form.turns[0].entries[4],
+            Entry::Question {
+                id: "ask".into(),
+                key: QuestionKey::new(1, vec![0], QuestionEnd::Answered),
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_of_several_results_gives_none_of_them_its_structured_result() {
+        let text = question_lines(&[
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ask","content":"done"},{"type":"tool_result","tool_use_id":"run","content":"ok"}]},"toolUseResult":{"answers":{"First?":"a"}}}"#,
+        ]);
+        let form = read_texts(&[&text]);
+        assert_eq!(
+            form.turns[0].entries[4],
+            Entry::Question {
+                id: "ask".into(),
+                key: QuestionKey::new(1, Vec::new(), QuestionEnd::Other),
+            }
+        );
+    }
+
     #[test]
     fn a_command_echo_reads_as_the_command_typed() {
         assert_eq!(
@@ -840,6 +1205,62 @@ mod tests {
             .as_deref(),
             Some("/compact keep it short")
         );
+        assert_eq!(
+            command_text("<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>the diff</command-args>")
+                .as_deref(),
+            Some("/review the diff")
+        );
         assert_eq!(command_text("plain words"), None);
+        assert_eq!(command_text("words, then <command-name>/x</command-name>"), None);
+    }
+
+    #[test]
+    fn a_bash_mode_input_opens_a_turn_as_typed_and_its_output_is_skipped() {
+        let text = [
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"<bash-input>ls -la</bash-input>"}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"<bash-stdout>total 0</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"<command-message>review</command-message>\n<command-name>/review</command-name>"}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m1","content":[{"type":"text","text":"fine"}]}}"#,
+        ]
+        .join("\n");
+        let form = read_texts(&[&text]);
+        assert_eq!(kinds(&form), vec![vec!["user"], vec!["user", "assistant"]]);
+        assert!(matches!(&form.turns[0].entries[0], Entry::User { text, via: Via::Prompt } if text == "!ls -la"));
+        assert!(matches!(&form.turns[1].entries[0], Entry::User { text, .. } if text == "/review"));
+        assert_eq!(form.skipped.get("user:bash-output"), Some(&1));
+        assert_eq!(form.unrecorded.get("user:bash-input"), Some(&1));
+        assert!(
+            !form.unrecorded.keys().any(|k| k.starts_with("user:opener")),
+            "a command names its opener: {:?}",
+            form.unrecorded
+        );
+    }
+
+    #[test]
+    fn a_command_tag_on_a_line_with_a_prompt_source_is_a_message_not_a_command_echo() {
+        let typed = r#"{"type":"user","isSidechain":false,"promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"<bash-input>git status</bash-input> -- why does this show up?"}}"#;
+        let form = read_texts(&[typed]);
+        assert!(matches!(
+            &form.turns[0].entries[0],
+            Entry::User { text, via: Via::Prompt } if text == "<bash-input>git status</bash-input> -- why does this show up?"
+        ));
+        assert_eq!(form.unrecorded.get("user:bash-input"), None);
+        let system = r#"{"type":"user","isSidechain":false,"promptSource":"system","message":{"role":"user","content":"<command-name>/compact</command-name><command-args>written by something else</command-args>"}}"#;
+        let form = read_texts(&[system]);
+        assert_eq!(form.turns[0].origin, Origin::Unknown);
+        assert!(matches!(
+            &form.turns[0].entries[0],
+            Entry::User { text, .. } if text.starts_with("<command-name>")
+        ));
+        assert_eq!(form.unrecorded.get("user:opener/promptSource/system"), Some(&1));
+    }
+
+    #[test]
+    fn an_opener_nothing_names_is_counted_by_its_prompt_source() {
+        let text =
+            r#"{"type":"user","isSidechain":false,"promptSource":"system","message":{"role":"user","content":"who"}}"#;
+        let form = read_texts(&[text]);
+        assert_eq!(form.turns[0].origin, Origin::Unknown);
+        assert_eq!(form.unrecorded.get("user:opener/promptSource/system"), Some(&1));
     }
 }

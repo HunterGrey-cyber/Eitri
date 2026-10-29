@@ -1,0 +1,17 @@
+{"type":"user","uuid":"h1","isSidechain":false,"promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"Start the checks"}}
+{"type":"assistant","uuid":"a1","isSidechain":false,"message":{"role":"assistant","id":"msg-1","content":[{"type":"tool_use","id":"bg-1","name":"Bash","input":{"command":"true","run_in_background":true}}]}}
+{"type":"user","uuid":"r1","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bg-1","content":"Command running in background with ID: bg1"}]}}
+{"type":"assistant","uuid":"a2","isSidechain":false,"message":{"role":"assistant","id":"msg-2","content":[{"type":"text","text":"Started"}]}}
+{"type":"system","uuid":"d1","isSidechain":false,"subtype":"turn_duration","durationMs":5}
+{"type":"user","uuid":"peer-1","isSidechain":false,"isMeta":true,"promptSource":"system","turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":2},"origin":{"kind":"peer","name":"reviewer","body":"Please look at the log"},"message":{"role":"user","content":"Another Claude session sent a message:\nPlease look at the log"}}
+{"type":"assistant","uuid":"p1","isSidechain":false,"message":{"role":"assistant","id":"msg-3","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"/work/log.txt"}}]}}
+{"type":"user","uuid":"p2","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"log"}]}}
+{"type":"attachment","uuid":"n1","isSidechain":false,"attachment":{"type":"queued_command","commandMode":"task-notification","origin":{"kind":"task-notification"},"prompt":"<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>bg-1</tool-use-id>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}
+{"type":"assistant","uuid":"p3","isSidechain":false,"message":{"role":"assistant","id":"msg-4","content":[{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"/work/out.txt"}}]}}
+{"type":"user","uuid":"p4","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","content":"out"}]}}
+{"type":"assistant","uuid":"p5","isSidechain":false,"message":{"role":"assistant","id":"msg-5","content":[{"type":"text","text":"Looked"}]}}
+{"type":"system","uuid":"d2","isSidechain":false,"subtype":"turn_duration","durationMs":5}
+{"type":"user","uuid":"fire-1","isSidechain":false,"isMeta":true,"promptSource":"system","turnOrigin":"scheduled","turnPosition":{"promptIndex":0,"turnIndex":3},"wakeupSource":"loop_wakeup","message":{"role":"user","content":"Check the build"}}
+{"type":"assistant","uuid":"f1","isSidechain":false,"message":{"role":"assistant","id":"msg-6","content":[{"type":"tool_use","id":"bash-2","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"f2","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash-2","content":"ok"}]}}
+{"type":"assistant","uuid":"f3","isSidechain":false,"message":{"role":"assistant","id":"msg-7","content":[{"type":"text","text":"Built"}]}}

@@ -1,0 +1,576 @@
+{
+  "domain_events": [
+    {
+      "turn_id": "main",
+      "type": "turn_started"
+    },
+    {
+      "cause": {
+        "cron_id": "cron",
+        "description": null,
+        "kind": "scheduled",
+        "peer_name": null,
+        "prompt": "run",
+        "schedule_reason": "due",
+        "scheduled_for_ms": 42,
+        "summary": null,
+        "task_id": null,
+        "task_kind": null,
+        "task_status": null,
+        "text": null,
+        "wakeup_source": "cron"
+      },
+      "origin": "cli",
+      "turn_id": "main",
+      "type": "turn_attributed"
+    },
+    {
+      "cause": {
+        "cron_id": "cron",
+        "description": null,
+        "kind": "scheduled",
+        "peer_name": null,
+        "prompt": "run",
+        "schedule_reason": "due",
+        "scheduled_for_ms": 42,
+        "summary": null,
+        "task_id": null,
+        "task_kind": null,
+        "task_status": null,
+        "text": null,
+        "wakeup_source": "cron"
+      },
+      "turn_id": "main",
+      "type": "turn_cause_updated"
+    },
+    {
+      "cause": {
+        "cron_id": "cron",
+        "description": null,
+        "kind": "scheduled",
+        "peer_name": null,
+        "prompt": "run",
+        "schedule_reason": "due",
+        "scheduled_for_ms": 42,
+        "summary": null,
+        "task_id": null,
+        "task_kind": null,
+        "task_status": null,
+        "text": null,
+        "wakeup_source": "cron"
+      },
+      "turn_id": "main",
+      "type": "cli_cycle_started"
+    },
+    {
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "edge": "notified",
+      "end_time_ms": null,
+      "error": null,
+      "is_backgrounded": null,
+      "last_tool_name": null,
+      "output_file": null,
+      "reason": null,
+      "run_id": null,
+      "status": null,
+      "summary": null,
+      "task": null,
+      "task_id": "b",
+      "type": "task_event",
+      "usage": null,
+      "workflow_progress": null
+    },
+    {
+      "new_conversation_id": "new",
+      "trigger": "clear",
+      "type": "conversation_reset"
+    },
+    {
+      "kind": "text",
+      "text": "before ",
+      "turn_id": "main",
+      "type": "content_delta"
+    },
+    {
+      "frame": {
+        "kind": "text",
+        "text": "child reply",
+        "turn_id": "main",
+        "type": "content_delta"
+      },
+      "parent_tool_use_id": "p",
+      "type": "subagent_frame"
+    },
+    {
+      "frame": {
+        "kind": "thinking",
+        "text": "child thought",
+        "turn_id": "main",
+        "type": "content_delta"
+      },
+      "parent_tool_use_id": "p",
+      "type": "subagent_frame"
+    },
+    {
+      "frame": {
+        "input": {
+          "path": "x"
+        },
+        "name": "Read",
+        "tool_use_id": "c",
+        "turn_id": "main",
+        "type": "tool_call_started"
+      },
+      "parent_tool_use_id": "p",
+      "type": "subagent_frame"
+    },
+    {
+      "frame": {
+        "content": "ok",
+        "is_error": false,
+        "tool_use_id": "c",
+        "turn_id": "main",
+        "type": "tool_call_completed"
+      },
+      "parent_tool_use_id": "p",
+      "type": "subagent_frame"
+    },
+    {
+      "kind": "text",
+      "text": "after",
+      "turn_id": "main",
+      "type": "content_delta"
+    },
+    {
+      "content": "plain <b>text</b>",
+      "kind": "api_retry",
+      "level": "notice",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "content": "plain <b>text</b>",
+      "kind": "compacting",
+      "level": "notice",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "content": "plain <b>text</b>",
+      "kind": "notification",
+      "level": "notice",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "content": "plain <b>text</b>",
+      "kind": "compaction",
+      "level": "notice",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "interaction_id": "i",
+      "questions": [],
+      "tool_use_id": "q",
+      "type": "question_asked",
+      "unsupported_reason": "Unsupported payload"
+    },
+    {
+      "answers": [],
+      "interaction_id": "i",
+      "outcome": "host_refused",
+      "reason": "Unsupported payload",
+      "type": "question_settled"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "num_turns": 3,
+        "origin_kind": "task-notification",
+        "reason": "no_result"
+      },
+      "outcome": "failed",
+      "result_text": "",
+      "stop_reason": null,
+      "turn_id": "main",
+      "type": "turn_completed",
+      "usage": null
+    }
+  ],
+  "events": {
+    "events": [
+      {
+        "turn_id": "main",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": "cron",
+          "description": null,
+          "kind": "scheduled",
+          "peer_name": null,
+          "prompt": "run",
+          "schedule_reason": "due",
+          "scheduled_for_ms": 42,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": null,
+          "wakeup_source": "cron"
+        },
+        "origin": "cli",
+        "turn_id": "main",
+        "type": "turn_attributed"
+      },
+      {
+        "cause": {
+          "cron_id": "cron",
+          "description": null,
+          "kind": "scheduled",
+          "peer_name": null,
+          "prompt": "run",
+          "schedule_reason": "due",
+          "scheduled_for_ms": 42,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": null,
+          "wakeup_source": "cron"
+        },
+        "turn_id": "main",
+        "type": "turn_cause_updated"
+      },
+      {
+        "cause": {
+          "cron_id": "cron",
+          "description": null,
+          "kind": "scheduled",
+          "peer_name": null,
+          "prompt": "run",
+          "schedule_reason": "due",
+          "scheduled_for_ms": 42,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": null,
+          "wakeup_source": "cron"
+        },
+        "turn_id": "main",
+        "type": "cli_cycle_started"
+      },
+      {
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "edge": "notified",
+        "end_time_ms": null,
+        "error": null,
+        "is_backgrounded": null,
+        "last_tool_name": null,
+        "output_file": null,
+        "reason": null,
+        "run_id": null,
+        "status": null,
+        "summary": null,
+        "task": null,
+        "task_id": "b",
+        "type": "task_event",
+        "usage": null,
+        "workflow_progress": null
+      },
+      {
+        "new_conversation_id": "new",
+        "trigger": "clear",
+        "type": "conversation_reset"
+      },
+      {
+        "kind": "text",
+        "text": "before ",
+        "turn_id": "main",
+        "type": "content_delta"
+      },
+      {
+        "frame": {
+          "kind": "text",
+          "text": "child reply",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        "parent_tool_use_id": "p",
+        "type": "subagent_frame"
+      },
+      {
+        "frame": {
+          "kind": "thinking",
+          "text": "child thought",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        "parent_tool_use_id": "p",
+        "type": "subagent_frame"
+      },
+      {
+        "frame": {
+          "input": {
+            "path": "x"
+          },
+          "name": "Read",
+          "tool_use_id": "c",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        "parent_tool_use_id": "p",
+        "type": "subagent_frame"
+      },
+      {
+        "frame": {
+          "content": "ok",
+          "is_error": false,
+          "tool_use_id": "c",
+          "turn_id": "main",
+          "type": "tool_call_completed"
+        },
+        "parent_tool_use_id": "p",
+        "type": "subagent_frame"
+      },
+      {
+        "kind": "text",
+        "text": "after",
+        "turn_id": "main",
+        "type": "content_delta"
+      },
+      {
+        "content": "plain <b>text</b>",
+        "kind": "api_retry",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "plain <b>text</b>",
+        "kind": "compacting",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "plain <b>text</b>",
+        "kind": "notification",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "plain <b>text</b>",
+        "kind": "compaction",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "interaction_id": "i",
+        "questions": [],
+        "tool_use_id": "q",
+        "type": "question_asked",
+        "unsupported_reason": "Unsupported payload"
+      },
+      {
+        "answers": [],
+        "interaction_id": "i",
+        "outcome": "host_refused",
+        "reason": "Unsupported payload",
+        "type": "question_settled"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "num_turns": 3,
+          "origin_kind": "task-notification",
+          "reason": "no_result"
+        },
+        "outcome": "failed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "main",
+        "type": "turn_completed",
+        "usage": null
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 20
+  },
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": null,
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": null,
+      "history": null,
+      "lastTurnEnding": "failed",
+      "model": null,
+      "notices": [
+        {
+          "content": "plain <b>text</b>",
+          "kind": "compaction",
+          "level": "notice",
+          "scalars": {},
+          "seq": 16,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
+      "notification": {
+        "content": "plain <b>text</b>",
+        "kind": "notification",
+        "level": "notice",
+        "scalars": {},
+        "seq": 15,
+        "taskId": null,
+        "taskStatus": null,
+        "toolUseId": null
+      },
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": null,
+      "questions": [
+        {
+          "interactionId": "i",
+          "questions": [],
+          "seq": 17,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "host_refused",
+            "reason": "Unsupported payload"
+          },
+          "toolUseId": "q",
+          "turnId": "main",
+          "unsupportedReason": "Unsupported payload"
+        }
+      ],
+      "sessionId": null,
+      "status": {
+        "kind": "starting"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [
+        {
+          "background": true,
+          "children": {
+            "assistantMessageOpen": false,
+            "thinking": [
+              {
+                "seq": 9,
+                "text": "child thought",
+                "turnId": "main"
+              }
+            ],
+            "thinkingOpen": false,
+            "toolCalls": [
+              {
+                "input": {
+                  "path": "x"
+                },
+                "name": "Read",
+                "result": {
+                  "content": "ok",
+                  "isError": false
+                },
+                "seq": 10,
+                "toolUseId": "c",
+                "turnId": "main"
+              }
+            ],
+            "transcript": [
+              {
+                "seq": 8,
+                "text": "child reply"
+              }
+            ]
+          },
+          "input": {},
+          "name": "background agent",
+          "result": null,
+          "seq": 8,
+          "toolUseId": "p",
+          "turnId": ""
+        }
+      ],
+      "transcript": [
+        {
+          "seq": 7,
+          "text": "before after"
+        }
+      ],
+      "turnEndings": [
+        {
+          "apiErrorStatus": null,
+          "kind": "failed",
+          "message": null,
+          "numTurns": 3,
+          "originKind": "task-notification",
+          "reason": "no_result",
+          "resetsAt": null,
+          "seq": 19,
+          "turnId": "main"
+        }
+      ],
+      "usage": null,
+      "userPrompts": []
+    },
+    "tab": 1,
+    "throughRevision": 20,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  }
+}

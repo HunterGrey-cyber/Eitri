@@ -27,6 +27,16 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_bridge::SessionModeChoice;
 
+fn task_command_error(error: ConversationError) -> BackendError {
+    match error {
+        ConversationError::Provider(agent::ProviderError::UnsupportedCapability(method)) => BackendError {
+            message: format!("this agent does not support {method}"),
+            benign: true,
+        },
+        other => other.into(),
+    }
+}
+
 /// The legacy backend's capabilities, stated once so a test can assert on the value
 /// `capabilities()` actually returns rather than on a copy of it.
 ///
@@ -48,6 +58,18 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     // to say "no decision": every request it raises is answered with Eitri's own policy.
     cli_auto_mode: false,
     steer: false,
+    // The legacy backend drives the CLI directly and reports none of the sidecar's protocol 3.22
+    // events.
+    cli_turns: false,
+    human_origin: false,
+    background_tasks: false,
+    workflow_progress: false,
+    task_control: false,
+    task_output: false,
+    subagent_frames: false,
+    session_notices: false,
+    conversation_reset: false,
+    structured_questions_v1: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -405,6 +427,54 @@ impl BackendError {
     fn fatal(message: String) -> Self {
         Self { message, benign: false }
     }
+
+    /// The refusal of a turn sent while the agent already had one open: the provider's own, or this
+    /// conversation's guard in front of it. The message is not an error to show; the tab holds it as a
+    /// steer instead ([`BackendError::is_turn_busy`]).
+    fn turn_busy() -> Self {
+        ConversationError::TurnAlreadyActive.into()
+    }
+
+    /// Whether this is the refusal [`AgentBackend::send_turn`] made of a turn sent while one was open.
+    pub fn is_turn_busy(&self) -> bool {
+        self.benign && self.message == ConversationError::TurnAlreadyActive.to_string()
+    }
+}
+
+/// An answer to one of Claude's questions on its way to the agent ([`AgentBackend::answer_question`]),
+/// read back with [`AgentBackend::finish_question_send`] on the backend that sent it. Holding it may
+/// keep the chat in this window (a refused answer has to put its question back here), so it is
+/// dropped once its reply was read.
+#[derive(Debug)]
+pub struct QuestionSend {
+    interaction_id: String,
+    send: agent::InteractionSend,
+}
+
+impl QuestionSend {
+    /// The question set the answer is for.
+    pub fn interaction_id(&self) -> &str {
+        &self.interaction_id
+    }
+
+    /// The reply as the page is told it, `None` while the answer is still out. Puts nothing back: for
+    /// a send whose session is gone.
+    pub(crate) fn reply(&self) -> Option<Result<(), BackendError>> {
+        self.send
+            .try_reply()
+            .map(|reply| reply.map(|_| ()).map_err(answer_refusal))
+    }
+}
+
+/// An answer the agent refused or that did not reach it, for the page: benign, since the question just
+/// waits for another answer and the session goes on (a lost connection is reported by the session's own
+/// stream). The agent's refusal is shown in its own words.
+fn answer_refusal(error: agent::ProviderError) -> BackendError {
+    let message = match error {
+        agent::ProviderError::Provider { message, .. } => message,
+        other => format!("the answer may not have reached Claude ({other}); the question is waiting again"),
+    };
+    BackendError { message, benign: true }
 }
 
 impl From<ConversationError> for BackendError {
@@ -440,6 +510,14 @@ pub enum SteerRefusal {
     Unsupported,
     /// It could, but not this one now: the turn was ending, or the agent said no.
     Refused(String),
+}
+
+/// Identifies a submitted opening prompt when the agent defers reading it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubmittedPrompt {
+    pub client_message_id: String,
+    pub turn_id: Option<String>,
+    pub after_revision: u64,
 }
 
 /// The event a submitted prompt becomes. Free function so `send_turn` and its test build it the
@@ -776,8 +854,7 @@ impl AgentBackend {
     /// conversation is owed.
     ///
     /// **The prompt is folded BEFORE the backend's send is even attempted, on both arms -- not
-    /// after acceptance, which is what an earlier revision of this comment argued for and got
-    /// wrong.** `AgentConversation::send_turn` returns as soon as the server ACKs the unary RPC;
+    /// after acceptance.** `AgentConversation::send_turn_as` returns as soon as the server ACKs the unary RPC;
     /// `active_turn_id` is set later, when the provider's own event arrives on the ingestion
     /// thread (see that method's own doc). Folding the prompt AFTER that ack raced this thread's
     /// `fold_locally` against the ingestion thread's `IngestState::fold` for the SAME mutex, with
@@ -786,41 +863,66 @@ impl AgentBackend {
     /// order for that turn. Folding first closes the race by construction rather than by timing:
     /// before the RPC is even sent, the ingestion thread has nothing of this turn's to fold yet.
     ///
-    /// The accepted cost: a rejected send (no session, a turn already active) now leaves the
-    /// prompt recorded even though its turn never happened. That is deliberate, and it is the
-    /// better failure -- the user genuinely typed it, and the caller's own error reporting
-    /// accompanies the row, whereas racing the ordering the way the previous revision did was a
-    /// silent, undetectable corruption of the transcript.
+    /// A busy refusal withdraws this local row so the tab can hold the prompt for the running turn.
+    /// Other benign failures retain it with the caller's error reporting. The returned client id
+    /// correlates later delivery or drop events when the CLI runs its own work ahead of this prompt;
+    /// `origin` marks it as the person's input only when it was admitted from the composer.
     ///
     /// A prompt whose send is refused benignly reaches the UI through the next pump, since the
     /// session lives on. A fatal failure retires the session before another pump, so its queued
     /// prompt is never drawn: the page says the message was not sent and puts it back in the box,
     /// and a failed tab's state carries no conversation, so a reload shows no row for it either.
-    pub fn send_turn(&mut self, wire_text: &str, as_typed: &str) -> Result<(), BackendError> {
+    pub fn send_turn(
+        &mut self,
+        wire_text: &str,
+        as_typed: &str,
+        origin: agent::PromptOrigin,
+    ) -> Result<SubmittedPrompt, BackendError> {
         if self.agent().is_external() {
             return Err(BackendError {
                 message: "this tab's turns carry its permission mode; send it through its tab".to_string(),
                 benign: true,
             });
         }
+        let client_message_id = uuid::Uuid::new_v4().to_string();
+        let after_revision = self.projection().last_revision;
         match self {
             AgentBackend::Legacy(session) => {
                 session.fold_locally(user_prompt_event(as_typed));
                 session.send_turn(wire_text)?;
-                Ok(())
+                Ok(SubmittedPrompt {
+                    client_message_id,
+                    turn_id: session.projection.active_turn_id.clone(),
+                    after_revision,
+                })
             }
             AgentBackend::Conversation { conversation, .. } => {
                 // Reaches the UI through the pump like every other event, because `fold_locally`
                 // queues it -- and it does so regardless of whether `send_turn` below succeeds,
                 // which is exactly what makes a rejected turn still show its prompt.
                 conversation.fold_locally(user_prompt_event(as_typed));
-                conversation.send_turn(wire_text)?;
+                let turn_id = match conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id) {
+                    Ok(turn_id) => turn_id,
+                    Err(error) => {
+                        // A turn was open that this side had not folded yet: the prompt it recorded was not
+                        // put into any turn, and the tab holds the message to steer into the open one.
+                        if matches!(error, ConversationError::TurnAlreadyActive) {
+                            conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
+                            return Err(BackendError::turn_busy());
+                        }
+                        return Err(error.into());
+                    }
+                };
                 // The resume picker's title for this session: the prompt as typed, never
                 // `wire_text`, which carries the editor context composed above it. Only a turn the
                 // provider accepted names a session. Legacy writes no records, so it has nothing to
                 // name.
                 conversation.note_title(as_typed);
-                Ok(())
+                Ok(SubmittedPrompt {
+                    client_message_id,
+                    turn_id: Some(turn_id),
+                    after_revision,
+                })
             }
         }
     }
@@ -834,19 +936,25 @@ impl AgentBackend {
         wire_text: &str,
         as_typed: &str,
         mode: SessionModeChoice,
-    ) -> Result<(), BackendError> {
+        origin: agent::PromptOrigin,
+    ) -> Result<SubmittedPrompt, BackendError> {
         if !self.agent().is_external() {
-            return self.send_turn(wire_text, as_typed);
+            return self.send_turn(wire_text, as_typed, origin);
         }
         let AgentBackend::Conversation { conversation, .. } = self else {
             unreachable!();
         };
         // Folded before the send, as on the sidecar, so the prompt keeps its place before the
         // agent's first event of the turn.
+        let after_revision = conversation.projection().last_revision;
         conversation.fold_locally(user_prompt_event(as_typed));
-        conversation.send_turn_with(wire_text, turn_policy(mode))?;
+        let turn_id = conversation.send_turn_with(wire_text, turn_policy(mode))?;
         conversation.note_title(as_typed);
-        Ok(())
+        Ok(SubmittedPrompt {
+            client_message_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: Some(turn_id),
+            after_revision,
+        })
     }
 
     /// Whether a message typed while a turn runs can go into that turn (the provider's capability
@@ -871,11 +979,12 @@ impl AgentBackend {
         client_message_id: &str,
         wire_text: &str,
         as_typed: &str,
+        origin: agent::PromptOrigin,
     ) -> Result<(), SteerRefusal> {
         let result = match self {
             AgentBackend::Legacy(_) => return Err(SteerRefusal::Unsupported),
             AgentBackend::Conversation { conversation, .. } => {
-                conversation.steer_turn(shown_turn, client_message_id, wire_text, as_typed)
+                conversation.steer_turn(shown_turn, client_message_id, wire_text, as_typed, origin)
             }
         };
         result.map_err(|e| match e {
@@ -920,10 +1029,8 @@ impl AgentBackend {
         }
     }
 
-    /// Stops the commands the agent left running after its turns ended, by stopping its session
-    /// (`AgentConversation::stop_background`); the session then ends through the pump, and its
-    /// conversation can be resumed. A refusal because of when it was asked is benign (a turn started,
-    /// the commands ended), and so is an agent that keeps no such count: the session goes on.
+    /// Stops work left running between turns. Claude stops the tasks and keeps its session;
+    /// Codex stops its session and offers resume. Unsupported providers get a benign refusal.
     pub fn stop_background(&mut self, shown: u32) -> Result<(), BackendError> {
         let benign = |message: String| BackendError { message, benign: true };
         let AgentBackend::Conversation { agent, conversation } = self else {
@@ -931,17 +1038,38 @@ impl AgentBackend {
                 "this agent leaves nothing running in the background".to_string(),
             ));
         };
-        if !agent.is_external() {
-            return Err(benign(
-                "this agent leaves nothing running in the background".to_string(),
-            ));
-        }
         match conversation.stop_background(shown) {
             Ok(()) => Ok(()),
             Err(ConversationError::Provider(agent::ProviderError::UnsupportedCapability(_))) => {
                 Err(benign(format!("{} cannot stop what it left running", agent.label())))
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn stop_task(&mut self, task_id: &str) -> Result<agent::TaskReply<()>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.stop_task(task_id).map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot stop one task".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    pub fn task_output(&mut self, task_id: &str) -> Result<agent::TaskReply<agent::TaskOutput>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.task_output(task_id).map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot read task output".into(),
+                benign: true,
+            }),
         }
     }
 
@@ -964,6 +1092,92 @@ impl AgentBackend {
                 Ok(())
             }
         }
+    }
+
+    /// Answers Claude's question set `interaction_id` with the person's `answers`.
+    ///
+    /// Reached only from a page's `question_answer`, after the page and the window agreed to it, and
+    /// from nothing that answers cards: a question is never in `pending_permissions`, so Bypass,
+    /// `approve_pending`, `confirm_bypass`, `Ctrl+y`, `a`/`d` and `answer_what_needs_no_human` cannot
+    /// see one. The answer is checked against the set before anything is sent
+    /// (`QuestionRecord::check_resolution`). Nothing waits for the agent here (this runs on the GTK
+    /// thread): the answer goes out and the returned send carries the agent's reply, read with
+    /// [`Self::finish_question_send`]. Every refusal or failure, here or in the reply, is benign and
+    /// leaves the question waiting for another answer. Nothing answers a question because time passed.
+    pub fn answer_question(
+        &mut self,
+        interaction_id: &str,
+        answers: Vec<agent::QuestionAnswer>,
+    ) -> Result<QuestionSend, BackendError> {
+        self.resolve_question(interaction_id, agent::InteractionResolution::Answers(answers))
+    }
+
+    /// Declines Claude's question set `interaction_id`: `Cancel` (Escape) or `Chat` ("Chat about
+    /// this", with what was answered `so_far`). The same door and checks as [`Self::answer_question`].
+    pub fn decline_question(
+        &mut self,
+        interaction_id: &str,
+        kind: agent::QuestionDeclineKind,
+        so_far: Vec<agent::QuestionAnswer>,
+    ) -> Result<QuestionSend, BackendError> {
+        self.resolve_question(interaction_id, agent::InteractionResolution::Decline { kind, so_far })
+    }
+
+    fn resolve_question(
+        &mut self,
+        interaction_id: &str,
+        resolution: agent::InteractionResolution,
+    ) -> Result<QuestionSend, BackendError> {
+        match self {
+            // The legacy backend's CLI is never offered the question tool, so it has none to answer.
+            AgentBackend::Legacy(_) => Err(BackendError {
+                message: "this session asks no questions".to_string(),
+                benign: true,
+            }),
+            AgentBackend::Conversation { conversation, .. } => {
+                match conversation.resolve_question(interaction_id, resolution) {
+                    Ok(send) => Ok(QuestionSend {
+                        interaction_id: interaction_id.to_string(),
+                        send,
+                    }),
+                    Err(ConversationError::Provider(error)) => Err(answer_refusal(error)),
+                    Err(error) => Err(BackendError {
+                        message: error.to_string(),
+                        benign: true,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// What became of `send`, an answer this backend sent: `None` while it is still on its way, never
+    /// waiting for it. A refusal or failure puts the question back to waiting before it is returned,
+    /// so the page that is told can answer again.
+    pub fn finish_question_send(&mut self, send: &QuestionSend) -> Option<Result<(), BackendError>> {
+        let reply = send.send.try_reply()?;
+        Some(self.question_reply(send, reply))
+    }
+
+    /// [`Self::finish_question_send`] for a caller that may block (not the GTK thread): waits up to
+    /// `timeout` for the reply, and a reply not come by then is a failure like any other.
+    pub fn wait_question_send(
+        &mut self,
+        send: &QuestionSend,
+        timeout: std::time::Duration,
+    ) -> Result<(), BackendError> {
+        let reply = send.send.wait(timeout);
+        self.question_reply(send, reply)
+    }
+
+    fn question_reply(&mut self, send: &QuestionSend, reply: agent::InteractionReply) -> Result<(), BackendError> {
+        let error = match reply {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        if let AgentBackend::Conversation { conversation, .. } = self {
+            conversation.question_send_failed(&send.interaction_id);
+        }
+        Err(answer_refusal(error))
     }
 
     /// Records that the panel was just handed a snapshot of this backend read at `revision`, for the
@@ -2775,7 +2989,7 @@ mod tests {
     /// against the PUBLIC trait because that private double belongs to `agent` and is not
     /// exported. Nothing in `agent` was widened to make this possible: `AgentProvider` and every
     /// request/error type it uses were already `pub` at the crate root.
-    struct RejectingProvider;
+    struct RejectingProvider(agent::ProviderErrorCode);
 
     impl agent::AgentProvider for RejectingProvider {
         fn capabilities(&self) -> ProviderCapabilities {
@@ -2790,14 +3004,10 @@ mod tests {
         fn resume_session(&self, _request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
             Err(agent::ProviderError::UnsupportedCapability("resume"))
         }
-        /// The one rigged method. `TurnAlreadyActive` is the same rejection reason
-        /// `AgentBackend::send_turn`'s own doc names ("a turn already active") and the same one
-        /// `agent::conversation`'s sibling test
-        /// (`a_providers_own_turn_already_active_maps_to_the_same_benign_error`) uses for the
-        /// identical shape of failure.
+        /// The one rigged method: it refuses with the code the provider was built with.
         fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
             Err(agent::ProviderError::Provider {
-                code: agent::ProviderErrorCode::TurnAlreadyActive,
+                code: self.0,
                 message: "a turn is already in progress on this session".into(),
             })
         }
@@ -2824,17 +3034,25 @@ mod tests {
     fn a_rejected_sidecar_turn_still_leaves_the_prompt_recorded() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("rejected-turn-keeps-prompt");
-        let conversation =
-            AgentConversation::create(std::sync::Arc::new(RejectingProvider), &dir, ProjectTrust::Untrusted)
-                .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
+        let conversation = AgentConversation::create(
+            std::sync::Arc::new(RejectingProvider(agent::ProviderErrorCode::IdempotencyConflict)),
+            &dir,
+            ProjectTrust::Untrusted,
+        )
+        .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
         let mut backend = AgentBackend::Conversation {
             agent: AgentId::Claude,
             conversation: Box::new(conversation),
         };
 
-        let result = backend.send_turn("wire text with context composed in", "what does this do?");
+        let result = backend.send_turn(
+            "wire text with context composed in",
+            "what does this do?",
+            agent::PromptOrigin::Composed,
+        );
 
-        result.expect_err("RejectingProvider's send_turn always fails");
+        let error = result.expect_err("RejectingProvider's send_turn always fails");
+        assert!(!error.is_turn_busy(), "any other refusal stays an error");
         assert_eq!(
             backend
                 .projection()
@@ -2844,6 +3062,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["what does this do?"],
             "the prompt was folded BEFORE the rejected send, so it survives the rejection"
+        );
+    }
+
+    /// A turn refused because one is open was never put into any turn: its recorded prompt is taken
+    /// back, and the refusal is told apart so the tab can hold the message instead of showing an error.
+    #[test]
+    fn a_send_refused_as_busy_takes_its_prompt_back() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("busy-turn-withdraws-prompt");
+        let conversation = AgentConversation::create(
+            std::sync::Arc::new(RejectingProvider(agent::ProviderErrorCode::TurnAlreadyActive)),
+            &dir,
+            ProjectTrust::Untrusted,
+        )
+        .expect("create_session succeeds on RejectingProvider; only send_turn is rigged to fail");
+        let mut backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+
+        let error = backend
+            .send_turn("wire text", "and the docs", agent::PromptOrigin::Composed)
+            .expect_err("the provider refuses it as busy");
+
+        assert!(error.is_turn_busy());
+        assert!(
+            backend.projection().user_prompts.is_empty(),
+            "no row for a message no turn read"
         );
     }
 
@@ -2867,6 +3113,7 @@ mod tests {
         let sent = backend.send_turn(
             "Editor context: /p/src/main.rs, line 3\n\nfix the picker",
             "fix the picker",
+            agent::PromptOrigin::Composed,
         );
         assert!(sent.is_ok(), "RecordingProvider accepts every turn");
         provider.queue(AgentDomainEvent::SessionOpened {
@@ -3888,6 +4135,66 @@ mod tests {
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
+    }
+
+    #[test]
+    fn leader_k_on_an_idle_claude_tab_sends_one_stop_task_per_live_task_and_keeps_the_session() {
+        let dir = agent::state_dirs::test_workspace_dir("claude-task-control");
+        let provider = std::sync::Arc::new(RecordingProvider::task_controlling());
+        let conversation = AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let mut backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let task = |id: &str, kind, ambient| agent::BackgroundTask {
+            task_id: id.into(),
+            run_id: None,
+            kind,
+            task_type: "test".into(),
+            description: id.into(),
+            subagent_type: None,
+            parent_task_id: None,
+            tool_use_id: None,
+            ambient,
+            workflow_name: None,
+        };
+        provider.queue(AgentDomainEvent::BackgroundTasksChanged {
+            tasks: vec![task("ended", agent::TaskKind::Shell, false)],
+            occurred_at: None,
+        });
+        provider.queue(AgentDomainEvent::BackgroundTasksChanged {
+            tasks: vec![
+                task("shell", agent::TaskKind::Shell, false),
+                task("workflow", agent::TaskKind::Workflow, false),
+                task("agent", agent::TaskKind::LocalAgent, false),
+                task("ambient", agent::TaskKind::Monitor, true),
+            ],
+            occurred_at: None,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backend.projection().background_calls != 3 {
+            assert!(std::time::Instant::now() < deadline, "roster never folded");
+            std::thread::yield_now();
+        }
+        backend.stop_background(3).unwrap();
+        assert_eq!(provider.stopped_tasks(), ["shell", "workflow", "agent"]);
+        assert_eq!(provider.closes(), 0);
+        assert!(backend.projection().active_turn_id.is_none());
+        assert!(matches!(
+            backend.projection().status,
+            agent::ProjectionStatus::Running | agent::ProjectionStatus::Starting
+        ));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_provider_without_the_method_gets_the_benign_wording() {
+        let dir = agent::state_dirs::test_workspace_dir("claude-task-control");
+        let (_, mut backend) = sidecar_backend(&dir);
+        let error = backend.stop_background(1).unwrap_err();
+        assert!(error.benign);
+        assert_eq!(error.message, "Claude cannot stop what it left running");
+        backend.shutdown();
     }
 
     fn sidecar_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
@@ -5275,6 +5582,20 @@ mod external_tests {
         (provider, backend)
     }
 
+    #[test]
+    fn a_codex_tab_still_stops_its_session() {
+        let dir = workspace("codex-stop-background");
+        let (provider, mut backend) = codex_backend(&dir);
+        backend.stop_background(1).unwrap();
+        assert_eq!(provider.stops(), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(backend.projection().status, agent::ProjectionStatus::Unavailable { .. }) {
+            assert!(std::time::Instant::now() < deadline, "session never ended");
+            std::thread::yield_now();
+        }
+        backend.shutdown();
+    }
+
     fn request(id: &str, tool: &str, input: serde_json::Value) -> AgentDomainEvent {
         AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -5510,11 +5831,18 @@ mod external_tests {
     fn an_external_turn_refuses_the_door_without_a_mode() {
         let dir = workspace("external-plain-send");
         let (provider, mut backend) = codex_backend(&dir);
-        let refused = backend.send_turn("hello", "hello").expect_err("no mode, no turn");
+        let refused = backend
+            .send_turn("hello", "hello", agent::PromptOrigin::Composed)
+            .expect_err("no mode, no turn");
         assert!(refused.benign, "{}", refused.message);
         assert!(provider.policies().is_empty());
         backend
-            .send_turn_in("hello", "hello", SessionModeChoice::Bypass)
+            .send_turn_in(
+                "hello",
+                "hello",
+                SessionModeChoice::Bypass,
+                agent::PromptOrigin::Composed,
+            )
             .expect("the tab's door carries the mode");
         assert_eq!(
             provider.policies(),
@@ -5628,5 +5956,376 @@ mod external_tests {
             .collect();
         external.sort();
         assert_eq!(external, vec!["codex-thread".to_string(), "gemini-session".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    //! Only the person answers one of Claude's questions, through `answer_question` or
+    //! `decline_question`. A question never enters `pending_permissions`, so nothing that answers
+    //! cards -- Bypass on arrival, `answer_what_needs_no_human`, `approve_pending` -- reaches one.
+    use super::*;
+    use crate::test_providers::RecordingProvider;
+    use agent::{
+        InteractionResolution, QuestionAnswer, QuestionDeclineKind, QuestionOptionSpec, QuestionSpec, QuestionState,
+        ResolveInteractionRequest, UiDelivery,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn workspace(label: &str) -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    fn backend_on(provider: RecordingProvider, dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
+        let provider = Arc::new(provider);
+        let conversation = AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
+        (
+            provider,
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            },
+        )
+    }
+
+    fn options(labels: &[&str]) -> Vec<QuestionOptionSpec> {
+        labels
+            .iter()
+            .map(|label| QuestionOptionSpec {
+                label: label.to_string(),
+                description: String::new(),
+                preview: None,
+            })
+            .collect()
+    }
+
+    /// A set of a single-select question and a multi-select one.
+    fn asked(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::QuestionAsked {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            questions: vec![
+                QuestionSpec {
+                    question: "Which layout?".into(),
+                    header: "Layout".into(),
+                    multi_select: false,
+                    options: options(&["Grid", "List"]),
+                },
+                QuestionSpec {
+                    question: "Which checks?".into(),
+                    header: "Checks".into(),
+                    multi_select: true,
+                    options: options(&["fmt", "clippy", "test"]),
+                },
+            ],
+            unsupported_reason: None,
+        }
+    }
+
+    /// A `Write` into `.git`: a card in every mode but Bypass.
+    fn card(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+            provider_prompt: None,
+        }
+    }
+
+    fn answer(question_index: u32, option_indexes: &[u32]) -> QuestionAnswer {
+        QuestionAnswer {
+            question_index,
+            option_indexes: option_indexes.to_vec(),
+            ..QuestionAnswer::default()
+        }
+    }
+
+    fn state_of(backend: &AgentBackend, id: &str) -> Option<QuestionState> {
+        backend.projection().question(id).map(|record| record.state.clone())
+    }
+
+    /// Takes deliveries in `mode` as the panel's pump does, answering what needs no human on the way,
+    /// until `done`; returns every event delivered.
+    fn deliver_until(
+        backend: &mut AgentBackend,
+        dir: &Path,
+        mode: PermissionMode,
+        host_answered: &mut BTreeSet<String>,
+        what: &str,
+        done: impl Fn(&AgentBackend, &[AgentDomainEvent]) -> bool,
+    ) -> Vec<AgentDomainEvent> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        while !done(backend, &delivered) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            if let UiDelivery::Events(events) = backend
+                .take_revised_ui_delivery(
+                    dir,
+                    &agent::PrefixRules::default(),
+                    mode,
+                    host_answered,
+                    &mut HumanApprovals::default(),
+                    &mut AnsweredForYou::default(),
+                )
+                .without_revisions()
+            {
+                delivered.extend(events);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        delivered
+    }
+
+    fn holds_question(delivered: &[AgentDomainEvent], id: &str) -> bool {
+        delivered.iter().any(
+            |event| matches!(event, AgentDomainEvent::QuestionAsked { interaction_id, .. } if interaction_id == id),
+        )
+    }
+
+    #[test]
+    fn bypass_never_answers_a_question() {
+        let dir = workspace("question-bypass-on-arrival");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.queue_all(vec![card("c1"), asked("q1")]);
+        let mut host_answered = BTreeSet::new();
+        let delivered = deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Bypass,
+            &mut host_answered,
+            "the card answered and the question delivered",
+            |_, delivered| holds_question(delivered, "q1"),
+        );
+        assert!(holds_question(&delivered, "q1"), "the question reaches the page");
+        assert_eq!(
+            provider.resolutions(),
+            vec![("c1".to_string(), true)],
+            "bypass answers the card"
+        );
+        assert!(provider.interactions().is_empty(), "and nothing answers the question");
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting));
+        assert!(!backend.projection().pending_permissions.contains_key("q1"));
+        backend.shutdown();
+    }
+
+    /// In every mode, and on a session whose CLI runs its own auto mode (where Auto defers cards to the
+    /// CLI), the step that answers what needs no human leaves a question to the person.
+    #[test]
+    fn answer_what_needs_no_human_skips_a_question() {
+        let dir = workspace("question-needs-a-human");
+        for (provider, mode) in [
+            (RecordingProvider::default(), PermissionMode::Manual),
+            (RecordingProvider::default(), PermissionMode::Auto),
+            (RecordingProvider::cli_auto(), PermissionMode::Auto),
+        ] {
+            let (provider, mut backend) = backend_on(provider, &dir);
+            provider.queue(asked("q1"));
+            deliver_until(
+                &mut backend,
+                &dir,
+                mode,
+                &mut BTreeSet::new(),
+                "the question delivered",
+                |_, delivered| holds_question(delivered, "q1"),
+            );
+            assert!(provider.interactions().is_empty(), "{mode:?}: nothing answered it");
+            assert!(provider.decisions().is_empty(), "{mode:?}: nor took it for a card");
+            assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting), "{mode:?}");
+            backend.shutdown();
+        }
+    }
+
+    /// Entering Bypass and the bypass resync answer through `approve_pending`; handed a question's id
+    /// among the cards', it answers the cards only.
+    #[test]
+    fn approve_pending_never_sees_a_question() {
+        let dir = workspace("question-approve-pending");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.queue_all(vec![card("c1"), asked("q1")]);
+        deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            "the card and the question",
+            |backend, delivered| {
+                holds_question(delivered, "q1") && backend.projection().pending_permissions.contains_key("c1")
+            },
+        );
+        let answered = backend.approve_pending(&["q1".to_string(), "c1".to_string()], "on entering bypass");
+        assert_eq!(answered.ids, vec!["c1".to_string()]);
+        assert_eq!(provider.resolutions(), vec![("c1".to_string(), true)]);
+        assert!(provider.interactions().is_empty());
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn answer_question_validates_before_sending() {
+        let dir = workspace("question-validates");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.queue(asked("q1"));
+        deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            "the question",
+            |backend, _| state_of(backend, "q1").is_some(),
+        );
+
+        // Two choices on a single-select question, an option the question does not have, a question the
+        // set does not have, a set that is not waiting: each refused here, and nothing sent.
+        for (id, answers, why) in [
+            ("q1", vec![answer(0, &[0, 1])], "one choice"),
+            ("q1", vec![answer(1, &[3])], "no option 3"),
+            ("q1", vec![answer(2, &[0])], "no question 2"),
+            ("q9", vec![answer(0, &[0])], "no question with that id"),
+        ] {
+            let refused = backend.answer_question(id, answers).unwrap_err();
+            assert!(refused.benign, "a refused answer leaves the session alone");
+            assert!(refused.message.contains(why), "{why}: {}", refused.message);
+            assert!(
+                !refused.message.contains("provider error"),
+                "told in its own words: {}",
+                refused.message
+            );
+        }
+        assert!(provider.interactions().is_empty(), "nothing reached the agent");
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting));
+
+        let mut typed = answer(1, &[0, 2]);
+        typed.other_text = Some("bench".into());
+        let given = vec![answer(0, &[1]), typed];
+        let send = backend.answer_question("q1", given.clone()).unwrap();
+        assert_eq!(send.interaction_id(), "q1");
+        assert!(matches!(backend.finish_question_send(&send), Some(Ok(()))));
+        assert_eq!(
+            provider.interactions(),
+            vec![ResolveInteractionRequest {
+                session_id: "fake-session".into(),
+                interaction_id: "q1".into(),
+                resolution: InteractionResolution::Answers(given),
+            }]
+        );
+        assert_eq!(
+            state_of(&backend, "q1"),
+            Some(QuestionState::Answering),
+            "on its way until Claude's side settles it"
+        );
+
+        // One answer per question: a second, or a decline, while the first is on its way is refused here.
+        let again = backend.answer_question("q1", vec![answer(0, &[0])]).unwrap_err();
+        assert!(
+            again.benign && again.message.contains("already on its way"),
+            "{}",
+            again.message
+        );
+        let decline = backend
+            .decline_question("q1", QuestionDeclineKind::Cancel, Vec::new())
+            .unwrap_err();
+        assert!(decline.message.contains("already on its way"), "{}", decline.message);
+        assert_eq!(provider.interactions().len(), 1);
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_refused_answer_keeps_the_question_waiting() {
+        let dir = workspace("question-refused");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.queue(asked("q1"));
+        deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            "the question",
+            |backend, _| state_of(backend, "q1").is_some(),
+        );
+
+        // The agent's own refusals: a rule of the set, and an id it no longer holds (a late answer).
+        for code in [
+            agent::ProviderErrorCode::InteractionAnswerRefused,
+            agent::ProviderErrorCode::InteractionNotFound,
+        ] {
+            provider.refuse_interactions(Some(code));
+            let send = backend.answer_question("q1", vec![answer(0, &[0])]).unwrap();
+            let refused = backend.finish_question_send(&send).unwrap().unwrap_err();
+            assert!(refused.benign, "{code:?}");
+            assert_eq!(refused.message, "answers refused by the test", "a plain refusal");
+            assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting), "{code:?}");
+        }
+        let send = backend
+            .decline_question("q1", QuestionDeclineKind::Chat, vec![answer(0, &[1])])
+            .unwrap();
+        let chat = backend.finish_question_send(&send).unwrap().unwrap_err();
+        assert!(chat.benign);
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting));
+        assert_eq!(provider.interactions().len(), 3, "each refusal was the agent's");
+
+        // Settled on Claude's side: the id is spent, and a later answer is refused here.
+        provider.refuse_interactions(None);
+        provider.queue(AgentDomainEvent::QuestionSettled {
+            interaction_id: "q1".into(),
+            outcome: agent::QuestionOutcome::Expired,
+            answers: Vec::new(),
+            reason: None,
+        });
+        deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            "the settlement",
+            |backend, _| matches!(state_of(backend, "q1"), Some(QuestionState::Settled { .. })),
+        );
+        let late = backend.answer_question("q1", vec![answer(0, &[0])]).unwrap_err();
+        assert!(
+            late.benign && late.message.contains("no longer waiting"),
+            "{}",
+            late.message
+        );
+        assert_eq!(provider.interactions().len(), 3, "nothing more was sent");
+        backend.shutdown();
+    }
+
+    /// The answer goes out without waiting for the agent: while its reply is out the question stays
+    /// `Answering` and reading the send says nothing yet; a reply that never came (a timeout, a lost
+    /// connection) is a benign failure that puts the question back to waiting.
+    #[test]
+    fn an_answer_goes_out_without_waiting_and_a_failed_send_puts_the_question_back() {
+        let dir = workspace("question-slow-agent");
+        let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+        provider.queue(asked("q1"));
+        deliver_until(
+            &mut backend,
+            &dir,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            "the question",
+            |backend, _| state_of(backend, "q1").is_some(),
+        );
+        provider.hold_interaction_replies(true);
+        let send = backend.answer_question("q1", vec![answer(0, &[0])]).unwrap();
+        assert!(backend.finish_question_send(&send).is_none(), "no reply yet");
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Answering));
+
+        provider.reply_to_held_interactions(|| Err(agent::ProviderError::Timeout));
+        let failed = backend.finish_question_send(&send).unwrap().unwrap_err();
+        assert!(failed.benign, "the session goes on: {}", failed.message);
+        assert!(failed.message.contains("waiting again"), "{}", failed.message);
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Waiting));
+
+        // Answered again, the reply waited for by a caller that may block.
+        let send = backend.answer_question("q1", vec![answer(0, &[1])]).unwrap();
+        provider.reply_to_held_interactions(|| Ok(None));
+        backend.wait_question_send(&send, Duration::from_secs(5)).unwrap();
+        assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Answering));
+        backend.shutdown();
     }
 }

@@ -6,7 +6,9 @@
 //!    turns that follow it on either side, is one segment.
 //! 3. Within a segment, entries are paired by a longest common subsequence over (kind, key): the key is the
 //!    tool-use id for a tool call, the normalised text for user, assistant and thinking text. Tool results
-//!    are paired by their tool-use id wherever they sit, since parallel calls finish in any order. An entry
+//!    and question sets are paired by their tool-use id wherever they sit, since parallel calls finish in
+//!    any order and a record may keep a question set where its call was asked rather than where it was
+//!    answered; a paired question set differs in the parts of its key that differ. An entry
 //!    left on one side whose twin is left on the other side elsewhere is paired as out of order; an entry
 //!    left on each side at the same place, of one kind, is paired as differing in text.
 //! 4. A turn that was not paired by its first entry is placed by its entries: in the record's turn that
@@ -108,6 +110,12 @@ pub enum Field {
     Input,
     IsError,
     Result,
+    /// A question set holds another number of questions.
+    Questions,
+    /// A question set has answers to other questions.
+    Answered,
+    /// A question set ended another way.
+    Outcome,
     /// The entry sits in another turn than its CLI turn's place in the record.
     Turn,
     /// The entry sits elsewhere in the order.
@@ -206,6 +214,7 @@ enum Key {
     Compaction(String),
     Interrupted,
     Ended(String),
+    Question(String),
 }
 
 fn key(entry: &Entry) -> Key {
@@ -219,6 +228,7 @@ fn key(entry: &Entry) -> Key {
         Entry::Compaction { trigger } => Key::Compaction(trigger.clone()),
         Entry::Interrupted => Key::Interrupted,
         Entry::Ended { reason } => Key::Ended(format!("{reason:?}")),
+        Entry::Question { id, .. } => Key::Question(id.clone()),
     }
 }
 
@@ -267,7 +277,7 @@ fn lcs<K: PartialEq>(a: &[K], b: &[K]) -> Vec<(usize, usize)> {
 enum Paired {
     /// By the subsequence within a segment.
     Lcs,
-    /// A tool result, by its tool-use id.
+    /// A tool result or a question set, by its tool-use id.
     ById,
     Order,
     Text,
@@ -285,8 +295,10 @@ fn entry_at(turns: &[Turn], at: At) -> &Entry {
     &turns[at.turn].entries[at.entry]
 }
 
+/// Whether an entry belongs to a call and pairs by the call's tool-use id rather than by its place: a
+/// tool result, or the question set a question call settled.
 fn is_result(entry: &Entry) -> bool {
-    matches!(entry, Entry::ToolResult { .. })
+    matches!(entry, Entry::ToolResult { .. } | Entry::Question { .. })
 }
 
 /// Whether the record can be held to the turn of the entry at `index` in its turn.
@@ -345,13 +357,13 @@ fn align_turns(cli: Vec<Turn>, eitri: Vec<Turn>, record: &EitriForm, pieces: &[V
         }
     }
 
-    // Tool results pair by id across the whole form.
-    let mut eitri_results: HashMap<String, Vec<At>> = HashMap::new();
+    // Tool results and question sets pair by id across the whole form.
+    let mut eitri_results: HashMap<Key, Vec<At>> = HashMap::new();
     for (t, turn) in eitri.iter().enumerate() {
         for (i, entry) in turn.entries.iter().enumerate() {
-            if let Entry::ToolResult { id, .. } = entry {
+            if is_result(entry) {
                 eitri_results
-                    .entry(id.clone())
+                    .entry(key(entry))
                     .or_default()
                     .push(At { turn: t, entry: i });
             }
@@ -361,8 +373,8 @@ fn align_turns(cli: Vec<Turn>, eitri: Vec<Turn>, record: &EitriForm, pieces: &[V
     let mut eitri_result_taken: HashMap<At, bool> = HashMap::new();
     for (t, turn) in cli.iter().enumerate() {
         for (i, entry) in turn.entries.iter().enumerate() {
-            if let Entry::ToolResult { id, .. } = entry {
-                if let Some(list) = eitri_results.get_mut(id) {
+            if is_result(entry) {
+                if let Some(list) = eitri_results.get_mut(&key(entry)) {
                     if !list.is_empty() {
                         let partner = list.remove(0);
                         result_partner.insert(At { turn: t, entry: i }, partner);
@@ -857,6 +869,17 @@ fn compare(cli: &Entry, eitri: &Entry, record: &EitriForm) -> (Vec<Field>, Vec<N
                 notes.push(Note::ResultFlattened);
             }
         }
+        (Entry::Question { key: ka, .. }, Entry::Question { key: kb, .. }) => {
+            if ka.count != kb.count {
+                fields.push(Field::Questions);
+            }
+            if ka.answered != kb.answered {
+                fields.push(Field::Answered);
+            }
+            if ka.end != kb.end {
+                fields.push(Field::Outcome);
+            }
+        }
         (a, b) if a.kind() != b.kind() => fields.push(Field::Text),
         _ => {}
     }
@@ -867,7 +890,7 @@ fn compare(cli: &Entry, eitri: &Entry, record: &EitriForm) -> (Vec<Field>, Vec<N
 /// its own truncation, counted from the oldest.
 ///
 /// A record that counted what it left out accounts for that many items by the caps' measure (a person's
-/// prompt, each reply block, each tool call with its result), and an older entry of no counted kind
+/// prompt, each reply block, each tool call with its result and question set), and an older entry of no counted kind
 /// between them; what lies past the count is a loss of its own. A record that could not count accounts
 /// for the whole prefix, and so does the stored history when the newest item left out could not have
 /// fitted its caps.
@@ -897,7 +920,8 @@ fn truncated_prefix(omission: &Omission, cli: &[Turn], pieces: &[Vec<usize>], pr
                         cut_calls.push(id);
                         counted <= *n
                     }
-                    Entry::ToolResult { id, .. } => cut_calls.contains(&id.as_str()),
+                    // A result and a question set go with their call, which the count already holds.
+                    Entry::ToolResult { id, .. } | Entry::Question { id, .. } => cut_calls.contains(&id.as_str()),
                     _ => counted < *n,
                 };
                 if !fits {

@@ -1,0 +1,1082 @@
+{
+  "domain_events": [
+    {
+      "occurred_at": 1793218269027,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+      "type": "turn_started"
+    },
+    {
+      "commands": [
+        {
+          "description": "<cli-text chars=135 sha256=525158602182d83e>",
+          "name": "deep-research"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+          "name": "dataviz"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+          "name": "update-config"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+          "name": "verify"
+        },
+        {
+          "description": "<cli-text chars=62 sha256=2243f16254904994>",
+          "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+          "name": "debug"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+          "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+          "name": "code-review"
+        },
+        {
+          "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+          "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+          "name": "simplify"
+        },
+        {
+          "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+          "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+          "name": "batch"
+        },
+        {
+          "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+          "name": "fewer-permission-prompts"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+          "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+          "name": "doctor"
+        },
+        {
+          "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+          "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+          "name": "loop"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f23242251a737310>",
+          "name": "claude-api"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+          "name": "workflow-authoring"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+          "name": "run"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+          "name": "run-skill-generator"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+          "name": "plugin-authoring"
+        },
+        {
+          "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+          "name": "agents"
+        },
+        {
+          "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+          "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+          "name": "auto-mode-setup"
+        },
+        {
+          "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+          "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+          "name": "autocompact"
+        },
+        {
+          "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "clear"
+        },
+        {
+          "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+          "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+          "name": "color"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+          "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+          "name": "compact"
+        },
+        {
+          "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+          "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+          "name": "config"
+        },
+        {
+          "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+          "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+          "name": "output-style"
+        },
+        {
+          "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+          "name": "context"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+          "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+          "name": "effort"
+        },
+        {
+          "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "fast"
+        },
+        {
+          "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "focus"
+        },
+        {
+          "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+          "name": "heapdump"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+          "name": "init"
+        },
+        {
+          "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+          "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+          "name": "mcp"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+          "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+          "name": "model"
+        },
+        {
+          "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+          "name": "__remote-workflow"
+        },
+        {
+          "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+          "name": "workflow-launch-exec"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+          "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+          "name": "reload-plugins"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+          "name": "reload-skills"
+        },
+        {
+          "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "rename"
+        },
+        {
+          "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+          "name": "security-review"
+        },
+        {
+          "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+          "name": "usage"
+        },
+        {
+          "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+          "name": "insights"
+        },
+        {
+          "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+          "name": "recap"
+        },
+        {
+          "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+          "name": "goal"
+        },
+        {
+          "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+          "name": "list-agents"
+        },
+        {
+          "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+          "name": "team-onboarding"
+        }
+      ],
+      "type": "commands_available"
+    },
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "053acb92-8792-4edf-a0f4-83bc7430940b",
+      "session_id": "7da409a9-cf04-4ae1-8896-6dba7f2581dc",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "kind": "text",
+      "text": "C20B-OPEN-DONE",
+      "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+      "type": "content_delta"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "num_turns": 1,
+        "reason": "completed"
+      },
+      "outcome": "completed",
+      "result_text": "C20B-OPEN-DONE",
+      "stop_reason": "end_turn",
+      "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+      "type": "turn_completed",
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 1000,
+          "output": 10
+        },
+        "total_cost_usd": 0.0042
+      }
+    },
+    {
+      "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+      "type": "turn_started"
+    },
+    {
+      "interaction_id": "d05b625f-ab2b-43bf-a1c3-c7fa54caac96",
+      "questions": [
+        {
+          "header": "Go",
+          "multi_select": false,
+          "options": [
+            {
+              "description": "C20 go ahead",
+              "label": "Yes",
+              "preview": null
+            },
+            {
+              "description": "C20 stop here",
+              "label": "No",
+              "preview": null
+            }
+          ],
+          "question": "Should the C20 change go ahead?"
+        }
+      ],
+      "tool_use_id": "toolu_q1",
+      "type": "question_asked",
+      "unsupported_reason": null
+    },
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "053acb92-8792-4edf-a0f4-83bc7430940b",
+      "session_id": "7da409a9-cf04-4ae1-8896-6dba7f2581dc",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "input": {
+        "questions": [
+          {
+            "header": "Go",
+            "multiSelect": false,
+            "options": [
+              {
+                "description": "C20 go ahead",
+                "label": "Yes"
+              },
+              {
+                "description": "C20 stop here",
+                "label": "No"
+              }
+            ],
+            "question": "Should the C20 change go ahead?"
+          }
+        ]
+      },
+      "name": "AskUserQuestion",
+      "tool_use_id": "toolu_q1",
+      "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+      "type": "tool_call_started"
+    },
+    {
+      "answers": [],
+      "interaction_id": "d05b625f-ab2b-43bf-a1c3-c7fa54caac96",
+      "outcome": "declined",
+      "reason": null,
+      "type": "question_settled"
+    },
+    {
+      "content": "<cli-text chars=225 sha256=8621ef054998d150>",
+      "is_error": true,
+      "tool_use_id": "toolu_q1",
+      "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+      "type": "tool_call_completed"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "num_turns": 3,
+        "reason": "<cli-text chars=13 sha256=fa0a718c164f4d46>"
+      },
+      "outcome": "interrupted",
+      "result_text": "",
+      "stop_reason": "tool_use",
+      "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+      "type": "turn_completed",
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 2000,
+          "output": 20
+        },
+        "total_cost_usd": 0.0084
+      }
+    }
+  ],
+  "events": {
+    "events": [
+      {
+        "occurred_at": 1793218269027,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+        "type": "turn_started"
+      },
+      {
+        "commands": [
+          {
+            "description": "<cli-text chars=135 sha256=525158602182d83e>",
+            "name": "deep-research"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+            "name": "dataviz"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+            "name": "update-config"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+            "name": "verify"
+          },
+          {
+            "description": "<cli-text chars=62 sha256=2243f16254904994>",
+            "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+            "name": "debug"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+            "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+            "name": "code-review"
+          },
+          {
+            "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+            "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+            "name": "simplify"
+          },
+          {
+            "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+            "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+            "name": "batch"
+          },
+          {
+            "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+            "name": "fewer-permission-prompts"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+            "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+            "name": "doctor"
+          },
+          {
+            "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+            "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+            "name": "loop"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=f23242251a737310>",
+            "name": "claude-api"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+            "name": "workflow-authoring"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+            "name": "run"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+            "name": "run-skill-generator"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+            "name": "plugin-authoring"
+          },
+          {
+            "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+            "name": "agents"
+          },
+          {
+            "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+            "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+            "name": "auto-mode-setup"
+          },
+          {
+            "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+            "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+            "name": "autocompact"
+          },
+          {
+            "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+            "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+            "name": "clear"
+          },
+          {
+            "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+            "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+            "name": "color"
+          },
+          {
+            "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+            "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+            "name": "compact"
+          },
+          {
+            "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+            "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+            "name": "config"
+          },
+          {
+            "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+            "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+            "name": "output-style"
+          },
+          {
+            "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+            "name": "context"
+          },
+          {
+            "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+            "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+            "name": "effort"
+          },
+          {
+            "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+            "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+            "name": "fast"
+          },
+          {
+            "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+            "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+            "name": "focus"
+          },
+          {
+            "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+            "name": "heapdump"
+          },
+          {
+            "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+            "name": "init"
+          },
+          {
+            "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+            "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+            "name": "mcp"
+          },
+          {
+            "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+            "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+            "name": "model"
+          },
+          {
+            "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+            "name": "__remote-workflow"
+          },
+          {
+            "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+            "name": "workflow-launch-exec"
+          },
+          {
+            "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+            "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+            "name": "reload-plugins"
+          },
+          {
+            "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+            "name": "reload-skills"
+          },
+          {
+            "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+            "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+            "name": "rename"
+          },
+          {
+            "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+            "name": "security-review"
+          },
+          {
+            "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+            "name": "usage"
+          },
+          {
+            "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+            "name": "insights"
+          },
+          {
+            "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+            "name": "recap"
+          },
+          {
+            "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+            "name": "goal"
+          },
+          {
+            "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+            "name": "list-agents"
+          },
+          {
+            "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+            "name": "team-onboarding"
+          }
+        ],
+        "type": "commands_available"
+      },
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "053acb92-8792-4edf-a0f4-83bc7430940b",
+        "session_id": "7da409a9-cf04-4ae1-8896-6dba7f2581dc",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "kind": "text",
+        "text": "C20B-OPEN-DONE",
+        "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "num_turns": 1,
+          "reason": "completed"
+        },
+        "outcome": "completed",
+        "result_text": "C20B-OPEN-DONE",
+        "stop_reason": "end_turn",
+        "turn_id": "c0808c15-0045-4e46-8574-b7074b13d7f5",
+        "type": "turn_completed",
+        "usage": {
+          "model": "claude-opus-5-5",
+          "num_turns": null,
+          "tokens": {
+            "cache_creation": 0,
+            "cache_read": 0,
+            "input": 1000,
+            "output": 10
+          },
+          "total_cost_usd": 0.0042
+        }
+      },
+      {
+        "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+        "type": "turn_started"
+      },
+      {
+        "interaction_id": "d05b625f-ab2b-43bf-a1c3-c7fa54caac96",
+        "questions": [
+          {
+            "header": "Go",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "C20 go ahead",
+                "label": "Yes",
+                "preview": null
+              },
+              {
+                "description": "C20 stop here",
+                "label": "No",
+                "preview": null
+              }
+            ],
+            "question": "Should the C20 change go ahead?"
+          }
+        ],
+        "tool_use_id": "toolu_q1",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "053acb92-8792-4edf-a0f4-83bc7430940b",
+        "session_id": "7da409a9-cf04-4ae1-8896-6dba7f2581dc",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "input": {
+          "questions": [
+            {
+              "header": "Go",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "C20 go ahead",
+                  "label": "Yes"
+                },
+                {
+                  "description": "C20 stop here",
+                  "label": "No"
+                }
+              ],
+              "question": "Should the C20 change go ahead?"
+            }
+          ]
+        },
+        "name": "AskUserQuestion",
+        "tool_use_id": "toolu_q1",
+        "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+        "type": "tool_call_started"
+      },
+      {
+        "answers": [],
+        "interaction_id": "d05b625f-ab2b-43bf-a1c3-c7fa54caac96",
+        "outcome": "declined",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "content": "<cli-text chars=225 sha256=8621ef054998d150>",
+        "is_error": true,
+        "tool_use_id": "toolu_q1",
+        "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+        "type": "tool_call_completed"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "num_turns": 3,
+          "reason": "<cli-text chars=13 sha256=fa0a718c164f4d46>"
+        },
+        "outcome": "interrupted",
+        "result_text": "",
+        "stop_reason": "tool_use",
+        "turn_id": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+        "type": "turn_completed",
+        "usage": {
+          "model": "claude-opus-5-5",
+          "num_turns": null,
+          "tokens": {
+            "cache_creation": 0,
+            "cache_read": 0,
+            "input": 2000,
+            "output": 20
+          },
+          "total_cost_usd": 0.0084
+        }
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 16
+  },
+  "scenario": "c20b",
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": [
+        {
+          "description": "<cli-text chars=135 sha256=525158602182d83e>",
+          "name": "deep-research"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+          "name": "dataviz"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+          "name": "update-config"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+          "name": "verify"
+        },
+        {
+          "description": "<cli-text chars=62 sha256=2243f16254904994>",
+          "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+          "name": "debug"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+          "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+          "name": "code-review"
+        },
+        {
+          "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+          "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+          "name": "simplify"
+        },
+        {
+          "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+          "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+          "name": "batch"
+        },
+        {
+          "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+          "name": "fewer-permission-prompts"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+          "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+          "name": "doctor"
+        },
+        {
+          "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+          "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+          "name": "loop"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f23242251a737310>",
+          "name": "claude-api"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+          "name": "workflow-authoring"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+          "name": "run"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+          "name": "run-skill-generator"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+          "name": "plugin-authoring"
+        },
+        {
+          "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+          "name": "agents"
+        },
+        {
+          "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+          "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+          "name": "auto-mode-setup"
+        },
+        {
+          "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+          "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+          "name": "autocompact"
+        },
+        {
+          "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "clear"
+        },
+        {
+          "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+          "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+          "name": "color"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+          "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+          "name": "compact"
+        },
+        {
+          "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+          "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+          "name": "config"
+        },
+        {
+          "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+          "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+          "name": "output-style"
+        },
+        {
+          "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+          "name": "context"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+          "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+          "name": "effort"
+        },
+        {
+          "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "fast"
+        },
+        {
+          "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "focus"
+        },
+        {
+          "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+          "name": "heapdump"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+          "name": "init"
+        },
+        {
+          "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+          "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+          "name": "mcp"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+          "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+          "name": "model"
+        },
+        {
+          "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+          "name": "__remote-workflow"
+        },
+        {
+          "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+          "name": "workflow-launch-exec"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+          "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+          "name": "reload-plugins"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+          "name": "reload-skills"
+        },
+        {
+          "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "rename"
+        },
+        {
+          "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+          "name": "security-review"
+        },
+        {
+          "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+          "name": "usage"
+        },
+        {
+          "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+          "name": "insights"
+        },
+        {
+          "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+          "name": "recap"
+        },
+        {
+          "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+          "name": "goal"
+        },
+        {
+          "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+          "name": "list-agents"
+        },
+        {
+          "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+          "name": "team-onboarding"
+        }
+      ],
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": "$RUN/project",
+      "history": null,
+      "lastTurnEnding": "interrupted",
+      "model": "claude-opus-5-5",
+      "notices": [
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 5,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "questions": [
+        {
+          "interactionId": "d05b625f-ab2b-43bf-a1c3-c7fa54caac96",
+          "questions": [
+            {
+              "header": "Go",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "C20 go ahead",
+                  "label": "Yes",
+                  "preview": null
+                },
+                {
+                  "description": "C20 stop here",
+                  "label": "No",
+                  "preview": null
+                }
+              ],
+              "question": "Should the C20 change go ahead?"
+            }
+          ],
+          "seq": 9,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "declined",
+            "reason": null
+          },
+          "toolUseId": "toolu_q1",
+          "turnId": "9229a790-4b1c-41d9-8eaa-160b5e2d4291",
+          "unsupportedReason": null
+        }
+      ],
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [
+        {
+          "input": {
+            "questions": [
+              {
+                "header": "Go",
+                "multiSelect": false,
+                "options": [
+                  {
+                    "description": "C20 go ahead",
+                    "label": "Yes"
+                  },
+                  {
+                    "description": "C20 stop here",
+                    "label": "No"
+                  }
+                ],
+                "question": "Should the C20 change go ahead?"
+              }
+            ]
+          },
+          "name": "AskUserQuestion",
+          "result": {
+            "content": "<cli-text chars=225 sha256=8621ef054998d150>",
+            "isError": true
+          },
+          "seq": 12,
+          "toolUseId": "toolu_q1",
+          "turnId": "9229a790-4b1c-41d9-8eaa-160b5e2d4291"
+        }
+      ],
+      "transcript": [
+        {
+          "seq": 6,
+          "text": "C20B-OPEN-DONE"
+        }
+      ],
+      "turnEndings": [
+        {
+          "apiErrorStatus": null,
+          "kind": "interrupted",
+          "message": null,
+          "numTurns": 3,
+          "reason": "<cli-text chars=13 sha256=fa0a718c164f4d46>",
+          "resetsAt": null,
+          "seq": 15,
+          "turnId": "9229a790-4b1c-41d9-8eaa-160b5e2d4291"
+        }
+      ],
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 2000,
+          "output": 20
+        },
+        "total_cost_usd": 0.0084
+      },
+      "userPrompts": []
+    },
+    "tab": 1,
+    "throughRevision": 16,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_claude_scripted_twins_are_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

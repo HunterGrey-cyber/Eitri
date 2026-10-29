@@ -121,3 +121,18 @@ describe("a Codex turn ending", () => {
     expect(turnEndingBandText(rate)).toBe("rate limited");
   });
 });
+
+it("an idle turn with no result is unfinished by its detail reason", () => {
+  expect(turnEndingText(e("failed", { reason: "no_result" }))).toBe("the turn did not finish: Claude Code went idle without a result");
+  expect(turnEndingBandText(e("failed", { reason: "no_result" }))).toBe("turn did not finish");
+});
+
+describe("a Claude Code turn ending", () => {
+  it("a usage limit says when the window resets, from the reset the account's report kept", () => {
+    const resetsAt = Date.UTC(2030, 2, 20, 12, 34, 56) / 1000;
+    const ending = e("limit_reached", { reason: "usage_limit", message: "Claude usage limit reached." });
+    const text = turnEndingText(ending, resetsAt, "4s");
+    expect(text).toMatch(/^stopped at the usage limit \(resets .*\d\d:\d\d\) after 4s: Claude usage limit reached\.$/);
+    expect(text).toContain(resetTimeText(resetsAt));
+  });
+});

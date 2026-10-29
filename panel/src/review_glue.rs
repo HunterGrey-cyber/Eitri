@@ -87,7 +87,9 @@ pub(super) fn editor_answered(state: &mut AgentPanelState, then: EditorThen, ans
                 out.send(view, serialize_command_result_for_js(&request_id, Err(&why)));
             }
             Ok(()) => {
-                state.tabs.set_draft(tab, &text);
+                if state.tabs.question_edit(edit.id).is_none() {
+                    state.tabs.set_draft(tab, &text);
+                }
                 state.pending_edits.push(edit);
                 out.send(view, eitri_core::agent_bridge::serialize_scratch_for_js(tab, true));
                 out.send(view, serialize_command_result_for_js(&request_id, Ok(())));
@@ -540,7 +542,39 @@ fn finish_scratch_edit(
     result: &eitri_core::scratch::EditDone,
     out: &mut Outbox,
 ) -> Option<ViewId> {
+    let question = state.tabs.question_edit(id);
     let (tab, draft) = state.tabs.finish_scratch_edit(id, result)?;
+    if let Some((_, interaction, index)) = question {
+        let view = state.tabs.view_of(tab);
+        if state
+            .tabs
+            .check_question_edit(tab, view, &interaction, Some(index))
+            .is_ok()
+        {
+            if let eitri_core::scratch::EditDone::Written(text) = result {
+                if text.len() <= 64 * 1024 {
+                    // Stored as well as sent: the page may be showing another tab now, and drops an envelope
+                    // for a tab it does not show; the dock restores the stored draft when the tab is shown.
+                    if let Err(why) = state.tabs.store_question_other(tab, &interaction, index, text) {
+                        eprintln!("[agent_panel] tab {}: edited answer not stored: {why}", tab.0);
+                    }
+                    out.send(
+                        view,
+                        serde_json::json!({
+                            "kind": "question_other_edited", "tab": tab.0,
+                            "interaction_id": interaction, "question_index": index, "text": text,
+                        })
+                        .to_string(),
+                    );
+                } else {
+                    out.send(
+                        view,
+                        eitri_core::agent_bridge::serialize_notice_for_js("the question text exceeds 64 KiB"),
+                    );
+                }
+            }
+        }
+    }
     let (shown, view) = (state.shown_in(tab), state.tabs.view_of(tab));
     if let Some(shown) = shown {
         if let Some(text) = &draft {

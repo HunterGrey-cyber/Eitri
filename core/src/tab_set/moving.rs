@@ -51,9 +51,16 @@ pub struct TabHandoff {
     stale: bool,
     reported_start_failure: bool,
     queue: Vec<Queued>,
+    /// A live transfer preserves keyboard admission; ordinary queue deserialization does not.
+    #[serde(default)]
+    queue_typed_by_person: Vec<bool>,
+    #[serde(default)]
+    opening_prompt: Option<OpeningPrompt>,
     queue_error: Option<String>,
     queue_note: Option<String>,
     draft: String,
+    question_draft: BTreeMap<String, serde_json::Value>,
+    editing_question: Option<(String, u32)>,
     /// Each waiting card's offered rule, in the rules file's own syntax: read back through the rule
     /// parser, so the record cannot carry a rule the parser would refuse.
     rule_offers: BTreeMap<String, String>,
@@ -125,6 +132,7 @@ enum MovedStart {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MovedAttention {
     cards: Vec<String>,
+    questions: Vec<String>,
     unread: bool,
 }
 
@@ -396,11 +404,16 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         turn_trace: _,
         reported_start_failure,
         queue,
+        opening_prompt,
         queue_error,
         queue_note,
         draft,
+        question_draft,
+        editing_question,
         rule_offers,
         was_running,
+        // Not carried: the projection's note of unseen work is live, noted again by the adopting window.
+        was_unseen_busy: _,
         note_ledger,
         creates_file_unsent,
         rule_offers_seen,
@@ -437,6 +450,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         state,
         attention: MovedAttention {
             cards: attention.card_ids(),
+            questions: attention.question_ids(),
             unread: attention.attention().unread,
         },
         failed_after_start: *failed_after_start,
@@ -454,9 +468,13 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         stale: *stale,
         reported_start_failure: *reported_start_failure,
         queue: queue.clone(),
+        queue_typed_by_person: queue.iter().map(|item| item.typed_by_person).collect(),
+        opening_prompt: opening_prompt.clone(),
         queue_error: queue_error.clone(),
         queue_note: queue_note.clone(),
         draft: draft.clone(),
+        question_draft: question_draft.clone(),
+        editing_question: editing_question.clone(),
         rule_offers: rule_offers
             .iter()
             .map(|(id, rule)| (id.clone(), rule.to_rule_string()))
@@ -479,7 +497,11 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
 /// The tray chip's count rebuilt in this window: the same cards in the same order, stamped on this
 /// process's clock, and unread if it was.
 fn attention_from(moved: MovedAttention) -> AttentionTracker {
-    let MovedAttention { cards, unread } = moved;
+    let MovedAttention {
+        cards,
+        questions,
+        unread,
+    } = moved;
     let mut attention = AttentionTracker::default();
     if unread {
         attention.session_ended(false);
@@ -489,6 +511,7 @@ fn attention_from(moved: MovedAttention) -> AttentionTracker {
         held.push(card);
         attention.resync(held.iter().cloned());
     }
+    attention.sync_questions(questions);
     attention
 }
 
@@ -777,6 +800,18 @@ impl TabSet {
                 outcome: Err(BackendError { message, benign: true }),
             });
         }
+        // A card or question waits for an answer: keep the message in the queue until it settles,
+        // because the session is stopped on the user.
+        if self.card_waits(tab) {
+            let outcome = self.hold_behind_card(tab, &turn);
+            return Some(Sent::Prompt {
+                tab,
+                page,
+                request_id: request_id.to_string(),
+                typed: turn.typed,
+                outcome,
+            });
+        }
         let gate = self.begin_turn_send(tab);
         self.send_when_allowed(
             gate,
@@ -786,6 +821,28 @@ impl TabSet {
                 turn,
             },
         )
+    }
+
+    /// Keeps a composer's message at the end of `tab`'s queue, marked to go as a turn once no card waits
+    /// (`TabSet::release_after_card`).
+    pub(super) fn hold_behind_card(&mut self, tab: TabId, turn: &FirstTurn) -> Result<(), BackendError> {
+        let outcome = self
+            .queue_message(
+                tab,
+                &turn.typed,
+                turn.wire.clone(),
+                wall_clock_ms(),
+                true,
+                turn.origin(),
+            )
+            .map(|_| ())
+            .map_err(|message| BackendError { message, benign: true });
+        if outcome.is_ok() {
+            if let Some(item) = self.get_mut(tab).and_then(|t| t.session.queue.last_mut()) {
+                item.behind_card = true;
+            }
+        }
+        outcome
     }
 
     /// Why no message may start a turn in `tab` now: it is frozen for a move (its record is taken, and a
@@ -878,9 +935,9 @@ impl TabSet {
         };
         if let Some(t) = self.get_mut(tab) {
             if let Some(turn) = turn {
-                t.session
-                    .queue
-                    .insert(0, Queued::held(&turn.typed, turn.wire, wall_clock_ms()));
+                let mut item = Queued::held(&turn.typed, turn.wire, wall_clock_ms());
+                item.typed_by_person = turn.typed_by_person;
+                t.session.queue.insert(0, item);
             }
             t.session.queue_error = Some(note.clone());
         }
@@ -983,10 +1040,12 @@ impl TabSet {
         if self.moving.contains(&tab.0) {
             return Err(MoveRefusedWhy::AlreadyMoving);
         }
-        if self.starting.contains(&tab.0) || self.pending_sends.contains_key(&tab.0) {
+        let t = &self.tabs[at];
+        // Ingestion can start the turn after the last pump checked `starting`. The final frozen
+        // pump reconciles that flag; a prompt still held for presence must stay here regardless.
+        if self.pending_sends.contains_key(&tab.0) || (self.starting.contains(&tab.0) && !t.turn_running()) {
             return Err(MoveRefusedWhy::Starting);
         }
-        let t = &self.tabs[at];
         if t.pending_handoff.is_some() {
             return Err(MoveRefusedWhy::TerminalHandoff);
         }
@@ -1260,10 +1319,14 @@ impl TabSet {
             project_tiers,
             stale,
             reported_start_failure,
-            queue,
+            mut queue,
+            queue_typed_by_person,
+            opening_prompt,
             queue_error,
             queue_note,
             draft,
+            question_draft,
+            editing_question,
             rule_offers,
             was_running,
             note_ledger,
@@ -1278,6 +1341,9 @@ impl TabSet {
             #[cfg(any(test, feature = "test-support"))]
             gate_log,
         } = handoff;
+        for (item, typed) in queue.iter_mut().zip(queue_typed_by_person) {
+            item.typed_by_person = typed;
+        }
         let id = self.insert_tab(agent, false);
         let at = self.position(id).expect("just inserted");
         let t = &mut self.tabs[at];
@@ -1304,14 +1370,18 @@ impl TabSet {
             turn_trace: None,
             reported_start_failure,
             queue,
+            opening_prompt,
             queue_error,
             queue_note,
             draft,
+            question_draft,
+            editing_question,
             rule_offers: rule_offers
                 .into_iter()
                 .filter_map(|(id, rule)| agent::PrefixRule::parse(&rule).map(|rule| (id, rule)))
                 .collect(),
             was_running,
+            was_unseen_busy: false,
             note_ledger,
             creates_file_unsent,
             rule_offers_seen,

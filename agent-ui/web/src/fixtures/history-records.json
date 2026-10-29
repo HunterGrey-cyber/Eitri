@@ -1,0 +1,1620 @@
+{
+  "events": {
+    "events": [
+      {
+        "cwd": "/project",
+        "model": "claude-sonnet-5",
+        "provider_session_id": "prov-1",
+        "session_id": "sess-1",
+        "type": "session_opened"
+      },
+      {
+        "text": "start",
+        "type": "user_prompt_submitted"
+      },
+      {
+        "turn_id": "t1",
+        "type": "turn_started"
+      },
+      {
+        "cause": null,
+        "origin": "client",
+        "turn_id": "t1",
+        "type": "turn_attributed"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "t1",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "cli-0",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": null,
+          "description": "cargo build --release",
+          "kind": "task",
+          "peer_name": null,
+          "prompt": null,
+          "schedule_reason": null,
+          "scheduled_for_ms": null,
+          "summary": "Background command \"cargo build\" completed (exit code 0)",
+          "task_id": "task-1",
+          "task_kind": "shell",
+          "task_status": "completed",
+          "text": null,
+          "tool_use_id": "tool-1",
+          "wakeup_source": null
+        },
+        "origin": "cli",
+        "turn_id": "cli-0",
+        "type": "turn_attributed"
+      },
+      {
+        "kind": "text",
+        "text": "Reply 0.",
+        "turn_id": "cli-0",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cli-0",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "cli-1",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": "cron-3",
+          "description": null,
+          "kind": "scheduled",
+          "peer_name": null,
+          "prompt": "Is the deploy green?",
+          "schedule_reason": "check the deploy",
+          "scheduled_for_ms": 1790000000000,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": null,
+          "wakeup_source": "loop_wakeup"
+        },
+        "origin": "cli",
+        "turn_id": "cli-1",
+        "type": "turn_attributed"
+      },
+      {
+        "kind": "text",
+        "text": "Reply 1.",
+        "turn_id": "cli-1",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cli-1",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "cli-2",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": null,
+          "description": null,
+          "kind": "peer",
+          "peer_name": "reviewer",
+          "prompt": null,
+          "schedule_reason": null,
+          "scheduled_for_ms": null,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": "Look at ‮line 4​ please",
+          "wakeup_source": null
+        },
+        "origin": "cli",
+        "turn_id": "cli-2",
+        "type": "turn_attributed"
+      },
+      {
+        "kind": "text",
+        "text": "Reply 2.",
+        "turn_id": "cli-2",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cli-2",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "cli-3",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": null,
+          "description": null,
+          "kind": "other",
+          "peer_name": null,
+          "prompt": null,
+          "schedule_reason": null,
+          "scheduled_for_ms": null,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": "coordinator",
+          "wakeup_source": null
+        },
+        "origin": "cli",
+        "turn_id": "cli-3",
+        "type": "turn_attributed"
+      },
+      {
+        "kind": "text",
+        "text": "Reply 3.",
+        "turn_id": "cli-3",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cli-3",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "cli-4",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": null,
+          "description": null,
+          "kind": "unknown",
+          "peer_name": null,
+          "prompt": null,
+          "schedule_reason": null,
+          "scheduled_for_ms": null,
+          "summary": null,
+          "task_id": null,
+          "task_kind": null,
+          "task_status": null,
+          "text": null,
+          "wakeup_source": null
+        },
+        "origin": "cli",
+        "turn_id": "cli-4",
+        "type": "turn_attributed"
+      },
+      {
+        "kind": "text",
+        "text": "Reply 4.",
+        "turn_id": "cli-4",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cli-4",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "turn_id": "follow-1",
+        "type": "turn_started"
+      },
+      {
+        "cause": null,
+        "origin": "follow_up",
+        "turn_id": "follow-1",
+        "type": "turn_attributed"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "follow-1",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "content": "Background command \"cargo build\" completed (exit code 0)",
+        "kind": "task",
+        "level": "notice",
+        "scalars": {
+          "exit_code": 0
+        },
+        "task_id": "task-1",
+        "task_status": "completed",
+        "tool_use_id": "toolu_bg",
+        "type": "session_notice"
+      },
+      {
+        "content": "Switched to claude-sonnet-5",
+        "kind": "model_fallback",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "The model refused",
+        "kind": "model_refusal",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": null,
+        "kind": "compaction",
+        "level": "info",
+        "scalars": {
+          "post_tokens": 41000,
+          "pre_tokens": 182000,
+          "trigger": "auto"
+        },
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "Try /compact",
+        "kind": "informational",
+        "level": "suggestion",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "blocked by policy",
+        "kind": "hook_block",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": null,
+        "kind": "peer_hold",
+        "level": "warning",
+        "scalars": {
+          "hold_state": "held",
+          "peer_name": "reviewer"
+        },
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": "Usage limit reset",
+        "kind": "rate_limit",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": null,
+        "kind": "unseen_turn",
+        "level": "notice",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "turn_id": "t2",
+        "type": "turn_started"
+      },
+      {
+        "interaction_id": "q-answered",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Which build?"
+          }
+        ],
+        "tool_use_id": "toolu_q1",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "interaction_id": "q-waiting",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": true,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Which targets?"
+          }
+        ],
+        "tool_use_id": "toolu_q2",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [
+          {
+            "answer": "release​",
+            "notes": "ship it",
+            "question_index": 0
+          }
+        ],
+        "interaction_id": "q-answered",
+        "outcome": "answered",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-answered",
+        "outcome": "expired",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-refused",
+        "questions": [],
+        "tool_use_id": null,
+        "type": "question_asked",
+        "unsupported_reason": "five options in one question"
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-refused",
+        "outcome": "host_refused",
+        "reason": "five options in one question",
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-declined",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-declined",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-declined",
+        "outcome": "declined",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-chat",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-chat",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-chat",
+        "outcome": "chat_requested",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-interrupted",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-interrupted",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-interrupted",
+        "outcome": "interrupted",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-expired",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-expired",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-expired",
+        "outcome": "expired",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-closed",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-closed",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-closed",
+        "outcome": "session_closed",
+        "reason": null,
+        "type": "question_settled"
+      },
+      {
+        "interaction_id": "q-failed",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Go on?"
+          }
+        ],
+        "tool_use_id": "toolu_q-failed",
+        "type": "question_asked",
+        "unsupported_reason": null
+      },
+      {
+        "answers": [],
+        "interaction_id": "q-failed",
+        "outcome": "provider_failed",
+        "reason": "the sidecar exited",
+        "type": "question_settled"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": null
+        },
+        "outcome": "completed",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "t2",
+        "type": "turn_completed",
+        "usage": null
+      },
+      {
+        "interaction_id": "q-last",
+        "questions": [
+          {
+            "header": "Target",
+            "multi_select": false,
+            "options": [
+              {
+                "description": "fast to build",
+                "label": "\"debug\"",
+                "preview": null
+              },
+              {
+                "description": "slow to build",
+                "label": "release​",
+                "preview": "```\ncargo build --release\n```"
+              }
+            ],
+            "question": "Still there?"
+          }
+        ],
+        "tool_use_id": "toolu_last",
+        "type": "question_asked",
+        "unsupported_reason": null
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 58
+  },
+  "middle": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": "t2",
+      "assistantMessageOpen": false,
+      "availableCommands": null,
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": true,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": "/project",
+      "history": null,
+      "lastTurnEnding": null,
+      "model": "claude-sonnet-5",
+      "notices": [
+        {
+          "content": "Background command \"cargo build\" completed (exit code 0)",
+          "kind": "task",
+          "level": "notice",
+          "scalars": {
+            "exit_code": 0
+          },
+          "seq": 28,
+          "taskId": "task-1",
+          "taskStatus": "completed",
+          "toolUseId": "toolu_bg"
+        },
+        {
+          "content": "Switched to claude-sonnet-5",
+          "kind": "model_fallback",
+          "level": "warning",
+          "scalars": {},
+          "seq": 29,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "The model refused",
+          "kind": "model_refusal",
+          "level": "warning",
+          "scalars": {},
+          "seq": 30,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "compaction",
+          "level": "info",
+          "scalars": {
+            "post_tokens": 41000,
+            "pre_tokens": 182000,
+            "trigger": "auto"
+          },
+          "seq": 31,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "Try /compact",
+          "kind": "informational",
+          "level": "suggestion",
+          "scalars": {},
+          "seq": 32,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "blocked by policy",
+          "kind": "hook_block",
+          "level": "warning",
+          "scalars": {},
+          "seq": 33,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "warning",
+          "scalars": {
+            "hold_state": "held",
+            "peer_name": "reviewer"
+          },
+          "seq": 34,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "Usage limit reset",
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {},
+          "seq": 35,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "unseen_turn",
+          "level": "notice",
+          "scalars": {},
+          "seq": 36,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "questions": [
+        {
+          "interactionId": "q-answered",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Which build?"
+            }
+          ],
+          "seq": 38,
+          "state": {
+            "kind": "waiting"
+          },
+          "toolUseId": "toolu_q1",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-waiting",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": true,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Which targets?"
+            }
+          ],
+          "seq": 39,
+          "state": {
+            "kind": "waiting"
+          },
+          "toolUseId": "toolu_q2",
+          "turnId": "t2",
+          "unsupportedReason": null
+        }
+      ],
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [],
+      "transcript": [
+        {
+          "seq": 7,
+          "text": "Reply 0."
+        },
+        {
+          "seq": 11,
+          "text": "Reply 1."
+        },
+        {
+          "seq": 15,
+          "text": "Reply 2."
+        },
+        {
+          "seq": 19,
+          "text": "Reply 3."
+        },
+        {
+          "seq": 23,
+          "text": "Reply 4."
+        }
+      ],
+      "turnEndings": [],
+      "turnStarts": [
+        {
+          "cause": {
+            "cronId": null,
+            "description": "cargo build --release",
+            "kind": "task",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": "Background command \"cargo build\" completed (exit code 0)",
+            "taskId": "task-1",
+            "taskKind": "shell",
+            "taskStatus": "completed",
+            "text": null,
+            "toolUseId": "tool-1",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 6,
+          "turnId": "cli-0"
+        },
+        {
+          "cause": {
+            "cronId": "cron-3",
+            "description": null,
+            "kind": "scheduled",
+            "peerName": null,
+            "prompt": "Is the deploy green?",
+            "scheduleReason": "check the deploy",
+            "scheduledForMs": 1790000000000,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": null,
+            "wakeupSource": "loop_wakeup"
+          },
+          "origin": "cli",
+          "seq": 10,
+          "turnId": "cli-1"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "peer",
+            "peerName": "reviewer",
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": "Look at ‮line 4​ please",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 14,
+          "turnId": "cli-2"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "other",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": "coordinator",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 18,
+          "turnId": "cli-3"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "unknown",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": null,
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 22,
+          "turnId": "cli-4"
+        },
+        {
+          "cause": null,
+          "origin": "follow_up",
+          "seq": 26,
+          "turnId": "follow-1"
+        }
+      ],
+      "usage": null,
+      "userPrompts": [
+        {
+          "seq": 1,
+          "text": "start"
+        }
+      ]
+    },
+    "tab": 1,
+    "throughRevision": 40,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": null,
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": true,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": "/project",
+      "history": null,
+      "lastTurnEnding": null,
+      "model": "claude-sonnet-5",
+      "notices": [
+        {
+          "content": "Background command \"cargo build\" completed (exit code 0)",
+          "kind": "task",
+          "level": "notice",
+          "scalars": {
+            "exit_code": 0
+          },
+          "seq": 28,
+          "taskId": "task-1",
+          "taskStatus": "completed",
+          "toolUseId": "toolu_bg"
+        },
+        {
+          "content": "Switched to claude-sonnet-5",
+          "kind": "model_fallback",
+          "level": "warning",
+          "scalars": {},
+          "seq": 29,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "The model refused",
+          "kind": "model_refusal",
+          "level": "warning",
+          "scalars": {},
+          "seq": 30,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "compaction",
+          "level": "info",
+          "scalars": {
+            "post_tokens": 41000,
+            "pre_tokens": 182000,
+            "trigger": "auto"
+          },
+          "seq": 31,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "Try /compact",
+          "kind": "informational",
+          "level": "suggestion",
+          "scalars": {},
+          "seq": 32,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "blocked by policy",
+          "kind": "hook_block",
+          "level": "warning",
+          "scalars": {},
+          "seq": 33,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "warning",
+          "scalars": {
+            "hold_state": "held",
+            "peer_name": "reviewer"
+          },
+          "seq": 34,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "Usage limit reset",
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {},
+          "seq": 35,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": null,
+          "kind": "unseen_turn",
+          "level": "notice",
+          "scalars": {},
+          "seq": 36,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "questions": [
+        {
+          "interactionId": "q-answered",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Which build?"
+            }
+          ],
+          "seq": 38,
+          "state": {
+            "answers": [
+              {
+                "answer": "release​",
+                "notes": "ship it",
+                "questionIndex": 0
+              }
+            ],
+            "kind": "settled",
+            "outcome": "answered",
+            "reason": null
+          },
+          "toolUseId": "toolu_q1",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-waiting",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": true,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Which targets?"
+            }
+          ],
+          "seq": 39,
+          "state": {
+            "kind": "waiting"
+          },
+          "toolUseId": "toolu_q2",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-refused",
+          "questions": [],
+          "seq": 42,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "host_refused",
+            "reason": "five options in one question"
+          },
+          "toolUseId": null,
+          "turnId": "t2",
+          "unsupportedReason": "five options in one question"
+        },
+        {
+          "interactionId": "q-declined",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 44,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "declined",
+            "reason": null
+          },
+          "toolUseId": "toolu_q-declined",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-chat",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 46,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "chat_requested",
+            "reason": null
+          },
+          "toolUseId": "toolu_q-chat",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-interrupted",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 48,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "interrupted",
+            "reason": null
+          },
+          "toolUseId": "toolu_q-interrupted",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-expired",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 50,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "expired",
+            "reason": null
+          },
+          "toolUseId": "toolu_q-expired",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-closed",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 52,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "session_closed",
+            "reason": null
+          },
+          "toolUseId": "toolu_q-closed",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-failed",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Go on?"
+            }
+          ],
+          "seq": 54,
+          "state": {
+            "answers": [],
+            "kind": "settled",
+            "outcome": "provider_failed",
+            "reason": "the sidecar exited"
+          },
+          "toolUseId": "toolu_q-failed",
+          "turnId": "t2",
+          "unsupportedReason": null
+        },
+        {
+          "interactionId": "q-last",
+          "questions": [
+            {
+              "header": "Target",
+              "multiSelect": false,
+              "options": [
+                {
+                  "description": "fast to build",
+                  "label": "\"debug\"",
+                  "preview": null
+                },
+                {
+                  "description": "slow to build",
+                  "label": "release​",
+                  "preview": "```\ncargo build --release\n```"
+                }
+              ],
+              "question": "Still there?"
+            }
+          ],
+          "seq": 57,
+          "state": {
+            "kind": "waiting"
+          },
+          "toolUseId": "toolu_last",
+          "turnId": null,
+          "unsupportedReason": null
+        }
+      ],
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [],
+      "transcript": [
+        {
+          "seq": 7,
+          "text": "Reply 0."
+        },
+        {
+          "seq": 11,
+          "text": "Reply 1."
+        },
+        {
+          "seq": 15,
+          "text": "Reply 2."
+        },
+        {
+          "seq": 19,
+          "text": "Reply 3."
+        },
+        {
+          "seq": 23,
+          "text": "Reply 4."
+        }
+      ],
+      "turnEndings": [],
+      "turnStarts": [
+        {
+          "cause": {
+            "cronId": null,
+            "description": "cargo build --release",
+            "kind": "task",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": "Background command \"cargo build\" completed (exit code 0)",
+            "taskId": "task-1",
+            "taskKind": "shell",
+            "taskStatus": "completed",
+            "text": null,
+            "toolUseId": "tool-1",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 6,
+          "turnId": "cli-0"
+        },
+        {
+          "cause": {
+            "cronId": "cron-3",
+            "description": null,
+            "kind": "scheduled",
+            "peerName": null,
+            "prompt": "Is the deploy green?",
+            "scheduleReason": "check the deploy",
+            "scheduledForMs": 1790000000000,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": null,
+            "wakeupSource": "loop_wakeup"
+          },
+          "origin": "cli",
+          "seq": 10,
+          "turnId": "cli-1"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "peer",
+            "peerName": "reviewer",
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": "Look at ‮line 4​ please",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 14,
+          "turnId": "cli-2"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "other",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": "coordinator",
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 18,
+          "turnId": "cli-3"
+        },
+        {
+          "cause": {
+            "cronId": null,
+            "description": null,
+            "kind": "unknown",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": null,
+            "taskId": null,
+            "taskKind": null,
+            "taskStatus": null,
+            "text": null,
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 22,
+          "turnId": "cli-4"
+        },
+        {
+          "cause": null,
+          "origin": "follow_up",
+          "seq": 26,
+          "turnId": "follow-1"
+        }
+      ],
+      "usage": null,
+      "userPrompts": [
+        {
+          "seq": 1,
+          "text": "start"
+        }
+      ]
+    },
+    "tab": 1,
+    "throughRevision": 58,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "split": 40,
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_history_records_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

@@ -123,14 +123,26 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
     },
-    /// The confirmed `<leader>k`: stop the commands the tab's agent left running after its turns
-    /// ended, by stopping its session. `running` is the count the question showed: an answer to a
+    /// The confirmed `<leader>k`: stop what the tab's agent left running after its turns ended.
+    /// Claude stops individual tasks; Codex stops its session. `running` is the count the question showed: an answer to a
     /// question about another count stops nothing (`TabSet::stop_background`).
     StopBackground {
         request_id: String,
         #[serde(default)]
         tab: Option<u64>,
         running: u32,
+    },
+    StopTask {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        task_id: String,
+    },
+    TaskOutput {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        task_id: String,
     },
     /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
     /// from its own receipt of the payload to the animation frame that rendered it.
@@ -171,6 +183,27 @@ pub enum InboundMessage {
         /// rule broader than the one it was shown.
         #[serde(default)]
         remember: bool,
+    },
+    /// The question dock's submit: the person's answers to Claude's question set `interaction_id`, by
+    /// option index and typed text, never as the answer's words (the sidecar builds those from the
+    /// question it kept). Gated exactly as a card answer. A malformed answer does not parse.
+    QuestionAnswer {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        interaction_id: String,
+        answers: Vec<QuestionAnswerWire>,
+    },
+    /// The question dock's Escape (`cancel`) or "Chat about this" (`chat`, with what was answered so
+    /// far). Gated exactly as a card answer. An unknown `kind` does not parse.
+    QuestionDecline {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        interaction_id: String,
+        kind: QuestionDeclineChoice,
+        #[serde(default)]
+        so_far: Vec<QuestionAnswerWire>,
     },
     /// `resume{tab, provider_session_id}` carries the Claude provider session id to continue on the
     /// tab the user was in. `start_session` is removed: a fresh session
@@ -257,6 +290,23 @@ pub enum InboundMessage {
         request_id: String,
         #[serde(default)]
         tab: Option<u64>,
+        text: String,
+    },
+    /// A question form mirror; it never submits an answer.
+    QuestionDraft {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        interaction_id: String,
+        draft: Value,
+    },
+    /// Edit a question's free text through the existing scratch route.
+    EditQuestionOther {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        interaction_id: String,
+        question_index: u32,
         text: String,
     },
     /// `Ctrl+c` on an idle draft: the text goes to history so `↑` recalls it.
@@ -591,9 +641,13 @@ impl InboundMessage {
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::StopBackground { tab, .. }
+            | InboundMessage::StopTask { tab, .. }
+            | InboundMessage::TaskOutput { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
             | InboundMessage::HandoffToTerminal { tab, .. }
             | InboundMessage::PermissionResponse { tab, .. }
+            | InboundMessage::QuestionAnswer { tab, .. }
+            | InboundMessage::QuestionDecline { tab, .. }
             | InboundMessage::Resume { tab, .. }
             | InboundMessage::RestoreLast { tab, .. }
             | InboundMessage::SelectTab { tab, .. }
@@ -607,6 +661,8 @@ impl InboundMessage {
             | InboundMessage::SendNow { tab, .. }
             | InboundMessage::Draft { tab, .. }
             | InboundMessage::EditDraft { tab, .. }
+            | InboundMessage::QuestionDraft { tab, .. }
+            | InboundMessage::EditQuestionOther { tab, .. }
             | InboundMessage::ReviewRequest { tab, .. }
             | InboundMessage::ReviewDiffRequest { tab, .. }
             | InboundMessage::ReviewRevert { tab, .. }
@@ -659,6 +715,53 @@ pub fn path_holds_control(path: &str) -> bool {
     path.chars().any(|c| c.is_ascii_control())
 }
 
+/// One question's answer in a `question_answer` or a chat `question_decline`. Every field is named on
+/// the wire and no other is taken, so a malformed answer is a parse failure, never a default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionAnswerWire {
+    pub question_index: u32,
+    pub option_indexes: Vec<u32>,
+    #[serde(default)]
+    pub other_text: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+impl QuestionAnswerWire {
+    pub fn into_answer(self) -> agent::QuestionAnswer {
+        let QuestionAnswerWire {
+            question_index,
+            option_indexes,
+            other_text,
+            notes,
+        } = self;
+        agent::QuestionAnswer {
+            question_index,
+            option_indexes,
+            other_text,
+            notes,
+        }
+    }
+}
+
+/// How a `question_decline` turns the set down, as a closed set: an unknown kind is a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionDeclineChoice {
+    Cancel,
+    Chat,
+}
+
+impl QuestionDeclineChoice {
+    pub fn kind(self) -> agent::QuestionDeclineKind {
+        match self {
+            QuestionDeclineChoice::Cancel => agent::QuestionDeclineKind::Cancel,
+            QuestionDeclineChoice::Chat => agent::QuestionDeclineKind::Chat,
+        }
+    }
+}
+
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
 ///
 /// Typed on the wire so an unrecognized value is a PARSE failure, not a value some later `match`
@@ -692,9 +795,13 @@ impl InboundMessage {
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::Interrupt { request_id, .. }
             | InboundMessage::StopBackground { request_id, .. }
+            | InboundMessage::StopTask { request_id, .. }
+            | InboundMessage::TaskOutput { request_id, .. }
             | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::HandoffToTerminal { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. }
+            | InboundMessage::QuestionAnswer { request_id, .. }
+            | InboundMessage::QuestionDecline { request_id, .. }
             | InboundMessage::Resume { request_id, .. }
             | InboundMessage::SelectTab { request_id, .. }
             | InboundMessage::RenameTab { request_id, .. }
@@ -709,6 +816,8 @@ impl InboundMessage {
             | InboundMessage::SendNow { request_id, .. }
             | InboundMessage::Draft { request_id, .. }
             | InboundMessage::EditDraft { request_id, .. }
+            | InboundMessage::QuestionDraft { request_id, .. }
+            | InboundMessage::EditQuestionOther { request_id, .. }
             | InboundMessage::HistoryPush { request_id, .. }
             | InboundMessage::OpenPath { request_id, .. }
             | InboundMessage::ReviewRequest { request_id, .. }
@@ -790,6 +899,19 @@ pub fn is_primary_copy(raw: &str) -> bool {
         kind: String,
     }
     raw.contains("\"copy_primary\"") && serde_json::from_str::<Kind>(raw).is_ok_and(|m| m.kind == "copy_primary")
+}
+
+/// A read reply, correlated with its request and its tab even after a switch.
+pub fn serialize_task_output_for_js(
+    request_id: &str,
+    tab: crate::tabs::TabId,
+    task_id: &str,
+    output: &agent::TaskOutput,
+) -> String {
+    json!({ "kind": "task_output_result", "requestId": request_id, "tab": tab.0,
+        "taskId": task_id, "output": output.output, "totalBytes": output.total_bytes,
+        "truncated": output.truncated })
+    .to_string()
 }
 
 /// `{"kind":"command_result","requestId":...,"ok":true}` or
@@ -1850,7 +1972,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         .turn_endings
         .iter()
         .map(|ending| {
-            json!({
+            let mut row = json!({
                 "seq": ending.seq,
                 "turnId": ending.turn_id,
                 "kind": ending.kind,
@@ -1858,7 +1980,14 @@ pub fn serialize_snapshot_with_notes_for_js(
                 "apiErrorStatus": ending.detail.api_error_status,
                 "message": ending.detail.message,
                 "resetsAt": ending.resets_at,
-            })
+            });
+            if let Some(origin) = &ending.detail.origin_kind {
+                row["originKind"] = json!(origin);
+            }
+            if let Some(count) = ending.detail.num_turns {
+                row["numTurns"] = json!(count);
+            }
+            row
         })
         .collect();
 
@@ -1933,6 +2062,19 @@ pub fn serialize_snapshot_with_notes_for_js(
         },
         "provider": provider,
     });
+    // Absence is an unavailable control, including snapshots from peers predating task reporting.
+    for (name, offered) in [
+        ("backgroundTasks", capabilities.background_tasks),
+        ("taskControl", capabilities.task_control),
+        ("taskOutput", capabilities.task_output),
+        ("workflowProgress", capabilities.workflow_progress),
+    ] {
+        if offered {
+            state["capabilities"][name] = json!(true);
+        }
+    }
+    projection.snapshot_modules(&mut state);
+
     // Changes whose call has not started (Rust holds them and attaches them when it does): sent only
     // while there are any, so a page rebuilt from this snapshot attaches them at the same moment.
     if !projection.changed_inputs_before_their_call.is_empty() {
@@ -1941,6 +2083,30 @@ pub fn serialize_snapshot_with_notes_for_js(
             .iter()
             .map(|(id, change)| json!({ "toolUseId": id, "change": change }))
             .collect();
+    }
+
+    // The starts of turns the user did not send, the CLI's notice rows and Claude's question sets,
+    // spelled out like the collections above. Each only while the projection holds any, so the
+    // snapshot of a conversation without them is what it was before they existed; the page reads a
+    // missing one as empty.
+    if !projection.turn_starts.is_empty() {
+        state["turnStarts"] = projection.turn_starts.iter().map(turn_start_json).collect();
+    }
+    if !projection.notices.is_empty() {
+        state["notices"] = projection.notices.iter().map(notice_json).collect();
+    }
+    // Claude Code is working where the panel cannot show it: sent only while it is, for the same
+    // reason, and a page reads a missing key as not.
+    if projection.cli_unseen_busy {
+        state["cliUnseenBusy"] = Value::Bool(true);
+    }
+    // Which prompt the running turn opened with, and whether Claude Code started that turn: sent only
+    // while set, so a page rebuilt mid-turn moves the same prompt aside and drops the same empty turn.
+    if let Some(seq) = projection.opening_prompt {
+        state["openingPromptSeq"] = json!(seq);
+    }
+    if projection.running_turn_cli {
+        state["runningTurnCli"] = Value::Bool(true);
     }
 
     // When the running turn started (wall clock ms, `Date.now()`'s clock), which the tab set keeps
@@ -1957,6 +2123,48 @@ pub fn serialize_snapshot_with_notes_for_js(
         "turnTimes": notes.turn_times.iter().map(TurnTime::to_json).collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+fn turn_start_json(start: &agent::TurnStartRecord) -> Value {
+    json!({
+        "seq": start.seq,
+        "turnId": start.turn_id,
+        "origin": start.origin,
+        "cause": start.cause.as_ref().map(|cause| {
+            let mut value = json!({
+                "kind": cause.kind,
+                "taskId": cause.task_id,
+                "taskKind": cause.task_kind,
+                "taskStatus": cause.task_status,
+                "description": cause.description,
+                "summary": cause.summary,
+                "peerName": cause.peer_name,
+                "text": cause.text,
+                "wakeupSource": cause.wakeup_source,
+                "scheduledForMs": cause.scheduled_for_ms,
+                "scheduleReason": cause.schedule_reason,
+                "cronId": cause.cron_id,
+                "prompt": cause.prompt,
+            });
+            if let Some(id) = &cause.tool_use_id {
+                value["toolUseId"] = json!(id);
+            }
+            value
+        }),
+    })
+}
+
+fn notice_json(notice: &agent::NoticeRecord) -> Value {
+    json!({
+        "seq": notice.seq,
+        "kind": notice.kind,
+        "level": notice.level,
+        "content": notice.content,
+        "scalars": notice.scalars,
+        "taskId": notice.task_id,
+        "toolUseId": notice.tool_use_id,
+        "taskStatus": notice.task_status,
+    })
 }
 
 /// `{"kind":"handoff","tab":...,"command":...,"cwd":...,"providerSessionId":...}` -- the
@@ -2201,6 +2409,8 @@ impl TabStateWire {
 /// One tab as the panel draws it (the tab bar, the chooser's open rows, the footer's mode pill).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabView {
+    /// Live form mirrors keyed by interaction id; absent on the wire when empty.
+    pub question_draft: std::collections::BTreeMap<String, Value>,
     pub id: crate::tabs::TabId,
     pub number: u16,
     pub label: String,
@@ -2237,7 +2447,7 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
     let tabs: Vec<Value> = tabs
         .iter()
         .map(|t| {
-            json!({
+            let mut row = json!({
                 "id": t.id.0,
                 "number": t.number,
                 "label": t.label,
@@ -2252,7 +2462,11 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
                 "resumesOnR": t.resumes_on_r,
                 "title": t.title,
                 "agent": t.agent,
-            })
+            });
+            if !t.question_draft.is_empty() {
+                row["questionDraft"] = json!(t.question_draft);
+            }
+            row
         })
         .collect();
     json!({
@@ -3919,6 +4133,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: Some(&provider),
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4160,6 +4375,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4406,6 +4622,316 @@ mod tests {
                 "the committed thinking fixture is not what this test produces; if the change is \
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
+        }
+    }
+
+    #[test]
+    fn session_notices_events_and_snapshot_are_twins() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/session-notices.json");
+        let mut fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original = fixture.clone();
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            // History A keeps rows, independently of live activity and band state.
+            let stored = agent::history::StoredHistory::from_parts(
+                "notices".into(),
+                "session".into(),
+                agent::history::HistoryParts {
+                    notices: projection.notices.clone(),
+                    ..Default::default()
+                },
+            );
+            let restored: agent::history::StoredHistory =
+                serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+            assert_eq!(restored.notices, projection.notices);
+            let mut refolded = AgentSessionProjection::default();
+            for record in restored.notices {
+                refolded.apply(&AgentDomainEvent::SessionNotice {
+                    kind: record.kind,
+                    level: record.level,
+                    content: record.content,
+                    scalars: record.scalars,
+                    task_id: record.task_id,
+                    tool_use_id: record.tool_use_id,
+                    task_status: record.task_status,
+                });
+            }
+            assert_eq!(refolded.notices.len(), projection.notices.len());
+            for (restored, original) in refolded.notices.iter().zip(&projection.notices) {
+                assert_eq!(restored.kind, original.kind);
+                assert_eq!(restored.content, original.content);
+                assert_eq!(restored.scalars, original.scalars);
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            case["snapshot"] = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            case["events"] =
+                serde_json::from_str(&serialize_events_for_js(TabId(1), 0, projection.last_revision, &events)).unwrap();
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap())).unwrap();
+        } else {
+            assert_eq!(original, fixture);
+        }
+    }
+
+    /// `fixtures/conversation-reset.json`: each case's events folded here, the events payload this side
+    /// sends for them and the snapshot it sends after them, which the panel's reducer must agree with
+    /// (`reducer.test.ts`). The snapshot is taken as it is once the new conversation's session opened,
+    /// with that session's id. `EITRI_WRITE_FIXTURES=1` rewrites the generated parts.
+    #[test]
+    fn conversation_reset_events_and_snapshot_are_twins() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agent-ui/web/src/fixtures/conversation-reset.json");
+        let mut fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original = fixture.clone();
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: projection.session_id.as_deref(),
+                provider_session_id: projection.provider_session_id.clone(),
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            case["snapshot"] = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            case["events"] =
+                serde_json::from_str(&serialize_events_for_js(TabId(1), 0, projection.last_revision, &events)).unwrap();
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap())).unwrap();
+        } else {
+            assert_eq!(original, fixture);
+        }
+    }
+
+    #[test]
+    fn questions_fixture_matches_events_and_canonical_snapshots() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/questions.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut projection = AgentSessionProjection::default();
+            for step in case["steps"].as_array().unwrap() {
+                let action = &step["action"];
+                if let Some(event) = action.get("event") {
+                    let event: AgentDomainEvent = serde_json::from_value(event.clone()).unwrap();
+                    let payload: Value = serde_json::from_str(&serialize_events_for_js(
+                        TabId(1),
+                        projection.last_revision,
+                        projection.last_revision + 1,
+                        std::slice::from_ref(&event),
+                    ))
+                    .unwrap();
+                    assert_eq!(payload["events"][0], action["event"]);
+                    projection.apply(&event);
+                } else {
+                    let id = action["interactionId"].as_str().unwrap();
+                    let changed = match action["send"].as_str().unwrap() {
+                        "answering" => projection.mark_question_answering(id),
+                        "failed" => projection.question_send_failed(id),
+                        other => panic!("unknown send action: {other}"),
+                    };
+                    assert_eq!(changed, action["changed"].as_bool().unwrap());
+                }
+                let view = SnapshotView {
+                    backend: "sidecar",
+                    conversation_id: None,
+                    session_id: None,
+                    provider_session_id: None,
+                    capabilities: agent::ProviderCapabilities::default(),
+                    provider: None,
+                    projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                    hidden_pending: None,
+                };
+                let canonical: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+                assert_eq!(canonical["throughRevision"], step["throughRevision"]);
+                assert_eq!(
+                    canonical["state"]["questions"], step["snapshot"]["questions"],
+                    "{}",
+                    case["name"]
+                );
+                assert_eq!(canonical["state"]["activeTurnId"], step["snapshot"]["activeTurnId"]);
+                assert_eq!(
+                    serde_json::to_value(
+                        projection
+                            .waiting_questions()
+                            .map(|q| &q.interaction_id)
+                            .collect::<Vec<_>>()
+                    )
+                    .unwrap(),
+                    step["waitingIds"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn background_tasks_events_and_snapshots_are_twins() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/background-tasks.json");
+        let mut fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let write = std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1");
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let name = case["name"].as_str().unwrap().to_owned();
+            let source: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+            let mut projection = AgentSessionProjection::default();
+            let mut delivered = Vec::new();
+            let mut snapshots = Vec::new();
+            let mut batches = Vec::new();
+            for (index, event) in source.iter().enumerate() {
+                let from = projection.last_revision;
+                let old_count = projection.background_tasks.running();
+                let derived = projection.apply_with_derived(event);
+                let count = projection.background_tasks.running();
+                assert_eq!(
+                    count as u64,
+                    case["expected_running"][index].as_u64().unwrap(),
+                    "{name} event {index}"
+                );
+                assert_eq!(projection.background_calls, count, "{name} event {index}");
+                assert_eq!(derived.len(), usize::from(old_count != count), "{name} event {index}");
+                let mut batch = vec![event.clone()];
+                batch.extend(derived);
+                delivered.extend(batch.iter().cloned());
+                let view = SnapshotView {
+                    backend: "sidecar",
+                    conversation_id: None,
+                    session_id: None,
+                    provider_session_id: None,
+                    capabilities: agent::ProviderCapabilities::default(),
+                    provider: None,
+                    projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                    hidden_pending: None,
+                };
+                let snapshot: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+                snapshots.push(snapshot);
+                let payload: Value = serde_json::from_str(&serialize_events_for_js(
+                    TabId(1),
+                    from,
+                    projection.last_revision,
+                    &batch,
+                ))
+                .unwrap();
+                batches.push(payload);
+            }
+            assert_eq!(
+                projection.notices.len() as u64,
+                case["expected_notice_count"].as_u64().unwrap(),
+                "{name}"
+            );
+            let rows = serde_json::to_value(&projection.background_tasks.rows).unwrap();
+            let expected_rows = case["expected_rows"].as_array().unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), expected_rows.len(), "{name}");
+            for (row, expected) in rows.as_array().unwrap().iter().zip(expected_rows) {
+                for (key, value) in expected.as_object().unwrap() {
+                    assert_eq!(&row[key], value, "{name} {key}");
+                }
+            }
+            let payload: Value = serde_json::from_str(&serialize_events_for_js(
+                TabId(1),
+                0,
+                projection.last_revision,
+                &delivered,
+            ))
+            .unwrap();
+            if write {
+                case["events"] = payload;
+                case["batches"] = json!(batches);
+                case["snapshots"] = json!(snapshots);
+            } else {
+                assert_eq!(case["events"], payload, "{name}");
+                assert_eq!(case["batches"], json!(batches), "{name}");
+                assert_eq!(case["snapshots"], json!(snapshots), "{name}");
+            }
+        }
+        if write {
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap())).unwrap();
+        }
+    }
+
+    #[test]
+    fn subagent_frames_events_and_snapshots_are_twins() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/subagent-frames.json");
+        let mut fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let write = std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1");
+        for case in fixture["cases"].as_array_mut().unwrap() {
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["events"].clone()).unwrap();
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let snapshot: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            if write {
+                case["snapshot"] = snapshot;
+            } else {
+                assert_eq!(case["snapshot"], snapshot, "{}", case["name"]);
+            }
+        }
+        if write {
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap())).unwrap();
+        }
+    }
+
+    #[test]
+    fn protocol_322_events_and_snapshot_are_twins() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/protocol-322.json");
+        let committed = std::fs::read_to_string(&path).unwrap();
+        let fixture: Value = serde_json::from_str(&committed).unwrap();
+        let events: Vec<AgentDomainEvent> = serde_json::from_value(fixture["domain_events"].clone()).unwrap();
+        let mut projection = AgentSessionProjection::default();
+        for event in &events {
+            projection.apply(event);
+        }
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities::default(),
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let snapshot: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        let payload: Value =
+            serde_json::from_str(&serialize_events_for_js(TabId(1), 0, projection.last_revision, &events)).unwrap();
+        let expected = json!({ "domain_events": fixture["domain_events"], "events": payload, "snapshot": snapshot });
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())).unwrap();
+        } else {
+            assert_eq!(fixture, expected);
         }
     }
 
@@ -4710,6 +5236,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4932,6 +5459,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -4962,6 +5490,1035 @@ mod tests {
                  intended, regenerate it with EITRI_WRITE_FIXTURES=1"
             );
         }
+    }
+
+    /// `agent-ui/web/src/fixtures/history-records.json`: turns the CLI started with every kind of
+    /// cause (and one of each other origin), one notice of every kind, and question sets left waiting
+    /// and settled each way, as the events this side sends, the snapshot taken partway (a question
+    /// still waiting in it) and the snapshot after them all. The panel's tests fold the events with
+    /// its own reducer, from the start and from the middle snapshot, and must arrive at the last
+    /// snapshot. Compared on every run; `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_history_records_fixture_is_what_the_serializer_sends() {
+        use agent::{
+            NoticeLevel, QuestionOptionSpec, QuestionOutcome, QuestionSpec, SessionNoticeKind, ShownAnswer, TurnCause,
+            TurnCauseKind, TurnOrigin,
+        };
+        let completed = |turn_id: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn_id.into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let cause = |kind: TurnCauseKind| {
+            let mut cause = TurnCause::of_kind(kind);
+            match kind {
+                TurnCauseKind::Task => {
+                    cause.task_id = Some("task-1".into());
+                    cause.tool_use_id = Some("tool-1".into());
+                    cause.task_kind = Some("shell".into());
+                    cause.task_status = Some("completed".into());
+                    cause.description = Some("cargo build --release".into());
+                    cause.summary = Some("Background command \"cargo build\" completed (exit code 0)".into());
+                }
+                TurnCauseKind::Scheduled => {
+                    cause.wakeup_source = Some("loop_wakeup".into());
+                    cause.scheduled_for_ms = Some(1_790_000_000_000);
+                    cause.schedule_reason = Some("check the deploy".into());
+                    cause.cron_id = Some("cron-3".into());
+                    cause.prompt = Some("Is the deploy green?".into());
+                }
+                TurnCauseKind::Peer => {
+                    cause.peer_name = Some("reviewer".into());
+                    cause.text = Some("Look at \u{202e}line 4\u{200b} please".into());
+                }
+                TurnCauseKind::Other => cause.text = Some("coordinator".into()),
+                TurnCauseKind::Unknown => {}
+            }
+            cause
+        };
+        let mut events = vec![AgentDomainEvent::SessionOpened {
+            session_id: "sess-1".into(),
+            provider_session_id: "prov-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/project".into(),
+        }];
+        // A turn the user sent, attributed as theirs: no row.
+        events.push(AgentDomainEvent::UserPromptSubmitted { text: "start".into() });
+        events.push(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        events.push(AgentDomainEvent::TurnAttributed {
+            turn_id: "t1".into(),
+            origin: TurnOrigin::Client,
+            cause: None,
+        });
+        events.push(completed("t1"));
+        let kinds = [
+            TurnCauseKind::Task,
+            TurnCauseKind::Scheduled,
+            TurnCauseKind::Peer,
+            TurnCauseKind::Other,
+            TurnCauseKind::Unknown,
+        ];
+        for (n, kind) in kinds.into_iter().enumerate() {
+            let turn = format!("cli-{n}");
+            events.push(AgentDomainEvent::TurnStarted { turn_id: turn.clone() });
+            events.push(AgentDomainEvent::TurnAttributed {
+                turn_id: turn.clone(),
+                origin: TurnOrigin::Cli,
+                cause: Some(cause(kind)),
+            });
+            events.push(AgentDomainEvent::ContentDelta {
+                turn_id: turn.clone(),
+                kind: agent::ContentKind::Text,
+                text: format!("Reply {n}."),
+            });
+            events.push(completed(&turn));
+        }
+        // A follow-up turn, which names no cause.
+        events.push(AgentDomainEvent::TurnStarted {
+            turn_id: "follow-1".into(),
+        });
+        events.push(AgentDomainEvent::TurnAttributed {
+            turn_id: "follow-1".into(),
+            origin: TurnOrigin::FollowUp,
+            cause: None,
+        });
+        events.push(completed("follow-1"));
+        let notice =
+            |kind: SessionNoticeKind, level: NoticeLevel, content: Option<&str>| AgentDomainEvent::SessionNotice {
+                kind,
+                level,
+                content: content.map(str::to_string),
+                scalars: Default::default(),
+                task_id: None,
+                tool_use_id: None,
+                task_status: None,
+            };
+        events.push(AgentDomainEvent::SessionNotice {
+            kind: SessionNoticeKind::Task,
+            level: NoticeLevel::Notice,
+            content: Some("Background command \"cargo build\" completed (exit code 0)".into()),
+            scalars: [("exit_code".to_string(), json!(0))].into_iter().collect(),
+            task_id: Some("task-1".into()),
+            tool_use_id: Some("toolu_bg".into()),
+            task_status: Some("completed".into()),
+        });
+        events.push(notice(
+            SessionNoticeKind::ModelFallback,
+            NoticeLevel::Warning,
+            Some("Switched to claude-sonnet-5"),
+        ));
+        events.push(notice(
+            SessionNoticeKind::ModelRefusal,
+            NoticeLevel::Warning,
+            Some("The model refused"),
+        ));
+        // No words: worded from its figures.
+        events.push(AgentDomainEvent::SessionNotice {
+            kind: SessionNoticeKind::Compaction,
+            level: NoticeLevel::Info,
+            content: None,
+            scalars: [
+                ("pre_tokens".to_string(), json!(182_000)),
+                ("post_tokens".to_string(), json!(41_000)),
+                ("trigger".to_string(), json!("auto")),
+            ]
+            .into_iter()
+            .collect(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        });
+        events.push(notice(
+            SessionNoticeKind::Informational,
+            NoticeLevel::Suggestion,
+            Some("Try /compact"),
+        ));
+        events.push(notice(
+            SessionNoticeKind::HookBlock,
+            NoticeLevel::Warning,
+            Some("blocked by policy"),
+        ));
+        events.push(AgentDomainEvent::SessionNotice {
+            kind: SessionNoticeKind::PeerHold,
+            level: NoticeLevel::Warning,
+            content: None,
+            scalars: [
+                ("peer_name".to_string(), json!("reviewer")),
+                ("hold_state".to_string(), json!("held")),
+            ]
+            .into_iter()
+            .collect(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        });
+        events.push(notice(
+            SessionNoticeKind::RateLimit,
+            NoticeLevel::Notice,
+            Some("Usage limit reset"),
+        ));
+        events.push(notice(SessionNoticeKind::UnseenTurn, NoticeLevel::Notice, None));
+        let questions = |text: &str, multi: bool| {
+            vec![QuestionSpec {
+                question: text.into(),
+                header: "Target".into(),
+                multi_select: multi,
+                options: vec![
+                    QuestionOptionSpec {
+                        label: "\"debug\"".into(),
+                        description: "fast to build".into(),
+                        preview: None,
+                    },
+                    QuestionOptionSpec {
+                        label: "release\u{200b}".into(),
+                        description: "slow to build".into(),
+                        preview: Some("```\ncargo build --release\n```".into()),
+                    },
+                ],
+            }]
+        };
+        events.push(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        events.push(AgentDomainEvent::QuestionAsked {
+            interaction_id: "q-answered".into(),
+            tool_use_id: Some("toolu_q1".into()),
+            questions: questions("Which build?", false),
+            unsupported_reason: None,
+        });
+        events.push(AgentDomainEvent::QuestionAsked {
+            interaction_id: "q-waiting".into(),
+            tool_use_id: Some("toolu_q2".into()),
+            questions: questions("Which targets?", true),
+            unsupported_reason: None,
+        });
+        // The middle snapshot is taken here: both questions wait in it.
+        let split = events.len();
+        events.push(AgentDomainEvent::QuestionSettled {
+            interaction_id: "q-answered".into(),
+            outcome: QuestionOutcome::Answered,
+            answers: vec![ShownAnswer {
+                question_index: 0,
+                answer: "release\u{200b}".into(),
+                notes: Some("ship it".into()),
+            }],
+            reason: None,
+        });
+        // A second settlement for the same id changes nothing.
+        events.push(AgentDomainEvent::QuestionSettled {
+            interaction_id: "q-answered".into(),
+            outcome: QuestionOutcome::Expired,
+            answers: vec![],
+            reason: None,
+        });
+        events.push(AgentDomainEvent::QuestionAsked {
+            interaction_id: "q-refused".into(),
+            tool_use_id: None,
+            questions: vec![],
+            unsupported_reason: Some("five options in one question".into()),
+        });
+        events.push(AgentDomainEvent::QuestionSettled {
+            interaction_id: "q-refused".into(),
+            outcome: QuestionOutcome::HostRefused,
+            answers: vec![],
+            reason: Some("five options in one question".into()),
+        });
+        for (id, outcome) in [
+            ("q-declined", QuestionOutcome::Declined),
+            ("q-chat", QuestionOutcome::ChatRequested),
+            ("q-interrupted", QuestionOutcome::Interrupted),
+            ("q-expired", QuestionOutcome::Expired),
+            ("q-closed", QuestionOutcome::SessionClosed),
+            ("q-failed", QuestionOutcome::ProviderFailed),
+        ] {
+            events.push(AgentDomainEvent::QuestionAsked {
+                interaction_id: id.into(),
+                tool_use_id: Some(format!("toolu_{id}")),
+                questions: questions("Go on?", false),
+                unsupported_reason: None,
+            });
+            events.push(AgentDomainEvent::QuestionSettled {
+                interaction_id: id.into(),
+                outcome,
+                answers: vec![],
+                reason: (outcome == QuestionOutcome::ProviderFailed).then(|| "the sidecar exited".into()),
+            });
+        }
+        events.push(completed("t2"));
+        // Asked between turns and left waiting.
+        events.push(AgentDomainEvent::QuestionAsked {
+            interaction_id: "q-last".into(),
+            tool_use_id: Some("toolu_last".into()),
+            questions: questions("Still there?", false),
+            unsupported_reason: None,
+        });
+
+        let view_of = |projection: &AgentSessionProjection| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities {
+                    interrupt: true,
+                    ..Default::default()
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()
+        };
+        let mut projection = AgentSessionProjection::default();
+        let mut middle = Value::Null;
+        for (at, event) in events.iter().enumerate() {
+            if at == split {
+                middle = view_of(&projection);
+            }
+            projection.apply(event);
+        }
+        assert_eq!(
+            projection.turn_starts.len(),
+            6,
+            "five causes and the follow-up; the user's turn has none"
+        );
+        assert_eq!(projection.notices.len(), 9, "one notice of every kind");
+        assert!(matches!(
+            projection.questions[0].state,
+            agent::QuestionState::Settled {
+                outcome: QuestionOutcome::Answered,
+                ..
+            }
+        ));
+        assert_eq!(projection.questions[0].turn_id.as_deref(), Some("t2"));
+        assert_eq!(projection.questions.last().unwrap().turn_id, None);
+        let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &events);
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_history_records_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "split": split,
+            "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+            "middle": middle,
+            "snapshot": view_of(&projection),
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/history-records.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the history records fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed history records fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// A conversation with none of the three collections sends none of their keys, so every snapshot
+    /// written before they existed is still what this side sends for such a conversation.
+    #[test]
+    fn a_snapshot_without_turn_starts_notices_or_questions_sends_none_of_their_keys() {
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        projection.apply(&AgentDomainEvent::TurnAttributed {
+            turn_id: "t1".into(),
+            origin: agent::TurnOrigin::Client,
+            cause: None,
+        });
+        let view = SnapshotView {
+            backend: "sidecar",
+            conversation_id: None,
+            session_id: None,
+            provider_session_id: None,
+            capabilities: agent::ProviderCapabilities::default(),
+            provider: None,
+            projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+            hidden_pending: None,
+        };
+        let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+        for key in ["turnStarts", "notices", "questions", "cliUnseenBusy"] {
+            assert!(
+                parsed["state"].get(key).is_none(),
+                "{key} sent for a conversation with none"
+            );
+        }
+    }
+
+    /// `agent-ui/web/src/fixtures/unseen-turns.json`: what a turn's end does in every combination of
+    /// a turn running or not, result text or not, and its own turn or another; a prompt a hook
+    /// stopped and a slash command that answered without a reply; the note of work out of sight and
+    /// its end; and a prompt taken back. Each case is the events this side delivers (the ones the
+    /// projection derives included, as ingestion delivers them) and the snapshot after them, which
+    /// the panel's tests fold and load and must find equal. Compared on every run;
+    /// `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_unseen_turns_fixture_is_what_the_serializer_sends() {
+        use agent::{ContentKind, SessionNoticeKind, TurnOutcome};
+        let opened = AgentDomainEvent::SessionOpened {
+            session_id: "sess-1".into(),
+            provider_session_id: "prov-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/project".into(),
+        };
+        let prompt = |text: &str| AgentDomainEvent::UserPromptSubmitted { text: text.into() };
+        let started = |turn: &str| AgentDomainEvent::TurnStarted { turn_id: turn.into() };
+        let text = |turn: &str, text: &str| AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        };
+        let ended = |turn: &str, outcome: TurnOutcome, result_text: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome,
+            result_text: result_text.into(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        // A turn of the user's own that is still running, and one that has ended.
+        let running = vec![
+            opened.clone(),
+            prompt("fix the parser"),
+            started("t1"),
+            text("t1", "Looking at it"),
+        ];
+        let mut finished = running.clone();
+        finished.push(ended("t1", TurnOutcome::Completed, "Looking at it"));
+        let with = |base: &[AgentDomainEvent], more: Vec<AgentDomainEvent>| {
+            let mut events = base.to_vec();
+            events.extend(more);
+            events
+        };
+        let cases: Vec<(&str, Vec<AgentDomainEvent>)> = vec![
+            (
+                "foreign_while_running_with_text",
+                with(
+                    &running,
+                    vec![
+                        ended(
+                            "unknown-turn",
+                            TurnOutcome::Completed,
+                            "The tests passed in the background.",
+                        ),
+                        text("t1", " and the fix is in"),
+                    ],
+                ),
+            ),
+            (
+                "foreign_while_running_without_text",
+                with(&running, vec![ended("unknown-turn", TurnOutcome::Failed, "")]),
+            ),
+            (
+                "foreign_none_running_with_text",
+                with(
+                    &finished,
+                    vec![ended("unknown-turn", TurnOutcome::Failed, "The build is green.")],
+                ),
+            ),
+            (
+                "foreign_none_running_without_text",
+                with(&finished, vec![ended("unknown-turn", TurnOutcome::Failed, "")]),
+            ),
+            ("own_turn_with_text", finished.clone()),
+            (
+                "own_turn_without_text",
+                with(&running, vec![ended("t1", TurnOutcome::Completed, "")]),
+            ),
+            (
+                "own_turn_failed_with_text",
+                with(&running, vec![ended("t1", TurnOutcome::Failed, "API Error: 500")]),
+            ),
+            (
+                "hook_blocked_prompt",
+                vec![
+                    opened.clone(),
+                    prompt("deploy to production"),
+                    started("t1"),
+                    ended(
+                        "t1",
+                        TurnOutcome::Completed,
+                        "Blocked by the deploy guard: production deploys need a ticket\u{202e}.",
+                    ),
+                ],
+            ),
+            (
+                "compact_answers_without_a_reply",
+                vec![
+                    opened.clone(),
+                    prompt("/compact"),
+                    started("t1"),
+                    ended("t1", TurnOutcome::Completed, "Compacted. ctrl+o to see full summary"),
+                ],
+            ),
+            (
+                "cli_work_unseen",
+                with(&finished, vec![AgentDomainEvent::CliWorkUnseen]),
+            ),
+            (
+                "cli_work_unseen_then_its_end",
+                with(
+                    &finished,
+                    vec![
+                        AgentDomainEvent::CliWorkUnseen,
+                        ended("unknown-turn", TurnOutcome::Completed, ""),
+                    ],
+                ),
+            ),
+            (
+                "cli_work_unseen_then_the_session_closes",
+                with(
+                    &finished,
+                    vec![
+                        AgentDomainEvent::CliWorkUnseen,
+                        AgentDomainEvent::SessionClosed {
+                            reason: "closed".into(),
+                        },
+                    ],
+                ),
+            ),
+            (
+                "cli_work_unseen_then_the_session_is_lost",
+                with(
+                    &finished,
+                    vec![
+                        AgentDomainEvent::CliWorkUnseen,
+                        AgentDomainEvent::SessionUnavailable {
+                            reason: "the sidecar exited".into(),
+                        },
+                    ],
+                ),
+            ),
+            (
+                "cli_work_unseen_then_a_resume_that_did_not_attach",
+                with(
+                    &finished,
+                    vec![
+                        AgentDomainEvent::CliWorkUnseen,
+                        AgentDomainEvent::ResumeOutcome {
+                            requested_provider_session_id: "prov-0".into(),
+                            status: agent::ResumeStatus::Rejected,
+                            attached_provider_session_id: None,
+                            forked: false,
+                            detail: None,
+                        },
+                    ],
+                ),
+            ),
+            (
+                "withdrawn_after_an_undelivered_prompt",
+                with(
+                    &finished,
+                    vec![prompt("and the docs"), AgentDomainEvent::UserPromptWithdrawn],
+                ),
+            ),
+            (
+                "withdrawn_after_a_delivered_one",
+                vec![
+                    opened.clone(),
+                    started("t1"),
+                    AgentDomainEvent::UserMessageDelivered {
+                        client_message_id: "eitri-1-1".into(),
+                        turn_id: "t1".into(),
+                        text: "and the docs".into(),
+                    },
+                    AgentDomainEvent::UserPromptWithdrawn,
+                ],
+            ),
+            (
+                "withdrawn_with_none",
+                vec![opened.clone(), AgentDomainEvent::UserPromptWithdrawn],
+            ),
+        ];
+
+        let mut written_cases = Vec::new();
+        for (name, events) in cases {
+            let mut projection = AgentSessionProjection::default();
+            let mut delivered = Vec::new();
+            for event in events {
+                let derived = projection.apply_with_derived(&event);
+                delivered.push(event);
+                delivered.extend(derived);
+            }
+            let kinds: Vec<_> = projection.notices.iter().map(|n| n.kind).collect();
+            match name {
+                "foreign_while_running_with_text" => {
+                    assert_eq!(projection.active_turn_id.as_deref(), Some("t1"), "{name}");
+                    assert_eq!(kinds, [SessionNoticeKind::UnseenTurn], "{name}");
+                    assert_eq!(projection.transcript.len(), 3, "{name}: the answer stands apart");
+                }
+                "foreign_while_running_without_text" => {
+                    assert_eq!(projection.active_turn_id.as_deref(), Some("t1"), "{name}");
+                    assert!(kinds.is_empty() && projection.turn_endings.is_empty(), "{name}");
+                }
+                "foreign_none_running_with_text" => {
+                    assert_eq!(kinds, [SessionNoticeKind::UnseenTurn], "{name}");
+                    assert!(projection.turn_endings.is_empty(), "{name}: no failed row");
+                }
+                "foreign_none_running_without_text" => {
+                    assert!(kinds.is_empty() && projection.turn_endings.is_empty(), "{name}");
+                }
+                "own_turn_failed_with_text" => {
+                    assert!(kinds.is_empty(), "{name}");
+                    assert_eq!(projection.turn_endings.len(), 1, "{name}");
+                }
+                "hook_blocked_prompt" => assert_eq!(kinds, [SessionNoticeKind::HookBlock], "{name}"),
+                "cli_work_unseen" => assert!(projection.cli_unseen_busy, "{name}"),
+                "cli_work_unseen_then_its_end"
+                | "cli_work_unseen_then_the_session_closes"
+                | "cli_work_unseen_then_the_session_is_lost"
+                | "cli_work_unseen_then_a_resume_that_did_not_attach" => {
+                    assert!(!projection.cli_unseen_busy, "{name}")
+                }
+                "withdrawn_after_an_undelivered_prompt" => assert_eq!(projection.user_prompts.len(), 1, "{name}"),
+                "withdrawn_after_a_delivered_one" => assert_eq!(projection.user_prompts.len(), 1, "{name}"),
+                _ => assert!(kinds.is_empty(), "{name}"),
+            }
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities {
+                    interrupt: true,
+                    ..Default::default()
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &delivered);
+            written_cases.push(json!({
+                "name": name,
+                "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+                "snapshot": serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap(),
+            }));
+        }
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_unseen_turns_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "cases": written_cases,
+        });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/unseen-turns.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the unseen turns fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed unseen turns fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// `agent-ui/web/src/fixtures/cli-turns.json`: turns Claude Code started by itself, with each kind of
+    /// cause and a cause the close refined; a prompt Claude Code read only after work of its own, delivered
+    /// and dropped; endings without a result, empty and not. Each case is the events this side delivers
+    /// (derived ones included), a snapshot taken partway (`split` events in) and the snapshot after them
+    /// all. The panel's tests fold the events, from the start and from the middle snapshot, and load the
+    /// last snapshot, and must find the same page each way. Compared on every run;
+    /// `EITRI_WRITE_FIXTURES=1` rewrites it.
+    #[test]
+    fn the_cli_turns_fixture_is_what_the_serializer_sends() {
+        use agent::{ContentKind, TurnCause, TurnCauseKind, TurnEndDetail, TurnOrigin, TurnOutcome};
+        let opened = AgentDomainEvent::SessionOpened {
+            session_id: "sess-1".into(),
+            provider_session_id: "prov-1".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/project".into(),
+        };
+        let prompt = |text: &str| AgentDomainEvent::UserPromptSubmitted { text: text.into() };
+        let started = |turn: &str| AgentDomainEvent::TurnStarted { turn_id: turn.into() };
+        let cli = |turn: &str, cause: Option<TurnCause>| AgentDomainEvent::TurnAttributed {
+            turn_id: turn.into(),
+            origin: TurnOrigin::Cli,
+            cause,
+        };
+        let text = |turn: &str, text: &str| AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        };
+        let ended = |turn: &str, outcome: TurnOutcome, reason: Option<&str>| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail {
+                reason: reason.map(str::to_string),
+                origin_kind: Some("task-notification".into()),
+                num_turns: Some(1),
+                ..Default::default()
+            },
+        };
+        let done = |turn: &str| ended(turn, TurnOutcome::Completed, None);
+        let task = || {
+            let mut cause = TurnCause::of_kind(TurnCauseKind::Task);
+            cause.task_id = Some("bzng1ikb4".into());
+            cause.task_kind = Some("shell".into());
+            cause.task_status = Some("completed".into());
+            cause.description = Some("cargo test".into());
+            cause.summary = Some("Background command \"cargo test\" completed (exit code 0)".into());
+            cause
+        };
+        let scheduled = |reason: Option<&str>| {
+            let mut cause = TurnCause::of_kind(TurnCauseKind::Scheduled);
+            cause.wakeup_source = Some("loop_wakeup".into());
+            cause.scheduled_for_ms = Some(1_790_000_000_000);
+            cause.schedule_reason = reason.map(str::to_string);
+            cause
+        };
+        let peer = || {
+            let mut cause = TurnCause::of_kind(TurnCauseKind::Peer);
+            cause.peer_name = Some("reviewer".into());
+            cause.text = Some("Please look at \u{202e}line 4\u{200b}".into());
+            cause
+        };
+        let cli_turn = |turn: &str, cause: TurnCause, reply: &str| {
+            vec![started(turn), cli(turn, Some(cause)), text(turn, reply), done(turn)]
+        };
+        let with = |base: Vec<AgentDomainEvent>, more: Vec<AgentDomainEvent>| {
+            let mut events = base;
+            events.extend(more);
+            events
+        };
+        // The user's own turn, finished, before each case.
+        let before = vec![
+            opened.clone(),
+            prompt("fix the parser"),
+            started("t1"),
+            text("t1", "Fixed."),
+            done("t1"),
+        ];
+        let base = before.len();
+        let delivered_prompt = AgentDomainEvent::UserMessageDelivered {
+            client_message_id: "eitri-1-2".into(),
+            turn_id: "t2".into(),
+            text: "and the docs".into(),
+        };
+        let cycle = AgentDomainEvent::CliCycleStarted {
+            turn_id: "t2".into(),
+            cause: Some(task()),
+        };
+        // (name, events, split: how many events the middle snapshot has folded)
+        let cases: Vec<(&str, Vec<AgentDomainEvent>, usize)> = vec![
+            (
+                "task_cause",
+                with(before.clone(), cli_turn("c1", task(), "The tests passed.")),
+                base + 2,
+            ),
+            (
+                "unknown_cause_updated_at_the_close",
+                with(
+                    before.clone(),
+                    vec![
+                        started("c1"),
+                        cli("c1", Some(TurnCause::of_kind(TurnCauseKind::Unknown))),
+                        text("c1", "Done."),
+                        AgentDomainEvent::TurnCauseUpdated {
+                            turn_id: "c1".into(),
+                            cause: Some(task()),
+                        },
+                        // No news: the cause stays.
+                        AgentDomainEvent::TurnCauseUpdated {
+                            turn_id: "c1".into(),
+                            cause: None,
+                        },
+                        done("c1"),
+                    ],
+                ),
+                base + 3,
+            ),
+            (
+                "scheduled_with_a_reason",
+                with(
+                    before.clone(),
+                    cli_turn("c1", scheduled(Some("check the deploy")), "Green."),
+                ),
+                base + 2,
+            ),
+            (
+                "scheduled_without_a_reason",
+                with(before.clone(), cli_turn("c1", scheduled(None), "Green.")),
+                base + 2,
+            ),
+            (
+                "three_empty_scheduled_turns",
+                with(
+                    before.clone(),
+                    ["c1", "c2", "c3"]
+                        .into_iter()
+                        .flat_map(|turn| vec![started(turn), cli(turn, Some(scheduled(None))), done(turn)])
+                        .collect(),
+                ),
+                base + 4,
+            ),
+            (
+                "peer_with_its_body",
+                with(before.clone(), cli_turn("c1", peer(), "Looked.")),
+                base + 2,
+            ),
+            (
+                "prompt_read_after_work_of_its_own",
+                with(
+                    before.clone(),
+                    vec![
+                        prompt("and the docs"),
+                        started("t2"),
+                        cycle.clone(),
+                        text("t2", "The build finished."),
+                        delivered_prompt.clone(),
+                        text("t2", "Docs updated."),
+                        done("t2"),
+                    ],
+                ),
+                base + 2,
+            ),
+            (
+                "prompt_dropped_after_work_of_its_own",
+                with(
+                    before.clone(),
+                    vec![
+                        prompt("and the docs"),
+                        started("t2"),
+                        cycle.clone(),
+                        text("t2", "The build finished."),
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "eitri-1-2".into(),
+                            reason: "Claude Code cancelled it".into(),
+                        },
+                        done("t2"),
+                    ],
+                ),
+                base + 3,
+            ),
+            (
+                "a_cli_turn_ending_off_screen",
+                with(before.clone(), cli_turn("c1", task(), "The tests passed.")),
+                base + 3,
+            ),
+            (
+                "no_result_after_a_reply",
+                with(
+                    before.clone(),
+                    vec![
+                        started("c1"),
+                        cli("c1", Some(task())),
+                        text("c1", "Looking"),
+                        ended("c1", TurnOutcome::Failed, Some(agent::NO_RESULT_REASON)),
+                    ],
+                ),
+                base + 3,
+            ),
+            (
+                "empty_no_result",
+                with(
+                    before.clone(),
+                    vec![
+                        started("c1"),
+                        cli("c1", Some(task())),
+                        ended("c1", TurnOutcome::Failed, Some(agent::NO_RESULT_REASON)),
+                    ],
+                ),
+                base + 2,
+            ),
+        ];
+
+        let view_of = |projection: &AgentSessionProjection| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: Some("sess-1"),
+                provider_session_id: Some("prov-1".into()),
+                capabilities: agent::ProviderCapabilities {
+                    interrupt: true,
+                    ..Default::default()
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()
+        };
+        let mut written_cases = Vec::new();
+        for (name, events, split) in cases {
+            let mut projection = AgentSessionProjection::default();
+            let mut attention = crate::attention::AttentionTracker::default();
+            let mut delivered = Vec::new();
+            let mut middle = Value::Null;
+            let mut middle_at = 0;
+            for (at, event) in events.into_iter().enumerate() {
+                if at == split {
+                    middle = view_of(&projection);
+                    middle_at = delivered.len();
+                }
+                // The user's own turn before the case was read.
+                if at == base {
+                    attention.seen();
+                }
+                let derived = projection.apply_with_derived(&event);
+                let mut batch = vec![event];
+                batch.extend(derived);
+                // Off screen throughout, so every end that is news marks the tab.
+                attention.observe(&batch, false);
+                delivered.extend(batch);
+            }
+            let prompts: Vec<_> = projection.user_prompts.iter().map(|p| p.text.as_str()).collect();
+            let starts: Vec<_> = projection
+                .turn_starts
+                .iter()
+                .map(|s| (s.turn_id.as_str(), s.cause.as_ref().map(|c| c.kind)))
+                .collect();
+            assert_eq!(projection.active_turn_id, None, "{name}: every case ends its turns");
+            match name {
+                "task_cause" | "a_cli_turn_ending_off_screen" | "peer_with_its_body" => {
+                    assert_eq!(starts.len(), 1, "{name}");
+                    assert!(attention.attention().unread, "{name}: its end off screen is news");
+                }
+                "unknown_cause_updated_at_the_close" => {
+                    assert_eq!(
+                        starts,
+                        [("c1", Some(TurnCauseKind::Task))],
+                        "{name}: the close's cause wins"
+                    )
+                }
+                "three_empty_scheduled_turns" => {
+                    assert_eq!(starts.len(), 3, "{name}: an empty turn that completed keeps its row");
+                    assert!(projection.turn_endings.is_empty(), "{name}");
+                }
+                "prompt_read_after_work_of_its_own" => {
+                    assert_eq!(prompts, ["fix the parser", "and the docs"], "{name}");
+                    assert_eq!(starts, [("t2", Some(TurnCauseKind::Task))], "{name}");
+                    let moved = projection.user_prompts.last().unwrap();
+                    let woken = projection
+                        .transcript
+                        .iter()
+                        .find(|m| m.text == "The build finished.")
+                        .unwrap();
+                    assert!(
+                        moved.delivered && moved.seq > woken.seq,
+                        "{name}: read after the woken work"
+                    );
+                }
+                "prompt_dropped_after_work_of_its_own" => {
+                    assert_eq!(
+                        prompts,
+                        ["fix the parser"],
+                        "{name}: the tab holds it, not the conversation"
+                    );
+                    assert_eq!(
+                        projection.steer_outcome("eitri-1-2"),
+                        Some(&agent::SteerOutcome::Dropped {
+                            reason: "Claude Code cancelled it".into()
+                        }),
+                        "{name}"
+                    );
+                }
+                "no_result_after_a_reply" => {
+                    assert_eq!(starts.len(), 1, "{name}");
+                    assert_eq!(projection.turn_endings.len(), 1, "{name}");
+                    assert_eq!(
+                        projection.turn_endings[0].detail.reason.as_deref(),
+                        Some(agent::NO_RESULT_REASON),
+                        "{name}"
+                    );
+                    assert_eq!(projection.turn_endings[0].detail.num_turns, Some(1), "{name}");
+                    assert!(attention.attention().unread, "{name}");
+                }
+                "empty_no_result" => {
+                    assert!(starts.is_empty(), "{name}: no row says why it started");
+                    assert!(projection.turn_endings.is_empty(), "{name}: no ending row");
+                    assert_eq!(projection.last_turn_ending, None, "{name}");
+                    assert!(!attention.attention().unread, "{name}: nothing to read");
+                }
+                _ => assert_eq!(starts.len(), 1, "{name}"),
+            }
+            let events_payload = serialize_events_for_js(TabId(1), 0, projection.last_revision, &delivered);
+            written_cases.push(json!({
+                "name": name,
+                "split": middle_at,
+                "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
+                "middle": middle,
+                "snapshot": view_of(&projection),
+            }));
+        }
+        let fixture = json!({
+            "writtenBy": "core/src/agent_bridge.rs, tests::the_cli_turns_fixture_is_what_the_serializer_sends \
+                          -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+            "cases": written_cases,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/cli-turns.json");
+        let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+        let committed = std::fs::read_to_string(&path).ok();
+        if committed.as_deref() == Some(written.as_str()) {
+            return;
+        }
+        if std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1") {
+            std::fs::write(&path, &written).expect("write the CLI turns fixture");
+        } else {
+            assert_eq!(
+                committed.as_deref(),
+                Some(written.as_str()),
+                "the committed CLI turns fixture is not what this test produces; if the change is \
+                 intended, regenerate it with EITRI_WRITE_FIXTURES=1"
+            );
+        }
+    }
+
+    /// A snapshot taken mid-turn names the prompt that turn opened with and whether Claude Code started
+    /// it; once the turn ends it names neither.
+    #[test]
+    fn the_running_turns_opening_prompt_and_origin_ride_the_snapshot_only_while_set() {
+        let snapshot = |projection: &AgentSessionProjection| {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities::default(),
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
+                hidden_pending: None,
+            };
+            serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()["state"].clone()
+        };
+        let mut projection = AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "go".into() });
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let state = snapshot(&projection);
+        assert_eq!(state["openingPromptSeq"], json!(0));
+        assert!(state.get("runningTurnCli").is_none());
+        projection.apply(&AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "c1".into() });
+        projection.apply(&AgentDomainEvent::TurnAttributed {
+            turn_id: "c1".into(),
+            origin: agent::TurnOrigin::Cli,
+            cause: None,
+        });
+        let state = snapshot(&projection);
+        assert!(state.get("openingPromptSeq").is_none());
+        assert_eq!(state["runningTurnCli"], json!(true));
     }
 
     /// A change held for a call that has not started rides the snapshot, so a page rebuilt from it
@@ -5016,6 +6573,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -5115,6 +6673,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -5147,6 +6706,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -5202,6 +6762,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(projection),
@@ -5259,6 +6820,7 @@ mod tests {
             interactive_permission_mode: true,
             cli_auto_mode: false,
             steer: false,
+            ..Default::default()
         };
         let mut projection = AgentSessionProjection::default();
         projection.apply(&AgentDomainEvent::SessionOpened {
@@ -5343,6 +6905,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5403,6 +6966,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: true,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5540,6 +7104,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5586,6 +7151,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5625,6 +7191,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5669,6 +7236,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5734,6 +7302,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5828,6 +7397,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 },
                 provider: None,
                 projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -5881,6 +7451,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -6001,6 +7572,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -6071,6 +7643,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
@@ -6248,6 +7821,36 @@ mod tests {
     }
 
     #[test]
+    fn task_commands_parse_and_the_output_reply_keeps_its_request_tab_and_task() {
+        for kind in ["stop_task", "task_output"] {
+            let raw = json!({"type": kind, "request_id": "q1", "tab": 4, "task_id": "task"});
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert_eq!(message.request_id(), "q1");
+            assert_eq!(message.tab_ref(), TabRef::Named(TabId(4)));
+            assert!(
+                matches!(message, InboundMessage::StopTask { task_id, .. } | InboundMessage::TaskOutput { task_id, .. } if task_id == "task")
+            );
+            let missing = json!({"type": kind, "request_id": "q1", "task_id": "task"});
+            assert_eq!(
+                parse_inbound_message(&missing.to_string()).unwrap().tab_ref(),
+                TabRef::Missing
+            );
+            assert!(parse_inbound_message(&json!({"type": kind, "request_id": "q1", "tab": 4}).to_string()).is_none());
+        }
+        let output = agent::TaskOutput {
+            output: "�<b>plain</b>".into(),
+            total_bytes: 9000,
+            truncated: true,
+        };
+        let wire: Value = serde_json::from_str(&serialize_task_output_for_js("q1", TabId(4), "task", &output)).unwrap();
+        assert_eq!(
+            wire,
+            json!({"kind": "task_output_result", "requestId": "q1", "tab": 4, "taskId": "task",
+            "output": "�<b>plain</b>", "totalBytes": 9000, "truncated": true})
+        );
+    }
+
+    #[test]
     fn a_tab_command_parses_and_says_which_tab_it_names() {
         let named = parse_inbound_message(r#"{"type":"send_message","request_id":"r1","tab":3,"text":"hi"}"#).unwrap();
         assert!(matches!(named.tab_ref(), TabRef::Named(TabId(3))));
@@ -6340,6 +7943,7 @@ mod tests {
     fn the_tabs_envelope_lists_every_tab_with_its_marker_and_the_active_one() {
         let tabs = [
             TabView {
+                question_draft: Default::default(),
                 id: TabId(1),
                 number: 1,
                 label: "1 fix-parser".into(),
@@ -6356,6 +7960,7 @@ mod tests {
                 agent: "claude".into(),
             },
             TabView {
+                question_draft: Default::default(),
                 id: TabId(4),
                 number: 2,
                 label: "2 new".into(),
@@ -6397,6 +8002,7 @@ mod tests {
     #[test]
     fn a_manual_tab_and_a_manual_default_are_sent_as_manual() {
         let tabs = vec![TabView {
+            question_draft: Default::default(),
             id: TabId(1),
             number: 1,
             label: "1 new".into(),
@@ -6740,6 +8346,36 @@ mod tests {
         let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
         let capabilities = parsed["state"]["capabilities"].as_object().unwrap();
         assert!(!capabilities.contains_key("modeSwitch"), "{capabilities:?}");
+    }
+
+    #[test]
+    fn a_snapshot_carries_each_offered_task_capability() {
+        let projection = AgentSessionProjection::default();
+        for offered in [false, true] {
+            let view = SnapshotView {
+                backend: "sidecar",
+                conversation_id: None,
+                session_id: None,
+                provider_session_id: None,
+                capabilities: agent::ProviderCapabilities {
+                    background_tasks: offered,
+                    task_control: offered,
+                    task_output: offered,
+                    workflow_progress: offered,
+                    ..Default::default()
+                },
+                provider: None,
+                projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                hidden_pending: None,
+            };
+            let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+            for field in ["backgroundTasks", "taskControl", "taskOutput", "workflowProgress"] {
+                assert_eq!(
+                    parsed["state"]["capabilities"][field].as_bool().unwrap_or(false),
+                    offered
+                );
+            }
+        }
     }
 
     #[test]
@@ -7127,5 +8763,108 @@ mod tests {
             first,
             "the last character of a long value is hashed"
         );
+    }
+}
+
+#[cfg(test)]
+mod question_message_tests {
+    //! The page's two question answers on the wire: every field named, the decline's kind a closed
+    //! set, and anything else a parse failure rather than a default.
+    use super::*;
+
+    #[test]
+    fn question_draft_has_a_tab_and_an_interaction_without_an_answer() {
+        let message = parse_inbound_message(r#"{"type":"question_draft","request_id":"d1","tab":3,"interaction_id":"q1","draft":{"page":1,"text":"typed"}}"#).unwrap();
+        assert_eq!(message.request_id(), "d1");
+        assert!(matches!(message.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+        assert!(
+            matches!(message, InboundMessage::QuestionDraft { interaction_id, draft, .. } if interaction_id == "q1" && draft["text"] == "typed")
+        );
+    }
+
+    #[test]
+    fn edit_question_other_names_the_question_and_text() {
+        let message = parse_inbound_message(r#"{"type":"edit_question_other","request_id":"e1","tab":3,"interaction_id":"q1","question_index":2,"text":"typed"}"#).unwrap();
+        assert_eq!(message.request_id(), "e1");
+        assert!(matches!(message.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+        assert!(
+            matches!(message, InboundMessage::EditQuestionOther { interaction_id, question_index: 2, text, .. } if interaction_id == "q1" && text == "typed")
+        );
+        assert!(parse_inbound_message(r#"{"type":"edit_question_other","request_id":"e1","interaction_id":"q1","question_index":-1,"text":"typed"}"#).is_none());
+    }
+
+    #[test]
+    fn a_question_answer_parses_into_indexes_and_typed_text() {
+        let message = parse_inbound_message(
+            r#"{"type":"question_answer","request_id":"r1","tab":3,"interaction_id":"i1","answers":[{"question_index":0,"option_indexes":[1]},{"question_index":1,"option_indexes":[0,2],"other_text":"bench","notes":null}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(message.request_id(), "r1");
+        assert!(matches!(message.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+        let InboundMessage::QuestionAnswer {
+            interaction_id,
+            answers,
+            ..
+        } = message
+        else {
+            panic!("a question_answer");
+        };
+        assert_eq!(interaction_id, "i1");
+        let answers: Vec<agent::QuestionAnswer> = answers.into_iter().map(QuestionAnswerWire::into_answer).collect();
+        assert_eq!(
+            answers,
+            vec![
+                agent::QuestionAnswer {
+                    question_index: 0,
+                    option_indexes: vec![1],
+                    other_text: None,
+                    notes: None,
+                },
+                agent::QuestionAnswer {
+                    question_index: 1,
+                    option_indexes: vec![0, 2],
+                    other_text: Some("bench".into()),
+                    notes: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_decline_parses_its_kind_and_what_was_answered() {
+        let cancel = parse_inbound_message(
+            r#"{"type":"question_decline","request_id":"r1","tab":3,"interaction_id":"i1","kind":"cancel"}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            cancel,
+            InboundMessage::QuestionDecline { kind: QuestionDeclineChoice::Cancel, ref so_far, .. } if so_far.is_empty()
+        ));
+        let chat = parse_inbound_message(
+            r#"{"type":"question_decline","request_id":"r2","tab":3,"interaction_id":"i1","kind":"chat","so_far":[{"question_index":0,"option_indexes":[0]}]}"#,
+        )
+        .expect("parses");
+        let InboundMessage::QuestionDecline { kind, so_far, .. } = chat else {
+            panic!("a question_decline");
+        };
+        assert_eq!(kind.kind(), agent::QuestionDeclineKind::Chat);
+        assert_eq!(so_far.len(), 1);
+        assert_eq!(QuestionDeclineChoice::Cancel.kind(), agent::QuestionDeclineKind::Cancel);
+    }
+
+    #[test]
+    fn an_unknown_kind_or_a_malformed_answer_does_not_parse() {
+        for raw in [
+            r#"{"type":"question_decline","request_id":"r","tab":1,"interaction_id":"i1","kind":"later"}"#,
+            r#"{"type":"question_decline","request_id":"r","tab":1,"interaction_id":"i1"}"#,
+            r#"{"type":"question_answer","request_id":"r","tab":1,"interaction_id":"i1"}"#,
+            r#"{"type":"question_answer","request_id":"r","tab":1,"interaction_id":"i1","answers":[{"question_index":0}]}"#,
+            r#"{"type":"question_answer","request_id":"r","tab":1,"interaction_id":"i1","answers":[{"question_index":-1,"option_indexes":[]}]}"#,
+            r#"{"type":"question_answer","request_id":"r","tab":1,"interaction_id":"i1","answers":[{"question_index":0,"option_indexes":["0"]}]}"#,
+            r#"{"type":"question_answer","request_id":"r","tab":1,"interaction_id":"i1","answers":[{"question_index":0,"option_indexes":[0],"answer":"Grid"}]}"#,
+            r#"{"type":"question_decline","request_id":"r","tab":1,"interaction_id":"i1","kind":"chat","so_far":[{"question_index":0,"option_indexes":[0],"updatedInput":{}}]}"#,
+        ] {
+            assert!(parse_inbound_message(raw).is_none(), "{raw}");
+        }
     }
 }

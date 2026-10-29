@@ -8,10 +8,12 @@ import { Composer } from "./components/Composer";
 import { HistorySearch } from "./components/HistorySearch";
 import { PermissionCard } from "./components/PermissionCard";
 import { SearchBar } from "./components/SearchBar";
+import { QuestionDock } from "./components/QuestionDock";
 import { TabBar } from "./components/TabBar";
 
 afterEach(cleanup);
 beforeAll(() => {
+  window.webkit = { messageHandlers: { eitriAgent: { postMessage: vi.fn() } } };
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -61,6 +63,14 @@ function renderChooser() {
 }
 
 describe("text fields take no autocorrection", () => {
+  it("the question dock's alternative and notes fields", () => {
+    const { container } = render(<QuestionDock tab={1} active blocked={() => false} onActivate={() => {}} stillWaiting={() => true}
+      record={{ seq: 1, interactionId: "q", toolUseId: null, turnId: null, state: { kind: "waiting" }, unsupportedReason: null,
+        questions: [{ header: "Choice", question: "Which?", multiSelect: false, options: [{ label: "One", description: "", preview: "preview" }] }] }}
+      draft={{ page: 0, focus: 1, answers: [{ options: [], other: true, text: "custom", notes: "notes", showNotes: true }] }} />);
+    expectNoTextAssist(container, 2);
+  });
+
   it("the composer", () => {
     const { container } = render(
       <Composer

@@ -14,15 +14,18 @@
 //!   has no schema version at all (its `version` is the CLI's own release, which promises nothing
 //!   about format), so B can only observe a format change as "nothing parsed". A does not have to
 //!   guess, and [`load`] refuses rather than parsing what it can and inventing the rest.
-//! - **Only the six record types are `Deserialize`, never `AgentSessionProjection`.** See that
+//! - **Only the record types are `Deserialize`, never `AgentSessionProjection`.** See that
 //!   type's own doc comment for why.
 //!
-//! Adding a field to `StoredHistory` or to any of the six record types needs `#[serde(default)]`,
+//! Adding a field to `StoredHistory` or to any of the record types needs `#[serde(default)]`,
 //! or every file written before it stops loading. The precedent is `ConversationRecord`'s
 //! `provider_advertised_resume` and `title`, and the test below is shaped after the one that pins
 //! them (`persistence::tests::a_record_written_before_provider_advertised_resume_existed_still_loads`).
 
-use crate::projection::{ToolCallRecord, TranscriptMessage, UserPromptRecord};
+use crate::projection::{
+    AgentSessionProjection, NoticeRecord, QuestionRecord, QuestionState, ToolCallRecord, TranscriptMessage,
+    TurnStartRecord, UserPromptRecord,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -35,11 +38,13 @@ pub const HISTORY_FORMAT_VERSION: u32 = 1;
 
 /// One conversation's history as Eitri recorded it.
 ///
-/// Deliberately not a serialized projection. It holds the three collections that ARE history and
+/// Deliberately not a serialized projection. It holds the collections that ARE history (prompts,
+/// replies, tool calls, the starts of turns the user did not send, notice rows and question sets) and
 /// nothing that is live state: no `status`, no `active_turn_id`, no `session_id`/
 /// `provider_session_id` inside a projection, no `model`, no `cwd`, no `usage`, and above all no
 /// `pending_permissions` -- a permission card restored from a file would be a request nobody can
-/// answer, since the provider that raised it is gone.
+/// answer, since the provider that raised it is gone. A question stored while it waited is kept as
+/// it stood, and is read back as settled with `SessionClosed` for the same reason.
 ///
 /// It also carries no `next_seq`. Loading this back is a REFOLD: each item's `seq` is a sorting key
 /// on disk and the projection's own `apply` assigns the numbers again. A stored counter would be a
@@ -58,6 +63,16 @@ pub struct StoredHistory {
     pub transcript: Vec<TranscriptMessage>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCallRecord>,
+    /// The starts of turns the user did not send, with why they started. An older file has none,
+    /// and an older build ignores them.
+    #[serde(default)]
+    pub turn_starts: Vec<TurnStartRecord>,
+    /// The CLI's notice rows.
+    #[serde(default)]
+    pub notices: Vec<NoticeRecord>,
+    /// Claude's question sets, as they stood when written: a waiting one restores as closed.
+    #[serde(default)]
+    pub questions: Vec<QuestionRecord>,
 }
 
 /// Why a stored history could not be loaded. Three outcomes, kept apart on purpose.
@@ -93,7 +108,7 @@ impl std::fmt::Display for HistoryLoadError {
 impl std::error::Error for HistoryLoadError {}
 
 impl StoredHistory {
-    /// Builds what should go on disk from the three collections, TRUNCATED.
+    /// Builds what should go on disk from the first three collections, TRUNCATED; the others empty.
     ///
     /// **This doc used to say:** "Truncation on the write path is not belt-and-braces: A
     /// accumulates ACROSS resumes. A resume loads history into the projection, the session then
@@ -129,7 +144,29 @@ impl StoredHistory {
         transcript: Vec<TranscriptMessage>,
         tool_calls: Vec<ToolCallRecord>,
     ) -> Self {
-        let (user_prompts, transcript, tool_calls) = truncate(user_prompts, transcript, tool_calls);
+        Self::from_parts(
+            conversation_id,
+            provider_session_id,
+            HistoryParts {
+                user_prompts,
+                transcript,
+                tool_calls,
+                ..HistoryParts::default()
+            },
+        )
+    }
+
+    /// [`Self::from_collections`] with every collection a stored history keeps, truncated together
+    /// by the same rule.
+    pub fn from_parts(conversation_id: String, provider_session_id: String, parts: HistoryParts) -> Self {
+        let HistoryParts {
+            user_prompts,
+            transcript,
+            tool_calls,
+            turn_starts,
+            notices,
+            questions,
+        } = truncate(parts);
         Self {
             version: HISTORY_FORMAT_VERSION,
             conversation_id,
@@ -138,23 +175,167 @@ impl StoredHistory {
             user_prompts,
             transcript,
             tool_calls,
+            turn_starts,
+            notices,
+            questions,
         }
     }
 
-    /// How many conversational items this holds -- the same three things the reader counts as items
-    /// (a tool result is not one; it belongs to the call it completes).
+    /// The collections, moved out.
+    pub fn into_parts(self) -> HistoryParts {
+        HistoryParts {
+            user_prompts: self.user_prompts,
+            transcript: self.transcript,
+            tool_calls: self.tool_calls,
+            turn_starts: self.turn_starts,
+            notices: self.notices,
+            questions: self.questions,
+        }
+    }
+
+    /// How many conversational items this holds -- the same things the reader counts as items (a
+    /// tool result is not one; it belongs to the call it completes).
     pub fn item_count(&self) -> usize {
-        self.user_prompts.len() + self.transcript.len() + self.tool_calls.len()
+        self.user_prompts.len()
+            + self.transcript.len()
+            + self.tool_calls.len()
+            + self.turn_starts.len()
+            + self.notices.len()
+            + self.questions.len()
+    }
+
+    /// How many characters this holds by the measure the caps cut by: every item's cost, summed.
+    pub fn char_count(&self) -> usize {
+        let view = HistoryView {
+            user_prompts: &self.user_prompts,
+            transcript: &self.transcript,
+            tool_calls: &self.tool_calls,
+            turn_starts: &self.turn_starts,
+            notices: &self.notices,
+            questions: &self.questions,
+        };
+        EVERY_WHICH
+            .into_iter()
+            .map(|which| (0..view.len(which)).map(|index| view.cost(which, index)).sum::<usize>())
+            .sum()
+    }
+}
+
+/// Every collection a stored history keeps, owned: what it is built from and what a load refolds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HistoryParts {
+    pub user_prompts: Vec<UserPromptRecord>,
+    pub transcript: Vec<TranscriptMessage>,
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub turn_starts: Vec<TurnStartRecord>,
+    pub notices: Vec<NoticeRecord>,
+    pub questions: Vec<QuestionRecord>,
+}
+
+impl HistoryParts {
+    fn view(&self) -> HistoryView<'_> {
+        HistoryView {
+            user_prompts: &self.user_prompts,
+            transcript: &self.transcript,
+            tool_calls: &self.tool_calls,
+            turn_starts: &self.turn_starts,
+            notices: &self.notices,
+            questions: &self.questions,
+        }
+    }
+}
+
+/// The same collections, borrowed: a projection's, for the copy taken under its lock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryView<'a> {
+    pub user_prompts: &'a [UserPromptRecord],
+    pub transcript: &'a [TranscriptMessage],
+    pub tool_calls: &'a [ToolCallRecord],
+    pub turn_starts: &'a [TurnStartRecord],
+    pub notices: &'a [NoticeRecord],
+    pub questions: &'a [QuestionRecord],
+}
+
+impl<'a> HistoryView<'a> {
+    pub(crate) fn of(projection: &'a AgentSessionProjection) -> Self {
+        Self {
+            user_prompts: &projection.user_prompts,
+            transcript: &projection.transcript,
+            tool_calls: &projection.tool_calls,
+            turn_starts: &projection.turn_starts,
+            notices: &projection.notices,
+            questions: &projection.questions,
+        }
+    }
+
+    fn len(&self, which: Which) -> usize {
+        match which {
+            Which::Prompt => self.user_prompts.len(),
+            Which::Message => self.transcript.len(),
+            Which::ToolCall => self.tool_calls.len(),
+            Which::TurnStart => self.turn_starts.len(),
+            Which::Notice => self.notices.len(),
+            Which::Question => self.questions.len(),
+        }
+    }
+
+    fn seq(&self, which: Which, index: usize) -> u64 {
+        match which {
+            Which::Prompt => self.user_prompts[index].seq,
+            Which::Message => self.transcript[index].seq,
+            Which::ToolCall => self.tool_calls[index].seq,
+            Which::TurnStart => self.turn_starts[index].seq,
+            Which::Notice => self.notices[index].seq,
+            Which::Question => self.questions[index].seq,
+        }
+    }
+
+    /// What one item costs against the character budget.
+    fn cost(&self, which: Which, index: usize) -> usize {
+        match which {
+            Which::Prompt => self.user_prompts[index].text.chars().count(),
+            Which::Message => self.transcript[index].text.chars().count(),
+            Which::ToolCall => tool_call_chars(&self.tool_calls[index]),
+            Which::TurnStart => turn_start_chars(&self.turn_starts[index]),
+            Which::Notice => notice_chars(&self.notices[index]),
+            Which::Question => question_chars(&self.questions[index]),
+        }
+    }
+
+    /// Copies of each collection from its start index on.
+    fn tails(&self, from: [usize; WHICH_COUNT]) -> HistoryParts {
+        HistoryParts {
+            user_prompts: self.user_prompts[from[Which::Prompt as usize]..].to_vec(),
+            transcript: self.transcript[from[Which::Message as usize]..].to_vec(),
+            tool_calls: self.tool_calls[from[Which::ToolCall as usize]..].to_vec(),
+            turn_starts: self.turn_starts[from[Which::TurnStart as usize]..].to_vec(),
+            notices: self.notices[from[Which::Notice as usize]..].to_vec(),
+            questions: self.questions[from[Which::Question as usize]..].to_vec(),
+        }
     }
 }
 
 /// Which collection an item came from, so truncation can put the survivors back where they belong.
+/// The order is the tie-break between items that share a `seq`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Which {
     Prompt,
     Message,
     ToolCall,
+    TurnStart,
+    Notice,
+    Question,
 }
+
+const WHICH_COUNT: usize = 6;
+const EVERY_WHICH: [Which; WHICH_COUNT] = [
+    Which::Prompt,
+    Which::Message,
+    Which::ToolCall,
+    Which::TurnStart,
+    Which::Notice,
+    Which::Question,
+];
 
 /// Keeps the newest items that fit both caps, and returns each collection with its survivors in
 /// their original order.
@@ -166,18 +347,8 @@ enum Which {
 /// exceeds the budget by itself, in which case both keep it. "Stops" rather than "skips": an item
 /// too large to fit ends the walk, so what survives is always a contiguous run of the newest items
 /// and never a mix of old small ones with a hole where a big one was.
-fn truncate(
-    user_prompts: Vec<UserPromptRecord>,
-    transcript: Vec<TranscriptMessage>,
-    tool_calls: Vec<ToolCallRecord>,
-) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
-    truncate_to(
-        user_prompts,
-        transcript,
-        tool_calls,
-        super::HISTORY_MAX_ITEMS,
-        super::HISTORY_MAX_CHARS,
-    )
+fn truncate(parts: HistoryParts) -> HistoryParts {
+    truncate_to(parts, super::HISTORY_MAX_ITEMS, super::HISTORY_MAX_CHARS)
 }
 
 /// [`truncate`] with the two caps as parameters.
@@ -186,30 +357,19 @@ fn truncate(
 /// observe the item cap, and a `HISTORY_MAX_CHARS`-sized string to observe the character one, would
 /// be slow enough that nobody writes the interesting cases. The product path never passes anything
 /// but the constants -- [`truncate`] is the only non-test caller.
-fn truncate_to(
-    mut user_prompts: Vec<UserPromptRecord>,
-    mut transcript: Vec<TranscriptMessage>,
-    mut tool_calls: Vec<ToolCallRecord>,
-    max_items: usize,
-    max_chars: usize,
-) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
+fn truncate_to(mut parts: HistoryParts, max_items: usize, max_chars: usize) -> HistoryParts {
+    let view = parts.view();
     let mut items: Vec<(u64, Which, usize, usize)> = Vec::new();
-    for (index, item) in user_prompts.iter().enumerate() {
-        items.push((item.seq, Which::Prompt, index, item.text.chars().count()));
-    }
-    for (index, item) in transcript.iter().enumerate() {
-        items.push((item.seq, Which::Message, index, item.text.chars().count()));
-    }
-    for (index, item) in tool_calls.iter().enumerate() {
-        items.push((item.seq, Which::ToolCall, index, tool_call_chars(item)));
+    for which in EVERY_WHICH {
+        for index in 0..view.len(which) {
+            items.push((view.seq(which, index), which, index, view.cost(which, index)));
+        }
     }
     // Newest first. The tie-break on `Which` and the index keeps the order total, so two items that
     // somehow share a seq are cut deterministically rather than by sort luck.
     items.sort_by_key(|(seq, which, index, _)| std::cmp::Reverse((*seq, *which as u8, *index)));
 
-    let mut keep_prompts = vec![false; user_prompts.len()];
-    let mut keep_messages = vec![false; transcript.len()];
-    let mut keep_tool_calls = vec![false; tool_calls.len()];
+    let mut keep: [Vec<bool>; WHICH_COUNT] = EVERY_WHICH.map(|which| vec![false; view.len(which)]);
     let mut kept = 0usize;
     let mut chars = 0usize;
     for (_, which, index, cost) in items {
@@ -221,109 +381,61 @@ fn truncate_to(
         if kept > 0 && chars + cost > max_chars {
             break;
         }
-        match which {
-            Which::Prompt => keep_prompts[index] = true,
-            Which::Message => keep_messages[index] = true,
-            Which::ToolCall => keep_tool_calls[index] = true,
-        }
+        keep[which as usize][index] = true;
         kept += 1;
         chars += cost;
     }
 
-    retain_by(&mut user_prompts, &keep_prompts);
-    retain_by(&mut transcript, &keep_messages);
-    retain_by(&mut tool_calls, &keep_tool_calls);
-    (user_prompts, transcript, tool_calls)
+    retain_by(&mut parts.user_prompts, &keep[Which::Prompt as usize]);
+    retain_by(&mut parts.transcript, &keep[Which::Message as usize]);
+    retain_by(&mut parts.tool_calls, &keep[Which::ToolCall as usize]);
+    retain_by(&mut parts.turn_starts, &keep[Which::TurnStart as usize]);
+    retain_by(&mut parts.notices, &keep[Which::Notice as usize]);
+    retain_by(&mut parts.questions, &keep[Which::Question as usize]);
+    parts
 }
 
-/// What [`truncate`] keeps of copies of the three collections, copying only the survivors: this runs
+/// What [`truncate`] keeps of copies of the collections, copying only the survivors: this runs
 /// under the lock the UI's reads of the conversation take, and a long session's collections hold
 /// far more than the caps keep. Collections in `seq` order (as the projection keeps them) are walked
 /// newest first from their ends and stop at the caps, so the work is what survives; anything else
 /// is copied whole and truncated as before.
-pub(crate) fn newest_that_fit(
-    user_prompts: &[UserPromptRecord],
-    transcript: &[TranscriptMessage],
-    tool_calls: &[ToolCallRecord],
-) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
-    newest_that_fit_to(
-        user_prompts,
-        transcript,
-        tool_calls,
-        super::HISTORY_MAX_ITEMS,
-        super::HISTORY_MAX_CHARS,
-    )
+pub(crate) fn newest_that_fit(view: HistoryView<'_>) -> HistoryParts {
+    newest_that_fit_to(view, super::HISTORY_MAX_ITEMS, super::HISTORY_MAX_CHARS)
 }
 
-fn newest_that_fit_to(
-    user_prompts: &[UserPromptRecord],
-    transcript: &[TranscriptMessage],
-    tool_calls: &[ToolCallRecord],
-    max_items: usize,
-    max_chars: usize,
-) -> (Vec<UserPromptRecord>, Vec<TranscriptMessage>, Vec<ToolCallRecord>) {
-    fn in_order(seqs: impl Iterator<Item = u64>) -> bool {
-        let mut last = None;
-        seqs.into_iter().all(|seq| {
-            let ok = last.is_none_or(|last| last <= seq);
-            last = Some(seq);
-            ok
-        })
-    }
-    if !in_order(user_prompts.iter().map(|p| p.seq))
-        || !in_order(transcript.iter().map(|m| m.seq))
-        || !in_order(tool_calls.iter().map(|c| c.seq))
-    {
-        return truncate_to(
-            user_prompts.to_vec(),
-            transcript.to_vec(),
-            tool_calls.to_vec(),
-            max_items,
-            max_chars,
-        );
+fn newest_that_fit_to(view: HistoryView<'_>, max_items: usize, max_chars: usize) -> HistoryParts {
+    let in_order = |which: Which| (1..view.len(which)).all(|i| view.seq(which, i - 1) <= view.seq(which, i));
+    if !EVERY_WHICH.into_iter().all(in_order) {
+        let whole = view.tails([0; WHICH_COUNT]);
+        return truncate_to(whole, max_items, max_chars);
     }
     // Each collection's survivors are a run at its end (the walk stops, never skips), so a cursor per
-    // collection says where its run starts. The next item is the newest of the three ends, by the
-    // same key `truncate_to` sorts on.
-    let (mut prompts, mut messages, mut calls) = (user_prompts.len(), transcript.len(), tool_calls.len());
+    // collection says where its run starts. The next item is the newest of the ends, by the same key
+    // `truncate_to` sorts on.
+    let mut cursors: [usize; WHICH_COUNT] = EVERY_WHICH.map(|which| view.len(which));
     let mut kept = 0usize;
     let mut chars = 0usize;
     while kept < max_items {
-        let ends = [
-            prompts
-                .checked_sub(1)
-                .map(|i| ((user_prompts[i].seq, Which::Prompt as u8, i), Which::Prompt)),
-            messages
-                .checked_sub(1)
-                .map(|i| ((transcript[i].seq, Which::Message as u8, i), Which::Message)),
-            calls
-                .checked_sub(1)
-                .map(|i| ((tool_calls[i].seq, Which::ToolCall as u8, i), Which::ToolCall)),
-        ];
-        let Some((_, which)) = ends.into_iter().flatten().max_by_key(|(key, _)| *key) else {
+        let newest = EVERY_WHICH
+            .into_iter()
+            .filter_map(|which| {
+                let index = cursors[which as usize].checked_sub(1)?;
+                Some(((view.seq(which, index), which as u8, index), which, index))
+            })
+            .max_by_key(|(key, _, _)| *key);
+        let Some((_, which, index)) = newest else {
             break;
         };
-        let cost = match which {
-            Which::Prompt => user_prompts[prompts - 1].text.chars().count(),
-            Which::Message => transcript[messages - 1].text.chars().count(),
-            Which::ToolCall => tool_call_chars(&tool_calls[calls - 1]),
-        };
+        let cost = view.cost(which, index);
         if kept > 0 && chars + cost > max_chars {
             break;
         }
-        match which {
-            Which::Prompt => prompts -= 1,
-            Which::Message => messages -= 1,
-            Which::ToolCall => calls -= 1,
-        }
+        cursors[which as usize] = index;
         kept += 1;
         chars += cost;
     }
-    (
-        user_prompts[prompts..].to_vec(),
-        transcript[messages..].to_vec(),
-        tool_calls[calls..].to_vec(),
-    )
+    view.tails(cursors)
 }
 
 fn retain_by<T>(items: &mut Vec<T>, keep: &[bool]) {
@@ -344,7 +456,70 @@ fn tool_call_chars(call: &ToolCallRecord) -> usize {
         .as_ref()
         .map(|r| super::transcript_jsonl::value_chars(&r.content))
         .unwrap_or(0);
-    call.name.chars().count() + super::transcript_jsonl::value_chars(&call.input) + result
+    let children = call
+        .children
+        .as_ref()
+        .map(|stream| {
+            stream
+                .transcript
+                .iter()
+                .map(|row| row.text.chars().count())
+                .sum::<usize>()
+                + stream
+                    .thinking
+                    .iter()
+                    .map(|row| row.text.chars().count())
+                    .sum::<usize>()
+                + stream.tool_calls.iter().map(tool_call_chars).sum::<usize>()
+        })
+        .unwrap_or(0);
+    call.name.chars().count() + super::transcript_jsonl::value_chars(&call.input) + result + children
+}
+
+/// A turn start costs the text of its cause: what its row can show.
+fn turn_start_chars(start: &TurnStartRecord) -> usize {
+    start
+        .cause
+        .as_ref()
+        .map(|cause| cause.texts().map(|text| text.chars().count()).sum())
+        .unwrap_or(0)
+}
+
+/// A notice costs its words and the values it may be worded from.
+fn notice_chars(notice: &NoticeRecord) -> usize {
+    let content = notice.content.as_deref().map(|c| c.chars().count()).unwrap_or(0);
+    content
+        + notice
+            .scalars
+            .values()
+            .map(super::transcript_jsonl::value_chars)
+            .sum::<usize>()
+}
+
+/// A question costs every text it holds: the questions, their choices and previews, and the
+/// answers and reasons it settled with.
+fn question_chars(question: &QuestionRecord) -> usize {
+    let count = |text: &str| text.chars().count();
+    let opt = |text: &Option<String>| text.as_deref().map(count).unwrap_or(0);
+    let asked: usize = question
+        .questions
+        .iter()
+        .map(|q| {
+            count(&q.question)
+                + count(&q.header)
+                + q.options
+                    .iter()
+                    .map(|o| count(&o.label) + count(&o.description) + opt(&o.preview))
+                    .sum::<usize>()
+        })
+        .sum();
+    let settled = match &question.state {
+        QuestionState::Settled { answers, reason, .. } => {
+            answers.iter().map(|a| count(&a.answer) + opt(&a.notes)).sum::<usize>() + opt(reason)
+        }
+        QuestionState::Waiting | QuestionState::Answering => 0,
+    };
+    asked + settled + opt(&question.unsupported_reason)
 }
 
 /// `$XDG_STATE_HOME/eitri/history/<conversation_id>/`.
@@ -489,6 +664,8 @@ mod tests {
 
     fn tool_call(seq: u64, id: &str) -> ToolCallRecord {
         ToolCallRecord {
+            children: None,
+            background: false,
             seq,
             turn_id: "t1".into(),
             tool_use_id: id.into(),
@@ -498,6 +675,94 @@ mod tests {
             denied: None,
             changed_input: None,
         }
+    }
+
+    fn three(
+        user_prompts: Vec<UserPromptRecord>,
+        transcript: Vec<TranscriptMessage>,
+        tool_calls: Vec<ToolCallRecord>,
+    ) -> HistoryParts {
+        HistoryParts {
+            user_prompts,
+            transcript,
+            tool_calls,
+            ..HistoryParts::default()
+        }
+    }
+
+    fn turn_start(seq: u64, summary: &str) -> TurnStartRecord {
+        let mut cause = crate::projection::TurnCause::of_kind(crate::projection::TurnCauseKind::Task);
+        cause.summary = Some(summary.to_string());
+        TurnStartRecord {
+            seq,
+            turn_id: format!("cli-{seq}"),
+            origin: crate::projection::TurnOrigin::Cli,
+            cause: Some(cause),
+        }
+    }
+
+    fn notice(seq: u64, content: &str) -> NoticeRecord {
+        NoticeRecord {
+            seq,
+            kind: crate::projection::SessionNoticeKind::Informational,
+            level: crate::projection::NoticeLevel::Notice,
+            content: Some(content.to_string()),
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        }
+    }
+
+    fn question(seq: u64, text: &str) -> QuestionRecord {
+        QuestionRecord {
+            seq,
+            interaction_id: format!("q-{seq}"),
+            tool_use_id: None,
+            turn_id: None,
+            questions: vec![crate::projection::QuestionSpec {
+                question: text.to_string(),
+                header: String::new(),
+                multi_select: false,
+                options: vec![],
+            }],
+            state: QuestionState::Waiting,
+            unsupported_reason: None,
+        }
+    }
+
+    /// The three collections added after the first three are bounded with them, by the same rule:
+    /// the newest items of the whole conversation within both caps, a turn start, a notice and a
+    /// question weighed by their text like any other item.
+    #[test]
+    fn newest_that_fit_bounds_the_new_collections() {
+        let parts = HistoryParts {
+            user_prompts: vec![prompt(1, "oldest")],
+            transcript: vec![message(2, "reply")],
+            tool_calls: vec![],
+            turn_starts: vec![turn_start(3, "a task ended"), turn_start(7, "tick")],
+            notices: vec![notice(4, "compacted"), notice(8, "fell back")],
+            questions: vec![question(5, "which one?"), question(9, "and now?")],
+        };
+        // Item cap: the newest three of the conversation, whichever collections they are in.
+        let kept = newest_that_fit_to(parts.view(), 3, usize::MAX);
+        assert_eq!(kept.turn_starts.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(kept.notices.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![8]);
+        assert_eq!(kept.questions.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![9]);
+        assert!(kept.user_prompts.is_empty() && kept.transcript.is_empty());
+        assert_eq!(kept, truncate_to(parts.clone(), 3, usize::MAX));
+
+        // Character cap: "and now?" (8) + "fell back" (9) fit in 20; "tick" (4) would pass it.
+        let kept = newest_that_fit_to(parts.view(), usize::MAX, 20);
+        assert!(kept.turn_starts.is_empty());
+        assert_eq!(kept.notices.len(), 1);
+        assert_eq!(kept.questions.len(), 1);
+        assert_eq!(kept, truncate_to(parts.clone(), usize::MAX, 20));
+
+        // And what is stored is what the history keeps: the write path bounds them too.
+        let stored = StoredHistory::from_parts("c".into(), "s".into(), parts.clone());
+        assert_eq!(stored.item_count(), 8);
+        assert_eq!(stored.into_parts(), parts);
     }
 
     fn history(conversation_id: &str, session_id: &str) -> StoredHistory {
@@ -658,11 +923,14 @@ mod tests {
         let messages = vec![message(30, "newest")];
         let calls = vec![tool_call(20, "toolu_mid")];
 
-        let (kept_prompts, kept_messages, kept_calls) = truncate_to(prompts, messages, calls, 2, usize::MAX);
+        let kept = truncate_to(three(prompts, messages, calls), 2, usize::MAX);
 
-        assert!(kept_prompts.is_empty(), "the two oldest items are prompts and must go");
-        assert_eq!(kept_messages.len(), 1);
-        assert_eq!(kept_calls.len(), 1);
+        assert!(
+            kept.user_prompts.is_empty(),
+            "the two oldest items are prompts and must go"
+        );
+        assert_eq!(kept.transcript.len(), 1);
+        assert_eq!(kept.tool_calls.len(), 1);
     }
 
     /// The character cap binds independently of the item cap, and the same way: newest back, whole
@@ -671,7 +939,7 @@ mod tests {
     fn the_character_cap_cuts_even_when_the_item_cap_is_not_reached() {
         let messages: Vec<TranscriptMessage> = (0..10u64).map(|i| message(i, &"z".repeat(10))).collect();
 
-        let (_, kept, _) = truncate_to(Vec::new(), messages, Vec::new(), usize::MAX, 35);
+        let kept = truncate_to(three(Vec::new(), messages, Vec::new()), usize::MAX, 35).transcript;
 
         assert_eq!(kept.len(), 3, "three ten-character messages fit in 35 characters");
         assert_eq!(kept.first().unwrap().seq, 7, "and they must be the NEWEST three");
@@ -841,10 +1109,33 @@ mod tests {
                 .into_iter()
                 .map(|q| tool_call(q, &format!("t{q}")))
                 .collect();
+            let n = next(4);
+            let starts: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| turn_start(q, &"c".repeat(next(40) as usize)))
+                .collect();
+            let n = next(4);
+            let notices: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| notice(q, &"n".repeat(next(40) as usize)))
+                .collect();
+            let n = next(4);
+            let questions: Vec<_> = seqs(&mut next, n)
+                .into_iter()
+                .map(|q| question(q, &"q".repeat(next(40) as usize)))
+                .collect();
+            let parts = HistoryParts {
+                user_prompts: prompts,
+                transcript: messages,
+                tool_calls: calls,
+                turn_starts: starts,
+                notices,
+                questions,
+            };
             let max_items = next(25) as usize;
             let max_chars = next(400) as usize;
-            let expected = truncate_to(prompts.clone(), messages.clone(), calls.clone(), max_items, max_chars);
-            let got = newest_that_fit_to(&prompts, &messages, &calls, max_items, max_chars);
+            let expected = truncate_to(parts.clone(), max_items, max_chars);
+            let got = newest_that_fit_to(parts.view(), max_items, max_chars);
             assert_eq!(got, expected, "round {round}");
         }
     }

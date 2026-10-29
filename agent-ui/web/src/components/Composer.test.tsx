@@ -984,3 +984,13 @@ describe("Composer local slash actions", () => {
     }
   });
 });
+
+it("names queue editing and immediate sending in an empty box only while messages are held", () => {
+  const { textarea, rerender } = renderComposerWithRerender({ queueCount: 1, running: true });
+  expect(textarea.placeholder).toBe("↑ to edit queued messages, Ctrl+Enter to send them now");
+  // A message already sent into the turn cannot be taken back or sent again, so the running hint stays.
+  rerender({ queueCount: 0, running: true, enterSteers: true });
+  expect(textarea.placeholder).toBe("Enter steers the running turn…");
+  rerender({ queueCount: 0, running: false });
+  expect(textarea.placeholder).toBe("");
+});

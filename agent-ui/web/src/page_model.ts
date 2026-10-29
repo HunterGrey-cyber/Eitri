@@ -3,6 +3,10 @@ import type { KeymapHelp } from "./keymap";
 import type { TrustPromptEnvelope } from "./trust";
 import type { NavKeyDirection } from "./bridge";
 import type { InboundPayload } from "./bridge";
+import { isMirrorRequest } from "./bridge";
+
+/** The host's words for a mirror whose question, tab or session is already gone. */
+const STALE_MIRROR_REFUSAL = /no longer waiting|no tab \d+|no such tab|has no live session/;
 import { withChooserTitles } from "./chooser";
 import { failureEvidence } from "./problems";
 import { applyCallNotes, applyEvents, applySnapshot, initialState, keepAfterFailure, resumeAttached } from "./reducer";
@@ -429,6 +433,11 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         } else if (record?.kind === "review") {
           // Said in the overlay's own header; the banner is for what breaks the conversation.
           if (next.review !== null) next.review = failRequest(next.review, envelope.requestId, envelope.error);
+        } else if (!record && isMirrorRequest(envelope.requestId) && STALE_MIRROR_REFUSAL.test(envelope.error)) {
+          // A mirror refused because what it mirrored is gone (its question settled, its tab or session closed):
+          // nothing waited for it and the conversation is untouched, so it is not the user's error. The page's
+          // log keeps it. Any other refusal of a mirror (a draft too large to keep) means the person's text will
+          // not survive a switch, so it is said like any other refusal.
         } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background"].includes(record.kind)) {
           // The kinds left out are already said (trust) or are a footer flash the page shows; everything else,
           // a refused permission answer included, is the banner.

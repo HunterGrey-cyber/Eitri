@@ -1,6 +1,15 @@
 {
   "domain_events": [
     {
+      "occurred_at": 1793217986475,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
+      "type": "turn_started"
+    },
+    {
       "commands": [
         {
           "description": "<cli-text chars=135 sha256=525158602182d83e>",
@@ -202,14 +211,10 @@
       "type": "commands_available"
     },
     {
-      "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
-      "type": "turn_started"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "725cf580-e4dd-4a3c-84b1-00506c99ffab",
-      "session_id": "df24b915-2b4b-430a-9c37-342f39547a1f",
+      "provider_session_id": "32c49d99-5b86-4a8f-ab91-eca70c07d1c9",
+      "session_id": "333fae6e-5336-402b-8ec2-3c4895633678",
       "type": "session_opened"
     },
     {
@@ -217,21 +222,32 @@
       "type": "cli_permission_mode"
     },
     {
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
       "kind": "text",
       "text": "C20OFF-DONE",
-      "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
+      "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 1,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "C20OFF-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
+      "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -248,6 +264,15 @@
   ],
   "events": {
     "events": [
+      {
+        "occurred_at": 1793217986475,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
+        "type": "turn_started"
+      },
       {
         "commands": [
           {
@@ -450,14 +475,10 @@
         "type": "commands_available"
       },
       {
-        "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
-        "type": "turn_started"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "725cf580-e4dd-4a3c-84b1-00506c99ffab",
-        "session_id": "df24b915-2b4b-430a-9c37-342f39547a1f",
+        "provider_session_id": "32c49d99-5b86-4a8f-ab91-eca70c07d1c9",
+        "session_id": "333fae6e-5336-402b-8ec2-3c4895633678",
         "type": "session_opened"
       },
       {
@@ -465,21 +486,32 @@
         "type": "cli_permission_mode"
       },
       {
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
         "kind": "text",
         "text": "C20OFF-DONE",
-        "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
+        "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 1,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "C20OFF-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "ca63572a-13da-43df-b2e5-043f9181ed5e",
+        "turn_id": "649c5442-cbf1-4650-a744-3fd841b2309d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -497,7 +529,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 6
+    "throughRevision": 8
   },
   "scenario": "c20_off",
   "snapshot": {
@@ -718,6 +750,18 @@
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
+      "notices": [
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 5,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
       "pendingPermissions": [],
       "provider": null,
       "providerSessionId": "prov-1",
@@ -730,7 +774,7 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 4,
+          "seq": 6,
           "text": "C20OFF-DONE"
         }
       ],
@@ -749,7 +793,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 6,
+    "throughRevision": 8,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

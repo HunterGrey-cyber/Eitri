@@ -202,13 +202,13 @@ describe("the panel with a message in the turn", () => {
     return container;
   }
 
-  it("draws both kinds of line and says Enter steers", () => {
+  it("draws both kinds of line and names the queued-message keys", () => {
     const container = running(true, [
       { text: "in the turn", queuedAt: 1, steered: true },
       { text: "held", queuedAt: 2, steered: false },
     ]);
     expect([...container.querySelectorAll(".queue-line")].map((l) => l.textContent)).toEqual(["↪ in the turn", "⧗ held"]);
-    expect(container.querySelector("textarea")!.placeholder).toBe("Enter steers the running turn…");
+    expect(container.querySelector("textarea")!.placeholder).toBe("↑ to edit queued messages, Ctrl+Enter to send them now");
   });
 
   it("↑ takes back the held messages, and with only a message in the turn walks history instead", () => {

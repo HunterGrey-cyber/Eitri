@@ -567,7 +567,7 @@ impl SpawnedSidecar {
 /// `ProviderInfo` also carries the protocol major and `sidecar_version`. The handshake checks
 /// the protocol major; this revision remains the checkout skew warning until the client checks
 /// the sidecar version range.
-pub const EXPECTED_VERDANDI_REVISION: &str = "8061cc4";
+pub const EXPECTED_VERDANDI_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
@@ -1203,7 +1203,15 @@ fn sidecar_command(
     account: Option<&crate::account::ClaudeAccount>,
 ) -> Command {
     let keep_test_seams = std::env::var_os(TEST_SEAMS_VAR).is_some_and(|v| v == "1");
-    sidecar_command_for(program_path, program_args, socket_path, account, keep_test_seams)
+    let bash_max_timeout = std::env::var_os("BASH_MAX_TIMEOUT_MS");
+    sidecar_command_for(
+        program_path,
+        program_args,
+        socket_path,
+        account,
+        keep_test_seams,
+        bash_max_timeout.as_deref(),
+    )
 }
 
 fn sidecar_command_for(
@@ -1212,6 +1220,7 @@ fn sidecar_command_for(
     socket_path: &Path,
     account: Option<&crate::account::ClaudeAccount>,
     keep_test_seams: bool,
+    bash_max_timeout: Option<&OsStr>,
 ) -> Command {
     let mut command = Command::new(program_path);
     command
@@ -1247,6 +1256,12 @@ fn sidecar_command_for(
     if let Some(account) = account {
         command.env("VERDANDI_CLAUDE_ACCOUNT", account.name());
     }
+    // Raise the ceiling for explicitly timed commands while keeping the CLI's default timeout.
+    // A value supplied by the user takes precedence, including an empty or non-UTF-8 value.
+    command.env(
+        "BASH_MAX_TIMEOUT_MS",
+        bash_max_timeout.unwrap_or(OsStr::new("2147483647")),
+    );
     command
 }
 
@@ -2110,6 +2125,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_sidecar_gets_the_raised_background_ceiling() {
+        for keep_test_seams in [false, true] {
+            let command = sidecar_command_for(
+                Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+                &[],
+                Path::new("/never/bound"),
+                None,
+                keep_test_seams,
+                None,
+            );
+            let env: Vec<_> = command.get_envs().collect();
+            assert!(env.contains(&(OsStr::new("BASH_MAX_TIMEOUT_MS"), Some(OsStr::new("2147483647")))));
+            assert!(!env.iter().any(|(key, _)| *key == "BASH_DEFAULT_TIMEOUT_MS"));
+        }
+    }
+
+    #[test]
+    fn a_user_value_of_the_ceiling_is_kept() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for value in [OsStr::new("9000000"), OsStr::new(""), OsStr::from_bytes(b"\xff")] {
+            let command = sidecar_command_for(
+                Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+                &[],
+                Path::new("/never/bound"),
+                None,
+                false,
+                Some(value),
+            );
+            let env: Vec<_> = command.get_envs().collect();
+            assert!(env.contains(&(OsStr::new("BASH_MAX_TIMEOUT_MS"), Some(value))));
+            assert!(!env.iter().any(|(key, _)| *key == "BASH_DEFAULT_TIMEOUT_MS"));
+        }
+    }
+
     /// `get_envs` reports a removal as `(key, None)`; an inherited value is gone only if that entry
     /// exists, and it must survive an account being set too.
     #[test]
@@ -2141,7 +2192,7 @@ mod tests {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "watch-test").unwrap();
         let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
         for keep in [false, true] {
-            let command = sidecar_command_for(program, &[], &socket, None, keep);
+            let command = sidecar_command_for(program, &[], &socket, None, keep, None);
             let removed: Vec<_> = command
                 .get_envs()
                 .filter(|(k, _)| k.to_string_lossy() == PARENT_WATCH_VAR)
@@ -2159,7 +2210,7 @@ mod tests {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "seam-test").unwrap();
         let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
         let removed = |keep: bool| -> Vec<String> {
-            sidecar_command_for(program, &[], &socket, None, keep)
+            sidecar_command_for(program, &[], &socket, None, keep, None)
                 .get_envs()
                 .filter(|(_, v)| v.is_none())
                 .map(|(k, _)| k.to_string_lossy().into_owned())
@@ -2185,12 +2236,19 @@ mod tests {
         );
     }
 
-    /// The shipped default: with nothing configured the child's environment is what it always was
-    /// (plus the one removal above), and the sidecar's own account support never engages.
+    /// Without an account the child sets only the socket and timeout ceiling, besides removing
+    /// inherited knobs that would change the sidecar's behaviour.
     #[test]
-    fn with_no_account_the_child_sets_the_socket_and_only_removes_the_inherited_knobs() {
+    fn with_no_account_the_child_sets_the_socket_and_ceiling_and_removes_the_inherited_knobs() {
         let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "account-test").unwrap();
-        let command = sidecar_command(Path::new("/usr/lib/eitri/verdandi-claude-sidecar"), &[], &socket, None);
+        let command = sidecar_command_for(
+            Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+            &[],
+            &socket,
+            None,
+            false,
+            None,
+        );
         let keys: Vec<String> = command
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().to_string())
@@ -2200,6 +2258,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "BASH_MAX_TIMEOUT_MS".to_string(),
                 "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH".to_string(),
@@ -2816,6 +2875,7 @@ mod tests {
             Path::new("/never/bound"),
             None,
             false,
+            None,
         );
         let mut child = command.spawn().unwrap();
         let pid = child.id() as libc::pid_t;

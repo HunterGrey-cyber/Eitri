@@ -106,6 +106,8 @@ fn ending(outcome: TurnOutcome, reason: &str, message: Option<String>) -> (TurnO
     (
         outcome,
         TurnEndDetail {
+            origin_kind: None,
+            num_turns: None,
             reason: Some(reason.to_string()),
             api_error_status: None,
             message: message.map(|m| cut_message(&m)).filter(|m| !m.is_empty()),

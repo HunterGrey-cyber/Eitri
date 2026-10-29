@@ -1315,6 +1315,24 @@ def kit_entries(shipped, counts):
              "files": [("vimium-LICENSE", text)]}]
 
 
+OPENCODE_MARKER = b"Question key mapping adapted from opencode"
+
+
+def question_key_entries(shipped, counts):
+    """Adapted source is absent from the npm tree, so its retained bundle marker selects its notice."""
+    with open(shipped["shell"], "rb") as f:
+        if OPENCODE_MARKER not in f.read():
+            return []
+    text = read_text(os.path.join(TEXTS, "opencode-LICENSE"))
+    if "MIT License" not in text or "Copyright (c) 2025 opencode" not in text:
+        raise Fail("license-texts/opencode-LICENSE is no longer opencode's MIT notice; re-check it")
+    counts["MIT"] = counts.get("MIT", 0) + 1
+    return [{"title": "opencode (question key mapping adapted into the agent panel)", "name": "opencode",
+             "version": "", "license": "MIT", "status": None, "copyleft": False,
+             "note": "adapted source, not an npm dependency; included in the panel bundle",
+             "files": [("opencode-LICENSE", text)]}]
+
+
 MARKDOWN_PLUGIN_WEB = os.path.join("plugins", "markdown", "web")
 # The first line of the plugin's src/style/markdown.css, a `/*!` comment esbuild keeps (`legalComments: "eof"`).
 MARKDOWN_NOTICE_MARKER = b"Adapted from Visual Studio Code's Markdown preview"
@@ -1510,6 +1528,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     web = [resolve(p, by_nv, counts_web) for p in npm_packages(os.path.join(repo, "agent-ui", "web"))]
     web += vite_runtime(shipped, counts_web, repo)
     web += kit_entries(shipped, counts_web)
+    web += question_key_entries(shipped, counts_web)
     plugin = [resolve(p, by_nv, counts_plugin) for p in markdown_plugin_packages(repo)]
     plugin += markdown_notice_entries(counts_plugin, repo)
 

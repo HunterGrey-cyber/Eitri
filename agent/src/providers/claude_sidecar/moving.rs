@@ -49,6 +49,10 @@ pub struct ClaudeProviderHandoff {
     /// The message id of the last text delta translated up to `folded_through`. Without it the first
     /// delta of the next message would not open a message of its own, and two would merge.
     pub last_text: Option<String>,
+    /// The same for each subagent's open reply, by the call that started it, the longest silent first:
+    /// without it the first delta of a subagent's next message would join the reply row on screen.
+    #[serde(default)]
+    pub last_child_replies: Vec<(String, String)>,
     /// Whether the session's CLI-mode line was printed up to `folded_through`.
     pub cli_mode_noted: bool,
     /// Messages reported dropped whose delivery may still come, with their typed text, oldest first.
@@ -70,6 +74,9 @@ pub enum MoveRefusedWhy {
     HoldingTurnEnd,
     /// A message is being sent to the sidecar right now.
     SteerInFlight,
+    /// An answer to Claude's question was sent and its reply not read yet: refused, it has to put the
+    /// question back in this window.
+    AnswerInFlight,
     /// No session is watched, so there is nothing to go on from.
     NoSession,
     /// More than one session is watched; a move hands over exactly one.
@@ -89,6 +96,7 @@ impl std::fmt::Display for MoveRefusedWhy {
             MoveRefusedWhy::SteerOpen | MoveRefusedWhy::SteerInFlight => {
                 f.write_str("a message is still on its way into the running turn")
             }
+            MoveRefusedWhy::AnswerInFlight => f.write_str("an answer to Claude's question is still on its way"),
             MoveRefusedWhy::HoldingTurnEnd => f.write_str("the turn's end waits for a message's follow-up turn"),
             MoveRefusedWhy::NoSession => f.write_str("the chat has no session to move"),
             MoveRefusedWhy::SeveralSessions => f.write_str("the chat watches more than one session"),
@@ -133,9 +141,14 @@ impl ClaudeSidecarProvider {
             splits_messages: _,
             provider_prompts: _,
             claude_code_prompt: _,
+            // Not carried: only a session create or resume reads it, and the taking side opens none.
+            #[cfg(feature = "test-support")]
+                questions_override: _,
             watches,
             parked,
             released,
+            #[cfg(feature = "test-support")]
+                per_task_stop_override: _,
         } = self;
         if released.load(Ordering::SeqCst) || lock(parked).is_some() {
             return Err(MoveRefusedWhy::NotDriving);
@@ -173,6 +186,7 @@ impl ClaudeSidecarProvider {
         let WatchMark {
             sequence,
             last_text,
+            child_replies,
             cli_mode_noted,
         } = mark;
         let handoff = ClaudeProviderHandoff {
@@ -185,6 +199,7 @@ impl ClaudeSidecarProvider {
             },
             folded_through: sequence,
             last_text,
+            last_child_replies: child_replies,
             cli_mode_noted,
             steers_given_up,
             stdout_partial,
@@ -217,6 +232,7 @@ impl ClaudeSidecarProvider {
             child,
             folded_through,
             last_text,
+            last_child_replies,
             cli_mode_noted,
             steers_given_up,
             stdout_partial,
@@ -249,6 +265,7 @@ impl ClaudeSidecarProvider {
         let mark = WatchMark {
             sequence: folded_through,
             last_text,
+            child_replies: last_child_replies,
             cli_mode_noted,
         };
         Ok(ClaudeSidecarProvider {
@@ -262,9 +279,13 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            #[cfg(feature = "test-support")]
+            questions_override: None,
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(Some(ParkedWatch { session_id, mark })),
             released: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            per_task_stop_override: None,
         })
     }
 

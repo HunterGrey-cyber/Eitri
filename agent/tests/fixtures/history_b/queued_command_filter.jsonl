@@ -1,0 +1,10 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Start"}}
+{"type":"attachment","uuid":"human","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"hello","origin":{"kind":"human"}}}
+{"type":"attachment","uuid":"no-origin","attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"text","text":"joined"},{"type":"image","source":{}},{"type":"text","text":" text"}]}}
+{"type":"attachment","uuid":"not-human","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"not a prompt","origin":{"kind":"task-notification"}}}
+{"type":"attachment","uuid":"peer","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"peer text","origin":{"kind":"peer"}}}
+{"type":"attachment","uuid":"meta","attachment":{"type":"queued_command","commandMode":"prompt","prompt":"instructions","isMeta":true}}
+{"type":"attachment","uuid":"wrong-mode","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"skip"}}
+{"type":"attachment","uuid":"wrong-type","attachment":{"type":"file","commandMode":"prompt","prompt":"skip"}}
+{"type":"attachment","uuid":"bad-prompt","attachment":{"type":"queued_command","commandMode":"prompt","prompt":123}}
+{"type":"attachment","uuid":"empty-blocks","attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"image","source":{}}]}}

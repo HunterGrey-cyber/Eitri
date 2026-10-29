@@ -1,5 +1,21 @@
+import * as roster from "./fold/roster";
+import * as notices from "./fold/notices";
+import * as subagents from "./fold/subagents";
+import * as questions from "./fold/questions";
+import * as reset from "./fold/reset";
 import { cleanCommands } from "./slashCommands";
-import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, ProviderPrompt, Seq, ToolCallRecord, TurnEnding, WireProviderPrompt } from "./types";
+import type {
+  AgentDomainEvent,
+  AgentUiSnapshot,
+  AgentUiState,
+  ProviderPrompt,
+  Seq,
+  ToolCallRecord,
+  TurnCause,
+  TurnEnding,
+  WireProviderPrompt,
+  WireTurnCause,
+} from "./types";
 
 /** The state before any snapshot arrives. `backend` defaults to "legacy" only because something
  * must be written here -- the real value always arrives with `hello` (before any session can exist)
@@ -25,6 +41,7 @@ export function initialState(): AgentUiState {
     usage: null,
     accountLimits: null,
     backgroundCalls: 0,
+    backgroundTasks: roster.emptyRoster(),
     availableCommands: null,
     turnEndings: [],
     lastTurnEnding: null,
@@ -32,6 +49,17 @@ export function initialState(): AgentUiState {
     assistantMessageOpen: false,
     thinking: [],
     thinkingOpen: false,
+    turnStarts: [],
+    notices: [],
+    apiRetry: null,
+    compacting: false,
+    rateLimitWarning: null,
+    fallbackModel: null,
+    notification: null,
+    questions: [],
+    cliUnseenBusy: false,
+    openingPromptSeq: null,
+    runningTurnCli: false,
     nextSeq: 0,
     turnThinking: false,
     ...NOTHING_HELD,
@@ -172,8 +200,80 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
   // `turnThinking` defaults to false here too, for every event: it is cleared by the ABSENCE of a
   // special case rather than by a maintained list of event types that ought to clear it.
   // Only the `content_delta`/`"thinking"` arm below sets it back to true.
-  const state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: false };
+  const preservesActivity = event.type === "turn_cause_updated" || event.type === "cli_cycle_started"
+    || event.type === "background_tasks_changed" || event.type === "task_event" || event.type === "conversation_reset"
+    || event.type === "subagent_frame" || (event.type === "session_notice" && !notices.recordsRow(event));
+  let state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: preservesActivity ? incoming.turnThinking : false };
   switch (event.type) {
+    case "turn_completed":
+      state = roster.onTurnCompleted(state, event);
+      state = notices.onTurnEnd(state, event);
+      break;
+    case "content_delta":
+      state = notices.onContent(state, event);
+      break;
+    case "tool_call_started":
+      state = notices.onContent(state, event);
+      state = questions.onCallStarted(state, event, seq);
+      break;
+    case "resume_outcome":
+      state = roster.onSessionEnd(state, event);
+      break;
+    case "session_closed":
+    case "session_unavailable":
+      state = roster.onSessionEnd(state, event);
+      state = questions.onSessionEnd(state, event);
+      break;
+  }
+  if (event.type === "permission_mode_changed") return { ...incoming, nextSeq: seq + 1 };
+  if (event.type === "subagent_frame") return subagents.fold({ ...state, turnThinking: incoming.turnThinking }, event, foldEvent);
+  return foldEvent(state, event, seq);
+}
+
+function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): AgentUiState {
+  switch (event.type) {
+    case "turn_cause_updated": {
+      // The cause the turn's close named replaces what its start said; a turn with no start row keeps
+      // none, and an update naming no cause is no news. MUST stay identical to `AgentSessionProjection::apply`.
+      if (event.cause === null || event.cause === undefined) return state;
+      let at = -1;
+      for (let i = state.turnStarts.length - 1; i >= 0; i -= 1) {
+        if (state.turnStarts[i].turnId === event.turn_id) {
+          at = i;
+          break;
+        }
+      }
+      if (at < 0) return state;
+      const cause = turnCauseFromWire(event.cause);
+      return { ...state, turnStarts: state.turnStarts.map((start, i) => (i === at ? { ...start, cause } : start)) };
+    }
+    case "cli_cycle_started": {
+      // Claude Code ran work of its own ahead of the running turn's prompt, which it has not read yet: the
+      // prompt leaves the conversation (the tab holds it until its delivery folds it back where Claude Code
+      // read it), and why the work started is a row. MUST stay identical to `AgentSessionProjection::apply`.
+      if (state.activeTurnId !== event.turn_id) return state;
+      const opening = state.openingPromptSeq;
+      const userPrompts =
+        opening === null ? state.userPrompts : state.userPrompts.filter((p) => p.seq !== opening || p.delivered === true);
+      return {
+        ...state,
+        userPrompts,
+        openingPromptSeq: null,
+        assistantMessageOpen: false,
+        thinkingOpen: false,
+        turnStarts: [
+          ...state.turnStarts,
+          { seq, turnId: event.turn_id, origin: "cli", cause: event.cause ? turnCauseFromWire(event.cause) : null },
+        ],
+      };
+    }
+    case "background_tasks_changed":
+    case "task_event":
+      return roster.fold(state, event);
+    case "conversation_reset":
+      return reset.fold(state, event);
+    case "subagent_frame":
+      return state;
     case "session_opened":
       // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
       // system/init at the start of each turn even inside one streaming session. Folding it is
@@ -191,7 +291,15 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
     case "turn_started":
       // A new turn is newer news than however the last one ended: the band stops saying it. The row
       // already in the transcript stays where it is.
-      return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false, thinkingOpen: false, lastTurnEnding: null };
+      // Until its `turn_attributed` says otherwise, a turn is one this host sent.
+      return {
+        ...state,
+        activeTurnId: event.turn_id,
+        assistantMessageOpen: false,
+        thinkingOpen: false,
+        lastTurnEnding: null,
+        runningTurnCli: false,
+      };
     case "assistant_message_boundary":
       // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
       // folds them (2026-09-25).
@@ -200,11 +308,13 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
       // a prompt can only occur between assistant messages, and leaving the run open appends the
       // next turn's reply to the last one.
+      // A prompt folded with no turn running is what the next turn opens with.
       return {
         ...state,
         userPrompts: [...state.userPrompts, { seq, text: event.text }],
         assistantMessageOpen: false,
         thinkingOpen: false,
+        openingPromptSeq: state.activeTurnId === null ? seq : state.openingPromptSeq,
       };
     case "user_message_delivered":
       // The same row a submitted prompt is, at the point the agent read it -- not where Enter was pressed,
@@ -317,8 +427,8 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
     case "permission_requested":
       return {
         ...state,
-        assistantMessageOpen: false,
-        thinkingOpen: false,
+        assistantMessageOpen: subagents.isChildCall(state.toolCalls, event.tool_use_id) ? state.assistantMessageOpen : false,
+        thinkingOpen: subagents.isChildCall(state.toolCalls, event.tool_use_id) ? state.thinkingOpen : false,
         pendingPermissions: [
           // Keyed by `permission_id` like the Rust map: a repeat replaces the card and takes the newer `seq`.
           ...state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id),
@@ -348,6 +458,13 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // frontend-local guess.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
     case "turn_completed": {
+      // A completion naming a turn this page is not running (another runs, or none does) ends nothing
+      // here: the running turn runs on, and a turn the panel never showed leaves no ending row. What it
+      // said arrives as the events Rust derives after it. Its usage is still the CLI's latest report,
+      // and it ends the note of unseen work. MUST stay identical to `AgentSessionProjection::apply`.
+      if (state.activeTurnId !== event.turn_id) {
+        return { ...state, usage: event.usage ?? state.usage, cliUnseenBusy: false };
+      }
       // The one authoritative source for "no turn is in flight" -- replaces the deleted
       // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
       // NOT end the conversation, only session_closed/session_unavailable do.
@@ -364,14 +481,29 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // null (only `turn_started` clears it, and only a non-completed end sets it). MUST stay identical
       // to `AgentSessionProjection::apply`. `detail` is read defensively: Rust always sends it, but an
       // event without one must still fold to a row rather than throw inside the reducer.
+      // A turn Claude Code started that showed nothing and ended without a result leaves nothing: no row
+      // saying why it started, and no failed ending for work nobody saw. MUST stay identical to Rust.
+      let emptyStart = -1;
+      if (state.runningTurnCli && event.detail?.reason === NO_RESULT_REASON) {
+        for (let i = state.turnStarts.length - 1; i >= 0; i -= 1) {
+          if (state.turnStarts[i].turnId === event.turn_id) {
+            if (!holdsItemAfter(state, state.turnStarts[i].seq)) emptyStart = i;
+            break;
+          }
+        }
+      }
       const done = {
         ...state,
+        cliUnseenBusy: false,
         activeTurnId: null,
         assistantMessageOpen: false,
         thinkingOpen: false,
         usage: event.usage ?? state.usage,
+        openingPromptSeq: null,
+        runningTurnCli: false,
         ...NOTHING_HELD,
       };
+      if (emptyStart >= 0) return { ...done, turnStarts: state.turnStarts.filter((_, i) => i !== emptyStart) };
       if (event.outcome === "completed") return done;
       const detail = event.detail ?? { reason: null, api_error_status: null, message: null };
       const ending: TurnEnding = {
@@ -381,13 +513,16 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         reason: detail.reason ?? null,
         apiErrorStatus: detail.api_error_status ?? null,
         message: detail.message ?? null,
+        ...(detail.origin_kind === undefined ? {} : { originKind: detail.origin_kind }),
+        ...(detail.num_turns === undefined ? {} : { numTurns: detail.num_turns }),
         resetsAt: state.accountLimits?.resetsAt ?? null,
       };
       return { ...done, turnEndings: [...state.turnEndings, ending], lastTurnEnding: event.outcome };
     }
-    // Both endings clear activeTurnId, mirroring AgentSessionProjection exactly: no turn_completed
-    // is ever coming, so leaving it set leaves App.tsx's turnInProgress true forever -- a spinner
-    // on a dead session, next to a reply that may be truncated. Clearing it is not a local guess at
+    // Both endings clear activeTurnId and cliUnseenBusy, mirroring AgentSessionProjection exactly: no
+    // turn_completed is ever coming, for this page's turn or for work it could not show, so leaving
+    // activeTurnId set leaves App.tsx's turnInProgress true forever -- a spinner on a dead session,
+    // next to a reply that may be truncated. Clearing it is not a local guess at
     // a completion: no message is closed out, no outcome invented; the turn just stops being in
     // flight, which is the truth.
     case "resume_outcome": {
@@ -400,6 +535,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return {
         ...withLostTurn(state, seq),
         activeTurnId: null,
+        openingPromptSeq: null,
+        runningTurnCli: false,
+        cliUnseenBusy: false,
         status: { kind: "unavailable", reason: describeFailedResume(event) },
         assistantMessageOpen: false,
         thinkingOpen: false,
@@ -410,6 +548,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return {
         ...withLostTurn(state, seq),
         activeTurnId: null,
+        openingPromptSeq: null,
+        runningTurnCli: false,
+        cliUnseenBusy: false,
         status: { kind: "unavailable", reason: event.reason },
         assistantMessageOpen: false,
         thinkingOpen: false,
@@ -419,6 +560,9 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return {
         ...withLostTurn(state, seq),
         activeTurnId: null,
+        openingPromptSeq: null,
+        runningTurnCli: false,
+        cliUnseenBusy: false,
         status: { kind: "closed", reason: event.reason },
         assistantMessageOpen: false,
         thinkingOpen: false,
@@ -437,9 +581,8 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       const id = event.tool_use_id;
       if (id === null || id === "") return state;
       const denied = { reasonType: event.reason_type, reason: event.reason };
-      if (state.toolCalls.some((call) => call.toolUseId === id)) {
-        return { ...state, toolCalls: state.toolCalls.map((call) => (call.toolUseId === id ? { ...call, denied } : call)) };
-      }
+      const updated = subagents.updateCall(state.toolCalls, id, (call) => ({ ...call, denied }));
+      if (updated) return { ...state, toolCalls: updated };
       const held = [...state.denialsBeforeTheirCall.filter((d) => d.toolUseId !== id), { toolUseId: id, denied }];
       return { ...state, denialsBeforeTheirCall: held.slice(-MAX_HELD_DENIALS) };
     }
@@ -479,15 +622,52 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // the page never saw it) and says so here: applied, never recomputed. Like
       // `AgentSessionProjection::apply`: the first call with that id, or held until it starts.
       const id = event.tool_use_id;
-      const at = state.toolCalls.findIndex((call) => call.toolUseId === id);
-      if (at >= 0) {
-        return { ...state, toolCalls: state.toolCalls.map((call, i) => (i === at ? { ...call, changedInput: event.change } : call)) };
-      }
+      const updated = subagents.updateCall(state.toolCalls, id, (call) => ({ ...call, changedInput: event.change }));
+      if (updated) return { ...state, toolCalls: updated };
       return {
         ...state,
         changedInputsBeforeTheirCall: pushBounded(state.changedInputsBeforeTheirCall, { toolUseId: id, change: event.change }),
       };
     }
+    case "turn_attributed": {
+      // A row only for a turn the user did not send; the `turn_started` before it already closed what was
+      // open. MUST stay identical to `AgentSessionProjection::apply`.
+      if (state.activeTurnId === event.turn_id) state = { ...state, runningTurnCli: event.origin === "cli" };
+      if (event.origin === "client") return state;
+      return {
+        ...state,
+        turnStarts: [
+          ...state.turnStarts,
+          { seq, turnId: event.turn_id, origin: event.origin, cause: event.cause ? turnCauseFromWire(event.cause) : null },
+        ],
+      };
+    }
+    case "session_notice":
+      return notices.fold(state, event);
+    case "cli_work_unseen":
+      // Work out of sight: noted, and nothing else -- no turn runs here because of it.
+      return { ...state, cliUnseenBusy: true };
+    case "user_prompt_withdrawn": {
+      // The newest prompt not put into a running turn goes; a delivered one is part of its turn and
+      // stays. Nothing to take back changes nothing. MUST stay identical to `AgentSessionProjection::apply`.
+      let at = -1;
+      for (let i = state.userPrompts.length - 1; i >= 0; i--) {
+        if (state.userPrompts[i].delivered !== true) {
+          at = i;
+          break;
+        }
+      }
+      if (at < 0) return state;
+      const removed = state.userPrompts[at].seq;
+      return {
+        ...state,
+        userPrompts: state.userPrompts.filter((_, i) => i !== at),
+        openingPromptSeq: state.openingPromptSeq === removed ? null : state.openingPromptSeq,
+      };
+    }
+    case "question_asked":
+    case "question_settled":
+      return questions.fold(state, event);
     case "permission_mode_changed":
       // The mode lives on the tab (`tabs` envelope), not the projection: `TabInfo.mode` is what the
       // band and the box read, and Rust's own `tabs` envelope already reflects an acknowledged
@@ -495,7 +675,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // event changes nothing the page draws. It still advances `nextSeq`, as Rust bumps
       // `last_revision` for it: the seqs Rust names (a turn's footer anchor) must be the page's own.
       // `turnThinking` is left as it was: a mode switch says nothing about what the agent is doing.
-      return { ...incoming, nextSeq: seq + 1 };
+      return state;
     default: {
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.
@@ -563,6 +743,45 @@ export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiSt
   };
 }
 
+/** `TurnEndDetail.reason` of a turn Claude Code went idle in without a result (Rust's `NO_RESULT_REASON`). */
+export const NO_RESULT_REASON = "no_result";
+
+/** Whether any item of the conversation was folded after `seq` (Rust's `holds_item_after`). */
+function holdsItemAfter(state: AgentUiState, seq: Seq): boolean {
+  const after = (items: readonly { seq: Seq }[]) => items.some((item) => item.seq > seq);
+  return (
+    after(state.userPrompts) ||
+    after(state.transcript) ||
+    after(state.toolCalls) ||
+    after(state.thinking) ||
+    after(state.notices) ||
+    after(state.questions) ||
+    after(state.turnEndings) ||
+    after(state.turnStarts) ||
+    after(state.pendingPermissions)
+  );
+}
+
+/** The event's snake_case cause as the snapshot spells it (`agent_bridge.rs`). */
+function turnCauseFromWire(wire: WireTurnCause): TurnCause {
+  return {
+    kind: wire.kind,
+    ...(wire.tool_use_id == null ? {} : { toolUseId: wire.tool_use_id }),
+    taskId: wire.task_id ?? null,
+    taskKind: wire.task_kind ?? null,
+    taskStatus: wire.task_status ?? null,
+    description: wire.description ?? null,
+    summary: wire.summary ?? null,
+    peerName: wire.peer_name ?? null,
+    text: wire.text ?? null,
+    wakeupSource: wire.wakeup_source ?? null,
+    scheduledForMs: wire.scheduled_for_ms ?? null,
+    scheduleReason: wire.schedule_reason ?? null,
+    cronId: wire.cron_id ?? null,
+    prompt: wire.prompt ?? null,
+  };
+}
+
 /** The event's snake_case `provider_prompt` as the snapshot spells it (`agent_bridge.rs`). */
 function providerPromptFromWire(wire: WireProviderPrompt): ProviderPrompt {
   const rule = wire.matched_ask_rule;
@@ -592,6 +811,8 @@ export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiSt
     ...state,
     status: { kind: "unavailable", reason },
     activeTurnId: null,
+    openingPromptSeq: null,
+    runningTurnCli: false,
     pendingPermissions: [],
     assistantMessageOpen: false,
     thinkingOpen: false,
@@ -641,12 +862,14 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   //
   // `turnEndings` and `lastTurnEnding` come from the wire like the other collections, with the same
   // defence for a payload without them (`[]`/`null`), so a reload keeps the rows and the band's word.
-  return {
+  let state: AgentUiState = {
+    ...initialState(),
     ...snapshot,
     usage: snapshot.usage ?? null,
     accountLimits: snapshot.accountLimits ?? null,
     // A payload from a build that predates the count is a tab with none.
     backgroundCalls: snapshot.backgroundCalls ?? 0,
+    backgroundTasks: roster.emptyRoster(),
     // `null` is "no list reported"; a payload from a build that predates the key says the same.
     availableCommands: cleanCommands(snapshot.availableCommands),
     turnEndings: snapshot.turnEndings ?? [],
@@ -655,12 +878,26 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     // thinking.
     thinking: snapshot.thinking ?? [],
     thinkingOpen: snapshot.thinkingOpen ?? false,
+    // Rust sends each only while it holds any: a payload without one is a conversation with none.
+    turnStarts: snapshot.turnStarts ?? [],
+    notices: snapshot.notices ?? [],
+    questions: snapshot.questions ?? [],
+    // Sent only while set: a payload without it is a tab with no unseen work noted.
+    cliUnseenBusy: snapshot.cliUnseenBusy ?? false,
+    // Both sent only while set.
+    openingPromptSeq: snapshot.openingPromptSeq ?? null,
+    runningTurnCli: snapshot.runningTurnCli ?? false,
     nextSeq: throughRevision,
     turnThinking: false,
     ...NOTHING_HELD,
     // The one held list Rust serializes: a change whose call has not started yet.
     changedInputsBeforeTheirCall: snapshot.changedInputsBeforeTheirCall ?? [],
   };
+  state = roster.fromSnapshot(state, snapshot);
+  state = notices.fromSnapshot(state, snapshot);
+  state = subagents.fromSnapshot(state, snapshot);
+  state = questions.fromSnapshot(state, snapshot);
+  return reset.fromSnapshot(state, snapshot);
 }
 
 /** Whether a `resume_outcome` confirms the session that was actually asked for -- the same

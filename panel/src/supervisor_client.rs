@@ -50,7 +50,8 @@ pub fn derive_status(projection: Option<&AgentSessionProjection>) -> AgentStatus
     if !projection.pending_permissions.is_empty() {
         return AgentStatus::Blocked;
     }
-    if projection.active_turn_id.is_some() {
+    // Claude Code working where this panel cannot show it is work all the same.
+    if projection.active_turn_id.is_some() || projection.cli_unseen_busy {
         return AgentStatus::Working;
     }
     AgentStatus::Idle
@@ -408,6 +409,21 @@ mod tests {
         let mut state = base_state();
         state.active_turn_id = Some("turn-1".into());
         assert_eq!(derive_status(Some(&state)), AgentStatus::Working);
+    }
+
+    #[test]
+    fn supervisor_reports_working_while_unseen() {
+        let mut state = base_state();
+        state.cli_unseen_busy = true;
+        assert_eq!(derive_status(Some(&state)), AgentStatus::Working);
+        state.status = ProjectionStatus::Closed {
+            reason: "closed_by_host".into(),
+        };
+        assert_eq!(
+            derive_status(Some(&state)),
+            AgentStatus::Done,
+            "an ended session is not working"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ type Props = {
   onOpenDetail?: () => void;
   /** The `↓N`/`↓ ⚑` button's own click. */
   onJump?: () => void;
+  onOpenTasks?: () => void;
 };
 
 /** `facts.pill`'s leading `"⏵⏵ "` names the mode word after it (`"manual"`/`"auto"`/`"bypass"`), which is all
@@ -76,7 +77,7 @@ function renderLeftSeg(
     );
   }
   return (
-    <span key={seg.id} className={`band-seg band-${seg.id}`}>
+    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : undefined}>
       {seg.text}
     </span>
   );
@@ -88,7 +89,7 @@ function renderLeftSeg(
  *  pixels a mono character actually takes (a hidden `.band-measure` span, re-measured whenever its
  *  own box changes size -- a font-size or theme push included, since either changes what that span
  *  renders at) and the band's own content-box width, and turning each `Seg` into markup. */
-export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump }: Props) {
+export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [widthPx, setWidthPx] = useState(0);
@@ -124,6 +125,12 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
   // grow upward and wrap that text onto more rows, for as long as this render still carries one; an
   // ordinary short prompt/flash never sets it, so the band stays the fixed one-editor-row height it
   // always was.
+  // The count opens the background tasks list only where the agent reports its tasks (a roster in
+  // `facts.backgroundTasks`); elsewhere (Codex, ACP) it stays plain text in its place inside the
+  // band's details button, since that list would have nothing to show.
+  const tasksButton = facts.backgroundTasks !== undefined && onOpenTasks !== undefined;
+  const background = tasksButton ? left.find((seg) => seg.id === "background") : undefined;
+  const detailLeft = tasksButton ? left.filter((seg) => seg.id !== "background") : left;
   const wrapping = segs.some((seg) => seg.wraps === true);
 
   return (
@@ -144,11 +151,12 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
           classes, no click handling and no place in `controlsOf`'s selector. */}
       {onOpenDetail !== undefined ? (
         <button type="button" className="band-open" onClick={onOpenDetail}>
-          {left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}
+          {detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}
         </button>
       ) : (
-        <div className="band-open">{left.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}</div>
+        <div className="band-open">{detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}</div>
       )}
+      {background && <button type="button" className="band-seg band-background" onClick={onOpenTasks}>{background.text}</button>}
       <span className="band-spacer" />
       <div className="band-right">
         {right.map((seg) => {

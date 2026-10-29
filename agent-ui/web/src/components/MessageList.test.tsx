@@ -4,7 +4,15 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { MessageList } from "./MessageList";
 import { noteUserScroll, resumeFollowing } from "../follow";
 import { applyEvent, initialState } from "../reducer";
-import type { AgentDomainEvent, AgentUiState } from "../types";
+import type { AgentDomainEvent, AgentUiState, NoticeRecord } from "../types";
+import { buildTimeline, UNSEEN_TURN_TEXT } from "../timeline";
+import foregroundAgentFixture from "../fixtures/claude-scripted-c03_fg.json";
+import backgroundAgentFixture from "../fixtures/claude-scripted-c03_bg.json";
+import subagentFixtures from "../fixtures/subagent-frames.json";
+import questionFixtures from "../fixtures/questions.json";
+import { agentCard, buildDisplay } from "../display";
+import cardRosterFixture from "../fixtures/claude-scripted-c01t.json";
+import { primaryText } from "../copyText";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
@@ -1982,5 +1990,355 @@ describe("turn ending rows", () => {
     ];
     const { container } = render(<MessageList state={events.reduce(applyEvent, initialState())} {...props} sessionEnded />);
     expect(container.querySelector(".row-ending .row-body")!.textContent).toBe("the turn did not finish: the session ended");
+  });
+});
+
+describe("notice rows: a prompt a hook stopped, and a turn this panel could not show", () => {
+  const notice = (seq: number, kind: NoticeRecord["kind"], level: NoticeRecord["level"], content: string | null): NoticeRecord => ({
+    seq,
+    kind,
+    level,
+    content,
+    scalars: {},
+    taskId: null,
+    toolUseId: null,
+    taskStatus: null,
+  });
+  const hookWords = "Blocked by the deploy guard:\nproduction deploys need a ticket\u202e.";
+  const withNotices = state({
+    userPrompts: [{ seq: 0, text: "deploy to production" }],
+    transcript: [{ seq: 3, text: "The tests passed in the background." }],
+    notices: [
+      notice(1, "hook_block", "warning", hookWords),
+      notice(2, "unseen_turn", "notice", null),
+      // A kind not yet drawn as a row stays out of the conversation.
+      notice(4, "informational", "info", "not a row yet"),
+    ],
+  });
+
+  it("draws both kinds in order, muted, each a j/k stop, the hook's words as plain text with hidden characters shown", () => {
+    const { container } = render(
+      <MessageList state={withNotices} sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={vi.fn()} />,
+    );
+    const kinds = Array.from(container.querySelectorAll(".row")).map((row) =>
+      Array.from(row.classList).find((name) => name.startsWith("row-") && name !== "row-current"),
+    );
+    expect(kinds).toEqual(["row-prompt", "row-notice", "row-notice", "row-assistant"]);
+    const notices = Array.from(container.querySelectorAll<HTMLElement>(".row-notice"));
+    expect(notices.map((row) => row.dataset.sign)).toEqual(["⚠", "·"]);
+    // The sign alone carries the warning glyph: the row reads it once.
+    expect(notices[0].textContent!.split("⚠").length - 1).toBe(1);
+    expect(notices[0].querySelector(".notice-text")!.textContent).toBe(
+      "UserPromptSubmit operation blocked by hook: Blocked by the deploy guard:\nproduction deploys need a ticket⟨U+202E⟩.",
+    );
+    expect(notices[0].querySelector(".permission-card-escape")).not.toBeNull();
+    expect(notices[0].querySelector("a, strong, code")).toBeNull();
+    expect(notices[1].textContent).toContain(UNSEEN_TURN_TEXT);
+    expect(container.textContent).not.toContain("not a row yet");
+  });
+
+  it("y copies what each says, whole", () => {
+    const rows = buildTimeline(withNotices).filter((item) => item.kind === "notice");
+    expect(rows.map((item) => item.key)).toEqual(["n-1", "n-2"]);
+    expect(rows.map(primaryText)).toEqual([`UserPromptSubmit operation blocked by hook: ${hookWords}`, UNSEEN_TURN_TEXT]);
+  });
+});
+
+describe("wake rows and expandable lifecycle notices", () => {
+  const cause = (over: Partial<import("../types").TurnCause>): import("../types").TurnCause => ({
+    kind: "unknown", taskId: null, taskKind: null, taskStatus: null, description: null, summary: null,
+    peerName: null, text: null, wakeupSource: null, scheduledForMs: null, scheduleReason: null, cronId: null, prompt: null, ...over,
+  });
+  const notices: NoticeRecord[] = [
+    { seq: 3, kind: "compaction", level: "notice", content: "**summary** <b>plain</b>\u202e", scalars: { pre_tokens: 182000, post_tokens: 41000, trigger: "auto" }, taskId: null, toolUseId: null, taskStatus: null },
+    { seq: 4, kind: "model_fallback", level: "warning", content: "**fallback** <b>plain</b>", scalars: {}, taskId: null, toolUseId: null, taskStatus: null },
+    { seq: 5, kind: "compaction", level: "notice", content: null, scalars: {}, taskId: null, toolUseId: null, taskStatus: null },
+  ];
+  const conversation = state({
+    turnStarts: [
+      { seq: 1, turnId: "peer", origin: "cli", cause: cause({ kind: "peer", peerName: "worker", text: "**ready**\n<b>body</b>\u202e" }) },
+      { seq: 2, turnId: "monitor", origin: "cli", cause: cause({ kind: "task", taskKind: "monitor", taskStatus: "running", description: "watch", summary: "event one\nevent two" }) },
+    ], notices,
+  });
+  const props = { expanded: {}, cursor: 0, sessionEnded: false, onAnswerPermission: vi.fn() };
+
+  it("makes each wake and notice a cursor stop, with full text available to y", () => {
+    const { container, rerender } = render(<MessageList state={conversation} {...props} />);
+    const rows = container.querySelectorAll('[data-nav-stop="row"]');
+    expect(rows).toHaveLength(5);
+    const timeline = buildTimeline(conversation);
+    // j/k change the cursor index supplied by the panel's keyboard controller.
+    for (const cursor of [0, 1, 2, 3, 4, 3, 2, 1, 0]) {
+      rerender(<MessageList state={conversation} {...props} cursor={cursor} />);
+      expect(container.querySelector(".row-current")).toBe(rows[cursor]);
+      expect(primaryText(timeline[cursor])).toBeTruthy();
+    }
+    expect(primaryText(timeline[0])).toBe("› Message from @worker: **ready**\n**ready**\n<b>body</b>\u202e");
+    expect(container.querySelector(".row-wake")!.getAttribute("data-sign")).toBe("●");
+    expect(container.querySelector(".notice-prominent")!.textContent).toContain("**fallback** <b>plain</b>");
+  });
+
+  it("puts a wake row's fold marker at the end of its words, not on a line of its own", () => {
+    const { container } = render(<MessageList state={conversation} {...props} />);
+    const marker = container.querySelector(".row-wake .fold-marker")!;
+    expect(marker.parentElement!.className).toBe("wake-head");
+    expect(marker.previousElementSibling!.className).toBe("wake-text");
+    expect(marker.previousElementSibling!.tagName).toBe("SPAN");
+  });
+
+  it("opens peer bodies and supplied summaries with the row's Enter fold, always as text", () => {
+    const { container, rerender } = render(<MessageList state={conversation} {...props} />);
+    expect(container.textContent).not.toContain("<b>body</b>");
+    expect(container.textContent).not.toContain("**summary**");
+    // Monitor output is an event, visible without opening a detail fold.
+    expect(container.textContent).toContain('Monitor event: "watch"');
+    expect(container.textContent).toContain("event one\nevent two");
+    rerender(<MessageList state={conversation} {...props} expanded={{ "w-1": true, "n-3": true, "n-5": true }} />);
+    expect(container.textContent).toContain("<b>body</b>⟨U+202E⟩");
+    expect(container.textContent).toContain("**summary** <b>plain</b>⟨U+202E⟩");
+    expect(container.querySelector("b, strong, a")).toBeNull();
+    const compact = container.querySelectorAll(".notice-compaction");
+    expect(compact[0].textContent).toContain("──── Conversation compacted · 182k → 41k tokens (auto) ────");
+    expect(compact[1].querySelector(".fold-marker")).toBeNull();
+    expect(compact[1].textContent).toContain("──── Conversation compacted ────");
+  });
+});
+
+it("updates a memoized background card when only its roster status changes", () => {
+  let s = initialState();
+  for (const event of cardRosterFixture.domain_events) s = applyEvent(s, event as AgentDomainEvent);
+  const task = s.backgroundTasks.rows.find((r) => r.tool_use_id === "toolu_lim")!;
+  s.backgroundTasks = { query_start: false, rows: [{ ...task, status: "running", live: true }] };
+  s.notices = [];
+  const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
+  const { container, rerender } = render(<MessageList {...props} state={s} />);
+  const card = () => container.querySelector('[data-tool-name="Bash"]')!;
+  expect(card().textContent).toContain("Running in the background · /tasks");
+  const ended = { ...s, backgroundTasks: { ...s.backgroundTasks, rows: [{ ...task, live: false, status: "completed" as const, summary: "completed", started_at: 1000, ended_at: 131000, usage: null }] } };
+  rerender(<MessageList {...props} state={ended} />);
+  expect(card().textContent).toContain("completed in background · 2m 10s");
+  expect(card().textContent).not.toContain("Running in the background");
+});
+
+// Child frames and question settlements remain view data; rendering never changes their fold.
+describe("subagent groups", () => {
+  const child = (seq: number, name = "Read"): import("../types").ToolCallRecord => ({
+    seq, toolUseId: `child-${seq}`, name, input: { file_path: "a.rs" }, result: null, turnId: "main",
+  });
+  const stream = (toolCalls: import("../types").ToolCallRecord[]) => ({
+    toolCalls, transcript: [], thinking: [], assistantMessageOpen: false, thinkingOpen: false,
+  });
+  const parent = (done = false): import("../types").ToolCallRecord => ({
+    seq: 1, toolUseId: "parent", name: "Agent", turnId: "main",
+    input: { subagent_type: "Explore", description: "find\u202ethe\u200bbug" },
+    children: stream([child(2), child(3, "Bash")]),
+    result: done ? { content: [{ type: "text", text: "This agent switched to small because its earlier model could not be used.\nReport <img src=x>\n<usage>subagent_tokens: 18000\ntool_uses: 7\nduration_ms: 34000</usage>" }], isError: false } : null,
+  });
+  const draw = (call = parent(), expanded = {}, detailed = false) => render(<MessageList
+    state={state({ activeTurnId: "main", toolCalls: [call] })} expanded={expanded} detailed={detailed}
+    sessionEnded={false} cursor={0} onAnswerPermission={vi.fn()} />);
+
+  it("folds the delegation by default and shows only the latest child call", () => {
+    const { container } = draw();
+    expect(container.querySelectorAll('[data-nav-stop="row"]')).toHaveLength(1);
+    expect(container.querySelector(".subagent-heading")?.textContent).toContain("Explore(find⟨U+202E⟩the⟨U+200B⟩bug)");
+    expect(container.querySelector(".subagent-status")?.textContent).toBe("⎿ Bash(a.rs) · 2 tool uses");
+    expect(container.querySelector('.fold-marker')?.getAttribute("aria-label")).toBe("collapsed");
+  });
+
+  it("shows Done statistics and a separate warning before the folded report", () => {
+    const call = parent(true);
+    const { container, rerender } = draw(call);
+    expect(container.querySelector(".subagent-status")?.textContent).toBe("⎿ Done (7 tool uses · 18k tokens · 0m 34s)");
+    expect(container.querySelector(".subagent-warning")?.textContent).toContain("This agent switched to small");
+    expect(container.querySelector(".subagent-report")).toBeNull();
+    rerender(<MessageList state={state({ toolCalls: [call] })} expanded={{ "t-1": true }} sessionEnded={false} cursor={0} onAnswerPermission={vi.fn()} />);
+    expect(container.querySelector(".subagent-report")?.textContent).toBe("Report <img src=x>");
+    expect(container.querySelector(".subagent-report img")).toBeNull();
+  });
+
+  it("indents nested children again, keeping every child an ordinary navigation stop", () => {
+    const nested = { ...child(2, "Agent"), children: stream([child(3)]) };
+    const call = { ...parent(), children: stream([nested]) };
+    const { container } = draw(call, { "t-1": true, "t-2": true });
+    expect(container.querySelectorAll('[data-nav-stop="row"]')).toHaveLength(3);
+    expect(container.querySelector('[data-depth="1"]')?.getAttribute("style")).toContain("1.5em");
+    expect(container.querySelector('[data-depth="2"]')?.getAttribute("style")).toContain("3em");
+    expect(container.querySelector(".row-tool-run")).toBeNull();
+  });
+
+  it("reads a background launch still in flight with the live line, never as background before the roster lists it", () => {
+    const launching = { ...parent(), input: { subagent_type: "Explore", description: "find", run_in_background: true }, children: undefined };
+    const live = draw(launching);
+    expect(live.container.querySelector(".subagent-status")?.textContent).toBe("⎿ Running · 0 tool uses");
+    live.unmount();
+    const ended = render(<MessageList state={state({ activeTurnId: null, toolCalls: [launching] })} expanded={{}} detailed={false}
+      sessionEnded={false} cursor={0} onAnswerPermission={vi.fn()} />);
+    expect(ended.container.querySelector(".subagent-status")?.textContent).toBe("⎿ stopped with the session");
+  });
+
+  it("moves only the head of the report into the warning line", () => {
+    const call = parent(true);
+    call.result = { content: [{ type: "text", text: "Found it.\nThe maximum number of turns was never the cause.\nThe model fallback path is fine.\n<usage>tool_uses: 7</usage>" }], isError: false };
+    const { container } = draw(call, { "t-1": true });
+    expect(container.querySelector(".subagent-warning")?.textContent).toContain("maximum number of turns");
+    expect(container.querySelector(".subagent-report")?.textContent).toBe("Found it.\nThe model fallback path is fine.");
+  });
+
+  it("never expands background children, including in the detailed view", () => {
+    const { container } = draw({ ...parent(), background: true }, { "t-1": true }, true);
+    expect(container.querySelectorAll('[data-nav-stop="row"]')).toHaveLength(1);
+    expect(container.querySelector(".fold-marker")).toBeNull();
+    expect(container.querySelector(".subagent-report")).toBeNull();
+  });
+});
+
+describe("question transcript rows", () => {
+  const question = (outcome?: import("../types").QuestionOutcome): import("../types").QuestionRecord => ({
+    seq: 3, interactionId: "q", toolUseId: "ask", turnId: "main", unsupportedReason: null,
+    questions: [{ header: "Target\u202e", question: "Which\u200b? <img src=x>", multiSelect: false, options: [] }],
+    state: outcome ? { kind: "settled", outcome, answers: [{ questionIndex: 0, answer: "local\u200b", notes: "safe\u202e" }], reason: null } : { kind: "waiting" },
+  });
+  it.each([
+    [undefined, "waiting for your answer"], ["answered", "→ local⟨U+200B⟩"],
+    ["declined", "User declined to answer questions"], ["chat_requested", "→ chat about this"],
+    ["interrupted", "(not answered: interrupted)"], ["expired", "(not answered: Claude Code withdrew the question)"],
+    ["session_closed", "(not answered: session closed)"], ["provider_failed", "(not answered: provider failed)"],
+    ["host_refused", "(not answered: host refused)"],
+  ] as const)("renders the %s outcome with revealed text at the linked call", (outcome, status) => {
+    const s = state({ questions: [question(outcome)], transcript: [{ seq: 2, text: "after the call" }],
+      toolCalls: [{ seq: 1, name: "AskUserQuestion", toolUseId: "ask", input: {}, result: null }] });
+    const { container } = render(<MessageList state={s} expanded={{}} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+    const row = container.querySelector(".row-question")!;
+    expect(container.querySelectorAll('[data-nav-stop="row"]')[0]).toBe(row);
+    expect(row.textContent).toContain("Target⟨U+202E⟩: Which⟨U+200B⟩? <img src=x>");
+    expect(row.textContent).toContain(status);
+    if (outcome) expect(row.textContent).toContain("→ notes: safe⟨U+202E⟩");
+    expect(row.querySelector("img")).toBeNull();
+    expect(container.querySelector(".row-tool")).toBeNull();
+    expect(primaryText(buildTimeline(s)[0])).toContain("Which\u200b?");
+  });
+
+  it("keeps an old call's result as plain revealed text when there is no question record", () => {
+    const { container } = render(<MessageList state={state({ toolCalls: [{
+      seq: 1, name: "AskUserQuestion", toolUseId: "ask", input: {},
+      result: { content: [{ type: "text", text: "refused\u202e\u200b <b>unsafe</b>" }], isError: true },
+    }] })} expanded={{}} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+    expect(container.querySelector(".row-question")?.textContent).toContain("?Claude asked a questionrefused⟨U+202E⟩⟨U+200B⟩ <b>unsafe</b>");
+    expect(container.querySelector(".row-question b")).toBeNull();
+    expect(container.querySelector(".row-tool")).toBeNull();
+  });
+});
+
+
+describe("structured transcript fixtures", () => {
+  it.each(subagentFixtures.cases)("renders $name with children contained by their parent", (testCase) => {
+    const s = testCase.events.reduce((s, event) => applyEvent(s, event as AgentDomainEvent), initialState());
+    const base = buildTimeline(s);
+    const childIds = s.toolCalls.flatMap((call) => call.children?.toolCalls.map((child) => child.toolUseId) ?? []);
+    expect(base.filter((item) => item.kind === "tool" && childIds.includes(item.call.toolUseId))).toEqual([]);
+    const folded = render(<MessageList state={s} expanded={{}} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+    expect(folded.container.querySelectorAll(".row-subagent")).toHaveLength(s.toolCalls.length);
+    expect(folded.container.querySelector(".subagent-child")).toBeNull();
+    folded.unmount();
+    const expanded = Object.fromEntries(Array.from({ length: s.nextSeq }, (_, seq) => [`t-${seq}`, true]));
+    const display = buildDisplay(base, { expanded, detailed: false, turnRunning: !!s.activeTurnId });
+    const shown = render(<MessageList state={s} expanded={expanded} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+    expect(shown.container.querySelectorAll('[data-nav-stop="row"]')).toHaveLength(display.length);
+    if (testCase.name.startsWith("background") || testCase.name === "unknown parent") {
+      expect(shown.container.querySelector(".subagent-child")).toBeNull();
+      expect(shown.container.querySelector(".subagent-status")?.textContent).not.toContain("Running in the background");
+    }
+  });
+
+  it.each(questionFixtures.cases)("renders every recorded state of $name", (testCase) => {
+    for (const step of testCase.steps) {
+      const s = { ...initialState(), ...step.snapshot } as AgentUiState;
+      const view = render(<MessageList state={s} expanded={{}} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+      expect(view.container.querySelectorAll(".row-question")).toHaveLength(s.questions.length);
+      expect(view.container.querySelector(".row-tool")).toBeNull();
+      const waiting = s.questions.filter((q) => q.state.kind !== "settled").length;
+      expect(view.container.textContent?.match(/waiting for your answer/g)?.length ?? 0).toBe(waiting);
+      view.unmount();
+    }
+  });
+});
+
+
+describe("subagent roster rendering", () => {
+  it.each([["foreground", foregroundAgentFixture], ["background", backgroundAgentFixture]] as const)("uses live %s task statistics without confusing foreground and background", (kind, fixture) => {
+    let s = initialState();
+    for (const event of fixture.domain_events) {
+      s = applyEvent(s, event as AgentDomainEvent);
+      if (event.type !== "task_event" || event.edge !== "progress") continue;
+      const view = render(<MessageList state={s} expanded={{}} cursor={0} sessionEnded={false} onAnswerPermission={vi.fn()} />);
+      const row = view.container.querySelector(".row-subagent")!;
+      if (kind === "background") {
+        expect(row.querySelector(".subagent-status")?.textContent).toContain(`Running in the background · ${event.usage?.tool_uses} tool uses · /tasks`);
+        expect(row.querySelector(".fold-marker")).toBeNull();
+      } else {
+        expect(row.querySelector(".subagent-status")?.textContent).toContain(`${event.usage?.tool_uses} tool uses · 0m 00s`);
+        expect(row.querySelector(".subagent-status")?.textContent).not.toContain("background");
+        expect(row.querySelector(".fold-marker")).not.toBeNull();
+      }
+      view.unmount();
+    }
+  });
+});
+
+
+it("uses a completed agent's final figures instead of its earlier progress figures", () => {
+  let s = initialState();
+  for (const event of foregroundAgentFixture.domain_events) {
+    s = applyEvent(s, event as AgentDomainEvent);
+    if (event.type === "task_event" && event.edge === "progress") break;
+  }
+  const parent = s.toolCalls.find((call) => call.name === "Agent")!;
+  const completed = { ...parent, result: { content: "report\n<usage>tool_uses: 7\nsubagent_tokens: 18000\nduration_ms: 34000</usage>", isError: false } };
+  expect(agentCard(completed, s).line).toBe("⎿ Done (7 tool uses · 18k tokens · 0m 34s)");
+});
+
+/* A foreground agent whose result can never arrive -- its turn was interrupted, the session ended, or
+   history restored the call without its result -- must not keep its live "Running" line: the row
+   reads as over, like any other call that ended without a result. */
+describe("a foreground agent that ended without a result", () => {
+  const agentStarted: AgentDomainEvent[] = [
+    { type: "session_opened", session_id: "s1", provider_session_id: "c1", model: "m", cwd: "/p" },
+    { type: "user_prompt_submitted", text: "look around" },
+    { type: "turn_started", turn_id: "t1" },
+    { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_a", name: "Agent",
+      input: { subagent_type: "Explore", description: "survey the tree", prompt: "look" } },
+  ];
+  const shown = (s: AgentUiState, sessionEnded: boolean) => {
+    const view = render(<MessageList state={s} sessionEnded={sessionEnded} expanded={{}} cursor={-1} onAnswerPermission={vi.fn()} />);
+    const row = view.container.querySelector(".row-subagent")!;
+    const seen = { line: row.querySelector(".subagent-status")!.textContent, sign: row.getAttribute("data-sign") };
+    view.unmount();
+    return seen;
+  };
+  const interrupted = () => applyEvent(agentStarted.reduce(applyEvent, initialState()), {
+    type: "turn_completed", turn_id: "t1", outcome: "interrupted", result_text: "", stop_reason: null, usage: null,
+    detail: { reason: null, api_error_status: null, message: null },
+  });
+
+  it("keeps the live line while its turn runs", () => {
+    expect(shown(agentStarted.reduce(applyEvent, initialState()), false)).toEqual({ line: "⎿ Running · 0 tool uses", sign: "◐" });
+  });
+
+  it("says no result was recorded once its turn was interrupted", () => {
+    expect(shown(interrupted(), false)).toEqual({ line: "⎿ no result recorded (0 tool uses)", sign: "·" });
+  });
+
+  it("says no result was recorded once the session has ended mid-call", () => {
+    expect(shown(agentStarted.reduce(applyEvent, initialState()), true)).toEqual({ line: "⎿ no result recorded (0 tool uses)", sign: "·" });
+  });
+
+  it("says no result was recorded for a call history restored without its result", () => {
+    const restored = state({
+      history: { source: "claude_transcript", restoredItems: 3, omittedItems: 0, uptoSeq: 3, sourcePath: "/claude/projects/p/sess.jsonl",
+        attemptedTranscriptPath: null, fallbackReason: null, writerVersion: "2.1.311" },
+      toolCalls: [{ seq: 2, toolUseId: "toolu_a", name: "Agent", input: { subagent_type: "Explore", description: "survey the tree" }, result: null }],
+    });
+    expect(shown(restored, false)).toEqual({ line: "⎿ no result recorded (0 tool uses)", sign: "·" });
   });
 });

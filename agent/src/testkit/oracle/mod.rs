@@ -102,6 +102,59 @@ pub enum Entry {
     Ended {
         reason: EndReason,
     },
+    /// A question set Claude asked (`AskUserQuestion`) and how it ended. Only its shape is kept: the words
+    /// asked and answered never enter the normal form, so no report can print them.
+    Question {
+        /// The call's tool-use id (a record without one gives its interaction id), for pairing only.
+        id: String,
+        key: QuestionKey,
+    },
+}
+
+/// How a question set ended, in the oracle's own closed list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum QuestionEnd {
+    /// The person's answers went back to Claude.
+    Answered,
+    /// The person turned the questions down.
+    Declined,
+    /// The person chose to answer in the chat instead.
+    Chat,
+    /// Something other than the person ended it: an interrupt, the session closing, an expiry.
+    Cancelled,
+    /// Any other end: a result the reader has no rule for, a host that could not show the form, a failed
+    /// provider.
+    Other,
+}
+
+impl QuestionEnd {
+    pub fn word(self) -> &'static str {
+        match self {
+            QuestionEnd::Answered => "answered",
+            QuestionEnd::Declined => "declined",
+            QuestionEnd::Chat => "chat",
+            QuestionEnd::Cancelled => "cancelled",
+            QuestionEnd::Other => "other",
+        }
+    }
+}
+
+/// All the oracle keeps of a question set, and all a report prints of it: how many questions it held,
+/// which of them (0-based, ascending) carry an answer, and how it ended.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct QuestionKey {
+    pub count: usize,
+    pub answered: Vec<usize>,
+    pub end: QuestionEnd,
+}
+
+impl QuestionKey {
+    /// The key with `answered` sorted and without repeats, whatever order the record gave.
+    pub fn new(count: usize, mut answered: Vec<usize>, end: QuestionEnd) -> Self {
+        answered.sort_unstable();
+        answered.dedup();
+        Self { count, answered, end }
+    }
 }
 
 impl Entry {
@@ -117,6 +170,7 @@ impl Entry {
             Entry::Compaction { .. } => "compaction",
             Entry::Interrupted => "interrupted",
             Entry::Ended { .. } => "ended",
+            Entry::Question { .. } => "question",
         }
     }
 }

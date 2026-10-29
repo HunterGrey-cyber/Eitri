@@ -1,6 +1,15 @@
 {
   "domain_events": [
     {
+      "occurred_at": 1793217971309,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
+      "type": "turn_started"
+    },
+    {
       "commands": [
         {
           "description": "<cli-text chars=135 sha256=525158602182d83e>",
@@ -202,14 +211,10 @@
       "type": "commands_available"
     },
     {
-      "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
-      "type": "turn_started"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "2992a363-8a30-4a05-94a0-46a6643a173e",
-      "session_id": "5e1eb697-ccc1-41ef-8e35-2d3ee7b5e2de",
+      "provider_session_id": "a3acd3ac-d29c-42f2-bb4c-34a9428cbee3",
+      "session_id": "4bfa0822-fef4-4be6-9076-c367874e9d12",
       "type": "session_opened"
     },
     {
@@ -217,21 +222,48 @@
       "type": "cli_permission_mode"
     },
     {
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
+      "content": null,
+      "kind": "api_retry",
+      "level": "notice",
+      "scalars": {
+        "attempt": 1,
+        "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
+        "error_status": 529,
+        "max_retries": 1,
+        "retry_delay_ms": 540
+      },
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
       "kind": "text",
       "text": "C13B-WARNED",
-      "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
+      "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 1,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "C13B-WARNED",
       "stop_reason": "end_turn",
-      "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
+      "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -246,14 +278,14 @@
       }
     },
     {
-      "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+      "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "2992a363-8a30-4a05-94a0-46a6643a173e",
-      "session_id": "5e1eb697-ccc1-41ef-8e35-2d3ee7b5e2de",
+      "provider_session_id": "a3acd3ac-d29c-42f2-bb4c-34a9428cbee3",
+      "session_id": "4bfa0822-fef4-4be6-9076-c367874e9d12",
       "type": "session_opened"
     },
     {
@@ -261,21 +293,38 @@
       "type": "cli_permission_mode"
     },
     {
+      "content": null,
+      "kind": "api_retry",
+      "level": "notice",
+      "scalars": {
+        "attempt": 1,
+        "error_kind": "<cli-text chars=10 sha256=3084e89ef570f74b>",
+        "error_status": 429,
+        "max_retries": 1,
+        "retry_delay_ms": 1000
+      },
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
       "kind": "text",
       "text": "<cli-text chars=50 sha256=033d24eb7909b855>",
-      "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+      "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": 429,
         "message": "<cli-text chars=50 sha256=033d24eb7909b855>",
+        "num_turns": 1,
         "reason": "<cli-text chars=9 sha256=8265edf37575deab>"
       },
       "outcome": "failed",
       "result_text": "<cli-text chars=50 sha256=033d24eb7909b855>",
       "stop_reason": "stop_sequence",
-      "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+      "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -292,6 +341,15 @@
   ],
   "events": {
     "events": [
+      {
+        "occurred_at": 1793217971309,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
+        "type": "turn_started"
+      },
       {
         "commands": [
           {
@@ -494,14 +552,10 @@
         "type": "commands_available"
       },
       {
-        "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
-        "type": "turn_started"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "2992a363-8a30-4a05-94a0-46a6643a173e",
-        "session_id": "5e1eb697-ccc1-41ef-8e35-2d3ee7b5e2de",
+        "provider_session_id": "a3acd3ac-d29c-42f2-bb4c-34a9428cbee3",
+        "session_id": "4bfa0822-fef4-4be6-9076-c367874e9d12",
         "type": "session_opened"
       },
       {
@@ -509,21 +563,48 @@
         "type": "cli_permission_mode"
       },
       {
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
+        "content": null,
+        "kind": "api_retry",
+        "level": "notice",
+        "scalars": {
+          "attempt": 1,
+          "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
+          "error_status": 529,
+          "max_retries": 1,
+          "retry_delay_ms": 540
+        },
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
         "kind": "text",
         "text": "C13B-WARNED",
-        "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
+        "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 1,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "C13B-WARNED",
         "stop_reason": "end_turn",
-        "turn_id": "fb5ef827-5786-4ed5-a6d4-04a025c37be2",
+        "turn_id": "39006bda-4a01-4772-b29b-4d9e90be1fff",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -538,14 +619,14 @@
         }
       },
       {
-        "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+        "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "2992a363-8a30-4a05-94a0-46a6643a173e",
-        "session_id": "5e1eb697-ccc1-41ef-8e35-2d3ee7b5e2de",
+        "provider_session_id": "a3acd3ac-d29c-42f2-bb4c-34a9428cbee3",
+        "session_id": "4bfa0822-fef4-4be6-9076-c367874e9d12",
         "type": "session_opened"
       },
       {
@@ -553,21 +634,38 @@
         "type": "cli_permission_mode"
       },
       {
+        "content": null,
+        "kind": "api_retry",
+        "level": "notice",
+        "scalars": {
+          "attempt": 1,
+          "error_kind": "<cli-text chars=10 sha256=3084e89ef570f74b>",
+          "error_status": 429,
+          "max_retries": 1,
+          "retry_delay_ms": 1000
+        },
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
         "kind": "text",
         "text": "<cli-text chars=50 sha256=033d24eb7909b855>",
-        "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+        "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": 429,
           "message": "<cli-text chars=50 sha256=033d24eb7909b855>",
+          "num_turns": 1,
           "reason": "<cli-text chars=9 sha256=8265edf37575deab>"
         },
         "outcome": "failed",
         "result_text": "<cli-text chars=50 sha256=033d24eb7909b855>",
         "stop_reason": "stop_sequence",
-        "turn_id": "869a8321-e312-40f6-af06-7f1be0c60d76",
+        "turn_id": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -585,7 +683,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 11
+    "throughRevision": 15
   },
   "scenario": "c13b",
   "snapshot": {
@@ -806,6 +904,18 @@
       "history": null,
       "lastTurnEnding": "failed",
       "model": "claude-opus-5-5",
+      "notices": [
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 5,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
       "pendingPermissions": [],
       "provider": null,
       "providerSessionId": "prov-1",
@@ -818,11 +928,11 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 4,
+          "seq": 7,
           "text": "C13B-WARNED"
         },
         {
-          "seq": 9,
+          "seq": 13,
           "text": "<cli-text chars=50 sha256=033d24eb7909b855>"
         }
       ],
@@ -831,10 +941,11 @@
           "apiErrorStatus": 429,
           "kind": "failed",
           "message": "<cli-text chars=50 sha256=033d24eb7909b855>",
+          "numTurns": 1,
           "reason": "<cli-text chars=9 sha256=8265edf37575deab>",
           "resetsAt": null,
-          "seq": 10,
-          "turnId": "869a8321-e312-40f6-af06-7f1be0c60d76"
+          "seq": 14,
+          "turnId": "9b40b70f-6b77-41eb-a06b-1a71e00af8b4"
         }
       ],
       "usage": {
@@ -851,7 +962,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 11,
+    "throughRevision": 15,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

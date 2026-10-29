@@ -14,6 +14,7 @@ export type SlashAction =
   | { kind: "keymap" }
   | { kind: "tab-info" }
   | { kind: "sessions" }
+  | { kind: "tasks"; workflows: boolean }
   | { kind: "open-path"; path: string }
   | { kind: "pointer"; text: string };
 
@@ -63,7 +64,13 @@ export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
   { name: "output-style", class: "works" },
 ];
 
-const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map(SLASH_COMMANDS.map((entry) => [entry.name, entry]));
+/** Local task controls postdate the CLI classification above. */
+const TASK_COMMANDS: readonly SlashCommandEntry[] = [
+  { name: "tasks", class: "sent-as-text", action: { kind: "tasks", workflows: false } },
+  { name: "bashes", class: "sent-as-text", action: { kind: "tasks", workflows: false } },
+  { name: "workflows", class: "sent-as-text", action: { kind: "tasks", workflows: true } },
+];
+const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map([...SLASH_COMMANDS, ...TASK_COMMANDS].map((entry) => [entry.name, entry]));
 
 /** Held back regardless of the table's class above, because a real interactive terminal opens a
  *  picker/wizard for these that a headless turn cannot draw -- all four degraded to a plain-text
@@ -177,6 +184,9 @@ const LISTED_SENT_AS_TEXT: ReadonlySet<string> = new Set(["init", "review", "sec
  *  `/effort` has no row in `SLASH_COMMANDS` -- it postdates that table -- but a bare `/effort` is sent and
  *  answered with its usage line (`barePickerCommand`), so it is listed beside `/model`. */
 const CLAUDE_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  tasks: "Show background tasks",
+  bashes: "Show background tasks",
+  workflows: "Show dynamic workflows",
   help: "Show Eitri's keys",
   status: "Show this tab's information",
   resume: "Open the sessions chooser",
@@ -208,7 +218,7 @@ const CLAUDE_HINTS: Readonly<Record<string, string>> = {
 /** Until the agent reports its list, offer local actions and commands with a useful headless effect.
  *  Terminal-only commands are omitted so completion never leads into a refusal. */
 export function builtInCompletions(): CompletionCommand[] {
-  const rows = SLASH_COMMANDS.filter(
+  const rows = [...SLASH_COMMANDS, ...TASK_COMMANDS].filter(
     (entry) =>
       (entry.action !== undefined || entry.class === "works" || LISTED_SENT_AS_TEXT.has(entry.name)) &&
       heldBackSlashCommand(`/${entry.name}`) === null,
@@ -277,7 +287,9 @@ export function completionSource(
   reported: readonly CompletionCommand[] | null,
 ): readonly CompletionCommand[] | null {
   const claude = agent === undefined || agent === "claude";
-  if (reported !== null) return claude ? reported.filter((c) => heldBackSlashCommand(`/${c.name}`) === null) : reported;
+  if (reported !== null) return claude ? reported.filter((c) => heldBackSlashCommand(`/${c.name}`) === null).map((c) =>
+    slashAction(`/${c.name}`)?.kind === "tasks" ? { name: c.name, description: CLAUDE_DESCRIPTIONS[c.name] } : c,
+  ) : reported;
   if (claude) return builtInCompletions();
   return null;
 }

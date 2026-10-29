@@ -21,7 +21,7 @@ fn files() -> Vec<String> {
 }
 
 /// The methods that put a turn on its way to an agent.
-const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_with"];
+const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_as", "send_turn_with"];
 
 /// The six places a turn leaves for an agent, each of which this scan must find: the tab set's two (its
 /// queue, which carries a typed prompt, a queue flush at a turn's end, a review message and a resumed
@@ -29,11 +29,20 @@ const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_with"];
 /// conversation's turn, a Claude turn sent through the mode-carrying door, and an external agent's (a
 /// Codex `turn/start`, an ACP `session/prompt`).
 const SENDS: &[(&str, &str)] = &[
-    ("core/src/tab_set.rs", ".send_turn_in(&wire, &typed, mode)"),
-    ("core/src/tab_set.rs", ".send_turn_in(&turn.wire, &turn.typed, mode)"),
+    ("core/src/tab_set.rs", ".send_turn_in(&wire, &typed, mode, origin)"),
+    (
+        "core/src/tab_set.rs",
+        ".send_turn_in(&turn.wire, &turn.typed, mode, turn.origin())",
+    ),
     ("core/src/agent_backend.rs", "session.send_turn(wire_text)"),
-    ("core/src/agent_backend.rs", "conversation.send_turn(wire_text)"),
-    ("core/src/agent_backend.rs", "self.send_turn(wire_text, as_typed)"),
+    (
+        "core/src/agent_backend.rs",
+        "conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id)",
+    ),
+    (
+        "core/src/agent_backend.rs",
+        "self.send_turn(wire_text, as_typed, origin)",
+    ),
     (
         "core/src/agent_backend.rs",
         "conversation.send_turn_with(wire_text, turn_policy(mode))",

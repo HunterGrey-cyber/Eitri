@@ -1373,7 +1373,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(declarationsOf(".composer")).toContain(`margin: 10px ${SIDE} 14px;`);
     // None of them is centred by a width and an auto margin instead: that would centre the list's box, not
     // its rows, and leave the foot and the conversation on different edges.
-    const FILLS = [".message-list > .row", ".turn-time", ".activity-line", ".queue-lines", ".turn-changes", ".composer", ".agent-ui-conversation > .row", ".history-notice"];
+    const FILLS = [".message-list > .row", ".message-list > :where(.subagent-child) > .row", ".turn-time", ".activity-line", ".queue-lines", ".turn-changes", ".composer", ".agent-ui-conversation > .row", ".history-notice"];
     for (const rule of rules.filter((r) => r.parent === null)) {
       for (const branch of rule.selector.split(",").map((b) => b.trim())) {
         if (!FILLS.includes(branch)) continue;
@@ -1895,6 +1895,35 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(sign.color).toBe("var(--nv-bg)");
     // Negative control: a rule hiding every sign cell would take the overlay's cursor with it.
     expect(computed(review, ".row-sign", ".row-sign { display: none; }").display).toBe("none");
+  });
+
+  it("draws a delegation's nested rows as the conversation draws its own, under the group's indent", () => {
+    // A nested row sits one wrapper deeper than the list's own rows (the wrapper carries the indent), so every
+    // rule that takes a row off the sign-cell grid has to reach it too, or its body falls into the 20px sign column.
+    const nested = (cls: string, sign = "✓") => `<div class="message-list"><div class="row row-tool" data-sign="✓"><span class="row-sign"></span><div class="row-body">general-purpose(B)</div></div>` +
+      `<div class="subagent-child" style="margin-inline-start: 1.5em" data-depth="1"><div class="row ${cls}" data-sign="${sign}"><span class="row-sign"></span><div class="row-body">Read: /a/long/path</div></div></div></div>`;
+    for (const cls of ["row-tool", "row-tool-run", "row-thinking", "row-assistant"]) {
+      const row = computed(nested(cls), ".subagent-child > .row");
+      expect(row.display, cls).toBe("block");
+      expect(row.position, cls).toBe("relative");
+      expect(computed(nested(cls), ".subagent-child .row-sign").display, cls).toBe("none");
+    }
+    for (const cls of ["row-tool", "row-tool-run", "row-thinking"]) {
+      expect(computed(nested(cls), ".subagent-child > .row").paddingLeft, cls).toBe("24px");
+    }
+    expect(computed(nested("row-tool"), ".subagent-child > .row").marginTop).toBe("12px");
+    expect(computed(nested("row-assistant"), ".subagent-child > .row").marginTop).toBe("24px");
+    // The mark is drawn in the nested row's own indent, as in the list's rows, with the same weight as theirs so
+    // the running and failed colours still win.
+    const sign = splitRules(stripComments(css)).find((r) => r.selector.split(",").map((b) => b.trim()).includes(".message-list > :where(.subagent-child) > .row-tool::before"));
+    expect(sign?.declarations).toMatch(/content:\s*attr\(data-sign\) \/ "";/);
+    expect(sign?.declarations).toMatch(/position:\s*absolute;/);
+  });
+
+  it("keeps the band's background-task count apart from the segment before it", () => {
+    // The count is a button of its own after the details button, whose gap does not reach it.
+    const band = `<div class="status-band"><button class="band-open"><span class="band-seg">manual</span></button><button type="button" class="band-seg band-background">1 background task</button></div>`;
+    expect(computed(band, "button.band-background").marginLeft).toBe("8px");
   });
 
   it("computes selector specificity the way this file's own comments already claim it, by hand", () => {
@@ -3263,6 +3292,15 @@ describe("the band's Ctrl+y segment", () => {
     expect(isolating).toBeGreaterThan(fallback);
     expect(body).not.toMatch(/unicode-bidi:\s*isolate\s*;/);
   });
+
+  /* Task descriptions are the agent's commands: drawn in storage order like the band's approval segment. */
+  it("draws the background-task rows in storage order with the override fallback first", () => {
+    const rule = rulesMatching(withoutComments, ".tasks-detail").find((r) => r.selector.includes(".tasks-row"))!;
+    expect(rule.body).toMatch(/direction:\s*ltr\s*;/);
+    const fallback = rule.body.search(/unicode-bidi:\s*bidi-override\s*;/);
+    expect(fallback).toBeGreaterThanOrEqual(0);
+    expect(rule.body.search(/unicode-bidi:\s*isolate-override\s*;/)).toBeGreaterThan(fallback);
+  });
 });
 
 describe("thinking text", () => {
@@ -3322,4 +3360,12 @@ describe("the thinking preview's box", () => {
     expect(decls.get("flex-direction")).toBe("column");
     expect(decls.get("justify-content")).toBe("flex-end");
   });
+});
+
+it("isolates revealed question and subagent text and preserves their line breaks", () => {
+  for (const selector of [".question-line", ".subagent-heading", ".subagent-status", ".subagent-warning", ".subagent-report"]) {
+    const block = withoutComments.split("}").find((rule) => rule.split("{")[0].split(",").some((part) => part.trim() === selector));
+    expect(block).toMatch(/unicode-bidi:\s*isolate\s*;/);
+    expect(block).toMatch(/white-space:\s*pre-wrap\s*;/);
+  }
 });

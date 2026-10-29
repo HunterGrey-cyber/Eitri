@@ -642,6 +642,28 @@ pub fn scrub_jsonl_in_place(scrubber: &Scrubber, path: &Path) -> io::Result<()> 
     write_jsonl(path, &lines)
 }
 
+/// The files under `dir`, leaving out those of a nested record: a directory below `root` that holds a
+/// `manifest.json` of its own is another run of the scenario, which lists its files itself.
+fn collect_files_outside_runs(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if path != root && path.join("manifest.json").is_file() {
+                continue;
+            }
+            collect_files_outside_runs(root, &path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .into_iter()
@@ -752,7 +774,7 @@ pub fn scrub_run(scrubber: &Scrubber, run: &Path, out: &Path) -> io::Result<Vec<
 /// Every file under `dir`, relative and sorted, `manifest.json` left out.
 pub fn listing(dir: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    collect_files(dir, &mut files);
+    collect_files_outside_runs(dir, dir, &mut files);
     let mut names: Vec<String> = files
         .iter()
         .filter_map(|f| f.strip_prefix(dir).ok())
@@ -845,6 +867,19 @@ const TWIN_KEEP_KEYS: &[&str] = &[
     "subtype",
     "role",
     "reason_type",
+    // The ids and enum words of background tasks, notices, subagent frames and resets: a twin whose `level` or
+    // `edge` were digested would no longer parse as a domain event.
+    "level",
+    "edge",
+    "parent_tool_use_id",
+    "run_id",
+    "parent_task_id",
+    "new_conversation_id",
+    "interaction_id",
+    "task_kind",
+    "task_status",
+    "rate_status",
+    "hold_state",
 ];
 
 /// CLI enum words that stay readable wherever they appear: task status and kind, stop reasons, turn and close
@@ -1388,6 +1423,15 @@ mod tests {
             ]
         );
         assert_eq!(files, listing(&out), "the files named are the files held");
+        let nested = out.join("typed");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("manifest.json"), "{}").unwrap();
+        fs::write(nested.join("outgoing.jsonl"), "").unwrap();
+        assert_eq!(
+            files,
+            listing(&out),
+            "a nested record lists its own files, so its files are not this record's"
+        );
         let indexes = |name: &str| -> Vec<u64> {
             read_jsonl(&out.join(name))
                 .unwrap()
@@ -1524,6 +1568,33 @@ mod tests {
         assert_eq!(e[6]["detail"]["reason"], "completed");
         assert_eq!(e[6]["result_text"], "I will read it");
         assert!(!out.to_string().contains("alice"));
+    }
+
+    #[test]
+    fn a_twin_of_task_notice_and_subagent_events_still_parses_as_domain_events() {
+        let events = vec![
+            json!({"type": "session_notice", "kind": "informational", "level": "warning",
+                   "content": "We're changing how this mode is billed", "scalars": {"rate_status": "allowed_warning"}}),
+            json!({"type": "task_event", "edge": "notified", "task_id": "bz5u13d5l", "run_id": "0mvrtyhxx-7e029d58",
+                   "status": "completed", "summary": "Background command finished with exit code 0"}),
+            json!({"type": "subagent_frame", "parent_tool_use_id": "toolu_ag",
+                   "frame": {"type": "tool_call_started", "turn_id": "t1", "tool_use_id": "toolu_sa", "name": "Bash",
+                             "input": {"command": "true"}}}),
+            json!({"type": "conversation_reset", "new_conversation_id": "5a1d8e0c-2b7f-4c1e-9d2a-0f3b6c7e8a91"}),
+        ];
+        let out = twin(&scrubber(), "demo", &scenario(), &events);
+        let e = &out["domain_events"];
+        assert_eq!(e[0]["level"], "warning");
+        assert_eq!(e[0]["scalars"]["rate_status"], "allowed_warning");
+        assert_eq!(e[0]["content"], cli_text("We're changing how this mode is billed"));
+        assert_eq!(e[1]["edge"], "notified");
+        assert_eq!(e[1]["run_id"], "0mvrtyhxx-7e029d58");
+        assert_eq!(e[2]["parent_tool_use_id"], "toolu_ag");
+        assert_eq!(e[3]["new_conversation_id"], "5a1d8e0c-2b7f-4c1e-9d2a-0f3b6c7e8a91");
+        for (n, event) in e.as_array().unwrap().iter().enumerate() {
+            serde_json::from_value::<crate::AgentDomainEvent>(event.clone())
+                .unwrap_or_else(|err| panic!("twin event {n} does not parse: {err}"));
+        }
     }
 
     #[test]

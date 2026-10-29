@@ -166,5 +166,37 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::ToolInputChanged { .. } => {}
         // Made only when a conversation moves between windows, which this demo never does.
         AgentDomainEvent::MoveSeeded(_) => {}
+        AgentDomainEvent::TurnAttributed { origin, cause, .. } => {
+            println!(
+                "[turn started by {origin:?}] cause={:?}",
+                cause.as_ref().map(|c| c.kind)
+            )
+        }
+        AgentDomainEvent::SessionNotice { kind, content, .. } => {
+            println!("[notice {kind:?}] {}", content.as_deref().unwrap_or("-"))
+        }
+        AgentDomainEvent::QuestionAsked { questions, .. } => println!("[question] {} asked", questions.len()),
+        AgentDomainEvent::QuestionSettled { outcome, .. } => println!("[question settled] {outcome:?}"),
+        AgentDomainEvent::CliWorkUnseen => println!("[Claude Code is working where this demo cannot show it]"),
+        // Folded by the host when a send is refused, which this demo never does.
+        AgentDomainEvent::UserPromptWithdrawn => {}
+        AgentDomainEvent::TurnCauseUpdated { turn_id, cause } => {
+            println!("[turn {turn_id} cause] {:?}", cause.as_ref().map(|c| c.kind))
+        }
+        AgentDomainEvent::CliCycleStarted { turn_id, .. } => println!("[turn {turn_id} goes on]"),
+        AgentDomainEvent::BackgroundTasksChanged { tasks, .. } => println!("[background tasks] {}", tasks.len()),
+        AgentDomainEvent::TaskEvent { edge, task_id, .. } => println!("[task {task_id}] {edge:?}"),
+        AgentDomainEvent::ConversationReset {
+            new_conversation_id, ..
+        } => {
+            println!("[new conversation] {new_conversation_id}")
+        }
+        AgentDomainEvent::SubagentFrame {
+            parent_tool_use_id,
+            frame,
+        } => {
+            print!("[subagent of {parent_tool_use_id}] ");
+            print_event(frame)
+        }
     }
 }

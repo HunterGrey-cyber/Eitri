@@ -3,8 +3,9 @@ Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on gli
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
 0.3.0 is the tiling release. The window becomes a keyboard-driven tiling manager, Codex and any agent that speaks
-ACP join Claude Code, and you can put web pages of your own in the window. Your Neovim stays the editor: a real
-`nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
+ACP join Claude Code, and you can put web pages of your own in the window. A Claude Code tab now also shows what
+Claude Code does on its own: background tasks, workflows, the turns it starts by itself and the questions it asks
+you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
 
 ## What's new in 0.3.0
 
@@ -65,6 +66,43 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 - The trust question shows everything whole, and also covers `CLAUDE.md`, `.mcp.json` and rules in the
   directories above the repository.
 
+**Claude Code's own work, in the tab**
+
+- A turn Claude Code starts without you is shown like yours. When a background command finishes, a monitor
+  reports, a subagent or workflow ends, or a scheduled wake-up fires, the tab shows what started the turn
+  (`Background command "build" completed`, `Scheduled wake-up: <reason>`), then its tool calls, cards and reply.
+  A message you send while it runs goes into that turn, and one Claude Code keeps for later waits as a `↪` line
+  until it is read.
+- Background work has a list. The band counts it in Claude Code's words (`2 shells, 1 monitor`), and `/tasks`
+  lists every background shell, monitor, subagent and workflow: `Enter` shows a task's detail and the end of its
+  output, `x` stops that one task, and `o` opens its output read-only in Neovim.
+- When a dynamic workflow needs your approval, its card shows the name, arguments and script (`View raw script`
+  opens it in Neovim). While one runs, the band shows how many of its agents are done, and `/workflows` lists its
+  phases and agents.
+- A foreground subagent's calls are nested under its row; a background subagent takes one status line, and its
+  report starts a turn of its own.
+- Claude Code's notices appear where its terminal shows them: `Compacting conversation...` and then a divider,
+  the retry while the model service is overloaded, and the words of a `UserPromptSubmit` hook that blocked a prompt.
+- `/clear` starts a new conversation in the same tab. Background tasks keep running, and a resume continues the
+  new conversation.
+- When Claude asks you a multiple-choice question (`AskUserQuestion`), a question box takes the place of the message
+  box. You pick with the number keys or `j`/`k`, can type an answer of your own (`Ctrl+g` edits it in Neovim), add
+  notes to an option with a preview, and send with `Ctrl+Enter`. Only you answer: bypass, `Ctrl+y`, the card keys
+  and saved rules never touch a question.
+- A resumed conversation follows Claude Code's own turns: turns it started by itself come back with their cause,
+  the `/` and `!` commands you typed come back as your prompts, and questions come back with your answers.
+- Eitri raises Claude Code's longest allowed command timeout (`BASH_MAX_TIMEOUT_MS`) to 2147483647 ms, so a
+  background command Claude starts with a long timeout keeps running. A background command started without a
+  timeout is still stopped after 30 minutes, Claude Code's own default, which Eitri keeps on purpose; a value you
+  set yourself wins.
+- Not in this release: plan mode, attaching files or images to a message, the terminal's `Ctrl+B` that moves a
+  running command to the background (in Eitri `Ctrl+b` is the prefix), and a list of scheduled wake-ups and cron
+  tasks. Those still fire, each as a turn of its own, while the tab stays open; closing the tab ends them, except a
+  cron task Claude Code was told to keep across sessions, which it saves in the project and may run in a later
+  session there.
+
+The agents guide's first section describes all of this.
+
 **Lighter at rest**
 
 - An idle window draws nothing, and the panel wakes only when it has something to draw. The bottom terminal echoes
@@ -89,6 +127,13 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 - **In the message box, `Ctrl+a` and `Ctrl+e` move to the start and end of the line**, as in a shell; they no
   longer select everything.
 - The panel's typing mode is now called INSERT (it was INPUT).
+- **In a Claude Code tab, `Ctrl+c` no longer stops background work.** It interrupts the turn; background commands,
+  subagents and workflows keep running. Stop one from `/tasks` with `x`.
+- **Closing a Claude Code tab, a chat view or the window asks first while background tasks run** or a question
+  waits, and says what would stop. Scheduled wake-ups and cron tasks are not counted: closing ends them without
+  asking, apart from a cron task Claude Code was told to keep across sessions.
+- **In a Manual tab, Claude Code's scheduling and task tools no longer ask** (`ScheduleWakeup`, the cron tools,
+  `ListAgents`, `TaskStop`); `SendMessage` still does.
 - **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
   window's layout and then saves only its own, so closing it no longer changes what the first window opens with.
 
@@ -115,17 +160,28 @@ for good; later releases' `install.sh` cannot build 0.2.0 from source. The 0.2.0
 
 Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat
 views and open rules) and the Markdown preview passed every row of their checks in an isolated, headless test
-session: scripted keys, not a person at a real desktop. The Claude Code backend's suites that run the real `claude` (2.1.302; 113 cases) were run on a development
-build shortly before this release, in two sessions because the first stopped when the test account reached the model
-service's rate limit; after the second, all 113 pass. Two cases failed along the way for reasons other than this
+session: scripted keys, not a person at a real desktop. The Claude Code backend's suites that run the real `claude`
+against the model service (2.1.302; 113 cases) last ran on a development build with an earlier Verdandi than the
+one this release pins. They ran in two sessions because the first stopped when the test account
+reached the model service's rate limit; after the second, all 113 pass. Two cases failed along the way for reasons other than this
 release's change: one hit the model service's usage-policy check on a probe that asks for a destructive command (it
 passed when run again), and one met this CLI version's new transcript line types, which the history reader now skips.
 Eight Glob and Grep probes in one suite are skipped, because this CLI build lists no such tools. The request a Claude Code tab
-now sends was captured from the built backend against a local stand-in: it carries `claude -p`'s system prompt with
-Claude Code's own identity line for the Agent SDK and Eitri's note once at its end. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
+sends was captured from that same earlier backend against a local stand-in: it carries `claude -p`'s system prompt
+with Claude Code's own identity line for the Agent SDK and Eitri's note once at its end. No turn against the real
+model service has run on this release's backend; what it adds was checked against a scripted stand-in, as the next
+paragraph says. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
 newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
-Steering, the redesigned chat page in a real window, input methods, and companion mode on Hyprland, niri, KDE or
-a real GNOME login have not been seen on a screen yet.
+Companion mode on Hyprland, niri, KDE or a real GNOME login has not been seen on a screen yet.
+
+The Claude Code tab's handling of Claude Code's own work was tested on this release's backend with the real Claude
+Code 2.1.311 against a scripted stand-in for the model service. The flows above ran end to end through Eitri's agent
+host, and fifteen screen checks of them passed in the redesigned chat page in the isolated, headless session, in dark
+and light and at a narrow panel width: turns Claude Code started, `/tasks` and `/workflows`, the workflow card,
+subagents, compaction, a message steered into a running turn, `/clear`, a scheduled wake-up, retries and the
+question box, where an answer typed through an input method was sent. Restoring a resumed conversation was also
+compared with real Claude Code session files. Steering was seen on a screen only in a Claude Code tab, and typing
+through an input method into the companion panel, in its message box or its question box, has not been verified.
 
 None of 0.3.0 has been through real hardware and a person's hands yet, so it is not yet stable enough for everyday
 use. That waits for real hardware and a week of daily use, not for a version number; reports from real desktops
@@ -203,7 +259,7 @@ notice.
 
 Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
-0.3.0 是平铺的版本。窗口变成一个用键盘操作的平铺管理器，Codex 和任何讲 ACP 的 agent 加入到 Claude Code 旁边，你还可以把自己的网页放进窗口。编辑器仍然是你的 Neovim：一个真正的 `nvim --embed`，用你自己的 `init.lua`、插件、LSP 和按键映射。
+0.3.0 是平铺的版本。窗口变成一个用键盘操作的平铺管理器，Codex 和任何讲 ACP 的 agent 加入到 Claude Code 旁边，你还可以把自己的网页放进窗口。Claude Code 标签页现在也能看到 Claude Code 自己在做的事：后台任务、工作流、它自己发起的回合，以及它问你的问题。编辑器仍然是你的 Neovim：一个真正的 `nvim --embed`，用你自己的 `init.lua`、插件、LSP 和按键映射。
 
 ### 0.3.0 的新内容
 
@@ -236,6 +292,21 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 - 回合审阅也统计 Codex 和 ACP 的编辑；撤销单个 hunk 时只检查这个 hunk 自己的行；在文件行上按 `y` 复制它的路径。
 - 信任提问把内容完整显示，并且也覆盖仓库上层目录里的 `CLAUDE.md`、`.mcp.json` 和规则。
 
+**Claude Code 自己做的事，在标签页里看得见**
+
+- Claude Code 不等你开口就开始的回合，现在和你发起的回合一样显示出来。后台命令结束、monitor 报告、子 agent 或工作流跑完、定时唤醒到点时，标签页先写出是什么引发了这个回合（`Background command "build" completed`、`Scheduled wake-up: <reason>`），然后是它的工具调用、卡片和回复。这个回合进行中你发的消息会进入这个回合；Claude Code 留到之后再读的消息，会以一行 `↪` 等着，直到被读到。
+- 后台的工作有了列表。状态栏用 Claude Code 的说法计数（`2 shells, 1 monitor`），`/tasks` 列出所有后台的 shell、monitor、子 agent 和工作流：`Enter` 查看一个任务的详情和它输出的末尾，`x` 只停掉这一个任务，`o` 在 Neovim 里以只读方式打开它的输出。
+- 动态工作流需要你批准时，卡片会显示它的名字、参数和脚本（`View raw script` 在 Neovim 里打开脚本）。运行期间，状态栏显示它有几个 agent 已经完成，`/workflows` 列出它的各个阶段和 agent。
+- 前台子 agent 的调用嵌套在它那一行下面；后台子 agent 只占一行状态，交回结果时会开始一个自己的回合。
+- Claude Code 的提示出现在它的终端里显示的位置：压缩时先是 `Compacting conversation...`，然后是一条分隔线；模型服务过载时显示重试；`UserPromptSubmit` hook 拦下一条提示时，显示 hook 的原话。
+- `/clear` 在同一个标签页里开始一段新对话。后台任务照常运行，之后恢复时接上的是新对话。
+- Claude 用选择题问你时（`AskUserQuestion`），提问框会取代输入框。可以用数字键或 `j`/`k` 选，也可以自己写答案（`Ctrl+g` 在 Neovim 里编辑），给带预览的选项加备注，最后用 `Ctrl+Enter` 一起发出。只有你能回答：bypass、`Ctrl+y`、卡片按键和保存的规则都不会替你回答提问。
+- 恢复的对话按 Claude Code 自己的回合来分：它自己发起的回合连同起因一起回来，你输入过的 `/` 和 `!` 命令作为你的提示回来，提问连同你的回答一起回来。
+- Eitri 把 Claude Code 允许的最长命令超时（`BASH_MAX_TIMEOUT_MS`）调到 2147483647 ms，所以 Claude 带着长超时启动的后台命令会一直跑到超时为止。没给超时的后台命令仍然在 30 分钟后被停掉，这是 Claude Code 自己的默认值，Eitri 有意保留；你自己设的值优先。
+- 这一版还没有：plan 模式、给消息附带文件或图片、终端里把正在运行的命令移到后台的 `Ctrl+B`（在 Eitri 里 `Ctrl+b` 是前缀键），以及定时唤醒和 cron 任务的列表。只要标签页开着，它们照样会触发，每次都是一个单独的回合；关掉标签页就会取消它们，只有被要求跨会话保留的 cron 任务例外：Claude Code 会把它存在项目里，之后在这个项目的另一个会话里可能还会运行。
+
+agent 指南的第一节讲了这些。
+
 **闲置时更省**
 
 - 闲置的窗口什么都不画，面板只在有东西要画时才醒来。底部终端回显按键不再等一帧，很长的回滚内容画起来也便宜得多。
@@ -248,6 +319,9 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 - **你信任过的每个项目都会再问一次**，因为这个问题现在显示的内容比以前多。
 - **在输入框里，`Ctrl+a` 和 `Ctrl+e` 移到行首和行尾**，和 shell 里一样；它们不再全选。
 - 面板的输入模式现在叫 INSERT（原来叫 INPUT）。
+- **在 Claude Code 标签页里，`Ctrl+c` 不再停掉后台工作。** 它只打断当前回合，后台命令、子 agent 和工作流会继续运行。要停掉其中一个，在 `/tasks` 里按 `x`。
+- **后台任务还在运行、或者有提问在等时，关闭 Claude Code 标签页、聊天视图或整个窗口会先问一句**，并说明会停掉什么。定时唤醒和 cron 任务不算在内：关闭会直接取消它们，不会先问；被要求跨会话保留的 cron 任务除外。
+- **在 Manual 标签页里，Claude Code 的定时和任务工具不再询问**（`ScheduleWakeup`、cron 相关工具、`ListAgents`、`TaskStop`）；`SendMessage` 仍然会问。
 - **同一个项目上的第二个 Eitri 窗口保存它自己的布局和标签页。** 它从第一个窗口的布局开始，之后只保存自己的，所以关掉它不再改变第一个窗口打开时的样子。
 
 ### 从 0.2.2 升级
@@ -260,7 +334,9 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 
 ### 哪些已经试过
 
-所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端中用真实 `claude`（2.1.302）运行的测试共 113 个用例，在本次发布前不久的一个开发构建上分两次运行，因为第一次在测试账号触到模型服务的速率限制时中断；第二次之后，113 个用例全部通过。中途有两个用例失败，原因都不在本次发布的改动：一个是在要求执行破坏性命令的探测上触发了模型服务的使用政策检查（重跑后通过），另一个是遇到这个 CLI 版本新增的对话记录行类型，历史读取器现在会跳过它们。某个测试套件里有八个 Glob 和 Grep 探测被跳过，因为这个 CLI 版本没有列出这两个工具。Claude Code 标签页现在发出的请求，在构建好的后端上对着一个本地替身录了下来：它带着 `claude -p` 的系统提示词，身份那一行换成 Claude Code 在 Agent SDK 里的说法，末尾带一次 Eitri 的说明。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
+所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端中用真实 `claude`（2.1.302）连真实模型服务运行的测试共 113 个用例，最近一次是在一个开发构建上跑的，那时用的 Verdandi 比这一版固定的要早。它们分两次运行，因为第一次在测试账号触到模型服务的速率限制时中断；第二次之后，113 个用例全部通过。中途有两个用例失败，原因都不在本次发布的改动：一个是在要求执行破坏性命令的探测上触发了模型服务的使用政策检查（重跑后通过），另一个是遇到这个 CLI 版本新增的对话记录行类型，历史读取器现在会跳过它们。某个测试套件里有八个 Glob 和 Grep 探测被跳过，因为这个 CLI 版本没有列出这两个工具。Claude Code 标签页发出的请求，也是在那个较早的后端上对着一个本地替身录下来的：它带着 `claude -p` 的系统提示词，身份那一行换成 Claude Code 在 Agent SDK 里的说法，末尾带一次 Eitri 的说明。这一版的后端还没有跟真实模型服务跑过一个回合；它新增的部分是对着脚本替身检查的，见下一段。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，还没有在屏幕上见过。
+
+Claude Code 标签页对 Claude Code 自己工作的处理，是在这一版的后端上，用真实的 Claude Code 2.1.311 对着一个模拟模型服务的脚本替身测的。上面这些流程都经 Eitri 的 agent 宿主端到端跑过，其中十五项画面检查在隔离的无界面会话里、在新的聊天页面上通过，深色、浅色和窄面板宽度都试过：Claude Code 发起的回合、`/tasks` 和 `/workflows`、工作流卡片、子 agent、压缩、插进运行中回合的消息、`/clear`、定时唤醒、重试和提问框（在提问框里用输入法打出的回答也发出去了）。恢复出来的对话还和真实的 Claude Code 会话文件做过比对。插话引导只在 Claude Code 标签页里在屏幕上看过；用输入法在 companion 面板里打字（无论是输入框还是提问框）还没有验证过。
 
 0.3.0 的所有内容都还没有经过真实硬件和真人的手，所以它还没有稳定到可以日常使用。这要等真实硬件和一周的日常使用，而不是等某个版本号；特别欢迎来自真实桌面的反馈。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
 

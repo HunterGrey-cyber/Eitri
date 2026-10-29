@@ -144,6 +144,7 @@ export function phaseOf(state: AgentUiState): TurnPhase {
     }
   }
   for (const call of state.toolCalls) {
+    if (call.background) continue;
     if (call.seq > lastItemSeq) {
       lastItemSeq = call.seq;
       lastIsMessage = false;
@@ -154,6 +155,7 @@ export function phaseOf(state: AgentUiState): TurnPhase {
   // started last, and a sibling completing changes nothing about it.
   let openTool: { seq: number; name: string; turnId: string | undefined } | null = null;
   for (const call of state.toolCalls) {
+    if (call.background) continue;
     if (call.result === null && (openTool === null || call.seq > openTool.seq)) {
       openTool = { seq: call.seq, name: call.name, turnId: call.turnId };
     }
@@ -203,4 +205,21 @@ export function phaseWord(phase: TurnPhase): string {
     case "blocked":
       return "waiting for you";
   }
+}
+
+/** Transient CLI phases take the same activity slot as the ordinary turn phase. */
+export function cliPhaseText(state: AgentUiState): string | null {
+  if (state.apiRetry) {
+    const s = state.apiRetry.scalars;
+    const error = s.error_kind ?? s.error_status ?? state.apiRetry.content ?? "API error";
+    const delay = typeof s.retry_delay_ms === "number" ? ` · Retrying in ${Math.ceil(s.retry_delay_ms / 1000)}s` : "";
+    const attempt = typeof s.attempt === "number" ? ` · attempt ${s.attempt}${typeof s.max_retries === "number" ? `/${s.max_retries}` : ""}` : "";
+    return `${error}${delay}${attempt}`;
+  }
+  if (state.compacting) return "Compacting conversation…";
+  if (state.accountLimits && state.accountLimits.usedPercent >= 100 && state.accountLimits.resetsAt !== null) {
+    const time = new Date(state.accountLimits.resetsAt * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
+    return `Usage limit reached · limit resets ${time} · continuing automatically at ${time}`;
+  }
+  return null;
 }

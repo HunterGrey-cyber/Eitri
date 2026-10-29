@@ -91,6 +91,7 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
         .send_turn(
             "Read main.rs and tell me the name of the function in it.",
             "read main.rs",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -98,7 +99,11 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("Count from 1 to 30, one number per line.", "count")
+        .send_turn(
+            "Count from 1 to 30, one number per line.",
+            "count",
+            agent::PromptOrigin::Composed,
+        )
         .map_err(|e| e.message)
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -131,6 +136,7 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
         .send_turn(
             "Create a file named tabs-proof.txt containing the word ok.",
             "write a file",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();

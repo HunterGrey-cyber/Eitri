@@ -1,0 +1,5 @@
+{"type": "user", "uuid": "prompt", "promptSource": "sdk", "message": {"content": "Choose a layout"}}
+{"type": "assistant", "uuid": "ask", "message": {"id": "msg", "content": [{"type": "tool_use", "id": "ask-layout", "name": "AskUserQuestion", "input": {"questions": [{"question": "Which layout?", "header": "Layout", "multiSelect": false, "options": [{"label": "Grid", "description": "Tiles"}, {"label": "List", "description": "Rows"}]}, {"question": "Which colour?", "header": "Colour", "multiSelect": false, "options": [{"label": "Dark", "description": "Night"}, {"label": "Light", "description": "Day"}]}]}}]}}
+{"type": "attachment", "uuid": "hook", "attachment": {"type": "hook_success", "hookName": "PermissionRequest", "content": ""}}
+{"type": "user", "uuid": "result", "toolUseResult": "Error: A permission hook refused this call.", "message": {"content": [{"type": "tool_result", "tool_use_id": "ask-layout", "content": "A permission hook refused this call.", "is_error": true}]}}
+{"type": "assistant", "uuid": "after", "message": {"id": "msg2", "content": [{"type": "text", "text": "I will ask in plain text."}]}}

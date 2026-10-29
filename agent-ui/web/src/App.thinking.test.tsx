@@ -356,3 +356,51 @@ describe("thinking in the conversation", () => {
     warn.mockRestore();
   });
 });
+
+describe("subagent navigation and folds", () => {
+  const delegation = (background = false): AgentUiState => ({
+    ...initialState(), status: { kind: "running" }, activeTurnId: "t1",
+    transcript: [{ seq: 3, text: "Main reply" }],
+    toolCalls: [{ seq: 1, toolUseId: "agent", turnId: "t1", name: "Agent",
+      input: { subagent_type: "Explore", description: "inspect code", run_in_background: background }, result: null,
+      children: { toolCalls: [{ seq: 2, toolUseId: "read", turnId: "t1", name: "Read", input: { file_path: "file.rs" }, result: null }],
+        transcript: [], thinking: [], assistantMessageOpen: false, thinkingOpen: false } }],
+  });
+
+  it("Enter toggles children, zo opens, zc closes and j/k visit the indented row", () => {
+    const { container, key } = started(delegation(), null);
+    key("g"); key("g");
+    const child = () => container.querySelector(".subagent-child");
+    expect(child()).toBeNull();
+    key("Enter");
+    expect(child()).not.toBeNull();
+    key("Enter");
+    expect(child()).toBeNull();
+    key("z"); key("o");
+    expect(child()).not.toBeNull();
+    key("z"); key("o");
+    expect(container.querySelectorAll(".subagent-child")).toHaveLength(1);
+    key("j");
+    expect(current(container)?.classList.contains("row-tool")).toBe(true);
+    key("k");
+    expect(current(container)?.classList.contains("row-subagent")).toBe(true);
+    key("j");
+    key("z"); key("c");
+    expect(child()).toBeNull();
+    expect(current(container)?.classList.contains("row-subagent")).toBe(true);
+    key("z"); key("o");
+    expect(child()).not.toBeNull();
+    key("z"); key("c");
+    expect(child()).toBeNull();
+  });
+
+  it("Enter, zo and the detailed view never open a background agent in the transcript", () => {
+    const { container, key } = started(delegation(true), null);
+    key("g"); key("g");
+    key("Enter");
+    key("z"); key("o");
+    key("o", { ctrlKey: true });
+    expect(container.querySelector(".subagent-child")).toBeNull();
+    expect(container.querySelector(".row-subagent .fold-marker")).toBeNull();
+  });
+});

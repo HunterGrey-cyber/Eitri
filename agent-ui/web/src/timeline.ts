@@ -1,11 +1,15 @@
 import type {
   AgentUiState,
+  QuestionRecord,
+  NoticeRecord,
   PermissionRequestRecord,
   Seq,
   ThinkingBlock,
   ToolCallRecord,
   TranscriptMessage,
   TurnEnding,
+  TurnStartRecord,
+  TurnCause,
   UserPromptRecord,
 } from "./types";
 
@@ -34,15 +38,22 @@ import type {
  * What keying on `seq` does NOT fix, and is not claimed to: `reducer.ts`'s `permission_resolved`
  * still filters by `permissionId`, so resolving one of two `""` cards removes both. That is a
  * reducer-level consequence of the same hazard and wants its own change. */
-export type TimelineItem =
+export type TimelineItem = (
   /** `delivered`: a message the agent read inside its running turn (`UserPromptRecord.delivered`). */
   | { kind: "prompt"; seq: Seq; key: string; text: string; delivered?: true }
-  | { kind: "message"; seq: Seq; key: string; text: string }
+  | { kind: "message"; seq: Seq; key: string; text: string; question?: QuestionRecord; plain?: true }
   | { kind: "tool"; seq: Seq; key: string; call: ToolCallRecord }
   | { kind: "permission"; seq: Seq; key: string; request: PermissionRequestRecord }
   /** Where a turn that did not complete stopped: failed, hit a limit, interrupted, or cut off by the
    *  session ending. Keyed `e-<seq>` like the others, by the `seq` of the event that ended the turn. */
   | { kind: "ending"; seq: Seq; key: string; ending: TurnEnding }
+  /** A CLI turn cause or task notification, with optional plain text detail. */
+  | {
+      kind: "wake"; seq: Seq; key: string; text: string; body: string | null;
+      scheduled: boolean; count: number; inlineBody?: boolean;
+    }
+  /** A durable CLI notice; transient activity stays out of the transcript. */
+  | { kind: "notice"; seq: Seq; key: string; notice: NoticeRecord }
   /** One block of the agent's thinking, keyed `k-<seq>`. `open` while the agent is still writing it
    *  (the state's `thinkingOpen`, for its last block only). Whether and how it is drawn is
    *  `display.ts`'s and `MessageList`'s to decide, by the panel's `agent.thinking` level. */
@@ -59,7 +70,162 @@ export type TimelineItem =
       /** Finished thinking blocks that sat between two of `calls`, folded away with them; absent when
        *  none did. Expanding the run puts them back as rows of their own. */
       thoughts?: ThinkingBlock[];
-    };
+    }) & { depth?: number };
+
+/** Durable notices drawn in sequence with the conversation. */
+const ROW_NOTICE_KINDS: ReadonlySet<NoticeRecord["kind"]> = new Set([
+  "hook_block", "unseen_turn", "model_fallback", "model_refusal", "compaction", "informational", "peer_hold", "rate_limit",
+]);
+
+function drawsNotice(notice: NoticeRecord): boolean {
+  if (!ROW_NOTICE_KINDS.has(notice.kind)) return false;
+  if (notice.kind === "informational") return notice.level !== "info";
+  if (notice.kind === "peer_hold") return ["held", "dropped"].includes(String(notice.scalars.hold_state));
+  if (notice.kind === "rate_limit") return !["allowed", "allowed_warning", "rejected"].includes(String(notice.scalars.rate_status));
+  return true;
+}
+
+const scalarText = (notice: NoticeRecord, key: string): string =>
+  typeof notice.scalars[key] === "string" ? notice.scalars[key] as string : "";
+const firstLine = (text: string): string => Array.from(text.split(/\r?\n/, 1)[0]).slice(0, 200).join("");
+
+/** Task notifications and task-caused turns share the same headline. */
+export function taskWakeText(cause: TurnCause): string {
+  const desc = cause.description ?? cause.taskId ?? "";
+  const summary = cause.summary ?? "";
+  const status = cause.taskStatus ?? "completed";
+  if (cause.taskKind === "workflow") return summary || `Dynamic workflow "${desc}" ${status}`;
+  if (cause.taskKind === "monitor" && status === "running") return `Monitor event: "${desc}"`;
+  if (["local_agent", "agent"].includes(cause.taskKind ?? "") && status === "completed") return `Agent "${desc}" finished`;
+  if (["shell", "local_bash"].includes(cause.taskKind ?? "")) {
+    if (summary.includes("was stopped after reaching its background time limit")) return summary;
+    const code = summary.match(/exit code[ :]+(-?\d+)/i)?.[1];
+    return `Background command "${desc}" ${status === "failed" ? "failed" : status === "stopped" ? "stopped" : "completed"}${code && Number(code) !== 0 ? ` (exit code ${code})` : ""}`;
+  }
+  return `Task "${desc}" ${status === "completed" ? "completed in background" : status}`;
+}
+
+type WakeItem = Extract<TimelineItem, { kind: "wake" }>;
+
+/** The second line of a row only when it says more than the headline already does. */
+const extraBody = (text: string, body: string | null): string | null =>
+  body === null || body === "" || text === body || text.endsWith(body) ? null : body;
+
+/** Wake rows are memoized on their item like every other row: the same object while what they say is
+ *  the same. `held` is the one the record produced last time. */
+function sameWake(held: WakeItem | undefined, item: WakeItem): WakeItem {
+  if (held && held.seq === item.seq && held.text === item.text && held.body === item.body &&
+      held.scheduled === item.scheduled && held.inlineBody === item.inlineBody) return held;
+  return item;
+}
+
+const wakeItems = new WeakMap<TurnStartRecord, WakeItem>();
+
+function wakeItem(start: TurnStartRecord): WakeItem {
+  const cause = start.cause;
+  let text = "Claude Code started this turn";
+  let body: string | null = null;
+  if (cause?.kind === "scheduled") {
+    text = cause.wakeupSource === "loop_wakeup" && cause.scheduleReason
+      ? `Scheduled wake-up: ${cause.scheduleReason}`
+      : cause.wakeupSource === "schedule_wakeup" && cause.prompt
+        ? `Scheduled task fired: ${firstLine(cause.prompt)}` : "Scheduled wake-up";
+  } else if (cause?.kind === "peer") {
+    text = `› Message from @${cause.peerName ?? "unknown"}: ${firstLine(cause.text ?? "")}`;
+    body = extraBody(text, cause.text);
+  } else if (cause?.kind === "task") {
+    text = taskWakeText(cause);
+    body = extraBody(text, cause.summary ?? cause.text);
+  }
+  const item = sameWake(wakeItems.get(start), {
+    kind: "wake", seq: start.seq, key: `w-${start.seq}`, text, body,
+    scheduled: cause?.kind === "scheduled", count: 1,
+    inlineBody: cause?.taskKind === "monitor" && cause.taskStatus === "running",
+  });
+  wakeItems.set(start, item);
+  return item;
+}
+
+/** What the turn that a task started says about the task: the notice record carries only the id, the
+ *  status and the CLI's words, so the kind and description come from that turn's cause. */
+function taskCauses(starts: readonly TurnStartRecord[]): Map<string, TurnCause> {
+  const byTask = new Map<string, TurnCause>();
+  for (const start of starts) {
+    const cause = start.cause;
+    if (cause?.kind === "task" && cause.taskId && !byTask.has(cause.taskId)) byTask.set(cause.taskId, cause);
+  }
+  return byTask;
+}
+
+const taskNotices = new WeakMap<NoticeRecord, WakeItem>();
+
+function taskNoticeItem(notice: NoticeRecord, known: TurnCause | undefined): WakeItem {
+  const cause: TurnCause = {
+    kind: "task", taskId: notice.taskId, taskKind: known?.taskKind ?? null,
+    taskStatus: notice.taskStatus ?? known?.taskStatus ?? null, description: known?.description ?? null,
+    summary: notice.content, peerName: null, text: null, wakeupSource: null, scheduledForMs: null,
+    scheduleReason: null, cronId: null, prompt: null,
+  };
+  // Without the kind the row cannot be worded by it; the CLI's own words stand instead.
+  const text = cause.taskKind ? taskWakeText(cause) : notice.content || taskWakeText(cause);
+  const item = sameWake(taskNotices.get(notice), {
+    kind: "wake", seq: notice.seq, key: `w-${notice.seq}`, text, body: extraBody(text, notice.content),
+    scheduled: false, count: 1, inlineBody: cause.taskKind === "monitor" && cause.taskStatus === "running",
+  });
+  taskNotices.set(notice, item);
+  return item;
+}
+
+/** A run of empty scheduled ticks folds into its first row, which keeps its identity while the run is
+ *  as long as it was: one folded item per first row and count. */
+const foldedWakes = new WeakMap<WakeItem, Map<number, WakeItem>>();
+
+function foldedWake(first: WakeItem, count: number): WakeItem {
+  let byCount = foldedWakes.get(first);
+  if (!byCount) foldedWakes.set(first, (byCount = new Map()));
+  let item = byCount.get(count);
+  if (!item) byCount.set(count, (item = { ...first, count }));
+  return item;
+}
+
+export function wakeText(item: Extract<TimelineItem, { kind: "wake" }>): string {
+  return `${item.text}${item.count > 1 ? ` ×${item.count}` : ""}`;
+}
+
+export function noticeBody(notice: NoticeRecord): string | null {
+  return notice.kind === "compaction" ? notice.content : null;
+}
+
+/** The sentence a turn this panel never saw is introduced by: its answer follows as a reply of its own. */
+export const UNSEEN_TURN_TEXT = "Claude Code ran a turn this panel could not show; reopen the tab to see its steps";
+
+/** What a notice row says, whole: what `y` copies and `/` searches. The hook's words are the CLI's,
+ *  drawn as plain text; the row itself shows only their first lines. A warning's `⚠` is the row's sign
+ *  (`MessageList`), not part of the text, so the row shows it once. */
+export function noticeText(notice: NoticeRecord): string {
+  switch (notice.kind) {
+    case "hook_block":
+      return notice.content?.startsWith("UserPromptSubmit operation blocked by hook:")
+        ? notice.content : `UserPromptSubmit operation blocked by hook: ${notice.content ?? ""}`;
+    case "unseen_turn":
+      return UNSEEN_TURN_TEXT;
+    case "peer_hold":
+      return `Message from @${scalarText(notice, "peer_name")} ${notice.scalars.hold_state === "dropped"
+        ? "dropped after 5 minutes unanswered" : "held: its sender runs in a different permission mode"}`;
+    case "rate_limit":
+      return "Usage limit reset · continuing automatically";
+    case "compaction": {
+      const { pre_tokens: before, post_tokens: after } = notice.scalars;
+      const tokens = (n: number) => n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
+      const figures = typeof before === "number" && typeof after === "number"
+        ? ` · ${tokens(before)} → ${tokens(after)} tokens` : "";
+      const trigger = scalarText(notice, "trigger");
+      return `──── Conversation compacted${figures}${trigger ? ` (${trigger})` : ""} ────`;
+    }
+    default:
+      return notice.content ?? notice.kind;
+  }
+}
 
 /** Whether a `toolUseId` can identify a tool call at all.
  *
@@ -112,6 +278,7 @@ const messageItems = new WeakMap<TranscriptMessage, TimelineItem>();
 const toolItems = new WeakMap<ToolCallRecord, TimelineItem>();
 const permissionItems = new WeakMap<PermissionRequestRecord, TimelineItem>();
 const endingItems = new WeakMap<TurnEnding, TimelineItem>();
+const noticeItems = new WeakMap<NoticeRecord, TimelineItem>();
 /** By block, one item for each value of `open`: a block's item changes when it closes. */
 const thinkingItems = new WeakMap<ThinkingBlock, { open?: TimelineItem; closed?: TimelineItem }>();
 
@@ -162,6 +329,14 @@ function endingItem(ending: TurnEnding): TimelineItem {
   return item;
 }
 
+function noticeItem(notice: NoticeRecord): TimelineItem {
+  const held = noticeItems.get(notice);
+  if (held !== undefined && held.seq === notice.seq) return held;
+  const item: TimelineItem = { kind: "notice", seq: notice.seq, key: `n-${notice.seq}`, notice };
+  noticeItems.set(notice, item);
+  return item;
+}
+
 function thinkingItem(block: ThinkingBlock, open: boolean): TimelineItem {
   let slots = thinkingItems.get(block);
   if (slots === undefined) {
@@ -176,8 +351,56 @@ function thinkingItem(block: ThinkingBlock, open: boolean): TimelineItem {
   return item;
 }
 
+/** The transcript keeps exactly the answers sent to the CLI, including partial answers. */
+export function questionLines(record: QuestionRecord): { text: string; muted: boolean }[] {
+  const lines: { text: string; muted: boolean }[] = [];
+  const settled = record.state.kind === "settled" ? record.state : null;
+  record.questions.forEach((question, index) => {
+    lines.push({ text: `? ${question.header ? `${question.header}: ` : ""}${question.question}`, muted: false });
+    for (const answer of settled?.answers.filter((answer) => answer.questionIndex === index) ?? []) {
+      lines.push({ text: `→ ${answer.answer}`, muted: true });
+      if (answer.notes) lines.push({ text: `→ notes: ${answer.notes}`, muted: true });
+    }
+  });
+  const outcome = settled?.outcome;
+  const status = !settled ? "waiting for your answer"
+    : outcome === "chat_requested" ? "→ chat about this"
+    : outcome === "declined" ? "User declined to answer questions"
+    : outcome === "interrupted" ? "(not answered: interrupted)"
+    : outcome === "expired" ? "(not answered: Claude Code withdrew the question)"
+    : outcome === "session_closed" ? "(not answered: session closed)"
+    : outcome === "provider_failed" ? "(not answered: provider failed)"
+    : outcome === "host_refused" ? "(not answered: host refused)" : "";
+  if (status) lines.push({ text: status, muted: true });
+  if (settled?.reason) lines.push({ text: settled.reason, muted: true });
+  if (record.unsupportedReason) lines.push({ text: record.unsupportedReason, muted: true });
+  return lines;
+}
+
+const questionItems = new WeakMap<QuestionRecord, TimelineItem>();
+
+function questionItem(record: QuestionRecord, call?: ToolCallRecord): TimelineItem {
+  const key = call ? `t-${call.seq}` : `q-${record.seq}`;
+  const held = questionItems.get(record);
+  if (held?.key === key) return held;
+  const item: TimelineItem = { kind: "message", seq: call?.seq ?? record.seq, key: call ? `t-${call.seq}` : `q-${record.seq}`,
+    text: questionLines(record).map((line) => line.text).join("\n"), question: record };
+  questionItems.set(record, item);
+  return item;
+}
+
+function questionFallback(call: ToolCallRecord): TimelineItem {
+  const content = call.result?.content;
+  const text = typeof content === "string" ? content : Array.isArray(content)
+    ? content.map((block) => typeof block?.text === "string" ? block.text : "").filter(Boolean).join("\n")
+    : content == null ? "" : JSON.stringify(content);
+  return { kind: "message", seq: call.seq, key: `t-${call.seq}`, plain: true,
+    text: `Claude asked a question${text ? `\n${text}` : ""}` };
+}
+
 export function buildTimeline(state: AgentUiState): TimelineItem[] {
   timelineBuilds += 1;
+  const causes = taskCauses(state.turnStarts ?? []);
   // Which linked cards hang off which call. A call may gate more than one.
   const anchored = new Map<string, PermissionRequestRecord[]>();
   const unanchored: PermissionRequestRecord[] = [];
@@ -196,12 +419,29 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
   // Several cards on one call keep the order they were requested in.
   for (const siblings of anchored.values()) siblings.sort((a, b) => a.seq - b.seq);
 
+  const questionByCall = new Map<string, QuestionRecord>();
+  for (const record of state.questions ?? []) if (record.toolUseId && !questionByCall.has(record.toolUseId)) questionByCall.set(record.toolUseId, record);
+
   const base: TimelineItem[] = [
     ...state.userPrompts.map(promptItem),
     ...state.transcript.map(messageItem),
-    ...state.toolCalls.map(toolItem),
+    ...state.toolCalls.map((call) => {
+      const record = questionByCall.get(call.toolUseId);
+      if (record) return questionItem(record, call);
+      if (call.name === "AskUserQuestion") return questionFallback(call);
+      const background = state.backgroundTasks?.rows.some((task) => task.tool_use_id === call.toolUseId && task.is_backgrounded === true);
+      return toolItem(background && !call.background ? { ...call, background: true } : call);
+    }),
+    ...(state.questions ?? []).filter((record) => !record.toolUseId || !knownToolUseIds.has(record.toolUseId)).map((record) => questionItem(record)),
     ...unanchored.map(permissionItem),
     ...state.turnEndings.map(endingItem),
+    // `?? []` for a hand-built state in a test, as for thinking below.
+    ...(state.notices ?? []).filter(drawsNotice).map(noticeItem),
+    ...(state.notices ?? []).filter((notice) => notice.kind === "task").map((notice) => taskNoticeItem(notice, causes.get(notice.taskId ?? ""))),
+    // A turn a task started whose notification is already a row draws nothing more.
+    ...(state.turnStarts ?? []).filter((start) => !start.cause?.taskId || !(state.notices ?? []).some(
+      (notice) => notice.kind === "task" && notice.taskId === start.cause?.taskId && notice.seq <= start.seq,
+    )).map(wakeItem),
     // A snapshot from a build before thinking was kept has none (`applySnapshot` fills `[]`); the
     // `?? []` covers a hand-built state in a test.
     ...(state.thinking ?? []).map((block, i, all) => thinkingItem(block, state.thinkingOpen === true && i === all.length - 1)),
@@ -219,7 +459,35 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
     anchored.delete(item.call.toolUseId);
     for (const request of siblings) out.push(permissionItem(request));
   }
-  return out;
+  const turnIds = new Map((state.turnStarts ?? []).map((start) => [start.seq, start.turnId]));
+  const emptyScheduled = new Set<Seq>();
+  let hasReply = false;
+  for (let i = out.length - 1; i >= 0; i--) {
+    const item = out[i];
+    if (item.kind === "message" && item.text !== "" && !item.question) hasReply = true;
+    if (item.kind === "wake") {
+      if (item.scheduled && !hasReply && turnIds.get(item.seq) !== state.activeTurnId) emptyScheduled.add(item.seq);
+      hasReply = false;
+    }
+  }
+  const folded: TimelineItem[] = [];
+  let previous: WakeItem | null = null;
+  let first: WakeItem | null = null;
+  for (const item of out) {
+    if (item.kind === "wake" && item.scheduled) {
+      const finished = emptyScheduled.has(item.seq);
+      if (previous && first && finished) {
+        const combined = foldedWake(first, previous.count + 1);
+        folded[folded.length - 1] = combined;
+        previous = combined;
+        continue;
+      }
+      previous = finished ? item : null;
+      first = previous;
+    } else previous = null;
+    folded.push(item);
+  }
+  return folded;
 }
 
 /**

@@ -436,6 +436,8 @@ fn a_resumed_ending_is_not_filled_by_a_live_limits_report() {
                 stop_reason: None,
                 usage: None,
                 detail: agent::TurnEndDetail {
+                    origin_kind: None,
+                    num_turns: None,
                     reason: Some("usage_limit".to_string()),
                     api_error_status: None,
                     message: None,

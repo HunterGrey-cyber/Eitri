@@ -11,12 +11,17 @@
 //! - Adjacent assistant text in one turn is one entry, and so is adjacent thinking: Eitri coalesces deltas,
 //!   the CLI writes one line per block. A record may also keep two messages of one turn as two rows; the
 //!   alignment joins those where the CLI holds the joined text.
+//! - A question set compares by its key alone ([`super::QuestionKey`]): how many questions, which carry an
+//!   answer, and how it ended. Eitri's own ends map onto the oracle's words in [`question_end`]: an interrupt,
+//!   an expiry and a closed session are all `cancelled`, a host that could not show the form and a failed
+//!   provider are `other`. A set still waiting has no key: the CLI writes no result for it either.
 //! - The CLI form is projected onto what each record holds before it is compared: A and B store no
 //!   thinking and no turn endings, and B does not open subagent transcripts. These are differences of
 //!   kind, counted by [`project`], never compared entry by entry.
 
-use super::{Entry, Source, Turn};
+use super::{Entry, QuestionEnd, QuestionKey, Source, Turn};
 use crate::history::strip_composed_block;
+use crate::projection::{QuestionOutcome, QuestionRecord, QuestionState};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -87,6 +92,37 @@ pub fn result_text(content: &Value) -> String {
             .join("\n"),
         other => canonical_json(other),
     }
+}
+
+/// An end Eitri records, in the oracle's words.
+pub fn question_end(outcome: QuestionOutcome) -> QuestionEnd {
+    match outcome {
+        QuestionOutcome::Answered => QuestionEnd::Answered,
+        QuestionOutcome::Declined => QuestionEnd::Declined,
+        QuestionOutcome::ChatRequested => QuestionEnd::Chat,
+        QuestionOutcome::Interrupted | QuestionOutcome::Expired | QuestionOutcome::SessionClosed => {
+            QuestionEnd::Cancelled
+        }
+        QuestionOutcome::ProviderFailed | QuestionOutcome::HostRefused => QuestionEnd::Other,
+    }
+}
+
+/// A question record of Eitri's as an entry, once it has settled; `None` while it waits.
+pub fn question_entry(record: &QuestionRecord) -> Option<Entry> {
+    let QuestionState::Settled { outcome, answers, .. } = &record.state else {
+        return None;
+    };
+    let answered = answers
+        .iter()
+        .filter_map(|answer| usize::try_from(answer.question_index).ok())
+        .collect();
+    Some(Entry::Question {
+        id: record
+            .tool_use_id
+            .clone()
+            .unwrap_or_else(|| record.interaction_id.clone()),
+        key: QuestionKey::new(record.questions.len(), answered, question_end(*outcome)),
+    })
 }
 
 /// Joins adjacent assistant text, and adjacent thinking, within each turn (and in nested subagent turns).
@@ -196,6 +232,94 @@ fn project_into(turns: &[Turn], source: Source, removed: &mut BTreeMap<&'static 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn record(state: QuestionState, tool_use_id: Option<&str>) -> QuestionRecord {
+        QuestionRecord {
+            seq: 1,
+            interaction_id: "interaction".into(),
+            tool_use_id: tool_use_id.map(str::to_owned),
+            turn_id: None,
+            questions: vec![
+                crate::projection::QuestionSpec {
+                    question: "First?".into(),
+                    header: String::new(),
+                    multi_select: false,
+                    options: Vec::new(),
+                };
+                2
+            ],
+            state,
+            unsupported_reason: None,
+        }
+    }
+
+    fn settled(outcome: QuestionOutcome, indexes: &[u32]) -> QuestionState {
+        QuestionState::Settled {
+            outcome,
+            answers: indexes
+                .iter()
+                .map(|&question_index| crate::projection::ShownAnswer {
+                    question_index,
+                    answer: "words".into(),
+                    notes: None,
+                })
+                .collect(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn every_end_eitri_records_maps_to_one_word_of_the_oracle_s_list() {
+        use QuestionOutcome::*;
+        let words: Vec<(QuestionOutcome, &str)> = [
+            Answered,
+            Declined,
+            ChatRequested,
+            Interrupted,
+            Expired,
+            SessionClosed,
+            ProviderFailed,
+            HostRefused,
+        ]
+        .into_iter()
+        .map(|outcome| (outcome, question_end(outcome).word()))
+        .collect();
+        assert_eq!(
+            words,
+            vec![
+                (Answered, "answered"),
+                (Declined, "declined"),
+                (ChatRequested, "chat"),
+                (Interrupted, "cancelled"),
+                (Expired, "cancelled"),
+                (SessionClosed, "cancelled"),
+                (ProviderFailed, "other"),
+                (HostRefused, "other"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_settled_record_is_its_key_and_a_waiting_one_is_nothing_yet() {
+        assert_eq!(
+            question_entry(&record(settled(QuestionOutcome::Answered, &[1, 0, 1]), Some("toolu"))),
+            Some(Entry::Question {
+                id: "toolu".into(),
+                key: QuestionKey::new(2, vec![0, 1], QuestionEnd::Answered),
+            }),
+            "answered indexes are sorted and counted once"
+        );
+        assert_eq!(
+            question_entry(&record(settled(QuestionOutcome::SessionClosed, &[]), None)),
+            Some(Entry::Question {
+                id: "interaction".into(),
+                key: QuestionKey::new(2, Vec::new(), QuestionEnd::Cancelled),
+            }),
+            "a record without a tool-use id pairs by its interaction id"
+        );
+        assert_eq!(question_entry(&record(QuestionState::Waiting, Some("toolu"))), None);
+        assert_eq!(question_entry(&record(QuestionState::Answering, Some("toolu"))), None);
+    }
 
     #[test]
     fn text_unifies_line_endings_and_trims_trailing_spaces() {

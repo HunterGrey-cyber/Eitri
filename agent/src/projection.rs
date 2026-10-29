@@ -13,6 +13,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
+#[cfg(test)]
+thread_local! {
+    static HOOK_CALLS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+fn count_hook(name: &'static str) {
+    HOOK_CALLS.with(|calls| calls.borrow_mut().push(name));
+}
+
+mod notices;
+mod questions;
+mod reset;
+mod roster;
+pub use roster::{BackgroundTaskRecord, TaskRoster};
+mod subagents;
+pub(crate) use subagents::restore_children;
+pub use subagents::SubagentStream;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
@@ -39,6 +57,10 @@ pub enum TurnOutcome {
 /// synthesized after its CLI died, and most legacy results.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEndDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u32>,
     /// The provider's terminal reason as it gave it (`max_turns`, `blocking_limit`, `api_error`,
     /// ...). An open set: the panel words the ones it knows and shows the rest verbatim.
     pub reason: Option<String>,
@@ -55,6 +77,19 @@ pub struct TurnEndDetail {
 /// what the provider said; the SDK's own error list allows 8 entries of 2000 characters each,
 /// which would bury the conversation under it.
 pub const MAX_TURN_END_MESSAGE_CHARS: usize = 400;
+
+/// [`TurnEndDetail::reason`] of a turn Claude Code went idle in without a result: the provider closed
+/// it, since no result will come.
+pub const NO_RESULT_REASON: &str = "no_result";
+
+/// The most characters of a hook's words a `HookBlock` notice keeps (cut with `…`): enough for any
+/// reason a hook gives, and a hook that prints a whole log cannot bury the conversation under it.
+pub const MAX_HOOK_BLOCK_CHARS: usize = 2000;
+
+/// The turn id a `TurnCompleted` carries when the backend had no turn of its own open: the legacy
+/// session names it so (`session.rs`), and so does a sidecar that does not report the turns Claude Code
+/// starts by itself. No turn the panel started has it, so such a completion ends none of its turns.
+pub const NO_OPEN_TURN_ID: &str = "unknown-turn";
 
 impl TurnEndDetail {
     /// Builds the detail from what a result carried. The message is the provider's error list
@@ -91,8 +126,15 @@ impl TurnEndDetail {
             reason: reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
             api_error_status,
             message,
+            ..Self::default()
         }
     }
+}
+
+/// Whether a prompt as the user typed it is a slash command, which the CLI runs itself rather than
+/// sending to the model.
+fn is_slash_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
 }
 
 fn cap_chars(text: &str, max: usize) -> String {
@@ -429,12 +471,180 @@ pub enum AgentDomainEvent {
         tool_use_id: String,
         change: InputChange,
     },
+    TurnCauseUpdated {
+        turn_id: String,
+        cause: Option<TurnCause>,
+    },
+    CliCycleStarted {
+        turn_id: String,
+        cause: Option<TurnCause>,
+    },
+    BackgroundTasksChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        occurred_at: Option<i64>,
+        tasks: Vec<BackgroundTask>,
+    },
+    TaskEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        occurred_at: Option<i64>,
+        edge: TaskEdge,
+        task_id: String,
+        run_id: Option<String>,
+        task: Option<BackgroundTask>,
+        status: Option<TaskStatus>,
+        summary: Option<String>,
+        last_tool_name: Option<String>,
+        usage: Option<TaskUsage>,
+        end_time_ms: Option<i64>,
+        error: Option<String>,
+        is_backgrounded: Option<bool>,
+        reason: Option<String>,
+        output_file: Option<String>,
+        workflow_progress: Option<WorkflowProgress>,
+    },
+    ConversationReset {
+        new_conversation_id: String,
+        trigger: Option<String>,
+    },
+    SubagentFrame {
+        parent_tool_use_id: String,
+        frame: Box<AgentDomainEvent>,
+    },
+    /// Who started the turn the `TurnStarted` just before it names, and why: folded right after that
+    /// `TurnStarted`. A turn with none is a [`TurnOrigin::Client`] turn, which is every turn of a
+    /// provider that does not say, so `TurnStarted` itself stays as it always was. Only a turn whose
+    /// origin is not `Client` leaves an item ([`TurnStartRecord`]).
+    TurnAttributed {
+        turn_id: String,
+        #[serde(default)]
+        origin: TurnOrigin,
+        cause: Option<TurnCause>,
+    },
+    /// A CLI notice, routed to a conversation row or live activity by kind and level. Its
+    /// text is the CLI's own, bounded on receipt; a notice without words is worded from `scalars`.
+    SessionNotice {
+        kind: SessionNoticeKind,
+        level: NoticeLevel,
+        content: Option<String>,
+        #[serde(default)]
+        scalars: std::collections::BTreeMap<String, serde_json::Value>,
+        task_id: Option<String>,
+        tool_use_id: Option<String>,
+        task_status: Option<String>,
+    },
+    /// Claude asked the person a set of questions (`AskUserQuestion`). A question record waits until
+    /// its `QuestionSettled`; `unsupported_reason` says why a set could not be offered as a form.
+    QuestionAsked {
+        interaction_id: String,
+        tool_use_id: Option<String>,
+        questions: Vec<QuestionSpec>,
+        unsupported_reason: Option<String>,
+    },
+    /// A question set ended: answered, declined, or ended by something else. The only thing that
+    /// settles a question record.
+    QuestionSettled {
+        interaction_id: String,
+        outcome: QuestionOutcome,
+        #[serde(default)]
+        answers: Vec<ShownAnswer>,
+        reason: Option<String>,
+    },
+    /// Claude Code is producing output this panel cannot show: the provider saw an assistant message
+    /// while no turn of the panel's was open (a turn the CLI started by itself, or a background agent
+    /// writing). Sets [`AgentSessionProjection::cli_unseen_busy`] until the next `TurnCompleted` or the
+    /// session's end, and changes nothing else: it never makes a turn run here, since a background agent's messages say
+    /// the same and would hold the composer for the agent's whole life.
+    CliWorkUnseen,
+    /// The newest prompt the user sent that was not put into a running turn is taken back: the send
+    /// it was folded for was refused, and the message goes on to reach the agent another way, where
+    /// it is folded again. Without it the message would be drawn twice. Changes nothing when no such
+    /// prompt is held.
+    UserPromptWithdrawn,
     /// A conversation's settled records, carried from the window that held it into this one, with
     /// their own sequence numbers and the revision they were taken at. **Made only by the move**
     /// ([`AgentSessionProjection::adopt`]), never by a provider: it is how an adopted projection is
     /// still built by folding alone. Taken only by a projection that holds no record and was never
     /// seeded; anywhere else it changes nothing but the revision.
     MoveSeeded(Box<crate::move_seed::MoveSeed>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Shell,
+    Monitor,
+    LocalAgent,
+    Workflow,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Paused,
+    Stopping,
+    Completed,
+    Failed,
+    Stopped,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEdge {
+    Started,
+    Progress,
+    Updated,
+    Notified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    pub task_id: String,
+    pub run_id: Option<String>,
+    pub kind: TaskKind,
+    pub task_type: String,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub ambient: bool,
+    pub workflow_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskUsage {
+    pub total_tokens: u64,
+    pub tool_uses: u32,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProgress {
+    pub phases: Vec<WorkflowPhase>,
+    pub agents: Vec<WorkflowAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPhase {
+    pub index: u32,
+    pub title: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAgent {
+    pub index: u32,
+    pub label: String,
+    pub phase_index: u32,
+    pub state: String,
+    pub model: Option<String>,
+    pub agent_type: Option<String>,
+    pub tokens: Option<u64>,
+    pub tool_calls: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
 }
 
 /// The longest string in a [`InputChange`], in characters; longer ones are cut with `…`.
@@ -880,6 +1090,10 @@ pub struct ThinkingBlock {
 /// The host reads each one within a tick of its fold, so this only bounds a session that steers a lot.
 pub const MAX_STEER_OUTCOMES: usize = 256;
 
+/// The reason a Claude Code session reports when the CLI itself refused a message (an unknown slash
+/// command, say). Sending the same text again is refused again, so a host never sends it on its own.
+pub const CLI_REFUSED_DROP: &str = "Claude refused it";
+
 /// What became of a message put into the running turn, as the provider reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SteerOutcome {
@@ -908,6 +1122,11 @@ pub struct UserPromptRecord {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<SubagentStream>,
+    /// A child call received outside its own turn cannot name that turn's reviewed edits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
     /// Ordering key, shared with `UserPromptRecord::seq`, `TranscriptMessage::seq` and
     /// `PermissionRequestRecord::seq`. See `AgentSessionProjection::apply`.
     pub seq: u64,
@@ -936,6 +1155,270 @@ pub struct ToolCallRecord {
     /// with the call, and restored with it (`history::load`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_input: Option<InputChange>,
+}
+
+/// Who started a turn. Every turn this host asked for with `send_turn` is a `Client` turn, which is
+/// also what a turn with no [`AgentDomainEvent::TurnAttributed`] is; `FollowUp` is the turn the CLI
+/// runs right after another to read a message it could not fold into it; `Cli` is a turn the CLI
+/// started on its own (a background task finished, a scheduled wake-up, a peer's message).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    #[default]
+    Client,
+    FollowUp,
+    Cli,
+}
+
+/// What made the CLI start a turn by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCauseKind {
+    Task,
+    Scheduled,
+    Peer,
+    Other,
+    Unknown,
+}
+
+/// Why a turn nobody here asked for started, as far as the CLI said. Every string is the CLI's or
+/// the task's own text, bounded where it was received and drawn as plain text; any slot the CLI did
+/// not fill is `None`. The `wakeup_source` .. `prompt` slots belong to a scheduled cause, `task_*`,
+/// `description` and `summary` to a task's, `peer_name` and `text` to a peer's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCause {
+    pub kind: TurnCauseKind,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub task_status: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub peer_name: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub wakeup_source: Option<String>,
+    /// When the wake-up was due, in milliseconds since the Unix epoch.
+    #[serde(default)]
+    pub scheduled_for_ms: Option<i64>,
+    #[serde(default)]
+    pub schedule_reason: Option<String>,
+    #[serde(default)]
+    pub cron_id: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+impl TurnCause {
+    /// A cause of `kind` with every other slot empty.
+    pub fn of_kind(kind: TurnCauseKind) -> Self {
+        Self {
+            kind,
+            task_id: None,
+            tool_use_id: None,
+            task_kind: None,
+            task_status: None,
+            description: None,
+            summary: None,
+            peer_name: None,
+            text: None,
+            wakeup_source: None,
+            scheduled_for_ms: None,
+            schedule_reason: None,
+            cron_id: None,
+            prompt: None,
+        }
+    }
+
+    /// Every text slot, in field order: what a stored history weighs the cause by.
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        [
+            &self.task_id,
+            &self.tool_use_id,
+            &self.task_kind,
+            &self.task_status,
+            &self.description,
+            &self.summary,
+            &self.peer_name,
+            &self.text,
+            &self.wakeup_source,
+            &self.schedule_reason,
+            &self.cron_id,
+            &self.prompt,
+        ]
+        .into_iter()
+        .filter_map(|slot| slot.as_deref())
+    }
+}
+
+/// The start of a turn its user did not send, as an item of the conversation: where the panel says
+/// why it started. Made by [`AgentDomainEvent::TurnAttributed`] only for a turn whose origin is not
+/// [`TurnOrigin::Client`], so a conversation of the user's own turns keeps none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStartRecord {
+    /// Ordering key, shared with the other collections. See `AgentSessionProjection::apply`.
+    pub seq: u64,
+    pub turn_id: String,
+    pub origin: TurnOrigin,
+    #[serde(default)]
+    pub cause: Option<TurnCause>,
+}
+
+/// Which notice a [`AgentDomainEvent::SessionNotice`] is. Its kind and scalars select a persistent
+/// row, a live activity or band report, or a quiet update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNoticeKind {
+    ApiRetry,
+    Compacting,
+    Notification,
+    /// A background task's end or news, and the card it settles.
+    Task,
+    ModelFallback,
+    ModelRefusal,
+    /// The conversation was compacted: the divider row.
+    Compaction,
+    Informational,
+    /// A prompt a hook stopped before the model saw it.
+    HookBlock,
+    /// A peer's message held back or dropped.
+    PeerHold,
+    /// The usage limit reset and the CLI went on by itself.
+    RateLimit,
+    /// The CLI ran a turn this panel could not show.
+    UnseenTurn,
+}
+
+impl SessionNoticeKind {
+    /// Shown for a moment while it lasts and never kept as a row of the conversation.
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::ApiRetry | Self::Compacting | Self::Notification)
+    }
+}
+
+/// How loudly a notice is drawn, in the CLI's own four levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeLevel {
+    Info,
+    Notice,
+    Suggestion,
+    Warning,
+}
+
+/// One notice row of the conversation. `content` is the CLI's own words when it gave any; `scalars`
+/// holds the plain values (numbers, short strings, flags) a notice without words is worded from, by
+/// name. Both are the CLI's text: bounded on receipt, drawn as plain text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoticeRecord {
+    /// Ordering key, shared with the other collections. See `AgentSessionProjection::apply`.
+    pub seq: u64,
+    pub kind: SessionNoticeKind,
+    pub level: NoticeLevel,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub scalars: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub task_status: Option<String>,
+}
+
+/// One choice a question offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOptionSpec {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    /// What choosing it would look like, as markdown, when the model gave one.
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
+/// One question of a set Claude asked (`AskUserQuestion`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionSpec {
+    pub question: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default)]
+    pub options: Vec<QuestionOptionSpec>,
+}
+
+/// One answer as it was sent to Claude, for the question at `question_index` of its set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownAnswer {
+    pub question_index: u32,
+    pub answer: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// How a question ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionOutcome {
+    Answered,
+    Declined,
+    /// The person chose to answer in the chat instead.
+    ChatRequested,
+    Interrupted,
+    Expired,
+    /// The session ended while it waited; also what a question restored from history while it
+    /// waited reads as, since nothing can answer it any more.
+    SessionClosed,
+    ProviderFailed,
+    /// This host could not show it, so Claude was told to ask in plain text.
+    HostRefused,
+}
+
+/// Where a question stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuestionState {
+    Waiting,
+    /// An answer is on its way to Claude; back to `Waiting` if it is refused.
+    Answering,
+    Settled {
+        outcome: QuestionOutcome,
+        #[serde(default)]
+        answers: Vec<ShownAnswer>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// One question set Claude asked, as an item of the conversation. Kept apart from
+/// `pending_permissions`: a question is not a permission, and nothing that answers cards answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionRecord {
+    /// Ordering key, shared with the other collections. See `AgentSessionProjection::apply`.
+    pub seq: u64,
+    pub interaction_id: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// The turn that was running when it was asked, if one was.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub questions: Vec<QuestionSpec>,
+    pub state: QuestionState,
+    /// Set when the set could not be offered as a form; it is then settled `HostRefused` at once.
+    #[serde(default)]
+    pub unsupported_reason: Option<String>,
 }
 
 /// One unanswered permission request. Deliberately carries no `PermissionSource`
@@ -1209,6 +1692,28 @@ pub struct AgentSessionProjection {
     /// How the latest turn ended when it did not complete, until the next turn starts: what the
     /// panel's status band shows. `None` while a turn runs and after one that completed.
     pub last_turn_ending: Option<TurnEndingKind>,
+    /// The starts of turns the user did not send (the CLI's own, follow-ups), each where it started,
+    /// ordered by `seq` with the other collections. Empty for a conversation of the user's own turns.
+    pub turn_starts: Vec<TurnStartRecord>,
+    /// The CLI's notices that stay in the conversation as rows, each where it arrived.
+    pub notices: Vec<NoticeRecord>,
+    /// Live notice state is replaced by reports and is never saved in history.
+    #[serde(skip)]
+    pub api_retry: Option<NoticeRecord>,
+    #[serde(skip)]
+    pub compacting: bool,
+    #[serde(skip)]
+    pub rate_limit_warning: Option<NoticeRecord>,
+    #[serde(skip)]
+    pub fallback_model: Option<String>,
+    #[serde(skip)]
+    pub notification: Option<NoticeRecord>,
+    /// Live process task membership and retained outcomes.
+    #[serde(default)]
+    pub background_tasks: TaskRoster,
+    /// Every question set Claude asked, where it was asked, waiting or settled. Not in
+    /// `pending_permissions`, and nothing that answers a card reads it.
+    pub questions: Vec<QuestionRecord>,
     /// The `seq` at which the latest `TurnCompleted` was folded, whatever its outcome, or `None` before
     /// the first. `turn_endings` records only the turns that did not complete; a host that lost the
     /// events to a resync reads here whether a turn it started has since ended. Not serialized: no view
@@ -1337,6 +1842,37 @@ pub struct AgentSessionProjection {
     /// can still be written outside this crate.
     #[serde(skip)]
     pub move_seeded: bool,
+    /// Set by [`AgentDomainEvent::CliWorkUnseen`] and cleared by the next `TurnCompleted`, whichever
+    /// turn it names, or by the session's end (closed, lost, or a resume that did not attach): Claude
+    /// Code is working where this panel cannot show it. It never makes a turn run here. Not serialized here: the snapshot carries it as `cliUnseenBusy` while it is set.
+    #[serde(skip)]
+    pub cli_unseen_busy: bool,
+    /// Whether the newest prompt folded while no turn was running is a slash command (`Some(true)`),
+    /// held for the turn it starts: `TurnStarted` takes it. `None` when no such prompt waits. Not
+    /// serialized.
+    #[serde(skip)]
+    pub prompt_before_turn: Option<bool>,
+    /// What [`Self::prompt_before_turn`] held when the running turn started: `Some(false)` for a turn
+    /// that a prompt of the user's own started, `Some(true)` for a slash command, `None` for a turn no
+    /// prompt started. Not serialized.
+    #[serde(skip)]
+    pub running_turn_prompt_is_slash: Option<bool>,
+    /// Whether the running turn has written any assistant text since its `TurnStarted`. Not
+    /// serialized.
+    #[serde(skip)]
+    pub running_turn_said_text: bool,
+    /// The `seq` of the prompt the running turn opened with (or the turn about to start will), while
+    /// that prompt is still a row of the conversation: set when a prompt is folded with no turn
+    /// running; cleared when it is taken back, moved out by [`AgentDomainEvent::CliCycleStarted`], or
+    /// its turn or the session ends. Not serialized here: the snapshot carries it as
+    /// `openingPromptSeq` while it is set, so a page rebuilt mid-turn moves the same row.
+    #[serde(skip)]
+    pub opening_prompt: Option<u64>,
+    /// Whether the running turn is one Claude Code started by itself ([`TurnOrigin::Cli`], said by
+    /// its `TurnAttributed`). Not serialized here: the snapshot carries it as `runningTurnCli` while it
+    /// is set.
+    #[serde(skip)]
+    pub running_turn_cli: bool,
 }
 
 /// [`AgentSessionProjection::call_index`]: the position of each tool-use id's first call, valid for
@@ -1431,7 +1967,7 @@ impl AgentSessionProjection {
                 if stale.is_some() {
                     index.covers = usize::MAX;
                 }
-                self.tool_calls.iter_mut().find(|c| c.tool_use_id == tool_use_id)
+                subagents::find_call_mut(&mut self.tool_calls, tool_use_id)
             }
         }
     }
@@ -1462,6 +1998,34 @@ impl AgentSessionProjection {
         }
     }
 
+    /// Whether any item of the conversation was folded after `seq`, the rows nested under a call
+    /// included: a subagent's reply is something the conversation shows.
+    fn holds_item_after(&self, seq: u64) -> bool {
+        fn stream_holds_after(stream: &SubagentStream, seq: u64) -> bool {
+            stream.transcript.iter().any(|item| item.seq > seq)
+                || stream.thinking.iter().any(|item| item.seq > seq)
+                || calls_hold_after(&stream.tool_calls, seq)
+        }
+        fn calls_hold_after(calls: &[ToolCallRecord], seq: u64) -> bool {
+            calls.iter().any(|call| {
+                call.seq > seq
+                    || call
+                        .children
+                        .as_ref()
+                        .is_some_and(|stream| stream_holds_after(stream, seq))
+            })
+        }
+        self.user_prompts.iter().any(|item| item.seq > seq)
+            || self.transcript.iter().any(|item| item.seq > seq)
+            || calls_hold_after(&self.tool_calls, seq)
+            || self.thinking.iter().any(|item| item.seq > seq)
+            || self.notices.iter().any(|item| item.seq > seq)
+            || self.questions.iter().any(|item| item.seq > seq)
+            || self.turn_endings.iter().any(|item| item.seq > seq)
+            || self.turn_starts.iter().any(|item| item.seq > seq)
+            || self.pending_permissions.values().any(|item| item.seq > seq)
+    }
+
     /// Remembers what a gate request carried; a second request for the same id replaces it, and an
     /// input too wide to remember ([`GateInput::of`]) leaves the id with nothing to compare.
     fn remember_gate_input(&mut self, tool_use_id: &str, input: &serde_json::Value) {
@@ -1477,36 +2041,124 @@ impl AgentSessionProjection {
     /// `None` is never read as "the same". Reads only, so it may run before or after the fold of
     /// `event` itself (which changes no gate input for a prompt).
     pub fn derived_after(&self, event: &AgentDomainEvent) -> Option<AgentDomainEvent> {
-        let AgentDomainEvent::PermissionRequested {
-            tool_use_id: Some(id),
-            input,
-            provider_prompt: Some(_),
+        let changed = (|| {
+            let AgentDomainEvent::PermissionRequested {
+                tool_use_id: Some(id),
+                input,
+                provider_prompt: Some(_),
+                ..
+            } = event
+            else {
+                return None;
+            };
+            if id.is_empty() {
+                return None;
+            }
+            let (_, gate) = self.gate_inputs.iter().find(|(held, _)| held == id)?;
+            let change = InputChange::between(gate, input)?;
+            Some(AgentDomainEvent::ToolInputChanged {
+                tool_use_id: id.clone(),
+                change,
+            })
+        })();
+        if changed.is_some() || matches!(event, AgentDomainEvent::TurnCompleted { .. }) {
+            changed
+        } else {
+            roster::derived_after(self, event)
+        }
+    }
+
+    /// Every event ingestion folds right after `event`, in order, and delivers like any other, so the
+    /// page folds them and decides nothing itself:
+    /// - a changed tool input ([`Self::derived_after`]);
+    /// - for a `TurnCompleted` that names no turn this projection is running (another turn runs, or
+    ///   none does) and carries result text: an `UnseenTurn` notice, then the text as an assistant
+    ///   message, then the boundary that closes it, so a reply of the running turn that streams on
+    ///   afterwards is not appended to it. Claude Code ran that turn where this panel could not show
+    ///   it, and its answer is all that reached here;
+    /// - for a completed `TurnCompleted` of the running turn that a prompt of the user's own (not a
+    ///   slash command) started, that wrote no assistant text and still carries result text: a
+    ///   `HookBlock` notice with that text, bounded. A hook stopped the prompt before the model saw
+    ///   it, and the text is the hook's. A slash command's turn is left alone: `/compact` and `/cost`
+    ///   answer with result text and no reply of their own.
+    ///
+    /// Reads only, and must run before the fold of `event`: whether a completion is this
+    /// projection's own turn is read off the turn it is still running.
+    pub fn derived_events_after(&self, event: &AgentDomainEvent) -> Vec<AgentDomainEvent> {
+        if let Some(changed) = self.derived_after(event) {
+            return vec![changed];
+        }
+        let AgentDomainEvent::TurnCompleted {
+            turn_id,
+            outcome,
+            result_text,
             ..
         } = event
         else {
-            return None;
+            return Vec::new();
         };
-        if id.is_empty() {
-            return None;
+        let text = result_text.trim();
+        if text.is_empty() {
+            return Vec::new();
         }
-        let (_, gate) = self.gate_inputs.iter().find(|(held, _)| held == id)?;
-        let change = InputChange::between(gate, input)?;
-        Some(AgentDomainEvent::ToolInputChanged {
-            tool_use_id: id.clone(),
-            change,
-        })
+        let notice =
+            |kind: SessionNoticeKind, level: NoticeLevel, content: Option<String>| AgentDomainEvent::SessionNotice {
+                kind,
+                level,
+                content,
+                scalars: Default::default(),
+                task_id: None,
+                tool_use_id: None,
+                task_status: None,
+            };
+        if self.active_turn_id.as_deref() != Some(turn_id.as_str()) {
+            return vec![
+                notice(SessionNoticeKind::UnseenTurn, NoticeLevel::Notice, None),
+                AgentDomainEvent::ContentDelta {
+                    turn_id: turn_id.clone(),
+                    kind: ContentKind::Text,
+                    text: result_text.clone(),
+                },
+                AgentDomainEvent::AssistantMessageBoundary {
+                    turn_id: turn_id.clone(),
+                },
+            ];
+        }
+        if *outcome == TurnOutcome::Completed
+            && !self.running_turn_said_text
+            && self.running_turn_prompt_is_slash == Some(false)
+        {
+            return vec![notice(
+                SessionNoticeKind::HookBlock,
+                NoticeLevel::Warning,
+                Some(cap_chars(text, MAX_HOOK_BLOCK_CHARS)),
+            )];
+        }
+        Vec::new()
     }
 
-    /// `apply`, then `apply` of what [`Self::derived_after`] derived from `event`, which is
-    /// returned. What ingestion does for every event it folds, for callers (tests, loaders) that
+    /// `apply`, then `apply` of each event [`Self::derived_events_after`] derived from `event`, which
+    /// are returned. What ingestion does for every event it folds, for callers (tests, loaders) that
     /// have no delivery queue.
-    pub fn apply_with_derived(&mut self, event: &AgentDomainEvent) -> Option<AgentDomainEvent> {
-        let derived = self.derived_after(event);
+    pub fn apply_with_derived(&mut self, event: &AgentDomainEvent) -> Vec<AgentDomainEvent> {
+        let derived = self.derived_events_after(event);
         self.apply(event);
-        if let Some(derived) = &derived {
+        for derived in &derived {
             self.apply(derived);
         }
         derived
+    }
+
+    /// Conditional, where the turn's end used to assign unconditionally -- which is how the sidecar
+    /// path's fabricated zero reached the projection in the first place. A turn that reported no
+    /// usage leaves whatever was last reported standing: silence is not a measurement, so it must not
+    /// overwrite one. A turn that DID report replaces the figure whole and never adds to it or keeps
+    /// the larger: the SDK reports a running total that `/clear` resets, so a smaller later figure is
+    /// the truth.
+    fn take_reported_usage(&mut self, usage: &Option<UsageInfo>) {
+        if let Some(reported) = usage {
+            self.usage = Some(reported.clone());
+        }
     }
 
     fn take_held_changed_input(&mut self, tool_use_id: &str) -> Option<InputChange> {
@@ -1584,9 +2236,87 @@ impl AgentSessionProjection {
     /// give both the same number, and every consumer that sorts on `seq` (`buildTimeline`, and the
     /// snapshot merge in `core/src/agent_bridge.rs`'s own tests) would then tie them in whatever
     /// order the arrays happened to be in, which is a mis-ordered pair rather than a failure.
+    /// Adds each concern's snapshot fields to the page's canonical state.
+    pub fn snapshot_modules(&self, state: &mut serde_json::Value) {
+        roster::snapshot_json(self, state);
+        notices::snapshot_json(self, state);
+        subagents::snapshot_json(self, state);
+        questions::snapshot_json(self, state);
+        reset::snapshot_json(self, state);
+    }
+
     pub fn apply(&mut self, event: &AgentDomainEvent) {
+        match event {
+            AgentDomainEvent::TurnCompleted { .. } => {
+                roster::on_turn_completed(self, event);
+                notices::on_turn_end(self, event);
+            }
+            AgentDomainEvent::ContentDelta { .. } | AgentDomainEvent::ToolCallStarted { .. } => {
+                notices::on_content(self, event);
+            }
+            AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
+                roster::on_session_end(self, event);
+                questions::on_session_end(self, event);
+            }
+            // A resume replaces the CLI process; `SessionOpened` repeats on every turn of one process and
+            // ends nothing.
+            AgentDomainEvent::ResumeOutcome { .. } => {
+                roster::on_session_end(self, event);
+            }
+            _ => {}
+        }
+        self.apply_inner(event);
+    }
+
+    fn apply_inner(&mut self, event: &AgentDomainEvent) {
         let seq = self.last_revision;
         match event {
+            // The cause the turn's close named: it replaces what its start said. A turn with no start
+            // row (one this host sent) keeps none, and an update that names no cause is no news.
+            AgentDomainEvent::TurnCauseUpdated {
+                turn_id,
+                cause: Some(cause),
+            } => {
+                if let Some(start) = self
+                    .turn_starts
+                    .iter_mut()
+                    .rev()
+                    .find(|start| &start.turn_id == turn_id)
+                {
+                    start.cause = Some(cause.clone());
+                }
+            }
+            AgentDomainEvent::TurnCauseUpdated { cause: None, .. } => {}
+            // Claude Code ran work of its own ahead of the running turn's prompt, which it has not read
+            // yet: the prompt leaves the conversation (the tab holds it as a message waiting to be
+            // read, and its delivery folds it back where Claude Code read it), and why the work started
+            // is a row here. A cycle of a turn that is not running changes nothing.
+            AgentDomainEvent::CliCycleStarted { turn_id, cause } => {
+                if self.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                    if let Some(opening) = self.opening_prompt.take() {
+                        if let Some(at) = self
+                            .user_prompts
+                            .iter()
+                            .position(|prompt| prompt.seq == opening && !prompt.delivered)
+                        {
+                            self.user_prompts.remove(at);
+                        }
+                    }
+                    self.assistant_message_open = false;
+                    self.thinking_open = false;
+                    self.turn_starts.push(TurnStartRecord {
+                        seq,
+                        turn_id: turn_id.clone(),
+                        origin: TurnOrigin::Cli,
+                        cause: cause.clone(),
+                    });
+                }
+            }
+            AgentDomainEvent::BackgroundTasksChanged { .. } | AgentDomainEvent::TaskEvent { .. } => {
+                roster::fold(self, event)
+            }
+            AgentDomainEvent::ConversationReset { .. } => reset::fold(self, event),
+            AgentDomainEvent::SubagentFrame { .. } => subagents::fold(self, event),
             AgentDomainEvent::SessionOpened {
                 session_id,
                 provider_session_id,
@@ -1604,6 +2334,10 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 self.thinking_open = false;
                 self.last_turn_ending = None;
+                self.running_turn_prompt_is_slash = self.prompt_before_turn.take();
+                self.running_turn_said_text = false;
+                // Until its `TurnAttributed` says otherwise, a turn is one this host sent.
+                self.running_turn_cli = false;
             }
             AgentDomainEvent::UserPromptSubmitted { text } => {
                 self.user_prompts.push(UserPromptRecord {
@@ -1611,6 +2345,11 @@ impl AgentSessionProjection {
                     text: text.clone(),
                     delivered: false,
                 });
+                // A prompt sent while a turn runs does not start that turn.
+                if self.active_turn_id.is_none() {
+                    self.prompt_before_turn = Some(is_slash_command(text));
+                    self.opening_prompt = Some(seq);
+                }
                 // Anything that can only occur BETWEEN assistant messages closes the run. A prompt
                 // is the clearest such thing: without this, the reply to the next turn is appended
                 // to the reply to the last one and they render as a single message.
@@ -1647,6 +2386,11 @@ impl AgentSessionProjection {
                 // The reply that follows a thought is a new thing on screen; the next thought is a new
                 // block.
                 self.thinking_open = false;
+                // Whatever turn the text names: a turn that wrote anything was not stopped by a hook,
+                // and erring that way only leaves a hook's row out.
+                if !text.trim().is_empty() {
+                    self.running_turn_said_text = true;
+                }
                 match self.transcript.last_mut() {
                     // Appending leaves `seq` alone: a message is ordered by where it started.
                     Some(open) if self.assistant_message_open => open.text.push_str(text),
@@ -1695,6 +2439,7 @@ impl AgentSessionProjection {
                 // streaming has ended; the text after it is a new message.
                 self.assistant_message_open = false;
                 self.thinking_open = false;
+                questions::on_call_started(self, tool_use_id, turn_id, seq);
                 let denied = self.take_held_denial(tool_use_id);
                 let changed_input = self.take_held_changed_input(tool_use_id);
                 if self.call_index.covers == self.tool_calls.len() {
@@ -1705,6 +2450,8 @@ impl AgentSessionProjection {
                     self.call_index.covers += 1;
                 }
                 self.tool_calls.push(ToolCallRecord {
+                    children: None,
+                    background: false,
                     seq,
                     turn_id: turn_id.clone(),
                     tool_use_id: tool_use_id.clone(),
@@ -1735,8 +2482,17 @@ impl AgentSessionProjection {
                 input,
                 provider_prompt,
             } => {
-                self.assistant_message_open = false;
-                self.thinking_open = false;
+                let child_call = tool_use_id.as_deref().is_some_and(|id| {
+                    self.tool_calls.iter_mut().any(|call| {
+                        call.children
+                            .as_mut()
+                            .is_some_and(|stream| subagents::find_call_mut(&mut stream.tool_calls, id).is_some())
+                    })
+                });
+                if !child_call {
+                    self.assistant_message_open = false;
+                    self.thinking_open = false;
+                }
                 if let Some(id) = tool_use_id.as_deref().filter(|id| !id.is_empty()) {
                     if provider_prompt.is_none() {
                         self.remember_gate_input(id, input);
@@ -1760,6 +2516,16 @@ impl AgentSessionProjection {
             AgentDomainEvent::PermissionResolved { permission_id, .. } => {
                 self.pending_permissions.remove(permission_id);
             }
+            // A completion of a turn this projection is not running (another turn runs, or none does)
+            // ends nothing here: the running turn runs on, and a turn the panel never showed leaves no
+            // ending row. What it said arrives as derived events (`derived_events_after`). Its usage
+            // is still the CLI's latest report, and it is the end of whatever unseen work was noted.
+            AgentDomainEvent::TurnCompleted { turn_id, usage, .. }
+                if self.active_turn_id.as_deref() != Some(turn_id.as_str()) =>
+            {
+                self.cli_unseen_busy = false;
+                self.take_reported_usage(usage);
+            }
             AgentDomainEvent::TurnCompleted {
                 turn_id,
                 outcome,
@@ -1767,14 +2533,34 @@ impl AgentSessionProjection {
                 detail,
                 ..
             } => {
+                self.cli_unseen_busy = false;
+                self.take_reported_usage(usage);
                 self.background_at_last_turn_end = self.background_calls;
                 self.last_turn_end_seq = Some(seq);
+                self.running_turn_prompt_is_slash = None;
+                self.running_turn_said_text = false;
+                // A turn Claude Code started that showed nothing and ended without a result leaves
+                // nothing: no row saying why it started, and no failed ending for work nobody saw.
+                let empty_start = if self.running_turn_cli && detail.reason.as_deref() == Some(NO_RESULT_REASON) {
+                    self.turn_starts
+                        .iter()
+                        .rposition(|start| &start.turn_id == turn_id)
+                        .filter(|&at| !self.holds_item_after(self.turn_starts[at].seq))
+                } else {
+                    None
+                };
+                self.opening_prompt = None;
+                self.running_turn_cli = false;
                 let kind = match outcome {
+                    _ if empty_start.is_some() => None,
                     TurnOutcome::Completed => None,
                     TurnOutcome::Interrupted => Some(TurnEndingKind::Interrupted),
                     TurnOutcome::Failed => Some(TurnEndingKind::Failed),
                     TurnOutcome::LimitReached => Some(TurnEndingKind::LimitReached),
                 };
+                if let Some(at) = empty_start {
+                    self.turn_starts.remove(at);
+                }
                 if let Some(kind) = kind {
                     self.turn_endings.push(TurnEndingRecord {
                         seq,
@@ -1789,18 +2575,9 @@ impl AgentSessionProjection {
                 self.assistant_message_open = false;
                 self.thinking_open = false;
                 self.clear_held_for_calls();
-                // Conditional, where this arm used to assign unconditionally -- which is how the
-                // sidecar path's fabricated zero reached the projection in the first place. A turn
-                // that reported no usage leaves whatever was last reported standing: silence is not
-                // a measurement, so it must not overwrite one. A turn that DID report replaces the
-                // figure whole and never adds to it or keeps the larger: the SDK reports a running
-                // total that `/clear` resets, so a smaller later figure is the truth.
-                if let Some(reported) = usage {
-                    self.usage = Some(reported.clone());
-                }
             }
-            // Both endings clear `active_turn_id`, and for one reason: no `TurnCompleted` is ever
-            // coming. Leaving it set is what turned a dead session into a spinner that never stops
+            // Both endings clear `active_turn_id` and `cli_unseen_busy`, and for one reason: no
+            // `TurnCompleted` is ever coming, for the panel's turn or for work it could not show. Leaving it set is what turned a dead session into a spinner that never stops
             // -- `App.tsx` derives `turnInProgress` from exactly this field, and
             // `supervisor_client::derive_status` reports `Working` from it ahead of any status
             // check, so a killed provider showed up as a busy agent in the dashboard too. This is
@@ -1826,6 +2603,9 @@ impl AgentSessionProjection {
                 ) {
                     self.record_lost_turn(seq);
                     self.active_turn_id = None;
+                    self.cli_unseen_busy = false;
+                    self.opening_prompt = None;
+                    self.running_turn_cli = false;
                     self.assistant_message_open = false;
                     self.thinking_open = false;
                     self.clear_held_for_calls();
@@ -1842,6 +2622,9 @@ impl AgentSessionProjection {
             AgentDomainEvent::SessionUnavailable { reason } => {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
+                self.cli_unseen_busy = false;
+                self.opening_prompt = None;
+                self.running_turn_cli = false;
                 self.assistant_message_open = false;
                 self.thinking_open = false;
                 self.clear_held_for_calls();
@@ -1850,6 +2633,9 @@ impl AgentSessionProjection {
             AgentDomainEvent::SessionClosed { reason } => {
                 self.record_lost_turn(seq);
                 self.active_turn_id = None;
+                self.cli_unseen_busy = false;
+                self.opening_prompt = None;
+                self.running_turn_cli = false;
                 self.assistant_message_open = false;
                 self.thinking_open = false;
                 self.clear_held_for_calls();
@@ -1931,6 +2717,39 @@ impl AgentSessionProjection {
                     }
                 }
             }
+            // An item only for a turn the user did not send, and whether the running turn is the CLI's
+            // own. The `TurnStarted` before it already closed whatever reply or thought was open.
+            AgentDomainEvent::TurnAttributed { turn_id, origin, cause } => {
+                if self.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                    self.running_turn_cli = *origin == TurnOrigin::Cli;
+                }
+                if *origin != TurnOrigin::Client {
+                    self.turn_starts.push(TurnStartRecord {
+                        seq,
+                        turn_id: turn_id.clone(),
+                        origin: *origin,
+                        cause: cause.clone(),
+                    });
+                }
+            }
+            // A row of its own between assistant messages, so the reply after it is a new message
+            // drawn below it rather than text appended above it.
+            AgentDomainEvent::SessionNotice { .. } => notices::fold(self, event),
+            // Asked between assistant messages, as a card is, and waiting until its settlement.
+            AgentDomainEvent::QuestionAsked { .. } | AgentDomainEvent::QuestionSettled { .. } => {
+                questions::fold(self, event);
+            }
+            AgentDomainEvent::CliWorkUnseen => self.cli_unseen_busy = true,
+            // The prompt goes, and with it what it said about the next turn: that turn is not its.
+            AgentDomainEvent::UserPromptWithdrawn => {
+                if let Some(at) = self.user_prompts.iter().rposition(|prompt| !prompt.delivered) {
+                    let removed = self.user_prompts.remove(at);
+                    self.prompt_before_turn = None;
+                    if self.opening_prompt == Some(removed.seq) {
+                        self.opening_prompt = None;
+                    }
+                }
+            }
             // Puts the records in place with their own `seq`s and leaves the revision where the
             // exporting projection had it after the bump below. Never touches the status or any other
             // live declaration: those come from the folds around it. A seed that does not fit (records
@@ -1949,12 +2768,14 @@ impl AgentSessionProjection {
 /// [`AgentSessionProjection::apply`] does to `thinking_open`, for a provider that has to know whether
 /// the thought it is about to send continues the block on screen or starts a new one.
 ///
-/// One difference, on the safe side: a `ResumeOutcome` counts as closing, though one that attached to
-/// the session asked for leaves the block open. A provider that takes an open block for closed only
+/// Two differences, on the safe side: a `ResumeOutcome` counts as closing, though one that attached to
+/// the session asked for leaves the block open; and so does a `TurnCompleted`, though one naming a
+/// turn the projection is not running leaves it open. A provider that takes an open block for closed only
 /// leaves out a separator; one that took a closed block for open would start the next block with one.
 /// No wildcard arm, so a new event has to say which it is.
 pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
     match event {
+        AgentDomainEvent::SessionNotice { .. } => !notices::records_row(event) && open,
         // An empty delta opens nothing and closes nothing.
         AgentDomainEvent::ContentDelta {
             kind: ContentKind::Thinking,
@@ -1974,7 +2795,10 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::TurnCompleted { .. }
         | AgentDomainEvent::ResumeOutcome { .. }
         | AgentDomainEvent::SessionUnavailable { .. }
-        | AgentDomainEvent::SessionClosed { .. } => false,
+        | AgentDomainEvent::SessionClosed { .. }
+        | AgentDomainEvent::QuestionAsked { .. }
+        // A row of its own when it names the running turn.
+        | AgentDomainEvent::CliCycleStarted { .. } => false,
         AgentDomainEvent::SessionOpened { .. }
         | AgentDomainEvent::ToolCallCompleted { .. }
         | AgentDomainEvent::PermissionResolved { .. }
@@ -1989,8 +2813,20 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::CommandsAvailable { .. }
         // Dropped changes nothing on screen: it only settles a queued message.
         | AgentDomainEvent::UserMessageDropped { .. }
+        // Says who started a turn its `TurnStarted` already began; a settlement adds no row.
+        | AgentDomainEvent::TurnAttributed { .. }
+        | AgentDomainEvent::QuestionSettled { .. }
+        // A note about work out of sight, and a prompt taken back: neither is a row between two
+        // thoughts.
+        | AgentDomainEvent::CliWorkUnseen
+        | AgentDomainEvent::UserPromptWithdrawn
         // A seed sets records, never whether a block is open.
-        | AgentDomainEvent::MoveSeeded(_) => open,
+        | AgentDomainEvent::MoveSeeded(_)
+        | AgentDomainEvent::TurnCauseUpdated { .. }
+        | AgentDomainEvent::BackgroundTasksChanged { .. }
+        | AgentDomainEvent::TaskEvent { .. }
+        | AgentDomainEvent::ConversationReset { .. }
+        | AgentDomainEvent::SubagentFrame { .. } => open,
     }
 }
 
@@ -2175,6 +3011,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             detail: TurnEndDetail {
+                origin_kind: None,
+                num_turns: None,
                 reason: Some("usage_limit".into()),
                 api_error_status: None,
                 message: None,
@@ -2297,6 +3135,8 @@ mod tests {
         assert_eq!(p.tool_calls[0].denied, git_destructive());
         assert!(p.denials_before_their_call.is_empty());
 
+        // The turn the refusal arrived in, and its end.
+        p.apply(&AgentDomainEvent::TurnStarted { turn_id: "t".into() });
         p.apply(&denied(Some("toolu_never")));
         p.apply(&AgentDomainEvent::TurnCompleted {
             turn_id: "t".into(),
@@ -2376,6 +3216,7 @@ mod tests {
         ];
         for (what, end) in ends {
             let mut p = AgentSessionProjection::default();
+            p.apply(&AgentDomainEvent::TurnStarted { turn_id: "t".into() });
             p.apply(&denied(Some("toolu_x")));
             assert_eq!(p.denials_before_their_call.len(), 1, "{what}");
             p.apply(&end);
@@ -2436,7 +3277,7 @@ mod tests {
                 push("git push --force origin main"),
                 false
             )),
-            None
+            Vec::new()
         );
         p.apply(&AgentDomainEvent::PermissionResolved {
             permission_id: "g".into(),
@@ -2450,10 +3291,10 @@ mod tests {
         ));
         assert_eq!(
             derived,
-            Some(AgentDomainEvent::ToolInputChanged {
+            vec![AgentDomainEvent::ToolInputChanged {
                 tool_use_id: "toolu_a".into(),
                 change: change_of(push("rtk git push --force origin main")),
-            })
+            }]
         );
         assert_eq!(
             p.tool_calls[0].changed_input,
@@ -2494,7 +3335,7 @@ mod tests {
             serde_json::json!({ "b": 2, "n": { "y": [1, 2], "x": 1 }, "a": 1 }),
             true,
         ));
-        assert_eq!(derived, None);
+        assert_eq!(derived, Vec::new());
         assert_eq!(p.tool_calls[0].changed_input, None);
         assert!(serde_json::to_value(&p.tool_calls[0])
             .unwrap()
@@ -2531,7 +3372,7 @@ mod tests {
             asked("g3", Some(""), push("y"), false),
             asked("c4", Some(""), push("z"), true),
         ] {
-            assert_eq!(p.apply_with_derived(&event), None);
+            assert_eq!(p.apply_with_derived(&event), Vec::new());
         }
         assert_eq!(p.tool_calls[0].changed_input, None);
         assert!(p.changed_inputs_before_their_call.is_empty());
@@ -2545,7 +3386,7 @@ mod tests {
         p.apply_with_derived(&asked("g", Some("toolu_a"), push("x"), false));
         assert_eq!(
             p.apply_with_derived(&asked("g", Some("toolu_a"), push("y"), false)),
-            None
+            Vec::new()
         );
         assert_eq!(p.tool_calls[0].changed_input, None);
     }
@@ -2568,7 +3409,7 @@ mod tests {
         p.apply(&started("toolu_b"));
         assert_eq!(
             p.apply_with_derived(&asked("c2", Some("toolu_b"), push("y"), true)),
-            None
+            Vec::new()
         );
         assert_eq!(
             p.tool_calls[1].changed_input, None,
@@ -2595,6 +3436,7 @@ mod tests {
     #[test]
     fn a_completed_turn_forgets_the_gate_inputs_and_an_empty_id_is_no_link() {
         let mut p = AgentSessionProjection::default();
+        p.apply(&AgentDomainEvent::TurnStarted { turn_id: "t".into() });
         p.apply(&asked("g", Some("toolu_a"), push("x"), false));
         p.apply(&AgentDomainEvent::TurnCompleted {
             turn_id: "t".into(),
@@ -2620,7 +3462,7 @@ mod tests {
         p.apply_with_derived(&asked("g", Some("toolu_a"), gate, false));
         let cli = serde_json::json!({ "file_path": "/p/a.rs", "content": "b".repeat(100_000) });
         let derived = p.apply_with_derived(&asked("c", Some("toolu_a"), cli, true));
-        let Some(AgentDomainEvent::ToolInputChanged { change, .. }) = derived else {
+        let [AgentDomainEvent::ToolInputChanged { change, .. }] = derived.as_slice() else {
             panic!("a rewritten body is a change");
         };
         assert_eq!(
@@ -2948,5 +3790,441 @@ mod tests {
         assert!(p
             .derived_after(&asked("c2", Some("toolu_b"), serde_json::json!("plain"), true))
             .is_some());
+    }
+    #[test]
+    fn roster_derivation_never_competes_with_existing_derived_events() {
+        let mut state = AgentSessionProjection::default();
+        state.apply(&asked("gate", Some("tool"), push("before"), false));
+        HOOK_CALLS.with(|calls| calls.borrow_mut().clear());
+        let changed = state.derived_events_after(&asked("prompt", Some("tool"), push("after"), true));
+        assert_eq!(changed.len(), 1);
+        assert!(matches!(changed[0], AgentDomainEvent::ToolInputChanged { .. }));
+        HOOK_CALLS.with(|calls| assert!(!calls.borrow().contains(&"roster::derived_after")));
+        let unchanged = state.derived_events_after(&asked("prompt", Some("tool"), push("before"), true));
+        assert!(unchanged.is_empty());
+        HOOK_CALLS.with(|calls| {
+            assert_eq!(
+                calls.borrow().iter().filter(|&&c| c == "roster::derived_after").count(),
+                1
+            )
+        });
+        HOOK_CALLS.with(|calls| calls.borrow_mut().clear());
+        let unseen = state.derived_events_after(&AgentDomainEvent::TurnCompleted {
+            turn_id: "foreign".into(),
+            outcome: TurnOutcome::Completed,
+            detail: TurnEndDetail::default(),
+            result_text: "answer".into(),
+            stop_reason: None,
+            usage: None,
+        });
+        assert_eq!(unseen.len(), 3);
+        HOOK_CALLS.with(|calls| assert!(!calls.borrow().contains(&"roster::derived_after")));
+    }
+}
+
+/// What a turn's end does when the turn is not the one this projection runs, the rows a turn's end
+/// leaves behind, the note of work out of sight, and a prompt taken back.
+#[cfg(test)]
+mod unseen_turns {
+    use super::*;
+
+    fn text(turn: &str, text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        }
+    }
+
+    fn ended(turn: &str, outcome: TurnOutcome, result_text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome,
+            result_text: result_text.into(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        }
+    }
+
+    fn prompt(text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::UserPromptSubmitted { text: text.into() }
+    }
+
+    fn started(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnStarted { turn_id: turn.into() }
+    }
+
+    /// Folds each event as ingestion does, the derived ones included.
+    fn fold(events: &[AgentDomainEvent]) -> AgentSessionProjection {
+        let mut p = AgentSessionProjection::default();
+        for event in events {
+            p.apply_with_derived(event);
+        }
+        p
+    }
+
+    fn kinds(p: &AgentSessionProjection) -> Vec<SessionNoticeKind> {
+        p.notices.iter().map(|n| n.kind).collect()
+    }
+
+    #[test]
+    fn a_foreign_completion_while_a_turn_runs_leaves_the_turn_running_and_shows_its_answer_apart() {
+        let mut p = fold(&[prompt("fix it"), started("t1"), text("t1", "Looking")]);
+        let derived = p.apply_with_derived(&ended(
+            "unknown-turn",
+            TurnOutcome::Completed,
+            "Done in the background.",
+        ));
+        assert_eq!(derived.len(), 3, "{derived:?}");
+        assert_eq!(p.active_turn_id.as_deref(), Some("t1"), "the running turn runs on");
+        assert!(p.turn_endings.is_empty());
+        assert_eq!(p.last_turn_end_seq, None, "no turn of this panel's ended");
+        assert_eq!(kinds(&p), [SessionNoticeKind::UnseenTurn]);
+        assert_eq!(
+            p.transcript.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["Looking", "Done in the background."]
+        );
+        assert!(
+            p.notices[0].seq < p.transcript[1].seq,
+            "the notice comes before the answer"
+        );
+        // The running turn's reply goes on in a message of its own, not appended to the answer.
+        p.apply_with_derived(&text("t1", " and fixed"));
+        assert_eq!(p.transcript.len(), 3);
+        assert_eq!(p.transcript[2].text, " and fixed");
+    }
+
+    #[test]
+    fn a_foreign_completion_without_text_changes_nothing_a_view_draws() {
+        let mut p = fold(&[prompt("fix it"), started("t1")]);
+        let derived = p.apply_with_derived(&ended("unknown-turn", TurnOutcome::Completed, "  "));
+        assert!(derived.is_empty());
+        assert_eq!(p.active_turn_id.as_deref(), Some("t1"));
+        assert!(p.notices.is_empty() && p.transcript.is_empty() && p.turn_endings.is_empty());
+    }
+
+    #[test]
+    fn a_completion_with_no_turn_running_draws_no_failed_row() {
+        for result_text in ["", "the answer"] {
+            let mut p = fold(&[
+                prompt("one"),
+                started("t1"),
+                text("t1", "done"),
+                ended("t1", TurnOutcome::Completed, "done"),
+            ]);
+            let end_seq = p.last_turn_end_seq;
+            p.apply_with_derived(&ended("unknown-turn", TurnOutcome::Failed, result_text));
+            assert!(p.turn_endings.is_empty(), "{result_text:?}");
+            assert_eq!(p.last_turn_ending, None);
+            assert_eq!(
+                p.last_turn_end_seq, end_seq,
+                "only this panel's own turns count as ended"
+            );
+            if result_text.is_empty() {
+                assert!(p.notices.is_empty());
+                assert_eq!(p.transcript.len(), 1);
+            } else {
+                assert_eq!(kinds(&p), [SessionNoticeKind::UnseenTurn]);
+                assert_eq!(p.transcript.last().unwrap().text, "the answer");
+                assert!(!p.assistant_message_open, "the answer is closed");
+            }
+        }
+    }
+
+    #[test]
+    fn the_turn_of_this_panel_with_its_reply_derives_nothing() {
+        let mut p = fold(&[prompt("hi"), started("t1"), text("t1", "hello")]);
+        assert!(p
+            .apply_with_derived(&ended("t1", TurnOutcome::Completed, "hello"))
+            .is_empty());
+        assert_eq!(p.active_turn_id, None);
+        assert!(p.notices.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_a_hook_stopped_shows_the_hooks_words_bounded() {
+        let mut p = fold(&[prompt("deploy it"), started("t1")]);
+        let words = format!("Blocked by policy: {}", "x".repeat(3000));
+        let derived = p.apply_with_derived(&ended("t1", TurnOutcome::Completed, &words));
+        assert_eq!(derived.len(), 1);
+        assert_eq!(kinds(&p), [SessionNoticeKind::HookBlock]);
+        assert_eq!(p.notices[0].level, NoticeLevel::Warning);
+        let content = p.notices[0].content.as_deref().unwrap();
+        assert_eq!(content.chars().count(), MAX_HOOK_BLOCK_CHARS + 1);
+        assert!(content.starts_with("Blocked by policy: ") && content.ends_with('…'));
+        assert!(p.transcript.is_empty(), "the hook's words are not a reply");
+        assert_eq!(p.active_turn_id, None);
+    }
+
+    #[test]
+    fn a_slash_command_turn_with_result_text_and_no_reply_is_no_hook_block() {
+        for command in ["/compact", "  /cost", "/context now"] {
+            let mut p = fold(&[prompt(command), started("t1")]);
+            assert!(
+                p.apply_with_derived(&ended("t1", TurnOutcome::Completed, "Compacted."))
+                    .is_empty(),
+                "{command}"
+            );
+            assert!(p.notices.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn a_turn_no_prompt_started_or_one_that_did_not_complete_is_no_hook_block() {
+        let mut p = fold(&[started("t1")]);
+        assert!(p
+            .apply_with_derived(&ended("t1", TurnOutcome::Completed, "text"))
+            .is_empty());
+        let mut p = fold(&[prompt("go"), started("t1")]);
+        assert!(p
+            .apply_with_derived(&ended("t1", TurnOutcome::Failed, "API Error"))
+            .is_empty());
+        // A prompt sent while another turn ran started none of it.
+        let mut p = fold(&[
+            started("t0"),
+            prompt("more"),
+            ended("t0", TurnOutcome::Completed, ""),
+            started("t1"),
+        ]);
+        assert!(p
+            .apply_with_derived(&ended("t1", TurnOutcome::Completed, "text"))
+            .is_empty());
+        assert!(p.notices.is_empty());
+    }
+
+    #[test]
+    fn work_out_of_sight_is_noted_until_the_next_completion_and_runs_no_turn() {
+        let mut p = AgentSessionProjection::default();
+        p.apply_with_derived(&AgentDomainEvent::CliWorkUnseen);
+        assert!(p.cli_unseen_busy);
+        assert_eq!(p.active_turn_id, None, "the note never makes a turn run here");
+        p.apply_with_derived(&ended("unknown-turn", TurnOutcome::Completed, ""));
+        assert!(!p.cli_unseen_busy);
+
+        let mut p = fold(&[prompt("hi"), started("t1"), AgentDomainEvent::CliWorkUnseen]);
+        assert!(p.cli_unseen_busy);
+        p.apply_with_derived(&ended("t1", TurnOutcome::Completed, ""));
+        assert!(!p.cli_unseen_busy, "any completion ends the note");
+    }
+
+    /// A session that ends sends no completion for the work it was doing out of sight, so its end is
+    /// the end of that work too: a dead session must not keep the close question and the handoff
+    /// refusal that work raises.
+    #[test]
+    fn the_sessions_end_ends_the_note_of_work_out_of_sight() {
+        let endings = [
+            AgentDomainEvent::SessionClosed {
+                reason: "closed".into(),
+            },
+            AgentDomainEvent::SessionUnavailable {
+                reason: "the sidecar exited".into(),
+            },
+            AgentDomainEvent::ResumeOutcome {
+                requested_provider_session_id: "p-0".into(),
+                status: ResumeStatus::Rejected,
+                attached_provider_session_id: None,
+                forked: false,
+                detail: None,
+            },
+        ];
+        for ending in endings {
+            let mut p = fold(&[AgentDomainEvent::CliWorkUnseen]);
+            assert!(p.cli_unseen_busy);
+            p.apply_with_derived(&ending);
+            assert!(!p.cli_unseen_busy, "{ending:?}");
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_prompt_takes_back_the_newest_one_not_put_into_a_turn() {
+        let mut p = fold(&[prompt("first"), started("t1"), prompt("second")]);
+        p.apply_with_derived(&AgentDomainEvent::UserPromptWithdrawn);
+        assert_eq!(
+            p.user_prompts.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["first"]
+        );
+
+        let mut p = fold(&[
+            started("t1"),
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "m1".into(),
+                turn_id: "t1".into(),
+                text: "steered".into(),
+            },
+        ]);
+        p.apply_with_derived(&AgentDomainEvent::UserPromptWithdrawn);
+        assert_eq!(
+            p.user_prompts
+                .iter()
+                .map(|r| (r.text.as_str(), r.delivered))
+                .collect::<Vec<_>>(),
+            [("steered", true)],
+            "a delivered message is part of its turn and is never taken back"
+        );
+
+        let mut p = AgentSessionProjection::default();
+        p.apply_with_derived(&AgentDomainEvent::UserPromptWithdrawn);
+        assert!(p.user_prompts.is_empty());
+        assert_eq!(p.last_revision, 1);
+    }
+
+    #[test]
+    fn a_withdrawn_prompt_starts_no_turn() {
+        let mut p = fold(&[prompt("refused"), AgentDomainEvent::UserPromptWithdrawn, started("t1")]);
+        assert!(p
+            .apply_with_derived(&ended("t1", TurnOutcome::Completed, "text"))
+            .is_empty());
+    }
+    #[test]
+    fn protocol_322_events_round_trip_and_snapshot_hooks_preserve_records() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/protocol-322.json")).unwrap();
+        let events: Vec<AgentDomainEvent> = serde_json::from_value(fixture["domain_events"].clone()).unwrap();
+        let mut state = AgentSessionProjection::default();
+        for event in &events {
+            assert_eq!(
+                serde_json::from_value::<AgentDomainEvent>(serde_json::to_value(event).unwrap()).unwrap(),
+                *event
+            );
+            let mut expected = serde_json::to_value(&state).unwrap();
+            let revision = state.last_revision;
+            let derived = state.derived_after(event);
+            assert!(derived.is_none());
+            state.apply(event);
+            assert_eq!(state.last_revision, revision + 1);
+            if matches!(
+                event,
+                AgentDomainEvent::BackgroundTasksChanged { .. } | AgentDomainEvent::TaskEvent { .. }
+            ) {
+                expected["last_revision"] = serde_json::json!(revision + 1);
+                assert_eq!(serde_json::to_value(&state).unwrap(), expected);
+            }
+            if let AgentDomainEvent::ConversationReset { .. } = event {
+                // The reset empties the conversation (the CLI's turn start before it) and keeps the
+                // running turn.
+                assert!(state.turn_starts.is_empty());
+                assert_eq!(state.provider_session_id.as_deref(), Some("new"));
+                assert_eq!(state.active_turn_id.as_deref(), Some("main"));
+            }
+        }
+        assert_eq!(
+            state.transcript.iter().find(|m| m.seq == 7).unwrap().text,
+            "before after"
+        );
+        assert_eq!(
+            state
+                .tool_calls
+                .iter()
+                .find(|call| call.tool_use_id == "p")
+                .unwrap()
+                .children
+                .as_ref()
+                .unwrap()
+                .transcript[0]
+                .text,
+            "child reply"
+        );
+        assert_eq!(state.notices.len(), 1);
+        assert_eq!(state.notices[0].kind, SessionNoticeKind::Compaction);
+        let mut snapshot = serde_json::json!({"sentinel": true});
+        HOOK_CALLS.with(|calls| calls.borrow_mut().clear());
+        state.snapshot_modules(&mut snapshot);
+        HOOK_CALLS.with(|calls| {
+            assert_eq!(
+                *calls.borrow(),
+                vec![
+                    "roster::snapshot_json",
+                    "notices::snapshot_json",
+                    "subagents::snapshot_json",
+                    "questions::snapshot_json",
+                    "reset::snapshot_json"
+                ]
+            )
+        });
+        assert_eq!(snapshot["sentinel"], true);
+        assert_eq!(snapshot["notification"], fixture["snapshot"]["state"]["notification"]);
+        assert_eq!(snapshot["questions"], fixture["snapshot"]["state"]["questions"]);
+        assert_eq!(snapshot.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn only_main_events_call_the_lifecycle_and_content_hooks() {
+        let mut state = AgentSessionProjection::default();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/protocol-322.json")).unwrap();
+        let events: Vec<AgentDomainEvent> = serde_json::from_value(fixture["domain_events"].clone()).unwrap();
+        HOOK_CALLS.with(|calls| calls.borrow_mut().clear());
+        for event in &events {
+            state.apply(event);
+        }
+        for event in [
+            AgentDomainEvent::SessionClosed {
+                reason: "closed".into(),
+            },
+            AgentDomainEvent::SessionUnavailable { reason: "gone".into() },
+        ] {
+            state.apply(&event);
+        }
+        HOOK_CALLS.with(|calls| {
+            let calls = calls.borrow();
+            for (hook, count) in [
+                ("roster::fold", 2),
+                ("notices::fold", 4),
+                ("questions::fold", 2),
+                ("reset::fold", 1),
+                ("subagents::fold", 4),
+                ("notices::on_content", 2),
+                ("notices::on_turn_end", 1),
+                ("roster::on_turn_completed", 1),
+                ("roster::on_session_end", 2),
+                ("questions::on_session_end", 2),
+            ] {
+                assert_eq!(calls.iter().filter(|&&c| c == hook).count(), count, "{hook}");
+            }
+        });
+    }
+
+    #[test]
+    fn child_frames_use_one_revision_and_preserve_main_streams() {
+        let mut state = AgentSessionProjection::default();
+        state.apply(&AgentDomainEvent::TurnStarted { turn_id: "t".into() });
+        state.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t".into(),
+            kind: ContentKind::Text,
+            text: "main".into(),
+        });
+        state.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t".into(),
+            kind: ContentKind::Thinking,
+            text: "thought".into(),
+        });
+        let revision = state.last_revision;
+        state.apply(&AgentDomainEvent::SubagentFrame {
+            parent_tool_use_id: "p".into(),
+            frame: Box::new(AgentDomainEvent::ContentDelta {
+                turn_id: "t".into(),
+                kind: ContentKind::Thinking,
+                text: "child".into(),
+            }),
+        });
+        assert_eq!(state.last_revision, revision + 1);
+        assert_eq!(state.active_turn_id.as_deref(), Some("t"));
+        assert!(state.assistant_message_open && state.thinking_open);
+        state.apply(&AgentDomainEvent::ContentDelta {
+            turn_id: "t".into(),
+            kind: ContentKind::Thinking,
+            text: " continues".into(),
+        });
+        assert_eq!(state.thinking.last().unwrap().text, "thought continues");
+        assert_eq!(state.transcript.last().unwrap().text, "main");
+        let before = serde_json::to_value(&state).unwrap();
+        state.apply(&AgentDomainEvent::SubagentFrame {
+            parent_tool_use_id: "p".into(),
+            frame: Box::new(AgentDomainEvent::TurnStarted { turn_id: "bad".into() }),
+        });
+        let mut after = serde_json::to_value(&state).unwrap();
+        after["last_revision"] = before["last_revision"].clone();
+        assert_eq!(before, after);
     }
 }

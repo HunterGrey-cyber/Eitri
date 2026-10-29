@@ -1,3 +1,6 @@
+import { liveTasks } from "./band";
+import type { BackgroundTaskRecord, ToolCallRecord } from "./types";
+
 /** The tools a non-Claude agent's tab names its calls by: Codex's item types, and `acp:<kind>` for an ACP
  *  agent. Their cards take no reason with a deny, and their rows may name the subagent that made them. */
 const CODEX_TOOLS = new Set(["commandExecution", "fileChange", "mcpToolCall", "webSearch", "collabAgentToolCall"]);
@@ -9,12 +12,40 @@ export function isExternalTool(name: string): boolean {
 /** Rows (never cards) of Codex's requests that Eitri answered itself, which may name a subagent too. */
 const CODEX_ANSWERED_REQUESTS = new Set(["permissions", "mcpElicitation", "requestUserInput"]);
 
-/** The task name of the subagent whose thread made a call, when Rust labelled the input with one. */
-export function subagentOf(toolName: string, input: unknown): string | null {
+/** The provider's subagent label, or Claude's ancestor description when its call tree is available. */
+export function subagentOf(toolName: string, input: unknown, origin?: {
+  toolUseId: string | null;
+  toolCalls: ToolCallRecord[];
+  backgroundTasks: BackgroundTaskRecord[];
+}): string | null {
+  if (!isExternalTool(toolName) && !CODEX_ANSWERED_REQUESTS.has(toolName) && origin) {
+    const path = toolCallPath(origin.toolCalls, origin.toolUseId);
+    if (!path || path.length < 2) return null;
+    for (const parent of path.slice(0, -1).reverse()) {
+      if ((parent.name === "Agent" || parent.name === "Task") && parent.input && typeof parent.input === "object") {
+        const description = (parent.input as Record<string, unknown>).description;
+        if (typeof description === "string" && description.trim()) return description;
+      }
+    }
+    const workflows = liveTasks(origin.backgroundTasks).filter((task) => task.kind === "workflow");
+    const name = workflows.length === 1 ? workflows[0].workflow_name : null;
+    return `a background agent${name ? ` (workflow ${name} running)` : ""}`;
+  }
   if (!(isExternalTool(toolName) || CODEX_ANSWERED_REQUESTS.has(toolName)) || input === null || typeof input !== "object")
     return null;
   const label = (input as Record<string, unknown>).subagent;
   return typeof label === "string" && label !== "" ? label : null;
+}
+
+/** The stored ancestry of a call, including an unknown parent's placeholder when one was received. */
+export function toolCallPath(calls: ToolCallRecord[], id: string | null): ToolCallRecord[] | null {
+  if (!id) return null;
+  for (const call of calls) {
+    if (call.toolUseId === id) return [call];
+    const nested = call.children && toolCallPath(call.children.toolCalls, id);
+    if (nested) return [call, ...nested];
+  }
+  return null;
 }
 
 /** What a tab's agent is called in a sentence: `Codex`, or the name an ACP agent was registered under. */

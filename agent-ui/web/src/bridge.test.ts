@@ -29,6 +29,19 @@ describe("installDispatch", () => {
     expect(sent).toHaveLength(3);
   });
 
+  it("carries task requests and delivers the plain output reply with its correlation fields", () => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const reply = { kind: "task_output_result", requestId: "o1", tab: 3, taskId: "task", output: "�<b>plain</b>", totalBytes: 9000, truncated: true };
+    window.__eitriDispatch!(JSON.stringify(reply));
+    expect(handler).toHaveBeenCalledWith(reply);
+    const requests: OutboundMessage[] = [
+      { type: "stop_task", request_id: "s1", tab: 3, task_id: "task" },
+      { type: "task_output", request_id: "o1", tab: 3, task_id: "task" },
+    ];
+    expect(requests.map((request) => JSON.parse(JSON.stringify(request)).task_id)).toEqual(["task", "task"]);
+  });
+
   it("demuxes a command_result envelope with ok:true", () => {
     const handler = vi.fn();
     installDispatch(handler);

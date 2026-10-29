@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=4ee8d79c87ded1bf7d1950f7b05562ad112cb8ae6869ca74909718b264ec113a -->
+<!-- translated-from: known-issues.md sha256=0c9ed05f349f23093aa814d213248cf61b05b7255fffc9d1b951e79a76e17dfa -->
 
 # 已知问题与限制
 
@@ -88,6 +88,11 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - 不提供 `system_prompt_preset` 的 sidecar 仍然会启动会话，使用 Agent SDK 的最小提示词。
   启动诊断会说明 Claude Code 的系统提示词不可用，并写出需要的后端版本；如果 `EITRI_VERDANDI_CHECKOUT` 或
   `EITRI_SIDECAR_BINARY` 选择了旧后端，请将该覆盖项指向为诊断中版本构建的后端。否则，运行 `eitri setup`。
+- **关闭 Claude 标签页会直接取消它的定时唤醒和 cron 任务，不会先问。** 标签页开着时它们照常触发。后台任务在运行或有提问在等时，关闭标签页、它所在的视图或整个窗口会先问；但 Eitri 还没有定时任务的列表，所以既不会把它们算进去，也不会提醒你它们不会再触发。（只有被要求跨会话保留的 cron 任务，Claude Code 才会在会话结束后留着。）
+- **后台子 agent 的权限卡片可能看不到。** 它画在这个子 agent 所在回合的最上面、子 agent 那一行的上方。提问框打开时，卡片可能滚出了视野，只有标签页上的 `⚑` 计数表明它在等。
+- **有些关于后台任务的报告只显示 Claude Code 的原话。** Claude Code 用 Eitri 还不认识的方式报告一个任务时（停掉的 shell、工作流里的 agent），那一行只显示 Claude Code 发来的文字，往往只是任务的描述，不说这个任务怎么样了。
+- **刚执行完 `/clear` 时，空白的视图中间可能留着一块空的高亮区域。** 下一个回合画出来后它就消失了。
+- **聊天面板很窄时（大约 320 像素），状态行会被截断。** 面板的模式只显示一个字母（`I`、`B`），权限模式的名字被截掉（`bypass permission`），活动行的转圈图标单独占一行。
 
 <a id="codex-and-acp-tabs"></a>
 ## Codex 与 ACP 标签页

@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=c1a74bd457790c296cc2dd586810f3fe6d946d2d0a7901374f304634a3da8fe3 -->
+<!-- translated-from: keys.md sha256=0ce12956067407009778a68adabb77cde3f03dfc0bc81208b269a9999e048618 -->
 
 # 按键
 
@@ -224,11 +224,11 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 | `Ctrl+y` | 批准这个标签页里等得最久的卡片（见[回答一张卡片](#answering-a-card)） |
 | `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来；`:q!` 什么都不改，除非你已经用 `:w` 保存过草稿，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（BROWSE 里也有） |
-| `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks) |
+| `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)；Claude 问你的选择题它永远不会回答（[Claude 的提问](#claudes-questions)） |
 | `Esc` | 停止输入，回到 BROWSE；命令菜单打开时，先关闭菜单并保留文字 |
 | `?` | 按键列表，在输入框为空时 |
 
-在 Claude 标签页中，单独输入以下五个斜杠词会运行 Eitri 自己的操作；仪表板的输入框和对话中的输入框都支持：
+在 Claude 标签页中，单独输入以下七个斜杠词会运行 Eitri 自己的操作；仪表板的输入框和对话中的输入框都支持：
 
 | 词 | 操作 |
 |---|---|
@@ -237,8 +237,10 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 | `/resume` | 打开会话选择器 |
 | `/memory` | 在编辑器中打开项目的 `CLAUDE.md`；文件不存在时显示 `no such file: CLAUDE.md` |
 | `/rewind` | 保留草稿并显示 `/rewind is not in Eitri — c reviews and reverts this turn's edits`（Eitri 没有 `/rewind`；用 `c` 审阅并撤销本轮的修改） |
+| `/tasks`（或 `/bashes`） | 打开[后台任务列表](#the-background-tasks-list) |
+| `/workflows` | 打开后台任务列表，并定位到动态工作流 |
 
-前四个操作会清空草稿。这五个词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页或你注册的 agent 的标签页中，这五个词都作为文字发出，没有 Claude 命令的拦截或选择器。
+前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页或你注册的 agent 的标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。
 
 ### 在 BROWSE 里
 
@@ -292,10 +294,47 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
-| `<leader>k` | 停止 Codex 标签页留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
+| `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `<leader>?` | 按键列表 |
 
 你可以在[自己的配置](configuration.zh-CN.md)里修改它们。
+
+<a id="the-background-tasks-list"></a>
+### 后台任务列表
+
+在 Claude 标签页里输入 `/tasks`、`/bashes` 或 `/workflows`，会打开 Claude Code 在后台运行的东西的列表：shell、monitor、local agent 和动态工作流，然后是已经结束的任务，以及折叠起来的一行 Claude Code 自己的系统任务。列表打开期间，按键都归它，最下面一行写着主要的几个键。
+
+| 按键 | 作用 |
+|---|---|
+| `j` / `k`，或 `Down` / `Up` | 下一个 / 上一个任务；在任务详情里则是滚动 |
+| `Enter` | 任务详情：shell 或 monitor 显示输出的末尾，工作流显示它的阶段和 agent |
+| `x` | 立即停掉选中的任务，只停这一个 |
+| `o` | 在 Neovim 里以只读方式打开任务的输出 |
+| `PageDown` 或空格 / `PageUp` | 向下 / 向上滚动一页 |
+| `Home` / `End` | 滚到顶部 / 底部 |
+| `q` 或 `Esc` | 从任务详情返回；在列表里则关闭列表 |
+
+列表显示什么，见[Codex 与其他 agent](agents.zh-CN.md#background-tasks-and-tasks)。
+
+<a id="claudes-questions"></a>
+### Claude 的提问
+
+Claude 用选择题问你时，提问框会取代输入框，直到你回答为止，下面这些键在提问框里起作用。在 BROWSE 里，活动行显示 `⚑ Claude has a question — i to answer`，按 `i` 回到提问框。
+
+| 按键 | 作用 |
+|---|---|
+| `1` ... `9` | 选这一行，停在当前问题上；选项之后的两行是 `Type something`（你自己写的回答）和 `Chat about this`，按 `Chat about this` 的数字只会把光标移过去 |
+| `j` / `k`，或 `Down` / `Up` | 在选项之间移动 |
+| 空格 | 选定光标所在的选项，停在当前问题上（在可以多选的问题里是选上或取消）；在 `Chat about this`、`Submit answers` 或 `Cancel` 上不起作用 |
+| `Enter` | 在只能选一个的问题里，选定光标所在的选项并进入下一步：下一个问题、汇总页，或者只有这一个问题时直接发出；在可以多选的问题里，选上或取消这个选项，在它的 `Next` 或 `Submit` 上则进入下一步或发出；在 `Type something` 上开始输入；在 `Chat about this` 上告诉 Claude 你想先聊一聊；在汇总页上，`Submit answers` 发出回答，`Cancel` 取消提问 |
+| `Tab` / `Shift+Tab`，或 `l` / `h` | 下一个 / 上一个问题；问题不止一个时，最后一个之后是汇总回答的一页 |
+| `Ctrl+Enter` | 发出所有回答，或者显示哪些问题还没回答 |
+| `n` | 给带预览的选项加备注 |
+| `Ctrl+g` | 在 Neovim 里编辑你在 `Type something` 下写的回答 |
+| `Ctrl+k` | 回到对话，提问继续等着 |
+| `Esc` | 在自己写的回答里：回到选项；其他地方：取消提问，这会停掉当前回合 |
+
+提问框出现之前就按住的键不会选中任何东西，按住不放产生的重复按键也不会。关于提问的更多内容，见[Codex 与其他 agent](agents.zh-CN.md#claudes-questions)。
 
 <a id="selecting-text"></a>
 ### 选择文字

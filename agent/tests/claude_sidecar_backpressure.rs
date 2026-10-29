@@ -106,6 +106,19 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
             // Made only by a move between windows, never read off the wire: matched for exhaustiveness.
             AgentDomainEvent::MoveSeeded(_) => "MoveSeeded",
+            AgentDomainEvent::TurnAttributed { .. } => "TurnAttributed",
+            AgentDomainEvent::SessionNotice { .. } => "SessionNotice",
+            AgentDomainEvent::QuestionAsked { .. } => "QuestionAsked",
+            AgentDomainEvent::QuestionSettled { .. } => "QuestionSettled",
+            AgentDomainEvent::CliWorkUnseen => "CliWorkUnseen",
+            // Folded by the host when a send is refused, never read off the wire: matched for exhaustiveness.
+            AgentDomainEvent::UserPromptWithdrawn => "UserPromptWithdrawn",
+            AgentDomainEvent::TurnCauseUpdated { .. } => "TurnCauseUpdated",
+            AgentDomainEvent::CliCycleStarted { .. } => "CliCycleStarted",
+            AgentDomainEvent::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
+            AgentDomainEvent::TaskEvent { .. } => "TaskEvent",
+            AgentDomainEvent::ConversationReset { .. } => "ConversationReset",
+            AgentDomainEvent::SubagentFrame { .. } => "SubagentFrame",
         };
         *counts.entry(kind).or_default() += 1;
     }

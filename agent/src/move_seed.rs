@@ -20,8 +20,9 @@ use crate::ingestion::{IngestStats, ResumeOutcomeRecord};
 use crate::lease::SessionLease;
 use crate::projection::{
     AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, CallIndex, GateInput, HistoryNotice, InputChange,
-    SlashCommand, SteerOutcome, ThinkingBlock, ToolCallDenial, ToolCallRecord, TranscriptMessage, TurnEndingKind,
-    TurnEndingRecord, UngatedCliModeRecord, UsageInfo, UserPromptRecord,
+    NoticeRecord, QuestionRecord, SlashCommand, SteerOutcome, ThinkingBlock, ToolCallDenial, ToolCallRecord,
+    TranscriptMessage, TurnEndingKind, TurnEndingRecord, TurnStartRecord, UngatedCliModeRecord, UsageInfo,
+    UserPromptRecord,
 };
 use crate::provider::{AgentProvider, ProviderCapabilities, ProviderInfo};
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,12 @@ pub struct MoveSeed {
     pub(crate) transcript: Vec<TranscriptMessage>,
     pub(crate) tool_calls: Vec<ToolCallRecord>,
     pub(crate) turn_endings: Vec<TurnEndingRecord>,
+    #[serde(default)]
+    pub(crate) turn_starts: Vec<TurnStartRecord>,
+    #[serde(default)]
+    pub(crate) notices: Vec<NoticeRecord>,
+    #[serde(default)]
+    pub(crate) questions: Vec<QuestionRecord>,
     pub(crate) last_turn_ending: Option<TurnEndingKind>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) thinking: Vec<ThinkingBlock>,
@@ -50,6 +57,8 @@ pub struct MoveSeed {
     pub(crate) cli_mode_reported: Option<String>,
     pub(crate) policy_mismatch: Option<(String, String)>,
     pub(crate) account_limits: Option<AccountLimitsRecord>,
+    #[serde(default)]
+    pub(crate) background_tasks: crate::TaskRoster,
     pub(crate) background_calls: u32,
     pub(crate) available_commands: Option<Vec<SlashCommand>>,
     pub(crate) background_at_last_turn_end: u32,
@@ -58,6 +67,16 @@ pub struct MoveSeed {
     pub(crate) changed_inputs_before_their_call: VecDeque<(String, InputChange)>,
     pub(crate) call_index: CallIndex,
     pub(crate) steer_outcomes: VecDeque<(String, SteerOutcome)>,
+    /// Whether Claude Code was working where the panel cannot show it. Settled for the move: no fold
+    /// after the seed sets it again until the next such notice arrives, which may be long after.
+    #[serde(default)]
+    pub(crate) cli_unseen_busy: bool,
+    /// The model the CLI fell back to, and the latest rate-limit warning: reports that stay on the
+    /// band after their turn ends until a later report replaces them, so they are settled for the move.
+    #[serde(default)]
+    pub(crate) fallback_model: Option<String>,
+    #[serde(default)]
+    pub(crate) rate_limit_warning: Option<NoticeRecord>,
     /// The exporting projection's `last_revision`: every record's `seq` is below it, and the adopting
     /// projection's revision equals it once the seed is folded.
     pub through_revision: u64,
@@ -147,8 +166,9 @@ pub struct ConversationHandoff {
     /// Whether the session's record is on disk: wrong, a title would be lost or the record written
     /// twice.
     pub record_written: bool,
-    /// Whether a turn ended since the history was last written: lost, that turn's history would
-    /// never be written.
+    /// Whether something the history stores (a turn's or the session's end, a question's ask, its
+    /// call's start or its settle) was folded since the history was last written: lost, it would never
+    /// be written.
     pub history_dirty: bool,
 }
 
@@ -234,6 +254,18 @@ impl AgentSessionProjection {
             // Live: a waiting card is rebuilt by folding the request that made it.
             pending_permissions: _,
             turn_endings,
+            turn_starts,
+            notices,
+            // Live: transient phases are rebuilt by the receiving session.
+            api_retry: _,
+            compacting: _,
+            // Settled: they stay on the band after the turn that reported them, until a later report
+            // replaces them.
+            rate_limit_warning,
+            fallback_model,
+            // Live, as the phases above.
+            notification: _,
+            questions,
             last_turn_ending,
             // Not carried: it tells the window that started a turn whether it ended, and a tab moves
             // only once no turn of its own is starting.
@@ -250,6 +282,7 @@ impl AgentSessionProjection {
             cli_mode_reported,
             policy_mismatch,
             account_limits,
+            background_tasks,
             background_calls,
             available_commands,
             background_at_last_turn_end,
@@ -260,6 +293,14 @@ impl AgentSessionProjection {
             steer_outcomes,
             // Not carried: the adopting projection marks its own seed when it takes this one.
             move_seeded: _,
+            cli_unseen_busy,
+            // Not carried, as `last_turn_end_seq`: they describe a turn being started or running, and a
+            // tab moves only once no turn of its own is starting.
+            prompt_before_turn: _,
+            running_turn_prompt_is_slash: _,
+            running_turn_said_text: _,
+            opening_prompt: _,
+            running_turn_cli: _,
         } = self;
         MoveSeed {
             session_id: session_id.clone(),
@@ -270,6 +311,9 @@ impl AgentSessionProjection {
             transcript: transcript.clone(),
             tool_calls: tool_calls.clone(),
             turn_endings: turn_endings.clone(),
+            turn_starts: turn_starts.clone(),
+            notices: notices.clone(),
+            questions: questions.clone(),
             last_turn_ending: *last_turn_ending,
             usage: usage.clone(),
             thinking: thinking.clone(),
@@ -278,6 +322,7 @@ impl AgentSessionProjection {
             cli_mode_reported: cli_mode_reported.clone(),
             policy_mismatch: policy_mismatch.clone(),
             account_limits: account_limits.clone(),
+            background_tasks: background_tasks.clone(),
             background_calls: *background_calls,
             available_commands: available_commands.clone(),
             background_at_last_turn_end: *background_at_last_turn_end,
@@ -286,6 +331,9 @@ impl AgentSessionProjection {
             changed_inputs_before_their_call: changed_inputs_before_their_call.clone(),
             call_index: call_index.clone(),
             steer_outcomes: steer_outcomes.clone(),
+            cli_unseen_busy: *cli_unseen_busy,
+            fallback_model: fallback_model.clone(),
+            rate_limit_warning: rate_limit_warning.clone(),
             through_revision: *last_revision,
         }
     }
@@ -348,7 +396,11 @@ impl AgentSessionProjection {
             .chain(seed.transcript.iter().map(|r| r.seq))
             .chain(seed.tool_calls.iter().map(|r| r.seq))
             .chain(seed.turn_endings.iter().map(|r| r.seq))
-            .chain(seed.thinking.iter().map(|r| r.seq));
+            .chain(seed.turn_starts.iter().map(|r| r.seq))
+            .chain(seed.notices.iter().map(|r| r.seq))
+            .chain(seed.questions.iter().map(|r| r.seq))
+            .chain(seed.thinking.iter().map(|r| r.seq))
+            .chain(seed.rate_limit_warning.iter().map(|r| r.seq));
         if seqs.into_iter().any(|seq| seq >= through) {
             return Err(SeedRefused::SeqPastRevision);
         }
@@ -363,6 +415,10 @@ impl AgentSessionProjection {
             && self.tool_calls.is_empty()
             && self.pending_permissions.is_empty()
             && self.turn_endings.is_empty()
+            && self.turn_starts.is_empty()
+            && self.notices.is_empty()
+            && self.background_tasks.rows.is_empty()
+            && self.questions.is_empty()
             && self.thinking.is_empty()
             && self.history.is_none()
     }
@@ -389,6 +445,9 @@ impl AgentSessionProjection {
             transcript,
             tool_calls,
             turn_endings,
+            turn_starts,
+            notices,
+            questions,
             last_turn_ending,
             usage,
             thinking,
@@ -397,6 +456,7 @@ impl AgentSessionProjection {
             cli_mode_reported,
             policy_mismatch,
             account_limits,
+            background_tasks,
             background_calls,
             available_commands,
             background_at_last_turn_end,
@@ -405,6 +465,9 @@ impl AgentSessionProjection {
             changed_inputs_before_their_call,
             call_index,
             steer_outcomes,
+            cli_unseen_busy,
+            fallback_model,
+            rate_limit_warning,
             through_revision,
         } = seed;
         self.session_id = session_id.clone();
@@ -415,6 +478,9 @@ impl AgentSessionProjection {
         self.transcript = transcript.clone();
         self.tool_calls = tool_calls.clone();
         self.turn_endings = turn_endings.clone();
+        self.turn_starts = turn_starts.clone();
+        self.notices = notices.clone();
+        self.questions = questions.clone();
         self.last_turn_ending = *last_turn_ending;
         self.usage = usage.clone();
         self.thinking = thinking.clone();
@@ -423,6 +489,7 @@ impl AgentSessionProjection {
         self.cli_mode_reported = cli_mode_reported.clone();
         self.policy_mismatch = policy_mismatch.clone();
         self.account_limits = account_limits.clone();
+        self.background_tasks = background_tasks.clone();
         self.background_calls = *background_calls;
         self.available_commands = available_commands.clone();
         self.background_at_last_turn_end = *background_at_last_turn_end;
@@ -431,6 +498,9 @@ impl AgentSessionProjection {
         self.changed_inputs_before_their_call = changed_inputs_before_their_call.clone();
         self.call_index = call_index.clone();
         self.steer_outcomes = steer_outcomes.clone();
+        self.cli_unseen_busy = *cli_unseen_busy;
+        self.fallback_model = fallback_model.clone();
+        self.rate_limit_warning = rate_limit_warning.clone();
         // `seed_fits` refused a zero revision, so this does not wrap.
         self.last_revision = through_revision - 1;
         self.move_seeded = true;
@@ -628,6 +698,96 @@ mod tests {
             source.export_settled(),
             "the values a snapshot leaves out are carried too"
         );
+    }
+
+    #[test]
+    fn a_background_roster_moves_with_its_count_and_pending_outcomes() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/background-tasks.json")).unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let mut source = AgentSessionProjection::default();
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+            for event in &events {
+                source.apply_with_derived(event);
+            }
+            let seed = source.export_settled();
+            let encoded = serde_json::to_vec(&seed).unwrap();
+            let seed = serde_json::from_slice(&encoded).unwrap();
+            let mut destination = AgentSessionProjection::default();
+            destination.apply(&AgentDomainEvent::MoveSeeded(Box::new(seed)));
+            assert_eq!(
+                source.background_tasks, destination.background_tasks,
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                source.background_calls, destination.background_calls,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    /// A fallback to another model and a rate-limit warning outlive the turn that reported them: the
+    /// band keeps showing both until a later report replaces them, so the window a tab moves to shows
+    /// them too, and a second move carries them on.
+    #[test]
+    fn a_reported_fallback_model_and_rate_limit_warning_move_with_the_chat() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/session-notices.json")).unwrap();
+        let mut notices = Vec::new();
+        for name in ["fallback", "rate_allowed_warning"] {
+            let case = cases["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap();
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+            notices.extend(events);
+        }
+        let mut source = source_with(&[opened()]);
+        fold(&mut source, &notices);
+        assert!(source.is_settled());
+        assert_eq!(source.fallback_model.as_deref(), Some("small"));
+        assert!(source.rate_limit_warning.is_some());
+
+        let wire = serde_json::to_string(&source.export_settled()).unwrap();
+        let seed: MoveSeed = serde_json::from_str(&wire).unwrap();
+        let adopted = AgentSessionProjection::adopt(&core(vec![opened()], seed, Vec::new())).unwrap();
+        assert_eq!(adopted.fallback_model.as_deref(), Some("small"));
+        assert_eq!(adopted.rate_limit_warning, source.rate_limit_warning);
+        let (mut shown, mut destination) = (serde_json::json!({}), serde_json::json!({}));
+        source.snapshot_modules(&mut shown);
+        adopted.snapshot_modules(&mut destination);
+        assert_eq!(shown["fallbackModel"], destination["fallbackModel"]);
+        assert_eq!(shown["rateLimitWarning"], destination["rateLimitWarning"]);
+        assert_eq!(adopted.export_settled(), source.export_settled());
+
+        // A report after the move replaces what the move carried, as it would have in the source.
+        let mut after = adopted;
+        let cleared: AgentDomainEvent = serde_json::from_value(serde_json::json!({
+            "type": "session_notice", "kind": "rate_limit", "level": "notice", "content": null,
+            "scalars": {"rate_status": "allowed"}, "task_id": null, "task_status": null, "tool_use_id": null
+        }))
+        .unwrap();
+        after.apply(&cleared);
+        assert!(after.rate_limit_warning.is_none());
+    }
+
+    /// Claude Code working where the panel cannot show it, with no turn of the panel's running, is a
+    /// settled chat that moves; the note goes with it, or the other window would close the tab and hand
+    /// it to a terminal without asking until the next notice.
+    #[test]
+    fn work_out_of_sight_moves_with_the_chat() {
+        let mut source = source_with(&[opened()]);
+        source.apply(&AgentDomainEvent::CliWorkUnseen);
+        assert!(source.is_settled() && source.cli_unseen_busy);
+        let wire = serde_json::to_string(&source.export_settled()).unwrap();
+        let seed: MoveSeed = serde_json::from_str(&wire).unwrap();
+        let adopted = AgentSessionProjection::adopt(&core(vec![opened()], seed, Vec::new())).unwrap();
+        assert!(adopted.cli_unseen_busy);
+        assert_eq!(adopted.export_settled(), source.export_settled());
     }
 
     #[test]

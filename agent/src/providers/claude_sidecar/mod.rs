@@ -12,6 +12,7 @@ mod spawn;
 mod steer;
 mod system_prompt;
 mod translate;
+pub(crate) mod translate_322;
 mod watch;
 
 /// Real, billed A/B runs proving that protocol 3's two narrowing fields do what they say at
@@ -31,7 +32,7 @@ pub use spawn::{
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
     ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
-    SteerTurnRequest, StreamingPreference,
+    SteerTurnRequest, StreamingPreference, TurnStamp,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::setting_sources::{ProjectTrust, Source};
@@ -86,6 +87,18 @@ const CAP_PERMISSION_DEFER: &str = claude_runtime_protocol::CAP_PERMISSION_DEFER
 /// Advertised only when the CLI can report what became of a message;
 /// exposed as `ProviderCapabilities::steer`.
 const CAP_STEER_TURN: &str = claude_runtime_protocol::CAP_STEER_TURN;
+/// Protocol 3.22: one capability per `ProviderCapabilities` flag of the same name, taken from the
+/// protocol crate so a renamed capability fails to compile instead of reading as absent.
+const CAP_CLI_TURNS: &str = claude_runtime_protocol::CAP_CLI_TURNS;
+const CAP_HUMAN_ORIGIN: &str = claude_runtime_protocol::CAP_HUMAN_ORIGIN;
+const CAP_BACKGROUND_TASKS: &str = claude_runtime_protocol::CAP_BACKGROUND_TASKS;
+const CAP_WORKFLOW_PROGRESS: &str = claude_runtime_protocol::CAP_WORKFLOW_PROGRESS;
+const CAP_TASK_CONTROL: &str = claude_runtime_protocol::CAP_TASK_CONTROL;
+const CAP_TASK_OUTPUT: &str = claude_runtime_protocol::CAP_TASK_OUTPUT;
+const CAP_SUBAGENT_FRAMES: &str = claude_runtime_protocol::CAP_SUBAGENT_FRAMES;
+const CAP_SESSION_NOTICES: &str = claude_runtime_protocol::CAP_SESSION_NOTICES;
+const CAP_CONVERSATION_RESET: &str = claude_runtime_protocol::CAP_CONVERSATION_RESET;
+const CAP_STRUCTURED_QUESTIONS_V1: &str = claude_runtime_protocol::CAP_STRUCTURED_QUESTIONS_V1;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -115,6 +128,18 @@ const CLIENT_IMPLEMENTS_PROVIDER_PROMPTS: bool = true;
 /// saved rule allows it, the CLI's `SessionReady` report is judged against the request
 /// (`translate::translate`), and its refusals are shown on their call (`PermissionDenied`).
 const CLIENT_IMPLEMENTS_CLI_AUTO_MODE: bool = true;
+/// Whether sessions ask the sidecar to leave background tasks running when a turn is interrupted
+/// (`ClaudeHostPolicy.per_task_stop`, offered with `task_control`). The panel's task list can
+/// stop one task explicitly, so interrupting a turn can safely spare its background work.
+pub const CLIENT_IMPLEMENTS_PER_TASK_STOP: bool = true;
+
+fn per_task_stop_policy(capable: bool, readiness: Option<bool>) -> bool {
+    capable && readiness.unwrap_or(CLIENT_IMPLEMENTS_PER_TASK_STOP)
+}
+/// Whether sessions ask the sidecar to hand Claude's questions to this host
+/// (`CreateSessionRequest.client_interactions.questions`, offered with `structured_questions_v1`).
+/// The panel has an explicit question dock; permission policy never supplies its answers.
+pub const CLIENT_IMPLEMENTS_QUESTIONS: bool = true;
 
 /// Whether to request the CLI's own prompts: both the handshake advertisement and client
 /// support are required. Without this capability, the headless CLI refuses its own prompts
@@ -158,6 +183,18 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         // Both or neither: see `ProviderCapabilities::cli_auto_mode`.
         cli_auto_mode: CLIENT_IMPLEMENTS_CLI_AUTO_MODE && has(CAP_CLI_AUTO_MODE) && has(CAP_PERMISSION_DEFER),
         steer: has(CAP_STEER_TURN),
+        // Reported as offered; whether a session opts into `per_task_stop` or questions is
+        // `CLIENT_IMPLEMENTS_PER_TASK_STOP` and `CLIENT_IMPLEMENTS_QUESTIONS`, not these flags.
+        cli_turns: has(CAP_CLI_TURNS),
+        human_origin: has(CAP_HUMAN_ORIGIN),
+        background_tasks: has(CAP_BACKGROUND_TASKS),
+        workflow_progress: has(CAP_WORKFLOW_PROGRESS),
+        task_control: has(CAP_TASK_CONTROL),
+        task_output: has(CAP_TASK_OUTPUT),
+        subagent_frames: has(CAP_SUBAGENT_FRAMES),
+        session_notices: has(CAP_SESSION_NOTICES),
+        conversation_reset: has(CAP_CONVERSATION_RESET),
+        structured_questions_v1: has(CAP_STRUCTURED_QUESTIONS_V1),
     }
 }
 
@@ -211,6 +248,10 @@ fn provider_error_code(code: ProtoErrorCode) -> ProviderErrorCode {
         ProtoErrorCode::DeadlineExceeded => ProviderErrorCode::DeadlineExceeded,
         ProtoErrorCode::TurnMismatch => ProviderErrorCode::TurnMismatch,
         ProtoErrorCode::SteerUnavailable => ProviderErrorCode::SteerUnavailable,
+        ProtoErrorCode::TaskNotFound => ProviderErrorCode::TaskNotFound,
+        ProtoErrorCode::TaskOutputUnavailable => ProviderErrorCode::TaskOutputUnavailable,
+        ProtoErrorCode::InteractionNotFound => ProviderErrorCode::InteractionNotFound,
+        ProtoErrorCode::InteractionAnswerRefused => ProviderErrorCode::InteractionAnswerRefused,
     }
 }
 
@@ -254,6 +295,8 @@ pub struct ClaudeSidecarProvider {
     provider_prompts: bool,
     /// Whether this peer offers Claude Code's preset for fresh and resumed sessions.
     claude_code_prompt: bool,
+    #[cfg(feature = "test-support")]
+    questions_override: Option<bool>,
     /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
     /// reads it, so a build without moves keeps none.
     #[cfg(target_os = "linux")]
@@ -263,6 +306,8 @@ pub struct ClaudeSidecarProvider {
     parked: Mutex<Option<ParkedWatch>>,
     /// Set once this process handed the sidecar to another: it acts for the session no more.
     released: AtomicBool,
+    #[cfg(feature = "test-support")]
+    per_task_stop_override: Option<bool>,
 }
 
 /// One session's watch task.
@@ -292,6 +337,9 @@ struct WatchState {
     /// Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new event
     /// resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
     consecutive_failures: usize,
+    /// The questions this watch delivered an ask or a settlement for, so the reconcile after a re-opened
+    /// stream adds only questions it never saw (`watch::reconcile_questions`).
+    questions: watch::QuestionLedger,
 }
 
 /// Where a session's watch stood just after one event: the event's sequence, and the state its
@@ -303,6 +351,8 @@ struct WatchMark {
     /// The message id of the last text delta translated, which decides whether the next delta opens
     /// a new assistant message.
     last_text: Option<String>,
+    /// The same for each subagent's open reply, by the call that started it, the longest silent first.
+    child_replies: Vec<(String, String)>,
     /// Whether the session's CLI-mode line was printed.
     cli_mode_noted: bool,
 }
@@ -314,6 +364,7 @@ impl WatchState {
             split: translate::MessageSplit::new(splits_messages),
             cli_mode_note: translate::CliModeNote::new(requested),
             consecutive_failures: 0,
+            questions: watch::QuestionLedger::default(),
         }
     }
 
@@ -321,9 +372,14 @@ impl WatchState {
     fn resumed(mark: &WatchMark, splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
         WatchState {
             tracker: watch::SequenceTracker::after(mark.sequence),
-            split: translate::MessageSplit::resuming(splits_messages, mark.last_text.clone()),
+            split: translate::MessageSplit::resuming(
+                splits_messages,
+                mark.last_text.clone(),
+                mark.child_replies.clone(),
+            ),
             cli_mode_note: translate::CliModeNote::resuming(requested, mark.cli_mode_noted),
             consecutive_failures: 0,
+            questions: watch::QuestionLedger::default(),
         }
     }
 
@@ -336,10 +392,14 @@ impl WatchState {
             cli_mode_note,
             // Not carried: a watch taken up elsewhere starts with a whole reconnect budget.
             consecutive_failures: _,
+            // Not carried: the other process's projection holds the questions already asked, and a
+            // reconcile there that adds one of them again replaces its record with the same set.
+            questions: _,
         } = self;
         WatchMark {
             sequence: tracker.after_sequence(),
             last_text: split.last_text().map(str::to_string),
+            child_replies: split.child_replies().to_vec(),
             cli_mode_noted: cli_mode_note.noted(),
         }
     }
@@ -508,11 +568,61 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            #[cfg(feature = "test-support")]
+            questions_override: None,
             #[cfg(target_os = "linux")]
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(None),
             released: AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            per_task_stop_override: None,
         })
+    }
+
+    /// Overrides host readiness for scripted interaction tests; the peer must still offer questions.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_questions_override_for_tests(&mut self, enabled: bool) {
+        self.questions_override = Some(enabled);
+    }
+
+    fn question_policy(&self) -> QuestionPolicy {
+        #[cfg(feature = "test-support")]
+        let readiness = self.questions_override;
+        #[cfg(not(feature = "test-support"))]
+        let readiness = None;
+        QuestionPolicy::resolve(self.capabilities.structured_questions_v1, readiness)
+    }
+
+    /// A private harness choice, made before creating a session; it never overrides a missing capability.
+    #[cfg(feature = "test-support")]
+    pub fn set_per_task_stop(&mut self, enabled: bool) {
+        self.per_task_stop_override = Some(enabled);
+    }
+
+    fn per_task_stop(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        let readiness = self.per_task_stop_override;
+        #[cfg(not(feature = "test-support"))]
+        let readiness = None;
+        per_task_stop_policy(self.capabilities.task_control, readiness)
+    }
+
+    /// Schedules a bounded unary RPC and returns its receiver immediately. The runtime's task
+    /// awaits network I/O and the timeout without blocking either its thread or the UI thread.
+    fn task_rpc<F, T>(&self, future: F) -> crate::TaskReply<T>
+    where
+        F: std::future::Future<Output = Result<T, ProviderError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.handle().spawn(async move {
+            let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, future)
+                .await
+                .unwrap_or(Err(ProviderError::Timeout));
+            let _ = tx.send(result);
+        });
+        rx
     }
 
     /// What the event stream is costing right now: queue depth, and how far behind production
@@ -584,8 +694,11 @@ impl ClaudeSidecarProvider {
     /// Issues one `CreateSession` (fresh or resuming) and starts watching the resulting session.
     /// Both paths must open the watch stream, and forgetting it on one of them would produce a
     /// session that accepts commands and reports nothing.
-    fn open_session(&self, request: ProtoCreateSessionRequest) -> Result<String, ProviderError> {
+    fn open_session(&self, mut request: ProtoCreateSessionRequest) -> Result<String, ProviderError> {
         self.require_driving()?;
+        if let Some(policy) = request.policy.as_mut() {
+            policy.per_task_stop = self.per_task_stop();
+        }
         let mut client = self.client.clone();
         let response = self.run_unary(async move { client.create_session(request).await })?;
         self.start_watching(response.session_id.clone());
@@ -638,6 +751,7 @@ impl ClaudeSidecarProvider {
         // The mode this session's `CreateSession` asked for, the one its CLI's reports are judged
         // against: every session this provider creates asks for the same one.
         let requested = requested_cli_mode(&self.capabilities);
+        let asks_questions = self.capabilities.structured_questions_v1;
         #[cfg(target_os = "linux")]
         let watched = session_id.clone();
         let task = self.runtime.handle().spawn(async move {
@@ -648,6 +762,8 @@ impl ClaudeSidecarProvider {
                 events.push(AgentDomainEvent::SessionUnavailable { reason });
             };
 
+            // The first open reads from the session's start; every later one is a re-watch.
+            let mut reopening = false;
             loop {
                 let request = WatchSessionEventsRequest {
                     session_id: session_id.clone(),
@@ -664,9 +780,9 @@ impl ClaudeSidecarProvider {
                 };
                 let mut stream = match opened {
                     Ok(response) => {
-                        // Whatever a held turn end waits for comes in the replay that follows, so its
-                        // wait starts over from here.
-                        events.stream_back();
+                        let snapshot = (std::mem::replace(&mut reopening, true) && asks_questions)
+                            .then(|| read_interaction_state(&client, &session_id));
+                        stream_reopened(&events, &mut state, snapshot).await;
                         response.into_inner()
                     }
                     Err(status) => {
@@ -715,8 +831,11 @@ impl ClaudeSidecarProvider {
                                         // terminal event, never inferred from the stream stopping.
                                         closed_by_session |=
                                             matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
+                                        state.questions.observe(&domain_event);
                                         translated.push(domain_event);
                                     }
+                                    // The asks a reconcile held back until the replay got this far.
+                                    translated.extend(state.questions.due(sequence));
                                     // Queued with the watch's position after the event, so whoever
                                     // takes them knows where the watch stood as of the last one.
                                     events.push_wire(translated, state.mark());
@@ -775,6 +894,55 @@ impl ClaudeSidecarProvider {
         // task running, as keeping it did.
         #[cfg(not(target_os = "linux"))]
         drop(task);
+    }
+}
+
+/// The watch stream is open again. First, when `snapshot` reads the sidecar's list of questions still
+/// waiting, the ask of each one this watch never saw is queued (`watch::reconcile_questions`), or held
+/// back until the replay reaches the sequence the list was read at. Only then does a held turn end
+/// start its new wait for its follow-up, which comes in the replay: the replay is not read while the
+/// list is, so a slow read must not use that wait up and have the steered message reported dropped
+/// while its delivery is still to be read.
+async fn stream_reopened<F>(events: &Arc<EventQueue>, state: &mut WatchState, snapshot: Option<F>)
+where
+    F: std::future::Future<Output = Option<crate::InteractionState>>,
+{
+    if let Some(read) = snapshot {
+        if let Some(snapshot) = read.await {
+            let added = watch::reconcile_questions(&mut state.questions, snapshot, state.tracker.after_sequence());
+            if !added.is_empty() {
+                events.push_wire(added, state.mark());
+            }
+        }
+    }
+    events.stream_back();
+}
+
+/// The sidecar's list of questions still waiting, after a re-opened watch. The replay itself carries
+/// every ask and settlement the break hid, so a failed read loses nothing; it is logged and the watch
+/// goes on.
+async fn read_interaction_state(
+    client: &RuntimeServiceClient<Channel>,
+    session_id: &str,
+) -> Option<crate::InteractionState> {
+    let request = claude_runtime_protocol::v1::GetInteractionStateRequest {
+        session_id: session_id.to_string(),
+    };
+    let mut client = client.clone();
+    let read = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.get_interaction_state(request)).await;
+    match read {
+        Ok(Ok(response)) => Some(translate_322::interaction_state(response.into_inner())),
+        Ok(Err(status)) => {
+            eprintln!(
+                "agent: ClaudeSidecarProvider: the questions still waiting could not be read after a re-watch: {}",
+                map_status(status)
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!("agent: ClaudeSidecarProvider: reading the questions still waiting after a re-watch timed out");
+            None
+        }
     }
 }
 
@@ -989,6 +1157,7 @@ fn build_create_request(
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     project: ProjectTrust,
+    questions: QuestionPolicy,
 ) -> ProtoCreateSessionRequest {
     build_create_request_loading(
         cwd,
@@ -1000,6 +1169,7 @@ fn build_create_request(
         crate::setting_sources::loads_user_settings(),
         project,
         cli_mode,
+        questions,
     )
 }
 
@@ -1029,6 +1199,7 @@ fn build_create_request_loading(
     user_settings: bool,
     project: ProjectTrust,
     cli_mode: crate::RequestedCliMode,
+    questions: QuestionPolicy,
 ) -> ProtoCreateSessionRequest {
     let denied = crate::process::disallowed_tools();
     ProtoCreateSessionRequest {
@@ -1115,9 +1286,15 @@ fn build_create_request_loading(
             // Never set: a sidecar that refuses its CLI refuses the session, and Eitri has no way
             // for a user to decide otherwise per session.
             accept_unsupported_cli: false,
+            // The session opener fills this from the handshake and host readiness, for fresh
+            // and resumed sessions alike. A peer without task controls receives no new field.
+            per_task_stop: false,
         }),
         resume_provider_session_id,
         fork,
+        // Absence preserves the CLI's own question handling until both ends support the host path.
+        client_interactions: (questions.capable && questions.client_implements)
+            .then_some(claude_runtime_protocol::v1::ClientInteractions { questions: true }),
         // Keep model, effort and output format at their defaults. A replacement would discard
         // Claude Code's instructions; the preset keeps them and adds only static panel context.
         // Without the capability both fields stay absent, retaining the SDK's minimal prompt.
@@ -1133,6 +1310,33 @@ fn build_create_request_loading(
     }
 }
 
+/// The peer's offer and the host's readiness are separate requirements for question delivery.
+#[derive(Clone, Copy)]
+struct QuestionPolicy {
+    capable: bool,
+    client_implements: bool,
+}
+
+impl QuestionPolicy {
+    /// The peer's offer, and the host's readiness: the shipped constant unless a scripted run
+    /// replaces it. The peer's offer is never replaced.
+    fn resolve(capable: bool, readiness_override: Option<bool>) -> Self {
+        Self {
+            capable,
+            client_implements: readiness_override.unwrap_or(CLIENT_IMPLEMENTS_QUESTIONS),
+        }
+    }
+}
+
+impl Default for QuestionPolicy {
+    fn default() -> Self {
+        Self {
+            capable: false,
+            client_implements: CLIENT_IMPLEMENTS_QUESTIONS,
+        }
+    }
+}
+
 /// The wire request for a fresh session. Destructured whole, so a field added to the request has to
 /// be placed here rather than dropped on the way to the wire.
 fn fresh_request(
@@ -1140,6 +1344,7 @@ fn fresh_request(
     provider_prompts: bool,
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
+    questions: QuestionPolicy,
 ) -> ProtoCreateSessionRequest {
     let CreateSessionRequest {
         cwd,
@@ -1155,6 +1360,7 @@ fn fresh_request(
         claude_code_prompt,
         cli_mode,
         project,
+        questions,
     )
 }
 
@@ -1165,6 +1371,7 @@ fn resume_request(
     provider_prompts: bool,
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
+    questions: QuestionPolicy,
 ) -> ProtoCreateSessionRequest {
     let ResumeSessionRequest {
         provider_session_id,
@@ -1181,7 +1388,35 @@ fn resume_request(
         claude_code_prompt,
         cli_mode,
         project,
+        questions,
     )
+}
+
+fn map_task_status(status: tonic::Status) -> ProviderError {
+    match map_status(status) {
+        ProviderError::Provider { code, message } => ProviderError::Provider {
+            code,
+            message: translate_322::bound(&message, 2000),
+        },
+        ProviderError::Transport(message) => ProviderError::Transport(translate_322::bound(&message, 2000)),
+        other => other,
+    }
+}
+
+/// A task refusal is plain bounded text, with no session-ending side effect.
+pub fn task_refusal(error: ProviderError) -> String {
+    let text = match error {
+        ProviderError::Provider {
+            code: ProviderErrorCode::TaskNotFound,
+            ..
+        } => "task no longer exists".into(),
+        ProviderError::Provider {
+            code: ProviderErrorCode::TaskOutputUnavailable,
+            ..
+        } => "task output is not available".into(),
+        other => other.to_string(),
+    };
+    translate_322::bound(&text, 2000)
 }
 
 impl AgentProvider for ClaudeSidecarProvider {
@@ -1202,6 +1437,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.provider_prompts,
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
+            self.question_policy(),
         ))
     }
 
@@ -1233,19 +1469,43 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.provider_prompts,
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
+            self.question_policy(),
         ))
     }
 
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError> {
+        self.send_turn_stamped(request, TurnStamp::default())
+    }
+
+    /// `SendTurn` with the message's client id when the sidecar can name it back (capability
+    /// `cli_turns`): Claude Code may run work of its own before it reads the message, and the sidecar
+    /// then reports when it does (`UserMessageDelivered`, shown with the stamp's typed text) or that
+    /// it dropped it. Marked as typed by the person only when the stamp says so and the sidecar
+    /// accepts the mark (capability `human_origin`; one without it refuses the mark).
+    fn send_turn_stamped(&self, request: SendTurnRequest, stamp: TurnStamp) -> Result<String, ProviderError> {
         self.require_driving()?;
         let mut client = self.client.clone();
+        let client_message_id = stamp
+            .client_message_id
+            .filter(|id| self.capabilities.cli_turns && !id.is_empty());
+        if let Some(id) = &client_message_id {
+            let typed = stamp.as_typed.unwrap_or_else(|| request.text.clone());
+            self.events.note_sent(id, typed);
+        }
         let proto_request = ProtoSendTurnRequest {
             session_id: request.session_id,
             command_id: uuid::Uuid::new_v4().to_string(),
             text: request.text,
+            client_message_id: client_message_id.clone(),
+            typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
         };
-        let response = self.run_unary(async move { client.send_turn(proto_request).await })?;
-        Ok(response.turn_id)
+        let result = self.run_unary(async move { client.send_turn(proto_request).await });
+        if result.is_err() {
+            if let Some(id) = &client_message_id {
+                self.events.forget_sent(id);
+            }
+        }
+        Ok(result?.turn_id)
     }
 
     /// Takes one message for the running turn and returns at once: the provider's runtime sends it.
@@ -1262,6 +1522,12 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// `Err` only when the gate refuses it here (the id is open already, or too many are open), when
     /// nothing was sent either.
     fn steer_turn(&self, request: SteerTurnRequest) -> Result<(), ProviderError> {
+        self.steer_turn_stamped(request, TurnStamp::default())
+    }
+
+    /// [`steer_turn`](Self::steer_turn), marked as typed by the person when the stamp says so and the
+    /// sidecar accepts the mark (capability `human_origin`).
+    fn steer_turn_stamped(&self, request: SteerTurnRequest, stamp: TurnStamp) -> Result<(), ProviderError> {
         if !self.capabilities.steer {
             return Err(ProviderError::UnsupportedCapability("steer"));
         }
@@ -1279,6 +1545,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             expected_turn_id,
             client_message_id: client_message_id.clone(),
             text,
+            typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
         };
         if let Some(now) = self.events.open_steer(&client_message_id, as_typed, proto_request)? {
             // Counted before this returns, so a move asked for right after it sees the send in flight.
@@ -1289,6 +1556,96 @@ impl AgentProvider for ClaudeSidecarProvider {
                 (client_message_id, now),
                 steering,
             ));
+        }
+        Ok(())
+    }
+
+    fn stop_task(&self, session_id: &str, task_id: &str) -> Result<crate::TaskReply<()>, ProviderError> {
+        if !self.capabilities.task_control {
+            return Err(ProviderError::UnsupportedCapability("stop_task"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::StopTaskRequest {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+            command_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut client = self.client.clone();
+        Ok(self.task_rpc(async move {
+            let response = client.stop_task(request).await.map_err(map_task_status)?.into_inner();
+            translate_322::task_stopped(response);
+            Ok(())
+        }))
+    }
+
+    fn task_output(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<crate::TaskReply<crate::TaskOutput>, ProviderError> {
+        if !self.capabilities.task_output {
+            return Err(ProviderError::UnsupportedCapability("task_output"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::GetTaskOutputRequest {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+        };
+        let mut client = self.client.clone();
+        Ok(self.task_rpc(async move {
+            let response = client
+                .get_task_output(request)
+                .await
+                .map_err(map_task_status)?
+                .into_inner();
+            let tail = translate_322::task_output(response);
+            Ok(crate::TaskOutput {
+                output: tail.output,
+                total_bytes: tail.total_bytes,
+                truncated: tail.truncated,
+            })
+        }))
+    }
+
+    fn stop_background(&self, session_id: &str, shown: u32, tasks: &[String]) -> Result<(), ProviderError> {
+        if !self.capabilities.task_control {
+            return Err(ProviderError::UnsupportedCapability("stop_background"));
+        }
+        self.require_driving()?;
+        if shown == 0 || tasks.len() != shown as usize {
+            return Err(ProviderError::Provider {
+                code: ProviderErrorCode::NoActiveTurn,
+                message: "background work changed: nothing was stopped; ask again".into(),
+            });
+        }
+        for task_id in tasks {
+            let request = claude_runtime_protocol::v1::StopTaskRequest {
+                session_id: session_id.to_owned(),
+                task_id: task_id.clone(),
+                command_id: uuid::Uuid::new_v4().to_string(),
+            };
+            let mut client = self.client.clone();
+            let events = Arc::clone(&self.events);
+            let task_id = task_id.clone();
+            self.runtime.handle().spawn(async move {
+                let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.stop_task(request)).await;
+                let result = match result {
+                    Ok(Ok(response)) => Ok(translate_322::task_stopped(response.into_inner())),
+                    Ok(Err(status)) => Err(map_task_status(status)),
+                    Err(_) => Err(ProviderError::Timeout),
+                };
+                if let Err(error) = result {
+                    events.push(AgentDomainEvent::SessionNotice {
+                        kind: crate::SessionNoticeKind::Task,
+                        level: crate::NoticeLevel::Warning,
+                        content: Some(task_refusal(error)),
+                        scalars: Default::default(),
+                        task_id: Some(task_id),
+                        tool_use_id: None,
+                        task_status: None,
+                    });
+                }
+            });
         }
         Ok(())
     }
@@ -1310,6 +1667,48 @@ impl AgentProvider for ClaudeSidecarProvider {
         let proto_request = resolve_request_for(&self.capabilities, request)?;
         self.run_unary(async move { client.resolve_permission(proto_request).await })?;
         Ok(())
+    }
+
+    /// One `ResolveInteraction`, spawned on the provider's runtime and bounded by `UNARY_RPC_TIMEOUT`;
+    /// the caller is never kept waiting for the sidecar (the person's answer comes from the GTK
+    /// thread). Refused here, with nothing sent, on a sidecar that does not offer questions. Until
+    /// the returned handle is dropped, which its holder does after reading the reply, the session is
+    /// not handed to another window: a refused answer has to put its question back where it was asked.
+    fn resolve_interaction(
+        &self,
+        request: crate::ResolveInteractionRequest,
+    ) -> Result<crate::InteractionSend, ProviderError> {
+        if !self.capabilities.structured_questions_v1 {
+            return Err(ProviderError::UnsupportedCapability("structured_questions_v1"));
+        }
+        self.require_driving()?;
+        let mut client = self.client.clone();
+        let proto_request = resolve_interaction_request_for(request, uuid::Uuid::new_v4().to_string());
+        // Counted before this returns, so a move asked for right after it sees the answer out.
+        let answering = Answering::begin(&self.events);
+        let (tx, send) = crate::InteractionSend::channel();
+        self.runtime.handle().spawn(async move {
+            let reply = match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.resolve_interaction(proto_request)).await {
+                Ok(Ok(response)) => Ok(translate_322::resolve_outcome(response.into_inner())),
+                Ok(Err(status)) => Err(map_status(status)),
+                Err(_) => Err(ProviderError::Timeout),
+            };
+            // The holder may be gone (its window closed); the reply then has nowhere to go.
+            let _ = tx.send(reply);
+        });
+        Ok(send.with_guard(answering))
+    }
+
+    fn get_interaction_state(&self, session_id: &str) -> Result<crate::InteractionState, ProviderError> {
+        if !self.capabilities.structured_questions_v1 {
+            return Err(ProviderError::UnsupportedCapability("structured_questions_v1"));
+        }
+        let mut client = self.client.clone();
+        let proto_request = claude_runtime_protocol::v1::GetInteractionStateRequest {
+            session_id: session_id.to_string(),
+        };
+        let response = self.run_unary(async move { client.get_interaction_state(proto_request).await })?;
+        Ok(translate_322::interaction_state(response))
     }
 
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError> {
@@ -1387,6 +1786,8 @@ struct QueueState {
     frozen: bool,
     /// `send_steers` tasks running.
     steering: usize,
+    /// Answers to questions whose reply has not been read yet.
+    answering: usize,
 }
 
 impl QueueState {
@@ -1506,6 +1907,9 @@ impl EventQueue {
         if state.steering > 0 {
             return Err(MoveRefusedWhy::SteerInFlight);
         }
+        if state.answering > 0 {
+            return Err(MoveRefusedWhy::AnswerInFlight);
+        }
         if let Some(at_take) = state.busy_at_take {
             return Err(busy(at_take));
         }
@@ -1580,6 +1984,19 @@ impl EventQueue {
         let opened = state.gate.open(client_id, as_typed, request)?;
         state.opened_since_take = true;
         Ok(opened)
+    }
+
+    /// A prompt about to be sent with `SendTurn` under `client_id` (`SteerGate::note_sent`). Counts as
+    /// handed over after the latest take, as a steered message does: its delivery may pass the gate
+    /// here before the next take.
+    fn note_sent(&self, client_id: &str, as_typed: String) {
+        let mut state = self.lock();
+        state.gate.note_sent(client_id, as_typed);
+        state.opened_since_take = true;
+    }
+
+    fn forget_sent(&self, client_id: &str) {
+        self.lock().gate.forget_sent(client_id);
     }
 
     /// Records an accepted message; the next one to send, if one waits.
@@ -1659,6 +2076,24 @@ impl Drop for Steering {
     }
 }
 
+/// One answer to a question counted as out, from before it is sent until its reply was read (the
+/// handle holding this is dropped).
+struct Answering(Arc<EventQueue>);
+
+impl Answering {
+    fn begin(events: &Arc<EventQueue>) -> Self {
+        events.lock().answering += 1;
+        Answering(Arc::clone(events))
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.answering = state.answering.saturating_sub(1);
+    }
+}
+
 async fn send_steers(
     client: RuntimeServiceClient<Channel>,
     events: Arc<EventQueue>,
@@ -1727,6 +2162,63 @@ fn resolve_request_for(
     })
 }
 
+/// The `ResolveInteraction` for the person's answer: option indexes, typed text and notes, each
+/// question by its index in the set, and nothing else. The sidecar builds the tool's input from the
+/// question it kept, so no text the page shows or sends becomes tool input, and no request this
+/// client makes carries an input of its own.
+fn resolve_interaction_request_for(
+    request: crate::ResolveInteractionRequest,
+    command_id: String,
+) -> claude_runtime_protocol::v1::ResolveInteractionRequest {
+    use claude_runtime_protocol::v1 as wire;
+    let answers = |answers: Vec<crate::QuestionAnswer>| wire::QuestionAnswers {
+        answers: answers
+            .into_iter()
+            .map(|answer| {
+                let crate::QuestionAnswer {
+                    question_index,
+                    option_indexes,
+                    other_text,
+                    notes,
+                } = answer;
+                wire::QuestionAnswer {
+                    question_index,
+                    option_indexes,
+                    other_text,
+                    notes,
+                }
+            })
+            .collect(),
+    };
+    let crate::ResolveInteractionRequest {
+        session_id,
+        interaction_id,
+        resolution,
+    } = request;
+    let result = match resolution {
+        crate::InteractionResolution::Answers(given) => {
+            wire::resolve_interaction_request::Result::Answers(answers(given))
+        }
+        crate::InteractionResolution::Decline { kind, so_far } => {
+            // What was answered so far goes only with a request to chat; a cancel carries none.
+            let (kind, so_far) = match kind {
+                crate::QuestionDeclineKind::Cancel => (wire::QuestionDeclineKind::Cancel, None),
+                crate::QuestionDeclineKind::Chat => (wire::QuestionDeclineKind::Chat, Some(answers(so_far))),
+            };
+            wire::resolve_interaction_request::Result::Decline(wire::QuestionDecline {
+                kind: kind as i32,
+                so_far,
+            })
+        }
+    };
+    wire::ResolveInteractionRequest {
+        session_id,
+        command_id,
+        interaction_id,
+        result: Some(result),
+    }
+}
+
 /// Records how far behind production one delivered event was.
 ///
 /// `occurred_at` is stamped by the sidecar the moment the event is drained from the kernel's pump,
@@ -1780,6 +2272,9 @@ pub enum ReplaySteerOutcome {
     Refused(String),
     /// No answer reached the provider: the CLI may have the message.
     Unknown,
+    /// Not a steer: a prompt sent with `SendTurn` under this id, which Claude Code names back only when
+    /// it reads it after work of its own, or drops it.
+    Sent,
 }
 
 /// Feeds recorded wire events through the translation the live watch applies (sequence check, message
@@ -1804,6 +2299,10 @@ pub fn replay_frames(
     let mut pending = pending.into_iter().peekable();
 
     let hand_in = |gate: &mut steer::SteerGate<()>, out: &mut Vec<AgentDomainEvent>, steer: &ReplaySteer| {
+        if steer.outcome == ReplaySteerOutcome::Sent {
+            gate.note_sent(&steer.client_message_id, steer.as_typed.clone());
+            return Ok(());
+        }
         gate.open(&steer.client_message_id, steer.as_typed.clone(), ())
             .map_err(|e| format!("steered message {}: {e}", steer.client_message_id))?;
         match &steer.outcome {
@@ -1812,6 +2311,7 @@ pub fn replay_frames(
             }
             ReplaySteerOutcome::Refused(reason) => out.extend(gate.refused(&steer.client_message_id, reason)),
             ReplaySteerOutcome::Unknown => out.extend(gate.unknown(&steer.client_message_id)),
+            ReplaySteerOutcome::Sent => unreachable!("noted above"),
         }
         Ok::<(), String>(())
     };
@@ -1862,6 +2362,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn question_readiness_override_replaces_only_the_host_side() {
+        let shipped = QuestionPolicy::resolve(true, None);
+        assert_eq!(shipped.client_implements, CLIENT_IMPLEMENTS_QUESTIONS);
+        assert!(shipped.capable);
+        let opted_in = QuestionPolicy::resolve(true, Some(true));
+        assert!(opted_in.capable && opted_in.client_implements);
+        let opted_out = QuestionPolicy::resolve(true, Some(false));
+        assert!(opted_out.capable && !opted_out.client_implements);
+        let incapable = QuestionPolicy::resolve(false, Some(true));
+        assert!(!incapable.capable && incapable.client_implements);
+    }
+
+    #[test]
     fn append_is_exact_static_panel_context() {
         let expected = concat!(
             "This session was started by Eitri, a desktop IDE built around Neovim. While the conversation is shown in Eitri's ",
@@ -1906,6 +2419,7 @@ mod tests {
                                 user_settings,
                                 project,
                                 cli_mode,
+                                QuestionPolicy::default(),
                             );
                             let decoded =
                                 ProtoCreateSessionRequest::decode(request.encode_to_vec().as_slice()).unwrap();
@@ -1944,9 +2458,11 @@ mod tests {
                                             crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,
                                         },
                                         accept_unsupported_cli: false,
+                                        per_task_stop: false,
                                     }),
                                     resume_provider_session_id: resume,
                                     fork: false,
+                                    client_interactions: None,
                                     model: None,
                                     effort: None,
                                     system_prompt: None,
@@ -1969,6 +2485,7 @@ mod tests {
                 true,
                 offered,
                 crate::RequestedCliMode::Default,
+                QuestionPolicy::default(),
             );
             let resumed = resume_request(
                 ResumeSessionRequest {
@@ -1980,6 +2497,7 @@ mod tests {
                 true,
                 offered,
                 crate::RequestedCliMode::Default,
+                QuestionPolicy::default(),
             );
             assert_eq!(fresh.system_prompt_preset.is_some(), offered);
             assert_eq!(resumed.system_prompt_preset, fresh.system_prompt_preset);
@@ -2007,6 +2525,7 @@ mod tests {
                         false,
                         cli_mode,
                         ProjectTrust::Untrusted,
+                        QuestionPolicy::default(),
                     ),
                 ),
                 (
@@ -2020,6 +2539,7 @@ mod tests {
                         false,
                         cli_mode,
                         ProjectTrust::Untrusted,
+                        QuestionPolicy::default(),
                     ),
                 ),
                 (
@@ -2033,6 +2553,7 @@ mod tests {
                         false,
                         cli_mode,
                         ProjectTrust::Untrusted,
+                        QuestionPolicy::default(),
                     ),
                 ),
             ]
@@ -2090,6 +2611,7 @@ mod tests {
                     false,
                     crate::RequestedCliMode::Default,
                     ProjectTrust::Untrusted,
+                    QuestionPolicy::default(),
                 )
                 .policy
                 .expect("a policy is always sent");
@@ -2121,6 +2643,7 @@ mod tests {
             user_settings,
             project,
             crate::RequestedCliMode::Default,
+            QuestionPolicy::default(),
         )
         .policy
         .expect("a policy is always sent")
@@ -2148,6 +2671,7 @@ mod tests {
                     true,
                     ProjectTrust::Untrusted,
                     crate::RequestedCliMode::Default,
+                    QuestionPolicy::default(),
                 )
                 .policy
                 .expect("a policy is always sent")
@@ -2176,6 +2700,7 @@ mod tests {
                 false,
                 ProjectTrust::Untrusted,
                 crate::RequestedCliMode::Default,
+                QuestionPolicy::default(),
             );
             let selection = request.policy.clone().expect("a policy is always sent").setting_sources;
             assert_ne!(selection, None, "{shape}: never absent");
@@ -2227,6 +2752,7 @@ mod tests {
                 false,
                 false,
                 crate::RequestedCliMode::Default,
+                QuestionPolicy::default(),
             )
         };
         let fresh = |project| {
@@ -2239,6 +2765,7 @@ mod tests {
                 false,
                 false,
                 crate::RequestedCliMode::Default,
+                QuestionPolicy::default(),
             )
         };
         let sources = |request: ProtoCreateSessionRequest| request.policy.unwrap().setting_sources.unwrap().sources;
@@ -2313,6 +2840,7 @@ mod tests {
                 false,
                 crate::RequestedCliMode::Default,
                 project,
+                QuestionPolicy::default(),
             )
             .policy
             .expect("a policy is always sent")
@@ -2340,7 +2868,7 @@ mod tests {
         HandshakeResponse {
             protocol_major: 3,
             // The handshake reports the protocol minor from `capabilities.json`.
-            protocol_minor: 21,
+            protocol_minor: 22,
             sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
@@ -2409,6 +2937,19 @@ mod tests {
                 "steer_turn",
                 "list_commands",
                 "system_prompt_preset",
+                // These entries follow `capabilities.json` order, with one `ProviderCapabilities` flag each.
+                // `task_output` requires the sidecar to open task output files safely and is present
+                // on the Linux systems represented by this fixture.
+                "cli_turns",
+                "human_origin",
+                "subagent_frames",
+                "background_tasks",
+                "workflow_progress",
+                "task_control",
+                "task_output",
+                "session_notices",
+                "conversation_reset",
+                "structured_questions_v1",
                 // Executable sources are advertised as capabilities rather than a separate wire field.
                 // `executable_host_cli` is always present; checkout builds also offer `executable_sdk_bundled`.
                 // Packaged builds cannot offer it: the SDK uses `createRequire` to find its CLI, and the
@@ -2517,6 +3058,168 @@ mod tests {
         older.capabilities.retain(|c| c != CAP_STEER_TURN);
         assert!(!capabilities_from_handshake(&older).steer);
         assert_eq!(CAP_STEER_TURN, "steer_turn", "the word the sidecar advertises");
+    }
+
+    /// Reads one flag of a `ProviderCapabilities`.
+    type Flag = fn(&ProviderCapabilities) -> bool;
+
+    /// The protocol 3.22 capabilities, each with the flag it alone sets.
+    fn capabilities_of_3_22() -> [(&'static str, Flag); 10] {
+        [
+            ("cli_turns", |c| c.cli_turns),
+            ("human_origin", |c| c.human_origin),
+            ("subagent_frames", |c| c.subagent_frames),
+            ("background_tasks", |c| c.background_tasks),
+            ("workflow_progress", |c| c.workflow_progress),
+            ("task_control", |c| c.task_control),
+            ("task_output", |c| c.task_output),
+            ("session_notices", |c| c.session_notices),
+            ("conversation_reset", |c| c.conversation_reset),
+            ("structured_questions_v1", |c| c.structured_questions_v1),
+        ]
+    }
+
+    /// A handshake listing one 3.22 capability sets exactly its flag and leaves every other flag
+    /// where a handshake without any of them puts it; listing none sets none.
+    #[test]
+    fn each_protocol_3_22_capability_sets_exactly_its_own_flag() {
+        let names: Vec<&str> = capabilities_of_3_22().iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            [
+                CAP_CLI_TURNS,
+                CAP_HUMAN_ORIGIN,
+                CAP_SUBAGENT_FRAMES,
+                CAP_BACKGROUND_TASKS,
+                CAP_WORKFLOW_PROGRESS,
+                CAP_TASK_CONTROL,
+                CAP_TASK_OUTPUT,
+                CAP_SESSION_NOTICES,
+                CAP_CONVERSATION_RESET,
+                CAP_STRUCTURED_QUESTIONS_V1,
+            ]
+            .to_vec(),
+            names,
+            "the words the sidecar advertises"
+        );
+        let all = capabilities_from_handshake(&real_handshake_today());
+        for (name, flag) in capabilities_of_3_22() {
+            assert!(flag(&all), "{name} is advertised by the pinned sidecar");
+        }
+
+        let mut without = real_handshake_today();
+        without.capabilities.retain(|c| !names.contains(&c.as_str()));
+        let base = capabilities_from_handshake(&without);
+        assert_eq!(base, all_off(all), "no 3.22 flag without its word");
+
+        for (name, _) in capabilities_of_3_22() {
+            let mut one = without.clone();
+            one.capabilities.push(name.to_string());
+            let got = capabilities_from_handshake(&one);
+            for (other, flag) in capabilities_of_3_22() {
+                assert_eq!(flag(&got), other == name, "advertising {name} alone, {other}");
+            }
+            assert_eq!(all_off(got), base, "advertising {name} moves no flag from before 3.22");
+        }
+    }
+
+    /// `capabilities` with every 3.22 flag cleared.
+    fn all_off(capabilities: ProviderCapabilities) -> ProviderCapabilities {
+        ProviderCapabilities {
+            cli_turns: false,
+            human_origin: false,
+            subagent_frames: false,
+            background_tasks: false,
+            workflow_progress: false,
+            task_control: false,
+            task_output: false,
+            session_notices: false,
+            conversation_reset: false,
+            structured_questions_v1: false,
+            ..capabilities
+        }
+    }
+
+    /// The field numbers of one encoded protobuf message's own fields, in wire order.
+    fn wire_field_numbers(mut bytes: &[u8]) -> Vec<u64> {
+        fn varint(bytes: &mut &[u8]) -> u64 {
+            let mut value = 0u64;
+            for shift in (0..64).step_by(7) {
+                let (byte, rest) = bytes.split_first().expect("a complete varint");
+                *bytes = rest;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            value
+        }
+        let mut numbers = Vec::new();
+        while !bytes.is_empty() {
+            let key = varint(&mut bytes);
+            numbers.push(key >> 3);
+            match key & 7 {
+                0 => {
+                    varint(&mut bytes);
+                }
+                1 => bytes = &bytes[8..],
+                2 => {
+                    let len = usize::try_from(varint(&mut bytes)).expect("a length");
+                    bytes = &bytes[len..];
+                }
+                5 => bytes = &bytes[4..],
+                other => panic!("wire type {other} is not one prost writes"),
+            }
+        }
+        numbers
+    }
+
+    /// An absent peer capability leaves questions absent; task control adds only its policy field.
+    #[test]
+    // The two opt-ins are constants on purpose; asserting them is the point, and flipping one must
+    // fail here until the request carries what it asks for.
+    #[allow(clippy::assertions_on_constants)]
+    fn create_requests_declare_per_task_stop_exactly_with_task_control() {
+        use prost::Message as _;
+        assert!(CLIENT_IMPLEMENTS_PER_TASK_STOP);
+        assert!(CLIENT_IMPLEMENTS_QUESTIONS);
+        let offered = capabilities_from_handshake(&real_handshake_today());
+        assert!(offered.task_control && offered.structured_questions_v1);
+        for cli_mode in [crate::RequestedCliMode::Default, crate::RequestedCliMode::Auto] {
+            for (resume, fork) in [(None, false), (Some("claude-id".to_string()), true)] {
+                for claude_code_prompt in [false, true] {
+                    let request = build_create_request_loading(
+                        "/p".into(),
+                        StreamingPreference::Partial,
+                        resume.clone(),
+                        fork,
+                        true,
+                        claude_code_prompt,
+                        true,
+                        ProjectTrust::Trusted,
+                        cli_mode,
+                        QuestionPolicy::default(),
+                    );
+                    assert!(request.client_interactions.is_none());
+                    let mut policy = request.policy.clone().expect("a policy is always sent");
+                    assert!(!policy.per_task_stop);
+                    let fields = wire_field_numbers(&request.encode_to_vec());
+                    assert!(!fields.contains(&11), "request fields {fields:?}");
+                    assert!(fields.iter().all(|n| *n <= 10), "request fields {fields:?}");
+                    let fields = wire_field_numbers(&policy.encode_to_vec());
+                    assert!(!fields.contains(&12), "policy fields {fields:?}");
+                    assert!(fields.iter().all(|n| *n <= 11), "policy fields {fields:?}");
+                    for capable in [false, true] {
+                        policy.per_task_stop = per_task_stop_policy(capable, None);
+                        assert_eq!(policy.per_task_stop, capable);
+                        let fields = wire_field_numbers(&policy.encode_to_vec());
+                        assert_eq!(fields.contains(&12), capable);
+                        for readiness in [false, true] {
+                            assert_eq!(per_task_stop_policy(capable, Some(readiness)), capable && readiness);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn detail(code: ProtoErrorCode, reason: &str, message: &str) -> ErrorDetail {
@@ -2640,6 +3343,30 @@ mod tests {
             provider_error_code(ProtoErrorCode::SteerUnavailable),
             ProviderErrorCode::SteerUnavailable
         );
+    }
+
+    /// Protocol 3.22's four codes each answer one request about one task or one question, which may
+    /// simply have ended first; the session stays healthy, so none of them is a reason to end it.
+    #[test]
+    fn the_task_and_question_refusals_map_one_to_one_and_are_benign() {
+        for (wire, mirrored) in [
+            (ProtoErrorCode::TaskNotFound, ProviderErrorCode::TaskNotFound),
+            (
+                ProtoErrorCode::TaskOutputUnavailable,
+                ProviderErrorCode::TaskOutputUnavailable,
+            ),
+            (
+                ProtoErrorCode::InteractionNotFound,
+                ProviderErrorCode::InteractionNotFound,
+            ),
+            (
+                ProtoErrorCode::InteractionAnswerRefused,
+                ProviderErrorCode::InteractionAnswerRefused,
+            ),
+        ] {
+            assert_eq!(provider_error_code(wire), mirrored);
+            assert!(mirrored.is_benign(), "{mirrored:?}");
+        }
     }
 
     fn turn_completed(turn: &str) -> AgentDomainEvent {
@@ -2774,6 +3501,56 @@ mod tests {
         );
     }
 
+    /// Re-opened, a stream first has its waiting questions read, and the replay is not read meanwhile:
+    /// a read slower than a held turn end's wait must not use that wait up, or the steered message
+    /// would be reported dropped while its delivery is still in the replay, and sent again.
+    #[test]
+    fn a_slow_question_list_read_after_a_re_open_does_not_use_up_the_follow_up_wait() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+        queue
+            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("m1");
+        let mut state = WatchState::fresh(true, crate::RequestedCliMode::Default);
+        let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
+        runtime.block_on(async {
+            queue.push(turn_completed("t1"));
+            queue.stream_lost();
+            let slow_read = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some(crate::InteractionState {
+                    through_sequence: 0,
+                    pending: Vec::new(),
+                })
+            };
+            stream_reopened(&queue, &mut state, Some(slow_read)).await;
+            // The replay, read once the list was.
+            queue.push(started.clone());
+            queue.push(AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "m1".into(),
+                turn_id: "t2".into(),
+                text: String::new(),
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert_eq!(
+            queue.take(),
+            [
+                turn_completed("t1"),
+                started,
+                AgentDomainEvent::UserMessageDelivered {
+                    client_message_id: "m1".into(),
+                    turn_id: "t2".into(),
+                    text: "typed".into(),
+                },
+            ]
+        );
+    }
+
     /// Re-opened, a stream whose replay brings no follow-up is given up on after a whole new wait.
     #[test]
     fn the_queue_gives_up_after_a_new_wait_once_the_stream_is_back() {
@@ -2825,10 +3602,10 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Forty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
+        // Fifty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
         // Checkout builds also advertise `executable_sdk_bundled`; a sidecar with egress
         // restrictions enabled additionally advertises `egress_restricted`.
-        assert_eq!(info.advertised_capabilities.len(), 42);
+        assert_eq!(info.advertised_capabilities.len(), 52);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
@@ -2900,6 +3677,7 @@ mod tests {
                     true,
                     ProjectTrust::Untrusted,
                     cli_mode,
+                    QuestionPolicy::default(),
                 )
             };
             let default = build(crate::RequestedCliMode::Default);
@@ -2986,6 +3764,7 @@ mod tests {
         WatchMark {
             sequence,
             last_text: Some(last_text.to_string()),
+            child_replies: Default::default(),
             cli_mode_noted: false,
         }
     }
@@ -3097,6 +3876,23 @@ mod tests {
         let steering = Steering::begin(&queue);
         assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::SteerInFlight)));
         drop(steering);
+        assert!(queue.freeze().is_ok());
+    }
+
+    /// A refused answer puts its question back in the window that sent it, so the chat does not move
+    /// while an answer's reply is unread; the reply read (its handle dropped), it may.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answer_whose_reply_is_unread_refuses_a_freeze() {
+        let queue = Arc::new(EventQueue::default());
+        let send = crate::InteractionSend::ready(Ok(None)).with_guard(Answering::begin(&queue));
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::AnswerInFlight)));
+        assert!(matches!(send.try_reply(), Some(Ok(None))));
+        assert!(
+            matches!(queue.freeze(), Err(MoveRefusedWhy::AnswerInFlight)),
+            "still held until the handle is dropped"
+        );
+        drop(send);
         assert!(queue.freeze().is_ok());
     }
 
@@ -3252,6 +4048,7 @@ mod tests {
                     turn_id: "t1".into(),
                     text: "x".into(),
                     message_id: Some(id.into()),
+                    ..Default::default()
                 },
             )),
             ..Default::default()
@@ -3267,5 +4064,104 @@ mod tests {
             resumed.split.before(&delta("m2")).is_some(),
             "a different message after the mark opens a message of its own"
         );
+    }
+}
+
+#[cfg(test)]
+mod question_request_tests {
+    use super::resolve_interaction_request_for;
+    use crate::{InteractionResolution, QuestionAnswer, QuestionDeclineKind, ResolveInteractionRequest};
+    use claude_runtime_protocol::v1 as wire;
+
+    fn given() -> Vec<QuestionAnswer> {
+        vec![
+            QuestionAnswer {
+                question_index: 0,
+                option_indexes: vec![1],
+                other_text: None,
+                notes: Some("keep the sidebar".into()),
+            },
+            QuestionAnswer {
+                question_index: 2,
+                option_indexes: vec![0, 3],
+                other_text: Some("typed".into()),
+                notes: None,
+            },
+        ]
+    }
+
+    /// The request carries the person's choices as indexes and the text they typed, each question by
+    /// its index, and nothing else: every field of it is named here, so a field that could carry the
+    /// tool's input would have to be added on purpose.
+    #[test]
+    fn an_answer_goes_as_indexes_and_typed_text_only() {
+        let request = resolve_interaction_request_for(
+            ResolveInteractionRequest {
+                session_id: "s1".into(),
+                interaction_id: "i1".into(),
+                resolution: InteractionResolution::Answers(given()),
+            },
+            "c1".into(),
+        );
+        let wire::ResolveInteractionRequest {
+            session_id,
+            command_id,
+            interaction_id,
+            result,
+        } = request;
+        assert_eq!(
+            (session_id.as_str(), command_id.as_str(), interaction_id.as_str()),
+            ("s1", "c1", "i1")
+        );
+        let Some(wire::resolve_interaction_request::Result::Answers(wire::QuestionAnswers { answers })) = result else {
+            panic!("an answer goes as answers: {result:?}");
+        };
+        // Question index, option indexes, typed text, notes: the whole of one answer.
+        type Sent = (u32, Vec<u32>, Option<String>, Option<String>);
+        let sent: Vec<Sent> = answers
+            .into_iter()
+            .map(|answer| {
+                let wire::QuestionAnswer {
+                    question_index,
+                    option_indexes,
+                    other_text,
+                    notes,
+                } = answer;
+                (question_index, option_indexes, other_text, notes)
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (0, vec![1], None, Some("keep the sidebar".to_string())),
+                (2, vec![0, 3], Some("typed".to_string()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decline_goes_with_its_kind_and_only_a_chat_carries_what_was_answered() {
+        let decline = |kind| {
+            resolve_interaction_request_for(
+                ResolveInteractionRequest {
+                    session_id: "s1".into(),
+                    interaction_id: "i1".into(),
+                    resolution: InteractionResolution::Decline { kind, so_far: given() },
+                },
+                "c1".into(),
+            )
+            .result
+        };
+        let Some(wire::resolve_interaction_request::Result::Decline(cancel)) = decline(QuestionDeclineKind::Cancel)
+        else {
+            panic!("a cancel goes as a decline");
+        };
+        assert_eq!(cancel.kind, wire::QuestionDeclineKind::Cancel as i32);
+        assert_eq!(cancel.so_far, None, "a cancel carries no answers");
+        let Some(wire::resolve_interaction_request::Result::Decline(chat)) = decline(QuestionDeclineKind::Chat) else {
+            panic!("a chat goes as a decline");
+        };
+        assert_eq!(chat.kind, wire::QuestionDeclineKind::Chat as i32);
+        assert_eq!(chat.so_far.map(|so_far| so_far.answers.len()), Some(2));
     }
 }

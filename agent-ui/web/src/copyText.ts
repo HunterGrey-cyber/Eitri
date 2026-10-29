@@ -1,5 +1,5 @@
 import { runSummary } from "./display";
-import type { TimelineItem } from "./timeline";
+import { noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
@@ -25,7 +25,11 @@ export function primaryText(item: TimelineItem): string {
     case "run":
       return runSummary(item.calls);
     case "ending":
-      return turnEndingText(item.ending);
+      return turnEndingText(item.ending, item.ending.resetsAt ?? null);
+    case "wake":
+      return [wakeText(item), item.body].filter(Boolean).join("\n");
+    case "notice":
+      return [noticeText(item.notice), noticeBody(item.notice)].filter(Boolean).join("\n");
     case "thinking":
       // The thought's own text, whether or not its fold is open: the row stands for it.
       return item.block.text;

@@ -579,9 +579,13 @@ export function Composer({
                   ? "This session has ended — start a new one."
                   : editingInNvim
                     ? "editing in nvim — :wq to return"
-                    : running
-                      ? runningPlaceholder(enterSteers)
-                      : // Nothing in an ordinary empty box while it holds the keys: the caret and the box's
+                    : // Only held messages: ↑ takes those back and Ctrl+Enter sends them, while a message
+                      // already sent into the turn can be neither, so it leaves the running hint in place.
+                      queueCount > 0
+                      ? "↑ to edit queued messages, Ctrl+Enter to send them now"
+                      : running
+                        ? runningPlaceholder(enterSteers)
+                        : // Nothing in an ordinary empty box while it holds the keys: the caret and the box's
                         // INPUT frame already say where the keys are, and grey text behind an input
                         // method's preedit reads as a second line of input. Without the keys there is no
                         // caret and no preedit, and the host may say how to get here.

@@ -20,10 +20,11 @@ pub(super) enum Admission {
     Refused(String),
 }
 
-/// Which messages from `view`'s page meet the window's gate: every answer that resolves a card, starts
-/// a session the user was asked about, or loosens permissions -- a card answer, a bypass `y`, a
-/// restore `y` (it resumes the saved bypass tabs in bypass) and a trust `y` or `n` (a covered page's
-/// question may not be the one the user read). `target` is the tab the message resolved to. Every
+/// Which messages from `view`'s page meet the window's gate: every answer that resolves a card or one
+/// of Claude's questions, starts a session the user was asked about, or loosens permissions -- a card
+/// answer, a question's answer or decline, a bypass `y`, a restore `y` (it resumes the saved bypass
+/// tabs in bypass) and a trust `y` or `n` (a covered page's question may not be the one the user
+/// read). `target` is the tab the message resolved to. Every
 /// variant is named, so a new message is classified when it is added rather than falling through
 /// ungated. Changes nothing.
 pub(super) fn admission(
@@ -39,9 +40,40 @@ pub(super) fn admission(
         Err(why) => Admission::Refused(why),
     };
     match msg {
-        InboundMessage::PermissionResponse { .. } => match target {
+        InboundMessage::StopTask { task_id, .. } | InboundMessage::TaskOutput { task_id, .. } => {
+            let Some(tab) = target else {
+                return Admission::Refused("no active session".into());
+            };
+            if let Err(why) = page_may_answer(&state.tabs, tab, view) {
+                return Admission::Refused(why);
+            }
+            if state.tabs.is_moving(tab) {
+                return Admission::Refused(eitri_core::tab_set::MOVING.into());
+            }
+            let Some(backend) = state.tabs.get(tab).and_then(|t| t.live()) else {
+                return Admission::Refused("no active session".into());
+            };
+            if backend.agent() != AgentId::Claude {
+                return Admission::Refused("task controls are only available for Claude".into());
+            }
+            if !backend
+                .projection()
+                .background_tasks
+                .rows
+                .iter()
+                .any(|row| row.task.task_id == *task_id)
+            {
+                return Admission::Refused("task no longer exists".into());
+            }
+            Admission::Ungated
+        }
+        // A question is answered the way a card is: only from the page showing its tab, and only
+        // while the window agrees that page is not covered.
+        InboundMessage::PermissionResponse { .. }
+        | InboundMessage::QuestionAnswer { .. }
+        | InboundMessage::QuestionDecline { .. } => match target {
             Some(tab) => from_its_page(tab),
-            // Unreachable (a card answer names its tab, or it was refused when resolved); asking the
+            // Unreachable (an answer names its tab, or it was refused when resolved); asking the
             // window is the side that refuses more.
             None => Admission::Gated(view),
         },
@@ -90,6 +122,8 @@ pub(super) fn admission(
         | InboundMessage::SendNow { .. }
         | InboundMessage::Draft { .. }
         | InboundMessage::EditDraft { .. }
+        | InboundMessage::QuestionDraft { .. }
+        | InboundMessage::EditQuestionOther { .. }
         | InboundMessage::HistoryPush { .. }
         | InboundMessage::OpenPath { .. }
         | InboundMessage::ReviewRequest { .. }
@@ -239,6 +273,87 @@ pub(super) fn admit(
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn task_commands_refuse_an_unknown_task_and_a_codex_tab() {
+        let dir = agent::state_dirs::test_workspace_dir("task-admission");
+        let (handle, _, _) = handle_with_recording_page();
+        let (provider, backend) = live_backend(&dir);
+        let tab = handle.state.borrow().tabs.active();
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        provider.queue(agent::AgentDomainEvent::BackgroundTasksChanged {
+            tasks: vec![agent::BackgroundTask {
+                task_id: "known".into(),
+                run_id: None,
+                kind: agent::TaskKind::Shell,
+                task_type: "shell".into(),
+                description: "test".into(),
+                subagent_type: None,
+                parent_task_id: None,
+                tool_use_id: None,
+                ambient: false,
+                workflow_name: None,
+            }],
+            occurred_at: None,
+        });
+        tick_handle_until(&handle, "the roster", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .background_calls
+                == 1
+        });
+        for kind in ["stop_task", "task_output"] {
+            for (id, accepted) in [("known", true), ("missing", false)] {
+                let message = parse_inbound_message(
+                    &serde_json::json!({"type": kind, "request_id": "t1", "tab": tab.0, "task_id": id}).to_string(),
+                )
+                .unwrap();
+                let result = admission(&handle.state.borrow(), &message, ViewId::BASE, Some(tab));
+                assert_eq!(result == Admission::Ungated, accepted);
+            }
+        }
+        let external = std::sync::Arc::new(eitri_core::test_providers::ExternalRecordingProvider::codex());
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            external,
+            &dir,
+            eitri_core::test_providers::empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        let codex = handle.state.borrow_mut().tabs.open(AgentId::Codex);
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(codex)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        for kind in ["stop_task", "task_output"] {
+            let message = parse_inbound_message(
+                &serde_json::json!({"type": kind, "request_id": "t1", "tab": codex.0, "task_id": "known"}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                matches!(admission(&handle.state.borrow(), &message, ViewId::BASE, Some(codex)), Admission::Refused(why) if why.contains("only available for Claude"))
+            );
+        }
+        shut_down_every_tab(&handle);
+    }
 
     /// A card answer from the page meets the window's gate at the moment it arrives: refused while the
     /// gate says a float covers the chat -- the card still waiting, nothing sent to the agent, the page
@@ -947,5 +1062,313 @@ mod tests {
                 "every message kind is named, none falls through `_`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    //! Claude's question is answered the way a card is: only from the page that shows its tab, and
+    //! only while the window agrees that page is not covered. A refusal leaves it waiting.
+    use super::*;
+    use crate::agent_panel::tests::*;
+
+    fn asked(id: &str) -> agent::AgentDomainEvent {
+        agent::AgentDomainEvent::QuestionAsked {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            questions: vec![agent::QuestionSpec {
+                question: "Which layout?".into(),
+                header: "Layout".into(),
+                multi_select: false,
+                options: ["Grid", "List"]
+                    .into_iter()
+                    .map(|label| agent::QuestionOptionSpec {
+                        label: label.into(),
+                        description: String::new(),
+                        preview: None,
+                    })
+                    .collect(),
+            }],
+            unsupported_reason: None,
+        }
+    }
+
+    fn question_state(handle: &AgentPanelHandle, tab: TabId, id: &str) -> Option<agent::QuestionState> {
+        let state = handle.state.borrow();
+        let backend = state.tabs.get(tab)?.live()?;
+        let found = backend.projection().question(id).map(|record| record.state.clone());
+        found
+    }
+
+    fn question_answer(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId, id: &str) {
+        handle.page_message(
+            from,
+            &format!(
+                r#"{{"type":"question_answer","request_id":"{request}","tab":{},"interaction_id":"{id}","answers":[{{"question_index":0,"option_indexes":[1]}}]}}"#,
+                tab.0
+            ),
+        );
+    }
+
+    fn question_decline(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId, id: &str, kind: &str) {
+        handle.page_message(
+            from,
+            &format!(
+                r#"{{"type":"question_decline","request_id":"{request}","tab":{},"interaction_id":"{id}","kind":"{kind}"}}"#,
+                tab.0
+            ),
+        );
+    }
+
+    /// A covered page's answer and decline are refused by the window's gate: the page is told why (a
+    /// failing `command_result`, on which the dock keeps its picks and typed text), nothing reaches the
+    /// agent and the question waits. Uncovered, the same page's answer goes.
+    #[test]
+    fn a_question_answer_from_a_covered_view_is_refused_and_the_dock_keeps_its_draft() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-question-covered");
+        let (handle, _base, second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        provider.queue(asked("q1"));
+        tick_handle_until(&handle, "the question", || question_state(&handle, tab, "q1").is_some());
+        let covered = Rc::new(Cell::new(true));
+        let asked_views = recording_gate(&handle, &[2], covered.clone());
+
+        question_answer(&handle, view(2), "r1", tab, "q1");
+        question_decline(&handle, view(2), "r2", tab, "q1", "cancel");
+        for request in ["r1", "r2"] {
+            assert!(
+                matches!(result_for(&second.sent.borrow(), request), Some(Err(why)) if why.contains("under terminal 2")),
+                "{request}"
+            );
+        }
+        assert!(provider.interactions().is_empty(), "nothing reached the agent");
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+        assert_eq!(*asked_views.borrow(), vec![view(2), view(2)], "asked at each answer");
+
+        covered.set(false);
+        question_answer(&handle, view(2), "r3", tab, "q1");
+        assert_eq!(
+            result_for(&second.sent.borrow(), "r3"),
+            None,
+            "told once the agent replied"
+        );
+        handle.tick();
+        assert_eq!(result_for(&second.sent.borrow(), "r3"), Some(Ok(())));
+        assert_eq!(provider.interactions().len(), 1);
+        assert_eq!(
+            question_state(&handle, tab, "q1"),
+            Some(agent::QuestionState::Answering)
+        );
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn editing_question_panel(
+        label: &str,
+    ) -> (
+        AgentPanelHandle,
+        Rc<RecordingPage>,
+        TabId,
+        std::sync::Arc<eitri_core::test_providers::RecordingProvider>,
+    ) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        let (handle, base, _) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::new().unwrap());
+        provider.queue(asked("q1"));
+        tick_handle_until(&handle, "question", || question_state(&handle, tab, "q1").is_some());
+        handle.set_answer_gate(Rc::new(|_| panic!("editing a question answers nothing")));
+        (handle, base, tab, provider)
+    }
+
+    #[test]
+    fn question_draft_and_edit_question_other_are_ungated_and_ctrl_g_round_trips() {
+        let (handle, page, tab, provider) = editing_question_panel("question-other-edit");
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        handle.on_editor_request({
+            let requests = requests.clone();
+            move |request| {
+                requests.borrow_mut().push(request.clone());
+                Ok(())
+            }
+        });
+        let before = page.sent.borrow().len();
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type":"question_draft", "request_id":"d", "tab":tab.0,
+                "interaction_id":"q1", "draft":{"text":"typed"}
+            })
+            .to_string(),
+        );
+        assert_eq!(page.sent.borrow().len(), before, "a draft is never echoed");
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type":"edit_question_other", "request_id":"e", "tab":tab.0,
+                "interaction_id":"q1", "question_index":0, "text":"typed"
+            })
+            .to_string(),
+        );
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(result_for(&page.sent.borrow(), "e"), Some(Ok(())));
+        let edit = handle.state.borrow().pending_edits[0].clone();
+        assert_eq!(std::fs::read_to_string(&edit.body).unwrap().trim_end(), "typed");
+        std::fs::write(
+            &edit.body,
+            "edited in nvim
+",
+        )
+        .unwrap();
+        std::fs::write(&edit.done, "written").unwrap();
+        handle.tick();
+        let edited: serde_json::Value = page
+            .sent
+            .borrow()
+            .iter()
+            .map(|s| json_of(s))
+            .find(|v| v["kind"] == "question_other_edited")
+            .unwrap();
+        assert_eq!(edited["tab"], tab.0);
+        assert_eq!(edited["interaction_id"], "q1");
+        assert_eq!(edited["question_index"], 0);
+        assert_eq!(edited["text"], "edited in nvim");
+        assert_eq!(handle.state.borrow().tabs.get(tab).unwrap().draft(), "");
+        assert!(provider.interactions().is_empty());
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+        assert!(!edit.body.exists() && !edit.done.exists());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn edit_question_other_refused_when_detached() {
+        let (handle, page, tab, provider) = editing_question_panel("question-other-detached");
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type":"edit_question_other", "request_id":"e", "tab":tab.0,
+                "interaction_id":"q1", "question_index":0, "text":"typed"
+            })
+            .to_string(),
+        );
+        assert!(
+            matches!(result_for(&page.sent.borrow(), "e"), Some(Err(why)) if why.contains("editor is not connected"))
+        );
+        assert!(handle.state.borrow().pending_edits.is_empty());
+        assert!(handle.state.borrow().tabs.get(tab).unwrap().editing_draft.is_none());
+        assert!(provider.interactions().is_empty());
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+        shut_down_every_tab(&handle);
+    }
+
+    /// Another page's answer is refused naming the tab, before the window is asked.
+    #[test]
+    fn a_question_answer_from_another_page_is_refused_before_the_window_is_asked() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-question-other-page");
+        let (handle, base, second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        provider.queue(asked("q1"));
+        tick_handle_until(&handle, "the question", || question_state(&handle, tab, "q1").is_some());
+        let asked_views = recording_gate(&handle, &[], Rc::new(Cell::new(false)));
+        let number = handle.state.borrow().tabs.get(tab).unwrap().number;
+
+        question_answer(&handle, ViewId::BASE, "r1", tab, "q1");
+        question_decline(&handle, ViewId::BASE, "r2", tab, "q1", "chat");
+        for request in ["r1", "r2"] {
+            assert_eq!(
+                result_for(&base.sent.borrow(), request),
+                Some(Err(format!("tab {number} is not shown in this page")))
+            );
+        }
+        assert!(asked_views.borrow().is_empty(), "refused before the window is asked");
+        assert!(provider.interactions().is_empty());
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+
+        question_decline(&handle, view(2), "r3", tab, "q1", "chat");
+        handle.tick();
+        assert_eq!(result_for(&second.sent.borrow(), "r3"), Some(Ok(())));
+        assert_eq!(provider.interactions().len(), 1);
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The page's answer never waits for the agent on the GTK thread: the message returns with the
+    /// answer out, the tick tells the page once the agent replied, and a reply that is a failure (a
+    /// timeout, a lost connection) is a refusal that leaves the session running and the question
+    /// waiting for another answer.
+    #[test]
+    fn a_slow_agent_never_holds_the_answer_and_its_failure_keeps_the_session() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-question-slow-agent");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.state.borrow_mut().tabs.select(tab);
+        provider.queue(asked("q1"));
+        tick_handle_until(&handle, "the question", || question_state(&handle, tab, "q1").is_some());
+        provider.hold_interaction_replies(true);
+
+        question_answer(&handle, ViewId::BASE, "r1", tab, "q1");
+        assert_eq!(provider.interactions().len(), 1, "the answer went out");
+        assert_eq!(
+            question_state(&handle, tab, "q1"),
+            Some(agent::QuestionState::Answering)
+        );
+        handle.tick();
+        assert_eq!(result_for(&base.sent.borrow(), "r1"), None, "no reply yet");
+
+        provider.reply_to_held_interactions(|| Err(agent::ProviderError::Timeout));
+        handle.tick();
+        assert!(
+            matches!(result_for(&base.sent.borrow(), "r1"), Some(Err(why)) if why.contains("waiting again")),
+            "{:?}",
+            result_for(&base.sent.borrow(), "r1")
+        );
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+        assert!(handle.state.borrow().question_sends.is_empty());
+        assert!(
+            handle.state.borrow().tabs.get(tab).unwrap().live().is_some(),
+            "the session goes on"
+        );
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown decline kind or a malformed answer does not parse: nothing is answered, nothing is
+    /// sent, and no default stands in for what the page meant.
+    #[test]
+    fn a_malformed_question_message_answers_nothing() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-question-malformed");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.state.borrow_mut().tabs.select(tab);
+        provider.queue(asked("q1"));
+        tick_handle_until(&handle, "the question", || question_state(&handle, tab, "q1").is_some());
+        question_decline(&handle, ViewId::BASE, "r1", tab, "q1", "later");
+        for answers in [
+            r#"[{"question_index":0,"option_indexes":["1"]}]"#,
+            r#"[{"question_index":-1,"option_indexes":[0]}]"#,
+            r#"[{"question_index":0}]"#,
+            r#"[{"question_index":0,"option_indexes":[0],"label":"Grid"}]"#,
+        ] {
+            handle.page_message(
+                ViewId::BASE,
+                &format!(
+                    r#"{{"type":"question_answer","request_id":"r2","tab":{},"interaction_id":"q1","answers":{answers}}}"#,
+                    tab.0
+                ),
+            );
+        }
+        assert_eq!(result_for(&base.sent.borrow(), "r1"), None);
+        assert_eq!(result_for(&base.sent.borrow(), "r2"), None);
+        assert!(provider.interactions().is_empty());
+        assert_eq!(question_state(&handle, tab, "q1"), Some(agent::QuestionState::Waiting));
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

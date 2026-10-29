@@ -146,7 +146,7 @@ impl PanelAction {
             PanelAction::Keymap => "all keys",
             PanelAction::Handoff => "continue in a terminal",
             PanelAction::ModeCycle => "mode",
-            PanelAction::StopBackground => "stop background commands",
+            PanelAction::StopBackground => "stop background work",
         }
     }
 }

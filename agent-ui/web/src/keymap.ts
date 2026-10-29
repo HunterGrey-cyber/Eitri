@@ -1,6 +1,27 @@
 import { superHeld } from "./heldSuper";
 import { isModifierKey } from "./typingGuard";
 
+export const TASKS_KEY_LINE = "↑/↓ j/k select · Enter view · x stop · o open · q close";
+
+/** An overlay claims all keys; modifiers and composition never turn typing into a task command. */
+export function tasksKey(event: KeyLike & { repeat?: boolean }):
+  "next" | "previous" | "view" | "stop" | "open" | "back" | "pageDown" | "pageUp" | "top" | "bottom" | null {
+  if (event.shiftKey || !isPlainAnswerKey(event)) return null;
+  switch (event.key) {
+    case "j": case "ArrowDown": return "next";
+    case "k": case "ArrowUp": return "previous";
+    case "Enter": return "view";
+    case "x": return event.repeat ? null : "stop";
+    case "o": return event.repeat ? null : "open";
+    case "q": case "Escape": return "back";
+    case "PageDown": case " ": return "pageDown";
+    case "PageUp": return "pageUp";
+    case "Home": return "top";
+    case "End": return "bottom";
+    default: return null;
+  }
+}
+
 /** Which of the panel's keyboard states has the keys.
  *
  * `hint` is declared here and rendered by the status line's mode block, and nothing reaches it yet:
@@ -1023,6 +1044,31 @@ export const REVIEW_KEYS: KeyHelp[] = [
   { keys: "o", what: "Open the file in the editor at the hunk's first line" },
   { keys: "y", what: "Copy path:line" },
   { keys: "q / Esc / c", what: "Close" },
+];
+
+/** The background tasks list's keys (`/tasks`, `/bashes`, `/workflows`), everything `tasksKey` claims. The list owns
+ *  every key while it is open. */
+export const TASKS_KEYS: KeyHelp[] = [
+  { keys: "j / k", what: "Next / previous task; in a task's detail, scroll (↓ / ↑ too)" },
+  { keys: "Enter", what: "View the task: its detail and, for a shell or monitor, the end of its output" },
+  { keys: "x", what: "Stop the selected task at once" },
+  { keys: "o", what: "Open the task's output in nvim, read-only" },
+  { keys: "PageDown / PageUp", what: "Scroll a page (Space too)" },
+  { keys: "Home / End", what: "Scroll to the top / bottom" },
+  { keys: "q / Esc", what: "Back from a task's detail; from the list, close" },
+];
+
+/** The question dock's keys, while Claude's question replaces the box (`questionKey`). */
+export const QUESTION_KEYS: KeyHelp[] = [
+  { keys: "1-9", what: "Pick that option" },
+  { keys: "j / k", what: "Move between options (↓ / ↑ too)" },
+  { keys: "Enter / Space", what: "Choose the option under the cursor" },
+  { keys: "Tab / Shift+Tab", what: "Next / previous question (h / l, ← / → too)" },
+  { keys: "Ctrl+Enter", what: "Submit every answer, or show what is still unanswered" },
+  { keys: "n", what: "Add notes to an option that has a preview" },
+  { keys: "Ctrl+g", what: "Edit the typed answer in nvim" },
+  { keys: "Ctrl+k", what: "Back to the transcript; the question keeps waiting (i returns)" },
+  { keys: "Esc", what: "In the typed answer: back to the options. Elsewhere: cancel the question, which stops the turn" },
 ];
 
 export const INPUT_KEYS: KeyHelp[] = [

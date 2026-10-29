@@ -1,7 +1,8 @@
+import { toolCardLine, agentCard, isAgentCall } from "../display";
 import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
-import { buildTimeline, isUsableLink, type TimelineItem } from "../timeline";
+import { buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
@@ -10,6 +11,8 @@ import type { TurnDurations } from "../turnTimes";
 import { HistoryNotice } from "./HistoryNotice";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
+import { Revealed } from "./Revealed";
+import { revealHidden } from "../revealHidden";
 import type { PermissionDecision } from "../bridge";
 import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
 import { pillLabel, pillShown } from "../pill";
@@ -293,13 +296,17 @@ export function MessageList({
     const observer = resizeObserverRef.current;
     if (observer === null) return;
     const observed = observedChildrenRef.current;
+    const children = new Set([
+      ...Array.from(list.children).filter((el) => !el.classList.contains("subagent-child")),
+      ...list.querySelectorAll(".subagent-child > .row"),
+    ]);
     for (const el of observed) {
-      if (el.parentElement !== list) {
+      if (!children.has(el)) {
         observer.unobserve(el);
         observed.delete(el);
       }
     }
-    for (const el of Array.from(list.children)) {
+    for (const el of children) {
       // The band changes size as it glides; it is not content, and is placed from the rows.
       if (el === bandElRef.current) continue;
       if (!observed.has(el)) {
@@ -710,9 +717,8 @@ export function MessageList({
           const call = item.kind === "tool" ? item.call : null;
           const permissionId = item.kind === "permission" ? item.request.permissionId : null;
           const footer = placedFooters.get(item.key) ?? null;
-          return (
-            <Fragment key={item.key}>
-              <TimelineRow
+          const row = (
+            <TimelineRow
                 item={item}
                 current={index === cursor}
                 yanked={item.key === yankedKey}
@@ -720,6 +726,8 @@ export function MessageList({
                 detailed={detailed}
                 thinkingDisplay={thinkingDisplay}
                 sessionEnded={sessionEnded}
+                cardLine={call === null ? null : toolCardLine(call, state)}
+                agent={call !== null && isAgentCall(call) ? agentCard(call, state, isAbandonedCall(call, state, sessionEnded)) : null}
                 abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
                 gated={call !== null && awaitingPermission.has(call.toolUseId)}
                 ruleOffer={permissionId === null ? null : (ruleOffers?.[permissionId] ?? null)}
@@ -727,6 +735,10 @@ export function MessageList({
                 handlers={rowHandlersRef}
                 ranFor={item.kind === "ending" ? endingDuration(turnDurations, item.ending.turnId) : null}
               />
+          );
+          return (
+            <Fragment key={item.key}>
+              {item.depth ? <div className="subagent-child" style={{ marginInlineStart: `${item.depth * 1.5}em` }} data-depth={item.depth}>{row}</div> : row}
               {footer !== null && (
                 // Chrome, not a row: no `data-nav-stop`, so `j`/`k` and `y` never see it, and the inner
                 // `aria-hidden` span is what VISUAL's copy leaves out (`VISUAL_CHROME`).
@@ -762,6 +774,8 @@ type TimelineRowProps = {
   sessionEnded: boolean;
   /** A tool call whose result can never arrive (`isAbandonedCall`). */
   abandoned: boolean;
+  cardLine: string | null;
+  agent: ReturnType<typeof agentCard> | null;
   /** A tool call a card is waiting on. */
   gated: boolean;
   /** A card's offered rule, exactly as Rust offered it. */
@@ -793,6 +807,8 @@ const TimelineRow = memo(function TimelineRow({
   thinkingDisplay,
   sessionEnded,
   abandoned,
+  cardLine,
+  agent,
   gated,
   ruleOffer,
   alreadyAnswered,
@@ -816,6 +832,14 @@ const TimelineRow = memo(function TimelineRow({
       );
     }
     case "message": {
+      if (item.question || item.plain) {
+        const lines = item.question ? questionLines(item.question) : item.text.split("\n").map((text, i) => ({ text, muted: i > 0 }));
+        return <Row kind="question" sign="?" current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+          {lines.map((line, i) => <div key={i} className={line.muted ? "question-line question-status" : "question-line"}>
+            <Revealed pieces={revealHidden(line.text)} />
+          </div>)}
+        </Row>;
+      }
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
         <Row kind="assistant" sign="" current={current} className={yankedClass} navStop="row">
@@ -827,6 +851,15 @@ const TimelineRow = memo(function TimelineRow({
       );
     }
     case "tool": {
+      if (agent) {
+        const whole = !agent.background && (expanded || detailed);
+        return <Row kind="subagent" sign={toolSign(item.call, abandoned)} current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+          <div className="subagent-heading"><Revealed pieces={revealHidden(agent.header)} />{!agent.background && <span className="fold-marker" aria-label={whole ? "expanded" : "collapsed"}>{whole ? "▾" : "▸"}</span>}</div>
+          {agent.warnings.map((warning, i) => <div key={i} className="subagent-warning"><Revealed pieces={revealHidden(warning)} /></div>)}
+          <div className="subagent-status"><Revealed pieces={revealHidden(agent.line)} /></div>
+          {whole && agent.report && <div className="subagent-report"><Revealed pieces={revealHidden(agent.report)} /></div>}
+        </Row>;
+      }
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
         <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row">
@@ -840,6 +873,7 @@ const TimelineRow = memo(function TimelineRow({
               detailed,
               expanded,
               abandoned,
+              cardLine,
             })}
           </div>
         </Row>
@@ -870,6 +904,32 @@ const TimelineRow = memo(function TimelineRow({
         <Row kind="ending" sign="·" current={current} className={yankedClass} navStop="row">
           {/* The reset time the ending itself kept: a later limit report never changes an older row. */}
           {turnEndingText(item.ending, item.ending.resetsAt ?? null, ranFor)}
+        </Row>
+      );
+    }
+    case "wake": {
+      return (
+        <Row kind="wake" sign="●" current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+          <div className="wake-head"><span className="wake-text"><Revealed pieces={revealHidden(wakeText(item))} /></span>
+            {item.body && !item.inlineBody && <span className="fold-marker" aria-label={expanded ? "expanded" : "collapsed"}>{expanded ? "▾" : "▸"}</span>}</div>
+          {item.body && (expanded || detailed || item.inlineBody) && <div className="wake-body"><Revealed pieces={revealHidden(item.body)} /></div>}
+        </Row>
+      );
+    }
+    case "notice": {
+      // One of the CLI's notices, muted like an ending row and a `j`/`k` stop like every conversation
+      // row, so `y` copies all it says (`noticeText`). The hook's words are the CLI's: plain text with
+      // hidden characters shown, never markdown, cut to their first lines on screen (`index.css`).
+      const yankedClass = yanked ? "row-yanked" : undefined;
+      const warning = item.notice.level === "warning" || item.notice.level === "suggestion" || ["hook_block", "model_fallback", "model_refusal", "peer_hold"].includes(item.notice.kind);
+      const body = noticeBody(item.notice);
+      return (
+        <Row kind="notice" sign={warning ? "⚠" : "·"} current={current} className={[yankedClass, warning ? "notice-prominent" : "", item.notice.kind === "compaction" ? "notice-compaction" : ""].filter(Boolean).join(" ")} navStop="row">
+          <div className="notice-text" data-notice-kind={item.notice.kind}>
+            <Revealed pieces={revealHidden(noticeText(item.notice))} />
+          </div>
+          {body && <span className="fold-marker" aria-label={expanded ? "expanded" : "collapsed"}>{expanded ? "▾" : "▸"}</span>}
+          {body && (expanded || detailed) && <div className="wake-body"><Revealed pieces={revealHidden(body)} /></div>}
         </Row>
       );
     }

@@ -97,15 +97,6 @@ pub trait ExternalProvider: AgentProvider {
     fn context_gauge(&self) -> Option<ContextGauge> {
         None
     }
-    /// Stops what the agent left running after its turns ended (`AgentDomainEvent::BackgroundCalls`) by
-    /// stopping the whole session, which ends with `SessionUnavailable` once nothing it started runs any
-    /// more; the conversation can be resumed. `shown` is the count the user was asked about: refused when
-    /// the agent's own count is another by now (an event not yet folded), while a turn runs (an interrupt
-    /// stops that) and when nothing is left running. An agent that tracks no such calls refuses it.
-    fn stop_background(&self, session_id: &str, shown: u32) -> Result<(), ProviderError> {
-        let _ = (session_id, shown);
-        Err(ProviderError::UnsupportedCapability("stop_background"))
-    }
     /// Whether the session ended because the provider stopped it itself with its conversation whole (what
     /// the agent left running, or kept running after an interrupt, was stopped with it), so continuing it is
     /// what the user is offered next. False while it runs and after any other end.

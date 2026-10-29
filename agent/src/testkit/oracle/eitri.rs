@@ -1,23 +1,28 @@
 //! Eitri's three records of a conversation, read into the normal form.
 //!
 //! - **E**, the domain event log with the final projection: the projection's rows (prompts, messages
-//!   taken into a running turn, replies, thinking, tool calls), each in the turn of the event that wrote
-//!   it, and the end of a turn that did not complete. A prompt opens a turn that the next unseen turn id
-//!   then names.
-//! - **A**, the stored history: prompts, replies and tool calls only, ordered by `seq`. It has no turn
-//!   endings and no thinking. A prompt that was not delivered into a running turn opens a turn; a tool
-//!   call's turn id names the turn it belongs to, so a call whose id differs from the running turn's opens
-//!   a turn of its own (one the CLI started without a prompt). A reply row stays with the turn it follows:
-//!   a turn the CLI started that holds only text cannot be told apart from the turn before it.
+//!   taken into a running turn, replies, thinking, tool calls, settled question sets), each in the turn of
+//!   the event that wrote it, and the end of a turn that did not complete. A prompt opens a turn that the
+//!   next unseen turn id then names.
+//! - **A**, the stored history: prompts, replies, tool calls and settled question sets only, ordered by
+//!   `seq`. It has no turn endings and no thinking. A prompt that was not delivered into a running turn
+//!   opens a turn; a tool call's turn id names the turn it belongs to, so a call whose id differs from the
+//!   running turn's opens a turn of its own (one the CLI started without a prompt). A reply row, and a
+//!   question set, stays with the turn it follows: a turn the CLI started that holds only text cannot be
+//!   told apart from the turn before it.
 //! - **B**, Eitri's restore reader run on the CLI's files and folded into a projection, read like A. Its
-//!   tool calls carry each line's own uuid as their turn id, so its turns come from its prompts alone
-//!   unless asked otherwise.
+//!   tool calls carry their transcript segment's turn id, so call attribution can be compared with
+//!   the CLI's turns; its question rows are the ones it restored from the CLI's results.
+//!
+//! A question set is read only as its key ([`super::normalise::question_entry`]): its words stay in the
+//! record.
 
+use super::normalise::question_entry;
 use super::{Attribution, EitriForm, Entry, Omission, Origin, Pos, Source, Turn, Via};
-use crate::history::transcript_jsonl::value_chars;
 use crate::history::{read_transcript_history, HistoryLoadError, StoredHistory, HISTORY_FORMAT_VERSION};
 use crate::projection::{
-    AgentDomainEvent, AgentSessionProjection, ToolCallRecord, TranscriptMessage, TurnOutcome, UserPromptRecord,
+    AgentDomainEvent, AgentSessionProjection, QuestionRecord, ToolCallRecord, TranscriptMessage, TurnOutcome,
+    UserPromptRecord,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -25,10 +30,10 @@ use std::path::{Path, PathBuf};
 
 /// E: the domain event log of a session and its final projection.
 ///
-/// The rows are the projection's own (the prompts, replies, thinking and tool calls a view draws), so a
-/// fold that loses or cuts a row shows as a difference. The events give each row its turn: `events` are
-/// every event the projection folded, derived ones included, in order, the last one at the projection's
-/// newest revision; the event folded at revision `r` wrote the rows whose `seq` is `r`. Rows a resume
+/// The rows are the projection's own (the prompts, replies, thinking, tool calls and question sets a view
+/// draws), so a fold that loses or cuts a row shows as a difference. The events give each row its turn:
+/// `events` are every event the projection folded, derived ones included, in order, the last one at the
+/// projection's newest revision; the event folded at revision `r` wrote the rows whose `seq` is `r`. Rows a resume
 /// seeded before the first event are not read here (they are the restore reader's, B). A tool result sits
 /// in the turn its own completion event names, and a turn that did not complete ends with the row its
 /// `TurnCompleted` gives, since the projection keeps no row for the end of a turn.
@@ -65,6 +70,10 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
     }
 
     for (index, event) in events.iter().enumerate() {
+        // Child rows are read under their parent call, so they cannot open a main turn here.
+        if matches!(event, AgentDomainEvent::SubagentFrame { .. }) {
+            continue;
+        }
         event_turn[index] = match event {
             AgentDomainEvent::UserPromptSubmitted { .. } => {
                 turns.push(Turn::new(turns.len() + 1, Origin::Human));
@@ -181,6 +190,9 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
                 input: call.input.clone(),
             },
         ));
+        if let Some(entry) = child_entry(call, true) {
+            placed.push((at, index, 2, entry));
+        }
         if let Some(result) = &call.result {
             let (result_at, result_index) = completion
                 .get(call.tool_use_id.as_str())
@@ -202,6 +214,13 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
                 .entry(call.tool_use_id.clone())
                 .or_insert_with(|| serde_json::to_value(change).unwrap_or(Value::Null));
         }
+    }
+    // A question set sits where it was asked; it is read once it has settled.
+    for record in &projection.questions {
+        let Some(entry) = question_entry(record) else { continue };
+        let Some(index) = writer(record.seq) else { continue };
+        let at = row_turn(index, &mut turns);
+        placed.push((at, index, 2, entry));
     }
     placed.sort_by_key(|(turn, index, rank, _)| (*turn, *index, *rank));
     for (at, index, _, entry) in placed {
@@ -232,21 +251,20 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
 
 /// A: a stored history.
 pub fn read_a(stored: &StoredHistory) -> EitriForm {
-    let (turns, changed_input) = from_collections(&stored.user_prompts, &stored.transcript, &stored.tool_calls, true);
-    let chars = stored
-        .user_prompts
-        .iter()
-        .map(|p| p.text.chars().count())
-        .sum::<usize>()
-        + stored.transcript.iter().map(|m| m.text.chars().count()).sum::<usize>()
-        + stored.tool_calls.iter().map(call_chars).sum::<usize>();
+    let (turns, changed_input) = from_collections(
+        &stored.user_prompts,
+        &stored.transcript,
+        &stored.tool_calls,
+        &stored.questions,
+        true,
+    );
     EitriForm {
         source: Source::A,
         turns,
         attribution: Attribution::ToolCallsAndMidTurnMessages,
         omission: Omission::Bounds {
             items: stored.item_count(),
-            chars,
+            chars: stored.char_count(),
         },
         changed_input,
     }
@@ -267,10 +285,8 @@ pub fn read_a_file(path: &Path) -> Result<EitriForm, HistoryLoadError> {
     Ok(read_a(&stored))
 }
 
-/// Whether B's turns are held against the CLI's (`read_b`'s `tool_turn_ids`): not while Eitri's restore
-/// reader gives each tool call its own line's uuid as its turn id, so that the calls of one turn carry
-/// different ids. A test fails once the reader gives a turn's calls one id while this is still false.
-pub const B_TURNS_HELD: bool = false;
+/// B's calls share their transcript segment's turn id, so their attribution is compared to the CLI's.
+pub const B_TURNS_HELD: bool = true;
 
 /// B: Eitri's restore reader on each file of the chain, folded in order into one projection.
 ///
@@ -293,6 +309,7 @@ pub fn read_b(chain: &[PathBuf], tool_turn_ids: bool) -> std::io::Result<EitriFo
         &projection.user_prompts,
         &projection.transcript,
         &projection.tool_calls,
+        &projection.questions,
         tool_turn_ids,
     );
     Ok(EitriForm {
@@ -311,25 +328,86 @@ pub fn read_b(chain: &[PathBuf], tool_turn_ids: bool) -> std::io::Result<EitriFo
     })
 }
 
-/// A tool call's size by the caps' measure: its name, its input and its result.
-pub fn call_chars(call: &ToolCallRecord) -> usize {
-    call.name.chars().count()
-        + value_chars(&call.input)
-        + call.result.as_ref().map(|r| value_chars(&r.content)).unwrap_or(0)
+fn child_entry(parent: &ToolCallRecord, thinking: bool) -> Option<Entry> {
+    let stream = parent.children.as_ref()?;
+    let mut rows = Vec::new();
+    for row in &stream.transcript {
+        rows.push((row.seq, 0, Entry::Assistant { text: row.text.clone() }));
+    }
+    if thinking {
+        for row in &stream.thinking {
+            rows.push((row.seq, 0, Entry::Thinking { text: row.text.clone() }));
+        }
+    }
+    for call in &stream.tool_calls {
+        rows.push((
+            call.seq,
+            1,
+            Entry::ToolUse {
+                id: call.tool_use_id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            },
+        ));
+        if let Some(entry) = child_entry(call, thinking) {
+            rows.push((call.seq, 2, entry));
+        }
+        if let Some(result) = &call.result {
+            rows.push((
+                call.seq,
+                3,
+                Entry::ToolResult {
+                    id: call.tool_use_id.clone(),
+                    is_error: result.is_error,
+                    content: result.content.clone(),
+                },
+            ));
+        }
+    }
+    rows.sort_by_key(|(seq, rank, _)| (*seq, *rank));
+    let mut turn = Turn::new(1, Origin::Unknown);
+    // The Agent call carries the same initial prompt as its child's transcript.
+    if let Some(prompt) = parent.input.get("prompt").and_then(Value::as_str) {
+        turn.push(
+            Entry::User {
+                text: prompt.into(),
+                via: Via::Prompt,
+            },
+            Pos {
+                input: 0,
+                line: parent.seq as usize + 1,
+            },
+        );
+    }
+    for (seq, _, entry) in rows {
+        turn.push(
+            entry,
+            Pos {
+                input: 0,
+                line: seq as usize + 1,
+            },
+        );
+    }
+    Some(Entry::Subagent {
+        parent_tool_use_id: parent.tool_use_id.clone(),
+        turns: vec![turn],
+    })
 }
 
 fn from_collections(
     prompts: &[UserPromptRecord],
     transcript: &[TranscriptMessage],
     calls: &[ToolCallRecord],
+    questions: &[QuestionRecord],
     tool_turn_ids: bool,
 ) -> (Vec<Turn>, BTreeMap<String, Value>) {
     enum Item<'a> {
         Prompt(&'a UserPromptRecord),
         Message(&'a TranscriptMessage),
         Call(&'a ToolCallRecord),
+        Question(Entry),
     }
-    // The same order the store cuts by: `seq`, then prompt before reply before call.
+    // The same order the store cuts by: `seq`, then prompt before reply before call before question.
     let mut items: Vec<(u64, u8, usize, Item)> = Vec::new();
     items.extend(prompts.iter().enumerate().map(|(i, p)| (p.seq, 0, i, Item::Prompt(p))));
     items.extend(
@@ -339,6 +417,12 @@ fn from_collections(
             .map(|(i, m)| (m.seq, 1, i, Item::Message(m))),
     );
     items.extend(calls.iter().enumerate().map(|(i, c)| (c.seq, 2, i, Item::Call(c))));
+    items.extend(
+        questions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, q)| question_entry(q).map(|entry| (q.seq, 3, i, Item::Question(entry)))),
+    );
     items.sort_by_key(|(seq, rank, index, _)| (*seq, *rank, *index));
 
     let mut turns: Vec<Turn> = Vec::new();
@@ -377,6 +461,13 @@ fn from_collections(
                     pos,
                 );
             }
+            // Placed by order, in the turn it follows, as a reply is.
+            Item::Question(entry) => {
+                if turns.is_empty() {
+                    open(&mut turns, &mut turn_ids, Origin::Unknown, None);
+                }
+                turns.last_mut().expect("one exists").push(entry, pos);
+            }
             Item::Message(message) => {
                 if turns.is_empty() {
                     open(&mut turns, &mut turn_ids, Origin::Unknown, None);
@@ -410,6 +501,9 @@ fn from_collections(
                     },
                     pos,
                 );
+                if let Some(entry) = child_entry(call, false) {
+                    turn.push(entry, pos);
+                }
                 if let Some(result) = &call.result {
                     turn.push(
                         Entry::ToolResult {
@@ -430,4 +524,120 @@ fn from_collections(
         }
     }
     (turns, changed_input)
+}
+
+#[cfg(test)]
+mod child_tests {
+    use super::*;
+
+    #[test]
+    fn event_and_stored_records_keep_nested_agents_under_their_calls() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../agent-ui/web/src/fixtures/subagent-frames.json"
+        ))
+        .unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "nested twice")
+            .unwrap();
+        let events: Vec<AgentDomainEvent> = serde_json::from_value(case["events"].clone()).unwrap();
+        let mut projection = AgentSessionProjection::default();
+        for event in &events {
+            projection.apply(event);
+        }
+        let stored = StoredHistory::from_collections(
+            "children".into(),
+            "session".into(),
+            vec![],
+            vec![],
+            projection.tool_calls.clone(),
+        );
+        fn children<'a>(turns: &'a [Turn], parent: &str) -> &'a [Turn] {
+            turns
+                .iter()
+                .flat_map(|turn| &turn.entries)
+                .find_map(|entry| match entry {
+                    Entry::Subagent {
+                        parent_tool_use_id,
+                        turns,
+                    } if parent_tool_use_id == parent => Some(turns.as_slice()),
+                    _ => None,
+                })
+                .unwrap()
+        }
+        for record in [read_e(&events, &projection), read_a(&stored)] {
+            let first = children(&record.turns, "parent");
+            let second = children(first, "nested");
+            let third = children(second, "deep");
+            assert!(third[0]
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Assistant { text } if text == "level three")));
+            assert!(!record
+                .turns
+                .iter()
+                .flat_map(|turn| &turn.entries)
+                .any(|entry| matches!(entry, Entry::ToolUse { id, .. } if id == "deep")));
+        }
+    }
+    #[test]
+    fn recorded_child_frames_match_the_nested_cli_transcripts() {
+        use crate::testkit::oracle::{align::align, cli_jsonl::read_chain, report::Report};
+        for scenario in ["c03_fg", "c03_bg"] {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/claude_scripted")
+                .join(scenario);
+            let mut value: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("expected-events.json")).unwrap()).unwrap();
+            fn run_root(value: &Value, scenario: &str) -> Option<String> {
+                match value {
+                    Value::String(text) => text.split(['"', '\'', ' ', '\n', '\t']).find_map(|path| {
+                        let (root, _) = path.split_once(&format!("/{scenario}/"))?;
+                        root.starts_with('/').then(|| format!("{root}/{scenario}"))
+                    }),
+                    Value::Array(values) => values.iter().find_map(|value| run_root(value, scenario)),
+                    Value::Object(fields) => fields.values().find_map(|value| run_root(value, scenario)),
+                    _ => None,
+                }
+            }
+            if let Some(root) = run_root(&value, scenario) {
+                use crate::testkit::claude_scripted::scrub::{Identity, Scrubber};
+                value = Scrubber::new(Path::new(&root), &Identity::default()).value(&value);
+            }
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(value).unwrap();
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let transcript = std::fs::read_dir(dir.join("transcript"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .unwrap();
+            let children = transcript.with_extension("").join("subagents");
+            let cli = read_chain(&[transcript], Some(&children)).unwrap();
+            let stored = StoredHistory::from_collections(
+                "recorded-children".into(),
+                "session".into(),
+                projection.user_prompts.clone(),
+                projection.transcript.clone(),
+                projection.tool_calls.clone(),
+            );
+            let record = read_e(&events, &projection);
+            let restored = read_a(&stored);
+            let report = Report::build(
+                &cli,
+                vec![align(&cli.turns, &record), align(&cli.turns, &restored)],
+                None,
+            );
+            let nested: Vec<_> = report
+                .unallowed()
+                .filter(|difference| difference.nested)
+                .map(|difference| (difference.kind, &difference.fields, difference.marker))
+                .collect();
+            assert!(nested.is_empty(), "{scenario}: {nested:?}");
+        }
+    }
 }

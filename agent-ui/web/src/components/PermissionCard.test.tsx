@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 /// <reference types="vite/client" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, cleanup, fireEvent } from "@testing-library/react";
+import { act, render, cleanup, fireEvent } from "@testing-library/react";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
-import { PermissionCard } from "./PermissionCard";
-import type { PermissionRequestRecord } from "../types";
+import { PermissionCard, PermissionCardContext } from "./PermissionCard";
+import type { BackgroundTaskRecord, PermissionRequestRecord, ToolCallRecord } from "../types";
+import { applyEvent, initialState } from "../reducer";
+import type { AgentDomainEvent } from "../types";
 import css from "../index.css?raw";
 
 const REQUEST: PermissionRequestRecord = {
@@ -482,4 +484,182 @@ it("shows every removed and added line of a large Edit", () => {
   expect(Array.from(container.querySelectorAll(".diff-removed .diff-text"), (line) => line.textContent)).toEqual(oldLines);
   expect(Array.from(container.querySelectorAll(".diff-added .diff-text"), (line) => line.textContent)).toEqual(newLines);
   expect(container.textContent).not.toContain("Too large to show here");
+});
+
+
+describe("Workflow permission view", () => {
+  function workflow(input: unknown) {
+    const onAnswer = vi.fn(), onViewScript = vi.fn();
+    const view = render(<PermissionCardContext.Provider value={{ state: initialState(), onViewScript }}>
+      <PermissionCard request={{ ...REQUEST, toolName: "Workflow", input }} sessionEnded={false} onAnswer={onAnswer} />
+    </PermissionCardContext.Provider>);
+    return { ...view, onAnswer, onViewScript };
+  }
+
+  it("draws the inline script as escaped monospace text without interpreting tags or phases", () => {
+    const script = '<script>alert(1)</script>\n// phases: <b>prepare</b>\u0007\u202e\u200b';
+    const view = workflow({ script, args: "<i>argument</i>\u202e" });
+    expect(view.getByText("Run a dynamic workflow?")).toBeTruthy();
+    expect(view.container.querySelector("pre.permission-card-script")!.textContent)
+      .toContain('<script>alert(1)</script>\n// phases: <b>prepare</b>⟨U+0007⟩⟨U+202E⟩⟨U+200B⟩');
+    expect(view.container.querySelector(".permission-card-input")!.textContent).toContain("<i>argument</i>⟨U+202E⟩");
+    expect(view.container.querySelector("script, b, i, ol, ul")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "View raw script" }));
+    expect(view.onViewScript).toHaveBeenCalledWith(script);
+    expect(view.onAnswer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "Named\u202e", args: ["one", "<b>two</b>"] },
+    { scriptPath: "/work/flow\u200b.js", args: { target: "<img src=x>" } },
+  ])("shows names, script paths and structured arguments as plain text: %j", (input) => {
+    const view = workflow(input);
+    expect(view.container.textContent).toContain("Arguments");
+    expect(view.container.textContent).toContain("⟨U+");
+    expect(view.container.textContent).toContain(JSON.stringify(input.args, null, 2));
+    expect(view.container.querySelector("b, img")).toBeNull();
+    expect(view.queryByRole("button", { name: "View raw script" })).toBeNull();
+    expect(view.queryByText(/don't ask again|Always allow/i)).toBeNull();
+    expect(view.container.querySelector('[data-nav-action="allow"]')!.getAttribute("data-key")).toBe("a");
+    expect(view.container.querySelector('[data-nav-action="deny"]')!.getAttribute("data-key")).toBe("d");
+    fireEvent.click(view.getByRole("button", { name: "Approve" }));
+    expect(view.onAnswer).toHaveBeenCalledTimes(1);
+    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined);
+  });
+
+  it.each(["resolvedScript", "resolved_script"])("shows and opens the supplied %s in preference to the original", (key) => {
+    const view = workflow({ script: "original", [key]: "resolved\u202e" });
+    expect(view.container.querySelector(".permission-card-script")!.textContent).toContain("resolved⟨U+202E⟩");
+    fireEvent.click(view.getByRole("button", { name: "View raw script" }));
+    expect(view.onViewScript).toHaveBeenCalledWith("resolved\u202e");
+  });
+
+  it("keeps unrecognized input fields visible and keeps denial's reason", () => {
+    const view = workflow({ script: "run()", option: "<b>flag</b>\u202e" });
+    expect(view.container.textContent).toContain('"option": "<b>flag</b>⟨U+202E⟩"');
+    fireEvent.change(view.container.querySelector("input")!, { target: { value: "inspect first" } });
+    fireEvent.click(view.getByRole("button", { name: "Deny" }));
+    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "deny", "inspect first");
+  });
+
+  it("uses the read-only editor route and returns to the waiting card without editing or answering", async () => {
+    const { default: App } = await import("../App");
+    Element.prototype.scrollIntoView = vi.fn();
+    const posted: Record<string, unknown>[] = [];
+    const priorWebkit = window.webkit;
+    window.webkit = { messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } } };
+    try {
+      const script = "// vim: set modifiable:\n<script>raw</script>\u202e";
+      const request = { ...REQUEST, toolName: "Workflow", input: { script } };
+      const view = render(<App />);
+      const dispatch = (payload: unknown) => act(() => window.__eitriDispatch!(JSON.stringify(payload)));
+      dispatch({ kind: "hello", backend: "legacy", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"],
+        resumableSessions: [], expectedVerdandiRevision: null, account: null });
+      dispatch({ kind: "tabs", active: 1, tabs: [{ id: 1, number: 1, label: "1 claude", name: null,
+        state: "live", mode: "manual", marker: null, pending: 1, resumable: false, failure: null, title: null }] });
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 1,
+        state: { ...initialState(), status: { kind: "running" }, pendingPermissions: [request] } });
+      fireEvent.click(view.getByRole("button", { name: "View raw script" }));
+      const scratch = posted.find((message) => message.type === "view_in_editor");
+      expect(scratch).toEqual({ type: "view_in_editor", request_id: expect.any(String), title: "Workflow script", text: script });
+      dispatch({ kind: "command_result", requestId: scratch!.request_id, ok: true });
+      dispatch({ kind: "arrive" });
+      expect(view.getByText("Run a dynamic workflow?")).toBeTruthy();
+      expect(buttons(view.container).approve.disabled).toBe(false);
+      expect(posted.some((message) => ["edit_draft", "permission_response", "send_message", "open_path"].includes(String(message.type)))).toBe(false);
+    } finally {
+      window.webkit = priorWebkit;
+    }
+  });
+});
+
+describe("the agent asking a permission card", () => {
+  const child: ToolCallRecord = { seq: 2, toolUseId: REQUEST.toolUseId!, name: "Bash", input: REQUEST.input, result: null };
+  const children = (calls: ToolCallRecord[]) => ({ transcript: [], thinking: [], toolCalls: calls,
+    assistantMessageOpen: false, thinkingOpen: false });
+  const parent = (name: string, input: unknown): ToolCallRecord => ({ seq: 1, toolUseId: "parent", name, input,
+    result: null, children: children([child]) });
+  function card(calls: ToolCallRecord[], workflows: Partial<BackgroundTaskRecord>[] = []) {
+    const current = initialState();
+    current.toolCalls = calls;
+    current.backgroundTasks.rows = workflows.map((task, i) => ({ task_id: String(i), kind: "workflow", live: true,
+      status: "running", ...task } as BackgroundTaskRecord));
+    return render(<PermissionCardContext.Provider value={{ state: current, onViewScript: vi.fn() }}>
+      <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />
+    </PermissionCardContext.Provider>);
+  }
+
+  it.each(["Agent", "Task"])("names a known %s parent in the main column with hidden characters revealed", (name) => {
+    const view = card([parent(name, { description: "Review <b>files</b>\u202e" })]);
+    expect(view.container.querySelector(".permission-card-provider")!.textContent).toBe("asked by Review <b>files</b>⟨U+202E⟩");
+    expect(view.container.querySelector("b")).toBeNull();
+  });
+
+  it("follows nested parent chains to the nearest known agent description", () => {
+    const inner = parent("Task", { description: "Inner" });
+    const outer = { ...parent("Agent", { description: "Outer" }), children: children([inner]) };
+    const view = card([outer]);
+    expect(view.getByText("asked by Inner")).toBeTruthy();
+  });
+
+  it("traces through a placeholder to a known ancestor", () => {
+    const unknown = parent("background agent", {});
+    const outer = { ...parent("Agent", { description: "Known" }), children: children([unknown]) };
+    expect(card([outer]).getByText("asked by Known")).toBeTruthy();
+  });
+
+  it.each([
+    [[], "asked by a background agent"],
+    [[{ workflow_name: "Flow <b>one</b>\u202e" }], "asked by a background agent (workflow Flow <b>one</b>⟨U+202E⟩ running)"],
+    [[{ workflow_name: "One" }, { workflow_name: "Two" }], "asked by a background agent"],
+    [[{ workflow_name: "Ended", live: false, status: "completed" }], "asked by a background agent"],
+    [[{ workflow_name: "Ended", status: "failed" }, { workflow_name: "Live" }], "asked by a background agent (workflow Live running)"],
+  ] as [Partial<BackgroundTaskRecord>[], string][])("labels unknown ancestry with the live workflow count: %j", (workflows, label) => {
+    const view = card([parent("background agent", {})], workflows);
+    expect(view.container.querySelector(".permission-card-provider")!.textContent).toBe(label);
+    expect(view.container.querySelector("b")).toBeNull();
+  });
+
+  it("does not infer a child from an unrelated parent or a live workflow", () => {
+    const view = card([child, parent("Agent", { description: "Other" })], [{ workflow_name: "Flow" }]);
+    expect(view.container.querySelector(".permission-card-provider")).toBeNull();
+  });
+});
+
+describe("the agent label at the moment a recorded card is drawn", () => {
+  const twins = import.meta.glob<{ domain_events: AgentDomainEvent[] }>("../fixtures/claude-scripted-*.json",
+    { eager: true, import: "default" });
+  const events = (scenario: string) => twins[`../fixtures/claude-scripted-${scenario}.json`].domain_events;
+
+  /** The card for `toolUseId` as the page draws it: the state folded through the event that raised it. */
+  function cardAt(scenario: string, toolUseId: string) {
+    const all = events(scenario);
+    const at = all.findIndex((e) => e.type === "permission_requested" && e.tool_use_id === toolUseId);
+    expect(at, `${toolUseId} is raised in ${scenario}`).toBeGreaterThanOrEqual(0);
+    const state = all.slice(0, at + 1).reduce(applyEvent, initialState());
+    const request = state.pendingPermissions.find((p) => p.toolUseId === toolUseId)!;
+    return render(<PermissionCardContext.Provider value={{ state, onViewScript: vi.fn() }}>
+      <PermissionCard request={request} sessionEnded={false} onAnswer={vi.fn()} />
+    </PermissionCardContext.Provider>);
+  }
+
+  // The CLI raises a child's card before the parent call or any of the child's frames reach the page, so
+  // nothing links the card to an agent yet and none is named.
+  it.each(["toolu_sb_read", "toolu_sb_bash"])("draws a foreground subagent's card %s with no agent label", (id) => {
+    expect(cardAt("c03_fg", id).container.querySelector(".permission-card-provider")).toBeNull();
+  });
+
+  it.each(["toolu_wa", "toolu_wb"])("draws a workflow agent's card %s with no agent label", (id) => {
+    expect(cardAt("c16w", id).container.querySelector(".permission-card-provider")).toBeNull();
+  });
+});
+
+describe("the Workflow card's script", () => {
+  it("draws only the resolved script when the request carries one", () => {
+    const request: PermissionRequestRecord = { ...REQUEST, toolName: "Workflow",
+      input: { script: "ORIGINAL-SOURCE", resolvedScript: "RESOLVED-SOURCE", args: { a: 1 } } };
+    const view = render(<PermissionCard request={request} sessionEnded={false} onAnswer={vi.fn()} />);
+    expect(view.container.textContent).toContain("RESOLVED-SOURCE");
+    expect(view.container.textContent).not.toContain("ORIGINAL-SOURCE");
+  });
 });

@@ -3,7 +3,7 @@ import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
 import { initialPageModel, pageModel, withoutHint } from "./page_model";
 import type { CommandRecord, PageModel } from "./page_model";
-import { installDispatch, postToRust, nextRequestId } from "./bridge";
+import { installDispatch, postToRust, nextMirrorId, nextRequestId } from "./bridge";
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
 import {
@@ -82,13 +82,17 @@ import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClos
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
+import { QuestionDock } from "./components/QuestionDock";
+import type { QuestionDockHandle } from "./components/QuestionDock";
 import { Composer } from "./components/Composer";
 import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
-import { cardApprovable } from "./components/PermissionCard";
+import { cardApprovable, PermissionCardContext } from "./components/PermissionCard";
 import { Row } from "./components/Row";
 import { classify, remedyNamesR } from "./problems";
+import { revealedText } from "./revealHidden";
+import { cliPhaseText } from "./turnPhase";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
 import { QueueLines } from "./components/QueueLines";
@@ -99,6 +103,7 @@ import { HintLayer } from "./components/HintLayer";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
+import { TasksOverlay, stopTaskWords, type TasksOverlayHandle } from "./components/TasksOverlay";
 import { TrustPrompt } from "./components/TrustPrompt";
 import {
   parseExCommand,
@@ -128,7 +133,7 @@ import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
-import { cardSummary, shortModel, usageSegment } from "./band";
+import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
 import type { TurnDurations } from "./turnTimes";
 import type { ApproveFact, BandFacts } from "./band";
@@ -510,6 +515,15 @@ function applyViewScroll(list: HTMLElement, view: TabViewState, follow: boolean,
 /** What `<leader>k` says when the agent left nothing running (Rust's `NOTHING_IN_THE_BACKGROUND`). */
 const NOTHING_IN_THE_BACKGROUND = "nothing is running in the background";
 
+/** What `<leader>k` says on a Claude tab: its session does not report what it left running, so "nothing" would
+ *  claim more than is known. */
+const CLAUDE_REPORTS_NO_BACKGROUND = "this Claude Code sidecar does not report background work";
+
+/** `<leader>k`'s line when there is nothing to stop, for the tab's agent. */
+function nothingToStopWords(agent: string | undefined): string {
+  return agent === "claude" ? CLAUDE_REPORTS_NO_BACKGROUND : NOTHING_IN_THE_BACKGROUND;
+}
+
 /** `<leader>k`'s question: what is stopped, by whom it was left running, and what stopping it costs. */
 function stopBackgroundQuestion(who: string, running: number): string {
   const what = running === 1 ? "the command" : `the ${running} commands`;
@@ -554,6 +568,17 @@ export default function App() {
     setConfirm: (value: SetStateAction<PageModel["confirm"]>) => setPageField("confirm", value),
     setRenaming: (value: SetStateAction<PageModel["renaming"]>) => setPageField("renaming", value),
   }), [setPageField]);
+  /** Whether `interaction` still waits for an answer in `tab`, judged from the model as the dispatch left it (ahead
+   *  of the render the dock was drawn in). A closed tab's questions are gone with it. A tab switched away from is no
+   *  longer this page's state, so its question is taken to wait: the host keeps the draft only if it does. */
+  function questionStillWaiting(tab: TabId, interaction: string): () => boolean {
+    return () => {
+      const page = pageRef.current;
+      if (!page.tabs?.tabs.some((entry) => entry.id === tab)) return false;
+      if (page.tabs.active !== tab) return true;
+      return page.state.questions.some((q) => q.interactionId === interaction && q.state.kind !== "settled");
+    };
+  }
   /** Records an outgoing request in the model without a render: nothing draws `inFlight`, and a render of the
    *  whole panel per outgoing command would be pure cost. The next change of the model carries it along, since
    *  every change starts from `pageRef`. */
@@ -652,6 +677,40 @@ export default function App() {
    *  (declared for the status line's mode block -- nothing reaches it yet). See
    *  `./keymap`'s own doc comment on `PanelMode`. */
   const [mode, setMode] = useState<PanelMode>("browse");
+  const questionDock = useRef<QuestionDockHandle>(null);
+  const waitingQuestions = state.questions.filter((q) => q.state.kind !== "settled").sort((a, b) => a.seq - b.seq);
+  const waitingQuestion = waitingQuestions[0];
+  const questionIdentity = waitingQuestion ? `${activeTab?.id}:${waitingQuestion.interactionId}` : null;
+  const questionArrival = useRef({ identity: null as string | null, at: 0, held: new Set<string>() });
+  const questionHeld = useRef(new Set<string>());
+  useEffect(() => {
+    const down = (e: globalThis.KeyboardEvent) => { questionHeld.current.add(e.code || e.key); };
+    const up = (e: globalThis.KeyboardEvent) => {
+      questionHeld.current.delete(e.code || e.key);
+      questionArrival.current.held.delete(e.code || e.key);
+    };
+    const blur = () => { questionHeld.current.clear(); questionArrival.current.held.clear(); };
+    window.addEventListener("keydown", down, true);
+    window.addEventListener("keyup", up, true);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down, true);
+      window.removeEventListener("keyup", up, true);
+      window.removeEventListener("blur", blur);
+    };
+  }, []);
+  useLayoutEffect(() => {
+    const composer = containerRef.current?.querySelector<HTMLElement>(".composer");
+    if (composer) composer.hidden = questionIdentity !== null;
+    const previous = questionArrival.current.identity;
+    if (previous === questionIdentity) return;
+    questionArrival.current = { identity: questionIdentity, at: performance.now(), held: new Set(questionHeld.current) };
+    if (questionIdentity !== null && mode === "input") questionDock.current?.focus();
+    else if (previous !== null && questionIdentity === null && mode === "input") setComposerFocusRequest((n) => n + 1);
+  }, [questionIdentity, sessionStarted]);
+  function questionBlocked() {
+    return performance.now() - questionArrival.current.at < 250 || questionArrival.current.held.size > 0;
+  }
   /** A held `j`/`k`'s glide (`./jkHold`): the last repeat's time on the keydowns' clock and on
    *  `performance.now()`'s, to date its release for the typing guard, and which way it goes. */
   const holdClockRef = useRef({ typed: 0, perf: 0 });
@@ -773,8 +832,8 @@ export default function App() {
    *  `Ctrl+y` segment and `approveOldestByKey` both require. Followed through `focusin`/`focusout`. */
   const [composerBoxFocused, setComposerBoxFocused] = useState(false);
   useEffect(() => {
-    const onIn = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.target));
-    const onOut = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.relatedTarget));
+    const onIn = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.target) || (event.target instanceof Element && event.target.closest(".question-dock") !== null));
+    const onOut = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.relatedTarget) || (event.relatedTarget instanceof Element && event.relatedTarget.closest(".question-dock") !== null));
     document.addEventListener("focusin", onIn);
     document.addEventListener("focusout", onOut);
     setComposerBoxFocused(isComposerBox(document.activeElement));
@@ -820,6 +879,13 @@ export default function App() {
    *  and for a tab that was left following or never had a saved threshold. */
   const [unseenSeed, setUnseenSeed] = useState<{ afterSeq: number; tick: number } | null>(null);
   const unseenSeedTick = useRef(0);
+  const [tasksOpen, setTasksOpen] = useState(false);
+  const [tasksWorkflows, setTasksWorkflows] = useState(false);
+  const [tasksInitialId, setTasksInitialId] = useState<string | null>(null);
+  const tasksRef = useRef<TasksOverlayHandle>(null);
+  const taskRequests = useRef(new Map<string, TabId>());
+  const taskScratchTab = useRef<TabId | null>(null);
+  const stopTasksSignature = useRef("");
   /** The footer's transient line. `seq` so the same text twice is two flashes. */
   const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
   const flashSeq = useRef(0);
@@ -829,6 +895,10 @@ export default function App() {
     flashSeq.current += 1;
     setFlash({ text, seq: flashSeq.current });
   }
+  useEffect(() => {
+    if (state.notification?.content) showFlash(revealedText(state.notification.content));
+  }, [activeTab?.id, state.notification]);
+  useEffect(() => { setTasksOpen(false); }, [activeTab?.id]);
   // Whether Super is held, from its own keydown/keyup: WebKitGTK reports it on no other key's event,
   // and `isPlainAnswerKey` reads this for `a`/`d`/`D` and the bypass `y` (heldSuper.ts). The first
   // effect in this component, so its window-capture listener runs before HINT's, which stops keys.
@@ -894,7 +964,7 @@ export default function App() {
     draftTimerRef.current = null;
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
-    if (pending !== null) postToRust({ type: "draft", request_id: nextRequestId(), tab: pending.tab, text: pending.text });
+    if (pending !== null) postToRust({ type: "draft", request_id: nextMirrorId(), tab: pending.tab, text: pending.text });
   }
   /** Whether a `draft` for `tab` is the echo of the refusal just recorded: Rust names the refused send in it
    *  (`refused`), which only the trust question's put-off does. Taken once; an echo that never comes expires
@@ -1135,11 +1205,18 @@ export default function App() {
         break;
       }
       case "tab.stop-background": {
-        // Only a live tab whose agent counts what it left running has anything to stop; a turn that runs
-        // is stopped by an interrupt, which takes what it left with it.
+        // Claude stops its roster explicitly; other providers keep the session-ending stop.
         const tab = activeTab?.id ?? null;
+        if (!isExternalAgent(activeTab?.agent)) {
+          if (!state.capabilities.backgroundTasks) showFlash(CLAUDE_REPORTS_NO_BACKGROUND);
+          else if (!state.capabilities.taskControl) showFlash("this sidecar cannot stop one task");
+          else if (tab === null || activeTab?.state !== "live" || liveTasks(state.backgroundTasks.rows).length === 0) showFlash(NOTHING_IN_THE_BACKGROUND);
+          else if (state.activeTurnId !== null) showFlash("a turn is running: /tasks can stop background work");
+          else askStopBackground(tab, liveTasks(state.backgroundTasks.rows).length);
+          break;
+        }
         if (tab === null || activeTab?.state !== "live" || state.backgroundCalls === 0) {
-          showFlash(NOTHING_IN_THE_BACKGROUND);
+          showFlash(nothingToStopWords(activeTab?.agent));
           break;
         }
         if (state.activeTurnId !== null) {
@@ -1267,6 +1344,9 @@ export default function App() {
   }
   function runSlashAction(action: SlashAction) {
     switch (action.kind) {
+      case "tasks":
+        openTasksOverlay(action.workflows);
+        break;
       case "keymap":
         keymapOpening.current = null;
         keymapClosedByKey.current = false;
@@ -1285,6 +1365,50 @@ export default function App() {
         showFlash(action.text);
         break;
     }
+  }
+  function openTasksOverlay(workflows = false, taskId: string | null = null) {
+    endKeyPrompts();
+    dropPendingKeys();
+    exitRegion();
+    closeTransientOverlays();
+    setReview(null);
+    setChooser(null);
+    setSearch(null);
+    setExLine(null);
+    setSlashPicker(null);
+    setMode("browse");
+    setTasksWorkflows(workflows);
+    setTasksInitialId(taskId);
+    setTasksOpen(true);
+  }
+  function closeTasksOverlay() {
+    taskScratchTab.current = null;
+    setTasksOpen(false);
+    (containerRef.current ?? startScreenRef.current)?.focus();
+  }
+  function onTasksKey(event: KeyboardEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    tasksRef.current?.key(event.nativeEvent);
+  }
+  function tasksOverlay() {
+    return tasksOpen && <TasksOverlay ref={tasksRef} state={state} workflows={tasksWorkflows} initialTaskId={tasksInitialId}
+      onClose={closeTasksOverlay}
+      onRequest={(kind, taskId, requestId) => {
+        const tab = activeTabRef.current;
+        if (tab === null || taskRequests.current.size >= 64) {
+          tasksRef.current?.reply({ requestId, error: "too many task commands are waiting" });
+          return;
+        }
+        taskRequests.current.set(requestId, tab);
+        postToRust({ type: kind, request_id: requestId, tab, task_id: taskId });
+      }}
+      onOpen={(title, text) => {
+        const requestId = nextRequestId();
+        taskScratchTab.current = activeTabRef.current;
+        trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+        postToRust({ type: "view_in_editor", request_id: requestId, title, text });
+      }} />;
   }
   /** `c` in BROWSE: opens the review overlay on this tab's latest turn and asks the shell for it. The
    *  overlay is drawn at once, saying it is loading, and filled in by the `review` envelope that answers
@@ -1420,12 +1544,19 @@ export default function App() {
    *  the keys the same way -- and so does the `:` command line
    *  (`exLine`), which is drawn and gated exactly like the `/` prompt. */
   const overlayOpen =
+    tasksOpen ||
     chooser !== null ||
     slashPicker !== null ||
     renaming !== null ||
     (search !== null && sessionStarted) ||
     exLine !== null ||
     review !== null;
+  useEffect(() => {
+    if (waitingQuestion && mode === "input" && paneFocused && !overlayOpen && confirm === null) {
+      const focused = document.activeElement;
+      if (!focused?.closest(".question-dock, .permission-card")) questionDock.current?.focus();
+    }
+  }, [questionIdentity, mode, paneFocused, overlayOpen, confirm]);
   /** For the document replay (installed once): see its note on the empty layout. */
   const overlayOpenRef = useRef(overlayOpen);
   overlayOpenRef.current = overlayOpen;
@@ -1822,6 +1953,7 @@ export default function App() {
         currentKeyAtRef.current = performance.now();
       }
       if (!isModeCycleKey(event)) return;
+      if (event.target instanceof Element && event.target.closest(".question-dock")) return;
       event.preventDefault();
       // Shift+Tab does nothing while CARET/VISUAL/V-LINE is on -- its y/n
       // bypass prompt would take the next `y`, meant as VISUAL's own copy. `Esc` first, same as
@@ -2619,7 +2751,11 @@ export default function App() {
   /** The keys overlay, the detail popover and the handoff confirmation: what every route that lands the keys
    *  somewhere else, or opens another overlay over the conversation, closes so the two never fight for the keys
    *  (a keys overlay left up over INPUT swallowed every keystroke). */
-  function closeTransientOverlays() {
+  function closeTransientOverlays(keepTasks = false) {
+    if (!keepTasks) {
+      setTasksOpen(false);
+      taskScratchTab.current = null;
+    }
     setKeymapOpen(false);
     setDetail(null);
     setHandoffOpen(false);
@@ -2627,6 +2763,17 @@ export default function App() {
 
   useEffect(() => {
     installDispatch((payload) => {
+      if (questionDock.current?.reply(payload)) return;
+      if (payload.kind === "question_other_edited") return;
+      if ((payload.kind === "task_output_result" || payload.kind === "command_result") && taskRequests.current.has(payload.requestId)) {
+        const tab = taskRequests.current.get(payload.requestId);
+        taskRequests.current.delete(payload.requestId);
+        if (tab === activeTabRef.current) {
+          tasksRef.current?.reply(payload.kind === "task_output_result" ? payload :
+            { requestId: payload.requestId, ...(!payload.ok ? { error: payload.error } : {}) });
+        }
+        return;
+      }
       // Every session-scoped envelope names its tab, and the page keeps only the active tab's state, so one for
       // any other tab -- a batch still in flight when the user switched away -- is dropped before any arm below
       // can touch the page.
@@ -2685,7 +2832,7 @@ export default function App() {
           if (payload.focused) {
             setDetail(null);
             setHandoffOpen(false);
-          } else closeTransientOverlays();
+          } else closeTransientOverlays(taskScratchTab.current === activeTabRef.current && taskScratchTab.current !== null);
           // The `/` prompt and the `:` line are this panel's own, like the keys overlay.
           setSearch(null);
           setExLine(null);
@@ -2731,8 +2878,9 @@ export default function App() {
           break;
         }
         case "arrive": {
-          // Every keyboard arrival into the chat lands BROWSE; an overlay would sit over whatever it lands on.
-          closeTransientOverlays();
+          // A scratch return keeps the task detail; other arrivals land on the conversation in BROWSE.
+          closeTransientOverlays(taskScratchTab.current === activeTabRef.current && taskScratchTab.current !== null);
+          taskScratchTab.current = null;
           endKeyPrompts();
           // A reserved two-key prefix or a leader sequence armed before this arrival means nothing about it.
           dropPendingKeys();
@@ -2865,6 +3013,8 @@ export default function App() {
           // clears its part) before the new tab's snapshot arrives. The first `tabs` this page sees takes this
           // branch too, since `activeTabRef.current` starts `null`.
           if (payload.active !== activeTabRef.current) {
+            setTasksOpen(false);
+            taskScratchTab.current = null;
             switchedRef.current = true;
             // A switch ends VISUAL, and first: `saveView` below reads `modeRef.current` to park the old tab's
             // mode, and `exitRegion` sets that ref synchronously, so a mode this page cannot re-enter is never
@@ -2986,6 +3136,8 @@ export default function App() {
           break;
         }
         case "events": {
+          const wakes = payload.events.filter((e) => e.type === "cli_cycle_started").length;
+          if (wakes) tasksRef.current?.wake(wakes);
           // A new turn resets the render trace: each turn reports its own first text, once.
           if (payload.events.some((e) => e.type === "turn_started")) {
             firstTextReceivedAt.current = null;
@@ -3620,9 +3772,13 @@ export default function App() {
     setDetail(null);
     setHandoffOpen(false);
     setKeymapOpen(false);
-    const word = agentWord(tabsRef.current?.tabs.find((t) => t.id === tab)?.agent);
+    const agent = tabsRef.current?.tabs.find((t) => t.id === tab)?.agent;
+    const claude = !isExternalAgent(agent);
+    const tasks = liveTasks(stateRef.current.backgroundTasks.rows);
+    stopTasksSignature.current = JSON.stringify(tasks.map((t) => [t.task_id, t.run_id, t.kind]).sort());
+    const word = agentWord(agent);
     const who = word === null ? "the agent" : word === "codex" ? "Codex" : word;
-    setConfirm({ kind: "stop_background", tab, running, lines: [stopBackgroundQuestion(who, running)], openedAt: performance.now() });
+    setConfirm({ kind: "stop_background", tab, running, lines: [claude ? `Stop ${stopTaskWords(tasks)}? y/n` : stopBackgroundQuestion(who, running)], openedAt: performance.now() });
   }
 
   /** What a route that hands the keys to something else ends -- every
@@ -3814,6 +3970,10 @@ export default function App() {
         return true;
       }
       if (confirm.kind === "stop_background") {
+        const claude = !isExternalAgent(activeTab?.agent);
+        const tasks = liveTasks(state.backgroundTasks.rows);
+        const running = claude ? tasks.length : state.backgroundCalls;
+        const signature = JSON.stringify(tasks.map((t) => [t.task_id, t.run_id, t.kind]).sort());
         // Any key but a counted `y` puts the question away and stops nothing (`n`, Escape included).
         if (event.key === "y" || event.key === "Y") {
           const plain = isPlainAnswerKey(event.nativeEvent as unknown as KeyLike);
@@ -3823,12 +3983,16 @@ export default function App() {
             !bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
           ) {
             showFlash("y must be pressed on its own to stop them; nothing was stopped");
-          } else if (activeTab?.id !== confirm.tab || activeTab?.state !== "live" || state.backgroundCalls === 0) {
+          } else if (activeTab?.id !== confirm.tab || activeTab?.state !== "live" || running === 0) {
             // Not the tab, or not the commands, the question was about any more.
-            showFlash(state.backgroundCalls === 0 ? NOTHING_IN_THE_BACKGROUND : "the tab changed; nothing was stopped");
-          } else if (state.backgroundCalls !== confirm.running) {
+            showFlash(running === 0 ? NOTHING_IN_THE_BACKGROUND : "the tab changed; nothing was stopped");
+          } else if (claude && !state.capabilities.taskControl) {
+            showFlash("this sidecar cannot stop one task");
+          } else if (claude && state.activeTurnId !== null) {
+            showFlash("a turn is running: /tasks can stop background work");
+          } else if (running !== confirm.running || (claude && signature !== stopTasksSignature.current)) {
             // The count moved while the question was up: asked again with the count as it is now.
-            askStopBackground(confirm.tab, state.backgroundCalls);
+            askStopBackground(confirm.tab, running);
             return true;
           } else {
             const stopId = nextRequestId();
@@ -3985,6 +4149,11 @@ export default function App() {
         // gives: the chooser's inputs and the composer must not see a key the prompt takes.
         onKeyDownCapture={(event) => {
           if (answerConfirm(event)) return;
+          if (tasksOpen) {
+            onTasksKey(event);
+            return;
+          }
+
           if (!keymapOpen) return;
           onKeymapKey(event);
         }}
@@ -4118,6 +4287,7 @@ export default function App() {
         />
         {/* `prefix w`'s chooser can open over an empty tab 1 too -- `.agent-ui-root` is this layout's
             own positioned ancestor (it has no `.agent-ui-scroller` to nest inside). */}
+        {tasksOverlay()}
         {chooser !== null && (
           <PanelErrorBoundary name="chooser" onError={() => overlayFailed("chooser", onChooserLeave)}>
             <Chooser
@@ -4283,7 +4453,7 @@ export default function App() {
    *  `a` take, never by pressing a button a DOM query found. */
   function approveOldestByKey(event: KeyboardEvent<HTMLDivElement>, typedAt: number, afterKill: boolean) {
     const box = event.target;
-    if (!isComposerBox(box)) return;
+    if (!isComposerBox(box) && !(box instanceof HTMLElement && box.closest(".question-dock"))) return;
     const index = sessionEnded ? null : oldestWaitingPermission(timeline, answeredRef.current);
     const item = index === null ? undefined : timeline[index];
     if (item?.kind !== "permission") return;
@@ -4861,6 +5031,11 @@ export default function App() {
     // overlay and everything else below: tmux's own `confirm-before` prompt takes the
     // keys the same way.
     if (answerConfirm(event)) return;
+    if (tasksOpen) {
+      onTasksKey(event);
+      return;
+    }
+
     // Every other keydown is "a key" to the typing guard, ahead of the overlays
     // below so a key typed into one still counts. It cancels a waiting `a`/`d`/`D` -- which says
     // so in the band -- and this key still does whatever it does. Shift+Tab as WebKitGTK delivers
@@ -5442,7 +5617,7 @@ export default function App() {
         // Entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
         // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
         // to land on. Leaving BROWSE (`to === "browse"`) carries no caret to place.
-        if (action.to === "input") {
+        if (action.to === "input" && !waitingQuestion) {
           setComposerCaret(action.caret);
           setComposerFocusRequest((n) => n + 1);
         }
@@ -5452,6 +5627,15 @@ export default function App() {
         showFlash("Esc does not interrupt — ctrl+c does");
         break;
       case "toggle-expand": {
+        const item = timeline[cursor];
+        if (waitingQuestion && item?.kind === "message" && item.question?.interactionId === waitingQuestion.interactionId) {
+          setMode("input");
+          questionDock.current?.focus();
+          break;
+        }
+        const toolId = item?.kind === "tool" ? item.call.toolUseId : item?.kind === "permission" ? item.request.toolUseId : null;
+        const task = toolId ? liveTasks(state.backgroundTasks.rows).find((t) => t.tool_use_id === toolId) : null;
+        if (task && event.key === "Enter") { openTasksOverlay(false, task.task_id); break; }
         // Keyed on the timeline KEY, not the cursor index -- see the doc comment on `expanded`
         // above for why an index would silently drift onto the wrong row. For a "run" key this
         // un-collapses it right back into its calls (`display.ts`'s `buildDisplay`).
@@ -5966,6 +6150,22 @@ export default function App() {
       // handler before `onKeyDown` ever runs, so VISUAL has to beat it here.
       onKeyDownCapture={(event) => {
         if (answerConfirm(event)) return;
+        if (tasksOpen) {
+          onTasksKey(event);
+          return;
+        }
+
+        const target = event.target instanceof Element ? event.target : null;
+        const questionCovered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null;
+        if (waitingQuestion && target?.closest(".question-dock") && questionCovered) {
+          onKeyDown(event);
+          event.stopPropagation();
+          return;
+        }
+        if (waitingQuestion && !questionCovered && mode === "input" && !target?.closest(".permission-card, .question-dock")) {
+          questionDock.current?.key(event);
+          if (event.isPropagationStopped()) return;
+        }
         onVisualKeyDownCapture(event);
       }}
       onKeyDown={onKeyDown}
@@ -6047,35 +6247,41 @@ export default function App() {
             prompt sent at a turn's end moved the cursor onto it) is -1, no current row at all --
             the old fallback, the live index itself, marked whichever
             unrelated frozen row sat at that position as the cursor's. */}
-        <MessageList
-          state={frozenSnapshot?.state ?? state}
-          turnDurations={frozenSnapshot?.turnDurations ?? turnDurations}
-          sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
-          expanded={frozenSnapshot?.expanded ?? expanded}
-          cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
-          timeline={frozenTimeline ?? timeline}
-          detailed={frozenSnapshot?.detailed ?? detailed}
-          thinkingDisplay={thinkingDisplay}
-          // The band is drawn at full strength only while the list has the keys: in INPUT they are in
-          // the composer, and a bright band left above it would compete with the box being typed in.
-          focused={paneFocused && !edgeFocused && mode !== "input"}
-          ruleOffers={frozenSnapshot?.ruleOffers ?? ruleOffers}
-          yankedKey={yanked?.key ?? null}
-          onAnswerPermission={answerPermission}
-          answeredPermissions={frozenSnapshot?.answeredPermissions ?? answeredPermissions}
-          onPermissionReason={(permissionId, reason) => {
-            if (reason === "") permissionReasons.current.delete(permissionId);
-            else permissionReasons.current.set(permissionId, reason);
-          }}
-          onOpenPath={openPath}
-          onUnreadChange={(label, jump, afterSeq) => {
-            setUnreadLabel(label);
-            unreadJumpRef.current = jump;
-            unseenAfterSeqRef.current = afterSeq;
-          }}
-          unseenSeed={unseenSeed}
-          visual={mode === "caret" ? "caret" : mode === "visual" ? "visual" : mode === "vline" ? "vline" : null}
-        />
+        <PermissionCardContext.Provider value={{ state: frozenSnapshot?.state ?? state, onViewScript: (text) => {
+          const requestId = nextRequestId();
+          trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+          postToRust({ type: "view_in_editor", request_id: requestId, title: "Workflow script", text });
+        } }}>
+          <MessageList
+            state={frozenSnapshot?.state ?? state}
+            turnDurations={frozenSnapshot?.turnDurations ?? turnDurations}
+            sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}
+            expanded={frozenSnapshot?.expanded ?? expanded}
+            cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
+            timeline={frozenTimeline ?? timeline}
+            detailed={frozenSnapshot?.detailed ?? detailed}
+            thinkingDisplay={thinkingDisplay}
+            // The band is drawn at full strength only while the list has the keys: in INPUT they are in
+            // the composer, and a bright band left above it would compete with the box being typed in.
+            focused={paneFocused && !edgeFocused && mode !== "input"}
+            ruleOffers={frozenSnapshot?.ruleOffers ?? ruleOffers}
+            yankedKey={yanked?.key ?? null}
+            onAnswerPermission={answerPermission}
+            answeredPermissions={frozenSnapshot?.answeredPermissions ?? answeredPermissions}
+            onPermissionReason={(permissionId, reason) => {
+              if (reason === "") permissionReasons.current.delete(permissionId);
+              else permissionReasons.current.set(permissionId, reason);
+            }}
+            onOpenPath={openPath}
+            onUnreadChange={(label, jump, afterSeq) => {
+              setUnreadLabel(label);
+              unreadJumpRef.current = jump;
+              unseenAfterSeqRef.current = afterSeq;
+            }}
+            unseenSeed={unseenSeed}
+            visual={mode === "caret" ? "caret" : mode === "visual" ? "visual" : mode === "vline" ? "vline" : null}
+          />
+        </PermissionCardContext.Provider>
         {keymapOpen && (
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
             <KeymapOverlay
@@ -6133,6 +6339,7 @@ export default function App() {
             />
           </PanelErrorBoundary>
         )}
+        {tasksOverlay()}
         {chooser !== null && (
           <PanelErrorBoundary name="chooser" onError={() => overlayFailed("chooser", onChooserLeave)}>
             <Chooser
@@ -6196,8 +6403,10 @@ export default function App() {
       </div>
       {sessionEndedBanner}
       {commandNoticeBanner}
+      <QueueLines items={queue} error={queueError} note={queueNote} />
       <ActivityLine
         state={state}
+        onOpenTasks={() => openTasksOverlay()}
         turnClock={turnClock}
         canInterrupt={state.capabilities.interrupt}
         onInterrupt={interrupt}
@@ -6206,7 +6415,6 @@ export default function App() {
         mode={mode}
       />
       <TurnChanges state={state} review={reviewSettings} />
-      <QueueLines items={queue} error={queueError} note={queueNote} />
       {/* Above the composer, deliberately -- the confirmation
           used to sit below everything, at the very bottom; the band leaves no room there for a
           multi-line dialog, so it moves up here instead, controlled by `handoffOpen`. It must not
@@ -6225,6 +6433,12 @@ export default function App() {
         handingOff={handingOff}
         onHandoff={handoffToTerminal}
       />
+      {waitingQuestion && activeTab && <QuestionDock
+        key={questionIdentity} ref={questionDock} tab={activeTab.id} record={waitingQuestion}
+        draft={activeTab.questionDraft?.[waitingQuestion.interactionId]}
+        active={mode === "input" && paneFocused} blocked={questionBlocked} onActivate={() => setMode("input")}
+        stillWaiting={questionStillWaiting(activeTab.id, waitingQuestion.interactionId)}
+      />}
       <Composer
         onSlashAction={runSlashAction}
         // A running turn no longer disables the composer -- it queues a follow-up instead. Only
@@ -6251,7 +6465,7 @@ export default function App() {
         caretOnFocus={composerCaret}
         // Only while the box can take a message: a landing on a disabled textarea could not focus it.
         hintTarget={!(sessionEnded || handingOff)}
-        onModeChange={setMode}
+        onModeChange={(next) => { if (!waitingQuestion) setMode(next); }}
         onSend={sendMessage}
         onDraftChange={mirrorDraft}
         running={turnInProgress}
@@ -6352,15 +6566,18 @@ export default function App() {
           showcmd: box !== null ? `${box.title}…` : null,
           message: flash?.text ?? null,
           prompt: confirmBandPrompt,
-          warn: statusWarning(state.provider, activeTab?.failure ?? null),
+          warn: statusWarning(state.provider, activeTab?.failure ?? null)
+            ?? (state.apiRetry ? revealedText(cliPhaseText(state) ?? "API retry") : null)
+            ?? (state.rateLimitWarning ? `Usage limit warning${typeof state.rateLimitWarning.scalars.resets_at_ms === "number" ? ` · limit resets ${new Date(state.rateLimitWarning.scalars.resets_at_ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false })}` : ""}` : null),
           unread: unreadLabel,
           cards: state.pendingPermissions.length,
+          questions: waitingQuestions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
           // About the window, not the session: an ended session still has an editor beside it.
           link: editorLink,
           position: timeline.length === 0 ? null : `${cursor + 1}/${timeline.length}`,
-          model: shortModel(state.model),
+          model: shortModel(state.fallbackModel === null ? state.model : revealedText(state.fallbackModel)),
           // This tab's last reported usage, right of the model; nothing until one arrives.
           usage: usageSegment(state.usage),
           // How the latest turn ended when it did not complete, until the next turn starts.
@@ -6373,10 +6590,12 @@ export default function App() {
           recovery: reviewRecovery.length > 0 ? { path: reviewRecovery[0].path, more: reviewRecovery.length - 1 } : null,
           // Commands this tab's agent left running after its turns ended; nothing while there are none.
           background: sessionEnded ? null : state.backgroundCalls,
+          backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}
         paneFocused={paneFocused}
         entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
         onOpenDetail={() => post({ type: "open_detail" })}
+        onOpenTasks={() => openTasksOverlay()}
         onJump={() => unreadJumpRef.current()}
       />
       <HintLayer root={containerRef.current} hints={hints} typed={hintTyped} />

@@ -742,6 +742,7 @@ async fn probe(sidecar: &mut Sidecar, scratch: &Path) -> Verdict {
                 provider_permission_prompts: provider_prompts,
                 cli_permission_mode: CliPermissionMode::Unspecified as i32,
                 accept_unsupported_cli: false,
+                per_task_stop: false,
             }),
             ..Default::default()
         };
@@ -762,6 +763,7 @@ async fn probe(sidecar: &mut Sidecar, scratch: &Path) -> Verdict {
             session_id: session_id.clone(),
             command_id: uuid::Uuid::new_v4().to_string(),
             text: PROMPT.to_string(),
+            ..Default::default()
         };
         tokio::time::timeout(RPC_BUDGET, client.send_turn(request))
             .await

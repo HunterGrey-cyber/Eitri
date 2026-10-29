@@ -1585,7 +1585,8 @@ impl ReviewFlow {
 }
 
 /// The one place this file sends a message: the review the user confirmed, queued and flushed as
-/// their own message. Everything that reaches it has been checked against the digest they saw.
+/// a host-composed message, without marking it as text the person typed. Everything that reaches it
+/// has been checked against the digest they saw.
 fn confirmed_send(tabs: &mut TabSet, tab: TabId, text: &str, now_ms: u64) -> Result<Option<Flush>, String> {
     tabs.send_review(tab, text, now_ms)
 }

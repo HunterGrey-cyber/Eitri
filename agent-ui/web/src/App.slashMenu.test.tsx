@@ -84,6 +84,12 @@ const ACP_COMMANDS = [
 ];
 
 describe("where a tab's / menu rows come from", () => {
+  it.each(["tasks", "bashes", "workflows"])("/%s opens Eitri's overlay from a reported command", (name) => {
+    const { container } = inInput("claude", { availableCommands: [{ name, description: "CLI command" }] });
+    type(container, `/${name}`);
+    fireEvent.keyDown(box(container)!, { key: "Enter" });
+    expect(container.querySelector('.tasks-overlay[aria-label="Background tasks"]')).not.toBeNull();
+  });
   it("a Claude tab offers Claude's built-in commands", () => {
     const { container } = inInput(undefined);
     type(container, "/co");

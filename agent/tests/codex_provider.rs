@@ -1940,7 +1940,7 @@ fn stopping_the_background_stops_the_session() {
     let (provider, id, _) = left_running(t, u, vec![]);
     let pid = provider.pid();
     assert!(!provider.stopped_resumable(), "a live session is no stopped one");
-    provider.stop_background(&id, 1).expect("the stop is taken");
+    provider.stop_background(&id, 1, &[]).expect("the stop is taken");
     let events = pump_until(&provider, |events| {
         events
             .iter()
@@ -1971,7 +1971,7 @@ fn the_background_is_not_stopped_while_a_turn_runs_or_when_nothing_is_left() {
             item_note("item/started", t, u, command("c1", "inProgress")),
         ],
     );
-    let refused = |provider: &CodexProvider| match provider.stop_background(&id, 1) {
+    let refused = |provider: &CodexProvider| match provider.stop_background(&id, 1, &[]) {
         Err(ProviderError::Provider { code, .. }) => code,
         other => panic!("expected a refusal, got {other:?}"),
     };
@@ -2107,7 +2107,7 @@ fn a_final_message_that_does_not_extend_what_streamed_is_not_spliced() {
 fn a_stop_for_a_count_that_moved_is_refused() {
     let (t, u) = ("th-67", "turn-67");
     let (provider, id, _) = left_running(t, u, vec![]);
-    match provider.stop_background(&id, 2) {
+    match provider.stop_background(&id, 2, &[]) {
         Err(ProviderError::Provider { code, message }) => {
             assert_eq!(code, ProviderErrorCode::NoActiveTurn);
             assert!(message.contains("ask again"), "{message}");

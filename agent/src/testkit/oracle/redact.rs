@@ -8,7 +8,10 @@
 //!
 //! Never printed while redacting: the text of any message, tool input values, tool results, paths, model
 //! ids, host and user names, URLs, names and bodies of peers, workflow names and scripts, error strings,
-//! timestamps and the input files' paths. Every value that is not one of the closed words below prints as
+//! timestamps and the input files' paths; of Claude's questions, the question text, headers, option labels,
+//! descriptions and previews, the answers and the notes. A question set prints as its key only (how many
+//! questions, the indexes answered, an end from a closed list), in either form: its words never enter the
+//! oracle's normal form. Every value that is not one of the closed words below prints as
 //! `other`, a tool name not on the built-in list as `tool:<digest>`, and an input key that does not look
 //! like a schema key as `key:<digest>`.
 //!
@@ -207,6 +210,12 @@ pub const ENUM_WORDS: &[&str] = &[
     "limit_reached",
     "interrupted",
     "variant",
+    "bash-input",
+    "bash-output",
+    "tool-message",
+    "opener",
+    "promptSource",
+    "none",
 ];
 
 /// Decides how each value of a report is printed.

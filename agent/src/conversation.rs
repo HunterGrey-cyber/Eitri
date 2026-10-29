@@ -53,12 +53,22 @@ use crate::persistence::{save_conversation_record, ConversationRecord};
 use crate::projection::{AgentDomainEvent, PermissionOutcome};
 use crate::provider::{
     AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
-    ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest,
+    ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest, TurnStamp,
 };
 use crate::setting_sources::ProjectTrust;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Who wrote a message the host sends: the person, at the composer (`Typed`), or the host or a plugin
+/// (`Composed`: turn review's prompts, a plugin page's send, a companion send that came from no
+/// keyboard, a restored queue the person did not send again). Only a `Typed` message is marked as the
+/// person's to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptOrigin {
+    Typed,
+    Composed,
+}
 
 #[derive(Debug)]
 pub enum ConversationError {
@@ -918,17 +928,27 @@ impl AgentConversation {
         self.external.as_ref().is_some_and(|e| e.stopped_resumable())
     }
 
-    /// Stops what the agent left running in the background by stopping its session
-    /// (`ExternalProvider::stop_background`). Only an external provider can.
+    /// Stops the background work in the canonical roster through this session's provider.
     pub fn stop_background(&self, shown: u32) -> Result<(), ConversationError> {
-        let Some(external) = self.external.as_ref() else {
-            return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
-                "stop_background",
-            )));
-        };
         let session_id = self.require_session()?;
-        external.stop_background(&session_id, shown)?;
+        let tasks: Vec<String> = self
+            .projection()
+            .background_tasks
+            .rows
+            .iter()
+            .filter(|row| row.live && !row.task.ambient)
+            .map(|row| row.task.task_id.clone())
+            .collect();
+        self.provider.stop_background(&session_id, shown, &tasks)?;
         Ok(())
+    }
+
+    pub fn stop_task(&self, task_id: &str) -> Result<crate::TaskReply<()>, ConversationError> {
+        Ok(self.provider.stop_task(&self.require_session()?, task_id)?)
+    }
+
+    pub fn task_output(&self, task_id: &str) -> Result<crate::TaskReply<crate::TaskOutput>, ConversationError> {
+        Ok(self.provider.task_output(&self.require_session()?, task_id)?)
     }
 
     pub fn provider_info(&self) -> &ProviderInfo {
@@ -963,6 +983,39 @@ impl AgentConversation {
                 session_id,
                 text: text.to_string(),
             })
+            .map_err(Self::turn_error)
+    }
+
+    /// [`send_turn`](Self::send_turn) of a message the host knows by `client_message_id`, written by
+    /// `origin`: the provider names the id back if the agent reads the message later than the send
+    /// (`UserMessageDelivered`, whose row shows `as_typed`) or drops it (`UserMessageDropped`), and
+    /// marks a `Typed` message as the person's where its agent accepts the mark.
+    pub fn send_turn_as(
+        &mut self,
+        text: &str,
+        as_typed: &str,
+        origin: PromptOrigin,
+        client_message_id: &str,
+    ) -> Result<String, ConversationError> {
+        if self.external.is_some() {
+            return Err(ConversationError::Unsupported);
+        }
+        if self.projection().active_turn_id.is_some() {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        let session_id = self.require_session()?;
+        self.provider
+            .send_turn_stamped(
+                SendTurnRequest {
+                    session_id,
+                    text: text.to_string(),
+                },
+                TurnStamp {
+                    client_message_id: Some(client_message_id.to_string()),
+                    typed_by_person: origin == PromptOrigin::Typed,
+                    as_typed: Some(as_typed.to_string()),
+                },
+            )
             .map_err(Self::turn_error)
     }
 
@@ -1074,6 +1127,7 @@ impl AgentConversation {
         client_message_id: &str,
         text: &str,
         as_typed: &str,
+        origin: PromptOrigin,
     ) -> Result<(), ConversationError> {
         if !self.steers() {
             return Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
@@ -1094,13 +1148,19 @@ impl AgentConversation {
         }
         let expected_turn_id = expected_turn_id.to_string();
         let session_id = self.require_session()?;
-        self.provider.steer_turn(crate::provider::SteerTurnRequest {
-            session_id,
-            expected_turn_id,
-            client_message_id: client_message_id.to_string(),
-            text: text.to_string(),
-            as_typed: as_typed.to_string(),
-        })?;
+        self.provider.steer_turn_stamped(
+            crate::provider::SteerTurnRequest {
+                session_id,
+                expected_turn_id,
+                client_message_id: client_message_id.to_string(),
+                text: text.to_string(),
+                as_typed: as_typed.to_string(),
+            },
+            TurnStamp {
+                typed_by_person: origin == PromptOrigin::Typed,
+                ..TurnStamp::default()
+            },
+        )?;
         Ok(())
     }
 
@@ -1130,6 +1190,54 @@ impl AgentConversation {
             decision,
         })?;
         Ok(())
+    }
+
+    /// Hands the person's answer to the question set `interaction_id` to the provider. Checked against
+    /// the set first (`QuestionRecord::check_resolution`), so an answer to a set no longer waiting, or
+    /// one breaking a rule of the set, is refused here and nothing is sent. The set is `Answering`
+    /// while the answer goes out and after the provider took it, until its `QuestionSettled`; a send
+    /// refused here leaves it `Waiting` for another answer. Nothing here waits for the provider: the
+    /// returned send carries its reply, and whoever reads a refusal or failure from it hands it to
+    /// [`Self::question_send_failed`], which puts the set back to `Waiting`. Questions never enter
+    /// `pending_permissions`, so nothing that answers cards can reach one: this is the one door.
+    pub fn resolve_question(
+        &mut self,
+        interaction_id: &str,
+        resolution: crate::InteractionResolution,
+    ) -> Result<crate::InteractionSend, ConversationError> {
+        let refused = |code, message: String| ConversationError::Provider(ProviderError::Provider { code, message });
+        // Its own statement, so the projection's lock is released before anything else locks it.
+        let checked = match self.projection().question(interaction_id) {
+            Some(record) => record.check_resolution(&resolution),
+            None => Err("no question with that id is waiting for an answer".to_string()),
+        };
+        if let Err(why) = checked {
+            return Err(refused(crate::ProviderErrorCode::InteractionAnswerRefused, why));
+        }
+        let session_id = self.require_session()?;
+        if !self.ingest.mark_question_send(interaction_id, true) {
+            // Settled or taken by another answer between the check and here.
+            return Err(refused(
+                crate::ProviderErrorCode::InteractionNotFound,
+                "this question is no longer waiting for an answer".to_string(),
+            ));
+        }
+        let sent = self.provider.resolve_interaction(crate::ResolveInteractionRequest {
+            session_id,
+            interaction_id: interaction_id.to_string(),
+            resolution,
+        });
+        sent.map_err(|error| {
+            self.ingest.mark_question_send(interaction_id, false);
+            ConversationError::Provider(error)
+        })
+    }
+
+    /// The provider refused or failed the answer to `interaction_id` sent through
+    /// [`Self::resolve_question`]: the set waits for another answer. Nothing changes for a set that
+    /// settled meanwhile.
+    pub fn question_send_failed(&self, interaction_id: &str) {
+        self.ingest.mark_question_send(interaction_id, false);
     }
 
     /// Drains whatever the provider has produced since the last call, folding each event into the
@@ -1493,6 +1601,7 @@ mod tests {
                     interrupt: true,
                     bypass_permission_mode: true,
                     steer: false,
+                    ..Default::default()
                 },
                 ..Default::default()
             }
@@ -1857,6 +1966,7 @@ mod tests {
                     interactive_permission_mode: true,
                     cli_auto_mode: false,
                     steer: false,
+                    ..Default::default()
                 }
             }
             fn info(&self) -> ProviderInfo {
@@ -2728,6 +2838,7 @@ mod tests {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             }
         }
         fn info(&self) -> ProviderInfo {
@@ -2800,6 +2911,52 @@ mod tests {
         );
         drop(conversation);
         assert!(lease_comes_free(&cwd, session), "and it goes with the conversation");
+    }
+
+    /// Eitri's own copy ending in a turn the CLI started: the restored turn is over, so the first
+    /// prompt after the resume reaches the provider instead of being refused as a turn in progress.
+    #[test]
+    fn a_resume_whose_stored_copy_ends_in_a_cli_turn_takes_the_first_prompt() {
+        let dir = unique_dir();
+        let conversation_id = conversation_id_for_cwd(&dir.canonicalize().expect("the test workspace exists"));
+        let session = format!("sess-{}", uuid::Uuid::new_v4().simple());
+        let parts = crate::history::HistoryParts {
+            user_prompts: vec![crate::UserPromptRecord {
+                seq: 1,
+                text: "check every hour".into(),
+                delivered: false,
+            }],
+            turn_starts: vec![crate::TurnStartRecord {
+                seq: 2,
+                turn_id: "cli-9".into(),
+                origin: crate::TurnOrigin::Cli,
+                cause: None,
+            }],
+            ..Default::default()
+        };
+        crate::history::store::save(&crate::history::StoredHistory::from_parts(
+            conversation_id,
+            session.clone(),
+            parts,
+        ))
+        .expect("writing the stored history should succeed");
+
+        let mut conversation = AgentConversation::resume(
+            AcceptingResume::attaching_to(&session),
+            &dir,
+            &session,
+            ProjectTrust::Untrusted,
+        )
+        .expect("the fake provider attaches to the session it was asked for");
+        wait_for_ingest(&conversation, 1);
+        assert_eq!(
+            conversation.projection().turn_starts.len(),
+            1,
+            "the CLI's turn was restored"
+        );
+
+        let sent = conversation.send_turn("and now?");
+        assert!(sent.is_ok(), "the first prompt after the resume is taken: {sent:?}");
     }
 
     /// A lease for some other session must never stand in for this one: nothing is asked of the

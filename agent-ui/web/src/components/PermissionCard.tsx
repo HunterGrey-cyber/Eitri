@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type {
   AcpCardInput,
+  AgentUiState,
   CodexCommandInput,
   CodexFileChange,
   CodexFileChangeInput,
@@ -18,6 +19,12 @@ import { EditDiff } from "./EditDiff";
 import { countEscapes, revealHidden } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
 import { NO_TEXT_ASSIST } from "../textField";
+
+/** Card views read the same conversation as the list, including its frozen visual selection. */
+export const PermissionCardContext = createContext<{
+  state: Pick<AgentUiState, "toolCalls" | "backgroundTasks">;
+  onViewScript: (script: string) => void;
+} | null>(null);
 
 type Props = {
   request: PermissionRequestRecord;
@@ -40,6 +47,7 @@ type Props = {
 };
 
 export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, onReasonChange }: Props) {
+  const view = useContext(PermissionCardContext);
   const [reason, setReason] = useState("");
   const [clicked, setClicked] = useState(false);
   const answered = clicked || alreadyAnswered;
@@ -66,6 +74,9 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
   const inert = answered || sessionEnded;
   const external = isExternalTool(request.toolName);
   const approvable = cardApprovable(request);
+  const subagent = !external && view ? subagentOf(request.toolName, request.input, {
+    toolUseId: request.toolUseId, toolCalls: view.state.toolCalls, backgroundTasks: view.state.backgroundTasks.rows,
+  }) : null;
 
   function handleAnswer(decision: PermissionDecision, remember = false) {
     if (inert) return;
@@ -90,10 +101,12 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         title={isUsableLink(request.toolUseId) ? `tool call ${request.toolUseId}` : undefined}
         data-tool-use-id={isUsableLink(request.toolUseId) ? request.toolUseId : undefined}
       >
-        Permission requested: <ShownInline text={request.toolName} />
+        {request.toolName === "Workflow" ? "Run a dynamic workflow?" : <>Permission requested: <ShownInline text={request.toolName} /></>}
       </div>
+      {subagent !== null && <div className="permission-card-provider">asked by <ShownInline text={subagent} /></div>}
       {request.providerPrompt && <ProviderPromptLine prompt={request.providerPrompt} />}
-      <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />
+      {request.toolName === "Workflow" ? <WorkflowInput input={request.input} onViewScript={view?.onViewScript} /> :
+        <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />}
       {/* A deny from another agent carries no reason (Codex's decline has no field for one), so there is
           no box to type into; `D` says so (`App.tsx`). */}
       {!external && (
@@ -154,6 +167,27 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
 /** Model- or hook-supplied text on the card, with the characters `revealHidden` knows drawn as escapes. */
 function ShownInline({ text }: { text: string }) {
   return <Revealed pieces={revealHidden(text)} />;
+}
+
+function WorkflowInput({ input, onViewScript }: { input: unknown; onViewScript?: (script: string) => void }) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return <ToolInput toolName="Workflow" input={input} />;
+  const fields = input as Record<string, unknown>;
+  const scriptKeys = ["resolvedScript", "resolved_script", "script"];
+  const scriptKey = scriptKeys.find((key) => typeof fields[key] === "string");
+  const script = scriptKey === undefined ? null : fields[scriptKey] as string;
+  const extra = Object.fromEntries(Object.entries(fields).filter(([key, value]) =>
+    !(scriptKeys.includes(key) && typeof value === "string") && !(["name", "scriptPath", "args"].includes(key) && value !== undefined)));
+  return <>
+    {["name", "scriptPath", "args"].filter((key) => fields[key] !== undefined).map((key) => <div key={key}>
+      <div className="permission-card-description">{key === "args" ? "Arguments" : key === "name" ? "Name" : "Script path"}</div>
+      <pre className="permission-card-input"><Shown text={typeof fields[key] === "string" ? fields[key] as string : JSON.stringify(fields[key], null, 2)} what={key} /></pre>
+    </div>)}
+    {script !== null && <>
+      <pre className="permission-card-input permission-card-script"><Shown text={script} what="script" /></pre>
+      {onViewScript && <button type="button" data-nav-order={5} onClick={() => onViewScript(script)}>View raw script</button>}
+    </>}
+    {Object.keys(extra).length > 0 && <pre className="permission-card-input"><Shown text={JSON.stringify(extra, null, 2)} what="input" /></pre>}
+  </>;
 }
 
 /** Whose question this card is when the CLI itself asked (after the gate had already answered the

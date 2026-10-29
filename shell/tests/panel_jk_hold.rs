@@ -425,6 +425,7 @@ fn replay_fixture() -> Vec<String> {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),
@@ -433,6 +434,7 @@ fn replay_fixture() -> Vec<String> {
         None,
     );
     let tabs = vec![TabView {
+        question_draft: Default::default(),
         id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),

@@ -349,11 +349,11 @@ right after a reply arrives do not start HINT or open the box in the middle of a
 | `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
-| `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks) |
+| `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)) |
 | `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |
 | `?` | the list of keys, from an empty box |
 
-On a Claude tab, five slash words run Eitri's own actions when typed alone, in either the dashboard's
+On a Claude tab, seven slash words run Eitri's own actions when typed alone, in either the dashboard's
 box or a conversation:
 
 | word | what it does |
@@ -363,13 +363,15 @@ box or a conversation:
 | `/resume` | open the sessions chooser |
 | `/memory` | open the project's `CLAUDE.md` in the editor; if missing, show `no such file: CLAUDE.md` |
 | `/rewind` | keep the draft and show `/rewind is not in Eitri — c reviews and reverts this turn's edits` |
+| `/tasks` (or `/bashes`) | open the [background tasks list](#the-background-tasks-list) |
+| `/workflows` | open the background tasks list at its dynamic workflows |
 
 The first four clear the draft. None of these sends a message to Claude. Other slash commands keep
 their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/model`, `/mcp`, `/agents`,
 `/doctor` and `/output-style` show an effect; a bare `/model` or `/effort` opens a picker. `/login` and
 `/config`, and `/resume` with arguments, need a full terminal and are refused with a message. Other
 words, including prompt templates and your own commands, are sent as typed. `?` lists the working
-CLI commands. In a Codex tab or a tab of an agent you registered, all five words are sent as text:
+CLI commands. In a Codex tab or a tab of an agent you registered, all seven words are sent as text:
 there are no Claude command holdbacks or pickers.
 
 ### In BROWSE
@@ -427,10 +429,50 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
-| `<leader>k` | stop the commands a Codex tab left running in the background, which ends its session (it can be resumed), after a `y/n` question |
+| `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `<leader>?` | the list of keys |
 
 You can change them in [your configuration](configuration.md).
+
+### The background tasks list
+
+`/tasks`, `/bashes` or `/workflows` in a Claude tab opens the list of what Claude Code runs in the background: shells,
+monitors, local agents and dynamic workflows, then the tasks that finished, and a folded row of Claude Code's own
+system tasks. The list has the keys while it is open, and its last line names the main ones.
+
+| keys | what they do |
+|---|---|
+| `j` / `k`, or `Down` / `Up` | the next / the previous task; in a task's detail, scroll |
+| `Enter` | the task's detail: for a shell or a monitor the end of its output, for a workflow its phases and agents |
+| `x` | stop the selected task at once, and only that one |
+| `o` | open the task's output read-only in Neovim |
+| `PageDown` or `Space` / `PageUp` | scroll a page down / up |
+| `Home` / `End` | scroll to the top / the bottom |
+| `q` or `Esc` | back from a task's detail; from the list, close it |
+
+What the list shows is in [Codex and other agents](agents.md#background-tasks-and-tasks).
+
+### Claude's questions
+
+When Claude asks you a multiple-choice question, a question box replaces the message box until you answer it, and
+these keys work there. In BROWSE the activity line reads `⚑ Claude has a question — i to answer`, and `i` goes back
+to the box.
+
+| keys | what they do |
+|---|---|
+| `1` ... `9` | pick that row and stay on the question; the rows after the options are `Type something` (your own answer) and `Chat about this`, whose number only moves the cursor to it |
+| `j` / `k`, or `Down` / `Up` | move between the options |
+| `Space` | pick the option under the cursor and stay on the question (in one that takes several answers, select or clear it); on `Chat about this`, `Submit answers` or `Cancel` it does nothing |
+| `Enter` | in a question with one answer, pick the option under the cursor and move on: to the next question, to the review page, or, for a single question, send it; in one that takes several answers, select or clear the option, and on its `Next` or `Submit` move on or send; on `Type something`, start typing; on `Chat about this`, tell Claude you would rather talk it over; on the review page, `Submit answers` sends and `Cancel` cancels the question |
+| `Tab` / `Shift+Tab`, or `l` / `h` | the next / the previous question; when there are several, a review page of your answers follows the last one |
+| `Ctrl+Enter` | send every answer, or show which questions are still unanswered |
+| `n` | add notes to an option that shows a preview |
+| `Ctrl+g` | edit the answer you are typing under `Type something` in Neovim |
+| `Ctrl+k` | back to the conversation; the question keeps waiting |
+| `Esc` | in a typed answer, back to the options; anywhere else, cancel the question, which stops the turn |
+
+A key held down before the box appeared does not pick anything, and a held key's repeat does not either. More on
+questions in [Codex and other agents](agents.md#claudes-questions).
 
 ### Selecting text
 

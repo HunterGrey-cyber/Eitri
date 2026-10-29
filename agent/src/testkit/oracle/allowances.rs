@@ -105,9 +105,40 @@ pub struct Matcher {
     pub text_contains: Option<String>,
     /// Inside a subagent's transcript, or not.
     pub nested: Option<bool>,
+    /// Whether the CLI's entry is the first of its turn (the message that opened the turn) or one taken into a
+    /// turn already running. A difference that names no CLI entry holds neither.
+    pub opens_turn: Option<bool>,
 }
 
 impl Matcher {
+    /// The fields the matcher states, as the JSON an allowance file holds them in: what a report names when an
+    /// allowance matched nothing, so the entry to delete can be told from the others of its id.
+    pub fn as_json(&self) -> String {
+        let mut fields = serde_json::Map::new();
+        let words = [
+            ("marker", &self.marker),
+            ("kind", &self.kind),
+            ("origin", &self.origin),
+            ("via", &self.via),
+            ("turn_match", &self.turn_match),
+            ("field", &self.field),
+            ("tool", &self.tool),
+            ("text_contains", &self.text_contains),
+        ];
+        for (name, value) in words {
+            if let Some(value) = value {
+                fields.insert(name.to_owned(), serde_json::Value::String(value.clone()));
+            }
+        }
+        if let Some(nested) = self.nested {
+            fields.insert("nested".to_owned(), serde_json::Value::Bool(nested));
+        }
+        if let Some(opens_turn) = self.opens_turn {
+            fields.insert("opens_turn".to_owned(), serde_json::Value::Bool(opens_turn));
+        }
+        serde_json::Value::Object(fields).to_string()
+    }
+
     fn validate(&self) -> Result<(), String> {
         let check = |name: &str, value: &Option<String>, words: &[&str]| -> Result<(), String> {
             match value {
@@ -150,6 +181,7 @@ impl Matcher {
                 .as_deref()
                 .is_none_or(|piece| d.text.as_deref().is_some_and(|t| t.contains(piece)))
             && self.nested.is_none_or(|n| n == d.nested)
+            && self.opens_turn.is_none_or(|o| d.opens_turn == Some(o))
     }
 }
 
@@ -205,18 +237,32 @@ pub fn allowances_dir() -> PathBuf {
 }
 
 /// The shapes of the CLI's turns an allowance may be conditioned on (see [`shapes_of`]).
-pub const SHAPES: &[&str] = &["replies-adjacent-across-turns", "notification-turn"];
+pub const SHAPES: &[&str] = &[
+    "replies-adjacent-across-turns",
+    "notification-turn",
+    "peer-message-mid-turn",
+];
 
 /// Which of [`SHAPES`] the CLI's turns have. `replies-adjacent-across-turns`: two replies of the CLI that no
 /// entry but a task notification separates, the second in a later turn than the first. A restore of the files
 /// reads them as one reply, since no turn start falls between them. `notification-turn`: a turn a task
 /// notification opened. A recording that ends before the CLI hands its last notification over has none, and
-/// the same scenario resumed has one.
+/// the same scenario resumed has one. `peer-message-mid-turn`: another session's message the CLI
+/// delivered into a running turn (a peer's entry that does not open its turn), which no record of Eitri's
+/// holds as a row.
 pub fn shapes_of(cli: &[Turn]) -> Vec<&'static str> {
     let mut previous: Option<(usize, bool)> = None;
     let mut shapes = Vec::new();
     if cli.iter().any(|t| t.origin == Origin::TaskNotification) {
         shapes.push(SHAPES[1]);
+    }
+    if cli.iter().any(|t| {
+        t.entries
+            .iter()
+            .skip(1)
+            .any(|e| matches!(e, Entry::User { via: Via::Peer, .. }))
+    }) {
+        shapes.push(SHAPES[2]);
     }
     for (at, turn) in cli.iter().enumerate() {
         for entry in &turn.entries {
@@ -350,6 +396,19 @@ impl AllowanceSet {
     /// The allowances of `scenario` from the tree's allowance directory.
     pub fn for_scenario(scenario: &str) -> Result<Self, AllowanceError> {
         Self::load(&allowances_dir(), scenario)
+    }
+
+    /// The allowances of one run of `scenario`: a variant or a numbered run that differs from the scenario's
+    /// base run has a file of its own, `<scenario>_<run>.json`, whose entries name `<scenario>_<run>`; a run
+    /// without one is held to the scenario's file. A file's allowances must all match in the run it is read for,
+    /// so a difference only one run has cannot sit in the file the others read.
+    pub fn for_run(scenario: &str, run: Option<&str>) -> Result<Self, AllowanceError> {
+        let dir = allowances_dir();
+        let name = run
+            .map(|run| format!("{scenario}_{run}"))
+            .filter(|name| dir.join(format!("{name}.json")).exists())
+            .unwrap_or_else(|| scenario.to_owned());
+        Self::load(&dir, &name)
     }
 
     /// The allowances that apply to a run whose CLI turns have the shapes `seen`: those naming no shape, and those
@@ -486,6 +545,26 @@ mod tests {
                 turn(Origin::TaskNotification, vec![notified()])
             ]),
             ["notification-turn"]
+        );
+    }
+
+    #[test]
+    fn a_peer_message_delivered_into_a_running_turn_is_its_own_shape() {
+        let turn = |origin: Origin, entries: Vec<Entry>| {
+            let mut turn = Turn::new(1, origin);
+            turn.entries = entries;
+            turn
+        };
+        let user = |via: Via| Entry::User {
+            text: "words".to_owned(),
+            via,
+        };
+        let reply = || Entry::Assistant { text: "ok".to_owned() };
+        // A turn another session's message opened is not a delivery into a running turn.
+        assert!(shapes_of(&[turn(Origin::Peer, vec![user(Via::Peer), reply()])]).is_empty());
+        assert_eq!(
+            shapes_of(&[turn(Origin::Human, vec![user(Via::Prompt), user(Via::Peer), reply()])]),
+            ["peer-message-mid-turn"]
         );
     }
 

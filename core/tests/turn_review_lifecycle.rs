@@ -340,6 +340,38 @@ fn a_tool_call_after_the_base_is_not_late() {
     assert!(!turn(&turns, "t1").late);
 }
 
+/// Claude Code may end a turn of its own that the panel never saw start: that end closes no record,
+/// neither the running turn's nor, once it is over, any other.
+#[test]
+fn a_completion_of_a_turn_the_panel_never_saw_ends_no_record() {
+    let scratch = Scratch::new("foreign-end");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.observe(1, "s1", &opened("s1"), now());
+    review.observe(1, "s1", &started("t1"), now());
+    poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
+    review.observe(1, "s1", &completed("unknown-turn"), now());
+    review.poll();
+    let turns = review.turns("s1");
+    assert_eq!(turns.len(), 1, "{turns:#?}");
+    assert_eq!(turn(&turns, "t1").ended_ms, None, "t1 runs on");
+    assert_eq!(turn(&turns, "t1").end, Snap::Pending);
+
+    review.observe(1, "s1", &completed("t1"), now());
+    poll_until(&mut review, "s1", "both snapshots", |t| is_ok(t, "t1"));
+    let ended_at = turn(&review.turns("s1"), "t1").ended_ms;
+    assert!(ended_at.is_some());
+    review.observe(1, "s1", &completed("unknown-turn"), now());
+    review.poll();
+    let turns = review.turns("s1");
+    assert_eq!(turns.len(), 1, "no record is made for it either: {turns:#?}");
+    assert_eq!(
+        turn(&turns, "t1").ended_ms,
+        ended_at,
+        "the ended record is left as it was"
+    );
+}
+
 #[test]
 fn an_end_still_running_when_the_next_turn_asks_marks_both() {
     let scratch = Scratch::new("overlap-next");
@@ -1369,6 +1401,55 @@ fn row(path: &str) -> Vec<(String, bool)> {
     vec![(path.to_string(), true)]
 }
 
+/// A turn Claude Code started by itself is a turn of the review like any other: what it changed is
+/// charged to it, not to the prompt that comes after it.
+#[test]
+fn a_cli_turns_edit_lands_in_its_own_record() {
+    let scratch = Scratch::new("cli-turn");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    review.observe(1, "s1", &opened("s1"), now());
+    run_turn(&mut review, "t1", || {});
+    tick();
+    // The CLI's own turn: its start says so, and it writes a file.
+    review.observe(1, "s1", &started("cli-1"), now());
+    review.observe(
+        1,
+        "s1",
+        &AgentDomainEvent::TurnAttributed {
+            turn_id: "cli-1".into(),
+            origin: agent::TurnOrigin::Cli,
+            cause: Some(agent::TurnCause::of_kind(agent::TurnCauseKind::Task)),
+        },
+        now(),
+    );
+    review.observe(1, "s1", &tool("cli-1"), now());
+    poll_until(&mut review, "s1", "the CLI turn's base", |t| has_base(t, "cli-1"));
+    std::fs::write(scratch.project().join("woken.txt"), "written by the woken turn\n").unwrap();
+    review.observe(1, "s1", &completed("cli-1"), now());
+    poll_until(&mut review, "s1", "the CLI turn's end", |t| is_ok(t, "cli-1"));
+    tick();
+    run_turn(&mut review, "t2", || {});
+
+    let turns = review.turns("s1");
+    assert_eq!(
+        turns.iter().map(|t| t.turn_id.as_str()).collect::<Vec<_>>(),
+        ["t1", "cli-1", "t2"],
+        "one record per turn"
+    );
+    assert_eq!(turn(&turns, "cli-1").n, 2);
+    assert_eq!(
+        rows(&review, TurnRef::N(2), Scope::Turn),
+        vec![("woken.txt".to_string(), false)],
+        "the CLI turn's own change"
+    );
+    assert_eq!(
+        rows(&review, TurnRef::N(3), Scope::Turn),
+        vec![],
+        "the next prompt's turn changed nothing"
+    );
+}
+
 #[test]
 fn a_too_large_file_that_did_not_change_is_not_listed_as_changed() {
     let scratch = Scratch::new("large-unchanged");
@@ -2162,4 +2243,108 @@ fn a_turns_end_and_the_next_base_never_wait_for_retention() {
     });
     assert!(gate.writer.is_some());
     drop(gate);
+}
+
+#[test]
+fn a_claude_shell_outliving_its_turn_marks_left_running_from_the_roster() {
+    let scratch = Scratch::new("claude-shell-left-running");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/background-tasks.json")).unwrap();
+    for name in ["level_before_started", "started_before_level_counts_at_result"] {
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
+        let mut projection = agent::AgentSessionProjection::default();
+        review.observe(1, "s1", &background(0), now());
+        let start = started(name);
+        projection.apply(&start);
+        review.observe(1, "s1", &start, now());
+        for event in events
+            .iter()
+            .take_while(|e| !matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+            .filter(|e| !matches!(e, AgentDomainEvent::TurnStarted { .. }))
+        {
+            let derived = projection.apply_with_derived(event);
+            review.observe(1, "s1", event, now());
+            for event in derived {
+                review.observe(1, "s1", &event, now());
+            }
+        }
+        let end = completed(name);
+        projection.apply_with_derived(&end);
+        review.observe(1, "s1", &end, now());
+        assert_eq!(projection.background_at_last_turn_end, 1);
+        poll_until(&mut review, "s1", "shell turn ended", |turns| is_ok(turns, name));
+        assert!(turn(&review.turns("s1"), name).left_running);
+    }
+}
+
+#[test]
+fn background_child_edits_are_workspace_changes_in_a_later_turn() {
+    use eitri_core::turn_review::named_paths;
+    let scratch = Scratch::new("background-child");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    let mut projection = agent::AgentSessionProjection::default();
+    let parent = AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "parent".into(),
+        name: "Agent".into(),
+        input: serde_json::json!({}),
+    };
+    for event in [started("t1"), parent] {
+        projection.apply(&event);
+        review.observe(1, "s1", &event, now());
+    }
+    poll_until(&mut review, "s1", "the first base", |t| has_base(t, "t1"));
+    let end = completed("t1");
+    projection.apply(&end);
+    review.observe(1, "s1", &end, now());
+    poll_until(&mut review, "s1", "the first end", |t| is_ok(t, "t1"));
+    let next = started("t2");
+    projection.apply(&next);
+    review.observe(1, "s1", &next, now());
+    poll_until(&mut review, "s1", "the next base", |t| has_base(t, "t2"));
+    let child = AgentDomainEvent::SubagentFrame {
+        parent_tool_use_id: "parent".into(),
+        frame: Box::new(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "late-edit".into(),
+            name: "Write".into(),
+            input: serde_json::json!({ "file_path": scratch.project().join("late.txt") }),
+        }),
+    };
+    projection.apply(&child);
+    review.observe(1, "s1", &child, now());
+    std::fs::write(scratch.project().join("late.txt"), "child wrote this\n").unwrap();
+    projection.apply(&AgentDomainEvent::SubagentFrame {
+        parent_tool_use_id: "parent".into(),
+        frame: Box::new(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "t1".into(),
+            tool_use_id: "late-edit".into(),
+            content: serde_json::json!("done"),
+            is_error: false,
+        }),
+    });
+    review.observe(1, "s1", &completed("t2"), now());
+    poll_until(&mut review, "s1", "the next end", |t| is_ok(t, "t2"));
+    let named = named_paths(&projection.tool_calls, &["t1", "t2"]).relative_to(&scratch.project());
+    assert!(named.paths.is_empty());
+    let overview = review
+        .overview_job("s1", TurnRef::N(2), Scope::Session, named)
+        .run()
+        .unwrap();
+    let file = overview
+        .files
+        .iter()
+        .find(|file| file.path == Path::new("late.txt"))
+        .unwrap();
+    assert_eq!(file.origin, Origin::Workspace);
+    assert_eq!(review.turns("s1").len(), 2);
 }

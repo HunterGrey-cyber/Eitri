@@ -3164,6 +3164,49 @@ impl AgentProvider for CodexProvider {
         Err(ProviderError::UnsupportedCapability("external"))
     }
 
+    /// Stops the session for what its turns left running, as an interrupt does for what a turn keeps
+    /// running: stdin's end, then the process group. Only between turns.
+    fn stop_background(&self, session_id: &str, shown: u32, _tasks: &[String]) -> Result<(), ProviderError> {
+        let mut st = lock(&self.state);
+        if st.thread_id.as_deref() != Some(session_id) {
+            return Err(provider_error(
+                ProviderErrorCode::SessionNotFound,
+                "no such Codex session",
+            ));
+        }
+        Self::require_open(&st)?;
+        // Before the commit the link does not hold the child yet, so stopping it here would end nothing.
+        if st.adopted_at.is_some() {
+            return Err(provider_error(ProviderErrorCode::NoActiveTurn, NOT_COMMITTED));
+        }
+        if st.turn.is_some() {
+            return Err(provider_error(
+                ProviderErrorCode::TurnAlreadyActive,
+                "a turn is running: interrupt it, which also stops what is left running",
+            ));
+        }
+        report_background(&mut st);
+        if st.background_reported == 0 {
+            return Err(provider_error(
+                ProviderErrorCode::NoActiveTurn,
+                "nothing is running in the background",
+            ));
+        }
+        // The user said yes to a number the panel had; one that moved since is asked about again.
+        if st.background_reported != shown {
+            return Err(provider_error(
+                ProviderErrorCode::NoActiveTurn,
+                format!(
+                    "{} running in the background now, not {shown}: nothing was stopped; ask again",
+                    st.background_reported
+                ),
+            ));
+        }
+        eprintln!("agent: the user stopped what Codex left running in the background; its session is stopped");
+        self.stop_session(&mut st, STOPPED_BACKGROUND.to_string());
+        Ok(())
+    }
+
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError> {
         let mut st = lock(&self.state);
         if st.thread_id.as_deref() != Some(request.session_id.as_str()) {
@@ -3616,49 +3659,6 @@ impl ExternalProvider for CodexProvider {
     fn stopped_resumable(&self) -> bool {
         let st = lock(&self.state);
         st.stopped_whole && st.blocked.is_none()
-    }
-
-    /// Stops the session for what its turns left running, as an interrupt does for what a turn keeps
-    /// running: stdin's end, then the process group. Only between turns.
-    fn stop_background(&self, session_id: &str, shown: u32) -> Result<(), ProviderError> {
-        let mut st = lock(&self.state);
-        if st.thread_id.as_deref() != Some(session_id) {
-            return Err(provider_error(
-                ProviderErrorCode::SessionNotFound,
-                "no such Codex session",
-            ));
-        }
-        Self::require_open(&st)?;
-        // Before the commit the link does not hold the child yet, so stopping it here would end nothing.
-        if st.adopted_at.is_some() {
-            return Err(provider_error(ProviderErrorCode::NoActiveTurn, NOT_COMMITTED));
-        }
-        if st.turn.is_some() {
-            return Err(provider_error(
-                ProviderErrorCode::TurnAlreadyActive,
-                "a turn is running: interrupt it, which also stops what is left running",
-            ));
-        }
-        report_background(&mut st);
-        if st.background_reported == 0 {
-            return Err(provider_error(
-                ProviderErrorCode::NoActiveTurn,
-                "nothing is running in the background",
-            ));
-        }
-        // The user said yes to a number the panel had; one that moved since is asked about again.
-        if st.background_reported != shown {
-            return Err(provider_error(
-                ProviderErrorCode::NoActiveTurn,
-                format!(
-                    "{} running in the background now, not {shown}: nothing was stopped; ask again",
-                    st.background_reported
-                ),
-            ));
-        }
-        eprintln!("agent: the user stopped what Codex left running in the background; its session is stopped");
-        self.stop_session(&mut st, STOPPED_BACKGROUND.to_string());
-        Ok(())
     }
 
     fn send_turn_with(&self, req: SendTurnRequest, policy: TurnPolicy) -> Result<String, ProviderError> {

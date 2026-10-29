@@ -7956,7 +7956,7 @@ describe("App: the ? keymap overlay", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
   const overlay = (c: HTMLElement) => c.querySelector<HTMLElement>(".keymap-overlay");
 
-  it("opens on ? and shows all eight groups, in their fixed order", () => {
+  it("opens on ? and shows all its groups, in their fixed order", () => {
     const { container } = started();
     act(() => root(container).focus());
     expect(overlay(container)).toBeNull();
@@ -7968,7 +7968,7 @@ describe("App: the ? keymap overlay", () => {
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
     // "Selecting" sits right after "This panel", "Review (c)" after it; "Leader and
     // tab keys" after that, then "Typing"; "Slash commands"
-    // sits between "Typing" and "Anywhere".
+    // sits between "Typing" and "Anywhere", followed by the Claude tab's tasks list and question keys.
     expect(titles).toEqual([
       "This panel",
       "Selecting (v)",
@@ -7976,6 +7976,8 @@ describe("App: the ? keymap overlay", () => {
       "Leader and tab keys",
       "Typing",
       "Slash commands",
+      "Background tasks (/tasks)",
+      "Claude's question",
       "Anywhere in the window",
       "After Ctrl+b",
     ]);
@@ -15207,4 +15209,93 @@ describe("chooser_titles", () => {
     dispatch({ kind: "chooser_titles", titles: [{ providerSessionId: "s-1", title: "the CLI's title" }] });
     expect(container.querySelector(".chooser")).toBeNull();
   });
+});
+
+it("draws an unread prompt once above activity and keeps the running hint while nothing is held", () => {
+  const { container } = render(<App />);
+  dispatch({ kind: "hello", ...HELLO });
+  dispatchLiveTab(snapshotState({ activeTurnId: "t" }));
+  dispatch({ kind: "queue", tab: 1, items: [{ text: "also check formatting", queuedAt: 1, steered: true }], error: null });
+  enterInputMode(container);
+  const lines = container.querySelectorAll(".queue-line");
+  expect(lines).toHaveLength(1);
+  expect(lines[0].textContent).toBe("↪ also check formatting");
+  expect(container.querySelector(".message-list")?.textContent).not.toContain("also check formatting");
+  const children = Array.from(container.querySelector(".agent-ui-conversation")!.children);
+  expect(children.indexOf(container.querySelector(".queue-lines")!)).toBeLessThan(children.indexOf(container.querySelector(".activity-line")!));
+  expect(container.querySelector("textarea")?.placeholder).not.toBe("↑ to edit queued messages, Ctrl+Enter to send them now");
+});
+
+it("flashes a notification's plain text in the band without adding a row, then expires it", () => {
+  vi.useFakeTimers();
+  const widen = stubBandWidth();
+  try {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState());
+    act(() => widen(container));
+    const rows = container.querySelectorAll('[data-nav-stop="row"]').length;
+    dispatch({ kind: "events", tab: 1, fromRevision: 1, throughRevision: 2, events: [
+      { type: "session_notice", kind: "notification", level: "notice", content: "Saved <b>plain</b>\u202e", scalars: {} },
+    ] });
+    expect(container.querySelector(".band-message")?.textContent).toBe("Saved <b>plain</b>⟨U+202E⟩");
+    expect(container.querySelector(".band-message b")).toBeNull();
+    expect(container.querySelectorAll('[data-nav-stop="row"]')).toHaveLength(rows);
+    act(() => vi.advanceTimersByTime(2000));
+    expect(container.querySelector(".band-message")).toBeNull();
+  } finally { vi.useRealTimers(); vi.unstubAllGlobals(); }
+});
+
+it("opens tasks from the Claude pill or the idle status stop and preserves the single activity slot", () => {
+  const widen = stubBandWidth();
+  try {
+    const state = applyEvent(snapshotState({ backend: "sidecar", capabilities: {
+      ...initialState().capabilities, backgroundTasks: true,
+    } }), { type: "background_tasks_changed", occurred_at: Date.now(), tasks: [
+      { task_id: "s", run_id: null, kind: "shell", task_type: "local_bash", description: "serve <b>text</b>", subagent_type: null,
+        parent_task_id: null, tool_use_id: null, ambient: false, workflow_name: null },
+    ] });
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(state);
+    act(() => widen(container));
+    expect(container.querySelector(".band-background")?.textContent).toBe("1 shell");
+    fireEvent.click(container.querySelector(".band-background")!);
+    expect(container.querySelector('[role="dialog"][aria-label="Background tasks"]')?.textContent).toContain("serve <b>text</b>");
+    fireEvent.keyDown(container.querySelector('[role="dialog"] button')!, { key: "Escape" });
+    expect(container.querySelector(".tasks-overlay")).toBeNull();
+    const button = container.querySelector<HTMLButtonElement>('.tasks-line[data-nav-stop="status"] button')!;
+    button.focus();
+    fireEvent.keyDown(button, { key: "Enter" });
+    expect(button.disabled).toBe(false);
+    // jsdom does not synthesize the browser's button click after an Enter keydown.
+    fireEvent.click(button);
+    expect(container.querySelector(".tasks-overlay")).not.toBeNull();
+    fireEvent.click(container.querySelector(".tasks-overlay button")!);
+    dispatch({ kind: "events", tab: 1, fromRevision: 1, throughRevision: 2, events: [{ type: "turn_started", turn_id: "t" }] });
+    expect(container.querySelectorAll(".activity-line")).toHaveLength(1);
+    expect(container.querySelector(".tasks-line")).toBeNull();
+  } finally { vi.unstubAllGlobals(); }
+});
+
+it("shows retry and rate warnings and the reported fallback model in the band", () => {
+  const widen = stubBandWidth();
+  try {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ activeTurnId: "t" }));
+    act(() => widen(container));
+    dispatch({ kind: "events", tab: 1, fromRevision: 1, throughRevision: 2, events: [
+      { type: "session_notice", kind: "api_retry", level: "notice", scalars: { error_status: 529, retry_delay_ms: 8000, attempt: 2, max_retries: 10 } },
+    ] });
+    expect(container.querySelector(".band-warn")?.getAttribute("title")).toBe("529 · Retrying in 8s · attempt 2/10");
+    const resets = new Date(2026, 9, 28, 15, 45).getTime();
+    dispatch({ kind: "events", tab: 1, fromRevision: 2, throughRevision: 5, events: [
+      { type: "content_delta", turn_id: "t", kind: "text", text: "back" },
+      { type: "session_notice", kind: "rate_limit", level: "notice", scalars: { rate_status: "allowed_warning", resets_at_ms: resets } },
+      { type: "session_notice", kind: "model_fallback", level: "notice", scalars: { to_model: "fallback-model" } },
+    ] });
+    expect(container.querySelector(".band-warn")?.getAttribute("title")).toBe("Usage limit warning · limit resets 15:45");
+    expect(container.querySelector(".band-model")?.textContent).toBe("fallback-model");
+  } finally { vi.unstubAllGlobals(); }
 });

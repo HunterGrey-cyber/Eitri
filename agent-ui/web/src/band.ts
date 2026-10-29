@@ -1,5 +1,5 @@
 import type { PanelMode } from "./keymap";
-import type { EditorLink, TurnEnding, UsageInfo } from "./types";
+import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
 import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
 
@@ -37,6 +37,7 @@ export type BandFacts = {
   warn: string | null;
   unread: string | null;
   cards: number;
+  questions?: number;
   queued: number;
   context: { file: string; lines: [number, number] | null } | null;
   position: string | null;
@@ -72,11 +73,54 @@ export type BandFacts = {
   /** How many commands this tab's agent left running after its turns ended. `0`, `null` or absent says
    *  nothing: optional things show nothing until there is something to show. */
   background?: number | null;
+  backgroundTasks?: BackgroundTaskRecord[];
 };
 
 /** The band's count of the commands an agent left running after its turns ended. */
 export function backgroundSegment(running: number): string {
   return `${running} running in background`;
+}
+
+/** Live work excludes ambient housekeeping and finished roster entries. */
+export function liveTasks(rows: BackgroundTaskRecord[]): BackgroundTaskRecord[] {
+  return rows.filter((r) => r.live && !r.ambient && ["running", "paused", "stopping"].includes(r.status));
+}
+
+export function backgroundFallback(count: number): string {
+  return `${count} background ${count === 1 ? "task" : "tasks"}`;
+}
+
+/** Shells and monitors share one CLI type; other mixtures use its generic count. */
+export function taskWords(tasks: BackgroundTaskRecord[]): string {
+  if (tasks.length === 0) return "";
+  const group = (r: BackgroundTaskRecord) => r.task_type || (r.kind === "monitor" ? "shell" : r.kind);
+  const kind = tasks[0].kind;
+  if (!tasks.every((r) => group(r) === group(tasks[0]))) return backgroundFallback(tasks.length);
+  const word = (n: number, singular: string, plural = `${singular}s`) => `${n} ${n === 1 ? singular : plural}`;
+  if (kind === "shell" || kind === "monitor") {
+    const monitors = tasks.filter((r) => r.kind === "monitor").length;
+    return [tasks.length - monitors > 0 ? word(tasks.length - monitors, "shell") : "", monitors > 0 ? word(monitors, "monitor") : ""].filter(Boolean).join(", ");
+  }
+  if (kind === "local_agent") return word(tasks.length, "local agent");
+  if (kind === "workflow") return word(tasks.length, "background dynamic workflow");
+  return backgroundFallback(tasks.length);
+}
+
+export function elapsedWords(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+export function tasksLine(tasks: BackgroundTaskRecord[], now: number): string {
+  const workflows = tasks.filter((r) => r.kind === "workflow").sort((a, b) => b.started_at - a.started_at);
+  const workflow = workflows[0];
+  if (!workflow) return `⏵ ${taskWords(tasks)} · /tasks`;
+  const agents = workflow.workflow_progress?.agents;
+  const done = agents?.filter((a) => ["done", "completed", "failed", "stopped"].includes(a.state)).length;
+  const status = workflow.status === "paused" ? "paused" : agents ? `${done}/${agents.length} agents` : "running";
+  const tokens = workflow.usage?.total_tokens;
+  const usage = tokens == null ? "" : ` · ${tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : tokens} tokens`;
+  return `⏵ ${revealedText(workflow.workflow_name ?? workflow.description)} · ${status} · ${elapsedWords(now - workflow.started_at)}${usage} · /tasks${tasks.length > 1 ? ` · +${tasks.length - 1} more` : ""}`;
 }
 
 /** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
@@ -245,13 +289,15 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
+  const tasks = f.backgroundTasks === undefined ? null : liveTasks(f.backgroundTasks);
+  const background = tasks === null ? (f.background ? backgroundSegment(f.background) : "") : taskWords(tasks);
   let segs: Seg[] = [
     mode,
     pill,
-    ...(f.cards > 0 ? [{ id: "cards", text: `⚑${f.cards}`, side: "left" } as Seg] : []),
+    ...(f.cards + (f.questions ?? 0) > 0 ? [{ id: "cards", text: `⚑${f.cards + (f.questions ?? 0)}`, side: "left" } as Seg] : []),
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${revealedText(f.approve.tool)}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
-    ...(f.background && f.background > 0 ? [{ id: "background", text: backgroundSegment(f.background), side: "left" } as Seg] : []),
+    ...(background ? [{ id: "background", text: background, side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
     ...(f.recovery ? [{ id: "recovery", text: recoverySegment(f.recovery.path, f.recovery.more), side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
@@ -267,6 +313,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   ];
   const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
+    (s) => tasks === null ? s : s.map((x) => x.id === "background" ? { ...x, text: backgroundFallback(tasks.length) } : x),
     // The usage figure is the least urgent thing on the band -- it goes before even the context
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
     (s) => s.filter((x) => x.id !== "usage"),

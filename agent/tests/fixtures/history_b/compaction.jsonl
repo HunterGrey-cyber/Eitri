@@ -1,0 +1,5 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Continue"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"before","content":[{"type":"text","text":"Before"}]}}
+{"type":"system","subtype":"compact_boundary","uuid":"divider","compactMetadata":{"trigger":"auto"}}
+{"type":"user","uuid":"summary","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"PRIVATE SUMMARY"}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"after","content":[{"type":"text","text":"After"}]}}

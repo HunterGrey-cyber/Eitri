@@ -678,6 +678,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: ProjectionRef::Borrowed(projection),
@@ -693,6 +694,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     // before its first keystroke ("the replay's conversation never rendered within 15 s"). One tab,
     // live, matching the fixed id every fixture builds its snapshot for.
     let tabs = vec![TabView {
+        question_draft: Default::default(),
         id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),

@@ -107,8 +107,9 @@ fn proto_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// The steered messages of each session, from `outgoing.jsonl`. The line that resumed a session was made on the
-/// session before it; every line after it belongs to the next recording.
+/// The steered messages of each session, and the prompts sent under a client id (`"stamped": true`), from
+/// `outgoing.jsonl`. The line that resumed a session was made on the session before it; every line after it
+/// belongs to the next recording.
 pub fn steers_by_session(outgoing: &str, sessions: usize) -> Result<Vec<Vec<ReplaySteer>>, String> {
     let mut by_session: Vec<Vec<ReplaySteer>> = (0..sessions).map(|_| Vec::new()).collect();
     let mut at = 0;
@@ -126,6 +127,19 @@ pub fn steers_by_session(outgoing: &str, sessions: usize) -> Result<Vec<Vec<Repl
                     .get_mut(at)
                     .ok_or_else(|| format!("outgoing.jsonl line {}: a steer after the last session", n + 1))?
                     .push(steer);
+            }
+            // A prompt sent under a client id the sidecar may name back (`ClaudeSidecarProvider::send_turn_stamped`).
+            Some("send_turn") if entry["error"].is_null() && entry["stamped"] == true => {
+                let sent = ReplaySteer {
+                    after_events: entry["proto_events"].as_u64().unwrap_or(0) as usize,
+                    client_message_id: entry["client_message_id"].as_str().unwrap_or_default().to_owned(),
+                    as_typed: entry["text"].as_str().unwrap_or_default().to_owned(),
+                    outcome: ReplaySteerOutcome::Sent,
+                };
+                by_session
+                    .get_mut(at)
+                    .ok_or_else(|| format!("outgoing.jsonl line {}: a send after the last session", n + 1))?
+                    .push(sent);
             }
             Some("resume_session") if entry["error"].is_null() => at += 1,
             _ => {}

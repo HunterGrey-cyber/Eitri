@@ -188,22 +188,29 @@ pre {
   background: var(--nv-fg);
   color: var(--nv-bg);
 }
-.message-list > .row {
+/* A delegation's nested rows sit one wrapper deeper (the wrapper carries the indent) and are drawn exactly as the
+   list's own rows: each rule that takes a row off the sign-cell grid names them too, through `:where` so the
+   branch weighs what the list's own does and the sign colours below still win. */
+.message-list > .row, .message-list > :where(.subagent-child) > .row {
   position: relative;
   display: block;
   padding: 0;
   background: none;
 }
-.message-list > .row + .row {
+.message-list > .row + .row, .message-list > :where(.subagent-child) > .row, .message-list > :where(.subagent-child) + .row {
   margin-top: 12px;
 }
 .message-list .row-sign {
   display: none;
 }
-.message-list > .row-tool, .message-list > .row-tool-run, .message-list > .row-thinking {
+.message-list > .row-tool, .message-list > .row-tool-run, .message-list > .row-thinking,
+.message-list > :where(.subagent-child) > .row-tool, .message-list > :where(.subagent-child) > .row-tool-run,
+.message-list > :where(.subagent-child) > .row-thinking {
   padding-left: 24px;
 }
-.message-list > .row-tool::before, .message-list > .row-tool-run::before, .message-list > .row-thinking::before {
+.message-list > .row-tool::before, .message-list > .row-tool-run::before, .message-list > .row-thinking::before,
+.message-list > :where(.subagent-child) > .row-tool::before, .message-list > :where(.subagent-child) > .row-tool-run::before,
+.message-list > :where(.subagent-child) > .row-thinking::before {
   content: attr(data-sign) / "";
   position: absolute;
   left: 0;
@@ -245,6 +252,11 @@ pre {
   font-size: var(--fs-xs);
 }
 .message-list > .row-assistant {
+  margin-top: 24px;
+  margin-bottom: 24px;
+}
+/* Its own rule, after the nested rows' 12px, and heavier than it in every engine. */
+.message-list > .subagent-child > .row-assistant {
   margin-top: 24px;
   margin-bottom: 24px;
 }
@@ -492,6 +504,21 @@ pre {
   font-size: var(--fs-sm);
   border-top: 1px solid var(--rule-soft);
   padding-top: 10px;
+}
+/* A notice of the CLI's: muted like an ending, its words kept as they came, and only their first lines
+   on screen -- `y` copies them whole. */
+.row-notice {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.notice-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  overflow: hidden;
 }
 .row-problem-remedy {
   white-space: pre-wrap;
@@ -1125,7 +1152,7 @@ pre {
   color: var(--nv-muted);
 }
 /* Overlays share the same document edge, small header, and visible keyboard destination. */
-.keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt {
+.keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt, .tasks-overlay {
   position: absolute;
   inset: 12px var(--page-pad);
   z-index: 5;
@@ -1678,7 +1705,7 @@ pre {
   .activity-keys {
     display: none;
   }
-  .keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt {
+  .keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt, .tasks-overlay {
     inset: 8px;
     padding: 16px;
   }
@@ -2039,3 +2066,143 @@ textarea,
 [data-visual-copying] .fold-marker {
   display: none;
 }
+
+/* External lifecycle prose stays in storage order, with its own direction boundary. */
+.row-wake {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.wake-text, .wake-body, .notice-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  unicode-bidi: isolate;
+}
+.notice-prominent {
+  color: var(--nv-fg);
+  font-weight: 600;
+}
+.notice-compaction {
+  border-top: 1px solid var(--rule-soft);
+  padding-top: 10px;
+}
+
+.tasks-line button, button.band-background {
+  font: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.tasks-line, .queue-text, .turn-activity, .tasks-overlay {
+  unicode-bidi: isolate;
+}
+
+.tasks-line button {
+  color: var(--nv-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.band-background {
+  flex-shrink: 0;
+  padding: 0;
+}
+.tasks-overlay {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Outside the details button, so that button's gap does not reach it: the same 8px keeps `manual` and `⚑2` from
+   running into the count. */
+.status-band button.band-background {
+  margin-left: 8px;
+  color: var(--nv-chrome-fg);
+}
+
+.tasks-row {
+  display: grid;
+  grid-template-columns: 1.2em minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 8px 4px;
+  cursor: pointer;
+}
+.tasks-row[aria-selected="true"], .tasks-system[data-selected="true"] {
+  background: var(--nv-cursorline);
+}
+.tasks-dim, .tasks-elapsed {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.tasks-elapsed {
+  text-align: right;
+  white-space: nowrap;
+}
+.tasks-close {
+  float: right;
+}
+.tasks-system, .tasks-close {
+  font: inherit;
+  color: var(--nv-fg);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.tasks-overlay h3 {
+  font-size: var(--fs-prose);
+  margin: 14px 0 6px;
+}
+.tasks-overlay pre, .tasks-detail, .tasks-row {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  unicode-bidi: isolate-override;
+}
+.tasks-agent {
+  padding: 6px 0 6px 1em;
+}
+
+/* Each delegation keeps its children in the same navigation list, with one indent per parent. */
+.subagent-child { min-width: 0; }
+.subagent-heading, .subagent-status, .subagent-warning, .subagent-report, .question-line {
+  unicode-bidi: isolate;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.subagent-heading .fold-marker { margin-inline-start: 0.5em; }
+.subagent-status, .subagent-warning, .question-status { color: var(--nv-muted); }
+.subagent-report { margin-top: 0.4em; }
+
+/* A question temporarily occupies the composer's slot and can scroll independently at narrow widths. */
+.question-dock {
+  margin: 10px var(--page-pad) 14px;
+  padding: 12px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 14px;
+  min-width: 0;
+  max-height: 55vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-code);
+}
+.question-dock[data-active="true"] { border-color: var(--nv-focus-ring); }
+.question-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.question-option { display: block; box-sizing: border-box; width: 100%; text-align: left; white-space: pre-wrap; }
+.question-dock button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.question-dock [data-focused="true"] { background: var(--nv-cursor-band); }
+.question-description { display: block; padding-left: 2em; color: var(--nv-muted); }
+.question-hint { color: var(--nv-muted); white-space: normal; }
+.question-text { unicode-bidi: isolate; white-space: pre-wrap; }
+.question-dock textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 3em;
+  resize: vertical;
+  font: inherit;
+  color: var(--nv-fg);
+  background: var(--nv-bg);
+  unicode-bidi: isolate;
+}
+.question-preview { font-family: var(--nv-font-mono); max-width: 100%; overflow: auto; }
+.question-footer { color: var(--nv-fg); }

@@ -158,6 +158,16 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "steer_turn",
         "list_commands",
         "system_prompt_preset",
+        "cli_turns",
+        "human_origin",
+        "subagent_frames",
+        "background_tasks",
+        "workflow_progress",
+        "task_control",
+        "task_output",
+        "session_notices",
+        "conversation_reset",
+        "structured_questions_v1",
         "executable_host_cli",
     ]
     .iter()
@@ -165,6 +175,9 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
     .collect();
     // Compare capability order and length as well as membership to catch changes to
     // the sidecar's literal list.
+    //
+    // `task_output` requires opening files without following links and knowing the uid.
+    // Linux supports both, so this test requires the capability.
     //
     // `steer_turn` requires CLI version 2.1.252 or later. Its absence fails this test
     // because an older CLI would lose steering support.

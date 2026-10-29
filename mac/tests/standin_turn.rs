@@ -117,7 +117,7 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("[card] first", "[card] first")
+        .send_turn("[card] first", "[card] first", agent::PromptOrigin::Composed)
         .map_err(|e| e.message)
         .unwrap();
     let mut seen = Vec::new();
@@ -183,7 +183,7 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("[now] second", "[now] second")
+        .send_turn("[now] second", "[now] second", agent::PromptOrigin::Composed)
         .unwrap();
     let ended = pump_until(set, &dir, Duration::from_secs(15), &mut seen, |set, seen| {
         !seen.is_empty() && !set.get(tab).unwrap().turn_running()
@@ -198,7 +198,7 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("third", "third")
+        .send_turn("third", "third", agent::PromptOrigin::Composed)
         .unwrap();
     let running = pump_until(set, &dir, Duration::from_secs(15), &mut seen, |set, _| {
         set.get(tab).unwrap().turn_running()

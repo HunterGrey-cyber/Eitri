@@ -1,8 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { phaseOf } from "./turnPhase";
+import subagentFrames from "./fixtures/subagent-frames.json";
+import sessionNotices from "./fixtures/session-notices.json";
+import conversationReset from "./fixtures/conversation-reset.json";
+import backgroundTasksFixture from "./fixtures/background-tasks.json";
+import * as roster322 from "./fold/roster";
+import * as notices322 from "./fold/notices";
+import * as questions322 from "./fold/questions";
+import * as subagents322 from "./fold/subagents";
+import * as reset322 from "./fold/reset";
+import protocol322 from "./fixtures/protocol-322.json";
+import questionsFixture from "./fixtures/questions.json";
+import { describe, expect, it, vi } from "vitest";
 import { applyCallNotes, applyEvent, applyEvents, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
-import type { AgentDomainEvent, AgentUiSnapshot, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
 /** What Rust really sends for the turn-ending cases; written from its serializer. */
 import fixture from "./fixtures/turn-endings.json";
+/** Turn starts, notices and questions as Rust folds and sends them; written from its serializer. */
+import historyRecords from "./fixtures/history-records.json";
+/** Turn ends of turns this page did not run, hook blocks, unseen work and withdrawn prompts, as Rust
+ *  folds and sends them; written from its serializer. */
+import unseenTurns from "./fixtures/unseen-turns.json";
+import cliTurns from "./fixtures/cli-turns.json";
 
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
@@ -998,7 +1016,9 @@ describe("a CLI refusal that arrives ahead of its call", () => {
       { type: "session_unavailable", reason: "gone" },
     ];
     for (const end of ends) {
-      let state = applyEvent(initialState(), denied("toolu_never"));
+      // The end of the turn the refusal arrived in: an end naming another turn ends nothing here.
+      let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t" });
+      state = applyEvent(state, denied("toolu_never"));
       expect(state.denialsBeforeTheirCall).toHaveLength(1);
       state = applyEvent(state, end);
       expect(state.denialsBeforeTheirCall).toEqual([]);
@@ -1146,7 +1166,7 @@ describe("turn endings", () => {
     late = applyEvent(late, limits(4000));
     expect(late.turnEndings[0].resetsAt).toBe(3000);
     late = applyEvent(late, { type: "turn_started", turn_id: "t2" } as AgentDomainEvent);
-    late = applyEvent(late, ended("limit_reached", usage));
+    late = applyEvent(late, ended("limit_reached", usage, "t2"));
     late = applyEvent(late, limits(5000));
     expect(late.turnEndings.map((e) => e.resetsAt)).toEqual([3000, 4000]);
   });
@@ -1320,5 +1340,526 @@ describe("applyEvents folds a batch exactly as one event at a time, over every k
       // Rust numbers every event once: the page's counter is the number of events folded.
       expect(one.nextSeq, `seed ${seed}`).toBe(events.length);
     }
+  });
+});
+
+describe("turn starts, notices and questions (history-records.json, what Rust sends)", () => {
+  const events = historyRecords.events.events as unknown as AgentDomainEvent[];
+  const final = historyRecords.snapshot.state as unknown as AgentUiSnapshot;
+  const middle = historyRecords.middle.state as unknown as AgentUiSnapshot;
+  const check = (state: AgentUiState) => {
+    expect(state.turnStarts).toEqual(final.turnStarts);
+    expect(state.notices).toEqual(final.notices);
+    expect(state.questions).toEqual(final.questions);
+    expect(state.activeTurnId).toBe(final.activeTurnId);
+    expect(state.transcript).toEqual(final.transcript);
+    expect(state.userPrompts).toEqual(final.userPrompts);
+    expect(state.nextSeq).toBe(historyRecords.snapshot.throughRevision);
+  };
+
+  it("folding every event one by one gives what the last snapshot carries", () => {
+    check(events.reduce(applyEvent, initialState()));
+  });
+
+  it("folding them as one batch gives the same", () => {
+    check(applyEvents(initialState(), events));
+  });
+
+  it("the middle snapshot, with questions still waiting, and the events after it give the same", () => {
+    const loaded = applySnapshot(initialState(), middle, historyRecords.middle.throughRevision);
+    expect(loaded.questions.map((q) => q.state.kind)).toEqual(["waiting", "waiting"]);
+    check(applyEvents(loaded, events.slice(historyRecords.split)));
+  });
+
+  it("the last snapshot loads as it was sent", () => {
+    check(applySnapshot(initialState(), final, historyRecords.snapshot.throughRevision));
+  });
+
+  it("covers every cause, every notice kind and every way a question ends", () => {
+    const loaded = applySnapshot(initialState(), final, historyRecords.snapshot.throughRevision);
+    expect(loaded.turnStarts.map((r) => [r.origin, r.cause?.kind ?? null])).toEqual([
+      ["cli", "task"],
+      ["cli", "scheduled"],
+      ["cli", "peer"],
+      ["cli", "other"],
+      ["cli", "unknown"],
+      ["follow_up", null],
+    ]);
+    expect(new Set(loaded.notices.map((n) => n.kind)).size).toBe(9);
+    const outcomes = loaded.questions.flatMap((q) => (q.state.kind === "settled" ? [q.state.outcome] : []));
+    expect(new Set(outcomes)).toEqual(
+      new Set(["answered", "declined", "chat_requested", "interrupted", "expired", "session_closed", "provider_failed", "host_refused"]),
+    );
+    expect(loaded.questions.filter((q) => q.state.kind === "waiting").map((q) => q.interactionId)).toEqual(["q-waiting", "q-last"]);
+  });
+
+  it("a snapshot without the three keys (a conversation with none, or an older build) holds none", () => {
+    const { turnStarts: _s, notices: _n, questions: _q, ...older } = final;
+    const loaded = applySnapshot(initialState(), older as AgentUiSnapshot, historyRecords.snapshot.throughRevision);
+    expect(loaded.turnStarts).toEqual([]);
+    expect(loaded.notices).toEqual([]);
+    expect(loaded.questions).toEqual([]);
+  });
+
+  it("a turn the user sent leaves no start row, and a settlement for no question changes nothing", () => {
+    let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
+    state = applyEvent(state, { type: "turn_attributed", turn_id: "t1", origin: "client", cause: null });
+    state = applyEvent(state, { type: "question_settled", interaction_id: "nobody", outcome: "declined", answers: [], reason: null });
+    expect(state.turnStarts).toEqual([]);
+    expect(state.questions).toEqual([]);
+    expect(state.nextSeq).toBe(3);
+  });
+});
+
+describe("turn ends this page did not run, hook blocks, unseen work, withdrawn prompts (unseen-turns.json)", () => {
+  const cases = unseenTurns.cases as unknown as {
+    name: string;
+    events: { events: AgentDomainEvent[]; throughRevision: number };
+    snapshot: { state: AgentUiSnapshot; throughRevision: number };
+  }[];
+  const byName = (name: string) => {
+    const found = cases.find((c) => c.name === name);
+    if (found === undefined) throw new Error(`no case ${name}`);
+    return found;
+  };
+  const folded = (name: string) => byName(name).events.events.reduce(applyEvent, initialState());
+
+  for (const c of cases) {
+    it(`${c.name}: folding the events, one by one or as a batch, gives what the snapshot carries`, () => {
+      const loaded = applySnapshot(initialState(), c.snapshot.state, c.snapshot.throughRevision);
+      for (const state of [c.events.events.reduce(applyEvent, initialState()), applyEvents(initialState(), c.events.events)]) {
+        expect(state.activeTurnId).toBe(c.snapshot.state.activeTurnId);
+        expect(state.userPrompts).toEqual(c.snapshot.state.userPrompts);
+        expect(state.transcript).toEqual(c.snapshot.state.transcript);
+        expect(state.notices).toEqual(c.snapshot.state.notices ?? []);
+        expect(state.turnEndings).toEqual(c.snapshot.state.turnEndings);
+        expect(state.lastTurnEnding).toBe(c.snapshot.state.lastTurnEnding);
+        expect(state.assistantMessageOpen).toBe(c.snapshot.state.assistantMessageOpen);
+        expect(state.cliUnseenBusy).toBe(c.snapshot.state.cliUnseenBusy ?? false);
+        expect(state.nextSeq).toBe(c.snapshot.throughRevision);
+        // The event-by-event page and the page loaded from Rust's snapshot are the same page.
+        expect(loaded.notices).toEqual(state.notices);
+        expect(loaded.transcript).toEqual(state.transcript);
+        expect(loaded.userPrompts).toEqual(state.userPrompts);
+        expect(loaded.turnEndings).toEqual(state.turnEndings);
+        expect(loaded.activeTurnId).toBe(state.activeTurnId);
+        expect(loaded.cliUnseenBusy).toBe(state.cliUnseenBusy);
+        expect(loaded.nextSeq).toBe(state.nextSeq);
+      }
+    });
+  }
+
+  it("a turn this page did not run, while its own runs, leaves its own running and shows the answer apart", () => {
+    const state = folded("foreign_while_running_with_text");
+    expect(state.activeTurnId).toBe("t1");
+    expect(state.notices.map((n) => n.kind)).toEqual(["unseen_turn"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["Looking at it", "The tests passed in the background.", " and the fix is in"]);
+    expect(state.notices[0].seq).toBeLessThan(state.transcript[1].seq);
+  });
+
+  it("with none running, such an end draws no failed row, and without text nothing at all", () => {
+    for (const name of ["foreign_none_running_with_text", "foreign_none_running_without_text", "foreign_while_running_without_text"]) {
+      const state = folded(name);
+      expect(state.turnEndings, name).toEqual([]);
+      expect(state.lastTurnEnding, name).toBeNull();
+    }
+    expect(folded("foreign_none_running_without_text").notices).toEqual([]);
+    expect(folded("foreign_while_running_without_text").activeTurnId).toBe("t1");
+  });
+
+  it("a prompt a hook stopped shows the hook's words; /compact shows nothing new", () => {
+    const blocked = folded("hook_blocked_prompt");
+    expect(blocked.notices.map((n) => [n.kind, n.level])).toEqual([["hook_block", "warning"]]);
+    expect(blocked.notices[0].content).toContain("production deploys need a ticket");
+    expect(blocked.transcript).toEqual([]);
+    const compact = folded("compact_answers_without_a_reply");
+    expect(compact.notices).toEqual([]);
+    expect(compact.transcript).toEqual([]);
+  });
+
+  it("unseen work is noted until the next completion, and no turn runs because of it", () => {
+    const noted = folded("cli_work_unseen");
+    expect(noted.cliUnseenBusy).toBe(true);
+    expect(noted.activeTurnId).toBeNull();
+    expect(folded("cli_work_unseen_then_its_end").cliUnseenBusy).toBe(false);
+  });
+
+  it("a session that ends ends the note of work out of sight: no completion for it is coming", () => {
+    for (const name of [
+      "cli_work_unseen_then_the_session_closes",
+      "cli_work_unseen_then_the_session_is_lost",
+      "cli_work_unseen_then_a_resume_that_did_not_attach",
+    ]) {
+      expect(folded(name).cliUnseenBusy, name).toBe(false);
+    }
+  });
+
+  it("a withdrawn prompt takes back the newest undelivered one, and nothing else", () => {
+    expect(folded("withdrawn_after_an_undelivered_prompt").userPrompts.map((p) => p.text)).toEqual(["fix the parser"]);
+    expect(folded("withdrawn_after_a_delivered_one").userPrompts).toEqual([{ seq: 2, text: "and the docs", delivered: true }]);
+    expect(folded("withdrawn_with_none").userPrompts).toEqual([]);
+  });
+});
+
+
+describe("protocol 3.22 routing", () => {
+  const events = protocol322.domain_events as AgentDomainEvent[];
+
+  it("folds every event to the Rust snapshot, batched or separately", () => {
+    const snapshot = protocol322.snapshot;
+    const restored = applySnapshot(initialState(), snapshot.state as unknown as AgentUiSnapshot, snapshot.throughRevision);
+    for (const state of [events.reduce(applyEvent, initialState()), applyEvents(initialState(), events)]) {
+      for (const key of ["userPrompts", "transcript", "toolCalls", "status", "activeTurnId", "pendingPermissions", "thinking", "thinkingOpen", "assistantMessageOpen", "turnStarts", "notices", "questions", "turnEndings", "lastTurnEnding", "backgroundCalls", "nextSeq"] as const) {
+        expect(state[key], key).toEqual(restored[key]);
+      }
+    }
+    expect(protocol322.events.events).toEqual(protocol322.domain_events);
+  });
+
+  it("keeps child text outside the main reply through delta batching", () => {
+    const state = applyEvents(initialState(), events.slice(0, 13));
+    expect(state.transcript.find((m) => m.seq === 7)?.text).toBe("before after");
+    expect(state.toolCalls.find((call) => call.toolUseId === "p")?.children?.transcript[0].text).toBe("child reply");
+    expect(state.activeTurnId).toBe("main");
+    expect(state.assistantMessageOpen).toBe(true);
+    expect(state.nextSeq).toBe(13);
+  });
+
+  it("preserves existing fields for the empty folds", () => {
+    const incoming = { ...initialState(), turnThinking: true };
+    const quiet = new Set(["turn_cause_updated", "cli_cycle_started", "background_tasks_changed", "task_event"]);
+    for (const event of events.filter((e) => quiet.has(e.type))) {
+      expect(applyEvent(incoming, event)).toEqual({ ...incoming, nextSeq: incoming.nextSeq + 1 });
+    }
+  });
+
+  it("calls the lifecycle and content hooks only for main events", () => {
+    const rosterFold = vi.spyOn(roster322, "fold");
+    const noticeFold = vi.spyOn(notices322, "fold");
+    const questionFold = vi.spyOn(questions322, "fold");
+    const resetFold = vi.spyOn(reset322, "fold");
+    const childFold = vi.spyOn(subagents322, "fold");
+    const content = vi.spyOn(notices322, "onContent");
+    const end = vi.spyOn(notices322, "onTurnEnd");
+    const completed = vi.spyOn(roster322, "onTurnCompleted");
+    const rosterEnd = vi.spyOn(roster322, "onSessionEnd");
+    const questionEnd = vi.spyOn(questions322, "onSessionEnd");
+    try {
+      let state = events.reduce(applyEvent, initialState());
+      state = applyEvent(state, { type: "session_closed", reason: "closed" });
+      applyEvent(state, { type: "session_unavailable", reason: "gone" });
+      expect(rosterFold).toHaveBeenCalledTimes(2);
+      expect(noticeFold).toHaveBeenCalledTimes(4);
+      expect(questionFold).toHaveBeenCalledTimes(2);
+      expect(resetFold).toHaveBeenCalledTimes(1);
+      expect(childFold).toHaveBeenCalledTimes(4);
+      expect(content).toHaveBeenCalledTimes(2);
+      expect(end).toHaveBeenCalledTimes(1);
+      expect(completed).toHaveBeenCalledTimes(1);
+      expect(rosterEnd).toHaveBeenCalledTimes(2);
+      expect(questionEnd).toHaveBeenCalledTimes(2);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it("replaces each concern through its snapshot hook", () => {
+    const spies = [roster322, notices322, subagents322, questions322, reset322].map((module) => vi.spyOn(module, "fromSnapshot"));
+    try {
+      const before = events.reduce(applyEvent, initialState());
+      const empty = initialState();
+      const after = applySnapshot(before, empty, 0);
+      for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1);
+      expect(after.transcript).toEqual([]);
+      expect(after.notices).toEqual([]);
+      expect(after.questions).toEqual([]);
+    } finally { vi.restoreAllMocks(); }
+  });
+});
+
+describe("session notices match the Rust snapshot", () => {
+  const cases = sessionNotices.cases as unknown as {
+    name: string; events: { events: AgentDomainEvent[] };
+    snapshot: { state: AgentUiSnapshot; throughRevision: number };
+  }[];
+  for (const c of cases) {
+    it(c.name, () => {
+      const folded = c.events.events.reduce(applyEvent, initialState());
+      const loaded = applySnapshot(initialState(), c.snapshot.state, c.snapshot.throughRevision);
+      for (const key of ["notices", "apiRetry", "compacting", "rateLimitWarning", "fallbackModel", "notification",
+        "transcript", "assistantMessageOpen", "thinkingOpen", "accountLimits", "turnEndings", "nextSeq"] as const) {
+        expect(folded[key]).toEqual(loaded[key]);
+      }
+      if (["informational_info", "peer_released", "rate_allowed", "rate_allowed_warning", "retry", "notification", "compacting", "rate_rejected"].includes(c.name)) {
+        expect(folded.notices).toEqual([]);
+      }
+      if (c.name === "rate_rejected") expect(folded.turnEndings[0].resetsAt).toBe(1800000123);
+      if (c.name === "quiet_preserves_stream") expect(folded.transcript.map((m) => m.text)).toEqual(["beforeafter"]);
+      if (c.name.startsWith("retry_cleared")) expect(folded.apiRetry).toBeNull();
+      const replaced = applySnapshot(folded, initialState(), 0);
+      expect(replaced.apiRetry).toBeNull();
+      expect(replaced.compacting).toBe(false);
+      expect(replaced.rateLimitWarning).toBeNull();
+      expect(replaced.fallbackModel).toBeNull();
+      expect(replaced.notification).toBeNull();
+    });
+  }
+});
+
+describe("/clear starts a new conversation in the same tab", () => {
+  const cases = conversationReset.cases as unknown as {
+    name: string; domain_events: AgentDomainEvent[]; events: { events: AgentDomainEvent[] };
+    snapshot: { state: AgentUiSnapshot; throughRevision: number };
+  }[];
+  const byName = (name: string) => {
+    const c = cases.find((c) => c.name === name);
+    if (!c) throw new Error(`no case ${name}`);
+    return c;
+  };
+
+  for (const c of cases) {
+    it(`${c.name}: the event fold equals the Rust snapshot`, () => {
+      const folded = c.events.events.reduce(applyEvent, initialState());
+      const loaded = applySnapshot(initialState(), c.snapshot.state, c.snapshot.throughRevision);
+      for (const key of ["providerSessionId", "userPrompts", "transcript", "toolCalls", "pendingPermissions", "activeTurnId",
+        "status", "backgroundCalls", "turnEndings", "lastTurnEnding", "turnStarts", "notices", "questions", "usage",
+        "history", "thinking", "thinkingOpen", "assistantMessageOpen", "nextSeq"] as const) {
+        expect(folded[key], key).toEqual(loaded[key]);
+      }
+      expect(c.events.events).toEqual(c.domain_events);
+    });
+  }
+
+  it("keeps the count of running commands and a waiting card, and nothing of the conversation", () => {
+    const state = byName("shell_count_and_card_survive_the_reset").events.events.reduce(applyEvent, initialState());
+    expect(state.providerSessionId).toBe("sess-new");
+    expect(state.backgroundCalls).toBe(1);
+    expect(state.pendingPermissions.map((p) => p.permissionId)).toEqual(["perm-1"]);
+    expect(state.toolCalls.map((c) => c.toolUseId)).toEqual(["tu-card"]);
+    expect(state.userPrompts).toEqual([]);
+    expect(state.transcript).toEqual([]);
+    expect(state.notices).toEqual([]);
+    expect(state.activeTurnId).toBeNull();
+  });
+
+  it("shows only what came after the reset", () => {
+    const state = byName("a_turn_after_the_reset_is_the_whole_conversation").events.events.reduce(applyEvent, initialState());
+    expect(state.userPrompts.map((p) => p.text)).toEqual(["after"]);
+    expect(state.transcript.map((m) => m.text)).toEqual(["after reply"]);
+    expect(state.toolCalls).toEqual([]);
+  });
+
+  it("leaves the running turn and the held state to the process", () => {
+    const events = byName("shell_count_and_card_survive_the_reset").domain_events;
+    const at = events.findIndex((e) => e.type === "conversation_reset");
+    const before = events.slice(0, at).reduce(applyEvent, initialState());
+    const after = applyEvent(before, events[at]);
+    expect(after.activeTurnId).toBe(before.activeTurnId);
+    expect(after.activeTurnId).not.toBeNull();
+    expect(after.sessionId).toBe(before.sessionId);
+    expect(after.nextSeq).toBe(before.nextSeq + 1);
+  });
+});
+
+describe("question states from Rust", () => {
+  for (const testCase of questionsFixture.cases) {
+    it(testCase.name, () => {
+      let state = initialState();
+      let reloaded = initialState();
+      for (const step of testCase.steps) {
+        const action = step.action as { event?: AgentDomainEvent; send?: string; interactionId?: string };
+        const apply = (before: AgentUiState) => action.event ? applyEvent(before, action.event)
+          : action.send === "answering" ? questions322.markQuestionAnswering(before, action.interactionId!)
+          : questions322.questionSendFailed(before, action.interactionId!);
+        state = apply(state);
+        reloaded = apply(reloaded);
+        expect(state.questions).toEqual(step.snapshot.questions ?? []);
+        expect(reloaded.questions).toEqual(state.questions);
+        expect(state.nextSeq).toBe(step.throughRevision);
+        expect(questions322.waitingQuestions(state).map((q) => q.interactionId)).toEqual(step.waitingIds);
+        reloaded = applySnapshot(initialState(), { ...initialState(), ...step.snapshot } as AgentUiSnapshot, step.throughRevision);
+        expect(reloaded.questions).toEqual(state.questions);
+      }
+    });
+  }
+});
+
+describe("turns Claude Code started, a prompt read after work of its own, endings without a result (cli-turns.json)", () => {
+  type Case = {
+    name: string;
+    split: number;
+    events: { events: AgentDomainEvent[]; throughRevision: number };
+    middle: { state: AgentUiSnapshot; throughRevision: number };
+    snapshot: { state: AgentUiSnapshot; throughRevision: number };
+  };
+  const cases = cliTurns.cases as unknown as Case[];
+  const byName = (name: string) => {
+    const found = cases.find((c) => c.name === name);
+    if (found === undefined) throw new Error(`no case ${name}`);
+    return found;
+  };
+  const folded = (name: string) => byName(name).events.events.reduce(applyEvent, initialState());
+  const keys = [
+    "activeTurnId",
+    "userPrompts",
+    "transcript",
+    "toolCalls",
+    "turnStarts",
+    "turnEndings",
+    "lastTurnEnding",
+    "notices",
+    "openingPromptSeq",
+    "runningTurnCli",
+    "assistantMessageOpen",
+    "nextSeq",
+  ] as const;
+
+  for (const c of cases) {
+    it(`${c.name}: event by event, as a batch, from the middle snapshot and from the last one, the same page`, () => {
+      const loaded = applySnapshot(initialState(), c.snapshot.state, c.snapshot.throughRevision);
+      const fromMiddle = applyEvents(applySnapshot(initialState(), c.middle.state, c.middle.throughRevision), c.events.events.slice(c.split));
+      for (const state of [c.events.events.reduce(applyEvent, initialState()), applyEvents(initialState(), c.events.events), fromMiddle]) {
+        for (const key of keys) expect(state[key], `${c.name}: ${key}`).toEqual(loaded[key]);
+      }
+      expect(loaded.nextSeq).toBe(c.snapshot.throughRevision);
+    });
+  }
+
+  it("a turn Claude Code started is a turn: it runs, and its start says why", () => {
+    const c = byName("task_cause");
+    const mid = applySnapshot(initialState(), c.middle.state, c.middle.throughRevision);
+    expect(mid.activeTurnId).toBe("c1");
+    expect(mid.runningTurnCli).toBe(true);
+    const state = folded("task_cause");
+    expect(state.turnStarts.map((r) => [r.turnId, r.origin, r.cause?.kind, r.cause?.description])).toEqual([["c1", "cli", "task", "cargo test"]]);
+  });
+
+  it("the cause the close named replaces the start's unknown one; an update with none changes nothing", () => {
+    expect(folded("unknown_cause_updated_at_the_close").turnStarts.map((r) => r.cause?.kind)).toEqual(["task"]);
+  });
+
+  it("scheduled causes keep their reason or its absence, and three empty scheduled turns keep three rows", () => {
+    expect(folded("scheduled_with_a_reason").turnStarts[0].cause?.scheduleReason).toBe("check the deploy");
+    expect(folded("scheduled_without_a_reason").turnStarts[0].cause?.scheduleReason).toBeNull();
+    const three = folded("three_empty_scheduled_turns");
+    expect(three.turnStarts.map((r) => r.turnId)).toEqual(["c1", "c2", "c3"]);
+    expect(three.turnEndings).toEqual([]);
+  });
+
+  it("a peer's cause carries its name and its body as given", () => {
+    const cause = folded("peer_with_its_body").turnStarts[0].cause;
+    expect(cause?.peerName).toBe("reviewer");
+    expect(cause?.text).toBe("Please look at \u202eline 4\u200b");
+  });
+
+  it("a prompt read after work of its own leaves the conversation at the cycle and comes back where it was read", () => {
+    const c = byName("prompt_read_after_work_of_its_own");
+    const events = c.events.events;
+    const cycle = events.findIndex((e) => e.type === "cli_cycle_started");
+    const atCycle = events.slice(0, cycle + 1).reduce(applyEvent, initialState());
+    expect(atCycle.userPrompts.map((p) => p.text)).toEqual(["fix the parser"]);
+    expect(atCycle.openingPromptSeq).toBeNull();
+    expect(atCycle.turnStarts.map((r) => [r.turnId, r.cause?.kind])).toEqual([["t2", "task"]]);
+    const state = folded(c.name);
+    expect(state.userPrompts.map((p) => p.text)).toEqual(["fix the parser", "and the docs"]);
+    const woken = state.transcript.find((m) => m.text === "The build finished.");
+    const read = state.userPrompts[1];
+    expect(read.delivered).toBe(true);
+    expect(read.seq).toBeGreaterThan(woken?.seq ?? Infinity);
+  });
+
+  it("a prompt dropped after work of its own is not in the conversation", () => {
+    expect(folded("prompt_dropped_after_work_of_its_own").userPrompts.map((p) => p.text)).toEqual(["fix the parser"]);
+  });
+
+  it("an ending without a result keeps its row, its origin and its count; an empty one leaves nothing", () => {
+    const kept = folded("no_result_after_a_reply");
+    expect(kept.turnEndings.map((e) => [e.kind, e.reason, e.originKind, e.numTurns])).toEqual([["failed", "no_result", "task-notification", 1]]);
+    expect(kept.turnStarts).toHaveLength(1);
+    const empty = folded("empty_no_result");
+    expect(empty.turnStarts).toEqual([]);
+    expect(empty.turnEndings).toEqual([]);
+    expect(empty.lastTurnEnding).toBeNull();
+    expect(empty.activeTurnId).toBeNull();
+  });
+});
+
+describe("background task reconciliation", () => {
+  for (const c of backgroundTasksFixture.cases) {
+    it(c.name, () => {
+      const test = c as unknown as { events: { events: AgentDomainEvent[] }; batches: { events: AgentDomainEvent[] }[];
+        snapshots: { state: AgentUiSnapshot; throughRevision: number }[]; expected_running: number[];
+        expected_rows: Record<string, unknown>[]; expected_notice_count: number; expected_prefix_rows?: Record<string, Record<string, unknown>[]> };
+      let state = initialState();
+      for (const [index, batch] of test.batches.entries()) {
+        const previous = state;
+        state = applyEvents(state, batch.events);
+        const snapshot = test.snapshots[index];
+        const restored = applySnapshot(initialState(), snapshot.state, snapshot.throughRevision);
+        expect(state.backgroundTasks).toEqual(restored.backgroundTasks);
+        expect(state.backgroundCalls).toBe(test.expected_running[index]);
+        expect(state.backgroundTasks.rows.filter((r) => r.live && !r.ambient).length).toBe(state.backgroundCalls);
+        expect(state.notices).toEqual(restored.notices);
+        test.expected_prefix_rows?.[index]?.forEach((row, i) => expect(state.backgroundTasks.rows[i]).toMatchObject(row));
+        // Resync after every prefix must preserve the next fold, including the pending query reset.
+        const resumed = applyEvents(applySnapshot(previous, index === 0 ? initialState() : test.snapshots[index - 1].state,
+          index === 0 ? 0 : test.snapshots[index - 1].throughRevision), batch.events);
+        for (const key of ["backgroundTasks", "backgroundCalls", "notices", "nextSeq"] as const) {
+          expect(resumed[key], key).toEqual(state[key]);
+        }
+      }
+      expect(applyEvents(initialState(), test.events.events)).toEqual(state);
+      expect(test.events.events.reduce(applyEvent, initialState())).toEqual(state);
+      expect(state.notices).toHaveLength(test.expected_notice_count);
+      expect(state.backgroundTasks.rows).toHaveLength(test.expected_rows.length);
+      test.expected_rows.forEach((row, index) => expect(state.backgroundTasks.rows[index]).toMatchObject(row));
+      expect(applySnapshot(state, initialState(), 0).backgroundTasks.rows).toEqual([]);
+    });
+  }
+});
+
+
+describe("nested subagent streams", () => {
+  for (const fixture of subagentFrames.cases) {
+    it(fixture.name, () => {
+      const events = fixture.events as AgentDomainEvent[];
+      let state = initialState();
+      for (const event of events) {
+        const before = state;
+        state = applyEvent(state, event);
+        if (event.type === "subagent_frame") {
+          const { toolCalls: _beforeCalls, nextSeq: _beforeSeq, denialsBeforeTheirCall: _beforeDenials,
+            changedInputsBeforeTheirCall: _beforeChanges, ...beforeMain } = before;
+          const { toolCalls: _afterCalls, nextSeq: _afterSeq, denialsBeforeTheirCall: _afterDenials,
+            changedInputsBeforeTheirCall: _afterChanges, ...afterMain } = state;
+          expect(afterMain).toEqual(beforeMain);
+          expect(phaseOf(state)).toEqual(phaseOf(before));
+        }
+      }
+      const snapshot = fixture.snapshot;
+      const restored = applySnapshot(initialState(), snapshot.state as unknown as AgentUiSnapshot, snapshot.throughRevision);
+      for (const folded of [state, applyEvents(initialState(), events)]) {
+        for (const key of ["toolCalls", "transcript", "thinking", "activeTurnId", "assistantMessageOpen", "thinkingOpen", "pendingPermissions", "nextSeq"] as const) {
+          expect(folded[key], key).toEqual(restored[key]);
+        }
+        const next: AgentDomainEvent[] = [
+          { type: "content_delta", turn_id: state.activeTurnId ?? "main", kind: "text", text: " more main" },
+          { type: "subagent_frame", parent_tool_use_id: state.toolCalls[0].toolUseId,
+            frame: { type: "content_delta", turn_id: "main", kind: "text", text: " more child" } },
+        ];
+        const continued = applyEvents(folded, next);
+        const reloaded = applyEvents(restored, next);
+        expect(continued.toolCalls).toEqual(reloaded.toolCalls);
+        expect(continued.transcript).toEqual(reloaded.transcript);
+      }
+    });
+  }
+
+  it("keeps adjacent main and child deltas separate during batching", () => {
+    const fixture = subagentFrames.cases.find((entry) => entry.name === "foreground children")!;
+    const state = applyEvents(initialState(), fixture.events as AgentDomainEvent[]);
+    expect(state.transcript.map((row) => row.text)).toEqual(["main reply"]);
+    const parent = state.toolCalls[0];
+    expect(parent.children?.transcript.map((row) => row.text)).toEqual(["child reply"]);
+    expect(parent.children?.toolCalls.map((call) => call.toolUseId)).toEqual(["child"]);
+    expect(state.toolCalls).toHaveLength(1);
   });
 });

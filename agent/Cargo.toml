@@ -10,7 +10,7 @@ serde = { version = "1", features = ["derive"] }
 # value, floats included; the default parser can land one bit off. No extra crate.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4"] }
-claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "8061cc4b0bf761d6ac065328c0916a0397c25ecc" }
+claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi.git", rev = "842d54e6c4cccf4aa71e8ded54c020c0253ad78e" }
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"

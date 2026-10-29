@@ -23,6 +23,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     out.send_all(ViewId::BASE, notes);
     collect_pending_starts(state, screen, out);
     collect_pending_handoffs(state, out);
+    inbound::collect_task_commands(state, out);
     report_sessions_that_never_opened(state, screen, out);
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
@@ -132,6 +133,14 @@ pub(super) fn tick_send(
             apply_flush(state, screen, tab, flush, out);
         }
     }
+    // A message a refused send left goes into the turn its tab now shows running; one typed behind a
+    // card goes out once the card is answered.
+    for tab in state.tabs.steer_waiting(super::inbound::now_ms()) {
+        send_queue(state, tab, out);
+    }
+    for (tab, flush) in state.tabs.release_after_card() {
+        apply_flush(state, screen, tab, flush, out);
+    }
     // A turn's end snapshot landed: the status band's hint, in the page of the hint's tab's view. A
     // page that has not said `ready` (still loading, or reloading) has nothing to show it, so it
     // waits here for the page; the review itself is asked for by `c`, never by this.
@@ -163,6 +172,7 @@ pub(super) fn tick_send(
     send_context_if_changed(state, out);
     poll_scratch_edits(state, out);
     poll_review_jobs(state, out);
+    poll_question_sends(state, out);
     poll_proposal_jobs(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
@@ -275,7 +285,9 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.retiring.is_empty()
         || state.supervisor_pending.is_some()
         || !state.pending_edits.is_empty()
+        || !state.task_commands.is_empty()
         || !state.review_jobs.is_empty()
+        || !state.question_sends.is_empty()
         || !state.proposal_jobs.is_empty()
         || !state.review_flow.is_idle()
         || state.trust.is_busy()
@@ -530,6 +542,22 @@ mod tests {
     fn every_unannounced_pending_job_keeps_the_tick_polling() {
         let (handle, _page) = settled_panel();
         let polls = |handle: &AgentPanelHandle| needs_polling(&handle.state.borrow());
+        assert!(!polls(&handle));
+
+        let (_task_tx, task_rx) = mpsc::channel();
+        handle
+            .state
+            .borrow_mut()
+            .task_commands
+            .push(inbound::PendingTaskCommand {
+                view: ViewId::BASE,
+                tab: TabId(1),
+                request_id: "task1".into(),
+                task_id: "task".into(),
+                reply: inbound::TaskCommandReply::Stop(task_rx),
+            });
+        assert!(polls(&handle), "a task RPC whose answer has no UI wake");
+        handle.state.borrow_mut().task_commands.clear();
         assert!(!polls(&handle));
 
         let (done_tx, done_rx) = mpsc::channel();

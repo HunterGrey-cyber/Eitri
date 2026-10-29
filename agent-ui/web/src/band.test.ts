@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { backgroundSegment, bandLayout, cardSummary, textWidth, usageSegment, type BandFacts } from "./band";
-import type { TokenUsage } from "./types";
+import { backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
+import { applyEvent, initialState } from "./reducer";
+import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
   unread: "↓3", cards: 1, queued: 1, context: { file: "eitri.zsh", lines: [3, 9] }, position: "14/30", model: "sonnet-5", usage: null };
@@ -472,4 +473,54 @@ it.each([
   [" \t\n rm file \n\t ", "rm file"],
 ])("preserves escaped whitespace at the edge of a command %j", (command, summary) => {
   expect(cardSummary({ command })).toBe(summary);
+});
+
+function roster(...kinds: TaskKind[]): BackgroundTaskRecord[] {
+  const tasks: BackgroundTask[] = kinds.map((kind, i) => ({ task_id: `${i}`, run_id: null, kind,
+    task_type: kind === "monitor" || kind === "shell" ? "local_bash" : kind,
+    description: `task ${i}`, subagent_type: null, parent_task_id: null, tool_use_id: null,
+    ambient: false, workflow_name: null }));
+  return applyEvent(initialState(), { type: "background_tasks_changed", occurred_at: 1000, tasks }).backgroundTasks.rows;
+}
+
+it("uses the CLI's homogeneous task words and its mixed or unknown kind fallback", () => {
+  expect(taskWords(roster("shell"))).toBe("1 shell");
+  expect(taskWords(roster("shell", "shell", "monitor"))).toBe("2 shells, 1 monitor");
+  expect(taskWords(roster("monitor", "monitor"))).toBe("2 monitors");
+  expect(taskWords(roster("local_agent"))).toBe("1 local agent");
+  expect(taskWords(roster("workflow"))).toBe("1 background dynamic workflow");
+  expect(taskWords(roster("shell", "local_agent"))).toBe("2 background tasks");
+  const distinctTypes = roster("shell", "monitor");
+  distinctTypes[1].task_type = "monitor_mcp";
+  expect(taskWords(distinctTypes)).toBe("2 background tasks");
+  expect(taskWords(roster("other"))).toBe("1 background task");
+  expect(taskWords([])).toBe("");
+});
+
+it("falls back to the generic count before dropping a pill that cannot fit", () => {
+  const facts = { ...idle, model: null, position: null, backgroundTasks: roster("workflow", "workflow") };
+  expect(bandLayout(facts, 900, 7.2).find((s) => s.id === "background")?.text).toBe("2 background dynamic workflows");
+  expect(bandLayout(facts, 300, 7.2).find((s) => s.id === "background")?.text).toBe("2 background tasks");
+  expect(bandLayout({ ...facts, backgroundTasks: [] }, 900, 7.2).find((s) => s.id === "background")).toBeUndefined();
+  expect(backgroundSegment(2)).toBe("2 running in background");
+});
+
+it("names the newest live workflow's progress, usage, pause and fallback", () => {
+  const tasks = roster("workflow", "shell");
+  const workflow = tasks.find((r) => r.kind === "workflow")!;
+  workflow.workflow_name = "Research\u202e";
+  workflow.usage = { total_tokens: 210000, duration_ms: 252000, tool_uses: 0 };
+  workflow.workflow_progress = { phases: [], agents: Array.from({ length: 8 }, (_, index) => ({ index, label: "a", phase_index: 0,
+    state: index < 3 ? "done" : "running", model: null, agent_type: null, tokens: null, tool_calls: null, duration_ms: null, error: null })) };
+  expect(tasksLine(tasks, 253000)).toBe("⏵ Research⟨U+202E⟩ · 3/8 agents · 4m 12s · 210k tokens · /tasks · +1 more");
+  workflow.status = "paused";
+  expect(tasksLine(tasks, 253000)).toContain(" · paused · ");
+  workflow.status = "running";
+  workflow.workflow_progress = null;
+  workflow.usage = null;
+  expect(tasksLine([workflow], 253000)).toBe("⏵ Research⟨U+202E⟩ · running · 4m 12s · /tasks");
+  workflow.ambient = true;
+  expect(liveTasks(tasks)).toHaveLength(1);
+  tasks[1].live = false;
+  expect(liveTasks(tasks)).toHaveLength(0);
 });

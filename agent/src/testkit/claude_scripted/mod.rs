@@ -1,6 +1,7 @@
 //! A small, ordered Messages API server with observable requests and driver-controlled holds.
 pub mod driver;
 pub mod gate_answer;
+pub mod host_view;
 mod http;
 pub mod matchers;
 pub mod proto_record;
@@ -315,6 +316,44 @@ impl ScriptedModel {
     /// The names of the holds a reply is waiting at right now.
     pub fn held(&self) -> Vec<String> {
         self.shared.state.lock().unwrap().holding.iter().cloned().collect()
+    }
+    /// Consumes each release marker once and mirrors active holds into private empty files. Keeping the caller's
+    /// seen set means a release file can remain as evidence without issuing another release on every poll.
+    pub fn poll_control_files(&self, released: &mut BTreeSet<String>) -> io::Result<()> {
+        let dir = &self.shared.dir;
+        let release_dir = dir.join("release");
+        let held_dir = dir.join("held");
+        crate::private_fs::create_private_dir_all(&release_dir, dir)?;
+        crate::private_fs::create_private_dir_all(&held_dir, dir)?;
+        let valid_name = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        };
+        for entry in std::fs::read_dir(&release_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some(name) = name.to_str().filter(|n| valid_name(n)) {
+                if entry.file_type()?.is_file() && released.insert(name.to_owned()) {
+                    self.release(name);
+                }
+            }
+        }
+        let held: BTreeSet<_> = self.held().into_iter().filter(|n| valid_name(n)).collect();
+        for name in &held {
+            crate::private_fs::write_private(&held_dir.join(name), b"")?;
+        }
+        for entry in std::fs::read_dir(&held_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some(name) = name.to_str().filter(|n| valid_name(n)) {
+                if entry.file_type()?.is_file() && !held.contains(name) {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
     }
     /// Arrival indexes of the requests whose answer is complete: written to the end, cut on purpose, or dropped by
     /// the client.

@@ -31,7 +31,8 @@ _spec.loader.exec_module(cl)
 
 # Scratch for fixtures this test file creates on the fly. Never /tmp: on this project's own dev
 # machines that is a small shared tmpfs, and it is not this test's call to assume otherwise elsewhere.
-_SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-collect-licenses-tests")
+_SCRATCH_ROOT = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                             "eitri-collect-licenses-tests")
 
 
 def _scratch_dir():
@@ -1151,6 +1152,32 @@ class KitLicence(unittest.TestCase):
             self.skipTest("the kit has not been built in this checkout")
         with open(bundle, "rb") as f:
             self.assertIn(cl.KIT_MARKER, f.read())
+
+
+class QuestionKeyLicence(unittest.TestCase):
+    _shell = KitLicence._shell
+
+    def test_opencode_is_printed_when_the_binary_carries_the_adapted_keys(self):
+        counts = {}
+        entries = cl.question_key_entries(self._shell(b"\x00" + cl.OPENCODE_MARKER), counts)
+        self.assertEqual([e["name"] for e in entries], ["opencode"])
+        self.assertEqual(counts, {"MIT": 1})
+        lines = []
+        cl.render_entries(entries, {}, lines)
+        self.assertIn("Copyright (c) 2025 opencode", "\n".join(lines))
+        self.assertIn("Permission is hereby granted", "\n".join(lines))
+
+    def test_a_binary_without_question_keys_lists_nothing(self):
+        counts = {}
+        self.assertEqual(cl.question_key_entries(self._shell(b"no adapted keys"), counts), [])
+        self.assertEqual(counts, {})
+
+    def test_the_panel_bundle_retains_the_notice_marker(self):
+        bundle = os.path.join(cl.REPO, "agent-ui", "web", "dist", "index.html")
+        if not os.path.isfile(bundle):
+            self.skipTest("the panel has not been built in this checkout")
+        with open(bundle, "rb") as f:
+            self.assertIn(cl.OPENCODE_MARKER, f.read())
 
 
 class MarkdownPluginLicences(unittest.TestCase):

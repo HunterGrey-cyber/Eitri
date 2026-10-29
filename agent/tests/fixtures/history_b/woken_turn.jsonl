@@ -1,0 +1,12 @@
+{"type":"user","uuid":"human-1","promptSource":"typed","message":{"role":"user","content":"Start a background command"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"msg-a1","content":[{"type":"tool_use","id":"bash-bg","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash-bg","content":"done"}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"msg-human","content":[{"type":"text","text":"Started"}]}}
+{"type":"user","uuid":"wake","promptSource":"system","message":{"role":"user","content":"<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>bash-bg</tool-use-id>\n<output-file>$RUN/tmp/tasks/bg-1.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"},"origin":{"kind":"task-notification","producer":"session-task"}}
+{"type":"assistant","uuid":"w1","message":{"role":"assistant","id":"msg-w1","content":[{"type":"tool_use","id":"check-1","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"w2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"check-1","content":"done"}]}}
+{"type":"assistant","uuid":"w3","message":{"role":"assistant","id":"msg-w3","content":[{"type":"tool_use","id":"check-2","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"w4","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"check-2","content":"done"}]}}
+{"type":"assistant","uuid":"w5","message":{"role":"assistant","id":"msg-w5","content":[{"type":"tool_use","id":"check-3","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"w6","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"check-3","content":"done"}]}}
+{"type":"assistant","uuid":"w7","message":{"role":"assistant","id":"msg-wake","content":[{"type":"text","text":"Finished"}]}}

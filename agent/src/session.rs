@@ -413,7 +413,7 @@ pub(crate) fn translate_wire_event(
         } => {
             let turn_id = active_turn_id
                 .map(|t| t.to_string())
-                .unwrap_or_else(|| "unknown-turn".to_string());
+                .unwrap_or_else(|| crate::projection::NO_OPEN_TURN_ID.to_string());
             let outcome = if *interrupt_requested {
                 *interrupt_requested = false;
                 TurnOutcome::Interrupted

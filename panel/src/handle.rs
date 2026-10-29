@@ -1734,7 +1734,7 @@ impl AgentPanelHandle {
         let Some(tab) = state.tabs.tab_in(view).and_then(|tab| state.tabs.get(tab)) else {
             return (0, 0);
         };
-        let running = matches!(tab.backend(), TabBackend::Starting(_)) || tab.turn_running();
+        let running = matches!(tab.backend(), TabBackend::Starting(_)) || tab.turn_running() || tab.question_waiting();
         (usize::from(running), tab.session.queue.len())
     }
 
@@ -1798,13 +1798,34 @@ impl AgentPanelHandle {
         self.state.borrow_mut().show_view_hook = Some(Rc::new(hook));
     }
 
-    /// Tabs whose turn is running or whose session is still connecting.
+    /// Tabs with a running turn, a session still connecting or a waiting question.
     pub fn running_count(&self) -> usize {
         let state = self.state.borrow();
         if state.shutting_down {
             return 0;
         }
         state.tabs.running_count()
+    }
+
+    /// Tabs with live non-ambient background work across the window.
+    pub fn background_count(&self) -> usize {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return 0;
+        }
+        state.tabs.background_count()
+    }
+
+    /// Background tabs a kill of this view closes, including every base-view tab for the base view.
+    pub fn view_background_count(&self, view: ViewId) -> usize {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return 0;
+        }
+        view_tabs(&state, view)
+            .iter()
+            .filter(|id| state.tabs.get(**id).is_some_and(|tab| tab.background_calls() > 0))
+            .count()
     }
 
     /// Every tab's queued messages, summed (the window-close prompt).
@@ -2030,6 +2051,33 @@ mod tests {
         assert_eq!(notices().len(), 1, "a later tabs change does not say it again");
     }
 
+    #[test]
+    fn view_kill_counts_background_tabs() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let handle = AgentPanelHandle::over(state.clone(), None);
+        let dir = agent::state_dirs::test_workspace_dir("view-background-count");
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.queue(agent::AgentDomainEvent::BackgroundCalls { running: 2 });
+        tick_handle_until(&handle, "background work", || handle.background_count() == 1);
+        assert_eq!(handle.view_running_queued(ViewId::BASE), (0, 0));
+        assert_eq!(handle.view_background_count(ViewId::BASE), 1);
+        let extra = ViewId::new(2).unwrap();
+        assert_eq!(handle.view_background_count(extra), 0);
+        state.borrow_mut().tabs.break_out(extra).unwrap();
+        assert_eq!(state.borrow().tabs.tab_in(extra), Some(tab));
+        assert_eq!(handle.view_background_count(ViewId::BASE), 0);
+        assert_eq!(handle.view_background_count(extra), 1);
+        assert_eq!(handle.background_count(), 1);
+        state.borrow_mut().shutting_down = true;
+        assert_eq!(handle.background_count(), 0);
+        assert_eq!(handle.view_background_count(extra), 0);
+        for taken in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = taken.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
     /// Every call a host makes into the panel raises the wake, so what it changed is sent; only reads and
     /// the scheduling calls themselves do not. A new `pub fn` on the handle must choose.
     #[test]
@@ -2073,6 +2121,8 @@ mod tests {
             "nav_claims",
             "newest_card_label_in",
             "running_count",
+            "background_count",
+            "view_background_count",
             "queued_count",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.

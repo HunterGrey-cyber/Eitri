@@ -4,6 +4,7 @@
 //! no sidecar process involved, matching this crate's own established preference for testing a
 //! pure reducer/translator in isolation before any real-process integration test exercises it.
 
+use super::translate_322;
 use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
 use crate::{
     AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome, UsageInfo,
@@ -52,6 +53,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
     let envelope_session_id = event.session_id;
     let envelope_turn_id = event.turn_id;
     let one = |event: AgentDomainEvent| Some(vec![event]);
+    let occurred_at = (event.occurred_at != 0).then_some(event.occurred_at);
     match event.event? {
         // `permission_mode` is the CLI's own `system/init` report, re-sent every turn (read by
         // nothing before 2026-09-27). On a session that asked for `default`, anything less restrictive
@@ -78,42 +80,46 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             }
             Some(out)
         }
-        ProtoEvent::TurnStarted(started) => one(AgentDomainEvent::TurnStarted {
-            turn_id: started.turn_id,
-        }),
-        ProtoEvent::TextDelta(delta) => one(AgentDomainEvent::ContentDelta {
-            turn_id: delta.turn_id,
-            kind: ContentKind::Text,
-            text: delta.text,
-        }),
-        ProtoEvent::ThinkingDelta(delta) => one(AgentDomainEvent::ContentDelta {
-            turn_id: delta.turn_id,
-            kind: ContentKind::Thinking,
-            text: delta.text,
-        }),
-        ProtoEvent::ToolCallStarted(started) => {
-            match serde_json::from_str(&started.input_json) {
-                Ok(input) => one(AgentDomainEvent::ToolCallStarted {
-                    turn_id: started.turn_id,
-                    tool_use_id: started.tool_use_id,
-                    name: started.name,
+        ProtoEvent::TurnStarted(started) => Some(translate_322::turn_started(started)),
+        ProtoEvent::TextDelta(delta) => one(translate_322::delta(
+            delta.turn_id,
+            delta.text,
+            delta.parent_tool_use_id,
+            ContentKind::Text,
+        )),
+        ProtoEvent::ThinkingDelta(delta) => one(translate_322::delta(
+            delta.turn_id,
+            delta.text,
+            delta.parent_tool_use_id,
+            ContentKind::Thinking,
+        )),
+        ProtoEvent::ToolCallStarted(started) => match serde_json::from_str(&started.input_json) {
+            Ok(input) => one(translate_322::child(
+                started.parent_tool_use_id,
+                AgentDomainEvent::ToolCallStarted {
+                    turn_id: translate_322::bound(&started.turn_id, 128),
+                    tool_use_id: translate_322::bound(&started.tool_use_id, 128),
+                    name: translate_322::bound(&started.name, 128),
                     input,
-                }),
-                Err(e) => {
-                    eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallStarted.input_json, dropping this event: {e}");
-                    None
-                }
-            }
-        }
-        ProtoEvent::ToolCallCompleted(completed) => match serde_json::from_str(&completed.content_json) {
-            Ok(content) => one(AgentDomainEvent::ToolCallCompleted {
-                turn_id: completed.turn_id,
-                tool_use_id: completed.tool_use_id,
-                content,
-                is_error: completed.is_error,
-            }),
+                },
+            )),
             Err(e) => {
-                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallCompleted.content_json, dropping this event: {e}");
+                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallStarted.input_json: {e}");
+                None
+            }
+        },
+        ProtoEvent::ToolCallCompleted(completed) => match serde_json::from_str(&completed.content_json) {
+            Ok(content) => one(translate_322::child(
+                completed.parent_tool_use_id,
+                AgentDomainEvent::ToolCallCompleted {
+                    turn_id: translate_322::bound(&completed.turn_id, 128),
+                    tool_use_id: translate_322::bound(&completed.tool_use_id, 128),
+                    content,
+                    is_error: completed.is_error,
+                },
+            )),
+            Err(e) => {
+                eprintln!("agent: ClaudeSidecarProvider: unparseable ToolCallCompleted.content_json: {e}");
                 None
             }
         },
@@ -140,7 +146,8 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 // discriminated anything, and it is `#[ignore]`d and has not been run since this
                 // change made it able to. Treat this as a hole being closed on principle, not as a
                 // behaviour anyone has observed.
-                tool_use_id: crate::projection::tool_use_link(requested.tool_use_id),
+                // Cut as the call's own `ToolCallStarted` cut it, so the card still finds its call.
+                tool_use_id: crate::projection::tool_use_link(translate_322::bound(&requested.tool_use_id, 128)),
                 tool_name: requested.tool_name,
                 input,
             })
@@ -157,16 +164,17 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             // Why it ended, for the row the panel draws where a turn did not complete. The text of
             // an error result is in `errors` (its `result_text` is empty); an API error arrives as a
             // "success" result whose `result_text` is the error. A negative status is not one.
-            let detail = TurnEndDetail::from_result(
+            let mut detail = TurnEndDetail::from_result(
                 outcome,
                 completed.is_error,
                 &completed.result_text,
-                completed.terminal_reason,
+                completed.terminal_reason.clone(),
                 completed.api_error_status.and_then(|status| u32::try_from(status).ok()),
                 &completed.errors,
             );
+            translate_322::turn_detail(&completed, &mut detail);
             one(AgentDomainEvent::TurnCompleted {
-                turn_id: completed.turn_id,
+                turn_id: translate_322::bound(&completed.turn_id, 128),
                 outcome,
                 detail,
                 result_text: completed.result_text,
@@ -196,8 +204,16 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 detail: Some(outcome.detail).filter(|d| !d.trim().is_empty()),
             })
         }
+        // The sidecar sends one of these for each assistant message the CLI writes while no turn of
+        // this client's is open (a turn the CLI started by itself, a background agent): the one sign
+        // here that Claude Code is working where the panel cannot show it.
+        ProtoEvent::ProviderNotice(notice)
+            if notice.kind == "assistant" && notice.subtype.as_deref() == Some("no_turn_in_progress") =>
+        {
+            one(AgentDomainEvent::CliWorkUnseen)
+        }
         ProtoEvent::ProviderNotice(notice) => {
-            // Diagnostics only -- never surfaced as a domain event.
+            // Every other notice is a diagnostic only -- never surfaced as a domain event.
             eprintln!(
                 "agent: ClaudeSidecarProvider: ProviderNotice kind={} subtype={:?} (turn {})",
                 notice.kind,
@@ -277,7 +293,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // refused the call and the model already has the refusal as its error result. The strings
         // are the CLI's, carried verbatim; an empty one is proto3's "unset", so it is no id.
         ProtoEvent::PermissionDenied(denied) => one(AgentDomainEvent::PermissionDenied {
-            tool_use_id: crate::projection::tool_use_link(denied.tool_use_id),
+            tool_use_id: crate::projection::tool_use_link(translate_322::bound(&denied.tool_use_id, 128)),
             tool_name: denied.tool_name,
             reason_type: denied.reason_type,
             reason: denied.reason,
@@ -289,7 +305,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // where the model read it.
         ProtoEvent::UserMessageDelivered(delivered) => one(AgentDomainEvent::UserMessageDelivered {
             client_message_id: delivered.client_message_id,
-            turn_id: delivered.turn_id,
+            turn_id: translate_322::bound(&delivered.turn_id, 128),
             text: String::new(),
         }),
         ProtoEvent::UserMessageDropped(dropped) => one(AgentDomainEvent::UserMessageDropped {
@@ -309,6 +325,14 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 }
             })),
         }),
+        ProtoEvent::TurnCauseUpdated(value) => one(translate_322::cause_updated(value)),
+        ProtoEvent::CliCycleStarted(value) => one(translate_322::cycle(value)),
+        ProtoEvent::BackgroundTasksChanged(value) => one(translate_322::roster(value, occurred_at)),
+        ProtoEvent::TaskEvent(value) => translate_322::task(value, occurred_at).and_then(one),
+        ProtoEvent::SessionNotice(value) => translate_322::notice(value).and_then(one),
+        ProtoEvent::ConversationReset(value) => one(translate_322::reset(value)),
+        ProtoEvent::InteractionRequested(value) => one(translate_322::requested(value)),
+        ProtoEvent::InteractionResolved(value) => translate_322::resolved(value).and_then(one),
     }
 }
 
@@ -318,7 +342,7 @@ fn drop_reason(reason: UserMessageDropReason) -> &'static str {
     match reason {
         UserMessageDropReason::Cancelled => "Claude cancelled it",
         UserMessageDropReason::Discarded => "Claude discarded it",
-        UserMessageDropReason::Refused => "Claude refused it",
+        UserMessageDropReason::Refused => crate::projection::CLI_REFUSED_DROP,
         UserMessageDropReason::SessionClosed => super::steer::SESSION_ENDED,
         UserMessageDropReason::Unspecified => "Claude did not take it",
     }
@@ -439,22 +463,44 @@ fn translate_close_reason(reason: SessionCloseReason) -> String {
 /// the legacy backend's handling of the CLI's `message.id`.
 /// Splitting is enabled only when the connected sidecar advertises `text_delta_message_id`;
 /// older sidecars keep concatenating text. `before` runs once before each event is translated.
-/// Only a `TextDelta` with `Some(message_id)` can close the preceding message.
-/// `TurnStarted` clears the tracked id. Other events, including `ThinkingDelta`, leave it alone.
+/// Only a `TextDelta` with `Some(message_id)` can close the preceding main message.
+/// `TurnStarted` clears the main id. Other events, including `ThinkingDelta`, leave it alone.
+/// Each subagent reply tracks its own message id by `parent_tool_use_id`, separate from the main
+/// stream. Its tool call clears that id, but a turn start does not: background replies span turns.
+/// No translated event reliably marks a subagent as done, so `CHILD_REPLIES_KEPT` bounds tracked
+/// ids by recency.
 pub(crate) struct MessageSplit {
     enabled: bool,
     last_text: Option<String>,
+    /// Per subagent (its call id, then the message id of the reply its stream has open), the one
+    /// that sent a delta longest ago first.
+    children: Vec<(String, String)>,
 }
+
+/// How many subagents' open replies one split tracks. A subagent that sent a delta recently is
+/// never dropped for one that did not: past the bound the entry of the subagent silent longest goes,
+/// which can only leave two replies of that one in a row if it speaks again.
+const CHILD_REPLIES_KEPT: usize = 256;
 
 impl MessageSplit {
     pub(crate) fn new(enabled: bool) -> Self {
-        Self::resuming(enabled, None)
+        Self::resuming(enabled, None, Vec::new())
     }
 
     /// A split that goes on from another process's: `last_text` is the message id that split had
-    /// translated last, so the first delta of a different message still opens a new one.
-    pub(crate) fn resuming(enabled: bool, last_text: Option<String>) -> Self {
-        Self { enabled, last_text }
+    /// translated last, and `children` the same for each subagent's open reply, so the first delta of
+    /// a different message still opens a new one.
+    pub(crate) fn resuming(enabled: bool, last_text: Option<String>, children: Vec<(String, String)>) -> Self {
+        Self {
+            enabled,
+            last_text,
+            children,
+        }
+    }
+
+    /// The message id of each subagent's open reply, the longest silent first (see [`Self::resuming`]).
+    pub(crate) fn child_replies(&self) -> &[(String, String)] {
+        &self.children
     }
 
     /// The message id of the last text delta translated, if any since the turn started.
@@ -471,11 +517,37 @@ impl MessageSplit {
                 self.last_text = None;
                 None
             }
+            ProtoEvent::ToolCallStarted(started) => {
+                if let Some(parent) = &started.parent_tool_use_id {
+                    self.children.retain(|(call, _)| call != parent);
+                }
+                None
+            }
             ProtoEvent::TextDelta(delta) => {
                 let id = delta.message_id.as_ref()?;
+                if let Some(parent) = &delta.parent_tool_use_id {
+                    let previous = match self.children.iter().position(|(call, _)| call == parent) {
+                        Some(at) => Some(self.children.remove(at).1),
+                        None => {
+                            if self.children.len() >= CHILD_REPLIES_KEPT {
+                                self.children.remove(0);
+                            }
+                            None
+                        }
+                    };
+                    self.children.push((parent.clone(), id.clone()));
+                    return previous
+                        .filter(|last| last != id)
+                        .map(|_| AgentDomainEvent::SubagentFrame {
+                            parent_tool_use_id: translate_322::bound(parent, 128),
+                            frame: Box::new(AgentDomainEvent::AssistantMessageBoundary {
+                                turn_id: translate_322::bound(&delta.turn_id, 128),
+                            }),
+                        });
+                }
                 let boundary = self.last_text.as_ref().is_some_and(|last| last != id).then(|| {
                     AgentDomainEvent::AssistantMessageBoundary {
-                        turn_id: delta.turn_id.clone(),
+                        turn_id: translate_322::bound(&delta.turn_id, 128),
                     }
                 });
                 self.last_text = Some(id.clone());
@@ -602,10 +674,105 @@ mod tests {
         );
     }
 
+    /// Every protocol 3.22 arm reaches the domain in either CLI mode, inside or outside a turn.
+    #[test]
+    fn each_protocol_3_22_arm_reaches_the_domain() {
+        use claude_runtime_protocol::v1 as wire;
+        let cause = || wire::TurnCause {
+            kind: wire::TurnCauseKind::Task as i32,
+            task_id: Some("b1".into()),
+            description: Some("a task".into()),
+            ..Default::default()
+        };
+        let task = || wire::BackgroundTask {
+            task_id: "b1".into(),
+            kind: wire::TaskKind::Workflow as i32,
+            description: "a task".into(),
+            ..Default::default()
+        };
+        let arms = [
+            ProtoEvent::TurnCauseUpdated(wire::TurnCauseUpdated {
+                turn_id: "t1".into(),
+                cause: Some(cause()),
+            }),
+            ProtoEvent::CliCycleStarted(wire::CliCycleStarted {
+                turn_id: "t1".into(),
+                cause: Some(cause()),
+            }),
+            ProtoEvent::BackgroundTasksChanged(wire::BackgroundTasksChanged { tasks: vec![task()] }),
+            ProtoEvent::TaskEvent(wire::TaskEvent {
+                edge: wire::TaskEdge::Notified as i32,
+                task_id: "b1".into(),
+                task: Some(task()),
+                status: Some(wire::TaskStatus::Killed as i32),
+                summary: Some("done".into()),
+                workflow_progress: Some(wire::WorkflowProgress {
+                    phases: vec![wire::WorkflowPhase {
+                        index: 1,
+                        title: "a phase".into(),
+                        kind: "parallel".into(),
+                    }],
+                    agents: vec![wire::WorkflowAgent {
+                        index: 1,
+                        label: "an agent".into(),
+                        phase_index: 1,
+                        state: "running".into(),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ProtoEvent::SessionNotice(wire::SessionNotice {
+                kind: wire::SessionNoticeKind::RateLimit as i32,
+                level: wire::NoticeLevel::Warning as i32,
+                content: Some("a notice".into()),
+                rate_status: Some(wire::RateLimitStatus::Rejected as i32),
+                ..Default::default()
+            }),
+            ProtoEvent::ConversationReset(wire::ConversationReset {
+                new_conversation_id: "c2".into(),
+                trigger: Some("clear".into()),
+            }),
+            ProtoEvent::InteractionRequested(wire::InteractionRequested {
+                interaction_id: "i1".into(),
+                tool_use_id: "toolu_1".into(),
+                kind: wire::InteractionKind::Question as i32,
+                payload: Some(wire::interaction_requested::Payload::Questions(wire::QuestionSet {
+                    questions: vec![wire::Question {
+                        question: "Which?".into(),
+                        header: "Pick".into(),
+                        multi_select: false,
+                        options: vec![wire::QuestionOption {
+                            label: "A".into(),
+                            ..Default::default()
+                        }],
+                    }],
+                })),
+                unsupported_reason: None,
+            }),
+            ProtoEvent::InteractionResolved(wire::InteractionResolved {
+                interaction_id: "i1".into(),
+                outcome: wire::InteractionOutcome::Answered as i32,
+                ..Default::default()
+            }),
+        ];
+        assert_eq!(arms.len(), 8, "one per arm 3.22 adds");
+        for arm in arms {
+            for requested in [RequestedCliMode::Default, RequestedCliMode::Auto] {
+                for turn_id in [None, Some("t1".to_string())] {
+                    let mut event = wrap(arm.clone());
+                    event.turn_id = turn_id;
+                    assert_eq!(super::translate(event, requested).len(), 1, "{arm:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn turn_started_translates() {
         let event = wrap(ProtoEvent::TurnStarted(TurnStarted {
             turn_id: "turn-1".into(),
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -658,6 +825,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             name: "Bash".into(),
             input_json: r#"{"command":"echo hi"}"#.into(),
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -677,6 +845,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             name: "Bash".into(),
             input_json: "not json".into(),
+            ..Default::default()
         }));
         assert_eq!(translate(event), None);
     }
@@ -688,6 +857,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             content_json: "not json".into(),
             is_error: false,
+            ..Default::default()
         }));
         assert_eq!(translate(event), None);
     }
@@ -699,6 +869,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             content_json: r#""hi""#.into(),
             is_error: false,
+            ..Default::default()
         }));
         assert_eq!(
             translate(event),
@@ -993,6 +1164,8 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let detail = |reason: Option<&str>, api_error_status: Option<u32>, message: Option<&str>| TurnEndDetail {
+            origin_kind: None,
+            num_turns: None,
             reason: reason.map(str::to_string),
             api_error_status,
             message: message.map(str::to_string),
@@ -1217,13 +1390,29 @@ mod tests {
         }
     }
 
+    /// Exactly one notice is read: the assistant message the CLI wrote while no turn of this client's
+    /// was open. Every other notice, the same kind with another subtype or none included, is a
+    /// diagnostic and becomes nothing.
     #[test]
-    fn provider_notice_never_becomes_a_domain_event() {
-        let event = wrap(ProtoEvent::ProviderNotice(ProviderNotice {
-            kind: "diagnostic".into(),
-            subtype: None,
-        }));
-        assert_eq!(translate(event), None);
+    fn only_the_no_turn_in_progress_notice_becomes_a_domain_event() {
+        let notice = |kind: &str, subtype: Option<&str>| {
+            wrap(ProtoEvent::ProviderNotice(ProviderNotice {
+                kind: kind.into(),
+                subtype: subtype.map(Into::into),
+            }))
+        };
+        assert_eq!(
+            translate(notice("assistant", Some("no_turn_in_progress"))),
+            Some(AgentDomainEvent::CliWorkUnseen)
+        );
+        for (kind, subtype) in [
+            ("diagnostic", None),
+            ("assistant", None),
+            ("assistant", Some("something_else")),
+            ("stream_event", Some("no_turn_in_progress")),
+        ] {
+            assert_eq!(translate(notice(kind, subtype)), None, "{kind} {subtype:?}");
+        }
     }
 
     fn ready(permission_mode: &str) -> ProtoSessionEvent {
@@ -1534,6 +1723,7 @@ mod tests {
             turn_id: turn.into(),
             text: text.into(),
             message_id: id.map(Into::into),
+            ..Default::default()
         }))
     }
 
@@ -1563,7 +1753,10 @@ mod tests {
         let mut split = MessageSplit::new(true);
         split.before(&text("t1", Some("msg_a"), "a"));
         assert_eq!(
-            split.before(&wrap(ProtoEvent::TurnStarted(TurnStarted { turn_id: "t2".into() }))),
+            split.before(&wrap(ProtoEvent::TurnStarted(TurnStarted {
+                turn_id: "t2".into(),
+                ..Default::default()
+            }))),
             None
         );
         assert_eq!(
@@ -1575,8 +1768,174 @@ mod tests {
             turn_id: "t2".into(),
             text: "…".into(),
             message_id: Some("msg_d".into()),
+            ..Default::default()
         }));
         assert_eq!(split.before(&thinking), None);
+    }
+
+    fn child_text(parent: &str, id: &str, text: &str) -> ProtoSessionEvent {
+        wrap(ProtoEvent::TextDelta(TextDelta {
+            turn_id: "t1".into(),
+            text: text.into(),
+            message_id: Some(id.into()),
+            parent_tool_use_id: Some(parent.into()),
+            ..Default::default()
+        }))
+    }
+
+    fn child_boundary(parent: &str) -> Option<AgentDomainEvent> {
+        Some(AgentDomainEvent::SubagentFrame {
+            parent_tool_use_id: parent.into(),
+            frame: Box::new(AgentDomainEvent::AssistantMessageBoundary { turn_id: "t1".into() }),
+        })
+    }
+
+    #[test]
+    fn a_subagents_new_message_id_closes_its_reply_without_touching_the_main_one() {
+        let mut split = MessageSplit::new(true);
+        assert_eq!(split.before(&text("t1", Some("main"), "a")), None);
+        assert_eq!(
+            split.before(&child_text("p1", "c1", "First reply.")),
+            None,
+            "its first reply opens"
+        );
+        assert_eq!(
+            split.before(&child_text("p1", "c1", " more")),
+            None,
+            "the same message continues"
+        );
+        assert_eq!(
+            split.before(&child_text("p1", "c2", "Second reply.")),
+            child_boundary("p1"),
+            "another message of the same subagent"
+        );
+        assert_eq!(
+            split.before(&child_text("p2", "c9", "Other.")),
+            None,
+            "another subagent has its own reply"
+        );
+        assert_eq!(
+            split.before(&text("t1", Some("main"), "b")),
+            None,
+            "the main message went on"
+        );
+        assert_eq!(split.last_text(), Some("main"));
+    }
+
+    #[test]
+    fn a_subagents_tool_call_ends_its_reply_and_a_turn_start_does_not() {
+        let mut split = MessageSplit::new(true);
+        split.before(&child_text("p1", "c1", "First reply."));
+        split.before(&wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "inner".into(),
+            parent_tool_use_id: Some("p1".into()),
+            ..Default::default()
+        })));
+        assert_eq!(
+            split.before(&child_text("p1", "c2", "After the call.")),
+            None,
+            "a tool call already closed the row"
+        );
+        split.before(&wrap(ProtoEvent::TurnStarted(TurnStarted {
+            turn_id: "t2".into(),
+            ..Default::default()
+        })));
+        assert_eq!(
+            split.before(&child_text("p1", "c3", "In the next turn.")),
+            child_boundary("p1"),
+            "a background subagent's reply goes on across turns"
+        );
+    }
+
+    #[test]
+    fn two_replies_of_one_subagent_with_no_call_between_are_two_rows() {
+        let mut split = MessageSplit::new(true);
+        let mut state = crate::AgentSessionProjection::default();
+        state.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        for event in [
+            wrap(ProtoEvent::ToolCallStarted(ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "p1".into(),
+                name: "Agent".into(),
+                input_json: "{}".into(),
+                ..Default::default()
+            })),
+            child_text("p1", "c1", "First reply."),
+            child_text("p1", "c2", "Second reply."),
+        ] {
+            let mut events: Vec<_> = split.before(&event).into_iter().collect();
+            events.extend(super::translate(event, RequestedCliMode::Default));
+            for event in &events {
+                state.apply(event);
+            }
+        }
+        let rows: Vec<_> = state.tool_calls[0]
+            .children
+            .as_ref()
+            .unwrap()
+            .transcript
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(rows, ["First reply.", "Second reply."]);
+    }
+
+    #[test]
+    fn finished_subagents_do_not_cost_a_live_one_its_split() {
+        let mut split = MessageSplit::new(true);
+        for at in 0..300 {
+            let call = format!("done-{at}");
+            assert_eq!(split.before(&child_text(&call, "only", "Its reply.")), None);
+        }
+        assert!(split.child_replies().len() <= CHILD_REPLIES_KEPT);
+        assert_eq!(split.before(&child_text("live", "l1", "First reply.")), None);
+        assert_eq!(
+            split.before(&child_text("live", "l2", "Second reply.")),
+            child_boundary("live")
+        );
+        let mut state = crate::AgentSessionProjection::default();
+        state.apply(&AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let mut split = MessageSplit::new(true);
+        for call in (0..300)
+            .map(|at| format!("done-{at}"))
+            .chain(std::iter::once("live".to_string()))
+        {
+            let ids: &[&str] = if call == "live" { &["l1", "l2"] } else { &["only"] };
+            for (at, id) in ids.iter().enumerate() {
+                let event = child_text(&call, id, &format!("{call} reply {at}."));
+                let mut events: Vec<_> = split.before(&event).into_iter().collect();
+                events.extend(super::translate(event, RequestedCliMode::Default));
+                for event in &events {
+                    state.apply(event);
+                }
+            }
+        }
+        let live = state.tool_calls.iter().find(|call| call.tool_use_id == "live").unwrap();
+        assert_eq!(live.children.as_ref().unwrap().transcript.len(), 2);
+    }
+
+    #[test]
+    fn past_the_bound_only_the_subagent_silent_longest_is_forgotten() {
+        let mut split = MessageSplit::new(true);
+        for at in 0..CHILD_REPLIES_KEPT {
+            split.before(&child_text(&format!("p{at}"), "a", "x"));
+        }
+        split.before(&child_text("newest", "a", "x"));
+        assert_eq!(split.child_replies().len(), CHILD_REPLIES_KEPT);
+        assert_eq!(split.before(&child_text("p1", "b", "y")), child_boundary("p1"));
+        assert_eq!(split.before(&child_text("p0", "b", "y")), None, "the oldest entry went");
+    }
+
+    #[test]
+    fn the_subagent_replies_a_watch_hands_over_are_the_ones_the_next_watch_splits_on() {
+        let mut split = MessageSplit::new(true);
+        split.before(&child_text("p1", "c1", "First reply."));
+        let mut resumed = MessageSplit::resuming(true, None, split.child_replies().to_vec());
+        assert_eq!(
+            resumed.before(&child_text("p1", "c2", "Second reply.")),
+            child_boundary("p1")
+        );
     }
 
     #[test]

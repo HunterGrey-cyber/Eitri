@@ -33,6 +33,112 @@ export type UserPromptRecord = {
  * ordered by the delta that opened it, as a reply is. Plain text the provider sent: drawn as text,
  * never as markdown or HTML. */
 export type ThinkingBlock = { seq: Seq; turnId: string; text: string };
+
+/** Who started a turn (Rust's `TurnOrigin`): `client` is a turn this panel sent, and what a turn with no
+ *  `turn_attributed` is; `follow_up` a turn the CLI ran after another to read a message; `cli` a turn the
+ *  CLI started by itself. */
+export type TurnOrigin = "client" | "follow_up" | "cli";
+export type TurnCauseKind = "task" | "scheduled" | "peer" | "other" | "unknown";
+/** Why the CLI started a turn, as the event spells it (snake_case, Rust's `TurnCause`). Every string is
+ *  the CLI's or a task's text: drawn as plain text. */
+export type WireTurnCause = {
+  kind: TurnCauseKind;
+  tool_use_id?: string;
+  task_id: string | null;
+  task_kind: string | null;
+  task_status: string | null;
+  description: string | null;
+  summary: string | null;
+  peer_name: string | null;
+  text: string | null;
+  wakeup_source: string | null;
+  scheduled_for_ms: number | null;
+  schedule_reason: string | null;
+  cron_id: string | null;
+  prompt: string | null;
+};
+/** The same cause as the state and a snapshot keep it. */
+export type TurnCause = {
+  kind: TurnCauseKind;
+  toolUseId?: string;
+  taskId: string | null;
+  taskKind: string | null;
+  taskStatus: string | null;
+  description: string | null;
+  summary: string | null;
+  peerName: string | null;
+  text: string | null;
+  wakeupSource: string | null;
+  scheduledForMs: number | null;
+  scheduleReason: string | null;
+  cronId: string | null;
+  prompt: string | null;
+};
+/** The start of a turn the user did not send, as a row of the conversation (Rust's `TurnStartRecord`).
+ *  A turn of the user's own has none. */
+export type TurnStartRecord = { seq: Seq; turnId: string; origin: TurnOrigin; cause: TurnCause | null };
+
+/** Rust's `SessionNoticeKind`: both recorded rows and live activity or band updates. */
+export type SessionNoticeKind =
+  | "api_retry"
+  | "compacting"
+  | "notification"
+  | "task"
+  | "model_fallback"
+  | "model_refusal"
+  | "compaction"
+  | "informational"
+  | "hook_block"
+  | "peer_hold"
+  | "rate_limit"
+  | "unseen_turn";
+export type NoticeLevel = "info" | "notice" | "suggestion" | "warning";
+/** One notice row (Rust's `NoticeRecord`). `content` is the CLI's own words when it gave any; `scalars`
+ *  the plain values a notice without words is worded from, by name. Both are drawn as plain text. */
+export type NoticeRecord = {
+  seq: Seq;
+  kind: SessionNoticeKind;
+  level: NoticeLevel;
+  content: string | null;
+  scalars: Record<string, unknown>;
+  taskId: string | null;
+  toolUseId: string | null;
+  taskStatus: string | null;
+};
+
+/** How a question set ended (Rust's `QuestionOutcome`). */
+export type QuestionOutcome =
+  | "answered"
+  | "declined"
+  | "chat_requested"
+  | "interrupted"
+  | "expired"
+  | "session_closed"
+  | "provider_failed"
+  | "host_refused";
+export type WireQuestionOption = { label: string; description: string; preview: string | null };
+export type WireQuestionSpec = { question: string; header: string; multi_select: boolean; options: WireQuestionOption[] };
+export type WireShownAnswer = { question_index: number; answer: string; notes: string | null };
+export type QuestionOption = { label: string; description: string; preview: string | null };
+export type QuestionSpec = { question: string; header: string; multiSelect: boolean; options: QuestionOption[] };
+/** One answer as it was sent, for the question at `questionIndex` of its set. */
+export type ShownAnswer = { questionIndex: number; answer: string; notes: string | null };
+export type QuestionState =
+  | { kind: "waiting" }
+  | { kind: "answering" }
+  | { kind: "settled"; outcome: QuestionOutcome; answers: ShownAnswer[]; reason: string | null };
+/** One question set Claude asked, as a row of the conversation (Rust's `QuestionRecord`). Not a
+ *  permission card: nothing that answers cards reads it. */
+export type QuestionRecord = {
+  seq: Seq;
+  interactionId: string;
+  toolUseId: string | null;
+  /** The turn that was running when it was asked, if one was. */
+  turnId: string | null;
+  questions: QuestionSpec[];
+  state: QuestionState;
+  unsupportedReason: string | null;
+};
 /** How the panel shows thinking (`init.lua`'s `agent.thinking`, the `display` envelope): `collapsed`
  * (the default) is one muted row per block, its text behind the row's fold; `preview` shows a block's
  * last lines in a box of fixed height while it is written, then the collapsed row; `expanded` shows every
@@ -40,7 +146,16 @@ export type ThinkingBlock = { seq: Seq; turnId: string; text: string };
  * whatever this says. */
 export type ThinkingDisplay = "collapsed" | "preview" | "expanded" | "hidden";
 export const THINKING_DISPLAYS: readonly ThinkingDisplay[] = ["collapsed", "preview", "expanded", "hidden"];
+export type SubagentStream = {
+  transcript: TranscriptMessage[];
+  thinking: ThinkingBlock[];
+  toolCalls: ToolCallRecord[];
+  assistantMessageOpen: boolean;
+  thinkingOpen: boolean;
+};
 export type ToolCallRecord = {
+  children?: SubagentStream;
+  background?: boolean;
   seq: Seq;
   toolUseId: string;
   name: string;
@@ -237,6 +352,10 @@ export type Capabilities = {
   /** Enter while a turn runs puts the message into that turn (the agent reads it at its next step);
    *  without it the message is held for the turn's end. Optional only for callers written before it. */
   steer?: boolean;
+  backgroundTasks?: boolean;
+  taskControl?: boolean;
+  taskOutput?: boolean;
+  workflowProgress?: boolean;
 };
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
@@ -372,6 +491,32 @@ export type AgentUiState = {
   /** The agent's thinking, oldest first (Rust's `thinking`). A snapshot carries it like the other
    * collections. */
   thinking: ThinkingBlock[];
+  /** The starts of turns the user did not send, each where it started (Rust's `turn_starts`). A snapshot
+   *  carries them while there are any. */
+  turnStarts: TurnStartRecord[];
+  /** The CLI's notice rows (Rust's `notices`). A snapshot carries them while there are any. */
+  notices: NoticeRecord[];
+  apiRetry: NoticeRecord | null;
+  compacting: boolean;
+  rateLimitWarning: NoticeRecord | null;
+  fallbackModel: string | null;
+  notification: NoticeRecord | null;
+  backgroundTasks: TaskRoster;
+  /** Every question set Claude asked, waiting or settled (Rust's `questions`). A snapshot carries them
+   *  while there are any. */
+  questions: QuestionRecord[];
+  /** Claude Code is working where this panel cannot show it (Rust's `cli_unseen_busy`): set by
+   *  `cli_work_unseen`, cleared by the next `turn_completed` whichever turn it names or by the
+   *  session's end (`session_closed`, `session_unavailable`, a `resume_outcome` that did not attach).
+   *  A snapshot carries it only while it is set. */
+  cliUnseenBusy: boolean;
+  /** The `seq` of the prompt the running turn opened with (or the turn about to start will), while it
+   *  is still a row of the conversation (Rust's `opening_prompt`): `cli_cycle_started` moves that row out.
+   *  A snapshot carries it only while it is set. */
+  openingPromptSeq: Seq | null;
+  /** The running turn is one Claude Code started by itself (Rust's `running_turn_cli`). A snapshot
+   *  carries it only while it is set. */
+  runningTurnCli: boolean;
   /** True while the last thinking block is still being written: the next thinking delta continues it.
    * Closed by assistant text and by everything that closes `assistantMessageOpen`. On the wire, as
    * `assistantMessageOpen` is and for the same reason: a snapshot taken mid-thought must neither split
@@ -423,8 +568,41 @@ export type AgentUiState = {
  * snapshot -- see that field's own doc comment on `AgentUiState`. */
 export type AgentUiSnapshot = Omit<
   AgentUiState,
-  "nextSeq" | "turnThinking" | "denialsBeforeTheirCall" | "changedInputsBeforeTheirCall" | "thinking" | "thinkingOpen"
+  | "nextSeq"
+  | "turnThinking"
+  | "denialsBeforeTheirCall"
+  | "changedInputsBeforeTheirCall"
+  | "thinking"
+  | "thinkingOpen"
+  | "turnStarts"
+  | "notices"
+  | "apiRetry"
+  | "compacting"
+  | "rateLimitWarning"
+  | "fallbackModel"
+  | "notification"
+  | "backgroundTasks"
+  | "questions"
+  | "cliUnseenBusy"
+  | "openingPromptSeq"
+  | "runningTurnCli"
 > & {
+  /** Sent only while there are any: a payload without them is a conversation with none. */
+  turnStarts?: AgentUiState["turnStarts"];
+  notices?: AgentUiState["notices"];
+  apiRetry?: NoticeRecord | null;
+  compacting?: boolean;
+  rateLimitWarning?: NoticeRecord | null;
+  fallbackModel?: string | null;
+  notification?: NoticeRecord | null;
+  backgroundTasks?: TaskRoster;
+  questions?: AgentUiState["questions"];
+  /** Sent only while it is set. */
+  cliUnseenBusy?: boolean;
+  /** Sent only while set; a page's own state carries `null` for none. */
+  openingPromptSeq?: Seq | null;
+  /** Sent only while set. */
+  runningTurnCli?: boolean;
   /** Present only while Rust holds a change whose call has not started: it is the one held list
    *  Rust sends, so a rebuilt page attaches it when the call starts, as Rust does. */
   changedInputsBeforeTheirCall?: AgentUiState["changedInputsBeforeTheirCall"];
@@ -487,7 +665,7 @@ export type TurnOutcome = "completed" | "interrupted" | "failed" | "limit_reache
 /** What a turn that did not complete carries beyond its outcome, as `turn_completed.detail` (snake_case,
  *  as serde derives it). `message` is the provider's own words, already trimmed and capped by Rust, and is
  *  the only place a reset time the CLI wrote into its text can appear: nothing here parses it. */
-export type TurnEndDetail = { reason: string | null; api_error_status: number | null; message: string | null };
+export type TurnEndDetail = { origin_kind?: string; num_turns?: number; reason: string | null; api_error_status: number | null; message: string | null };
 
 /** How a turn ended without completing: its outcome, or `lost` when the session ended under a turn that
  *  was still running (no `turn_completed` was ever coming). */
@@ -496,6 +674,8 @@ export type TurnEndingKind = "interrupted" | "failed" | "limit_reached" | "lost"
 /** One turn-ending row of the conversation. Ordered by `seq` with the other items; on the wire in a
  *  snapshot's `turnEndings` (camelCase, like the other collections). */
 export type TurnEnding = {
+  originKind?: string;
+  numTurns?: number;
   seq: Seq;
   turnId: string;
   kind: TurnEndingKind;
@@ -554,7 +734,37 @@ export type UsageInfo = {
  *  by the reducer into `AgentUiState.accountLimits`). Account-wide, not per turn. `resetsAt` is Unix
  *  seconds. A `null` slot is something the agent did not say. */
 export type AccountLimits = { usedPercent: number; windowMinutes: number | null; resetsAt: number | null; plan: string | null };
+export type TaskKind = "shell" | "monitor" | "local_agent" | "workflow" | "other";
+export type TaskStatus = "running" | "paused" | "stopping" | "completed" | "failed" | "stopped" | "ended";
+export type TaskEdge = "started" | "progress" | "updated" | "notified";
+export type BackgroundTask = {
+  task_id: string; run_id: string | null; kind: TaskKind; task_type: string; description: string;
+  subagent_type: string | null; parent_task_id: string | null; tool_use_id: string | null; ambient: boolean; workflow_name: string | null;
+};
+export type TaskRoster = { rows: BackgroundTaskRecord[]; query_start: boolean };
+export type BackgroundTaskRecord = BackgroundTask & {
+  status: TaskStatus; live: boolean; started_at: number; ended_at: number | null; finished_seq: number | null;
+  summary: string | null; last_tool_name: string | null; usage: TaskUsage | null; error: string | null;
+  is_backgrounded: boolean | null; reason: string | null; output_file: string | null;
+  workflow_progress: WorkflowProgress | null;
+};
+export type TaskUsage = { total_tokens: number; tool_uses: number; duration_ms: number };
+export type WorkflowProgress = {
+  phases: { index: number; title: string; kind: string }[];
+  agents: { index: number; label: string; phase_index: number; state: string; model: string | null; agent_type: string | null;
+    tokens: number | null; tool_calls: number | null; duration_ms: number | null; error: string | null }[];
+};
+export type SubagentContent = Extract<AgentDomainEvent, { type: "tool_call_started" | "tool_call_completed" | "content_delta" | "assistant_message_boundary" | "subagent_frame" }>;
+
 export type AgentDomainEvent =
+  | { type: "turn_cause_updated"; turn_id: string; cause: WireTurnCause | null }
+  | { type: "cli_cycle_started"; turn_id: string; cause: WireTurnCause | null }
+  | { type: "background_tasks_changed"; occurred_at?: number; tasks: BackgroundTask[] }
+  | { type: "task_event"; occurred_at?: number; edge: TaskEdge; task_id: string; run_id: string | null; task: BackgroundTask | null; status: TaskStatus | null;
+      summary: string | null; last_tool_name: string | null; usage: TaskUsage | null; end_time_ms: number | null; error: string | null;
+      is_backgrounded: boolean | null; reason: string | null; output_file: string | null; workflow_progress: WorkflowProgress | null }
+  | { type: "conversation_reset"; new_conversation_id: string; trigger: string | null }
+  | { type: "subagent_frame"; parent_tool_use_id: string; frame: SubagentContent }
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
@@ -643,7 +853,37 @@ export type AgentDomainEvent =
    *  derives it when it folds the prompt and sends it right after, even when the host answered the
    *  gate request itself and so never delivered it: the page applies it and compares nothing.
    *  Lands on the call's row as `ToolCallRecord.changedInput`, or is held until the call starts. */
-  | { type: "tool_input_changed"; tool_use_id: string; change: InputChange };
+  | { type: "tool_input_changed"; tool_use_id: string; change: InputChange }
+  /** Who started the turn the `turn_started` before it named, and why (`AgentDomainEvent::TurnAttributed`).
+   *  A row only for a turn whose origin is not `client`. */
+  | { type: "turn_attributed"; turn_id: string; origin: TurnOrigin; cause: WireTurnCause | null }
+  /** A notice the CLI's terminal shows as a row (`AgentDomainEvent::SessionNotice`). */
+  | {
+      type: "session_notice";
+      kind: SessionNoticeKind;
+      level: NoticeLevel;
+      content: string | null;
+      scalars: Record<string, unknown>;
+      task_id: string | null;
+      tool_use_id: string | null;
+      task_status: string | null;
+    }
+  /** Claude asked a set of questions (`AgentDomainEvent::QuestionAsked`); it waits until its settlement. */
+  | {
+      type: "question_asked";
+      interaction_id: string;
+      tool_use_id: string | null;
+      questions: WireQuestionSpec[];
+      unsupported_reason: string | null;
+    }
+  /** A question set ended (`AgentDomainEvent::QuestionSettled`): the only thing that settles one. */
+  | { type: "question_settled"; interaction_id: string; outcome: QuestionOutcome; answers: WireShownAnswer[]; reason: string | null }
+  /** Claude Code is working where this panel cannot show it (`AgentDomainEvent::CliWorkUnseen`): sets
+   *  `cliUnseenBusy` until the next `turn_completed` or the session's end. Never makes a turn run here. */
+  | { type: "cli_work_unseen" }
+  /** The newest prompt not put into a running turn is taken back (`AgentDomainEvent::UserPromptWithdrawn`):
+   *  its send was refused and the message reaches the agent another way, where it is folded again. */
+  | { type: "user_prompt_withdrawn" };
 
 /** A session tab's identity for its whole life, and the bridge's (`eitri_core::tabs::TabId`). */
 export type TabId = number;
@@ -653,6 +893,8 @@ export type TabState = "not_started" | "starting" | "awaiting_trust" | "live" | 
 /** `eitri_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
 export type TabMarker = "needs_input" | "ended" | "working" | "unread";
 export type TabInfo = {
+  /** Opaque host mirrors, keyed by interaction id; the dock checks each draft before using it. */
+  questionDraft?: Record<string, unknown>;
   id: TabId;
   number: number;
   /** `<n> <name>`, worded by Rust (`tabs::label`). */

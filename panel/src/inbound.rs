@@ -3,6 +3,54 @@
 
 use super::*;
 
+pub(super) enum TaskCommandReply {
+    Stop(agent::TaskReply<()>),
+    Output(agent::TaskReply<agent::TaskOutput>),
+}
+
+pub(super) struct PendingTaskCommand {
+    pub(super) view: ViewId,
+    pub(super) tab: TabId,
+    pub(super) request_id: String,
+    pub(super) task_id: String,
+    pub(super) reply: TaskCommandReply,
+}
+
+/// Task RPCs run on the provider runtime. Only ready replies are taken on this thread.
+pub(super) fn collect_task_commands(state: &mut AgentPanelState, out: &mut Outbox) {
+    state.task_commands.retain(|pending| {
+        use std::sync::mpsc::TryRecvError;
+        let result = match &pending.reply {
+            TaskCommandReply::Stop(rx) => rx
+                .try_recv()
+                .map(|result| result.map(|()| serialize_command_result_for_js(&pending.request_id, Ok(())))),
+            TaskCommandReply::Output(rx) => rx.try_recv().map(|result| {
+                result.map(|output| {
+                    eitri_core::agent_bridge::serialize_task_output_for_js(
+                        &pending.request_id,
+                        pending.tab,
+                        &pending.task_id,
+                        &output,
+                    )
+                })
+            }),
+        };
+        let payload = match result {
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => {
+                serialize_command_result_for_js(&pending.request_id, Err("task request ended before an answer arrived"))
+            }
+            Ok(Err(error)) => serialize_command_result_for_js(
+                &pending.request_id,
+                Err(&agent::providers::claude_sidecar::task_refusal(error)),
+            ),
+            Ok(Ok(payload)) => payload,
+        };
+        out.send(pending.view, payload);
+        false
+    });
+}
+
 /// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
 pub(super) struct PermissionAnswer {
     pub(super) permission_id: String,
@@ -131,6 +179,65 @@ pub(super) fn now_ms() -> u64 {
 /// envelope goes out only if `tab` is on screen, to the page that shows it -- each page draws only its
 /// own tab, and a background tab catches up with a snapshot when it is switched to. The
 /// `command_result` is owed either way, to `view`'s page, which sent the command.
+/// An answer to one of Claude's questions on its way, and the page request its reply answers.
+pub(super) struct PendingQuestionSend {
+    tab: TabId,
+    view: ViewId,
+    request_id: String,
+    send: eitri_core::agent_backend::QuestionSend,
+}
+
+/// A `question_answer` or `question_decline` taken by the tab's session: refused at once, the page is
+/// told now; sent, it is told by the tick once the agent replied.
+fn question_sent(
+    state: &mut AgentPanelState,
+    screen: &Screen,
+    view: ViewId,
+    tab: TabId,
+    request_id: &str,
+    sent: Result<eitri_core::agent_backend::QuestionSend, BackendError>,
+    out: &mut Outbox,
+) {
+    match sent {
+        Ok(send) => state.question_sends.push(PendingQuestionSend {
+            tab,
+            view,
+            request_id: request_id.to_string(),
+            send,
+        }),
+        Err(error) => apply_command_outcome(state, screen, view, tab, request_id, Err(error), out),
+    }
+}
+
+/// Tells each page whose answer the agent replied to: a `command_result`, a refusal with the question
+/// waiting again. Every refusal or failure of an answer is benign, so none ends a session here. The
+/// handle is dropped once read, which lets the chat move again.
+pub(super) fn poll_question_sends(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.question_sends.is_empty() {
+        return;
+    }
+    let AgentPanelState {
+        question_sends, tabs, ..
+    } = state;
+    question_sends.retain(|pending| match tabs.finish_question_send(pending.tab, &pending.send) {
+        None => true,
+        Some(reply) => {
+            if let Err(error) = &reply {
+                eprintln!(
+                    "[agent_panel] tab {}: answer not taken (session stays alive): {}",
+                    pending.tab.0, error.message
+                );
+            }
+            let told = match &reply {
+                Ok(()) => serialize_command_result_for_js(&pending.request_id, Ok(())),
+                Err(error) => serialize_command_result_for_js(&pending.request_id, Err(&error.message)),
+            };
+            out.send(pending.view, told);
+            false
+        }
+    });
+}
+
 pub(super) fn apply_command_outcome(
     state: &mut AgentPanelState,
     screen: &Screen,
@@ -423,12 +530,14 @@ pub(super) fn handle_inbound_message(
                         // composed wire text. The tab set sends it under the tab's mode (an external
                         // agent's turn runs under it), traced from the send.
                         TabBackend::Live(_) => Plan::Send(FirstTurn {
+                            typed_by_person: true,
                             wire: composed,
                             typed: text.clone(),
                         }),
                         // The session waits for the trust check (and, when it must, the question)
                         // before anything is spawned.
                         TabBackend::NotStarted => Plan::Defer(FirstTurn {
+                            typed_by_person: true,
                             wire: composed,
                             typed: text.clone(),
                         }),
@@ -542,11 +651,40 @@ pub(super) fn handle_inbound_message(
             apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
         }
         InboundMessage::StopBackground { running, .. } => {
-            // The tab the question was asked in, never the one on screen now. A refusal is benign and
-            // leaves the session alone; a taken stop ends the session through the pump, as a lost one.
+            // The tab the question was asked in, never the one on screen now. Claude stops its tasks;
+            // Codex ends its session through the pump. A refusal leaves the session alone.
             let tab = tab_of(target);
             let outcome = state.tabs.stop_background(tab, running);
             apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
+        }
+        message @ (InboundMessage::StopTask { .. } | InboundMessage::TaskOutput { .. }) => {
+            let tab = tab_of(target);
+            if state.task_commands.len() >= 64 {
+                refuse(&mut out, "too many task requests: wait for an answer");
+            } else {
+                let (task_id, output) = match message {
+                    InboundMessage::StopTask { task_id, .. } => (task_id, false),
+                    InboundMessage::TaskOutput { task_id, .. } => (task_id, true),
+                    _ => unreachable!(),
+                };
+                let result = backend_for(&mut state.tabs, tab).and_then(|backend| {
+                    if output {
+                        backend.task_output(&task_id).map(TaskCommandReply::Output)
+                    } else {
+                        backend.stop_task(&task_id).map(TaskCommandReply::Stop)
+                    }
+                });
+                match result {
+                    Ok(reply) => state.task_commands.push(PendingTaskCommand {
+                        view,
+                        tab,
+                        request_id,
+                        task_id,
+                        reply,
+                    }),
+                    Err(error) => refuse(&mut out, &error.message),
+                }
+            }
         }
         message @ InboundMessage::PermissionResponse { .. } => {
             let tab = tab_of(target);
@@ -567,6 +705,40 @@ pub(super) fn handle_inbound_message(
                 Err(why) => refuse(&mut out, &why),
                 Ok(outcome) => apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out),
             }
+        }
+        // Only the person answers Claude's question, from the page that shows its tab, past the window's
+        // gate (admission); `answer_question` checks the page again and checks the answer against the
+        // set before anything is sent. A refusal leaves the question waiting and the page keeps its
+        // draft. The answer goes out without waiting for the agent; its `command_result` follows from
+        // the tick once the agent replied (`poll_question_sends`).
+        InboundMessage::QuestionAnswer {
+            interaction_id,
+            answers,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let answers = answers
+                .into_iter()
+                .map(eitri_core::agent_bridge::QuestionAnswerWire::into_answer)
+                .collect();
+            let sent = state.tabs.answer_question(tab, view, &interaction_id, answers);
+            question_sent(state, screen, view, tab, &request_id, sent, &mut out);
+        }
+        InboundMessage::QuestionDecline {
+            interaction_id,
+            kind,
+            so_far,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let so_far = so_far
+                .into_iter()
+                .map(eitri_core::agent_bridge::QuestionAnswerWire::into_answer)
+                .collect();
+            let sent = state
+                .tabs
+                .decline_question(tab, view, &interaction_id, kind.kind(), so_far);
+            question_sent(state, screen, view, tab, &request_id, sent, &mut out);
         }
         // The window's HINT session reacts by calling back into this panel, so it is told once the
         // step is over.
@@ -620,9 +792,14 @@ pub(super) fn handle_inbound_message(
                     // confirmed by backtrace.
                     let provider_session_id = backend.provider_session_id();
                     let projection = backend.projection();
+                    let question_waiting = projection.waiting_questions().next().is_some();
                     (
                         provider_session_id,
                         projection.active_turn_id.clone(),
+                        projection.cli_unseen_busy,
+                        eitri_core::tabs::background_summary(&projection),
+                        projection.background_calls,
+                        question_waiting,
                         projection.cwd.clone(),
                         crate::terminal_handoff::ConversationLiveness::of(&projection.status),
                     )
@@ -635,16 +812,29 @@ pub(super) fn handle_inbound_message(
             }
             let prepared = crate::terminal_handoff::prepare_handoff(
                 &project_dir,
-                session_facts
-                    .as_ref()
-                    .map(|(provider_session_id, active_turn_id, reported_cwd, liveness)| {
+                session_facts.as_ref().map(
+                    |(
+                        provider_session_id,
+                        active_turn_id,
+                        cli_unseen_busy,
+                        background,
+                        background_count,
+                        question_waiting,
+                        reported_cwd,
+                        liveness,
+                    )| {
                         crate::terminal_handoff::HandoffFacts {
                             provider_session_id: provider_session_id.as_deref(),
                             active_turn_id: active_turn_id.as_deref(),
+                            cli_unseen_busy: *cli_unseen_busy,
+                            background: background.as_deref(),
+                            background_count: *background_count,
+                            question_waiting: *question_waiting,
                             reported_cwd: reported_cwd.as_deref(),
                             liveness: *liveness,
                         }
-                    }),
+                    },
+                ),
             );
             let command = match prepared {
                 Ok(command) => command,
@@ -833,7 +1023,10 @@ pub(super) fn handle_inbound_message(
             let tab = tab_of(target);
             // Captured now: what the editor shows when Enter is pressed.
             let wire = eitri_core::editor_context::compose_turn_text(&text, (state.editor_context)().as_ref());
-            match state.tabs.queue_message(tab, &text, wire, now_ms(), true) {
+            match state
+                .tabs
+                .queue_message(tab, &text, wire, now_ms(), true, agent::PromptOrigin::Typed)
+            {
                 Ok(_) => {
                     remember_prompts(state, std::slice::from_ref(&text), &mut out);
                     // The turn may have ended between the panel's Enter and this handler.
@@ -988,6 +1181,63 @@ pub(super) fn handle_inbound_message(
             if let Err(why) = started {
                 refuse(&mut out, &why);
             }
+        }
+        InboundMessage::QuestionDraft {
+            interaction_id, draft, ..
+        } => {
+            if let Err(why) = state
+                .tabs
+                .set_question_draft(tab_of(target), view, &interaction_id, draft)
+            {
+                refuse(&mut out, &why);
+            }
+        }
+        InboundMessage::EditQuestionOther {
+            interaction_id,
+            question_index,
+            text,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let prepared = (|| {
+                state
+                    .tabs
+                    .check_question_edit(tab, view, &interaction_id, Some(question_index))?;
+                if text.len() > 64 * 1024 {
+                    return Err("the question text exceeds 64 KiB".to_string());
+                }
+                state
+                    .scratch
+                    .as_mut()
+                    .ok_or("the scratch directory could not be created at startup")?
+                    .prepare_edit(&text)
+                    .map_err(|e| format!("could not write the scratch file: {e}"))
+            })();
+            let (request, edit) = match prepared {
+                Ok(pair) => pair,
+                Err(why) => {
+                    refuse(&mut out, &why);
+                    return out;
+                }
+            };
+            if let Err(why) = state
+                .tabs
+                .begin_question_edit(tab, edit.id, interaction_id, question_index)
+            {
+                edit.cleanup();
+                refuse(&mut out, &why);
+                return out;
+            }
+            out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Draft {
+                    view,
+                    request_id,
+                    tab,
+                    text,
+                    edit,
+                },
+            });
         }
         // `Ctrl+g`: the draft goes to nvim. Begun here; the window's answer keeps the edit or undoes it.
         InboundMessage::EditDraft { text, .. } => {
@@ -1452,6 +1702,83 @@ mod tests {
             ["in the turn"],
             "the message comes back to the box"
         );
+    }
+
+    #[test]
+    fn task_commands_reach_the_provider_and_the_output_reply_returns_to_the_requesting_page() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-task-output");
+        let (handle, page, _) = handle_with_recording_page();
+        let provider = std::sync::Arc::new(RecordingProvider::task_controlling());
+        let conversation = agent::AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let tab = handle.state.borrow().tabs.active();
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        provider.queue(agent::AgentDomainEvent::BackgroundTasksChanged {
+            tasks: vec![agent::BackgroundTask {
+                task_id: "task".into(),
+                run_id: None,
+                kind: agent::TaskKind::Shell,
+                task_type: "shell".into(),
+                description: "test".into(),
+                subagent_type: None,
+                parent_task_id: None,
+                tool_use_id: None,
+                ambient: false,
+                workflow_name: None,
+            }],
+            occurred_at: None,
+        });
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"ready"}"#);
+        tick_handle_until(&handle, "the roster", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .background_calls
+                == 1
+        });
+        for (kind, request) in [("stop_task", "s1"), ("task_output", "o1")] {
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({"type": kind, "request_id": request, "tab": tab.0, "task_id": "task"}).to_string(),
+            );
+        }
+        assert!(crate::agent_panel::tick::needs_polling(&handle.state.borrow()));
+        tick_handle_until(&handle, "the task replies", || {
+            page.sent.borrow().iter().any(|payload| {
+                let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+                value["kind"] == "task_output_result" && value["requestId"] == "o1"
+            })
+        });
+        assert_eq!(provider.stopped_tasks(), ["task"]);
+        assert_eq!(result_for(&page.sent.borrow(), "s1"), Some(Ok(())));
+        let output: serde_json::Value = page
+            .sent
+            .borrow()
+            .iter()
+            .map(|payload| serde_json::from_str::<serde_json::Value>(payload).unwrap())
+            .find(|value| value["kind"] == "task_output_result")
+            .unwrap();
+        assert_eq!(output["tab"], tab.0);
+        assert_eq!(output["taskId"], "task");
+        assert_eq!(output["output"], "<b>plain</b>\u{202e}");
+        assert_eq!(output["totalBytes"], 10000);
+        assert_eq!(output["truncated"], true);
+        assert!(handle.state.borrow().task_commands.is_empty());
+        shut_down_every_tab(&handle);
     }
 
     /// The confirmed `<leader>k` reaches the conversation of the tab it names, never the one on screen.

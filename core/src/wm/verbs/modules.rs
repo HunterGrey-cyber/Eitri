@@ -1197,6 +1197,7 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
                 counts.running,
                 counts.queued,
                 0,
+                counts.background,
             )
         }
         None => {
@@ -1204,7 +1205,7 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
                 ModuleKind::Agent => cx.reads.chat_kill_counts(ViewId::BASE),
                 _ => ChatKillCounts::default(),
             };
-            close::prompt(&id, &title, scope, counts.running, counts.queued, 0)
+            close::prompt(&id, &title, scope, counts.running, counts.queued, 0, counts.background)
         }
     };
     w.say(format!("[modules] {id}: {text}"));

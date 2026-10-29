@@ -1,0 +1,2141 @@
+{
+  "cases": [
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "api_retry",
+          "level": "notice",
+          "scalars": {
+            "attempt": 2,
+            "error_kind": "overloaded",
+            "error_status": 503,
+            "max_retries": 10,
+            "retry_delay_ms": 8000
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "api_retry",
+            "level": "notice",
+            "scalars": {
+              "attempt": 2,
+              "error_kind": "overloaded",
+              "error_status": 503,
+              "max_retries": 10,
+              "retry_delay_ms": 8000
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "retry",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "apiRetry": {
+            "content": null,
+            "kind": "api_retry",
+            "level": "notice",
+            "scalars": {
+              "attempt": 2,
+              "error_kind": "overloaded",
+              "error_status": 503,
+              "max_retries": 10,
+              "retry_delay_ms": 8000
+            },
+            "seq": 0,
+            "taskId": null,
+            "taskStatus": null,
+            "toolUseId": null
+          },
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "api_retry",
+          "level": "notice",
+          "scalars": {
+            "attempt": 1
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "kind": "text",
+          "text": "Ready",
+          "turn_id": "t",
+          "type": "content_delta"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "api_retry",
+            "level": "notice",
+            "scalars": {
+              "attempt": 1
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "kind": "text",
+            "text": "Ready",
+            "turn_id": "t",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 2
+      },
+      "name": "retry_cleared_by_delta",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 1,
+              "text": "Ready"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 2,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "api_retry",
+          "level": "notice",
+          "scalars": {
+            "attempt": 1
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "input": {},
+          "name": "Read",
+          "tool_use_id": "tool",
+          "turn_id": "t",
+          "type": "tool_call_started"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "api_retry",
+            "level": "notice",
+            "scalars": {
+              "attempt": 1
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "input": {},
+            "name": "Read",
+            "tool_use_id": "tool",
+            "turn_id": "t",
+            "type": "tool_call_started"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 2
+      },
+      "name": "retry_cleared_by_tool",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "input": {},
+              "name": "Read",
+              "result": null,
+              "seq": 1,
+              "toolUseId": "tool",
+              "turnId": "t"
+            }
+          ],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 2,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "turn_id": "t",
+          "type": "turn_started"
+        },
+        {
+          "content": null,
+          "kind": "api_retry",
+          "level": "notice",
+          "scalars": {
+            "attempt": 1
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "detail": {},
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": null,
+          "turn_id": "t",
+          "type": "turn_completed",
+          "usage": null
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "turn_id": "t",
+            "type": "turn_started"
+          },
+          {
+            "content": null,
+            "kind": "api_retry",
+            "level": "notice",
+            "scalars": {
+              "attempt": 1
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 3
+      },
+      "name": "retry_cleared_by_end",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 3,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "compacting",
+          "level": "notice",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "compacting",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "compacting",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "compacting": true,
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "compacting",
+          "level": "notice",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "content": null,
+          "kind": "compaction",
+          "level": "notice",
+          "scalars": {
+            "post_tokens": 41000,
+            "pre_tokens": 182000,
+            "trigger": "auto"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "compacting",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "content": null,
+            "kind": "compaction",
+            "level": "notice",
+            "scalars": {
+              "post_tokens": 41000,
+              "pre_tokens": 182000,
+              "trigger": "auto"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 2
+      },
+      "name": "compaction",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": null,
+              "kind": "compaction",
+              "level": "notice",
+              "scalars": {
+                "post_tokens": 41000,
+                "pre_tokens": 182000,
+                "trigger": "auto"
+              },
+              "seq": 1,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 2,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Switched model",
+          "kind": "model_fallback",
+          "level": "warning",
+          "scalars": {
+            "from_model": "large",
+            "to_model": "small"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Switched model",
+            "kind": "model_fallback",
+            "level": "warning",
+            "scalars": {
+              "from_model": "large",
+              "to_model": "small"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "fallback",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "fallbackModel": "small",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": "Switched model",
+              "kind": "model_fallback",
+              "level": "warning",
+              "scalars": {
+                "from_model": "large",
+                "to_model": "small"
+              },
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "model_refusal",
+          "level": "warning",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "model_refusal",
+            "level": "warning",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "refusal_without_content",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": null,
+              "kind": "model_refusal",
+              "level": "warning",
+              "scalars": {},
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Message <b> stays text‮",
+          "kind": "informational",
+          "level": "info",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Message <b> stays text‮",
+            "kind": "informational",
+            "level": "info",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "informational_info",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Message <b> stays text‮",
+          "kind": "informational",
+          "level": "notice",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Message <b> stays text‮",
+            "kind": "informational",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "informational_notice",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": "Message <b> stays text‮",
+              "kind": "informational",
+              "level": "notice",
+              "scalars": {},
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Message <b> stays text‮",
+          "kind": "informational",
+          "level": "suggestion",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Message <b> stays text‮",
+            "kind": "informational",
+            "level": "suggestion",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "informational_suggestion",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": "Message <b> stays text‮",
+              "kind": "informational",
+              "level": "suggestion",
+              "scalars": {},
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Message <b> stays text‮",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Message <b> stays text‮",
+            "kind": "informational",
+            "level": "warning",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "informational_warning",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": "Message <b> stays text‮",
+              "kind": "informational",
+              "level": "warning",
+              "scalars": {},
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "notice",
+          "scalars": {
+            "hold_state": "held",
+            "peer_name": "peer"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "peer_hold",
+            "level": "notice",
+            "scalars": {
+              "hold_state": "held",
+              "peer_name": "peer"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "peer_held",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": null,
+              "kind": "peer_hold",
+              "level": "notice",
+              "scalars": {
+                "hold_state": "held",
+                "peer_name": "peer"
+              },
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "notice",
+          "scalars": {
+            "hold_state": "released",
+            "peer_name": "peer"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "peer_hold",
+            "level": "notice",
+            "scalars": {
+              "hold_state": "released",
+              "peer_name": "peer"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "peer_released",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "notice",
+          "scalars": {
+            "hold_state": "dropped",
+            "peer_name": "peer"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "peer_hold",
+            "level": "notice",
+            "scalars": {
+              "hold_state": "dropped",
+              "peer_name": "peer"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "peer_dropped",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": null,
+              "kind": "peer_hold",
+              "level": "notice",
+              "scalars": {
+                "hold_state": "dropped",
+                "peer_name": "peer"
+              },
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed",
+            "resets_at_ms": 1800000123000
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed",
+              "resets_at_ms": 1800000123000
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "rate_allowed",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed_warning",
+            "resets_at_ms": 1800000123000
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed_warning",
+              "resets_at_ms": 1800000123000
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "rate_allowed_warning",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "rateLimitWarning": {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed_warning",
+              "resets_at_ms": 1800000123000
+            },
+            "seq": 0,
+            "taskId": null,
+            "taskStatus": null,
+            "toolUseId": null
+          },
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Usage limit reset",
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Usage limit reset",
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "rate_reset",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notices": [
+            {
+              "content": "Usage limit reset",
+              "kind": "rate_limit",
+              "level": "notice",
+              "scalars": {},
+              "seq": 0,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed_warning"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed_warning"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 2
+      },
+      "name": "rate_warning_cleared",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 2,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "turn_id": "t",
+          "type": "turn_started"
+        },
+        {
+          "plan": null,
+          "resets_at": 1800000123,
+          "type": "account_limits",
+          "used_percent": 95.0,
+          "window_minutes": null
+        },
+        {
+          "detail": {
+            "reason": "usage_limit"
+          },
+          "outcome": "limit_reached",
+          "result_text": "",
+          "stop_reason": null,
+          "turn_id": "t",
+          "type": "turn_completed",
+          "usage": null
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "turn_id": "t",
+            "type": "turn_started"
+          },
+          {
+            "plan": null,
+            "resets_at": 1800000123,
+            "type": "account_limits",
+            "used_percent": 95.0,
+            "window_minutes": null
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": "usage_limit"
+            },
+            "outcome": "limit_reached",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 3
+      },
+      "name": "rate_rejected",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": {
+            "plan": null,
+            "resetsAt": 1800000123,
+            "usedPercent": 95.0,
+            "windowMinutes": null
+          },
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": "limit_reached",
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "limit_reached",
+              "message": null,
+              "reason": "usage_limit",
+              "resetsAt": 1800000123,
+              "seq": 2,
+              "turnId": "t"
+            }
+          ],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 3,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "content": "Background update",
+          "kind": "notification",
+          "level": "notice",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "content": "Background update",
+            "kind": "notification",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 1
+      },
+      "name": "notification",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "notification": {
+            "content": "Background update",
+            "kind": "notification",
+            "level": "notice",
+            "scalars": {},
+            "seq": 0,
+            "taskId": null,
+            "taskStatus": null,
+            "toolUseId": null
+          },
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 1,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "kind": "text",
+          "text": "before",
+          "turn_id": "t",
+          "type": "content_delta"
+        },
+        {
+          "content": "Message <b> stays text‮",
+          "kind": "informational",
+          "level": "info",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "content": null,
+          "kind": "peer_hold",
+          "level": "notice",
+          "scalars": {
+            "hold_state": "released",
+            "peer_name": "peer"
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed",
+            "resets_at_ms": 1800000123000
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "content": null,
+          "kind": "rate_limit",
+          "level": "notice",
+          "scalars": {
+            "rate_status": "allowed_warning",
+            "resets_at_ms": 1800000123000
+          },
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "kind": "text",
+          "text": "after",
+          "turn_id": "t",
+          "type": "content_delta"
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "kind": "text",
+            "text": "before",
+            "turn_id": "t",
+            "type": "content_delta"
+          },
+          {
+            "content": "Message <b> stays text‮",
+            "kind": "informational",
+            "level": "info",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "content": null,
+            "kind": "peer_hold",
+            "level": "notice",
+            "scalars": {
+              "hold_state": "released",
+              "peer_name": "peer"
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed",
+              "resets_at_ms": 1800000123000
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed_warning",
+              "resets_at_ms": 1800000123000
+            },
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "kind": "text",
+            "text": "after",
+            "turn_id": "t",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "name": "quiet_preserves_stream",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "rateLimitWarning": {
+            "content": null,
+            "kind": "rate_limit",
+            "level": "notice",
+            "scalars": {
+              "rate_status": "allowed_warning",
+              "resets_at_ms": 1800000123000
+            },
+            "seq": 4,
+            "taskId": null,
+            "taskStatus": null,
+            "toolUseId": null
+          },
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 0,
+              "text": "beforeafter"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 6,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    }
+  ]
+}

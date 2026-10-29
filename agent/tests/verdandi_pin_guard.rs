@@ -15,13 +15,87 @@ use agent::EXPECTED_VERDANDI_REVISION;
 
 #[test]
 fn the_pinned_protocol_exposes_the_preset() {
-    assert_eq!(claude_runtime_protocol::PROTOCOL_MINOR, 21);
     assert_eq!(
         claude_runtime_protocol::CAP_SYSTEM_PROMPT_PRESET,
         "system_prompt_preset"
     );
     let preset = claude_runtime_protocol::v1::SystemPromptPreset { append: None };
     assert!(preset.append.is_none());
+}
+
+/// The pinned revision speaks protocol 3.22, whose capabilities Eitri reads by name. Each constant the
+/// protocol crate exports must be the word Eitri compares the handshake against, and each must be one
+/// the crate lists as new in minor 22: a rename on either side fails here, not as a feature that
+/// silently reads as absent.
+#[test]
+fn the_pinned_protocol_is_3_22_and_names_its_capabilities_as_eitri_reads_them() {
+    use claude_runtime_protocol as wire;
+    assert_eq!(wire::PROTOCOL_MAJOR, 3);
+    assert_eq!(wire::PROTOCOL_MINOR, 22);
+    let read_by_eitri = [
+        (wire::CAP_CLI_TURNS, "cli_turns"),
+        (wire::CAP_HUMAN_ORIGIN, "human_origin"),
+        (wire::CAP_SUBAGENT_FRAMES, "subagent_frames"),
+        (wire::CAP_BACKGROUND_TASKS, "background_tasks"),
+        (wire::CAP_WORKFLOW_PROGRESS, "workflow_progress"),
+        (wire::CAP_TASK_CONTROL, "task_control"),
+        (wire::CAP_TASK_OUTPUT, "task_output"),
+        (wire::CAP_SESSION_NOTICES, "session_notices"),
+        (wire::CAP_CONVERSATION_RESET, "conversation_reset"),
+        (wire::CAP_STRUCTURED_QUESTIONS_V1, "structured_questions_v1"),
+    ];
+    for (exported, word) in read_by_eitri {
+        assert_eq!(exported, word, "the capability string Eitri compares against");
+        assert_eq!(
+            wire::CAPABILITY_SINCE_MINOR
+                .iter()
+                .find(|(name, _)| *name == word)
+                .map(|(_, minor)| *minor),
+            Some(22),
+            "{word} must be a capability of minor 22"
+        );
+    }
+    let new_in_22: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
+        .iter()
+        .filter(|(_, minor)| *minor == 22)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        new_in_22,
+        read_by_eitri.iter().map(|(_, word)| *word).collect::<Vec<_>>(),
+        "every capability minor 22 adds has a ProviderCapabilities flag"
+    );
+}
+
+/// Both opt-ins have explicit controls in the panel.
+#[test]
+// Constants on purpose: this test is what a flip has to change.
+#[allow(clippy::assertions_on_constants)]
+fn the_3_22_opt_ins_match_the_available_controls() {
+    assert!(agent::providers::claude_sidecar::CLIENT_IMPLEMENTS_PER_TASK_STOP);
+    assert!(agent::providers::claude_sidecar::CLIENT_IMPLEMENTS_QUESTIONS);
+}
+
+/// `Cargo.lock` names the manifest's revision in full: the lock decides which commit is built, so a
+/// manifest bumped without its lock would build the old protocol under the new name.
+#[test]
+fn the_lock_names_the_manifest_revision() {
+    let manifest_rev = cargo_toml_rev();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock");
+    let lock = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let package = lock
+        .split("[[package]]")
+        .find(|block| block.contains("name = \"claude-runtime-protocol\""))
+        .unwrap_or_else(|| panic!("{}: no claude-runtime-protocol package", path.display()));
+    let source = package
+        .lines()
+        .find(|line| line.starts_with("source = "))
+        .unwrap_or_else(|| panic!("claude-runtime-protocol has no source line: {package}"));
+    assert!(
+        source.contains(&format!("?rev={manifest_rev}#{manifest_rev}\"")),
+        "Cargo.lock's {source} must name agent/Cargo.toml's rev {manifest_rev} in full"
+    );
+    assert_eq!(manifest_rev.len(), 40, "the manifest names the full revision");
 }
 
 /// Pulls the `rev = "..."` value off `agent/Cargo.toml`'s `claude-runtime-protocol` dependency line,

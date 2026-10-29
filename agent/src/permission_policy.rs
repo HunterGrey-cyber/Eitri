@@ -217,9 +217,8 @@ fn ask(reason: &'static str) -> Classification {
 /// `WebFetch` is here for a different reason from the rest -- see the module doc's rule (d): the
 /// CLI does exempt some documentation domains, and this version refuses to guess which.
 ///
-/// `MultiEdit` deliberately stays here rather than joining the fast path: it is not on either CLI
-/// tool list this module has actually read (`TOOLS_OFFERED_BY_CLI_2_1_272`, or the 2.1.283 `Agent`
-/// rename noted beside it), so there is no measurement of how the real CLI treats it under
+/// `MultiEdit` deliberately stays here rather than joining the fast path: it is not on the CLI
+/// tool census (`TOOLS_OFFERED_BY_CLI_2_1_311`), so there is no measurement of how it behaves under
 /// acceptEdits and guessing would be the same permissive error rule (d) already refuses for
 /// `WebFetch`.
 pub const ALWAYS_ASK_TOOLS: &[&str] = &["MultiEdit", "WebSearch", "WebFetch"];
@@ -254,52 +253,57 @@ const EDIT_TOOLS: &[&str] = &["Write", "Edit", "NotebookEdit"];
 /// `claude --print` with no `--permission-mode`, which denies where it would have prompted, **ran**
 /// `ToolSearch {"query": "select:Read"}` and returned the schema. It loads a description; it opens
 /// no file, runs no command and reaches no network.
-pub const NEVER_ASK_TOOLS: &[&str] = &["TodoWrite", "Task", "Agent", "ToolSearch"];
+///
+/// **The six scheduling and task tools are here on a measurement against CLI 2.1.311**
+/// (2026-10-28). `ScheduleWakeup`, `CronList`, `CronDelete`, `ListAgents` and `TaskStop` change no
+/// file, run no command and reach no network (`TaskStop` stops only work the agent itself
+/// started); `CronCreate` only schedules a prompt, and when that prompt runs, each call it makes
+/// comes through this gate like any other. The oracle is the one `ToolSearch` was measured with,
+/// run in the Claude harness sandbox against the scripted model (scenario `policy_six`, through
+/// `run.py --exec`): `claude --print --permission-mode default` with no permission prompt tool ran
+/// all six (a wake-up an hour out, a far one-shot cron, the cron list, that cron's deletion, the
+/// agent list, and the stop of a background subagent it had just started), each with the CLI's own
+/// permission decision `accept`, while a `Bash` `touch` later in the same session was denied.
+/// `SendMessage` is not here: it reaches another session.
+pub const NEVER_ASK_TOOLS: &[&str] = &[
+    "TodoWrite",
+    "Task",
+    "Agent",
+    "ToolSearch",
+    "ScheduleWakeup",
+    "CronCreate",
+    "CronList",
+    "CronDelete",
+    "ListAgents",
+    "TaskStop",
+];
 
-/// The tools CLI 2.1.272 actually offers, read off its own `system/init` on 2026-09-19 (later).
-///
-/// It is here to keep one fact visible: **the two tables above were written against a tool set that
-/// is not this one.** `Grep`, `Glob`, `MultiEdit` and `TodoWrite` are named by the policy and do not
-/// exist on this build; eighteen tools that DO exist were unknown to it, and an unknown tool is a
-/// card. Most of those are rare enough that a card is the right answer and no worse than an
-/// annoyance -- and several (`SendMessage`, `PushNotification`, `RemoteTrigger`, `CronCreate`,
-/// `EnterWorktree`) reach outside this machine or change the tree, so they must stay cards. Only
-/// `ToolSearch` was frequent enough to matter, and only it has been measured. **Do not promote a
-/// name off this list without its own oracle run**; the list is a record of what exists, not a
-/// judgement about any of it.
-///
-/// **CLI 2.1.283's own list is not recorded here.** The rerun (above) confirmed exactly one
-/// fact about it -- `Task` is now spelled `Agent` -- from a single card's log line, not from a fresh
-/// `system/init` read the way this table was built; inventing the rest of this table's shape for
-/// 2.1.283 from that one line would be exactly the guessing this module's own doc forbids. Re-read
-/// `system/init` on 2.1.283 before adding a `TOOLS_OFFERED_BY_CLI_2_1_283` beside this one.
-pub const TOOLS_OFFERED_BY_CLI_2_1_272: &[&str] = &[
+/// The CLI 2.1.311 tool census: `system/init`, followed by declared names absent there.
+/// Membership records availability only; each permission exemption needs its own measurement.
+pub const TOOLS_OFFERED_BY_CLI_2_1_311: &[&str] = &[
     "Task",
     "Bash",
     "CronCreate",
     "CronDelete",
     "CronList",
-    "DesignSync",
     "Edit",
     "EnterWorktree",
     "ExitWorktree",
     "ListAgents",
-    "LSP",
     "Monitor",
     "NotebookEdit",
-    "PushNotification",
     "Read",
-    "RemoteTrigger",
     "ReportFindings",
     "ScheduleWakeup",
     "SendMessage",
     "Skill",
-    "TaskOutput",
     "TaskStop",
     "ToolSearch",
     "WebFetch",
     "WebSearch",
+    "Workflow",
     "Write",
+    "Agent",
 ];
 
 /// The read-only `Bash` commands the CLI's own documentation names, verbatim and in its order.
@@ -3704,7 +3708,7 @@ mod tests {
     /// The other side of that change, and the reason it is one name rather than a category: every
     /// remaining tool this CLI offers still reaches the user. Written as the real list off
     /// `system/init` rather than an invented name, because the names that matter are the ones a real
-    /// session can actually produce -- five of these reach outside this machine or change the tree.
+    /// session can actually produce -- four of these reach outside this machine or change the tree.
     ///
     /// `Write`, `Edit` and `NotebookEdit` belong in `decided_elsewhere` because of the
     /// acceptEdits fast path: with `file_path: "src/main.rs"`, an in-project path, all three are
@@ -3713,10 +3717,19 @@ mod tests {
     #[test]
     fn every_other_tool_this_cli_offers_still_reaches_the_user() {
         let ws = Workspace::new();
-        let decided_elsewhere = ["Task", "Bash", "Read", "ToolSearch", "Write", "Edit", "NotebookEdit"];
+        let decided_elsewhere = [
+            "Task",
+            "Agent",
+            "Bash",
+            "Read",
+            "ToolSearch",
+            "Write",
+            "Edit",
+            "NotebookEdit",
+        ];
         let mut carded = 0;
-        for tool in TOOLS_OFFERED_BY_CLI_2_1_272 {
-            if decided_elsewhere.contains(tool) {
+        for tool in TOOLS_OFFERED_BY_CLI_2_1_311 {
+            if decided_elsewhere.contains(tool) || tools_the_cli_runs_unasked().iter().any(|(t, _)| t == tool) {
                 continue;
             }
             assert_eq!(
@@ -3727,8 +3740,81 @@ mod tests {
             carded += 1;
         }
         assert_eq!(
-            carded, 19,
+            carded, 9,
             "the CLI's tool list changed; re-read its system/init before editing this"
+        );
+    }
+
+    /// The scheduling and task tools CLI 2.1.311 runs in its default mode without asking, each with
+    /// the input shape the oracle ran it with.
+    fn tools_the_cli_runs_unasked() -> [(&'static str, Value); 6] {
+        [
+            (
+                "ScheduleWakeup",
+                json!({ "delaySeconds": 3600, "reason": "check the build", "prompt": "look again", "noop": false }),
+            ),
+            (
+                "CronCreate",
+                json!({ "cron": "0 0 1 1 *", "prompt": "look again", "recurring": false }),
+            ),
+            ("CronList", json!({})),
+            ("CronDelete", json!({ "id": "7766fdf6" })),
+            ("ListAgents", json!({})),
+            ("TaskStop", json!({ "task_id": "a52621bff8287df82" })),
+        ]
+    }
+
+    /// The CLI runs these without asking in its default mode, so a card for them would make Eitri
+    /// stricter than the CLI it drives, in a Manual tab and in an Auto tab whose CLI runs `default`
+    /// alike.
+    #[test]
+    fn the_tools_the_cli_runs_unasked_are_allowed() {
+        let ws = Workspace::new();
+        for (tool, input) in tools_the_cli_runs_unasked() {
+            assert!(NEVER_ASK_TOOLS.contains(&tool), "{tool} is on the never-ask list");
+            assert!(
+                TOOLS_OFFERED_BY_CLI_2_1_311.contains(&tool),
+                "{tool} is a tool the CLI offers"
+            );
+            assert_eq!(
+                classify_with_rules(tool, &input, ws.path(), &PrefixRules::default()).verdict,
+                PermissionVerdict::AllowWithoutAsking,
+                "{tool} {input}: allowed without a card in an Auto tab"
+            );
+            assert_eq!(
+                classify_in_manual(tool, &input, ws.path(), &PrefixRules::default()).verdict,
+                PermissionVerdict::AllowWithoutAsking,
+                "{tool} {input}: allowed without a card in a Manual tab"
+            );
+        }
+    }
+
+    /// A message to another session leaves this one, so it is a card in both modes even though it
+    /// sits beside the scheduling tools on the CLI's list.
+    #[test]
+    fn a_message_to_another_session_still_gets_a_card() {
+        let ws = Workspace::new();
+        let input = json!({ "to": "a04e34ddf6855a0f0", "message": "hello", "summary": "say hello" });
+        for classification in [
+            classify_with_rules("SendMessage", &input, ws.path(), &PrefixRules::default()),
+            classify_in_manual("SendMessage", &input, ws.path(), &PrefixRules::default()),
+        ] {
+            assert_eq!(classification.verdict, PermissionVerdict::AskTheUser);
+        }
+    }
+
+    #[test]
+    fn an_unknown_tool_name_gets_a_card_in_manual_too() {
+        let ws = Workspace::new();
+        assert_eq!(
+            classify_in_manual(
+                "SomeToolInventedNextRelease",
+                &json!({}),
+                ws.path(),
+                &PrefixRules::default()
+            )
+            .verdict,
+            PermissionVerdict::AskTheUser
         );
     }
 

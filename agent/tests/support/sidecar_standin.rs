@@ -15,16 +15,29 @@
 //! - `ignore-eof`: stdin's end of file no longer ends the process;
 //! - `end`: the turn completes.
 //!
+//! With `--cli-turns` the stand-in offers protocol 3.22's `cli_turns` and `human_origin`, and a script
+//! can play what Claude Code does by itself (`<kind>` is `task`, `scheduled`, `peer` or `unknown`):
+//! - `cli-start <kind>`: a turn the CLI started, for that cause; the steps after it are that turn's;
+//! - `cause <kind>`: the current turn's cause, refined at its close;
+//! - `cycle <kind>`: a cycle of the CLI's own inside the current turn, ahead of its prompt;
+//! - `deliver`, `drop`: the CLI read the latest `SendTurn`'s message (named by its client id), or
+//!   dropped it;
+//! - `end-no-result`: the current turn ends without a result.
+//!
+//! `--record-sends <file>` appends a line per `SendTurn` and `SteerTurn` request:
+//! `<rpc> <client id, or -> <typed_by_person>`.
+//!
 //! A steered message's text is the number of milliseconds after which it is delivered (500 if it is
 //! not a number).
 
 use claude_runtime_protocol::v1::session_event::Event;
 use claude_runtime_protocol::v1::{
-    CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse, HandshakeRequest,
-    HandshakeResponse, InterruptTurnRequest, InterruptTurnResponse, PermissionOutcome, PermissionRequested,
-    PermissionResolved, ResolvePermissionRequest, ResolvePermissionResponse, SendTurnRequest, SendTurnResponse,
-    SessionCloseReason, SessionClosed, SessionEvent, SessionReady, SteerTurnRequest, SteerTurnResponse, TextDelta,
-    TurnCompleted, TurnOutcome, TurnStarted, UserMessageDelivered, WatchSessionEventsRequest,
+    CliCycleStarted, CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
+    HandshakeRequest, HandshakeResponse, InterruptTurnRequest, InterruptTurnResponse, PermissionOutcome,
+    PermissionRequested, PermissionResolved, ResolvePermissionRequest, ResolvePermissionResponse, SendTurnRequest,
+    SendTurnResponse, SessionCloseReason, SessionClosed, SessionEvent, SessionReady, SteerTurnRequest,
+    SteerTurnResponse, TextDelta, TurnCause, TurnCauseKind, TurnCauseUpdated, TurnCompleted, TurnOrigin, TurnOutcome,
+    TurnStarted, UserMessageDelivered, UserMessageDropReason, UserMessageDropped, WatchSessionEventsRequest,
 };
 use prost::Message as _;
 use std::collections::HashMap;
@@ -51,6 +64,8 @@ struct Session {
     watchers: Vec<Watcher>,
     /// The rest of a script, by the permission it waits on, with its turn.
     waiting: HashMap<String, (String, Vec<String>)>,
+    /// The client id of the latest `SendTurn`'s message, if it named one.
+    last_client_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -59,6 +74,8 @@ struct Shared {
     next_id: AtomicU64,
     without_system_prompt_preset: bool,
     record_create: Mutex<Option<std::fs::File>>,
+    cli_turns: bool,
+    record_sends: Mutex<Option<std::fs::File>>,
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -89,10 +106,49 @@ impl Shared {
             .watchers
             .retain(|watcher| watcher.send(Ok(event.clone())).is_ok());
     }
+
+    fn client_id(&self, session_id: &str) -> String {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|session| session.last_client_id.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool) {
+        if let Some(file) = self.record_sends.lock().unwrap().as_mut() {
+            writeln!(file, "{rpc} {} {typed}", client_id.unwrap_or("-")).unwrap();
+            file.flush().unwrap();
+        }
+    }
+}
+
+/// A cause of `kind`, with the slots that kind fills.
+fn cause(kind: Option<&str>) -> Option<TurnCause> {
+    let mut cause = TurnCause::default();
+    match kind {
+        Some("task") => {
+            cause.kind = TurnCauseKind::Task as i32;
+            cause.task_id = Some("task-1".into());
+            cause.description = Some("cargo test".into());
+        }
+        Some("scheduled") => {
+            cause.kind = TurnCauseKind::Scheduled as i32;
+            cause.schedule_reason = Some("check the deploy".into());
+        }
+        Some("peer") => {
+            cause.kind = TurnCauseKind::Peer as i32;
+            cause.peer_name = Some("reviewer".into());
+            cause.text = Some("look at line 4".into());
+        }
+        _ => cause.kind = TurnCauseKind::Unknown as i32,
+    }
+    Some(cause)
 }
 
 /// Runs a turn's script from `steps`, until its end or a permission request.
-fn run(shared: Arc<Shared>, session_id: String, turn_id: String, mut steps: Vec<String>) {
+fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: Vec<String>) {
     tokio::spawn(async move {
         while !steps.is_empty() {
             let step = steps.remove(0);
@@ -108,6 +164,7 @@ fn run(shared: Arc<Shared>, session_id: String, turn_id: String, mut steps: Vec<
                             turn_id: turn_id.clone(),
                             text,
                             message_id: Some(message_id),
+                            ..Default::default()
                         }),
                     );
                 }
@@ -140,6 +197,61 @@ fn run(shared: Arc<Shared>, session_id: String, turn_id: String, mut steps: Vec<
                     }
                 }
                 Some("ignore-eof") => IGNORE_EOF.store(true, Ordering::SeqCst),
+                Some("cli-start") => {
+                    turn_id = shared.id("cli");
+                    shared.emit(
+                        &session_id,
+                        Some(&turn_id),
+                        Event::TurnStarted(TurnStarted {
+                            turn_id: turn_id.clone(),
+                            origin: TurnOrigin::Cli as i32,
+                            cause: cause(words.next()),
+                        }),
+                    );
+                }
+                Some("cause") => shared.emit(
+                    &session_id,
+                    Some(&turn_id),
+                    Event::TurnCauseUpdated(TurnCauseUpdated {
+                        turn_id: turn_id.clone(),
+                        cause: cause(words.next()),
+                    }),
+                ),
+                Some("cycle") => shared.emit(
+                    &session_id,
+                    Some(&turn_id),
+                    Event::CliCycleStarted(CliCycleStarted {
+                        turn_id: turn_id.clone(),
+                        cause: cause(words.next()),
+                    }),
+                ),
+                Some("deliver") => shared.emit(
+                    &session_id,
+                    Some(&turn_id),
+                    Event::UserMessageDelivered(UserMessageDelivered {
+                        client_message_id: shared.client_id(&session_id),
+                        turn_id: turn_id.clone(),
+                        into_running_turn: true,
+                    }),
+                ),
+                Some("drop") => shared.emit(
+                    &session_id,
+                    Some(&turn_id),
+                    Event::UserMessageDropped(UserMessageDropped {
+                        client_message_id: shared.client_id(&session_id),
+                        reason: UserMessageDropReason::Cancelled as i32,
+                    }),
+                ),
+                Some("end-no-result") => shared.emit(
+                    &session_id,
+                    Some(&turn_id),
+                    Event::TurnCompleted(TurnCompleted {
+                        turn_id: turn_id.clone(),
+                        outcome: TurnOutcome::Failed as i32,
+                        terminal_reason: Some("no_result".to_string()),
+                        ..Default::default()
+                    }),
+                ),
                 Some("end") => shared.emit(
                     &session_id,
                     Some(&turn_id),
@@ -156,7 +268,7 @@ fn run(shared: Arc<Shared>, session_id: String, turn_id: String, mut steps: Vec<
     });
 }
 
-fn handshake(without_system_prompt_preset: bool) -> HandshakeResponse {
+fn handshake(without_system_prompt_preset: bool, cli_turns: bool) -> HandshakeResponse {
     let mut response = HandshakeResponse {
         protocol_major: 3,
         protocol_minor: 21,
@@ -182,6 +294,12 @@ fn handshake(without_system_prompt_preset: bool) -> HandshakeResponse {
     };
     if without_system_prompt_preset {
         response.capabilities.retain(|c| c != "system_prompt_preset");
+    }
+    if cli_turns {
+        response.protocol_minor = 22;
+        response
+            .capabilities
+            .extend(["cli_turns".to_string(), "human_origin".to_string()]);
     }
     response
 }
@@ -233,7 +351,7 @@ impl Service<http::Request<Body>> for StandIn {
             let response = match method.as_str() {
                 "Handshake" => {
                     unary(req, move |_: HandshakeRequest| async move {
-                        Ok(handshake(shared.without_system_prompt_preset))
+                        Ok(handshake(shared.without_system_prompt_preset, shared.cli_turns))
                     })
                     .await
                 }
@@ -276,12 +394,17 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "SendTurn" => {
                     unary(req, move |request: SendTurnRequest| async move {
+                        shared.record_send("send", request.client_message_id.as_deref(), request.typed_by_person);
+                        if let Some(session) = shared.sessions.lock().unwrap().get_mut(&request.session_id) {
+                            session.last_client_id = request.client_message_id.clone();
+                        }
                         let turn_id = shared.id("turn");
                         shared.emit(
                             &request.session_id,
                             Some(&turn_id),
                             Event::TurnStarted(TurnStarted {
                                 turn_id: turn_id.clone(),
+                                ..Default::default()
                             }),
                         );
                         let steps = request.text.split(';').map(|step| step.trim().to_string()).collect();
@@ -292,6 +415,7 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "SteerTurn" => {
                     unary(req, move |request: SteerTurnRequest| async move {
+                        shared.record_send("steer", Some(&request.client_message_id), request.typed_by_person);
                         let after = request.text.trim().parse().unwrap_or(500);
                         let turn_id = request.expected_turn_id.clone();
                         let shared = Arc::clone(&shared);
@@ -396,6 +520,12 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--without-system-prompt-preset") => shared.without_system_prompt_preset = true,
+            Some("--cli-turns") => shared.cli_turns = true,
+            Some("--record-sends") => {
+                let path = std::path::PathBuf::from(args.next().expect("record file"));
+                assert!(path.is_absolute(), "record file must be absolute");
+                *shared.record_sends.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+            }
             Some("--record-create") => {
                 let path = std::path::PathBuf::from(args.next().expect("record file"));
                 assert!(path.is_absolute(), "record file must be absolute");

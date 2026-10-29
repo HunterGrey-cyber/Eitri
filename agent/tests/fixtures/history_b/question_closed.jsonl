@@ -1,0 +1,4 @@
+{"type": "user", "uuid": "prompt", "promptSource": "sdk", "message": {"content": "Choose a layout"}}
+{"type": "assistant", "uuid": "ask", "message": {"id": "msg", "content": [{"type": "tool_use", "id": "ask-layout", "name": "AskUserQuestion", "input": {"questions": [{"question": "Which layout?", "header": "Layout", "multiSelect": false, "options": [{"label": "Grid", "description": "Tiles"}, {"label": "List", "description": "Rows"}]}]}}]}}
+{"type": "user", "uuid": "result", "toolUseResult": "Error: Tool permission request failed: AbortError: Tool permission stream closed before response received", "message": {"content": [{"type": "tool_result", "tool_use_id": "ask-layout", "content": "Tool permission request failed: AbortError: Tool permission stream closed before response received", "is_error": true}]}}
+{"type": "assistant", "uuid": "after", "message": {"id": "msg2", "content": [{"type": "text", "text": "Going on without an answer."}]}}

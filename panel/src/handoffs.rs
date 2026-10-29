@@ -101,7 +101,11 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // Named, not moved: a scratch edit is out in the editor, whose window sends the draft to the
         // tab's holder; a review job finishes where it runs and reports to the holder.
         pending_edits: _,
+        task_commands: _,
         review_jobs: _,
+        // A chat whose answer's reply is unread refuses to move (the provider's freeze), and the
+        // reply is told to the page that answered here.
+        question_sends: _,
         // The tab itself moves through the tab set's own record.
         tabs,
         // The window's, not the tab's.
@@ -486,6 +490,7 @@ mod tests {
             counts_as_other: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         let typed = |text: &str| FirstTurn {
+            typed_by_person: true,
             wire: text.into(),
             typed: text.into(),
         };

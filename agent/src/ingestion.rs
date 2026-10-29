@@ -186,7 +186,8 @@ struct IngestState {
     /// it returns.
     record_written: bool,
     /// Whether this conversation has produced something worth storing since its history was last
-    /// written. Set by `fold` at a turn boundary and nowhere else -- see `flush_history`.
+    /// written. Set by `fold` at a turn's end, the session's end, and inside a turn at a question's
+    /// ask, the start of its call and its settle (`fold_one`) -- see `flush_history`.
     history_dirty: bool,
     /// The last `SessionOpened` folded and every resume verdict, unavailability or close folded after
     /// it (all of them while none has opened the session), for the conversation's whole life: what
@@ -244,7 +245,8 @@ fn new_fold_log() -> Option<Vec<(u64, AgentDomainEvent)>> {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryProgress {
-    /// A turn boundary has been folded and its write has not started yet.
+    /// Something the history stores has been folded (a turn's or the session's end, a question's ask,
+    /// its call's start or its settle) and its write has not started yet.
     pub history_dirty: bool,
     /// The provider position of the last batch folded.
     pub folded_through: u64,
@@ -271,9 +273,10 @@ fn note_folded_through(state: &mut IngestState, through: u64) {
     note_nothing_owed(state);
 }
 
-/// Called on the ingestion thread after a fold: its own write, if one ran, has finished by then, so a
-/// clean flag with no failed write outstanding means the stored history holds everything owed through
-/// `folded_through`.
+/// Called on the ingestion thread once every history write owed through `folded_through` has returned: a
+/// clean flag with no failed write outstanding then means the stored history holds everything owed
+/// through it. A fold that detached a session for a `/clear` does not call it at its end: that session's
+/// history is written after the fold, outside the lock, and `fold_batch` calls it once the write is done.
 fn note_nothing_owed(state: &mut IngestState) {
     if !state.history_dirty && !state.history_save_failed {
         state.history_saved_through = state.history_saved_through.max(state.folded_through);
@@ -299,6 +302,8 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::ContentDelta { .. }
         | AgentDomainEvent::ToolCallStarted { .. }
         | AgentDomainEvent::PermissionRequested { .. }
+        // A waiting question is live state, as a waiting card is.
+        | AgentDomainEvent::QuestionAsked { .. }
         | AgentDomainEvent::MoveSeeded(_) => true,
         AgentDomainEvent::SessionOpened { .. }
         | AgentDomainEvent::UserMessageDropped { .. }
@@ -317,7 +322,21 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::BackgroundCalls { .. }
         | AgentDomainEvent::CommandsAvailable { .. }
         | AgentDomainEvent::AccountLimits { .. }
-        | AgentDomainEvent::ToolInputChanged { .. } => false,
+        | AgentDomainEvent::ToolInputChanged { .. }
+        // Follows the `TurnStarted` that began the turn; a notice and a settlement are records.
+        | AgentDomainEvent::TurnAttributed { .. }
+        | AgentDomainEvent::SessionNotice { .. }
+        | AgentDomainEvent::QuestionSettled { .. }
+        // A note about work out of sight starts no turn here, and a prompt taken back removes a record.
+        | AgentDomainEvent::CliWorkUnseen
+        | AgentDomainEvent::UserPromptWithdrawn
+        | AgentDomainEvent::TurnCauseUpdated { .. }
+        | AgentDomainEvent::CliCycleStarted { .. }
+        | AgentDomainEvent::BackgroundTasksChanged { .. }
+        | AgentDomainEvent::TaskEvent { .. }
+        | AgentDomainEvent::ConversationReset { .. } => false,
+        // A subagent's frame starts what its inner event would.
+        AgentDomainEvent::SubagentFrame { frame, .. } => may_start_a_turn(frame),
     }
 }
 
@@ -359,13 +378,14 @@ pub(crate) struct MovedIngest {
 }
 
 impl IngestState {
-    /// Folds `event`, then the event the projection derives from it (a changed tool input: the
-    /// comparison is made once, here, and the derived event is folded and delivered like any other,
-    /// so the panel learns of it even when the host answered the request it came with).
+    /// Folds `event`, then the events the projection derives from it (a changed tool input; the rows
+    /// a turn's end leaves when the turn was not one this panel ran, or a hook stopped its prompt).
+    /// Each judgement is made once, here, and the derived events are folded and delivered like any
+    /// other, so the panel learns of them even when the host answered the request they came with.
     fn fold(&mut self, event: AgentDomainEvent) {
-        let derived = self.projection.derived_after(&event);
+        let derived = self.projection.derived_events_after(&event);
         self.fold_one(event);
-        if let Some(derived) = derived {
+        for derived in derived {
             self.fold_one(derived);
         }
     }
@@ -416,16 +436,39 @@ impl IngestState {
                 self.running_turn = None;
             }
         }
-        // A turn boundary, and only a turn boundary: that is the quiet moment. `apply` has just
-        // closed `assistant_message_open`, so nothing half-written can be stored, and one write per
-        // turn is three orders of magnitude fewer than one per event -- a partial-streamed reply is
-        // 400+ events and each write is two fsyncs.
-        if matches!(
-            event,
-            AgentDomainEvent::TurnCompleted { .. }
-                | AgentDomainEvent::SessionClosed { .. }
-                | AgentDomainEvent::SessionUnavailable { .. }
-        ) {
+        // A turn boundary is the quiet moment. `apply` has just closed `assistant_message_open`, so
+        // nothing half-written can be stored, and one write per turn is three orders of magnitude
+        // fewer than one per event -- a partial-streamed reply is 400+ events and each write is two
+        // fsyncs.
+        //
+        // A question is the one mark inside a turn: its ask, the start of the call that asks it, and
+        // its settle. While a question waits the CLI has stopped until the person answers, and a
+        // close in that wait ends the turn with no turn end folded here and nothing written at
+        // shutdown (see `flush_history`), so without these writes the stored history would hold no
+        // record of the question at all. The reply before it is whole (the CLI asks only after the
+        // message holding the call has streamed to its end) and `apply` closes it at `QuestionAsked`. The ask can
+        // arrive before the frame that starts its call, so that frame is written too, or the stored
+        // question would stand without its call. The settle is written so a question answered or
+        // declined before a close is not stored as still waiting. A turn holds a handful of
+        // questions at most, and the turn's own end writes again.
+        let asks_a_question = match &event {
+            AgentDomainEvent::ToolCallStarted { tool_use_id, .. } => self
+                .projection
+                .questions
+                .iter()
+                .any(|q| q.tool_use_id.as_deref() == Some(tool_use_id.as_str())),
+            _ => false,
+        };
+        if asks_a_question
+            || matches!(
+                event,
+                AgentDomainEvent::TurnCompleted { .. }
+                    | AgentDomainEvent::SessionClosed { .. }
+                    | AgentDomainEvent::SessionUnavailable { .. }
+                    | AgentDomainEvent::QuestionAsked { .. }
+                    | AgentDomainEvent::QuestionSettled { .. }
+            )
+        {
             self.history_dirty = true;
         }
 
@@ -1021,6 +1064,18 @@ impl ConversationIngest {
         wake_ui(&self.ui_wake);
     }
 
+    /// Marks the question set `interaction_id` as having an answer on its way (`sending`), or as
+    /// waiting again after that answer was refused or failed; `false` when it was not in the state
+    /// the change starts from. Host state only: no event is folded, and a snapshot carries it.
+    pub(crate) fn mark_question_send(&self, interaction_id: &str, sending: bool) -> bool {
+        let mut state = self.lock_state("mark_question_send");
+        if sending {
+            state.projection.mark_question_answering(interaction_id)
+        } else {
+            state.projection.question_send_failed(interaction_id)
+        }
+    }
+
     /// Stops the ingestion thread and waits for it. Idempotent.
     pub(crate) fn stop(&mut self) {
         // Stored before the raise, which takes the signal's lock: the thread's wait reads the flag under
@@ -1065,6 +1120,8 @@ fn ingest_loop(
     } = halt;
     // The last position the provider reported, so an unchanged one costs no lock.
     let mut noted_through: Option<u64> = None;
+    // The id the last `/clear` named for the new conversation, until the `SessionOpened` that adopts it.
+    let mut reset_expected: Option<String> = None;
     // Until the provider or this side raises the signal: an unfreeze raises it too, so a frozen
     // thread wakes when it is let go.
     let idle = |seen: Option<u64>| match (&announced, seen) {
@@ -1110,57 +1167,220 @@ fn ingest_loop(
             idle(seen);
             continue;
         }
-        // Adoption touches the filesystem, so it happens OUTSIDE the state lock -- holding it across
-        // a `flock` and a JSON write would block every UI tick reading the projection for the
-        // duration.
-        let mut adopt: Option<String> = None;
-        let mut title: Option<String> = None;
-        let mut name: Option<Option<String>> = None;
-        {
-            let mut guard = state.lock().unwrap();
-            if let Some(through) = through {
-                guard.folded_through = through;
-            }
-            for event in events {
-                if let AgentDomainEvent::SessionOpened {
-                    provider_session_id, ..
-                } = &event
-                {
-                    // Taken while the state's lock is held, the one order the two are ever taken in:
-                    // a reader holding the state lock then sees the id that goes with that state.
-                    let mut session = session_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Only the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a
-                    // system/init at the start of every turn, not once per session -- so adopting
-                    // unconditionally would re-take a lease this conversation already holds, on
-                    // every single turn.
-                    if session.is_none() {
-                        adopt = Some(provider_session_id.clone());
-                        // A title noted before this point goes into the record adoption writes. One
-                        // noted after it waits in `pending_title` until `record_written`, and
-                        // `flush_title` writes it then.
-                        title = guard.pending_title.take();
-                        // Same shape for a rename noted before adoption.
-                        name = guard.pending_name.take();
-                    }
-                    *session = Some(provider_session_id.clone());
-                }
-                guard.fold(event);
-            }
-            note_nothing_owed(&mut guard);
-        }
+        fold_batch(
+            &state,
+            &session_id,
+            &context,
+            events,
+            through,
+            &mut reset_expected,
+            &ui_wake,
+        );
+        drop(batch);
+    }
+    // The last batch folded may owe the history a write that the next round would have made: a
+    // stop landing between that fold and the check above ends the loop first. Nothing else writes
+    // it, and a question asked there would be missing from the stored history, or one settled
+    // there stored as still waiting, which a load restores as closed. Under the gate, and not while
+    // frozen: a frozen conversation writes nothing, its history goes with its move.
+    let gate = pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !frozen.load(Ordering::SeqCst) {
+        flush_history(&state, &session_id, &context);
+    }
+    drop(gate);
+}
+
+/// What `/clear` left the old conversation to write once the state's lock is released: its history
+/// as it stood before the reset, a title or name noted for it and not written yet, and its lease,
+/// released after the writes.
+struct ClearedSession {
+    provider_session_id: String,
+    history: Option<crate::history::HistoryParts>,
+    title: Option<String>,
+    name: Option<Option<String>>,
+    lease: Option<SessionLease>,
+}
+
+/// One stretch of a batch, folded under the state's lock, and what it leaves for this thread to write
+/// once the lock is released.
+#[derive(Default)]
+struct Stretch {
+    adopt: Option<String>,
+    title: Option<String>,
+    name: Option<Option<String>>,
+    cleared: Option<ClearedSession>,
+}
+
+/// Folds `events` and writes what they call for, in the order they call for it. Filesystem work
+/// (adoption, the old conversation's history at a `/clear`) happens OUTSIDE the state lock -- holding it
+/// across a `flock` and a JSON write would block every UI tick reading the projection for the duration
+/// -- so the batch is folded in stretches: one ends after a `ConversationReset`, and before one when an
+/// adoption is still to be written, so each write sees the session it belongs to.
+fn fold_batch(
+    state: &Mutex<IngestState>,
+    session_id: &Mutex<Option<String>>,
+    context: &AdoptionContext,
+    events: Vec<AgentDomainEvent>,
+    mut through: Option<u64>,
+    reset_expected: &mut Option<String>,
+    ui_wake: &Mutex<Option<UiWake>>,
+) {
+    let mut events = events.into_iter().peekable();
+    while events.peek().is_some() {
+        let stretch = fold_stretch(state, session_id, &mut events, through.take(), reset_expected);
         // After the lock is released: the UI takes the same lock when it is woken.
-        wake_ui(&ui_wake);
-        if let Some(provider_session_id) = adopt {
-            let lease = adopt_provider_session(&context, &provider_session_id, title.as_deref(), name);
+        wake_ui(ui_wake);
+        if let Some(provider_session_id) = stretch.adopt {
+            let lease = adopt_provider_session(context, &provider_session_id, stretch.title.as_deref(), stretch.name);
             {
                 let mut guard = state.lock().unwrap();
                 guard.lease = lease;
                 guard.record_written = true;
             }
-            wake_ui(&ui_wake);
+            wake_ui(ui_wake);
         }
-        drop(batch);
+        if let Some(cleared) = stretch.cleared {
+            let stored = write_cleared_session(context, cleared);
+            let mut guard = state.lock().unwrap();
+            match stored {
+                // The old conversation's history did not reach the disk: nothing may claim it did.
+                Some(false) => guard.history_save_failed = true,
+                Some(true) => guard.history_save_failed = false,
+                None => {}
+            }
+            // Later stretches of the batch have folded nothing yet, and the last one notes its own end.
+            if events.peek().is_none() {
+                note_nothing_owed(&mut guard);
+            }
+        }
     }
+}
+
+fn fold_stretch(
+    state: &Mutex<IngestState>,
+    session_id: &Mutex<Option<String>>,
+    events: &mut std::iter::Peekable<std::vec::IntoIter<AgentDomainEvent>>,
+    through: Option<u64>,
+    reset_expected: &mut Option<String>,
+) -> Stretch {
+    let mut stretch = Stretch::default();
+    let mut guard = state.lock().unwrap();
+    if let Some(through) = through {
+        guard.folded_through = through;
+    }
+    while let Some(event) = events.peek() {
+        if let AgentDomainEvent::ConversationReset {
+            new_conversation_id, ..
+        } = event
+        {
+            // The session adopted earlier in this stretch has no record on disk yet: write it first,
+            // so the reset finds the record it flushes into.
+            if stretch.adopt.is_some() {
+                break;
+            }
+            *reset_expected = Some(new_conversation_id.clone());
+            stretch.cleared = detach_for_reset(&mut guard, session_id);
+            let event = events.next().expect("peeked");
+            guard.fold(event);
+            break;
+        }
+        let event = events.next().expect("peeked");
+        if let AgentDomainEvent::SessionOpened {
+            provider_session_id, ..
+        } = &event
+        {
+            // Taken while the state's lock is held, the one order the two are ever taken in: a reader
+            // holding the state lock then sees the id that goes with that state.
+            let mut session = session_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Only the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a system/init at the
+            // start of every turn, not once per session -- so adopting unconditionally would re-take a
+            // lease this conversation already holds, on every single turn. After a `/clear` the slot is
+            // empty again, so the new conversation's first one adopts it.
+            if session.is_none() {
+                stretch.adopt = Some(provider_session_id.clone());
+                // A title noted before this point goes into the record adoption writes. One noted after
+                // it waits in `pending_title` until `record_written`, and `flush_title` writes it then.
+                stretch.title = guard.pending_title.take();
+                // Same shape for a rename noted before adoption.
+                stretch.name = guard.pending_name.take();
+                if let Some(expected) = reset_expected.take() {
+                    if expected != *provider_session_id {
+                        eprintln!(
+                            "agent: /clear named the new conversation {expected}, and the session that opened \
+                             after it is {provider_session_id}; the record and history follow the session"
+                        );
+                    }
+                }
+            }
+            *session = Some(provider_session_id.clone());
+        }
+        guard.fold(event);
+    }
+    // A detached session's history is still to be written: `fold_batch` notes the end once it has been.
+    if stretch.cleared.is_none() {
+        note_nothing_owed(&mut guard);
+    }
+    stretch
+}
+
+/// A `/clear`'s first two steps, before the reset is folded: the old conversation's history is taken
+/// from the projection as it stands (so every row it showed is kept, A-only ones included), and the
+/// session is detached -- the id slot emptied, `record_written` false, the lease taken out to be
+/// released. From here `flush_history` writes nothing until the next `SessionOpened` adopts the new
+/// conversation, so the `/clear` turn's own `TurnCompleted`, which marks the history dirty, cannot
+/// write the cleared projection over the old conversation's history; the dirty flag waits for the new
+/// one's record. `None` when there was no session to detach.
+fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>) -> Option<ClearedSession> {
+    let old = session_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let had_record = std::mem::replace(&mut guard.record_written, false);
+    // Written below from the pre-reset projection, so what was owed is covered.
+    guard.history_dirty = false;
+    let lease = guard.lease.take();
+    let provider_session_id = old?;
+    let history = had_record.then(|| history_snapshot(&guard.projection));
+    // A title or name noted for the old conversation belongs in its record, not the new one's.
+    let (title, name) = if had_record {
+        (guard.pending_title.take(), guard.pending_name.take())
+    } else {
+        (None, None)
+    };
+    Some(ClearedSession {
+        provider_session_id,
+        history,
+        title,
+        name,
+        lease,
+    })
+}
+
+/// The old conversation's last writes after a `/clear`, then its lease is released: the history comes
+/// first, so no other window can take the session before what this one showed of it is stored. Whether
+/// the history was stored: `None` when there was none to write.
+fn write_cleared_session(context: &AdoptionContext, cleared: ClearedSession) -> Option<bool> {
+    let ClearedSession {
+        provider_session_id,
+        history,
+        title,
+        name,
+        lease,
+    } = cleared;
+    let stored = history.map(|parts| store_history(context, &provider_session_id, parts));
+    if let Some(title) = title {
+        if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title)
+        {
+            eprintln!("agent: could not record the title of session {provider_session_id}: {e}");
+        }
+    }
+    if let Some(name) = name {
+        if let Err(e) = crate::persistence::set_name(&context.conversation_id, &provider_session_id, name.as_deref()) {
+            eprintln!("agent: could not record the name of session {provider_session_id}: {e}");
+        }
+    }
+    drop(lease);
+    stored
 }
 
 /// Writes a title noted after this session's record was written -- into that record, on this
@@ -1217,7 +1437,7 @@ fn flush_name(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, co
 /// the whole conversation, landing on a 33ms GTK tick.
 ///
 /// The lock is held only long enough to read the dirty flag and copy what the history keeps of the
-/// three collections (`history_snapshot`: the newest items within the caps, not the whole session).
+/// collections (`history_snapshot`: the newest items within the caps, not the whole session).
 /// Serializing and writing happen after it is released.
 ///
 /// Two gates, the same two `flush_title` has: the record must be on disk (a history file for a
@@ -1227,14 +1447,19 @@ fn flush_name(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, co
 /// Best-effort. A failure is one line on stderr and a resume that falls back further; it must never
 /// fail a live session. Precedent: `persist_record` and `flush_title`.
 ///
-/// **What this deliberately does not do is flush at shutdown.** `AgentConversation::shutdown` stops
+/// **What this deliberately does not write is the close itself.** `AgentConversation::shutdown` stops
 /// this thread FIRST and then folds its terminal events on the caller's thread, so the
 /// `SessionClosed` it synthesizes never reaches this function -- writing it from there would put the
 /// write back on the UI thread, which is the one thing this whole arrangement exists to prevent.
-/// The cost is the design's own accepted one: a `kill -9`, a power loss or a close can lose the last
-/// turn. A is the fallback; B normally covers it.
+/// What this thread folded before the stop is still written: `ingest_loop` calls this once more on
+/// its way out (so the caller's join may wait for that one write, as it already does for a write the
+/// stop lands in). The cost is the design's own accepted one: a `kill -9` or a power loss can lose
+/// the last turn, and a close loses whatever the provider emits after the stop. A is the fallback; B
+/// normally covers it. A question waiting for the person is not lost that way: its ask and its call
+/// mark the history dirty when they fold (`IngestState::fold_one`) and are written before the
+/// thread ends, and a load settles a record stored waiting as closed.
 fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, context: &AdoptionContext) {
-    let (provider_session_id, user_prompts, transcript, tool_calls, snapshot_through) = {
+    let (provider_session_id, parts, snapshot_through) = {
         let mut guard = state.lock().unwrap();
         if !guard.history_dirty || !guard.record_written {
             return;
@@ -1245,15 +1470,25 @@ fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>,
         // Cleared before the write, not after: a turn that completes while this one is writing must
         // mark the history dirty again rather than be swallowed by a later clear.
         guard.history_dirty = false;
-        let (user_prompts, transcript, tool_calls) = history_snapshot(&guard.projection);
-        (id, user_prompts, transcript, tool_calls, guard.folded_through)
+        (id, history_snapshot(&guard.projection), guard.folded_through)
     };
-    let history = crate::history::StoredHistory::from_collections(
+    let saved = store_history(context, &provider_session_id, parts);
+    let mut guard = state.lock().unwrap();
+    if saved {
+        guard.history_save_failed = false;
+        guard.history_saved_through = guard.history_saved_through.max(snapshot_through);
+    } else {
+        guard.history_save_failed = true;
+    }
+}
+
+/// Writes one session's history and moves its record's "last used". Best-effort, as `flush_history`;
+/// returns whether the history file was written.
+fn store_history(context: &AdoptionContext, provider_session_id: &str, parts: crate::history::HistoryParts) -> bool {
+    let history = crate::history::StoredHistory::from_parts(
         context.conversation_id.clone(),
-        provider_session_id.clone(),
-        user_prompts,
-        transcript,
-        tool_calls,
+        provider_session_id.to_string(),
+        parts,
     );
     #[cfg(test)]
     tests::note_history_writer_thread(&context.conversation_id);
@@ -1261,35 +1496,26 @@ fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>,
     tests::hold_history_write(&context.conversation_id);
     if let Err(e) = crate::history::store::save(&history) {
         eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
-        state.lock().unwrap().history_save_failed = true;
-        return;
-    }
-    {
-        let mut guard = state.lock().unwrap();
-        guard.history_save_failed = false;
-        guard.history_saved_through = guard.history_saved_through.max(snapshot_through);
+        return false;
     }
     // The turn changed the conversation, so the record's "last used" moves with it: the session picker
     // and the launch offer lead with the session used last, not the one opened last.
     if let Err(e) = crate::persistence::touch_updated_at(
         &context.conversation_id,
-        &provider_session_id,
+        provider_session_id,
         &crate::conversation::epoch_millis(),
     ) {
         eprintln!("agent: could not update the record of session {provider_session_id}: {e}");
     }
+    true
 }
 
 /// What the stored history keeps of the conversation, copied: only what the history's caps keep,
-/// since this runs under the lock every UI read of the conversation takes.
-fn history_snapshot(
-    projection: &AgentSessionProjection,
-) -> (
-    Vec<crate::UserPromptRecord>,
-    Vec<crate::TranscriptMessage>,
-    Vec<crate::ToolCallRecord>,
-) {
-    crate::history::store::newest_that_fit(&projection.user_prompts, &projection.transcript, &projection.tool_calls)
+/// since this runs under the lock every UI read of the conversation takes. Every collection the
+/// history keeps: prompts, replies, tool calls, the starts of turns the user did not send, notice
+/// rows and question sets.
+fn history_snapshot(projection: &AgentSessionProjection) -> crate::history::HistoryParts {
+    crate::history::store::newest_that_fit(crate::history::store::HistoryView::of(projection))
 }
 
 fn adopt_provider_session(
@@ -1777,11 +2003,11 @@ pub(crate) mod tests {
         assert_eq!(again.updated_at, moved, "nothing new was stored, so nothing moved");
     }
 
-    /// A turn boundary marks the history dirty; nothing inside a turn does. The negative half is
-    /// the load-bearing one: a partial-streamed reply is 400+ events, and marking on any of them
-    /// would mean 400 writes, each two fsyncs.
+    /// A turn boundary marks the history dirty; inside a turn only a question does (below). The
+    /// negative half is the load-bearing one: a partial-streamed reply is 400+ events, and marking on
+    /// any of them would mean 400 writes, each two fsyncs.
     #[test]
-    fn only_a_turn_boundary_marks_the_history_dirty() {
+    fn only_a_turn_boundary_or_a_question_marks_the_history_dirty() {
         let mut state = state();
         state.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         state.fold(text("partial"));
@@ -1821,6 +2047,719 @@ pub(crate) mod tests {
             state.fold(event);
             assert!(state.history_dirty);
         }
+    }
+
+    fn question_asked(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::QuestionAsked {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            questions: vec![crate::QuestionSpec {
+                question: "Go ahead?".into(),
+                header: "Go".into(),
+                multi_select: false,
+                options: vec![
+                    crate::QuestionOptionSpec {
+                        label: "Yes".into(),
+                        description: "go".into(),
+                        preview: None,
+                    },
+                    crate::QuestionOptionSpec {
+                        label: "No".into(),
+                        description: "stop".into(),
+                        preview: None,
+                    },
+                ],
+            }],
+            unsupported_reason: None,
+        }
+    }
+
+    fn question_settled(
+        id: &str,
+        outcome: crate::QuestionOutcome,
+        answers: Vec<crate::ShownAnswer>,
+    ) -> AgentDomainEvent {
+        AgentDomainEvent::QuestionSettled {
+            interaction_id: id.into(),
+            outcome,
+            answers,
+            reason: None,
+        }
+    }
+
+    /// Inside a turn a question asked, the start of its call and its settle each mark the history
+    /// dirty: the CLI waits on the person there, and a close in that wait folds no turn end.
+    #[test]
+    fn a_question_its_call_and_its_settle_mark_the_history_dirty_inside_a_turn() {
+        let mut state = state();
+        let call = |id: &str| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({}),
+        };
+        state.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        state.fold(question_asked("q1"));
+        assert!(state.history_dirty, "a question that waits is owed to the history");
+        state.history_dirty = false;
+        state.fold(call("toolu_q1"));
+        assert!(state.history_dirty, "the start of the call that asked it is owed too");
+        state.history_dirty = false;
+        state.fold(call("toolu_other"));
+        assert!(!state.history_dirty, "a call no question names owes nothing");
+        state.fold(question_settled("q1", crate::QuestionOutcome::Declined, vec![]));
+        assert!(state.history_dirty, "its settle is owed too");
+    }
+
+    /// A session closed while a question waits, or after it was answered or declined in a turn that
+    /// had not ended: history A holds the prompt, the reply before the question and the question, and
+    /// loading it shows the waiting one settled `SessionClosed` and the others as they were settled.
+    /// Nothing is written at the close itself, as in the product: the close's events are folded on
+    /// the caller's thread and never flushed.
+    #[test]
+    fn a_question_in_a_turn_cut_by_the_close_is_kept_in_history_a() {
+        let answered = vec![crate::ShownAnswer {
+            question_index: 0,
+            answer: "Yes".into(),
+            notes: None,
+        }];
+        let cases = [
+            ("sess-waiting", None),
+            ("sess-answered", Some((crate::QuestionOutcome::Answered, answered))),
+            ("sess-declined", Some((crate::QuestionOutcome::Declined, vec![]))),
+        ];
+        for (session, settle) in cases {
+            let mut c = Driven::new();
+            c.batch(vec![opened(session)]);
+            c.prompt("first");
+            c.batch(vec![
+                AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+                reply("t1", "first reply"),
+                completed("t1"),
+            ]);
+            c.prompt("ask me");
+            // The order the sidecar hands them over in: the ask before the frame that starts its call,
+            // each in a batch of its own.
+            c.batch(vec![
+                AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                reply("t2", "Before I go on:"),
+                question_asked("q1"),
+            ]);
+            c.batch(vec![AgentDomainEvent::ToolCallStarted {
+                turn_id: "t2".into(),
+                tool_use_id: "toolu_q1".into(),
+                name: "AskUserQuestion".into(),
+                input: serde_json::json!({}),
+            }]);
+            let stored = c.a(session);
+            assert_eq!(
+                texts(&stored),
+                (
+                    vec!["first".to_string(), "ask me".to_string()],
+                    vec!["first reply".to_string(), "Before I go on:".to_string()]
+                ),
+                "{session}: the cut turn's prompt and its whole reply are stored"
+            );
+            assert_eq!(
+                stored.questions.len(),
+                1,
+                "{session}: the question is stored as it waits"
+            );
+            assert_eq!(stored.questions[0].state, crate::QuestionState::Waiting);
+            assert_eq!(stored.questions[0].turn_id.as_deref(), Some("t2"));
+            assert_eq!(
+                stored
+                    .tool_calls
+                    .iter()
+                    .map(|c| c.tool_use_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["toolu_q1"],
+                "{session}: the question's call, started after the ask, is stored with it"
+            );
+            if let Some((outcome, answers)) = settle.clone() {
+                c.batch(vec![question_settled("q1", outcome, answers)]);
+            }
+            // The close: shutdown folds its terminal events after the ingestion thread stopped, so no
+            // write follows them.
+            c.state.lock().unwrap().fold(AgentDomainEvent::SessionClosed {
+                reason: "closed_by_host".into(),
+            });
+
+            let missing = crate::state_dirs::test_workspace_dir("transcript").join("none.jsonl");
+            let restored = crate::history::load::seed_from(Ok(missing), &c.context.conversation_id, session);
+            let want = match settle {
+                None => crate::QuestionState::Settled {
+                    outcome: crate::QuestionOutcome::SessionClosed,
+                    answers: vec![],
+                    reason: None,
+                },
+                Some((outcome, answers)) => crate::QuestionState::Settled {
+                    outcome,
+                    answers,
+                    reason: None,
+                },
+            };
+            assert_eq!(
+                restored.questions.iter().map(|q| q.state.clone()).collect::<Vec<_>>(),
+                vec![want],
+                "{session}: the restored question is settled as it stood at the close"
+            );
+            assert!(
+                restored.waiting_questions().next().is_none(),
+                "{session}: nothing is answerable"
+            );
+            assert_eq!(restored.questions[0].turn_id.as_deref(), Some("t2"));
+            assert_eq!(restored.tool_calls.len(), 1, "{session}: the question's call is kept");
+            assert_eq!(restored.active_turn_id, None);
+        }
+    }
+
+    /// A provider whose next batch, once handed over, can raise the conversation's stop in the same
+    /// pump: the stop then lands after the batch is folded and before the loop's next round.
+    #[derive(Default)]
+    struct StopsWithBatch {
+        quiet: super::idle_wakeups::Quiet,
+        next: Mutex<Option<(Vec<AgentDomainEvent>, Option<Arc<AtomicBool>>)>>,
+    }
+
+    impl StopsWithBatch {
+        fn hand_over(&self, events: Vec<AgentDomainEvent>, stop: Option<Arc<AtomicBool>>) {
+            *self.next.lock().unwrap() = Some((events, stop));
+        }
+    }
+
+    impl crate::provider::AgentProvider for StopsWithBatch {
+        fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+            self.quiet.capabilities()
+        }
+        fn info(&self) -> crate::provider::ProviderInfo {
+            self.quiet.info()
+        }
+        fn create_session(
+            &self,
+            r: crate::provider::CreateSessionRequest,
+        ) -> Result<String, crate::provider::ProviderError> {
+            self.quiet.create_session(r)
+        }
+        fn resume_session(
+            &self,
+            r: crate::provider::ResumeSessionRequest,
+        ) -> Result<String, crate::provider::ProviderError> {
+            self.quiet.resume_session(r)
+        }
+        fn send_turn(&self, r: crate::provider::SendTurnRequest) -> Result<String, crate::provider::ProviderError> {
+            self.quiet.send_turn(r)
+        }
+        fn interrupt_turn(
+            &self,
+            r: crate::provider::InterruptTurnRequest,
+        ) -> Result<(), crate::provider::ProviderError> {
+            self.quiet.interrupt_turn(r)
+        }
+        fn resolve_permission(
+            &self,
+            r: crate::provider::ResolvePermissionRequest,
+        ) -> Result<(), crate::provider::ProviderError> {
+            self.quiet.resolve_permission(r)
+        }
+        fn close_session(&self, r: crate::provider::CloseSessionRequest) -> Result<(), crate::provider::ProviderError> {
+            self.quiet.close_session(r)
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            let Some((events, stop)) = self.next.lock().unwrap().take() else {
+                return Vec::new();
+            };
+            if let Some(stop) = stop {
+                stop.store(true, Ordering::SeqCst);
+            }
+            events
+        }
+    }
+
+    /// A stop that lands right after the batch asking a question, or the one settling it, is folded:
+    /// the thread writes what that batch owes the history before it ends, so the question is stored
+    /// (waiting, then answered) rather than missing or left waiting.
+    #[test]
+    fn a_stop_right_after_a_question_batch_still_writes_it_to_history_a() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let load = |conversation_id: &str| crate::history::store::load(conversation_id, "sess-stop").ok();
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} did not happen within 10 s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let start = |provider: Arc<StopsWithBatch>| {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let ingest = ConversationIngest::start(
+                provider,
+                crate::conversation::PROVIDER_NAME,
+                id.clone(),
+                format!("/ws/{id}"),
+                true,
+                None,
+                None,
+                AgentSessionProjection::default(),
+            );
+            (ingest, id)
+        };
+        let asked = || {
+            vec![
+                opened("sess-stop"),
+                AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+                reply("t1", "Before I go on:"),
+                question_asked("q1"),
+            ]
+        };
+
+        // The ask, with the stop in the same pump.
+        let provider = Arc::new(StopsWithBatch::default());
+        let (mut ingest, id) = start(Arc::clone(&provider));
+        provider.hand_over(asked(), Some(Arc::clone(&ingest.stop)));
+        wait_for("the stop", &|| ingest.thread.as_ref().is_some_and(|t| t.is_finished()));
+        ingest.stop();
+        let stored = load(&id).expect("history A written for a question asked just before the stop");
+        assert_eq!(
+            stored.questions.len(),
+            1,
+            "the question asked just before the stop is stored"
+        );
+        assert_eq!(stored.questions[0].state, crate::QuestionState::Waiting);
+
+        // The ask written in the ordinary way, then the settle with the stop in the same pump.
+        let provider = Arc::new(StopsWithBatch::default());
+        let (mut ingest, id) = start(Arc::clone(&provider));
+        provider.hand_over(asked(), None);
+        wait_for("the question stored", &|| {
+            load(&id).is_some_and(|a| a.questions.len() == 1)
+        });
+        let answers = vec![crate::ShownAnswer {
+            question_index: 0,
+            answer: "Yes".into(),
+            notes: None,
+        }];
+        provider.hand_over(
+            vec![question_settled(
+                "q1",
+                crate::QuestionOutcome::Answered,
+                answers.clone(),
+            )],
+            Some(Arc::clone(&ingest.stop)),
+        );
+        wait_for("the stop", &|| ingest.thread.as_ref().is_some_and(|t| t.is_finished()));
+        ingest.stop();
+        let stored = load(&id).expect("history A");
+        assert_eq!(
+            stored.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: crate::QuestionOutcome::Answered,
+                answers,
+                reason: None,
+            },
+            "the question answered just before the stop is stored answered, not waiting"
+        );
+    }
+
+    /// A conversation driven through `fold_batch` and `flush_history` on the test's thread, in the order
+    /// the ingestion loop calls them: each batch is folded and written, then the history flushed.
+    struct Driven {
+        state: Mutex<IngestState>,
+        slot: Mutex<Option<String>>,
+        context: AdoptionContext,
+        reset_expected: Option<String>,
+    }
+
+    impl Driven {
+        fn new() -> Self {
+            crate::state_dirs::redirect_state_to_a_test_root();
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            Self {
+                state: Mutex::new(state()),
+                slot: Mutex::new(None),
+                context: AdoptionContext {
+                    provider_name: crate::conversation::PROVIDER_NAME,
+                    conversation_id: id.clone(),
+                    canonical_cwd: format!("/ws/{id}"),
+                    provider_advertises_resume: true,
+                },
+                reset_expected: None,
+            }
+        }
+
+        fn batch(&mut self, events: Vec<AgentDomainEvent>) {
+            self.fold(events, None);
+            flush_history(&self.state, &self.slot, &self.context);
+        }
+
+        /// One batch the provider announced as covering `through`, folded and written, history not flushed.
+        fn fold(&mut self, events: Vec<AgentDomainEvent>, through: Option<u64>) {
+            let wake: Mutex<Option<UiWake>> = Mutex::new(None);
+            fold_batch(
+                &self.state,
+                &self.slot,
+                &self.context,
+                events,
+                through,
+                &mut self.reset_expected,
+                &wake,
+            );
+        }
+
+        /// A prompt the host folds on its own thread before it sends the turn.
+        fn prompt(&mut self, text: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .fold(AgentDomainEvent::UserPromptSubmitted { text: text.into() });
+        }
+
+        fn a_bytes(&self, provider_session_id: &str) -> Vec<u8> {
+            std::fs::read(
+                crate::history::store::history_path(&self.context.conversation_id, provider_session_id).unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("history A of {provider_session_id}: {e}"))
+        }
+
+        fn a(&self, provider_session_id: &str) -> crate::history::StoredHistory {
+            crate::history::store::load(&self.context.conversation_id, provider_session_id).unwrap()
+        }
+
+        fn leased(&self, provider_session_id: &str) -> bool {
+            crate::lease::SessionLease::is_held(
+                self.context.provider_name,
+                &self.context.canonical_cwd,
+                provider_session_id,
+            )
+            .unwrap()
+        }
+
+        /// Whether the session's lease is free. A lock stays with every descriptor of the same open file, and a
+        /// process another test spawns at that moment holds a copy of ours until it has exec'd, so a lease that was
+        /// dropped can read as held for a few milliseconds: this waits out that stretch.
+        fn released(&self, provider_session_id: &str) -> bool {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while self.leased(provider_session_id) {
+                if std::time::Instant::now() >= end {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            true
+        }
+
+        fn recorded(&self, provider_session_id: &str) -> bool {
+            crate::persistence::existing_record(&self.context.conversation_id, provider_session_id).is_some()
+        }
+    }
+
+    fn opened(provider_session_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: provider_session_id.into(),
+            model: "m".into(),
+            cwd: "/ws".into(),
+        }
+    }
+
+    fn completed(turn_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn_id.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        }
+    }
+
+    fn reply(turn_id: &str, text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta {
+            turn_id: turn_id.into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        }
+    }
+
+    fn reset(new_conversation_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ConversationReset {
+            new_conversation_id: new_conversation_id.into(),
+            trigger: Some("clear".into()),
+        }
+    }
+
+    /// The old conversation: one turn of the user's, one the CLI started by itself, and a notice row.
+    fn before_clear(c: &mut Driven) {
+        c.batch(vec![opened("sess-old")]);
+        c.prompt("first");
+        c.batch(vec![
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            reply("t1", "first reply"),
+            completed("t1"),
+            AgentDomainEvent::TurnStarted {
+                turn_id: "t-cli".into(),
+            },
+            AgentDomainEvent::TurnAttributed {
+                turn_id: "t-cli".into(),
+                origin: crate::TurnOrigin::Cli,
+                cause: None,
+            },
+            AgentDomainEvent::SessionNotice {
+                kind: crate::SessionNoticeKind::Compaction,
+                level: crate::NoticeLevel::Notice,
+                content: Some("compacted".into()),
+                scalars: Default::default(),
+                task_id: None,
+                tool_use_id: None,
+                task_status: None,
+            },
+            reply("t-cli", "woken reply"),
+            completed("t-cli"),
+        ]);
+        c.prompt("/clear");
+    }
+
+    /// The new conversation's one turn, after its session opened.
+    fn one_turn_after(c: &mut Driven) {
+        c.prompt("after");
+        c.batch(vec![
+            opened("sess-new"),
+            AgentDomainEvent::TurnStarted { turn_id: "t3".into() },
+            reply("t3", "after reply"),
+            completed("t3"),
+        ]);
+    }
+
+    fn texts(history: &crate::history::StoredHistory) -> (Vec<String>, Vec<String>) {
+        (
+            history.user_prompts.iter().map(|p| p.text.clone()).collect(),
+            history.transcript.iter().map(|m| m.text.clone()).collect(),
+        )
+    }
+
+    /// `/clear` writes the old conversation's history from what it showed before the reset, and nothing
+    /// written after it reaches that file: not the `/clear` turn's own end (whether it folds before or
+    /// after the new session opens), not the new conversation's turns. The lease moves to the new
+    /// session, which gets its own record and a history holding only what came after the reset.
+    #[test]
+    fn the_old_ids_history_is_unchanged_after_clear_and_one_turn() {
+        for end_first in [false, true] {
+            let mut c = Driven::new();
+            before_clear(&mut c);
+            assert!(c.leased("sess-old"));
+            c.batch(vec![
+                AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                reset("sess-new"),
+            ]);
+            let written_at_reset = c.a_bytes("sess-old");
+            assert!(
+                c.released("sess-old"),
+                "the old session's lease is released at the reset"
+            );
+            assert_eq!(read_session_id(&c.slot), None);
+            if end_first {
+                c.batch(vec![completed("t2")]);
+                assert_eq!(
+                    c.a_bytes("sess-old"),
+                    written_at_reset,
+                    "the /clear turn's end wrote the old history"
+                );
+                c.batch(vec![opened("sess-new")]);
+            } else {
+                c.batch(vec![opened("sess-new"), completed("t2")]);
+            }
+            one_turn_after(&mut c);
+
+            assert_eq!(c.a_bytes("sess-old"), written_at_reset, "end first: {end_first}");
+            let old = c.a("sess-old");
+            assert_eq!(
+                texts(&old),
+                (
+                    vec!["first".to_string(), "/clear".to_string()],
+                    vec!["first reply".to_string(), "woken reply".to_string()]
+                )
+            );
+            assert_eq!(old.turn_starts.len(), 1, "the CLI's turn start is kept");
+            assert_eq!(old.notices.len(), 1, "the notice row is kept");
+
+            let new = c.a("sess-new");
+            assert_eq!(
+                texts(&new),
+                (vec!["after".to_string()], vec!["after reply".to_string()])
+            );
+            assert!(new.turn_starts.is_empty() && new.notices.is_empty());
+
+            assert!(c.leased("sess-new"), "the new session holds the lease");
+            assert!(c.released("sess-old"));
+            assert!(c.recorded("sess-old") && c.recorded("sess-new"));
+            assert_eq!(read_session_id(&c.slot).as_deref(), Some("sess-new"));
+            let offered: Vec<String> = crate::persistence::resumable_sessions(&c.context.conversation_id)
+                .into_iter()
+                .map(|s| s.provider_session_id)
+                .collect();
+            assert!(
+                offered.contains(&"sess-old".to_string()),
+                "the old conversation is still offered"
+            );
+            assert!(offered.contains(&"sess-new".to_string()));
+        }
+    }
+
+    /// Two `/clear`s inside one batch: each session in between gets its record before the next reset
+    /// detaches it, and only the last one keeps a lease.
+    #[test]
+    fn each_session_of_a_batch_with_two_resets_is_recorded_and_only_the_last_is_leased() {
+        let mut c = Driven::new();
+        c.batch(vec![
+            opened("sess-a"),
+            reset("sess-b"),
+            opened("sess-b"),
+            reset("sess-c"),
+            opened("sess-c"),
+        ]);
+        assert!(c.recorded("sess-a") && c.recorded("sess-b") && c.recorded("sess-c"));
+        assert!(c.a("sess-a").user_prompts.is_empty());
+        assert!(
+            c.a("sess-b").user_prompts.is_empty(),
+            "the session between the resets has its history"
+        );
+        assert!(c.released("sess-a") && c.released("sess-b"));
+        assert!(c.leased("sess-c"));
+        assert_eq!(read_session_id(&c.slot).as_deref(), Some("sess-c"));
+    }
+
+    /// The old conversation, settled and stored, with the provider position it has folded through and
+    /// the `/clear` turn started; the next batch ends in the reset.
+    #[cfg(feature = "test-support")]
+    fn settled_before_clear() -> Driven {
+        let mut c = Driven::new();
+        before_clear(&mut c);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.folded_through = 4;
+            st.history_saved_through = 4;
+        }
+        c
+    }
+
+    /// Folds the batch that ends in the reset, announced as covering position 9, on a thread of its own,
+    /// and hands `check` the conversation while that thread is held inside the old conversation's write.
+    #[cfg(feature = "test-support")]
+    fn with_the_cleared_write_held(c: &mut Driven, check: impl FnOnce(&Mutex<IngestState>)) {
+        let (reached, release) = hold_next_history_write(&c.context.conversation_id);
+        let wake: Mutex<Option<UiWake>> = Mutex::new(None);
+        let Driven {
+            state,
+            slot,
+            context,
+            reset_expected,
+        } = c;
+        let (state, slot, context) = (&*state, &*slot, &*context);
+        std::thread::scope(|scope| {
+            let folding = scope.spawn(|| {
+                fold_batch(
+                    state,
+                    slot,
+                    context,
+                    vec![
+                        AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                        reset("sess-new"),
+                    ],
+                    Some(9),
+                    reset_expected,
+                    &wake,
+                );
+            });
+            reached
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the fold reached the old conversation's write");
+            // Released whether or not the check held, so a failing check ends the test instead of
+            // leaving the folding thread waiting for good.
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(state)));
+            release.send(()).unwrap();
+            folding.join().unwrap();
+            if let Err(failure) = checked {
+                std::panic::resume_unwind(failure);
+            }
+        });
+    }
+
+    /// `/clear` detaches the old conversation and clears its dirty flag because its history is written
+    /// right after the fold, outside the lock. Until that write has returned, the saved position stays
+    /// behind the folded one; once it has, the position catches up.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn the_saved_position_waits_for_the_old_conversations_write_at_a_clear() {
+        let mut c = settled_before_clear();
+        with_the_cleared_write_held(&mut c, |state| {
+            let held = progress_of(&state.lock().unwrap());
+            assert_eq!(held.folded_through, 9);
+            assert!(!held.history_dirty, "the flag is already clear while the write is held");
+            assert!(
+                held.history_saved_through < held.folded_through,
+                "the old history is not on disk yet, so progress must not have passed it: {held:?}"
+            );
+            assert!(!held.history_save_failed);
+        });
+        let after = progress_of(&c.state.lock().unwrap());
+        assert_eq!(after.history_saved_through, after.folded_through, "{after:?}");
+        assert!(!after.history_save_failed);
+        assert_eq!(
+            texts(&c.a("sess-old")).0,
+            ["first", "/clear"],
+            "the write that was held reached the disk"
+        );
+    }
+
+    /// An old conversation whose history cannot be stored at a `/clear` leaves the failure noted and the
+    /// saved position where it was: progress never claims a write that did not happen.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_failed_write_of_the_old_conversation_at_a_clear_is_noted_and_progress_stays_behind() {
+        let mut c = settled_before_clear();
+        // A file where the conversation's history directory has to go makes the save fail.
+        let directory = crate::history::store::history_path(&c.context.conversation_id, "sess-old")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        c.fold(
+            vec![
+                AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                reset("sess-new"),
+            ],
+            Some(9),
+        );
+        let after = progress_of(&c.state.lock().unwrap());
+        assert!(after.history_save_failed, "{after:?}");
+        assert_eq!(after.folded_through, 9);
+        assert_eq!(
+            after.history_saved_through, 4,
+            "nothing past the last stored position is claimed: {after:?}"
+        );
+        assert!(
+            c.released("sess-old"),
+            "the lease is still released after a failed write"
+        );
+    }
+
+    /// A title noted for the old conversation and not yet written goes into its record, not into the
+    /// new conversation's.
+    #[test]
+    fn a_title_noted_before_clear_stays_with_the_old_conversation() {
+        let mut c = Driven::new();
+        c.batch(vec![opened("sess-old")]);
+        c.state.lock().unwrap().pending_title = Some("old title".into());
+        c.batch(vec![reset("sess-new"), opened("sess-new")]);
+        let old = crate::persistence::existing_record(&c.context.conversation_id, "sess-old").unwrap();
+        let new = crate::persistence::existing_record(&c.context.conversation_id, "sess-new").unwrap();
+        assert_eq!(old.title.as_deref(), Some("old title"));
+        assert_eq!(new.title, None);
     }
 
     fn state() -> IngestState {
@@ -1998,7 +2937,7 @@ mod history_snapshot_cost {
         let started = std::time::Instant::now();
         let kept = history_snapshot(p);
         let elapsed = started.elapsed();
-        assert!(kept.2.len() <= crate::history::HISTORY_MAX_ITEMS);
+        assert!(kept.tool_calls.len() <= crate::history::HISTORY_MAX_ITEMS);
         elapsed
     }
 
@@ -2022,12 +2961,20 @@ mod history_snapshot_cost {
 
         let (small_kept, large_kept) = (history_snapshot(&small), history_snapshot(&large));
         assert_eq!(
-            (small_kept.0.len(), small_kept.1.len(), small_kept.2.len()),
-            (large_kept.0.len(), large_kept.1.len(), large_kept.2.len()),
+            (
+                small_kept.user_prompts.len(),
+                small_kept.transcript.len(),
+                small_kept.tool_calls.len()
+            ),
+            (
+                large_kept.user_prompts.len(),
+                large_kept.transcript.len(),
+                large_kept.tool_calls.len()
+            ),
             "the snapshot kept a different amount of a session eight times the size"
         );
         assert!(
-            small_kept.2.len() < 500,
+            small_kept.tool_calls.len() < 500,
             "the session did not reach the caps, so it proves nothing"
         );
 

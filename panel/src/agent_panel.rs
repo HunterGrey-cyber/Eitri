@@ -242,9 +242,13 @@ struct AgentPanelState {
     scratch: Option<eitri_core::scratch::ScratchDir>,
     /// Edits out in nvim, polled by the tick until their marker appears.
     pending_edits: Vec<eitri_core::scratch::PendingEdit>,
+    task_commands: Vec<inbound::PendingTaskCommand>,
     /// Reviews being worked out on worker threads, polled by the tick: git never runs on the GTK
     /// thread, so the answer comes back through a channel the tick drains.
     review_jobs: Vec<PendingReview>,
+    /// Answers to Claude's questions on their way to the agent, polled by the tick: the GTK thread
+    /// never waits for the agent's reply, and the page that answered is told once it came.
+    question_sends: Vec<PendingQuestionSend>,
     /// Pending edits' proposals being read on worker threads, polled by the tick: the agent names the
     /// file, and nothing it names is opened on the GTK thread.
     proposal_jobs: Vec<PendingProposal>,
@@ -500,7 +504,9 @@ impl AgentPanelState {
             reported_tabs: Vec::new(),
             scratch,
             pending_edits: Vec::new(),
+            task_commands: Vec::new(),
             review_jobs: Vec::new(),
+            question_sends: Vec::new(),
             proposal_jobs: Vec::new(),
             review_hints: Vec::new(),
             shown_hints: Vec::new(),
@@ -1345,6 +1351,7 @@ mod tests {
         DeferredStart::FirstSend {
             request_id: request_id.to_string(),
             first_turn: FirstTurn {
+                typed_by_person: true,
                 wire: format!("wire: {text}"),
                 typed: text.to_string(),
             },

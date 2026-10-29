@@ -134,6 +134,16 @@ pub(crate) struct SteerGate<R> {
     /// out or the stream ended, with their typed text, newest last, at most [`MAX_OPEN_STEERS`]: a
     /// delivery that still comes for one is passed on.
     given_up: VecDeque<(String, String)>,
+    /// Prompts sent with `SendTurn` under a client id, with their typed text, newest last, at most
+    /// [`MAX_OPEN_STEERS`]: Claude Code may run work of its own before it reads one, and then names it
+    /// back when it does (the delivery shows this text) or drops it. Never open messages: an ordinary
+    /// turn's prompt is never named back, and its turn's end is not held for it.
+    sent: VecDeque<(String, String)>,
+    /// What the process this session was taken over from handed over (its sent prompts and the
+    /// messages it gave up on), newest last, at most twice [`MAX_OPEN_STEERS`]: a delivery that still
+    /// comes for one is passed on. Kept apart from `sent` and `given_up` so this process's own entries
+    /// neither push it out nor are pushed out by it, and only ever shrinks.
+    inherited: VecDeque<(String, String)>,
     /// The watch stream broke and has not been re-opened: no hold may give up meanwhile.
     stream_down: bool,
 }
@@ -146,6 +156,8 @@ impl<R> Default for SteerGate<R> {
             holding: None,
             generations: 0,
             given_up: VecDeque::new(),
+            sent: VecDeque::new(),
+            inherited: VecDeque::new(),
             stream_down: false,
         }
     }
@@ -171,6 +183,21 @@ impl<R> SteerGate<R> {
             })
         })?;
         Ok(now)
+    }
+
+    /// A prompt is about to be sent with `SendTurn` under `client_id`: its delivery or drop, if Claude
+    /// Code names it back, is passed on (the delivery with `as_typed`). Forgotten if the send fails.
+    pub(crate) fn note_sent(&mut self, client_id: &str, as_typed: String) {
+        self.sent.retain(|(id, _)| id != client_id);
+        if self.sent.len() >= MAX_OPEN_STEERS {
+            self.sent.pop_front();
+        }
+        self.sent.push_back((client_id.to_string(), as_typed));
+    }
+
+    /// The `SendTurn` for `client_id` failed: nothing will name it back.
+    pub(crate) fn forget_sent(&mut self, client_id: &str) {
+        self.sent.retain(|(id, _)| id != client_id);
     }
 
     /// `SteerTurn` answered: the CLI has the message. Returns the next message to send, if one waits.
@@ -216,6 +243,10 @@ impl<R> SteerGate<R> {
             } => {
                 if let Some(at) = self.open.iter().position(|s| &s.client_id == client_message_id) {
                     *text = self.open.remove(at).as_typed;
+                } else if let Some(at) = self.sent.iter().position(|(id, _)| id == client_message_id) {
+                    // A sent prompt Claude Code read after work of its own.
+                    let (_, typed) = self.sent.remove(at).expect("found above");
+                    *text = typed;
                 } else if let Some(at) = self.given_up.iter().position(|(id, _)| id == client_message_id) {
                     // Reported dropped when the wait ran out, and read after all: passed on, so the
                     // host takes back the message it held again rather than sending it twice.
@@ -223,6 +254,10 @@ impl<R> SteerGate<R> {
                     eprintln!(
                         "agent: ClaudeSidecarProvider: a message reported dropped was read after all ({client_message_id})"
                     );
+                    *text = typed;
+                } else if let Some(at) = self.inherited.iter().position(|(id, _)| id == client_message_id) {
+                    // Sent or given up on by the process this session was taken over from.
+                    let (_, typed) = self.inherited.remove(at).expect("found above");
                     *text = typed;
                 } else {
                     // Not a message this provider sent, or one already reported: folding it would add
@@ -236,6 +271,8 @@ impl<R> SteerGate<R> {
             AgentDomainEvent::UserMessageDropped { client_message_id, .. } => {
                 self.open.retain(|s| &s.client_id != client_message_id);
                 self.given_up.retain(|(id, _)| id != client_message_id);
+                self.sent.retain(|(id, _)| id != client_message_id);
+                self.inherited.retain(|(id, _)| id != client_message_id);
             }
             _ => {}
         }
@@ -328,6 +365,8 @@ impl<R> SteerGate<R> {
             // Rebuilt: a gate taken over holds nothing, so it starts counting its holds afresh.
             generations: _,
             given_up,
+            sent,
+            inherited,
             // Rebuilt: the taking side's watch is not open yet, and opening it is what says it is up.
             stream_down: _,
         } = self;
@@ -337,17 +376,26 @@ impl<R> SteerGate<R> {
         if !open.is_empty() {
             return Err(SteerBusy::Open);
         }
-        Ok(given_up.iter().cloned().collect())
+        // A sent prompt Claude Code may still name back travels with the messages given up on: the
+        // taking side passes either one's delivery on with its text. The taking side keeps the newest,
+        // so the order is oldest first: what an earlier process handed here, then this process's own
+        // sent prompts, then the ones it gave up on. `sent` fills up with ordinary prompts nobody names
+        // back, and a message reported dropped that is then read must not be lost to them, or the host
+        // would send it a second time.
+        Ok(inherited.iter().chain(sent).chain(given_up).cloned().collect())
     }
 
-    /// The gate of a session taken over from another process: nothing open or held, and the messages
-    /// that process had given up on, so a delivery that still comes for one is passed on there too.
+    /// The gate of a session taken over from another process: nothing open or held, and the prompts
+    /// that process sent and the messages it had given up on, so a delivery that still comes for one
+    /// is passed on there too.
     /// Only a move takes a session over, and moves exist only on Linux.
     #[cfg(target_os = "linux")]
-    pub(crate) fn taken_over(given_up: Vec<(String, String)>) -> Self {
+    pub(crate) fn taken_over(handed: Vec<(String, String)>) -> Self {
         let mut gate = Self::default();
-        let skip = given_up.len().saturating_sub(MAX_OPEN_STEERS);
-        gate.given_up = given_up.into_iter().skip(skip).collect();
+        // Two bounded lists of the giving process travel in a hand-over, behind what it inherited
+        // itself; keeping the newest two lists' worth keeps all of the giving process's own.
+        let skip = handed.len().saturating_sub(2 * MAX_OPEN_STEERS);
+        gate.inherited = handed.into_iter().skip(skip).collect();
         gate
     }
 
@@ -769,6 +817,136 @@ mod tests {
         assert_eq!(
             taker.pass(delivered("a", "t2")).ready,
             [delivered_as("a", "t2", "typed")]
+        );
+    }
+
+    #[test]
+    fn a_sent_prompt_named_back_carries_its_typed_text_once() {
+        let mut gate = Gate::default();
+        gate.note_sent("p1", "typed prompt".into());
+        assert_eq!(
+            gate.pass(delivered("p1", "t1")).ready,
+            [delivered_as("p1", "t1", "typed prompt")]
+        );
+        assert!(
+            gate.pass(delivered("p1", "t2")).ready.is_empty(),
+            "a second delivery would add a prompt row nobody typed again"
+        );
+    }
+
+    #[test]
+    fn a_sent_prompt_whose_send_failed_or_that_was_dropped_is_not_folded_later() {
+        let mut gate = Gate::default();
+        gate.note_sent("failed", "a".into());
+        gate.forget_sent("failed");
+        assert!(
+            gate.pass(delivered("failed", "t1")).ready.is_empty(),
+            "the CLI never had it"
+        );
+
+        gate.note_sent("dropped", "b".into());
+        assert_eq!(
+            gate.pass(drop_of("dropped", "cancelled")).ready,
+            [drop_of("dropped", "cancelled")]
+        );
+        assert!(
+            gate.pass(delivered("dropped", "t1")).ready.is_empty(),
+            "already reported dropped"
+        );
+    }
+
+    #[test]
+    fn sent_prompts_are_bounded_and_the_oldest_goes_first() {
+        let mut gate = Gate::default();
+        for n in 0..=MAX_OPEN_STEERS {
+            gate.note_sent(&format!("p{n}"), format!("typed {n}"));
+        }
+        assert!(
+            gate.pass(delivered("p0", "t1")).ready.is_empty(),
+            "the oldest was let go"
+        );
+        assert_eq!(
+            gate.pass(delivered("p1", "t1")).ready,
+            [delivered_as("p1", "t1", "typed 1")]
+        );
+        // Sending one again moves it to the newest place rather than holding two records.
+        gate.note_sent("p2", "typed again".into());
+        assert_eq!(
+            gate.pass(delivered("p2", "t1")).ready,
+            [delivered_as("p2", "t1", "typed again")]
+        );
+    }
+
+    #[test]
+    fn a_hand_over_carries_the_sent_prompts() {
+        let mut gate = Gate::default();
+        gate.note_sent("p1", "typed".into());
+        assert_eq!(gate.hand_over(), Ok(vec![("p1".to_string(), "typed".to_string())]));
+    }
+
+    /// Ordinary prompts are never named back, so `sent` stays full in a long session; a message given
+    /// up on must still reach the taking side, or its late delivery is ignored there and the host sends
+    /// it a second time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_message_given_up_on_survives_a_hand_over_beside_a_full_list_of_sent_prompts() {
+        let mut gate = Gate::default();
+        for n in 0..MAX_OPEN_STEERS {
+            gate.note_sent(&format!("p{n}"), String::new());
+        }
+        gate.open("steer", "typed steer".into(), "req").unwrap();
+        gate.accepted("steer");
+        let generation = gate.pass(completed("t1")).hold_started.unwrap();
+        gate.expire(generation);
+
+        let mut taker: Gate = SteerGate::taken_over(gate.hand_over().unwrap());
+        assert_eq!(
+            taker.pass(delivered("steer", "t2")).ready,
+            [delivered_as("steer", "t2", "typed steer")]
+        );
+        assert_eq!(
+            taker.pass(delivered("p0", "t2")).ready,
+            [delivered_as("p0", "t2", "")],
+            "the oldest sent prompt travels too"
+        );
+    }
+
+    /// A session moved twice: what the first process handed over fills a whole bound, and the second
+    /// process's own prompts are newer than all of it, so they must reach the third.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_hand_over_keeps_the_middle_process_own_prompts_over_older_inherited_ones() {
+        let handed: Vec<_> = (0..2 * MAX_OPEN_STEERS)
+            .map(|n| (format!("old{n}"), format!("old typed {n}")))
+            .collect();
+        let mut middle: Gate = SteerGate::taken_over(handed);
+        middle.note_sent("mine", "typed here".into());
+        middle.open("steer", "typed steer".into(), "req").unwrap();
+        middle.accepted("steer");
+        let generation = middle.pass(completed("t1")).hold_started.unwrap();
+        middle.expire(generation);
+
+        let mut last: Gate = SteerGate::taken_over(middle.hand_over().unwrap());
+        assert_eq!(
+            last.pass(delivered("mine", "t2")).ready,
+            [delivered_as("mine", "t2", "typed here")],
+            "a prompt sent between the two moves"
+        );
+        assert_eq!(
+            last.pass(delivered("steer", "t2")).ready,
+            [delivered_as("steer", "t2", "typed steer")],
+            "a message given up on between the two moves"
+        );
+        assert!(
+            last.pass(delivered("old0", "t2")).ready.is_empty(),
+            "the oldest inherited entries make room"
+        );
+        let newest = 2 * MAX_OPEN_STEERS - 1;
+        let (id, typed) = (format!("old{newest}"), format!("old typed {newest}"));
+        assert_eq!(
+            last.pass(delivered(&id, "t2")).ready,
+            [delivered_as(&id, "t2", &typed)],
+            "the newest inherited entries stay"
         );
     }
 }

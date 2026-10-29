@@ -108,6 +108,7 @@ fn a_queued_message_goes_out_after_an_interrupt() {
         .send_turn(
             "Count slowly from 1 to 300, one number per line, with no other text.",
             "count",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -120,6 +121,7 @@ fn a_queued_message_goes_out_after_an_interrupt() {
         "Now reply with exactly QUEUED-OK and nothing else.".into(),
         1,
         true,
+        agent::PromptOrigin::Composed,
     )
     .unwrap();
     match set.send_now(tab, "", String::new(), 2).unwrap() {
@@ -162,6 +164,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
         .send_turn(
             "Use the Bash tool to run `uname -s` and tell me its output in one word.",
             "uname",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -245,7 +248,7 @@ fn deny_the_next_card(
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, label)
+        .send_turn(prompt, label, agent::PromptOrigin::Composed)
         .map_err(|e| e.message)
         .unwrap();
     pump_until(set, dir, label, |set, _| {
@@ -307,7 +310,7 @@ fn the_cli_decides(set: &mut TabSet, dir: &std::path::Path, tab: eitri_core::tab
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, command)
+        .send_turn(prompt, command, agent::PromptOrigin::Composed)
         .map_err(|e| e.message)
         .unwrap();
     // Until this turn reports its end: right after the send it has not started, so `turn_running`
@@ -348,6 +351,7 @@ fn auto_offers_bash_on(kind: BackendKind, label: &str) {
         .send_turn(
             "Use the Bash tool to run `ls` in the current directory and tell me the file names.",
             "ls",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();

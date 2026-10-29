@@ -298,6 +298,8 @@ pub trait HostReads {
 /// names, and whether its tabs can close now.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatKillCounts {
+    /// Tabs with live non-ambient background work.
+    pub background: usize,
     pub running: usize,
     pub queued: usize,
     pub tab: Option<String>,

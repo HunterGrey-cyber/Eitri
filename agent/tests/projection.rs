@@ -407,6 +407,8 @@ fn ended(turn_id: &str, outcome: TurnOutcome, detail: TurnEndDetail) -> AgentDom
 #[test]
 fn a_turn_that_did_not_complete_is_an_item_where_it_ended() {
     let failed = TurnEndDetail {
+        origin_kind: None,
+        num_turns: None,
         reason: Some("api_error".into()),
         api_error_status: Some(529),
         message: Some("API Error: 529 Overloaded".into()),
@@ -1266,6 +1268,9 @@ fn every_seq_is_strictly_below_the_revision_a_snapshot_would_report() {
         .chain(projection.pending_permissions.values().map(|p| p.seq))
         .chain(projection.turn_endings.iter().map(|e| e.seq))
         .chain(projection.thinking.iter().map(|t| t.seq))
+        .chain(projection.turn_starts.iter().map(|r| r.seq))
+        .chain(projection.notices.iter().map(|r| r.seq))
+        .chain(projection.questions.iter().map(|r| r.seq))
         .max()
         .unwrap();
     assert!(
@@ -1304,6 +1309,9 @@ fn no_single_event_ever_creates_more_than_one_item() {
             .chain(projection.pending_permissions.values().map(|p| p.seq))
             .chain(projection.turn_endings.iter().map(|e| e.seq))
             .chain(projection.thinking.iter().map(|t| t.seq))
+            .chain(projection.turn_starts.iter().map(|r| r.seq))
+            .chain(projection.notices.iter().map(|r| r.seq))
+            .chain(projection.questions.iter().map(|r| r.seq))
             .collect();
         let before_dedup = seqs.len();
         seqs.sort_unstable();
@@ -1361,7 +1369,7 @@ fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
 /// (a tool call and its completion; a permission and its resolution; text on both sides of the
 /// break a tool call forces).
 fn every_event_variant() -> Vec<AgentDomainEvent> {
-    vec![
+    let mut events = vec![
         AgentDomainEvent::SessionOpened {
             session_id: "sess-1".into(),
             provider_session_id: "prov-1".into(),
@@ -1495,7 +1503,56 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
             client_message_id: "eitri-1-2".into(),
             reason: "the turn ended before the agent read it".into(),
         },
-    ]
+        AgentDomainEvent::TurnAttributed {
+            turn_id: "t1".into(),
+            origin: agent::TurnOrigin::Cli,
+            cause: Some(agent::TurnCause::of_kind(agent::TurnCauseKind::Unknown)),
+        },
+        AgentDomainEvent::SessionNotice {
+            kind: agent::SessionNoticeKind::ModelFallback,
+            level: agent::NoticeLevel::Warning,
+            content: Some("switched model".into()),
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        },
+        AgentDomainEvent::QuestionAsked {
+            interaction_id: "q-1".into(),
+            tool_use_id: Some("tu-q".into()),
+            questions: vec![],
+            unsupported_reason: None,
+        },
+        AgentDomainEvent::QuestionSettled {
+            interaction_id: "q-1".into(),
+            outcome: agent::QuestionOutcome::Declined,
+            answers: vec![],
+            reason: None,
+        },
+        AgentDomainEvent::CliWorkUnseen,
+        AgentDomainEvent::UserPromptWithdrawn,
+    ];
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/protocol-322.json")).unwrap();
+    let additions: Vec<AgentDomainEvent> = serde_json::from_value(fixture["domain_events"].clone()).unwrap();
+    events.extend(additions.into_iter().filter(|event| {
+        matches!(
+            event,
+            AgentDomainEvent::TurnCauseUpdated { .. }
+                | AgentDomainEvent::CliCycleStarted { .. }
+                | AgentDomainEvent::BackgroundTasksChanged { .. }
+                | AgentDomainEvent::TaskEvent { .. }
+                | AgentDomainEvent::ConversationReset { .. }
+                | AgentDomainEvent::SubagentFrame { .. }
+                | AgentDomainEvent::SessionNotice {
+                    kind: agent::SessionNoticeKind::ApiRetry
+                        | agent::SessionNoticeKind::Compacting
+                        | agent::SessionNoticeKind::Notification,
+                    ..
+                }
+        )
+    }));
+    events
 }
 
 /// A name per variant, for the assertion messages -- and, more usefully, an exhaustive `match` with
@@ -1536,6 +1593,18 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::UserMessageDelivered { .. } => "UserMessageDelivered",
         AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
         AgentDomainEvent::MoveSeeded(_) => "MoveSeeded",
+        AgentDomainEvent::TurnAttributed { .. } => "TurnAttributed",
+        AgentDomainEvent::SessionNotice { .. } => "SessionNotice",
+        AgentDomainEvent::QuestionAsked { .. } => "QuestionAsked",
+        AgentDomainEvent::QuestionSettled { .. } => "QuestionSettled",
+        AgentDomainEvent::CliWorkUnseen => "CliWorkUnseen",
+        AgentDomainEvent::UserPromptWithdrawn => "UserPromptWithdrawn",
+        AgentDomainEvent::TurnCauseUpdated { .. } => "TurnCauseUpdated",
+        AgentDomainEvent::CliCycleStarted { .. } => "CliCycleStarted",
+        AgentDomainEvent::BackgroundTasksChanged { .. } => "BackgroundTasksChanged",
+        AgentDomainEvent::TaskEvent { .. } => "TaskEvent",
+        AgentDomainEvent::ConversationReset { .. } => "ConversationReset",
+        AgentDomainEvent::SubagentFrame { .. } => "SubagentFrame",
     }
 }
 
@@ -1756,6 +1825,8 @@ fn thinking_open_after_says_what_apply_does() {
             client_message_id: "eitri-1-2".into(),
             reason: "the turn ended before the agent read it".into(),
         },
+        AgentDomainEvent::CliWorkUnseen,
+        AgentDomainEvent::UserPromptWithdrawn,
     ];
     for open in [true, false] {
         for event in &events {

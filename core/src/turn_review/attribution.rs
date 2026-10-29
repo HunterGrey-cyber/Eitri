@@ -76,7 +76,12 @@ impl Origin {
 pub fn named_paths(tool_calls: &[agent::ToolCallRecord], turn_ids: &[&str]) -> NamedPaths {
     let mut named = NamedPaths::default();
     for call in tool_calls {
-        if !turn_ids.contains(&call.turn_id.as_str()) {
+        if let Some(children) = &call.children {
+            let child_named = named_paths(&children.tool_calls, turn_ids);
+            named.paths.extend(child_named.paths);
+            named.pending_no_result += child_named.pending_no_result;
+        }
+        if call.background || !turn_ids.contains(&call.turn_id.as_str()) {
             continue;
         }
         let kind = match call_kind(&call.name) {
@@ -214,6 +219,8 @@ mod tests {
 
     fn call(turn: &str, name: &str, input: serde_json::Value, result: Option<bool>) -> ToolCallRecord {
         ToolCallRecord {
+            children: None,
+            background: false,
             seq: 0,
             turn_id: turn.into(),
             tool_use_id: format!("tu-{name}-{turn}"),
@@ -456,5 +463,26 @@ mod tests {
             Some(false),
         )];
         assert_eq!(named_paths(&calls, &["t1"]).paths, set(&["/p/a.rs"]));
+    }
+    #[test]
+    fn foreground_edits_nested_under_agent_calls_are_named() {
+        let mut edit = call("t1", "Write", json!({ "file_path": "child.txt" }), Some(false));
+        edit.background = false;
+        let mut nested = call("t1", "Agent", json!({}), Some(false));
+        nested.tool_use_id = "nested".into();
+        nested
+            .children
+            .get_or_insert_with(Default::default)
+            .tool_calls
+            .push(edit);
+        let mut parent = call("t1", "Agent", json!({}), Some(false));
+        parent
+            .children
+            .get_or_insert_with(Default::default)
+            .tool_calls
+            .push(nested);
+        let named = named_paths(&[parent], &["t1"]);
+        assert_eq!(named.paths, set(&["child.txt"]));
+        assert_eq!(named.pending_no_result, 0);
     }
 }

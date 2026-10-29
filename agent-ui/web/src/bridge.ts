@@ -4,13 +4,22 @@ import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
 import type { ProposedChange } from "./proposal";
 
+export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
+
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
   | { type: "send_message"; request_id: string; tab: TabId; text: string }
+  | { type: "question_answer"; request_id: string; tab: TabId; interaction_id: string; answers: QuestionAnswerWire[] }
+  | { type: "question_decline"; request_id: string; tab: TabId; interaction_id: string; kind: "cancel" | "chat"; so_far?: QuestionAnswerWire[] }
+  | { type: "question_draft"; request_id: string; tab: TabId; interaction_id: string; draft: unknown }
+  | { type: "edit_question_other"; request_id: string; tab: TabId; interaction_id: string; question_index: number; text: string }
   | { type: "interrupt"; request_id: string; tab: TabId }
-  /** The confirmed `<leader>k`: stop what the tab's agent left running, which ends its session. `running` is
+  /** The confirmed `<leader>k`: stop what the tab's agent left running: a Claude tab stops each live task and keeps its
+   *  session, another agent's tab ends its session. `running` is
    *  the count the question named; Rust stops nothing when the tab's count is another by then. */
   | { type: "stop_background"; request_id: string; tab: TabId; running: number }
+  | { type: "stop_task"; request_id: string; tab: TabId; task_id: string }
+  | { type: "task_output"; request_id: string; tab: TabId; task_id: string }
   /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
@@ -207,6 +216,19 @@ export function nextRequestId(): string {
   return `req-${requestCounter}`;
 }
 
+const MIRROR_PREFIX = "mirror-";
+/** The id of a mirror (`draft`, `question_draft`): a copy of what the page holds, kept by Rust so a reload or a
+ *  switch finds it again. Rust answers a mirror only to refuse it, and nothing on the page waits for that answer,
+ *  so the id itself says what it was: a refusal can arrive after the dock or the tab that sent it is gone, and a
+ *  table of mirrors in flight would grow with every one Rust took without a word. */
+export function nextMirrorId(): string {
+  requestCounter += 1;
+  return `${MIRROR_PREFIX}${requestCounter}`;
+}
+export function isMirrorRequest(requestId: string): boolean {
+  return requestId.startsWith(MIRROR_PREFIX);
+}
+
 export function postToRust(message: OutboundMessage): void {
   const handler = window.webkit?.messageHandlers?.eitriAgent;
   if (!handler) {
@@ -222,6 +244,8 @@ type InboundHandler = (
     /** `message` is the shell's own one-line word on what it did (`sent`, `queued: ...`), where it has one. */
     | { kind: "command_result"; requestId: string; ok: true; message?: string }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
+    /** Plain text: render through revealHidden, never as Markdown or HTML. */
+    | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean }
     | {
         kind: "events";
         tab: TabId;
@@ -359,6 +383,8 @@ type InboundHandler = (
     /** Companion mode only (never sent by the one-window mode): where the panel stands with the
      *  editor beside it. Window-scoped. `serialize_editor_link_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "editor_link"; state: EditorLinkState; text: string }
+    /** A question's typed answer as it came back from nvim (Ctrl+G in the question dock). */
+    | { kind: "question_other_edited"; tab: TabId; interaction_id: string; question_index: number; text: string }
     /** Whether the scratch-editor round trip currently has this tab's draft open in nvim. */
     | { kind: "scratch"; tab: TabId; editing: boolean }
     /** The footer's transient line, from Rust -- e.g. a `gf` refusal. */
@@ -439,6 +465,8 @@ export function installDispatch(handler: InboundHandler): void {
       if (
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
+        obj.kind === "task_output_result" ||
+        obj.kind === "question_other_edited" ||
         obj.kind === "events" ||
         obj.kind === "snapshot" ||
         obj.kind === "handoff" ||

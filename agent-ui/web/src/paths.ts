@@ -81,6 +81,9 @@ export function pathsIn(item: TimelineItem): PathRef[] {
       return prosePaths(item.text);
     case "run":
     case "ending":
+    // A notice names no file it is about.
+    case "wake":
+    case "notice":
     // A thought names files it was considering, not ones it is about; `gf` there would open
     // something the row does not even show while folded.
     case "thinking":
@@ -114,6 +117,9 @@ export function viewText(item: TimelineItem): { title: string; text: string } {
       return { title: "tool calls", text: primaryText(item) };
     case "ending":
       return { title: "turn ending", text: primaryText(item) };
+    case "wake":
+    case "notice":
+      return { title: "notice", text: primaryText(item) };
     case "thinking":
       // Fenced: the scratch buffer is markdown, and a thought is plain text.
       return { title: "thinking", text: fenced(item.block.text) };

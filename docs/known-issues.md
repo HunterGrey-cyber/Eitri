@@ -188,6 +188,21 @@ one-window mode.
   The startup diagnostic says Claude Code's system prompt is unavailable and names the required backend revision;
   if `EITRI_VERDANDI_CHECKOUT` or `EITRI_SIDECAR_BINARY` selects an older backend, point that override at a backend
   built for the named revision. Otherwise, run `eitri setup`.
+- **Closing a Claude tab ends its scheduled wake-ups and cron tasks without asking.** They fire while the tab stays
+  open. Closing the tab, its view or the window asks first while background tasks run or a question waits, but Eitri
+  has no list of scheduled jobs yet, so it neither counts them nor warns that they will not fire. (Claude Code keeps
+  a cron task after its session ends only when it was told to keep it across sessions.)
+- **A background subagent's permission card can be out of sight.** It is drawn at the top of the subagent's turn,
+  above the subagent's row. While a question box is open the card may be scrolled out of view, and only the tab's
+  `⚑` count shows that it waits.
+- **Some reports about background tasks show only Claude Code's bare words.** When Claude Code reports on a task in a
+  way Eitri does not recognise yet (a stopped shell, a workflow's agents), the row shows the words Claude Code sent,
+  often just the task's description, without saying what happened to the task.
+- **Right after `/clear`, an empty highlighted block can stay in the middle of the empty view.** It goes away when
+  the next turn draws.
+- **In a narrow chat pane (about 320 pixels) the status line is cut short.** The panel's mode shows as a single
+  letter (`I`, `B`), the permission mode's name is cut off (`bypass permission`), and the activity line's spinner
+  sits on a line of its own.
 
 ## Codex and ACP tabs
 

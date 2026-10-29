@@ -94,7 +94,8 @@ describe("the changed input, applied", () => {
   });
 
   it("a turn's end forgets a held change", () => {
-    let state = applyEvent(initialState(), changed("toolu_a", cmd("y")));
+    let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t" });
+    state = applyEvent(state, changed("toolu_a", cmd("y")));
     state = applyEvent(state, { type: "turn_completed", turn_id: "t", outcome: "completed", result_text: "", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } } as AgentDomainEvent);
     expect(state.changedInputsBeforeTheirCall).toEqual([]);
   });

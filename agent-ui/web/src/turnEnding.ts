@@ -30,8 +30,8 @@ export function resetTimeText(resetsAt: number, now: Date = new Date()): string 
 /** The row's one line, in plain words, for a turn that did not complete. The provider's own message follows
  *  after a colon when it said anything; it is shown as it came (Rust already trimmed and capped it), and
  *  nothing here reads a reset time out of it -- if the CLI wrote one into its text, it is in the text.
- *  `resetsAt` is the reset time the ending kept from the account's limit reports, when the agent gave one (Codex
- *  does, Claude Code does not): a turn stopped by the usage limit says when it ends. `ranFor` is how long the
+ *  `resetsAt` is the reset time the ending kept from the account's limit reports, when Codex or Claude Code
+ *  gave one: a turn stopped by the usage limit says when it ends. `ranFor` is how long the
  *  turn ran, already worded (`formatDuration`), when Rust stamped it: ` after 12s` follows the headline. */
 export function turnEndingText(ending: Wording, resetsAt: number | null = null, ranFor: string | null = null): string {
   const message = ending.message !== null && ending.message !== "" ? `: ${ending.message}` : "";
@@ -39,6 +39,7 @@ export function turnEndingText(ending: Wording, resetsAt: number | null = null, 
   const after = ranFor === null ? "" : ` after ${ranFor}`;
   const tail = `${after}${message}`;
   const reason = ending.reason ?? "";
+  if (reason === "no_result") return `the turn did not finish: Claude Code went idle without a result${after}`;
   switch (ending.kind) {
     case "interrupted":
       return `interrupted${after}`;
@@ -73,6 +74,7 @@ export function turnEndingText(ending: Wording, resetsAt: number | null = null, 
 /** The band's few words for the latest ending; the row has the detail. */
 export function turnEndingBandText(ending: Wording): string {
   const reason = ending.reason ?? "";
+  if (reason === "no_result") return "turn did not finish";
   switch (ending.kind) {
     case "interrupted":
       return "interrupted";

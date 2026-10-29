@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { ActivityLine } from "./ActivityLine";
-import { initialState } from "../reducer";
-import type { AgentUiState } from "../types";
+import { applyEvent, initialState } from "../reducer";
+import protocol322 from "../fixtures/protocol-322.json";
+import type { AgentDomainEvent, AgentUiState } from "../types";
 
 afterEach(cleanup);
 const running = (over: Partial<AgentUiState>): AgentUiState => ({ ...initialState(), status: { kind: "running" }, ...over });
@@ -126,4 +127,54 @@ it("draws a hidden character in the waiting card's tool name as an escape", () =
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool={"mcp__x__‮evil"} />,
   );
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — j to it, a / d alone");
+});
+
+it("names a folded CLI turn's cause in the activity slot", () => {
+  const state = (protocol322.domain_events.slice(0, 2) as AgentDomainEvent[]).reduce(applyEvent, running({}));
+  const { container } = render(<ActivityLine state={state} canInterrupt onInterrupt={vi.fn()} />);
+  // The interrupt key stands at the line's right edge, so the cause leaves no separator hanging after it.
+  expect(container.querySelector(".turn-activity")?.textContent).toBe("Claude Code is handling: due");
+  expect(container.querySelectorAll(".activity-line")).toHaveLength(1);
+});
+
+it("shows retry facts and compaction elapsed in the one activity slot", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-28T08:00:00Z"));
+  try {
+    let state = applyEvent(running({ activeTurnId: "t" }), { type: "session_notice", kind: "api_retry", level: "warning",
+      task_id: null, tool_use_id: null, task_status: null, content: null, scalars: { error_kind: "overloaded", retry_delay_ms: 8000, attempt: 2, max_retries: 10 } });
+    const { container, rerender } = render(<ActivityLine state={state} canInterrupt onInterrupt={vi.fn()} />);
+    expect(container.querySelector(".turn-activity")?.textContent).toBe("overloaded · Retrying in 8s · attempt 2/10");
+    expect(container.querySelector("button.stop")?.textContent).toBe("ctrl+c interrupt");
+    state = applyEvent(state, { type: "content_delta", turn_id: "t", kind: "text", text: "back" });
+    state = applyEvent(state, { type: "session_notice", kind: "compacting", level: "notice", content: null, scalars: {}, task_id: null, tool_use_id: null, task_status: null });
+    rerender(<ActivityLine state={state} canInterrupt onInterrupt={vi.fn()} />);
+    act(() => vi.advanceTimersByTime(8000));
+    expect(container.querySelector(".turn-activity")?.textContent).toBe("Compacting conversation… 0m 08s");
+    rerender(<ActivityLine state={{ ...state, status: { kind: "closed", reason: "gone" } }} canInterrupt onInterrupt={vi.fn()} />);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+it("uses 24-hour times and cancel while a live turn waits at the usage limit", () => {
+  const resetsAt = new Date(2026, 9, 28, 15, 45).getTime() / 1000;
+  const state = running({ activeTurnId: "t", accountLimits: { usedPercent: 100, windowMinutes: null, resetsAt, plan: null } });
+  const { container } = render(<ActivityLine state={state} canInterrupt onInterrupt={vi.fn()} />);
+  expect(container.querySelector(".turn-activity")?.textContent).toBe("Usage limit reached · limit resets 15:45 · continuing automatically at 15:45");
+  expect(container.querySelector("button.stop")?.textContent).toBe("ctrl+c cancel");
+});
+
+it("shows the tasks line only while idle and opens tasks on activation", () => {
+  const state = applyEvent(running({}), { type: "background_tasks_changed", tasks: [
+    { task_id: "s", run_id: null, kind: "shell", task_type: "local_bash", description: "serve", subagent_type: null,
+      parent_task_id: null, tool_use_id: null, ambient: false, workflow_name: null },
+  ] });
+  const open = vi.fn();
+  const { container, rerender } = render(<ActivityLine state={state} canInterrupt onInterrupt={vi.fn()} onOpenTasks={open} />);
+  expect(container.querySelector('[data-nav-stop="status"]')?.textContent).toBe("⏵ 1 shell · /tasks");
+  fireEvent.click(container.querySelector("button")!);
+  expect(open).toHaveBeenCalledOnce();
+  rerender(<ActivityLine state={{ ...state, activeTurnId: "t" }} canInterrupt onInterrupt={vi.fn()} onOpenTasks={open} />);
+  expect(container.querySelector(".tasks-line")).toBeNull();
+  expect(container.querySelectorAll(".activity-line")).toHaveLength(1);
 });

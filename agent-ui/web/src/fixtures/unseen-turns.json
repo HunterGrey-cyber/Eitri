@@ -1,0 +1,1760 @@
+{
+  "cases": [
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "The tests passed in the background.",
+            "stop_reason": null,
+            "turn_id": "unknown-turn",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "content": null,
+            "kind": "unseen_turn",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "kind": "text",
+            "text": "The tests passed in the background.",
+            "turn_id": "unknown-turn",
+            "type": "content_delta"
+          },
+          {
+            "turn_id": "unknown-turn",
+            "type": "assistant_message_boundary"
+          },
+          {
+            "kind": "text",
+            "text": " and the fix is in",
+            "turn_id": "t1",
+            "type": "content_delta"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "name": "foreign_while_running_with_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "notices": [
+            {
+              "content": null,
+              "kind": "unseen_turn",
+              "level": "notice",
+              "scalars": {},
+              "seq": 5,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "openingPromptSeq": 1,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            },
+            {
+              "seq": 6,
+              "text": "The tests passed in the background."
+            },
+            {
+              "seq": 8,
+              "text": " and the fix is in"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "failed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "unknown-turn",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "foreign_while_running_without_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "openingPromptSeq": 1,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "failed",
+            "result_text": "The build is green.",
+            "stop_reason": null,
+            "turn_id": "unknown-turn",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "content": null,
+            "kind": "unseen_turn",
+            "level": "notice",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "kind": "text",
+            "text": "The build is green.",
+            "turn_id": "unknown-turn",
+            "type": "content_delta"
+          },
+          {
+            "turn_id": "unknown-turn",
+            "type": "assistant_message_boundary"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "name": "foreign_none_running_with_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "notices": [
+            {
+              "content": null,
+              "kind": "unseen_turn",
+              "level": "notice",
+              "scalars": {},
+              "seq": 6,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            },
+            {
+              "seq": 7,
+              "text": "The build is green."
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "failed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "unknown-turn",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "name": "foreign_none_running_without_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 6,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "own_turn_with_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "own_turn_without_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "failed",
+            "result_text": "API Error: 500",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "own_turn_failed_with_text",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "failed",
+              "message": null,
+              "reason": null,
+              "resetsAt": null,
+              "seq": 4,
+              "turnId": "t1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "deploy to production",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Blocked by the deploy guard: production deploys need a ticket‮.",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "content": "Blocked by the deploy guard: production deploys need a ticket‮.",
+            "kind": "hook_block",
+            "level": "warning",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 5
+      },
+      "name": "hook_blocked_prompt",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "notices": [
+            {
+              "content": "Blocked by the deploy guard: production deploys need a ticket‮.",
+              "kind": "hook_block",
+              "level": "warning",
+              "scalars": {},
+              "seq": 4,
+              "taskId": null,
+              "taskStatus": null,
+              "toolUseId": null
+            }
+          ],
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "deploy to production"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 5,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "/compact",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Compacted. ctrl+o to see full summary",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "compact_answers_without_a_reply",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "/compact"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "type": "cli_work_unseen"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 6
+      },
+      "name": "cli_work_unseen",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "cliUnseenBusy": true,
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 6,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "type": "cli_work_unseen"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "unknown-turn",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "cli_work_unseen_then_its_end",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "type": "cli_work_unseen"
+          },
+          {
+            "reason": "closed",
+            "type": "session_closed"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "cli_work_unseen_then_the_session_closes",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "closed",
+            "reason": "closed"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "type": "cli_work_unseen"
+          },
+          {
+            "reason": "the sidecar exited",
+            "type": "session_unavailable"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "cli_work_unseen_then_the_session_is_lost",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "unavailable",
+            "reason": "the sidecar exited"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "type": "cli_work_unseen"
+          },
+          {
+            "attached_provider_session_id": null,
+            "detail": null,
+            "forked": false,
+            "requested_provider_session_id": "prov-0",
+            "status": "rejected",
+            "type": "resume_outcome"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "cli_work_unseen_then_a_resume_that_did_not_attach",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "unavailable",
+            "reason": "the provider does not have session prov-0 any more, so that conversation cannot be continued. Start a new session instead."
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Looking at it",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "Looking at it",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "text": "and the docs",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "type": "user_prompt_withdrawn"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 7
+      },
+      "name": "withdrawn_after_an_undelivered_prompt",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Looking at it"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "client_message_id": "eitri-1-1",
+            "text": "and the docs",
+            "turn_id": "t1",
+            "type": "user_message_delivered"
+          },
+          {
+            "type": "user_prompt_withdrawn"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 4
+      },
+      "name": "withdrawn_after_a_delivered_one",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "delivered": true,
+              "seq": 2,
+              "text": "and the docs"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "type": "user_prompt_withdrawn"
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 2
+      },
+      "name": "withdrawn_with_none",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 2,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    }
+  ],
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_unseen_turns_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

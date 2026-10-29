@@ -1,0 +1,7 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Run both steps"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"msg-a1","content":[{"type":"tool_use","id":"first","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"first","content":"done"}]}}
+{"type":"attachment","uuid":"steer-1","attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"text","text":"Also "},{"type":"text","text":"check status"}]}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"msg-a2","content":[{"type":"tool_use","id":"second","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"r2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"second","content":"done"}]}}
+{"type":"assistant","uuid":"a3","message":{"role":"assistant","id":"reply-1","content":[{"type":"text","text":"Done"}]}}

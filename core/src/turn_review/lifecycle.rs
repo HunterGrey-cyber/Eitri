@@ -1059,7 +1059,24 @@ impl TurnReview {
                 self.start_turn(tab, turn_id, now_ms, false);
             }
             AgentDomainEvent::ToolCallStarted { turn_id, .. } => self.tool_started(tab, turn_id),
-            AgentDomainEvent::TurnCompleted { .. } => {
+            // Only a child call in the still-running turn can affect its snapshot timing.
+            AgentDomainEvent::SubagentFrame { frame, .. } => {
+                let mut inner = frame.as_ref();
+                while let AgentDomainEvent::SubagentFrame { frame, .. } = inner {
+                    inner = frame;
+                }
+                if let AgentDomainEvent::ToolCallStarted { turn_id, .. } = inner {
+                    self.tool_started(tab, turn_id);
+                } else {
+                    return;
+                }
+            }
+            // Only the end of the turn this tab is running ends its record: Claude Code may end a turn
+            // of its own that the panel never saw start, while the panel's turn runs on or none does.
+            AgentDomainEvent::TurnCompleted { turn_id, .. } => {
+                if self.active_turn_id(tab).as_deref() != Some(turn_id.as_str()) {
+                    return;
+                }
                 self.mark_left_running(tab);
                 self.end_active(tab, now_ms, false)
             }

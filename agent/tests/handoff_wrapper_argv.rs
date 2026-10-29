@@ -19,8 +19,22 @@
 //! happens to equal today's — this is a guard on the command, not on which function built it, and
 //! the wrapper's own comment says so rather than claiming otherwise.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
+
+/// Writes an executable script through a child process. Written from this process, the file's write
+/// descriptor would be open here while a test on another thread forks; the forked child holds it until
+/// it execs, and running the script meanwhile fails with `ETXTBSY` ("Text file busy").
+fn write_script(path: &std::path::Path, body: &str) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+        .arg("sh")
+        .arg(body)
+        .arg(path)
+        .status()
+        .expect("sh runs");
+    assert!(status.success(), "writing the script failed: {status}");
+}
 
 /// Writes an executable stub `claude` into `dir` that prints `$0` and each argument on its own
 /// line, and returns the directory to put on `PATH`.
@@ -30,15 +44,8 @@ use std::process::{Command, Stdio};
 /// `PATH` resolution and of `#!` scripts, not of the wrapper.
 fn stub_claude_in(dir: &std::path::Path) {
     let script = dir.join("claude");
-    {
-        let mut f = std::fs::File::create(&script).expect("create stub claude");
-        // `$0` is how the wrapper named the program; the rest is its argv tail.
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "printf '%s\\n' \"$0\" \"$@\"").unwrap();
-    }
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
+    // `$0` is how the wrapper named the program; the rest is its argv tail.
+    write_script(&script, "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\"\n");
 }
 
 /// A private temp directory for one run. Unique per call, not per process: cargo runs the tests in

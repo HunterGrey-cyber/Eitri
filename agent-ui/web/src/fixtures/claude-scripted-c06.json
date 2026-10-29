@@ -1,6 +1,15 @@
 {
   "domain_events": [
     {
+      "occurred_at": 1793217947253,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
+      "type": "turn_started"
+    },
+    {
       "commands": [
         {
           "description": "<cli-text chars=135 sha256=525158602182d83e>",
@@ -202,14 +211,10 @@
       "type": "commands_available"
     },
     {
-      "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
-      "type": "turn_started"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "27593b3c-d8ab-49e6-a6c3-7f68df8f3cb9",
-      "session_id": "6857eee7-d6aa-47e4-970c-48fc1848baa5",
+      "provider_session_id": "6c9a9024-812b-401e-bd8d-c3cf7b31ba51",
+      "session_id": "47887d17-6ec0-45d5-a6a4-f9f419cebc3f",
       "type": "session_opened"
     },
     {
@@ -217,33 +222,44 @@
       "type": "cli_permission_mode"
     },
     {
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
       "kind": "text",
       "text": "C06-FIRST words ",
-      "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+      "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "before the ",
-      "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+      "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "steer",
-      "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+      "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 1,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "C06-FIRST words before the steer",
       "stop_reason": "end_turn",
-      "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+      "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -258,20 +274,26 @@
       }
     },
     {
-      "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+      "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
       "type": "turn_started"
+    },
+    {
+      "cause": null,
+      "origin": "follow_up",
+      "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
+      "type": "turn_attributed"
     },
     {
       "client_message_id": "msg-2",
       "text": "C06-LATE",
-      "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+      "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
       "type": "user_message_delivered"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "27593b3c-d8ab-49e6-a6c3-7f68df8f3cb9",
-      "session_id": "6857eee7-d6aa-47e4-970c-48fc1848baa5",
+      "provider_session_id": "6c9a9024-812b-401e-bd8d-c3cf7b31ba51",
+      "session_id": "47887d17-6ec0-45d5-a6a4-f9f419cebc3f",
       "type": "session_opened"
     },
     {
@@ -281,19 +303,20 @@
     {
       "kind": "text",
       "text": "LATE-DONE",
-      "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+      "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 1,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "LATE-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+      "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -310,6 +333,15 @@
   ],
   "events": {
     "events": [
+      {
+        "occurred_at": 1793217947253,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
+        "type": "turn_started"
+      },
       {
         "commands": [
           {
@@ -512,14 +544,10 @@
         "type": "commands_available"
       },
       {
-        "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
-        "type": "turn_started"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "27593b3c-d8ab-49e6-a6c3-7f68df8f3cb9",
-        "session_id": "6857eee7-d6aa-47e4-970c-48fc1848baa5",
+        "provider_session_id": "6c9a9024-812b-401e-bd8d-c3cf7b31ba51",
+        "session_id": "47887d17-6ec0-45d5-a6a4-f9f419cebc3f",
         "type": "session_opened"
       },
       {
@@ -527,33 +555,44 @@
         "type": "cli_permission_mode"
       },
       {
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
         "kind": "text",
         "text": "C06-FIRST words ",
-        "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+        "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "before the ",
-        "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+        "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "steer",
-        "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+        "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 1,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "C06-FIRST words before the steer",
         "stop_reason": "end_turn",
-        "turn_id": "83b2932c-390e-4b04-aa26-7f26715a7242",
+        "turn_id": "488d53f4-0c05-4c6c-a8a1-77520d19fd94",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -568,20 +607,26 @@
         }
       },
       {
-        "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+        "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
         "type": "turn_started"
+      },
+      {
+        "cause": null,
+        "origin": "follow_up",
+        "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
+        "type": "turn_attributed"
       },
       {
         "client_message_id": "msg-2",
         "text": "C06-LATE",
-        "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+        "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
         "type": "user_message_delivered"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "27593b3c-d8ab-49e6-a6c3-7f68df8f3cb9",
-        "session_id": "6857eee7-d6aa-47e4-970c-48fc1848baa5",
+        "provider_session_id": "6c9a9024-812b-401e-bd8d-c3cf7b31ba51",
+        "session_id": "47887d17-6ec0-45d5-a6a4-f9f419cebc3f",
         "type": "session_opened"
       },
       {
@@ -591,19 +636,20 @@
       {
         "kind": "text",
         "text": "LATE-DONE",
-        "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+        "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 1,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "LATE-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "d83acd62-6d52-4919-bee5-da04e077effa",
+        "turn_id": "db87536b-c604-4061-afc7-5e8bc303d22d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -621,7 +667,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 14
+    "throughRevision": 17
   },
   "scenario": "c06",
   "snapshot": {
@@ -842,6 +888,18 @@
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
+      "notices": [
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 5,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
       "pendingPermissions": [],
       "provider": null,
       "providerSessionId": "prov-1",
@@ -854,15 +912,23 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 4,
+          "seq": 6,
           "text": "C06-FIRST words before the steer"
         },
         {
-          "seq": 12,
+          "seq": 15,
           "text": "LATE-DONE"
         }
       ],
       "turnEndings": [],
+      "turnStarts": [
+        {
+          "cause": null,
+          "origin": "follow_up",
+          "seq": 11,
+          "turnId": "db87536b-c604-4061-afc7-5e8bc303d22d"
+        }
+      ],
       "usage": {
         "model": "claude-opus-5-5",
         "num_turns": null,
@@ -877,13 +943,13 @@
       "userPrompts": [
         {
           "delivered": true,
-          "seq": 9,
+          "seq": 12,
           "text": "C06-LATE"
         }
       ]
     },
     "tab": 1,
-    "throughRevision": 14,
+    "throughRevision": 17,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

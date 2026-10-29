@@ -1,6 +1,15 @@
 {
   "domain_events": [
     {
+      "occurred_at": 1793217925108,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
+      "type": "turn_started"
+    },
+    {
       "commands": [
         {
           "description": "<cli-text chars=135 sha256=525158602182d83e>",
@@ -202,14 +211,21 @@
       "type": "commands_available"
     },
     {
-      "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
-      "type": "turn_started"
+      "input": {
+        "command": "<cli-text chars=35 sha256=1a2797085ab45fa2>",
+        "description": "C01 background",
+        "run_in_background": true
+      },
+      "permission_id": "34ee5482-92cb-4508-a234-9e4580ad9488",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_bg1",
+      "type": "permission_requested"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-      "session_id": "57b0b406-b64b-4345-ba41-6911a2219fd0",
+      "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+      "session_id": "2106ff95-56df-4734-b73f-405ed03cf460",
       "type": "session_opened"
     },
     {
@@ -217,20 +233,19 @@
       "type": "cli_permission_mode"
     },
     {
-      "input": {
-        "command": "<cli-text chars=35 sha256=1a2797085ab45fa2>",
-        "description": "C01 background",
-        "run_in_background": true
-      },
-      "permission_id": "441d3f9d-8c84-495e-8128-6d1250cb2366",
-      "tool_name": "Bash",
-      "tool_use_id": "toolu_bg1",
-      "type": "permission_requested"
+      "outcome": "allowed",
+      "permission_id": "34ee5482-92cb-4508-a234-9e4580ad9488",
+      "type": "permission_resolved"
     },
     {
-      "outcome": "allowed",
-      "permission_id": "441d3f9d-8c84-495e-8128-6d1250cb2366",
-      "type": "permission_resolved"
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
     },
     {
       "input": {
@@ -240,32 +255,80 @@
       },
       "name": "Bash",
       "tool_use_id": "toolu_bg1",
-      "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+      "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
       "type": "tool_call_started"
     },
     {
-      "content": "<cli-text chars=265 sha256=0703464f7dae66ba>",
+      "occurred_at": 1793217925512,
+      "tasks": [
+        {
+          "ambient": false,
+          "description": "C01 background",
+          "kind": "shell",
+          "parent_task_id": null,
+          "run_id": "0mvsjniko-07c65a15",
+          "subagent_type": null,
+          "task_id": "b54jybhnt",
+          "task_type": "local_bash",
+          "tool_use_id": null,
+          "workflow_name": null
+        }
+      ],
+      "type": "background_tasks_changed"
+    },
+    {
+      "edge": "started",
+      "end_time_ms": null,
+      "error": null,
+      "is_backgrounded": true,
+      "last_tool_name": null,
+      "occurred_at": 1793217925532,
+      "output_file": null,
+      "reason": null,
+      "run_id": "0mvsjniko-07c65a15",
+      "status": null,
+      "summary": null,
+      "task": {
+        "ambient": false,
+        "description": "C01 background",
+        "kind": "shell",
+        "parent_task_id": null,
+        "run_id": "0mvsjniko-07c65a15",
+        "subagent_type": null,
+        "task_id": "b54jybhnt",
+        "task_type": "local_bash",
+        "tool_use_id": "toolu_bg1",
+        "workflow_name": null
+      },
+      "task_id": "b54jybhnt",
+      "type": "task_event",
+      "usage": null,
+      "workflow_progress": null
+    },
+    {
+      "content": "<cli-text chars=265 sha256=6d86a4e5deb4f511>",
       "is_error": false,
       "tool_use_id": "toolu_bg1",
-      "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+      "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "STARTED",
-      "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+      "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 2,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "STARTED",
       "stop_reason": "end_turn",
-      "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+      "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -280,25 +343,61 @@
       }
     },
     {
+      "edge": "updated",
+      "end_time_ms": 1793217925752,
+      "error": null,
+      "is_backgrounded": null,
+      "last_tool_name": null,
+      "occurred_at": 1793217925793,
+      "output_file": null,
+      "reason": null,
+      "run_id": "0mvsjniko-07c65a15",
+      "status": "completed",
+      "summary": null,
+      "task": null,
+      "task_id": "b54jybhnt",
+      "type": "task_event",
+      "usage": null,
+      "workflow_progress": null
+    },
+    {
+      "edge": "notified",
+      "end_time_ms": null,
+      "error": null,
+      "is_backgrounded": null,
+      "last_tool_name": null,
+      "occurred_at": 1793217925812,
+      "output_file": "$RUN/tmp/claude-$UID/-RUN-project/3d523605-3c2f-44db-bd0b-efea5c1aeb42/tasks/b54jybhnt.output",
+      "reason": null,
+      "run_id": "0mvsjniko-07c65a15",
+      "status": "completed",
+      "summary": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+      "task": null,
+      "task_id": "b54jybhnt",
+      "type": "task_event",
+      "usage": null,
+      "workflow_progress": null
+    },
+    {
+      "occurred_at": 1793217925832,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
       "input": {
         "command": "echo WOKE",
         "description": "C01 woke"
       },
-      "permission_id": "94f98621-67b2-4fee-bdb3-c1d5f38783cd",
+      "permission_id": "23dc4619-e615-4714-9e6a-0353b79c7130",
       "tool_name": "Bash",
       "tool_use_id": "toolu_w1",
       "type": "permission_requested"
     },
     {
-      "outcome": "allowed",
-      "permission_id": "94f98621-67b2-4fee-bdb3-c1d5f38783cd",
-      "type": "permission_resolved"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-      "session_id": "57b0b406-b64b-4345-ba41-6911a2219fd0",
+      "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+      "session_id": "2106ff95-56df-4734-b73f-405ed03cf460",
       "type": "session_opened"
     },
     {
@@ -306,15 +405,69 @@
       "type": "cli_permission_mode"
     },
     {
+      "outcome": "allowed",
+      "permission_id": "23dc4619-e615-4714-9e6a-0353b79c7130",
+      "type": "permission_resolved"
+    },
+    {
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+      "type": "turn_started"
+    },
+    {
+      "cause": {
+        "cron_id": null,
+        "description": "C01 background",
+        "kind": "task",
+        "peer_name": null,
+        "prompt": null,
+        "schedule_reason": null,
+        "scheduled_for_ms": null,
+        "summary": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+        "task_id": "b54jybhnt",
+        "task_kind": "shell",
+        "task_status": "completed",
+        "text": null,
+        "wakeup_source": null
+      },
+      "origin": "cli",
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+      "type": "turn_attributed"
+    },
+    {
+      "input": {
+        "command": "echo WOKE",
+        "description": "C01 woke"
+      },
+      "name": "Bash",
+      "tool_use_id": "toolu_w1",
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+      "type": "tool_call_started"
+    },
+    {
+      "content": "WOKE",
+      "is_error": false,
+      "tool_use_id": "toolu_w1",
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+      "type": "tool_call_completed"
+    },
+    {
+      "kind": "text",
+      "text": "WAKE_DONE",
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+      "type": "content_delta"
+    },
+    {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 2,
+        "origin_kind": "<cli-text chars=17 sha256=10db6e550ec4c2b2>",
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "WAKE_DONE",
       "stop_reason": "end_turn",
-      "turn_id": "unknown-turn",
+      "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -329,7 +482,7 @@
       }
     },
     {
-      "turn_id": "6fcfd104-8d2b-4c42-bf99-238be0804b8d",
+      "turn_id": "809aab75-c6f0-42c9-9ef8-a42fd7dabab1",
       "type": "turn_started"
     },
     {
@@ -341,13 +494,22 @@
       "outcome": "failed",
       "result_text": "",
       "stop_reason": null,
-      "turn_id": "6fcfd104-8d2b-4c42-bf99-238be0804b8d",
+      "turn_id": "809aab75-c6f0-42c9-9ef8-a42fd7dabab1",
       "type": "turn_completed",
       "usage": null
     },
     {
       "reason": "closed_by_host",
       "type": "session_closed"
+    },
+    {
+      "occurred_at": 1793217926315,
+      "tasks": [],
+      "type": "background_tasks_changed"
+    },
+    {
+      "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
+      "type": "turn_started"
     },
     {
       "commands": [
@@ -551,22 +713,18 @@
       "type": "commands_available"
     },
     {
-      "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
-      "type": "turn_started"
-    },
-    {
-      "attached_provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
+      "attached_provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
       "detail": null,
       "forked": false,
-      "requested_provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
+      "requested_provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
       "status": "attached",
       "type": "resume_outcome"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-      "session_id": "b36c8bec-9f9f-47b4-8e4e-50184fe1d70d",
+      "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+      "session_id": "684e4c79-0765-40b7-8b35-730e1987a86f",
       "type": "session_opened"
     },
     {
@@ -574,21 +732,32 @@
       "type": "cli_permission_mode"
     },
     {
+      "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+      "kind": "informational",
+      "level": "warning",
+      "scalars": {},
+      "task_id": null,
+      "task_status": null,
+      "tool_use_id": null,
+      "type": "session_notice"
+    },
+    {
       "kind": "text",
       "text": "RESUME_REPLY",
-      "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
+      "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
       "type": "content_delta"
     },
     {
       "detail": {
         "api_error_status": null,
         "message": null,
+        "num_turns": 1,
         "reason": "completed"
       },
       "outcome": "completed",
       "result_text": "RESUME_REPLY",
       "stop_reason": "end_turn",
-      "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
+      "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -606,6 +775,15 @@
   "events": {
     "events": [
       {
+        "occurred_at": 1793217925108,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
+        "type": "turn_started"
+      },
+      {
         "commands": [
           {
             "description": "<cli-text chars=135 sha256=525158602182d83e>",
@@ -807,14 +985,21 @@
         "type": "commands_available"
       },
       {
-        "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
-        "type": "turn_started"
+        "input": {
+          "command": "<cli-text chars=35 sha256=1a2797085ab45fa2>",
+          "description": "C01 background",
+          "run_in_background": true
+        },
+        "permission_id": "34ee5482-92cb-4508-a234-9e4580ad9488",
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_bg1",
+        "type": "permission_requested"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-        "session_id": "57b0b406-b64b-4345-ba41-6911a2219fd0",
+        "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+        "session_id": "2106ff95-56df-4734-b73f-405ed03cf460",
         "type": "session_opened"
       },
       {
@@ -822,20 +1007,19 @@
         "type": "cli_permission_mode"
       },
       {
-        "input": {
-          "command": "<cli-text chars=35 sha256=1a2797085ab45fa2>",
-          "description": "C01 background",
-          "run_in_background": true
-        },
-        "permission_id": "441d3f9d-8c84-495e-8128-6d1250cb2366",
-        "tool_name": "Bash",
-        "tool_use_id": "toolu_bg1",
-        "type": "permission_requested"
+        "outcome": "allowed",
+        "permission_id": "34ee5482-92cb-4508-a234-9e4580ad9488",
+        "type": "permission_resolved"
       },
       {
-        "outcome": "allowed",
-        "permission_id": "441d3f9d-8c84-495e-8128-6d1250cb2366",
-        "type": "permission_resolved"
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
       },
       {
         "input": {
@@ -845,32 +1029,80 @@
         },
         "name": "Bash",
         "tool_use_id": "toolu_bg1",
-        "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+        "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
         "type": "tool_call_started"
       },
       {
-        "content": "<cli-text chars=265 sha256=0703464f7dae66ba>",
+        "occurred_at": 1793217925512,
+        "tasks": [
+          {
+            "ambient": false,
+            "description": "C01 background",
+            "kind": "shell",
+            "parent_task_id": null,
+            "run_id": "0mvsjniko-07c65a15",
+            "subagent_type": null,
+            "task_id": "b54jybhnt",
+            "task_type": "local_bash",
+            "tool_use_id": null,
+            "workflow_name": null
+          }
+        ],
+        "type": "background_tasks_changed"
+      },
+      {
+        "edge": "started",
+        "end_time_ms": null,
+        "error": null,
+        "is_backgrounded": true,
+        "last_tool_name": null,
+        "occurred_at": 1793217925532,
+        "output_file": null,
+        "reason": null,
+        "run_id": "0mvsjniko-07c65a15",
+        "status": null,
+        "summary": null,
+        "task": {
+          "ambient": false,
+          "description": "C01 background",
+          "kind": "shell",
+          "parent_task_id": null,
+          "run_id": "0mvsjniko-07c65a15",
+          "subagent_type": null,
+          "task_id": "b54jybhnt",
+          "task_type": "local_bash",
+          "tool_use_id": "toolu_bg1",
+          "workflow_name": null
+        },
+        "task_id": "b54jybhnt",
+        "type": "task_event",
+        "usage": null,
+        "workflow_progress": null
+      },
+      {
+        "content": "<cli-text chars=265 sha256=6d86a4e5deb4f511>",
         "is_error": false,
         "tool_use_id": "toolu_bg1",
-        "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+        "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "STARTED",
-        "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+        "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 2,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "STARTED",
         "stop_reason": "end_turn",
-        "turn_id": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b",
+        "turn_id": "8ff72a11-a53e-4358-9230-8fcd24c1559d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -885,25 +1117,61 @@
         }
       },
       {
+        "edge": "updated",
+        "end_time_ms": 1793217925752,
+        "error": null,
+        "is_backgrounded": null,
+        "last_tool_name": null,
+        "occurred_at": 1793217925793,
+        "output_file": null,
+        "reason": null,
+        "run_id": "0mvsjniko-07c65a15",
+        "status": "completed",
+        "summary": null,
+        "task": null,
+        "task_id": "b54jybhnt",
+        "type": "task_event",
+        "usage": null,
+        "workflow_progress": null
+      },
+      {
+        "edge": "notified",
+        "end_time_ms": null,
+        "error": null,
+        "is_backgrounded": null,
+        "last_tool_name": null,
+        "occurred_at": 1793217925812,
+        "output_file": "$RUN/tmp/claude-$UID/-RUN-project/3d523605-3c2f-44db-bd0b-efea5c1aeb42/tasks/b54jybhnt.output",
+        "reason": null,
+        "run_id": "0mvsjniko-07c65a15",
+        "status": "completed",
+        "summary": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+        "task": null,
+        "task_id": "b54jybhnt",
+        "type": "task_event",
+        "usage": null,
+        "workflow_progress": null
+      },
+      {
+        "occurred_at": 1793217925832,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
         "input": {
           "command": "echo WOKE",
           "description": "C01 woke"
         },
-        "permission_id": "94f98621-67b2-4fee-bdb3-c1d5f38783cd",
+        "permission_id": "23dc4619-e615-4714-9e6a-0353b79c7130",
         "tool_name": "Bash",
         "tool_use_id": "toolu_w1",
         "type": "permission_requested"
       },
       {
-        "outcome": "allowed",
-        "permission_id": "94f98621-67b2-4fee-bdb3-c1d5f38783cd",
-        "type": "permission_resolved"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-        "session_id": "57b0b406-b64b-4345-ba41-6911a2219fd0",
+        "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+        "session_id": "2106ff95-56df-4734-b73f-405ed03cf460",
         "type": "session_opened"
       },
       {
@@ -911,15 +1179,69 @@
         "type": "cli_permission_mode"
       },
       {
+        "outcome": "allowed",
+        "permission_id": "23dc4619-e615-4714-9e6a-0353b79c7130",
+        "type": "permission_resolved"
+      },
+      {
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+        "type": "turn_started"
+      },
+      {
+        "cause": {
+          "cron_id": null,
+          "description": "C01 background",
+          "kind": "task",
+          "peer_name": null,
+          "prompt": null,
+          "schedule_reason": null,
+          "scheduled_for_ms": null,
+          "summary": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+          "task_id": "b54jybhnt",
+          "task_kind": "shell",
+          "task_status": "completed",
+          "text": null,
+          "wakeup_source": null
+        },
+        "origin": "cli",
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+        "type": "turn_attributed"
+      },
+      {
+        "input": {
+          "command": "echo WOKE",
+          "description": "C01 woke"
+        },
+        "name": "Bash",
+        "tool_use_id": "toolu_w1",
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+        "type": "tool_call_started"
+      },
+      {
+        "content": "WOKE",
+        "is_error": false,
+        "tool_use_id": "toolu_w1",
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+        "type": "tool_call_completed"
+      },
+      {
+        "kind": "text",
+        "text": "WAKE_DONE",
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
+        "type": "content_delta"
+      },
+      {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 2,
+          "origin_kind": "<cli-text chars=17 sha256=10db6e550ec4c2b2>",
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "WAKE_DONE",
         "stop_reason": "end_turn",
-        "turn_id": "unknown-turn",
+        "turn_id": "597bcd4c-5c1e-4cd7-8731-4c7942674aef",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -934,7 +1256,7 @@
         }
       },
       {
-        "turn_id": "6fcfd104-8d2b-4c42-bf99-238be0804b8d",
+        "turn_id": "809aab75-c6f0-42c9-9ef8-a42fd7dabab1",
         "type": "turn_started"
       },
       {
@@ -946,13 +1268,22 @@
         "outcome": "failed",
         "result_text": "",
         "stop_reason": null,
-        "turn_id": "6fcfd104-8d2b-4c42-bf99-238be0804b8d",
+        "turn_id": "809aab75-c6f0-42c9-9ef8-a42fd7dabab1",
         "type": "turn_completed",
         "usage": null
       },
       {
         "reason": "closed_by_host",
         "type": "session_closed"
+      },
+      {
+        "occurred_at": 1793217926315,
+        "tasks": [],
+        "type": "background_tasks_changed"
+      },
+      {
+        "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
+        "type": "turn_started"
       },
       {
         "commands": [
@@ -1156,22 +1487,18 @@
         "type": "commands_available"
       },
       {
-        "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
-        "type": "turn_started"
-      },
-      {
-        "attached_provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
+        "attached_provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
         "detail": null,
         "forked": false,
-        "requested_provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
+        "requested_provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
         "status": "attached",
         "type": "resume_outcome"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "79bb91d9-5d03-4e36-90b4-19486fd00f5e",
-        "session_id": "b36c8bec-9f9f-47b4-8e4e-50184fe1d70d",
+        "provider_session_id": "3d523605-3c2f-44db-bd0b-efea5c1aeb42",
+        "session_id": "684e4c79-0765-40b7-8b35-730e1987a86f",
         "type": "session_opened"
       },
       {
@@ -1179,21 +1506,32 @@
         "type": "cli_permission_mode"
       },
       {
+        "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+        "kind": "informational",
+        "level": "warning",
+        "scalars": {},
+        "task_id": null,
+        "task_status": null,
+        "tool_use_id": null,
+        "type": "session_notice"
+      },
+      {
         "kind": "text",
         "text": "RESUME_REPLY",
-        "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
+        "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
         "type": "content_delta"
       },
       {
         "detail": {
           "api_error_status": null,
           "message": null,
+          "num_turns": 1,
           "reason": "completed"
         },
         "outcome": "completed",
         "result_text": "RESUME_REPLY",
         "stop_reason": "end_turn",
-        "turn_id": "58d697b2-a88e-4570-96a4-1dec3c7aad8e",
+        "turn_id": "e03533cb-e4bb-43ab-8ab3-acb7a88fb3c9",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1211,7 +1549,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 25
+    "throughRevision": 39
   },
   "scenario": "c01",
   "snapshot": {
@@ -1432,6 +1770,38 @@
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
+      "notices": [
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 7,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        },
+        {
+          "content": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+          "kind": "task",
+          "level": "notice",
+          "scalars": {},
+          "seq": 15,
+          "taskId": "b54jybhnt",
+          "taskStatus": "completed",
+          "toolUseId": "toolu_bg1"
+        },
+        {
+          "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "seq": 36,
+          "taskId": null,
+          "taskStatus": null,
+          "toolUseId": null
+        }
+      ],
       "pendingPermissions": [],
       "provider": null,
       "providerSessionId": "prov-1",
@@ -1450,21 +1820,39 @@
           },
           "name": "Bash",
           "result": {
-            "content": "<cli-text chars=265 sha256=0703464f7dae66ba>",
+            "content": "<cli-text chars=265 sha256=6d86a4e5deb4f511>",
             "isError": false
           },
-          "seq": 6,
+          "seq": 8,
           "toolUseId": "toolu_bg1",
-          "turnId": "9ea8a5a3-20a2-4ada-b70b-3c0106bde55b"
+          "turnId": "8ff72a11-a53e-4358-9230-8fcd24c1559d"
+        },
+        {
+          "input": {
+            "command": "echo WOKE",
+            "description": "C01 woke"
+          },
+          "name": "Bash",
+          "result": {
+            "content": "WOKE",
+            "isError": false
+          },
+          "seq": 23,
+          "toolUseId": "toolu_w1",
+          "turnId": "597bcd4c-5c1e-4cd7-8731-4c7942674aef"
         }
       ],
       "transcript": [
         {
-          "seq": 8,
+          "seq": 12,
           "text": "STARTED"
         },
         {
-          "seq": 23,
+          "seq": 25,
+          "text": "WAKE_DONE"
+        },
+        {
+          "seq": 37,
           "text": "RESUME_REPLY"
         }
       ],
@@ -1475,8 +1863,30 @@
           "message": null,
           "reason": null,
           "resetsAt": null,
-          "seq": 16,
-          "turnId": "6fcfd104-8d2b-4c42-bf99-238be0804b8d"
+          "seq": 28,
+          "turnId": "809aab75-c6f0-42c9-9ef8-a42fd7dabab1"
+        }
+      ],
+      "turnStarts": [
+        {
+          "cause": {
+            "cronId": null,
+            "description": "C01 background",
+            "kind": "task",
+            "peerName": null,
+            "prompt": null,
+            "scheduleReason": null,
+            "scheduledForMs": null,
+            "summary": "<cli-text chars=59 sha256=d817aaed228c10e4>",
+            "taskId": "b54jybhnt",
+            "taskKind": "shell",
+            "taskStatus": "completed",
+            "text": null,
+            "wakeupSource": null
+          },
+          "origin": "cli",
+          "seq": 22,
+          "turnId": "597bcd4c-5c1e-4cd7-8731-4c7942674aef"
         }
       ],
       "usage": {
@@ -1493,7 +1903,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 25,
+    "throughRevision": 39,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

@@ -445,6 +445,11 @@ pub(super) fn prompt_sent(
         title_from_first_prompt(state, tab, typed);
     }
     apply_outcome(state, screen, tab, request, outcome, out);
+    // A message the tab kept instead of sending (a card waits, or the agent was busy) is a line in the
+    // queue the page draws.
+    if state.tabs.get(tab).is_some_and(|t| !t.session.queue.is_empty()) {
+        send_queue(state, tab, out);
+    }
 }
 
 /// The page a held message's result goes to, as the ledger has it: its page, or `None` once that page

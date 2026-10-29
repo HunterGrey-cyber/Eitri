@@ -25,11 +25,15 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+use std::rc::Rc;
 
 use serde_json::Value;
 
 use super::composed_block::strip_composed_block;
-use crate::projection::{AgentDomainEvent, ContentKind};
+use crate::projection::{
+    AgentDomainEvent, ContentKind, NoticeLevel, QuestionOptionSpec, QuestionOutcome, QuestionSpec, SessionNoticeKind,
+    ShownAnswer, TurnCause, TurnCauseKind, TurnOrigin, TurnOutcome,
+};
 
 /// The most conversational items a restored history may carry.
 ///
@@ -77,8 +81,8 @@ pub const HISTORY_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// sessions Eitri itself drove carries `promptSource: "sdk"` and no `origin` field at all, so an
 /// allow-list of "human" alone would return nothing in the only situation this feature exists for.
 ///
-/// What it misses, knowingly: a bare `/compact` and other slash commands, which carry no
-/// `promptSource` (2 lines here). A slash command is a command, not a message.
+/// It does not take a slash command's echo or a bash-mode input, which carry no `promptSource`:
+/// [`typed_command`] restores those, as the commands the person typed.
 const HUMAN_PROMPT_SOURCES: [&str; 4] = ["typed", "suggestion_accepted", "queued", "sdk"];
 
 /// Everything read out of one transcript, ready for a caller to fold into a projection.
@@ -96,7 +100,8 @@ pub struct TranscriptHistory {
     /// expressed on disk. Reconstructing it would mean guessing at those 127 positions, and a wrong
     /// guess silently drops a whole stretch of conversation. Flattening is uglier and loses nothing.
     pub events: Vec<AgentDomainEvent>,
-    /// Conversational items this parse kept -- prompts, assistant text blocks and tool calls. A
+    /// Conversational items this parse kept -- prompts, assistant text blocks, tool calls,
+    /// CLI turn causes and notices. A
     /// tool result is not an item; it belongs to the call it completes.
     ///
     /// **This is a PRE-FOLD count and must never be shown to a user.** It counts the slots this
@@ -138,10 +143,9 @@ pub struct HistoryCounts {
     pub malformed_lines: u64,
     /// Lines longer than [`HISTORY_MAX_LINE_BYTES`], discarded without being buffered.
     pub oversized_lines: u64,
-    /// `attachment` lines. The single biggest thing this module throws away: 21% of the bytes in a
-    /// session file, and 13-24 of the 19-69 lines in an Eitri-driven one.
+    /// Skipped `attachment` lines; a displayable queued human prompt is restored instead.
     pub attachment_lines: u64,
-    /// `system` lines, all ten subtypes, `compact_boundary` included.
+    /// Skipped `system` lines; `compact_boundary` restores a notice instead.
     pub system_lines: u64,
     /// The fourteen side-record types (`last-prompt`, `ai-title`, `cost-state`, `api-request`, ...).
     pub side_record_lines: u64,
@@ -158,8 +162,8 @@ pub struct HistoryCounts {
     pub sidechain_lines: u64,
     /// `type:"user"` lines that produced neither a prompt nor a tool result.
     ///
-    /// Mostly the allow-list's rejections: compaction summaries, `isMeta` injections, slash-command
-    /// echoes, `<local-command-stdout>`, bash-mode lines, interrupt markers. But **not only** those
+    /// Mostly the allow-list's rejections: compaction summaries, `isMeta` injections, what a command
+    /// printed (`<local-command-stdout>`, bash-mode output), interrupt markers. But **not only** those
     /// -- a line that never reached the allow-list lands here too, because "nothing came out of it"
     /// is the same observation from this counter's point of view: no `message` object, an empty
     /// `content` array, or a line whose only block was a `tool_result` dropped for an empty or
@@ -170,6 +174,10 @@ pub struct HistoryCounts {
     /// Prompts that were nothing but an editor-context block, which `compose_turn_text` sends when
     /// the user typed no words at all.
     pub empty_prompt_lines: u64,
+    /// Assistant lines the CLI files under its own model name (`<synthetic>`) without marking them as an
+    /// API error: the `No response requested.` line it writes after an interrupt. They are no reply of
+    /// the model's, and the CLI's own readers leave them out.
+    pub synthetic_lines: u64,
     /// Content blocks dropped inside an otherwise usable line: `thinking`, `image`, an unknown
     /// block type, a `tool_use` with no usable id.
     pub dropped_blocks: u64,
@@ -212,6 +220,9 @@ pub(crate) fn read_history_from(
     let mut slots: VecDeque<Slot> = VecDeque::new();
     let mut total_chars: usize = 0;
     let mut omitted: usize = 0;
+    let mut segment: Option<Rc<Segment>> = None;
+    let mut segment_count = 0usize;
+    let mut last_text_message: Option<Option<String>> = None;
 
     while let Some(line) = read_bounded_line(reader)? {
         let raw = match line {
@@ -247,9 +258,66 @@ pub(crate) fn read_history_from(
                 SkipReason::Sidechain => counts.sidechain_lines += 1,
                 SkipReason::RejectedUser => counts.rejected_user_lines += 1,
                 SkipReason::EmptyPrompt => counts.empty_prompt_lines += 1,
+                SkipReason::Synthetic => counts.synthetic_lines += 1,
             }
         }
-        for outcome in parsed.outcomes {
+        if parsed.starts_segment {
+            segment_count += 1;
+            let cause = parsed.outcomes.iter().find_map(|outcome| match outcome {
+                Outcome::Item {
+                    event: AgentDomainEvent::TurnAttributed { cause, .. },
+                    ..
+                } => cause.clone(),
+                _ => None,
+            });
+            segment = Some(Rc::new(Segment {
+                turn_id: if parsed.uuid.is_empty() {
+                    format!("history-{segment_count}")
+                } else {
+                    parsed.uuid
+                },
+                cause,
+            }));
+            last_text_message = None;
+        }
+        for mut outcome in parsed.outcomes {
+            // A bounded tail can begin after its opener. It still needs a closed turn of its own.
+            let segment = segment.get_or_insert_with(|| {
+                segment_count += 1;
+                Rc::new(Segment {
+                    turn_id: format!("history-{segment_count}"),
+                    cause: None,
+                })
+            });
+            let event = match &mut outcome {
+                Outcome::Item { event, .. } | Outcome::ToolResult { event, .. } => event,
+            };
+            match event {
+                AgentDomainEvent::ContentDelta { turn_id, .. }
+                | AgentDomainEvent::ToolCallStarted { turn_id, .. }
+                | AgentDomainEvent::ToolCallCompleted { turn_id, .. }
+                | AgentDomainEvent::UserMessageDelivered { turn_id, .. }
+                | AgentDomainEvent::TurnAttributed { turn_id, .. } => *turn_id = segment.turn_id.clone(),
+                _ => {}
+            }
+            let mut prefix = Vec::new();
+            if matches!(
+                event,
+                AgentDomainEvent::ContentDelta {
+                    kind: ContentKind::Text,
+                    ..
+                }
+            ) {
+                if last_text_message
+                    .as_ref()
+                    .is_some_and(|id| id != &parsed.assistant_message_id)
+                {
+                    prefix.push(AgentDomainEvent::AssistantMessageBoundary {
+                        turn_id: segment.turn_id.clone(),
+                    });
+                }
+                last_text_message = Some(parsed.assistant_message_id.clone());
+            }
             match outcome {
                 Outcome::Item {
                     chars,
@@ -259,20 +327,46 @@ pub(crate) fn read_history_from(
                     slots.push_back(Slot {
                         chars,
                         tool_use_id,
-                        events: vec![event],
+                        segment: Rc::clone(segment),
+                        events: {
+                            prefix.push(event);
+                            prefix
+                        },
+                        manual_compaction: parsed.manual_compaction,
                     });
                     total_chars += chars;
+                    // The command line that ran the compaction opens its own turn, and the divider is a part
+                    // of that turn after the line, as a live tab shows it.
+                    if parsed.command_prompt && slots.len() >= 2 && slots[slots.len() - 2].manual_compaction {
+                        let last = slots.len() - 1;
+                        slots.swap(last - 1, last);
+                        slots[last].segment = Rc::clone(segment);
+                        slots[last].manual_compaction = false;
+                    }
                 }
                 Outcome::ToolResult {
                     tool_use_id,
-                    chars,
+                    mut chars,
                     event,
+                    structured,
                 } => {
                     let call = slots
                         .iter()
                         .position(|s| s.tool_use_id.as_deref() == Some(tool_use_id.as_str()));
                     match call {
                         Some(index) => {
+                            if let Some((asked, settled)) =
+                                restored_question(&slots[index], &event, structured.as_ref())
+                            {
+                                chars += [&asked, &settled]
+                                    .into_iter()
+                                    .map(|event| serde_json::to_string(event).map_or(0, |text| text.chars().count()))
+                                    .sum::<usize>();
+                                // Keep the question at the call's arrival position, with its result
+                                // where it was read. Only a known outcome creates a historical form.
+                                slots[index].events.push(asked);
+                                slots.back_mut().expect("the call is retained").events.push(settled);
+                            }
                             // The result's size belongs to the call it completes, so that
                             // truncation weighs a tool call by what it will actually render.
                             slots[index].chars += chars;
@@ -307,8 +401,31 @@ pub(crate) fn read_history_from(
             kept_tool_use_ids.push(id.as_str());
         }
     }
+    let mut open_segment: Option<&Rc<Segment>> = None;
     for slot in &slots {
+        if open_segment.is_none_or(|open| !Rc::ptr_eq(open, &slot.segment)) {
+            if let Some(open) = open_segment {
+                events.push(completed_segment(&open.turn_id));
+            }
+            let turn_id = slot.segment.turn_id.clone();
+            events.push(AgentDomainEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+            });
+            if let Some(cause) = &slot.segment.cause {
+                events.push(AgentDomainEvent::TurnAttributed {
+                    turn_id: turn_id.clone(),
+                    origin: TurnOrigin::Cli,
+                    cause: Some(cause.clone()),
+                });
+            }
+            events.push(AgentDomainEvent::AssistantMessageBoundary { turn_id });
+            open_segment = Some(&slot.segment);
+        }
         for event in &slot.events {
+            // Attribution is reconstructed from the segment even if truncation removed its opener.
+            if matches!(event, AgentDomainEvent::TurnAttributed { .. }) {
+                continue;
+            }
             // A completion whose call was evicted after the two were matched. Dropping it here
             // rather than letting `apply` find nothing keeps "an event in this list always does
             // something" true, and keeps the orphan count honest.
@@ -322,6 +439,10 @@ pub(crate) fn read_history_from(
         }
     }
 
+    if let Some(open) = open_segment {
+        events.push(completed_segment(&open.turn_id));
+    }
+
     Ok(TranscriptHistory {
         events,
         parsed_items,
@@ -333,18 +454,35 @@ pub(crate) fn read_history_from(
     })
 }
 
-/// One conversational item, plus the tool results that followed it in the file.
-///
-/// Eviction removes a whole slot. Because eviction only ever takes from the front, a slot's
-/// trailing results can only refer to calls in this slot or in an earlier one -- and an earlier one
-/// is always evicted first -- so keeping a call never loses its result.
+/// Shared by retained items so eviction of an opener keeps the turn's identity and cause.
+struct Segment {
+    turn_id: String,
+    cause: Option<TurnCause>,
+}
+
+fn completed_segment(turn_id: &str) -> AgentDomainEvent {
+    AgentDomainEvent::TurnCompleted {
+        turn_id: turn_id.to_owned(),
+        outcome: TurnOutcome::Completed,
+        result_text: String::new(),
+        stop_reason: None,
+        usage: None,
+        detail: Default::default(),
+    }
+}
+
+/// One conversational item and later tool results, evicted together from the front.
 struct Slot {
     chars: usize,
+    segment: Rc<Segment>,
     /// Set only for a tool-call item; this is how a later `tool_result` finds the call it belongs
     /// to. Never `Some("")`: an empty id compares equal to every other empty id, which would
     /// cross-link two unrelated records, so such a block is dropped at parse time instead.
     tool_use_id: Option<String>,
     events: Vec<AgentDomainEvent>,
+    /// The divider of a compaction the person asked for, which the CLI writes before the command line that
+    /// asked for it.
+    manual_compaction: bool,
 }
 
 enum Outcome {
@@ -357,6 +495,7 @@ enum Outcome {
         tool_use_id: String,
         chars: usize,
         event: AgentDomainEvent,
+        structured: Option<Value>,
     },
 }
 
@@ -371,13 +510,23 @@ pub(crate) enum SkipReason {
     Sidechain,
     RejectedUser,
     EmptyPrompt,
+    Synthetic,
 }
 
+#[derive(Default)]
 pub(crate) struct ParsedLine {
+    starts_segment: bool,
+    uuid: String,
+    assistant_message_id: Option<String>,
     outcomes: Vec<Outcome>,
     skip: Option<SkipReason>,
     dropped_blocks: u32,
     version: Option<String>,
+    /// The line is a `/compact` run by the person's command: its divider belongs to the turn of the command
+    /// line that follows it.
+    manual_compaction: bool,
+    /// The line is the echo of a command the person typed (a slash command, a bash-mode input).
+    command_prompt: bool,
 }
 
 impl ParsedLine {
@@ -387,6 +536,7 @@ impl ParsedLine {
             skip: Some(reason),
             dropped_blocks: 0,
             version: None,
+            ..Self::default()
         }
     }
 }
@@ -476,14 +626,30 @@ pub(crate) fn classify_line(raw: &str) -> ParsedLine {
     let Some(kind) = value.get("type").and_then(Value::as_str) else {
         return with_version(ParsedLine::skipped(SkipReason::UnknownType));
     };
-    match line_type(kind) {
+    let mut parsed = match line_type(kind) {
         LineType::User => with_version(classify_user_line(&value)),
         LineType::Assistant => with_version(classify_assistant_line(&value)),
-        LineType::Attachment => with_version(ParsedLine::skipped(SkipReason::Attachment)),
-        // Every subtype, `compact_boundary` included. Session identity comes only from a live
-        // `SessionOpened`, never from history, and drawing "a compaction happened here" line is a
-        // separate product decision; what matters is already done, which is that the summary
-        // itself cannot become the user's words.
+        LineType::Attachment => with_version(classify_attachment_line(&value)),
+        LineType::System if value.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
+            let manual = value.pointer("/compactMetadata/trigger").and_then(Value::as_str) == Some("manual");
+            with_version(ParsedLine {
+                manual_compaction: manual,
+                outcomes: vec![Outcome::Item {
+                    chars: 0,
+                    tool_use_id: None,
+                    event: AgentDomainEvent::SessionNotice {
+                        kind: SessionNoticeKind::Compaction,
+                        level: NoticeLevel::Info,
+                        content: None,
+                        scalars: Default::default(),
+                        task_id: None,
+                        tool_use_id: None,
+                        task_status: None,
+                    },
+                }],
+                ..ParsedLine::default()
+            })
+        }
         LineType::System => with_version(ParsedLine::skipped(SkipReason::System)),
         LineType::LastPrompt
         | LineType::AtisLatch
@@ -508,7 +674,25 @@ pub(crate) fn classify_line(raw: &str) -> ParsedLine {
         | LineType::Launched
         | LineType::ForkContextRef => with_version(ParsedLine::skipped(SkipReason::SubagentOnly)),
         LineType::Unknown => with_version(ParsedLine::skipped(SkipReason::UnknownType)),
+    };
+    parsed.uuid = line_uuid(&value);
+    parsed.starts_segment = parsed.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            Outcome::Item {
+                event: AgentDomainEvent::UserPromptSubmitted { .. } | AgentDomainEvent::TurnAttributed { .. },
+                ..
+            }
+        )
+    });
+    if kind == "assistant" {
+        parsed.assistant_message_id = value
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
+    parsed
 }
 
 fn flag_is_true(value: &Value, key: &str) -> bool {
@@ -520,7 +704,9 @@ fn flag_is_true(value: &Value, key: &str) -> bool {
 /// block level by the caller, because one real line carries both a `text` and a `tool_result` and
 /// the two halves have different answers.
 fn user_line_is_the_users_own_words(value: &Value) -> bool {
-    !flag_is_true(value, "isMeta")
+    (value.get("origin").is_none()
+        || value.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str) == Some("human"))
+        && !flag_is_true(value, "isMeta")
         && !flag_is_true(value, "isCompactSummary")
         && !flag_is_true(value, "isVisibleInTranscriptOnly")
         && !flag_is_true(value, "isSidechain")
@@ -531,6 +717,20 @@ fn user_line_is_the_users_own_words(value: &Value) -> bool {
 }
 
 fn classify_user_line(value: &Value) -> ParsedLine {
+    if let Some(cause) = cli_turn_cause(value) {
+        return ParsedLine {
+            outcomes: vec![Outcome::Item {
+                chars: cause.texts().map(|s| s.chars().count()).sum(),
+                tool_use_id: None,
+                event: AgentDomainEvent::TurnAttributed {
+                    turn_id: line_uuid(value),
+                    origin: TurnOrigin::Cli,
+                    cause: Some(cause),
+                },
+            }],
+            ..ParsedLine::default()
+        };
+    }
     let turn_id = line_uuid(value);
     let content = value.get("message").and_then(|m| m.get("content"));
     let mut outcomes = Vec::new();
@@ -541,11 +741,18 @@ fn classify_user_line(value: &Value) -> ParsedLine {
     match content {
         Some(Value::String(text)) => prompt_text.push_str(text),
         Some(Value::Array(blocks)) => {
+            let structured = value.get("toolUseResult").filter(|_| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                    .count()
+                    == 1
+            });
             for block in blocks {
                 match block.get("type").and_then(Value::as_str) {
                     Some("tool_result") => {
                         saw_tool_result = true;
-                        match tool_result_outcome(block, &turn_id) {
+                        match tool_result_outcome(block, &turn_id, structured) {
                             Some(outcome) => outcomes.push(outcome),
                             None => dropped_blocks += 1,
                         }
@@ -564,6 +771,7 @@ fn classify_user_line(value: &Value) -> ParsedLine {
     }
 
     let mut skip = None;
+    let mut command_prompt = false;
     // A line carrying a tool result is a transport frame, never a message -- so its text, if any,
     // is not the user's. Dropping that half is the safe direction. One such mixed line exists in
     // the whole corpus, and the text on it is not a person's words.
@@ -571,7 +779,14 @@ fn classify_user_line(value: &Value) -> ParsedLine {
         dropped_blocks += 1;
     }
     if !prompt_text.is_empty() && !saw_tool_result {
-        if user_line_is_the_users_own_words(value) {
+        if let Some(text) = typed_command(value, &prompt_text) {
+            command_prompt = true;
+            outcomes.push(Outcome::Item {
+                chars: text.chars().count(),
+                tool_use_id: None,
+                event: AgentDomainEvent::UserPromptSubmitted { text },
+            });
+        } else if user_line_is_the_users_own_words(value) {
             let text = strip_composed_block(&prompt_text).to_owned();
             if text.is_empty() {
                 skip = Some(SkipReason::EmptyPrompt);
@@ -594,10 +809,181 @@ fn classify_user_line(value: &Value) -> ParsedLine {
         skip,
         dropped_blocks,
         version: None,
+        command_prompt,
+        ..ParsedLine::default()
     }
 }
 
-fn tool_result_outcome(block: &Value, turn_id: &str) -> Option<Outcome> {
+/// A command the person typed, as the CLI's own resume shows it: a slash command's echo
+/// (`<command-name>/name</command-name>`, after a `<command-message>` for a skill or prompt command, with its
+/// `<command-args>`) as `/name args`, and a bash-mode input (`<bash-input>cmd</bash-input>`) as `!cmd`.
+///
+/// The CLI writes these lines with no `promptSource` (a command is not sent to the model as a message), so
+/// the allow-list of a person's words never takes them; they get their own, as narrow: no `promptSource` (a
+/// line that has one is a message, and goes through the allow-list like any other: a typed prompt that
+/// starts with a command tag keeps all its words), not a meta line, a summary, a transcript-only line or a
+/// sidechain line, no origin but a person's, and not a tool's message (`sourceToolUseID`, what a skill the
+/// model ran writes). What a command printed (`<local-command-stdout>`,
+/// `<bash-stdout>`) is never a prompt and stays out, as it does of a live tab's record.
+fn typed_command(value: &Value, text: &str) -> Option<String> {
+    let origin = value.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str);
+    if flag_is_true(value, "isMeta")
+        || flag_is_true(value, "isCompactSummary")
+        || flag_is_true(value, "isVisibleInTranscriptOnly")
+        || flag_is_true(value, "isSidechain")
+        || value.get("sourceToolUseID").is_some()
+        || value.get("promptSource").is_some()
+        || (value.get("origin").is_some() && origin != Some("human"))
+    {
+        return None;
+    }
+    let tag = |name: &str| -> Option<&str> {
+        let (_, rest) = text.split_once(&format!("<{name}>"))?;
+        rest.split_once(&format!("</{name}>")).map(|(inner, _)| inner.trim())
+    };
+    if text.starts_with("<bash-input>") {
+        return tag("bash-input")
+            .filter(|cmd| !cmd.is_empty())
+            .map(|cmd| format!("!{cmd}"));
+    }
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return None;
+    }
+    let name = tag("command-name").filter(|name| !name.is_empty())?;
+    Some(match tag("command-args").filter(|args| !args.is_empty()) {
+        Some(args) => format!("{name} {args}"),
+        None => name.to_owned(),
+    })
+}
+
+/// Metadata is plain text, bounded independently of the transcript's larger history budget.
+const CAUSE_MAX_CHARS: usize = 2000;
+
+fn bounded(text: &str) -> String {
+    text.chars().take(CAUSE_MAX_CHARS).collect()
+}
+
+fn bounded_field(value: &Value, name: &str) -> Option<String> {
+    value.get(name).and_then(Value::as_str).map(bounded)
+}
+
+fn text_blocks(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let mut text = String::new();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(part) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(part);
+                    }
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Only the envelope's known tags are read. Its contents never become markup or a prompt row.
+fn envelope_tag(envelope: &str, name: &str) -> Option<String> {
+    let (_, rest) = envelope.split_once(&format!("<{name}>"))?;
+    let (text, _) = rest.split_once(&format!("</{name}>"))?;
+    Some(bounded(text.trim()))
+}
+
+fn cli_turn_cause(value: &Value) -> Option<TurnCause> {
+    let origin = value.get("origin").unwrap_or(&Value::Null);
+    let kind = origin.get("kind").and_then(Value::as_str);
+    // Human-authored envelopes are still the user's words, even if they quote a notification.
+    if kind == Some("human") || user_line_is_the_users_own_words(value) {
+        return None;
+    }
+    let text = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(text_blocks)
+        .unwrap_or_default();
+    let envelope = text
+        .trim()
+        .strip_prefix("<task-notification>")
+        .and_then(|rest| rest.split_once("</task-notification>").map(|(body, _)| body));
+    // The scheduler marks its fires as a task-notification with this subkind.
+    if kind == Some("task-notification") && origin.get("subkind").and_then(Value::as_str) == Some("scheduled-trigger") {
+        return Some(scheduled_cause(value, &text));
+    }
+    if kind == Some("task-notification") || envelope.is_some() {
+        let mut cause = TurnCause::of_kind(TurnCauseKind::Task);
+        if let Some(body) = envelope {
+            cause.task_id = envelope_tag(body, "task-id");
+            cause.tool_use_id = envelope_tag(body, "tool-use-id");
+            cause.task_kind = envelope_tag(body, "task-type");
+            cause.task_status = envelope_tag(body, "status");
+            cause.summary = envelope_tag(body, "summary");
+        }
+        return Some(cause);
+    }
+    if matches!(kind, Some("peer" | "coordinator" | "observer")) {
+        let mut cause = TurnCause::of_kind(TurnCauseKind::Peer);
+        cause.peer_name = bounded_field(origin, "name");
+        cause.text = bounded_field(origin, "body").or_else(|| Some(bounded(&text)));
+        return Some(cause);
+    }
+    if kind == Some("scheduled-trigger")
+        || flag_is_true(value, "modelScheduledOrigin")
+        || value.get("wakeupSource").and_then(Value::as_str).is_some()
+    {
+        return Some(scheduled_cause(value, &text));
+    }
+    None
+}
+
+fn scheduled_cause(value: &Value, text: &str) -> TurnCause {
+    let mut cause = TurnCause::of_kind(TurnCauseKind::Scheduled);
+    cause.wakeup_source = bounded_field(value, "wakeupSource");
+    cause.prompt = Some(bounded(text));
+    cause
+}
+
+fn classify_attachment_line(value: &Value) -> ParsedLine {
+    let Some(attachment) = value.get("attachment") else {
+        return ParsedLine::skipped(SkipReason::Attachment);
+    };
+    let human_origin = |value: &Value| {
+        value.get("origin").is_none()
+            || value.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str) == Some("human")
+    };
+    if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
+        || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
+        || flag_is_true(attachment, "isMeta")
+        || flag_is_true(value, "isMeta")
+        || !human_origin(attachment)
+        || !human_origin(value)
+    {
+        return ParsedLine::skipped(SkipReason::Attachment);
+    }
+    let Some(prompt) = attachment.get("prompt").and_then(text_blocks) else {
+        return ParsedLine::skipped(SkipReason::Attachment);
+    };
+    let text = strip_composed_block(&prompt).to_owned();
+    if text.is_empty() {
+        return ParsedLine::skipped(SkipReason::Attachment);
+    }
+    ParsedLine {
+        outcomes: vec![Outcome::Item {
+            chars: text.chars().count(),
+            tool_use_id: None,
+            event: AgentDomainEvent::UserMessageDelivered {
+                client_message_id: line_uuid(value),
+                turn_id: String::new(),
+                text,
+            },
+        }],
+        ..ParsedLine::default()
+    }
+}
+
+fn tool_result_outcome(block: &Value, turn_id: &str, structured: Option<&Value>) -> Option<Outcome> {
     let tool_use_id = block.get("tool_use_id").and_then(Value::as_str)?;
     if tool_use_id.is_empty() {
         return None;
@@ -607,6 +993,7 @@ fn tool_result_outcome(block: &Value, turn_id: &str) -> Option<Outcome> {
     Some(Outcome::ToolResult {
         tool_use_id: tool_use_id.to_owned(),
         chars: value_chars(&content),
+        structured: structured.cloned(),
         event: AgentDomainEvent::ToolCallCompleted {
             turn_id: turn_id.to_owned(),
             tool_use_id: tool_use_id.to_owned(),
@@ -616,7 +1003,199 @@ fn tool_result_outcome(block: &Value, turn_id: &str) -> Option<Outcome> {
     })
 }
 
+/// How Claude Code 2.1.311 words the result of a call whose permission request was still open when
+/// the host's stream closed (the session was closed, or its host died): the request's failure, then
+/// the abort that failed it.
+const QUESTION_STREAM_CLOSED: &str =
+    "Tool permission request failed: AbortError: Tool permission stream closed before response received";
+
+/// A restored question has no live interaction id. Its tool id gives it a stable local identity.
+/// Unknown or malformed results keep the ordinary tool row rather than opening a form.
+fn restored_question(
+    call: &Slot,
+    result: &AgentDomainEvent,
+    structured: Option<&Value>,
+) -> Option<(AgentDomainEvent, AgentDomainEvent)> {
+    if call
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentDomainEvent::QuestionAsked { .. }))
+    {
+        return None;
+    }
+    let (id, input) = call.events.iter().find_map(|event| match event {
+        AgentDomainEvent::ToolCallStarted {
+            tool_use_id,
+            name,
+            input,
+            ..
+        } if name == "AskUserQuestion" => Some((tool_use_id, input)),
+        _ => None,
+    })?;
+    if !question_fits(id, 128) {
+        return None;
+    }
+    let raw_questions = input.get("questions")?.as_array()?;
+    if !(1..=4).contains(&raw_questions.len()) || serde_json::to_vec(raw_questions).ok()?.len() > 256 * 1024 {
+        return None;
+    }
+    let mut questions: Vec<QuestionSpec> = Vec::new();
+    for raw in raw_questions {
+        let question = question_text(raw, "question", 4000)?;
+        let header = question_text(raw, "header", 256)?;
+        if questions.iter().any(|q| q.question == question) {
+            return None;
+        }
+        let mut options: Vec<QuestionOptionSpec> = Vec::new();
+        let raw_options = raw.get("options")?.as_array()?;
+        if !(2..=4).contains(&raw_options.len()) {
+            return None;
+        }
+        for option in raw_options {
+            let label = question_text(option, "label", 1000)?;
+            if options.iter().any(|o| o.label == label) {
+                return None;
+            }
+            options.push(QuestionOptionSpec {
+                label,
+                description: question_text(option, "description", 4000)?,
+                preview: match option.get("preview") {
+                    Some(_) => Some(question_text(option, "preview", 16384)?),
+                    None => None,
+                },
+            });
+        }
+        questions.push(QuestionSpec {
+            question,
+            header,
+            multi_select: raw.get("multiSelect").map(Value::as_bool).unwrap_or(Some(false))?,
+            options,
+        });
+    }
+    let AgentDomainEvent::ToolCallCompleted { content, is_error, .. } = result else {
+        return None;
+    };
+    let text = text_blocks(content).unwrap_or_default();
+    let text = text.trim_start();
+    let mut reason = None;
+    let outcome = if text.starts_with("The user doesn't want to proceed with this tool use. The tool use was rejected")
+        || text.starts_with("User declined to answer questions")
+    {
+        QuestionOutcome::Declined
+    } else if text.starts_with("The user wants to clarify these questions.")
+        || text.starts_with("User asked Claude for more questions!")
+        || text.starts_with("User asked Claude for more questions (so far):")
+    {
+        QuestionOutcome::ChatRequested
+    } else if text.starts_with(QUESTION_STREAM_CLOSED) {
+        // The CLI's own result when the stream its permission request went out on closed before
+        // any answer came back: the session that showed the question ended while it waited.
+        QuestionOutcome::SessionClosed
+    } else if structured.and_then(|v| v.get("answers")).is_some_and(Value::is_object) {
+        QuestionOutcome::Answered
+    } else if *is_error && text.starts_with("[Request interrupted by user") {
+        QuestionOutcome::Interrupted
+    } else if *is_error {
+        // Something other than the person refused the call before it reached them: a permission hook's
+        // denial, the CLI's own check of the input. The question was never shown, and the result's words
+        // say why; they are the settled row's reason, since its call is not drawn beside it.
+        reason = Some(bounded_reason(text));
+        QuestionOutcome::HostRefused
+    } else {
+        return None;
+    };
+    let mut answers = Vec::new();
+    if matches!(outcome, QuestionOutcome::Answered | QuestionOutcome::ChatRequested) {
+        if let Some(values) = structured.and_then(|v| v.get("answers")) {
+            let values = values.as_object()?;
+            if values.len() > questions.len() || values.keys().any(|key| !questions.iter().any(|q| &q.question == key))
+            {
+                return None;
+            }
+            for (index, question) in questions.iter().enumerate() {
+                if let Some(answer) = values.get(&question.question) {
+                    let answer = answer.as_str()?;
+                    if !question_fits(answer, 32768) {
+                        return None;
+                    }
+                    let raw_notes = structured
+                        .and_then(|v| v.get("annotations"))
+                        .and_then(|v| v.get(&question.question))
+                        .and_then(|v| v.get("notes"));
+                    let notes = match raw_notes {
+                        Some(value) => Some(value.as_str().filter(|text| question_fits(text, 8192))?.to_owned()),
+                        None => None,
+                    };
+                    answers.push(ShownAnswer {
+                        question_index: index as u32,
+                        answer: answer.to_owned(),
+                        notes,
+                    });
+                }
+            }
+        }
+    }
+    if answers.iter().map(|a| a.answer.encode_utf16().count()).sum::<usize>() > 32768 {
+        return None;
+    }
+    Some((
+        AgentDomainEvent::QuestionAsked {
+            interaction_id: id.clone(),
+            tool_use_id: Some(id.clone()),
+            questions,
+            unsupported_reason: None,
+        },
+        AgentDomainEvent::QuestionSettled {
+            interaction_id: id.clone(),
+            outcome,
+            answers,
+            reason,
+        },
+    ))
+}
+
+/// The most a restored question's reason holds, as a live settlement's: cut on a character boundary, with `…`.
+const QUESTION_REASON_MAX_CHARS: usize = 2000;
+
+fn bounded_reason(text: &str) -> String {
+    let text = text.trim_end();
+    if text.chars().count() <= QUESTION_REASON_MAX_CHARS {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(QUESTION_REASON_MAX_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+fn question_fits(text: &str, max: usize) -> bool {
+    text.encode_utf16().count() <= max
+}
+
+fn question_text(value: &Value, key: &str, max: usize) -> Option<String> {
+    let text = value.get(key)?.as_str()?;
+    question_fits(text, max).then(|| text.to_owned())
+}
+
+/// Whether the CLI wrote this assistant line under its own model name rather than the model's.
+///
+/// The CLI's readers that pick out what the model said (its reply text, its turn summaries, its
+/// idle-time bookkeeping) all leave out a message whose model is `<synthetic>`; the interrupted-turn
+/// filler `No response requested.` is the one it writes into a session file. An API error it writes
+/// under the same name carries `isApiErrorMessage` and is shown to the person as the turn's reply, as
+/// it is live, so it stays.
+fn is_synthetic_filler(value: &Value) -> bool {
+    value
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        == Some("<synthetic>")
+        && !flag_is_true(value, "isApiErrorMessage")
+}
+
 fn classify_assistant_line(value: &Value) -> ParsedLine {
+    if is_synthetic_filler(value) {
+        return ParsedLine::skipped(SkipReason::Synthetic);
+    }
     let turn_id = line_uuid(value);
     let mut outcomes = Vec::new();
     let mut dropped_blocks = 0u32;
@@ -657,6 +1236,7 @@ fn classify_assistant_line(value: &Value) -> ParsedLine {
         skip,
         dropped_blocks,
         version: None,
+        ..ParsedLine::default()
     }
 }
 
@@ -679,10 +1259,8 @@ fn tool_use_outcome(block: &Value, turn_id: &str) -> Option<Outcome> {
     })
 }
 
-/// `ToolCallRecord::turn_id` is a required `String` and history has no notion of a turn, so the
-/// line's own `uuid` stands in. It never reaches a screen -- `serialize_snapshot_for_js` does not
-/// send it -- so it is a debugging aid, not a claim. The four conversational line types carry a
-/// `uuid` 100% of the time; a line without one gets the empty string rather than a fabricated id.
+/// The opener's UUID becomes the restored turn id, which groups calls into runs on screen.
+/// Missing UUIDs get a deterministic segment id while the file is read.
 fn line_uuid(value: &Value) -> String {
     value.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned()
 }
@@ -798,6 +1376,670 @@ mod tests {
         read_history_from(&mut Cursor::new(lines.as_bytes()), false).expect("a cursor cannot fail")
     }
 
+    fn item_events(history: &TranscriptHistory) -> Vec<&AgentDomainEvent> {
+        history
+            .events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    AgentDomainEvent::TurnStarted { .. }
+                        | AgentDomainEvent::TurnCompleted { .. }
+                        | AgentDomainEvent::AssistantMessageBoundary { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn projected(history: &TranscriptHistory) -> crate::projection::AgentSessionProjection {
+        let mut projection = crate::projection::AgentSessionProjection::default();
+        for event in &history.events {
+            match event {
+                AgentDomainEvent::TurnStarted { .. } => assert!(projection.active_turn_id.is_none()),
+                AgentDomainEvent::TurnCompleted { turn_id, outcome, .. } => {
+                    assert_eq!(projection.active_turn_id.as_ref(), Some(turn_id));
+                    assert_eq!(*outcome, TurnOutcome::Completed);
+                }
+                AgentDomainEvent::ContentDelta { turn_id, .. }
+                | AgentDomainEvent::ToolCallStarted { turn_id, .. }
+                | AgentDomainEvent::ToolCallCompleted { turn_id, .. }
+                | AgentDomainEvent::UserMessageDelivered { turn_id, .. }
+                | AgentDomainEvent::TurnAttributed { turn_id, .. }
+                | AgentDomainEvent::AssistantMessageBoundary { turn_id } => {
+                    assert_eq!(projection.active_turn_id.as_ref(), Some(turn_id));
+                }
+                _ => {}
+            }
+            projection.apply(event);
+        }
+        assert_eq!(projection.active_turn_id, None);
+        assert!(!projection.assistant_message_open);
+        projection
+    }
+
+    fn turn_ids(history: &TranscriptHistory) -> Vec<&str> {
+        history
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDomainEvent::TurnStarted { turn_id } => Some(turn_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn boundary_count(history: &TranscriptHistory) -> usize {
+        history
+            .events
+            .iter()
+            .filter(|event| matches!(event, AgentDomainEvent::AssistantMessageBoundary { .. }))
+            .count()
+    }
+
+    fn restored_questions(lines: &str) -> crate::projection::AgentSessionProjection {
+        let projection = projected(&fold(lines));
+        assert!(projection.waiting_questions().next().is_none());
+        assert_eq!(projection.tool_calls.len(), 1);
+        projection
+    }
+
+    #[test]
+    fn answered_single_restores_only_the_answered_question() {
+        let projection = restored_questions(include_str!("../../tests/fixtures/history_b/question_single.jsonl"));
+        let row = &projection.questions[0];
+        assert_eq!(row.turn_id.as_deref(), Some("prompt"));
+        assert_eq!(row.tool_use_id.as_deref(), Some("ask-layout"));
+        assert_eq!(row.questions.len(), 2);
+        assert_eq!(row.questions[0].options[0].label, "Grid");
+        assert_eq!(
+            row.state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::Answered,
+                answers: vec![ShownAnswer {
+                    question_index: 0,
+                    answer: "Grid".into(),
+                    notes: None
+                }],
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn multi_select_restores_the_exact_quoted_answer() {
+        let projection = restored_questions(include_str!("../../tests/fixtures/history_b/question_multi.jsonl"));
+        assert!(projection.questions[0].questions[0].multi_select);
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::Answered,
+                answers: vec![ShownAnswer {
+                    question_index: 0,
+                    answer: "\"a, b\", \"say \\\"hi\\\"\"".into(),
+                    notes: None
+                }],
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn preview_restores_choices_and_notes() {
+        let projection = restored_questions(include_str!("../../tests/fixtures/history_b/question_preview.jsonl"));
+        assert_eq!(
+            projection.questions[0].questions[0].options[1].preview.as_deref(),
+            Some("# List\n\nRows")
+        );
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::Answered,
+                answers: vec![ShownAnswer {
+                    question_index: 0,
+                    answer: "List".into(),
+                    notes: Some("Keep \"this\" row\u{200b}".into())
+                }],
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejected_question_is_declined_and_never_rearmed() {
+        let lines = include_str!("../../tests/fixtures/history_b/question_declined.jsonl");
+        let repeated = format!("{lines}{}\n", lines.lines().last().unwrap());
+        let projection = restored_questions(&repeated);
+        assert_eq!(projection.questions.len(), 1);
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::Declined,
+                answers: vec![],
+                reason: None,
+            }
+        );
+    }
+
+    /// A question whose session closed while it waited: the CLI wrote the failed permission request as
+    /// the call's result and went on. The row comes back settled closed, with no answer and nothing
+    /// to answer; the reply after it stays a reply.
+    #[test]
+    fn a_question_cut_by_the_closed_stream_restores_as_session_closed() {
+        let lines = include_str!("../../tests/fixtures/history_b/question_closed.jsonl");
+        let projection = restored_questions(lines);
+        assert_eq!(projection.questions.len(), 1);
+        assert_eq!(projection.questions[0].tool_use_id.as_deref(), Some("ask-layout"));
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::SessionClosed,
+                answers: vec![],
+                reason: None,
+            }
+        );
+        assert_eq!(
+            projection.transcript.last().map(|m| m.text.as_str()),
+            Some("Going on without an answer.")
+        );
+        // Another failure of the permission request is not the session closing, and an answer-shaped
+        // structured result beside the closed text names no answer.
+        let other = lines.replace(
+            "AbortError: Tool permission stream closed before response received",
+            "Error: something else",
+        );
+        assert_eq!(
+            restored_questions(&other).questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::HostRefused,
+                answers: vec![],
+                reason: Some("Tool permission request failed: Error: something else".into()),
+            }
+        );
+        let with_answers = lines.replace(
+            r#""toolUseResult": "Error: Tool permission request failed: AbortError: Tool permission stream closed before response received""#,
+            r#""toolUseResult": {"answers": {"Which layout?": "Grid"}}"#,
+        );
+        assert_ne!(with_answers, lines);
+        assert_eq!(
+            restored_questions(&with_answers).questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::SessionClosed,
+                answers: vec![],
+                reason: None,
+            }
+        );
+    }
+
+    /// A call something other than the person refused (a permission hook, the CLI's check of its input) still
+    /// yields its question row, settled as refused with the result's words; an interrupt's error reads as one.
+    #[test]
+    fn an_errored_question_call_restores_a_refused_row_with_its_reason() {
+        let lines = include_str!("../../tests/fixtures/history_b/question_refused.jsonl");
+        let projection = restored_questions(lines);
+        assert_eq!(projection.questions.len(), 1);
+        assert_eq!(projection.questions[0].questions.len(), 2);
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::HostRefused,
+                answers: vec![],
+                reason: Some("A permission hook refused this call.".into()),
+            }
+        );
+        let interrupted = lines.replace(
+            "A permission hook refused this call.",
+            "[Request interrupted by user for tool use]",
+        );
+        assert_eq!(
+            restored_questions(&interrupted).questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::Interrupted,
+                answers: vec![],
+                reason: None,
+            }
+        );
+        let long = lines.replace("A permission hook refused this call.", &"x".repeat(3000));
+        let crate::QuestionState::Settled {
+            reason: Some(reason), ..
+        } = &restored_questions(&long).questions[0].state
+        else {
+            panic!("a refused row with its reason");
+        };
+        assert_eq!(reason.chars().count(), 2000);
+        assert!(reason.ends_with('…'));
+        // The same words in a result that is not an error stay a plain tool row.
+        let plain = lines.replace(r#""is_error": true"#, r#""is_error": false"#);
+        assert!(restored_questions(&plain).questions.is_empty());
+    }
+
+    #[test]
+    fn clarification_restores_chat_requested() {
+        let projection = restored_questions(include_str!("../../tests/fixtures/history_b/question_chat.jsonl"));
+        assert_eq!(
+            projection.questions[0].state,
+            crate::QuestionState::Settled {
+                outcome: QuestionOutcome::ChatRequested,
+                answers: vec![],
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_result_or_missing_result_keeps_a_plain_tool_row() {
+        let lines = include_str!("../../tests/fixtures/history_b/question_plain.jsonl");
+        assert!(restored_questions(lines).questions.is_empty());
+        let unfinished = lines.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(restored_questions(&unfinished).questions.is_empty());
+        // Familiar presentation text alone is not a structured answer.
+        assert!(restored_questions(&lines.replace(
+            "An unfamiliar result with no structured answers",
+            "User answered Claude's questions:"
+        ))
+        .questions
+        .is_empty());
+    }
+
+    #[test]
+    fn oversized_or_malformed_question_data_keeps_the_plain_tool_row() {
+        let lines = include_str!("../../tests/fixtures/history_b/question_preview.jsonl");
+        for (line_index, pointer, value) in [
+            (
+                2,
+                "/toolUseResult/annotations/Which layout?/notes",
+                Value::String("n".repeat(8193)),
+            ),
+            (
+                1,
+                "/message/content/0/input/questions/0/question",
+                Value::String("q".repeat(4001)),
+            ),
+            (
+                1,
+                "/message/content/0/input/questions/0/options/0/preview",
+                Value::String("p".repeat(16385)),
+            ),
+            (
+                2,
+                "/toolUseResult/answers/Which layout?",
+                Value::String("a".repeat(32769)),
+            ),
+            (2, "/toolUseResult/answers/Which layout?", Value::Bool(false)),
+        ] {
+            let mut rows: Vec<Value> = lines.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            *rows[line_index].pointer_mut(pointer).unwrap() = value;
+            let malformed = rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+            assert!(restored_questions(&malformed).questions.is_empty(), "{pointer}");
+        }
+    }
+
+    #[test]
+    fn a_steer_read_mid_turn_is_delivered_in_its_segment() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/steer_mid_turn.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert_eq!(projection.user_prompts.len(), 2);
+        assert_eq!(projection.user_prompts[1].text, "Also check status");
+        assert!(projection.user_prompts[1].delivered);
+        assert!(projection.tool_calls.iter().all(|call| call.turn_id == "turn-1"));
+        assert!(history.events.iter().any(|event| matches!(event,
+            AgentDomainEvent::UserMessageDelivered { client_message_id, turn_id, text }
+            if client_message_id == "steer-1" && turn_id == "turn-1" && text == "Also check status"
+        )));
+    }
+
+    #[test]
+    fn a_woken_turn_has_its_own_reply_and_one_run_of_three_calls() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/woken_turn.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["human-1", "wake"]);
+        assert_eq!(
+            projection
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Started", "Finished"]
+        );
+        assert_eq!(
+            projection
+                .tool_calls
+                .iter()
+                .map(|c| c.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            ["human-1", "wake", "wake", "wake"]
+        );
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert_eq!(boundary_count(&history), 2);
+    }
+
+    #[test]
+    fn a_skill_injection_between_calls_adds_no_turn_or_boundary() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/meta_between_calls.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert_eq!(boundary_count(&history), 1);
+        assert_eq!(projection.tool_calls.len(), 2);
+        assert!(projection.tool_calls.iter().all(|call| call.turn_id == "turn-1"));
+    }
+
+    #[test]
+    fn rejected_user_lines_never_split_a_turn_or_its_call_run() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/rejected_lines.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert_eq!(boundary_count(&history), 1);
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert_eq!(projection.tool_calls.len(), 2);
+        assert!(projection.tool_calls.iter().all(|call| call.turn_id == "turn-1"));
+        assert_eq!(history.counts.sidechain_lines, 1);
+        assert_eq!(history.counts.rejected_user_lines, 5);
+    }
+
+    #[test]
+    fn queued_commands_restore_only_displayable_human_prompts() {
+        let history = fold(include_str!(
+            "../../tests/fixtures/history_b/queued_command_filter.jsonl"
+        ));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert_eq!(
+            projection
+                .user_prompts
+                .iter()
+                .map(|p| (p.text.as_str(), p.delivered))
+                .collect::<Vec<_>>(),
+            [("Start", false), ("hello", true), ("joined text", true)]
+        );
+        assert!(projection.turn_starts.is_empty());
+        assert_eq!(history.counts.attachment_lines, 7);
+    }
+
+    #[test]
+    fn a_final_cli_segment_is_closed_and_the_next_prompt_can_start() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/task_notification.jsonl"));
+        let mut projection = projected(&history);
+        assert!(
+            matches!(history.events.last(), Some(AgentDomainEvent::TurnCompleted { turn_id, .. }) if turn_id == "wake")
+        );
+        projection.apply(&AgentDomainEvent::UserPromptSubmitted {
+            text: "And now?".into(),
+        });
+        projection.apply(&AgentDomainEvent::TurnStarted { turn_id: "live".into() });
+        assert_eq!(projection.active_turn_id.as_deref(), Some("live"));
+    }
+
+    #[test]
+    fn a_background_completion_carries_its_status_summary_and_both_links() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/task_notification.jsonl"));
+        let projection = projected(&history);
+        let start = &projection.turn_starts[0];
+        assert_eq!(start.origin, TurnOrigin::Cli);
+        let cause = start.cause.as_ref().unwrap();
+        assert_eq!(cause.kind, TurnCauseKind::Task);
+        assert_eq!(cause.task_id.as_deref(), Some("bg-1"));
+        assert_eq!(cause.tool_use_id.as_deref(), Some("bash-bg"));
+        assert_eq!(cause.task_kind, None, "recorded envelopes carry no task-type tag");
+        assert_eq!(cause.task_status.as_deref(), Some("completed"));
+        assert_eq!(
+            cause.summary.as_deref(),
+            Some("Background command completed (exit code 0)")
+        );
+    }
+
+    #[test]
+    fn peer_bodies_are_bounded_as_unicode_text() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/peer.jsonl"));
+        let projection = projected(&history);
+        assert!(projection.user_prompts.is_empty());
+        let cause = projection.turn_starts[0].cause.as_ref().unwrap();
+        assert_eq!(cause.kind, TurnCauseKind::Peer);
+        assert_eq!(cause.peer_name.as_deref(), Some("reviewer"));
+        assert_eq!(cause.text.as_ref().unwrap(), &"界".repeat(2000));
+    }
+
+    #[test]
+    fn compaction_restores_a_divider_and_keeps_the_summary_private() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/compaction.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert_eq!(projection.notices.len(), 1);
+        assert_eq!(projection.notices[0].kind, SessionNoticeKind::Compaction);
+        assert_eq!(projection.transcript.len(), 2);
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert!(!format!("{:?}", history.events).contains("PRIVATE SUMMARY"));
+    }
+
+    /// The turn-level order of a history: each turn start, prompt and compaction divider.
+    fn turn_outline(history: &TranscriptHistory) -> Vec<String> {
+        history
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDomainEvent::TurnStarted { .. } => Some("turn".to_owned()),
+                AgentDomainEvent::UserPromptSubmitted { text } => Some(format!("prompt {text}")),
+                AgentDomainEvent::SessionNotice {
+                    kind: SessionNoticeKind::Compaction,
+                    ..
+                } => Some("compaction".to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A compaction the person asked for is written before the line of the command that asked: the divider
+    /// belongs to the turn that line opens, as in a live tab, and not to the turn before it or a turn of its
+    /// own. One the CLI ran by itself stays where it was written.
+    #[test]
+    fn a_manual_compaction_divider_sits_in_the_turn_of_the_compact_command() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/compaction_manual.jsonl"));
+        assert_eq!(
+            turn_outline(&history),
+            [
+                "turn",
+                "prompt Before the compaction",
+                "turn",
+                "prompt /compact",
+                "compaction",
+                "turn",
+                "prompt After the compaction"
+            ]
+        );
+        assert!(!format!("{:?}", history.events).contains("PRIVATE SUMMARY"));
+        let recorded = fold(include_str!(
+            "../../tests/fixtures/claude_scripted/c10/transcript/0c888376-deae-4f45-96e4-b6ff56a20d1a.jsonl"
+        ));
+        assert_eq!(
+            turn_outline(&recorded),
+            ["turn", "prompt C10-START", "turn", "prompt /compact", "compaction"]
+        );
+        let auto = fold(include_str!("../../tests/fixtures/history_b/compaction.jsonl"));
+        assert_eq!(turn_outline(&auto), ["turn", "prompt Continue", "compaction"]);
+    }
+
+    #[test]
+    fn a_recorded_wakeup_mark_opens_a_scheduled_turn() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/scheduled_fire.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1", "fire"]);
+        assert_eq!(projection.user_prompts.len(), 1);
+        let cause = projection.turn_starts[0].cause.as_ref().unwrap();
+        assert_eq!(cause.kind, TurnCauseKind::Scheduled);
+        assert_eq!(cause.wakeup_source.as_deref(), Some("loop_wakeup"));
+        assert_eq!(cause.prompt.as_deref(), Some("Check status"));
+    }
+
+    #[test]
+    fn an_unmarked_meta_fire_stays_in_the_preceding_turn() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/unmarked_fire.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+        assert!(projection.turn_starts.is_empty());
+        assert_eq!(projection.transcript.len(), 2);
+    }
+
+    #[test]
+    fn only_a_changed_text_message_id_splits_replies_within_a_segment() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/message_boundaries.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(boundary_count(&history), 2);
+        assert_eq!(
+            projection
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["First reply", "Second reply"]
+        );
+        assert_eq!(turn_ids(&history), ["turn-1"]);
+    }
+
+    #[test]
+    fn missing_opener_uuids_get_segment_ids_instead_of_each_calls_uuid() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/fallback_ids.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["history-1", "history-2"]);
+        assert_eq!(
+            projection
+                .tool_calls
+                .iter()
+                .map(|call| call.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            ["history-1", "history-2"]
+        );
+        assert_eq!(
+            projection.turn_starts[0].cause.as_ref().unwrap().peer_name.as_deref(),
+            Some("watcher")
+        );
+    }
+
+    #[test]
+    fn human_words_cannot_be_misattributed_as_a_cli_turn() {
+        let envelope = include_str!("../../tests/fixtures/history_b/task_notification.jsonl")
+            .lines()
+            .find(|line| line.contains("task-notification"))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(envelope).unwrap();
+        value["promptSource"] = Value::from("typed");
+        value.as_object_mut().unwrap().remove("origin");
+        let projection = projected(&fold(&value.to_string()));
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert!(projection.turn_starts.is_empty());
+        value["origin"] = serde_json::json!({"kind": "human"});
+        value["wakeupSource"] = Value::from("loop_wakeup");
+        let projection = projected(&fold(&value.to_string()));
+        assert_eq!(projection.user_prompts.len(), 1);
+        assert!(projection.turn_starts.is_empty());
+    }
+
+    #[test]
+    fn a_system_envelope_without_origin_still_starts_a_cli_turn() {
+        let envelope = include_str!("../../tests/fixtures/history_b/task_notification.jsonl")
+            .lines()
+            .find(|line| line.contains("task-notification"))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(envelope).unwrap();
+        value.as_object_mut().unwrap().remove("origin");
+        let projection = projected(&fold(&value.to_string()));
+        assert!(projection.user_prompts.is_empty());
+        assert_eq!(
+            projection.turn_starts[0].cause.as_ref().unwrap().kind,
+            TurnCauseKind::Task
+        );
+    }
+
+    #[test]
+    fn coordinator_and_observer_lines_carry_their_peer_identity() {
+        let peer = include_str!("../../tests/fixtures/history_b/peer.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let mut value: Value = serde_json::from_str(peer).unwrap();
+        for kind in ["coordinator", "observer"] {
+            value["origin"]["kind"] = Value::from(kind);
+            let projection = projected(&fold(&value.to_string()));
+            assert!(projection.user_prompts.is_empty());
+            assert_eq!(
+                projection.turn_starts[0].cause.as_ref().unwrap().peer_name.as_deref(),
+                Some("reviewer")
+            );
+        }
+    }
+
+    #[test]
+    fn every_task_cause_field_is_bounded_and_markup_stays_text() {
+        let envelope = include_str!("../../tests/fixtures/history_b/task_notification.jsonl")
+            .lines()
+            .find(|line| line.contains("task-notification"))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(envelope).unwrap();
+        let long = "界".repeat(CAUSE_MAX_CHARS + 1);
+        value["message"]["content"] = Value::from(format!(
+            "<task-notification><task-id>{long}</task-id><tool-use-id>{long}</tool-use-id><task-type>{long}</task-type><status>{long}</status><summary>{long}</summary></task-notification>"
+        ));
+        let projection = projected(&fold(&value.to_string()));
+        let cause = projection.turn_starts[0].cause.as_ref().unwrap();
+        assert_eq!(cause.texts().count(), 5);
+        assert!(cause.texts().all(|text| text.chars().count() == CAUSE_MAX_CHARS));
+        value["message"]["content"] =
+            Value::from("<task-notification><summary><b>completed</b></summary></task-notification>");
+        let projection = projected(&fold(&value.to_string()));
+        assert_eq!(
+            projection.turn_starts[0].cause.as_ref().unwrap().summary.as_deref(),
+            Some("<b>completed</b>")
+        );
+    }
+
+    #[test]
+    fn the_other_scheduled_marks_also_open_cli_segments() {
+        let fire = include_str!("../../tests/fixtures/history_b/scheduled_fire.jsonl")
+            .lines()
+            .find(|line| line.contains("wakeupSource"))
+            .unwrap();
+        for mark in [
+            serde_json::json!({"modelScheduledOrigin": true}),
+            serde_json::json!({"origin": {"kind": "scheduled-trigger"}}),
+            serde_json::json!({"origin": {"kind": "task-notification", "subkind": "scheduled-trigger"}}),
+        ] {
+            let mut value: Value = serde_json::from_str(fire).unwrap();
+            value.as_object_mut().unwrap().remove("wakeupSource");
+            value.as_object_mut().unwrap().extend(mark.as_object().unwrap().clone());
+            let projection = projected(&fold(&value.to_string()));
+            assert!(projection.user_prompts.is_empty());
+            assert_eq!(
+                projection.turn_starts[0].cause.as_ref().unwrap().kind,
+                TurnCauseKind::Scheduled
+            );
+        }
+    }
+
+    #[test]
+    fn evicting_a_cli_opener_keeps_its_retained_calls_in_the_closed_segment() {
+        let envelope = include_str!("../../tests/fixtures/history_b/task_notification.jsonl")
+            .lines()
+            .find(|line| line.contains("task-notification"))
+            .unwrap();
+        let call = include_str!("../../tests/fixtures/history_b/meta_between_calls.jsonl")
+            .lines()
+            .find(|line| line.contains("tool_use"))
+            .unwrap();
+        let mut lines = vec![envelope.to_owned()];
+        for n in 0..HISTORY_MAX_ITEMS {
+            let mut value: Value = serde_json::from_str(call).unwrap();
+            value["message"]["content"][0]["id"] = Value::from(format!("call-{n}"));
+            lines.push(value.to_string());
+        }
+        let history = fold(&lines.join("\n"));
+        let projection = projected(&history);
+        assert_eq!(history.omitted_items, Some(1));
+        assert_eq!(turn_ids(&history), ["wake"]);
+        assert_eq!(
+            projection.turn_starts[0].cause.as_ref().unwrap().task_id.as_deref(),
+            Some("bg-1")
+        );
+        assert!(projection.tool_calls.iter().all(|call| call.turn_id == "wake"));
+    }
+
     fn skip_reason(line: &str) -> Option<SkipReason> {
         classify_line(line).skip
     }
@@ -858,12 +2100,62 @@ mod tests {
         let history = fold(line);
         assert_eq!(assistant_text(&history), vec!["here is why".to_string()]);
         assert!(matches!(
-            history.events[0],
+            item_events(&history)[0],
             AgentDomainEvent::ContentDelta {
                 kind: ContentKind::Text,
                 ..
             }
         ));
+    }
+
+    const SYNTHETIC_REPLY: &str = r#"{"type":"assistant","uuid":"a-synth","message":{"id":"m-synth","role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+
+    #[test]
+    fn the_synthetic_reply_after_an_interrupt_is_dropped_and_counted() {
+        assert_eq!(skip_reason(SYNTHETIC_REPLY), Some(SkipReason::Synthetic));
+        let history = fold(&[
+            typed_prompt("go"),
+            r#"{"type":"user","uuid":"u-int","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#.to_owned(),
+            SYNTHETIC_REPLY.to_owned(),
+        ].join("\n"));
+        assert!(assistant_text(&history).is_empty(), "{:?}", assistant_text(&history));
+        assert_eq!(history.counts.synthetic_lines, 1);
+        assert_eq!(history.counts.skipped_lines, 2);
+    }
+
+    #[test]
+    fn a_real_reply_in_the_place_of_the_synthetic_one_is_kept() {
+        let real = SYNTHETIC_REPLY
+            .replace("<synthetic>", "claude-sonnet-4-5")
+            .replace("a-synth", "a-real");
+        let history = fold(&[typed_prompt("go"), real].join("\n"));
+        assert_eq!(assistant_text(&history), vec!["No response requested.".to_owned()]);
+        assert_eq!(history.counts.synthetic_lines, 0);
+    }
+
+    #[test]
+    fn a_synthetic_line_that_carries_a_tool_use_leaves_no_call_behind() {
+        let line = r#"{"type":"assistant","uuid":"a-synth","message":{"id":"m","role":"assistant","model":"<synthetic>","content":[{"type":"tool_use","id":"toolu_s","name":"Bash","input":{}}]}}"#;
+        let history = fold(&[typed_prompt("go"), line.to_owned()].join("\n"));
+        assert!(
+            item_events(&history)
+                .iter()
+                .all(|event| !matches!(event, AgentDomainEvent::ToolCallStarted { .. })),
+            "{:?}",
+            item_events(&history)
+        );
+        assert_eq!(history.counts.synthetic_lines, 1);
+    }
+
+    #[test]
+    fn an_api_error_written_under_the_synthetic_name_is_still_a_reply() {
+        let line = r#"{"type":"assistant","uuid":"a-err","isApiErrorMessage":true,"message":{"id":"m","role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: Request rejected (429)"}]}}"#;
+        let history = fold(&[typed_prompt("go"), line.to_owned()].join("\n"));
+        assert_eq!(
+            assistant_text(&history),
+            vec!["API Error: Request rejected (429)".to_owned()]
+        );
+        assert_eq!(history.counts.synthetic_lines, 0);
     }
 
     #[test]
@@ -876,16 +2168,15 @@ mod tests {
         assert_eq!(history.counts.skipped_lines, 1);
     }
 
-    /// All ten subtypes, `compact_boundary` included. Session identity never comes from history.
+    /// Session identity never comes from history; only compaction has a persistent divider.
     #[test]
-    fn every_system_subtype_is_skipped_and_counted() {
+    fn system_subtypes_other_than_compaction_are_skipped_and_counted() {
         for subtype in [
             "turn_duration",
             "stop_hook_summary",
             "away_summary",
             "informational",
             "api_error",
-            "compact_boundary",
             "local_command",
             "model_refusal_fallback",
             "scheduled_task_fire",
@@ -957,7 +2248,7 @@ mod tests {
         lines.push(typed_prompt("after"));
         let history = fold(&lines.join("\n"));
         assert_eq!(prompts(&history), vec!["before", "after"]);
-        assert_eq!(history.events.len(), 2);
+        assert_eq!(item_events(&history).len(), 2);
         assert_eq!(history.parsed_items, 2);
         assert_eq!(history.omitted_items, Some(0));
         assert_eq!(history.counts.side_record_lines, 6);
@@ -1028,20 +2319,79 @@ mod tests {
     }
 
     /// The 131 measured lines with no `promptSource` and no `isMeta` are interrupt markers, slash
-    /// command echoes, `<local-command-stdout>` and bash-mode lines. Not one is a person's prose.
+    /// command echoes, `<local-command-stdout>` and bash-mode lines. Not one is a person's prose; the
+    /// commands the person typed are restored by their own rule (below), and nothing else of these is.
     #[test]
     fn a_user_line_with_no_prompt_source_is_rejected() {
         for content in [
             "[Request interrupted by user]",
             "[Request interrupted by user for tool use]",
-            "<command-name>/clear</command-name>",
             "<local-command-stdout>ok</local-command-stdout>",
-            "<bash-input>ls</bash-input>",
+            "<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>",
+            "<command-name></command-name>",
+            "<bash-input></bash-input>",
             "/compact",
         ] {
             let line = user_line("", &serde_json::to_string(content).unwrap());
             assert_eq!(skip_reason(&line), Some(SkipReason::RejectedUser), "content {content}");
         }
+    }
+
+    /// A command the person typed is a prompt of its own turn, as the CLI's resume shows it: a local command
+    /// with no reply, a prompt command whose expansion and reply follow, a bash-mode input. What they printed,
+    /// a command a skill the model ran wrote, and one from another producer stay out.
+    #[test]
+    fn commands_the_person_typed_open_their_own_turns_as_typed() {
+        let history = fold(include_str!("../../tests/fixtures/history_b/typed_commands.jsonl"));
+        let projection = projected(&history);
+        assert_eq!(turn_ids(&history), ["cmd-model", "cmd-review", "bash-in", "typed"]);
+        assert_eq!(
+            prompts(&history),
+            ["/model", "/review the last diff", "!ls -la", "Thanks"].map(String::from)
+        );
+        assert_eq!(projection.tool_calls.len(), 1);
+        assert_eq!(projection.tool_calls[0].turn_id, "cmd-review");
+        let texts: Vec<&str> = projection.transcript.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["Looks fine", "Welcome"]);
+        // The caveat, the expansion, both outputs and the line of the skill the model ran.
+        assert_eq!(history.counts.rejected_user_lines, 5);
+        for extra in [
+            r#""origin":{"kind":"unknown"},"#,
+            r#""isMeta":true,"#,
+            r#""isVisibleInTranscriptOnly":true,"#,
+        ] {
+            let line = user_line(extra, r#""<command-name>/model</command-name>""#);
+            assert_eq!(skip_reason(&line), Some(SkipReason::RejectedUser), "{extra}");
+        }
+    }
+
+    /// A command echo is the one the CLI writes with no `promptSource`. A line that carries one is a message
+    /// with a producer: a person's own prompt that merely starts with a command tag keeps every word, and
+    /// another producer's line with the same tags is nobody's words.
+    #[test]
+    fn a_command_tag_on_a_line_with_a_prompt_source_is_not_a_command_echo() {
+        let typed = user_line(
+            r#""promptSource":"typed","origin":{"kind":"human"},"#,
+            r#""<bash-input>git status</bash-input> -- why does this show up?""#,
+        );
+        assert_eq!(
+            prompts(&fold(&typed)),
+            ["<bash-input>git status</bash-input> -- why does this show up?".to_string()]
+        );
+        let typed_command = user_line(
+            r#""promptSource":"typed","origin":{"kind":"human"},"#,
+            r#""<command-name>/compact</command-name><command-args>keep it short</command-args>""#,
+        );
+        assert_eq!(
+            prompts(&fold(&typed_command)),
+            ["<command-name>/compact</command-name><command-args>keep it short</command-args>".to_string()]
+        );
+        let system = user_line(
+            r#""promptSource":"system","#,
+            r#""<command-name>/compact</command-name><command-args>written by something else</command-args>""#,
+        );
+        assert_eq!(skip_reason(&system), Some(SkipReason::RejectedUser));
+        assert!(prompts(&fold(&system)).is_empty());
     }
 
     #[test]
@@ -1130,10 +2480,10 @@ mod tests {
             r#"{"type":"user","uuid":"u-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a\nb","is_error":false}]}}"#,
         );
         let history = fold(lines);
-        assert_eq!(history.events.len(), 2);
+        assert_eq!(item_events(&history).len(), 2);
         // A result is not an item: it belongs to the call it completes.
         assert_eq!(history.parsed_items, 1);
-        match &history.events[0] {
+        match &item_events(&history)[0] {
             AgentDomainEvent::ToolCallStarted {
                 tool_use_id,
                 name,
@@ -1146,7 +2496,7 @@ mod tests {
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
-        match &history.events[1] {
+        match &item_events(&history)[1] {
             AgentDomainEvent::ToolCallCompleted {
                 tool_use_id,
                 content,
@@ -1171,7 +2521,7 @@ mod tests {
             r#"{"type":"user","uuid":"u","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"x"}]}]}}"#,
         );
         let history = fold(lines);
-        match &history.events[1] {
+        match &item_events(&history)[1] {
             AgentDomainEvent::ToolCallCompleted { is_error, content, .. } => {
                 assert!(!is_error);
                 // The provider's own value, passed through byte for byte rather than flattened.
@@ -1193,7 +2543,7 @@ mod tests {
         );
         let history = fold(lines);
         assert!(prompts(&history).is_empty());
-        assert_eq!(history.events.len(), 2);
+        assert_eq!(item_events(&history).len(), 2);
         assert_eq!(history.counts.dropped_blocks, 1);
     }
 
@@ -1290,9 +2640,8 @@ mod tests {
             r#"{"type":"user","uuid":"u2","parentUuid":"p","promptSource":"typed","message":{"role":"user","content":"second"}}"#,
         ];
         let history = fold(&lines.join("\n"));
-        let order: Vec<&str> = history
-            .events
-            .iter()
+        let order: Vec<&str> = item_events(&history)
+            .into_iter()
             .map(|event| match event {
                 AgentDomainEvent::UserPromptSubmitted { text } => text.as_str(),
                 AgentDomainEvent::ContentDelta { text, .. } => text.as_str(),
@@ -1401,8 +2750,7 @@ mod tests {
         // The completion was evicted along with the call it belonged to, so nothing dangles and
         // nothing had to be filtered out afterwards.
         assert!(
-            history
-                .events
+            item_events(&history)
                 .iter()
                 .all(|e| matches!(e, AgentDomainEvent::UserPromptSubmitted { .. })),
             "{:?}",
@@ -1502,6 +2850,7 @@ mod tests {
                 + c.sidechain_lines
                 + c.rejected_user_lines
                 + c.empty_prompt_lines
+                + c.synthetic_lines
         );
         assert_eq!(c.skipped_lines, 7);
     }
@@ -1641,10 +2990,16 @@ mod tests {
         assert_eq!((started, completed), (1, 1));
         assert_eq!(history.counts.orphan_tool_results, 0);
 
-        // The compaction summary was refused, its paired boundary line was dropped as a `system`
-        // line, and neither reached the events.
+        // The summary stays private while its paired boundary restores the compaction divider.
         assert_eq!(history.counts.rejected_user_lines, 2, "the summary and the isMeta line");
-        assert_eq!(history.counts.system_lines, 1);
+        assert_eq!(history.counts.system_lines, 0);
+        assert!(history.events.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::SessionNotice {
+                kind: SessionNoticeKind::Compaction,
+                ..
+            }
+        )));
         let rendered = format!("{:?}", history.events);
         assert!(!rendered.contains("This session is being continued"));
 
@@ -1716,7 +3071,13 @@ mod tests {
                             path.display()
                         );
                     }
-                    AgentDomainEvent::ContentDelta { .. } => {}
+                    AgentDomainEvent::ContentDelta { .. }
+                    | AgentDomainEvent::TurnStarted { .. }
+                    | AgentDomainEvent::TurnAttributed { .. }
+                    | AgentDomainEvent::TurnCompleted { .. }
+                    | AgentDomainEvent::AssistantMessageBoundary { .. }
+                    | AgentDomainEvent::UserMessageDelivered { .. }
+                    | AgentDomainEvent::SessionNotice { .. } => {}
                     other => panic!("{}: history produced {other:?}", path.display()),
                 }
             }
@@ -1739,7 +3100,8 @@ mod tests {
                     + counts.unknown_type_lines
                     + counts.sidechain_lines
                     + counts.rejected_user_lines
-                    + counts.empty_prompt_lines,
+                    + counts.empty_prompt_lines
+                    + counts.synthetic_lines,
                 "{}: the skipped-line categories do not sum to the total",
                 path.display()
             );

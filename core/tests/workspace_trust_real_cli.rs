@@ -167,7 +167,11 @@ fn run_arm(kind: BackendKind, trust: ProjectTrust, fx: &Fixture, expect_all: boo
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn("Reply with the single word ok.", "Reply with the single word ok.")
+        .send_turn(
+            "Reply with the single word ok.",
+            "Reply with the single word ok.",
+            agent::PromptOrigin::Composed,
+        )
         .map_err(|e| e.message)
         .unwrap();
     let mut started = false;

@@ -2840,6 +2840,7 @@ fn build_ui(
             eitri_core::wm::ChatKillCounts {
                 running,
                 queued,
+                background: agent.view_background_count(view),
                 tab,
                 blocked: agent.tabs_cannot_close(view).map(str::to_string),
             }
@@ -3190,11 +3191,13 @@ fn build_ui(
                         }
                     };
                     let (running, queued) = (agent.running_count(), agent.queued_count());
+                    let background = agent.background_count();
                     // Counted now, as the window close counts them, so the close compares like with like.
                     let jobs = terminal::jobs::count_terminal_jobs(&terminals.borrow());
-                    let text = eitri_core::wm::close::prompt(&id, &kill_title(&id), scope, running, queued, jobs);
+                    let text =
+                        eitri_core::wm::close::prompt(&id, &kill_title(&id), scope, running, queued, jobs, background);
                     // What `y` also answers for the window close, if this kill closes it.
-                    let confirmed = eitri_core::tabs::window_close_prompt_with_jobs(running, queued, jobs);
+                    let confirmed = eitri_core::tabs::window_close_prompt_with_jobs(running, queued, jobs, background);
                     println!("[modules] {id}: {text}");
                     let kill_now = kill_now.clone();
                     let kill_refused = kill_refused.clone();
@@ -4423,7 +4426,12 @@ impl editor_quit::QuitHost for ShellQuitHost {
                     .map(|t| terminal::jobs::count_terminal_jobs(&t))
             })
             .unwrap_or(0);
-        eitri_core::tabs::window_close_prompt_with_jobs(self.agent.running_count(), self.agent.queued_count(), jobs)
+        eitri_core::tabs::window_close_prompt_with_jobs(
+            self.agent.running_count(),
+            self.agent.queued_count(),
+            jobs,
+            self.agent.background_count(),
+        )
     }
     fn ask_to_close_window(&self, text: &str) {
         self.prompt.ask_to_close_window(text);

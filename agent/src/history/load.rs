@@ -7,15 +7,17 @@
 //! Four properties this module holds, each with its reason:
 //!
 //! 1. **There is exactly one `seq` allocator, and it is `AgentSessionProjection::apply`.** Both
-//!    sources are REFOLDED: B's parser already produces `AgentDomainEvent`s, and A's three stored
+//!    sources are REFOLDED: B's parser already produces `AgentDomainEvent`s, and A's stored
 //!    collections are merged by their on-disk `seq` and turned back into events here. A stored
 //!    `seq` is a sort key and is never written back into the projection, so "no item has a number
 //!    that something other than `apply` chose" holds by construction rather than by convention.
 //! 2. **The seed is complete before the first live event exists.** `ConversationIngest::start`
 //!    takes it as a parameter and spawns its thread afterwards, so every live `seq` is greater than
 //!    every historical one with no renumbering, no offset, and nothing for the frontend to change.
-//! 3. **`assistant_message_open` is false when this module returns.** Otherwise the first live
-//!    reply is appended to the last historical assistant message and the two render as one.
+//! 3. **`assistant_message_open` is false and no turn is active when this module returns.**
+//!    Otherwise the first live reply is appended to the last historical assistant message and the
+//!    two render as one, or the first prompt is refused as a turn already running: a restored turn
+//!    is a closed turn, and both sources close every turn they start.
 //! 4. **B wins whenever it can be read at all, and a fall to A is always said out loud.** No
 //!    merging, no difference detection, no silent degradation: the two records can genuinely
 //!    differ (the CLI compacts its own context and Eitri's copy does not), and a user with
@@ -28,8 +30,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::projection::{
-    AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource, ToolCallRecord,
-    TranscriptMessage, UserPromptRecord,
+    AgentDomainEvent, AgentSessionProjection, ContentKind, HistoryNotice, HistorySource, NoticeRecord, QuestionOutcome,
+    QuestionRecord, QuestionState, ToolCallRecord, TranscriptMessage, TurnEndDetail, TurnOutcome, TurnStartRecord,
+    UserPromptRecord,
 };
 
 use super::store::{self, HistoryLoadError, StoredHistory};
@@ -85,6 +88,10 @@ pub(crate) fn seed_from(
     // Neither source restores thinking today, so this is already false; stated so a later source
     // that does cannot leave a restored thought open for the first live one to be appended to.
     projection.thinking_open = false;
+    // Every turn a source restores is over: the process that ran it is gone. Both sources close the
+    // turns they start; this holds even for one that did not, so the first prompt sent after a
+    // resume is never refused as a turn already running.
+    projection.active_turn_id = None;
     projection
 }
 
@@ -109,7 +116,12 @@ pub(crate) fn seed_from(
 /// would have merged depends on neighbours that were also evicted -- so the choice is between a
 /// dropped-item count that is exact in its own unit and a row estimate that is not exact in any.
 fn restorable_item_count(projection: &AgentSessionProjection) -> usize {
-    projection.user_prompts.len() + projection.transcript.len() + projection.tool_calls.len()
+    projection.user_prompts.len()
+        + projection.transcript.len()
+        + projection.tool_calls.len()
+        + projection.turn_starts.len()
+        + projection.notices.len()
+        + projection.questions.len()
 }
 
 /// What came of trying to read the Claude CLI's own transcript.
@@ -253,7 +265,7 @@ fn load_transcript(projection: &mut AgentSessionProjection, path: &Path, history
 
 /// Folds A in, when B could not be used.
 ///
-/// The caps are applied HERE as well as at write time, through the same `from_collections` the
+/// The caps are applied HERE as well as at write time, through the same `from_parts` the
 /// writer uses. Not belt-and-braces: a file written by a build with different constants, or by a
 /// future one, would otherwise decide this process's memory and this panel's length. Re-truncating
 /// through the writer's own function is also what makes `omitted_items` a real number on this path
@@ -279,34 +291,39 @@ fn load_stored(
         return;
     };
     let before = stored.item_count();
-    let capped = StoredHistory::from_collections(
-        stored.conversation_id,
-        stored.provider_session_id,
-        stored.user_prompts,
-        stored.transcript,
-        stored.tool_calls,
-    );
+    let (conversation_id, provider_session_id) = (stored.conversation_id.clone(), stored.provider_session_id.clone());
+    let capped = StoredHistory::from_parts(conversation_id, provider_session_id, stored.into_parts());
     let kept = capped.item_count();
     if kept == 0 {
         return;
     }
     let items_before = restorable_item_count(projection);
-    for event in stored_events(&capped) {
+    let refold = stored_events(&capped);
+    let mut question_turns = refold.question_turns.into_iter();
+    for event in refold.events {
         projection.apply(&event);
-        // The reason A cannot simply be handed to `apply` as a stream: each
-        // stored `TranscriptMessage` is an already-COALESCED assistant message, and `apply` closes
-        // a run only on a prompt or a turn boundary -- neither of which A stores. Two adjacent
-        // stored messages would merge back into one. Closing after every one keeps them apart.
-        if matches!(
-            event,
+        match event {
+            // The reason A cannot simply be handed to `apply` as a stream: each
+            // stored `TranscriptMessage` is an already-COALESCED assistant message, and `apply` closes
+            // a run only on a prompt or a turn boundary -- neither of which A stores. Two adjacent
+            // stored messages would merge back into one. Closing after every one keeps them apart.
             AgentDomainEvent::ContentDelta {
                 kind: ContentKind::Text,
                 ..
+            } => projection.assistant_message_open = false,
+            // `QuestionAsked` names no turn: a live record takes the turn running when it was asked.
+            // The refold cannot stand in for that turn -- A stores no start for a turn of the user's
+            // own, and keeps a turn of the CLI's open until the next start or prompt -- so the
+            // record takes back the turn it was stored with. The fold has just pushed it.
+            AgentDomainEvent::QuestionAsked { .. } => {
+                if let Some(record) = projection.questions.last_mut() {
+                    record.turn_id = question_turns.next().flatten();
+                }
             }
-        ) {
-            projection.assistant_message_open = false;
+            _ => {}
         }
     }
+    crate::projection::restore_children(projection, &capped.tool_calls);
     projection.history = Some(HistoryNotice {
         source: HistorySource::EitriCopy,
         restored_items: restorable_item_count(projection) - items_before,
@@ -325,17 +342,28 @@ fn load_stored(
     });
 }
 
-/// A's three collections, merged by their stored `seq` and turned back into the events that
-/// produced them.
+/// A's collections, merged by their stored `seq` and turned back into the events that produced
+/// them.
 ///
 /// The stored `seq` is used HERE and only here: as the sort key that recovers the one order the
-/// three collections were written in. The numbers themselves are then thrown away -- `apply`
-/// assigns new ones, contiguous and this process's own (one allocator).
-fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
+/// collections were written in. The numbers themselves are then thrown away -- `apply` assigns new
+/// ones, contiguous and this process's own (one allocator).
+///
+/// Restored turns are closed turns: a stored turn start becomes its `TurnStarted` and attribution,
+/// and the turn ends, completed, before the next turn start or the next prompt of the user's own
+/// (a delivered prompt was read inside the running turn and does not end it), or after the last
+/// item. A question stored while it waited is settled `SessionClosed`: nothing can answer it now.
+///
+/// `question_turns` holds each refolded question's stored turn, in the order of its `QuestionAsked`
+/// in `events`: the event carries none, and the folder puts it back on the record.
+fn stored_events(stored: &StoredHistory) -> Refold {
     enum Item<'a> {
         Prompt(&'a UserPromptRecord),
         Message(&'a TranscriptMessage),
         Call(&'a ToolCallRecord),
+        TurnStart(&'a TurnStartRecord),
+        Notice(&'a NoticeRecord),
+        Question(&'a QuestionRecord),
     }
     let mut items: Vec<(u64, u8, Item<'_>)> = Vec::new();
     for prompt in &stored.user_prompts {
@@ -347,24 +375,94 @@ fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
     for call in &stored.tool_calls {
         items.push((call.seq, 2, Item::Call(call)));
     }
-    // A stable sort on (seq, kind): two items cannot share a `seq` in a file this build wrote, but
-    // a corrupt or hand-edited one could, and "whatever order the vectors happened to be in" is not
-    // an answer a reader can reproduce.
+    for start in &stored.turn_starts {
+        items.push((start.seq, 3, Item::TurnStart(start)));
+    }
+    for notice in &stored.notices {
+        items.push((notice.seq, 4, Item::Notice(notice)));
+    }
+    for question in &stored.questions {
+        items.push((question.seq, 5, Item::Question(question)));
+    }
+    // A stable sort on (seq, kind). Items of different kinds can share a `seq`: a question the CLI
+    // asked before announcing the turn it woke for takes the `seq` of the call it asks about once that
+    // call starts, so the call (kind 2) is folded first and its question (kind 5) after it. Two items
+    // of one kind do not share one in a file this build wrote, but a corrupt or hand-edited file could
+    // have it, and "whatever order the vectors happened to be in" is not an answer a reader can
+    // reproduce. Code that keys or dedupes stored items by `seq` alone would lose the question.
     items.sort_by_key(|(seq, kind, _)| (*seq, *kind));
 
     let mut events = Vec::new();
+    let mut question_turns = Vec::new();
+    let mut open_turn: Option<String> = None;
     for (_, _, item) in items {
         match item {
-            Item::Prompt(prompt) => events.push(AgentDomainEvent::UserPromptSubmitted {
+            Item::Prompt(prompt) if prompt.delivered => events.push(AgentDomainEvent::UserMessageDelivered {
+                // A stored prompt keeps no client id; this one names its place and matches no message
+                // a host is waiting on.
+                client_message_id: format!("history-{}", prompt.seq),
+                turn_id: String::new(),
                 text: prompt.text.clone(),
             }),
+            Item::Prompt(prompt) => {
+                close_turn(&mut events, &mut open_turn);
+                events.push(AgentDomainEvent::UserPromptSubmitted {
+                    text: prompt.text.clone(),
+                });
+            }
             Item::Message(message) => events.push(AgentDomainEvent::ContentDelta {
-                // A stores no turn ids, and nothing renders one: `serialize_snapshot_for_js` does
-                // not send `turn_id` to the frontend at all.
+                // A stores no turn ids for replies; its stored message boundaries keep replies apart.
+                // B instead reconstructs turn ids from the transcript's segment openers.
                 turn_id: String::new(),
                 kind: ContentKind::Text,
                 text: message.text.clone(),
             }),
+            Item::TurnStart(start) => {
+                close_turn(&mut events, &mut open_turn);
+                events.push(AgentDomainEvent::TurnStarted {
+                    turn_id: start.turn_id.clone(),
+                });
+                events.push(AgentDomainEvent::TurnAttributed {
+                    turn_id: start.turn_id.clone(),
+                    origin: start.origin,
+                    cause: start.cause.clone(),
+                });
+                open_turn = Some(start.turn_id.clone());
+            }
+            Item::Notice(notice) => events.push(AgentDomainEvent::SessionNotice {
+                kind: notice.kind,
+                level: notice.level,
+                content: notice.content.clone(),
+                scalars: notice.scalars.clone(),
+                task_id: notice.task_id.clone(),
+                tool_use_id: notice.tool_use_id.clone(),
+                task_status: notice.task_status.clone(),
+            }),
+            Item::Question(question) => {
+                question_turns.push(question.turn_id.clone());
+                events.push(AgentDomainEvent::QuestionAsked {
+                    interaction_id: question.interaction_id.clone(),
+                    tool_use_id: question.tool_use_id.clone(),
+                    questions: question.questions.clone(),
+                    unsupported_reason: question.unsupported_reason.clone(),
+                });
+                let (outcome, answers, reason) = match &question.state {
+                    QuestionState::Settled {
+                        outcome,
+                        answers,
+                        reason,
+                    } => (*outcome, answers.clone(), reason.clone()),
+                    QuestionState::Waiting | QuestionState::Answering => {
+                        (QuestionOutcome::SessionClosed, Vec::new(), None)
+                    }
+                };
+                events.push(AgentDomainEvent::QuestionSettled {
+                    interaction_id: question.interaction_id.clone(),
+                    outcome,
+                    answers,
+                    reason,
+                });
+            }
             Item::Call(call) => {
                 events.push(AgentDomainEvent::ToolCallStarted {
                     turn_id: call.turn_id.clone(),
@@ -378,6 +476,15 @@ fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
                     events.push(AgentDomainEvent::ToolInputChanged {
                         tool_use_id: call.tool_use_id.clone(),
                         change: change.clone(),
+                    });
+                }
+                // The CLI's refusal, on the call it refused; an empty id is no link here either.
+                if let Some(denied) = call.denied.as_ref().filter(|_| !call.tool_use_id.is_empty()) {
+                    events.push(AgentDomainEvent::PermissionDenied {
+                        tool_use_id: Some(call.tool_use_id.clone()),
+                        tool_name: call.name.clone(),
+                        reason_type: denied.reason_type.clone(),
+                        reason: denied.reason.clone(),
                     });
                 }
                 if let Some(result) = &call.result {
@@ -398,7 +505,29 @@ fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
             }
         }
     }
-    events
+    close_turn(&mut events, &mut open_turn);
+    Refold { events, question_turns }
+}
+
+/// What [`stored_events`] makes of A: the events, and the stored turn of each question among them.
+struct Refold {
+    events: Vec<AgentDomainEvent>,
+    question_turns: Vec<Option<String>>,
+}
+
+/// Ends the restored turn that is open, if one is, as completed: it is over, and how it ended
+/// beyond that is not stored.
+fn close_turn(events: &mut Vec<AgentDomainEvent>, open_turn: &mut Option<String>) {
+    if let Some(turn_id) = open_turn.take() {
+        events.push(AgentDomainEvent::TurnCompleted {
+            turn_id,
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        });
+    }
 }
 
 /// One line, to stderr, with everything the parse threw away.
@@ -420,7 +549,7 @@ fn log_counts(path: &Path, history: &TranscriptHistory, restored: Option<usize>)
         "agent: parsed {items} {item_word} from {path} (restored {restored} {row_word}, omitted by truncation: {omitted}, \
          skipped lines: {skipped} [malformed {malformed}, oversized {oversized}, attachment \
          {attachment}, system {system}, side record {side}, subagent {subagent}, unknown type \
-         {unknown}, sidechain {sidechain}, rejected user {rejected}, empty prompt {empty}], \
+         {unknown}, sidechain {sidechain}, rejected user {rejected}, empty prompt {empty}, synthetic {synthetic}], \
          dropped blocks: {blocks}, orphan tool results: {orphans}, written by claude {version})",
         items = history.parsed_items,
         // Agreement, for the same reason the panel's own notice has it: this
@@ -449,6 +578,7 @@ fn log_counts(path: &Path, history: &TranscriptHistory, restored: Option<usize>)
         sidechain = counts.sidechain_lines,
         rejected = counts.rejected_user_lines,
         empty = counts.empty_prompt_lines,
+        synthetic = counts.synthetic_lines,
         blocks = counts.dropped_blocks,
         orphans = counts.orphan_tool_results,
         version = history.writer_version.as_deref().unwrap_or("<unreported>"),
@@ -514,6 +644,8 @@ mod tests {
 
     fn tool_call(seq: u64, id: &str, result: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
+            children: None,
+            background: false,
             seq,
             turn_id: "t-1".into(),
             tool_use_id: id.into(),
@@ -1161,5 +1293,570 @@ mod tests {
         }
         assert!(restored_any > 0, "no real file restored anything");
         eprintln!("{folded} of {restored_any} real transcripts fold at least one pair of adjacent assistant slots");
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Turn starts, notices and questions through A; restored turns are closed
+    // -------------------------------------------------------------------------------------
+
+    use crate::projection::{
+        NoticeLevel, QuestionOptionSpec, QuestionSpec, SessionNoticeKind, ShownAnswer, ToolCallDenial, TurnCause,
+        TurnCauseKind, TurnOrigin,
+    };
+
+    fn store_parts(conversation_id: &str, session_id: &str, parts: store::HistoryParts) {
+        store::save(&StoredHistory::from_parts(
+            conversation_id.to_string(),
+            session_id.to_string(),
+            parts,
+        ))
+        .expect("writing a test stored history should succeed");
+    }
+
+    fn task_cause() -> TurnCause {
+        let mut cause = TurnCause::of_kind(TurnCauseKind::Task);
+        cause.task_id = Some("task-7".into());
+        cause.task_status = Some("completed".into());
+        cause.summary = Some("the build finished".into());
+        cause
+    }
+
+    fn one_question(text: &str) -> Vec<QuestionSpec> {
+        vec![QuestionSpec {
+            question: text.into(),
+            header: "Pick".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOptionSpec {
+                    label: "left".into(),
+                    description: "the left one".into(),
+                    preview: None,
+                },
+                QuestionOptionSpec {
+                    label: "right".into(),
+                    description: "the right one".into(),
+                    preview: Some("`right`".into()),
+                },
+            ],
+        }]
+    }
+
+    fn task_notice() -> AgentDomainEvent {
+        AgentDomainEvent::SessionNotice {
+            kind: SessionNoticeKind::Task,
+            level: NoticeLevel::Notice,
+            content: Some("Background command finished".into()),
+            scalars: [("exit_code".to_string(), serde_json::json!(0))].into_iter().collect(),
+            task_id: Some("task-7".into()),
+            tool_use_id: Some("toolu_bg".into()),
+            task_status: Some("completed".into()),
+        }
+    }
+
+    /// A conversation as a live session folds it: a turn of the user's own with a message read
+    /// inside it and a call the CLI refused, then a turn the CLI started because a task ended, with
+    /// its notice, an answered question and one still waiting when the session stopped.
+    fn live_conversation() -> AgentSessionProjection {
+        let mut live = AgentSessionProjection::default();
+        let events = vec![
+            AgentDomainEvent::UserPromptSubmitted {
+                text: "build it".into(),
+            },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: ContentKind::Text,
+                text: "Building.".into(),
+            },
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_rm".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "rm -rf build" }),
+            },
+            AgentDomainEvent::PermissionDenied {
+                tool_use_id: Some("toolu_rm".into()),
+                tool_name: "Bash".into(),
+                reason_type: Some("classifier".into()),
+                reason: Some("[Destructive]".into()),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t1".into(),
+                tool_use_id: "toolu_rm".into(),
+                content: serde_json::json!("refused"),
+                is_error: true,
+            },
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "eitri-1-1".into(),
+                turn_id: "t1".into(),
+                text: "in the background".into(),
+            },
+            AgentDomainEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                outcome: TurnOutcome::Completed,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: TurnEndDetail::default(),
+            },
+            task_notice(),
+            AgentDomainEvent::TurnStarted {
+                turn_id: "cli-1".into(),
+            },
+            AgentDomainEvent::TurnAttributed {
+                turn_id: "cli-1".into(),
+                origin: TurnOrigin::Cli,
+                cause: Some(task_cause()),
+            },
+            AgentDomainEvent::ContentDelta {
+                turn_id: "cli-1".into(),
+                kind: ContentKind::Text,
+                text: "The build finished.".into(),
+            },
+            AgentDomainEvent::QuestionAsked {
+                interaction_id: "q-1".into(),
+                tool_use_id: Some("toolu_q1".into()),
+                questions: one_question("Which target?"),
+                unsupported_reason: None,
+            },
+            AgentDomainEvent::QuestionSettled {
+                interaction_id: "q-1".into(),
+                outcome: QuestionOutcome::Answered,
+                answers: vec![ShownAnswer {
+                    question_index: 0,
+                    answer: "right".into(),
+                    notes: Some("the fast one".into()),
+                }],
+                reason: None,
+            },
+            AgentDomainEvent::QuestionAsked {
+                interaction_id: "q-2".into(),
+                tool_use_id: Some("toolu_q2".into()),
+                questions: one_question("Deploy now?"),
+                unsupported_reason: None,
+            },
+        ];
+        for event in &events {
+            live.apply(event);
+        }
+        live
+    }
+
+    /// What the history writer stores of a projection: the same copy and the same caps ingestion uses.
+    fn store_projection(conversation_id: &str, session_id: &str, live: &AgentSessionProjection) {
+        let parts = store::newest_that_fit(store::HistoryView::of(live));
+        store_parts(conversation_id, session_id, parts);
+    }
+
+    fn without_seq<T: Clone>(items: &[T], clear: impl Fn(&mut T)) -> Vec<T> {
+        items
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                clear(&mut item);
+                item
+            })
+            .collect()
+    }
+
+    /// Everything the three new collections hold comes back from Eitri's own copy as it was, but for
+    /// the numbers `apply` gives again and a waiting question, which comes back closed.
+    #[test]
+    fn a_round_trip_keeps_turn_starts_notices_and_questions() {
+        let conversation_id = setup();
+        let live = live_conversation();
+        assert_eq!(
+            live.turn_starts.len(),
+            1,
+            "the CLI's turn has a start row; the user's has none"
+        );
+        store_projection(&conversation_id, "sess-new", &live);
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-new");
+
+        assert_eq!(
+            without_seq(&restored.turn_starts, |r| r.seq = 0),
+            without_seq(&live.turn_starts, |r| r.seq = 0)
+        );
+        assert_eq!(restored.turn_starts[0].cause, Some(task_cause()));
+        assert_eq!(
+            without_seq(&restored.notices, |r| r.seq = 0),
+            without_seq(&live.notices, |r| r.seq = 0)
+        );
+        assert_eq!(
+            without_seq(&restored.questions[..1], |r| r.seq = 0),
+            without_seq(&live.questions[..1], |r| r.seq = 0),
+            "a settled question comes back as it was settled, in the turn it was asked in"
+        );
+        assert_eq!(live.questions[1].state, QuestionState::Waiting);
+        assert_eq!(
+            restored.questions[1].state,
+            QuestionState::Settled {
+                outcome: QuestionOutcome::SessionClosed,
+                answers: vec![],
+                reason: None
+            }
+        );
+        // The rows keep the order they were drawn in.
+        let order = |p: &AgentSessionProjection| {
+            let mut rows: Vec<(u64, &str)> = p
+                .user_prompts
+                .iter()
+                .map(|r| (r.seq, "prompt"))
+                .chain(p.transcript.iter().map(|r| (r.seq, "reply")))
+                .chain(p.tool_calls.iter().map(|r| (r.seq, "call")))
+                .chain(p.turn_starts.iter().map(|r| (r.seq, "start")))
+                .chain(p.notices.iter().map(|r| (r.seq, "notice")))
+                .chain(p.questions.iter().map(|r| (r.seq, "question")))
+                .collect();
+            rows.sort_unstable();
+            rows.into_iter().map(|(_, kind)| kind).collect::<Vec<_>>()
+        };
+        assert_eq!(order(&restored), order(&live));
+        let notice = restored.history.as_ref().expect("history was restored");
+        assert_eq!(notice.restored_items, 9, "every row the panel draws is counted");
+        assert_eq!(restored.active_turn_id, None);
+    }
+
+    /// A question keeps the turn it was asked in across a restore and the write after it: one asked in
+    /// a turn of the user's own (A stores no start for that turn), and one asked between turns right
+    /// after a turn of the CLI's (which the refold keeps open until the next start or prompt).
+    #[test]
+    fn a_restored_question_keeps_the_turn_it_was_asked_in() {
+        let conversation_id = setup();
+        let ask = |id: &str| AgentDomainEvent::QuestionAsked {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            questions: one_question("Which?"),
+            unsupported_reason: None,
+        };
+        let settle = |id: &str| AgentDomainEvent::QuestionSettled {
+            interaction_id: id.into(),
+            outcome: QuestionOutcome::Declined,
+            answers: vec![],
+            reason: None,
+        };
+        let completed = |id: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: id.into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: TurnEndDetail::default(),
+        };
+        let mut live = AgentSessionProjection::default();
+        for event in [
+            AgentDomainEvent::UserPromptSubmitted { text: "ask me".into() },
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            ask("in-mine"),
+            settle("in-mine"),
+            completed("t1"),
+            AgentDomainEvent::TurnStarted {
+                turn_id: "cli-1".into(),
+            },
+            AgentDomainEvent::TurnAttributed {
+                turn_id: "cli-1".into(),
+                origin: TurnOrigin::Cli,
+                cause: None,
+            },
+            completed("cli-1"),
+            ask("between"),
+            settle("between"),
+        ] {
+            live.apply(&event);
+        }
+        let turns = |p: &AgentSessionProjection| p.questions.iter().map(|q| q.turn_id.clone()).collect::<Vec<_>>();
+        assert_eq!(turns(&live), vec![Some("t1".to_string()), None]);
+        store_projection(&conversation_id, "sess-turns", &live);
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-turns");
+        assert_eq!(turns(&restored), turns(&live));
+        let again = store::newest_that_fit(store::HistoryView::of(&restored));
+        assert_eq!(
+            again.questions.iter().map(|q| q.turn_id.clone()).collect::<Vec<_>>(),
+            turns(&live),
+            "the next write stores the same turns"
+        );
+    }
+
+    /// The two marks A always stored but did not restore: a message read inside a running turn stays
+    /// one (not the start of a new turn), and a call the CLI refused keeps its refusal.
+    #[test]
+    fn a_refold_restores_delivered_prompts_and_denied_calls() {
+        let conversation_id = setup();
+        let mut refused = tool_call(3, "toolu_rm", Some("refused"));
+        refused.denied = Some(ToolCallDenial {
+            reason_type: Some("classifier".into()),
+            reason: Some("[Destructive]".into()),
+        });
+        let mut unlinked = tool_call(5, "", None);
+        unlinked.denied = Some(ToolCallDenial {
+            reason_type: Some("rule".into()),
+            reason: None,
+        });
+        let delivered = UserPromptRecord {
+            seq: 4,
+            text: "in the background".into(),
+            delivered: true,
+        };
+        store_copy(
+            &conversation_id,
+            "sess-marks",
+            vec![prompt(1, "build it"), delivered],
+            vec![message(2, "Building.")],
+            vec![refused.clone(), unlinked],
+        );
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-marks");
+
+        assert_eq!(
+            restored
+                .user_prompts
+                .iter()
+                .map(|p| (p.text.as_str(), p.delivered))
+                .collect::<Vec<_>>(),
+            vec![("build it", false), ("in the background", true)]
+        );
+        assert_eq!(restored.tool_calls[0].denied, refused.denied);
+        assert_eq!(restored.tool_calls[1].denied, None, "an empty id is no link to refuse");
+        assert!(restored.denials_before_their_call.is_empty());
+        // And the same projection written again stores the same marks.
+        let again = store::newest_that_fit(store::HistoryView::of(&restored));
+        assert!(again.user_prompts[1].delivered);
+        assert_eq!(again.tool_calls[0].denied, refused.denied);
+    }
+
+    /// A file an older build wrote, with none of the new collections, still restores: the
+    /// collections are `#[serde(default)]` and the format version is unchanged.
+    #[test]
+    fn an_older_history_file_without_new_collections_loads() {
+        let conversation_id = setup();
+        let path = store::history_path(&conversation_id, "sess-old").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = format!(
+            r#"{{"version":{},"conversation_id":"{conversation_id}","provider_session_id":"sess-old",
+                 "written_at":"1","user_prompts":[{{"seq":1,"text":"hi"}}],
+                 "transcript":[{{"seq":2,"text":"hello"}}],"tool_calls":[]}}"#,
+            store::HISTORY_FORMAT_VERSION
+        );
+        std::fs::write(&path, text).unwrap();
+        let loaded = store::load(&conversation_id, "sess-old").expect("an older file loads");
+        assert!(loaded.turn_starts.is_empty() && loaded.notices.is_empty() && loaded.questions.is_empty());
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-old");
+        assert_eq!(restored.user_prompts.len(), 1);
+        assert_eq!(restored.transcript.len(), 1);
+        assert!(restored.turn_starts.is_empty() && restored.notices.is_empty() && restored.questions.is_empty());
+    }
+
+    /// A question stored while it waited, or while an answer was on its way, comes back closed: the
+    /// provider that asked it is gone and nothing can answer it. A settled one keeps its outcome.
+    #[test]
+    fn a_waiting_question_restores_as_closed() {
+        let conversation_id = setup();
+        let record = |seq: u64, id: &str, state: QuestionState| QuestionRecord {
+            seq,
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            turn_id: None,
+            questions: one_question("Which?"),
+            state,
+            unsupported_reason: None,
+        };
+        let declined = QuestionState::Settled {
+            outcome: QuestionOutcome::Declined,
+            answers: vec![],
+            reason: Some("the person cancelled".into()),
+        };
+        store_parts(
+            &conversation_id,
+            "sess-q",
+            store::HistoryParts {
+                questions: vec![
+                    record(1, "waiting", QuestionState::Waiting),
+                    record(2, "answering", QuestionState::Answering),
+                    record(3, "declined", declined.clone()),
+                ],
+                ..store::HistoryParts::default()
+            },
+        );
+
+        let restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-q");
+
+        let closed = QuestionState::Settled {
+            outcome: QuestionOutcome::SessionClosed,
+            answers: vec![],
+            reason: None,
+        };
+        assert_eq!(
+            restored.questions.iter().map(|q| q.state.clone()).collect::<Vec<_>>(),
+            vec![closed.clone(), closed, declined]
+        );
+        assert!(restored.pending_permissions.is_empty());
+    }
+
+    #[test]
+    fn a_cli_segment_at_the_end_of_b_is_closed_before_the_first_live_prompt() {
+        let conversation_id = setup();
+        let path = write_transcript(include_str!("../../tests/fixtures/history_b/task_notification.jsonl"));
+        let mut restored = seed_from(Ok(path), &conversation_id, "sess-b-cli");
+        assert_eq!(restored.active_turn_id, None);
+        assert!(!restored.assistant_message_open);
+        assert_eq!(restored.turn_starts.len(), 1);
+        assert_eq!(restored.transcript.len(), 2);
+        assert_eq!(restored.user_prompts.len(), 1);
+        assert!(restored.turn_endings.is_empty());
+        restored.apply(&AgentDomainEvent::UserPromptSubmitted {
+            text: "Next step".into(),
+        });
+        restored.apply(&AgentDomainEvent::TurnStarted { turn_id: "live".into() });
+        assert_eq!(restored.active_turn_id.as_deref(), Some("live"));
+    }
+
+    /// A stored turn of the CLI's own as the last thing in the file: the restored turn is closed, so
+    /// the first prompt after the resume is taken rather than refused as a turn already running
+    /// (`AgentConversation::send_turn` refuses exactly when `active_turn_id` is set).
+    #[test]
+    fn a_restored_projection_accepts_the_first_prompt() {
+        let conversation_id = setup();
+        let start = TurnStartRecord {
+            seq: 3,
+            turn_id: "cli-9".into(),
+            origin: TurnOrigin::Cli,
+            cause: Some(TurnCause::of_kind(TurnCauseKind::Scheduled)),
+        };
+        let parts = store::HistoryParts {
+            user_prompts: vec![prompt(1, "check every hour")],
+            transcript: vec![message(2, "Scheduled."), message(4, "Checked; all green.")],
+            turn_starts: vec![start],
+            ..store::HistoryParts::default()
+        };
+        let stored = StoredHistory::from_parts(conversation_id.clone(), "sess-cli".into(), parts.clone());
+        let events = stored_events(&stored).events;
+        assert!(
+            matches!(events.last(), Some(AgentDomainEvent::TurnCompleted { turn_id, outcome: TurnOutcome::Completed, .. }) if turn_id == "cli-9"),
+            "the last restored turn is closed: {events:?}"
+        );
+        store_parts(&conversation_id, "sess-cli", parts);
+
+        let mut restored = seed_from(Ok(missing_transcript()), &conversation_id, "sess-cli");
+        assert_eq!(restored.active_turn_id, None);
+        assert_eq!(restored.turn_starts.len(), 1);
+        assert!(
+            restored.turn_endings.is_empty(),
+            "a restored turn ends completed, with no ending row"
+        );
+
+        // The user's first prompt after the resume starts a turn of its own.
+        restored.apply(&AgentDomainEvent::UserPromptSubmitted {
+            text: "and now?".into(),
+        });
+        restored.apply(&AgentDomainEvent::TurnStarted {
+            turn_id: "t-live".into(),
+        });
+        assert_eq!(restored.active_turn_id.as_deref(), Some("t-live"));
+    }
+
+    /// Every turn a refold starts it also ends, before the next start or prompt of the user's own,
+    /// and a message read inside a turn does not end it.
+    #[test]
+    fn every_restored_turn_start_is_closed_before_the_next_start_or_prompt() {
+        let start = |seq: u64, id: &str| TurnStartRecord {
+            seq,
+            turn_id: id.into(),
+            origin: TurnOrigin::Cli,
+            cause: None,
+        };
+        let stored = StoredHistory::from_parts(
+            "c".into(),
+            "s".into(),
+            store::HistoryParts {
+                user_prompts: vec![
+                    UserPromptRecord {
+                        seq: 2,
+                        text: "read inside".into(),
+                        delivered: true,
+                    },
+                    prompt(5, "mine"),
+                ],
+                turn_starts: vec![start(1, "cli-a"), start(3, "cli-b")],
+                ..store::HistoryParts::default()
+            },
+        );
+        let shape: Vec<String> = stored_events(&stored)
+            .events
+            .iter()
+            .map(|event| match event {
+                AgentDomainEvent::TurnStarted { turn_id } => format!("start {turn_id}"),
+                AgentDomainEvent::TurnAttributed { .. } => "attributed".into(),
+                AgentDomainEvent::TurnCompleted { turn_id, .. } => format!("end {turn_id}"),
+                AgentDomainEvent::UserMessageDelivered { client_message_id, .. } => {
+                    format!("delivered {client_message_id}")
+                }
+                AgentDomainEvent::UserPromptSubmitted { text } => format!("prompt {text}"),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "start cli-a",
+                "attributed",
+                "delivered history-2",
+                "end cli-a",
+                "start cli-b",
+                "attributed",
+                "end cli-b",
+                "prompt mine"
+            ]
+        );
+    }
+    #[test]
+    fn a_refold_restores_nested_children_without_main_rows() {
+        let conversation_id = setup();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../agent-ui/web/src/fixtures/subagent-frames.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut live = AgentSessionProjection::default();
+            let events: Vec<AgentDomainEvent> = serde_json::from_value(case["events"].clone()).unwrap();
+            for event in events {
+                live.apply(&event);
+            }
+            store_copy(&conversation_id, "children", vec![], vec![], live.tool_calls.clone());
+            let restored = seed_from(Ok(missing_transcript()), &conversation_id, "children");
+            assert_eq!(restored.tool_calls.len(), live.tool_calls.len());
+            assert!(restored.transcript.is_empty());
+            assert!(restored.thinking.is_empty());
+            assert!(restored.active_turn_id.is_none());
+            let mut marks = 0;
+            fn check(saved: &[ToolCallRecord], loaded: &[ToolCallRecord], marks: &mut usize) {
+                for (saved, loaded) in saved.iter().zip(loaded) {
+                    assert_eq!(saved.tool_use_id, loaded.tool_use_id);
+                    assert_eq!(saved.turn_id, loaded.turn_id);
+                    assert_eq!(saved.result, loaded.result);
+                    assert_eq!(saved.background, loaded.background);
+                    assert_eq!(saved.denied, loaded.denied);
+                    assert_eq!(saved.changed_input, loaded.changed_input);
+                    if let Some(stream) = &saved.children {
+                        *marks += 1;
+                        let restored = loaded.children.as_ref().unwrap();
+                        assert_eq!(
+                            stream.transcript.iter().map(|row| &row.text).collect::<Vec<_>>(),
+                            restored.transcript.iter().map(|row| &row.text).collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            stream.thinking.iter().map(|row| &row.text).collect::<Vec<_>>(),
+                            restored.thinking.iter().map(|row| &row.text).collect::<Vec<_>>()
+                        );
+                        assert_eq!(stream.tool_calls.len(), restored.tool_calls.len());
+                        check(&stream.tool_calls, &restored.tool_calls, marks);
+                    }
+                }
+            }
+            check(&live.tool_calls, &restored.tool_calls, &mut marks);
+            assert!(marks > 0);
+            let parts = store::newest_that_fit(store::HistoryView::of(&restored));
+            assert_eq!(parts.tool_calls, restored.tool_calls);
+        }
     }
 }

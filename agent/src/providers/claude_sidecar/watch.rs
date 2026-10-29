@@ -40,7 +40,9 @@
 //! did. Reporting "I can no longer see this session" is the honest alternative to guessing at the
 //! events that went missing.
 
-use crate::provider::{ProviderError, ProviderErrorCode};
+use crate::provider::{InteractionState, ProviderError, ProviderErrorCode};
+use crate::AgentDomainEvent;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// How long to wait before each reconnect attempt. Three tries inside ~1 second: long enough to ride
@@ -200,9 +202,273 @@ pub(crate) fn events_lost_reason(first: u64, last: u64) -> String {
     )
 }
 
+/// How many question ids one watch remembers. A session holds at most four questions waiting at once,
+/// so this reaches back far past any question that could still be waiting.
+const QUESTION_IDS_KEPT: usize = 256;
+
+/// The question sets one watch has delivered an ask or a settlement for, newest last, and the asks a
+/// reconcile holds back until the replay reaches the sequence its list was read at.
+#[derive(Debug, Default)]
+pub(crate) struct QuestionLedger {
+    seen: VecDeque<String>,
+    deferred: Option<DeferredAsks>,
+}
+
+/// Asks from the sidecar's list of waiting questions, read when the watch had delivered less than the
+/// list is consistent with: they belong after event `through`, where the sidecar's own replay puts
+/// them, not ahead of the replay that comes first.
+#[derive(Debug)]
+struct DeferredAsks {
+    through: u64,
+    asks: Vec<AgentDomainEvent>,
+}
+
+impl QuestionLedger {
+    /// Notes the question an event this watch delivers asks or settles, a subagent's included.
+    pub(crate) fn observe(&mut self, event: &AgentDomainEvent) {
+        match event {
+            AgentDomainEvent::QuestionAsked { interaction_id, .. }
+            | AgentDomainEvent::QuestionSettled { interaction_id, .. } => self.note(interaction_id),
+            AgentDomainEvent::SubagentFrame { frame, .. } => self.observe(frame),
+            _ => {}
+        }
+    }
+
+    fn note(&mut self, interaction_id: &str) {
+        if self.knows(interaction_id) {
+            return;
+        }
+        if self.seen.len() == QUESTION_IDS_KEPT {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(interaction_id.to_string());
+    }
+
+    fn knows(&self, interaction_id: &str) -> bool {
+        self.seen.iter().any(|seen| seen == interaction_id)
+    }
+
+    /// The asks a reconcile held back for the event at `sequence` the watch just delivered: due once
+    /// the replay reached the sequence their list was read at, minus every question the replay asked
+    /// or settled on the way there.
+    pub(crate) fn due(&mut self, sequence: u64) -> Vec<AgentDomainEvent> {
+        match &self.deferred {
+            Some(deferred) if deferred.through <= sequence => {}
+            _ => return Vec::new(),
+        }
+        let deferred = self.deferred.take().expect("checked just above");
+        self.unseen(deferred.asks)
+    }
+
+    /// Of `asks`, the ones this watch never delivered an ask or a settlement for, noted as delivered.
+    fn unseen(&mut self, asks: Vec<AgentDomainEvent>) -> Vec<AgentDomainEvent> {
+        let mut added = Vec::new();
+        for event in asks {
+            let AgentDomainEvent::QuestionAsked { interaction_id, .. } = &event else {
+                continue;
+            };
+            if interaction_id.is_empty() || self.knows(interaction_id) {
+                continue;
+            }
+            self.observe(&event);
+            added.push(event);
+        }
+        added
+    }
+}
+
+/// What a re-opened watch adds from `GetInteractionState`, read when the watch had delivered every
+/// event through `delivered_through`: the ask of every question still waiting that this watch never
+/// delivered an ask or a settlement for, in the sidecar's order. Everything else the stream itself
+/// carries -- the replay after the cursor brings every ask and settlement the break hid, and a hole it
+/// cannot replay ends the session loudly -- so a question this watch saw is never asked again, and one
+/// the sidecar no longer holds is never settled here: that would claim an outcome nobody reported. The
+/// same ask arriving later in the stream replaces the record with itself.
+///
+/// The list is consistent with the sidecar's events through its `through_sequence`. When the watch has
+/// delivered less than that, the asks wait for the replay to get there (`QuestionLedger::due`): put
+/// ahead of the replay, an ask would end an assistant message the replay is still carrying and split
+/// one reply in two. Nothing is returned then.
+pub(crate) fn reconcile_questions(
+    ledger: &mut QuestionLedger,
+    state: InteractionState,
+    delivered_through: u64,
+) -> Vec<AgentDomainEvent> {
+    let InteractionState {
+        through_sequence,
+        pending,
+    } = state;
+    // A newer list replaces one still held back: it is consistent with at least as much.
+    ledger.deferred = None;
+    if through_sequence > delivered_through {
+        ledger.deferred = Some(DeferredAsks {
+            through: through_sequence,
+            asks: pending,
+        });
+        return Vec::new();
+    }
+    ledger.unseen(pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asked(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::QuestionAsked {
+            interaction_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            questions: vec![crate::QuestionSpec {
+                question: format!("question {id}?"),
+                header: "Pick".into(),
+                multi_select: false,
+                options: ["A", "B"]
+                    .into_iter()
+                    .map(|label| crate::QuestionOptionSpec {
+                        label: label.into(),
+                        description: String::new(),
+                        preview: None,
+                    })
+                    .collect(),
+            }],
+            unsupported_reason: None,
+        }
+    }
+
+    fn settled(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::QuestionSettled {
+            interaction_id: id.into(),
+            outcome: crate::QuestionOutcome::Answered,
+            answers: Vec::new(),
+            reason: None,
+        }
+    }
+
+    fn waiting_ids(projection: &crate::AgentSessionProjection) -> Vec<String> {
+        projection
+            .waiting_questions()
+            .map(|record| record.interaction_id.clone())
+            .collect()
+    }
+
+    /// After the stream broke and was opened again, the questions still waiting are the ones that
+    /// waited before: the reconcile adds nothing this watch already delivered, and never revives one it
+    /// saw settled.
+    #[test]
+    fn the_reconcile_after_a_re_watch_restores_the_same_pending_set() {
+        let mut ledger = QuestionLedger::default();
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in [asked("q0"), asked("q1"), asked("q2"), settled("q0")] {
+            ledger.observe(&event);
+            projection.apply(&event);
+        }
+        let before = waiting_ids(&projection);
+        assert_eq!(before, vec!["q1".to_string(), "q2".to_string()]);
+        let added = reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 9,
+                pending: vec![asked("q1"), asked("q2")],
+            },
+            9,
+        );
+        assert!(
+            added.is_empty(),
+            "every question still waiting was delivered: {added:?}"
+        );
+        assert_eq!(waiting_ids(&projection), before);
+
+        // A sidecar that still listed one this watch saw settled does not bring it back.
+        assert!(reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 9,
+                pending: vec![asked("q0"), asked("q1"), asked("q2")],
+            },
+            9,
+        )
+        .is_empty());
+    }
+
+    /// A question this watch never delivered -- asked before a move brought the watch here -- comes back
+    /// from the sidecar's list in its order, and folding it again leaves the same set waiting; one
+    /// added is not added twice.
+    #[test]
+    fn a_question_the_watch_never_saw_is_added_from_the_sidecars_list() {
+        let mut ledger = QuestionLedger::default();
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in [asked("q1"), asked("q2")] {
+            projection.apply(&event);
+        }
+        ledger.observe(&asked("q3"));
+        projection.apply(&asked("q3"));
+        let added = reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 3,
+                pending: vec![asked("q1"), asked("q2"), asked("q3")],
+            },
+            3,
+        );
+        assert_eq!(added, vec![asked("q1"), asked("q2")]);
+        for event in &added {
+            projection.apply(event);
+        }
+        let mut waiting = waiting_ids(&projection);
+        waiting.sort();
+        assert_eq!(waiting, vec!["q1".to_string(), "q2".to_string(), "q3".to_string()]);
+        assert!(reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 3,
+                pending: vec![asked("q1")],
+            },
+            3,
+        )
+        .is_empty());
+    }
+
+    /// A list read while the replay still has events before the list's sequence waits for them: the
+    /// question is added right after the event it is consistent with, never ahead of the reply text the
+    /// replay is still carrying.
+    #[test]
+    fn a_list_newer_than_the_watch_is_added_where_the_replay_reaches_it() {
+        let mut ledger = QuestionLedger::default();
+        let added = reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 8,
+                pending: vec![asked("q1")],
+            },
+            5,
+        );
+        assert!(added.is_empty(), "nothing goes ahead of the replay: {added:?}");
+        for sequence in 6..8 {
+            assert!(ledger.due(sequence).is_empty(), "not due before event 8, at {sequence}");
+        }
+        assert_eq!(ledger.due(8), vec![asked("q1")]);
+        assert!(ledger.due(9).is_empty(), "added once");
+    }
+
+    /// A question the replay asks or settles on its way to the list's sequence is the replay's: the
+    /// held-back ask is dropped, so a settled question is never brought back.
+    #[test]
+    fn a_held_back_ask_the_replay_carried_is_not_added_again() {
+        let mut ledger = QuestionLedger::default();
+        assert!(reconcile_questions(
+            &mut ledger,
+            InteractionState {
+                through_sequence: 8,
+                pending: vec![asked("q1"), asked("q2")],
+            },
+            5,
+        )
+        .is_empty());
+        ledger.observe(&asked("q1"));
+        ledger.observe(&settled("q1"));
+        ledger.observe(&asked("q2"));
+        assert!(ledger.due(8).is_empty());
+    }
 
     #[test]
     fn a_dense_stream_delivers_every_event() {

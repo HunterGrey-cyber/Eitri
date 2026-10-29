@@ -21,7 +21,7 @@ use super::align::{Alignment, EntryPair, Field, Mark, Note, TurnMatch};
 use super::allowances::AllowanceSet;
 use super::normalise::{result_text, text, user_text};
 use super::redact::{utf16_len, Redactor};
-use super::{CliForm, EndReason, Entry, Inconsistency, InputKind, Origin, Pos, Source, Turn, Via};
+use super::{CliForm, EndReason, Entry, Inconsistency, InputKind, Origin, Pos, QuestionKey, Source, Turn, Via};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -129,6 +129,9 @@ pub fn field_word(field: &Field) -> &'static str {
         Field::Input => "input",
         Field::IsError => "is_error",
         Field::Result => "result",
+        Field::Questions => "questions",
+        Field::Answered => "answered",
+        Field::Outcome => "outcome",
         Field::Turn => "turn",
         Field::Order => "order",
     }
@@ -172,7 +175,19 @@ pub const TURN_MATCH_WORDS: &[&str] = &[
     "cli_only",
     "eitri_only",
 ];
-pub const FIELD_WORDS: &[&str] = &["text", "via", "name", "input", "is_error", "result", "turn", "order"];
+pub const FIELD_WORDS: &[&str] = &[
+    "text",
+    "via",
+    "name",
+    "input",
+    "is_error",
+    "result",
+    "questions",
+    "answered",
+    "outcome",
+    "turn",
+    "order",
+];
 /// Entry kinds, and `turn` for a turn the record merged into another.
 pub const KIND_WORDS: &[&str] = &[
     "user",
@@ -184,6 +199,7 @@ pub const KIND_WORDS: &[&str] = &[
     "compaction",
     "interrupted",
     "ended",
+    "question",
     "turn",
 ];
 
@@ -226,6 +242,9 @@ pub struct Difference {
     pub text: Option<String>,
     /// Inside a subagent's transcript.
     pub nested: bool,
+    /// Whether the CLI's entry opened its turn (`Some(true)`) or was taken into a running turn
+    /// (`Some(false)`); `None` for a difference with no CLI entry.
+    pub opens_turn: Option<bool>,
     pub by_kind: Option<ByKind>,
     /// The ids of the allowances that cover it.
     pub allowed: Vec<String>,
@@ -359,10 +378,11 @@ impl Report {
             }
             if matched == 0 {
                 self.unmatched_allowances.push(format!(
-                    "allowance {} matched nothing: delete it (scenario {}, source {})",
+                    "allowance {} matched nothing: delete it (scenario {}, source {}) matcher {}",
                     allowance.id,
                     set.scenario(),
-                    source_word(allowance.source)
+                    source_word(allowance.source),
+                    allowance.matcher.as_json()
                 ));
             } else {
                 *self.allowance_matches.entry(allowance.id.clone()).or_default() += matched;
@@ -904,7 +924,20 @@ pub fn describe(entry: &Entry, r: &Redactor) -> String {
         Entry::Compaction { trigger } => format!("compaction {}", r.word(trigger)),
         Entry::Interrupted => "interrupted".to_owned(),
         Entry::Ended { reason } => format!("ended {}", end_word(reason, r)),
+        Entry::Question { key, .. } => question_line(key),
     }
+}
+
+/// A question set as the report prints it, with or without text shown: its key, nothing it asked or was
+/// answered, and no id.
+fn question_line(key: &QuestionKey) -> String {
+    let answered: Vec<String> = key.answered.iter().map(usize::to_string).collect();
+    format!(
+        "question count={} answered=[{}] outcome={}",
+        key.count,
+        answered.join(","),
+        key.end.word()
+    )
 }
 
 fn text_json(t: &str, r: &Redactor) -> Value {
@@ -950,6 +983,11 @@ pub fn describe_json(entry: &Entry, r: &Redactor) -> Value {
         Entry::Compaction { trigger } => json!({"trigger": r.word(trigger)}),
         Entry::Interrupted => json!({}),
         Entry::Ended { reason } => json!({"reason": end_word(reason, r)}),
+        Entry::Question { key, .. } => json!({
+            "count": key.count,
+            "answered": key.answered,
+            "outcome": key.end.word(),
+        }),
     };
     value["kind"] = json!(entry.kind());
     value
@@ -973,6 +1011,7 @@ fn collect(a: &Alignment, start: usize, prefix: &mut Vec<usize>, nested: bool, o
                 tool: None,
                 text: None,
                 nested,
+                opens_turn: None,
                 by_kind: None,
                 allowed: Vec::new(),
             });
@@ -1014,6 +1053,7 @@ fn collect(a: &Alignment, start: usize, prefix: &mut Vec<usize>, nested: bool, o
                     },
                     text: entry_text(shown),
                     nested,
+                    opens_turn: entry.cli.map(|at| at.entry == 0),
                     by_kind,
                     allowed: Vec::new(),
                 });

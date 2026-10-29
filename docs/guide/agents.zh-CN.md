@@ -1,11 +1,79 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=80360e2c829632370d6d81afc818586cdb7f7e944c14e55d96eca4b9e94a4486 -->
+<!-- translated-from: agents.md sha256=00cad545e776539285b7e17e154ec430bf59c2d227ec20c369c90c52eea7f1bb -->
 
 # Codex 与其他 agent
 
 agent 面板里的每个标签页都运行一个 agent，创建标签页时选定。默认是 Claude Code。一个标签页也可以运行 Codex，或者任何你注册的、通过标准输入输出说 Agent Client Protocol（ACP）的 agent。这一页讲这两种需要准备什么、怎样打开这样的标签页、Eitri 在启动之前会问你什么、谁来回答 agent 的请求，以及和 Claude 标签页相比，哪些地方更弱或者没有。
 
 Eitri 运行的是你自己安装并登录好的 agent；它不附带其中任何一个。面板、按键、队列、[回合审阅](turn-review.zh-CN.md)以及[快速上手](getting-started.zh-CN.md)的其余内容，在每个标签页里都一样。关于[权限](permissions.zh-CN.md)和 [Claude 账号](configuration.zh-CN.md#accounts)的页面只描述 Claude 标签页，除非这一页另有说明。
+
+Claude 标签页还能看到 Claude Code 自己在做的事：后台任务、动态工作流、子 agent、它自己发起的回合，以及它问你的问题。这部分放在最前面，因为 Codex 和 ACP 标签页都没有。
+
+<a id="what-a-claude-tab-shows-of-claude-codes-own-work"></a>
+## Claude 标签页能看到 Claude Code 自己做的事
+
+Claude Code 做的很多事，发生在你发起的回合之外：它在后台运行命令和子 agent，运行动态工作流，给自己定时唤醒，等这些有了结果，再自己发起回合。Claude 标签页把这些都显示出来，也让你能停掉它们。
+
+<a id="turns-claude-code-starts"></a>
+### Claude Code 自己发起的回合
+
+后台命令结束、monitor 有了报告、后台的子 agent 或工作流跑完、定时唤醒或 cron 任务到点时，Claude Code 会在你没有发提示的情况下开始一个回合。标签页把它当作和你的回合一样的回合来显示：第一行写明是什么引发了它，比如 `Background command "build" completed` 或 `Scheduled wake-up: check the deploy`，后面是它的工具调用、卡片和回复。它运行期间，活动行显示 `Claude Code is handling: ...`；它引出的卡片就放在这个回合里对应的工具行下面。
+
+这样的回合进行中按 `Enter`，消息会进入这个回合，和任何进行中的回合一样。Claude Code 留到之后再读的消息，会在活动行上方显示为一行 `↪`，等 Claude Code 读到后，再出现在它被读到的位置。
+
+<a id="background-tasks-and-tasks"></a>
+### 后台任务与 `/tasks`
+
+状态栏用 Claude Code 的说法统计这个标签页的后台工作：`1 shell`、`2 shells, 1 monitor`、`1 local agent`。没有回合在运行时，输入框上方还有一行显示同样的内容，结尾是 `/tasks`。
+
+`/tasks`（或 `/bashes`）打开后台任务列表：shell、monitor、local agent（在后台运行的子 agent）和动态工作流，然后是已经结束的任务。`j` 和 `k` 选择任务，`Enter` 显示详情：shell 或 monitor 显示它输出的末尾，转义序列已去掉，隐藏字符会显示出来；工作流显示它的各个阶段和 agent。`x` 停掉选中的任务，只停这一个。`o` 在 Neovim 里以只读方式打开它的输出。`q` 返回；在列表里按则关闭列表。全部按键见[按键](keys.zh-CN.md#the-background-tasks-list)。
+
+`<leader>k` 会先问一个列出这些任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉这个标签页的所有后台任务。它只在没有回合运行时可用，对话会继续下去。
+
+`Ctrl+c` 打断回合，但不会停掉它留下的后台工作；要停，用 `/tasks` 或 `<leader>k`。后台任务还在运行时，关闭这个标签页、它所在的视图或整个窗口都会先问，并说明还有什么在运行。定时唤醒和 cron 任务不算在内，所以关闭会直接取消它们，不会先问；被要求跨会话保留的 cron 任务除外（见[Claude 标签页暂时还没有的](#not-in-a-claude-tab-yet)）。
+
+<a id="dynamic-workflows"></a>
+### 动态工作流
+
+动态工作流是 Claude Code 在后台运行的一个脚本，带着它自己的 agent。需要你批准时，卡片写着 `Run a dynamic workflow?`，以纯文本显示工作流的名字、参数和脚本；`View raw script` 在 Neovim 里以只读方式打开脚本。运行期间，状态栏显示它的名字、已完成的 agent 数量、用时和 token。`/workflows` 打开任务列表并定位到工作流，工作流的详情先列出各个阶段，再列出它的 agent，以及每个 agent 的状态、模型、token 和工具调用次数。在那里按 `x` 会停掉这次运行。工作流结束后，Claude Code 会在一个自己的回合里汇报。
+
+<a id="subagents"></a>
+### 子 agent
+
+Claude 在前台运行的子 agent，它的调用嵌套在这个子 agent 那一行下面，`Enter` 展开或折叠。在后台运行的子 agent 只占一行状态，写着它用了几次工具，直到完成；它交回的报告会开始一个自己的回合。
+
+<a id="notices-compaction-and-clear"></a>
+### 提示、压缩与 `/clear`
+
+Claude Code 的提示出现在它的终端里显示的位置。Claude Code 压缩对话时，活动行显示 `Compacting conversation...`，之后一条分隔线标出压缩的位置，并写着压缩前后的 token 数。模型服务过载时，活动行显示重试（`overloaded · Retrying in 1s · attempt 1/2`），直到回复到来。被 `UserPromptSubmit` hook 拦下的提示，会在一行淡色的行里显示 hook 的原话。
+
+`/clear` 在同一个标签页里开始一段新对话。画面清空，后台任务继续运行，并且仍然显示在状态栏里；之后恢复这个标签页时，接上的是新对话。
+
+<a id="long-running-commands"></a>
+### 长时间运行的命令
+
+Claude Code 限制 Claude 能给一条命令设的超时。Eitri 启动它时把 `BASH_MAX_TIMEOUT_MS` 设为 2147483647，也就是它接受的最大值（将近 25 天），所以 Claude 带着长超时启动的后台命令，会一直运行到这个超时为止。没有给超时的后台命令，仍然会在 30 分钟后被停掉。这是 Claude Code 自己的默认值，Eitri 有意保留它。发生这种情况时 Claude 会得到通知，可以带上超时重新启动这条命令，`/tasks` 里这个任务的详情也会写明。如果你自己设置了 `BASH_MAX_TIMEOUT_MS`，不管是在环境变量里，还是在 Claude Code 的 `settings.json` 的 `env` 里，Claude Code 都用你的值。
+
+<a id="claudes-questions"></a>
+### Claude 的提问
+
+Claude 用选择题问你时（Claude Code 的 `AskUserQuestion` 工具），提问框会取代输入框，活动行显示 `⚑ Claude has a question`，标签页把这个提问和卡片一起计数。用数字选一个选项，或者用 `j` 和 `k` 移到它上面再按空格；这两种方式都会停在当前问题上，在可以多选的问题里，同样的键可以选上或取消任意多个选项。在只能选一个的问题里，`Enter` 选定光标所在的选项并进入下一步。`Type something` 可以填你自己的回答，`Ctrl+g` 在 Neovim 里编辑它。`n` 给带预览的选项加备注。`Tab` 进入下一个问题；问题不止一个时，最后有一页汇总你的回答。`Ctrl+Enter` 把所有回答一起发出。在 `Chat about this` 上按 `Enter`，是告诉 Claude 你想先聊一聊（按它的数字只会把光标移过去，空格在它上面不起作用）；`Esc` 取消提问，这会停掉当前回合。`Ctrl+k` 回到对话，提问继续等着，按 `i` 再回到提问框。写到一半的回答，在切换到别的标签页再回来、或重新加载页面之后都还在。
+
+只有你能回答提问：bypass、`Ctrl+y`、卡片按键、保存的规则和 Claude Code 的分类器都不会替你回答（见[权限](permissions.zh-CN.md#claudes-questions-to-you)）。有提问在等时关闭标签页，会先问，并说明关闭会取消这个提问。全部按键见[按键](keys.zh-CN.md#claudes-questions)。
+
+<a id="resuming-a-conversation"></a>
+### 恢复对话
+
+恢复的对话是根据 Claude Code 自己的会话文件重建的，回合的划分也和 Claude Code 一致。Claude Code 自己发起的回合，会连同引发它的原因一起回来。你输入过的斜杠命令和 `!` 命令，会作为你的提示回来。提问会连同你给出的回答一起回来，或者显示为已拒绝。Claude Code 在打断之后写下的那行 `No response requested.` 不会出现。
+
+有几样东西不会回来：子 agent 自己的调用（Claude Code 把它们存在单独的文件里），以及另一个 Claude Code 会话在回合进行中送进来的消息（实时的标签页里也不显示它）。还有少数回合，是 Claude Code 出于 Eitri 暂时还不认识的原因自己发起的，它们会并到前一个回合里。被打断的提问，或者标签页关闭时还在等的提问，恢复后可能显示为已拒绝，因为 Claude Code 就是这样记录的。
+
+<a id="not-in-a-claude-tab-yet"></a>
+### Claude 标签页暂时还没有的
+
+plan 模式、给消息附带文件或图片，以及定时唤醒和 cron 任务的列表。只要标签页开着，它们照样会触发，每次都是一个单独的回合。关闭这个标签页、它所在的视图或整个窗口会取消它们；Eitri 没有它们的列表，所以不会先问。Claude Code 只会在会话结束后保留一种 cron 任务：被要求跨会话保留的那种，它会存在项目的 `.claude/scheduled_tasks.json` 里，之后在这个项目的另一个会话里可能还会运行。
+
+Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，在 Claude 标签页里没有对应的操作。在 Eitri 里，`Ctrl+b` 是前缀键。
 
 <a id="opening-a-tab-for-another-agent"></a>
 ## 为另一个 agent 打开标签页
@@ -101,6 +169,7 @@ Codex 在它的 `workspace-write` 沙箱里运行，批准策略是 `on-request`
 ### Codex 标签页没有什么
 
 - 斜杠命令按输入的原样发给 Codex。没有被拦下的命令列表，没有 `/model` 或 `/effort` 选择器，也没有 `/` 命令菜单（Codex 不报告可补全的命令列表）。
+- 没有[Claude 标签页能看到的那些 Claude Code 自己做的事](#what-a-claude-tab-shows-of-claude-codes-own-work)：`/tasks` 和 `/workflows` 按原样发给 Codex，状态栏只统计还在后台运行的命令。
 - `<leader>t`（在终端里继续）会闪出 “Continuing a Codex session in a terminal is not available yet”。
 - `prefix i` 没有只属于 Claude 的几行（Claude 会话 id、CLI 构建、权限规则、账号和模型）。
 - 保存的权限规则、Claude Code 的 auto 模式和 `agent.user_settings` 开关都不适用。

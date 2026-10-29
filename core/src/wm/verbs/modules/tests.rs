@@ -1451,3 +1451,30 @@ fn a_chat_view_number_killed_before_is_asked_for_again() {
     assert!(create < tab);
     assert!(r.layout.borrow().is_shown(&agent2()));
 }
+
+#[test]
+fn killing_an_agent_view_with_background_shells_asks_and_names_them() {
+    for chat in [agent(), agent2()] {
+        let root = Node::split(Axis::Row, 0.5, Node::Leaf(editor()), Node::Leaf(chat.clone()));
+        let r = driven(Layout::new(root, chat.clone()).unwrap());
+        r.host.set_chat_kill_counts(
+            ViewId::of_module(&chat).unwrap(),
+            ChatKillCounts {
+                background: 2,
+                ..ChatKillCounts::default()
+            },
+        );
+        r.run(Action::ModuleKill, Origin::Key { keycode: K1 });
+        let prompt = r.chrome().prompt.unwrap();
+        assert_eq!(
+            prompt.text,
+            format!(
+                "kill-pane {}? 2 with background tasks (y/n)",
+                if chat == agent() { "agent" } else { "agent 2" }
+            )
+        );
+        assert!(r.layout.borrow().is_shown(&chat));
+        r.window_key(key("n", K2));
+        assert!(r.layout.borrow().is_shown(&chat));
+    }
+}

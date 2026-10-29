@@ -1,0 +1,763 @@
+{
+  "cases": [
+    {
+      "domain_events": [
+        {
+          "cwd": "/ws",
+          "model": "claude-opus-5-5",
+          "provider_session_id": "sess-old",
+          "session_id": "verdandi-1",
+          "type": "session_opened"
+        },
+        {
+          "text": "start the build",
+          "type": "user_prompt_submitted"
+        },
+        {
+          "turn_id": "t1",
+          "type": "turn_started"
+        },
+        {
+          "input": {
+            "command": "make",
+            "run_in_background": true
+          },
+          "name": "Bash",
+          "tool_use_id": "tu-bg",
+          "turn_id": "t1",
+          "type": "tool_call_started"
+        },
+        {
+          "content": "Command running in background with ID: bg-1.",
+          "is_error": false,
+          "tool_use_id": "tu-bg",
+          "turn_id": "t1",
+          "type": "tool_call_completed"
+        },
+        {
+          "tasks": [
+            {
+              "ambient": false,
+              "description": "a long build",
+              "kind": "shell",
+              "parent_task_id": null,
+              "run_id": "run-1",
+              "subagent_type": null,
+              "task_id": "bg-1",
+              "task_type": "local_bash",
+              "tool_use_id": "tu-bg",
+              "workflow_name": null
+            }
+          ],
+          "type": "background_tasks_changed"
+        },
+        {
+          "running": 1,
+          "type": "background_calls"
+        },
+        {
+          "kind": "text",
+          "text": "started",
+          "turn_id": "t1",
+          "type": "content_delta"
+        },
+        {
+          "detail": {
+            "api_error_status": null,
+            "message": null,
+            "num_turns": 2,
+            "reason": "completed"
+          },
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": "end_turn",
+          "turn_id": "t1",
+          "type": "turn_completed",
+          "usage": null
+        },
+        {
+          "content": "a warning row",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "text": "/clear",
+          "type": "user_prompt_submitted"
+        },
+        {
+          "turn_id": "t2",
+          "type": "turn_started"
+        },
+        {
+          "input": {
+            "command": "rm -rf build"
+          },
+          "name": "Bash",
+          "tool_use_id": "tu-card",
+          "turn_id": "t2",
+          "type": "tool_call_started"
+        },
+        {
+          "input": {
+            "command": "rm -rf build"
+          },
+          "permission_id": "perm-1",
+          "tool_name": "Bash",
+          "tool_use_id": "tu-card",
+          "type": "permission_requested"
+        },
+        {
+          "new_conversation_id": "sess-new",
+          "trigger": "clear",
+          "type": "conversation_reset"
+        },
+        {
+          "cwd": "/ws",
+          "model": "claude-opus-5-5",
+          "provider_session_id": "sess-new",
+          "session_id": "verdandi-1",
+          "type": "session_opened"
+        },
+        {
+          "detail": {
+            "api_error_status": null,
+            "message": null,
+            "num_turns": 0,
+            "reason": "completed"
+          },
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": "end_turn",
+          "turn_id": "t2",
+          "type": "turn_completed",
+          "usage": null
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "cwd": "/ws",
+            "model": "claude-opus-5-5",
+            "provider_session_id": "sess-old",
+            "session_id": "verdandi-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "start the build",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "input": {
+              "command": "make",
+              "run_in_background": true
+            },
+            "name": "Bash",
+            "tool_use_id": "tu-bg",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "Command running in background with ID: bg-1.",
+            "is_error": false,
+            "tool_use_id": "tu-bg",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "tasks": [
+              {
+                "ambient": false,
+                "description": "a long build",
+                "kind": "shell",
+                "parent_task_id": null,
+                "run_id": "run-1",
+                "subagent_type": null,
+                "task_id": "bg-1",
+                "task_type": "local_bash",
+                "tool_use_id": "tu-bg",
+                "workflow_name": null
+              }
+            ],
+            "type": "background_tasks_changed"
+          },
+          {
+            "running": 1,
+            "type": "background_calls"
+          },
+          {
+            "kind": "text",
+            "text": "started",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 2,
+              "reason": "completed"
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": "end_turn",
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "content": "a warning row",
+            "kind": "informational",
+            "level": "warning",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "text": "/clear",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t2",
+            "type": "turn_started"
+          },
+          {
+            "input": {
+              "command": "rm -rf build"
+            },
+            "name": "Bash",
+            "tool_use_id": "tu-card",
+            "turn_id": "t2",
+            "type": "tool_call_started"
+          },
+          {
+            "input": {
+              "command": "rm -rf build"
+            },
+            "permission_id": "perm-1",
+            "tool_name": "Bash",
+            "tool_use_id": "tu-card",
+            "type": "permission_requested"
+          },
+          {
+            "new_conversation_id": "sess-new",
+            "trigger": "clear",
+            "type": "conversation_reset"
+          },
+          {
+            "cwd": "/ws",
+            "model": "claude-opus-5-5",
+            "provider_session_id": "sess-new",
+            "session_id": "verdandi-1",
+            "type": "session_opened"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 0,
+              "reason": "completed"
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": "end_turn",
+            "turn_id": "t2",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 17
+      },
+      "name": "shell_count_and_card_survive_the_reset",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 1,
+          "backgroundTasks": {
+            "query_start": false,
+            "rows": [
+              {
+                "ambient": false,
+                "description": "a long build",
+                "ended_at": null,
+                "error": null,
+                "finished_seq": null,
+                "is_backgrounded": null,
+                "kind": "shell",
+                "last_tool_name": null,
+                "live": true,
+                "output_file": null,
+                "parent_task_id": null,
+                "reason": null,
+                "run_id": "run-1",
+                "started_at": 5,
+                "status": "running",
+                "subagent_type": null,
+                "summary": null,
+                "task_id": "bg-1",
+                "task_type": "local_bash",
+                "tool_use_id": "tu-bg",
+                "usage": null,
+                "workflow_name": null,
+                "workflow_progress": null
+              }
+            ]
+          },
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/ws",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-opus-5-5",
+          "pendingPermissions": [
+            {
+              "input": {
+                "command": "rm -rf build"
+              },
+              "permissionId": "perm-1",
+              "seq": 13,
+              "toolName": "Bash",
+              "toolUseId": "tu-card"
+            }
+          ],
+          "provider": null,
+          "providerSessionId": "sess-new",
+          "sessionId": "verdandi-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "input": {
+                "command": "rm -rf build"
+              },
+              "name": "Bash",
+              "result": null,
+              "seq": 12,
+              "toolUseId": "tu-card",
+              "turnId": "t2"
+            }
+          ],
+          "transcript": [],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 17,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "domain_events": [
+        {
+          "cwd": "/ws",
+          "model": "claude-opus-5-5",
+          "provider_session_id": "sess-old",
+          "session_id": "verdandi-1",
+          "type": "session_opened"
+        },
+        {
+          "text": "start the build",
+          "type": "user_prompt_submitted"
+        },
+        {
+          "turn_id": "t1",
+          "type": "turn_started"
+        },
+        {
+          "input": {
+            "command": "make",
+            "run_in_background": true
+          },
+          "name": "Bash",
+          "tool_use_id": "tu-bg",
+          "turn_id": "t1",
+          "type": "tool_call_started"
+        },
+        {
+          "content": "Command running in background with ID: bg-1.",
+          "is_error": false,
+          "tool_use_id": "tu-bg",
+          "turn_id": "t1",
+          "type": "tool_call_completed"
+        },
+        {
+          "tasks": [
+            {
+              "ambient": false,
+              "description": "a long build",
+              "kind": "shell",
+              "parent_task_id": null,
+              "run_id": "run-1",
+              "subagent_type": null,
+              "task_id": "bg-1",
+              "task_type": "local_bash",
+              "tool_use_id": "tu-bg",
+              "workflow_name": null
+            }
+          ],
+          "type": "background_tasks_changed"
+        },
+        {
+          "running": 1,
+          "type": "background_calls"
+        },
+        {
+          "kind": "text",
+          "text": "started",
+          "turn_id": "t1",
+          "type": "content_delta"
+        },
+        {
+          "detail": {
+            "api_error_status": null,
+            "message": null,
+            "num_turns": 2,
+            "reason": "completed"
+          },
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": "end_turn",
+          "turn_id": "t1",
+          "type": "turn_completed",
+          "usage": null
+        },
+        {
+          "content": "a warning row",
+          "kind": "informational",
+          "level": "warning",
+          "scalars": {},
+          "task_id": null,
+          "task_status": null,
+          "tool_use_id": null,
+          "type": "session_notice"
+        },
+        {
+          "text": "/clear",
+          "type": "user_prompt_submitted"
+        },
+        {
+          "turn_id": "t2",
+          "type": "turn_started"
+        },
+        {
+          "new_conversation_id": "sess-new",
+          "trigger": "clear",
+          "type": "conversation_reset"
+        },
+        {
+          "cwd": "/ws",
+          "model": "claude-opus-5-5",
+          "provider_session_id": "sess-new",
+          "session_id": "verdandi-1",
+          "type": "session_opened"
+        },
+        {
+          "detail": {
+            "api_error_status": null,
+            "message": null,
+            "num_turns": 0,
+            "reason": "completed"
+          },
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": "end_turn",
+          "turn_id": "t2",
+          "type": "turn_completed",
+          "usage": null
+        },
+        {
+          "text": "after",
+          "type": "user_prompt_submitted"
+        },
+        {
+          "turn_id": "t3",
+          "type": "turn_started"
+        },
+        {
+          "kind": "text",
+          "text": "after reply",
+          "turn_id": "t3",
+          "type": "content_delta"
+        },
+        {
+          "detail": {
+            "api_error_status": null,
+            "message": null,
+            "num_turns": 1,
+            "reason": "completed"
+          },
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": "end_turn",
+          "turn_id": "t3",
+          "type": "turn_completed",
+          "usage": null
+        }
+      ],
+      "events": {
+        "events": [
+          {
+            "cwd": "/ws",
+            "model": "claude-opus-5-5",
+            "provider_session_id": "sess-old",
+            "session_id": "verdandi-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "start the build",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "input": {
+              "command": "make",
+              "run_in_background": true
+            },
+            "name": "Bash",
+            "tool_use_id": "tu-bg",
+            "turn_id": "t1",
+            "type": "tool_call_started"
+          },
+          {
+            "content": "Command running in background with ID: bg-1.",
+            "is_error": false,
+            "tool_use_id": "tu-bg",
+            "turn_id": "t1",
+            "type": "tool_call_completed"
+          },
+          {
+            "tasks": [
+              {
+                "ambient": false,
+                "description": "a long build",
+                "kind": "shell",
+                "parent_task_id": null,
+                "run_id": "run-1",
+                "subagent_type": null,
+                "task_id": "bg-1",
+                "task_type": "local_bash",
+                "tool_use_id": "tu-bg",
+                "workflow_name": null
+              }
+            ],
+            "type": "background_tasks_changed"
+          },
+          {
+            "running": 1,
+            "type": "background_calls"
+          },
+          {
+            "kind": "text",
+            "text": "started",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 2,
+              "reason": "completed"
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": "end_turn",
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "content": "a warning row",
+            "kind": "informational",
+            "level": "warning",
+            "scalars": {},
+            "task_id": null,
+            "task_status": null,
+            "tool_use_id": null,
+            "type": "session_notice"
+          },
+          {
+            "text": "/clear",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t2",
+            "type": "turn_started"
+          },
+          {
+            "new_conversation_id": "sess-new",
+            "trigger": "clear",
+            "type": "conversation_reset"
+          },
+          {
+            "cwd": "/ws",
+            "model": "claude-opus-5-5",
+            "provider_session_id": "sess-new",
+            "session_id": "verdandi-1",
+            "type": "session_opened"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 0,
+              "reason": "completed"
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": "end_turn",
+            "turn_id": "t2",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "text": "after",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t3",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "after reply",
+            "turn_id": "t3",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "reason": "completed"
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": "end_turn",
+            "turn_id": "t3",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 19
+      },
+      "name": "a_turn_after_the_reset_is_the_whole_conversation",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 1,
+          "backgroundTasks": {
+            "query_start": false,
+            "rows": [
+              {
+                "ambient": false,
+                "description": "a long build",
+                "ended_at": null,
+                "error": null,
+                "finished_seq": null,
+                "is_backgrounded": null,
+                "kind": "shell",
+                "last_tool_name": null,
+                "live": true,
+                "output_file": null,
+                "parent_task_id": null,
+                "reason": null,
+                "run_id": "run-1",
+                "started_at": 5,
+                "status": "running",
+                "subagent_type": null,
+                "summary": null,
+                "task_id": "bg-1",
+                "task_type": "local_bash",
+                "tool_use_id": "tu-bg",
+                "usage": null,
+                "workflow_name": null,
+                "workflow_progress": null
+              }
+            ]
+          },
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/ws",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-opus-5-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "sess-new",
+          "sessionId": "verdandi-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 17,
+              "text": "after reply"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 15,
+              "text": "after"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 19,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    }
+  ]
+}

@@ -188,6 +188,10 @@ pub struct CloseFacts {
     /// `label_name` of the tab, for the prompt.
     pub label_name: String,
     pub turn_running: bool,
+    /// Claude Code is working where this panel cannot show it: closing ends that work unseen.
+    pub unseen_work: bool,
+    pub background: Option<String>,
+    pub question_waiting: bool,
     /// Messages held for the turn's end.
     pub queued: usize,
     /// Messages sent into the running turn that the agent has not been seen to read.
@@ -254,11 +258,54 @@ pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     }
 }
 
+/// Fixed task-kind words shared by close and handoff prompts; task descriptions never enter them.
+pub fn background_summary(projection: &agent::AgentSessionProjection) -> Option<String> {
+    if projection.background_calls == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (kind, singular, plural) in [
+        (agent::TaskKind::Shell, "shell", "shells"),
+        (agent::TaskKind::Monitor, "monitor", "monitors"),
+        (agent::TaskKind::LocalAgent, "local agent", "local agents"),
+        (
+            agent::TaskKind::Workflow,
+            "background dynamic workflow",
+            "background dynamic workflows",
+        ),
+        (agent::TaskKind::Other, "task", "tasks"),
+    ] {
+        let count = projection
+            .background_tasks
+            .rows
+            .iter()
+            .filter(|row| row.live && !row.task.ambient && row.task.kind == kind)
+            .count();
+        if count > 0 {
+            parts.push(format!("{count} {}", if count == 1 { singular } else { plural }));
+        }
+    }
+    if parts.is_empty() {
+        let count = projection.background_calls;
+        parts.push(format!("{count} {}", if count == 1 { "command" } else { "commands" }));
+    }
+    Some(parts.join(", "))
+}
+
 /// tmux's `confirm-before`, plus a line for each consequence that applies.
 pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     let mut lines = vec![format!("close {} \"{}\"? (y/n)", facts.number, facts.label_name)];
     if facts.turn_running {
         lines.push("a turn is running — it will be interrupted".to_string());
+    }
+    if facts.unseen_work {
+        lines.push("Claude Code is working where this panel cannot show it".to_string());
+    }
+    if let Some(background) = &facts.background {
+        lines.push(format!("{background} running in the background"));
+    }
+    if facts.question_waiting {
+        lines.push("closing cancels Claude's question".to_string());
     }
     match facts.queued {
         0 => {}
@@ -281,26 +328,16 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
 /// [`window_close_prompt`] for a window that also holds terminals: `jobs` is how many of them run a
 /// job in the foreground (a command the shell handed its terminal to; a job left in the background
 /// at a prompt is not one), which closing the window ends, so the window asks about those too. With
-/// no jobs it is exactly `window_close_prompt(running, queued)`.
-pub fn window_close_prompt_with_jobs(running: usize, queued: usize, jobs: usize) -> Option<String> {
-    counts_text(running, queued, jobs).map(|here| format!("close window? {here} (y/n)"))
+/// no jobs it is exactly `window_close_prompt(running, queued, background)`.
+pub fn window_close_prompt_with_jobs(running: usize, queued: usize, jobs: usize, background: usize) -> Option<String> {
+    counts_text(running, queued, jobs, background).map(|here| format!("close window? {here} (y/n)"))
 }
 
-/// The window asks only if some tab is running or has a queued message. A message
+/// The window asks while a tab has a running turn, waiting question, queued message or background work. A message
 /// sent into a running turn and not yet read counts as queued here; the tab's own close prompt tells
 /// the two apart.
-pub fn window_close_prompt(running: usize, queued: usize) -> Option<String> {
-    let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} running"));
-    }
-    if queued > 0 {
-        parts.push(format!("{queued} queued"));
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(format!("close window? {} (y/n)", parts.join(", ")))
+pub fn window_close_prompt(running: usize, queued: usize, background: usize) -> Option<String> {
+    window_close_prompt_with_jobs(running, queued, 0, background)
 }
 
 /// The other window of a linked pair, for this window's close prompt.
@@ -314,14 +351,17 @@ pub struct OtherWindow<'a> {
 }
 
 /// The counted part of a close prompt: turns running, messages queued, and terminals running a job in the
-/// foreground. `None` when all three are zero.
-fn counts_text(running: usize, queued: usize, jobs: usize) -> Option<String> {
+/// foreground, plus tabs with background work. `None` when all counts are zero.
+fn counts_text(running: usize, queued: usize, jobs: usize, background: usize) -> Option<String> {
     let mut parts = Vec::new();
     if running > 0 {
         parts.push(format!("{running} running"));
     }
     if queued > 0 {
         parts.push(format!("{queued} queued"));
+    }
+    if background > 0 {
+        parts.push(format!("{background} with background tasks"));
     }
     match jobs {
         0 => {}
@@ -343,10 +383,10 @@ pub fn linked_window_close_prompt(
     movable: usize,
 ) -> Option<String> {
     let Some(other) = other else {
-        return window_close_prompt_with_jobs(running, queued, jobs);
+        return window_close_prompt_with_jobs(running, queued, jobs, 0);
     };
-    let here = counts_text(running, queued, jobs)?;
-    let there = counts_text(other.running, other.queued, 0).unwrap_or_else(|| "idle".to_string());
+    let here = counts_text(running, queued, jobs, 0)?;
+    let there = counts_text(other.running, other.queued, 0, 0).unwrap_or_else(|| "idle".to_string());
     let stays = if other.stays_without_editor {
         " (stays open without the editor)"
     } else {
@@ -624,7 +664,10 @@ mod tests {
             None,
             "nothing here: no prompt, as today"
         );
-        assert_eq!(linked_window_close_prompt(1, 1, 0, None, 0), window_close_prompt(1, 1));
+        assert_eq!(
+            linked_window_close_prompt(1, 1, 0, None, 0),
+            window_close_prompt(1, 1, 0)
+        );
     }
 
     #[test]
@@ -646,7 +689,7 @@ mod tests {
         );
         assert_eq!(
             linked_window_close_prompt(1, 1, 2, None, 0),
-            window_close_prompt_with_jobs(1, 1, 2),
+            window_close_prompt_with_jobs(1, 1, 2, 0),
             "unlinked, the prompt is the one a single window asks"
         );
     }
@@ -865,6 +908,9 @@ mod tests {
             number: 2,
             label_name: "docs".into(),
             turn_running,
+            unseen_work: false,
+            background: None,
+            question_waiting: false,
             queued,
             steered: 0,
             legacy,
@@ -888,6 +934,21 @@ mod tests {
             close_steps(&empty),
             vec![Remove],
             "an empty tab has nothing to shut down"
+        );
+    }
+
+    #[test]
+    fn the_close_prompt_names_work_the_panel_cannot_show() {
+        let unseen = CloseFacts {
+            unseen_work: true,
+            ..facts(false, 0, false)
+        };
+        assert_eq!(
+            close_prompt(&unseen),
+            vec![
+                "close 2 \"docs\"? (y/n)",
+                "Claude Code is working where this panel cannot show it"
+            ]
         );
     }
 
@@ -1025,34 +1086,50 @@ mod tests {
     }
 
     #[test]
-    fn the_window_asks_only_when_something_is_running_or_queued() {
-        assert_eq!(window_close_prompt(0, 0), None);
+    fn window_close_names_background_tabs_beside_turns_queues_and_jobs() {
         assert_eq!(
-            window_close_prompt(2, 1).as_deref(),
+            window_close_prompt(1, 0, 1).as_deref(),
+            Some("close window? 1 running, 1 with background tasks (y/n)")
+        );
+        assert_eq!(
+            window_close_prompt(0, 0, 2).as_deref(),
+            Some("close window? 2 with background tasks (y/n)")
+        );
+        assert_eq!(
+            window_close_prompt_with_jobs(1, 2, 3, 4).as_deref(),
+            Some("close window? 1 running, 2 queued, 4 with background tasks, 3 terminal jobs (y/n)")
+        );
+    }
+
+    #[test]
+    fn the_window_asks_only_when_something_is_running_or_queued() {
+        assert_eq!(window_close_prompt(0, 0, 0), None);
+        assert_eq!(
+            window_close_prompt(2, 1, 0).as_deref(),
             Some("close window? 2 running, 1 queued (y/n)")
         );
         assert_eq!(
-            window_close_prompt(2, 0).as_deref(),
+            window_close_prompt(2, 0, 0).as_deref(),
             Some("close window? 2 running (y/n)")
         );
         assert_eq!(
-            window_close_prompt(0, 3).as_deref(),
+            window_close_prompt(0, 3, 0).as_deref(),
             Some("close window? 3 queued (y/n)")
         );
     }
 
     #[test]
     fn the_close_names_terminal_jobs_beside_turns() {
-        assert_eq!(window_close_prompt_with_jobs(0, 0, 0), None);
+        assert_eq!(window_close_prompt_with_jobs(0, 0, 0, 0), None);
         assert_eq!(
-            window_close_prompt_with_jobs(0, 0, 1).as_deref(),
+            window_close_prompt_with_jobs(0, 0, 1, 0).as_deref(),
             Some("close window? 1 terminal job (y/n)")
         );
         assert_eq!(
-            window_close_prompt_with_jobs(1, 2, 2).as_deref(),
+            window_close_prompt_with_jobs(1, 2, 2, 0).as_deref(),
             Some("close window? 1 running, 2 queued, 2 terminal jobs (y/n)")
         );
-        assert_eq!(window_close_prompt_with_jobs(2, 1, 0), window_close_prompt(2, 1));
+        assert_eq!(window_close_prompt_with_jobs(2, 1, 0, 0), window_close_prompt(2, 1, 0));
     }
 
     #[test]

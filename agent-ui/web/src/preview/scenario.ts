@@ -232,6 +232,7 @@ function basePackets(scenario: Scenario, theme: Record<string, string>): unknown
       { seq: 5.5, turnId: "t1", text: thinking3 },
     ],
     thinkingOpen: false,
+    turnStarts: [], notices: [], questions: [],
     history: null, assistantMessageOpen: false, nextSeq: 15, turnThinking: false,
     denialsBeforeTheirCall: [], changedInputsBeforeTheirCall: [],
   };

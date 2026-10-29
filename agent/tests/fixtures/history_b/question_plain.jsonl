@@ -1,0 +1,3 @@
+{"type": "user", "uuid": "prompt", "promptSource": "sdk", "message": {"content": "Choose a layout"}}
+{"type": "assistant", "uuid": "ask", "message": {"id": "msg", "content": [{"type": "tool_use", "id": "ask-layout", "name": "AskUserQuestion", "input": {"questions": [{"question": "Which layout?", "header": "Layout", "multiSelect": false, "options": [{"label": "Grid", "description": "Tiles"}, {"label": "List", "description": "Rows"}]}]}}]}}
+{"type": "user", "uuid": "result", "message": {"content": [{"type": "tool_result", "tool_use_id": "ask-layout", "content": "An unfamiliar result with no structured answers", "is_error": false}]}}

@@ -1,0 +1,1062 @@
+{
+  "cases": [
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "input": {},
+          "name": "Agent",
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        {
+          "kind": "text",
+          "text": "main ",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "child ",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "kind": "text",
+          "text": "reply",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "reply",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "thinking",
+            "text": "child thought",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Read",
+            "tool_use_id": "child",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "child",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "content": "done",
+          "is_error": false,
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_completed"
+        }
+      ],
+      "name": "foreground children",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "main",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "children": {
+                "assistantMessageOpen": false,
+                "thinking": [
+                  {
+                    "seq": 6,
+                    "text": "child thought",
+                    "turnId": "main"
+                  }
+                ],
+                "thinkingOpen": false,
+                "toolCalls": [
+                  {
+                    "input": {},
+                    "name": "Read",
+                    "result": {
+                      "content": "done",
+                      "isError": false
+                    },
+                    "seq": 7,
+                    "toolUseId": "child",
+                    "turnId": "main"
+                  }
+                ],
+                "transcript": [
+                  {
+                    "seq": 3,
+                    "text": "child reply"
+                  }
+                ]
+              },
+              "input": {},
+              "name": "Agent",
+              "result": {
+                "content": "done",
+                "isError": false
+              },
+              "seq": 1,
+              "toolUseId": "parent",
+              "turnId": "main"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "main reply"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 10,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "input": {},
+          "name": "Agent",
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Write",
+            "tool_use_id": "overlap",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "detail": {},
+          "outcome": "completed",
+          "result_text": "",
+          "stop_reason": null,
+          "turn_id": "main",
+          "type": "turn_completed",
+          "usage": null
+        },
+        {
+          "turn_id": "next",
+          "type": "turn_started"
+        },
+        {
+          "kind": "text",
+          "text": "next reply",
+          "turn_id": "next",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "overlap",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Write",
+            "tool_use_id": "late",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "late",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "late child",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        }
+      ],
+      "name": "background after parent turn and during another turn",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "next",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "children": {
+                "assistantMessageOpen": true,
+                "thinking": [],
+                "thinkingOpen": false,
+                "toolCalls": [
+                  {
+                    "background": true,
+                    "input": {},
+                    "name": "Write",
+                    "result": {
+                      "content": "done",
+                      "isError": false
+                    },
+                    "seq": 2,
+                    "toolUseId": "overlap",
+                    "turnId": "main"
+                  },
+                  {
+                    "background": true,
+                    "input": {},
+                    "name": "Write",
+                    "result": {
+                      "content": "done",
+                      "isError": false
+                    },
+                    "seq": 7,
+                    "toolUseId": "late",
+                    "turnId": "main"
+                  }
+                ],
+                "transcript": [
+                  {
+                    "seq": 9,
+                    "text": "late child"
+                  }
+                ]
+              },
+              "input": {},
+              "name": "Agent",
+              "result": null,
+              "seq": 1,
+              "toolUseId": "parent",
+              "turnId": "main"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 5,
+              "text": "next reply"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 10,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "input": {},
+          "name": "Agent",
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        {
+          "kind": "text",
+          "text": "main",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Write",
+            "tool_use_id": "child",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "input": {
+            "file_path": "child.txt"
+          },
+          "permission_id": "card",
+          "provider_prompt": null,
+          "tool_name": "Write",
+          "tool_use_id": "child",
+          "type": "permission_requested"
+        },
+        {
+          "reason": "blocked",
+          "reason_type": "classifier",
+          "tool_name": "Edit",
+          "tool_use_id": "early",
+          "type": "permission_denied"
+        },
+        {
+          "change": {
+            "fields": {
+              "file_path": "changed.txt"
+            }
+          },
+          "tool_use_id": "early",
+          "type": "tool_input_changed"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Edit",
+            "tool_use_id": "early",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "reason": "no",
+          "reason_type": "classifier",
+          "tool_name": "Write",
+          "tool_use_id": "child",
+          "type": "permission_denied"
+        },
+        {
+          "change": {
+            "fields": {
+              "file_path": "child.txt"
+            }
+          },
+          "tool_use_id": "child",
+          "type": "tool_input_changed"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "child",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "outcome": "allowed",
+          "permission_id": "card",
+          "type": "permission_resolved"
+        }
+      ],
+      "name": "child card and held call metadata",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "main",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "children": {
+                "assistantMessageOpen": false,
+                "thinking": [],
+                "thinkingOpen": false,
+                "toolCalls": [
+                  {
+                    "changedInput": {
+                      "fields": {
+                        "file_path": "child.txt"
+                      }
+                    },
+                    "denied": {
+                      "reason": "no",
+                      "reasonType": "classifier"
+                    },
+                    "input": {},
+                    "name": "Write",
+                    "result": {
+                      "content": "done",
+                      "isError": false
+                    },
+                    "seq": 3,
+                    "toolUseId": "child",
+                    "turnId": "main"
+                  },
+                  {
+                    "changedInput": {
+                      "fields": {
+                        "file_path": "changed.txt"
+                      }
+                    },
+                    "denied": {
+                      "reason": "blocked",
+                      "reasonType": "classifier"
+                    },
+                    "input": {},
+                    "name": "Edit",
+                    "result": null,
+                    "seq": 7,
+                    "toolUseId": "early",
+                    "turnId": "main"
+                  }
+                ],
+                "transcript": []
+              },
+              "input": {},
+              "name": "Agent",
+              "result": null,
+              "seq": 1,
+              "toolUseId": "parent",
+              "turnId": "main"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "main"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 12,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "kind": "text",
+          "text": "main",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "unknown",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "missing",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Agent",
+            "tool_use_id": "orphan",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "missing",
+          "type": "subagent_frame"
+        }
+      ],
+      "name": "unknown parent",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "main",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "background": true,
+              "children": {
+                "assistantMessageOpen": false,
+                "thinking": [],
+                "thinkingOpen": false,
+                "toolCalls": [
+                  {
+                    "input": {},
+                    "name": "Agent",
+                    "result": null,
+                    "seq": 3,
+                    "toolUseId": "orphan",
+                    "turnId": "main"
+                  }
+                ],
+                "transcript": [
+                  {
+                    "seq": 2,
+                    "text": "unknown"
+                  }
+                ]
+              },
+              "input": {},
+              "name": "background agent",
+              "result": null,
+              "seq": 2,
+              "toolUseId": "missing",
+              "turnId": ""
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 1,
+              "text": "main"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 4,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "input": {},
+          "name": "Agent",
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        {
+          "kind": "text",
+          "text": "main",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Agent",
+            "tool_use_id": "nested",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "level one",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "input": {},
+            "name": "Agent",
+            "tool_use_id": "deep",
+            "turn_id": "main",
+            "type": "tool_call_started"
+          },
+          "parent_tool_use_id": "nested",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "level two",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "nested",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "frame": {
+              "kind": "text",
+              "text": "level three",
+              "turn_id": "main",
+              "type": "content_delta"
+            },
+            "parent_tool_use_id": "deep",
+            "type": "subagent_frame"
+          },
+          "parent_tool_use_id": "nested",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "deep",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "nested",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "content": "done",
+            "is_error": false,
+            "tool_use_id": "nested",
+            "turn_id": "main",
+            "type": "tool_call_completed"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "turn_id": "bad",
+            "type": "turn_started"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        }
+      ],
+      "name": "nested twice",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "main",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [
+            {
+              "children": {
+                "assistantMessageOpen": true,
+                "thinking": [],
+                "thinkingOpen": false,
+                "toolCalls": [
+                  {
+                    "children": {
+                      "assistantMessageOpen": true,
+                      "thinking": [],
+                      "thinkingOpen": false,
+                      "toolCalls": [
+                        {
+                          "children": {
+                            "assistantMessageOpen": true,
+                            "thinking": [],
+                            "thinkingOpen": false,
+                            "toolCalls": [],
+                            "transcript": [
+                              {
+                                "seq": 7,
+                                "text": "level three"
+                              }
+                            ]
+                          },
+                          "input": {},
+                          "name": "Agent",
+                          "result": {
+                            "content": "done",
+                            "isError": false
+                          },
+                          "seq": 5,
+                          "toolUseId": "deep",
+                          "turnId": "main"
+                        }
+                      ],
+                      "transcript": [
+                        {
+                          "seq": 6,
+                          "text": "level two"
+                        }
+                      ]
+                    },
+                    "input": {},
+                    "name": "Agent",
+                    "result": {
+                      "content": "done",
+                      "isError": false
+                    },
+                    "seq": 3,
+                    "toolUseId": "nested",
+                    "turnId": "main"
+                  }
+                ],
+                "transcript": [
+                  {
+                    "seq": 4,
+                    "text": "level one"
+                  }
+                ]
+              },
+              "input": {},
+              "name": "Agent",
+              "result": null,
+              "seq": 1,
+              "toolUseId": "parent",
+              "turnId": "main"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "main"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 11,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    },
+    {
+      "events": [
+        {
+          "turn_id": "main",
+          "type": "turn_started"
+        },
+        {
+          "input": {},
+          "name": "Agent",
+          "tool_use_id": "parent",
+          "turn_id": "main",
+          "type": "tool_call_started"
+        },
+        {
+          "kind": "text",
+          "text": "main ",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "kind": "thinking",
+          "text": "main thought ",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "child ",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "thinking",
+            "text": "child thought ",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "kind": "text",
+          "text": "reply",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "kind": "thinking",
+          "text": "continues",
+          "turn_id": "main",
+          "type": "content_delta"
+        },
+        {
+          "frame": {
+            "kind": "text",
+            "text": "reply",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        },
+        {
+          "frame": {
+            "kind": "thinking",
+            "text": "continues",
+            "turn_id": "main",
+            "type": "content_delta"
+          },
+          "parent_tool_use_id": "parent",
+          "type": "subagent_frame"
+        }
+      ],
+      "name": "separate main text and thinking streams",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "main",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": false,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": null,
+          "history": null,
+          "lastTurnEnding": null,
+          "model": null,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": null,
+          "sessionId": null,
+          "status": {
+            "kind": "starting"
+          },
+          "thinking": [
+            {
+              "seq": 3,
+              "text": "main thought ",
+              "turnId": "main"
+            },
+            {
+              "seq": 7,
+              "text": "continues",
+              "turnId": "main"
+            }
+          ],
+          "thinkingOpen": true,
+          "toolCalls": [
+            {
+              "children": {
+                "assistantMessageOpen": true,
+                "thinking": [
+                  {
+                    "seq": 5,
+                    "text": "child thought continues",
+                    "turnId": "main"
+                  }
+                ],
+                "thinkingOpen": true,
+                "toolCalls": [],
+                "transcript": [
+                  {
+                    "seq": 4,
+                    "text": "child reply"
+                  }
+                ]
+              },
+              "input": {},
+              "name": "Agent",
+              "result": null,
+              "seq": 1,
+              "toolUseId": "parent",
+              "turnId": "main"
+            }
+          ],
+          "transcript": [
+            {
+              "seq": 2,
+              "text": "main reply"
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": []
+        },
+        "tab": 1,
+        "throughRevision": 10,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      }
+    }
+  ]
+}

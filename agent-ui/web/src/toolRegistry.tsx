@@ -6,6 +6,7 @@ import { EditDiff } from "./components/EditDiff";
 import { HiddenWarning, Revealed } from "./components/Revealed";
 import { subagentOf } from "./externalTools";
 import { countEscapes, revealHidden } from "./revealHidden";
+import { toolCardLine } from "./display";
 import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
@@ -199,7 +200,7 @@ function answeredRequest(label: string): ToolRenderConfig {
 }
 
 /** A tool this registry recognizes by name only: one muted line, its own summary, nothing more.
- *  Every name in `TOOLS_OFFERED_BY_CLI_2_1_272` this file has no richer view for gets one of these,
+ *  Every name in `TOOLS_OFFERED_BY_CLI_2_1_311` this file has no richer view for gets one of these,
  *  so "not in the table" (the 2026-09-19 defect: 18 of 26 real tools carded as unknown) cannot
  *  recur -- adding a tool to the CLI's own list and forgetting to register it here is caught by
  *  `toolRegistry.test.tsx`'s own coverage check, not left to be noticed on a screen. */
@@ -379,8 +380,8 @@ function acpConfig(name: string): ToolRenderConfig {
   };
 }
 
-/** The tools Claude Code 2.1.27x actually offers, matching `agent/src/permission_policy.rs`'s own
- *  `TOOLS_OFFERED_BY_CLI_2_1_272` (`toolRegistry.test.tsx` reads that file as text and checks every
+/** The tools Claude Code 2.1.311 actually offers, matching `agent/src/permission_policy.rs`'s own
+ *  `TOOLS_OFFERED_BY_CLI_2_1_311` (`toolRegistry.test.tsx` reads that file as text and checks every
  *  name here). `Grep`/`Glob`/`WebFetch`/`WebSearch` predate that list and are kept for a build that
  *  does carry them; `ToolSearch`, `Edit`, `Write`, `NotebookEdit` and `Skill` get their own view
  *  below; everything else gets `oneLine` -- a real tool the model called always says its name and a
@@ -432,6 +433,8 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     label: "Skill",
     renderInvocation: (input) => <div className="tool-card tool-card-skill">Used skill: {commandOf(input)}</div>,
   },
+  Workflow: oneLine("Workflow"),
+  RunWorkflow: oneLine("RunWorkflow"),
   Task: oneLine("Task"),
   // CLI 2.1.283+ spells the subagent tool `Agent` (the same tool, renamed -- see
   // `agent/src/permission_policy.rs`'s `NEVER_ASK_TOOLS`); `Task` stays for an older CLI.
@@ -683,9 +686,11 @@ function ChangedInputNote({ name, change }: { name: string; change: InputChange 
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
-  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
+  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean; cardLine?: string | null } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
+  const cardLine = opts.cardLine === undefined ? toolCardLine(call) : opts.cardLine;
+  const specialInvocation = cardLine !== null && !["Bash", "Monitor", "Agent", "Task"].includes(call.name);
   // `opts.detailed` (Ctrl+o) used to reach only `ToolResult`'s own head/tail
   // cut, never `editConfig`'s `maxLines`, so a folded (unexpanded) Edit/Write/NotebookEdit row
   // stayed folded even in the detailed view -- silently, since `EditDiff`'s own doc already
@@ -693,6 +698,8 @@ export function renderToolCall(
   // above). `Ctrl+o` now widens a diff exactly as it widens a `Bash`/`Read` result.
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
+  ) : specialInvocation ? (
+    <div className="tool-card tool-card-muted"><Shown text={cardLine!} /></div>
   ) : config ? (
     config.renderInvocation(call.input, {
       expanded: (opts.expanded ?? showResult) || opts.detailed === true,
@@ -708,6 +715,8 @@ export function renderToolCall(
       <pre>{JSON.stringify(call.input, null, 2)}</pre>
     </details>
   );
+
+  const showOrdinaryResult = cardLine === null || (call.result?.isError === true && !["Workflow", "RunWorkflow"].includes(call.name));
 
   // A quiet tool (`ToolSearch`) never gets a separate result row: its own line is the whole story.
   if (config?.quiet) {
@@ -766,8 +775,9 @@ export function renderToolCall(
       {promptNote}
       {deniedNote}
       {changedNote}
-      {shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
-      {!shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
+      {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note"><Shown text={cardLine} /></div>}
+      {showOrdinaryResult && shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
+      {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
         <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} />
       )}
     </div>

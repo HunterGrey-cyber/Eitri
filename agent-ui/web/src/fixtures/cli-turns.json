@@ -1,0 +1,2825 @@
+{
+  "cases": [
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "The tests passed.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "task_cause",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "The tests passed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "unknown",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "Done.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "turn_id": "c1",
+            "type": "turn_cause_updated"
+          },
+          {
+            "cause": null,
+            "turn_id": "c1",
+            "type": "turn_cause_updated"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 11
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Done."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "unknown",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 8,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "unknown_cause_updated_at_the_close",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Done."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 11,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 8
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "scheduled",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": "check the deploy",
+              "scheduled_for_ms": 1790000000000,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": "loop_wakeup"
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "Green.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": "check the deploy",
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "scheduled_with_a_reason",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Green."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": "check the deploy",
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "scheduled",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": 1790000000000,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": "loop_wakeup"
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "Green.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "scheduled_without_a_reason",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Green."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "scheduled",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": 1790000000000,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": "loop_wakeup"
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c2",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "scheduled",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": 1790000000000,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": "loop_wakeup"
+            },
+            "origin": "cli",
+            "turn_id": "c2",
+            "type": "turn_attributed"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c2",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c3",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "scheduled",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": 1790000000000,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": null,
+              "wakeup_source": "loop_wakeup"
+            },
+            "origin": "cli",
+            "turn_id": "c3",
+            "type": "turn_attributed"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c3",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 14
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c2",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "three_empty_scheduled_turns",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            },
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 9,
+              "turnId": "c2"
+            },
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "scheduled",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": 1790000000000,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": null,
+                "wakeupSource": "loop_wakeup"
+              },
+              "origin": "cli",
+              "seq": 12,
+              "turnId": "c3"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 14,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 9
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": null,
+              "kind": "peer",
+              "peer_name": "reviewer",
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": null,
+              "task_id": null,
+              "task_kind": null,
+              "task_status": null,
+              "text": "Please look at ‮line 4​",
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "Looked.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "peer",
+                "peerName": "reviewer",
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": "Please look at ‮line 4​",
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "peer_with_its_body",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Looked."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": null,
+                "kind": "peer",
+                "peerName": "reviewer",
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": null,
+                "taskId": null,
+                "taskKind": null,
+                "taskStatus": null,
+                "text": "Please look at ‮line 4​",
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "text": "and the docs",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t2",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "turn_id": "t2",
+            "type": "cli_cycle_started"
+          },
+          {
+            "kind": "text",
+            "text": "The build finished.",
+            "turn_id": "t2",
+            "type": "content_delta"
+          },
+          {
+            "client_message_id": "eitri-1-2",
+            "text": "and the docs",
+            "turn_id": "t2",
+            "type": "user_message_delivered"
+          },
+          {
+            "kind": "text",
+            "text": "Docs updated.",
+            "turn_id": "t2",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t2",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 12
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t2",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "openingPromptSeq": 5,
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            },
+            {
+              "seq": 5,
+              "text": "and the docs"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "prompt_read_after_work_of_its_own",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 8,
+              "text": "The build finished."
+            },
+            {
+              "seq": 10,
+              "text": "Docs updated."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 7,
+              "turnId": "t2"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            },
+            {
+              "delivered": true,
+              "seq": 9,
+              "text": "and the docs"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 12,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "text": "and the docs",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t2",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "turn_id": "t2",
+            "type": "cli_cycle_started"
+          },
+          {
+            "kind": "text",
+            "text": "The build finished.",
+            "turn_id": "t2",
+            "type": "content_delta"
+          },
+          {
+            "client_message_id": "eitri-1-2",
+            "reason": "Claude Code cancelled it",
+            "type": "user_message_dropped"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t2",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 11
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "t2",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 7,
+              "turnId": "t2"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 8,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "prompt_dropped_after_work_of_its_own",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 8,
+              "text": "The build finished."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 7,
+              "turnId": "t2"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 11,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 8
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "The tests passed.",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "The tests passed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 8,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "a_cli_turn_ending_off_screen",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "The tests passed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 8
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "kind": "text",
+            "text": "Looking",
+            "turn_id": "c1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": "no_result"
+            },
+            "outcome": "failed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 9
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": true,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Looking"
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 8,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "no_result_after_a_reply",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": "failed",
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            },
+            {
+              "seq": 7,
+              "text": "Looking"
+            }
+          ],
+          "turnEndings": [
+            {
+              "apiErrorStatus": null,
+              "kind": "failed",
+              "message": null,
+              "numTurns": 1,
+              "originKind": "task-notification",
+              "reason": "no_result",
+              "resetsAt": null,
+              "seq": 8,
+              "turnId": "c1"
+            }
+          ],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 9,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 8
+    },
+    {
+      "events": {
+        "events": [
+          {
+            "cwd": "/project",
+            "model": "claude-sonnet-5",
+            "provider_session_id": "prov-1",
+            "session_id": "sess-1",
+            "type": "session_opened"
+          },
+          {
+            "text": "fix the parser",
+            "type": "user_prompt_submitted"
+          },
+          {
+            "turn_id": "t1",
+            "type": "turn_started"
+          },
+          {
+            "kind": "text",
+            "text": "Fixed.",
+            "turn_id": "t1",
+            "type": "content_delta"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": null
+            },
+            "outcome": "completed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "t1",
+            "type": "turn_completed",
+            "usage": null
+          },
+          {
+            "turn_id": "c1",
+            "type": "turn_started"
+          },
+          {
+            "cause": {
+              "cron_id": null,
+              "description": "cargo test",
+              "kind": "task",
+              "peer_name": null,
+              "prompt": null,
+              "schedule_reason": null,
+              "scheduled_for_ms": null,
+              "summary": "Background command \"cargo test\" completed (exit code 0)",
+              "task_id": "bzng1ikb4",
+              "task_kind": "shell",
+              "task_status": "completed",
+              "text": null,
+              "wakeup_source": null
+            },
+            "origin": "cli",
+            "turn_id": "c1",
+            "type": "turn_attributed"
+          },
+          {
+            "detail": {
+              "api_error_status": null,
+              "message": null,
+              "num_turns": 1,
+              "origin_kind": "task-notification",
+              "reason": "no_result"
+            },
+            "outcome": "failed",
+            "result_text": "",
+            "stop_reason": null,
+            "turn_id": "c1",
+            "type": "turn_completed",
+            "usage": null
+          }
+        ],
+        "fromRevision": 0,
+        "kind": "events",
+        "tab": 1,
+        "throughRevision": 8
+      },
+      "middle": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": "c1",
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "runningTurnCli": true,
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "turnStarts": [
+            {
+              "cause": {
+                "cronId": null,
+                "description": "cargo test",
+                "kind": "task",
+                "peerName": null,
+                "prompt": null,
+                "scheduleReason": null,
+                "scheduledForMs": null,
+                "summary": "Background command \"cargo test\" completed (exit code 0)",
+                "taskId": "bzng1ikb4",
+                "taskKind": "shell",
+                "taskStatus": "completed",
+                "text": null,
+                "wakeupSource": null
+              },
+              "origin": "cli",
+              "seq": 6,
+              "turnId": "c1"
+            }
+          ],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 7,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "name": "empty_no_result",
+      "snapshot": {
+        "kind": "snapshot",
+        "state": {
+          "accountLimits": null,
+          "activeTurnId": null,
+          "assistantMessageOpen": false,
+          "availableCommands": null,
+          "backend": "sidecar",
+          "backgroundCalls": 0,
+          "capabilities": {
+            "bypassPermissionMode": false,
+            "fork": false,
+            "interrupt": true,
+            "resume": false,
+            "steer": false
+          },
+          "conversationId": null,
+          "cwd": "/project",
+          "history": null,
+          "lastTurnEnding": null,
+          "model": "claude-sonnet-5",
+          "pendingPermissions": [],
+          "provider": null,
+          "providerSessionId": "prov-1",
+          "sessionId": "sess-1",
+          "status": {
+            "kind": "running"
+          },
+          "thinking": [],
+          "thinkingOpen": false,
+          "toolCalls": [],
+          "transcript": [
+            {
+              "seq": 3,
+              "text": "Fixed."
+            }
+          ],
+          "turnEndings": [],
+          "usage": null,
+          "userPrompts": [
+            {
+              "seq": 1,
+              "text": "fix the parser"
+            }
+          ]
+        },
+        "tab": 1,
+        "throughRevision": 8,
+        "turnStartedAtMs": null,
+        "turnTimes": []
+      },
+      "split": 7
+    }
+  ],
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_cli_turns_fixture_is_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

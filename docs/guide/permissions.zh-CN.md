@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=11ebb26448be0f340acb65bc92457da6b052635440328b9f8698926185d3ee57 -->
+<!-- translated-from: permissions.md sha256=feb77d0aed271bf2ee26723398ea03d67317136bb0ee1d181c176c56eb26d087 -->
 
 # 权限与信任
 
@@ -19,6 +19,8 @@ Claude Code 想运行的每一次工具调用，在运行之前都会先发给 E
 manual 是最严格的模式。不管 Claude Code 在运行什么，每一次调用都由 Eitri 自己的规则来回答：也就是[Auto，在 Claude Code 没有运行它的 auto 模式时](#auto-when-claude-code-is-not-running-its-auto-mode)里描述的那些规则，只有一处不同：**用 Claude Code 的文件工具（`Write`、`Edit`、`NotebookEdit`）做的每一次文件编辑或写入都是一张卡片**，在项目内部也一样。没有任何东西交给 Claude Code 的 auto 模式，所以不会有哪一行写 `blocked by auto`。在项目内部读取和搜索、只读命令仍然不经询问直接运行，你的[保存的规则](#saved-rules)仍然适用（会写文件的 shell 命令和在 auto 下一样按它的文字判断，所以允许它的规则照样放行），Claude Code 自己的问题按 auto 下的方式处理（[Claude Code 自己提问时](#when-claude-code-itself-asks)）。
 
 以 Eitri 自己的规则来衡量，manual 绝不比 auto 更宽松：它只是把这些规则放行的一部分变成卡片。但在 Claude Code 运行它自己的 auto 模式的地方，Auto 标签页并不使用这些规则：凡是没有保存的规则放行的调用，它都交给 Claude Code 的分类器，而分类器可能拒绝。Manual 标签页自己回答这些调用，所以在项目内部读取、只读命令、子代理（`Task`、`Agent`）、`ToolSearch` 和 `TodoWrite` 在 manual 下运行时不经过 Claude Code 的分类器（Eitri 的批准会跳过它），而在 auto 下那个分类器本可能拦下其中一个。其余凡是 Eitri 的规则会放到卡片上的，在 manual 下也是卡片。
+
+Claude Code 的定时和任务工具在任何模式下都不出卡片，因为 Claude Code 自己运行它们时也不询问：`ScheduleWakeup`、`CronCreate`、`CronList`、`CronDelete`、`ListAgents` 和 `TaskStop`。它们安排的事，只要标签页还开着，之后会作为一个单独的回合出现；关掉标签页就取消了，只有被要求跨会话保留的 cron 任务例外：Claude Code 会把它存在项目里，之后在这个项目的另一个会话里可能还会运行（见[Codex 与其他 agent](agents.zh-CN.md#not-in-a-claude-tab-yet)）。`SendMessage` 会把消息送到另一个会话，凡是由 Eitri 的规则来决定的地方，它仍然是一张卡片。
 
 <a id="auto-when-claude-code-runs-its-own-auto-mode"></a>
 ### Auto，在 Claude Code 运行它自己的 auto 模式时
@@ -43,6 +45,8 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 ### Bypass
 
 在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。只能从 auto 进入 bypass。离开 bypass 不需要确认，并且会落到 manual。
+
+Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题](#claudes-questions-to-you)）。
 
 要不经提问就以 bypass 开始，只能事先说好，办法是在你的 `init.lua` 里写 `agent.default_mode = "bypass"`；见[一次启动怎样开始](configuration.zh-CN.md#how-a-launch-starts)。
 
@@ -86,6 +90,20 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 **给出了理由的问题**（卡片写 “Claude Code asked” 并显示那句话）：在 Auto 或 Manual 标签页里，只有当你片刻之前在一张卡片上批准过同一次调用、同样的输入，并且只用一次时，Eitri 才回答它；否则它是一张卡片。因为在 Auto 标签页里通常由 Claude Code 自己的 auto 模式来决定，所以通常没有之前的批准，这样的问题在那里就是一张卡片；在 Manual 标签页里，你通常已经先在 Eitri 自己的卡片上批准了这次调用。在 Claude Code 的 auto 模式运行的地方，它对敏感文件（`.git/`、`.claude/`）的检查根本不会询问，由它的分类器来决定；敏感文件的问题出现在 Claude Code 运行于默认模式的时候。
 
 有一个要知道的限制：Eitri 分不清 Claude Code 自己的理由和 hook 给出的理由。你的某个 hook（或者某个被信任的项目的 hook）带着理由来询问，会被当作任何其他带理由的问题，所以在 Auto 或 Manual 标签页里，你在卡片上对同一次调用的批准也会回答它。
+
+<a id="a-dynamic-workflows-card"></a>
+## 动态工作流的卡片
+
+Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它以纯文本显示工作流的名字（或者它的脚本路径）、参数和脚本，`View raw script` 在 Neovim 里以只读方式打开脚本。你像对待其他卡片一样批准或拒绝它。工作流没有“不再询问”的选项，在你批准之前，卡片也不会列出任何阶段。谁来回答这张卡片，以及 Auto 把什么交给 Claude Code，都和其他工具一样。
+
+<a id="claudes-questions-to-you"></a>
+## Claude 问你的问题
+
+除了请求权限，Claude 还可以用选择题问你（Claude Code 的 `AskUserQuestion` 工具）。这种提问从来不是权限卡片，只有你能回答它，用的是你在提问框里按的键（[按键](keys.zh-CN.md#claudes-questions)）。bypass 不会回答它，进入 bypass 也不会；`Ctrl+y`、卡片按键 `a` 和 `d`、保存的规则以及 Claude Code 的分类器同样不会。卡片和提问同时在等时，这些键只回答卡片。
+
+- 被[浮动窗口](agents.zh-CN.md#a-chat-under-a-float)盖住的提问框不会发出回答，和被盖住的卡片一样，你已经选的内容会保留；浮动窗口移开之后就能发出。
+- 问题、选项和预览都以纯文本显示，隐藏字符和改变文字方向的字符会显示成可见的转义。预览里的 Markdown 不会显示图片、运行脚本或出现可点的控件。
+- 有提问在等时关闭标签页，会先问，并说明关闭会取消这个提问。
 
 <a id="trusting-a-project"></a>
 ## 信任一个项目
@@ -154,4 +172,5 @@ eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 - **被信任的项目自己的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任了那个目录时，才会到达 Auto 标签页。** 这是 Claude Code 自己的规则。你的用户设置里的规则始终适用。
 - **信任一个项目，就意味着信任它的代码会运行。** hook 从 `.claude/` 之外调用的脚本，只通过 hook 的命令文本被覆盖，就像构建这个项目一样。
 - **Bypass 也会回答你自己的 ask 规则。** 在 bypass 标签页里，`permissions.ask` 规则（你的，或者被信任的项目的）什么也拦不住：它引出的问题，Eitri 会像对待其他问题一样替你回答。
+- **另一个 Claude Code 会话发来的消息不会显示。** 回合进行中另一个会话给这个会话发消息时，Claude Code 会把它送进这个回合，Claude 也会读到，但标签页里没有对应的一行，实时不显示，恢复之后也不显示。
 - **理由不是出处的证明。** 在 Auto 或 Manual 标签页里，带理由的问题会凭你对同一次调用的批准被回答，而 Eitri 分不清 Claude Code 自己的检查和一个带着理由来询问的 hook。

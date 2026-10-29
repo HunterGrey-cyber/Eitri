@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// make a send fail, this one to see what the host answered.
 #[derive(Default)]
 pub struct RecordingProvider {
+    task_control: bool,
+    stopped_tasks: std::sync::Mutex<Vec<String>>,
     queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
     resolved: std::sync::Mutex<Vec<(String, bool)>>,
     /// Every turn text a send reached the provider with, accepted or refused.
@@ -35,9 +37,32 @@ pub struct RecordingProvider {
     after_resolution: std::sync::Mutex<Option<Vec<AgentDomainEvent>>>,
     /// How many times ingestion has asked this provider for events.
     pumps: AtomicUsize,
+    /// Advertises `steer` and takes messages into the running turn.
+    steering: bool,
+    /// Every message it was sent into a running turn, in order.
+    steers: std::sync::Mutex<Vec<agent::SteerTurnRequest>>,
+    /// Every answer to a question that reached it, in order, taken or refused.
+    interactions: std::sync::Mutex<Vec<agent::ResolveInteractionRequest>>,
+    /// While set, every `resolve_interaction` is refused with this code (what the sidecar does with a
+    /// spent id or an answer that breaks a rule of the set).
+    refusing_interactions: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
+    /// While set, answers to questions get no reply until [`Self::reply_to_held_interactions`].
+    holding_interaction_replies: std::sync::atomic::AtomicBool,
+    held_interaction_replies: std::sync::Mutex<Vec<std::sync::mpsc::Sender<agent::InteractionReply>>>,
+    turn_stamps: std::sync::Mutex<Vec<agent::TurnStamp>>,
+    steer_stamps: std::sync::Mutex<Vec<agent::TurnStamp>>,
 }
 
 impl RecordingProvider {
+    pub fn task_controlling() -> Self {
+        Self {
+            task_control: true,
+            ..Default::default()
+        }
+    }
+    pub fn stopped_tasks(&self) -> Vec<String> {
+        self.stopped_tasks.lock().unwrap().clone()
+    }
     pub fn queue(&self, event: AgentDomainEvent) {
         self.queued.lock().unwrap().push(event);
     }
@@ -68,6 +93,18 @@ impl RecordingProvider {
             ..Default::default()
         }
     }
+    /// A provider that takes messages into the running turn, as the Claude sidecar does.
+    pub fn steering() -> Self {
+        RecordingProvider {
+            steering: true,
+            interrupt_capable: true,
+            ..Default::default()
+        }
+    }
+    /// Every message sent into a running turn, in order.
+    pub fn steers(&self) -> Vec<agent::SteerTurnRequest> {
+        self.steers.lock().unwrap().clone()
+    }
     /// A provider whose sessions run the CLI's own auto mode under the gate
     /// (`ProviderCapabilities::cli_auto_mode`), so the host may defer to it.
     pub fn cli_auto() -> Self {
@@ -91,6 +128,12 @@ impl RecordingProvider {
     pub fn closes(&self) -> usize {
         self.closes.load(Ordering::SeqCst)
     }
+    pub fn turn_stamps(&self) -> Vec<agent::TurnStamp> {
+        self.turn_stamps.lock().unwrap().clone()
+    }
+    pub fn steer_stamps(&self) -> Vec<agent::TurnStamp> {
+        self.steer_stamps.lock().unwrap().clone()
+    }
     pub fn turns(&self) -> Vec<String> {
         self.turns.lock().unwrap().clone()
     }
@@ -109,6 +152,25 @@ impl RecordingProvider {
     pub fn refuse_resolutions(&self, on: bool) {
         self.refusing_resolutions.store(on, Ordering::SeqCst);
     }
+    /// Every answer to a question that reached the provider, in order.
+    pub fn interactions(&self) -> Vec<agent::ResolveInteractionRequest> {
+        self.interactions.lock().unwrap().clone()
+    }
+    /// Refuses every later `resolve_interaction` with `code`, or none again with `None`.
+    pub fn refuse_interactions(&self, code: Option<agent::ProviderErrorCode>) {
+        *self.refusing_interactions.lock().unwrap() = code;
+    }
+    /// Leaves the reply to every later answer out until [`Self::reply_to_held_interactions`]: an
+    /// agent that is slow to take an answer.
+    pub fn hold_interaction_replies(&self, on: bool) {
+        self.holding_interaction_replies.store(on, Ordering::SeqCst);
+    }
+    /// Replies `reply` to every answer held so far.
+    pub fn reply_to_held_interactions(&self, reply: impl Fn() -> agent::InteractionReply) {
+        for tx in self.held_interaction_replies.lock().unwrap().drain(..) {
+            let _ = tx.send(reply());
+        }
+    }
 }
 
 impl agent::AgentProvider for RecordingProvider {
@@ -116,8 +178,34 @@ impl agent::AgentProvider for RecordingProvider {
         ProviderCapabilities {
             interrupt: self.interrupt_capable,
             cli_auto_mode: self.cli_auto,
+            steer: self.steering,
+            task_control: self.task_control,
+            task_output: self.task_control,
             ..ProviderCapabilities::default()
         }
+    }
+    fn steer_turn(&self, request: agent::SteerTurnRequest) -> Result<(), agent::ProviderError> {
+        if !self.steering {
+            return Err(agent::ProviderError::UnsupportedCapability("steer"));
+        }
+        self.steers.lock().unwrap().push(request);
+        Ok(())
+    }
+    fn send_turn_stamped(
+        &self,
+        request: agent::SendTurnRequest,
+        stamp: agent::TurnStamp,
+    ) -> Result<String, agent::ProviderError> {
+        self.turn_stamps.lock().unwrap().push(stamp);
+        self.send_turn(request)
+    }
+    fn steer_turn_stamped(
+        &self,
+        request: agent::SteerTurnRequest,
+        stamp: agent::TurnStamp,
+    ) -> Result<(), agent::ProviderError> {
+        self.steer_stamps.lock().unwrap().push(stamp);
+        self.steer_turn(request)
     }
     fn info(&self) -> ProviderInfo {
         ProviderInfo::default()
@@ -137,6 +225,41 @@ impl agent::AgentProvider for RecordingProvider {
             });
         }
         Ok("turn-1".into())
+    }
+    fn stop_background(&self, session_id: &str, _shown: u32, tasks: &[String]) -> Result<(), agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("stop_background"));
+        }
+        for task in tasks {
+            let _reply = self.stop_task(session_id, task)?;
+        }
+        Ok(())
+    }
+    fn stop_task(&self, _session_id: &str, task_id: &str) -> Result<agent::TaskReply<()>, agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("stop_task"));
+        }
+        self.stopped_tasks.lock().unwrap().push(task_id.to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        Ok(rx)
+    }
+    fn task_output(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+    ) -> Result<agent::TaskReply<agent::TaskOutput>, agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("task_output"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(agent::TaskOutput {
+            output: "<b>plain</b>\u{202e}".into(),
+            total_bytes: 10000,
+            truncated: true,
+        }))
+        .unwrap();
+        Ok(rx)
     }
     fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
         self.interrupts.fetch_add(1, Ordering::SeqCst);
@@ -176,6 +299,27 @@ impl agent::AgentProvider for RecordingProvider {
             }
         }
         Ok(())
+    }
+    fn resolve_interaction(
+        &self,
+        request: agent::ResolveInteractionRequest,
+    ) -> Result<agent::InteractionSend, agent::ProviderError> {
+        self.interactions.lock().unwrap().push(request);
+        if self.holding_interaction_replies.load(Ordering::SeqCst) {
+            let (tx, send) = agent::InteractionSend::channel();
+            self.held_interaction_replies.lock().unwrap().push(tx);
+            return Ok(send);
+        }
+        // The agent's refusal comes in the reply, as a real sidecar's does.
+        Ok(agent::InteractionSend::ready(
+            match *self.refusing_interactions.lock().unwrap() {
+                Some(code) => Err(agent::ProviderError::Provider {
+                    code,
+                    message: "answers refused by the test".into(),
+                }),
+                None => Ok(None),
+            },
+        ))
     }
     fn close_session(&self, _request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
         self.closes.fetch_add(1, Ordering::SeqCst);
@@ -327,6 +471,22 @@ impl agent::AgentProvider for ExternalRecordingProvider {
     fn send_turn(&self, _request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
         Err(agent::ProviderError::UnsupportedCapability("external"))
     }
+    /// What Codex does once the stop is taken: the count drops, and the session ends once its child is
+    /// gone.
+    fn stop_background(&self, _session_id: &str, _shown: u32, _tasks: &[String]) -> Result<(), agent::ProviderError> {
+        if let Some(code) = self.stop_refusal.lock().unwrap().take() {
+            return Err(agent::ProviderError::Provider {
+                code,
+                message: "refused by the scripted provider".into(),
+            });
+        }
+        *self.stops.lock().unwrap() += 1;
+        self.inner.queue(AgentDomainEvent::BackgroundCalls { running: 0 });
+        self.inner.queue(AgentDomainEvent::SessionUnavailable {
+            reason: agent::providers::codex::provider::STOPPED_BACKGROUND.to_string(),
+        });
+        Ok(())
+    }
     fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
         agent::AgentProvider::interrupt_turn(&self.inner, request)
     }
@@ -382,22 +542,6 @@ impl agent::ExternalProvider for ExternalRecordingProvider {
     /// As Codex: a session it stopped itself can be continued.
     fn stopped_resumable(&self) -> bool {
         self.stops() > 0
-    }
-    /// What Codex does once the stop is taken: the count drops, and the session ends once its child is
-    /// gone.
-    fn stop_background(&self, _session_id: &str, _shown: u32) -> Result<(), agent::ProviderError> {
-        if let Some(code) = self.stop_refusal.lock().unwrap().take() {
-            return Err(agent::ProviderError::Provider {
-                code,
-                message: "refused by the scripted provider".into(),
-            });
-        }
-        *self.stops.lock().unwrap() += 1;
-        self.inner.queue(AgentDomainEvent::BackgroundCalls { running: 0 });
-        self.inner.queue(AgentDomainEvent::SessionUnavailable {
-            reason: agent::providers::codex::provider::STOPPED_BACKGROUND.to_string(),
-        });
-        Ok(())
     }
 }
 

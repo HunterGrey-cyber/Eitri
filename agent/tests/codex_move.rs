@@ -535,7 +535,7 @@ fn a_provider_that_is_stopping_refuses_the_move() {
         "the command the turn left running counts as background: {events:#?}"
     );
     source
-        .stop_background(thread, shown)
+        .stop_background(thread, shown, &[])
         .expect("the background is stopped");
     let refused = source
         .freeze_for_move()

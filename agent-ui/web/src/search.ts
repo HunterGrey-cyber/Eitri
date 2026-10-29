@@ -1,4 +1,4 @@
-import type { TimelineItem } from "./timeline";
+import { noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
@@ -17,7 +17,11 @@ export function rowSearchText(item: TimelineItem): string {
     case "permission":
       return [item.request.toolName, JSON.stringify(item.request.input)].join("\n");
     case "ending":
-      return turnEndingText(item.ending);
+      return turnEndingText(item.ending, item.ending.resetsAt ?? null);
+    case "wake":
+      return [wakeText(item), item.body].filter(Boolean).join("\n");
+    case "notice":
+      return [noticeText(item.notice), noticeBody(item.notice)].filter(Boolean).join("\n");
     case "run":
       // A collapsed run has no invocation of its own on screen to search -- each call's name
       // and input, so `/bash` still finds it even while it is folded, and the thoughts folded with them.

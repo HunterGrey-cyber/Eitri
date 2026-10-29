@@ -588,7 +588,7 @@ fn drive_turn(
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(prompt, label)
+        .send_turn(prompt, label, agent::PromptOrigin::Composed)
         .map_err(|e| e.message)
         .unwrap();
 
@@ -836,6 +836,7 @@ fn host_answer_latency_in_bypass() {
             "Use the Read tool to read each of f1.txt, f2.txt, f3.txt, f4.txt and f5.txt in the \
              current directory, one call per file, then reply with exactly DONE and nothing else.",
             "latency-reads",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -1818,6 +1819,7 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
                     "Use the Write tool to create a file named inside.txt in the current directory \
                      containing the word ok.",
                     label,
+                    agent::PromptOrigin::Composed,
                 )
                 .map_err(|e| e.message)
                 .unwrap();
@@ -2190,6 +2192,7 @@ fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
             "Use the Write tool to create a file named first.txt in the current directory containing \
              the word ok.",
             "first-write",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();
@@ -2392,7 +2395,7 @@ fn bypass_approves_the_waiting_card(
         .unwrap()
         .live_mut()
         .unwrap()
-        .send_turn(first_prompt, "first-write")
+        .send_turn(first_prompt, "first-write", agent::PromptOrigin::Composed)
         .map_err(|e| e.message)
         .unwrap();
     // The card for the first call itself: a card for any other call says nothing here.
@@ -2736,6 +2739,7 @@ fn a_manual_tab_cards_an_in_project_write_on_a_cli_auto_session() {
                  MANUAL and nothing else. Do not use any other tool."
             ),
             "manual-write",
+            agent::PromptOrigin::Composed,
         )
         .map_err(|e| e.message)
         .unwrap();

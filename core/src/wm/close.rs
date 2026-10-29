@@ -249,8 +249,16 @@ impl NvimAnswer {
 /// question stands in for that one too. `jobs` is the window close's third count, its terminals
 /// running a job (`terminal::jobs`), named only for [`KillScope::Window`]: a module's own kill ends
 /// at most its own terminal, whose y/n is tmux's plain one.
-pub fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usize, queued: usize, jobs: usize) -> String {
-    prompt_closing_tab(id, title, scope, None, running, queued, jobs)
+pub fn prompt(
+    id: &ModuleId,
+    title: &str,
+    scope: KillScope,
+    running: usize,
+    queued: usize,
+    jobs: usize,
+    background: usize,
+) -> String {
+    prompt_closing_tab(id, title, scope, None, running, queued, jobs, background)
 }
 
 /// [`prompt`] for a chat view that shows one tab (`agent#N`): the y/n names the tab it closes,
@@ -264,6 +272,7 @@ pub fn prompt_closing_tab(
     running: usize,
     queued: usize,
     jobs: usize,
+    background: usize,
 ) -> String {
     let mut consequences = Vec::new();
     if scope == KillScope::Window {
@@ -273,6 +282,9 @@ pub fn prompt_closing_tab(
         }
         if queued > 0 {
             consequences.push(format!("{queued} queued"));
+        }
+        if background > 0 {
+            consequences.push(format!("{background} with background tasks"));
         }
         match jobs {
             0 => {}
@@ -291,6 +303,9 @@ pub fn prompt_closing_tab(
             }
             if queued > 0 {
                 consequences.push(format!("{queued} queued"));
+            }
+            if background > 0 {
+                consequences.push(format!("{background} with background tasks"));
             }
         }
         ModuleKind::Editor => consequences.push("nvim cannot be reopened in this window".to_string()),
@@ -986,13 +1001,30 @@ mod kill_tests {
 
     /// tmux's own text, with the module's name where tmux puts the pane's number.
     #[test]
+    fn kill_prompts_name_background_tabs_for_agent_views_and_the_window() {
+        let view = ModuleId::parse("agent#2").unwrap();
+        assert_eq!(
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0, 0, 1),
+            "kill-pane agent 2? closes tab 3 refactor, 1 with background tasks (y/n)"
+        );
+        assert_eq!(
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 1, 2, 3, 4),
+            "kill-pane editor? closes Eitri, 1 running, 2 queued, 4 with background tasks, 3 terminal jobs (y/n)"
+        );
+        assert_eq!(
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 0, 1),
+            "kill-pane terminal? (y/n)"
+        );
+    }
+
+    #[test]
     fn the_prompt_is_tmuxs_kill_pane_prompt() {
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 0),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 0, 0),
             "kill-pane terminal? (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::lua("notes"), "Notes", KillScope::Module, 3, 3, 0),
+            prompt(&ModuleId::lua("notes"), "Notes", KillScope::Module, 3, 3, 0, 0),
             "kill-pane Notes? (y/n)"
         );
     }
@@ -1001,15 +1033,15 @@ mod kill_tests {
     fn the_agents_prompt_says_how_many_tabs_are_running_or_queued() {
         let agent = ModuleId::agent();
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 0, 0, 0),
+            prompt(&agent, "agent", KillScope::Module, 0, 0, 0, 0),
             "kill-pane agent? (y/n)"
         );
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 1, 0, 0),
+            prompt(&agent, "agent", KillScope::Module, 1, 0, 0, 0),
             "kill-pane agent? 1 running (y/n)"
         );
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 2, 1, 0),
+            prompt(&agent, "agent", KillScope::Module, 2, 1, 0, 0),
             "kill-pane agent? 2 running, 1 queued (y/n)"
         );
     }
@@ -1017,7 +1049,7 @@ mod kill_tests {
     #[test]
     fn the_editors_prompt_says_it_will_not_come_back() {
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Module, 5, 5, 0),
+            prompt(&ModuleId::editor(), "editor", KillScope::Module, 5, 5, 0, 0),
             "kill-pane editor? nvim cannot be reopened in this window (y/n)"
         );
     }
@@ -1027,19 +1059,19 @@ mod kill_tests {
     #[test]
     fn the_last_modules_prompt_says_it_closes_eitri_and_what_is_running() {
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 0),
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 0, 0),
             "kill-pane editor? closes Eitri (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1, 0),
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1, 0, 0),
             "kill-pane editor? closes Eitri, 2 running, 1 queued (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 0),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 0, 0),
             "kill-pane terminal? closes Eitri, 1 running (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3, 0),
+            prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3, 0, 0),
             "kill-pane agent? closes Eitri, 3 queued (y/n)"
         );
     }
@@ -1049,15 +1081,15 @@ mod kill_tests {
     #[test]
     fn the_last_modules_kill_names_terminal_jobs() {
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 2),
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 2, 0),
             "kill-pane editor? closes Eitri, 2 terminal jobs (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 1),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 1, 0),
             "kill-pane terminal? closes Eitri, 1 running, 1 terminal job (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 1),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 1, 0),
             "kill-pane terminal? (y/n)",
             "a module's own kill asks tmux's plain question"
         );
@@ -1126,20 +1158,20 @@ mod kill_tests {
     fn the_y_n_for_an_extra_view_names_its_tab() {
         let view = ModuleId::parse("agent#2").unwrap();
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0, 0, 0),
             "kill-pane agent 2? closes tab 3 refactor (y/n)"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 1, 2, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 1, 2, 0, 0),
             "kill-pane agent 2? closes tab 3 refactor, 1 running, 2 queued (y/n)"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, None, 0, 0, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, None, 0, 0, 0, 0),
             "kill-pane agent 2? (y/n)",
             "a view whose tab has gone names none"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Window, Some("3 refactor"), 1, 0, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Window, Some("3 refactor"), 1, 0, 0, 0),
             "kill-pane agent 2? closes Eitri, 1 running (y/n)",
             "the last module's kill is the window close's question"
         );
@@ -1149,6 +1181,7 @@ mod kill_tests {
                 "terminal",
                 KillScope::Module,
                 Some("3 refactor"),
+                0,
                 0,
                 0,
                 0

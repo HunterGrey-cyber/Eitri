@@ -341,6 +341,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: ProjectionRef::Borrowed(projection),
@@ -351,6 +352,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     // A real launch's `TabSet` always sends a `tabs` envelope before the active tab's own snapshot
     // (`serialize_tabs_for_js`'s own doc), because the page drops a snapshot for a tab it does not know yet.
     let tabs = vec![TabView {
+        question_draft: Default::default(),
         id: eitri_core::tabs::TabId(1),
         number: 1,
         label: "1".into(),

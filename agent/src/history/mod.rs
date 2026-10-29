@@ -24,7 +24,7 @@ pub mod store;
 pub mod transcript_jsonl;
 
 pub use composed_block::strip_composed_block;
-pub use store::{HistoryLoadError, StoredHistory, HISTORY_FORMAT_VERSION};
+pub use store::{HistoryLoadError, HistoryParts, StoredHistory, HISTORY_FORMAT_VERSION};
 pub use transcript_jsonl::{
     read_transcript_history, HistoryCounts, TranscriptHistory, HISTORY_MAX_CHARS, HISTORY_MAX_ITEMS,
     HISTORY_MAX_LINE_BYTES, HISTORY_SCAN_MAX_BYTES,

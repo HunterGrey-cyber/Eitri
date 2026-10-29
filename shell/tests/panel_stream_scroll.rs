@@ -546,6 +546,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),
@@ -2547,6 +2548,7 @@ fn ctrl_e_y_replay() -> Replay {
                 interactive_permission_mode: true,
                 cli_auto_mode: false,
                 steer: false,
+                ..Default::default()
             },
             provider: None,
             projection: ProjectionRef::Borrowed(&projection),
@@ -2829,6 +2831,7 @@ fn trace_dir() -> PathBuf {
 /// here is built for.
 fn sole_tab_envelope(sole_tab: eitri_core::tabs::TabId) -> String {
     let tabs = vec![TabView {
+        question_draft: Default::default(),
         id: sole_tab,
         number: 1,
         label: "1".into(),

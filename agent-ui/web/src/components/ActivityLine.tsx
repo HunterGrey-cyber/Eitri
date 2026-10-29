@@ -1,11 +1,15 @@
+import { useEffect, useState } from "react";
+import { elapsedWords, liveTasks, tasksLine } from "../band";
+import { taskWakeText } from "../timeline";
 import type { AgentUiState, TurnClock } from "../types";
 import type { PanelMode } from "../keymap";
-import { phaseOf } from "../turnPhase";
+import { cliPhaseText, phaseOf } from "../turnPhase";
 import { TurnActivity } from "./TurnActivity";
 import { revealedText } from "../revealHidden";
 
 type Props = {
   state: AgentUiState;
+  onOpenTasks?: () => void;
   /** How long the current turn has been running, tracked in `App.tsx` (`TurnClock`) rather than in
    *  `AgentUiState` -- see that type's own doc comment. `null` before any turn has started, and
    *  optional/defaulted for callers (existing tests, mainly) that render no in-flight indicator at
@@ -29,7 +33,7 @@ type Props = {
 };
 
 /** The old `StatusLine`'s body that was about the turn --
- *  the in-flight motion indicator and Stop -- now its own line, only while a turn runs, directly
+ *  the in-flight motion indicator and Stop -- shares one slot with idle background work directly
  *  above the composer. The mode block, the session status word and the position counter moved to
  *  `Footer`/`StatusRow`, and `data-nav-stop="status"` moves with the content it used to gate on
  *  ("the status line, only while Stop shows") rather than staying behind on an element with
@@ -38,7 +42,7 @@ type Props = {
  *  Restyled to one mono line, Claude Code's own
  *  `✻ Working… 1m 12s · ctrl+c interrupt` -- the interrupt words ARE the Stop button now (the
  *  mouse route stays), not a separate span beside it. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse" }: Props) {
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse", onOpenTasks }: Props) {
   // Moved out of `SessionHeader.tsx`: a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
@@ -49,20 +53,52 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   // This guard is not load-bearing for THOSE two events any more, then -- it is what keeps a
   // session that dies some OTHER way (nothing here has found one) from reading "working" forever.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
-  if (!working) return null;
+  const [now, setNow] = useState(Date.now);
+  const [compactingSince, setCompactingSince] = useState(Date.now);
+  useEffect(() => { if (state.compacting) setCompactingSince(Date.now()); }, [state.compacting, state.activeTurnId, state.sessionId]);
+  const tasks = liveTasks(state.backgroundTasks.rows);
+  const workflowLive = tasks.some((task) => task.kind === "workflow");
+  const ticking = state.status.kind === "running" && (working ? state.compacting : workflowLive);
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [ticking]);
+  if (state.questions.some((q) => q.state.kind !== "settled")) return (
+    <div className="activity-line activity-question">⚑ Claude has a question{mode === "browse" ? " — i to answer" : ""}</div>
+  );
+  if (!working) return state.status.kind === "running" && tasks.length > 0 ? (
+    <div className="activity-line tasks-line" data-nav-stop="status">
+      <button type="button" onClick={onOpenTasks}>{tasksLine(tasks, now)}</button>
+    </div>
+  ) : null;
+  const special = cliPhaseText(state);
+  const limit = special?.startsWith("Usage limit reached") === true;
+  const start = state.turnStarts.find((r) => r.turnId === state.activeTurnId);
+  const cause = start?.cause;
+  const causeText = cause?.kind === "task" ? taskWakeText(cause)
+    : cause?.kind === "peer" ? `Message from @${cause.peerName ?? "unknown"}: ${cause.text ?? ""}`
+    : cause?.kind === "scheduled" ? cause.scheduleReason ?? cause.prompt ?? "Scheduled wake-up"
+    : "Claude Code started this turn";
   const phase = phaseOf(state);
   // The star is the line's one moving thing, and it moves only while the agent is working: a card
   // waiting, or a phase that is the user's to end, holds it still (`index.css`'s `turn-breath`).
-  const moving = pendingTool === null && phase.kind !== "blocked";
+  const moving = pendingTool === null && phase.kind !== "blocked" && !limit;
   return (
     <div className="activity-line" data-nav-stop="status">
       <span className="activity-glyph" aria-hidden="true" data-moving={moving ? "true" : undefined}>
         ✻
       </span>
+      {" "}
       {/* A card waiting IS what the line says: the phase word beside it only said
           "waiting for you" again, and at 520px the two were cut together, losing the keys that
           answer the card (seen in a GUI pass, 2026-09-26). */}
-      {pendingTool === null && <TurnActivity phase={phase} clock={turnClock} />}
+      {pendingTool === null && (special !== null ? (
+        <span className="turn-activity">{revealedText(special)}{state.compacting && !state.apiRetry ? ` ${elapsedWords(now - compactingSince)}` : ""}</span>
+      ) : start ? (
+        <span className="turn-activity">Claude Code is handling: {revealedText(causeText)}</span>
+      ) : <TurnActivity phase={phase} clock={turnClock} />)}
       {pendingTool !== null ? (
         <span className="activity-card">
           {/* The old "a / d" / "Esc, then a / d"
@@ -75,13 +111,13 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
           ⚑ {revealedText(pendingTool)} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (
-        queued > 0 && <span className="activity-keys">{queued} queued · </span>
+        special === null && !start && queued > 0 && <span className="activity-keys">{queued} queued · </span>
       )}
       {/* Stays reachable even while a card waits (`j` past the last row lands here, `withACardAndStop`'s
           own fixture name) -- the card takes over the LINE's message, not this control. */}
       {canInterrupt && (
         <button type="button" className="stop" onClick={onInterrupt}>
-          ctrl+c interrupt
+          {limit ? "ctrl+c cancel" : "ctrl+c interrupt"}
         </button>
       )}
     </div>

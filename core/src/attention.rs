@@ -24,6 +24,16 @@
 //! whose session died with a card waiting would go from `agent ⚑1` back to a bare `agent`, its only
 //! sign gone. `shell` calls it at every place it takes a session away,
 //! not only on the event that says so: a fatal command, or a session that never opened.
+//!
+//! **Only the end of a turn the panel ran is news.** A `TurnCompleted` naming another turn than the
+//! one the tracker saw start (Claude Code ran a turn of its own that the panel could not show), or
+//! arriving when the tracker saw the last turn end, sets nothing; nor does one named
+//! [`agent::NO_OPEN_TURN_ID`], which a backend gives only a completion that came with no turn of its
+//! own open, whatever the tracker saw. When the tracker cannot tell (a new tracker, a new session in
+//! the tab, a resync that dropped events) any other completion counts, as it always did: a stray
+//! mark is a small cost, a missed finished turn a larger one. A turn Claude Code started by itself
+//! that drew nothing and ended without a result is no news either: the panel drops it, and an unread
+//! mark would point at nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,10 +49,27 @@ fn next_stamp() -> u64 {
     ARRIVAL_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Whether the panel shows `event` as something in the conversation: what makes a turn Claude Code
+/// started worth the unread mark however it ends.
+fn draws_a_row(event: &AgentDomainEvent) -> bool {
+    match event {
+        AgentDomainEvent::ContentDelta { text, .. } => !text.is_empty(),
+        // A retry, a compaction under way or a notification shows for a moment and leaves no row.
+        AgentDomainEvent::SessionNotice { kind, .. } => !kind.is_transient(),
+        AgentDomainEvent::UserPromptSubmitted { .. }
+        | AgentDomainEvent::UserMessageDelivered { .. }
+        | AgentDomainEvent::ToolCallStarted { .. }
+        | AgentDomainEvent::PermissionRequested { .. }
+        | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::SubagentFrame { .. } => true,
+        _ => false,
+    }
+}
+
 /// What the agent's tray chip shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attention {
-    /// Permission cards waiting for the user.
+    /// Permission cards and structured questions waiting for the user.
     pub pending: usize,
     /// A turn completed, or the session ended, while the chat was not on screen, and it has not
     /// been on screen since.
@@ -58,8 +85,24 @@ pub struct Attention {
 #[derive(Debug, Default)]
 pub struct AttentionTracker {
     cards: BTreeMap<String, u64>,
+    questions: BTreeMap<String, u64>,
     unread: bool,
     arrived: u64,
+    turn: TurnSeen,
+    /// The running turn is one Claude Code started by itself, and nothing of it reached the panel yet.
+    empty_cli_turn: bool,
+}
+
+/// Which turn the tracker saw running, as far as the deliveries it was handed say.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum TurnSeen {
+    /// Nothing it saw says: a new tracker or session, events dropped by a resync, or no turn start
+    /// ever delivered.
+    #[default]
+    Unknown,
+    Running(String),
+    /// The turn it saw start has ended, and no other has started since.
+    Idle,
 }
 
 impl AttentionTracker {
@@ -69,7 +112,10 @@ impl AttentionTracker {
     /// not rise, so [`react`] would miss that card.
     pub fn restart(&mut self) {
         self.cards.clear();
+        self.questions.clear();
         self.unread = false;
+        self.turn = TurnSeen::Unknown;
+        self.empty_cli_turn = false;
     }
 
     /// One pump's delivery, as the panel got it (after the policy answered what needs no human).
@@ -78,6 +124,7 @@ impl AttentionTracker {
         for event in delivered {
             match event {
                 AgentDomainEvent::PermissionRequested { permission_id, .. } => {
+                    self.empty_cli_turn = false;
                     if !self.cards.contains_key(permission_id) {
                         self.cards.insert(permission_id.clone(), next_stamp());
                         self.arrived += 1;
@@ -86,10 +133,37 @@ impl AttentionTracker {
                 AgentDomainEvent::PermissionResolved { permission_id, .. } => {
                     self.cards.remove(permission_id);
                 }
-                AgentDomainEvent::TurnCompleted { .. } if !on_screen => self.unread = true,
+                AgentDomainEvent::TurnStarted { turn_id } => {
+                    self.turn = TurnSeen::Running(turn_id.clone());
+                    self.empty_cli_turn = false;
+                }
+                AgentDomainEvent::TurnAttributed {
+                    turn_id,
+                    origin: agent::TurnOrigin::Cli,
+                    ..
+                } if self.turn == TurnSeen::Running(turn_id.clone()) => self.empty_cli_turn = true,
+                // Ended no turn of the panel's, whichever the tracker saw running.
+                AgentDomainEvent::TurnCompleted { turn_id, .. } if turn_id == agent::NO_OPEN_TURN_ID => {}
+                AgentDomainEvent::TurnCompleted { turn_id, detail, .. } => {
+                    let counts = match &self.turn {
+                        TurnSeen::Running(running) if running == turn_id => {
+                            self.turn = TurnSeen::Idle;
+                            let empty = std::mem::take(&mut self.empty_cli_turn);
+                            !(empty && detail.reason.as_deref() == Some(agent::NO_RESULT_REASON))
+                        }
+                        TurnSeen::Running(_) | TurnSeen::Idle => false,
+                        // Stays unknown: a backend whose turn starts are never delivered (the legacy
+                        // one) must keep counting every completion.
+                        TurnSeen::Unknown => true,
+                    };
+                    if counts && !on_screen {
+                        self.unread = true;
+                    }
+                }
                 AgentDomainEvent::SessionUnavailable { .. } | AgentDomainEvent::SessionClosed { .. } => {
                     self.session_ended(on_screen);
                 }
+                event if draws_a_row(event) => self.empty_cli_turn = false,
                 _ => {}
             }
         }
@@ -100,6 +174,7 @@ impl AttentionTracker {
     /// module doc).
     pub fn session_ended(&mut self, on_screen: bool) {
         self.cards.clear();
+        self.questions.clear();
         if !on_screen {
             self.unread = true;
         }
@@ -108,6 +183,8 @@ impl AttentionTracker {
     /// A resync: the panel rebuilds every card from the projection, so the count does too. A card
     /// it holds that the tracker did not is one more arrival.
     pub fn resync(&mut self, pending: impl IntoIterator<Item = String>) {
+        // The dropped events may have started or ended turns.
+        self.turn = TurnSeen::Unknown;
         let ids: BTreeSet<String> = pending.into_iter().collect();
         let mut cards = BTreeMap::new();
         for id in ids {
@@ -121,6 +198,22 @@ impl AttentionTracker {
             cards.insert(id, stamp);
         }
         self.cards = cards;
+    }
+
+    pub fn question_ids(&self) -> Vec<String> {
+        self.questions.keys().cloned().collect()
+    }
+
+    /// Questions need attention without becoming cards that bypass may approve.
+    pub fn sync_questions(&mut self, waiting: impl IntoIterator<Item = String>) {
+        let ids: BTreeSet<String> = waiting.into_iter().collect();
+        self.questions.retain(|id, _| ids.contains(id));
+        for id in ids {
+            self.questions.entry(id).or_insert_with(|| {
+                self.arrived += 1;
+                next_stamp()
+            });
+        }
     }
 
     /// Forgets every card the projection no longer holds.
@@ -145,17 +238,17 @@ impl AttentionTracker {
 
     /// When the oldest card still pending arrived, on the process-wide clock; `None` with no card.
     pub fn oldest_pending_stamp(&self) -> Option<u64> {
-        self.cards.values().min().copied()
+        self.cards.values().chain(self.questions.values()).min().copied()
     }
 
     /// When the newest card still pending arrived.
     pub fn newest_pending_stamp(&self) -> Option<u64> {
-        self.cards.values().max().copied()
+        self.cards.values().chain(self.questions.values()).max().copied()
     }
 
     pub fn attention(&self) -> Attention {
         Attention {
-            pending: self.cards.len(),
+            pending: self.cards.len() + self.questions.len(),
             unread: self.unread,
             arrived: self.arrived,
         }
@@ -264,6 +357,25 @@ mod tests {
     }
 
     #[test]
+    fn a_question_counts_for_attention() {
+        let mut tracker = AttentionTracker::default();
+        let before = tracker.attention();
+        tracker.sync_questions(["q1".into()]);
+        assert_eq!(tracker.attention().pending, 1);
+        assert_eq!(
+            crate::layout::tray::chip_label("agent", Some(tracker.attention())),
+            "agent ⚑1"
+        );
+        assert!(tracker.card_ids().is_empty());
+        assert!(react(ChatOnPermission::Badge, before, tracker.attention(), AgentPlace::Hidden).toast);
+        tracker.resync(Vec::new());
+        tracker.sync_questions(["q1".into()]);
+        assert_eq!(tracker.attention().arrived, 1);
+        tracker.sync_questions(Vec::new());
+        assert_eq!(tracker.attention().pending, 0);
+    }
+
+    #[test]
     fn cards_count_what_the_panel_was_handed_and_stop_counting_when_resolved() {
         let mut t = AttentionTracker::default();
         t.observe(&[requested("p1"), requested("p2")], false);
@@ -352,6 +464,141 @@ mod tests {
         assert!(t.attention().unread);
         t.seen();
         assert!(!t.attention().unread);
+    }
+
+    fn started(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnStarted { turn_id: turn.into() }
+    }
+
+    fn ended(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: TurnOutcome::Failed,
+            result_text: "the answer".into(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        }
+    }
+
+    /// The end of a turn Claude Code ran where the panel could not show it is no news: not while the
+    /// panel's own turn runs, and not after that turn ended. The panel's own turn still counts.
+    #[test]
+    fn a_completion_of_a_turn_the_panel_did_not_run_marks_nothing_unread() {
+        let mut t = AttentionTracker::default();
+        t.observe(&[started("t1"), ended("unknown-turn")], false);
+        assert!(!t.attention().unread, "another turn's end while t1 runs");
+        t.observe(&[ended("t1")], true);
+        t.observe(&[ended("unknown-turn")], false);
+        assert!(!t.attention().unread, "a turn's end with none running");
+        t.observe(&[started("t2"), ended("t2")], false);
+        assert!(t.attention().unread, "the panel's own turn ended off screen");
+    }
+
+    /// Without a turn start to compare with (a backend that never delivers one, or events a resync
+    /// dropped), every completion still counts.
+    #[test]
+    fn without_a_turn_start_seen_every_completion_counts() {
+        let mut t = AttentionTracker::default();
+        t.observe(&[started("t1")], true);
+        t.resync(Vec::<String>::new());
+        t.observe(&[ended("t9")], false);
+        assert!(t.attention().unread);
+        t.seen();
+        t.observe(&[ended("t10")], false);
+        assert!(t.attention().unread, "still nothing to compare with");
+    }
+
+    /// A completion that came with no turn of the backend's own open is no news even when the tracker
+    /// has nothing to compare with: a resumed idle tab, or a resync while another turn runs.
+    #[test]
+    fn a_completion_with_no_turn_open_never_counts() {
+        let mut t = AttentionTracker::default();
+        t.observe(&[ended(agent::NO_OPEN_TURN_ID)], false);
+        assert!(!t.attention().unread, "a new tracker");
+        t.observe(&[started("t1")], true);
+        t.resync(Vec::<String>::new());
+        t.observe(&[ended(agent::NO_OPEN_TURN_ID)], false);
+        assert!(!t.attention().unread, "after a resync, while t1 runs");
+        t.observe(&[ended("t1")], false);
+        assert!(t.attention().unread, "the panel's own turn still counts");
+    }
+
+    /// A turn Claude Code started is the panel's like any other: its end off screen is news. One that drew
+    /// nothing and ended without a result is not: the panel drops it, so there is nothing to read.
+    #[test]
+    fn a_cli_turn_ending_off_screen_is_unread_unless_it_drew_nothing_and_had_no_result() {
+        let cli = |turn: &str| AgentDomainEvent::TurnAttributed {
+            turn_id: turn.into(),
+            origin: agent::TurnOrigin::Cli,
+            cause: None,
+        };
+        let no_result = |turn: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: TurnOutcome::Failed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: agent::TurnEndDetail {
+                reason: Some(agent::NO_RESULT_REASON.into()),
+                ..Default::default()
+            },
+        };
+        let text = |turn: &str| AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: agent::ContentKind::Text,
+            text: "done".into(),
+        };
+        let mut t = AttentionTracker::default();
+        t.observe(&[started("c1"), cli("c1"), text("c1"), ended("c1")], false);
+        assert!(t.attention().unread, "a CLI turn that said something");
+        t.seen();
+        t.observe(&[started("c2"), cli("c2"), no_result("c2")], false);
+        assert!(!t.attention().unread, "an empty CLI turn without a result is dropped");
+        t.observe(&[started("c3"), cli("c3"), text("c3"), no_result("c3")], false);
+        assert!(
+            t.attention().unread,
+            "one that said something still counts without a result"
+        );
+        let notice = |kind: agent::SessionNoticeKind| AgentDomainEvent::SessionNotice {
+            kind,
+            level: agent::NoticeLevel::Info,
+            content: None,
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        };
+        t.seen();
+        t.observe(
+            &[
+                started("c5"),
+                cli("c5"),
+                notice(agent::SessionNoticeKind::ApiRetry),
+                no_result("c5"),
+            ],
+            false,
+        );
+        assert!(
+            !t.attention().unread,
+            "a retry shown for a moment leaves nothing to read"
+        );
+        t.observe(
+            &[
+                started("c6"),
+                cli("c6"),
+                notice(agent::SessionNoticeKind::ModelFallback),
+                no_result("c6"),
+            ],
+            false,
+        );
+        assert!(
+            t.attention().unread,
+            "a notice that stays as a row is something to read"
+        );
+        t.seen();
+        t.observe(&[started("t4"), no_result("t4")], false);
+        assert!(t.attention().unread, "a turn the panel sent counts however it ends");
     }
 
     #[test]

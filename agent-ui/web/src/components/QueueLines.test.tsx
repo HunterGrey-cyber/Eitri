@@ -16,3 +16,9 @@ it("lists each queued message on one muted line, and says why a flush was refuse
   rerender(<QueueLines items={[]} error={null} />);
   expect(container.firstChild).toBeNull();
 });
+
+it("draws an unread message once as a steered line and reveals its hidden text", () => {
+  const { container } = render(<QueueLines items={[{ text: "follow\u202eup", queuedAt: 1, steered: true }]} error={null} />);
+  expect(container.querySelectorAll(".queue-line")).toHaveLength(1);
+  expect(container.textContent).toBe("↪ follow⟨U+202E⟩up");
+});

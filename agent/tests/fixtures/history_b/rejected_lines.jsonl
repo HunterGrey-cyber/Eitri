@@ -1,0 +1,9 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Run steps"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"msg-a1","content":[{"type":"tool_use","id":"first","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"rejected-0","promptSource":"sdk","message":{"role":"user","content":"injected"},"isMeta":true}
+{"type":"user","uuid":"rejected-1","promptSource":"sdk","message":{"role":"user","content":"injected"},"isCompactSummary":true}
+{"type":"user","uuid":"rejected-2","promptSource":"sdk","message":{"role":"user","content":"injected"},"isVisibleInTranscriptOnly":true}
+{"type":"user","uuid":"rejected-3","promptSource":"sdk","message":{"role":"user","content":"injected"},"isSidechain":true}
+{"type":"user","uuid":"rejected-4","promptSource":"sdk","message":{"role":"user","content":"injected"},"origin":{"kind":"unknown"}}
+{"type":"user","uuid":"no-source","message":{"role":"user","content":"unclassified"}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"msg-a2","content":[{"type":"tool_use","id":"second","name":"Bash","input":{"command":"true"}}]}}

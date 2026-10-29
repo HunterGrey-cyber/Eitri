@@ -1,0 +1,10 @@
+{"type":"user","uuid":"h1","isSidechain":false,"promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"Start the review"}}
+{"type":"assistant","uuid":"a1","isSidechain":false,"message":{"role":"assistant","id":"msg-1","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"/work/log.txt"}}]}}
+{"type":"user","uuid":"r1","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"log"}]}}
+{"type":"attachment","uuid":"q1","isSidechain":false,"attachment":{"type":"queued_command","commandMode":"prompt","isMeta":true,"origin":{"kind":"peer","name":"reviewer","body":"Look at line 4"},"prompt":"<agent-message from=\"reviewer\">\nLook at line 4\n</agent-message>"}}
+{"type":"assistant","uuid":"a2","isSidechain":false,"message":{"role":"assistant","id":"msg-2","content":[{"type":"text","text":"Looked"}]}}
+{"type":"system","uuid":"d1","isSidechain":false,"subtype":"turn_duration","durationMs":5}
+{"type":"user","uuid":"peer-1","isSidechain":false,"isMeta":true,"promptSource":"system","turnOrigin":"peer","turnPosition":{"promptIndex":0,"turnIndex":2},"origin":{"kind":"peer","name":"reviewer","body":"Are you done?"},"message":{"role":"user","content":"Another Claude session sent a message:\nAre you done?"}}
+{"type":"assistant","uuid":"a3","isSidechain":false,"message":{"role":"assistant","id":"msg-3","content":[{"type":"tool_use","id":"read-2","name":"Read","input":{"file_path":"/work/notes.txt"}}]}}
+{"type":"user","uuid":"r2","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","content":"notes"}]}}
+{"type":"assistant","uuid":"a4","isSidechain":false,"message":{"role":"assistant","id":"msg-4","content":[{"type":"text","text":"Not yet"}]}}

@@ -146,6 +146,23 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         AgentDomainEvent::UserMessageDelivered { .. } | AgentDomainEvent::UserMessageDropped { .. } => false,
         // A whole conversation's records arriving with a move: never a stream fragment.
         AgentDomainEvent::MoveSeeded(_) => false,
+        // Why a turn started, a notice row, and a question the person has to answer: each is news
+        // the user may act on or read at once.
+        AgentDomainEvent::TurnAttributed { .. }
+        | AgentDomainEvent::SessionNotice { .. }
+        | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::QuestionSettled { .. } => false,
+        // Work going on out of sight changes what closing asks, and a prompt taken back changes a
+        // row the user is looking at.
+        AgentDomainEvent::CliWorkUnseen
+        | AgentDomainEvent::UserPromptWithdrawn
+        | AgentDomainEvent::TurnCauseUpdated { .. }
+        | AgentDomainEvent::CliCycleStarted { .. }
+        | AgentDomainEvent::BackgroundTasksChanged { .. }
+        | AgentDomainEvent::TaskEvent { .. }
+        | AgentDomainEvent::ConversationReset { .. } => false,
+        // A subagent's text and calls stream like the parent's.
+        AgentDomainEvent::SubagentFrame { frame, .. } => is_plain_stream_content(frame),
     }
 }
 

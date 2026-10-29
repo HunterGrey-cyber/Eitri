@@ -32,7 +32,7 @@ use super::page::{repeat, PANEL_DOCUMENT};
 use super::window::{host_for_later, on_next_turn, Host, MacEmbedder};
 use crate::assembly::{assemble, Assembly};
 use crate::editor::{AttachStep, AttachWait, Editor};
-use crate::quit::{QuitAfter, QuitDecision, QuitGate, QuitSource};
+use crate::quit::{AtWork, QuitAfter, QuitDecision, QuitGate, QuitSource};
 use crate::startup::{self, ProjectStart};
 
 /// What starting and leaving have done, for the log and the acceptance build.
@@ -342,30 +342,29 @@ impl Host {
     /// A quit the window sees before nvim does. `true`: it goes on now. `false`: it is held (a question is
     /// put, on the next turn) or dropped (one is already open).
     pub fn quit_requested(&self, source: QuitSource) -> bool {
-        self.quit_decided(source, |gate, running, queued| {
-            gate.request(source, running, queued, Instant::now())
-        })
+        self.quit_decided(source, |gate, work| gate.request(source, work, Instant::now()))
     }
 
     /// The quit chord from the key monitor, `repeat` for the key's auto-repeat. `true`: it goes on (to the
     /// menu's Quit) without the prefix seeing it.
     pub fn quit_chord(&self, repeat: bool) -> bool {
-        self.quit_decided(QuitSource::Key, |gate, running, queued| {
-            gate.request_chord(repeat, running, queued, Instant::now())
+        self.quit_decided(QuitSource::Key, |gate, work| {
+            gate.request_chord(repeat, work, Instant::now())
         })
     }
 
-    fn quit_decided(
-        &self,
-        source: QuitSource,
-        decide: impl FnOnce(&mut QuitGate, usize, usize) -> QuitDecision,
-    ) -> bool {
+    fn quit_decided(&self, source: QuitSource, decide: impl FnOnce(&mut QuitGate, AtWork) -> QuitDecision) -> bool {
         let Some(assembly) = self.assembly() else { return true };
         if self.life.finished.get() {
             return true;
         }
-        let (running, queued) = (assembly.panel.running_count(), assembly.panel.queued_count());
-        let decision = decide(&mut self.life.quit.borrow_mut(), running, queued);
+        // Background work a finished turn left running counts as the Linux window's close counts it.
+        let work = AtWork {
+            running: assembly.panel.running_count(),
+            queued: assembly.panel.queued_count(),
+            background: assembly.panel.background_count(),
+        };
+        let decision = decide(&mut self.life.quit.borrow_mut(), work);
         self.life.log_quit(format!("{source:?}: {decision:?}"));
         match decision {
             QuitDecision::Proceed => true,

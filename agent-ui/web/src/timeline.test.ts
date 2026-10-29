@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter, waitingCardIndex } from "./timeline";
+import { buildTimeline, oldestPendingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
+import { primaryText } from "./copyText";
 import { initialState } from "./reducer";
 import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
 
@@ -31,6 +32,10 @@ function labels(s: AgentUiState): string[] {
         return `perm:${item.request.permissionId}`;
       case "ending":
         return `ending:${item.ending.kind}`;
+      case "wake":
+        return `wake:${item.text}`;
+      case "notice":
+        return `notice:${item.notice.kind}`;
       case "thinking":
         return `thinking:${item.block.text}${item.open ? "…" : ""}`;
       case "run":
@@ -276,6 +281,38 @@ describe("buildTimeline's item identity", () => {
   });
 });
 
+describe("buildTimeline's identity for wake rows", () => {
+  const cause = (over: Partial<import("./types").TurnCause>): import("./types").TurnCause => ({
+    kind: "unknown", taskId: null, taskKind: null, taskStatus: null, description: null, summary: null,
+    peerName: null, text: null, wakeupSource: null, scheduledForMs: null, scheduleReason: null, cronId: null, prompt: null, ...over,
+  });
+
+  it("hands back the same wake, task notice and folded item while their records are the same", () => {
+    const scheduled = [1, 2, 3].map((seq) => ({ seq, turnId: `t${seq}`, origin: "cli" as const, cause: cause({ kind: "scheduled" }) }));
+    const peer = { seq: 10, turnId: "p", origin: "cli" as const, cause: cause({ kind: "peer", peerName: "w", text: "a\nb" }) };
+    const taskNotice = { seq: 20, kind: "task" as const, level: "notice" as const, content: "done", scalars: {}, taskId: "x", toolUseId: null, taskStatus: "completed" };
+    const s = state({ turnStarts: [...scheduled, peer], notices: [taskNotice] });
+    const before = buildTimeline(s);
+    const byKey = (items: TimelineItem[], key: string) => items.find((item) => item.key === key)!;
+    expect(byKey(before, "w-1")).toMatchObject({ count: 3 });
+    const again = buildTimeline({ ...s });
+    expect(again.length).toBe(before.length);
+    again.forEach((item, i) => expect(item, item.key).toBe(before[i]));
+
+    // A fourth empty tick is a new folded item; the peer and task rows keep theirs.
+    const fourth = { seq: 4, turnId: "t4", origin: "cli" as const, cause: cause({ kind: "scheduled" }) };
+    const longer = buildTimeline({ ...s, turnStarts: [...scheduled, fourth, peer] });
+    expect(byKey(longer, "w-1")).toMatchObject({ count: 4 });
+    expect(byKey(longer, "w-1")).not.toBe(byKey(before, "w-1"));
+    expect(byKey(longer, "w-10")).toBe(byKey(before, "w-10"));
+    expect(byKey(longer, "w-20")).toBe(byKey(before, "w-20"));
+    // A replaced record is a new item.
+    const copy = buildTimeline({ ...s, notices: [{ ...taskNotice }] });
+    expect(byKey(copy, "w-20")).not.toBe(byKey(before, "w-20"));
+    expect(byKey(copy, "w-20")).toMatchObject({ text: "done" });
+  });
+});
+
 describe("oldestPendingPermission (focus_permission's target)", () => {
   it("is the card with the lowest seq, wherever it is drawn", () => {
     // perm-late (seq 5) hangs under tool t1 (seq 1); perm-early (seq 3) has no call and sits at seq 3.
@@ -499,4 +536,128 @@ describe("waitingCardAfter (a count before ]p / [p)", () => {
     expect(waitingCardAfter(timeline, cardRows[0] + 1, 1, 9999, new Set())).toBe(cardRows[1]);
     expect(waitingCardAfter(timeline, cardRows[0] + 1, 1, 9998, new Set())).toBe(cardRows[0]);
   });
+});
+
+describe("CLI wake and notice rows", () => {
+  const cause = (over: Partial<import("./types").TurnCause> = {}): import("./types").TurnCause => ({
+    kind: "unknown", taskId: null, taskKind: null, taskStatus: null, description: null, summary: null,
+    peerName: null, text: null, wakeupSource: null, scheduledForMs: null, scheduleReason: null, cronId: null, prompt: null, ...over,
+  });
+  const notice = (kind: import("./types").NoticeRecord["kind"], over: Partial<import("./types").NoticeRecord> = {}): import("./types").NoticeRecord => ({
+    seq: 1, kind, level: "notice", content: null, scalars: {}, taskId: null, toolUseId: null, taskStatus: null, ...over,
+  });
+  const wake = (over: Partial<import("./types").TurnCause> = {}) => buildTimeline(state({
+    turnStarts: [{ seq: 1, turnId: "cli", origin: "cli", cause: cause(over) }],
+  }))[0];
+
+  it.each([
+    [{ kind: "scheduled", wakeupSource: "loop_wakeup", scheduleReason: "check tests" }, "Scheduled wake-up: check tests"],
+    [{ kind: "scheduled", wakeupSource: "schedule_wakeup", prompt: "run tests\nthen report" }, "Scheduled task fired: run tests"],
+    [{ kind: "scheduled" }, "Scheduled wake-up"],
+    [{ kind: "peer", peerName: "builder", text: "ready\nall done" }, "› Message from @builder: ready"],
+    [{ kind: "other" }, "Claude Code started this turn"],
+    [{ kind: "unknown" }, "Claude Code started this turn"],
+  ] as const)("words a CLI cause %j exactly", (over, text) => {
+    expect(wake(over)).toMatchObject({ kind: "wake", text });
+  });
+
+  it("cuts the cron first line at 200 Unicode characters", () => {
+    expect(wake({ kind: "scheduled", wakeupSource: "schedule_wakeup", prompt: "😀".repeat(201) + "\nignored" }))
+      .toMatchObject({ text: "Scheduled task fired: " + "😀".repeat(200) });
+  });
+
+  it.each([
+    ["shell", "completed", null, 'Background command "build" completed'],
+    ["shell", "completed", "exit code 2: error", 'Background command "build" completed (exit code 2)'],
+    ["shell", "failed", null, 'Background command "build" failed'],
+    ["shell", "stopped", 'Background command "build" was stopped after reaching its background time limit', 'Background command "build" was stopped after reaching its background time limit'],
+    ["remote_agent", "completed", null, 'Task "build" completed in background'],
+    ["remote_agent", "stopped", null, 'Task "build" stopped'],
+    ["remote_agent", "failed", null, 'Task "build" failed'],
+    ["local_agent", "completed", null, 'Agent "build" finished'],
+    ["workflow", "completed", 'Dynamic workflow "build" completed', 'Dynamic workflow "build" completed'],
+    ["workflow", "failed", 'Dynamic workflow "build" failed: error', 'Dynamic workflow "build" failed: error'],
+    ["workflow", "stopped", 'Dynamic workflow "build" was stopped', 'Dynamic workflow "build" was stopped'],
+    ["monitor", "running", "event line", 'Monitor event: "build"'],
+  ])("words task %s %s exactly", (taskKind, taskStatus, summary, text) => {
+    expect(wake({ kind: "task", taskKind, taskStatus, summary, description: "build" })).toMatchObject({ text });
+  });
+
+  it("uses a task notification as the following turn's single cause row, worded by the turn's cause", () => {
+    const rows = buildTimeline(state({
+      notices: [notice("task", { taskId: "task1", taskStatus: "completed", content: "done" })],
+      turnStarts: [{ seq: 2, turnId: "cli", origin: "cli", cause: cause({ kind: "task", taskId: "task1", taskKind: "shell", description: "build" }) }],
+    }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: "wake", key: "w-1", text: 'Background command "build" completed', body: "done" });
+  });
+
+  it("words a task notification with no turn by the CLI's own words, and keeps the exit code of a command", () => {
+    expect(buildTimeline(state({ notices: [notice("task", { taskId: "t9", taskStatus: "completed", content: "Task t9 is done" })] }))[0])
+      .toMatchObject({ text: "Task t9 is done", body: null });
+    const rows = buildTimeline(state({
+      notices: [notice("task", { taskId: "t1", taskStatus: "completed", content: "exit code 2: error" })],
+      turnStarts: [{ seq: 2, turnId: "cli", origin: "cli", cause: cause({ kind: "task", taskId: "t1", taskKind: "shell", description: "build" }) }],
+    }));
+    expect(rows[0]).toMatchObject({ text: 'Background command "build" completed (exit code 2)', body: "exit code 2: error" });
+  });
+
+  it("shows a Monitor event's lines inline under its headline", () => {
+    const rows = buildTimeline(state({
+      notices: [notice("task", { taskId: "m1", taskStatus: "running", content: "line one\nline two" })],
+      turnStarts: [{ seq: 2, turnId: "cli", origin: "cli", cause: cause({ kind: "task", taskId: "m1", taskKind: "monitor", taskStatus: "running", description: "watch" }) }],
+    }));
+    expect(rows[0]).toMatchObject({ text: 'Monitor event: "watch"', body: "line one\nline two", inlineBody: true });
+  });
+
+  it("gives a body only when it says more than the headline", () => {
+    expect(wake({ kind: "peer", peerName: "w", text: "ready" })).toMatchObject({ text: "› Message from @w: ready", body: null });
+    expect(wake({ kind: "peer", peerName: "w", text: "ready\nmore" })).toMatchObject({ body: "ready\nmore" });
+  });
+
+  it("folds three empty finished scheduled turns into the first row", () => {
+    const turnStarts = [1, 2, 3].map((seq) => ({ seq, turnId: `t${seq}`, origin: "cli" as const, cause: cause({ kind: "scheduled" }) }));
+    const rows = buildTimeline(state({ turnStarts }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ key: "w-1", count: 3 });
+    expect(primaryText(rows[0])).toBe("Scheduled wake-up ×3");
+    // Replies and an unfinished turn each end the run of empty ticks.
+    expect(buildTimeline(state({ turnStarts, transcript: [msg(1.5, "reply")] }))).toHaveLength(3);
+    expect(buildTimeline(state({ turnStarts, activeTurnId: "t3" }))).toHaveLength(2);
+    // A reply after a tick belongs to that tick, so it cannot join an earlier empty tick.
+    expect(buildTimeline(state({ turnStarts, transcript: [msg(2.5, "reply")] }))).toHaveLength(4);
+  });
+
+  it.each([
+    ["model_fallback", "warning", "Switched model", {}, "Switched model"],
+    ["model_refusal", "warning", "Cannot answer", {}, "Cannot answer"],
+    ["informational", "notice", "Hook message", {}, "Hook message"],
+    ["informational", "suggestion", "Try again", {}, "Try again"],
+    ["informational", "warning", "Warning", {}, "Warning"],
+    ["peer_hold", "warning", null, { peer_name: "worker", hold_state: "held" }, "Message from @worker held: its sender runs in a different permission mode"],
+    ["peer_hold", "warning", null, { peer_name: "worker", hold_state: "dropped" }, "Message from @worker dropped after 5 minutes unanswered"],
+    ["rate_limit", "notice", null, { rate_status: "reset" }, "Usage limit reset · continuing automatically"],
+    ["compaction", "notice", null, { pre_tokens: 182000, post_tokens: 41000, trigger: "auto" }, "──── Conversation compacted · 182k → 41k tokens (auto) ────"],
+    ["compaction", "notice", null, {}, "──── Conversation compacted ────"],
+    ["hook_block", "warning", "blocked", {}, "UserPromptSubmit operation blocked by hook: blocked"],
+    ["hook_block", "warning", "UserPromptSubmit operation blocked by hook: blocked", {}, "UserPromptSubmit operation blocked by hook: blocked"],
+  ] as const)("words notice %s %s exactly", (kind, level, content, scalars, text) => {
+    const rows = buildTimeline(state({ notices: [notice(kind, { level, content, scalars })] }));
+    expect(rows).toHaveLength(1);
+    expect(primaryText(rows[0])).toBe(text);
+  });
+
+  it("does not draw transient, info, released or ordinary rate notices", () => {
+    const notices = [notice("api_retry"), notice("compacting"), notice("notification"),
+      notice("informational", { level: "info" }), notice("peer_hold", { scalars: { hold_state: "released" } }),
+      ...["allowed", "allowed_warning", "rejected"].map((rate_status) => notice("rate_limit", { scalars: { rate_status } }))];
+    expect(buildTimeline(state({ notices }))).toEqual([]);
+  });
+});
+
+it("marks every question of a set with its own ?, the first as the rest, since the list draws no sign cell", () => {
+  const spec = (header: string, question: string) => ({ header, question, multiSelect: false, options: [{ label: "A", description: "", preview: null }] });
+  const lines = questionLines({ seq: 1, interactionId: "q", toolUseId: null, turnId: null, unsupportedReason: null,
+    state: { kind: "waiting" }, questions: [spec("Mode", "Choose a mode"), spec("Checks", "Choose checks")] });
+  expect(lines.filter((line) => !line.muted).map((line) => line.text)).toEqual(["? Mode: Choose a mode", "? Checks: Choose checks"]);
 });

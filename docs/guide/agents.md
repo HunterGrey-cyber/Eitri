@@ -12,6 +12,125 @@ Eitri runs the agents you installed and signed in to; it ships none of them. The
 tab. The pages on [permissions](permissions.md) and the [Claude account](configuration.md#accounts) describe
 Claude tabs only, except where this page says otherwise.
 
+A Claude tab also shows the work Claude Code does on its own: background tasks, dynamic workflows, subagents, the
+turns it starts by itself and the questions it asks you. That comes first below, since Codex and ACP tabs have none
+of it.
+
+## What a Claude tab shows of Claude Code's own work
+
+Much of what Claude Code does happens outside the turn you started. It runs commands and subagents in the
+background, runs dynamic workflows, schedules wake-ups for later, and starts turns of its own when any of these
+report back. A Claude tab shows all of it, and lets you stop it.
+
+### Turns Claude Code starts
+
+When a background command finishes, a monitor reports, a background subagent or workflow ends, or a scheduled
+wake-up or cron task fires, Claude Code starts a turn without a prompt from you. The tab shows it as a turn like
+yours. Its first row says what started it, for example `Background command "build" completed` or
+`Scheduled wake-up: check the deploy`, and its tool calls, cards and reply follow. While it runs, the activity line
+reads `Claude Code is handling: ...`, and a card it raises sits under its own tool row in that turn.
+
+`Enter` while such a turn runs puts your message into it, as in any running turn. A message Claude Code keeps for
+later shows as a `↪` line above the activity line until Claude Code reads it, and then appears where it was read.
+
+### Background tasks and `/tasks`
+
+The band counts the tab's background work in Claude Code's words: `1 shell`, `2 shells, 1 monitor`,
+`1 local agent`. While no turn runs, a line above the message box says the same and ends in `/tasks`.
+
+`/tasks` (or `/bashes`) opens the list of background tasks: shells, monitors, local agents (subagents in the
+background) and dynamic workflows, then the ones that finished. `j` and `k` select a task and `Enter` shows its
+detail: for a shell or a monitor, the end of its output, with escape sequences removed and hidden characters made
+visible; for a workflow, its phases and agents. `x` stops the selected task, and only that one. `o` opens its output
+read-only in Neovim. `q` goes back, and from the list closes it. All the keys are in
+[Keys](keys.md#the-background-tasks-list).
+
+`<leader>k` stops every background task of the tab after a `y/n` question that names them
+(`Stop 2 shells, 1 monitor? y/n`). It works while no turn runs, and the conversation goes on.
+
+`Ctrl+c` interrupts the turn and leaves its background work running: stop that from `/tasks` or with `<leader>k`.
+Closing the tab, its view or the window while background tasks run asks first and says what is still running.
+Scheduled wake-ups and cron tasks are not counted, so closing ends them without asking, apart from a cron task
+Claude Code was told to keep across sessions (see [Not in a Claude tab yet](#not-in-a-claude-tab-yet)).
+
+### Dynamic workflows
+
+A dynamic workflow is a script Claude Code runs in the background, with agents of its own. When one needs your
+approval, its card reads `Run a dynamic workflow?` and shows the workflow's name, its arguments and its script as
+plain text; `View raw script` opens the script read-only in Neovim. While it runs, the band shows its name, how many
+of its agents are done, the time and the tokens. `/workflows` opens the tasks list at the workflows, where a
+workflow's detail lists its phases, then its agents with their state, model, tokens and tool calls. `x` there stops
+the run. When the workflow ends, Claude Code reports back in a turn of its own.
+
+### Subagents
+
+The calls of a subagent Claude runs in the foreground are nested under the subagent's row, and `Enter` opens and
+folds them. A subagent in the background takes one status line, with the number of tools it used, until it is done,
+and its report starts a turn of its own.
+
+### Notices, compaction and `/clear`
+
+Claude Code's notices appear where its terminal shows them. While Claude Code compacts the conversation, the activity
+line reads `Compacting conversation...`, and a divider then marks the place, with the token counts before and after.
+When the model service is overloaded, the activity line shows the retry (`overloaded · Retrying in 1s · attempt
+1/2`) until the reply arrives. A prompt that a `UserPromptSubmit` hook blocked shows the hook's words in a muted row.
+
+`/clear` starts a new conversation in the same tab. The view empties, background tasks keep running and stay in the
+band, and a later resume of the tab continues the new conversation.
+
+### Long-running commands
+
+Claude Code limits the timeout Claude may give a command. Eitri starts it with `BASH_MAX_TIMEOUT_MS` set to
+2147483647, the largest value it takes (almost 25 days), so a background command that Claude starts with a long
+timeout runs for as long as that timeout says. A background command started without a timeout is still stopped
+after 30 minutes. That is Claude Code's own default, and Eitri keeps it on purpose. Claude is told when it happens
+and can start the command again with a timeout, and the task's detail in `/tasks` says so. If you set
+`BASH_MAX_TIMEOUT_MS` yourself, in your environment or in the `env` of Claude Code's `settings.json`, Claude Code
+uses your value.
+
+### Claude's questions
+
+When Claude asks you a multiple-choice question (Claude Code's `AskUserQuestion` tool), a question box takes the
+place of the message box, the activity line reads `⚑ Claude has a question`, and the tab counts the question with
+its cards. Pick an option by its number, or move to it with `j` and `k` and press `Space`. Either way the box stays
+on that question; in a question that takes several answers, the same keys select and clear as many as you like. In a
+question with one answer, `Enter` picks the option under the cursor and moves on. `Type something` takes an answer
+in your own words, and
+`Ctrl+g` edits it in Neovim. `n` adds notes to an option that shows a preview. `Tab` goes to the next question; when there are
+several, a review page lists your answers. `Ctrl+Enter` sends them all. `Enter` on `Chat about this` tells Claude you
+would rather talk it over (its number only moves the cursor there, and `Space` does nothing on it), and `Esc` cancels the question, which
+stops the turn. `Ctrl+k` goes back to the conversation with the
+question still waiting, and `i` returns to it. A half-written answer survives a switch to another tab and a reload of
+the page.
+
+Only you answer a question: bypass, `Ctrl+y`, the card keys, saved rules and Claude Code's classifier never do (see
+[Permissions](permissions.md#claudes-questions-to-you)). Closing the tab while a question waits asks first and says
+that closing cancels it. All the keys are in [Keys](keys.md#claudes-questions).
+
+### Resuming a conversation
+
+A resumed conversation is rebuilt from Claude Code's own session file, and it follows Claude Code's turns. A turn
+Claude Code started by itself comes back with what started it. The slash commands and `!` commands you typed come
+back as your prompts. Questions come back with the answers you gave, or as declined. The `No response requested.`
+line that Claude Code writes after an interrupt is left out.
+
+A few things do not come back: a subagent's own calls, which Claude Code keeps in a file of their own, and a message
+that another Claude Code session delivered into a running turn (the live tab does not show it either). A few turns
+that Claude Code starts by itself for a reason Eitri does not recognise yet come back inside the turn before them.
+A question that was interrupted, or whose tab was closed, may come back as declined, because that is how Claude Code
+recorded it.
+
+### Not in a Claude tab yet
+
+Plan mode, attaching files or images to a message, and a list of the scheduled wake-ups and cron tasks. Those still
+fire while the tab stays open, each as a turn of its own. Closing the tab, its view or the window ends them, and
+since Eitri has no list of them it does not ask first. The only cron task Claude Code keeps after its session ends is
+one it was told to keep across sessions: it saves that one in the project's `.claude/scheduled_tasks.json`, and may
+run it in a later session there.
+
+The Claude Code terminal's `Ctrl+B`, which moves a running foreground command to the background, has no
+counterpart in a Claude tab. In Eitri `Ctrl+b` is the prefix key.
+
 ## Opening a tab for another agent
 
 - **`:tabnew codex`**, or `:tabnew` followed by `claude` or the name of an agent you registered, in the panel's command line
@@ -183,6 +302,9 @@ tab's mode.
 
 - Slash commands are sent to Codex as typed. There is no held-back command list, no `/model` or `/effort`
   picker, and no `/` command menu (Codex reports no command list to complete from).
+- None of [what a Claude tab shows of Claude Code's own work](#what-a-claude-tab-shows-of-claude-codes-own-work):
+  `/tasks` and `/workflows` are sent to Codex as typed, and the band only counts the commands still running in the
+  background.
 - `<leader>t` (continue in a terminal) flashes "Continuing a Codex session in a terminal is not available yet".
 - `prefix i` lacks the Claude-only rows (the Claude session ids, the CLI build, permission rules, account and
   model).

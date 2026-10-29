@@ -40,6 +40,13 @@ itself, so reading inside the project, read-only commands, subagents (`Task`, `A
 in auto that classifier could have blocked one. Everything else Eitri's rules would put on a card is a card in
 manual too.
 
+Claude Code's scheduling and task tools run without a card in every mode, as Claude Code itself runs them without
+asking: `ScheduleWakeup`, `CronCreate`, `CronList`, `CronDelete`, `ListAgents` and `TaskStop`. What they schedule
+shows up later as a turn of its own while the tab stays open. Closing the tab ends it, except a cron task Claude
+Code was told to keep across sessions, which it saves in the project and may run in a later session there (see
+[Codex and other agents](agents.md#not-in-a-claude-tab-yet)).
+`SendMessage`, which reaches another session, is still a card wherever Eitri's rules decide.
+
 ### Auto, when Claude Code runs its own auto mode
 
 This is the normal case. Eitri asks Claude Code to run its own auto mode and then lets it judge the calls:
@@ -79,6 +86,8 @@ a `y/n` that says what else changes: if cards are waiting in the tab it reads "S
 waiting cards?", and every waiting card is counted. The `y` counts only when it is pressed on its own and a moment
 after the question appears, and only the cards still waiting at that moment are approved. Bypass is entered only
 from auto. Leaving bypass needs no question and lands in manual.
+
+Bypass never answers a question Claude asks you ([Claude's questions to you](#claudes-questions-to-you)).
 
 Starting in bypass without the question is possible only by saying so in advance, with
 `agent.default_mode = "bypass"` in your `init.lua`; see
@@ -165,6 +174,28 @@ default mode.
 One limit to know about: Eitri cannot tell Claude Code's own reason from a reason a hook gave. A hook of yours
 (or of a trusted project) that asks with a reason is treated like any other question with a reason, so in an
 Auto or Manual tab your approval of that same call on a card answers it too.
+
+## A dynamic workflow's card
+
+A card for Claude Code's `Workflow` tool reads `Run a dynamic workflow?`. It shows the workflow's name (or the path
+of its script), its arguments and its script, all as plain text, and `View raw script` opens the script read-only in
+Neovim. You approve or deny it like any other card. There is no "don't ask again" for a workflow, and the card lists
+no phases before you approve it. Who answers the card, and what Auto leaves to
+Claude Code, is the same as for any other tool.
+
+## Claude's questions to you
+
+Besides asking for permission, Claude can ask you a multiple-choice question (Claude Code's `AskUserQuestion`
+tool). Such a question is never a permission card, and only you answer it, with keys you press in its question box
+([Keys](keys.md#claudes-questions)). Bypass does not answer it, entering bypass does not either, and neither do
+`Ctrl+y`, the card keys `a` and `d`, a saved rule or Claude Code's classifier. When a card and a
+question wait together, those keys answer only the card.
+
+- A question box under a [float](agents.md#a-chat-under-a-float) refuses to send, as a covered card does, and keeps
+  your picks; it sends once the float is off.
+- The question, its options and its previews are drawn as plain text, and hidden or direction-changing characters
+  are shown as visible escapes. A preview's Markdown is drawn with no images, scripts or controls.
+- Closing the tab while a question waits asks first and says that closing cancels the question.
 
 ## Trusting a project
 
@@ -289,5 +320,8 @@ above is weaker than it may sound.
   only through the hook's command text, as building the project is.
 - **Bypass answers your own ask rules too.** In a bypass tab a `permissions.ask` rule, yours or a trusted
   project's, stops nothing: Eitri answers the question it raises like any other.
+- **A message from another Claude Code session is not shown.** When another session sends this one a message while a
+  turn runs, Claude Code delivers it into that turn and Claude reads it, but the tab shows no row for it, live or
+  after a resume.
 - **A reason is not proof of origin.** In an Auto or Manual tab, a question with a reason is answered on your approval of
   the same call, and Eitri cannot tell Claude Code's own check from a hook that asks with a reason.

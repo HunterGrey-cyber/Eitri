@@ -1,3 +1,4 @@
+import { revealedText } from "../revealHidden";
 import type { QueueItem } from "../types";
 
 function firstLine(text: string): string {
@@ -17,18 +18,18 @@ export function QueueLines({ items, error, note = null }: { items: QueueItem[]; 
       {items.map((item) =>
         item.steered === true ? (
           <div key={item.queuedAt + item.text} className="queue-line queue-line-steered">
-            <span className="queue-glyph">↪</span> <span className="queue-text">{firstLine(item.text)}</span>
+            <span className="queue-glyph">↪</span> <span className="queue-text">{revealedText(firstLine(item.text))}</span>
           </div>
         ) : (
           <div key={item.queuedAt + item.text} className="queue-line">
-            <span className="queue-glyph">⧗</span> <span className="queue-text">{firstLine(item.text)}</span>
+            <span className="queue-glyph">⧗</span> <span className="queue-text">{revealedText(firstLine(item.text))}</span>
           </div>
         ),
       )}
-      {note !== null && held && <div className="queue-note">{note}</div>}
+      {note !== null && held && <div className="queue-note">{revealedText(note)}</div>}
       {error !== null && (
         <div className="queue-error" role="alert">
-          ⚠ not sent: {error} — Enter or Ctrl+Enter tries again
+          ⚠ not sent: {revealedText(error)} — Enter or Ctrl+Enter tries again
         </div>
       )}
     </div>

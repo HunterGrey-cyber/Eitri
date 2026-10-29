@@ -14,7 +14,10 @@ import {
   RESULT_TAIL_CHARS,
   truncateResult,
 } from "./toolRegistry";
-import type { ToolCallRecord } from "./types";
+import { initialState, applyEvent } from "./reducer";
+import { toolCardLine } from "./display";
+import rosterFixture from "./fixtures/claude-scripted-c01t.json";
+import type { AgentDomainEvent, BackgroundTaskRecord, ToolCallRecord } from "./types";
 import { ProjectDirContext } from "./projectPath";
 import policyRs from "../../../agent/src/permission_policy.rs?raw";
 
@@ -474,10 +477,11 @@ describe("a tool named after an Object.prototype member", () => {
 describe("the registry: runs, edits, gated calls and the detailed view", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
-  it("names every tool Claude Code 2.1.27x offers (read from permission_policy.rs)", () => {
-    const block = policyRs.match(/TOOLS_OFFERED_BY_CLI_2_1_272: &\[&str\] = &\[([\s\S]*?)\];/)![1];
+  it("names every tool Claude Code 2.1.311 offers (read from permission_policy.rs)", () => {
+    const block = policyRs.match(/TOOLS_OFFERED_BY_CLI_2_1_311: &\[&str\] = &\[([\s\S]*?)\];/)![1];
     const offered = Array.from(block.matchAll(/"([^"]+)"/g)).map((m) => m[1]);
-    expect(offered.length).toBeGreaterThan(20);
+    expect(offered).toHaveLength(23);
+    expect(new Set(offered).size).toBe(23);
     for (const name of offered) expect(lookupTool(name), name).toBeDefined();
   });
 
@@ -736,4 +740,184 @@ describe("a folded result's preview", () => {
     expect(shownLines(huge)).toEqual(["l0", "l1", "l2"]);
     expect(more(huge)).toBe("… +199,997 lines (Enter to expand, Ctrl+o for all)");
   });
+});
+
+describe("background and scheduling cards", () => {
+  const show = (c: ToolCallRecord, s = initialState()) => renderToStaticMarkup(<>{renderToolCall(c, false, { cardLine: toolCardLine(c, s) })}</>);
+  const rosterState = () => {
+    let s = initialState();
+    for (const event of rosterFixture.domain_events) s = applyEvent(s, event as AgentDomainEvent);
+    return s;
+  };
+  // The id the CLI gave the background command of toolu_lim in the recording.
+  const limTask = rosterState().backgroundTasks.rows.find((r) => r.tool_use_id === "toolu_lim")!.task_id;
+  const background = (name = "Bash") => call({ name, toolUseId: "toolu_lim", input: { command: "sleep 10", run_in_background: true, name: "build" }, result: { content: `Command running in background with ID: ${limTask}. Output is being written`, isError: false } });
+  const settled = (status: BackgroundTaskRecord["status"], summary: string | null, ms: number) => {
+    const s = rosterState();
+    s.backgroundTasks.rows = [{ ...s.backgroundTasks.rows.find((r) => r.tool_use_id === "toolu_lim")!, status, summary, live: false, started_at: 1000, ended_at: 1000 + ms, usage: null }];
+    s.notices = [];
+    return s;
+  };
+
+  it.each(["Bash", "Monitor", "Agent", "Task"])("shows %s as live only while the roster lists it", (name) => {
+    const s = settled("running", null, 0);
+    s.backgroundTasks.rows[0].live = true;
+    expect(show(background(name), s)).toContain("Running in the background · /tasks");
+    s.backgroundTasks.rows[0].live = false;
+    expect(show(background(name), s)).not.toContain("Running in the background");
+  });
+
+  it.each([
+    ["completed", null, 130000, "completed in background · 2m 10s"],
+    ["stopped", null, 41000, "stopped · 0m 41s"],
+    ["failed", "command failed (exit code 1)", 12000, "failed · exit code 1 · 0m 12s"],
+    ["stopped", 'Background command "C01t limit" was stopped after reaching its background time limit', 1800000, "stopped at its background time limit · 30m 00s"],
+    ["stopped", "stopped because the system is running low on memory", 12000, "stopped: the system was low on memory"],
+  ] as const)("settles %s with %s", (status, summary, ms, expected) => {
+    const out = show(background(), settled(status, summary, ms));
+    expect(out).toContain(expected);
+    expect(out).not.toContain("Running in the background");
+  });
+
+  it("settles restored A cards from their notice, and missing outcomes with the session", () => {
+    const s = initialState();
+    s.notices = [{ seq: 4, kind: "task", level: "notice", content: "exit code 1", scalars: {}, taskId: limTask, toolUseId: "toolu_lim", taskStatus: "failed" }];
+    expect(show(background(), s)).toContain("failed · exit code 1");
+    expect(show(background())).toContain("stopped with the session");
+  });
+
+  it.each([true, false])("settles restored B by the envelope's tool id (%s) or task id", (linked) => {
+    const s = initialState();
+    s.turnStarts = [{ seq: 4, turnId: "wake", origin: "cli", cause: { kind: "task", toolUseId: linked ? "toolu_lim" : undefined, taskId: limTask, taskStatus: "completed", taskKind: "shell", description: null, summary: "done", peerName: null, text: null, wakeupSource: null, scheduledForMs: null, scheduleReason: null, cronId: null, prompt: null } }];
+    expect(show(background(), s)).toContain("completed in background");
+  });
+
+  it.each(["Workflow", "RunWorkflow"])("keeps %s running until the roster settles it", (name) => {
+    const s = settled("running", null, 0);
+    s.backgroundTasks.rows[0].live = true;
+    s.backgroundTasks.rows[0].workflow_name = "build";
+    expect(show(background(name), s)).toContain("Workflow build · running in the background · /tasks");
+  });
+  it.each(["completed", "stopped", "failed"] as const)("settles a %s workflow to its notification", (status) => {
+    const summary = `Dynamic workflow "build" ${status}`;
+    expect(toolCardLine(background("Workflow"), settled(status, summary, 1000))).toContain(summary);
+  });
+  it("settles a workflow launch error immediately", () => {
+    expect(show(call({ name: "Workflow", input: { name: "build" }, result: { content: { error: "syntax error" }, isError: false } }))).toContain("failed: syntax error");
+  });
+  it("names the task being stopped by its description", () => {
+    const s = settled("running", null, 0);
+    expect(toolCardLine(call({ name: "TaskStop", input: { task_id: limTask } }), s)).toBe('TaskStop · "C01t limit"');
+  });
+  it("shows wake-up delay, reason and the returned time without the dynamic prompt", () => {
+    const c = call({ name: "ScheduleWakeup", input: { delaySeconds: 300, reason: "check build", prompt: "<<autonomous-loop-dynamic>>" }, result: { content: { scheduledFor: new Date(2026, 9, 28, 14, 5).toISOString() }, isError: false } });
+    expect(show(c)).toContain("Wake up in 5m: check build · at 14:05");
+    expect(show(c)).not.toContain("autonomous-loop-dynamic");
+  });
+  it.each(["stopped", "no-op"])("shows a %s wake-up result", (status) => {
+    expect(show(call({ name: "ScheduleWakeup", input: { delaySeconds: 300 }, result: { content: { status }, isError: false } }))).toContain(`· ${status}`);
+  });
+  it("shows cron's human schedule, prompt and next run", () => {
+    expect(show(call({ name: "CronCreate", input: { prompt: "check build" }, result: { content: { humanSchedule: "every hour", nextFireAt: new Date(2026, 9, 28, 14, 5).toISOString() }, isError: false } }))).toContain("every hour: check build · next run 14:05");
+  });
+  it.each([
+    ["CronDelete", { id: "abc" }, "CronDelete abc"],
+    ["CronList", {}, "list scheduled tasks"],
+    ["ListAgents", {}, "list agents"],
+    ["SendMessage", { to: "builder", message: "check build\nprivate second line" }, "→ builder: check build"],
+  ])("summarizes %s", (name, input, expected) => {
+    const out = show(call({ name: name as string, input }));
+    expect(out).toContain(expected);
+    expect(out).not.toContain("private second line");
+  });
+  it("renders hidden characters and markup in the new labels as visible text", () => {
+    const out = show(call({ name: "SendMessage", input: { to: "<img>", message: "a\u202eb" } }));
+    expect(out).toContain("&lt;img&gt;");
+    expect(out).toContain("U+202E");
+    expect(out).not.toContain("<img>");
+  });
+});
+
+it("keeps scheduling failures visible when their cards are folded", () => {
+  const c = call({ name: "CronCreate", input: { cron: "invalid", prompt: "check" }, result: { content: "invalid schedule", isError: true } });
+  const out = renderToStaticMarkup(<>{renderToolCall(c, false)}</>);
+  expect(out).toContain("invalid schedule");
+  expect(out).toContain('data-state="error"');
+});
+
+it("reads the recorded CLI wake-up time from a textual result", () => {
+  const c = call({ name: "ScheduleWakeup", input: { delaySeconds: 60, reason: "check" }, result: { content: "Next wakeup scheduled for 12:24:00 (in 107s).", isError: false } });
+  expect(toolCardLine(c)).toBe("Wake up in 1m: check · at 12:24");
+});
+
+it("keeps a background launch pending until the roster receives its task", () => {
+  const s = initialState();
+  s.activeTurnId = "turn";
+  const c = call({ turnId: "turn", input: { command: "build", run_in_background: true } });
+  const out = renderToStaticMarkup(<>{renderToolCall(c, false, { cardLine: toolCardLine(c, s) })}</>);
+  expect(out).toContain("Running…");
+  expect(out).not.toContain("stopped with the session");
+  expect(out).not.toContain("Running in the background");
+});
+
+it("prints a failed background launch's error once", () => {
+  const c = call({
+    input: { command: "build", run_in_background: true },
+    result: { content: "spawn refused: no such directory", isError: true },
+  });
+  const out = renderToStaticMarkup(<>{renderToolCall(c, false, { cardLine: toolCardLine(c, initialState()) })}</>);
+  expect(out.split("spawn refused: no such directory")).toHaveLength(2);
+  expect(out).toContain("failed");
+});
+
+it("does not take a foreground command that prints the launch phrase for a background card", () => {
+  const c = call({
+    input: { command: "echo moved" },
+    result: { content: "log: was moved to the background (ID: b1) earlier", isError: false },
+  });
+  expect(toolCardLine(c, initialState())).toBeNull();
+});
+
+it("still recognises a command moved to the background after its timeout", () => {
+  const c = call({
+    input: { command: "sleep 10" },
+    result: {
+      content: "Command did not complete within its 2s timeout and was moved to the background (ID: bxdq1rqn1). Output is being written",
+      isError: false,
+    },
+  });
+  expect(toolCardLine(c, initialState())).toContain("stopped with the session");
+});
+
+it("draws a foreground command the CLI follows as a task as the ordinary call it is, until it is moved aside", () => {
+  // The CLI starts following a foreground command as a task a few seconds in, saying it is not in the
+  // background; the command still runs in its turn and its result is what it printed.
+  const s = initialState();
+  s.activeTurnId = "turn";
+  const row: BackgroundTaskRecord = {
+    task_id: "bp1", run_id: "r1", kind: "shell", task_type: "local_bash", description: "woken foreground",
+    subagent_type: null, parent_task_id: null, tool_use_id: "toolu_w", ambient: false, workflow_name: null,
+    status: "running", live: false, started_at: 1, ended_at: null, finished_seq: null, summary: null,
+    last_tool_name: null, usage: null, error: null, is_backgrounded: false, reason: null, output_file: null,
+    workflow_progress: null,
+  };
+  s.backgroundTasks = { rows: [row], query_start: false };
+  const show = (c: ToolCallRecord) => renderToStaticMarkup(<>{renderToolCall(c, false, { cardLine: toolCardLine(c, s) })}</>);
+  const running = call({ toolUseId: "toolu_w", turnId: "turn", input: { command: "wait w; echo W" } });
+  expect(toolCardLine(running, s)).toBeNull();
+  expect(show(running)).toContain("Running…");
+  expect(show(running)).not.toContain("stopped with the session");
+
+  s.backgroundTasks = { rows: [{ ...row, status: "completed", ended_at: 2, finished_seq: 3 }], query_start: false };
+  s.notices = [{ seq: 5, kind: "task", level: "notice", content: "woken foreground", scalars: {}, taskId: "bp1", toolUseId: "toolu_w", taskStatus: "completed" }];
+  const done = call({ toolUseId: "toolu_w", turnId: "turn", input: { command: "wait w; echo W" }, result: { content: "W", isError: false } });
+  expect(toolCardLine(done, s)).toBeNull();
+  expect(show(done)).not.toContain("in background");
+
+  // Moved aside: the task says so and the result names the move, and the line follows the roster again.
+  s.backgroundTasks = { rows: [{ ...row, is_backgrounded: true, live: true }], query_start: false };
+  s.notices = [];
+  const moved = call({ toolUseId: "toolu_w", turnId: "turn", input: { command: "wait w; echo W" },
+    result: { content: "Command was moved to the background (ID: bp1). Output is being written", isError: false } });
+  expect(toolCardLine(moved, s)).toBe("⎿ Running in the background · /tasks");
 });

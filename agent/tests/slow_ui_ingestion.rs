@@ -72,6 +72,7 @@ impl AgentProvider for ScriptedProvider {
             interactive_permission_mode: true,
             cli_auto_mode: false,
             steer: false,
+            ..Default::default()
         }
     }
     fn info(&self) -> ProviderInfo {

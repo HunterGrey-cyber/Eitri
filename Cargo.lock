@@ -665,7 +665,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "claude-runtime-protocol"
 version = "0.1.0"
-source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=8061cc4b0bf761d6ac065328c0916a0397c25ecc#8061cc4b0bf761d6ac065328c0916a0397c25ecc"
+source = "git+https://github.com/HunterGrey-cyber/verdandi.git?rev=842d54e6c4cccf4aa71e8ded54c020c0253ad78e#842d54e6c4cccf4aa71e8ded54c020c0253ad78e"
 dependencies = [
  "prost",
  "serde_json",

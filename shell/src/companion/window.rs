@@ -821,7 +821,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         window.connect_close_request(move |_| {
             // A running or queued turn is worth one y/n; `y` closes the window again and this sees
             // the confirmation.
-            if let Some(text) = eitri_core::tabs::window_close_prompt(agent.running_count(), agent.queued_count()) {
+            if let Some(text) = eitri_core::tabs::window_close_prompt(
+                agent.running_count(),
+                agent.queued_count(),
+                agent.background_count(),
+            ) {
                 if !close_prompt.confirmed() {
                     close_prompt.ask_to_close_window(&text);
                     return gtk4::glib::Propagation::Stop;

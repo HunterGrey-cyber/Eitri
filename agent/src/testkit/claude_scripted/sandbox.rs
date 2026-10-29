@@ -114,6 +114,48 @@ pub fn check() -> bool {
     }
 }
 
+/// Moves what the earlier runs of this sandbox left aside, under `<dir>-<name>` (they stay on disk for anyone
+/// looking at a failure), so the next run starts from the state a run starts from: no log, no endpoint record, no
+/// CLI configuration or transcript, no task output of the CLI, no open gate. A scenario that runs more than once
+/// in one sandbox (a variant beside its base) calls this before each run after the first.
+pub fn set_earlier_run_aside(run: &Path, name: &str) {
+    // The runner reads `log/test.out` for the whole sandbox run, so the log directory stays and its files go.
+    let log = run.join("log");
+    let log_aside = run.join(format!("log-{name}"));
+    std::fs::create_dir_all(&log_aside).unwrap_or_else(|e| panic!("making log-{name}: {e}"));
+    for entry in std::fs::read_dir(&log).into_iter().flatten().flatten() {
+        if entry.file_name() != "test.out" {
+            std::fs::rename(entry.path(), log_aside.join(entry.file_name()))
+                .unwrap_or_else(|e| panic!("setting a log aside: {e}"));
+        }
+    }
+    for dir in ["standin", "claude", "project", "tmp", "r"] {
+        let from = run.join(dir);
+        if from.exists() {
+            std::fs::rename(&from, run.join(format!("{dir}-{name}")))
+                .unwrap_or_else(|e| panic!("setting {dir} aside: {e}"));
+        }
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .recursive(true)
+            .create(&from)
+            .unwrap_or_else(|e| panic!("recreating {dir}: {e}"));
+    }
+    for entry in std::fs::read_dir(run.join("gates")).into_iter().flatten().flatten() {
+        if entry.path().extension().is_some_and(|e| e == "open") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Waits (fifteen seconds at most) for the process `pid` to be gone, so the next run's sidecar and CLI start
+/// alone.
+pub fn wait_gone(pid: u32) {
+    let end = Instant::now() + Duration::from_secs(15);
+    while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Every condition of the self-check, cheapest first, so that outside the sandbox the missing run variable
 /// ends it before any connect is tried. `network` must succeed only when a connect outside loopback fails
 /// at once for want of a route.
@@ -247,7 +289,7 @@ fn other_runs_hidden(root: &Path, run: &Path, on_tmpfs: &dyn Fn(&Path) -> io::Re
                 return Err(format!(
                     "{} is not on the sandbox's tmpfs: other runs and their sockets are in view",
                     dir.display()
-                ))
+                ));
             }
             Err(e) => return Err(format!("cannot statfs {}: {e}", dir.display())),
         }
@@ -447,6 +489,36 @@ mod tests {
 
     const RUN: &str = "/mnt/eitri-runs/ch/abcd1234/c00";
     const PASSWD_HOME: &str = "/home/someone";
+
+    #[test]
+    fn a_run_set_aside_leaves_the_next_one_empty_directories_and_the_runners_log_in_place() {
+        let run = crate::state_dirs::test_workspace_dir("sandbox-aside");
+        for dir in ["log", "standin", "claude/projects", "project", "tmp", "r", "gates"] {
+            fs::create_dir_all(run.join(dir)).unwrap();
+        }
+        fs::write(run.join("log/test.out"), "the runner reads this").unwrap();
+        fs::write(run.join("log/cli-stdout.jsonl"), "x").unwrap();
+        fs::write(run.join("standin/endpoint.jsonl"), "x").unwrap();
+        fs::write(run.join("claude/projects/s.jsonl"), "x").unwrap();
+        fs::write(run.join("gates/wait"), "#!/bin/sh").unwrap();
+        fs::write(run.join("gates/k.open"), "").unwrap();
+
+        set_earlier_run_aside(&run, "before-run3");
+
+        assert_eq!(
+            fs::read_to_string(run.join("log/test.out")).unwrap(),
+            "the runner reads this"
+        );
+        assert!(!run.join("log/cli-stdout.jsonl").exists(), "the tap's log moved");
+        assert!(run.join("log-before-run3/cli-stdout.jsonl").is_file());
+        assert!(run.join("standin-before-run3/endpoint.jsonl").is_file());
+        assert!(run.join("claude-before-run3/projects/s.jsonl").is_file());
+        for dir in ["standin", "claude", "project", "tmp", "r"] {
+            assert_eq!(fs::read_dir(run.join(dir)).unwrap().count(), 0, "{dir} starts empty");
+        }
+        assert!(run.join("gates/wait").is_file(), "the gate script stays");
+        assert!(!run.join("gates/k.open").exists(), "an opened gate is closed again");
+    }
 
     /// The mount table of a sandbox on a host with a synced tree: the remote mount is covered, so nothing at
     /// its mount point is that file system.

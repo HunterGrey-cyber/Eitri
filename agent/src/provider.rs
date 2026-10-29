@@ -81,6 +81,23 @@ pub struct SteerTurnRequest {
     pub as_typed: String,
 }
 
+/// What a provider may say about a message besides its text ([`AgentProvider::send_turn_stamped`],
+/// [`AgentProvider::steer_turn_stamped`]). A provider that cannot carry a part leaves it off; the
+/// default methods leave all of it off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnStamp {
+    /// The host's own id for the message, which the agent names back when it reads the message later
+    /// than the send (`UserMessageDelivered`) or drops it (`UserMessageDropped`). Sent only by a
+    /// provider whose agent can say so.
+    pub client_message_id: Option<String>,
+    /// The person typed it into the composer; text the host or a plugin composed is `false`. Sent
+    /// only by a provider whose agent accepts the mark.
+    pub typed_by_person: bool,
+    /// What the person typed, which the conversation shows if the agent reads the message later
+    /// than the send. `None`: the request's own text.
+    pub as_typed: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InterruptTurnRequest {
     pub session_id: String,
@@ -143,9 +160,139 @@ pub struct ResolvePermissionRequest {
     pub decision: PermissionDecision,
 }
 
+/// One question's answer as the person gave it: the options chosen, by their index in the question
+/// Claude asked, and the text typed in its "Type something" field. Never the answer's words: the
+/// provider builds those from the question it kept, so nothing a page sends becomes the tool's input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    /// The question's index in its set.
+    pub question_index: u32,
+    pub option_indexes: Vec<u32>,
+    pub other_text: Option<String>,
+    /// Taken only by a single-select question that offers previews.
+    pub notes: Option<String>,
+}
+
+/// How the person turned a question set down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionDeclineKind {
+    /// Escape: Claude is told the person declined, and the turn stops as it does in the terminal.
+    Cancel,
+    /// "Chat about this": Claude is told to ask in the chat what the person wants to clarify, with
+    /// what was answered so far, and the turn goes on.
+    Chat,
+}
+
+/// What the person did with one question set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionResolution {
+    /// Submitted; a question left out was not answered.
+    Answers(Vec<QuestionAnswer>),
+    /// Declined. `so_far` is what was answered before a `Chat`; a `Cancel` carries none.
+    Decline {
+        kind: QuestionDeclineKind,
+        so_far: Vec<QuestionAnswer>,
+    },
+}
+
+/// The person's answer to one question set Claude asked ([`AgentProvider::resolve_interaction`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveInteractionRequest {
+    pub session_id: String,
+    pub interaction_id: String,
+    pub resolution: InteractionResolution,
+}
+
+/// What became of an answer to a question set: the outcome the provider reported when it reported
+/// one, or why it was not taken.
+pub type InteractionReply = Result<Option<crate::QuestionOutcome>, ProviderError>;
+
+/// An answer to a question set on its way to the provider ([`AgentProvider::resolve_interaction`]).
+/// Sending never waits for the provider: the reply comes through this handle, read without blocking
+/// ([`Self::try_reply`]) by whoever polls it, or waited for ([`Self::wait`]) by a caller that may
+/// block. A provider may tie a guard to the handle that lasts until the handle is dropped, so the
+/// session is not handed elsewhere while the reply is still unread.
+pub struct InteractionSend {
+    rx: std::sync::mpsc::Receiver<InteractionReply>,
+    _guard: Option<Box<dyn Send>>,
+}
+
+impl std::fmt::Debug for InteractionSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractionSend").finish_non_exhaustive()
+    }
+}
+
+impl InteractionSend {
+    /// A send still on its way, and the sender its reply goes through. A sender dropped with no reply
+    /// reads as a transport failure.
+    pub fn channel() -> (std::sync::mpsc::Sender<InteractionReply>, Self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (tx, InteractionSend { rx, _guard: None })
+    }
+
+    /// A send whose reply is already known.
+    pub fn ready(reply: InteractionReply) -> Self {
+        let (tx, send) = Self::channel();
+        let _ = tx.send(reply);
+        send
+    }
+
+    /// Keeps `guard` alive for as long as this handle.
+    pub fn with_guard(mut self, guard: impl Send + 'static) -> Self {
+        self._guard = Some(Box::new(guard));
+        self
+    }
+
+    /// The reply once it came, `None` while the answer is still on its way. Read once: a later call
+    /// after a reply was taken reads as a transport failure.
+    pub fn try_reply(&self) -> Option<InteractionReply> {
+        match self.rx.try_recv() {
+            Ok(reply) => Some(reply),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(Self::stopped())),
+        }
+    }
+
+    /// Waits for the reply up to `timeout`, for a caller that may block; past it, `Timeout`.
+    pub fn wait(&self, timeout: std::time::Duration) -> InteractionReply {
+        match self.rx.recv_timeout(timeout) {
+            Ok(reply) => reply,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ProviderError::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Self::stopped()),
+        }
+    }
+
+    fn stopped() -> ProviderError {
+        ProviderError::Transport("the answer's send stopped before the provider replied".to_string())
+    }
+}
+
+/// The question sets a session still waits on, as its provider holds them
+/// ([`AgentProvider::get_interaction_state`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InteractionState {
+    /// The provider's event sequence the set is consistent with: events after it apply on top.
+    pub through_sequence: u64,
+    /// One `QuestionAsked` per question set still waiting, checked like a live one.
+    pub pending: Vec<AgentDomainEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CloseSessionRequest {
     pub session_id: String,
+}
+
+/// A task RPC completes on the provider runtime; callers poll this receiver without waiting.
+pub type TaskReply<T> = std::sync::mpsc::Receiver<Result<T, ProviderError>>;
+
+/// The last bytes of a task's output, decoded lossily rather than treated as a file path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOutput {
+    pub output: String,
+    pub total_bytes: u64,
+    pub truncated: bool,
 }
 
 /// What a provider can actually do, as reported by the provider itself -- never inferred from a
@@ -197,6 +344,43 @@ pub struct ProviderCapabilities {
     /// ([`AgentProvider::steer_turn`]); the agent reads it at its next step. Without it a message
     /// typed while a turn runs is held by the host until the turn ends.
     pub steer: bool,
+    // Protocol 3.22: one flag per capability the sidecar advertises, each read from the handshake's
+    // list alone. They report what the sidecar offers; what this client asks the sidecar for is decided
+    // separately (`CLIENT_IMPLEMENTS_*` in the Claude provider), so a flag here never puts anything new
+    // on the wire by itself. `serde(default)`: a value serialized before a flag existed reads as
+    // "not offered".
+    /// The sidecar opens a turn for work Claude Code starts by itself, with its origin and cause.
+    #[serde(default)]
+    pub cli_turns: bool,
+    /// The sidecar can mark a message as typed by a person.
+    #[serde(default)]
+    pub human_origin: bool,
+    /// The sidecar reports the CLI's background tasks (`BackgroundTasksChanged`, `TaskEvent`).
+    #[serde(default)]
+    pub background_tasks: bool,
+    /// A workflow task's events carry its phases and agents.
+    #[serde(default)]
+    pub workflow_progress: bool,
+    /// The sidecar can stop one background task (`StopTask`), and can keep an interrupt from
+    /// stopping background work when the session asks for that.
+    #[serde(default)]
+    pub task_control: bool,
+    /// The sidecar can read a background task's output (`GetTaskOutput`).
+    #[serde(default)]
+    pub task_output: bool,
+    /// A subagent's text and tool calls carry the id of the call that started it.
+    #[serde(default)]
+    pub subagent_frames: bool,
+    /// The sidecar reports the CLI's notices: retries, rate limits, model fallbacks, compaction,
+    /// notifications.
+    #[serde(default)]
+    pub session_notices: bool,
+    /// The sidecar reports `/clear` starting a new conversation in the same session.
+    #[serde(default)]
+    pub conversation_reset: bool,
+    /// The sidecar can hand Claude's questions to this host to answer, when the session asks for it.
+    #[serde(default)]
+    pub structured_questions_v1: bool,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -267,6 +451,14 @@ pub enum ProviderErrorCode {
     /// The session cannot take a message into the running turn now; the host holds it for the turn's
     /// end.
     SteerUnavailable,
+    /// A request named a background task the session does not know (it may have ended already).
+    TaskNotFound,
+    /// A background task's output cannot be read.
+    TaskOutputUnavailable,
+    /// A request named a question the session does not hold (it may have been resolved already).
+    InteractionNotFound,
+    /// An answer to a question was refused as it was given.
+    InteractionAnswerRefused,
 }
 
 impl ProviderErrorCode {
@@ -286,6 +478,10 @@ impl ProviderErrorCode {
                 | ProviderErrorCode::IdempotencyConflict
                 | ProviderErrorCode::TurnMismatch
                 | ProviderErrorCode::SteerUnavailable
+                | ProviderErrorCode::TaskNotFound
+                | ProviderErrorCode::TaskOutputUnavailable
+                | ProviderErrorCode::InteractionNotFound
+                | ProviderErrorCode::InteractionAnswerRefused
         )
     }
 }
@@ -345,6 +541,12 @@ pub trait AgentProvider {
     /// Returns the new turn's own id. At most one active turn per session -- a
     /// provider rejects a second `send_turn` while one is already in flight rather than queuing it.
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError>;
+    /// [`send_turn`](Self::send_turn) with what the host knows about the message beyond its text. The
+    /// default drops the stamp: a provider that cannot carry it sends exactly what `send_turn` does.
+    fn send_turn_stamped(&self, request: SendTurnRequest, stamp: TurnStamp) -> Result<String, ProviderError> {
+        let _ = stamp;
+        self.send_turn(request)
+    }
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError>;
     /// Puts one user message into the running turn without interrupting it. Called on the host's UI
     /// thread, so it must not wait on the agent: `Ok` means the provider took the message and will send
@@ -379,7 +581,45 @@ pub trait AgentProvider {
         let _ = request;
         Err(ProviderError::UnsupportedCapability("steer"))
     }
+    /// [`steer_turn`](Self::steer_turn) with the stamp's mark of a typed message. The default drops the
+    /// stamp. The request's own `client_message_id` and `as_typed` stand; the stamp's are not read.
+    fn steer_turn_stamped(&self, request: SteerTurnRequest, stamp: TurnStamp) -> Result<(), ProviderError> {
+        let _ = stamp;
+        self.steer_turn(request)
+    }
+    /// Stops work left running between turns. `tasks` is the canonical projection's live,
+    /// non-ambient roster; providers with their own background count still validate `shown`.
+    fn stop_background(&self, session_id: &str, shown: u32, tasks: &[String]) -> Result<(), ProviderError> {
+        let _ = (session_id, shown, tasks);
+        Err(ProviderError::UnsupportedCapability("stop_background"))
+    }
+    /// Starts one stop without waiting on the UI thread. The receiver carries the RPC's outcome.
+    fn stop_task(&self, session_id: &str, task_id: &str) -> Result<TaskReply<()>, ProviderError> {
+        let _ = (session_id, task_id);
+        Err(ProviderError::UnsupportedCapability("stop_task"))
+    }
+    /// Reads a bounded output tail on the provider runtime, never opening a sidecar-supplied path.
+    fn task_output(&self, session_id: &str, task_id: &str) -> Result<TaskReply<TaskOutput>, ProviderError> {
+        let _ = (session_id, task_id);
+        Err(ProviderError::UnsupportedCapability("task_output"))
+    }
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError>;
+    /// Hands the person's answer to one question set to the agent without waiting for it: `Err` is a
+    /// refusal before anything was sent, `Ok` the send on its way, whose reply says whether the
+    /// provider took it, with the outcome it reported when it reported one. The question ends only
+    /// with its `QuestionSettled`, which arrives through [`pump`](Self::pump). An id is single use: an
+    /// answer to one already settled is refused (`InteractionNotFound`), and an answer that breaks a
+    /// rule of the set is refused (`InteractionAnswerRefused`) with the question still waiting. A
+    /// provider that cannot ask questions refuses every one.
+    fn resolve_interaction(&self, request: ResolveInteractionRequest) -> Result<InteractionSend, ProviderError> {
+        let _ = request;
+        Err(ProviderError::UnsupportedCapability("structured_questions_v1"))
+    }
+    /// The question sets the session still waits on, asked after its event stream was opened again.
+    fn get_interaction_state(&self, session_id: &str) -> Result<InteractionState, ProviderError> {
+        let _ = session_id;
+        Err(ProviderError::UnsupportedCapability("structured_questions_v1"))
+    }
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError>;
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --
     /// mirrors `AgentSession::pump()`'s existing contract exactly.

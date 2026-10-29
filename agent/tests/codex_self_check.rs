@@ -14,7 +14,6 @@ mod codex_peer;
 use agent::providers::codex::self_check::{ensure_checked, ensure_checked_tweaked, CheckTweaks, SelfCheckError};
 use agent::providers::codex::{locate_codex, CodexLaunch, CodexProvider};
 use agent::{ProviderError, ProviderErrorCode};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -62,16 +61,29 @@ fn verdicts(state: &Path) -> usize {
 
 // ---------------------------------------------------------------- no Codex needed
 
+/// Writes an executable script through a child process. Written from this process, the file's write
+/// descriptor would be open here while a test on another thread forks; the forked child holds it until
+/// it execs, and running the script meanwhile fails with `ETXTBSY` ("Text file busy").
+fn write_script(path: &std::path::Path, body: &str) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+        .arg("sh")
+        .arg(body)
+        .arg(path)
+        .status()
+        .expect("sh runs");
+    assert!(status.success(), "writing the script failed: {status}");
+}
+
 #[test]
 fn a_codex_that_cannot_run_the_check_refuses_every_start() {
     let scratch = Scratch::new("stand-in");
     let program = scratch.0.join("codex");
-    std::fs::write(
+    write_script(
         &program,
         "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'codex-cli 0.161.0' ;;\n  *) exit 1 ;;\nesac\n",
-    )
-    .expect("writes the stand-in");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     let launch = || CodexLaunch {
         program: program.clone(),
         cwd: scratch.0.clone(),

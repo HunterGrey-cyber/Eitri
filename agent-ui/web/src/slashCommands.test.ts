@@ -217,6 +217,9 @@ describe("the `/` menu's rows", () => {
       "rewind",
       "doctor",
       "output-style",
+      "tasks",
+      "bashes",
+      "workflows",
     ]);
   });
 

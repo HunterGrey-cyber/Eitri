@@ -1,6 +1,6 @@
 import { forwardRef, useLayoutEffect, useRef } from "react";
 import type { Ref } from "react";
-import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
+import { browseKeys, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -331,6 +331,22 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         ]}
       />
       {claudeSlashCommands && <SlashCommands />}
+      {/* Claude Code's background tasks list and its question dock own their keys while they are up, like the
+          review overlay; both exist only on Claude tabs, so they follow the slash commands. */}
+      {claudeSlashCommands && (
+        <Section
+          title="Background tasks (/tasks)"
+          rows={TASKS_KEYS}
+          note="Opened with /tasks (or /bashes), /workflows, the band's background count, the tasks line, or Enter on a running background card. <leader>k asks before stopping everything left running."
+        />
+      )}
+      {claudeSlashCommands && (
+        <Section
+          title="Claude's question"
+          rows={QUESTION_KEYS}
+          note="While Claude asks, the question takes the box's place; only keys you press answer it."
+        />
+      )}
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section
         title={`After ${prefixLabel}`}

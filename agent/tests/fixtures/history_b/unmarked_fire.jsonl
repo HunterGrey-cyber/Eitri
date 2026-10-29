@@ -1,0 +1,4 @@
+{"type":"user","uuid":"turn-1","promptSource":"typed","message":{"role":"user","content":"Schedule"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","id":"m1","content":[{"type":"text","text":"Scheduled"}]}}
+{"type":"user","uuid":"fire","isMeta":true,"promptSource":"system","turnOrigin":"scheduled","message":{"role":"user","content":"Check"}}
+{"type":"assistant","uuid":"a2","message":{"role":"assistant","id":"m2","content":[{"type":"text","text":"Checked"}]}}
