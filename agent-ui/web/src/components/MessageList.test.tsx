@@ -560,10 +560,14 @@ describe("MessageList: an abandoned tool result never spins forever (sw-panel-re
   });
 });
 
-/* Following a new row must not pull a reader away from an earlier row reached with `j`/`k`.
-   Deltas merge into one transcript entry and do not rerun this effect. Use `.message-list`
-   scroll events rather than the cursor or a measurement after the new row mounts. jsdom has no
-   layout or automatic scroll events, so these tests set the dimensions and dispatch `scroll`. */
+/* The other half of `j` not scrolling inside a long output: before this, a new ROW unconditionally scrolled the
+   view to the bottom, which fought the cursor the moment a user had used `j`/`k` to read something
+   further up. (Not every streamed delta, as this comment first said: deltas merge into one
+   transcript entry and never re-ran the effect -- see `MessageList.tsx`'s own comment.) The guard is
+   driven by scroll events on `.message-list`, not by the cursor and not by a measurement taken after
+   the new row is already in the DOM -- see that same comment for why each of those was wrong. jsdom
+   implements no layout and fires no scroll events on its own, so these tests set the three
+   dimensions and dispatch `scroll` themselves. */
 function setScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight: number; scrollTop: number }) {
   Object.defineProperty(list, "scrollHeight", { value: dims.scrollHeight, configurable: true });
   Object.defineProperty(list, "clientHeight", { value: dims.clientHeight, configurable: true });
@@ -605,8 +609,9 @@ describe("MessageList auto-follow", () => {
     expect(list.scrollTop).toBe(2200);
   });
 
-  /* Bring the new row to the end in the same render commit, before paint. Waiting for a smooth
-     scroll leaves the user prompt as the last visible text while the reply's first row mounts. */
+  /* The GUI pass's F-c, red on the earlier follow snap: the new row is at the end in the SAME commit -- before
+     paint -- rather than after a smooth scroll's animation, which is what left the user's own prompt
+     the last row with text for a frame or two as a reply's first row mounted. */
   it("brings a new row into view in the same commit, by a snap and never a smooth scroll", () => {
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     const { container, rerender } = render(<MessageList state={state({ userPrompts: texts("why?") })} {...props} />);
@@ -907,10 +912,15 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
   });
 });
 
-/* Distinguish wheel intent from actual scrolling. An upward scroll through any route, including
-   browser keys or a Tab reveal, must stop following. A negative `deltaY` that moves nothing must
-   not stop it permanently: a sideways swipe may jitter vertically, a nested tool-result box may
-   consume the wheel, or the list may already be at the top. */
+/* The follow guard must distinguish a wheel intent from a successful scroll. Change B
+   recognised a wheel, a held pointer, a touch drag and the panel's own keys, and read every other
+   scroll as the engine's -- so (a) a reader who scrolled up by a route it did not list (the
+   browser's own PageUp/arrow scroll with a control inside the list focused, a Tab reveal) was put
+   back at the bottom by the next delta, a trap the base did not have; and (b) any wheel with a
+   negative `deltaY` ended following even when the list never moved (a sideways touchpad swipe with
+   a sub-pixel vertical jitter, a wheel an expanded tool result's own box took, a wheel with nothing
+   to scroll up to), which the base did not do either. Each test below that is not marked as a
+   guard fails on the earlier follow logic. */
 describe("MessageList: a send resumes following", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
@@ -1163,10 +1173,16 @@ describe("MessageList: every route a user scrolls by is theirs, and a gesture th
   });
 });
 
-/* A provisional stop must be settled when the gesture window expires, even if no state change
-   follows. A wheel routed elsewhere can otherwise leave a new permission row below the view
-   indefinitely while the turn waits. Catch up with a snap, and check `scrollTop`; the unmount
-   guard also checks cleanup of the timer. */
+/* A provisional stop was previously taken back only inside the
+   follow effect, which runs on a state change. A misprediction (a wheel the engine sent somewhere
+   else) followed, inside its window, by a new row and then silence -- a permission card, after which
+   the turn waits -- left that row below the view until something else arrived, which may be nothing.
+   The take-back now also runs when the gesture's window runs out, and catches up with what the stop
+   held back. The five tests below that are not marked as guards fail on the earlier take-back; so does the unmount
+   guard, which counts the new timer itself. The other three guards pass on both.
+
+   Correction (the GUI pass, 2026-09-24): the catch-up for a new row is a snap now, as every follow is,
+   so the tests below read `scrollTop` where they read a call to `scrollIntoView`. */
 describe("MessageList: a stop on a gesture that moved nothing is settled when the gesture ends", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
   const scrollIntoView = () => Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -1315,9 +1331,12 @@ describe("MessageList: a stop on a gesture that moved nothing is settled when th
     expect(list.scrollTop).toBe(1600);
   });
 
-  /* WebKitGTK animates a wheel scroll over about 200ms. Its first scroll event can report the
-     unchanged position. At the bottom, that event must not re-arm following or clear the
-     provisional stop, or the next delta or new row could cancel the wheel's scroll. */
+  /* Found while building the real-engine test for the above: WebKitGTK performs the
+     default scroll for a wheel event and animates it over about 200ms, and its FIRST scroll event,
+     0-1ms after the wheel, can report the list exactly where the wheel found it -- seen in 2 of 8
+     wheels at the tail. At the bottom, that event re-armed following and cleared the provisional
+     stop, so the next delta (or a new row's smooth scroll) cancelled the wheel's scroll: the very
+     case the stop exists for. The first two fail on the earlier take-back; the three after them are guards. */
   it("keeps a wheel's stop through the wheel's own first scroll event when it reports no movement", () => {
     const pass = fakeTime();
     const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
@@ -1600,10 +1619,14 @@ describe("MessageList watches rows that mount without a new state", () => {
   });
 });
 
-/* A following view must stay at the end when the list or a row changes size, even without a
-   state change. Divider drags, zoom, the terminal, or composer growth can resize the list while
-   a turn waits. Row wrapping or font changes can resize content independently. Observe both the
-   list and every row with `ResizeObserver`, then snap a following view to its end. */
+/* The follow snap ran only on a state change, so
+   a resize with nothing streaming -- a divider drag, an unzoom, the bottom terminal shown, the composer
+   growing -- left a following view short (482px and 651px, measured), for as long as a tool call ran,
+   a permission card waited, or the turn was over. Rows can change size with the list's box unchanged
+   too (`--column-w` set on the list; a font push also shortens the list, since the
+   status line and composer grow with it). The `ResizeObserver` watches the list and every row, and
+   snaps a following view to its end. The four tests not marked
+   as guards fail on the earlier follow snap, which observed the list alone and only wrote its width. */
 describe("MessageList keeps a following view at its end when the list or a row changes size", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
 

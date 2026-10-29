@@ -1,57 +1,53 @@
-//! Checks display isolation in test sources on every plain `cargo test`, without `--ignored`.
-//! `support/own_x_server.rs` protects only tests that call it before connecting. Checking only
-//! `GDK_BACKEND=x11` still permits a connection to an inherited XWayland display.
+//! Checks display isolation from test sources on every plain `cargo test`,
+//! including tests that run only with `--ignored`.
 //!
-//! Every Rust file under `shell/tests` and `neovide-editor/tests` is read as text. A file that
-//! opens a display must include `own_x_server.rs` with `#[path]` and call `isolate` or `init_gtk`,
-//! unless [`ALLOWED`] supplies a reason and the required replacement calls.
+//! `support/own_x_server.rs` isolates a test only if the test calls it before opening
+//! a display. Checking only `GDK_BACKEND=x11` also accepts a desktop's XWayland display.
+//! This scan reads every Rust file under `shell/tests` and `neovide-editor/tests` and
+//! requires display-using tests to include and call the helper, unless [`ALLOWED`]
+//! names the file and the checks that replace the helper.
 //!
-//! [`find_signals`] detects display use. Comments and string literals are blanked out for code
-//! checks by [`code_and_strings`], so a message mentioning `LiveHarness` does not count.
-//! [`CODE_SIGNALS`] lists display-related names such as `LiveHarness`, `NeovideEditorPane`,
-//! `WebView`, GTK application and window types, and winit's `EventLoop`.
-//! [`DISPLAY_CRATES`] identifies display paths and imports, including renamed, globbed and
-//! grouped `use` items and `extern crate` declarations. [`use_items`] handles these imports.
-//! [`resolved`] follows every binding through chains of aliases, including duplicate bindings.
-//! [`used_positions`] recognises uses as paths, calls, macros and attributes, including paths
-//! prefixed by `self::`, `crate::`, `super::` or a local module. Thus `g::init()` and
-//! `crate::g::init()` count like `gtk4::init()` when `g` aliases `gtk4`. Display globs also bind
-//! names the scan follows, such as `init` and `test_synced`.
-//! String checks use [`PROGRAMS`] to detect commands that launch display servers or clients,
-//! input injectors, clipboard or screen tools, or the product's GUI binary. The first word or
-//! its file name counts, so `"/usr/bin/xdotool key a"` counts as `"xdotool"`. If the file runs
-//! `sh -c`, any word of another literal can name a program.
+//! [`find_signals`] detects display use through:
+//! - display-specific names such as `LiveHarness`, `NeovideEditorPane`, `WebView`,
+//!   GTK application and window types, and winit's `EventLoop` ([`CODE_SIGNALS`]);
+//! - display crate paths ([`DISPLAY_CRATES`]) and their imports, including renamed,
+//!   grouped and glob imports. [`use_items`] and [`resolved`] follow alias chains
+//!   and multiple bindings of a name. [`used_positions`] finds paths, calls, macros
+//!   and attributes, including paths prefixed by `self::`, `crate::`, `super::`
+//!   or a local module. Globs also bind names such as `init` and `test_synced`;
+//! - command literals naming display servers, clients, input, clipboard or screen
+//!   tools, or the GUI binary ([`PROGRAMS`]). The first command word or its file name
+//!   counts, as do program words inside literals when the file runs `sh -c`.
+//! Comments and strings are blanked by [`code_and_strings`] for code signals;
+//! command literals are examined separately. Mentioning `LiveHarness` in a message
+//! therefore does not count as display use.
 //!
-//! [`offence`] requires the real helper to be included and called in a test's `main` before
-//! its first display signal. A call in an unused function or after a connection cannot isolate
-//! that connection. Independent GTK initialisation and GTK test macros are rejected. The macros
-//! initialise GTK before the test body, so calling the helper inside the body is too late.
-//! Aliases and globs of GTK test macros are rejected too.
+//! [`offence`] requires the real helper to be `#[path]`-included and called by the
+//! file's `main` before its first display signal. A call in an unused function or
+//! after a connection is too late. Separate `gtk4::init` calls and gtk-rs test macros
+//! are refused, including aliases and glob imports: the macros initialise GTK before
+//! the test body, so a helper call in the body cannot isolate them.
 //!
-//! [`ALLOWED`] entries must match calls in the file's `main`, in order. GTK initialisation is
-//! counted across the whole file and must occur exactly once in an allowed spelling, including aliases.
-//! Each check of the display socket, compositor or outputs must use a `match` or `if let Err`
-//! whose error arm exits the process or returns from `main`.
+//! An allowlisted file must keep its checks in order in its real `main`, initialise
+//! GTK exactly once across the file, and stop on a failed display check. Each socket,
+//! compositor or output check must be matched with an `Err` arm that exits or returns
+//! from `main`. A file that otherwise matches must be listed in [`ALLOWED`] with a reason.
 //!
-//! This text scan catches accidental omissions and misuse. It does not prove which code runs.
-//! The following cases can bypass its checks:
-//! - An inline `mod own_x_server { .. }` can sit beside the real helper included under another
-//!   name, since the `#[path]` attribute and module declaration are checked separately.
-//! - A helper call under `#[cfg(any())]` or `if false { .. }` is still present in the text.
-//! - `let _ = own_x_server::init_gtk(..)` immediately drops and stops the returned server.
-//!   The test then loses its display and GTK fails to connect.
-//! - A nested module's `fn main` before the real entry point is selected by [`main_range`],
-//!   which takes the first textual `fn main(`.
-//! - A helper call in an uncalled closure inside `main` counts at its textual position.
-//! - An imported GTK init or test macro taken as a value and called through a local variable
-//!   is not followed, as in `use gtk4::init as start; let f = start; f()`. A bare name only
-//!   counts when used as a path, call, macro or attribute.
+//! This is a text check for accidental omissions, with these limitations:
+//! - A local `mod own_x_server` can coexist with the real helper included under
+//!   another name; the path attribute and module declaration are checked separately.
+//! - Helper calls under `#[cfg(any())]`, `if false` or uncalled closures still count.
+//! - Discarding the server with `let _ = own_x_server::init_gtk(..)` stops it immediately;
+//!   GTK then fails to find that display.
+//! - [`main_range`] takes the first textual `fn main(`, including one in a nested module.
+//! - Taking GTK init or a test macro as a value and calling it through a local variable
+//!   is not followed. Bare names count only as paths, calls, macros or attributes.
 //!
-//! The scan does not read modules included from `src/`, resolve executable names held in
-//! variables, inspect generated scripts, or cover tests outside these two crates' `tests/`.
-//! Display connections in other functions called before the helper are not ordered against it.
-//! GTK init anywhere in the file is still rejected, but a winit `EventLoop::new` inside an
-//! earlier call to `setup()` can escape this ordering check.
+//! The scan does not read modules included from `src/`, commands held in variables,
+//! or scripts written to files and executed. It does not order display calls inside
+//! functions called by `main`; a winit connection in such a function can precede the
+//! helper. GTK init anywhere in the test file is still checked. Tests outside these
+//! two crates' `tests/` directories are not scanned.
 
 use std::path::{Path, PathBuf};
 
@@ -1288,7 +1284,7 @@ fn code_and_strings_blanks_every_literal_and_comment() {
     assert_eq!(code.lines().count(), 2, "newlines are kept");
 }
 
-// ---- Ways around the scan ----------------------------------------------------------------
+// ---- what review showed the scan could be walked around by (2026-09-29) -----------
 
 /// The include a passing source starts with.
 const INCLUDE: &str = "#[path = \"support/own_x_server.rs\"]\nmod own_x_server;\n";
@@ -1783,10 +1779,10 @@ fn the_helper_must_come_first_in_main() {
 
 // ---- the parked limits' follow-up (2026-09-29): aliases resolved outside the flattener -----------------------
 
-/// Checks that names imported from display crates count through chains of aliases.
-/// An alias such as `g` in `use gtk4 as g;` or `start` in `use gtk4::init as start;`
-/// must count in `main`'s call order, the allowlisted file's GTK init count, and the
-/// ban on GTK test macros.
+/// Two limits the scan once had: a name a `use` binds to
+/// a display crate, or to a path in one -- `g` in `use gtk4 as g;`, `start` in `use gtk4::init as start;`,
+/// through any chain of them -- is that crate wherever it is used: in `main`'s order, in the allowlisted file's
+/// count of GTK's init, and in the macro ban.
 #[test]
 fn aliases_count_in_main_and_in_the_macro_ban() {
     let with = |body: &str| format!("{INCLUDE}{body}");

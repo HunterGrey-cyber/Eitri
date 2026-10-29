@@ -190,18 +190,27 @@ pub enum PermissionMode {
     Bypass,
 }
 
-/// Classifies the CLI's reported permission mode for a gated session.
-/// Sessions normally request `default` on both backends. The explicit legacy flag
-/// `--permission-mode default` overrides a project's `permissions.defaultMode`, and the
-/// sidecar also requests `default`. Checking reports guards against changes in that behavior.
-/// If a hook gives no answer, such as after its 600 s timeout or a relay failure that escapes
-/// `write_fail_closed_deny`, `default` denies unless a project `permissions.allow` rule matches.
-/// This check cannot detect those allow rules. A less restrictive mode can run the tool
-/// without a hook answer, so less restrictive or unknown reported modes stop the session.
-/// A session that requested [`RequestedCliMode::Auto`] through `cli_auto_mode` and
-/// `permission_defer` instead accepts `auto` or its `default` fallback when auto is unavailable.
-/// Any other report stops that session, including stricter modes and an empty report:
-/// a sidecar offering auto always reports the mode. Unrequested `auto` still stops a session.
+/// What a permission mode the CLI reports about itself means for a gated session.
+///
+/// Eitri asks for `default` on both backends. A project's own `.claude/settings.json` can set
+/// `permissions.defaultMode`, but an explicit `--permission-mode default` outranks it: measured on
+/// CLI 2.1.283 (2026-09-28), `acceptEdits` there reports `default` and a `Write` is denied, and
+/// `bypassPermissions` there is ignored even with no flag. Legacy passes the flag and the sidecar
+/// states `default` explicitly, so this is a backstop for a CLI whose rule
+/// changes or a sidecar that stops stating the mode, not a path a project setting reaches today.
+/// The fall-through that matters
+/// is a hook that gives no answer (the 600 s hook timeout, a relay failure that escapes
+/// `write_fail_closed_deny`): under `default` that is a denial (bar a project `permissions.allow`
+/// rule matching the call, which this tripwire does not see -- `spawn_hook_listener`'s doc), under a
+/// less restrictive mode the tool runs. So the report is checked wherever the CLI makes one, and
+/// anything not known to be at least as strict as `default` stops the session.
+///
+/// **A session that asked for the CLI's own auto mode** ([`RequestedCliMode::Auto`], a sidecar
+/// offering `cli_auto_mode` and `permission_defer`) is judged against what it asked for instead:
+/// `auto` is expected, `default` is the CLI's documented fallback when auto is unavailable to it,
+/// and everything else -- stricter modes and an empty report included, since a sidecar that offers
+/// auto always reports the mode -- stops the session. A session that did not ask for auto is
+/// judged as before, so `auto` there still stops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModeReport {
     /// `default`: what Eitri asked for.

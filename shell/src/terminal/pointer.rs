@@ -1,7 +1,10 @@
-//! Pointer geometry for the bottom terminal: map widget-relative pixels and click counts
-//! to selection commands. No `gtk4` or `gdk` types are used, so tests need no display, just
-//! like `crate::wheel_zoom`. Mouse reporting reuses [`cell_at`] to keep its pixel-to-cell
-//! mapping identical to selection.
+//! Pointer geometry for the bottom terminal (selection): turning a widget-
+//! relative pixel and a click count into what [`eitri_terminal::SelectCommand`] needs. GTK-free
+//! (no `gtk4`/`gdk` type anywhere in this file), so it is tested without a display, the same as
+//! `crate::wheel_zoom`.
+//!
+//! Mouse reporting reuses [`cell_at`] for the same reason: a program's own mouse mode
+//! needs the identical pixel -> cell mapping this selection code does.
 
 use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseModes, MouseMods};
 use eitri_terminal::SelectKind;
@@ -81,8 +84,8 @@ pub(crate) fn route(shift: bool, modes: MouseModes) -> PointerRoute {
     }
 }
 
-/// Where a wheel notch belongs: a program mouse report, alternate-screen arrow-key scrolling
-/// when the program has no mouse mode, or the pane's scrollback.
+/// Where a wheel notch belongs: the program (a report), this pane's own arrow-key alternate scroll
+/// (`less`/`man` in the alternate screen, no mouse mode of its own), or the scrollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WheelRoute {
     Report,
@@ -91,7 +94,7 @@ pub(crate) enum WheelRoute {
 }
 
 /// **Shift+wheel never sends arrows**: alacritty's own `scroll_terminal` requires `!shift` for
-/// alternate scroll, so a `Shift`-held wheel always reaches the pane's own
+/// alternate scroll so a `Shift`-held wheel always reaches the pane's own
 /// scrollback, matching the plain-selection rule above.
 pub(crate) fn wheel_route(shift: bool, modes: MouseModes) -> WheelRoute {
     match route(shift, modes) {
@@ -143,12 +146,16 @@ impl ReportTracker {
         mouse_input(MouseKind::Motion(self.held), cell)
     }
 
-    /// Whether a button is tracked as held after a reported press.
-    /// Use this state to decide whether a release matches a program press. [`route`] uses mouse modes and
-    /// the current Shift state, so Shift newly held at release can make it return `Local`.
-    /// Skipping the release then would strand `held` and turn the next hover into a phantom drag.
-    /// `connect_drag_end` saves `is_held()` before releasing unconditionally, as `connect_cancel`
-    /// also does. Releasing with nothing held is a no-op.
+    /// Whether a button is currently tracked as held (a press this tracker actually reported).
+    /// **Release handling reads this, not [`route`], to decide whether a release should
+    /// report:** xterm's own convention is that a release follows the press it matches, regardless
+    /// of the Shift state sampled at release. `route` re-derives its answer from *current* Shift
+    /// with no memory of press time, so `pane.rs::connect_drag_end` used to gate its release report
+    /// on `route(shift, modes) == Program` -- correct for the common case, but a release with Shift
+    /// held only at that moment made `route` say `Local`, so `release` was never called and `held`
+    /// stayed stranded (the next ordinary motion then reported a phantom drag). `connect_drag_end`
+    /// now checks `is_held()` before calling and releases unconditionally, the same way
+    /// `connect_cancel` already did (its own doc: "safe to call unconditionally").
     pub(crate) fn is_held(&self) -> bool {
         self.held.is_some()
     }
@@ -320,12 +327,16 @@ mod tests {
         assert!(!tracker.is_held());
     }
 
-    /// A press without Shift routes to the program and starts tracking the button. If Shift is
-    /// held only at release, `route()` returns `Local`, but the tracked press still needs its
-    /// release. Gating release on `route()` would strand `held` and report a phantom drag on the
-    /// next hover. Check `is_held()` and release regardless of the current Shift state. This tests
-    /// the `ReportTracker`/`route()` behavior used by `pane.rs`; exercising the GTK gesture itself
-    /// requires a display.
+    /// A press with no Shift routes to the program and
+    /// the tracker starts holding the button; if Shift is held only at release, `route()` alone
+    /// says `Local` for that moment. Gating the release report on `route()` there (the old
+    /// `pane.rs::connect_drag_end`, `if route(shift, modes) == Program { report_release(..) }`)
+    /// skips `ReportTracker::release` entirely and strands `held` -- so an ordinary hover motion
+    /// right after reports a phantom left-button drag. The fix reads `is_held()` instead and calls
+    /// release unconditionally once it knows a button is tracked (xterm's own convention: the
+    /// release follows the press, not the Shift state sampled at release). This test pins that
+    /// corrected decision at the `ReportTracker`/`route()` level, which is what `pane.rs` calls
+    /// through a GTK gesture this crate cannot unit-test without a display.
     #[test]
     fn a_release_reports_even_when_shift_is_held_only_at_release() {
         let mut tracker = ReportTracker::default();

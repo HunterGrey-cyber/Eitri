@@ -1,6 +1,6 @@
 //! Holds `support/own_x_server.rs` to the one property it exists for: a client of the display it
 //! hands out can reach that `Xvfb` or nothing -- never another X server, the desktop's included
-//!.
+//! (2026-09-29).
 //!
 //! **The environment it recreates** is the one incident 2 happened in: an agent shell with a network
 //! namespace of its own and the host's `/tmp`. There the desktop's abstract `@/tmp/.X11-unix/X0` is

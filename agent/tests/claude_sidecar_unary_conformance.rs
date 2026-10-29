@@ -173,21 +173,24 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
     .iter()
     .map(ToString::to_string)
     .collect();
-    // Compare capability order and length as well as membership to catch changes to
-    // the sidecar's literal list.
+    // Order and length included for the protocol 3.22 list, not just set membership: the fixture is
+    // transcribed from the sidecar's own literal, and this is what keeps the transcription honest.
     //
-    // `task_output` requires opening files without following links and knowing the uid.
-    // Linux supports both, so this test requires the capability.
+    // `task_output` is advertised only when the sidecar can open a file without following a link and
+    // knows its own uid, which a Linux host can; its absence fails here, as `steer_turn`'s does.
     //
-    // `steer_turn` requires CLI version 2.1.252 or later. Its absence fails this test
-    // because an older CLI would lose steering support.
+    // `steer_turn` is advertised only when the sidecar's CLI is at least 2.1.252. Every CLI this runs
+    // against today is, so its absence fails here rather than being tolerated: a host on an older CLI
+    // would lose steering, and the run should say so.
     //
-    // Strip two optional capabilities before comparing the rest with `expected`.
-    // `egress_restricted` must follow `tool_allow_list` and precede `set_permission_mode`;
-    // it appears when the sidecar configuration restricts egress. `executable_sdk_bundled`
-    // must be last; it is available from a source checkout with node_modules, but cannot
-    // be served by a packaged single-file artifact. Accept either, neither or both only
-    // at these positions. Other differences require updating the fixture.
+    // Two permitted differences, each transcribed from Verdandi's own handshake handler at its one
+    // permitted position, stripped out before comparing what remains against `expected` verbatim:
+    // `egress_restricted`, right after `tool_allow_list` (before `set_permission_mode`) when this
+    // sidecar's own configuration restricts egress; and a trailing `executable_sdk_bundled` on a
+    // build running from a Verdandi CHECKOUT, which a packaged single-file artifact cannot serve at
+    // all (no node_modules for the SDK's own CLI to resolve through). This test spawns whichever the
+    // host has, so it accepts either, neither, or both -- but only in their one permitted slot.
+    // Anything else means the real list moved and the fixture owes an update.
     let mut actual = info.advertised_capabilities.clone();
     if let Some(pos) = actual.iter().position(|c| c == "egress_restricted") {
         assert_eq!(

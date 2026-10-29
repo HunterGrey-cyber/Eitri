@@ -7,8 +7,7 @@
 Why this exists: the .deb/.pkg ship statically linked Rust binaries, an embedded web bundle, and a
 Node single-executable sidecar with ~135 npm packages inside it. MIT, BSD and ISC all require the
 copyright notice itself to travel with a binary copy, so an SPDX id per package is not enough; this
-emits each package's own licence TEXT. Decision and reasoning:
-Each shipped component must carry the licence text its distribution requires.
+emits each package's own licence TEXT.
 
 It FAILS -- exit 1, and no output file -- rather than warn, on:
   * a licence expression it cannot classify, or one that is copyleft and not acknowledged below;
@@ -104,8 +103,9 @@ TARGET = "x86_64-unknown-linux-gnu"
 SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard"]
 SHIPPED_CARGO_PACKAGES = ["shell", "agent", "supervisor"]
 
-# Spell small counts as words in generated prose, deriving them from the current binary list.
-# Counts beyond this table fall back to digits rather than failing.
+# Small counts, spelled as words in prose (never digits): a note once read
+# "all five binaries" as a literal, stale after `agent-hook` was dropped and four were left. Anything
+# past this table falls back to the digit rather than failing: nothing here needs a word past six.
 _COUNT_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
 
 
@@ -178,7 +178,7 @@ ALLOWLIST = {
         "field, but it ships an MIT LICENSE file (Fabio Spampinato), which is reproduced. Re-check when it "
         "declares one."),
     ("npm", "@anthropic-ai/claude-agent-sdk"): (
-        "NOT open source. Bundled into the sidecar knowingly. "
+        "NOT open source. Bundled into the sidecar knowingly (a standing decision, 2026-09-19). "
         "Its own LICENSE.md is reproduced verbatim; Eitri's MIT licence does not and cannot "
         "cover it."),
 }
@@ -379,8 +379,8 @@ def cargo_packages(repo=REPO):
     Build dependencies are excluded for the same reason -- EXCEPT the C they compile into the
     binary (vendored Lua; Skia's prebuilt archive), which native_components() covers by looking
     at the binaries themselves. `repo` is where cargo metadata/tree run (--repo; default this
-    checkout), so the same script can describe a different clone's dependency tree (including
-    the public clone at the release tag)."""
+    checkout), so the same script can describe a different clone's dependency tree (the public clone
+    at the release tag)."""
     meta = load_metadata(repo)
     workspace = set(meta["workspace_members"])
     by_nv = {}
@@ -680,7 +680,7 @@ def skia_license_text(binaries_dir, override=None):
     skia/LICENSE_SKIA -- a sibling of the shipped binaries themselves under the SAME cargo target dir
     that produced them, so this follows --binaries-dir like everything else here (the release container
     builds under CARGO_TARGET_DIR=/build/target, not this repo's own target/). `override` (--skia-
-    license-dir) is for a tree with no build subtree at all -- a public clone plus an
+    license-dir) is for a tree with no build subtree at all: a public clone plus an
     extracted release tarball, which ships no target/ directory to look under."""
     base = override or os.path.join(binaries_dir, "build")
     lic = sorted(glob.glob(os.path.join(base, "skia-bindings-*", "out", "skia", "LICENSE_SKIA")))
@@ -907,7 +907,7 @@ def _skia_archive_member_component(stem):
 # A defined-symbol prefix expected somewhere among a component's own members: not how members are
 # classified (their own name already does that, above, unambiguously against this pinned archive --
 # see the module-level comment), but independent corroborating evidence, and the source of the
-# counts used to corroborate the archive's component classification.
+# counts this script's own commit history records.
 _SKIA_ARCHIVE_SYMBOL_PREFIXES = {
     "expat": re.compile(r"^XML_"),
     "libjpeg-turbo": re.compile(r"^(jpeg_|jinit_)"),
@@ -936,8 +936,7 @@ def _skia_archive_root(archive_path, extract_dir, expected_sha256=None):
     deleted. extract_dir is a REQUIRED, caller-owned scratch location -- deliberately never derived
     from archive_path itself (e.g. a sibling "<archive_path>.extracted", which this function used to
     write). That broke two ways, found in review: release.sh's own --skia-archive-path names a file
-    under /build/skia, which is read-only during the offline build phase (see release.sh's
-    cache-mount table), so writing beside it raised EROFS there; and on a dev machine --skia-archive-
+    under /build/skia, which is read-only during the offline build phase (a read-only cache mount), so writing beside it raised EROFS there; and on a dev machine --skia-archive-
     path can point straight at another checkout's shared cargo build cache (rust-skia's own
     out/.cache/), where it deleted and rebuilt a 63 MB tree in place on every run. This also
     deliberately never falls back to a bare tempfile.mkdtemp(), unlike extract_dir's own callers may
@@ -1054,7 +1053,7 @@ def skia_archive_components(archive_dir):
 
 def skia_archive_symbol_counts(archive_dir):
     """How many of each _SKIA_ARCHIVE_SYMBOL_PREFIXES-matching symbol the archive's `.a` files
-    define, keyed the same as that table -- the corroborating counts the first classification of this archive
+    define, keyed the same as that table -- the corroborating counts an earlier evidence table
     used (71 XML_*, 89 jpeg_*  and 34 jinit_* separately, 71 wuffs_*, 547 hb_* per library, 194
     u_*/ubrk_*), read via `nm --defined-only`, independent of skia_archive_components()'s own
     member-name classification above."""
@@ -1135,8 +1134,10 @@ def skia_archive_notice_entries(archive_path, extract_dir, expected_sha256=None)
         members = by_comp[comp]
         archives_here = sorted({m.split("(", 1)[0] for m in members})
         license_id, files = text(comp)
-        # Component licence texts come from packaging/license-texts/, except Skia's LICENSE_SKIA.
-        # _license_skia_from_archive reads that text directly from the archive.
+        # Every component's text is vendored under packaging/license-texts/ EXCEPT Skia's own, which
+        # is its own LICENSE_SKIA read straight out of the archive (_license_skia_from_archive) --
+        # The note used to say "vendored" for every entry alike, which was wrong for
+        # the one component whose text this archive itself supplies.
         source = "its own LICENSE_SKIA inside the archive" if comp == "Skia" \
             else "text vendored in packaging/license-texts/"
         entries.append({
@@ -1411,9 +1412,11 @@ def artwork_entries(repo=REPO):
              "files": [("packaging/icons/LICENSE", notice)]}]
 
 
-# Share the nvim-rs usage notice between THIRD-PARTY-LICENSES and SOURCE so both files
-# use the same sentence and resolved version. EXTRA_TEXTS checks its own version elsewhere;
-# that guard would not catch a hardcoded, stale version in this notice.
+# The exact LGPL-3.0 section 4(a) "prominent notice" sentence. Shared
+# between THIRD-PARTY-LICENSES (build_header) and SOURCE (write_source_notice) so the two files
+# never say it differently, and takes the real resolved version rather than a hardcoded one nothing
+# re-checks: a bump trips EXTRA_TEXTS's own version-mismatch guard elsewhere in this file, but that
+# guard has nothing to do with this sentence, and a stale version here could otherwise survive it.
 def nvim_rs_lgpl_notice(version):
     return (f"This program statically links nvim-rs {version}, which is licensed under the GNU "
             "LGPL-3.0; its use is covered by that licence.")
@@ -1423,17 +1426,18 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
                   counts_rust, counts_web, counts_sc, skia_archive_count=0, artwork_count=0, plugin_count=0,
                   counts_plugin=None):
     """The prose block before PART 1, as its own function so a unit test can check the two profiles'
-    shapes without a real build. `sc` is the sidecar_facts()
+    shapes (LGPL-3.0 sec 4(a)) without a real build. `sc` is the sidecar_facts()
     dict, or None when no_sidecar. `skia_archive_count` (no_sidecar only) is the number of entries
-    skia_archive_notice_entries() found, for the "Contents:" list below; that list
+    skia_archive_notice_entries() found, for the "Contents:" list below: that list
     used to stop at part 3/4 and never mentioned the archive-contents section at all. `artwork_count`
     is the number of entries artwork_entries() found (Eitri's own icon, under its own licence). `plugin_count` and
     `counts_plugin` describe part 5, the Markdown preview plugin's page, which ships as a plugin directory."""
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
-    # LGPL-3.0 4(a) asks for a prominent notice that the library is used, so the nvim-rs notice
-    # comes first in both profiles: both ship the same statically linked `shell`.
+    # LGPL-3.0 4(a): a "prominent notice ... that the Library is used" -- first, in BOTH profiles
+    # (the same sentence is at the top of THIRD-PARTY-LICENSES; the private/sidecar
+    # profile ships the identical statically-linked `shell`, so 4(a) is owed there too).
     L = [RULE, "Eitri -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
     L += [
         "Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
@@ -1504,8 +1508,8 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     sidecar_artifact/verdandi ignored, plus the archive-contents section below); otherwise the
     private/dev profile (parts 1-4, sidecar_artifact and verdandi required, no archive-contents
     section -- the private profile does not ship the archive). `repo` and `binaries_dir` let this
-    describe a different tree's dependencies and a different directory's binaries (using
-    the public clone's Cargo.lock, the public release's extracted binaries). `skia_license_dir`
+    describe a different tree's dependencies and a different directory's binaries (the public clone's Cargo.lock,
+    the public release's extracted binaries). `skia_license_dir`
     (--skia-license-dir) overrides where the Skia licence lookup looks, for a `binaries_dir` with no
     build/ subtree of its own -- see skia_license_text(). `skia_archive_path` (--skia-archive-path,
     required when `no_sidecar`) is the Skia prebuilt archive this build linked -- see
@@ -1541,8 +1545,8 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
                 continue
             sc_pkgs.append(resolve(p, by_nv, counts_sc))
     if no_sidecar:
-        # Compute archive entries before build_header() so its Contents list can include
-        # this section's count alongside the other sections.
+        # Computed here, before build_header(), so the header's own "Contents:" list
+        # can show this section's count the same way it shows every other part's.
         archive_entries = skia_archive_notice_entries(skia_archive_path, skia_archive_extract_dir,
                                                         skia_archive_sha256)
 
@@ -1551,9 +1555,9 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
         raise Fail(f"COPYLEFT_ACK names {sorted(n for _, n in COPYLEFT_ACK)} but the tree ships "
                    f"{sorted(e['name'] for e in copyleft)}: drop the stale acknowledgement")
 
-    # Find shipped binaries containing nvim-rs code by checking symbols, then update its
-    # resolved status text with that list. Deriving the list avoids stale attribution when
-    # another binary starts linking nvim-rs.
+    # Which shipped binaries actually carry nvim-rs code, checked by symbol. Patches
+    # the nvim-rs entry's already-resolved status text in place, naming the real hit list rather than
+    # a hand-kept "`shell`" that a future binary picking it up would leave silently stale.
     nvim_rs_binaries = nvim_rs_symbol_check(shipped)
     for e in rust:
         if e["name"] == "nvim-rs" and e["status"] and "{binaries}" in e["status"]:

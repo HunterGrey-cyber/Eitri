@@ -84,9 +84,9 @@ fn the_fork_rev_is_the_lockfiles_where_it_has_one_whatever_the_override_says() {
 
 #[test]
 fn a_path_neovide_takes_the_override_before_its_checkout() {
-    // The source archive has no `.git` in the fork directory. `SOURCE` supplies the build
-    // commit override, which must take precedence over querying the checkout.
-    // This preserves the fork identity when rebuilding without git metadata.
+    // The source asset has no `.git` in `neovide/`, so an offline
+    // rebuild from it said "neovide fork unknown" where the shipped binary names the fork commit.
+    // `SOURCE` now gives `EITRI_BUILD_FORK_COMMIT`, and it must win over asking git.
     let mut asked_git = false;
     let rev = resolve_fork_rev(PATH_NEOVIDE_LOCKFILE, Some("1".repeat(40)), || {
         asked_git = true;

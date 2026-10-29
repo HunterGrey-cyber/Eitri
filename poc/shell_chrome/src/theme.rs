@@ -1,5 +1,10 @@
-//! Placeholder `Theme` palette for the feasibility probe.
-//! Formats theme tokens into a GTK stylesheet loadable by `CssProvider`.
+//! Minimal placeholder implementation of the `Theme` struct of the shell design's
+//! unified visual system.
+//!
+//! This is a throwaway feasibility-probe palette, not a real design system.
+//! The same `Theme` shape is meant to eventually also drive the Neovim theme
+//! bridge and the WebView CSS variables; here we only implement the GTK CSS
+//! side (turning the token set into a `CssProvider`-loadable stylesheet).
 
 /// Plain RGBA color, kept simple (no external color-crate dependency) since
 /// all we need is to format it into CSS `rgb()`/`rgba()` literals.

@@ -1,18 +1,20 @@
-//! Input queued behind an asynchronous paste.
+//! Input that waits for a paste (bottom-terminal phase 2).
 //!
-//! `Ctrl+Shift+V` reads clipboard text asynchronously. On Wayland the text arrives through
-//! a pipe from the clipboard source, possibly a main-loop turn or more later. Later typing
-//! must follow the paste: an Enter that overtook it could run an unfinished command.
-//! A paste reserves its place when the chord is pressed. Subsequent keys, input-method
-//! commits, `Ctrl+a` literals, mouse reports and focus reports wait behind it.
-//! Reports are input too and must not overtake queued keys.
+//! `Ctrl+Shift+V` reads the clipboard asynchronously: on Wayland the text comes through a pipe from
+//! whichever program owns the clipboard, a main-loop turn or more later. Anything typed in that time
+//! -- the `"` that closes a quoted argument, the Enter that runs the line -- must reach the shell
+//! after the paste, never before it: an Enter that overtook a paste would run a command before the
+//! user had finished it. So a paste takes a place in line when the chord is pressed, and every key,
+//! input-method commit, `Ctrl+a` literal, mouse report and focus report after it waits behind that
+//! place until the text is in (a mouse report is input too, and must never
+//! overtake keys still waiting behind a paste).
 //!
-//! A clipboard that never answers must not hold the keyboard. After `pane::PASTE_TIMEOUT`,
-//! the pane abandons the paste and releases the queued input. Late clipboard text is dropped
-//! and logged because inserting it then would interrupt later typing.
+//! **A clipboard that never answers must not hold the keyboard.** The pane gives up on a paste after
+//! `pane::PASTE_TIMEOUT`; what waited behind it goes on, and text that turns up after that is
+//! dropped (and logged), since by then it would land in the middle of later typing.
 //!
-//! The queue is pure and tested without a display. `pane.rs` starts the GTK read and reports
-//! how it ended.
+//! Pure, and tested without a display. The GTK half (`pane.rs`) starts the read and reports how it
+//! ended.
 
 use std::collections::VecDeque;
 

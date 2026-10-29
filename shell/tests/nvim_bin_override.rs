@@ -1,20 +1,22 @@
-//! Checks that setting `NEOVIM_BIN` before building a `LiveHarness` makes the pinned fork's
-//! `CmdLineSettings` spawn that binary. Its clap argument uses `env = "NEOVIM_BIN"`.
-//! `shell::main` relies on this when it sets the variable. The pure `eitri_core::nvim_bin`
-//! tests inject `version_of` and do not exercise the fork.
+//! Checks that the pinned fork honours `NEOVIM_BIN` when it is set before `LiveHarness` is built.
+//! `CmdLineSettings` reads it through `#[arg(long = "neovim-bin", env = "NEOVIM_BIN")]`
+//! and launches the selected binary. The environment assignment in `shell::main` depends
+//! on this behaviour. Unit tests with an injected `version_of` do not exercise the fork's
+//! process launch.
 //!
-//! A wrapper script appends its argv to a marker file, then execs the real `nvim` to provide a
-//! working session. The marker proves the fork ran the selected binary instead of resolving
-//! `nvim` on `PATH`.
+//! A wrapper script logs its argv to a marker file and then execs the real `nvim`, keeping
+//! the harness session functional. The marker shows that the fork launched the selected
+//! wrapper rather than resolving `nvim` on `PATH` itself.
 //!
-//! This `harness = false` test checks `--ignored` in `main` because cargo does not skip it.
-//! It needs `nvim` (>= 0.10) on `PATH` and a display connection for winit's clipboard,
-//! even though it opens no window. `support/own_x_server.rs` starts an isolated `Xvfb` before
-//! winit connects and clears inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run with:
+//! With `harness = false`, `main` handles `--ignored` itself. The test needs `nvim` >= 0.10
+//! on `PATH` and a display connection for winit's clipboard, even though it opens no window.
+//! `support/own_x_server.rs` starts a separate `Xvfb` and points the test at it before winit
+//! connects, dropping inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run it with:
 //!
 //!     cargo test -p shell --test nvim_bin_override -- --ignored
 //!
-//! A plain `main` keeps winit's event loop on the main thread.
+//! The test uses a plain `main` (`harness = false`) so winit creates its event loop
+//! on the main thread.
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -35,7 +37,7 @@ fn main() {
         println!("nvim_bin_override: ignored (spawns a real nvim, needs a display); run with `-- --ignored`");
         return;
     }
-    // As `shell`'s own `main` and `cursor_animation` do: a pipe or socket on
+    // As `shell`'s own `main` and `cursor_animation` do (since 2026-09-29): a pipe or socket on
     // stdin whose writer stays open -- an agent tool's -- reaches the embedded nvim as a buffer and
     // blocks it at startup (`neovide_editor::stdin`), which failed this test as "nvim never became ready".
     if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {

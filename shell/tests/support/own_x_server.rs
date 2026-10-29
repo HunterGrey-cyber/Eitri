@@ -1,38 +1,79 @@
-//! Provides an Xvfb started by each test instead of connecting to an inherited display.
-//! The shell and editor tests include this shared file with #[path]. Checking only
-//! GDK_BACKEND=x11 cannot exclude a desktop's XWayland session.
+//! The display every window-opening or display-connecting test in this workspace runs on: an `Xvfb`
+//! the test starts itself, never one it inherits. `shell/tests/*` and `neovide-editor/tests/*` both
+//! `#[path]`-include this one file (2026-09-29).
 //!
-//! The server disables TCP and filesystem Unix sockets with -nolisten tcp and -nolisten unix.
-//! Clients use its abstract socket in the process's network namespace. It creates no X socket
-//! or display lock file in /tmp, though it briefly writes a compiled keymap there.
-//! Disabling filesystem sockets prevents a server in a separate network namespace with a shared
-//! /tmp from unlinking a desktop socket whose abstract counterpart it cannot see.
+//! **Why (2026-09-29).** `panel_stream_scroll`'s header said "never the real desktop", and nothing in
+//! it enforced that: a GUI pass ran `cargo test -p shell --test panel_stream_scroll -- --ignored`
+//! without the `xvfb-run` wrapper its header names, `gtk4::init()` took the inherited
+//! `WAYLAND_DISPLAY=wayland-0`, and its WebViews opened, one after another, on the desktop
+//! screen until the run was killed. `band_xft_zoom`, `close_prompt_placement` and
+//! `hidden_widget_restyle` checked only `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on that same
+//! desktop satisfies, and the headless `LiveHarness` tests (`neovide-editor`'s `fullscreen_setting`,
+//! `os_scale_factor`, `scale_factor_setting`, `unfocused_cursor`, `shell`'s `nvim_bin_override`)
+//! connected winit and the clipboard to whatever display they inherited -- the desktop's, from any
+//! agent shell. `panel_visual_mode.rs` had closed the hole for itself on 2026-09-28 by starting its
+//! own server; this is that fix, shared. A documented invocation is not a guard.
 //!
-//! isolate selects a display number from FIRST_DISPLAY upward with no socket file, lock file
-//! or visible socket. It retries if another server wins the bind. This also protects clients
-//! that cannot see the abstract socket, including sandboxed WebKit processes: their filesystem
-//! fallback finds no socket instead of reaching another server with the same display number.
-//! The server uses -noreset to stay alive between clients. XAUTHORITY points at an empty file
-//! in target/tmp, removed on shutdown and on SIGTERM, SIGINT or SIGHUP.
-//! init_gtk checks the pid behind each X connection through OwnXServer::foreign_x_connections;
-//! a display name alone cannot identify the server.
+//! **The server listens on no file.** `-nolisten tcp` and **`-nolisten unix`** leave it only
+//! Linux's abstract socket, `@/tmp/.X11-unix/X<n>`, in this process's network namespace, and
+//! `-displayfd` implies no lock file: nothing under `/tmp/.X11-unix` is ever created, unlinked or
+//! bound, and no `/tmp/.X<n>-lock` is written -- no socket file, no lock file. The one file it does
+//! write in `/tmp` is transient: its compiled keymap, `/tmp/server-<n>.xkm`, created and unlinked
+//! again on every start (found with `strace` of this exact
+//! command line on 2026-09-29; a first probe's "the server wrote no file at all" missed it). The first version
+//! of this file, and `panel_visual_mode.rs`'s server until the same day, lacked `-nolisten unix`:
+//! run from an agent shell with a network namespace of its own, where the desktop's abstract
+//! `@/tmp/.X11-unix/X0` is invisible but `/tmp` is shared, `-displayfd` found `:0` "free",
+//! **unlinked the desktop's `/tmp/.X11-unix/X0`** (xtrans unlinks the path before binding), bound
+//! its own there and removed that on exit: the session's XWayland lost its socket file for the rest
+//! of the session.
 //!
-//! Before any display connection, DISPLAY points at this server and GDK_BACKEND is x11.
-//! WAYLAND_DISPLAY and WAYLAND_SOCKET are removed. Inherited displays, including xvfb-run's,
-//! are ignored. GTK_IM_MODULE and XMODIFIERS select GTK's built-in input method so keys do not
-//! reach a session input method or cause candidate windows on another display.
-//! init_gtk initialises GTK and refuses to continue unless every X connection is to this server.
+//! **Nor does it share a number with anything that does.** Without a
+//! file of its own, the server still had a *name*, and in that same shell the name was the desktop's:
+//! `-displayfd` picked `:0` because the desktop's abstract socket is invisible there, while its file
+//! `/tmp/.X11-unix/X0` is not. `libxcb` and `x11rb` try the abstract socket first and fall back to
+//! that file on `ENOENT`/`ECONNREFUSED`, so a client that could not see this namespace's abstract
+//! socket (WebKit's sandboxed processes unshare the network), or one that connected after the server
+//! had gone (it died, or `-terminate` ended it when its last client left), reached the desktop's
+//! XWayland under the name this file exported, with the desktop's `XAUTHORITY` cookie still in the
+//! environment -- and `init_gtk`'s name check could not tell the two `:0`s apart
+//! (`tests/own_display_guard.rs` reproduced all three). So [`isolate`] now picks the number itself:
+//! from [`FIRST_DISPLAY`] up, the first one with no socket file, no lock file and no socket this
+//! namespace can see under it, and starts `Xvfb :<n>` on it, retrying the next number if another
+//! server wins the bind. A client that falls back finds no file (`ENOENT`) and connects to nothing.
+//! The server runs with **`-noreset`**, not `-terminate`, so it stays up between one client leaving
+//! and the next arriving; `XAUTHORITY` points at an empty file of the test's own (in `target/tmp`,
+//! removed when the server stops and when SIGTERM, SIGINT or SIGHUP ends the
+//! test), so no cookie of any other server is ever offered; and [`init_gtk`] identifies the server
+//! GDK connected to by the pid behind its socket ([`OwnXServer::foreign_x_connections`]), not by its
+//! name.
 //!
-//! cut_session_bus points DBUS_SESSION_BUS_ADDRESS at NO_SESSION_BUS, a socket path that cannot
-//! exist, and removes AT_SPI_BUS_ADDRESS. Removing the session bus address alone would let GDBus
-//! fall back to XDG_RUNTIME_DIR/bus or autolaunch. Blocking the bus prevents activation of
-//! accessibility, portal and GVfs services, which these tests do not use.
+//! It then points this process at the server before anything connects to a display: `DISPLAY` set
+//! to it, `GDK_BACKEND=x11`, and `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` removed, so neither GTK nor
+//! winit has any other display to fall back to. An inherited `DISPLAY` -- `xvfb-run`'s included --
+//! is ignored, and said so. The desktop's input method is replaced with GTK's own (`GTK_IM_MODULE`,
+//! `XMODIFIERS`): an inherited `GTK_IM_MODULE=fcitx` would route this window's keys through the
+//! session's live fcitx5 daemon over the session bus, whose candidate window draws on the desktop.
+//! [`init_gtk`] does that, initialises GTK, and refuses to go on unless every X connection in the
+//! process is to this server.
 //!
-//! The server is stopped by its captured pid. OwnXServer::exit handles explicit main exits,
-//! since process::exit runs no destructors; Drop handles panic unwinding out of main.
-//! PR_SET_PDEATHSIG sends SIGTERM if the spawning thread ends through an abort, another exit
-//! or SIGKILL. It is set between fork and exec. Call isolate from the main thread so the
-//! server's lifetime follows that thread.
+//! **Nor does it reach the session bus.** A bare run on the desktop's own
+//! bus asked it for `org.a11y.Bus.GetAddress`, and D-Bus-activated `org.freedesktop.portal.Desktop` and
+//! `org.gtk.vfs.Daemon` -- services that then run with the session's real `HOME` (measured on a private bus under
+//! `dbus-monitor`, 2026-09-29). So `DBUS_SESSION_BUS_ADDRESS` is pointed at
+//! [`NO_SESSION_BUS`], a socket path that cannot exist, and `AT_SPI_BUS_ADDRESS` (which GTK would
+//! use before asking the session bus) is removed ([`cut_session_bus`]; `cursor_animation` calls it
+//! too). Unsetting the address would not do: GDBus then falls back to `$XDG_RUNTIME_DIR/bus`, the
+//! same bus, and without that to `autolaunch:`, which starts a bus of its own. With no bus, GTK runs
+//! without accessibility, portals or GVfs, which none of these tests uses.
+//!
+//! **The server never outlives the test.** It is stopped by the pid captured at spawn, never found
+//! by name: by [`OwnXServer::exit`] on every path out of `main` after [`isolate`] (`process::exit`
+//! runs no destructor), or by `Drop` when a panic unwinds out of `main`. For every death neither
+//! sees -- a panic inside a GTK callback (an `extern "C"` frame: the process aborts), a
+//! `process::exit` somewhere else, SIGKILL -- the kernel sends the server SIGTERM itself
+//! (`PR_SET_PDEATHSIG`, set between fork and exec, so it cannot be missed). Call [`isolate`] from the
+//! main thread: `PR_SET_PDEATHSIG` fires when the thread that spawned the server ends.
 #![allow(dead_code)] // each test uses a different subset: `init_gtk` or `isolate`, `display` or not.
 
 use std::io::BufRead;

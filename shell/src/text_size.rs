@@ -1,61 +1,59 @@
-//! Zoom both panes together or adjust each pane independently.
+//! Zoom both panes together or each one independently.
 //!
-//! `S` is nvim's `g:neovide_scale_factor`, shared by application keys, user mappings,
-//! and typed `:let` commands. `R` is the panel's factor relative to `S`; it starts at
-//! 1.0, survives panel reloads, and is not persisted across restarts. The base size is
-//! `agent.font_size` or its default. The panel size is
-//! `base * clamp(S * R, ZOOM_MIN, ZOOM_MAX)`.
+//! `S` is `g:neovide_scale_factor`, shared by zoom keys, user mappings and typed `:let` commands.
+//! `R` is the panel's factor relative to S. It starts at 1.0, survives panel reloads within the
+//! session, and is not persisted. `base` is `agent.font_size` or the shipped default.
+//! The panel's effective scale is `P = clamp(S × R, ZOOM_MIN, ZOOM_MAX)` and its pixel size is
+//! `base × P`.
 //!
-//! [`TextSize`] is the pure state model. Operations return the new state and any value
-//! to send to `set_scale_factor_setting`. [`TextSizeController`] connects it to GTK
-//! actions and nvim's scale reports. Pending writes let the panel use the intended
-//! scale before nvim echoes it, including during a colorscheme recompute.
+//! [`TextSize`] is a pure model. Each operation returns its new state and any S value to send
+//! to `set_scale_factor_setting`. [`TextSizeController`] wires the model to GTK accelerators
+//! and nvim's asynchronous scale reports. Pending writes keep a colorscheme recompute between
+//! a write and its echo from using a stale scale.
 //!
-//! nvim's scale callback fires only when its per-tick watcher observes a change.
-//! Writing a value it already holds may produce no echo. Waiting for that echo alone
-//! can leave `pending` stuck and make subsequent steps use a stale scale.
-//! A timeout cannot safely resolve this: a slow nvim tick can outlast any deadline.
-//! Falling back to `reported_s` before an echo arrives makes editor-only compensation
-//! use the wrong scale, and later echoes do not repair the resulting relative factor.
-//! The model therefore tracks outstanding writes without measuring elapsed time.
+//! Nvim's watcher reports changes, so assigning its existing value may produce no echo.
+//! A pending write therefore cannot always wait for a matching report. A timeout is also
+//! unsafe: a slow nvim tick can outlast it. Falling back to a stale report during another
+//! editor-only step would compute the wrong R compensation, which later echoes cannot repair.
+//! The model uses no clock or expiry. It tracks pending writes and their echoes instead.
 //!
-//! `reported_s` starts from the pane's `scale_factor_setting()` and always takes the
-//! latest reported value. `pending` holds the latest unconfirmed write.
-//! `burst`, capped at [`BURST_CAP`] with the oldest entry dropped, holds values written
-//! since `pending` was last cleared. It distinguishes echoes of earlier writes from
-//! external changes. `current_s()` uses `pending` when present, otherwise `reported_s`,
-//! with a fallback of 1.0 for a value that is not finite and positive.
+//! `reported_s` is nvim's last reported value, seeded from the pane's startup
+//! `scale_factor_setting()` rather than an assumed 1.0. `pending` is the latest write awaiting
+//! confirmation. `burst` remembers writes since `pending` was last `None`, up to [`BURST_CAP`],
+//! dropping the oldest if full. This distinguishes intermediate echoes from external changes.
+//! `current_s()` uses `pending` when present, otherwise `reported_s`, substituting 1.0 for a
+//! non-finite or non-positive value in arithmetic. It trusts a pending value until a report
+//! or write resolves it, regardless of how long nvim takes.
 //!
-//! Writes are rounded to two decimals. Writing `current_s()` changes nothing and sends
-//! nothing. Writing `reported_s` sends the value but clears `pending` and `burst`:
-//! nvim may still need the write, but an unchanged value may never be echoed.
-//! Any other write sets `pending` and appends the value to `burst`.
+//! Every outgoing S value is rounded to two decimals. If it equals `current_s()`, no write
+//! is sent and state is unchanged: nvim's watcher would see no change either, so there is
+//! nothing to wait for.
+//! If a different outgoing value equals `reported_s`, it is still sent because nvim may have
+//! applied the pending value, but `pending` and `burst` are cleared without waiting for an echo.
+//! Otherwise the write becomes `pending` and is added to `burst`.
 //!
-//! Every report updates `reported_s`. An echo matching `pending` clears `pending` and
-//! `burst`. An echo matching an older value in `burst` leaves both intact because a
-//! newer write is still outstanding. Any unrecognised report is authoritative and
-//! clears both. Reports leave the relative panel factor unchanged, so external scale
-//! changes move both panes together.
+//! Every report updates `reported_s`. An echo of `pending` clears `pending` and `burst`.
+//! An echo of an earlier value still in `burst` leaves both intact. A report outside the burst
+//! is treated as an external change and clears both. Reports never change R, so external
+//! scale changes move the panel together with the editor.
 //!
-//! Editor-only steps compensate with `R' = R * current_s() / S'` to keep the panel size.
-//! Panel-only steps never write `S`: they step the clamped effective panel scale by
-//! 0.1 and divide by `current_s()` to obtain the new relative factor.
-//! Reset sets `R = 1` and writes 1.0 through the same write logic. If `reported_s` is
-//! already 1.0, this clears a pending write that nvim never echoed.
+//! Editor-only steps compensate with `R' = R × current_s() / S'` to keep the panel still.
+//! Panel-only steps leave S alone: `P' = clamp(current_s() × R ± 0.1)`, then `R' = P'/current_s()`.
+//! Reset sets R to 1.0 and writes S = 1.0 through the same write path. When `reported_s` is
+//! already 1.0, this clears a pending different value even if nvim never echoed that write.
 //!
-//! Two interleavings can still leave stale state. Reversing zoom operations within one
-//! frame, with a nvim tick between them, can leave `R` and the step count wrong until
-//! reset. An external writer restoring the last reported value within the same tick
-//! as an application write can hide the change from the watcher and leave `pending`
-//! stuck until the next key.
+//! Two races can leave state needing another key or reset. Opposing keys within one frame
+//! can interleave with a nvim tick and leave R or the step count wrong. An external writer
+//! can restore the last-reported value within the tick of a local write, producing no change
+//! report and leaving the local write pending.
 //!
-//! Lua panel pages follow `S` with their own factor:
-//! `page zoom = clamp(S * R_page, ZOOM_MIN, ZOOM_MAX)`. WebKit applies this to the whole
-//! page, including layout. Each module's `R_page` starts at 1.0 when first shown,
-//! lasts for the session, and is not persisted. Both-panes steps leave it unchanged;
-//! both-panes reset sets it to 1.0; editor-only steps compensate it to preserve page
-//! size. Prefix keys targeting a page adjust or reset only that page's factor.
-//! Pages use the same `current_s()` and pending-write handling as the panel.
+//! Lua panel pages follow the same S with a per-module `R_page`. WebKit receives
+//! `clamp(S × R_page, ZOOM_MIN, ZOOM_MAX)` as whole-page zoom, so layout scales with text.
+//! `R_page` starts at 1.0 when the page is first shown, lasts for the session, and is not
+//! persisted. A both-panes step leaves it unchanged, a both-panes reset sets it to 1.0,
+//! and an editor-only step compensates it to keep the page still. Prefix keys focused on
+//! a page step or reset that page's factor alone. Pages use the same `current_s()` and
+//! pending-write handling as the panel.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -194,7 +192,7 @@ impl TextSize {
         self.base * self.panel_scale()
     }
 
-    // --- Both panes. R is never touched here. ---
+    // --- Both panes (app-level accelerators). R is never touched here. ---
 
     /// `app.text-larger`: `S' = clamp(S + 0.1)`; R unchanged.
     pub(crate) fn both_larger(self) -> (Self, Option<f32>) {
@@ -227,7 +225,7 @@ impl TextSize {
         }
     }
 
-    // --- One pane, editor focused.
+    // --- One pane, editor focused (`Ctrl+a =`/`-`/`0`).
     // Each writes a fresh S and adjusts R so the PANEL's px does not move. ---
 
     /// `S' = clamp(S + 0.1)`; `R' = R·S/S'` (panel px unchanged).
@@ -255,7 +253,7 @@ impl TextSize {
         }
     }
 
-    // --- One pane, panel focused.
+    // --- One pane, panel focused (`Ctrl+a =`/`-`/`0`).
     // None of these write S at all -- only R moves. ---
 
     /// `P' = clamp(P + 0.1)`; `R' = P'/S`.
@@ -492,11 +490,10 @@ pub(crate) struct TextSizeController {
     /// A `RefCell`, not a `Cell` (2026-09-23): `TextSize` holds a `Vec` (`burst`) and so is no
     /// longer `Copy`.
     state: RefCell<TextSize>,
-    /// `None` when there is no nvim to receive `g:neovide_scale_factor` writes.
-    /// In that case `apply_editor` logs and does nothing, while `apply_both` scales the
-    /// panel alone so the remaining pane can still be resized. Every window has an editor,
-    /// even when a Lua `main` panel hides it, so `main.rs` passes `Some`. The pane buffers
-    /// writes made before nvim starts.
+    /// `None` when there is no nvim to write `g:neovide_scale_factor` to:
+    /// `apply_editor` logs and does nothing; `apply_both` scales the panel alone.
+    /// Every window has an editor, even when a Lua `main` panel hides it, so `main.rs`
+    /// passes `Some`. The pane buffers writes made before nvim starts.
     editor: Option<Rc<NeovideEditorPane>>,
     panel: AgentPanelHandle,
     /// The panel's live px, shared with `main.rs`'s colorscheme listener (`panel_tokens`, via
@@ -529,8 +526,8 @@ impl TextSizeController {
         });
         this.push_panel_px();
 
-        // Register app-level actions so GTK handles the key before nvim or the panel.
-        // `TEXT_SIZE_ACTIONS` documents why each accelerator is bound.
+        // App-level, so GTK takes them before nvim or the panel sees the key (see
+        // `TEXT_SIZE_ACTIONS`'s own doc for why each accelerator is bound).
         for (name, step) in TEXT_SIZE_ACTIONS.iter().copied() {
             let action = gtk4::gio::SimpleAction::new(name, None);
             let weak = Rc::downgrade(&this);
@@ -568,8 +565,8 @@ impl TextSizeController {
         this
     }
 
-    /// `app.text-larger`/`-smaller`/`-reset` scale both panes together.
-    /// Without an editor, they scale the panel alone.
+    /// `app.text-larger`/`-smaller`/`-reset` move both panes together, or the panel alone
+    /// when no editor is present. `main.rs` always supplies an editor.
     pub(crate) fn apply_both(self: &Rc<Self>, step: TextStep) {
         let Some(editor) = &self.editor else {
             eprintln!("[text-size] {step:?} (both panes): no editor pane, scaling the panel alone");
@@ -599,8 +596,8 @@ impl TextSizeController {
         );
     }
 
-    /// Handles `text.larger`/`text.smaller`/`text.reset` with the editor focused.
-    /// These actions are unbound by default; `Ctrl`+wheel over a pane adjusts that pane.
+    /// The keymap's `text.larger`/`text.smaller`/`text.reset` (not bound by default; `Ctrl`+wheel
+    /// over a pane is the default per-pane route) with the editor focused.
     pub(crate) fn apply_editor(self: &Rc<Self>, step: TextStep) {
         let Some(editor) = &self.editor else {
             eprintln!("[text-size] {step:?} (editor): no editor pane, ignoring");

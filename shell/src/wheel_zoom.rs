@@ -123,8 +123,8 @@ mod tests {
         assert_eq!(wheel.scroll(f64::NAN), 0);
     }
 
-    /// A touchpad sends many small `dy`s. Each whole unit produces one step, and reversing
-    /// direction mid-gesture clears the remainder.
+    /// A touchpad sends many small `dy`s; one step per whole unit, and a reversal
+    /// mid-gesture does not spend the remainder the other way.
     #[test]
     fn smooth_scroll_steps_once_per_whole_unit_and_a_reversal_clears_the_remainder() {
         let mut wheel = WheelZoom::default();

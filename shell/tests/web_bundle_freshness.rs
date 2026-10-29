@@ -223,10 +223,15 @@ fn vitest_config_is_not_a_watched_input() {
     assert_eq!(fixture.run_and_log(false), Vec::<String>::new());
 }
 
-/// A missing node_modules directory must not invoke npm when the bundle and fingerprint are current.
-/// The LGPL source asset ships dist/index.html and its matching dist/.inputs-sha256 without
-/// node_modules. Its offline rebuild must use those current assets without installing dependencies
-/// or rebuilding. The release proof uses a failing npm stub to check that no npm command runs.
+/// `node_modules` missing alone, with the bundle and its fingerprint still current, is exactly the
+/// state of the LGPL source asset: it ships `dist/index.html`
+/// and a matching `dist/.inputs-sha256`, but `release_check.py` forbids it from ever shipping
+/// `node_modules/`. Its offline rebuild must reach no npm at all -- an earlier revision of
+/// `decide_web_build` ran `ci` (and so `run build`, which `release.sh`'s proof step fails on
+/// through a stub `npm` that exits 1) here even though nothing needed rebuilding, breaking that
+/// proof. This replaces an older, narrower
+/// `a_missing_node_modules_runs_ci_then_the_build`, whose fixture was this exact state and so
+/// could not simultaneously hold both this case and the next one.
 #[test]
 fn node_modules_missing_with_the_bundle_current_runs_no_npm_command() {
     let fixture = Fixture::installed("node-modules-missing-bundle-current");
@@ -322,10 +327,14 @@ fn watch_paths_cover_every_top_level_input_and_the_src_directory_only() {
     );
 }
 
-/// Pins compute_fingerprint to a literal SHA-256 for src/a.ts containing x followed by a newline.
-/// WebBundleFingerprintTests in packaging/tests/test_release_layout.py uses the same fixture and
-/// hash for release_check.py's independent web_bundle_fingerprint implementation.
-/// The shared expected value catches drift between the two algorithms before source asset checks fail.
+/// Pins one literal sha256 for `compute_fingerprint` over a minimal, fixed fixture (a single
+/// `src/a.ts` holding `x\n`, nothing else) -- the same fixture and the same literal hash
+/// `packaging/tests/test_release_layout.py`'s own `WebBundleFingerprintTests` asserts against
+/// `release_check.py`'s independent `web_bundle_fingerprint`. The two sides are separate
+/// implementations of the same algorithm, kept in step only by their doc comments and by whatever
+/// exercises each one -- nothing else compares them against each other directly, so a change to
+/// either one that silently drifted from the other would otherwise only surface as every real
+/// release's source asset failing `release_check.py`'s `check_eitri_source_tree`.
 #[test]
 fn fingerprint_matches_the_pinned_value_the_python_side_also_asserts() {
     let scratch = ScratchDir::new("pinned-fingerprint");

@@ -539,8 +539,8 @@ mod tests {
         assert!(a.dividers.is_empty());
     }
 
-    /// A module's minimum size keeps the divider from shrinking it below that size.
-    /// The bottom module has an 80px minimum height here.
+    /// A module's minimum size holds the divider off it, as `GtkPaned` with `shrink = false` did
+    /// for the bottom slot's 80px floor (the old `build_vertical_split`).
     #[test]
     fn a_minimum_size_holds_the_divider_off_a_module() {
         let mut layout = bottom_tree();
@@ -862,10 +862,10 @@ mod tests {
         );
     }
 
-    /// Resize targets for both default trees, checked for every focus and direction,
-    /// including every `None`. Each tree has at most one divider per axis: `Row` separates
-    /// the editor and agent, and `Column` sits above the bottom module.
-    /// Each target includes the divider's axis and movement sign.
+    /// The old `resize_target(direction, focused_pane, has_bottom)` (the old `shell/src/layout.rs`), as data:
+    /// which divider (each tree has at most one per axis: `Row` is the divider across, between the
+    /// editor and the agent; `Column` the one above the bottom module) and which way. Every row of
+    /// both trees is checked, including every `None`.
     #[test]
     fn resize_moves_the_divider_todays_resize_target_moved() {
         use Direction::*;

@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# Fill the binary package's pkgver, source archive, Node version and checksums from
-# RELEASE and SHA256SUMS, then regenerate .SRCINFO. Print the suggested commit command
-# for manual use so the operator can choose the public author identity.
+# packaging/aur/bump-bin.sh -- fills packaging/aur/eitri-bin/PKGBUILD's pkgver, _verdandi_source,
+# _nodever and sha256sums from a real release directory (RELEASE + SHA256SUMS, as
+# release.sh writes them), then regenerates .SRCINFO. Never runs git -- it only ever *prints* the commit an
+# operator would run by hand, because the AUR is public git with visible authorship and the
+# global git identity on this machine is private.
 #
 # Usage: packaging/aur/bump-bin.sh <release-dir> [--allow-prerelease] [--pkgbuild-dir DIR]
 #
-# <release-dir> holds RELEASE and SHA256SUMS produced by release.sh.
-# --allow-prerelease permits a version containing "-rc." for container tests only.
-# Publishing that pkgver would sort above the final release in pacman's version comparison
-# and prevent an automatic upgrade to the final version.
-# --pkgbuild-dir DIR selects a test directory so prerelease bumps leave the tracked recipe clean.
+#   <release-dir>        holds RELEASE and SHA256SUMS (release.sh's output, e.g.
+#                         ~/.cache/eitri-release/v0.2.0/).
+#   --allow-prerelease    Fill the PKGBUILD/.SRCINFO anyway when the release's own EITRI_VERSION
+#                         is a prerelease (contains "-rc."). Only ever pass this for
+#                         packaging/aur/test-in-container.sh's own use: eitri-bin is not
+#                         published to the AUR for a prerelease version (see the note at the top
+#                         of eitri-bin/PKGBUILD) -- pacman's
+#                         own version comparison sorts a `-rc.N` pkgver ABOVE the final release
+#                         that follows it, stranding every rc installer with no upgrade path.
+#   --pkgbuild-dir DIR    Operate on DIR instead of the sibling eitri-bin/ directory (testing
+#                         only -- keeps a prerelease bump from dirtying the tracked PKGBUILD).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,7 +144,7 @@ if [ "$IS_PRERELEASE" = 1 ] && [ "$ALLOW_PRERELEASE" != 1 ]; then
 bump-bin.sh: $VERSION is a prerelease (-rc.N). eitri-bin is never published to the AUR for a
 prerelease version: its pkgver ('-' -> '_') sorts ABOVE the eventual final release under pacman's
 own vercmp (vercmp 0.2.0_rc.1-1 0.2.0-1 => 1), stranding every -rc.N installer above 0.2.0 with no
-upgrade path (the private review notes #3).
+upgrade path.
 
 Pass --allow-prerelease only to build and test this version locally
 (packaging/aur/test-in-container.sh); the result must never be pushed to the AUR.

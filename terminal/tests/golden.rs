@@ -1,13 +1,23 @@
-//! Renders the golden operation corpus and inspects the resulting pixels.
+//! Renders Verdandi's own golden op corpus and inspects the resulting pixels.
 //!
-//! The corpus is read directly from `terminal-render/tests/golden/paintops.txt` in the workspace
-//! so these tests and the corpus producer share one file rather than copies that can drift.
+//! Moved from the frozen `terminal-pane/tests/golden.rs` (2026-09-23).
+//! Since the move the corpus is read from `terminal-render/tests/golden/paintops.txt` itself, in this
+//! workspace, rather than from a copy of it: one file, so the two can no longer drift apart.
 //!
-//! The corpus supplies real operation streams without constructing a `Term` or invoking the
-//! builder in these tests. Checks sample computed cell positions for specific colours and
-//! the presence or absence of ink, catching glyphs drawn in the wrong column.
-//! `surfaces::raster_n32_premul` provides an in-memory Skia canvas so these tests run
-//! without a GPU or window.
+//! The corpus in `fixtures/paintops.txt` is the exact op stream Verdandi's builder produces for 17
+//! known scenarios, copied verbatim from `crates/terminal-render/tests/golden/paintops.txt`. It was
+//! copied from there and still matches that file byte for byte at the Verdandi revision this
+//! workspace pins. Using it
+//! here means the backend is tested against real op streams without this crate needing the builder,
+//! a `Term`, or any terminal vocabulary at test time.
+//!
+//! **These are pixel assertions, not smoke tests.** Every check samples the rendered surface at a
+//! computed cell position and asserts what is actually there: a specific colour, or the presence or
+//! absence of ink. "It drew something and did not crash" would pass against a backend that put every
+//! glyph in the wrong column, which is precisely the failure mode a cell-lattice bug produces.
+//!
+//! No GPU and no window: `surfaces::raster_n32_premul` gives a real Skia canvas in memory, so these
+//! run in CI and in a plain `cargo test`.
 
 mod fixture;
 

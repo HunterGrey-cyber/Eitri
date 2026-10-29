@@ -1,10 +1,14 @@
-//! The window's colours come from the embedded nvim's highlight groups.
-//! nvim sends a snapshot through `nvim_theme.lua` and `feed`; token derivation produces
-//! a complete set used by `gtk_css` for the chrome and by the agent panel's WebView.
-//! No separate palette is supplied.
+//! The window's colours, derived from the embedded nvim's own highlight groups.
 //!
-//! Token derivation and the socket protocol live in the core without GTK dependencies.
-//! This crate keeps the GTK CSS provider and the `glib` timer that polls the feed.
+//! nvim pushes a snapshot (`nvim_theme.lua` → `feed`), `eitri_core::theme::tokens` turns it into
+//! a complete token set, and two consumers paint with it: `gtk_css` (the chrome) and the agent
+//! panel's WebView (through `eitri_core::agent_bridge::serialize_theme_for_js`). Eitri ships
+//! no palette of its own.
+//!
+//! Token derivation itself (`color`/`payload`/`tokens`) moved to `eitri_core::theme` -- it has no GTK dependency, unlike
+//! `gtk_css`, and unlike `feed`'s `glib` timer, which is all of `feed` that stayed here. The socket
+//! protocol and `nvim_theme.lua` went to `eitri_core::theme::feed` in L2 T5: this sentence used to
+//! say `feed` stayed for want of portability, which its protocol half then disproved.
 
 pub(crate) mod feed;
 pub(crate) mod gtk_css;

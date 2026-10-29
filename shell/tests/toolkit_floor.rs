@@ -1,19 +1,32 @@
-//! Checks the GTK 4.14 and WebKit 2.40 toolkit floor in manifests and resolved Cargo features.
-//! The ABI check over shipped binaries lives in packaging/check-abi-floor.py.
+//! Holds the GTK 4.14 / WebKit 2.40 toolkit floor. Two of the three
+//! layers of the check live here; the third (the ABI check over shipped binaries) is
+//! `packaging/check-abi-floor.py`.
 //!
-//! The three product manifests naming a gtk4 version feature must request only v4_14.
-//! The resolved graph from cargo tree -e features -i <crate>, run with --locked --offline,
-//! must not enable gtk4, gdk4 or gsk4 above v4_14, or webkit6 above v2_40.
-//! This catches dependencies that raise the floor through feature unification.
+//! 1. `gtk4_manifests_declare_exactly_the_v4_14_floor` -- the three product manifests that name a
+//!    `gtk4` version feature (`shell`, `neovide-editor`, `supervisor`) say `v4_14` and nothing
+//!    else, catching a manifest bump directly.
+//! 2. `gtk_webkit_feature_unification_never_exceeds_the_floor` -- Cargo's *resolved* feature graph
+//!    (`cargo tree -e features -i <crate>`, run with `--locked --offline` so it reads only what is
+//!    already fetched) never carries `gtk4`/`gdk4`/`gsk4` above `v4_14` or `webkit6` above `v2_40`
+//!    through any dependency path, including one that would enable it through unification rather
+//!    than through one of the three manifests above. This is the check that would catch a *new*
+//!    dependency raising the floor even if nobody touched a manifest here.
 //!
-//! collect_enablers follows feature children through any package's features, including forwarding
-//! such as default = ["gtk4/v4_16"], rather than only same-crate version-feature chains.
-//! A fixture-based unit test checks this traversal without editing a manifest or running cargo tree.
+//! Both must fail today (the floor is `v4_18`) before the manifest edit lands; that red run is
+//! recorded in the commit message rather than pinned as a third test, since pinning "must currently
+//! fail" would make the guard itself a tautology once the fix lands.
+//!
+//! **Correction:** check 2's walk (`collect_enablers`) follows a feature
+//! child down through *any* package's own feature, not only a same-crate `vN_M` version chain --
+//! the original single-level walk treated every feature child alike and skipped it, which let a
+//! forwarded feature (`shell/Cargo.toml`'s `default = ["gtk4/v4_16"]`, reproduced by hand) evade
+//! both tests. The `tests` module below pins the red case as a fixture-based unit test, so it does
+//! not need a manifest edit or a real `cargo tree` invocation to stay checked.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// GTK's own convention: `v4_N`. The floor this plan sets.
+/// GTK's own convention: `v4_N`. The floor.
 const GTK_FLOOR: u32 = 14;
 /// WebKitGTK's convention: `v2_N`. Not currently requested by any manifest here (no manifest names
 /// a `webkit6` version feature), but checked anyway so a future dependency raising it is caught the
@@ -198,7 +211,7 @@ fn run_cargo_tree_inverted(invert: &str, root: &Path) -> String {
 }
 
 /// Every real enabler of the above-floor feature node at `parent`: a package that asked for it
-/// directly, or a *different* package's
+/// directly, or -- since the walk was widened -- a *different* package's
 /// own (non-version-shaped) feature forwarding it, e.g. `shell feature "default"` via
 /// `default = ["gtk4/v4_16"]` in `shell/Cargo.toml`. The original, single-level walk treated *any*
 /// feature child as "a chained feature, not a direct enabler" and skipped it outright, which is

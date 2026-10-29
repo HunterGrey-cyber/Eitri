@@ -1,7 +1,10 @@
-//! Shell chrome feasibility probe with a custom top bar, Wayland window controls,
-//! drag-to-move, a `GtkPaned` splitter, a status bar and CSS that suppresses Adwaita styling.
-//! The splitter stands in for editor and agent panes. This probe has no embedded editor,
-//! Neovim connection or real project and file state.
+//! shell_chrome — feasibility probe for the custom-top-bar test.
+//!
+//! This proves *shell chrome mechanics only*: custom top bar with working
+//! Wayland window controls and drag-to-move, a GtkPaned splitter standing in
+//! for the future Neovide|Agent split, a status bar strip, and a CSS theme
+//! that suppresses default Adwaita styling. It does not embed Neovide, does
+//! not talk to Neovim, and holds no real project/file state.
 
 mod theme;
 

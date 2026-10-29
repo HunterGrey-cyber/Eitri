@@ -1,18 +1,43 @@
 #!/usr/bin/env bash
-# Build, check and install the binary and source packages in clean archlinux:latest
-# containers, then run --version for each installed package.
+# packaging/aur/test-in-container.sh -- builds, checks and installs both eitri-bin and
+# eitri-git in clean archlinux:latest containers (acceptance: both
+# packages build, install and run --version in a clean Arch container).
 #
-# Override source= entries in temporary recipes to use local release assets and repositories.
-# Serve release assets from --release-dir on 127.0.0.1 with python3 -m http.server;
-# --network host lets the binary-package container reach that server.
-# Bind-mount source repositories read-only under /mirrors/ and use git+file:// sources.
-# Tag a throwaway clone with --tag so pkgver() also exercises prerelease tags without
-# changing the input checkout. Validate that the mirrors contain the pinned revisions.
-# Node downloads and cargo registry access still use the network. Cargo normally fetches
-# the pinned git dependency from its public URL. The optional cargo mirror redirect applies
-# inside the container for testing unpublished revisions.
+# Every source= in both PKGBUILDs points at a real, not-yet-existing GitHub location (the AUR
+# entries are meant to track *published* releases/tags), so every run here overrides source= to a
+# test-only, local, never-committed location -- documented, not silent (`--network host` is used only where a
+# 127.0.0.1 server must be reached, with that reason recorded):
 #
-# To test another release, select its asset directory and matching checkout and mirrors.
+#   eitri-bin   the two eitri.git release assets (the tarball, the verdandi source archive) are
+#                 served from --release-dir by a `python3 -m http.server` on 127.0.0.1, reached with
+#                 --network host. Node still comes from the real nodejs.org (a real, always-true
+#                 part of the recipe, not an artifact of this being a test).
+#   eitri-git   all three git sources (Eitri, neovide, verdandi) come from local repositories,
+#                 bind-mounted read-only into the container at /mirrors/ with source= rewritten to
+#                 git+file:///mirrors/...: --eitri-checkout (tagged with --tag in a throwaway
+#                 clone, since the public repo carries no tag yet during the rc window --
+#                 so eitri-git's pkgver() runs against a latest tag that is a prerelease, the
+#                 case an earlier sed broke on),
+#                 --neovide-mirror (must carry neovibe-integration, with the checkout's submodule
+#                 commit on it) and --verdandi-mirror (must hold agent/Cargo.toml's pinned rev) --
+#                 no tag needed on either; both are checked before the container starts.
+#                 node-<...>.tar.xz is the same real nodejs.org download as -bin's, and cargo still
+#                 fetches the pinned Verdandi crate from its real public URL -- unless
+#                 --cargo-verdandi-from-mirror is given: then cargo's git fetch of that URL is redirected
+#                 (git `insteadOf`, inside the container only) to --verdandi-mirror as well. That is for a
+#                 rehearsal before the pinned Verdandi commit is pushed; a real release leaves it off, so
+#                 the run also proves the public Verdandi has the pin.
+#
+# Usage:
+#   test-in-container.sh --release-dir DIR --eitri-checkout DIR --neovide-mirror DIR \
+#       --verdandi-mirror DIR [--tag TAG] [--work DIR] [--only bin|git] [--jobs N]
+#       [--cargo-verdandi-from-mirror]
+#
+# --release-dir is the only thing that needs to change to re-run this against a later (real,
+# signed) release: `--release-dir ~/.cache/eitri-release/v0.2.0/` (release.sh's default --out)
+# once it exists, keeping --eitri-checkout/--neovide-mirror/--verdandi-mirror pointed at whatever
+# public clone/mirrors correspond to that release (a fresh public export for a real cut, or the
+# same ones here if the commits have not moved).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -113,8 +138,9 @@ stop_http_server() {
 }
 trap stop_http_server EXIT
 
-# Reuse pacman's package cache across runs in a named Docker volume.
-# This avoids leaving root-owned cache files in a bind-mounted host directory.
+# One archlinux:latest pull-through cache for pacman's own package cache across repeated runs of
+# this script (a named docker volume, not a host bind mount -- the hygiene rule is about
+# not leaving root-owned files on a HOST path, which a volume never does).
 docker volume create nv-aur-pacman-cache >/dev/null
 
 run_arch() {
@@ -140,8 +166,8 @@ run_arch() {
 # eventual `pacman -U` both need it, and makepkg -s escalates through sudo to install missing
 # makedepends/depends as it goes. The actual build itself never runs as root -- every `makepkg`/
 # `namcap` invocation below is `runuser -u builder`, a user created here at the caller's own host
-# uid/gid, so nothing this container writes onto the bind-mounted /build is root-owned (spec sec
-# 2.4's hygiene intent, met through runuser rather than through `docker run --user`, since a single
+# uid/gid, so nothing this container writes onto the bind-mounted /build is root-owned (the
+# hygiene intent, met through runuser rather than through `docker run --user`, since a single
 # container needs to be root for pacman -Syu/-U and non-root for makepkg in the same run).
 # shellcheck disable=SC2016 # expanded by the container's bash -c, not here
 ARCH_SETUP='
@@ -273,8 +299,10 @@ test_git() {
 			-e "GIT_CONFIG_KEY_0=url.file:///mirrors/verdandi.git.insteadOf"
 			-e "GIT_CONFIG_VALUE_0=https://github.com/HunterGrey-cyber/verdandi.git")
 	fi
-	# Use the default bridge network for cargo, npm, the Skia archive and Node downloads.
-	# The git+file:// source mounts need no network access and no host network mode.
+	# Real network: cargo's registry and the pinned Verdandi git dependency, npm, the Skia archive
+	# (prepare()) and nodejs.org -- git+file:// sources need no network of their own, so this is
+	# the default bridge network, not the 127.0.0.1-only --network host exception,
+	# just ordinary package-build network access (already an accepted AUR norm).
 	run_arch "nv-aur-git-$$" "$WORK/log-git.log" \
 		--mount "type=bind,src=$WORK/eitri-tagged.git,dst=/mirrors/eitri.git,readonly" \
 		--mount "type=bind,src=$NEOVIDE_MIRROR,dst=/mirrors/neovide.git,readonly" \

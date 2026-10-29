@@ -162,10 +162,11 @@ setup_keys() {
 	fi
 }
 
-# setup_old_installer prepares fixtures/install-0.2.0.sh, the installer shipped in
-# 0.2.0. test_install.py pins its hash. Remove embedded signing keys, as for INSTALLER,
-# so signature checks use the test key. Run it through INSTALLER_UNDER_TEST to test
-# upgrading with a saved installer, using only fixture releases and scratch homes.
+# setup_old_installer: OLD_INSTALLER, the install.sh that 0.2.0 shipped (fixtures/install-0.2.0.sh, which
+# is packaging/install.sh from the tree 0.2.0 was cut from; test_install.py pins its hash), with every key line of its
+# signers block taken out as INSTALLER's are, so it checks signatures against the test key like every
+# other run here. It is what a user who saved 0.2.0's installer reruns to upgrade; tests run it
+# through INSTALLER_UNDER_TEST. It only ever runs against fixture releases, in scratch homes.
 setup_old_installer() {
 	awk '
 		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1; print; next }

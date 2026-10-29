@@ -44,17 +44,19 @@ use super::verbs::Preset;
 pub const MIN_RATIO: f32 = 0.05;
 pub const MAX_RATIO: f32 = 0.95;
 
-/// The editor's share of the default `Row(editor | agent)` preserves a 760px editor in a
-/// 1280px window with a 1px divider, leaving 1279px to divide. The ratio scales with window width.
-/// The previous `GtkPaned` also scaled after its first allocation, but kept its initial 760px
-/// position on a first allocation at another width, such as a maximised or tiled launch.
-/// A share of 0.6 would give 767px in the default window.
+/// The editor's share of the default `Row(editor | agent)`: exactly where the window it
+/// replaces put the divider. `build_content_area` set its `GtkPaned` to 760px (in the old `shell/src/layout.rs`) in the 1280px default window, whose 1px divider leaves 1279px to divide, and a `GtkPaned` whose children
+/// both resize scales that position with the window after its first allocation -- which is what a
+/// ratio does. So the default window is pixel-identical. A first allocation of another width (a
+/// maximised or tiled launch) is not: `GtkPaned` kept the 760px it was given before it had a size,
+/// and the manual check compares that case too. (0.6, an earlier figure, is 767px.)
 pub const DEFAULT_EDITOR_SHARE: f32 = 760.0 / 1279.0;
 
-/// The share the existing root keeps when a module is placed below it.
-/// The previous bottom split started 480px down. With a 39px top bar (`min-height: 38px` plus
-/// its 1px border), the default content height is 721px, or 720px after the divider.
-/// 480 of 720 is two thirds. These dimensions come from the CSS rather than measurement.
+/// The share the existing root keeps when a module is placed below it: the bottom slot it replaces
+/// started with its divider 480px down (the old `build_vertical_split`). The default
+/// window's content is 721px tall if the top bar is the 39px its CSS asks for (`.topbar`'s
+/// `min-height: 38px` and 1px border), 720 after the divider, and 480 of 720 is two thirds. **Read
+/// off the CSS, not measured**: the checklist's first item measures where this divider lands.
 pub const BELOW_ROOT_SHARE: f32 = 2.0 / 3.0;
 
 /// The share the existing root keeps when a module is placed to its right. Nothing today does

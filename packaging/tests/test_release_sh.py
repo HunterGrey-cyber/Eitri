@@ -1,5 +1,4 @@
-"""Tests for packaging/release.sh:
-every refusal it makes before anything is built, each with its own message, and a sign/verify round
+"""Tests for packaging/release.sh: every refusal it makes before anything is built, each with its own message, and a sign/verify round
 trip through the same shell functions a release uses.
 
     python3 -m pytest packaging/tests/test_release_sh.py -q
@@ -245,7 +244,7 @@ class ReleaseShTestCase(unittest.TestCase):
     def write_signers(self, block):
         """packaging/release-signers and the matching packaging/install.sh embedded block,
         together, so a test that changes what the fixture signs never leaves the two fixture
-        files disagreeing by accident (the signer drift check would refuse that)."""
+        files disagreeing by accident (the drift check would refuse that)."""
         _write(os.path.join(self.clone, "packaging", "release-signers"), block)
         _write(os.path.join(self.clone, "packaging", "install.sh"), _install_sh_fixture(block))
 
@@ -481,7 +480,7 @@ class Refusals(ReleaseShTestCase):
 class EmbeddedSignersRule(ReleaseShTestCase):
     """packaging/install.sh's embedded release-signers block must
     agree with the tracked packaging/release-signers, for every version; a final version also
-    needs a real key in it. Each case refuses with its own message (the plan's acceptance)."""
+    needs a real key in it. Each case refuses with its own message (the acceptance condition)."""
 
     def test_a_drifted_embedded_block_refuses_on_a_release_candidate(self):
         # The tracked file gains a key; install.sh's fixture is left as it was -- the drift itself,
@@ -525,11 +524,11 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
     """Once packaging/release-signers holds a real
     key, a release candidate must actually be verifiable against it -- fill_notes' 'install.sh
     verifies it itself, with the release key built into it' claim describes a signature that must
-    exist and must be by that key. Before this round, an rc with a key already embedded could still
+    exist and must be by that key. An rc with a key already embedded could once
     build --unsigned or against an unrelated --release-signers throwaway, so the shipped notes
     would lie. The version stays the fixture default (1.0.0-rc.1, an rc); every case here commits a
     real key into both packaging/release-signers and install.sh's embedded block first, via
-    write_signers (so the signer drift check never fires here -- these are about the signing rule,
+    write_signers (so the drift check never fires here -- these are about the *new* rule,
     layered on top of an already-agreeing pair)."""
 
     def commit_a_real_key(self):
@@ -614,8 +613,8 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
 
 class TwinFreshnessRule(ReleaseShTestCase):
     """release_check.py's `twins` check is wired into preflight, over
-    $RS_SOURCE's own root, before anything is built.
-    task17-18.md's acceptance: 'editing an English guide without its twin fails ... release.sh').
+    $RS_SOURCE's own root, before anything is built (editing an English guide without its twin
+    must fail release.sh).
     The fixture's own README.md/INSTALL.md and their Chinese twins (_twin_doc_files) start fresh --
     PositiveControls already proves that shape reaches docker; these prove each way of breaking it
     is refused first, by release_check's own message, with no docker call."""
@@ -648,8 +647,8 @@ class TwinFreshnessRule(ReleaseShTestCase):
 
 class LeakScanRule(ReleaseShTestCase):
     """publish/scan.sh is only in the private checkout. The public clone's own copy of release.sh
-    passes the cmp refusal, so running it by mistake must not skip the host leak scan quietly
-    -- without the scanner the run stops unless --no-leak-scan asks for that, and
+    passes the cmp refusal, so running it by mistake must not skip the host leak scan quietly:
+    without the scanner the run stops unless --no-leak-scan asks for that, and
     --no-leak-scan is refused wherever the scanner exists and for a final version."""
 
     def clone_copy(self):
@@ -1210,7 +1209,7 @@ class SignAndVerify(unittest.TestCase):
         self.assertEqual(self.sign().returncode, 0)
         proc = _bash(f'verify_sums "{self.signers}" "{self.rel}"', self.env.vars, self.scratch)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # The same verification command used by the installer must also succeed.
+        # The installer's own command, verbatim, agrees.
         with open(os.path.join(self.rel, "SHA256SUMS"), "rb") as sums:
             direct = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", self.signers, "-I", "release@eitri",
                                      "-n", "eitri-release", "-s", os.path.join(self.rel, "SHA256SUMS.sig")],
@@ -1413,8 +1412,7 @@ class SignSumsRetries(unittest.TestCase):
 
 
 class VerifyReleaseSignature(unittest.TestCase):
-    """verify_release_signature, which host_main runs right after sign_sums:
-    preflight's signers_list_blob matches a --release-signers override against packaging/
+    """verify_release_signature, which host_main runs right after sign_sums. Preflight's signers_list_blob matches a --release-signers override against packaging/
     release-signers by the key blob alone, and the signature used to be verified against the
     override only. An override listing the embedded key's blob under the right principal and
     namespace, while packaging/release-signers lists it under another, passed at release time --
@@ -1573,8 +1571,7 @@ class HostScans(unittest.TestCase):
 
 
 class ReleaseNotes(unittest.TestCase):
-    """fill_notes, over the real release-notes.md.in, with the real publish/scan.sh:
-    the Verify section must describe what THIS build's shipped install.sh
+    """fill_notes, over the real release-notes.md.in, with the real publish/scan.sh. The Verify section must describe what THIS build's shipped install.sh
     can actually check, which takes two facts, never one: whether packaging/release-signers (the
     block install.sh embeds) holds a key, and whether this run signed (RS_SIGN_KEY non-empty).
 
@@ -1678,7 +1675,7 @@ class ReleaseNotes(unittest.TestCase):
 
 class ReleaseNotesBilingual(unittest.TestCase):
     """One page, the English notes, a `---` rule, then the Chinese notes
-    under the Simplified Chinese heading. Reuses ReleaseNotes.render() (called
+    under `## 简体中文`. Reuses ReleaseNotes.render() (called
     unbound, `ReleaseNotes.render(self, ...)`, so its addCleanup/skipTest register against *this*
     instance rather than a throwaway one) against the exact same three release-signers/RS_SIGN_KEY
     combinations ReleaseNotes already covers for the English half."""

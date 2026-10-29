@@ -1,25 +1,50 @@
-//! Produces a manual terminal resume command after the panel session has closed.
+//! "Continue this conversation in a real terminal": the rule for when it is possible, and the
+//! command it produces.
 //!
-//! This module starts no process and takes no lease. `shell` is a GUI process without a dedicated
-//! terminal to hand over: desktop-launcher stdio may not be a terminal, and a cargo run terminal
-//! also carries the shell's diagnostics.
+//! **What this does NOT do, and why.** It starts nothing and it takes no lease. The supported,
+//! strongly-exclusive handoff (`agent::handoff::
+//! prepare_eitri_to_cli_handoff` implements it) works by spawning
+//! `eitri-claude-handoff` as a direct child with the already-locked lease fd inherited and the
+//! host's own stdio inherited -- it hands the CALLER's terminal to `claude`. `shell` is a GUI
+//! process and has no terminal to hand over: under a desktop launcher its stdio is not a terminal
+//! at all, and under `cargo run` it is a terminal `shell` is itself still writing `eprintln!`
+//! diagnostics to, which an interactive TUI would then be sharing with it.
 //!
-//! `agent::handoff::prepare_eitri_to_cli_handoff` instead spawns `eitri-claude-handoff` directly
-//! with the locked lease descriptor and the caller's stdio inherited. Passing that descriptor
-//! through an arbitrary terminal emulator has no verified descriptor-preservation guarantee.
-//! A reused descriptor number could pass `fcntl(fd, F_GETFD)` without referring to the lease.
+//! Routing the lease fd through a terminal emulator instead was considered and not taken, on two
+//! grounds that are about what can be ESTABLISHED here rather than about what would happen.
+//! First, which emulator: `$TERMINAL` is unset on this machine, the GNOME default key names
+//! `xdg-terminal-exec`, which is not installed, and five emulators are (foot, alacritty, kitty,
+//! gnome-terminal, xterm) -- so the choice would be a guess. Second, and worse: nothing in a
+//! terminal emulator's interface promises to preserve a file descriptor it knows nothing about
+//! across the fork/exec that starts the command, and whether any of these does has NOT been
+//! tested here. The failure that matters is not "the lock was silently dropped" but "fd number N
+//! is open and refers to something else": `eitri-claude-handoff`'s own sanity check is
+//! `fcntl(fd, F_GETFD)`, which only asks whether the descriptor is open, so a reused number would
+//! pass it and `claude` would run believing it holds a lease it does not.
 //!
-//! The command is shown explicitly as a raw/manual path with a concurrency warning.
-//! No lease prevents this workspace from resuming the same session, and even a lease cannot
-//! prevent an external `claude --resume` from doing so.
+//! So this takes the other path that handoff design allows, and names it the way the design requires:
+//! it permits handing the user the command to run themselves, on
+//! the condition that it is shown explicitly as the
+//! raw/manual path, carrying a concurrency warning. That warning is not a formality here: with no
+//! lease taken, nothing prevents this workspace from also resuming the same session, and the design
+//! rejects any claim that a lease would stop an external `claude --resume` anyway.
 //!
-//! `agent_panel` closes the session and waits for shutdown before showing the command.
-//! The shutdown worker calls `AgentBackend::shutdown()` and drops the backend; this path writes
-//! no projection. The default legacy backend cannot resume and advertises `resumable: None`.
-//! `AgentPanelState::last_handoff` keeps the `ClaudeResumeCommand` in Rust so a reloaded page can
-//! show it again. This retains the command, not the conversation transcript.
+//! What this module DOES enforce is the ordering that design asks for, **steps 1-4 and only those**:
+//! `agent_panel` closes the session for real and waits for that close to finish before the command
+//! is ever shown. The user cannot be looking at the command while Eitri is still driving the
+//! session.
 //!
-//! The direct handoff helper has no consumer here because it requires a caller-owned terminal.
+//! Step 5 (saving the Eitri projection and the provider session ID) is NOT done here, and saying "steps 1-5"
+//! would be one step too many. Nothing on this path writes a projection: the teardown worker
+//! (`spawn_teardown`) calls `AgentBackend::shutdown()` and drops the backend, and on the default
+//! legacy backend nothing is persisted at all (`BackendGreeting::for_kind` returns `resumable: None`
+//! for it, because that backend cannot resume). What the panel does keep is narrower and is the reason the command does
+//! not evaporate on a reload: `AgentPanelState::last_handoff` holds the produced
+//! `ClaudeResumeCommand` in the Rust host, so a reloaded document is handed it again. That is the
+//! command, not the transcript -- the conversation itself is gone from this panel either way.
+//!
+//! `agent::handoff::prepare_eitri_to_cli_handoff` is therefore still without a consumer. It is
+//! the right mechanism for a host that owns a terminal; `shell` is not one.
 
 use agent::handoff::{ClaudeResumeCommand, ResumeCommandError};
 use std::path::Path;

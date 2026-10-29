@@ -1,5 +1,5 @@
 """Unit tests holding the two nfpm profiles -- packaging/nfpm.yaml (private mirror) and
-packaging/nfpm-public.yaml (public, GitHub Releases) -- to their packaging invariants.
+packaging/nfpm-public.yaml (public, GitHub Releases) -- to the invariants both packages share.
 
     python3 packaging/test_nfpm_profiles.py
     python3 -m pytest packaging
@@ -192,15 +192,14 @@ RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/eitri-claude-handoff",
 }
 
-# Only the private profile includes the sidecar binary and the .rev file that identifies
-# the source revision used to build it.
+# Contents entries expected ONLY in the private (mirror) profile: the sidecar itself and the
+# rev file recording which Verdandi revision it was built from.
 PRIVATE_ONLY_DSTS = {
     "/usr/lib/eitri/verdandi-claude-sidecar",
     "/usr/lib/eitri/verdandi-claude-sidecar.rev",
 }
 
-# Only the public profile includes the installer used by the setup subcommand.
-# The private profile has no installer entry.
+# Contents entries expected ONLY in the public profile: the installer, staged as `eitri setup`.
 PUBLIC_ONLY_DSTS = {
     "/usr/lib/eitri/eitri-setup",
 }
@@ -233,10 +232,9 @@ class AgreesWithPyYAML(unittest.TestCase):
 
 
 class PublicProfileNeverCarriesTheSDK(unittest.TestCase):
-    """No sidecar is carried in any public artifact: checked here on the
+    """No sidecar in any public artifact: checked here on the
     profile itself, so a future edit that adds the sidecar back to the public YAML fails a fast
-    unit test rather than waiting for a release build's own content-and-leak check
-    to catch it."""
+    unit test rather than waiting for a release build's own content-and-leak check to catch it."""
 
     def test_verdandi_claude_sidecar_is_named_nowhere_in_the_public_profile(self):
         text = _read(PUBLIC_PATH)
@@ -264,8 +262,9 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
     `agent-hook` (legacy's PreToolUse relay binary) ships in neither profile."""
 
     def test_agent_hook_is_absent_from_both_files(self):
-        # Check parsed contents entries: comments may explain that agent-hook is absent,
-        # and a raw substring check would fail on that explanation.
+        # On the parsed `contents` entries, not the raw text: both files' own comments legitimately
+        # explain, in prose, that agent-hook is absent and why -- a raw substring check would
+        # fail on that very sentence.
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             for entry in _load_yaml(path)["contents"]:
                 self.assertNotIn("agent-hook", entry["src"], (path, entry))
@@ -290,12 +289,11 @@ class ReleaseAndSourceAreInBoth(unittest.TestCase):
 
 
 class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
-    """The profiles may differ only in "the sidecar
+    """The two files may differ only in: the sidecar
     entry and its `.rev`; `eitri-setup`; the dependency blocks; the licence and description
-    fields; maintainer/homepage." `version_schema` is a `nfpm-public.yaml`-only addition for
-    prerelease ordering, which the private profile may adopt later
-    as well; until then it is an allowed
-    top-level difference too, same as the fields named above."""
+    fields; maintainer/homepage. `version_schema` is a `nfpm-public.yaml`-only addition from the
+    prerelease-ordering work, which may still be revisited for the private profile; until then it is
+    an allowed top-level difference too, same as the fields named above."""
 
     ALLOWED_DIFFERING_TOP_LEVEL_KEYS = {
         "maintainer",
@@ -370,7 +368,7 @@ APPARMOR_SRC = "./packaging/apparmor/eitri"
 class TheDebCarriesTheAppArmorProfile(unittest.TestCase):
     """Ubuntu 23.10+ lets WebKit's bwrap sandbox start only under an AppArmor profile granting
     `userns`. Both profiles ship packaging/apparmor/eitri to the .deb alone, as a conffile, and
-    nothing loads it (no maintainer script)."""
+    nothing loads it (no maintainer script: the rule, REL-2)."""
 
     def test_both_profiles_ship_it_to_the_deb_only_as_a_conffile(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):

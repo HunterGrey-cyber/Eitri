@@ -4261,7 +4261,7 @@ mod tests {
 
     /// The same mechanism, but reaching an existing HARD-LINKED file rather than an outside symlink:
     /// `resolve_missing_edit_target`'s fallback always set `is_hard_link: false`, since that branch
-    /// believes it is naming something that does not exist yet ([codex], "important").
+    /// believes it is naming something that does not exist yet.
     #[test]
     fn a_dotdot_past_a_missing_component_cannot_reach_a_hard_link_lexically() {
         let ws = Workspace::new();
@@ -4302,7 +4302,7 @@ mod tests {
         );
     }
 
-    /// [codex], "blocking": the CLI checks a protected name at both the requested spelling and the
+    /// The CLI checks a protected name at both the requested spelling and the
     /// resolved one. An ordinary, unremarkable symlink whose target has an unprotected name used to
     /// slip past this policy entirely, since only [`EditTarget::logical`] -- the resolved path --
     /// was ever checked.

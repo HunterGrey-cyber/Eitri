@@ -1,6 +1,6 @@
 """Unit tests for packaging/release_check.py -- the release build's content and layout checks,
 factored out as pure functions so each one is tested here with no container and no network
-access.
+.
 
     python3 -m pytest packaging -q
     python3 packaging/tests/test_release_layout.py
@@ -124,8 +124,8 @@ _NFPM = shutil.which("nfpm")
 
 
 def _make_rpm(dest_path, data_files):
-    """A real .rpm via the host's own nfpm 2.47.0 (from the release container's tool
-    list). Stages `data_files` (relpaths rooted at /) under a scratch dir and points a minimal
+    """A real .rpm via the host's own nfpm 2.47.0 (the tool the release container
+    uses). Stages `data_files` (relpaths rooted at /) under a scratch dir and points a minimal
     nfpm.yaml's `contents` at them."""
     stage = _scratch_dir()
     for relpath, content in data_files:
@@ -272,7 +272,7 @@ class ReleaseFieldsTests(unittest.TestCase):
         -- read back, not retyped, so a
         change there that this file's VERSION_RE does not follow is caught rather than assumed
         away. Skips (does not fail the suite) if that line is not found in its current shape,
-        since this lane must not depend on another lane's in-flight edits."""
+        since this test must not depend on that line's exact shape."""
         install_sh = os.path.join(_PACKAGING, "install.sh")
         if not os.path.isfile(install_sh):
             self.skipTest("packaging/install.sh not present in this checkout")
@@ -382,7 +382,7 @@ class GhReleaseCommandTests(unittest.TestCase):
 
 class TarGzScanTests(unittest.TestCase):
     """Every content-scan rule, over a real gzip-compressed tarball extracted with
-    release_check.extract_tar_gz."""
+    release_check.extract_tar_gz -- the same tool the release uses for that asset type."""
 
     def setUp(self):
         self.dest = _scratch_dir()
@@ -475,8 +475,8 @@ class TarGzScanTests(unittest.TestCase):
         self.assertEqual(rc.find_sdk_mentions(files), ["lib/eitri/shell"])
 
     def test_install_sh_mentioning_the_sdk_passes_when_allowed(self):
-        """eitri-setup/install.sh
-        mentioning the SDK passes (M2)."""
+        """The one allowed-fixture case: eitri-setup/install.sh
+        mentioning the SDK passes."""
         files = self._extract([
             ("install.sh", b"# fetches and builds claude-agent-sdk locally, per I2\n"),
             ("lib/eitri/eitri-setup", b"# fetches and builds claude-agent-sdk locally, per I2\n"),
@@ -517,8 +517,7 @@ class DebExtractionTests(unittest.TestCase):
 
 @unittest.skipUnless(_NFPM, "nfpm not on PATH")
 class RpmExtractionTests(unittest.TestCase):
-    """The host's real nfpm 2.47.0 building a real .rpm, then the host's real bsdtar -xf (M8's
-    tool list)."""
+    """The host's real nfpm 2.47.0 building a real .rpm, then the host's real bsdtar -xf."""
 
     def test_a_real_rpm_extracts_and_scans(self):
         dest = _scratch_dir()
@@ -591,7 +590,7 @@ class TreeEqualityTests(unittest.TestCase):
     def test_the_eitri_source_assets_known_additions_are_allowed(self):
         """The Eitri source asset equals `git archive HEAD` except exactly
         vendor/, skia/, neovide/, proto/, .cargo/config.toml, agent-ui/web/dist/index.html,
-        agent-ui/web/dist/.inputs-sha256, the plugin keyboard kit's
+        agent-ui/web/dist/.inputs-sha256 (the web bundle's fingerprint), the plugin keyboard kit's
         plugin-kit/keys/dist/keys.js and its .inputs-sha256, THIRD-PARTY-LICENSES and SOURCE."""
         repo, head = _init_git_repo({"core/lib.rs": b"fn f() {}\n"})
         extracted = _scratch_dir()
@@ -922,8 +921,8 @@ class ScanViewOnDiskTests(unittest.TestCase):
 
 class ThirdPartyLicensesScanAllowTests(unittest.TestCase):
     """publish/scan-allow.txt's THIRD-PARTY-LICENSES entry removes third-party addresses before the
-    other rules run; an address carrying one of scan.sh's own private identifiers must still hit
-    the identifier rule. The identifiers come from scan-allow.txt itself (_private_identifiers), never
+    other rules run; an address carrying one of scan.sh's own private identifiers must still hit.
+    The identifiers come from scan-allow.txt itself (_private_identifiers), never
     from this file, which ships: every one is checked, and nothing private is spelled here, whole or
     in pieces. The third-party addresses are invented, and pieced so the email rule passes this file."""
 
@@ -1186,7 +1185,7 @@ class BinaryAssetTreeTests(unittest.TestCase):
         self.assertEqual(rc.TRACKED_ART["legacy-desktop"], "packaging/legacy/eitri.desktop")
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         with open(os.path.join(repo, "packaging", "legacy", "eitri.desktop"), "rb") as f:
-            # The sha256 of the desktop entry shipped in 0.2.0, retained for compatibility with its installer.
+            # The sha256 of packaging/eitri.desktop from the tree 0.2.0 is cut from.
             self.assertEqual(hashlib.sha256(f.read()).hexdigest(),
                              "b58906bcaf3da9e06b3031b0b36d9298e11a7c227c90e36b50c0b7b68aa7f343")
 
@@ -1357,7 +1356,7 @@ class WebBundleFingerprintTests(unittest.TestCase):
     comments), kept in step only by those doc comments and by whatever exercises each one --
     nothing else compares them against each other directly, so a change to either one that
     silently drifted from the other would otherwise only surface as every real release's source
-    asset failing `check_eitri_source_tree`."""
+    asset failing `check_eitri_source_tree` ."""
 
     PINNED_SHA256 = "ae53f67ca66e61114b0f5453e451fa06c6ed8d9f8d44bee54b35d51b23fe3408"
 
@@ -1520,7 +1519,7 @@ class ReleaseAssetsTests(unittest.TestCase):
     release directory: every asset a real one has, built with the same formats (a real .tar.gz, .deb
     and .rpm, git archives of real repositories), extracted with the real tools. The unbroken set
     passes; then one violation per asset is planted, and each must be reported (the
-    parts were tested, the whole was not)."""
+    parts were tested separately, the whole must be too)."""
 
     VERSION = "1.0.0-rc.1"
     SKIA = "skia-binaries-k.tar.gz"
@@ -1751,12 +1750,11 @@ def _fresh_zh_twin(english_name, english_text):
 
 
 class TwinsCheckTests(unittest.TestCase):
-    """release_check.check_twins checks translation freshness:
-    every Chinese guide anywhere under a
+    """release_check.check_twins every Chinese guide anywhere under a
     tree, at any depth, must still match the English original it was translated from. README.md/
     README.zh-CN.md and INSTALL.md/INSTALL.zh-CN.md are required pairs at the tree's own top level;
     any other discovered <name>.zh-CN.md is paired with its own <name>.md in the same directory the
-    same way (recursively, at every depth). One property
+    same way (recursion, not just the top level). One property
     broken per test, so each failure mode has its own fixture and its own message to check."""
 
     def setUp(self):
@@ -1964,10 +1962,8 @@ class TwinsCliTests(unittest.TestCase):
 
 
 class ReleaseSignersAgreementTests(unittest.TestCase):
-    """Check that the installer and release use identical signer data:
-    packaging/install.sh's embedded_release_signers() heredoc must stay byte-identical to the
-    tracked packaging/release-signers -- a hand-kept copy that drifts is the defect the report
-    of this check must name. These tests plant a minimal install.sh shape carrying the real
+    """packaging/install.sh's embedded_release_signers() heredoc must stay byte-identical to the
+    tracked packaging/release-signers -- a hand-kept copy that drifts is the defect. These tests plant a minimal install.sh shape carrying the real
     heredoc marker (`EITRI_RELEASE_SIGNERS`) rather than reading the real 130KB file, since only
     the marker shape and the block between the two marker lines matter here."""
 

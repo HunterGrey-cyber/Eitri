@@ -615,8 +615,10 @@ mod snap_tests {
     use super::*;
     use neovide::units::PixelSize;
 
-    /// A 1598px pane with 44px cells holds 36 rows and a 14px remainder. Snapping moves that
-    /// remainder to the top without losing a row, placing it beside matching buffer background.
+    /// The exact geometry from the 2026-09-19 report, reproduced as arithmetic so the fix cannot
+    /// quietly stop applying: a 1598px-tall pane at a 44px cell is 36 rows plus **14px**, and that
+    /// 14 is the gap reported at the bottom. After the snap it is at the top, where the
+    /// pixel below it is buffer background of the same colour.
     #[test]
     fn the_reported_band_moves_from_the_bottom_edge_to_the_top() {
         let grid_scale = GridScale::new(PixelSize::new(22.0, 44.0));

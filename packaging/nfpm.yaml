@@ -10,7 +10,7 @@ description: |
 homepage: https://github.com/HunterGrey-cyber/eitri
 # SPDX. The public expression (packaging/nfpm-public.yaml) plus
 # LicenseRef-Anthropic-Claude-Agent-SDK: unlike the public profile, this one ships the sidecar
-# so its notice must name the SDK's own licence too.
+# (a standing decision, 2026-09-19), so its notice must name the SDK's own licence too.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0 AND LicenseRef-Anthropic-Claude-Agent-SDK
 
 # Direct links only -- gtk4 and webkitgtk pull in the other ~100 transitively, and listing those

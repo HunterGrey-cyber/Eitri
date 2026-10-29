@@ -465,7 +465,7 @@ t_tarball_install_builds_sidecar_from_beside_file() {
 
 TESTS="$TESTS t_tarball_verdandi_source_beside_file_copied_before_use"
 t_tarball_verdandi_source_beside_file_copied_before_use() {
-	# review-2 TOCTOU finding (+[codex] duplicate): use_verdandi_source_beside_tarball used to point
+	# A TOCTOU finding: use_verdandi_source_beside_tarball used to point
 	# NV_VERDANDI_SOURCE_TARBALL_OVERRIDE straight at the file beside --tarball, which
 	# sidecar_download_verdandi_source then hashed in place and sidecar_build_core reopened a SECOND
 	# time (after Node's own extraction) to extract -- a file in --tarball's own, possibly shared,

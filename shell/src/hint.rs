@@ -34,8 +34,8 @@ use neovide_editor::NeovideEditorPane;
 use crate::agent_panel::{AgentPanelHandle, HintInbound};
 use crate::module_grid::ModuleHosts;
 
-/// How long `shell` waits for the panel's `hint_targets` before labelling the GTK targets alone
-///. A panel that never answers -- not loaded, wedged, replaced -- must not hold the
+/// How long `shell` waits for the panel's `hint_targets` before labelling the GTK targets alone.
+/// A panel that never answers -- not loaded, wedged, replaced -- must not hold the
 /// window in a HINT with no labels.
 const PANEL_ANSWER_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -214,7 +214,7 @@ pub(crate) struct HintWidgets {
     /// HINT feeds it straight into `WindowLayout::modules`, which orders its labels by it. The alias
     /// promises no order of its own -- `ModuleGrid::live_hosts` is add order -- so a builder that
     /// "tidied" `main.rs`'s closure into `live_hosts()` would reorder every label, and nothing
-    /// headless would notice.
+    /// headless would notice (found in review).
     pub(crate) modules: ModuleHosts,
     pub(crate) focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
     /// Every container strip's entries that name a module now, with their label widgets
@@ -241,7 +241,7 @@ pub(crate) fn strips_after_modules(mut order: TargetOrder, top_items: usize) -> 
     order
 }
 
-/// Whether the widget is mapped and has a non-zero width and height.
+/// Shown, and on screen with a non-zero size: "visible" for a GTK widget.
 fn visible(widget: &gtk4::Widget) -> bool {
     widget.is_mapped() && widget.width() > 0 && widget.height() > 0
 }
@@ -477,14 +477,14 @@ impl HintCoordinator {
         }
     }
 
-    /// The panel's two messages. A `hint_targets` for any session but the active one is ignored
-    ///, as is a second answer after the timeout already planned without it.
+    /// The panel's two messages. A `hint_targets` for any session but the active one is ignored,
+    /// as is a second answer after the timeout already planned without it.
     ///
     /// A `hint_request` only ever starts a HINT, never cancels one. The panel's `f` cannot reach the
     /// panel while a HINT's key controller is attached, so a request that arrives with one up was
     /// posted before it started: a held `f`'s repeat, or `ff` typed faster than this main loop
     /// handled the first. Toggling on it tore down the HINT the first `f` had just opened
-    ///. The panel also stops sending them itself (`App.tsx::requestHint`).
+    /// The panel also stops sending them itself (`App.tsx::requestHint`).
     pub(crate) fn on_panel(self: &Rc<Self>, message: HintInbound) {
         match message {
             HintInbound::Request if self.is_active() => {}
@@ -774,8 +774,8 @@ mod tests {
 
     const NONE: ModifierType = ModifierType::empty();
 
-    /// `Esc` cancels. `Ctrl+Shift+F` does not trigger HINT here, so it is treated like other chords
-    /// and does nothing.
+    /// `Esc` cancels; `Ctrl+Shift+F` is no longer the HINT's trigger, so it is a chord
+    /// like any other and does nothing.
     #[test]
     fn escape_cancels_and_ctrl_shift_f_is_just_a_chord() {
         assert_eq!(classify_key(Key::Escape, NONE, &[]), HintKey::Cancel);

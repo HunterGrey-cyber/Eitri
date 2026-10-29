@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Layer 2 of the GTK 4.14 / WebKit 2.40 / glibc 2.39 toolkit floor (spec
-compliance checked from imported symbols). Layer 1 is
+"""Layer 2 of the GTK 4.14 / WebKit 2.40 / glibc 2.39 toolkit floor. Layer 1 is
 shell/tests/toolkit_floor.rs (the Cargo feature graph); layer 3 is the release container itself
 (release.sh) linking against Ubuntu 24.04's real libraries. This layer maps every
 gtk_/gdk_/gsk_/webkit_/jsc_-prefixed symbol a binary imports (`nm -D --undefined-only`) back to the

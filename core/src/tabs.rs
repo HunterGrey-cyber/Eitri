@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn a_new_tab_takes_the_lowest_free_number_from_one() {
-        assert_eq!(lowest_free_number(&[]), 1, "numbered from 1");
+        assert_eq!(lowest_free_number(&[]), 1, "tab numbers start at 1");
         assert_eq!(lowest_free_number(&[1, 2, 3]), 4);
         assert_eq!(
             lowest_free_number(&[1, 3]),

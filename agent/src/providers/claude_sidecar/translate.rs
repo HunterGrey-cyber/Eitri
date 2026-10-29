@@ -222,13 +222,17 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             );
             None
         }
-        // The `set_permission_mode` capability reports each accepted switch to every watcher.
-        // This client never requests a switch. CLI auto sessions reject every switch report.
-        // Otherwise a report naming `default` is a no-op; a less restrictive
-        // mode name or a BYPASS enum closes the session. The `Bypass` match only decodes a report.
-        // The interactive and rule-based modes both map to `Auto`. An UNSPECIFIED enum is logged and dropped
-        // after checking the provider mode name. A missing CLI mode name closes the session
-        // regardless of the enum.
+        // Capability 'set_permission_mode'. Emitted once per accepted switch, to
+        // every watcher. **This client never asks for a switch**, so any
+        // report is unsolicited: one naming `default` is folded as a no-op, and one naming anything
+        // less restrictive -- or the BYPASS enum at all -- closes the session. The
+        // `Bypass =>` pattern below is the wire guard's one allowlisted entry: it decodes a report
+        // the sidecar sends; it never constructs a request.
+        //
+        // INTERACTIVE and VERDANDI_RULES are both Eitri's `Auto` (`capabilities_from_handshake`'s
+        // note on verdandi_rules); UNSPECIFIED is not a mode anybody chose, so it is dropped, loudly
+        // -- after the provider-mode check, which never depends on it. A report naming no CLI mode
+        // at all closes the session whatever its enum says.
         ProtoEvent::PermissionModeChanged(changed) => {
             // A session created with the CLI's auto mode refuses every switch (the proto's
             // `SetPermissionModeRequest`), so a report of one is a peer breaking that rule, and what
@@ -348,10 +352,14 @@ fn drop_reason(reason: UserMessageDropReason) -> &'static str {
     }
 }
 
-/// Returns `None` for a hook request, or `Some` with the CLI's words for a prompt it raised.
-/// UNSPECIFIED is treated as HOOK for older sidecars, and provider fields on HOOK are ignored.
-/// An unknown origin becomes a provider prompt excluded from permission-policy evaluation.
-/// In Auto it needs its own card and cannot reuse an earlier approval. Bypass answers it normally.
+/// Which kind of request this is: `None` for the gate's own, `Some` with the
+/// CLI's own words for a prompt the CLI raised itself after the gate answered.
+///
+/// UNSPECIFIED is what a sidecar older than the field sends, and the proto says to read it as HOOK;
+/// provider fields on a HOOK request (which the proto says never happens) are not believed. A value
+/// this client does not know fails toward a provider prompt the permission policy never judges AND
+/// that no earlier approval answers in Auto (`unrecognized_origin`, `needs_its_own_card`): an unknown
+/// kind of ask is a card of its own there. Bypass answers it like any other.
 fn provider_prompt_of(requested: &claude_runtime_protocol::v1::PermissionRequested) -> Option<crate::ProviderPrompt> {
     let unrecognized_origin = match ProtoPermissionOrigin::try_from(requested.origin) {
         Ok(ProtoPermissionOrigin::Unspecified) | Ok(ProtoPermissionOrigin::Hook) => return None,
@@ -459,16 +467,25 @@ fn translate_close_reason(reason: SessionCloseReason) -> String {
     }
 }
 
-/// Splits consecutive assistant messages when `TextDelta.message_id` changes, matching
-/// the legacy backend's handling of the CLI's `message.id`.
-/// Splitting is enabled only when the connected sidecar advertises `text_delta_message_id`;
-/// older sidecars keep concatenating text. `before` runs once before each event is translated.
-/// Only a `TextDelta` with `Some(message_id)` can close the preceding main message.
-/// `TurnStarted` clears the main id. Other events, including `ThinkingDelta`, leave it alone.
-/// Each subagent reply tracks its own message id by `parent_tool_use_id`, separate from the main
-/// stream. Its tool call clears that id, but a turn start does not: background replies span turns.
-/// No translated event reliably marks a subagent as done, so `CHILD_REPLIES_KEPT` bounds tracked
-/// ids by recency.
+/// Splits consecutive sidecar assistant messages at a `TextDelta.message_id` change, the same rule
+/// the legacy backend applies to the CLI's `message.id` (`session.rs`'s `AssistantText` arm).
+/// `ProtoEvent::TextDelta` carries no message identity on the wire until capability
+/// `text_delta_message_id`, so `before` is a no-op when `enabled` is `false` --
+/// the capability this provider actually connected against, not a compile-time constant, since an
+/// older sidecar must keep concatenating exactly as it always has.
+///
+/// Called once per raw proto event, before that event's own translation: only a `TextDelta` with
+/// `Some(message_id)` can close the message before it, and only a `TurnStarted` clears the tracked
+/// id (a new turn is already a new message, so there is nothing left to compare against). Every
+/// other event -- `ThinkingDelta` included, despite carrying the same `message_id` field -- leaves
+/// the tracked id untouched and never splits: thinking is not assistant text.
+///
+/// A subagent's reply is its own stream: its deltas never touch the main message's id, and each
+/// subagent (by its `parent_tool_use_id`) is tracked on its own, closing its reply row at a change of
+/// message id. A subagent's own tool call ends its reply, so it clears that subagent's id; a turn
+/// start does not, since a background subagent goes on across turns. Nothing the translator sees says
+/// a subagent is done (the result of its Agent call arrives at once for a background one), so the
+/// tracked ids are bounded by recency instead: see `CHILD_REPLIES_KEPT`.
 pub(crate) struct MessageSplit {
     enabled: bool,
     last_text: Option<String>,
@@ -660,7 +677,7 @@ mod tests {
             // mode that differs from its request. Empty here means unreported: noted without tripping
             // the mode guard, leaving exactly one event for this test.
             permission_mode: String::new(),
-            // `account_identity` and `init_fingerprint` are not read by this test.
+            // account_identity, init_fingerprint: read by nothing in this test.
             ..Default::default()
         }));
         assert_eq!(
@@ -889,7 +906,7 @@ mod tests {
             tool_use_id: "tu-1".into(),
             tool_name: "Write".into(),
             input_json: "{}".into(),
-            // `origin` UNSPECIFIED and no provider fields: the wire shape before provider prompts were supported.
+            // `origin` UNSPECIFIED and no provider fields: what a sidecar older than the `provider_permission_prompts` capability sends.
             ..Default::default()
         }));
         assert_eq!(
@@ -952,9 +969,9 @@ mod tests {
         );
     }
 
-    /// Builds a `PermissionRequested` fixture with the supplied origin.
-    /// Its reason, subject, blocked path and triggering ask rule are carried verbatim into
-    /// `provider_prompt` for the permission card.
+    /// A `PermissionRequested` the CLI itself raised: origin PROVIDER_PROMPT,
+    /// with the CLI's own words carried verbatim into `provider_prompt` -- the reason sentence the
+    /// card shows, the subject, the blocked path, and the user's ask rule when one forced it.
     fn provider_prompt_wire(origin: i32) -> PermissionRequested {
         PermissionRequested {
             permission_id: "perm-2".into(),

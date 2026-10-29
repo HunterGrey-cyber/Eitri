@@ -1,21 +1,27 @@
-//! Supplies a fallback when `gtk-xft-dpi` is unset before a `WebView` is created.
+//! Guard against `gtk-xft-dpi`
+//! being unset when the agent panel's `WebView` is created.
 //!
-//! WebKitGTK 2.52.6's `fontDPI()` uses `gtk-xft-dpi` when set. Otherwise it derives DPI from
-//! the primary screen's diagonal pixels divided by diagonal millimetres, without guarding
-//! against zero millimetres. If the monitor reports 0x0mm and neither a portal nor
-//! `gtk-4.0/settings.ini` supplies a DPI, WebKit divides by zero. `devicePixelRatio` becomes
-//! `Infinity`, and the panel stays blank with `innerWidth` and `innerHeight` both zero.
-//! Resizing does not recover it; the process must be relaunched.
+//! WebKitGTK 2.52.6's `fontDPI()` uses `gtk-xft-dpi` when it is set, and otherwise falls back to
+//! the primary screen's own DPI, computed by `ScreenManagerGtk.cpp` as diagonal pixels divided by
+//! diagonal millimetres, with **no guard for 0mm**
+//! (`Source/WebCore/platform/gtk/PlatformScreenGtk.cpp`, tag `webkitgtk-2.52.6`). A monitor that
+//! reports 0x0mm (this project's headless-sway sandbox; on real hardware, an EDID that reports 0mm,
+//! seen on some projectors/TVs/virtual displays) with no xsettings portal and no
+//! `gtk-4.0/settings.ini` leaves `gtk-xft-dpi` at GTK's own "unset" sentinel, so WebKit's DPI
+//! divides by zero: `devicePixelRatio` becomes `Infinity` and the panel goes permanently blank
+//! (`innerWidth`/`innerHeight` both 0) -- not recoverable by a resize, only by relaunching the
+//! whole process.
 //!
-//! Before any `WebView` is constructed, unset values (`<= 0`) are replaced with GTK's own
-//! default of 96dpi, stored as `96 * 1024` in the setting's 1/1024dpi units. WebKit then reads
-//! a finite value without deriving it from the monitor. Native GTK text already uses 96dpi
-//! when this setting is unset. Existing positive values from the user or portal are preserved.
-//!
-//! The fallback is pinned for the process. GTK 4.22.5 marks a value set through
-//! `gtk_settings_set_property` as `GTK_SETTINGS_SOURCE_APPLICATION`, and
-//! `settings_update_xsetting` ignores later portal or xsettings updates for that property.
-//! A session that starts with the setting unset therefore does not follow later DPI changes.
+//! The fix sets `gtk-xft-dpi` to GTK's own default for unset (96dpi, `96 * 1024` in the setting's
+//! 1/1024dpi units) before any `WebView` is constructed, so WebKit reads a real number instead of
+//! deriving one from the monitor. This changes nothing for native GTK text: 96dpi is what GTK
+//! itself already uses when the setting is unset. A real desktop's xsettings/portal value, or a
+//! user's own `settings.ini`, is never touched -- only `<= 0` (GTK's own "nothing has set this")
+//! is replaced. Once replaced, the value is pinned for the process: GTK 4.22.5 marks a property set
+//! through `gtk_settings_set_property` as `GTK_SETTINGS_SOURCE_APPLICATION` (`gtksettings.c`), and
+//! `settings_update_xsetting` ignores later portal/xsettings updates for an application-sourced
+//! property. So a real DPI that only arrives after startup (a text-scaling change) is not followed
+//! in a session that started with the setting unset -- accepted: that session had no DPI at all.
 
 /// GTK's own font default when the setting is unset (`gtk-xft-dpi` is in 1/1024 dpi).
 pub(crate) const GTK_DEFAULT_XFT_DPI: i32 = 96 * 1024;

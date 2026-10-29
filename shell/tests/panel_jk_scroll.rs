@@ -1,32 +1,36 @@
-//! Tests the agent panel's `j`/`k` scrolling across rows of different heights using real WebKitGTK.
-//! This exercises layout that jsdom cannot provide for `agent-ui/web/src/jkScroll.ts`.
-//! Across window sizes and zoom levels, the test checks these behaviours:
+//! The agent panel's `j`/`k` over rows of very different heights -- a two-line reply, a tool result, a
+//! reply taller than the view, a code block, a one-line reply -- driven against the real WebKitGTK `shell`
+//! links, not jsdom (which has no layout, so the rules in `agent-ui/web/src/jkScroll.ts` can only be
+//! checked there as arithmetic).
 //!
-//! - A single `j` or `k` moves the view by at most two thirds of its height.
-//!   `G`, `gg`, `Ctrl+f` and `Ctrl+b` are not checked.
-//! - After each press, the cursor row keeps at least two lines on screen. A row that fits
-//!   keeps a two-line margin on both sides unless bringing it fully into view would
-//!   move the view by more than two thirds; such a row is entered like a tall row.
-//! - The same press sequence at zoom 1.0 and 1.5 visits the same rows in the same order,
-//!   landing in the same place.
-//! - `k` enters a tall row near its end, two thirds down; `j` enters near its head, one third down.
-//!   In the 900px runs, the 750px prose row and unfolded 618px result are also entered this way.
-//! - Counts move that many steps inside a row. A tool result is entered at the end nearest
-//!   the reader and moves three of its own lines per press.
-//! - A lone press eases the view over about 150ms without the scroll listener pulling
-//!   the cursor off its target row. A second press during the ease ends where two slow presses end.
-//! - A folded result previews three lines and a count. A long first line cannot widen the list.
+//! What this turns the 2026-10-01 measurement (`jk_measure.rs` on `scratch/jk-measure`) into, as
+//! assertions, over the window sizes and zoom levels it measured:
+//! - **no single `j`/`k` moves the view by more than two thirds of it** (it was a whole view: -901 of 900
+//!   when `k` entered a row taller than the view; `G`/`gg`/`Ctrl+f`/`Ctrl+b` are not asserted);
+//! - **the cursor row always keeps at least two lines on screen** after a press (it was 0.39px at zoom 1.0,
+//!   a dead press), and a row that fits keeps a two-line margin on both sides -- unless bringing it in whole
+//!   would move the view more than two thirds of itself, when it is entered as a tall row is (below);
+//! - **the same press sequence at zoom 1.0 and 1.5 visits the same rows in the same order**, each landing in
+//!   the same place (it was nothing at one and a whole view at the other, from a sub-pixel);
+//! - **`k` into a tall row lands on its end** (two thirds of the way down), **`j` on its head** (a third); in
+//!   this fixture's 900px runs, L2 (750px) and the unfolded T1 (618px) fit the view but are entered that way;
+//! - **counts move that many steps inside a row**, a tool result's box is entered at the end nearest the
+//!   reader and moves three of its own lines a press;
+//! - **a lone press eases the view over about 150ms** without the list's scroll listener pulling the cursor
+//!   off the row it is moving to, and a second press during the ease ends where two slow presses end;
+//! - **a folded result's preview** is three lines and a count, and a runaway first line cannot widen the
+//!   list.
 //!
-//! Uses a plain `main` (`harness = false`) because GTK must own the main thread. Run with:
+//! A plain `main` (`harness = false`), because GTK must own the main thread; opt-in with `-- --ignored`:
 //!
 //!     cargo test -p shell --test panel_jk_scroll -- --ignored
 //!
-//! It starts its own X server through `support/own_x_server.rs` and uses no other display.
-//! Keys arrive as XTEST events through `xdotool`, using the harness from `panel_visual_mode.rs`.
-//! Needs `Xvfb` and `xdotool`. Run one GUI test at a time on the machine.
-//! Prints one `JKS` line per run with the worst single move as a fraction of the view.
-//! `JKS_RUNS=<name,...>` selects configurations. `JKS_TRACE=1` prints every press,
-//! the source and target rows, `scrollTop` before and after, and every row's extent.
+//! It starts its own X server (`support/own_x_server.rs`) and talks to no other display; keys arrive as real
+//! X key events (XTEST via `xdotool`), the harness copied from `panel_visual_mode.rs`. Needs `Xvfb` and
+//! `xdotool`. One GUI pass at a time on the machine, like every other: take the GUI slot first. It prints one `JKS` line per run with the worst single move as a
+//! fraction of the view, so a regression shows as a number as well as a failure. `JKS_RUNS=<name,...>` runs only
+//! the named configurations; `JKS_TRACE=1` prints every press (the rows it went between, `scrollTop` before and
+//! after, every row's extent), which is what a failure needs to be read.
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;

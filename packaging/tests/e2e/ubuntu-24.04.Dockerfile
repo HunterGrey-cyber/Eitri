@@ -4,9 +4,8 @@
 # instead of silently degrading (ubuntu:24.04 carries no openssh-client by default, and install.sh's own
 # degrade-on-missing-ssh-keygen path would otherwise accept a tampered SHA256SUMS.sig here with no
 # test noticing). No nvim by default -- ARG WITH_DISTRO_NVIM=1 adds Ubuntu's own neovim (0.9.5,
-# below the fork's 0.10 floor: measured by `apt-cache policy`), for the one
-# variant run.sh uses to prove the private nvim install leaves the distro one untouched
-# . No sudo, no build toolchain, no git: install.sh's prebuilt/curl path needs none of them, and
+# below the fork's 0.10 floor: per `apt-cache policy` measured in the image), for the one
+# variant run.sh uses to prove the private nvim install leaves the distro one untouched. No sudo, no build toolchain, no git: install.sh's prebuilt/curl path needs none of them, and
 # their absence is itself part of what this image proves.
 #
 # Built and run by packaging/tests/e2e/run.sh: `docker build

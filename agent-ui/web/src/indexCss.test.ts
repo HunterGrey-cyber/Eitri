@@ -902,10 +902,11 @@ describe("index.css", () => {
   });
 
   it("the status band is one editor row high, and never grows", () => {
-    // The status band must align with the editor's status line. A min-height lets children,
-    // especially the fallback font for the mode glyph, make the band taller. --nv-editor-row
-    // supplies the editor's cell height; fixed height and overflow: hidden keep the band at
-    // that height.
+    // The panel band must align with the editor's status line (reported: the agent pane's bottom input / auto line was too wide and should
+    // be as wide as the neighbouring Neovim status line -- the band used to be `min-height: 24px`, which grows with whatever its
+    // children need (the `⏵⏵` fallback symbol font in particular). `--nv-editor-row` is the
+    // editor's own cell height (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`); a fixed
+    // `height` plus `overflow: hidden` is what actually stops the grow, not just a bigger min.
     const [band] = rulesMatching(withoutComments, ".status-band").filter((r) => r.selector.trim() === ".status-band");
     const decl = (name: string) =>
       band.body
@@ -2413,11 +2414,15 @@ describe("index.css cascade (which rule actually wins)", () => {
  * is the accepted cost and the reason the parse asserts its own sentinels before it is used: a
  * refactor that breaks the parse fails here loudly rather than quietly admitting everything.
  */
-/* Long Bash commands, unbroken paths, URLs and patterns can push the conversation sideways when
-   their <pre> keeps white-space: pre. Prose URLs and markdown tables need overflow handling
-   too. jsdom has no layout, so these tests check that list text can break and every rendered
-   <pre> wraps or scrolls within its own box. shell/tests/panel_stream_scroll.rs measures the
-   result in WebKitGTK. */
+/* A long `Bash` command scrolled the whole
+   conversation sideways -- 517px at a 420px panel, identical on `main` -- because `toolRegistry.tsx`
+   renders it as a `<pre>` and no rule ever took that `<pre>` off the UA's `white-space: pre`, and
+   `.message-list` scrolls on both axes. A WebKitGTK probe then found every other tool card (a path,
+   a URL, a pattern with no space in it), a URL in a reply's prose and a markdown table doing the same.
+   jsdom has no layout, so what these pin is the stylesheet's half of the contract: every line in the
+   list may break where it has to, and every `<pre>` the panel renders there either wraps or scrolls in
+   its own box. `shell/tests/panel_stream_scroll.rs` measures the result in the real engine. Both
+   tests fail on the earlier follow snap. */
 describe("index.css: nothing in the conversation scrolls it sideways", () => {
   afterEach(() => {
     document.head.innerHTML = "";

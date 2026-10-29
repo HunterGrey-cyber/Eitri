@@ -1,12 +1,16 @@
-//! Shows the terminal bell as a flash of the pane, with no sound.
+//! The bell, as a flash of the pane.
 //!
-//! On `BEL`, the pane tints itself with the theme's foreground for [`FLASH`].
-//! The session coalesces bells to at most one per rendered frame. Here a new flash can start only
-//! [`MIN_INTERVAL`] after the last one started, limiting a flood to two flashes per second.
-//! This prevents repeated bells, such as binary output from `cat`, from producing a strobe.
+//! A program rings the bell with `BEL` (`\a`): a finished `make; tput bel`, zsh at the start of an
+//! empty line, `less` at the end of a file. The pane tints itself with the theme's foreground for
+//! [`FLASH`], and makes no sound. Foot's bell defaults ring the desktop's system bell instead; the
+//! flash is a deliberate choice, and silent.
 //!
-//! The logic is pure and tested without a display. The pane (`pane.rs`) requests repaints and
-//! paints [`tint`].
+//! **A flood must not strobe.** A `cat` of a binary file rings on most reads. The session already
+//! folds bells to at most one per rendered frame (`eitri-terminal`'s
+//! `a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame`); here a new flash can start only
+//! [`MIN_INTERVAL`] after the last one started, so a flood is at most two flashes a second.
+//!
+//! Pure, and tested without a display: the pane (`pane.rs`) asks, repaints, and paints [`tint`].
 
 use std::time::{Duration, Instant};
 

@@ -1,4 +1,5 @@
-# Checksums, version selection and signature verification. Sourced by harness.sh.
+# Checksums (MIN-3), version selection (MIN-1) and the signature (SIG-2). Sourced by
+# harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
@@ -349,8 +350,9 @@ t_no_check_novalidate() {
 		'release@eitri eitri-release ' "the identity and namespace"
 }
 
-# Exercise embedded-key verification with $KEYED_INSTALLER, which harness.sh's setup_keys
-# creates by adding the test key to the installer's signers block. Pass no --release-signers.
+# The embedded-key branch, the one every final release's installer takes: $KEYED_INSTALLER
+# is the unkeyed installer with the test key added to its signers block (harness.sh's setup_keys),
+# run with no --release-signers at all.
 
 TESTS="$TESTS t_embedded_key_good_signature"
 t_embedded_key_good_signature() {

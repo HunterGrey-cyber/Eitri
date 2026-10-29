@@ -295,7 +295,7 @@ window {{
     font-size: 12px;
 }}
 
-/* The window-close y/n and `prefix x`'s kill y/n:
+/* The window-close y/n and `prefix x`'s kill y/n (2026-09-26):
    `.module-toast`'s own colours, `shell::close_prompt`'s own widget. Sized to sit inside
    the top bar's own strip, where the prefix strip just drew (`eitri_core::wm::close::prompt_origin`). */
 .close-prompt {{
@@ -349,11 +349,16 @@ impl ThemeCss {
         let provider = CssProvider::new();
         provider.load_from_string(&gtk_css(tokens));
         let display = gtk4::gdk::Display::default().expect("no default GDK display");
-        // Use `STYLE_PROVIDER_PRIORITY_USER` (800) so window colours come from nvim.
-        // GTK loads `$XDG_CONFIG_HOME/gtk-4.0/gtk.css` at the same priority. At equal priority,
-        // the later provider wins, so installing this provider after GTK's user provider
-        // makes it take precedence regardless of selector specificity. At `_APPLICATION`
-        // (600), user CSS could override window buttons and dividers with a separate theme.
+        // `STYLE_PROVIDER_PRIORITY_USER` (800), not `_APPLICATION` (600): GTK loads
+        // `$XDG_CONFIG_HOME/gtk-4.0/gtk.css` at `_USER` into the same cascade, and at equal
+        // priority the *later*-added provider wins (gtkstylecascade's insertion order), so adding
+        // ours here — after GTK's own already-registered user provider — makes it win regardless
+        // of selector specificity. This deliberately overrides GTK's "user has the last word"
+        // convention, because every colour in this window is meant to come from nvim (GTK's default
+        // Adwaita appearance is suppressed). At `_APPLICATION` a foreign `~/.config/gtk-4.0/gtk.css` (a real one exists
+        // on this project's own dev machine) would win over `.win-btn`/the paned divider/etc, which
+        // is not "GTK providing windowing only" — it's a second, uncontrolled theme leaking through
+        // the one this crate exists to paint. A GUI pass checks this against a real `gtk.css`.
         gtk4::style_context_add_provider_for_display(&display, &provider, gtk4::STYLE_PROVIDER_PRIORITY_USER);
         ThemeCss { provider }
     }

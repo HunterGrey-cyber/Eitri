@@ -1,15 +1,26 @@
-//! Coordinates every editor quit, including `prefix x` and window closes, and handles nvim's
-//! exit, cancellation, and declined window closes without silently discarding unsaved changes.
+//! The one flow every quit of the editor takes -- `prefix x` on it, every window close -- and what
+//! nvim's exit, a cancel and a declined window close then do. Closing the window never discards
+//! unsaved editor changes silently; `eitri_core::wm::close`'s module doc has the rules and their
+//! precedents.
 //!
-//! [`EditorQuitting`] owns each decision and its order so tests can exercise the flow with a
-//! fake [`QuitHost`]. `main.rs` implements the host over the pane, layout, grid, window prompt,
-//! and toast. The GTK calls in that adapter still need GUI checks.
+//! **Why a module of its own.** The flow used to live in
+//! four closures in `main.rs` (`ask_nvim_to_quit`, `on_exited_unrequested`, the window's
+//! `connect_close_request`, the decline hook), where no test could reach it: a mutation pass
+//! deleted six of its rules at once -- the close's route through nvim, the `y`'s withdrawal, the
+//! reveal of an editor off screen, the retirement of an exited editor, the decline hook -- and every
+//! test stayed green. Here every decision and its order is [`EditorQuitting`]'s, under test against a
+//! fake [`QuitHost`]; `main.rs` implements the host over the pane, the layout, the grid, the window's
+//! y/n and the toast, one GTK call per method, and that one-line layer is what only the GUI
+//! checklist still checks.
 //!
-//! Quits use nvim's `:confirm qall`. If nvim stops answering or becomes unreachable,
-//! [`QuitHost::end_nvim`] sends SIGTERM and closes stdin, then sends SIGKILL by pid after
-//! the timeout if necessary. Swap files are kept. No path sends `:qa!`, including shutdown.
-//! Nothing closes or retires twice, and exit handling waits until nvim's own process is gone.
-//! The pane reports the exit only after that process ends.
+//! **Never `:qa!`** (2026-09-27). Ending the editor is only
+//! nvim's own `:confirm qall`, or -- when nvim's loop stopped answering it, or nvim is out of
+//! reach -- [`QuitHost::end_nvim`]: its stdin closed (nvim exits keeping its swap files) and
+//! SIGTERM -- SIGTERM first while nvim may be in its prompt (the quit follow-up) -- then SIGKILL by
+//! pid after the patience (`neovide_editor`'s `nvim_child::end`). The fork's shutdown
+//! sends no quit either, so a window close that proceeds can no longer destroy work; what is left
+//! to get right is that nothing closes or retires twice, and nothing follows an exit while nvim's
+//! own process lives (the pane reports the exit only once it is gone).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -79,7 +90,7 @@ pub(crate) trait QuitHost {
     /// The quit request's watch once its worker has published how it ended, waited for briefly
     /// (`NeovideEditorPane::settled_watched_call`). Read only at nvim's exit, when nvim-rs has
     /// resolved the request already: for one still outstanding it blocks the GTK thread for the
-    /// whole bound.
+    /// whole bound (which is why `begin_unsent` does not read it).
     fn settled_watch(&self) -> Option<CallWatch>;
     /// Has nvim run `lua` as an RPC request (`NeovideEditorPane::exec_lua_watched`).
     fn send_quit(&self, lua: &str) -> bool;
@@ -142,13 +153,15 @@ impl EditorQuitting {
         })
     }
 
-    /// Asks nvim to `:confirm qall` for `quit`. Nvim prompts for unsaved buffers, and only its
-    /// exit closes anything ([`EditorQuitting::nvim_exited`]). Use RPC: typed keys could be
-    /// swallowed by a pending key read after `f` or inside `getchar()`. Show and focus a hidden
-    /// or zoomed-away editor first, since its prompt is drawn there. A second request is refused
-    /// with text describing nvim's state while the first is pending. Once nvim's loop has not
-    /// answered the pane's watch for `NVIM_QUIT_PATIENCE`, a second request kills it and keeps
-    /// its swap files. A toast explains this when the timeout is reached.
+    /// Asks nvim to `:confirm qall` for `quit` -- the one route every quit of the editor takes. nvim
+    /// decides: its own prompt for unsaved buffers, and only its exit closes anything
+    /// ([`EditorQuitting::nvim_exited`]). The quit is an RPC request, never typed keys, which a key
+    /// nvim is waiting for (after `f`, inside `getchar()`) would swallow. An
+    /// editor that is not on screen -- hidden, or zoomed away -- is brought on screen and given
+    /// the keys first, since the prompt is drawn in it. A second request while nvim has the quit is
+    /// refused (`Err`, the text to show, saying what nvim is doing), except once nvim's own loop has
+    /// not answered the pane's watch for `NVIM_QUIT_PATIENCE`: then the second request kills it
+    /// (`kill_rules::quit_request`), its swap files kept. A toast says so when that point is reached.
     pub(crate) fn ask(self: &Rc<Self>, quit: EditorQuit) -> Result<AskedNvim, String> {
         let host = &self.host;
         if host.nvim_exit_pending() {
@@ -236,18 +249,24 @@ impl EditorQuitting {
         AskedNvim::Ending
     }
 
-    /// A request that sends nothing to nvim gets a fresh in-flight entry and generation, whether
-    /// nvim has just exited or is out of reach. Reusing an older request's generation and `sent`
-    /// state could let a delayed cancellation erase the new request or close the wrong scope.
-    /// An unanswered older request is merged through `kill_rules::merge`, with a window close taking
-    /// precedence over an editor kill. An answered request and its confirmation are dropped.
+    /// A request that sends nvim nothing (nvim exited just now, or is out of reach) gets its own
+    /// entry in flight, with its own generation: it used to be merged
+    /// into whatever was in flight, keeping that quit's generation and its `sent` -- so an older
+    /// quit nvim had answered without quitting (its cancel letter absent, the watch not yet polled)
+    /// cleared it at nvim's exit, and a `prefix x` closed the whole window. What an older quit
+    /// still in flight was for joins the new one (a window close wins over the editor's own kill,
+    /// `kill_rules::merge`); one nvim answered is dropped, `y` and all.
     ///
-    /// A kill that carries a window close must still allow that close to be withdrawn.
-    /// [`Asked::lent_by`] identifies the sent close even under the kill's new generation.
-    /// Its cancellation letter, an answer read by a later request, or an answer read at nvim's exit
-    /// removes that close regardless of how late it arrives.
-    /// Nothing here waits for the watch to settle on the GTK thread: a bounded wait could freeze
-    /// the window while the dialog is open and still miss an answer published after the bound.
+    /// **A close a kill joins stays that close's to take back.** A window close cancelled in nvim's prompt just before
+    /// its launcher exited has an answer the watch's worker may not have published yet, and a cancel
+    /// letter not read yet. A kill that joins it carries the close ([`kill_rules::merge`]) under its
+    /// own generation, so it records which sent close it carries ([`Asked::lent_by`]): that close's
+    /// letter ([`EditorQuitting::cancelled`]), its request read answered here by a later request, or
+    /// at nvim's exit ([`EditorQuitting::nvim_exited`]) takes the close back out, however late. The
+    /// follow-up first read the settled watch here instead (up to the pane's 500 ms `SETTLE_WAIT`,
+    /// on the GTK thread): an answer published after that bound kept the close for good, with every
+    /// later sign of the cancel ignored (codex), and the wait froze the window when nvim's dialog
+    /// was still up. Nothing here waits now.
     fn begin_unsent(&self, quit: EditorQuit, rehide: bool) {
         // The last request nvim was sent came back with its answer: its Lua returned, so nvim did
         // not quit. Every send replaces the watch, and nothing is sent once nvim is out of reach
@@ -330,12 +349,15 @@ impl EditorQuitting {
         }
     }
 
-    /// Clears a sent quit unless its request is known to have ended with nvim gone. If the Lua
-    /// returned, the user cancelled, so neither the quit nor its `y` may authorize a later exit,
-    /// even without a cancel letter from the pane-switch shim. At exit,
-    /// [`EditorQuitting::nvim_exited`] reads the settled watch. A request still outstanding after
-    /// that wait is cleared too, so the close asks again rather than trusting an old `y`.
-    /// A quit that sent nothing because nvim had already exited is kept. Returns the cleared quit.
+    /// Clears the quit in flight unless its own request is known to have ended with nvim gone. An
+    /// answered request means nvim ran the Lua and did not quit -- the user cancelled -- so neither
+    /// the quit nor the `y` it carries may answer a later, unrequested exit (without the pane-switch shim's letter, a cancelled window close stayed in flight, and a `:qa`
+    /// typed later closed the window on the old `y` while a tab was still running). A request whose
+    /// ending is not known yet is not taken as the quit either: at the
+    /// exit, [`EditorQuitting::nvim_exited`] reads the settled watch, and one still outstanding
+    /// after that wait is cleared too, so the close asks again rather than trusting the old `y`. A
+    /// quit that sent nothing (joined to an nvim that had exited already) is kept. Returns what it
+    /// cleared.
     fn settle(&self, watch: Option<&CallWatch>) -> Option<Asked> {
         let mut in_flight = self.in_flight.borrow_mut();
         if !in_flight.as_ref().is_some_and(|asked| asked.sent) {
@@ -1135,10 +1157,10 @@ mod tests {
         assert_eq!(fake.log(), ["hide_editor", "close_window_confirmed"]);
     }
 
-    /// An older quit that nvim answered without quitting must not clear a newer explicit
-    /// ending, even before its cancel letter or watch update is read. Each request has its
-    /// own generation: `prefix x` while nvim is unreachable retires the editor when it exits
-    /// without reusing a cancelled window close's `y`.
+    /// An old quit nvim answered without quitting -- its cancel letter
+    /// absent, the watch not yet polled -- must not take a newer, explicit ending with it. Each
+    /// request has its own generation: `prefix x` while nvim is out of reach retires the editor
+    /// when nvim goes, never closes the whole window, and never on the cancelled `y`.
     #[test]
     fn an_answered_old_quit_never_takes_a_newer_ending_with_it() {
         let fake = Fake::new();
@@ -1225,11 +1247,12 @@ mod tests {
         fake.log()
     }
 
-    /// A window close is cancelled in nvim's prompt, then its launcher exits and `prefix x`
-    /// is confirmed before the worker publishes the answer or the cancel letter is read.
-    /// The kill carries the potentially live close. A late cancel letter removes that close,
-    /// so nvim's exit retires the editor without reusing the cancelled `y` to close a window
-    /// that still has a running tab.
+    /// From its own scenario: a window
+    /// close is cancelled in nvim's prompt; before the watch's worker publishes nvim's answer, and
+    /// before the cancel letter is read, the launcher exits and a `prefix x` on the editor is
+    /// confirmed. The kill carries the close (it may still be live), but the letter, read late,
+    /// takes it back out, and nvim's exit retires the editor -- never closes the window on the
+    /// cancelled `y`, with a tab still running.
     #[test]
     fn a_close_cancelled_as_the_launcher_went_lends_no_y_to_a_kill() {
         let fake = Fake::new();
@@ -1243,10 +1266,12 @@ mod tests {
         );
     }
 
-    /// An answer published after a kill joins a window close must still withdraw the cancelled close.
-    /// Waiting on the watch with a 500 ms bound could miss it, ignore the old cancellation generation,
-    /// and close the window when nvim exited. Reading the answer again at exit removes the close
-    /// even without a cancellation letter from the pane-switch shim.
+    /// The follow-up used to read the settled watch at the
+    /// kill instead, and a worker publishing after its 500 ms bound left the close in the kill for
+    /// good -- the late letter named an old generation and was ignored, and the answer, once
+    /// published, was never read for a quit that sent nothing -- so nvim's exit closed the window.
+    /// Now the answer counts however late it is published: read at the exit, it takes the close
+    /// back out even with no letter at all (no pane-switch shim).
     #[test]
     fn a_cancel_published_after_any_bound_still_takes_the_close_back() {
         let fake = Fake::new();
@@ -1331,8 +1356,10 @@ mod tests {
         assert_eq!(nvim_goes(&fake, &quitting), ["close_window_confirmed"]);
     }
 
-    /// A request that sends nothing never waits on the GTK thread, whether a kill joins a close
-    /// whose dialog is still open, a close joins an older close, or a kill joins another kill.
+    /// A request that sends nothing never waits on the GTK thread --
+    /// not a kill joining a close whose dialog is still up (the follow-up blocked there for the whole
+    /// 500 ms), not a close joining an older one (the orphan path, the second close), and not a
+    /// kill joining a kill.
     #[test]
     fn a_request_that_sends_nothing_never_waits_on_the_gtk_thread() {
         let joins = [
@@ -1355,10 +1382,10 @@ mod tests {
         }
     }
 
-    /// The quit's answer reaches a worker through the RPC oneshot, but nvim's exit does not
-    /// wait for that worker. Cancelling nvim's prompt and immediately typing `:qa` can report
-    /// the exit before the watch says the quit was answered. Read the settled watch at exit
-    /// so the cancelled `y` is not reused.
+    /// The quit's answer comes back through nvim-rs's oneshot to a worker
+    /// thread, and nvim's exit is reported without waiting for that worker. A close cancelled in
+    /// nvim's prompt and followed at once by `:qa` can reach the exit before the watch says the
+    /// quit was answered. The exit reads the settled watch, so the cancelled `y` is not reused.
     #[test]
     fn the_exit_waits_for_the_quits_answer_before_using_its_y() {
         let fake = Fake::new();

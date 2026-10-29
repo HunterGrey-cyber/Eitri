@@ -1185,8 +1185,10 @@ describe("EmptyTab", () => {
     });
   });
 
-  /** Esc in the composer returns to BROWSE and focuses the screen root, making the dashboard's
-   *  navigation and action keys reachable again. */
+  /** Esc in the new-session screen's composer could not return to the menu above it, so hjkl could
+   *  not switch options -- Esc in the composer used to be swallowed by the `mode === "input"`
+   *  early return with nothing of its own to say about it, stranding the user in INPUT with no way
+   *  back to the dashboard's own j/k/letters. */
   describe("the dashboard's keys", () => {
     it("Esc in the composer returns to the menu, keys on the screen's root", () => {
       const onModeChange = vi.fn();

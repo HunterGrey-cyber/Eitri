@@ -1,22 +1,29 @@
-//! Measures held j and k scrolling on a real WebKitGTK page using plugin-kit/keys.
-//! The long plain page loads the kit bundle and a host bridge stub with the default settings.
-//! One XTEST key-down starts the hold, the X server repeats it at a set rate, and one key-up ends it.
-//! Frame times and movement show missed frames, stalls, reversals and uneven scrolling.
-//! The j run starts at the top; the k run starts at the bottom.
+//! A held `j`/`k` on a plugin page, against the real WebKitGTK page: what every animation frame shows while
+//! the key is held, measured, for the keyboard kit every plugin page loads (`plugin-kit/keys`).
 //!
-//! A plain main with `harness = false` keeps GTK on the main thread. Run with:
+//! The page is a long plain document (`jk_frames::plain_page`) with two scripts added at document end: the
+//! kit's bundle, and a stand-in for the host bridge that accepts the kit's key table as declared and hands
+//! it the settings' defaults. The key is held as a person holds it: one XTEST key-down, the X server's own
+//! auto-repeat at a set rate (`xset r rate`), one key-up. The report is the frame times (missed frames)
+//! and the view's movement per frame (stalls, reversals, unevenness) over the hold, for `j` from the top
+//! and `k` from the bottom.
+//!
+//! A plain `main` (`harness = false`), because GTK must own the main thread; opt-in with `-- --ignored`:
 //!
 //!     cargo test -p shell --test plugin_page_jk_hold -- --ignored
 //!
-//! The harness starts its own X server through support/own_x_server.rs and uses no other display.
-//! It needs Xvfb, xdotool and xset. Run one GUI test at a time in each slot.
-//! JKP_KIT=<path> measures another kit bundle without checking its results.
-//! JKP_OUT=<dir> writes each run's frame log as JSON; an unwritable directory fails either mode.
-//! JKP_REPEAT=<per second> sets the repeat rate, defaulting to 30 after a 250 ms delay.
+//! It starts its own X server (`support/own_x_server.rs`) and talks to no other display. Needs `Xvfb`,
+//! `xdotool` and `xset`. One GUI pass at a time per slot on the machine: take a slot first.
 //!
-//! Each run prints one JKP line. Without JKP_KIT, both keys must move throughout the steady hold
-//! without reaching the end. Every frame must move in the key's direction, and the coefficient
-//! of variation of movement per frame must be at most 0.2.
+//! - `JKP_KIT=<path>` measures another build of the kit (an older `dist/keys.js`) and checks nothing: the
+//!   numbers are its report.
+//! - `JKP_OUT=<dir>` writes each run's frame log there as JSON.
+//! - `JKP_REPEAT=<per second>` sets the auto-repeat rate (30 when unset), after a 250ms delay.
+//!
+//! It prints one `JKP` line per run. Without `JKP_KIT` it fails unless, for both keys, the view moved
+//! during the steady hold without reaching the end it was going to, no frame stood still or moved against
+//! the key, and the per-frame move's spread (cv) is at most 0.2. A `JKP_OUT` that cannot be written fails
+//! the run in either mode.
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;

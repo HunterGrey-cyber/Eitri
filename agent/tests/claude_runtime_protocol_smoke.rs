@@ -37,21 +37,21 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
                     claude_runtime_protocol::v1::SettingSource::Local as i32,
                 ],
             }),
-            // `false` preserves the value sent by clients that predate `permission_mode_switchable`.
-            // This smoke test does not exercise permission-mode switching.
+            // permission_mode_switchable: `false` is what every session built
+            // before this field existed sends -- this smoke test does not exercise switching.
             permission_mode_switchable: false,
-            // Set `provider_permission_prompts` to `true`, as `build_create_request` does when
-            // the handshake advertises it. The assertion checks that the generated field carries
-            // the value, beyond merely compiling.
+            // provider_permission_prompts: stated `true` (what Eitri's own
+            // `build_create_request` sends when the handshake advertises it) so the assertion below
+            // proves the generated field carries a value, not merely that it compiles.
             provider_permission_prompts: true,
-            // `build_create_request` sends AUTO for `cli_permission_mode` when the handshake
-            // offers both `cli_auto_mode` and `permission_defer`.
+            // cli_permission_mode: AUTO is what `build_create_request` sends when
+            // the handshake offers both `cli_auto_mode` and `permission_defer`.
             cli_permission_mode: claude_runtime_protocol::v1::CliPermissionMode::Auto as i32,
-            // `accept_unsupported_cli: false` preserves the value sent by clients
-            // that predate this field.
+            // accept_unsupported_cli (protocol 3.15): false is what every client
+            // that predates the field sends.
             accept_unsupported_cli: false,
-            // Keep `per_task_stop` false until the application can stop an individual
-            // background task.
+            // per_task_stop (protocol 3.22): false is what every session Eitri
+            // creates sends until it can stop one background task by itself.
             per_task_stop: false,
         }),
         // Leave model, effort and output format at their defaults. With both prompt fields absent,
@@ -61,10 +61,10 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
         system_prompt: None,
         system_prompt_preset: None,
         output_format: None,
-        // `await_account_identity` is unexercised here.
+        // await_account_identity: unexercised here.
         await_account_identity: false,
-        // Set `client_interactions.questions` so the assertion below checks that
-        // the generated message carries its field value.
+        // client_interactions (protocol 3.22): stated here so the assertion below
+        // proves the generated message carries its one field.
         client_interactions: Some(claude_runtime_protocol::v1::ClientInteractions { questions: true }),
     };
     assert_eq!(request.cwd, "/tmp/example");

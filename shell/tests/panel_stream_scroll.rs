@@ -1,104 +1,100 @@
-//! Checks that the agent panel keeps streaming replies at the reader's chosen position in
-//! WebKitGTK, the engine `shell` links. With `.row { container-type: inline-size }`, WebKitGTK
-//! 2.52.6 reset `.message-list`'s `scrollTop` to a stale value when the elapsed counter ticked.
-//! `MessageList` read the drop as user scrolling and stopped following, hiding new output.
-//! jsdom has no layout, and Chromium did not reproduce this movement.
+//! Tests that streaming replies follow the bottom while leaving a parked reader in place.
+//! This drives the real WebKitGTK engine linked by `shell`; jsdom has no layout, and Chromium
+//! does not reproduce the scroll reset exercised here.
 //!
-//! The test uses `webkit6` with the document embedded by `agent_panel.rs` and the same
-//! `agent_bridge::serialize_*_for_js` functions used by the product. It calls
-//! `evaluate_javascript` every 33ms, matching the pump's cadence.
+//! With `.row { container-type: inline-size }`, WebKitGTK 2.52.6 reset `.message-list`'s
+//! `scrollTop` to a stale value when the status line's elapsed counter ticked. `MessageList`'s
+//! `onScroll` interpreted the drop as a reader scrolling up and stopped following the reply.
+//! The harness loads the document embedded by `agent_panel.rs` and uses the product's
+//! `serialize_*_for_js` functions, with one `evaluate_javascript` call per 33ms pump tick.
 //!
-//! Run each scenario at 560x740 and 519x480 CSS px with page zoom 1.0 and 1.5, and at
-//! 1280x800 with zoom 1.0. Window dimensions are the CSS dimensions times the zoom.
-//! The reply begins with long code lines (`WIDE_CODE`) that grow with each delta. `index.css`
-//! uses a block-level `pre` with `max-width: 100%` and `overflow-x: auto`, so the code block
-//! stays as wide as its row and scrolls internally without moving the conversation sideways.
+//! Each scenario runs on 560x740 and 519x480 CSS-px panels at zoom 1.0 and 1.5
+//! (`gtk-xft-dpi=147456`), and on a 1280x800 panel at zoom 1.0. Window dimensions are the CSS
+//! dimensions times the zoom. The reply begins with a fenced block of long lines (`WIDE_CODE`).
+//! `.code-block` is a block-level `pre` with `max-width: 100%` and `overflow-x: auto`, so it
+//! stays as wide as its row while its content grows and scrolls inside it. The conversation
+//! must neither shift nor scroll sideways as the block grows.
 //!
-//! - S1, follow: start at the bottom with no input. Any scroll event with a decreased
-//!   `scrollTop` must still be at the true bottom, since a decrease can be a bottom clamp.
-//!   No interval longer than 250ms may stay more than 50px short of the end. Finish at the bottom.
-//! - S2, parked inside the streaming reply: once the second assistant message is 1.5 screens
-//!   tall, send a wheel and let it scroll. After 300ms, require no scroll events, an unchanged
-//!   `scrollTop` in every frame, and the same text offset at the reading point. Later deltas
-//!   append plain paragraphs, excluding markdown restructuring above the reader.
-//! - S3, parked in older history: park before any text arrives and apply S2's stability checks.
-//!   This protects parked readers when follow logic changes.
-//! - S4, re-arm: write `scrollTop = scrollHeight` every 400ms during the turn and apply S1's
-//!   check that a decrease in `scrollTop` still leaves the list at its bottom.
-//! - S5, browser PageUp: focus a control inside the list from the start of the live tool call,
-//!   then send PageUp and its default scroll. The tool row uses `tabindex=-1` because the replay
-//!   has no natively focusable row element. Apply S2's checks. Tracking only wheels, pointers,
-//!   touch drags and panel keys misses this input and can snap the reader back on the next delta.
-//! - S6, sideways swipe: once message 2 is half a screen tall, send eight wheels with
-//!   `deltaX: -40` and sub-pixel vertical jitter. The list must not move; S1 applies throughout.
-//!   A negative `deltaY` alone must not end following when the swipe does not scroll up.
-//! - S7, cancelled wheel followed by a row and silence: cancel an upward wheel at the bottom
-//!   after `MessageList` sees it, then add the live tool row during the gesture. WebKitGTK scrolls
-//!   synthetic wheels unless cancelled. Leave 330ms of quiet before the call to avoid a pending
-//!   snap event, and let the call run about 2s instead of 630ms. Require the bottom within
-//!   `S7_CATCH_UP_LIMIT_MS` of the wheel, when the gesture ends. S1's decrease and final-distance
-//!   checks apply. Waiting for another state change would leave the new row below the view.
-//! - S8, initial scroll event with no movement: once message 2 is half a screen tall, send an
-//!   upward wheel (`S8_WHEEL_DELTA`) just before a text delta, then dispatch a scroll event with
-//!   the list unmoved. WebKitGTK can send this event before its animated wheel scroll starts.
-//!   From `S8_SETTLE_MS` to the turn's end, stay at least half the wheel distance above its start.
-//!   The initial event must not re-arm following and let the delta's snap cancel the wheel.
-//! - S1(c), every following frame at the end: in S1 and S6, require the end within `AT_BOTTOM_PX`
-//!   throughout the turn. S1's 50px/250ms allowance alone permits a smooth scroll to leave a newly
-//!   mounted reply row below the edge for a frame or two.
-//! - S9, layout changes without streaming: after the turn, while following, make four changes
-//!   one second apart. Narrow to `S9_NARROW` of the width, capped at `S9_NARROWED_MAX_CSS_PX`,
-//!   then shorten to `S9_SHORTEN` of the height. Raise the font size with a theme envelope via
-//!   `serialize_theme_for_js`, then set `--page-pad` to `S9_PAGE_PAD` on `.message-list` to narrow
-//!   the rows while leaving the footer's page margin unchanged.
-//!   Require the end by the second sampled frame (`S9_MAX_SHORT_FRAMES`) after each change and
-//!   stay there. Snapping only on state changes misses these layout changes.
-//! - Sideways, every scenario: require `.message-list`'s `scrollWidth` to be within `SIDEWAYS_PX`
-//!   of `clientWidth` in every frame, except the frame sampled during a width change
-//!   (`judge_sideways`). Exercise a long live command (`LIVE_COMMAND`), an older long path
-//!   (`LONG_PATH`) and a long prose URL (`LONG_URL`).
+//! S1 follows the bottom without input. A scroll event that reports a lower `scrollTop` must
+//! still leave the list at its true bottom. The view must never remain more than 50px short
+//! for over 250ms, and the turn must end at the bottom.
+//! S2 parks inside the second assistant message once it is 1.5 screens tall, using a wheel
+//! event and its resulting scroll. After 300ms, no scroll event, frame's `scrollTop`, or text
+//! offset at the reading point may change. Subsequent deltas append plain paragraphs, excluding
+//! markdown restructuring above the reading point from this check.
+//! S3 parks in older history before the first delta and checks the same stable position.
+//! S4 writes `scrollTop = scrollHeight` every 400ms during the turn and applies S1's check
+//! on scroll events that report a lower position.
+//! S5 parks with the browser's default PageUp action on a control inside the list. The control
+//! has held focus since the live tool call began, so focus landing cannot explain the park.
+//! The replay uses `tabindex=-1` on the tool row because it has no naturally focusable element.
+//! S2's stability checks apply. Following must remain stopped even when the panel's own input
+//! handlers did not initiate the scroll.
+//! S6 sends eight sideways wheel events with `deltaX: -40` and sub-pixel vertical jitter once
+//! the second reply is half a screen tall. The list does not move, and S1's checks still apply.
+//! A negative `deltaY` alone must not stop following.
+//! S7 cancels an upward wheel after `MessageList` sees it, so the gesture moves nothing.
+//! A tool row arrives during the gesture, followed by silence. The replay waits 330ms before
+//! the tool call to exclude pending snap events, and the call lasts about 2s. Following must
+//! catch up within `S7_CATCH_UP_LIMIT_MS` of the wheel, when the gesture ends, without waiting
+//! for the tool result. S1's downward-scroll and final-position checks also apply.
+//! S8 sends an animated upward wheel (`S8_WHEEL_DELTA`) just before a text delta, followed by
+//! a scroll event reporting no movement. WebKitGTK can emit that event before the wheel's first
+//! real step. From `S8_SETTLE_MS` onward, the view must stay at least half the wheel's distance
+//! above its initial position. The unmoved event must not re-arm following and cancel the wheel.
+//! S1(c) checks every following frame in S1 and S6 against `AT_BOTTOM_PX`. Smooth scrolling
+//! a newly mounted reply row can leave its text below the visible edge for a frame, even when
+//! the broader 50px/250ms allowance passes.
+//! S9 changes layout after streaming ends, with the view following at the bottom. It narrows
+//! the window to `S9_NARROW` and at most `S9_NARROWED_MAX_CSS_PX`, shortens it to `S9_SHORTEN`,
+//! raises the font size through `serialize_theme_for_js`, and sets `.message-list`'s `--page-pad`
+//! to `S9_PAGE_PAD`. The changes are a second apart. After each, the view must reach its end by
+//! `S9_MAX_SHORT_FRAMES`, the second sampled frame, and stay there. These changes need no new
+//! streaming state, so following must respond to layout changes themselves.
+//! Every scenario checks that `.message-list`'s `scrollWidth` stays within `SIDEWAYS_PX` of
+//! `clientWidth`. `LIVE_COMMAND`, `LONG_PATH`, and `LONG_URL` exercise long command, path, and
+//! prose tokens. `judge_sideways` excludes the single frame in which the list's width changes.
 //!
-//! Re-snapping before paint while following can hide the size-container bug from S1 and S4:
-//! the engine's drop is corrected before the scroll event reads the position. S2 exposes it
-//! with a parked reader, so keep that coverage. S5 parks similarly but was not checked with
-//! the container restored. `indexCss.test.ts` provides a matching guard without a display.
+//! Snapping before paint can hide the size-container reset in S1 and S4: their scroll events
+//! already read the corrected bottom. A parked reader in S2 still exposes the reset, so keep
+//! that coverage. S5 parks similarly but has not been checked with the container restored.
+//! `indexCss.test.ts` provides a guard that does not require a display.
 //!
-//! Parked scroll events are checked by order. `scrollIndex` counts events dispatched before
-//! the park; only later events can move the reader. A `t >= park.t` check can include the
-//! previous delta's snap event, dispatched just before the park callback in the same rendering
-//! update. WebKitGTK's 1ms clock can give both the same timestamp. Each run prints this count.
-//! `judge_self_test` runs synthetic checks without a display on every invocation, including
-//! plain `cargo test --workspace`. It covers timestamp ties, movement that must fail, and a
-//! park with no index.
+//! Parked scroll events are checked by dispatch order. The park stores `scrollIndex`, the count
+//! of events already dispatched, and only subsequent events can indicate unwanted movement.
+//! A previous delta's snap may dispatch just before the park's frame callback in the same
+//! rendering update. WebKitGTK's 1ms clock can give that event the park's timestamp, even though
+//! it reads the earlier position. Comparing timestamps would incorrectly count it as movement.
+//! Each run prints the number of such events. `judge_self_test` runs synthetic checks on every
+//! invocation, including without `--ignored`, covering this tie, a subsequent movement at the
+//! same timestamp, and a park without an index.
 //!
-//! Trigger checks prevent empty passes. History must span three screens and start at the
-//! bottom; the counter must tick at least five times during streaming; and the turn must grow
-//! the list by two screens. S2, S3 and S5 must park with at least two later counter ticks.
-//! S5 needs focus at least 500ms before PageUp, so focus itself cannot explain the stable park.
-//! S6 needs all eight swipes while following with a screen of growth left. S7 needs its wheel
-//! cancelled at the bottom, the tool row to move the view away from the bottom without wheel
-//! movement, and `S7_MIN_PAUSE_MS` of quiet. S8 needs a wheel while following with a screen of
-//! growth left. S9 needs each change to move the list's end by at least `HIDDEN_PX`, and each
-//! resize must change the list's own box. On the smaller panels, the three long tokens must exceed
-//! the list width in their rendered font.
-//! Every panel also needs code content at least `CODE_OVERFLOW_MIN_PX` wider than its visible
-//! code block, and the block must never exceed its row. This supplies overflow on the wide
-//! panel, where the three tokens fit on one line.
-//! A missed trigger fails as "did not exercise the trigger". Between paragraphs the reading
-//! point can resolve to the row body and track only `scrollTop`; the separate `scrollTop`
-//! checks still cover that case.
+//! Guards require three screens of initial history, an initial bottom position, at least five
+//! elapsed-counter updates during streaming, and two screens of growth. S2, S3, and S5 must
+//! actually park with at least two subsequent counter ticks. S5 needs focus inside the list
+//! at least 500ms before PageUp. S6 needs all eight swipes while following with a screen of
+//! growth still to come. S7 needs a cancelled wheel at the bottom, a new tool row that leaves
+//! the view short without wheel movement, and at least `S7_MIN_PAUSE_MS` of silence. S8 needs
+//! its wheel while following with a screen of growth still to come. Each S9 change must move
+//! the list's end at least `HIDDEN_PX` from the old position, and each resize must change the
+//! list's own box. The sideways tokens must each exceed the list's width in their rendered font.
+//! Every panel also needs code content at least `CODE_OVERFLOW_MIN_PX` wider than its block's
+//! visible width, with the block never wider than its row. This exercises overflow on the wide
+//! panel where the three tokens fit. Missing a guard fails as "did not exercise the trigger".
+//! A reading point between paragraphs can resolve to the row body, whose offset only tracks
+//! `scrollTop`; the separate scroll-position checks still cover that case.
 //!
-//! `support/own_x_server.rs` starts an `Xvfb` with a 1920x1200 screen and no input devices
-//! before GTK initialises. It clears inherited `WAYLAND_DISPLAY` and `DISPLAY` values.
-//! Run with:
+//! The harness starts its own Xvfb through `support/own_x_server.rs` before GTK initialises,
+//! discarding inherited `WAYLAND_DISPLAY` and `DISPLAY`. It uses a 1920x1200 screen with no
+//! input devices, so this command cannot reach the desktop it was launched from:
 //!
 //!     cargo test -p shell --test panel_stream_scroll -- --ignored
 //!
-//! A 640x480 screen clamps the 1110px-tall window and causes a missing-trigger failure.
-//! A plain `main` (`harness = false`) keeps GTK on the main thread. Every frame and scroll
-//! event is traced to `$PANEL_STREAM_SCROLL_TRACE_DIR`, default `<target tmp>/panel_stream_scroll/`.
-//! `PANEL_STREAM_SCROLL_ONLY=S1,S2` narrows the scenarios. The matrix is fixed, at about 15s per
-//! run, forty-five runs.
+//! A 640x480 screen would clamp the 1110px-tall window and fail the size guard. A plain `main`
+//! (`harness = false`) keeps GTK on the main thread. Frame and scroll-event traces go to
+//! `$PANEL_STREAM_SCROLL_TRACE_DIR`, defaulting to `<target tmp>/panel_stream_scroll/`.
+//! `PANEL_STREAM_SCROLL_ONLY=S1,S2` narrows scenarios while the configuration matrix stays fixed.
+//! The full run has forty-five runs of about 15s each.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -529,7 +525,7 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         resumable: Vec::new(),
         account: None,
     };
-    // This replay uses a single tab.
+    // Interim: one tab until the panel moves onto TabSet.
     let sole_tab = eitri_core::tabs::TabId(1);
     let snapshot = serialize_snapshot_for_js(
         sole_tab,
@@ -848,7 +844,7 @@ const INSTRUMENT: &str = r#"
     // the `?` keymap overlay swallows keys), or one the engine sends somewhere else, which
     // `MessageList` can only find out once the gesture is over -- at the tail, just before the live
     // tool call's row arrives. Then the replay is quiet for about 2s. WebKitGTK performs a synthetic
-    // wheel's scroll, so this one is cancelled, after `MessageList`'s own
+    // wheel's scroll (measured), so this one is cancelled, after `MessageList`'s own
     // passive listener has seen it.
     if (SCENARIO === "S7" && P.gesture === null && env && env.kind === "events"
         && env.events.some((e) => e.type === "tool_call_started")) {
@@ -1567,16 +1563,19 @@ fn judge(config: Config, scenario: Scenario, probe: &Probe) -> Verdict {
             ));
         }
 
-        // The reader must stay where they parked from the park itself onward. The settle only
-        // excuses the park's own scroll event; starting checks after it can hide a yank inside it.
-        // A clock tick that moves the reader 80ms after parking must therefore still count as movement.
+        // Where the reader parked is where the reader stays, from the park itself onward. The
+        // settle below only excuses the park's own scroll event; it must not hide a yank that lands
+        // inside it -- the first version of this check started at the end of the settle, and on the
+        // broken build a clock tick 80ms after the park moved the reader and read as a pass.
         //
-        // Frames count strictly after the park's own frame, whose timestamp was read before
-        // the park was written and whose position is therefore still the old one. Scroll events
-        // count from `scrollIndex`, rather than by timestamp. A previous delta's snap can dispatch
-        // its event just before the park's frame callback in the same rendering update.
-        // WebKitGTK's 1ms clock can give that old position the park's timestamp, so `s.t >= t_park`
-        // can falsely report a yank. Counting by order includes the first event after the park.
+        // Frames count from strictly after the park's own frame, whose `t` was read before the park
+        // was written, so it reads the pre-park position whatever its timestamp. Scroll events count
+        // from where the park said its events start (`scrollIndex`), NOT by timestamp: the previous delta's snap has its scroll event dispatched in
+        // the same rendering update as the frame callback that writes the park, before it -- so it
+        // reads the pre-park position -- and WebKitGTK's 1ms clock gave it the park's own timestamp
+        // about one S2 run in three. `s.t >= t_park` counted it as a yank: 4 false S2 failures in 12
+        // runs on the fixed build, each "a parked reader was moved" with 0 frames off the park. By
+        // order, the first event dispatched after the write is still the first one counted.
         let off_park: Vec<&Frame> = probe
             .frames
             .iter()
@@ -1693,11 +1692,12 @@ fn judge(config: Config, scenario: Scenario, probe: &Probe) -> Verdict {
     v
 }
 
-/// S7: a wheel up that the list could take lands at the tail and moves nothing, the live tool
-/// call's row arrives during the gesture, and then the replay stays quiet for about 2s.
-/// `MessageList` must scroll to that row when the gesture ends, not when the next state change
-/// (the tool result) arrives. Otherwise a row that arrives just before a pause, such as a
-/// permission card after which the turn waits for the user, stays below the view.
+/// S7: a wheel up that the list could take lands at the
+/// tail and moves nothing, the live tool call's row arrives inside its gesture, and then the replay is
+/// quiet for about 2s. `MessageList` must scroll to that row when the gesture ends, not when the next
+/// state change -- the tool result -- arrives: with the earlier take-back, it ran only at a state change,
+/// so a row that came just before a pause (a permission card, after which the turn waits for the
+/// user) stayed below the view.
 fn judge_s7(probe: &Probe, t_end: f64, v: &mut Verdict) {
     let Some(gesture) = &probe.gesture else {
         v.vacuous.push("the wheel before the tool call never happened".into());
@@ -1798,11 +1798,11 @@ fn judge_s7(probe: &Probe, t_end: f64, v: &mut Verdict) {
     }
 }
 
-/// S8 sends a wheel up at the tail while the reply streams, then a text delta.
-/// WebKitGTK animates the wheel scroll but can first emit a scroll event with no movement.
-/// That event is dispatched here so every run exercises it. The wheel must move the view
-/// and leave following stopped for the rest of the turn. Re-arming at the bottom on the
-/// first event can clear the provisional stop and let the delta's snap cancel the wheel.
+/// S8: a wheel up at the tail while the reply streams, which WebKitGTK performs,
+/// animated; its first scroll event reports no movement yet (measured 0-1ms after the wheel in 2 of 8
+/// wheels at the tail, dispatched here so every run has it); and a delta right behind it. The wheel
+/// is the user's, so its scroll must land and stay, and following must stop for good. With the earlier take-back that first event re-armed following at the bottom and cleared the provisional
+/// stop, and the delta's snap cancelled the wheel's scroll.
 fn judge_s8(config: Config, probe: &Probe, t_end: f64, v: &mut Verdict) {
     let Some(gesture) = &probe.gesture else {
         v.vacuous.push("the wheel never happened".into());
@@ -1943,12 +1943,13 @@ fn judge_wide_layout(config: Config, probe: &Probe, v: &mut Verdict) {
     }
 }
 
-/// S9 changes layout after the turn ends while the view follows at the bottom.
-/// The window narrows so the reply reflows taller, then shortens the list's box. A theme
-/// envelope raises the font size, and `--page-pad` on the list narrows only the rows. After each,
-/// at most `S9_MAX_SHORT_FRAMES` sampled frames may show the view short of the end.
-/// It must then stay at the end until the next change. Snapping only on state changes
-/// leaves the view short while nothing streams.
+/// S9 (the GUI pass's F-a, and the investigation's F5): with the turn over and the view following
+/// at its end, four changes move the list's end with no state change behind them -- the window
+/// narrows (the reply reflows taller), then shortens (the list's own box gets shorter), a theme
+/// envelope raises the font size, and `--page-pad` on the list narrows the rows and nothing else. After
+/// each, at most `S9_MAX_SHORT_FRAMES` sampled frame may show the view short of its end, and it must
+/// still be there when the next change comes. With the earlier follow snap, it ran only on a state
+/// change, so each change left the view short for as long as nothing streamed.
 fn judge_s9(probe: &Probe, t_end: f64, v: &mut Verdict) {
     // One window resize can reach the page as more than one `resize` event; those within 100ms of the
     // previous one are the same change.
@@ -2140,7 +2141,7 @@ fn synthetic_tokens(width: f64, list: f64) -> Value {
 enum S9Shape {
     /// Back at the end one frame after each change -- what the fix does.
     Fixed,
-    /// Left where it was until the end.
+    /// Left where it was until the end -- what the earlier follow snap did.
     Stuck,
     /// Back at the end, but 400ms after each change.
     Slow,
@@ -2440,7 +2441,7 @@ fn judge_self_test() -> Result<usize, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// BROWSE's `Ctrl+e`/`Ctrl+y`, copying vim's own `:help CTRL-E`/
+// BROWSE's Ctrl+e / Ctrl+y, copying vim's own `:help CTRL-E`/
 // `:help CTRL-Y`. This is a real WebKitGTK check for exactly what jsdom (`App.test.tsx`) cannot
 // lay out: a real computed line height actually moves `.message-list`'s `scrollTop`, a real capped
 // tool-result box (`.tool-result-body`'s own max-height + overflow-y) takes the box-first
@@ -2603,10 +2604,12 @@ fn ctrl_e_y_replay() -> Replay {
     steps.push(mark("plain-e1"));
     steps.push(key("9", false, false)); // a count -- "99 Ctrl+y", far more than one screen's worth
     steps.push(key("9", false, false));
-    // Ctrl+y first sends a bare `Control` keydown with `ctrlKey: true`, then a `y` keydown.
-    // Send both after the digits to check that the bare modifier preserves `countRef`.
-    // Going straight to `key("y", true, false)` skips the separate `Control` event,
-    // so it cannot catch the modifier clearing the count before the chord.
+    // A real Ctrl+y arrives as the bare
+    // `Control` keydown FIRST (`ctrlKey: true` already set on that very event), then `y` -- this
+    // step used to go straight from the digits to `key("y", true, false)`, which never exercised the
+    // production bug (a bare `Control` keydown between a count and its Ctrl chord used to clear
+    // `countRef`) even in this real engine, since a single synthetic event carrying `ctrlKey` has no
+    // separate `Control` keydown to trip it.
     steps.push(key("Control", true, false));
     steps.push(key("y", true, false));
     steps.push(mark("rehomed"));

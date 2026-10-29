@@ -69,11 +69,13 @@ fn direction_from_args(args: &[String]) -> Option<char> {
     })
 }
 
-/// Returns a stderr notice for a typed `tmux` inside nvim's `:terminal`.
-/// Pane-switch calls (`select-pane -<dir>`) and calls with non-terminal stderr return `None`.
-/// The navigation plugin uses piped descriptors through `system()`, so its calls must stay silent
-/// and exit successfully to avoid breaking keystrokes. Only an interactive terminal gets the notice.
-/// This function performs no process exit or environment lookup, so it can be tested directly.
+/// Whether a typed `tmux` inside nvim's own `:terminal` deserves a message on
+/// stderr, and what it says. `None` for a real pane-switch call (`select-pane -<dir>`), because
+/// that is `vim-tmux-navigator` doing its job, and `None` for any call whose stderr is not a
+/// terminal -- the plugin's own calls run through `system()` with piped fds, never a terminal, and
+/// must keep exiting 0 silently (the shim's contract: a failure here must never surface as a broken
+/// keystroke). Only a human typing `tmux` at a real prompt inside `:terminal` sees this. Kept pure
+/// (no process exit, no env lookups of its own) so it is unit-testable without a process.
 fn notice_for(
     args: &[String],
     stderr_is_tty: bool,
@@ -109,12 +111,14 @@ fn own_dir_from(socket_var: Option<&OsStr>, path_var: Option<&str>) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Finds the first real `tmux` on `path_var` after the shim, or returns `"tmux is not installed"`.
-/// The shim's position is `own_dir` or any entry whose `tmux` resolves to `shim` itself.
-/// A candidate resolving to `shim` is never returned: `is_file()` follows the `bin/tmux` symlink,
-/// so a directory prepended by the shell could otherwise make the shim look like the real tmux.
-/// `shim` is this binary's canonical path; if unavailable, only `own_dir` identifies its position.
-/// Candidates need only be files, like the binary accepted by `pane_switch::locate_shim_binary`.
+/// The first real `tmux` on `path_var` after the shim's own place on it, or `"tmux is not
+/// installed"` if none. The shim's place is `own_dir` ([`own_dir_from`]), or any entry
+/// whose `tmux` is `shim` itself; and a candidate that resolves to `shim` is never offered, however
+/// it got onto `PATH` -- `is_file()` follows the `bin/tmux` symlink, so without this a directory
+/// the shell prepended would make the walk start early and name the shim as the real tmux. `shim`
+/// is this binary, canonicalized (`None` if that cannot be read: then only `own_dir` places it).
+/// Only checks the entry is a file, the same bar `pane_switch::locate_shim_binary` holds this
+/// shim's own binary to.
 fn real_tmux_after(path_var: Option<&str>, own_dir: &Path, shim: Option<&Path>) -> String {
     let Some(path_var) = path_var else {
         return "tmux is not installed".to_string();
@@ -247,8 +251,8 @@ mod tests {
         dir
     }
 
-    /// A `select-pane` call gets no notice, whether or not stderr is a terminal,
-    /// so the navigation plugin can switch panes silently.
+    /// A real `select-pane` call never gets the notice, tty or not -- it is
+    /// `vim-tmux-navigator` doing exactly its job.
     #[test]
     fn a_pane_switch_call_never_gets_a_notice() {
         let a = args(&["-S", "/s", "select-pane", "-t", "%0", "-R"]);
@@ -262,8 +266,8 @@ mod tests {
         );
     }
 
-    /// The plugin's other calls, such as zoom checks and clipboard fallbacks, use `system()`
-    /// with piped descriptors, so they must also stay silent.
+    /// The plugin's other calls (a zoom check, a clipboard fallback, ...) run through
+    /// `system()` with piped fds -- never a terminal -- so they keep exiting silently too.
     #[test]
     fn a_non_pane_switch_call_off_a_terminal_gets_no_notice() {
         let a = args(&["-S", "/s", "display-message", "-p", "#{window_zoomed_flag}"]);
@@ -343,10 +347,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An interactive shell inside nvim's `:terminal` can prepend a directory to `PATH`, moving the
-    /// shim away from the first entry. Starting there could return the shim's own `bin/tmux` symlink
-    /// as the real tmux. The socket identifies the shim's directory, and candidates resolving to the
-    /// shim itself are skipped even if the search starts early.
+    /// Inside nvim's `:terminal`, an interactive shell's rc file
+    /// prepends its own directory (`export PATH="$HOME/.local/bin:$PATH"`), so `PATH`'s leading entry
+    /// is no longer the shim's. Walking from there reached the shim's own `bin/tmux` symlink first
+    /// and named it as "the real tmux". The shim's directory comes from the socket now, and a
+    /// candidate that is the shim itself is never offered even when the walk starts early.
     #[test]
     fn a_directory_the_shell_prepended_never_makes_the_shim_the_real_tmux() {
         let root = scratch_dir("prepended");

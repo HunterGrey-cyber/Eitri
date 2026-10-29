@@ -1,45 +1,48 @@
-//! The bottom terminal's widget: a `GtkGLArea` that paints the session's latest frame
-//! and handles keyboard, click, focus and resize events. The pane keeps the latest `PaintList`
-//! and the GL surface. Bytes, parsing, encoding and rendering belong to the session thread.
+//! The bottom terminal's `GtkGLArea` paints the session's latest frame and handles keyboard,
+//! click, focus and resize events. The session thread handles terminal bytes, parsing,
+//! encoding and rendering. The pane keeps the latest `PaintList` and the GL surface.
 //!
-//! `start` requests a shell; the session starts at the first allocation with area. The pane
-//! keeps that allocation in [`State::allocation`] and builds metrics at that size. The first
-//! `resize` can arrive before metrics exist, and GTK sends no second resize for the same
-//! allocation. Using a 1x1 placeholder would leave the first shell nearly blank until a resize.
+//! The shell starts lazily. `start` marks it as wanted; the session spawns at the first
+//! allocation with area. That allocation is kept in [`State::allocation`] and used to build
+//! the metrics. The first resize can arrive before metrics exist, and GTK sends no second
+//! resize for the same allocation, so a 1x1 placeholder would leave the PTY at the wrong size.
 //!
-//! The session's waker sends on a channel awaited by `glib::spawn_future_local` on the main
-//! loop. A 33 ms poll would add up to 33 ms to each echo. An idle terminal needs no wake-ups.
-//! An unmapped pane tells the session it is hidden, so hidden output produces no renders.
+//! The session wakes the main loop through a channel awaited by a `glib::spawn_future_local`
+//! future. There is no polling timer to delay echo or wake an idle terminal. When unmapped,
+//! the pane tells the session it is hidden, so output in a hidden terminal renders nothing.
 //!
-//! If `$SHELL` cannot start, the pane tries the passwd entry's shell and then `/bin/sh`.
-//! If all fail, it shows a failure frame and waits for Enter instead of retrying on resize.
+//! If `$SHELL` cannot start, startup falls back to the passwd entry's shell and then `/bin/sh`.
+//! If none starts, the pane displays the failure and waits for Enter instead of retrying
+//! on every resize.
 //!
-//! `ime.rs` attaches a `GtkIMMulticontext` to the key controller. Commits go through [`submit`],
-//! and unfinished composition is drawn at `Update::cursor`. The input method's caret is updated
-//! on preedit changes, focus gain and cursor movement while focused. GTK can focus the input
-//! method out before the pane receives its focus notification, and that can emit a commit.
-//! [`connect_ime`] checks GTK's current focus so composition interrupted by focus loss is dropped.
-//! [`TerminalPane::start`] sets the client widget, so an unused terminal creates no input client.
-//! No `RefCell` borrow spans `reset`, `set_cursor_location` or `set_client_widget`: input-method
-//! calls can emit `commit` or `preedit-changed` synchronously, and those handlers borrow state.
+//! Chinese input uses `ime.rs` and a `GtkIMMulticontext` on the key controller. Commits go
+//! through [`submit`]; unfinished composition is drawn at `Update::cursor`. The input method
+//! is pointed at its caret on `preedit-*`, on gaining focus, and when a frame moves the cursor
+//! while focused. GTK's key controller manages input-method focus and can focus it out before
+//! the focus report arrives, causing fcitx5 to commit. [`connect_ime`] checks GTK focus so
+//! composition interrupted by leaving the terminal is discarded. [`TerminalPane::start`]
+//! sets the client widget, so an unused terminal creates no input-method client.
+//! No `RefCell` borrow is held across `reset`, `set_cursor_location` or `set_client_widget`:
+//! `reset` can emit signals whose handlers borrow the state before the call returns.
 //!
-//! Typed keys, prefix literals, clipboard pastes and input-method commits all use [`submit`].
-//! The clipboard read is asynchronous; `input_queue` holds later typing behind it so Enter
-//! cannot overtake the text it runs.
+//! All input for the shell goes through [`submit`]: typed keys, prefix literals, clipboard
+//! paste and input-method commits. Clipboard reads are asynchronous. `input_queue` keeps
+//! later input behind a pending paste so Enter cannot overtake the text it should run.
+//! Middle click pastes the primary selection through the same path (`paste_primary`).
 //!
-//! A middle click pastes the primary selection through `paste_primary` and the same input queue.
-//! `connect_pointer` maps drag motion and double/triple clicks to `SelectCommand`s using
-//! `pointer::cell_at` and `kind_for`. On release, `pump` copies the finished selection to both
-//! the clipboard and primary selection. `copy_selection` copies `State::last_selection` again
-//! for `Ctrl+Shift+C` without another session round trip.
+//! `connect_pointer` maps clicks and motion to `SelectCommand`s with `pointer::cell_at` and
+//! `kind_for`. Releasing a selection copies its text to the clipboard and primary selection
+//! through `pump`'s `events.selection` handling. `Ctrl+Shift+C` copies `State::last_selection`
+//! again through `copy_selection`.
 //!
-//! OSC 52 copies go to GTK's clipboard (`c`) or primary selection (`p`/`s`), even while hidden.
-//! `Term` refuses clipboard reads. A bell briefly tints the pane through `bell.rs`; a bell rung
-//! while hidden does not flash when the pane returns. Program titles have no pane header to use.
+//! OSC 52 copies reach GTK's clipboard (`c`) or primary selection (`p`/`s`), even while hidden.
+//! `Term` refuses clipboard reads. A bell briefly tints the pane through `bell.rs`; bells
+//! received while hidden are not flashed when it returns. Program titles have no header
+//! to display in.
 //!
-//! `TerminalMetrics` is built lazily by [`ensure_session`], so an unused terminal never touches
-//! a font manager. If no usable monospace font exists, the pane shows its failure frame instead
-//! of panicking the process.
+//! Font metrics are lazy. [`ensure_session`] builds `TerminalMetrics` when starting the shell,
+//! so [`TerminalPane::new`] never touches a font manager. If no usable monospace font exists,
+//! the pane displays its failure frame instead of letting a font-manager panic close the process.
 
 use std::cell::RefCell;
 use std::panic;
@@ -124,8 +127,8 @@ struct State {
     /// gesture is the program's or this pane's own. Reset to [`MouseModes::default`] (report off) on
     /// a restart, the same as `cursor`.
     mouse: MouseModes,
-    /// Which button (if any) a drag or motion is holding, for the live mouse mode's own report
-    ///. Reset on a restart: a button held across a restarted shell reports nothing new.
+    /// Which button (if any) a drag or motion is holding, for the live mouse mode's own report.
+    /// Reset on a restart: a button held across a restarted shell reports nothing new.
     reports: pointer::ReportTracker,
     /// `prefix [`/`prefix PageUp` opened copy mode: `connect_keyboard` reads
     /// this ahead of `scroll_chord`, and the input method's commit and preedit handlers read it too
@@ -311,7 +314,8 @@ impl State {
         self.last_selection = None;
         self.mouse = MouseModes::default();
         self.reports = pointer::ReportTracker::default();
-        // Leave copy mode on exit or restart: the old session has no remaining scrollback to use.
+        // Leaving copy mode on exit/restart too -- a gone or about-to-be-replaced
+        // shell holds nothing left to scroll back through.
         self.copy_mode = false;
     }
 
@@ -356,7 +360,7 @@ impl State {
     /// **except in copy mode**, where it is a copy-mode key or nothing (`keys::copy_mode_commit`):
     /// with an input method attached a printable key arrives only as a commit (`ime.rs`), so without
     /// this `k`, `j`, `g`, `G`, `q` and every other letter would be typed into the shell underneath
-    ///.
+    /// (copy mode never leaks a key to the shell).
     fn route_commit(&mut self, text: &str, gtk: GtkFocus) -> CommitRoute {
         match self.ime.commit(text, gtk) {
             Commit::Dropped(why) => CommitRoute::Dropped(why),
@@ -802,7 +806,7 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             repoint = s.take_cursor(update.cursor);
             area.queue_render();
         }
-        // Independent of `update.frame`: a synchronized update
+        // Independent of `update.frame` (mouse reporting): a synchronized update
         // can hold every frame back for up to 150ms while the mode changes underneath it, and
         // `pointer::route`/`wheel_route` must see the live mode the moment it changes, not only
         // when the next frame happens to render.
@@ -842,9 +846,11 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             text.chars().count()
         );
     }
-    // A finished selection is copied to both the clipboard and primary selection on release.
-    // Keep it in `State::last_selection` so `Ctrl+Shift+C` can copy it again without a session
-    // round trip. The OSC 52 copies above do not update this cached selection.
+    // A finished host selection copies on release to the clipboard AND the primary selection
+    // (foot's own `selection-target=clipboard` plus every X/Wayland
+    // terminal's own primary-selection convention) -- unlike the two OSC 52 copies above, this one
+    // is also kept (`State::last_selection`) for `Ctrl+Shift+C` to copy again with no session round
+    // trip (`copy_selection`'s own doc).
     if let Some(text) = update.events.selection {
         area.clipboard().set_text(&text);
         area.primary_clipboard().set_text(&text);
@@ -919,11 +925,13 @@ fn connect_resize(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
     });
 }
 
-/// Queue a snapshot on scale changes so an idle pane can receive `resize`.
-/// `connect_resize` rescales through `State::allocate` and `TerminalMetrics::rescale`; a scale
-/// change alone leaves the logical size and grid dimensions unchanged. GTK emits the resize
-/// only on the next `GLArea` snapshot. Without `queue_render`, the old framebuffer stays
-/// upscaled and blurry until output causes a redraw.
+/// `connect_resize` above already rescales
+/// correctly on a scale change (`State::allocate` -> `TerminalMetrics::rescale`; cols/rows are
+/// unchanged, e.g. 160x13 in the sandbox, since the scale-only case never changes the logical
+/// size). What is missing is a reason for GTK to *emit* that `resize` at all: it fires only on the
+/// `GLArea`'s next snapshot, and nothing here asks for one while the pane is idle, so the old
+/// framebuffer sits on screen upscaled (blurry) until the next output redraws it. `queue_render`
+/// asks for that snapshot.
 fn connect_scale_change(area: &GLArea) {
     area.connect_scale_factor_notify(gtk4::prelude::GLAreaExt::queue_render);
 }
@@ -986,9 +994,9 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
 /// Clicking the pane focuses it (GTK4 does not do this for a plain widget; the frozen pane's own
 /// doc records the editor losing click-focus the day a second focusable pane appeared), the primary
 /// button also drags a selection out of it, and the middle
-/// button pastes the primary selection -- foot's and alacritty's own convention. **Since phase 3c
-///, any of that is instead a mouse report when the program's own mode asks for one and
-/// `Shift` is not held**: what changed
+/// button pastes the primary selection -- foot's and alacritty's own convention. **Any of that is
+/// instead a mouse report when the program's own mode asks for one and
+/// `Shift` is not held** (`pointer::route`: Shift always selects): what changed
 /// is which of two already-connected controllers acts, never a new one for reporting.
 ///
 /// **Two controllers on the primary button, not one**, because they answer different questions:
@@ -1080,11 +1088,17 @@ fn connect_pointer(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontex
                 return;
             };
             let (x, y) = (start_x + offset_x, start_y + offset_y);
-            // Use `reports.is_held()` to remember whether the press was reported. `route()` uses the
-            // current Shift state, so a release with Shift newly held can route locally even though
-            // the program received the press. Skipping that release would strand `ReportTracker::held`
-            // and make the next ordinary motion report a phantom drag. Always call `report_release`;
-            // it is a no-op when no button is held, as `connect_cancel` also relies on.
+            // Decide from `reports.is_held()`, never from `route()`
+            // sampled at release. `route` re-derives its answer from *current* Shift state with no
+            // memory of press time, so gating the release report on `route(shift, modes) ==
+            // Program` (the old code) missed a release with Shift held only at that moment --
+            // `report_release` was skipped, `ReportTracker::held` stayed stranded, and the next
+            // ordinary motion reported a phantom left-button drag (`is_held`'s own doc,
+            // `pointer::tests::a_release_reports_even_when_shift_is_held_only_at_release`). A button
+            // `report_press` reported is real regardless of the Shift state at release (xterm's own
+            // convention: the release follows the press it matches), so `report_release` runs
+            // unconditionally here too -- it is already a no-op if nothing is held, the same fact
+            // `connect_cancel` below already relies on.
             let was_held = state.borrow().reports.is_held();
             report_release(&state, gesture.current_event_state(), x, y);
             if was_held {
@@ -1242,15 +1256,18 @@ enum SelectStage {
     Extend,
 }
 
-/// The geometry needed to turn a pointer position into a [`SelectCommand`]: cell size, grid
-/// dimensions and the last frame's absolute top line (`PaintList::top_line`). The session thread
-/// keeps `Screen::top_line`; the pane uses the frame to correlate a click with its displayed text.
-/// Returns `None` until metrics exist, and uses top line zero when no frame exists.
+/// The geometry a pointer position needs to become a [`SelectCommand`]: the cell size and grid the
+/// pane's own metrics are built at, and the absolute top line its LAST FRAME reported
+/// (`PaintList::top_line`, provenance-only for painting but exactly the correlation selection needs --
+/// the host has no other way to learn `Screen::top_line`, which lives on the session's own thread).
+/// `None` before a shell has ever spawned (no metrics yet) or rendered once (no frame yet).
 ///
-/// Cell sizes are returned in widget-logical pixels, matching GTK gesture and motion coordinates.
-/// Metrics use device pixels, so divide by [`TerminalMetrics::scale`]. [`im_cursor_rect`] makes
-/// the reverse conversion. Without this division, scale 2 clicks land at about half their
-/// intended row and column.
+/// The cell size is returned in **widget-logical** pixels, the unit GTK's gesture and motion
+/// controllers report `(x, y)` in. The metrics themselves are in device pixels (the font is built at
+/// `size_pt * scale`, the GLArea's allocation is device pixels), so they are divided by
+/// [`TerminalMetrics::scale`] here -- the same conversion [`im_cursor_rect`] makes the other way.
+/// Without it, at GTK scale 2 (which includes 125% and 150% outputs, since GTK ceils) a click landed
+/// on about half its row and column.
 fn selection_geometry(state: &State) -> Option<(f64, f64, u16, u16, i32)> {
     let metrics = state.metrics.as_ref()?;
     let top_line = state.frame.as_ref().map_or(0, |f| f.top_line);
@@ -1285,10 +1302,13 @@ fn send_select(state: &Rc<RefCell<State>>, stage: SelectStage, x: f64, y: f64) {
     session.send(SessionCommand::Select(cmd));
 }
 
-/// Copy the last finished selection to the clipboard for `Ctrl+Shift+C`.
-/// `State::last_selection` holds the text received through `pump`'s `events.selection`, so no
-/// additional `SelectCommand::Finish` or session round trip is needed. With no selection, only
-/// a log line is emitted. The key is still swallowed so its encoding cannot reach the child.
+/// `Ctrl+Shift+C`: copies the pane's last finished selection to the clipboard again. Reads `State::last_selection` -- what a drag's own release already put there
+/// (`pump`'s `events.selection` handling) -- rather than asking the session for `SelectCommand::Finish`
+/// again: that would need a round trip through its update channel for no benefit, since the session
+/// already told the host once and the text has not changed since (its own doc: "the session is the
+/// single source either way"). With nothing selected, this is a no-op but for the log line: the key
+/// is still swallowed either way (forwarding it would send `terminal_input`'s own encoding of
+/// `Ctrl+Shift+C` -- `keys::clipboard_chord`'s own doc explains why that must never reach the child).
 fn copy_selection(state: &Rc<RefCell<State>>, area: &GLArea) {
     let Some(text) = state.borrow().last_selection.clone() else {
         println!("[terminal] Ctrl+Shift+C: nothing is selected");
@@ -1301,8 +1321,10 @@ fn copy_selection(state: &Rc<RefCell<State>>, area: &GLArea) {
     );
 }
 
-/// Grid lines scrolled per wheel notch. Reuse the terminal library's `LINES_PER_NOTCH`
-/// so scrollback and alternate-screen arrow-key repeats use the same multiplier.
+/// How many grid lines one wheel notch scrolls (3 lines a notch,
+/// foot/alacritty's own `multiplier`) -- the same multiplier
+/// `eitri_terminal::mouse::LINES_PER_NOTCH` uses for alternate-scroll's own arrow-key repeats,
+/// so the two conventions cannot drift apart.
 const LINES_PER_WHEEL_NOTCH: i32 = eitri_terminal::mouse::LINES_PER_NOTCH as i32;
 
 /// One scroll event, in `unit`, folded into `wheel`'s carry-over state -- the same accumulator
@@ -1317,22 +1339,26 @@ fn wheel_notches(wheel: &mut WheelZoom, unit: gtk4::gdk::ScrollUnit, dy: f64) ->
     wheel.scroll_in(unit, dy)
 }
 
-/// Convert whole `notches` from [`wheel_notches`] to a scrollback request. Zero returns `None`.
-/// Multiply the positive-is-up count by `LINES_PER_WHEEL_NOTCH` without changing its sign,
-/// so positive values scroll into history.
+/// `notches` (as [`wheel_notches`] returns them) turned into what the scrollback asks for.
+/// `None` until a whole notch completes. `WheelZoom::scroll_in`'s positive-is-up convention
+/// multiplies straight through with no sign flip of its own ("up is into history" here).
 fn scroll_request(notches: i32) -> Option<ScrollRequest> {
     (notches != 0).then_some(ScrollRequest::Lines(notches * LINES_PER_WHEEL_NOTCH))
 }
 
-/// Handle vertical wheel scrolling over the pane. `KINETIC` is disabled so scrolling stops
-/// with the gesture. `crate::wheel_zoom::install` claims Ctrl+wheel during capture on the module
-/// host to change text size before this controller receives it.
-///
-/// `pointer::wheel_route` chooses program mouse reports, alternate-screen arrow keys or
-/// scrollback. Reports and arrows both use `SessionCommand::Mouse(Wheel)` because the session
-/// thread needs the live `APP_CURSOR` bit to choose the bytes. Scrollback uses
-/// `SessionCommand::Scroll` directly. Send one mouse report per notch: programs may already
-/// multiply each wheel event, so sending a report per scrollback line would multiply twice.
+/// A plain (Ctrl-less) vertical scroll over the pane: `Shift+PageUp`'s wheel equivalent
+/// (bottom-terminal phase 3a). No `KINETIC` flag -- a kinetic fling would keep delivering scroll
+/// events after the gesture ends, spending notches the user's hand never asked for. Ctrl+wheel
+/// never reaches this controller: `crate::wheel_zoom::install`'s own controller is capture-phase on
+/// the module host (outside this widget) and claims Ctrl+wheel first, for the pane's text size.
+/// **A plain wheel notch is not always the pane's own scrollback**:
+/// `pointer::wheel_route` decides between a report (the program's own mouse mode), the alternate
+/// screen's arrow-key convention (`less`/`man`, `ALTERNATE_SCROLL`), and the scrollback, and
+/// only the session thread can tell a report from arrows apart (it needs the live `APP_CURSOR` bit,
+/// `mouse::alternate_scroll`'s own doc) -- so both ride `SessionCommand::Mouse(Wheel)` and the
+/// session picks the bytes; only `Scrollback` still sends `SessionCommand::Scroll` directly. One
+/// report per NOTCH, not per line (xterm/foot send one button-4/5 event per notch, and nvim's
+/// default `mousescroll` already multiplies -- three would scroll nine).
 fn connect_scroll(area: &GLArea, state: &Rc<RefCell<State>>) {
     let controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
     let wheel = RefCell::new(WheelZoom::default());
@@ -1618,9 +1644,12 @@ fn paste_clipboard(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontex
     paste_from(state, area, im, area.clipboard(), "Ctrl+Shift+V");
 }
 
-/// Paste the PRIMARY selection on a middle click through the same path as `Ctrl+Shift+V`.
-/// Reuse `InputQueue` and [`PASTE_TIMEOUT`] so composition, asynchronous paste reads and later
-/// typing stay ordered without a second implementation for this gesture.
+/// A middle click: pastes the PRIMARY selection (foot's and alacritty's
+/// own convention). The same door as `Ctrl+Shift+V` (queued behind a composition in flight, the
+/// same [`PASTE_TIMEOUT`]): a middle click during a fast paste-then-type is exactly the race
+/// `InputQueue` already exists to order correctly, and reimplementing that ordering a second time
+/// for one gesture would be the second implementation this crate's own module doc (`lib.rs`) warns
+/// against.
 fn paste_primary(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
     paste_from(state, area, im, area.primary_clipboard(), "middle click");
 }
@@ -1683,8 +1712,8 @@ mod tests {
         assert_eq!(scroll_request(notches), Some(ScrollRequest::Lines(3)));
     }
 
-    /// Small touchpad `dy` values accumulate to one whole wheel notch before producing a request,
-    /// rather than producing a scroll step for every event.
+    /// A touchpad's small `dy`s must accumulate to the same whole
+    /// notch a real wheel click would be, not step on every event.
     #[test]
     fn ten_surface_pixel_events_worth_one_notch_make_one_request() {
         let mut wheel = WheelZoom::default();
@@ -1711,9 +1740,12 @@ mod tests {
         );
     }
 
-    /// An unused terminal must not create a Skia `FontMgr` or perform a fontconfig match at launch.
-    /// `State::new`, used by `TerminalPane::new`, leaves metrics absent before any `gtk4::GLArea`
-    /// is built. This construction check needs no display or `gtk4::init`.
+    /// An unused, hidden terminal must not build metrics -- a
+    /// Skia `FontMgr`, a fontconfig match, and (before the fix) an `.expect("no usable font")`
+    /// panic path -- at every launch, only because a window exists. `State::new` is the
+    /// construction seam `TerminalPane::new` uses before any `gtk4::GLArea` is even built, so this
+    /// needs no display and no `gtk4::init` -- consistent with every other test in this module,
+    /// none of which touches real GTK.
     #[test]
     fn a_freshly_constructed_pane_builds_no_metrics() {
         let state = State::new(PathBuf::from("/tmp"));
@@ -1757,7 +1789,8 @@ mod tests {
         );
     }
 
-    /// First-show test allocation: 1280x234 device pixels at scale 1.
+    /// The pane's own allocation in the GUI pass that found defect 1: 1280x234 device pixels at
+    /// scale 1, which the old eagerly built metrics spawned at 13x160.
     const FIRST_SHOW: Allocation = Allocation {
         width: 1280.0,
         height: 234.0,
@@ -1811,9 +1844,9 @@ mod tests {
         assert_eq!((size.cols, size.rows), (expected.cols(), expected.rows()));
     }
 
-    /// Pointer positions use widget-logical pixels while metrics use device pixels. At scale 2,
-    /// a logical point in the middle of cell (row 3, col 10) must map to that cell. Dividing by
-    /// the device cell size without converting units would halve both coordinates.
+    /// A pointer position arrives in widget-logical pixels while the metrics
+    /// are device pixels. At scale 2 a logical point in the middle of cell (row 3, col 10) must name
+    /// that cell -- not (1, 5), which dividing by the device cell size gave.
     #[test]
     fn a_pointer_at_scale_2_lands_on_the_cell_it_is_over() {
         let mut state = State::new(PathBuf::from("/tmp"));
@@ -2011,10 +2044,14 @@ mod tests {
         assert_eq!(state.ime_caret(), None);
     }
 
-    /// A bell received while hidden must not flash when the pane becomes visible; an on-screen
-    /// bell flashes. This test covers only `State::bell`'s `on_screen` handling. The full path
-    /// requires a display: the map handler drains updates with `pump(.., false)` before sending
-    /// `Visible(true)`, and the session folds hidden bells into an update without waking the pane.
+    /// Bottom-terminal phase 2: a bell rung while the terminal was hidden comes out with the first
+    /// update after it is shown again, and must not flash then; one rung on screen flashes.
+    ///
+    /// This only reaches `State::bell`'s `on_screen` branch: it does not
+    /// drive `connect_visibility`'s map handler, which is what actually calls `pump(.., false)`
+    /// before sending `Visible(true)`, nor the session's own folding of a hidden bell
+    /// (`session.rs:571-576`) into one `Update` never woken for. That whole path needs a display and
+    /// is the GUI pass's job; this test is the pure half only.
     #[test]
     fn a_bell_from_while_the_pane_was_hidden_does_not_flash() {
         let mut state = State::new(PathBuf::from("/tmp"));
@@ -2046,9 +2083,10 @@ mod tests {
         window_is_active: true,
     };
 
-    /// With an input method attached, printable keys arrive as commits, so commits handle copy-mode
-    /// letters. In copy mode they become copy-mode keys or are ignored; they never reach the shell.
-    /// After `q` leaves copy mode, the next commit is typing again.
+    /// With an input method attached every printable
+    /// key arrives as a commit, never as `key-pressed`, so copy mode's letters are decided here.
+    /// In copy mode a commit is a copy-mode key or nothing -- never the shell's, whatever it
+    /// carries -- and once `q` has left, the next commit is typing again.
     #[test]
     fn in_copy_mode_a_commit_is_a_copy_mode_key_and_never_reaches_the_shell() {
         let mut state = State::new(PathBuf::from("/tmp"));

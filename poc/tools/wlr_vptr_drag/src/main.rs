@@ -146,8 +146,11 @@ fn parse_args() -> Args {
 }
 
 fn main() -> ExitCode {
-    // Require an explicit socket for an isolated sandbox compositor.
-    // Falling back to an ambient socket could inject input into the live desktop session.
+    // Hard safety rule: never fall back to a default/ambient socket. The
+    // caller must explicitly point this at an isolated sandbox compositor.
+    // See poc/docs/synthetic-input-findings.md for why this is non-negotiable
+    // in this project -- ambient uinput-based injection (ydotool) already
+    // caused a real near-miss incident against the live desktop session.
     let wayland_display = match env::var("WAYLAND_DISPLAY") {
         Ok(v) if !v.is_empty() => v,
         _ => {

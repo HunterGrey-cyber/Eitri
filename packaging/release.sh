@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # packaging/release.sh builds a release inside the pinned build container.
 # Usage: packaging/release.sh <version> --source DIR (--sign KEY | --unsigned)
-# Optional: --release-signers FILE, --out DIR, --rehearsal, a local sidecar mirror, --no-leak-scan.
+# Optional: --release-signers FILE, --out DIR, --rehearsal, --verdandi-mirror DIR, --no-leak-scan.
 # The version must be X.Y.Z or X.Y.Z-rc.N and match the clone's [workspace.package] version.
 # --source requires a public clone at the exported commit, with its submodule initialized at
 # the pinned commit and no untracked, modified or ignored files in either tree.
@@ -16,7 +16,8 @@
 # build tree in DIR/work/, and dependency caches under DIR/.
 # --rehearsal requires a release candidate and --unsigned. It writes DIR/v<version>-rehearsal/
 # and sets REHEARSAL=1 in RELEASE. The nvim pin may be absent; then NVIM_* fields are omitted.
-# The local sidecar mirror is for rehearsals: fetch the pinned revision from a local repository.
+# --verdandi-mirror is for rehearsals: fetch the pinned Verdandi revision from that local git
+# repository instead of its public URL, for a public commit not pushed yet.
 # The source asset still uses git archive at that exact revision.
 # --no-leak-scan requires a release candidate and an absent publish/scan.sh. It skips scanning
 # and marks the output as unscanned; that output must not be published.
@@ -50,8 +51,8 @@ say() { echo "release.sh: $*" >&2; }
 warn() { echo "release.sh: WARNING: $*" >&2; }
 step() { echo "release.sh: [$(date -u +%H:%M:%S)] $*" >&2; }
 
-# kv_get FILE KEY: return the first KEY=value value, or nothing.
-# Read pins.env and RELEASE as data so their contents are never executed.
+# kv_get FILE KEY: the value of the first KEY=value line, or nothing. pins.env and RELEASE are read
+# this way, never sourced.
 kv_get() {
 	local line
 	while IFS= read -r line || [ -n "$line" ]; do
@@ -113,11 +114,11 @@ signers_list_blob() {
 # The same test packaging/install.sh's prepare_signers makes of its embedded block.
 signers_has_key() { [ -f "$1" ] && grep -Eq '^[[:space:]]*[^#[:space:]]' "$1"; }
 
-# sign_sums KEY DIR: write DIR/SHA256SUMS.sig in ssh-keygen's signature format.
-# ssh-keygen reads a protected key's passphrase from /dev/tty, so piping output through tee
-# still works. Retry a failed signature up to three times: a mistyped passphrase would
-# otherwise end the build after SHA256SUMS is written, and prepare_dirs refuses to rebuild
-# that release in place.
+# sign_sums KEY DIR: DIR/SHA256SUMS.sig, ssh-keygen's own signature format.
+# A passphrase-protected KEY is asked for on the controlling terminal (ssh-keygen reads /dev/tty, so
+# piping this script's output through tee is fine), and ssh-keygen asks only once: a mistyped
+# passphrase would end the run here, after the whole build, with SHA256SUMS already written -- which
+# prepare_dirs then refuses to rebuild in place. So a failed signature is tried up to three times.
 sign_sums() {
 	local attempt=1
 	rm -f -- "$2/SHA256SUMS.sig"
@@ -129,7 +130,7 @@ sign_sums() {
 	[ -s "$2/SHA256SUMS.sig" ] || die "ssh-keygen wrote no $2/SHA256SUMS.sig"
 }
 
-# verify_sums SIGNERS DIR: run the same signature check as packaging/install.sh.
+# verify_sums SIGNERS DIR: the exact check packaging/install.sh runs.
 verify_sums() {
 	ssh-keygen -Y verify -f "$1" -I "$RS_SIGN_IDENTITY" -n "$RS_SIGN_NAMESPACE" \
 		-s "$2/SHA256SUMS.sig" < "$2/SHA256SUMS"
@@ -161,8 +162,8 @@ write_sums() {
 	mv -- "$dir/SHA256SUMS.tmp" "$dir/SHA256SUMS"
 }
 
-# write_release FILE: write RELEASE from the RS_* values. Write the nvim pair only when
-# known; a rehearsal carries REHEARSAL=1.
+# write_release FILE: RELEASE from the RS_* values. The nvim pair is written only
+# when known; a rehearsal carries REHEARSAL=1.
 write_release() {
 	{
 		echo "EITRI_VERSION=$RS_VERSION"
@@ -982,8 +983,8 @@ ctr_phase_f() {
 	step "phase F done"
 }
 
-# ctr_tar DIR PARENT OUT: create a reproducible .tar.gz of PARENT/DIR.
-# Keep each file's mtime, which the caller sets.
+# ctr_tar DIR PARENT OUT: a reproducible .tar.gz of PARENT/DIR, keeping each
+# file's own mtime -- the caller sets them.
 ctr_tar() {
 	tar --sort=name --format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
 		--owner=0 --group=0 --numeric-owner -C "$2" -cf - "$1" | gzip -n -9 > "$3"
@@ -1182,9 +1183,9 @@ ctr_phase_b() {
 	grep -qx 'directory = "vendor"' "$sd/$sa/.cargo/config.toml" \
 		|| ctr_die "cargo vendor's printed config does not name directory = \"vendor\""
 	install -D -m 0644 agent-ui/web/dist/index.html "$sd/$sa/agent-ui/web/dist/index.html"
-	# build.rs skips npm only when this fingerprint matches the input tree.
-	# Ship it with its bundle so the source asset can rebuild offline without a separate
-	# mtime check to keep in sync with build.rs.
+	# build.rs skips npm only when this fingerprint matches the tree it finds --
+	# shipping it alongside the bundle it was written for is what lets the source asset's own offline
+	# rebuild skip npm too, with no mtime rule to keep in sync with build.rs's own.
 	install -D -m 0644 agent-ui/web/dist/.inputs-sha256 "$sd/$sa/agent-ui/web/dist/.inputs-sha256"
 	# The plugin keyboard kit is the same case: its bundle and the fingerprint it was built from travel
 	# together, so the offline rebuild of the asset skips npm for it too.

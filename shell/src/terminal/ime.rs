@@ -1,39 +1,61 @@
-//! The terminal's input method: composition, focus gating, and text sent to the shell.
+//! The terminal's input method (bottom-terminal phase 2): what fcitx5/rime says, and what of it
+//! reaches the shell.
 //!
-//! A `GtkIMMulticontext` uses the pane as its client widget and is attached to the key controller
-//! with `set_im_context`. GTK runs it before `key-pressed`, so keys consumed by composition never
-//! reach the terminal's key handler. Composed text arrives through `commit`; `preedit-changed`
-//! updates the composition drawn by the pane, and `set_cursor_location` positions the candidates.
-//! GTK wiring lives in `pane.rs`; the pure logic here is tested with synthetic signals.
+//! The pattern is `neovide-editor/src/keyboard.rs`'s (finished there, candidate placement
+//! included): a `GtkIMMulticontext` whose client widget is the pane, attached to the pane's key
+//! controller with `set_im_context`, so GTK runs the input method on every key BEFORE `key-pressed`
+//! and a key it consumes (a composition in progress) never reaches the terminal's own key path.
+//! Composed text arrives through `commit`; the pane draws the unfinished composition itself
+//! (`preedit-changed`, `eitri_terminal::layout_preedit`) and tells the input method where it is
+//! (`set_cursor_location`). The GTK wiring is `pane.rs`'s; the decisions are here, pure, and tested
+//! with synthetic signals.
 //!
-//! A commit reaches the shell only while the terminal has the keys and is not resetting its input
-//! method. The prefix, navigation keys, HINT, and app accelerators run in capture phase and can move
-//! focus before the input method sees a key. GTK focuses the input method out during the focus
-//! change, before notifying focus listeners. fcitx5-gtk can synchronously commit unfinished text
-//! there, so `nihao` followed by `Ctrl+k` can produce a commit of `ni hao`.
+//! **A commit reaches the shell only while the terminal holds the keys, and never out of the pane's
+//! own reset.** Eitri's keys are taken before the input method sees them -- the `Ctrl+a` prefix,
+//! `Ctrl+h/j/k/l`, HINT and the app accelerators are all capture phase -- so a composition can be
+//! cut off by anything that moves the keys elsewhere: `Ctrl+k`, `Ctrl+a t`, a HINT label, a click in
+//! another module, alt-tab. **GTK then focuses the input method out itself, from inside the focus
+//! change, before the focus report says that the keys left** (GTK 4.22.5; the report is the window
+//! controller's `TermOp::SetFocused`, or `companion::focus` in the companion window): the key controller owns its
+//! input method's focus since `set_im_context` (`gtkeventcontrollerkey.c:142-177`), and
+//! `gtk_window_root_set_focus` clears the old widget's `has_focus` and runs that crossing before it
+//! notifies `focus-widget` (`gtkwindow.c:2252-2270`), as `_gtk_window_set_is_active` clears
+//! `is_active` and crosses before it notifies `is-active` (`:6161-6186`). fcitx5-gtk 5.1.7 commits its
+//! composition right there, synchronously (`fcitximcontext.cpp:796-807`: committing on focus-out is
+//! the client's job, `ClientUnfocusCommit`), and rime's default composition carries nothing that
+//! keeps it back, so `nihao` then `Ctrl+k` commits `ni hao`. So [`ImeGate::commit`] is told what GTK
+//! says at that moment ([`GtkFocus`]: the widget's own `has_focus` and its window's `is_active`, one
+//! of them already false -- which one depends on how the keys left), and not only what the focus report
+//! last said; any of the three saying no drops the commit. That text is
+//! half-typed pinyin, or a candidate the user never chose: garbage to a shell. **Dropping it is
+//! Eitri's choice, not fcitx5's convention:** in other GTK4 apps the same click away inserts
+//! the raw `ni hao`. The same holds while the pane resets the input
+//! method for a reason of its own: a paste or a `Ctrl+a` literal cutting into a composition discards
+//! it, then goes to the shell (fcitx5-gtk commits out of `reset` too, `fcitximcontext.cpp:1119`).
 //!
-//! [`ImeGate::commit`] checks [`GtkFocus`], the widget's `has_focus` and its window's `is_active`,
-//! as well as the last focus report. Any false value drops the commit, preventing unfinished pinyin
-//! or an unchosen candidate from reaching the shell. A reset can also emit a commit, so a paste
-//! or literal `Ctrl+a` discards the composition during reset before sending its own input.
+//! **What asking GTK covers:** every focus-out GTK itself starts, which is every way the keys leave
+//! (Eitri's own moves, a click, alt-tab). Not one the fcitx5 server starts: its `NotifyFocusOut`
+//! (fcitx5 5.1.22, `dbusfrontend.cpp:626-634`) makes fcitx5-gtk commit if it still believes it has
+//! focus (`fcitximcontext.cpp:708-715`). That reaches the shell only if the server focuses the
+//! terminal's input context out while GTK says the terminal has the keys, or if a stale one meets
+//! pinyin typed within a D-Bus round trip of the keys coming back. GTK cannot see either, so neither
+//! can the gate; neither is expected in practice.
 //!
-//! GTK state catches focus changes initiated by GTK, including navigation, clicks, and switching
-//! applications. It cannot detect a focus-out initiated by the fcitx5 server while GTK still reports
-//! focus. Such a commit can pass the gate, including a stale focus-out arriving just after focus
-//! returns and new composition begins within one D-Bus exchange.
+//! **What a commit becomes:** its text, byte for byte and never bracketed (`keys::normalize_commit`):
+//! a committed string is what the user typed. **A commit with a line break is a paste**
+//! (`keys::normalize_paste`, 2026-09-25): bracketed when the
+//! program asked, its line breaks Enter otherwise, as `Ctrl+Shift+V` sends one; before, fcitx5's
+//! `Ctrl+;` clipboard history arrived unbracketed and zsh ran each line. **With an input method attached -- any GTK module,
+//! fcitx5 running or not -- that is every printable key it does not compose**; see the test
+//! `a_printable_key_arriving_as_a_commit_keeps_its_text_and_loses_what_only_a_key_says` for why, and
+//! for what that costs a program that asked for more than text. And a key the input method binds
+//! never reaches the shell at all.
 //!
-//! Single-line commits keep their bytes unchanged and are not bracketed (`keys::normalize_commit`).
-//! A commit containing a line break is treated as a paste (`keys::normalize_paste`): bracketed when
-//! the program requests it, otherwise with line breaks sent as Enter, like `Ctrl+Shift+V`.
-//! This also covers fcitx5's `Ctrl+;` clipboard history, whose unbracketed lines could execute in zsh.
-//!
-//! With an input method attached, printable keys it does not compose arrive as text commits even
-//! if fcitx5 is not running. Text commits lose information available only in key events; keys bound
-//! by the input method never reach the shell.
-//!
-//! The pane follows the input method's caret. fcitx5-rime defaults to the first composition cell on
-//! Linux (`PreeditCursorPositionAtBeginning`), keeping the beam and candidate window there while
-//! typing. Pango preedit attributes, including rime's `HighLight` on the converted segment, are not drawn.
+//! **The caret is the input method's.** fcitx5-rime puts it at the composition's FIRST cell by
+//! default on Linux (`PreeditCursorPositionAtBeginning`, so its candidate window stays put while the user
+//! types), and the pane follows it: the beam and the candidate window sit there, as in other
+//! apps. The pango attributes that come with a preedit (rime's `HighLight` on the segment being
+//! converted) are not drawn.
 
 use gtk4::gdk::Rectangle;
 use terminal_input::NormalizedInput;
@@ -215,10 +237,10 @@ mod tests {
         }
     }
 
-    /// A commit with a line break, such as fcitx5 clipboard history from `Ctrl+;`, is a paste.
-    /// Like `Ctrl+Shift+V`, it is bracketed when requested by the program; otherwise its line
-    /// breaks become Enter. Treating it as typing could execute each line in the shell.
-    /// A single-line commit keeps its bytes and is never bracketed.
+    /// A commit with a line break -- fcitx5's clipboard history, `Ctrl+;`
+    /// -- is a paste, as `Ctrl+Shift+V` sends one: bracketed when the program asked (zsh does),
+    /// and otherwise its line breaks become Enter. It used to arrive as typed text, and zsh ran each
+    /// line. A single-line commit is still typing, byte for byte and never bracketed.
     #[test]
     fn a_multi_line_commit_is_a_paste_and_a_single_line_one_is_typing() {
         let mut gate = focused();
@@ -376,16 +398,22 @@ mod tests {
         assert_eq!(gate.preedit().map(|p| p.caret), Some(0));
     }
 
-    /// With an input method attached, printable keys it does not compose arrive as commits,
-    /// not `key-pressed` events. fcitx5-gtk forwards keys its server does not consume to GTK's
-    /// simple context, including when no server runs. That context commits printable characters,
-    /// as do GTK's Wayland context and the multicontext with `GTK_IM_MODULE=none`.
-    /// Enter, Tab, Backspace, Escape, arrows, function keys and `Ctrl`/`Alt` chords still use
-    /// the key path unless the input method binds them, in which case they never reach the shell.
-    /// A commit keeps text but loses key-only information. This test checks the missing release
-    /// under kitty event reporting, the keypad digit's distinct code under disambiguation,
-    /// and the letter and Space escapes under flag 8. Programs requesting releases or keypad
-    /// codes cannot recover that information from a text commit.
+    /// With an input method attached -- any GTK module, fcitx5 running or not -- every printable key it
+    /// does not compose arrives as a commit, never as `key-pressed`. fcitx5-gtk 5.1.7 (when it is the
+    /// `GTK_IM_MODULE`) hands a key its server does not take, and every key while no server runs, to
+    /// GTK's simple context (`fcitximcontext.cpp:485-525`, sync mode or not), which commits any
+    /// printable character (`gtkimcontextsimple.c:745-750`, GTK 4.22.5); GTK's Wayland context commits
+    /// it itself (`gtkimcontextwayland.c:621-645`), and so does the multicontext with no module at all,
+    /// `GTK_IM_MODULE=none` (`gtkimmulticontext.c:376-407`) -- what the editor saw. Enter,
+    /// Tab, Backspace, Escape, the arrows, the function keys and `Ctrl`/`Alt` chords still take the key
+    /// path, except a key the input method binds, which never reaches the shell (`Ctrl+Shift+U`, fcitx5
+    /// hotkeys, `F4` with rime on). A commit is its text, so the
+    /// text is right and what only a key can say is lost. Each loss is pinned here, so this test fails
+    /// the day one stops being true and the record must change: the release a program asked for (nvim's
+    /// kitty flags 3 include event types; the key path sends one for `a`, a commit has none), a keypad
+    /// digit's own code under disambiguation, and, under flag 8 (every key as an escape), the escape
+    /// for a letter and for Space. nvim and zsh tolerate all of it; a program that needs releases
+    /// or keypad codes does not get them.
     #[test]
     fn a_printable_key_arriving_as_a_commit_keeps_its_text_and_loses_what_only_a_key_says() {
         use crate::terminal::keys::{normalize_key, RawKey};

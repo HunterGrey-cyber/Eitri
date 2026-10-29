@@ -70,22 +70,23 @@ pub const CLIENT_PROTOCOL_MAJOR: u32 = 3;
 const CAP_INTERRUPT_TURN: &str = "interrupt_turn";
 const CAP_RESUME_SESSION: &str = "resume_session";
 const CAP_FORK_SESSION: &str = "fork_session";
-/// Read by `connect()` to set `splits_messages`. `start_watching` uses it to split
-/// assistant messages when `TextDelta.message_id` changes, through `translate::MessageSplit`.
+/// The sidecar numbers each assistant message in its text deltas. Read by `connect()` to decide `splits_messages`, which `start_watching` then
+/// uses to split two sidecar assistant messages at a `TextDelta.message_id` change -- see
+/// `translate::MessageSplit`.
 const CAP_TEXT_DELTA_MESSAGE_ID: &str = "text_delta_message_id";
-/// `ClaudeHostPolicy.provider_permission_prompts` routes the CLI's own permission prompts,
-/// including sensitive-file checks under `.git/` or `.claude/`, as `PermissionRequested`
-/// with origin PROVIDER_PROMPT. `connect()` stores the capability in `provider_prompts`,
-/// which `build_create_request` sends.
+/// `ClaudeHostPolicy.provider_permission_prompts` -- the CLI's OWN permission
+/// prompts (its sensitive-file safety check on `.git/`/`.claude/` is the measured one) routed to this
+/// host as `PermissionRequested` with origin PROVIDER_PROMPT. Read by `connect()` into
+/// `provider_prompts`, which `build_create_request` sends.
 const CAP_PROVIDER_PERMISSION_PROMPTS: &str = "provider_permission_prompts";
-/// Capabilities for `ClaudeHostPolicy.cli_permission_mode` and `ResolvePermissionRequest.defer`.
-/// Use the protocol crate's generated constants so a renamed capability fails to compile
-/// instead of silently reading as absent.
+/// Protocol 3.14: `ClaudeHostPolicy.cli_permission_mode` and
+/// `ResolvePermissionRequest.defer`. Taken from the protocol crate's generated constants rather than
+/// typed here, so a renamed capability fails to compile instead of reading as absent.
 const CAP_CLI_AUTO_MODE: &str = claude_runtime_protocol::CAP_CLI_AUTO_MODE;
 const CAP_PERMISSION_DEFER: &str = claude_runtime_protocol::CAP_PERMISSION_DEFER;
-/// The `SteerTurn` RPC and its `UserMessageDelivered` and `UserMessageDropped` events.
-/// Advertised only when the CLI can report what became of a message;
-/// exposed as `ProviderCapabilities::steer`.
+/// Protocol 3.20: the `SteerTurn` RPC and its `UserMessageDelivered` /
+/// `UserMessageDropped` events. Advertised only when the sidecar's CLI is new enough to report what
+/// became of a message; `ProviderCapabilities::steer`.
 const CAP_STEER_TURN: &str = claude_runtime_protocol::CAP_STEER_TURN;
 /// Protocol 3.22: one capability per `ProviderCapabilities` flag of the same name, taken from the
 /// protocol crate so a renamed capability fails to compile instead of reading as absent.
@@ -141,11 +142,14 @@ fn per_task_stop_policy(capable: bool, readiness: Option<bool>) -> bool {
 /// The panel has an explicit question dock; permission policy never supplies its answers.
 pub const CLIENT_IMPLEMENTS_QUESTIONS: bool = true;
 
-/// Whether to request the CLI's own prompts: both the handshake advertisement and client
-/// support are required. Without this capability, the headless CLI refuses its own prompts
-/// without notifying the caller.
-/// This stays internal because no caller outside the provider branches on it, just like
-/// `splits_messages`. All sessions created here are gated and request prompts when supported.
+/// Whether sessions on this sidecar ask for the CLI's own prompts: the intersection of
+/// what the handshake advertised and what this client implements, like every capability here. A
+/// sidecar without it is sent nothing new and behaves exactly as it did before the capability existed -- the CLI's own
+/// asks are refused headlessly, with nobody told.
+///
+/// Not a `ProviderCapabilities` field, for the reason `splits_messages` is not: no caller outside
+/// this provider branches on it. Every session this client creates is gated, so it is asked
+/// for on every one of them.
 fn provider_prompts_from_handshake(response: &HandshakeResponse) -> bool {
     CLIENT_IMPLEMENTS_PROVIDER_PROMPTS
         && response
@@ -2852,22 +2856,35 @@ mod tests {
         assert_eq!(sent(ProjectTrust::Trusted), ALL_THREE.to_vec());
     }
 
-    /// A manually maintained handshake fixture for testing capability and information mapping.
-    /// It does not observe a running sidecar, so protocol or capability changes can leave it
-    /// stale while unit tests still pass. Update it when the real handshake changes.
+    /// The shape the real sidecar returns at the revision this crate pins
+    /// (`EXPECTED_VERDANDI_REVISION`) -- transcribed from
+    /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.
     ///
-    /// These tests check `capabilities_from_handshake`'s intersection logic, capability names,
-    /// and preservation of `ProviderInfo` fields. The ignored real-process test
-    /// `the_live_handshake_still_matches_the_fixture_in_mod_rs` checks the live handshake
-    /// without spending model tokens.
+    /// **This is a hand-maintained record, NOT a drift detector.** Nothing in Rust observes the real
+    /// sidecar: when Verdandi adds a capability, changes a permission mode, or bumps its protocol
+    /// major, every test below keeps passing against this frozen literal, and it stays wrong until a
+    /// human opens this file and edits it. That is exactly what happened once already -- this
+    /// fixture sat at `protocol_major: 1` with seven capabilities while `CLIENT_PROTOCOL_MAJOR` was
+    /// 2 and the pinned sidecar advertised nine, so it described a peer `connect()` would have
+    /// REFUSED, and `cargo test -p agent` was green throughout.
     ///
-    /// `claude_agent_sdk_version` and the two `*claude_code_version` fields are sample installed
-    /// versions. The live test does not pin them; unit tests only check that
+    /// What these tests do earn is the reverse direction: they pin `capabilities_from_handshake`'s
+    /// own logic against a realistic input, so a change to the intersection rule, a mistyped
+    /// capability constant, or a silently-dropped `ProviderInfo` field fails here. For a check that
+    /// a real sidecar still says this, see
+    /// `agent/tests/claude_sidecar_unary_conformance.rs::the_live_handshake_still_matches_the_fixture_in_mod_rs`
+    /// -- `#[ignore]`d, real-process, and costs no model tokens.
+    ///
+    /// Two of these fields are not protocol facts and that live test deliberately does not pin
+    /// them: `claude_agent_sdk_version` and the two `*claude_code_version`s are whatever happens to
+    /// be installed (the run on 2026-09-15 reported CLI 2.1.272 against the 2.1.269 written here).
+    /// They stay as plausible sample values, because the tests below only check that
     /// `info_from_handshake` carries them through unchanged.
     fn real_handshake_today() -> HandshakeResponse {
         HandshakeResponse {
             protocol_major: 3,
-            // The handshake reports the protocol minor from `capabilities.json`.
+            // The handshake reports `capabilities.json`'s minor (it was the literal 0 until
+            // 2026-09-30): 22 at the pinned revision.
             protocol_minor: 22,
             sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
@@ -2881,16 +2898,17 @@ mod tests {
                 "interrupt_turn",
                 "resolve_permission",
                 "close_session",
-                // Resume and fork are parameters of `CreateSession`, rather than separate RPCs.
-                // They need explicit capability advertisements because the service definition cannot
-                // show whether they are supported.
+                // Not RPC names: resume and fork are parameters of `CreateSession`, so the sidecar
+                // advertises them explicitly because a client cannot discover them from the service
+                // definition.
                 "resume_session",
                 "fork_session",
                 "setting_sources",
                 "tool_policy",
-                // These capabilities accompany `CreateSessionRequest`'s `model`, `effort`,
-                // `system_prompt` and `output_format` fields. `build_create_request` sends none of them,
-                // and this crate does not yet read these capability entries.
+                // Added alongside `CreateSessionRequest`'s own `model`/`effort`/
+                // `system_prompt`/`output_format` fields (`build_create_request` sends none of
+                // them, so this fixture change is capability-list-only). Read by nothing in this
+                // crate yet.
                 "session_model",
                 "session_effort",
                 "system_prompt",
@@ -2906,9 +2924,10 @@ mod tests {
                 "set_permission_mode",
                 // Capability 'text_delta_message_id' -- see CAP_TEXT_DELTA_MESSAGE_ID.
                 "text_delta_message_id",
-                // `ClaudeHostPolicy.provider_permission_prompts` routes the CLI's own permission prompts
-                // as `PermissionRequested` with origin PROVIDER_PROMPT. The handshake fixture places
-                // this capability before the executable entries.
+                // `ClaudeHostPolicy.provider_permission_prompts`,
+                // the CLI's own permission prompts routed to the host as `PermissionRequested`
+                // with origin PROVIDER_PROMPT. Transcribed from Verdandi's handshake literal
+                // (`runtimeServiceImpl.ts`), which puts it last before the executable entries.
                 "provider_permission_prompts",
                 // Protocol 3.13, all unread by this client (`build_create_request` sends neither
                 // `init_check` nor `await_account_identity`).
@@ -2917,13 +2936,15 @@ mod tests {
                 "egress_probe",
                 "structured_output_tools",
                 "effective_tool_report",
-                // The CLI's own auto mode under the gate, deferred answers, and refusal events.
-                // The first two together provide `ProviderCapabilities::cli_auto_mode`.
-                // The entries follow `capabilities.json` order.
+                // Protocol 3.14: the CLI's own auto mode under the gate, the deferring
+                // answer, and the CLI's refusals as events. The first two together are
+                // `ProviderCapabilities::cli_auto_mode`. Since 2026-09-30 the list is built from
+                // `capabilities.json` in its order, which is the order here.
                 "cli_auto_mode",
                 "permission_defer",
                 "permission_denied_events",
-                // These capabilities are listed in `capabilities.json`; this client reads none of them.
+                // Protocol 3.15-3.19, transcribed from `capabilities.json` (minors 15-19); none is read by
+                // this client.
                 "cli_compatibility_report",
                 "gated_cli_mode_default",
                 "effective_claude_config_dir",
@@ -2931,15 +2952,16 @@ mod tests {
                 "effective_session_report",
                 "extra_mcp_servers",
                 "extra_mcp_servers_http",
-                // `steer_turn` provides `ProviderCapabilities::steer` and is advertised only when the
-                // sidecar's CLI is at least 2.1.252. `list_commands` provides the `CommandsUpdated` event,
-                // which is translated whenever it arrives.
+                // Protocol 3.20: `steer_turn` is `ProviderCapabilities::steer`, and is
+                // advertised only when the sidecar's CLI is at least 2.1.252, which every CLI this
+                // client meets today is. `list_commands` is the `CommandsUpdated` event, translated
+                // whenever it arrives.
                 "steer_turn",
                 "list_commands",
                 "system_prompt_preset",
-                // These entries follow `capabilities.json` order, with one `ProviderCapabilities` flag each.
-                // `task_output` requires the sidecar to open task output files safely and is present
-                // on the Linux systems represented by this fixture.
+                // Protocol 3.22, in `capabilities.json`'s order: one `ProviderCapabilities`
+                // flag each. `task_output` is conditional (the sidecar must be able to open a task's
+                // output file safely), and present on the Linux hosts this fixture describes.
                 "cli_turns",
                 "human_origin",
                 "subagent_frames",
@@ -2950,13 +2972,20 @@ mod tests {
                 "session_notices",
                 "conversation_reset",
                 "structured_questions_v1",
-                // Executable sources are advertised as capabilities rather than a separate wire field.
-                // `executable_host_cli` is always present; checkout builds also offer `executable_sdk_bundled`.
-                // Packaged builds cannot offer it: the SDK uses `createRequire` to find its CLI, and the
-                // single-file artifact has no node_modules. This fixture represents a packaged build.
-                // A packaged process rejected SDK_BUNDLED with INVALID_CONFIGURATION naming host_cli.
-                // The additional capabilities from `session_model` onward were copied from the protocol
-                // and have not been checked against a live process.
+                // Which executable sources this build can actually serve, advertised as capability
+                // strings rather than a new wire field. `executable_host_cli` is always present;
+                // a checkout build adds one more, `executable_sdk_bundled`, which a PACKAGED build
+                // cannot serve at all (the SDK resolves its own CLI through `createRequire`, and a
+                // single-file artifact has no node_modules for it to find). This fixture carries
+                // the PACKAGED shape because that is what a shipped install meets.
+                //
+                // Measured 2026-09-18 against the real artifact
+                // (verdandi-claude-sidecar-0.1.0-linux-x64), not transcribed from a commit
+                // message: a live Handshake returned exactly the first twelve of this list, and a
+                // CreateSession carrying SDK_BUNDLED was refused with INVALID_CONFIGURATION naming
+                // host_cli. The rest (session_model onward) is transcribed from the proto
+                // definition, not independently measured against a live sidecar -- see the live
+                // conformance test's own note on that gap.
                 "executable_host_cli",
                 // `egress_restricted` is the one other conditional entry (present only when the
                 // sidecar's own config enables it) and is deliberately NOT in this fixture, so the
@@ -2970,9 +2999,9 @@ mod tests {
             permission_modes: vec!["interactive".into(), "verdandi_rules".into(), "bypass".into()],
             max_message_bytes: 4 * 1024 * 1024,
             event_buffer_policy: "bounded-1000".into(),
-            // Leave `account_binding`, `account_name` and `account_config_dir` at their defaults;
-            // this fixture has no measured account identity. `AccountBinding::Unspecified` is zero,
-            // as it would be for a peer that omits these fields.
+            // account_binding/account_name/account_config_dir: the account-identity fields.
+            // AccountBinding::Unspecified (the i32 default, 0) means "a sidecar older than these
+            // fields", which is an honest reading for a fixture that predates them being measured.
             ..Default::default()
         }
     }
@@ -3034,9 +3063,14 @@ mod tests {
 
     #[test]
     fn a_capability_needs_both_the_provider_advertising_it_and_this_client_implementing_it() {
-        // A capability needs both provider advertisement and client implementation.
-        // Resume has both. Fork is advertised, but remains unavailable because
-        // `CLIENT_IMPLEMENTS_FORK` is false, avoiding a UI control that cannot work.
+        // Both halves have to bite, and today each is demonstrated by a different capability.
+        //
+        // The client half was written for a day that has since arrived. Verdandi added
+        // `resume_session` to the wire while `resume_session()` here still returned
+        // `UnsupportedCapability`, and reporting the advertisement alone would have put a Resume
+        // control in the UI that could not work. Resume is genuinely implemented now, so `fork`
+        // carries that half: `fork_session` IS advertised by the pinned sidecar, and this still
+        // reports false, because `CLIENT_IMPLEMENTS_FORK` is false.
         let advertised = capabilities_from_handshake(&real_handshake_today());
         assert!(advertised.resume, "advertised by the sidecar and implemented here");
         assert!(!advertised.fork, "advertised by the sidecar, not implemented here");
@@ -3602,9 +3636,11 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Fifty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
-        // Checkout builds also advertise `executable_sdk_bundled`; a sidecar with egress
-        // restrictions enabled additionally advertises `egress_restricted`.
+        // Fifty-two: the PACKAGED shape at the pinned revision (twenty-four up to
+        // `provider_permission_prompts`, five from protocol 3.13, three from 3.14, seven from 3.15-3.19, two from 3.20, one from 3.21 and ten from
+        // 3.22), which a shipped install meets. A checkout build advertises one more,
+        // executable_sdk_bundled, and a sidecar with egress restrictions enabled advertises
+        // egress_restricted besides. See real_handshake_today().
         assert_eq!(info.advertised_capabilities.len(), 52);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));

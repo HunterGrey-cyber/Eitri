@@ -1,14 +1,18 @@
-//! The bottom terminal's GTK half. The engine handles the PTY, session thread, emulator
-//! and painting without GTK.
+//! The bottom terminal's GTK half.
+//! The engine -- PTY, session thread, emulator, paint -- is `eitri-terminal`, which has no GTK.
 //!
-//! This module holds [`TerminalPane`] and pure functions for the terminal's own behavior:
-//! `Ctrl+a t`, literal `Ctrl+a Ctrl+a`, app-reserved chords and terminal colours.
-//! These functions can be tested without a display.
+//! This module holds the widget ([`TerminalPane`]) and the few decisions `main.rs` makes about it,
+//! each as a pure function so it is tested without a display: what `Ctrl+a t` does, where
+//! `Ctrl+a Ctrl+a` goes, which chords the terminal gives up to Eitri, and its colours.
 //!
-//! `ModuleId::terminal()` is placed below the editor's own column and stays hidden until
-//! the first `Ctrl+a t`. A Lua `bottom` panel goes under everything without replacing it.
-//! The layout and `ModuleGrid` control placement, visibility, focus after hiding and
-//! `Ctrl+h/j/k/l` destinations. This module keeps the terminal-specific behavior.
+//! **A module since the modules design.** It is
+//! `ModuleId::terminal()`, placed below the editor's own column (since 2026-09-28; not below the
+//! editor and the agent together, as it was before -- a Lua `bottom` panel still goes under
+//! everything instead of replacing anything) and
+//! hidden in the layout until the first `Ctrl+a t`. Where it goes, what shows it, who gets the keys
+//! when it hides and where `Ctrl+h/j/k/l` from it lead are the layout's (`eitri_core::layout`,
+//! `ModuleGrid`), not a slot index's: this module keeps only the decisions that are the terminal's
+//! own.
 
 mod bell;
 mod gl;
@@ -95,8 +99,8 @@ pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError
     eitri_core::wm::persist::first_launch_layout(decls)
 }
 
-/// Whether the shell's end closes the terminal module,
-/// as tmux closes a pane whose process exits. A real end does -- `exit`, `Ctrl+d`, a
+/// Whether the shell's end closes the terminal module (decided 2026-09-26: `exit` in the bottom
+/// terminal closes the terminal window), as tmux closes a pane whose process exits. A real end does -- `exit`, `Ctrl+d`, a
 /// signal -- and `main.rs` then kills the module as `prefix x` does, without asking. What does not,
 /// and keeps its notice under the last screen with Enter restarting:
 /// - a child that left the terminal and still runs (`exec nohup cmd`): it is still this terminal's
@@ -110,7 +114,7 @@ pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError
 /// As the last module on screen, this is not the layout's kill to make (`eitri_core::layout::kill`
 /// refuses the last one, as a hide does): it closes the window instead, tmux's own last-pane rule,
 /// through the ordinary close path -- `close window? N running (y/n)` when a tab runs, and `n`
-/// leaves everything, this terminal and its notice included ([`OnExit`]).
+/// leaves everything, this terminal and its notice included ([`OnExit`], task 6, 2026-09-26).
 pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
     !exit.detached && (exit.code.is_some() || exit.signal.is_some())
 }
@@ -180,10 +184,9 @@ mod tests {
         (a.modules, a.dividers.iter().map(|d| d.rect).collect())
     }
 
-    /// The terminal stays hidden until the first `Ctrl+a t`. Until then, the window's module
-    /// and divider rectangles match the `[editor | agent]` layout pixel for pixel.
-    /// While hidden below the editor, the terminal's pinned split collapses to the editor's
-    /// leaf alone.
+    /// The terminal stays hidden until the first `Ctrl+a t`. Its pinned split collapses to the
+    /// editor's own leaf, so the visible window has the same `[editor | agent]` rectangles
+    /// as a layout without the terminal.
     #[test]
     fn the_terminal_starts_hidden_below_the_editor() {
         let layout = initial_layout(&[]).unwrap();

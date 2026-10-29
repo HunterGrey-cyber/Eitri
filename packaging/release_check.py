@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""packaging/release_check.py -- the release build's content and layout checks, as pure functions
-for the release release.sh
-assembles; this file is every check that release.sh runs against it, factored out so each one has a
+"""packaging/release_check.py -- the release build's content and layout checks, as pure functions.
+release.sh assembles the release; this file is every check that release.sh runs against it, factored out so each one has a
 failing fixture and a passing fixture in packaging/tests/test_release_layout.py with no container and
 no network -- the pattern packaging/collect-licenses.py and packaging/test_collect_licenses.py follow.
 
@@ -27,7 +26,7 @@ Usage (release.sh calls these):
 Every check function below takes plain data (a dict, a string, a list of (relpath, path) pairs) and
 raises ReleaseCheckError on a problem -- never touches the network, and touches the filesystem only
 to read fixtures/extracted files the caller already produced. Extraction (SS5) is the one part that
-shells out, to the extraction tools: `tar`, `dpkg-deb`, `bsdtar`.
+shells out, to the usual tools: `tar`, `dpkg-deb`, `bsdtar`.
 """
 
 from __future__ import annotations
@@ -68,8 +67,9 @@ _IMAGE_ID_RE = re.compile(r"^(sha256:)?[0-9a-f]{12}([0-9a-f]{52})?$")
 _VERDANDI_SOURCE_RE = re.compile(r"^verdandi-[0-9a-f]{7}-source\.tar\.gz$")
 _SKIA_ARCHIVE_RE = re.compile(r"^skia-binaries-\S+\.tar\.gz$")
 
-# Validate the RELEASE keys, including VERDANDI_SOURCE_SHA256 and the Skia archive/hash pair.
-# packaging/pins.env uses the same SKIA_BINARIES_ARCHIVE and SKIA_BINARIES_SHA256 names.
+# Exactly the RELEASE keys, which already include VERDANDI_SOURCE_SHA256 and the Skia
+# pair (SKIA_BINARIES_ARCHIVE/SKIA_BINARIES_SHA256) -- packaging/pins.env carries those two under
+# the same names used here.
 RELEASE_FIELDS: dict[str, re.Pattern] = {
     "EITRI_VERSION": VERSION_RE,
     "EITRI_COMMIT": _HEX40,
@@ -90,8 +90,7 @@ RELEASE_FIELDS: dict[str, re.Pattern] = {
 
 
 def parse_release_text(text: str) -> dict[str, str]:
-    """KEY=value, one per line, blank lines and '#'-led lines skipped -- the shape this docstring
-    describes and both release.sh and the installer read with a `case` loop, never `eval`/`.`. The
+    """KEY=value, one per line, blank lines and '#'-led lines skipped -- the shape both release.sh and the installer read with a `case` loop, never `eval`/`.`. The
     value is taken verbatim to end of line: no quoting, no expansion, so this parser matches
     exactly what a shell `case` reader sees."""
     fields: dict[str, str] = {}
@@ -192,7 +191,7 @@ _GH_REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 
 
 def gh_release_command(version: str, assets: Sequence[str], title: str, notes_file: str, repo: str) -> list[str]:
-    """The argv release.sh prints -- and never runs (I4: "by hand") -- for `gh release create`.
+    """The argv release.sh prints -- and never runs ("by hand") -- for `gh release create`.
     --repo always: release.sh runs from the private checkout, whose remotes are not the public
     GitHub repository, and `gh` otherwise picks its repository from the current directory's remotes;
     --verify-tag always, so `gh` cannot create a missing tag from the default branch's current tip;
@@ -258,8 +257,7 @@ SEA_SENTINEL = _SEA_SENTINEL_PREFIX + _SEA_SENTINEL_SUFFIX
 
 def find_sentinel_hits(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths whose content contains the Node SEA fuse sentinel, whatever the file is named --
-    this is what catches a sidecar binary renamed away from `verdandi-claude-sidecar*` (spec sec
-    4.2 step 9's own parenthetical: "so a renamed sidecar is still caught")."""
+    this is what catches a sidecar binary renamed away from `verdandi-claude-sidecar*`, so a renamed sidecar is still caught."""
     needle = SEA_SENTINEL.encode("ascii")
     hits = []
     for rel, path in files:
@@ -279,12 +277,12 @@ def find_anthropic_node_modules(files: Iterable[tuple[str, str]]) -> list[str]:
 
 def find_node_modules_dirs(files: Iterable[tuple[str, str]]) -> list[str]:
     """relpaths under any node_modules/ directory at all -- in either source asset (Verdandi's or
-    Eitri's), no node_modules/ of any kind may ship (sec 4.2 step 9)."""
+    Eitri's), no node_modules/ of any kind may ship."""
     return [rel for rel, _ in files if re.search(r"(^|/)node_modules/", rel)]
 
 
 def find_verdandi_sidecar_filenames(files: Iterable[tuple[str, str]]) -> list[str]:
-    """relpaths whose basename matches `verdandi-claude-sidecar*` (sec 4.2 step 9) -- a second,
+    """relpaths whose basename matches `verdandi-claude-sidecar*` -- a second,
     name-based net beside find_sentinel_hits's content-based one."""
     return [rel for rel, _ in files if fnmatch.fnmatch(os.path.basename(rel), "verdandi-claude-sidecar*")]
 
@@ -346,7 +344,7 @@ def find_sdk_mentions(
     """relpaths whose content mentions the Claude Agent SDK by package name or Anthropic's legal
     name, and are not exempted by `is_allowed(relpath)`. release.sh supplies the concrete
     allowlist: legitimate only in eitri-setup and the
-    install.sh asset (which print the SDK line, I2/I2src), and possibly THIRD-PARTY-LICENSES; in
+    install.sh asset (which print the SDK line), and possibly THIRD-PARTY-LICENSES; in
     the Verdandi source asset, its package.json files, package-lock.json, and the sentinel's own
     definition in apps/claude-sidecar/scripts/buildBinary.mjs."""
     hits = []
@@ -619,8 +617,10 @@ def check_skia_build_output(output_text: str, expected_url: str) -> None:
         raise ReleaseCheckError("skia-bindings did not install the pinned archive: " + "; ".join(problems))
 
 
-# Read the relink recipe from the generated SOURCE and run those commands directly.
-# This catches a broken shipped recipe rather than testing a separately typed copy.
+# --- 11. The relink recipe, read out of the generated SOURCE ----------------------
+#
+# The proof runs the recipe SOURCE prints, never a retyped copy of it, so a SOURCE whose recipe
+# stops working fails the release rather than a user.
 
 class RelinkRecipe:
     def __init__(self, copy: str, unlock: str, patch: str, build: str, modified_dir: str):
@@ -686,8 +686,8 @@ _REBUILD_ENV_RE = re.compile(r"^    (EITRI_BUILD_[A-Z_]+)=(.*)$")
 def parse_rebuild_env(source_text: str) -> dict[str, str]:
     """The environment SOURCE tells a rebuild from the source asset to set, so the rebuilt
     `shell --version` names the same Eitri and Neovide fork commits as the shipped one: each of
-    REBUILD_ENV_NAMES exactly once, as a full 40-hex commit, nothing else (with only the first,
-    a rebuild would say "neovide fork unknown")."""
+    REBUILD_ENV_NAMES exactly once, as a full 40-hex commit, nothing else (before, SOURCE named
+    only the first, and a rebuild said "neovide fork unknown")."""
     found: dict[str, list[str]] = {}
     for line in source_text.splitlines():
         m = _REBUILD_ENV_RE.match(line)
@@ -1032,8 +1032,7 @@ def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdan
     proto/ equal to the public Verdandi's; skia/ exactly the pinned archive; .cargo/config.toml
     pointing at vendor/; the shipped `dist/.inputs-sha256` matches a fresh fingerprint over the
     shipped web sources, the same content-based rule `shell/build_web.rs` uses
-    to decide the offline rebuild can skip npm -- replaces an earlier mtime rule (this check's
-    first version), which a tar extraction or `SOURCE_DATE_EPOCH` normalization could satisfy or
+    to decide the offline rebuild can skip npm -- replaces an earlier mtime rule, which a tar extraction or `SOURCE_DATE_EPOCH` normalization could satisfy or
     fail independently of whether the bundle's content ever matched its sources. The content rules
     run over the whole tree for the sentinel and node_modules, and over the additions only for the
     SDK's name (Eitri's own tracked source legitimately names it)."""
@@ -1210,8 +1209,8 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
             f"{tarball}:{troles[role]}": os.path.join(x["tarball"], troles[role]),
             f"{source}:{tracked_path}": os.path.join(src_root, tracked_path),
         })
-    # Compare the installer asset with the tarball's setup script, the .deb's setup script,
-    # and the source asset's packaging/install.sh.
+    # The installer, four copies: the asset, the tarball's and both packages'
+    # eitri-setup, and the source asset's packaging/install.sh.
     problems += check_same_bytes({
         install_sh: os.path.join(out_dir, install_sh),
         f"{tarball}:eitri-setup": os.path.join(x["tarball"], troles["setup"]),
@@ -1336,7 +1335,7 @@ def check_twins(root: str) -> None:
     (`docs/guide`) must also have its twin. A file with no twin at all elsewhere (e.g. CONTRIBUTING.md,
     English-only by design) is never checked.
 
-    Recurses because `publish/export.sh` mirrors
+    Recurses: `publish/export.sh` mirrors
     `publish/files/` into the exported tree path for path ("Files that exist only in the public
     tree", export.sh), so a future guide nested under a subdirectory (e.g.
     `docs/USAGE.md`/`docs/USAGE.zh-CN.md`) would otherwise never be discovered -- this used to

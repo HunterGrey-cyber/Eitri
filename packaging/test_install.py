@@ -112,7 +112,7 @@ def test_installer_shellcheck_clean():
 
 def test_the_0_2_0_installer_fixture_is_the_file_0_2_0_shipped():
     """fixtures/install-0.2.0.sh is what the harness runs as 0.2.0's own installer (a user who saved it
-    reruns it to upgrade, INSTALL.md): packaging/install.sh at main 4ce433a0, the tree 0.2.0 is cut from.
+    reruns it to upgrade, INSTALL.md): packaging/install.sh from the tree 0.2.0 is cut from.
     Pinned by hash, and against the commit itself where this checkout still has it."""
     fixture = TESTS / "fixtures" / "install-0.2.0.sh"
     assert hashlib.sha256(fixture.read_bytes()).hexdigest() == (
@@ -284,9 +284,8 @@ _RULING_CITATION_PATTERN = re.compile(
 
 def test_help_cites_no_internal_ruling_or_spec_section():
     """`install.sh --help` is what a stranger
-    running the curl installer actually reads. It must omit internal design references
-    and section markers that mean nothing outside this repo's own
-    planning docs."""
+    running the curl installer actually reads. It used to cite a spec section and a ruling id
+    -- markers that mean nothing outside this repo's own planning documents."""
     proc = subprocess.run(["sh", str(INSTALLER), "--help"], capture_output=True, text=True)
     assert proc.returncode == 0, report(proc)
     match = _RULING_CITATION_PATTERN.search(proc.stdout)

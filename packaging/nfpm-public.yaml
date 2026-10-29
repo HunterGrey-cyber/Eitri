@@ -19,9 +19,10 @@ license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
 # This is the PUBLIC profile: what `release.sh` packages from the public commit built in the
 # Ubuntu 24.04 container. No sidecar, no `agent-hook` (no
 # release ships the legacy backend), no maintainer scripts (a postinst would build the sidecar as
-# root). The private mirror's
+# root: the public packages have no maintainer scripts). The private mirror's
 # profile is packaging/nfpm.yaml; packaging/test_nfpm_profiles.py holds the two to differing only
-# in the fields that test lists.
+# in the contents entries and top-level keys that its `PRIVATE_ONLY_DSTS`, `PUBLIC_ONLY_DSTS` and
+# `ALLOWED_DIFFERING_TOP_LEVEL_KEYS` name.
 #
 # neovim is deliberately NOT a dependency of either the deb or the rpm: Ubuntu 24.04 ships
 # neovim 0.9.5 (`apt-cache policy` measured in the release container's base image --

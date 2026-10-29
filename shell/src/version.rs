@@ -1,7 +1,12 @@
-//! Handles `--version` with one output line, without initializing GTK or using a display.
-//! Version output omits copyright notices to avoid triggering the extra LGPL notice
-//! requirements for combined works that display them during execution. `SOURCE` carries
-//! the dependency notices and license references.
+//! `shell --version` / `eitri --version` (through the launcher): one line, printed with no GTK
+//! and no display touched.
+//!
+//! Deliberately prints **no copyright notices**. LGPL-3.0
+//! §4(c): that clause only
+//! binds "a Combined Work that displays copyright notices during execution" -- `--version` is the
+//! one place in this binary that could have started being that, so it deliberately is not. An
+//! About dialog or a notices view, if either is ever built, is where nvim-rs's own notice and the
+//! GPL/LGPL text references belong instead (see `SOURCE`, which already carries them).
 
 /// `eitri <version> (commit <12 hex>, neovide fork <7 hex>, verdandi <7 hex>)`.
 ///

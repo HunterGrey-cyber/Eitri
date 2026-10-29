@@ -21,10 +21,9 @@
 //! commands for this install's layout, and the escape hatch. `main()` also prints it to stderr.
 //! This module does not set the escape hatch or disable the sandbox automatically.
 //!
-//! `packaging/apparmor/eitri` is the one profile text. The `.deb` installs it as
-//! `/etc/apparmor.d/eitri` for `/usr/lib/eitri/shell`, as configuration with no maintainer
-//! script, so a restart or `apparmor_parser -r` loads it. For other installs, [`render_profile`]
-//! writes the same text with the resolved executable path and the profile name `eitri-user-<uid>`, so different
+//! The packaged AppArmor profile is installed as configuration for the packaged executable.
+//! A restart or `apparmor_parser -r` loads it. For other installs, [`render_profile`] uses
+//! the resolved executable path and a profile name containing the user ID, so different
 //! users' installs do not replace each other's profiles. The literal path limits the grant
 //! to that install rather than using a home-directory glob.
 //! `packaging/install.sh` renders the same profile through `apparmor_render`;

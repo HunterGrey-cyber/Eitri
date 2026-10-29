@@ -1,7 +1,7 @@
 # A minimal Fedora image carrying only
-# what a real end user's machine has -- the installer hint table's runtime libraries, plus
+# what a real end user's machine has -- the fedora/rhel hint row's runtime libraries, plus
 # openssh-clients so the real `ssh-keygen -Y verify` path actually runs. Fedora 44,
-# matching fedora-44.Dockerfile's own
+# not Fedora 41 (changed 2026-09-28): fedora-44.Dockerfile is this file's own
 # name, and the rpm install check (run.sh) runs on Fedora 44 too. No sudo, no build toolchain: this
 # is the prebuilt/curl install.sh path, which needs neither.
 #

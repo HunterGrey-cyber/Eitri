@@ -12,7 +12,8 @@ any run below). No screen capture or synthetic pointer/keyboard input works in t
 `neovide_embed_live/MANUAL_VERIFICATION.md` and this repo's other phases) — everything below is
 from stdout instrumentation and `/proc/<pid>/stat` CPU sampling, not visual inspection.
 
-Instrumentation added to `shell_composed` for this pass (both **kept**):
+Instrumentation added to `shell_composed` for this pass (both **kept**, see this directory's
+git history for the exact patch):
 
 - `SHELL_COMPOSED_LOG_EVERY_N_FRAMES` env var overrides the periodic frame-pacing log's cadence
   (default still 60). Set to `1` during resize-sweep runs to get a dt/fps line for *every* frame,

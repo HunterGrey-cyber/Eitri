@@ -1,15 +1,18 @@
-//! Probe what happens when a Claude Code slash command reaches the sidecar as prompt text.
-//! Commands such as `/compact` need observation to determine their effect through this backend.
-//! This ignored test makes real, billed CLI calls. Run it once, alone, in an isolated profile.
-//! The only outcome assertion is completion or timeout. Classify the printed results by hand
-//! as works, sent as text, no-op, error or hangs, using events, reply text and token usage.
+//! Probe what happens when a Claude Code slash command is sent as plain turn text through
+//! the sidecar backend. Typed commands such as `/compact` reach the CLI as prompt text;
+//! their effects need observation rather than an assumption that they act like TUI commands.
+//!
+//! Ignored, real and billed on the TEST profile: run once, alone. The only outcome assertion
+//! is completion or timeout. Classify the printed results by hand as works, sent as text,
+//! no-op, error or hangs, recording events, reply text and usage alongside the CLI build.
 //!
 //! Run:
 //! ```sh
-//! claude --version   # record the CLI build
+//! claude --version   # record the routed CLI build; the wrapper does not pin it
 //! ANTHROPIC_MODEL=haiku cargo test -p agent --test slash_commands_conformance -- \
 //!     --ignored --nocapture --test-threads=1
 //! ```
+//! `VERDANDI_CLAUDE_CLI_PATH` selects the sidecar's CLI.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, ContentKind, CreateSessionRequest,

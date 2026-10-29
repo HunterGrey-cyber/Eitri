@@ -284,12 +284,15 @@ pub enum AgentDomainEvent {
         kind: ContentKind,
         text: String,
     },
-    /// Ends the streaming assistant message so the next text starts a new transcript entry,
-    /// even when no tool call separates the messages. `ContentDelta` carries no message identity,
-    /// so consecutive messages would otherwise merge. The legacy backend emits this when a
-    /// text block's `message.id` changes. The sidecar emits it from `TextDelta.message_id` when
-    /// it advertises `text_delta_message_id`; without that capability it emits no boundary.
-    /// See `providers::claude_sidecar::translate::MessageSplit`.
+    /// The assistant message that was streaming is over, and the next text starts a new one --
+    /// with no tool call between, which would have closed it anyway. `ContentDelta` carries no
+    /// message identity, so without this two messages in a row folded into one transcript entry
+    /// (`After the table.TURN-1-DONE`, the phase-3 GUI pass, 2026-09-25). Emitted by the legacy
+    /// backend when a text block's `message.id` differs from the last one. The sidecar emits it
+    /// too, from `TextDelta.message_id` when the sidecar advertises capability
+    /// `text_delta_message_id` -- see
+    /// `providers::claude_sidecar::translate::MessageSplit`; absent the capability it stays silent,
+    /// the same as before.
     AssistantMessageBoundary {
         turn_id: String,
     },
@@ -310,11 +313,13 @@ pub enum AgentDomainEvent {
         tool_use_id: Option<String>,
         tool_name: String,
         input: serde_json::Value,
-        /// `Some` when the CLI itself asked after the `PreToolUse` gate had already answered:
-        /// `PERMISSION_ORIGIN_PROVIDER_PROMPT`, with capability `provider_permission_prompts`.
-        /// `None` for the gate's request: every legacy request and sidecar origins HOOK or UNSPECIFIED.
-        /// See [`ProviderPrompt`]. Omitted from the serialized event when `None` so gate requests
-        /// keep their existing serialized shape.
+        /// `Some` when the CLI itself asked, after the `PreToolUse` gate had already answered (Verdandi
+        /// `PERMISSION_ORIGIN_PROVIDER_PROMPT`, capability `provider_permission_prompts`);
+        /// `None` for the gate's own request -- every legacy request, and every sidecar request
+        /// whose origin is HOOK or UNSPECIFIED (an older sidecar). See [`ProviderPrompt`].
+        ///
+        /// Omitted from the serialized event when `None`, so a gate request reads exactly as it did
+        /// before this field existed.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_prompt: Option<ProviderPrompt>,
     },
@@ -366,10 +371,14 @@ pub enum AgentDomainEvent {
     SessionClosed {
         reason: String,
     },
-    /// Represents a sidecar `PermissionModeChanged` acknowledgment of `SetPermissionMode`
-    /// with capability `set_permission_mode`. This client issues no such RPC, but still decodes
-    /// the event because the pinned protocol can emit it. A `default` report is folded as a
-    /// no-op; a less restrictive report becomes `UngatedCliMode` instead.
+    /// A `SetPermissionMode` the sidecar acknowledged (Verdandi `PermissionModeChanged`, capability
+    /// `set_permission_mode`). Produced by `providers/claude_sidecar/translate.rs` when the
+    /// sidecar acknowledges the `SetPermissionMode` RPC this client issues.
+    ///
+    /// **Since 2026-09-27 this client issues no such RPC** (removed, not
+    /// disabled). The pinned proto can still emit the event, so it is still decoded; one reporting
+    /// `default` arrives here and is folded as a no-op, and one reporting anything less
+    /// restrictive becomes `UngatedCliMode` instead.
     PermissionModeChanged {
         mode: crate::PermissionMode,
         /// `SetPermissionModeResponse.permission_mode` verbatim -- `default` / `bypassPermissions`,
@@ -1465,22 +1474,25 @@ pub struct PermissionRequestRecord {
     pub provider_prompt: Option<ProviderPrompt>,
 }
 
-/// The CLI's own permission prompt, relayed through `provider_permission_prompts`.
+/// The CLI's own permission prompt, as the sidecar relays it (capability
+/// `provider_permission_prompts`).
 ///
-/// Every v1 session is gated: the CLI runs `default` and a `PreToolUse` hook asks about each
-/// call. The CLI can still prompt after the hook allows a call, such as a sensitive-file
-/// write under `.git/` or `.claude/`. Neither hook approval nor a session rule silences it.
-/// Without someone to answer, the headless CLI refuses the write. With this capability,
-/// the prompt arrives as another `PermissionRequested` with a new `permission_id` and is
-/// answered through `ResolvePermission`. It may share the gate request's `tool_use_id`,
-/// but that is not guaranteed.
+/// **Why it exists.** Every v1 session is gated: the CLI runs `default` and a `PreToolUse` hook
+/// asks Eitri about every call. The CLI can still ask on its OWN after that hook allowed a call --
+/// its sensitive-file safety check on a `Write` under `.git/` or `.claude/` is the measured case --
+/// and neither a hook `allow` nor a session rule silences it. With nobody to ask, a headless CLI
+/// refused the write that a real `bypassPermissions` session runs. With the capability, that ask
+/// arrives as a second `PermissionRequested` for the SAME tool call (same `tool_use_id`, measured
+/// but not guaranteed), a new `permission_id`, answered with the same `ResolvePermission`.
 ///
-/// `classify_permission_request` and saved prefix rules judge only the gate's request.
-/// `eitri_core::agent_backend` answers the CLI's prompt: bypass answers every one, while
-/// Auto uses the human's earlier approval of the same call. The classifier does not answer it.
+/// **It is never the permission policy's to answer:** `classify_permission_request`
+/// and the saved prefix rules judge the gate's request only. The CLI flagged this call after the gate
+/// allowed it, and the CLI itself does not let a rule silence the check. Who answers it is
+/// `eitri_core::agent_backend`'s decision (bypass, which answers every one, or in Auto the human's
+/// own earlier approval of the same call), never the classifier's.
 ///
-/// Every field comes verbatim from the CLI and may be absent. `reason` is prose for display,
-/// never for parsing.
+/// Every field is the CLI's own, verbatim, and any may be absent. `reason` is English prose ("Claude
+/// requested permissions to edit <path> which is a sensitive file.") -- shown, never parsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderPrompt {
     /// The SDK's `decisionReason`: why the CLI asked, in its own words.

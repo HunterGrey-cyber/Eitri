@@ -7,7 +7,7 @@
 # private checkout can end up baked into a layer. Every pinned download's version and sha256 comes
 # in as a build arg, read by the caller out of packaging/pins.env (which lives one directory up and
 # is therefore never part of this build context either) -- pins.env stays the one source of truth
-# for those pins, and this file never repeats a pinned hash as a literal.
+# for pinned downloads, and this file never repeats a pinned hash as a literal.
 #
 #   docker build \
 #       --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
@@ -20,12 +20,12 @@
 # Never `docker build --pull`: the pinned digest below is the only base there is (the build
 # host's /etc/docker/daemon.json points registry traffic at a dead proxy). A 2-line probe
 # Dockerfile (this FROM line + `RUN true`, built without --pull) was checked first and used only
-# the local image.
+# the local image, per the usual risk assessment of a tag that can move.
 FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
-# The build packages, plus ca-certificates (the
+# The apt list the release needs, plus ca-certificates (the list as first written lacked it, and
 # --no-install-recommends https downloads below need it) and libarchive-tools (bsdtar, for the
-# content checks the release runs on extracted assets).
+# content checks release.sh runs on extracted assets).
 RUN apt-get update \
 	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 		build-essential \
@@ -45,7 +45,7 @@ RUN apt-get update \
 
 # --- Rust, via rustup-init checked by sha256 --------------------------------------------------
 #
-# The pitfall: install with CARGO_HOME=/opt/cargo
+# The pitfall (cache mounts): install with CARGO_HOME=/opt/cargo
 # RUSTUP_HOME=/opt/rustup, put /opt/cargo/bin on PATH, and ONLY THEN set CARGO_HOME=/build/cargo
 # for the actual project builds. /build/cargo is where release.sh bind-mounts a host cache
 # directory (rw in phase F, and the proof run gets an empty CARGO_HOME entirely) -- installing
@@ -71,8 +71,8 @@ ENV CARGO_HOME=/build/cargo
 
 # --- Node, checked by sha256, for `shell/build.rs`'s `npm ci` of agent-ui/web only -------------
 #
-# The official Node tarball at the version and sha256 in packaging/pins.env is
-# used for shell/build.rs's npm ci of agent-ui/web and nothing else: the release never builds
+# The official Node tarball at the version and sha256 in packaging/pins.env
+# is used for shell/build.rs's npm ci of agent-ui/web and nothing else: the release never builds
 # the sidecar. NODE_VERSION/NODE_SHA256_LINUX_X64 are pins.env's NODE_VERSION/
 # NODE_SHA256_linux_x64, passed in as build args since pins.env itself is outside this build
 # context.
@@ -102,7 +102,7 @@ RUN set -eu; \
 	install -m 0755 /tmp/nfpm-extract/nfpm /usr/local/bin/nfpm; \
 	rm -rf /tmp/nfpm.tar.gz /tmp/nfpm-extract
 
-# --- The build user ----------------------------------------------------------------------------
+# --- The build user (root vs not) ----------------------------------
 #
 # ubuntu:24.04 already ships uid 1000 as user "ubuntu" (noted in packaging/tests/install/
 # Dockerfile.dash), and this host's own uid is 1000 too. Rename it in place when the caller's UID
@@ -121,7 +121,7 @@ RUN set -eu; \
 		useradd -u "${UID}" -g "${GID}" -m -d /home/builder -s /bin/bash builder; \
 	fi
 
-# --- Fixed in-container paths ------------------------------------------------------------------
+# --- Fixed in-container paths (cache mounts) ----------
 #
 # No host path is ever compiled into a public binary: /build/src is where the read-only source
 # clone is copied, /build/{cargo,target,npm,skia} are the bind-mounted host caches (skia ro in

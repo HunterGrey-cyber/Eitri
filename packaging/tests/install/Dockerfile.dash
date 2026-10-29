@@ -12,7 +12,7 @@ ARG UID=1000
 ARG GID=1000
 # python3 is only for the harness's fixture server (`python3 -m http.server` on the container's own
 # 127.0.0.1): with the server inside, the container runs with --network none and reaches nothing of
-# the host's. git is real (--from-source/--verdandi-checkout tests clone, archive,
+# the host's. git is real (the --from-source/--verdandi-checkout tests clone, archive,
 # commit and read real repositories -- unlike the C/Rust/pkg-config toolchain check_build_tools also
 # checks, which the harness stubs entirely, so no rustc/cc/pkg-config/protobuf-compiler is needed
 # here).

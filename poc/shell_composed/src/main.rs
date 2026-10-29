@@ -992,16 +992,19 @@ fn build_content_area(editor: &gtk4::Widget, agent: &gtk4::Widget) -> (gtk4::Wid
     (widget, paned)
 }
 
-/// Debounces WebView resizing to avoid repeated reflows during divider motion.
-/// Hiding a `Paned` child would give the editor the full width and remove the divider, so keep
-/// both pane children visible and place `agent` as an overlay child of a `gtk4::Overlay`.
-/// A `DrawingArea` sensor is the overlay's main child and receives its full current allocation.
-/// Its resize signal drives `agent.set_size_request` about 70ms after the last resize in a burst.
-/// Between updates, the agent stays visible at its previous size without reflowing on every change.
-/// The first size is applied immediately so startup does not leave the WebView at zero or stale size.
-/// `Start` alignment prevents the overlay from stretching the agent automatically. Clipping keeps
-/// an agent still at its old size from spilling into the editor while its pane is shrinking.
-/// Return the overlay for use as `Paned`'s end child; using `agent` directly would bypass debouncing.
+/// Debounces WebView resizing to avoid reflowing it on every divider movement.
+/// Hiding a `Paned` child during a drag would give the other child the full width and remove
+/// the handle. Both children must remain visible to preserve the split.
+///
+/// The returned `gtk4::Overlay` is the real end child of `Paned`. Its main child is an empty
+/// `DrawingArea` sensor that receives the full allocation and emits `resize` signals.
+/// `agent` is an overlay child aligned at `Start`, so it keeps its last size during a burst.
+/// The sensor updates `agent` through `set_size_request` about 70ms after the last resize.
+/// The first allocation is applied immediately to avoid starting with a stale or zero size.
+/// Clipping prevents the old, larger WebView from spilling into the editor while shrinking.
+///
+/// The caller must use the returned widget as `Paned`'s end child. Passing `agent` directly
+/// would bypass the debounce and restore reflow on every divider movement.
 fn install_webview_resize_throttle(agent: &gtk4::Widget) -> gtk4::Widget {
     const DEBOUNCE_MS: u32 = 70;
 

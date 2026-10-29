@@ -1,13 +1,27 @@
-//! Executes a `PaintList` onto a Skia canvas.
+//! Moved from the frozen `terminal-pane/src/backend.rs` (2026-09-23),
+//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120` and one
+//! split: the op loop of [`paint`] is [`paint_ops`] (bottom-terminal phase 2), so the host can paint
+//! an input method's preedit over a finished frame without clearing it. Where it says "Verdandi" or
+//! "the handoff", the contract now lives in this workspace's `terminal-render/`.
 //!
-//! Terminal semantics are resolved before painting: colours, glyph column counts, and cursor
-//! contrast arrive in the operations. Palette handling, SGR, inverse, selection, wide-character
-//! spacers, and scrollback arithmetic belong in `terminal-render`, where they are resolved once.
+//! Executes a `PaintList` onto a Skia canvas. This is the entire backend.
 //!
-//! Every visible cell is repainted each frame. There is no damage tracking, partial redraw, or
-//! glyph atlas here, keeping drawing errors confined to operations, metrics, drawing, or clipping.
-//! [`paint_ops`] draws operations without clearing the canvas, so the host can draw input-method
-//! preedit over a finished frame.
+//! The rule from the handoff, and the reason this file is short:
+//!
+//! > A backend EXECUTES these ops. It never interprets terminal semantics.
+//!
+//! So there is no palette here, no SGR, no inverse, no selection flag, no wide-char spacer, no
+//! cursor inference, no scrollback arithmetic. Every colour arrives resolved, every glyph arrives
+//! with the column count it occupies, the cursor arrives with the character it covers already
+//! recoloured to contrast. If a change to this file ever needs one of those concepts, the contract
+//! has leaked and the fix belongs in Verdandi — send it back with a failing test rather than
+//! deciding it here, because a second interpretation that merely happens to agree today is the
+//! thing this architecture exists to prevent.
+//!
+//! Correctness first, deliberately: every visible cell is repainted every frame. No damage, no
+//! partial redraw, no glyph atlas. That keeps the fault domain to the four things that can actually
+//! be wrong at this stage — the op contract, cell metrics, Skia drawing, and pane clipping — and
+//! there is no measurement yet saying a full repaint is too slow.
 
 use crate::metrics::TerminalMetrics;
 use skia_safe::{Canvas, Color, Paint, Rect};

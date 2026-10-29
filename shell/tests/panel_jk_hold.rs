@@ -1,27 +1,29 @@
-//! Measures held `j` and `k` scrolling in the agent panel against a real WebKitGTK page.
-//! The test sends one XTEST key-down, lets the X server repeat at a set rate
-//! (`xset r rate`), then sends one key-up. The page logs each animation frame's time,
-//! `scrollTop`, the cursor row's top and each keydown. Frame times and movement per
-//! frame reveal missed frames, jumps, stalls and reversals. The same measurements
-//! are taken for WebKitGTK's held-arrow scrolling on a long plain page for comparison.
+//! A held `j`/`k` in the agent panel, against the real WebKitGTK page: what every animation frame shows
+//! while the key is held, measured, so "smooth" is a number as well as a look.
 //!
-//! Uses a plain `main` (`harness = false`) because GTK must own the main thread.
-//! Run explicitly with:
+//! The key is held as a person holds it: one XTEST key-down, the X server's own auto-repeat at a set rate
+//! (`xset r rate`), one key-up. The page logs each animation frame's time, the list's `scrollTop` and the
+//! cursor row's top, and each keydown; the report is the frame times (missed frames) and the view's
+//! movement per frame (jumps, stalls, reversals) over the hold, for `j` and for `k`. The same is measured
+//! for WebKitGTK's own held-arrow scroll of a long plain page, the reference a held key should feel like.
+//!
+//! A plain `main` (`harness = false`), because GTK must own the main thread; opt-in with `-- --ignored`:
 //!
 //!     cargo test -p shell --test panel_jk_hold -- --ignored
 //!
-//! It starts its own X server through `support/own_x_server.rs` and uses no other display.
-//! Needs `Xvfb`, `xdotool` and `xset`. Run one GUI test at a time on the machine.
+//! It starts its own X server (`support/own_x_server.rs`) and talks to no other display. Needs `Xvfb`,
+//! `xdotool` and `xset`. One GUI pass at a time on the machine: take the GUI slot first.
 //!
-//! - `JKH_HTML=<path>` measures another page build, such as an older `dist/index.html`, without assertions.
-//! - `JKH_OUT=<dir>` saves each run's frame log as JSON and a mid-hold screenshot using `import`.
-//! - `JKH_REPEAT=<per second>` sets the repeat rate, defaulting to 30 after a 250ms delay.
-//! - `JKH_GROUPS=<n>` sets the conversation length to `4n` rows, defaulting to 40 groups.
-//! - `JKH_CSS=<rules>` adds a stylesheet to the panel page.
-//! - `JKH_SAMPLER=1` logs when the page's main thread was busy for more than 30ms.
-//! - `JKH_RECORD=1`, with `JKH_OUT`, records video of each held key, including the plain page.
+//! - `JKH_HTML=<path>` measures another build of the page (an older `dist/index.html`) and checks nothing:
+//!   the numbers are its report.
+//! - `JKH_OUT=<dir>` writes each run's frame log there as JSON, and a screenshot mid-hold (`import`).
+//! - `JKH_REPEAT=<per second>` sets the auto-repeat rate (30 when unset), after a 250ms delay.
+//! - `JKH_GROUPS=<n>` makes the conversation `4n` rows long (40 when unset).
+//! - `JKH_CSS=<rules>` adds a stylesheet to the panel's page, for an experiment.
+//! - `JKH_SAMPLER=1` also logs when the page's main thread was busy for more than 30ms.
+//! - `JKH_RECORD=1` (with `JKH_OUT`) also records a video of each held key, the plain page's too.
 //!
-//! Prints one `JKH` line per run.
+//! It prints one `JKH` line per run.
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;

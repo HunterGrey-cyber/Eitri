@@ -1,7 +1,9 @@
-//! Window chrome: top bar and window controls (minimize/maximize/close).
-//! Styling lives in `theme::gtk_css`.
+//! Window chrome: top bar and window controls (minimize/maximize/close). Styling itself lives in
+//! `theme::gtk_css`.
 //!
-//! There is no bottom status bar. The pane cursors indicate keyboard focus.
+//! **There is no bottom status bar** (deleted 2026-09-19; the UI design had already
+//! called for it). Its last job was naming the focused pane, which the cursors do on their own
+//! (the focus report).
 
 use std::path::Path;
 use std::rc::Rc;

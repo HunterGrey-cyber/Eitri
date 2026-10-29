@@ -42,10 +42,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// How long `SpawnedSidecar::drop` waits after closing stdin before sending SIGKILL.
-/// The sidecar first reaps its CLI: 250ms grace, then SIGTERM, then SIGKILL after 3s,
-/// then a final 1s wait, for about 4.3s total. Killing the sidecar during that cleanup
-/// can orphan the CLI. The 6s grace leaves more than 1.5s of margin.
+/// How long `SpawnedSidecar::drop` waits, after closing the sidecar's stdin, before escalating to
+/// SIGKILL. A sidecar that advertises the `set_permission_mode` capability (protocol 3; an older one
+/// does not reap) reaps the `claude` CLI it owns before exiting on its own: a 250ms
+/// internal grace, then SIGTERM, then SIGKILL 3s later if that CLI hasn't exited, then
+/// gives up 1s after that: ~4.3s worst case. Killing the SIDECAR inside that window orphans the
+/// `claude` process it was in the middle of ending, which is worse than the thing this constant
+/// exists to bound. 6s leaves >1.5s of margin over that worst case; measured ~1.4s mid-turn
+/// (Verdandi's own test).
 pub const SIDECAR_EXIT_GRACE: Duration = Duration::from_secs(6);
 
 /// How long a started sidecar is given to bind its socket before the start is called failed.
@@ -551,22 +555,70 @@ impl SpawnedSidecar {
     }
 }
 
-/// The sidecar revision this client is developed and verified against.
-/// A different checkout revision produces a startup diagnostic rather than preventing startup,
-/// so development overrides can test unreleased sidecars and protocol changes.
-/// Keep this value aligned with the protocol dependency in `agent/Cargo.toml`, since that
-/// dependency supplies the generated wire types this client compiles against.
-/// Use the seven-character prefix here because the per-user directory and release checks use it.
+/// The Verdandi revision this client is developed and verified against (protocol 3.22).
 ///
-/// Before updating this value, run the real-sidecar tests against the candidate revision.
-/// These cover multi-turn content, bypassed tool execution, reuse after interruption, teardown
-/// without orphan processes, resume with matching content and provider session ID, streaming,
-/// replay, recovery and backpressure. Compilation alone does not check the live handshake.
+/// Not a hard pin -- `EITRI_VERDANDI_CHECKOUT` exists precisely so a Verdandi feature branch or a
+/// protocol migration can be tested against an unreleased sidecar, and hard-failing on a different
+/// revision would defeat that. It is a BASELINE: when the checkout is at a different revision, that
+/// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
+/// this session actually running?" is answerable after the fact rather than guessed at.
 ///
-/// Checkout revision diagnostics require git metadata, which packaged sidecar artifacts lack.
-/// `ProviderInfo` also carries the protocol major and `sidecar_version`. The handshake checks
-/// the protocol major; this revision remains the checkout skew warning until the client checks
-/// the sidecar version range.
+/// It is also the `rev` that `agent/Cargo.toml` pins `claude-runtime-protocol` to, and the two must
+/// stay equal, because the generated wire types this crate compiles against come from exactly that
+/// revision, so it is the revision "verified against" can honestly refer to. (The checkout actually
+/// RUNNING may differ; that is what the drift warning below reports, and what
+/// `EITRI_VERDANDI_CHECKOUT` is for.) `agent/Cargo.toml` names the full commit; this stays the
+/// 7-character prefix, because the per-user sidecar directory and the release checks are keyed by
+/// exactly that.
+///
+/// The value earns its way here by the real suite, never by a version bump: the whole `#[ignore]`d
+/// real-sidecar set is re-run against the exact pushed revision first (multi-turn with a content
+/// oracle, BYPASS tool execution, post-interrupt reuse, orphan-free teardown, a real resume proven
+/// by both a content oracle and a provider-session-id match, partial assistant streaming measured
+/// before/after, and the replay/recovery and backpressure suites). Move it again on the same
+/// terms, not before. When a bump changes no generated type and no capability, it exists only to
+/// track the sidecar artifact this client spawns.
+///
+/// Keep this doc comment and the literal in step. They once drifted apart (the prose named one
+/// revision while the constant held another, two revisions apart) and nothing failed.
+///
+/// **Slated for retirement, and the replacement is already on the wire.** A git revision is a
+/// development-machine concept: a packaged install will spawn a shipped sidecar ARTIFACT with no
+/// checkout and no `.git` to read, so this check has nothing to compare and the description line
+/// above it has nothing to describe. The compatibility token is to become protocol major (already
+/// checked at handshake) plus `sidecar_version`, which Verdandi stamps from `package.json` at build
+/// time -- both already carried on `ProviderInfo`. Until this client range-checks that version,
+/// this constant is what warns about skew, so it is kept accurate rather than deleted early.
+///
+/// What this client reads from the protocol at this revision, by minor version:
+/// - Earlier minors: `SetPermissionMode`, `PermissionModeChanged` and `TextDelta.message_id`;
+///   `ClaudeHostPolicy.provider_permission_prompts` (tag 9), `PermissionRequested.origin` with the
+///   four `provider_*` fields (tags 5-9), `PermissionOrigin`, `MatchedAskRule`, and capability
+///   `provider_permission_prompts`.
+/// - 3.14: `ClaudeHostPolicy.cli_permission_mode` (tag 11, `CliPermissionMode`),
+///   `ResolvePermissionRequest.defer` (tag 6), `PermissionOutcome.DEFERRED`, the `PermissionDenied`
+///   event (`SessionEvent` arm 23); capabilities `cli_auto_mode`, `permission_defer` and
+///   `permission_denied_events`. Fields this client does not send or read:
+///   `await_account_identity`, `ToolAllowList.init_check`, the handshake's `egress_probe` and
+///   `structured_output_tools`, `SessionReady.effective_*`.
+/// - 3.20: the `SteerTurn` RPC, the `UserMessageDelivered`, `UserMessageDropped` and
+///   `CommandsUpdated` events (`SessionEvent` arms 24-26), error codes `TURN_MISMATCH` and
+///   `STEER_UNAVAILABLE`, and `ErrorDetail.reason`; capabilities `steer_turn` (only when the
+///   sidecar's CLI is at least 2.1.252) and `list_commands`. Added and not read or sent: the
+///   handshake's `cli_compatibility`, `bundled_cli_compatibility` and `effective_claude_config_dir`,
+///   `ClaudeHostPolicy.accept_unsupported_cli` (always false), and `SessionReady`'s
+///   `effective_setting_sources`, `effective_configuration` and `cli_permission_mode_kind`; seven
+///   more capabilities from minors 15-19 this client does not branch on.
+/// - 3.21: `CreateSessionRequest.system_prompt_preset` (field 10) and `SystemPromptPreset` with an
+///   optional append; the field-7 comments distinguish replacement from the SDK's minimal default.
+///   Read: capability `system_prompt_preset`, selecting the preset on fresh and resumed sessions.
+/// - 3.22: Claude Code's own turns, background tasks and workflows, the CLI's notices, `/clear`
+///   and structured questions, behind ten capabilities. Read: the ten capability flags
+///   (`ProviderCapabilities`); the eight new `SessionEvent` arms are received, logged and dropped
+///   until each one is folded. Not sent: `ClaudeHostPolicy.per_task_stop`,
+///   `CreateSessionRequest.client_interactions`, `typed_by_person` and
+///   `SendTurnRequest.client_message_id`. Not called: `StopTask`, `GetTaskOutput`,
+///   `ResolveInteraction`, `GetInteractionState`.
 pub const EXPECTED_VERDANDI_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
@@ -1730,8 +1782,9 @@ mod tests {
         assert!(message.contains("did not bind"), "{message}");
     }
 
-    /// The sidecar reaps its CLIs before exiting: 250 ms, SIGTERM, then SIGKILL after 3 s and
-    /// another 1 s before giving up. Killing it sooner can orphan the CLI it is shutting down.
+    /// A sidecar with the `set_permission_mode` capability (protocol 3; an older one does not reap) reaps its CLIs
+    /// before exiting -- 250 ms, SIGTERM, SIGKILL 3 s later, give up 1 s after that: ~4.3 s worst case. Killing it
+    /// inside that window orphans the `claude` it was ending.
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn the_grace_covers_the_sidecars_own_reap() {
@@ -1865,8 +1918,13 @@ mod tests {
                 .lines()
                 .filter(|l| l.contains("EITRI_VERDANDI_CHECKOUT:-"))
                 .collect::<Vec<_>>();
-            // Require at least one default and check every occurrence. A script may need the default
-            // in more than one place; checking only `uses[0]` would miss a conflicting value elsewhere.
+            // At least one, and EVERY one agreeing -- not "exactly one". An exact count went red
+            // when `install.sh` legitimately gained a second use (one in the artifact-copying
+            // helper, one in the checkout guard below it). "Exactly
+            // one" was only ever a way of making `uses[0]` cover the whole file; checking all of
+            // them covers it properly, and does not stand in the way of a script that honestly
+            // needs the default twice. What must not happen -- a script defaulting somewhere this
+            // code does not -- is still caught, now on every line rather than the first.
             assert!(!uses.is_empty(), "{script} never names the default Verdandi checkout");
             for line in &uses {
                 assert!(

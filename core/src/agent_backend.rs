@@ -1297,82 +1297,132 @@ impl AgentBackend {
         }
     }
 
-    /// Answers permission requests that need no human and returns the events the UI should see.
-    /// Both backends gate every tool call with `PreToolUse`, so the UI's permission policy is
-    /// applied here before deciding whether to show a card.
+    /// Answers every `PermissionRequested` in this batch that `agent::permission_policy` says needs
+    /// no human, and returns the events the UI should still see.
     ///
-    /// Successfully answered requests are hidden from the UI. `ToolCallStarted` and
-    /// `ToolCallCompleted` still show what ran. If sending an answer fails, the request is
-    /// delivered so the user can resolve it instead of leaving an invisible pending request.
+    /// **This is the single point both backends converge on, and that is why the fix lives here.**
+    /// Both install a `PreToolUse` gate whose matcher is `*` -- legacy generates the hook, the
+    /// sidecar gets one from Verdandi's own broker -- and both are right to: "the host sees every
+    /// call" is the correct layering, because the policy of what needs a human belongs to the
+    /// product that has the human. What was wrong was equating "the host was asked" with "the user
+    /// must answer", which is what put a card in front of the user for every single `Read`. Fixing
+    /// it here needs no change in Verdandi and no change on any wire.
     ///
-    /// `Bypass` allows gate requests before classification. The CLI remains gated, using
-    /// `--permission-mode default` with a hook or the sidecar's INTERACTIVE mode.
-    /// The caller supplies `Tab::mode` on every pump; this function stores no mode of its own.
-    /// An id already in `host_answered` is dropped without another answer or a card.
-    /// The tab set retains such an id only while the projection still lists the request,
-    /// which has already been answered and is waiting for its resolution.
+    /// An auto-answered request is dropped from the delivery entirely, so the frontend never learns
+    /// it existed and no card is drawn. The tool call itself still arrives as
+    /// `ToolCallStarted`/`ToolCallCompleted`, so the transcript still shows what ran -- this
+    /// suppresses the question, never the record.
     ///
-    /// Nothing is answered after `UngatedCliMode`, whether it arrives in this batch or is
-    /// already in the projection. `TabSet::pump` closes the session and thereby denies pending
-    /// requests, so no automatic grant is sent to a session that must be closed.
+    /// **If the answer fails to send, the event is delivered after all.** A request left pending in
+    /// the projection with no card on screen is a session the user cannot unstick, which is a worse
+    /// failure than an extra click.
     ///
-    /// Resolutions arrive on a later pump, including legacy's locally folded hook answers.
-    /// A resolution for a hidden request is harmless because the UI removes pending requests by id.
+    /// **In `Bypass` (since 2026-09-27), every `PermissionRequested` is answered `Allow` here,
+    /// unconditionally, before the classifier ever runs.** This is Eitri's own definition of
+    /// bypass: the CLI itself is never told to skip permissions (it always runs gated,
+    /// `--permission-mode default` plus the hook, or the sidecar's INTERACTIVE mode); "bypass" means
+    /// Eitri answers every request `allow` under that gate instead of showing a card. `mode` comes
+    /// from the caller's `Tab::mode` on every pump -- this function holds no mode of its own, so
+    /// nothing here can drift from what the tab set thinks the tab is in.
     ///
-    /// `host_answered` also keeps answered requests out of resync snapshots and the attention
-    /// tray through `TabSet::pump`, `SnapshotView::of`, and `AttentionTracker::resync`.
-    /// This prevents an answered request from reappearing as a card.
+    /// **An id already in `host_answered` is dropped without a second answer, whatever the mode**
+    /// (a duplicate delivery of a request already answered, e.g. after a resync). One check before
+    /// any answer is chosen covers every way of answering below, and the copy is no card either:
+    /// the tab set keeps an id there only while the projection still lists it, so the request it
+    /// repeats has been answered and is only waiting for its resolution.
     ///
-    /// The CLI's own prompts (`provider_prompt: Some`) are handled before gate requests.
-    /// They can ask for checks, such as sensitive files, that a hook allowance or session
-    /// rule does not silence. These prompts bypass the classifier and saved prefix rules.
-    /// `Bypass` allows all such prompts, including forced asks, unknown kinds and prompts
-    /// with no reason. In `Auto`, a prompt requires an approval matching its id, tool and
-    /// input, which is consumed when used. Otherwise a card is shown. A prompt marked
-    /// `needs_its_own_card` requires a card in `Auto` even with a matching approval: it was
-    /// forced by the user's ask rule, has an unknown kind, or gives no reason for asking.
-    /// A content-scoped ask rule can also give no reason.
-    /// Each prompt answered without a card is added to `answered_for_you` with its row note.
+    /// **Nothing is answered once the CLI has reported an ungated mode** -- neither
+    /// in this batch after the `UngatedCliMode`, nor in any batch after the projection recorded one,
+    /// and this holds in both modes. Such a session is about to be closed (`TabSet::pump`), and a
+    /// request left unanswered is denied by that close; an automatic `allow` here -- in bypass or
+    /// under the classifier -- would be a grant made to a session nobody should be granting anything.
     ///
-    /// After `respond_permission` succeeds, a `Write`, `Edit` or `NotebookEdit` allowed by
-    /// the classifier is added to `answered_for_you.by_the_fast_path` by tool-use id.
-    /// Only the acceptEdits fast path allows these tools under the classifier; saved prefix
-    /// rules do not apply to them. The entry includes `(tool_name, input)` because a later
-    /// card can lack a tool-use id, preventing removal by id alone. Requests without a
-    /// tool-use id are still answered but have no row note.
+    /// Resolutions arrive on a later pump, including legacy's locally folded hook answers. A
+    /// resolution for a request hidden here is harmless: the page removes pending requests by id.
     ///
-    /// File existence at `file_path` is checked just before allowing a `Write`, before the
-    /// CLI can write it. A write to a missing file is added to `answered_for_you.creates_file`
-    /// in both the fast path and bypass. `note_new_files` only sees delivered cards, so it
-    /// cannot detect files created by these automatic answers.
+    /// **The second gap this doc used to record is closed, not merely documented, by
+    /// `host_answered`:** an id this function inserts into `host_answered` is hidden from a
+    /// `Resync`'s snapshot and from the attention tray by `TabSet::pump` (`SnapshotView::of`,
+    /// `AttentionTracker::resync`), so a request answered here can no longer resurrect a card the
+    /// user was never meant to see, in bypass or under the classifier alike.
     ///
-    /// `classify_with_rules` checks `agent::rule_that_allows` first.
-    /// `REASON_ALLOWED_BY_A_PROJECT_RULE` identifies a saved prefix rule allowance.
-    /// After a successful answer, the rule's display string and `(tool_name, input)` are
-    /// stored in `answered_for_you.by_rule` by tool-use id. The arguments let a later card
-    /// remove the candidate even when that card lacks a tool-use id.
-    /// These notes track actual answers: the absence of a card alone can also mean input
-    /// validation failed before the hook ran, the request had no tool-use id, or bypass
-    /// answered the gate instead of the classifier or saved rule.
+    /// **The CLI's own prompts have their own rules, checked before either
+    /// path above** (`provider_prompt: Some`): the CLI raised one after the gate had already
+    /// answered, for a check of its own that no hook `allow` or session rule silences (its
+    /// sensitive-file check is the measured one). So the classifier and the saved prefix rules never
+    /// see it: their `allow` would silence the very check the CLI added after the gate. **Bypass
+    /// allows every one**, whatever it says about why it asked: one the
+    /// user's own `permissions.ask` rule forced, one of a kind this build does not know and one that
+    /// gives no reason are answered like the sensitive-file check, because bypass lets everything
+    /// through. In `Auto` it is allowed only when `approvals` holds the same call -- id, tool and
+    /// input the user approved on a card -- and that approval is then used up; otherwise it is a card,
+    /// so Auto never passes a check of the CLI's that the user has not seen. One that
+    /// `needs_its_own_card` -- forced by the user's own ask rule, of an unknown
+    /// kind, or giving no reason for asking (a content-scoped ask rule looks like that) -- is a card in
+    /// `Auto` even with such an approval.
+    /// Each answered without a card goes into `answered_for_you` with its row's note.
     ///
-    /// When the session requested CLI auto mode, the sidecar offered `cli_auto_mode` and
-    /// `permission_defer`, and `AgentSessionProjection::cli_runs_auto` is true, `Auto`
-    /// allows gate requests matched by `agent::rule_that_allows` and otherwise sends
-    /// `PermissionDecision::Defer`. The local classifier is skipped and the CLI's classifier
-    /// decides without a card. A refusal produces `AgentDomainEvent::PermissionDenied` and
-    /// the call's error result. A failed deferral is delivered as a card.
-    /// The projection is read before each request because ingestion can fold a trip or
-    /// fallback during the batch. A fallback to `default` restores local classification;
-    /// a trip stops answers. CLI prompts and bypass keep their behavior.
+    /// **The acceptEdits fast path's own row note is recorded here too, never inferred elsewhere.**
+    /// A `Write`/`Edit`/`NotebookEdit` this
+    /// function allowed under the classifier -- which only the fast path ever does for those three
+    /// (`agent::permission_policy`'s module doc: no saved rule touches them) -- goes into
+    /// `answered_for_you.by_the_fast_path` by tool-use id, with the `(tool_name, input)` the answer
+    /// saw (a LATER card for the same call can carry an empty tool-use id, so the tab
+    /// set's own "same id" removal cannot always find the candidate this leaves), once
+    /// `respond_permission` succeeded. The tab set used to infer the same thing from absence (a call
+    /// that started in Auto and completed with no card delivered for it), which was also true of a
+    /// call the CLI's `validateInput` failed before any hook ran, of a card whose request carried no
+    /// tool-use id, and of a gate a switch to bypass answered instead. A request with no tool-use id
+    /// is answered as ever and noted nowhere: there is no row to name.
     ///
-    /// `Manual` never defers or uses the fast path. `agent::classify_in_manual` requires a
-    /// card for every file write or edit and otherwise uses the Auto classifier with saved
-    /// rules. CLI prompts follow the Auto behavior. External agent requests require cards
-    /// in both modes. `Manual` is never more permissive than `Auto`.
+    /// **So is a `Write` that creates its file**, in the fast path and in bypass alike:
+    /// whether anything exists at its `file_path` is checked just before the `allow` is sent, when
+    /// the CLI cannot have written it yet, and a `Write` over nothing goes into
+    /// `answered_for_you.creates_file`. `note_new_files` only ever sees a delivered card, which
+    /// neither of these two answers leaves behind.
     ///
-    /// Each event keeps its fold revision from `take_revised_ui_delivery`.
-    /// Dropping an event also drops its revision.
-    /// `decide` chooses the answer. `answer_and_record` sends it and records the result.
+    /// **So is a saved prefix rule's own note**, which before 2026-09-28 was inferred the same way.
+    /// `classify_with_rules`
+    /// checks `agent::rule_that_allows` before anything else, so `classification.reason ==
+    /// REASON_ALLOWED_BY_A_PROJECT_RULE` means a rule, not the read-only classifier, is why this call
+    /// is being allowed here; `agent::rule_that_allows` is asked again for the rule's own display
+    /// string (cheap, and the same re-ask the tab set used to make -- only moved to where the answer
+    /// is actually given) and the pair goes into `answered_for_you.by_rule` by tool-use id, with the
+    /// `(tool_name, input)` the answer saw for the same reason `by_the_fast_path` carries it, once
+    /// `respond_permission` succeeded. The tab set used to make every `ToolCallStarted` a rule WOULD
+    /// answer -- re-asking `agent::rule_that_allows` on that event's own arguments, before any gate
+    /// existed to answer -- a candidate, and infer the answer from no card ever having arrived: also
+    /// true of a call the CLI's `validateInput` failed before any hook ran (no gate at all), and of a
+    /// gate a switch to bypass answered instead of the rule.
+    ///
+    /// **On a session whose CLI runs its own auto mode under the gate, `Auto` defers** (2026-10-02,
+    /// Verdandi protocol 3.14). Such a session asked for it (`ProviderCapabilities::cli_auto_mode`:
+    /// the sidecar offered both `cli_auto_mode` and `permission_defer`) and the CLI's latest report
+    /// says `auto` (`AgentSessionProjection::cli_runs_auto`). There a gate request in `Auto` is
+    /// answered `allow` when a saved prefix rule allows it -- `agent::rule_that_allows`, the same
+    /// rule path `classify_with_rules` takes, with the same limits -- and otherwise
+    /// `PermissionDecision::Defer`: Eitri's own classifier is not consulted and no card is drawn, and
+    /// the CLI's classifier decides. A refusal comes back as `AgentDomainEvent::PermissionDenied`
+    /// and the call's error result. A deferral that fails to send is a card, like any failed answer.
+    /// The projection is read again immediately before each request, not once per batch: ingestion
+    /// keeps folding while the batch is answered, and a trip or a fallback to `default` it folds
+    /// there must reach the next request, which then is not deferred (a trip: not answered).
+    ///
+    /// Everything above is unchanged on such a session: the tripwire, the CLI's own prompts and
+    /// bypass. A session that did not ask for auto, or whose CLI fell back to `default`, is answered
+    /// exactly as before, by the classifier below.
+    ///
+    /// **`Manual` never defers and never takes the fast path**, on any session: Eitri's own policy
+    /// answers every gate request (`agent::classify_in_manual`, which cards every file write or edit
+    /// and is otherwise the Auto classifier with its saved rules), whatever the CLI runs under it.
+    /// The CLI's own prompts are answered as in `Auto`, and an external agent's requests are all
+    /// cards, as in `Auto`. It is never more permissive than `Auto` on any request.
+    ///
+    /// Each event travels with its fold revision (`take_revised_ui_delivery`), untouched: a kept
+    /// event keeps its own, a dropped one takes its with it.
+    ///
+    /// The choice of answer is `decide`'s; sending it and recording it is `answer_and_record`'s, the
+    /// one place an answer chosen here reaches the provider.
     fn answer_what_needs_no_human(
         &mut self,
         events: Vec<(u64, AgentDomainEvent)>,
@@ -3187,10 +3237,17 @@ mod tests {
         dir
     }
 
-    /// Drives the pump until all queued events arrive or the deadline passes.
-    /// Sidecar events cross the ingestion thread, so the first pump after a queue is normally empty.
-    /// The thread folds every 5 ms, and events queued together can arrive in separate deliveries.
-    /// Collects until 100 ms pass with nothing new so later events are not left undelivered.
+    /// Drives the pump until what the provider queued has been delivered, or the deadline passes.
+    /// The sidecar's events cross the ingestion thread, so the first call after a queue is normally
+    /// empty.
+    ///
+    /// Everything queued, not only the first batch (seen 2026-09-28): the ingestion thread folds
+    /// every 5 ms, so under a loaded test run events queued together can arrive in two deliveries,
+    /// and a helper that returned the first left a test's later events undelivered -- a forced 30 ms
+    /// pause between two `queue` calls reproduced `left: 1, right: 3` in
+    /// `approve_pending_never_answers_a_prompt_only_a_human_answers`. Collected until 100 ms pass
+    /// with nothing new, as the panel's own pump keeps taking deliveries; the same fix `deliver()`
+    /// got.
     fn pump_until_delivery(
         backend: &mut AgentBackend,
         project_root: &Path,
@@ -3288,7 +3345,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         });
 
@@ -3415,7 +3472,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         });
         let delivered = pump_until_delivery(&mut backend, &dir, PermissionMode::Auto);
@@ -3802,7 +3859,7 @@ mod tests {
             permission_id: "perm-write".into(),
             tool_use_id: Some("tool-2".into()),
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         });
 
@@ -3913,7 +3970,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         };
 
@@ -4005,7 +4062,7 @@ mod tests {
             permission_id: id.into(),
             tool_use_id: None,
             tool_name: "Write".into(),
-            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // A write under `.git` still needs a card under the acceptEdits fast path.
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }), // still cards under the fast path
             provider_prompt: None,
         };
 
@@ -4066,7 +4123,7 @@ mod tests {
         backend.shutdown();
     }
 
-    // ---- The CLI's own permission prompts ----
+    // ---- The CLI's own permission prompts --------------------------------------
 
     /// The CLI's own prompt for `tool_use_id`, as the sidecar translation produces it.
     fn provider_prompt(
@@ -4726,7 +4783,7 @@ mod tests {
         backend.shutdown();
     }
 
-    // ---- The CLI's own auto mode under the gate ----
+    // ---- The CLI's own auto mode under the gate (protocol 3.14) ---------------
 
     fn auto_backend(dir: &Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {
         let provider = std::sync::Arc::new(RecordingProvider::cli_auto());

@@ -392,9 +392,11 @@ pub(crate) fn attach_keyboard_input(
             send_text(&live_state, &text, &activity);
         });
     }
-    // Publish the cursor location so the IME can place its candidate popup near the nvim cursor.
-    // Without `set_cursor_location`, it positions the popup against the whole `GLArea`.
-    // `im_cursor_rect_for_editor` handles the coordinate conversion.
+    // --- IME candidate-window placement. Without these, `set_cursor_location` is never
+    // called at all and the input method has no choice but to position its candidate popup
+    // against the whole `GLArea` -- which is exactly what the feasibility doc's own check
+    // (the candidate box must appear near the correct Neovim cursor) had no way to pass. See
+    // `im_cursor_rect_for_editor` for the coordinate reasoning.
     {
         let live_state = live_state.clone();
         let area = gl_area.clone();

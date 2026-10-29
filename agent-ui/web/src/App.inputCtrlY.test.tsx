@@ -484,7 +484,8 @@ describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
     });
   });
 
-  /* Cases where a delayed approval must refuse a changed target or preserve a yank. */
+  /* Cases where a delayed approval must refuse a changed target or preserve a yank were seen
+     failing before the fix that added them. */
   describe("the answer window and the yank guard", () => {
     const TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
     const YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";

@@ -8546,8 +8546,8 @@ mod tests {
         assert_eq!(ids, ["r9", "r10", "r11"]);
     }
 
-    /// An answer is routed through `TabSet::resolve` to the tab it names.
-    /// An absent or gone tab must be refused.
+    /// Tab routing: an answer is for the tab it names,
+    /// through `TabSet::resolve`.
     #[test]
     fn trust_answer_naming_no_tab_or_a_gone_tab_is_refused() {
         let set = crate::tab_set::TabSet::new(crate::agent_backend::BackendKind::Sidecar, SessionModeChoice::Auto);

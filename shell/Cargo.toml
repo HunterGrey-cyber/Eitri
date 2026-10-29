@@ -82,8 +82,7 @@ eitri-panel = { path = "../panel", features = ["test-support"] }
 # from this crate's own test code.
 neovide = { path = "../neovide" }
 
-# Guards the GTK 4.14 / WebKit 2.40 toolkit floor.
-# A plain #[test] harness (unlike the three below), added explicitly so its presence in
+# Guards the GTK 4.14 / WebKit 2.40 toolkit floor: a plain #[test] harness (unlike the three below), added explicitly so its presence in
 # `cargo test`'s default run is visible in this file rather than only in tests/'s directory listing.
 [[test]]
 name = "toolkit_floor"
@@ -149,8 +148,7 @@ harness = false
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. It starts an
 # `Xvfb` of its own (`tests/support/own_x_server.rs`, shared since 2026-09-29) and refuses any other
 # display, since it sends real keys and clicks and writes the clipboard (see the file's header; needs
-# `Xvfb` and `xdotool`). BROWSE visual mode,
-# driven against the real
+# `Xvfb` and `xdotool`). BROWSE visual mode, driven against the real
 # WebKitGTK `Selection.modify` jsdom does not have.
 [[test]]
 name = "panel_visual_mode"
@@ -159,7 +157,7 @@ harness = false
 # A plain `main`, opt-in with `-- --ignored`. Holds `tests/support/own_x_server.rs` to its one
 # property: a client of the display it hands out reaches that `Xvfb` or nothing, never another
 # server's socket file -- using an isolated network namespace and shared `/tmp` with a
-# stand-in for the desktop's `/tmp/.X11-unix/X0`. It builds that namespace
+# stand-in for the desktop's `/tmp/.X11-unix/X0` (2026-09-29). It builds that namespace
 # itself: it re-executes under `bwrap` with a fresh `/tmp` holding a random-token
 # marker, a fresh `/run/user/<uid>` and `--unshare-net`, and refuses only where `bwrap` is missing or
 # the marker is not there -- so it needs no wrapper of its own. Needs `Xvfb` and `bwrap`.
@@ -168,7 +166,7 @@ name = "own_display_guard"
 harness = false
 
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
-# `Xvfb` (`tests/support/own_x_server.rs`;
+# `Xvfb` (`tests/support/own_x_server.rs`, since 2026-09-29;
 # see the file's header). Holds the 2026-09-29 IME fix: a web module's `WebView` at (0,0) of its
 # `WebHost`, so the position WebKitGTK adds to the input method's caret rectangle is zero.
 [[test]]

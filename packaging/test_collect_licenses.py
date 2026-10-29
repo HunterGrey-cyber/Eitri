@@ -107,8 +107,8 @@ class ShippedTree(unittest.TestCase):
 
 
 class RepoAndBinariesDirParams(unittest.TestCase):
-    """--repo and --binaries-dir select the public clone's Cargo.lock and the public
-    release's extracted binaries."""
+    """--repo and --binaries-dir (both are needed for the public clone's Cargo.lock and the public
+    release's extracted binaries)."""
 
     def test_repo_param_changes_where_cargo_metadata_runs(self):
         empty = _scratch_dir()
@@ -132,9 +132,8 @@ class RepoAndBinariesDirParams(unittest.TestCase):
 
 class SkiaLicenseLookup(unittest.TestCase):
     """The Skia licence text used to be read from <repo>/target/release/build/... unconditionally,
-    ignoring --binaries-dir entirely: the container builds under a different CARGO_TARGET_DIR,
-    and the public-clone-plus-extracted-tarball tree has no build/ subtree at all.
-    skia_license_text() is now the standalone function collect()'s native_components() calls,
+    ignoring --binaries-dir entirely: the release container builds under a different CARGO_TARGET_DIR,
+    and a public-clone-plus-extracted-tarball tree has no build/ subtree at all. skia_license_text() is now the standalone function collect()'s native_components() calls,
     testable on a fixture directory with no real binaries or a real build."""
 
     def _scratch(self):
@@ -176,8 +175,7 @@ class SkiaLicenseLookup(unittest.TestCase):
 
 
 class NvimRsSymbolCheck(unittest.TestCase):
-    """The collector checks by symbol which shipped binaries actually contain nvim-rs code,
-    matching any DEMANGLED symbol containing "nvim_rs" -- not just a leading mangled prefix
+    """The check is by symbol which shipped binaries actually contain nvim-rs code, matching any DEMANGLED symbol containing "nvim_rs" -- not just a leading mangled prefix
     like `_ZN7nvim_rs`, which misses trait impls and monomorphised code and would undercount which
     binaries really carry it."""
 
@@ -235,7 +233,7 @@ class NvimRsSymbolCheck(unittest.TestCase):
 
 class RustStdComponent(unittest.TestCase):
     """The note said "statically linked into all five binaries" -- stale since
-    excluding `agent-hook` leaves four (the header a line above it already says so). Now
+    `agent-hook` was dropped and left four (the header a line above it already says so). Now
     derived from `len(SHIPPED_BINARIES)` rather than a literal number word, so the next binary
     count change fixes this note without anyone having to remember it exists."""
 
@@ -508,7 +506,7 @@ class SkiaArchiveComponents(unittest.TestCase):
         self.assertEqual(found, {"expat": ["libskia.a(libexpat.xmlparse.o)"]})
 
     def test_real_pinned_archive_matches_symbol_count_table(self):
-        """The expected symbol-count table, against the real,
+        """The evidence table of expected symbol counts, against the real,
         pinned (sha256-checked) archive this release links -- skipped where that build cache is
         absent, the same shape as test_real_shell_binary_carries_nvim_rs... above. Every count
         matches exactly once skia_archive_symbol_counts() counts only "T" (global function) symbols,
@@ -615,8 +613,7 @@ class SkiaArchiveNoticeEntries(unittest.TestCase):
 
     def test_only_its_own_subdirectory_of_extract_dir_is_replaced(self):
         """extract_dir is the caller's directory, not this script's: only the fixed
-        SKIA_ARCHIVE_EXTRACT_SUBDIR inside it is removed and rebuilt (by contrast,
-        the previous version rmtree'd extract_dir itself, so `--skia-archive-extract-dir /build/out`
+        SKIA_ARCHIVE_EXTRACT_SUBDIR inside it is removed and rebuilt (the previous version rmtree'd extract_dir itself, so `--skia-archive-extract-dir /build/out`
         would have wiped the release output)."""
         archive = self._fixture_tarball(os.path.join(self.dir, "input"))
         extract_dir = os.path.join(self.dir, "out")

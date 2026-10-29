@@ -290,9 +290,9 @@ sidecar_dir="$FAKE_HOME/.local/share/eitri/sidecar/abcdef0"
 mkdir -p "$sidecar_dir"
 printf '#!/bin/sh\n' >"$sidecar_dir/verdandi-claude-sidecar"
 chmod +x "$sidecar_dir/verdandi-claude-sidecar"
-# Treat a relative XDG_DATA_HOME as unset and find the sidecar under $HOME/.local/share.
-# Using `${XDG_DATA_HOME:-default}` would instead search relative to the launcher's current
-# directory and wrongly print the missing-sidecar hint.
+# A RELATIVE XDG_DATA_HOME must be treated as though it were unset -- so the sidecar has to be found under $HOME/.local/share, not under a directory literally
+# named "relative/xdg" relative to wherever the launcher happens to run from. A naive
+# `${XDG_DATA_HOME:-default}` would miss it here and wrongly print the hint.
 EXTRA_ENV=("XDG_DATA_HOME=relative/xdg")
 out="$(run_launcher "$PROJECT_DIR")"
 assert_not_contains "$out" "no sidecar built yet" "a relative XDG_DATA_HOME falls back to \$HOME/.local/share, where the sidecar sits"

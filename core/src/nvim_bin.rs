@@ -859,11 +859,13 @@ mod tests {
         assert_eq!(result, Ok(Choice::Path));
     }
 
-    /// Writes and chmods `path` inside a short-lived `sh` child.
-    /// A write fd opened in this process could be inherited by a child forked by a concurrent test.
-    /// Running `path` would then fail with `ETXTBSY` until that child execs and closes its copy.
-    /// Writing in a separate child avoids intermittent `version_of_binary_*` failures under
-    /// `--test-threads=4` with `ExecutableFileBusy` (error 26).
+    /// Writes and chmods `path` from inside a short-lived `sh` child, not this process (matching
+    /// `agent::process::tests::fake_binary_script`'s own fix for the identical flake):
+    /// a write fd this process held open here would be copied, still open, into any child a
+    /// concurrent test thread forks in the meantime, and running `path` fails with `ETXTBSY` until
+    /// that unrelated child execs and its copy of the fd finally closes -- reproduced here as one
+    /// `version_of_binary_*` test failing intermittently under `--test-threads=4` (reproduced with
+    /// `spawn err: Os { code: 26, kind: ExecutableFileBusy, .. }`).
     fn write_executable_script(path: &Path, script: &str) {
         let status = std::process::Command::new("sh")
             .arg("-c")

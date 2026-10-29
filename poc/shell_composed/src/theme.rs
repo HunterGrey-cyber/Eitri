@@ -1,5 +1,11 @@
-//! Placeholder `Theme` palette for the feasibility probe.
-//! Formats theme tokens into a GTK stylesheet loadable by `CssProvider`.
+//! Copied from `poc/shell_chrome/src/theme.rs` verbatim, to avoid a cross-crate dependency
+//! for this throwaway probe crate. See that crate for the
+//! original doc comments/rationale — not repeated here beyond what's needed to keep this file
+//! self-explanatory.
+//!
+//! Minimal placeholder implementation of the `Theme` struct of the shell design
+//! (a unified visual system). This is a throwaway
+//! feasibility-probe palette, not a real design system.
 
 /// Plain RGBA color, kept simple (no external color-crate dependency) since
 /// all we need is to format it into CSS `rgb()`/`rgba()` literals.

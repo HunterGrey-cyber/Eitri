@@ -120,7 +120,7 @@ class RealShellBinary(unittest.TestCase):
     fresh checkout or a CI machine with no build must not fail `python3 -m pytest packaging`.
 
     The GTK/WebKit half is asserted unconditionally (this binary is built at the v4_14
-    floor on every host this test can run on). **The glibc half used to be asserted
+    floor, on every host this test can run on). **The glibc half used to be asserted
     unconditionally too** -- `returncode == 1` and `FAIL glibc` in the output, hard-coding this
     Arch host's own glibc 2.44 link -- which fails on any compliant host (glibc <= 2.39, including
     Ubuntu 24.04, the declared build platform, and Debian 12; reproduced with
@@ -160,7 +160,7 @@ class RealShellBinary(unittest.TestCase):
 
 
 class ScratchCompliantBinary(unittest.TestCase):
-    """A binary that *is* compliant (glibc <= 2.39, no
+    """The probe: a binary that *is* compliant (glibc <= 2.39, no
     GTK/WebKit symbols at all) must PASS this check, not be asserted to fail it -- the case the old
     hard-coded `RealShellBinary` assertion could not express because it only ever saw this Arch
     host's own non-compliant link. Runs the real script over a copy of `/usr/bin/true` -- max

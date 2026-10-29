@@ -1,19 +1,20 @@
-//! `ModuleGrid` contains every module. Each host gets its parent once in [`ModuleGrid::add`]
-//! and loses it only in `dispose`, when the window goes away. A web module's `WebView` is
-//! parented to its [`WebHost`] before the host is added to the grid.
+//! `ModuleGrid` contains every module and replaces `layout::build_content_area`,
+//! `layout::build_vertical_split` and `PaneLayout`'s index matches.
 //!
-//! Hiding uses `set_child_visible(false)`. Zoom, resize, split, swap, move and even operations
-//! allocate the same children again. Floating or raising a module reorders children on the
-//! same parent through [`ModuleGrid::restack`], which never moves the editor.
-//! The terminal's `GtkGLArea` has no unrealize handler, and reparenting a `WebView` unrealizes it.
-//! Re-realizing a GL module on another toplevel with a new GL context, frame clock and scale
-//! has not been exercised. The editor releases its Skia state on unrealize and keeps nvim
-//! across re-realization. Each host logs unrealize in [`ModuleGrid::add`] so unexpected
-//! unrealization can be detected.
+//! Every module host is parented once in `ModuleGrid::add` and unparented only in `dispose`
+//! when the window closes. Hiding uses `set_child_visible(false)`; layout changes allocate the
+//! same children again. A web module's `WebView` is parented to its `WebHost` before the host
+//! enters the grid. Floating or raising a module reorders children on the same parent through
+//! `ModuleGrid::restack`, without moving the editor. The terminal's `GtkGLArea` has no
+//! unrealize handler, and reparenting unrealizes a `WebView`. Re-realizing a GL module in
+//! another toplevel with a new GL context, frame clock and scale has not been tested. The
+//! editor releases its Skia state on unrealize and keeps nvim across re-realize, so it no
+//! longer requires this restriction on its own. Every host logs unrealize in `ModuleGrid::add`,
+//! allowing a GUI check that layout changes preserve this invariant.
 //!
-//! Rectangles come from the layout's `arrange` function. The grid measures children's minimum
-//! sizes, allocates the resulting geometry, holds web hosts at their settled size during
-//! resizing, and converts divider drags into ratios.
+//! Rectangles come from `layout::arrange`. This container measures children to supply their
+//! minimum sizes, allocates the resulting geometry and holds web hosts at their settled size
+//! during resizing through `throttle`, then turns divider drags into ratios.
 
 pub(crate) mod floatbars;
 pub(crate) mod strips;
@@ -303,7 +304,7 @@ impl ModuleGrid {
             widget.connect_unrealize(move |_| {
                 unrealized.set(unrealized.get() + 1);
                 // Expected exactly once per host, when the window closes. Any earlier line is the
-                // bug this container exists to rule out.
+                // bug this container exists to rule out (held by a counter).
                 eprintln!(
                     "[module_grid] {id} unrealized ({} so far) -- must not happen before the window closes",
                     unrealized.get()
@@ -1551,17 +1552,20 @@ fn handle_allocation(divider: &Divider) -> Rect {
     }
 }
 
-/// [`ModuleGrid::hide_module`]'s order, with GTK effects passed in for tests
-/// without a display. `layout::hide` records the hide and chooses the most recent
-/// neighbor if `id` holds the keys, or the next drawn tab if `id` was a drawn tab.
-/// `map` shows the destination's host if it was an undrawn tab. `focus` then gives
-/// it the keys before `unmap` removes `id` (`ModuleGrid::apply`,
+/// [`ModuleGrid::hide_module`]'s order, with its GTK effects passed in so that a test without a
+/// display can see it. `eitri_core::layout::hide` records the hide and chooses who gets the keys
+/// (the most recent module next to `id`, if `id` holds them; the tab drawn next, if `id` was a drawn
+/// tab). Then `map` puts that module's host on screen if it was an undrawn tab, `focus` gives it the
+/// keys, and only then does `unmap` take `id` off the screen (`ModuleGrid::apply`,
 /// `set_child_visible(false)`).
 ///
-/// Unmapping the focused widget first lets GTK's focus chain choose the next
-/// widget instead of the layout. Keeping the effects separate makes their order testable.
-/// The layout is released before GTK effects run: focus changes write its focus,
-/// and `apply` reads it.
+/// **Focus first is required, not only tidy** (the modules design). Unmapping the widget
+/// that holds the keys first lets GTK's own focus chain choose where they go, and it once chose the
+/// WebView. This order once sat inline in `hide_module`, and swapping
+/// its two statements left every test green.
+///
+/// The layout is released before either effect runs, because both re-enter it: a focus change
+/// reaches the focus report, which writes the layout's focus, and `apply` reads the layout.
 fn hide_then_unmap(
     layout: &RefCell<Layout>,
     id: &ModuleId,
@@ -2084,10 +2088,11 @@ mod tests {
         })
     }
 
-    /// Hiding the focused terminal with `Ctrl+a t` gives the keys to the most recent
-    /// module above it before unmapping the terminal. Swapping those effects in
-    /// `hide_then_unmap` must fail this test. Both upper modules are tried as the
-    /// last focused module, so always choosing the same one cannot pass.
+    /// `Ctrl+a t` with the keys in the terminal gives them to the
+    /// module above it, and only then unmaps it. With the two effects swapped in
+    /// `hide_then_unmap` this fails; before the seam, the same swap inline in `hide_module` left
+    /// all 190 `shell` tests green. Both upper modules are tried as the one that had the keys last,
+    /// so a fixed choice cannot pass either.
     #[test]
     fn hiding_the_module_with_the_keys_gives_them_away_before_it_unmaps() {
         for last_above in [ModuleId::agent(), ModuleId::editor()] {

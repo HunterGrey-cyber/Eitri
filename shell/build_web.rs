@@ -1,18 +1,31 @@
-// Checks whether built web bundles need rebuilding and runs npm when they do.
-// A SHA-256 fingerprint covers source paths and contents, `package.json`, `package-lock.json`,
-// `index.html`, and top-level `vite.config.*` and `tsconfig*.json` files. Including paths makes
-// source deletions change the fingerprint too. A successful build writes `dist/.inputs-sha256`;
-// a missing or different fingerprint forces a rebuild.
+// Decides whether a web project's built bundle (`agent-ui/web`'s `dist/index.html`, the plugin
+// keyboard kit's `dist/keys.js`) needs rebuilding, and runs npm when it does
+// (the web bundle's fingerprint rule). Before this,
+// `build.rs` decided by an mtime walk of `src/` only and ran `npm ci` only when `node_modules` was
+// missing -- so a change to `package.json`/`package-lock.json` alone, to `index.html` or a Vite/
+// TypeScript config, or a deleted source file, embedded the old bundle, and `publish.sh`/
+// `release.sh` built incrementally.
 //
-// `npm ci` runs when `node_modules` is missing or the lockfile hash differs from the hash saved
-// after the last successful install. Changing only `package.json` rebuilds without reinstalling.
-// The explicit clean-build environment flag forces both installation and rebuilding for shipped
-// binaries. It is separate from `PROFILE=release` so an offline source rebuild can use existing
-// assets without reaching npm.
+// A plain `.rs` file rather than a module, `include!`d by both `build.rs` and
+// `tests/web_bundle_freshness.rs`, for the same reason `build_info_lockfile.rs` is (see that
+// file's own doc comment): `build.rs` is compiled as a wholly separate binary from `shell` itself,
+// so it cannot `use` anything from `src/`, and a `#[cfg(test)]` module written inside `build.rs`
+// never runs under `cargo test` (`cargo test` builds `build.rs` as `build-script-build`, never
+// with `--test`).
 //
-// This file is `include!`d by `build.rs` and `tests/web_bundle_freshness.rs` to share the logic.
-// The build script is a separate binary and cannot import `src/`. Its own test modules are not
-// run by `cargo test`, which builds it without `--test`.
+// The rule: a sha256 fingerprint over every build input -- each file under `src/` by relative path
+// and content (so a deletion changes it), `package.json`, `package-lock.json`, `index.html`, and
+// every top-level `vite.config.*`/`tsconfig*.json` -- is written beside the bundle
+// (`dist/.inputs-sha256`) after a successful build; missing or differing forces a rebuild. `npm ci`
+// runs only when `node_modules` is missing or the lockfile's own sha256 differs from the one
+// recorded when `node_modules` was last installed (`node_modules/.eitri-lock-sha256`, written
+// after a successful `npm ci`) -- so editing `package.json` alone (no lockfile change) rebuilds
+// without reinstalling, matching what an `npm ci`-clean tree would actually need.
+// `EITRI_WEB_CLEAN_BUILD=1` forces both, even when nothing changed: `release.sh` sets it for the
+// build of the shipped binaries, so a release never embeds a bundle (or a `node_modules`) left over
+// from an earlier, unrelated build in the same tree. It is deliberately not tied to
+// `PROFILE=release` -- the LGPL source asset's offline rebuild (an LGPL 4(d)(0) obligation) is itself a
+// release build with no network, and must not reach npm.
 
 // `Path`/`PathBuf`/`Command` are deliberately not `use`d here: this file is `include!`d into both
 // `build.rs` and `tests/web_bundle_freshness.rs`, and each already imports all three at its own top
@@ -42,10 +55,15 @@ fn decide_web_build(
     fingerprint_matches: bool,
     clean_build: bool,
 ) -> WebBuildPlan {
-    // Build only for the clean-build switch or a changed input fingerprint, not merely
-    // because `node_modules` is absent. The source asset includes `dist/index.html` and a
-    // matching `dist/.inputs-sha256` but excludes `node_modules/`. Its offline rebuild must
-    // avoid npm when the bundled output is current.
+    // A build is needed only for the clean-build switch or a fingerprint that no longer matches
+    // what `dist/index.html` was built from -- never merely because `node_modules` happens to be
+    // absent. That distinction is load-bearing: the LGPL source asset
+    // ships `dist/index.html` and a matching `dist/.inputs-sha256` but never
+    // `node_modules/` (`release_check.py` forbids any `node_modules` path in it), so its offline
+    // rebuild must reach no npm at all when nothing has actually changed -- an earlier revision of
+    // this function ran `npm ci` (and so `npm run build`, through `PATH`'s stub, exit 1) for that
+    // exact asset even though its bundle was already current, failing `release.sh`'s own offline
+    // proof step (reproduced with a fixture in that state).
     let npm_build = clean_build || !fingerprint_matches;
     // `npm ci` only when a build is actually happening (an install with nothing to build for is
     // pointless), and only for the two reasons the doc comment above gives, or the clean-build
@@ -220,9 +238,14 @@ fn ensure_web_bundle_built(web_dir: &Path, output: &str, npm_override_dir: Optio
                 web_dir.display()
             );
         }
-        // Save `current_fingerprint`, computed before the build. The build writes only to `dist/`,
-        // which the fingerprint excludes. Recomputing afterwards could mark a concurrent input edit
-        // as already built even though the bundle was produced from the earlier contents.
+        // Reuses `current_fingerprint` (computed before `npm ci`/`npm run build` ran) rather than
+        // recomputing now: `npm run build` writes only into `dist/`, never into anything the
+        // fingerprint covers, so the two are equal when nothing else touched this tree while the
+        // build ran -- but recomputing *after* the build, as an earlier revision of this function
+        // did, actively hides the one case where they are not equal: an input edited concurrently
+        // with `npm run build` would be captured as already-built by a recompute, even though the
+        // bundle embedded moments later was built from the state before that edit -- exactly the
+        // stale-embedded-bundle failure the fingerprint rule exists to catch.
         write_state_file(&web_dir.join(FINGERPRINT_REL), &current_fingerprint);
     }
 }

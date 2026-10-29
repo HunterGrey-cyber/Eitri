@@ -1,6 +1,8 @@
-//! The shell window combines custom chrome, a module grid driven by layout data,
-//! an embedded editor pane, and an agent panel. The agent panel hosts a frontend
-//! in a WebView and bridges it to a lazily started `agent::AgentSession`.
+//! shell: the real Eitri product window -- custom chrome, the module grid (a layout that is data),
+//! the neovide-editor crate
+//! embedded as the real editor pane, and the real agent-ui panel (a WebView-hosted frontend bridged
+//! to a lazily-started `agent::AgentSession`). See
+//! the crate's own module docs.
 
 mod agent_panel;
 mod chat_views;
@@ -98,7 +100,7 @@ use wire::{wire_host, WireDeps, WireKind};
 const APP_ID: &str = "cn.huntergrey.eitri";
 
 /// How long the top bar's app name shows the prefix indicator's block when a layout verb is refused
-///.
+/// (the refusal flashes the top bar, the same way the prefix indicator shows).
 const REFUSAL_FLASH: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Resolve the user's configuration independently of the project's working directory.
@@ -340,7 +342,7 @@ fn main() -> glib::ExitCode {
         }
     }
 
-    // WebKit's sandbox:
+    // WebKit's sandbox (the Ubuntu user-namespace case):
     // decided here, once, while this is still the only thread -- `webkit_sandbox`'s module doc says
     // why that matters for the pending option (B) -- and before any `WebView` exists. Where it cannot
     // start (a stock Ubuntu 24.04 desktop with no AppArmor profile for this binary), no `WebView` is
@@ -442,8 +444,9 @@ fn build_ui(
     // Window 2 of a pair has no editor: no nvim is started, so none of the editor's feeds, the pane-switch channel
     // or the scratch directory exists in it, and every use of the editor below is behind its `Option`.
     let owns_editor = pair.owns_editor();
-    // Initialize `gtk-xft-dpi` before building any agent or Lua panel WebView,
-    // so it is set when the WebView reads it.
+    // Before anything else, so
+    // `gtk-xft-dpi` is never unset by the time the agent panel's (or a Lua panel's) `WebView` reads
+    // it. See `xft_dpi`'s module doc.
     xft_dpi::ensure_xft_dpi();
     // The plugin trace lines a GUI pass reads exist only in a probe build, switched on from its environment before
     // any plugin page is made (a page built with the trace on also writes its console to stdout).
@@ -475,9 +478,10 @@ fn build_ui(
     let mut context_feed = owns_editor
         .then(eitri_core::editor_context::feed::EditorContextFeed::new)
         .flatten();
-    // Build the feed for nvim's `mapleader`, `timeoutlen`, and Normal-mode maps here.
-    // Its `child_env()` and `--cmd` must reach the editor pane's constructor;
-    // neither can be added to an already running child.
+    // The fourth push socket: nvim's `mapleader`, `timeoutlen`
+    // and Normal-mode maps, built here for the same reason the other three are -- its `child_env()`
+    // and `--cmd` must reach the editor pane's constructor, which cannot be handed to an already
+    // running child.
     let mut nvim_keys_feed = owns_editor
         .then(eitri_core::nvim_keys::feed::NvimKeysFeed::new)
         .flatten();
@@ -488,9 +492,9 @@ fn build_ui(
     let mut nvim_extra_args = theme_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default();
     nvim_extra_args.extend(context_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
     nvim_extra_args.extend(nvim_keys_feed.as_ref().map(|feed| feed.nvim_args()).unwrap_or_default());
-    // Load the navigation fallback from the pane-switch channel's directory so
-    // `Ctrl+h/j/k/l` can leave the editor without vim-tmux-navigator and from Visual mode.
-    // Only add it when the channel exists, since navigation needs its socket.
+    // The nav fallback's loader, from the pane-switch channel's own directory,
+    // so `Ctrl+h/j/k/l` leave the editor without vim-tmux-navigator and from Visual mode. Only
+    // where the channel exists, because leaving can only work where its socket does.
     nvim_extra_args.extend(pane_switch.as_ref().map(|ps| ps.nvim_args()).unwrap_or_default());
     // wire 3. Unconditional and stateless -- no socket, no directory, nothing to fail at startup --
     // because the only reload trigger a normal Neovim config installs is `FocusGained`, and nothing
@@ -773,15 +777,17 @@ fn build_ui(
         plugin_panels.set_follow_feed(socket.socket_path(), scratch_path.as_deref());
     }
 
-    // The bottom terminal starts hidden on first launch. Its shell starts when it is first shown
-    // through any route, via the change hook below. A terminal that is never shown starts no
-    // process and touches no font manager. Restoring a layout with the terminal shown starts it at
-    // launch.
+    // The bottom terminal is a module
+    // since the modules design. Hidden in a first launch, and
+    // its shell is not started until it is first shown, by any route (the change hook below): a
+    // window whose terminal is never shown starts no process, touches no font manager, and looks
+    // exactly as it did before the terminal existed. A layout that reopens with it shown starts it
+    // at launch.
     //
-    // Every terminal in the window has its own PTY and is stored in one registry by id. A killed
-    // instance's pane stays idle there for reuse by the same numbered instance, whose host the
-    // grid already holds under that id. New panes use the window's current colours, kept up to
-    // date by the theme listener below.
+    // Every terminal of the window -- the base one and each numbered instance, each with its own PTY --
+    // is in one registry keyed by its id. A killed instance's pane waits there, idle, and is reused
+    // only by a new instance of the same number, whose host the grid already holds under that id.
+    // New panes take the colours the window has now; the theme listener below keeps this current.
     let terminal_colors = Rc::new(std::cell::Cell::new(terminal::colors_from(
         &eitri_core::theme::ThemeTokens::fallback(),
     )));
@@ -802,11 +808,12 @@ fn build_ui(
         .borrow_mut()
         .take_or_make(&ModuleId::terminal(), || make_terminal_pane());
 
-    // The initial layout has `[editor | agent]` with the terminal hidden below both.
-    // Lua panels are placed by `position` in registration order (`terminal::initial_layout`,
-    // `Layout::initial`, `PanelSlot::placement`). Every window has editor, agent, and
-    // terminal modules outside the Lua registry, so Lua panels do not replace them.
-    // A Lua `bottom` panel goes below the terminal.
+    // The layout is data (the modules design):
+    // `[editor | agent]`, the terminal below both
+    // (hidden), then each Lua panel placed by its `position` in the order it was registered
+    // (`terminal::initial_layout`, `Layout::initial`, `PanelSlot::placement`). The editor, the agent
+    // and the terminal are not in the Lua registry at all: every window has all three, and a Lua
+    // panel no longer replaces any of them -- a Lua `bottom` panel goes under the terminal.
     let lua_panels: Vec<(ModuleId, PanelSlot, gtk4::Widget)> = {
         let panels = lua_engine.panels.borrow();
         panels
@@ -875,7 +882,7 @@ fn build_ui(
         .filter(|(id, _, _)| !deferred.contains(id))
         .filter_map(|(id, _, _)| plugin_panels.own_rule(id).map(|rule| (id.clone(), rule)))
         .collect();
-    // Each Lua panel's module key after `Ctrl+a`. A key that is reserved,
+    // Each Lua panel's module key after `Ctrl+a` (the modules design). A key that is reserved,
     // taken twice or not one character is a startup failure naming it, as `agent.font_size` is:
     // `init.lua`'s own errors are only logged, and a key that silently did nothing is the failure
     // this refuses.
@@ -937,7 +944,7 @@ fn build_ui(
             module_keys: module_keys.clone(),
         },
     );
-    // The layout this window opens with: this project's state file if
+    // The layout this window opens with (the modules design): this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
     // is state rather than config -- it is logged and the default opens.
@@ -1449,7 +1456,7 @@ fn build_ui(
         let bg = tokens.bg;
         (bg.r, bg.g, bg.b)
     };
-    // The panel's LIVE size: starts at the base and
+    // The panel's LIVE size (zoom-together design): starts at the base and
     // is kept current by `text_size_controller` below. `panel_tokens` reads this rather than the
     // captured `panel_font_size` so a colorscheme change re-derives every OTHER token but never
     // resets a zoom back to the un-zoomed base.
@@ -1741,7 +1748,7 @@ fn build_ui(
         }
     }
 
-    // The global `f` HINT. Three
+    // The global `f` HINT (`hint.rs`). Three
     // triggers reach the same toggle: `prefix f` (the keymap's `hint`, below), `f` on the top bar,
     // and `f` in the panel's BROWSE (the panel's `hint_request`).
     let hint_coordinator = hint::HintCoordinator::new(hint::HintWidgets {
@@ -1969,10 +1976,11 @@ fn build_ui(
         }));
     }
 
-    // A module key or tray chip focuses the oldest pending card in the chat if one
-    // waits (`focus_oldest_card`). Otherwise it enters BROWSE, like other keyboard
-    // arrivals. The page's `App.tsx` arrival effect selects the last row when the
-    // reader was following it, or restores the row and scroll position they left.
+    // Where the keys land after a module key or a tray chip. Into the agent: on its oldest pending
+    // card if one waits (`focus_oldest_card`), else BROWSE (this reverses
+    // 2026-09-19's behaviour, where the cursor only flashed in the input after Ctrl+l), as every keyboard arrival there does
+    // (the controller's `move_focus`) -- on the last row if the reader was following it, else on the row and scroll
+    // they left (decided 2026-09-29; the page decides, `App.tsx`'s `arrive` effect).
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
@@ -2203,11 +2211,13 @@ fn build_ui(
             Err(_) => true,
         }));
     }
-    // `show_on_screen` restores `id` where it was hidden and leaves keyboard focus
-    // where it is. Lua show calls and module keys for hidden modules use this path.
-    // End a zoom first if it would hide `id`, so a successful show puts it on screen.
-    // A plugin that starts hidden and is absent from this workspace opens through
-    // its own rule (`open_plugin_module`), leaving keyboard focus where it is.
+    // `show_on_screen`: shows `id` where it was hidden from, the keys staying where they are
+    // (`eitri.layout.show`, and the first half of `Ctrl+a <key>` on a hidden module). A zoom that
+    // would keep it off screen ends first, as `Ctrl+a e`/`a` have always ended it: a module shown is a
+    // module on screen (`show` used to log success and leave it behind
+    // the zoom).
+    // A plugin module that starts hidden and that this workspace does not hold yet is opened by its own
+    // rule, the keys left where they are (`open_plugin_module`).
     let show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
@@ -2865,11 +2875,11 @@ fn build_ui(
     // view then, whatever holds the keys by the time the message is read. Set and taken around that one
     // action only.
     let tab_verb_view: Rc<std::cell::Cell<Option<ViewId>>> = Rc::default();
-    // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
-    // same code, so behavior is shared across both routes. `keymap.ts` resolves the
-    // panel's `<leader>` bindings.
-    // In an extra chat view, `tabs::view_plan` chooses that view's own tab or the base
-    // view's tabs. Elsewhere, `tabs::plan` chooses the action.
+    // The prefix's own `Action::Tab` chord and the panel's own `tab_verb` messages (`<leader>`
+    // bindings `keymap.ts` resolves) run the same code, so a verb behaves the same
+    // whichever route sent it. With the keys in an extra chat view the
+    // extra-view table decides (`tabs::view_plan`): that view's own tab, or the base view's tabs;
+    // anywhere else `tabs::plan` does, as it always has.
     let run_tab_action: Rc<dyn Fn(TabAction)> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
@@ -3278,8 +3288,9 @@ fn build_ui(
                     give_keys(&chat);
                     agent.open_keymap(view, plugin, opening);
                 }
-                // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
-                // letters typed after the chord go into the entry instead of acting as panel keys.
+                // `prefix :`: tmux's `command-prompt`. The chat comes up with the
+                // keys and its `:` line opens, which runs nothing -- so the letters typed after the chord
+                // land in a box instead of running as panel keys.
                 Action::PanelCommandLine => {
                     // A chat view that holds the keys opens the line in its own page; from anywhere else it
                     // opens in the base view's, which takes the keys.
@@ -3302,8 +3313,10 @@ fn build_ui(
                     agent.open_command_line(view);
                 }
                 Action::WindowImmersive => window_modes.toggle_immersive(),
-                // `run_tab_action` is shared with the panel's `tab_verb` messages.
-                // It computes `keys_in` the same way `focused()` does here.
+                // The body that used to live here is `run_tab_action`,
+                // shared with the panel's own `tab_verb` messages. Unchanged
+                // behaviour -- `run_tab_action` computes its own `keys_in` the same `focused()`
+                // does here.
                 Action::Tab(tab_action) => run_tab_action(tab_action),
                 // i3's `move <dir>` with the keys on a float: it moves by `FLOAT_MOVE_CELLS` editor cells that
                 // way, as `M-arrow` resizes a tile. A tile's or a selected container's move is the controller's.
@@ -4078,13 +4091,14 @@ fn build_ui(
         }
     }
     window.connect_close_request(move |_window| {
-        // Confirm running tabs once, then let nvim handle unsaved buffers through `:confirm qall`, as
-        // for `prefix x`. The window closes when nvim exits
-        // (`editor_quit::EditorQuitting::window_close`). Proceed only once nvim is gone or never ran;
-        // refuse a close if nvim cannot be killed. A termination signal skips the prompts because
-        // nobody may be present to answer. Then `pane.shutdown()` ends nvim by closing stdin, sending
-        // SIGTERM and, after five seconds, SIGKILL by pid. It preserves swap files rather than using
-        // `:qa!`.
+        // A running tab is worth one y/n, and then
+        // nvim decides through its own `:confirm qall` -- the route `prefix x` on the editor takes --
+        // and the window closes when nvim exits (`editor_quit::EditorQuitting::window_close`).
+        // So this is reached only once nvim is gone or never ran -- never for an nvim that could not
+        // be killed (T6-1: the close is refused instead) -- except after a termination signal, which
+        // asks no one: nobody may be there to answer, and the process was told to end. Then
+        // `pane.shutdown()` below ends nvim itself, never with `:qa!` (stdin closed, SIGTERM, SIGKILL
+        // by its pid after five seconds), its swap files kept.
         if !ending_by_signal.get() && editor_quitting.window_close() == editor_quit::WindowClose::Wait {
             return glib::Propagation::Stop;
         }
@@ -4159,20 +4173,24 @@ fn build_ui(
         if let Some(socket) = &follow_socket {
             socket.cleanup();
         }
-        // Shut down any `AgentSession` started by the panel. If the mode-selector screen
-        // was never left, this is a no-op. The session's `Rc<RefCell<AgentPanelState>>`
-        // is otherwise held by internal closures that do not run on window close, so
-        // this call ensures settings backup restoration, hook socket cleanup, and child SIGTERM.
-        // The panel's `shutdown` starts teardown on workers and returns the remaining
-        // work. `hold_until_done` takes a `gio` application hold for it, so the panel's
-        // shutdown returns at once and the process stays alive after the window closes
-        // until teardown reports completion.
+        // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
+        // left the mode-selector screen) -- without this, a normal window close never runs
+        // `AgentSession::shutdown()` at all: the `Rc<RefCell<AgentPanelState>>` that owns the
+        // session is otherwise only reachable from closures internal to agent_panel.rs, none of
+        // which run on window close on their own. See `AgentPanelHandle`'s own doc for the full
+        // consequences (settings backup restore, hook socket cleanup, child SIGTERM) this closes.
+        // The panel does not block this thread waiting for its children: `shutdown` starts their
+        // teardowns on workers and returns what is left to wait for, and `hold_until_done` takes a
+        // `gio` application hold for it, so THE PANEL'S HALF returns at once and the process stays
+        // alive with no window on screen until the teardown reports. See `AgentPanelHandle::shutdown`.
         //
-        // `pane.shutdown()` above runs first on this thread and waits for nvim to exit.
-        // The close path waits for nvim's `:confirm qall` before reaching this handler,
-        // so nvim has already exited and that call returns at once. An nvim that cannot
-        // be killed refuses the close instead of reaching this handler.
-        // Plugins shut down with the window; the application waits up to the grace period.
+        // Not the whole handler, and the distinction matters to anyone debugging a slow close:
+        // `pane.shutdown()` above runs FIRST and on this thread, and it spins until nvim exits
+        // (`LiveHarness::shutdown` in the fork). nvim has already exited before it
+        // runs (the close waits for nvim's own `:confirm qall`, and an nvim that cannot be killed
+        // refuses the close rather than reaching here), so it returns at once. Named because three
+        // consecutive reviews of this path died on a comment that over-claimed.
+        // Every plugin task ends with the window; the application waits for them, at most the grace.
         plugin_panels.shutdown(&app_for_close);
         agent_panel::hold_until_done(&app_for_close, agent_panel_handle.shutdown());
         // `lua_engine` is otherwise unused past this point in this task, but referencing it
@@ -5214,9 +5232,10 @@ mod tests {
         found
     }
 
-    /// Register every accelerator through the core keymap. An accelerator literal in
-    /// `shell/src` bypasses the keymap and its check against `Ctrl+Shift` bindings.
-    /// Exercise `is_accel` directly so a broken scanner cannot make this test pass.
+    /// Every accelerator is registered from `eitri_core::keymap::root`, so an
+    /// accelerator-shaped literal anywhere in `shell/src` is one registered around the keymap --
+    /// and one the no-`Ctrl+Shift` check in core never saw. `is_accel` is exercised directly, so
+    /// this cannot pass because the scanner went blind.
     #[test]
     fn shell_src_writes_no_accelerator_literal() {
         sources();

@@ -1,94 +1,90 @@
-//! These tests exercise BROWSE's VISUAL mode and copying through the DOM `Selection.modify` API
-//! in the real WebKitGTK used by `shell`. jsdom has no `Selection.modify`.
-//! Compile without running with `cargo test -p shell --test panel_visual_mode --no-run`.
-//! Run GUI tests one at a time with:
+//! Tests BROWSE's CARET, VISUAL, and V-LINE modes against the real WebKitGTK engine linked
+//! by `shell`. jsdom lacks `Selection.modify`, so these checks require a real WebView.
+//! Compile with `cargo test -p shell --test panel_visual_mode --no-run`. Run with:
 //!
 //!     cargo test -p shell --test panel_visual_mode -- --ignored
 //!
-//! The harness starts its own X server through `support/own_x_server.rs` and ignores inherited
-//! `DISPLAY` and `WAYLAND_DISPLAY`. Checking only `GDK_BACKEND=x11` could accept a desktop's
-//! XWayland display and send input or clipboard writes to the real desktop.
-//! `Xvfb -displayfd` selects a free display number. GDK must open that display, and every
-//! `xdotool` command receives it explicitly. The captured server pid is used for cleanup.
-//! The shared server helper disables TCP and Unix socket listeners. Without `-nolisten unix`,
-//! a server in a separate network namespace could unlink the desktop's `/tmp/.X11-unix/X0`.
-//! Running under `xvfb-run` is unnecessary because its display is ignored too.
+//! The harness starts its own X server through `support/own_x_server.rs`, discards inherited
+//! `DISPLAY` and `WAYLAND_DISPLAY`, verifies GDK opened that display, and passes it explicitly
+//! to every `xdotool` invocation. It stops the server using the captured pid. An outer
+//! `xvfb-run` display is ignored. Checking `GDK_BACKEND=x11` alone would also accept XWayland
+//! on the desktop, where test input and clipboard writes could affect the running session.
+//! Disabling Unix socket listening also prevents a server in a separate network namespace
+//! from unlinking the desktop's `/tmp/.X11-unix/X0` socket.
 //!
-//! No window manager runs on this server. `xdotool windowactivate` aborts when
-//! `_NET_ACTIVE_WINDOW` is unsupported, stopping chained keys. `Harness::focus` instead uses
-//! `windowfocus` (`XSetInputFocus`) and verifies the result with `getwindowfocus`.
-//! Keys, text and clicks have no window argument so libxdo uses XTEST to send trusted input
-//! to the focused window. GTK4's XInput2 path need not deliver synthetic `XSendEvent` input.
-//! Before any case runs, a real key must reach the page as a trusted `KeyboardEvent`.
-//! Failure is reported as a harness failure for that window.
-//! A plain `main` with `harness = false` lets GTK own the main thread.
+//! No window manager runs on this server. `xdotool windowactivate` requires `_NET_ACTIVE_WINDOW`
+//! and would abort chained keys. `Harness::focus` instead uses `windowfocus` and `XSetInputFocus`,
+//! then checks `getwindowfocus`. Keys, text, and clicks omit a window argument so libxdo uses
+//! XTEST to send trusted events to the focused window. GTK4's XInput2 path need not deliver
+//! synthetic `XSendEvent` input. W0 verifies that a trusted `KeyboardEvent` reaches the page;
+//! failure marks every case in that window as a harness failure.
+//! A plain `main` (`harness = false`) keeps GTK on the main thread.
 //!
-//! The page loads with `PANEL_BASE_URI`. An opaque origin from `load_html(.., None)` has no
-//! `navigator.clipboard` in WebKitGTK. The constant is duplicated because `shell` has no library
-//! target exposing it; `panel_base_uri_matches_product` checks it against `panel_document.rs`.
-//! Copies are read back through GDK's `Clipboard`. Flash text and wrapped `writeText` calls
-//! cannot prove the clipboard changed. Trusted input supplies the user activation that
-//! `navigator.clipboard.writeText` may require.
-//! `Harness::posted` and `posted_type` capture page messages, including unexpected
-//! `permission_response` messages while selecting text. `clear_clipboard` and
-//! `read_fresh_clipboard` use a sentinel so stale contents cannot pass a failed copy.
+//! The document loads with `PANEL_BASE_URI`. An opaque origin from `load_html(.., None)` has
+//! no `navigator.clipboard` in WebKitGTK. The constant is duplicated because `shell` has no
+//! `[lib]` target through which an integration test can import it; `panel_base_uri_matches_product`
+//! checks it against the product source. Copies are read back from GDK's `Clipboard`, so a flash
+//! message or wrapped `writeText` cannot stand in for an actual copy. Real XTEST keys provide
+//! trusted input; script-dispatched keys may lack the activation needed by `writeText`.
+//! `Harness::posted` and `posted_type` capture messages, including any unexpected
+//! `permission_response`. `clear_clipboard` and `read_fresh_clipboard` use a sentinel so a failed
+//! copy cannot pass by returning stale text.
 //!
-//! Each zoom level, 1.0 and 1.5, has a main window and a fixtures window.
-//! The main transcript has an English prompt, a reply with a Chinese paragraph, code and a
-//! 2x2 table, a waiting `Edit` card, and a `Bash` result taller than its 260px fold.
-//! The card precedes the tool call so copying into the next row crosses the card's controls.
-//! Fixtures include code-only and table-only replies and a 300-paragraph reply.
-//! Plain `v` or `V` starts at the first character of a code-only or table-only row.
+//! Each replay has one window at each zoom, 1.0 and 1.5. The main replay contains an English
+//! prompt, a reply with a Chinese paragraph, a fenced code block and a table, a waiting `Edit`
+//! card, and a `Bash` call with output exceeding the 260px fold. The card precedes the tool row
+//! so selection can cross its controls. The fixtures replay has separate code-only, table-only,
+//! and 300-paragraph replies. A plain `v` or `V` starts at a block's or table's first character.
+//! From BROWSE, `v` starts CARET with one character selected. A second `v` starts VISUAL.
+//! `V` starts V-LINE directly.
 //!
-//! From BROWSE, `v` enters CARET with a one-character selection; a second `v` enters VISUAL.
-//! `V` enters V-LINE directly. The cases cover the following behavior.
 //! W0 checks trusted key delivery in both windows. W1 checks that `Selection.modify` and
-//! `caretRangeFromPoint` exist on the non-editable page.
-//! W2 exercises `vvey`, `vvwey`, `vv2ey` and `vvwwy` on the English prompt. The Chinese word-copy
-//! result is printed without an assertion that it matches Vim exactly. `w`, `e` and `b` now use
-//! Vim's word rules. The Chinese-copy case has not been rerun since that change.
-//! W3 checks that `Vjy` and `vVjy` copy both prompt and reply text without the prompt marker
-//! or button labels.
-//! W4 checks that `vv$y` copies one code line and `Vjy` copies two with one newline and no
-//! highlight.js residue. It uses both the code-only fixture and a HINT landing in the main reply.
-//! The harness sends `hint_collect`, receives `hint_targets`, then sends `hint_land {index}`.
-//! It tries indices and inspects the copied text to locate the code block.
-//! W5 checks `Vjjy` across the table-only reply, with tabs between cells and newlines between rows.
-//! The exact string is printed and pinned in `W5_PINNED` on the first run.
-//! `Selection.modify(..., "line")` does not cross table rows in WebKitGTK 2.52.6.
-//! `visual.ts` uses `stepByLinePoint` to probe above or below the caret at the goal column until
-//! `caretRangeFromPoint` resolves beyond the starting rectangle. This also crosses structured
-//! permission cards and reaches the end of long transcripts.
-//! W6 searches for the tool-output row and presses `Enter` to draw its folded result.
-//! After `V` and each of 40 `j` keys, the caret stays within the box's and list's visible rectangles.
-//! The copy includes the invocation through "build line 040", excluding line 041.
-//! W7 searches for the waiting `Edit` card, fills its reason box, then uses `V` and five `j` keys
-//! to cross the diff and controls into the Bash row. The copy includes the heading, file and diff
-//! lines, excluding button labels, reason text, placeholder text and diff gutter signs.
-//! Geometry-based stepping reaches the diff and following row at both zoom levels.
-//! In both CARET and VISUAL, `d`, `a` and `Shift+D` post no `permission_response`.
-//! Clicking the reason box returns to BROWSE, and the following Enter denies.
-//! The click converts CSS pixels to X pixels using the page's measured ratio; at zoom 1.5,
-//! one CSS pixel spans 1.5 widget pixels.
+//! `caretRangeFromPoint` exist in the non-editable page.
+//! W2 checks `vvey`, `vvwey`, `vv2ey`, and `vvwwy` on the English prompt with inclusive selection.
+//! The copied word from the Chinese paragraph is logged without an exact boundary assertion.
+//! Word motions `w`, `e`, and `b` follow vim's word rules; the Chinese result has not been
+//! checked again since that change.
+//! W3 checks that `Vjy` copies both prompt and reply without the prompt marker or button labels.
+//! Entering through CARET with `vVjy` must copy the same text.
+//! W4 checks exact code text: `vv$y` copies one line and `Vjy` copies two with one newline and
+//! no highlight.js residue. It checks both the code-only reply and a code block reached by HINT.
+//! The harness sends `hint_collect`, reads `hint_targets`, and sends `hint_land {index}`,
+//! trying indexes and checking the copied text to find the block. This needs no GTK-side
+//! `HintCoordinator`.
+//! W5 checks `Vjjy` across the table-only reply, with tab-separated cells and newline-separated
+//! rows. The exact string is printed and pinned in `W5_PINNED`. WebKitGTK 2.52.6's
+//! `Selection.modify(..., "line")` cannot cross a table row boundary. `visual.ts` uses
+//! `stepByLinePoint` to probe at the goal column until `caretRangeFromPoint` lands beyond the
+//! starting rect, allowing `j` and `k` to cross table rows and structured permission cards.
+//! W6 searches for the tool-output row and presses Enter to render the folded result. After
+//! `V` and 40 `j` steps, the caret must remain within the visible tool box and list after every
+//! key. The copy includes the invocation through "build line 040", excluding line 041.
+//! W7 searches for the waiting `Edit` card, fills its reason box, and uses `V` and five `j`
+//! steps to cross the diff and controls into the next row. The copy includes the heading,
+//! filename, and both diff lines. It excludes button labels, reason text and placeholder, and
+//! diff gutter signs. `stepByLinePoint` makes these steps cross the structured content at both
+//! zooms. In CARET and VISUAL, `d`, `a`, and `Shift+D` must post no `permission_response`.
+//! A real click in the reason box returns to BROWSE, where Enter denies. Click coordinates use
+//! the page's measured CSS-to-X pixel ratio; at zoom 1.5 one CSS pixel is 1.5 widget pixels.
 //! W8 checks that `v v l Esc` returns to CARET with one character selected at the moving end.
-//! A second `Esc` clears the selection and shows BROWSE; `y` then copies the row.
-//! W9 starts CARET with `G v`, moves with `l`, then enters VISUAL with `v` and moves with `e e`
-//! while a reply streams in 40 `events` envelopes about 33ms apart. Selection anchor and reply
-//! DOM nodes stay identical after every delta. Copying produces text, and the reply retains
-//! all streamed text after `Esc`.
-//! W10 checks `vv3w` equals `vvwww`. On the long fixture it times `9999l`, `9999j` and copying
-//! the resulting selection from keydown to keyup. Times are printed; only a 60-second hang
-//! guard is asserted. Geometry-based stepping lets `9999j` reach the transcript's actual end.
+//! A second Esc clears the selection and shows BROWSE; `y` then copies the row.
+//! W9 uses `G v l v e e` in a reply streamed through 40 `events` envelopes about 33ms apart.
+//! The anchor node and reply DOM node must stay identical after each delta. Copying must yield
+//! text, and leaving selection must preserve the reply built by all deltas.
+//! W10 compares `vv3w` with `vvwww`. On the long transcript it times `9999l`, `9999j`, and
+//! copying the resulting large selection from keydown to keyup in the page. Timings are printed
+//! with only a 60s hang guard. Geometry-based stepping reaches the actual transcript end where
+//! repeated `Selection.modify(..., "line")` steps could stop early.
 //! W11 checks one-character CARET selections after `l`, `w`, `$`, `j` across a row boundary,
-//! `gg`, `G` and `3w`. The list has `data-visual="caret"`; `Esc` puts `.row-current` on the
-//! caret's row and shows BROWSE.
-//! W12 checks that `v v w e >` inserts quoted text into the composer, focuses it, places the
-//! caret at its end and posts one `draft` without sending. A second `V j >` appends a quote
-//! with blank paragraphs preserved. Existing composer text is separated from the quote by
-//! a blank line. A selection extended backward from the reply to the prompt with `gg` moves
-//! `.row-current` to the selection's start on the prompt row.
-//! W13 checks a table row taller than 200px with a short cell beside a wrapped cell.
-//! When pixel probing exhausts its budget, DOM position lets `j` reach the next row.
+//! `gg`, `G`, and `3w`. The list carries `data-visual="caret"`. Esc puts `.row-current` on the
+//! caret's row and returns the band to BROWSE.
+//! W12 checks that `v v w e >` puts `> The quick\n\n` in the focused composer, places its caret
+//! at the end, posts one `draft`, and sends nothing. A second quote over two paragraphs preserves
+//! the intervening blank line and appends a quoted region. Existing `hello` text is followed by
+//! `\n\n` before the quote. Extending a reply selection backward with `gg` moves `.row-current`
+//! to the prompt row at the selection's start.
+//! W13 checks a table row over 200px tall due to a wrapping neighbouring cell. When the pixel
+//! probe exhausts its budget, `j` uses DOM position to reach the next row from a short cell.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -124,8 +120,9 @@ const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 /// `Harness::clear_clipboard`'s own marker: a string no real copy in this replay could ever produce.
 const CLIPBOARD_SENTINEL: &str = "\u{2039}panel_visual_mode: cleared before this case\u{203a}";
 
-/// The exact table toString() output from WebKitGTK 2.52.6 at both zoom levels.
-/// V-LINE includes whole table rows, including every cell in the last row.
+/// W5's exact `toString()` of the table (pinned on first run), as
+/// WebKitGTK 2.52.6 printed it at both zooms once V-LINE took whole table rows (before
+/// that the last row stopped at its first cell, "3").
 const W5_PINNED: Option<&str> = Some("a\tb\n1\t2\n3\t4");
 
 /// The document `shell/src/agent_panel.rs` embeds, byte for byte.
@@ -406,11 +403,14 @@ impl Harness {
         pump(60);
     }
 
-    /// Sends a real left click at a point in page CSS pixels from getBoundingClientRect.
-    /// Zoom and DPI scaling make CSS pixels differ from X pixels. The conversion measures the
-    /// WebView's widget width divided by the page's innerWidth, then applies the WebView's origin
-    /// in the window, the window's surface_transform offset and GDK's integer scale.
-    /// This keeps clicks on the reason box at zoom 1.5 and with client-side decorations.
+    /// A real left click at a point given in the page's own CSS px (`getBoundingClientRect`).
+    ///
+    /// CSS px are not X px. `set_zoom_level(1.5)` (and WebKit's own
+    /// `gtk-xft-dpi` zoom, `shell/src/webkit_zoom.rs`) make one CSS px several widget px, so the
+    /// first version's straight copy clicked beside the reason box at zoom 1.5. The ratio is
+    /// measured, not assumed: the WebView's width in widget px over the page's `innerWidth` in CSS
+    /// px. Then the WebView's origin inside the window, the window's offset inside its X surface
+    /// (`surface_transform`, non-zero only with client-side decorations), and GDK's integer scale.
     fn click_css(&self, css_x: f64, css_y: f64) -> Result<(), String> {
         let inner_width = self
             .eval("JSON.stringify(window.innerWidth)", 1000)?
@@ -686,7 +686,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
         },
         None,
     );
-    // Harness setup: a real launch's `TabSet`
+    // A real launch's `TabSet`
     // always sends a `tabs` envelope before the active tab's own snapshot (`agent_bridge.rs`'s own
     // doc comment on `serialize_tabs_for_js`: "always BEFORE the active tab's snapshot"), because
     // `tabs.ts`'s `acceptsEnvelope` drops a snapshot for a tab the page does not know about yet
@@ -719,7 +719,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
     ]
 }
 
-/// The main replay.
+/// The main replay .
 fn replay_main() -> Vec<String> {
     let mut projection = opened_projection();
     let turn_id = "t1".to_string();
@@ -735,8 +735,9 @@ fn replay_main() -> Vec<String> {
             kind: ContentKind::Text,
             text: reply_markdown(),
         },
-        // Put the card before Bash so the selection crosses its reason box and buttons into another row.
-        // This makes the check that controls are excluded from the copy exercise those controls.
+        // The card comes BEFORE the Bash call, so a row follows it -- W7's copy has to cross
+        // the card's own controls (its reason box and buttons) for "none of them reached the copy"
+        // to be a claim at all. As the last row, nothing could follow them into a selection.
         AgentDomainEvent::PermissionRequested {
             permission_id: "perm_edit".into(),
             tool_use_id: Some("toolu_edit".into()),
@@ -774,9 +775,11 @@ fn replay_main() -> Vec<String> {
     on_ready_batch(&projection)
 }
 
-/// Replays alternating prompts and code-only, table-only, tall-row table and long replies.
-/// From gg, 1, 3, 5 or 7 j motions reach those replies respectively.
-/// The long reply stays last so 9999j must reach paragraph 300 at the transcript's end.
+/// The fixtures replay (a 4th turn is inserted BEFORE the long reply
+/// so W10's own "9999j reaches paragraph 300" stays the transcript's real end): rows `[prompt,
+/// code-only reply, prompt, table-only reply, prompt, tall-row table reply, prompt, long reply]`, so
+/// `gg` then 1 / 3 / 5 / 7 `j` reach the code, the table, W13's own wrapped-cell table and the long
+/// reply.
 fn replay_fixtures() -> Vec<String> {
     let mut projection = opened_projection();
     for event in finished_turn("tc", "code please", code_block_markdown())
@@ -1364,9 +1367,11 @@ fn w4_code_block_after_hint(h: &Harness) -> Result<(), String> {
     })
 }
 
-/// Copies the table-only reply with Vjjy from the header's first cell through both body rows.
-/// Each copied line must contain a whole row with tab-separated cells. V-LINE uses tableRowEdge
-/// because paragraphboundary alone stops at a cell. W5_PINNED holds the exact copied string.
+/// W5 on the fixtures' table-only reply: `V` starts on the header's first cell, `jj` walks two rows
+/// down. Structurally: the first line is the header's cells, tab-separated, the second the first
+/// body row's, and the third the second body row's, whole. Inside a table V-LINE's hard
+/// line is the ROW (`visual.ts`'s `tableRowEdge`); `paragraphboundary` alone stopped at the cell, and
+/// this case used to accept a third line of just "3". The exact string is pinned in `W5_PINNED`.
 fn w5_table(h: &Harness) -> Result<(), String> {
     h.clear_clipboard();
     h.xdotool_keys(&["g", "g", "j", "j", "j", "V", "j", "j", "y"]);
@@ -1399,13 +1404,16 @@ fn w5_table(h: &Harness) -> Result<(), String> {
     Ok(())
 }
 
-/// Searches for tool output and unfolds it with Enter before starting V-LINE.
-/// Finished results are folded by default, and search matches their text without drawing it.
-/// After every j, the caret must lie inside the visible rectangles of both the tool box and list.
-/// The copy includes the starting line and the line reached by 40 j motions, excluding the next.
-/// When the row's top is visible, V starts on the invocation line, so the last line is build line 040.
-/// If the top is offscreen, the expectation starts at the first output line under the list's top edge.
-/// App.test.tsx exercises the same keys with a hard-line Selection.modify stub.
+/// Search reaches a folded tool-output row, so `Enter` must unfold it before selection.
+/// `MessageList` draws the result only when `expanded[key] === true`; search can match text
+/// that is still folded.
+///
+/// After each `j`, the caret must lie inside both the tool-result box and the list's visible
+/// rectangles. V-LINE copies from its starting line through the line reached by 40 `j` motions,
+/// excluding the next line. When the row's top is visible, `V` starts on `$ cat build.log`, so
+/// the last copied line is "build line 040". Otherwise it starts on the first output line under
+/// the list's top edge, and the expectation is read from there. The DOM-based test in
+/// `agent-ui/web/src/App.test.tsx` uses the same keys with a hard-line `modify` stub.
 fn w6_tall_tool_output(h: &Harness) -> Result<(), String> {
     search(h, "build line 001");
     let folded = h.eval(
@@ -1647,8 +1655,8 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
             ));
         }
     }
-    // The a, d and Shift+D keys must post no permission_response in CARET or VISUAL.
-    // Exercise both v followed by a key and v v followed by a key; both modes share capture handling.
+    // `a`, `d`, and `Shift+D` must post no permission answer in CARET or VISUAL. The
+    // capture-phase key handler applies in both modes.
     for keys in [
         vec!["v", "d"],
         vec!["v", "a"],
@@ -1673,8 +1681,8 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     }
     println!("[panel_visual_mode] W7: v/vv then a/d/D posted no permission_response, in CARET and in VISUAL");
 
-    // A plain v enters CARET. A real click in the reason box returns to BROWSE immediately,
-    // and Enter then denies the request.
+    // v, then a real click into the reason box: BROWSE at once, and the Enter
+    // that follows denies as the box says. A plain `v` starts CARET, not VISUAL.
     to_card(h);
     h.xdotool_key("v");
     if h.mode()?.as_str() != Some("caret") {
@@ -1721,8 +1729,9 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     }
 }
 
-/// The sequence v v l Escape returns from VISUAL to CARET with one character selected
-/// at the moving end. A second Escape returns to BROWSE with nothing selected.
+/// `v v l Escape` enters CARET, enters VISUAL, moves once, then returns to CARET with one
+/// character selected at the moving end. A second `Esc` returns to BROWSE with nothing
+/// selected.
 fn w8_escape(h: &Harness) -> Result<(), String> {
     h.xdotool_keys(&["g", "g", "v", "v", "l", "Escape"]);
     let mode = h.mode()?;
@@ -1765,8 +1774,9 @@ fn w8_escape(h: &Harness) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts CARET in the streaming reply with v and moves with l before a second v enters VISUAL.
-/// The e e motions then extend the selection while deltas arrive.
+/// `v` alone only starts CARET, so W9 starts there and moves (`l`) before the
+/// SECOND `v` switches to VISUAL for `e e` over the deltas (W9 starts
+/// CARET in the streaming reply, moves, then `v e e` over the deltas).
 fn w9_streaming(h: &Harness) -> Result<(), String> {
     let reply = streaming_reply_steps();
     evaluate_js_dispatch(&h.webview, &reply.setup);
@@ -1888,9 +1898,9 @@ fn w10_long_transcript_timing(h: &Harness) -> Result<(), String> {
             ));
         }
         if motion == "j" {
-            // At zoom 1.5 the goal column can land two characters into a paragraph, and all start with "par".
-            // A prefix check alone cannot identify paragraph 300. Require paragraph 299 in full,
-            // then a final segment that is a prefix of paragraph 300.
+            // A prefix check alone could not tell paragraph 300 from any
+            // other at zoom 1.5, where the goal column lands two characters in and every paragraph
+            // starts "par". The copy must hold paragraph 299 whole, and end in a prefix of 300.
             let second_last_full = format!(
                 "para {:03}: the quick brown fox jumps over the lazy dog",
                 LONG_PARAGRAPHS - 1
@@ -1987,13 +1997,13 @@ fn caret_info(h: &Harness) -> Result<CaretInfo, String> {
     })
 }
 
-/// Checks the exact character selected after each CARET motion, as well as its length.
-/// From gg v on "The quick brown fox jumps over the lazy dog", v selects T, l selects h,
-/// w selects q, $ selects the final g or its line break, gg selects T and 3w selects f in fox.
-/// G must select the last selectable character with both ends inside the list; a length check
-/// alone could accept a newline outside it. The sequence gg j crosses into the reply row.
-/// The list keeps data-visual="caret" throughout. Esc puts .row-current on the caret's row
-/// and returns the mode band to BROWSE.
+/// Check the expected character as well as the one-character selection after every motion. On
+/// "The quick brown fox jumps over the lazy dog", `gg v` selects "T", `l` selects "h", `w`
+/// selects "q", and `$` selects the line break or final "g". `gg` returns to "T" and `3w`
+/// reaches the "f" of "fox". `G` selects the list's last character with both selection ends
+/// inside the list, excluding the following newline. `gg j` crosses into the reply.
+/// `data-visual="caret"` holds throughout; `Esc` moves `.row-current` to the caret's row and
+/// returns the band to BROWSE.
 fn w11_caret_motions(h: &Harness) -> Result<(), String> {
     h.xdotool_keys(&["g", "g", "v"]);
     if h.mode()?.as_str() != Some("caret") {
@@ -2297,10 +2307,10 @@ fn w12_quote(h: &Harness) -> Result<(), String> {
         "[panel_visual_mode] W12: v v w e > quoted \"The quick\", posted exactly one matching draft, sent nothing"
     );
 
-    // Quote the reply's Chinese paragraph and the code block's first line with V j >.
-    // Their toString() output has a blank line between them, which becomes a bare > line
-    // so the quote stays one blockquote. Prompt and reply rows have only one newline between
-    // them and would not exercise the blank-line marker.
+    // The second `V j >` spans the reply's Chinese paragraph and the code block's first line.
+    // `toString()` inserts a blank line between the paragraph and the block. Quoting turns that
+    // blank into a bare `>` line to keep one blockquote. A selection across the prompt and
+    // reply joins with only one newline and would not exercise this case.
     h.xdotool_key("Escape"); // back to BROWSE
     h.clear_posted();
     h.xdotool_keys(&["g", "g", "j", "V", "j", "greater"]);
@@ -2323,8 +2333,8 @@ fn w12_quote(h: &Harness) -> Result<(), String> {
             "W12: the second quote should start with the reply's paragraph as its own line: {appended:?}"
         ));
     }
-    // The blank line between the paragraph and code block becomes a bare > line.
-    // This keeps the quote in one blockquote and prevents lazy continuation into it.
+    // The blank line between the two paragraphs is a bare `>` line, so the quote stays
+    // one blockquote rather than two, and nothing lazily continues into it.
     let Some((_, after_blank)) = appended.split_once("\n>\n") else {
         return Err(format!(
             "W12: the blank line between the paragraph and the block below it should be a bare \">\" line: {appended:?}"
@@ -2354,10 +2364,11 @@ fn w12_quote(h: &Harness) -> Result<(), String> {
     }
     println!("[panel_visual_mode] W12: with \"hello\" typed first, the quote followed it: {third:?}");
 
-    // Quoting with > must move the row cursor to the selection's start row.
-    // Start on the reply row and extend VISUAL backward with gg to the prompt row.
-    // Nothing else moves the BROWSE cursor during the selection, so leaving landCursorOnRowKey
-    // as a no-op in vquote would leave .row-current on the reply row and fail this check.
+    // `>` must move the row cursor to the selection's start row. Start BROWSE on the reply
+    // (`row-assistant`), then extend VISUAL backward with `gg` to the prompt (`row-prompt`).
+    // The selection starts on the opposite row from the initial BROWSE cursor. If
+    // `landCursorOnRowKey` did nothing in the `vquote` arm, `.row-current` would remain on the
+    // reply because nothing else moves the BROWSE cursor during the region.
     h.xdotool_key("Escape"); // back to BROWSE, from the composer left open by the check above
     h.xdotool_keys(&["g", "g", "j"]); // BROWSE: onto the reply row
     let on_reply = h.eval(
@@ -2548,12 +2559,16 @@ fn main() {
         println!("panel_visual_mode: ignored (drives a real WebKitGTK WebView); run with `-- --ignored`");
         return;
     }
-    // The harness starts its own X server, ignores inherited displays and checks GDK's connection.
-    // It uses GTK's built-in input method. A session input method can route keys asynchronously
-    // over D-Bus, leaving search Return pending when the next v arrives, or compose letters
-    // instead of typing them. init_gtk configures both the display and input method.
+    // The harness refuses a DISPLAY it did not start -- so it starts one, and nothing below
+    // ever reads the inherited one. GTK's own built-in input method, never the one the desktop session
+    // names: an inherited `GTK_IM_MODULE=fcitx` routed every key of this window through
+    // the session's live fcitx5 daemon over the session bus -- asynchronously, so a `/` search's `Return`
+    // still sat in flight when the next key arrived (W6/W7 failed intermittently, about one run in
+    // three, with the search prompt still open and the following `v` typed into it), and with the
+    // session's rime switched on a letter would have been composed, not typed. The IME half is the GUI
+    // pass's. `init_gtk` sets both, and refuses unless GDK opened this server's display.
     let server = own_x_server::init_gtk("panel_visual_mode", "1280x900x24");
-    // After `init_gtk`, not before: the probe then inherits this test's own
+    // After `init_gtk`, not before (since 2026-09-29): the probe then inherits this test's own
     // display and no other. Today's `xdotool version` connects to nothing, but a release that opens its
     // display before reading the subcommand would otherwise have reached the session's.
     if Command::new("xdotool").arg("version").output().is_err() {

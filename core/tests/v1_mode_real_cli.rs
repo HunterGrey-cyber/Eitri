@@ -1,11 +1,11 @@
 //! Real-CLI probes of host-answered bypass. Ignored by default because these spawn real
 //! Claude sessions and bill the account they run as.
 //!
-//! **Run only on a dedicated test account, through the resolved binary, with a scratch state home:**
+//! **Run only on the TEST profile, through the resolved binary, with a scratch state home:**
 //!
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
-//! XDG_STATE_HOME=$HOME/.cache/nv-v1-mode/state \
+//! XDG_STATE_HOME=$HOME/.cache/nv-v1mode-t5/state \
 //!     cargo test -p eitri-core --test v1_mode_real_cli -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -17,7 +17,8 @@
 //! `cargo test` invocation, or the legacy arms fail with "agent-hook binary not found" before any
 //! turn runs.
 //!
-//! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
+//! The test-account wrapper sets `VERDANDI_CLAUDE_CLI_PATH` to the `claude-wrapper` launcher, which
+//! selects the sidecar's CLI. PATH alone does not select it.
 //!
 //! Bypass means the host answers `allow` while the CLI stays gated, never `bypassPermissions`
 //! on the wire. Tests 1/1b/2/6 require answered requests to stay out of panel delivery, their
@@ -33,22 +34,22 @@
 //! in-project `Write` `allow` through the acceptEdits fast path, and says so only as a note on the
 //! call's row (`autoNotes` in the panel's payload; `events_from_payload` turns each note into an
 //! `answered_for_you` event). A test that needs a card in an Auto tab therefore uses a call both
-//! backends card (a project `permissions.ask` rule, or a path outside the project), and the tests
+//! worlds card -- a project `permissions.ask` rule, or a path outside the project -- and the tests
 //! about "nothing runs ungated" accept an answer the host gave itself ([`GateTrace`]) as proof that
-//! the gate saw the call.
-//! A card an ask rule forces is a card of its own in an Auto tab, and so is one that explains
-//! nothing, which is how a content-scoped ask rule reaches the host on CLI 2.1.288; bypass approves
-//! both, on entering it and in a bypass tab (test 6a). A waiting card the host's own policy raised,
-//! which only legacy does, is test 6b.
+//! the gate saw the call, where they used to look only for a card. A card an ask rule forces is a card
+//! of its own in an Auto tab, and so is one that explains nothing, which is how a content-scoped ask
+//! rule reaches the host on CLI 2.1.288; bypass approves both, on entering it and in a bypass tab
+//! (test 6a). A waiting card the host's own policy raised, which only legacy does, is test 6b.
 //!
-//! Test 7 asks whether a `PreToolUse` hook that answers `ask` with a reason is answered by the host
-//! on the strength of the gate card the human approved for the same call. Measured on CLI 2.1.292: on
-//! the sidecar there is no gate card (an Auto tab defers) and the CLI's prompt for the hook is a card;
-//! on legacy the CLI refuses the call headlessly with the hook's reason and no prompt arrives. The
-//! hook goes in the trusted project tier so the test never edits the user's own settings file.
+//! Test 7 asks whether a `PreToolUse` hook that answers `ask` with a reason is answered by the host on the strength
+//! of the gate card the human approved for the same call. Measured on CLI 2.1.292: on the sidecar there is no gate card
+//! (an Auto tab defers) and the CLI's prompt for the hook is a card; on legacy the CLI refuses the call headlessly with the
+//! hook's reason and no prompt arrives. The hook is in the trusted project tier because the test profile's user settings
+//! file is a link to a shared one a test must not edit.
 //!
-//! Test 8 is Manual mode on a sidecar whose CLI runs its own `auto`: a real in-project `Write` must be
-//! the gate's own card, neither answered by the host nor deferred. Passed on CLI 2.1.293.
+//! Test 8 is Manual mode on a sidecar whose CLI runs its own `auto`: a real in-project `Write` must be a
+//! card of the gate's own, with no host answer a deferral. Passed 2026-10-14 on CLI 2.1.293 (TEST profile,
+//! a protocol 3.14 sidecar).
 //!
 //! A run that misses the behavior being measured fails as INCONCLUSIVE. Test 1b needs exactly
 //! five Reads paired with their resolutions by id; test 3 requires an `Agent`/`Task` call and
@@ -1537,21 +1538,25 @@ fn a_subagent_tool_call_reaches_the_host_on_legacy() {
     a_subagent_tool_call_reaches_the_host_on(BackendKind::Legacy, "subagent-legacy");
 }
 
-/// Writes into `.claude/` and `.git/` inside a real git repository. The CLI's sensitive-file
-/// check can ask after the gate allows a call; `bypassPermissions` runs these writes.
-/// The sidecar routes that prompt to the host through `provider_permission_prompts`.
+/// Test 4 writes into `.claude/` and `.git/` inside a real git repository. The CLI's sensitive-file
+/// check can ask after the gate allows a call; a real `bypassPermissions` session runs these.
+/// Sidecars that advertise `provider_permission_prompts` route that prompt to the host via `provider_permission_prompts`.
 ///
-/// In bypass both writes must succeed without a card: files exist, tool results are not
-/// errors, and no permission request reaches the panel.
-/// In Auto, the outcome for `.git/probe2` depends on who answers the gate. With CLI `auto`,
-/// the host defers without a card and the gate resolves `deferred`. Print the classifier's
-/// write decision without asserting it. When the host policy answers instead, approve the
-/// single gate card through `TabSet::answer_card`. The host answers the CLI prompt without
-/// a second card. At least one allowed resolution must name a permission id never delivered
-/// to the panel, proving that the prompt was handled. A write with neither a card nor a
-/// host answer would have bypassed the gate.
+/// - In bypass both writes succeed without a card: the file exists, the tool result is not an
+///   error, and no permission request reaches the panel.
+/// - In Auto, the outcome of writing `.git/probe2` depends on who answers the gate.
+///   On a sidecar whose CLI runs its own `auto` the host defers: no card is drawn, the gate request
+///   resolves `deferred`, and the CLI's classifier decides whether the write runs (a measurement,
+///   printed, not asserted: nothing here promises the classifier refuses a protected path). Where the
+///   host's own policy answers instead, the gate draws exactly ONE card, the human approves it
+///   (`TabSet::answer_card`, the panel's own route) and the CLI's own prompt for the same call is then
+///   answered without a second card; at least one allowed resolution names a permission id that was
+///   never delivered -- that is the CLI's own prompt, answered by the host, so the mechanism really
+///   ran. Either way the gate saw the call: no card and no answer of the host to it would be a write
+///   that bypassed the gate.
 ///
-/// Requires a sidecar advertising `provider_permission_prompts`.
+/// Needs a sidecar advertising `provider_permission_prompts`:
+/// `EITRI_SIDECAR_BINARY=<that artifact>`.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn protected_paths_under_default_with_hook_allow() {
@@ -1574,7 +1579,7 @@ fn protected_paths_under_default_with_hook_allow() {
     assert_eq!(
         advertised,
         Some(true),
-        "this probe needs a sidecar with provider_permission_prompts (Verdandi b3aa188+)"
+        "this probe needs a sidecar with provider_permission_prompts (a Verdandi with that capability)"
     );
 
     for rel in [".claude/probe.json", ".git/probe"] {

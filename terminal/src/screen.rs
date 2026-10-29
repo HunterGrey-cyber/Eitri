@@ -1,23 +1,65 @@
-//! Bytes in, a `PaintList` out, and replies back to the program.
+//! Bytes in, a `PaintList` out, and the answers the terminal owes the program.
 //!
-//! [`Screen::feed`] parses bytes and marks the screen dirty. The session renders at most once
-//! per frame, avoiding a full projection on every PTY read. [`Screen::take_replies`] returns
-//! terminal replies. `Config::scrolling_history` retains 10,000 lines.
+//! The frozen `terminal-pane/src/live.rs` with three changes,
+//! each measured against the frozen driver before it was taken:
+//! - **feed and render are split.** The frozen driver built a whole `PaintList` on every PTY read,
+//!   which ran 30-100x slower than the source under a noisy stream (15 MB of `yes`: 44 s against
+//!   1.5 s). [`Screen::feed`] only parses and marks dirty; the session renders at most once a frame.
+//! - **a real listener.** Replies go back to the program ([`Screen::take_replies`]).
+//! - **scrollback exists.** `Config::scrolling_history` is 10,000 lines (alacritty's default); the
+//!   frozen comment calling it "deliberately zero" was wrong, since `Term` never read history from
+//!   `total_lines`. Nothing shows it yet -- the view is always `FollowBottom` until phase 3.
 //!
-//! `terminal-sync` withholds publication between `ESC[?2026h` and `ESC[?2026l`.
-//! The session uses [`Screen::open_update`] to track the open update and
-//! [`Screen::abort_sync`] to end it after a deadline. RIS (`ESC c`) is another dispatch and
-//! does not end the update, so the deadline restores publication if a program never closes it.
+//! **A synchronized update that never ends is the session's to end.** `terminal-sync` publishes
+//! nothing between `ESC[?2026h` and `ESC[?2026l`, and ships no deadline on purpose: its
+//! `SyncBarrier::abort_sync` doc puts that policy in the engine's event loop, where alacritty's own
+//! 150 ms lives (`vte-0.15.0` `SYNC_UPDATE_TIMEOUT`). [`Screen::open_update`] says an update is
+//! open and which one; the session aborts it with [`Screen::abort_sync`] once it has been open too
+//! long. A RIS (`ESC c`) does NOT end an open update -- the barrier
+//! counts it as one more dispatch -- so after a killed nvim, a `reset` is not what brings the
+//! screen back; the deadline is.
 //!
-//! While an update is open, `render` uses the snapshot from just before its content began.
-//! `feed` steps the sync driver one byte at a time and snapshots when `in_sync` changes from
-//! false to true. This captures the last complete state before any new update content mutates it.
-//! A second update in the same read captures the completed state left by the first update.
+//! **`render` never projects the live `Term` while an update is open.** An earlier design
+//! snapshotted `self.frame` inside every `publish` closure -- on every `FrameComplete`, every
+//! end-of-read `Wakeup`, and every `SyncAborted` -- which paid a full O(rows x cols)
+//! [`Projector::full`] on every PTY read that touched anything, whether or not a synchronized
+//! update was ever in play: measured 2.6-7.6x slower on a plain flood with no BSU/ESU anywhere, and
+//! paying the cost while hidden, which the session's render clock is meant to rule out.
 //!
-//! Outside an update, the live `Term` is complete, so `render` projects it directly.
-//! `end_sync` and `abort_sync` clear `in_sync` even when nothing was dispatched, allowing the
-//! next render to reflect a resize without a separate resize snapshot.
-//! `Projector::full` leaves damage untouched; these snapshots do not consume a delta stream.
+//! The fix keeps the guarantee but ties the cost to what actually needs it. Two fixed points:
+//! - **Outside an open update, the live `Term` IS the last publication.** `SyncBarrier::end_sync`
+//!   and `abort_sync` both clear `in_sync` unconditionally, so `open_update()` reporting `None`
+//!   means `Term` is at a real, complete, presentable state -- there is nothing left to snapshot
+//!   for, and [`Screen::render`] projects the live `Term` directly, right there, at most once per
+//!   call (bounded by however often the caller calls it -- the render clock, not the PTY's).
+//! - **A synchronized update cannot mutate `Term` before its own `BSU` is dispatched.** So the one
+//!   moment a snapshot is structurally necessary is the instant `in_sync` flips false -> true:
+//!   [`Screen::feed`] steps `terminal-sync::SyncDriver::feed` one byte at a time (which is what it
+//!   already does internally -- see its own "WHY BYTE AT A TIME" doc -- so this adds no real
+//!   iteration cost, only moves the loop boundary) and takes `self.frame = self.projector.full(term)`
+//!   exactly at that transition, before any byte of the new update's content can hide behind it.
+//!   Everything published *after* that -- `FrameComplete`, `Wakeup`, `SyncAborted` -- needs no
+//!   snapshot of its own: either it closes the update, in which case the next `render()` call
+//!   reads the live `Term` per the point above, or it is itself a transition into a *further*
+//!   nested/new update, in which case it is captured by that transition instead.
+//!
+//! `render_never_shows_a_frame_torn_by_a_later_update_in_the_same_read` (the tear's own
+//! repro, `BSU CUP ED "frame\r\nplus1" ESU BSU CUP ED "HEL"` in one `feed()` call, never rendered
+//! in between) still passes under this design: the second `BSU`'s false->true transition captures
+//! `self.frame` at exactly the moment `Term` shows "frame"/"plus1" and nothing of "HEL" yet.
+//! `resize` no longer snapshots at all -- it used to, conditionally, but `render`'s own check now
+//! subsumes that, and subsumes a bug in the old conditional: resizing *inside*
+//! an update that goes on to publish nothing (an ESU or abort with no dispatch in between, so
+//! `SyncBarrier`'s own `dirty` flag never latches) used to leave `render` reporting the *old* grid
+//! size forever, because nothing about that resize ever triggered `feed`'s or `abort_sync`'s old
+//! per-publish snapshot. `Term::resize` unconditionally clears `in_sync` on the barrier by ending
+//! up at `open_update() == None` the moment the update actually ends (`end_sync`/`abort_sync` flip
+//! `in_sync` regardless of `dirty`), so the very next `render()` call reads the live, correctly
+//! resized `Term` -- no special-casing needed in `resize` at all.
+//! This is still `Projector::full`'s own documented safety property doing the work: it "does
+//! **not** touch damage, so it is safe to call for a newly attached consumer at any moment" -- an
+//! extra full snapshot, wherever one is taken, is not the delta-stream-stealing hazard
+//! `Projector::next` guards against, since `Screen` never calls `next`.
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Dimensions;

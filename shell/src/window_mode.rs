@@ -1,9 +1,9 @@
-//! Window modes: windowed, fullscreen (the top bar stays, the window buttons go), and immersive
-//! (the top bar goes too, and `Ctrl+k` shows it for as long as it has focus).
+//! Window modes: windowed, fullscreen (the top bar stays, the window buttons go),
+//! and immersive (the top bar also hides; `Ctrl+k` shows it while it has focus).
 //!
-//! The mode follows `g:neovide_fullscreen` both ways: a `:let`, a mapping or `init.lua`
-//! setting it changes the window mode. Changes from `F11` or the compositor write it back,
-//! so the variable reflects what the window is doing.
+//! The mode follows `g:neovide_fullscreen` in both directions. A `:let`, mapping or
+//! `init.lua` change moves the window. Changes from `F11` or the compositor are
+//! written back so the variable reflects the window's fullscreen state.
 
 use std::cell::Cell;
 use std::rc::Rc;

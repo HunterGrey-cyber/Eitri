@@ -76,7 +76,8 @@ pub(crate) fn keys_after_failure(focused: Option<&ModuleId>) -> KeysAfterFailure
 mod tests {
     use super::*;
 
-    /// A failed editor moves keyboard focus only if it held focus when it failed.
+    /// The focus move (one of the mutations tried on this flow): the keys leave only an
+    /// editor that held them.
     #[test]
     fn the_keys_leave_a_failed_editor_only_if_it_held_them() {
         assert_eq!(keys_after_failure(Some(&ModuleId::editor())), KeysAfterFailure::ToChat);

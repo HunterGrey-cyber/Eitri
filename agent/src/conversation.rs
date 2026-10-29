@@ -1576,8 +1576,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         queued_events: Mutex<Vec<AgentDomainEvent>>,
         send_turn_error: Mutex<Option<ProviderError>>,
-        /// The error `close_session` returns once, so failed-close handling in `shutdown` can be tested
-        /// without a wedged or crashed provider.
+        /// What `close_session` returns, once, so `shutdown`'s handling of a failed close can
+        /// be driven without a real wedged or crashed provider.
         close_session_error: Mutex<Option<ProviderError>>,
         /// Every event ever queued. A test waits for ingestion to reach exactly this, which is a
         /// real condition rather than a sleep long enough to probably be fine.

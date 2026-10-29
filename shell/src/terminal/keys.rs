@@ -1,30 +1,54 @@
-//! GTK keyboard events normalised into `terminal_input::NormalizedInput`.
+//! Moved from the frozen `terminal-pane/src/input.rs` (2026-09-23),
+//! unchanged above the `Eitri additions` marker but for one function: [`location_for`] now says
+//! which side a modifier is on (GUI pass 2026-09-23, defect 2). Where it says "the caller" or "a
+//! session", read `eitri-terminal`'s `TerminalSession`, which encodes on its own thread against
+//! the live mode.
 //!
-//! `TerminalSession` encodes on its own thread against the live terminal mode.
-//! Producing bytes is [`terminal_input::encode`]'s job. It needs the current `TermMode`
-//! from the component that owns the `Term`, so the caller supplies that mode:
+//! GTK keyboard events, normalised into `terminal_input::NormalizedInput`.
+//!
+//! # Where this stops
+//!
+//! It stops one function call short of the PTY. Producing bytes is
+//! [`terminal_input::encode`]'s job, and that call needs the authoritative terminal's current
+//! `TermMode` -- which belongs to whoever owns the `Term`, not to a pane. So the whole of this
+//! module's output is a `NormalizedInput`, and the caller writes:
 //!
 //! ```ignore
 //! let bytes = terminal_input::encode(&normalized, session.term_mode());
 //! ```
 //!
-//! Kitty protocol handling, `APP_CURSOR`, legacy escapes and bracketed paste belong to
-//! the encoder. Keeping them there avoids a second implementation in the GTK adapter.
-//! [`location_for`] identifies which side a modifier is on. Other keyboard fields need
-//! reconstruction because GTK does not supply the encoder's expected values directly.
+//! That division is not bookkeeping. `terminal-input` is a rule-for-rule transcription of
+//! Alacritty's own encoder, differentially tested against it upstream; the kitty protocol,
+//! `APP_CURSOR`, the legacy escapes and bracketed paste all live there. Re-deciding any of it here
+//! would be the second implementation the architecture exists to prevent.
 //!
-//! `text_with_all_modifiers` must include the Control transformation: `Ctrl+A` becomes
-//! `\x01`. GDK does not apply it, so [`control_transform`] reproduces the libxkbcommon table.
-//! Otherwise a legacy terminal could send a letter where a control code is needed.
-//! `key_without_modifiers` comes from translating the hardware keycode with no modifiers;
-//! it supplies the kitty protocol's base-key lookup, such as `!` to `1`.
-//! GTK4 does not expose `repeat`, so [`RepeatTracker`] derives it from press and release
-//! events. Reporting repeats as fresh presses loses information under `REPORT_EVENT_TYPES`.
-//! These keyboard adaptations have not yet been checked with a real keyboard.
+//! # Where this does not stop, and why that is still correct
 //!
-//! [`normalize_key`] takes plain [`RawKey`] data, so its logic can be tested without a
-//! display, `gtk::init`, or compositor. Filling `unmodified_keyval` requires a live GDK
-//! display, so the caller supplies it.
+//! `terminal_input::keys::KeyEvent` is shaped like winit's, because the encoder it feeds was
+//! written against winit's. GTK is not winit, so three of its fields have to be *reconstructed*
+//! rather than copied, and each reconstruction is a real decision:
+//!
+//!   * **`text_with_all_modifiers`** must include the Control transformation -- `Ctrl+A` has to
+//!     arrive as `\x01`, not `"a"`. winit gets this from libxkbcommon; GDK does not apply it, so
+//!     [`control_transform`] reproduces libxkbcommon's own table. Get this wrong and a legacy
+//!     terminal sends the letter instead of the control code: `Ctrl+C` stops interrupting.
+//!   * **`key_without_modifiers`** comes from asking GDK to re-translate the hardware keycode with
+//!     no modifiers held. It feeds one kitty-protocol branch (the `!` -> `1` base-key lookup).
+//!   * **`repeat`** is not surfaced by GTK4 at all. [`RepeatTracker`] recovers it from the press /
+//!     release sequence, because a repeat that reports itself as a fresh press is a real fidelity
+//!     loss once `REPORT_EVENT_TYPES` is negotiated -- and nvim negotiates it.
+//!
+//! These are host-adaptation decisions, not terminal semantics: they describe the keyboard, not
+//! what a terminal does with it. But they are decisions, they are not observed from a real
+//! keyboard yet, and they are written down here so the next person knows where to look when a
+//! chord misbehaves.
+//!
+//! # Testability
+//!
+//! [`normalize_key`] takes [`RawKey`] -- plain data -- rather than a GTK controller, so every rule
+//! above is unit-testable with no display, no `gtk::init`, and no compositor. The only part that
+//! genuinely needs a live GDK display is filling in `unmodified_keyval`, which is why that is a
+//! caller-supplied field and not something this function goes and fetches.
 
 use eitri_terminal::ScrollRequest;
 use gtk4::gdk::{Key as GdkKey, ModifierType};
@@ -118,8 +142,8 @@ impl DeliveredKeys {
         Self::default()
     }
 
-    /// Records that this keyval's press was forwarded to the child.
-    /// Stores lowercase so its release still matches if Shift is released first.
+    /// Records that this keyval's press was forwarded to the child. Stored lower-cased:
+    /// see the struct's own doc.
     pub fn mark(&mut self, keyval: GdkKey) {
         let keyval = keyval.to_lower();
         if !self.held.contains(&keyval) {
@@ -127,9 +151,10 @@ impl DeliveredKeys {
         }
     }
 
-    /// Reports whether this keyval's press was forwarded, then forgets it.
-    /// A release ends the entry until the next press, whether forwarded or not.
-    /// Compares lowercase so releasing Shift before the letter still matches its press.
+    /// Whether this keyval's press was forwarded -- and forgets it either way, since a release
+    /// (delivered or not) ends that keyval's story until its next press. Compared lower-cased:
+    /// a release reported under a different case than its press (Shift let go first)
+    /// still matches -- see the struct's own doc.
     pub fn take(&mut self, keyval: GdkKey) -> bool {
         let keyval = keyval.to_lower();
         match self.held.iter().position(|&held| held == keyval) {
@@ -665,10 +690,14 @@ mod tests {
         assert!(!delivered.take(GdkKey::b));
     }
 
-    /// A forwarded `Ctrl+Shift+letter` press has an uppercase GDK keyval. If Shift is
-    /// released before the letter, GDK reports its release in lowercase with Ctrl held.
-    /// `take()` must match across this case change; otherwise the release is swallowed
-    /// and the child's key state goes out of sync under the kitty keyboard protocol.
+    /// A forwarded `Ctrl+Shift+letter` press marks its
+    /// keyval as GDK reports it while Shift is still held -- the uppercase form. GDK derives a
+    /// release's keyval from the modifier state *at release time*, independent of the press: a user
+    /// who lets go of Shift before the letter has the letter's release reported in lowercase, with
+    /// Ctrl still held. Matching `take()` on the raw keyval therefore missed it and the release was
+    /// silently swallowed (`pane.rs`'s `if !was_delivered { return; }`), desyncing the child's view
+    /// of which keys are down -- a real defect for a program that negotiated the kitty keyboard
+    /// protocol's key-release reporting.
     #[test]
     fn a_release_is_matched_even_if_shift_was_let_go_first() {
         let mut delivered = DeliveredKeys::new();
@@ -692,17 +721,18 @@ mod tests {
 /// Which of foot's two clipboard chords a key is ([`clipboard_chord`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardChord {
-    /// `Ctrl+Shift+C` copies the last finished selection to the clipboard again.
-    /// The chord is consumed even with nothing selected and is never forwarded to the shell.
+    /// `Ctrl+Shift+C`: copies the last finished selection to the clipboard again --
+    /// swallowed with nothing selected too (`pane::copy_selection`'s
+    /// own doc), never forwarded.
     Copy,
     /// `Ctrl+Shift+V`: the clipboard's text, as a paste (phase 2).
     Paste,
 }
 
-/// Recognises `Ctrl+Shift+C` and `Ctrl+Shift+V` as clipboard chords.
-/// The pane keeps both from the child: the encoder would turn them into 0x03
-/// (SIGINT) and 0x16 respectively. `Paste` pastes clipboard text;
-/// `Copy` copies the last finished selection, or is swallowed if none exists.
+/// `Ctrl+Shift+C` or `Ctrl+Shift+V`: foot's copy and paste, so hands used to foot press them
+/// here too. The pane never passes either on: the encoder would turn
+/// `Ctrl+Shift+C` into 0x03 -- SIGINT to whatever is running -- and `Ctrl+Shift+V` into 0x16,
+/// zsh's `quoted-insert`. `Paste` pastes and `Copy` copies.
 pub(crate) fn clipboard_chord(keyval: GdkKey, state: ModifierType) -> Option<ClipboardChord> {
     let others = ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
     if !state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) || state.intersects(others) {
@@ -756,8 +786,8 @@ pub(crate) fn literal(key: &eitri_core::keymap::KeySpec) -> Option<Vec<Normalize
     }
 }
 
-/// Whether a key press restarts an exited shell while the pane holds its last screen.
-/// Only plain Enter restarts it; a chord never does.
+/// Whether a key press restarts a shell that has exited (the pane holds the last screen,
+/// Enter restarts). Plain Enter only: a chord is never a restart.
 pub(crate) fn restarts(keyval: GdkKey, state: ModifierType) -> bool {
     let chords =
         ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::SHIFT_MASK;
@@ -1009,8 +1039,9 @@ mod eitri_tests {
         assert_eq!(scroll_chord(GdkKey::a, shift), None, "not a scroll key at all");
     }
 
-    /// Checks copy-mode bindings, deliberately unbound `Ctrl+b` and `Ctrl+f`, and a plain letter.
-    /// `Esc` leaves copy mode immediately because there is no selection to clear first.
+    /// Every row of the copy-mode key table, plus its two named negatives: `Ctrl+b`/`Ctrl+f` (the vi page
+    /// keys, deliberately unbound) and a plain, unbound letter. `Esc` leaves outright -- there is no
+    /// selection feature yet to clear first.
     #[test]
     fn copy_mode_key_matches_every_row_of_the_table() {
         let none = ModifierType::empty();

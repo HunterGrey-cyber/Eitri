@@ -1,11 +1,17 @@
-//! `shell` keeps the resize step and the bottom modules' minimum size from the two-`GtkPaned`
-//! layout that `module_grid` replaced. `Direction`, divider selection and zoom behavior belong
-//! to the core layout module. Its tests preserve the old `hidden_for_zoom` and `resize_target`
-//! behavior.
+//! What `shell` keeps of the two-`GtkPaned` layout that `module_grid` replaced (the modules design):
+//! the pixel size of a resize
+//! step, the bottom modules' floor, and `Direction`, which is `eitri-core`'s now.
+//! Which divider moves, and how a zoom hides the rest, is `eitri_core::layout`'s; the old
+//! `hidden_for_zoom`/`resize_target` tables live on as its tests
+//! (`navigation_reproduces_todays_dispatch_*`, `resize_moves_the_divider_todays_resize_target_moved`).
 //!
-//! A hidden module is outside the geometry, so zoom and resize ignore it, and ending a zoom
-//! never shows it. Hiding the zoomed module ends the zoom (`Layout::hide_unfocused`). Showing a
-//! module restores its ratio; the first show gives it `BELOW_ROOT_SHARE`'s third.
+//! The bottom terminal's own `PaneLayout` additions on `main` (`bottom_shown`, `bottom_visible`,
+//! `shown_position`, `hiding_bottom_must_unzoom`) did not come across with it when the modules
+//! design re-homed it: a hidden module is not in the geometry, so a zoom and a resize
+//! ignore it and ending a zoom never shows it (`invariant_4_a_zoom_never_touches_the_hidden_set`);
+//! hiding the zoomed module ends the zoom (`Layout::hide_unfocused`); and a shown module keeps its
+//! ratio, the first show giving it `BELOW_ROOT_SHARE`'s third (`show_puts_a_module_back_where_it_was`,
+//! `the_terminal_hides_and_shows_as_ctrl_a_t_did_on_main`).
 
 pub(crate) use eitri_core::layout::Direction;
 

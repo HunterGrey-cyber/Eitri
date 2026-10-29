@@ -165,8 +165,8 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
          Bump both together and re-verify against the real proto diff \
          (the drill: `git diff <old>..<new> -- proto crates` \
          should be empty for a \
-         mechanical follow-up, or the capability/wire changes it adds should be named in the dated \
-         record)."
+         mechanical follow-up, or the capability/wire changes it adds should be named in the commit \
+         message)."
     );
 }
 

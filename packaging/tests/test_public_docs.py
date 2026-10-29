@@ -1,10 +1,8 @@
-"""Tests for the public docs under publish/files/
--- or, in the public tree this file also ships in, at the root, where publish/export.sh
+"""Tests for the public docs under publish/files/ -- or, in the public tree this file also ships in, at the root, where publish/export.sh
 copies them (public_docs_dir(); `PublicTreeLayoutTests` runs this whole suite in that layout): every
 documented `curl ... install.sh | sh` command must carry the same HTTPS-safety flags
-packaging/install.sh's own fetch() function uses for the identical download (
-the private review notes #6: a GitHub `releases/latest/download/` URL
-answers with a 302, and without `-L` (or `--proto-redir`) `curl -sSf | sh` silently pipes nothing to
+packaging/install.sh's own fetch() function uses for the identical download (a GitHub
+`releases/latest/download/` URL answers with a 302, and without `-L` (or `--proto-redir`) `curl -sSf | sh` silently pipes nothing to
 `sh` and exits 0 -- no install happens and no error is shown).
 
 Also: INSTALL.md's "verify before running" recipe must actually hash the downloaded
@@ -14,7 +12,7 @@ host or mirror that swaps `install.sh` while leaving `SHA256SUMS`/`.sig` alone p
 the documented recipe otherwise). `VerifyRecipeRefusesTamperedInstallShTests` proves this by actually
 running the recipe, extracted verbatim out of INSTALL.md, against a throwaway ssh key and a tiny
 self-signed `SHA256SUMS` this test builds itself in pytest's own `tmp_path` -- never against
-`/scratch/...` or the real rc.1 release, so it ships publicly and runs for any contributor with
+a real release, so it ships publicly and runs for any contributor with
 `ssh-keygen` on PATH (skipped, not failed, if it is absent). The same class also covers a tampered
 `SHA256SUMS` (edited after it was signed) and a missing `SHA256SUMS.sig`, not only a tampered
 `install.sh`: dropping or weakening the signature step's own `exit 1` fails one of these, not only
@@ -216,7 +214,7 @@ class CurlFlagsParsingTests(unittest.TestCase):
         self.assertEqual(missing_flags(line, self.required), [])
 
     def test_a_line_missing_dash_L_is_caught(self):
-        # Without -L, -sSf does not follow redirects, so a 302 redirect pipes an empty
+        # The exact regression found in review: -sSf with no L, so a 302 redirect pipes an empty
         # body to `sh` -- silently installs nothing, exit 0.
         line = (
             "curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSf "
@@ -351,7 +349,7 @@ class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
     /scratch/... or the real rc.1 release -- this suite ships publicly and must run for any
     contributor). It must run install.sh when everything matches, and refuse -- never running
     install.sh -- when install.sh's bytes were swapped after signing while SHA256SUMS/.sig were
-    left alone: an attack by a compromised release host or mirror."""
+    left alone: exactly the attack the recipe must stop (a compromised release host or mirror)."""
 
     @classmethod
     def setUpClass(cls):
@@ -463,8 +461,7 @@ class VerifyRecipeRefusesTamperedInstallShTests(unittest.TestCase):
 
 
 class PublicDocsTwinsAreFresh(unittest.TestCase):
-    """The twins check on the real tracked files (a release's own
-    acceptance line): the twins actually tracked under public_docs_dir(_REPO_ROOT) -- publish/files/
+    """The private-side test: the twins actually tracked under public_docs_dir(_REPO_ROOT) -- publish/files/
     in this tree, the root in the public one -- must pass release_check's own `twins` check right
     now, so editing README.md or INSTALL.md without updating its Chinese twin fails
     `pytest packaging` long before anyone runs a release. This never builds a fixture: it is the

@@ -1408,9 +1408,10 @@ require_ssh_keygen() {
 	die "ssh-keygen was not found, so the release signature cannot be checked, and this installer carries a release key to check it against: refusing, because without that check a release someone else built would install unnoticed. Install OpenSSH's client$_rsk and re-run; or, to install with only the checksums checked, re-run with --insecure-skip-signature"
 }
 
-# verify_signature SUMS SIG: with a listed key, reject missing, unfetchable or bad signatures.
-# require_ssh_keygen also rejects a missing verifier unless --insecure-skip-signature is set.
-# Use key-based verification; no-validate check mode accepts a signature from any key.
+# verify_signature SUMS SIG: with a key listed, a missing or unfetchable SIG refuses and a
+# bad one refuses, and so does a missing ssh-keygen unless --insecure-skip-signature
+# (require_ssh_keygen). The command is the documented verify form; ssh-keygen's no-validate check mode is
+# never used (it accepts a signature by any key).
 verify_signature() {
 	if [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
 		warn "this installer carries no release key: checksums only detect corruption, they do not show who made the release"
@@ -1904,8 +1905,10 @@ on_exit() {
 		if [ "$_oe_rc" != 0 ]; then
 			if [ "$NV_NEW_CREATED" = 1 ]; then rm -rf -- "$NV_LIB.new" 2>/dev/null || :; fi
 			if [ ! -e "$NV_LIB" ] && [ -d "$NV_LIB.old" ]; then mv -- "$NV_LIB.old" "$NV_LIB" 2>/dev/null || :; fi
-			# unpack_new may create NV_LIBROOT before a later step, including the sidecar build, fails.
-			# rmdir removes it only if empty, preserving any installed files or recovery directory.
+			# unpack_new's own `mkdir -p -- "$NV_LIBROOT"` can be the only thing that ever touched a
+			# fresh $HOME before a later step (now including a fatal sidecar-build failure)
+			# died: rmdir only succeeds while it is still empty, so an install (or
+			# eitri.old) genuinely there is never touched.
 			rmdir -- "$NV_LIBROOT" 2>/dev/null || :
 		fi
 		# The temporary names a write goes through before its `mv` (none is left on success).
@@ -2094,9 +2097,10 @@ sidecar_download_verdandi_source() {
 	SDV_TARBALL=$_sdv_out
 }
 
-# sidecar_sdk_notice REPO: after npm ci and before the build, print the installed SDK's
-# version and LICENSE.md terms. Read both from the installed files so the notice matches
-# what was downloaded and tells the user about the non-open-source SDK before building.
+# sidecar_sdk_notice REPO: runs after npm ci and before the build -- the SDK's own
+# version and what its LICENSE.md states, both read from the files npm ci just wrote rather than
+# hard-coded: the user is downloading Anthropic's non-open-source SDK to their own machine and
+# should be told before the build runs.
 sidecar_sdk_notice() {
 	_ssn_pkg=$1/node_modules/@anthropic-ai/claude-agent-sdk/package.json
 	_ssn_lic=$1/node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md
@@ -4050,11 +4054,13 @@ main() {
 	check_home
 	set_paths
 	check_root
-	# check_data_home applies to modes that write under NV_DATA: do_install, do_from_source,
-	# do_sidecar_only, do_nvim_only and do_nvim_offer. --uninstall has its own path checks.
-	# --build-sidecar-into uses NV_CACHE_NV for its workdir and the caller's DIR for output,
-	# so it neither reads nor writes NV_DATA/XDG_DATA_HOME. Package builds may therefore use
-	# this mode with XDG_DATA_HOME outside $HOME.
+	# check_data_home's own scope (its doc comment above) is every mode that writes under NV_DATA:
+	# do_install, do_from_source, do_sidecar_only, do_nvim_only, do_nvim_offer. --uninstall is
+	# exempt on purpose (its own comment explains why); --build-sidecar-into is exempt too --
+	# neither reads nor writes anything under NV_DATA/XDG_DATA_HOME (its workdir is under
+	# NV_CACHE_NV, its output goes to the caller's own --build-sidecar-into DIR) -- it is the AUR
+	# package's build() entry point, which can run in a sandbox that sets XDG_DATA_HOME
+	# outside $HOME for reasons this mode never needs to care about.
 	case $OPT_MODE in
 	uninstall | build-sidecar-into) ;;
 	*) check_data_home ;;

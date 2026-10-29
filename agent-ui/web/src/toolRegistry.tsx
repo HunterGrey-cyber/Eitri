@@ -417,8 +417,9 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     label: "Web search",
     renderInvocation: (input) => <div className="tool-card">Search: {pathOf(input, "query")}</div>,
   },
-  // Tools are deferred on this CLI, so nearly every action starts with ToolSearch.
-  // Show one muted line with no result row or expandable card.
+  // Deferred on this CLI, so nearly every action the agent takes reaches this one first (the
+  // 2026-09-19 defect that made auto mode still show a pile of popups once the policy started asking about it) --
+  // one muted line, no result row, never a card of its own worth expanding.
   ToolSearch: {
     label: "Load a tool",
     quiet: true,

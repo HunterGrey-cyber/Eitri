@@ -14,8 +14,7 @@
 -- This is a genuinely separate Lua runtime from Neovim's own `:lua`/`init.lua` -- it runs inside
 -- `shell`'s own embedded `mlua` interpreter, not inside the `nvim --embed` process the editor
 -- pane drives. There is currently no bridge between the two: you cannot call `vim.*` APIs from
--- here, and Neovim's own Lua cannot call `eitri.*` (see
--- the runtime separation above). That bridge -- an `EditorContext` exposed to the
+-- here, and Neovim's own Lua cannot call `eitri.*`. That bridge -- an `EditorContext` exposed to the
 -- agent side via Neovim RPC -- is separate, not-yet-built work.
 --
 -- Everything below lives under one global table, `eitri`, with exactly four extension points

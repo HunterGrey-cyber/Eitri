@@ -111,9 +111,8 @@ Nothing in this capture required a change to `agent/src/wire.rs` or `agent/src/h
 ## Transcript compatibility with Claude Code 2.1.302 (2026-10-26)
 
 The later TEST-profile `stream_capture_conformance` run reported ten previously unknown transcript
-lines: four `api-request`, five `api-request-blob` and one `api-request-shape`. The run is recorded in
-`/home/user/work/p0a/t8-results.md` on the maintainer's machine (outside git); no request bodies or
-transcript text are reproduced here. This is a transcript-format update, not a re-recording of the
+lines: four `api-request`, five `api-request-blob` and one `api-request-shape`. The run was made on the maintainer's machine and its raw output is not
+kept in this repository; no request bodies or transcript text are reproduced here. This is a transcript-format update, not a re-recording of the
 2.1.292 backend baseline above.
 
 `agent/src/history/transcript_jsonl.rs` classifies all three as known side records, skipped and counted

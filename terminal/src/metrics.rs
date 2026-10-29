@@ -1,12 +1,20 @@
-//! The single cell lattice every drawing operation uses.
+//! Moved from the frozen `terminal-pane/src/metrics.rs` (2026-09-23),
+//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120`, and for
+//! one change: a private-use codepoint falls back through the terminal's own family
+//! ([`TerminalMetrics::font_for`], GUI pass 2026-09-23, defect 4). Where it says "Verdandi" or "the
+//! handoff", the contract now lives in this workspace's `terminal-render/`.
 //!
-//! Render operations carry cell coordinates, without fonts, cell size, baseline, or DPI.
-//! This module supplies one grid-to-pixel transform for backgrounds, glyphs, cursors, and
-//! notices so they align. Separate transforms could offset a cursor or underline from its glyph.
+//! The single cell lattice every op is placed on.
 //!
-//! The same metrics determine PTY size, so the terminal's column count matches the drawn grid
-//! and text wraps in the right place. Private-use codepoints use the terminal's font family
-//! for fallback lookup through [`TerminalMetrics::font_for`].
+//! Verdandi emits cells and has no opinion on fonts, cell size, baseline or DPI — the handoff says
+//! so explicitly and carries none of them. That makes the grid-to-pixel transform entirely this
+//! side's responsibility, and it makes having exactly ONE of it the whole ballgame: backgrounds,
+//! glyphs, the cursor and the overlay notice must land on the same lattice or a cursor sits half a
+//! pixel off its character and an underline misses the glyph it belongs to.
+//!
+//! The same object also decides the PTY size. That is deliberate rather than convenient: if text
+//! layout and PTY geometry each computed a cell size, the terminal would be told it has a number of
+//! columns that does not match the number being drawn, and every wrap would land in the wrong place.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

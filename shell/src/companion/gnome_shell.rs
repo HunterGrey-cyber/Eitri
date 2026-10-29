@@ -119,9 +119,9 @@ struct Inner {
     owner_changes: Cell<u64>,
     /// The owner that was last refused, so its refusal is logged once.
     refused: RefCell<Option<String>>,
-    /// Caches method support for the current D-Bus service: `true` after a successful call,
-    /// `false` after an unknown-method response. Cleared when the service's unique bus name changes,
-    /// since the replacement may implement a different version of the extension.
+    /// What the current owner showed about the methods it was called with: `true` once one answered,
+    /// `false` once the owner reported it has no such method (an older version of the extension).
+    /// Forgotten whenever the owner changes, since the next one may be another version.
     methods: RefCell<HashMap<&'static str, bool>>,
     /// Ends the watch on the name.
     unwatch: RefCell<Option<Box<dyn FnOnce()>>>,

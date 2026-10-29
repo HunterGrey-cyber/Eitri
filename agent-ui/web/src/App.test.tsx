@@ -1713,9 +1713,11 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".row-current")!.textContent).toContain("second");
   });
 
-  /* Moving the cursor with `j` must scroll its row into view, or movement below the viewport is invisible.
-     jsdom has no layout, so this checks the call to the right element's `scrollIntoView`.
-     Actual row visibility needs a browser check. */
+  /* THE DEFECT: `j` could not scroll down inside a long output -- half of it is that nothing ever scrolled the cursor
+     into view at all, so once `j` moved the highlight past the bottom of the viewport, the key
+     read as doing nothing. jsdom implements no layout, so this is the only half of that this
+     environment can see: that the right element's `scrollIntoView` was actually called. Whether
+     the row really lands in the viewport is a GUI check nobody has run yet. */
   it("scrolls the cursor row into view when j/k move the cursor", () => {
     const { container } = startedApp();
     events(
@@ -1734,9 +1736,10 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".row-current")!.textContent).toContain("second");
   });
 
-  /* An expanded tool result can scroll inside `.tool-result-body` past its 260px fold.
-     `j`/`k` must scroll that box before moving off the row, until it cannot move in that direction.
-     `scrollCursorRowBox` in `App.tsx` handles this. */
+  /* The other half of `j` not scrolling inside a long output: a long tool result opened past its 260px fold
+     (`.tool-result-body`) had no keyboard route into itself at all, only a mouse wheel. `j`/`k`
+     must scroll THAT box first and only move the cursor off the row once the box has nothing
+     further to give in the pressed direction -- see `scrollCursorRowBox` in `App.tsx`. */
   describe("j/k scroll a long tool result before moving off it", () => {
     function startedAppWithExpandedResult() {
       const rendered = startedApp();
@@ -6178,11 +6181,14 @@ describe("App global HINT: the panel's half", () => {
   });
 });
 
-/* Moving only between rows skips text in replies taller than the viewport and leaves
-   the end of a long last reply unreachable. These tests check scrolling within the current row.
-   jsdom has no layout, so `fakeLayout` stacks rows at the given heights in a viewport at y = 0.
-   Rects follow `scrollTop`, clamped to [0, scrollHeight - clientHeight]. With 20px line height,
-   one step is 3 x 20 = 60px. This does not prove what a real WebKit draws. */
+/* Tall replies used to be impossible to scroll through (`j`/`k` could not scroll the screen while an output was selected, especially when the last
+   output was very long. `j`/`k` moved row to row only, so a reply taller than the view was
+   skipped over, and on the LAST row there was nowhere to move and the rest of it was unreachable.
+
+   jsdom implements no layout, so `fakeLayout` stands one in: the rows stacked at the given heights in
+   a list viewport `viewport` px tall at y = 0, every rect following the list's `scrollTop`, which
+   clamps to [0, scrollHeight - clientHeight] the way a browser's does. Each row's line height is set
+   inline to 20px, so one step is 3 x 20 = 60px. None of this proves what a real WebKit draws. */
 describe("App keyboard: scrolling through the conversation", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);

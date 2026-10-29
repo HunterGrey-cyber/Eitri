@@ -1,15 +1,18 @@
-//! Tracks keyboard focus in the companion window. The panel's current row has a solid sign cell
-//! while it receives keys and a hollow one otherwise. The companion has no window controller,
-//! so its tracker lives here; the main window uses the controller's focus tracking.
+//! Tracks keyboard focus in the companion window. The panel's current row has a solid sign
+//! cell while it has the keys and a hollow one otherwise. The main window's cursors follow
+//! its window controller; the companion window has no controller, so it tracks focus here.
 //!
-//! GTK's focus widget identifies the focused module. Cursors are solid only when that module
-//! contains the focus widget and the window is active, so switching windows makes them hollow.
-//! Changes to the focus widget and `notify::is-active` run the same update function.
-//! The focus callback reports the module holding the focus widget even when the window is inactive.
+//! GTK's focus widget (`GtkWindow:focus-widget`) identifies the focused module. Each change
+//! runs one function to update the indicators together. A cursor is focused only when its
+//! pane contains the focus widget and the window is active, so it goes hollow on alt-tab.
+//! A bright BROWSE mode block means keys typed now go to the panel. `notify::is-active`
+//! runs the same function. `install`'s `on_owner` reports the module holding focus even
+//! when the window is inactive.
 //!
-//! Tracking uses `ModuleId` because positions in a dynamic layout do not identify modules.
-//! On every focus change, `install` reads `ModuleGrid::live_hosts` and keeps each module's
-//! last focus state by id. Modules added after startup are tracked from their first focus change.
+//! Modules are keyed by `ModuleId`: fixed slot indices cannot identify panes in a data-driven
+//! layout. `install` reads `ModuleGrid::live_hosts` on every focus change and remembers each
+//! module's last state by id. Modules added after startup are tracked from their first
+//! focus change.
 
 use std::collections::BTreeMap;
 
@@ -67,9 +70,8 @@ pub(crate) fn install(
 ) {
     let last: std::cell::RefCell<BTreeMap<ModuleId, bool>> = std::cell::RefCell::new(BTreeMap::new());
     let apply = move |window: &gtk4::ApplicationWindow| {
-        // Read the module list on every focus change so modules added after `present()` are found.
-        // Reading it once before this closure would miss them. Headless tests do not catch that change;
-        // focus tracking, `Ctrl+a Ctrl+a`, and `Ctrl+h/j/k/l` need checking with a module added at runtime.
+        // Read the modules on every focus change so modules added after `present()` are found.
+        // Taking this list before the closure would miss them; headless tests do not catch that.
         let modules = hosts();
         let chain = std::iter::successors(
             gtk4::prelude::GtkWindowExt::focus(window),

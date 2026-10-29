@@ -1,15 +1,24 @@
+//! Moved from the frozen `terminal-pane/src/gl.rs` (2026-09-23),
+//! unchanged below this paragraph. It lives in `shell` rather than in `eitri-terminal` because the
+//! libepoxy lookup it does is how a GtkGLArea's GL is reached, not how a terminal paints: a macOS
+//! host would bring its own.
+//!
 //! GL/Skia interop for a `GtkGLArea`.
 //!
-//! This lives in `shell` because the libepoxy lookup reaches GTK's GL context; it is independent
-//! of terminal painting. A macOS host would provide its own lookup.
-//! The editor's equivalent GL interop module has `pub(crate)` items, so it cannot be imported here.
+//! Carried over from `neovide-editor/src/gl_interop.rs`, which is a private module (`mod gl_interop;`)
+//! with every item `pub(crate)`, so it cannot be imported. Four other crates in this repository have
+//! already copied it for the same reason. Factoring it into a shared crate would be the better move
+//! and is deliberately not attempted here: it would mean changing `neovide-editor`, and this round
+//! is an integration, not a refactor of the editor pane.
 //!
-//! `GlInterface::new_native()` does not work with the libepoxy lookup used here. Symbols such as
-//! `epoxy_glClear` are data slots: resolve `epoxy_<name>` with dlsym, then dereference the slot
-//! to obtain the function pointer. Skipping that dereference causes SIGSEGV.
+//! Two hazards are carried over with it, both found the hard way and both fatal to get wrong:
 //!
-//! Skia's cached GL state must be invalidated every frame; see
-//! [`SkiaState::invalidate_cached_gl_state`].
+//! 1. **`GlInterface::new_native()` does not work here.** libepoxy on this machine exports only
+//!    *data* symbols named `epoxy_glClear` and the like, so the interface has to be assembled by
+//!    dlsym'ing `epoxy_<name>` and then dereferencing the slot once more to reach the function
+//!    pointer. Skipping that second dereference is a real SIGSEGV, not a subtle wrongness.
+//! 2. **Skia's cached GL state must be invalidated every frame.** See
+//!    [`SkiaState::invalidate_cached_gl_state`].
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, surfaces, DirectContext, SurfaceOrigin};

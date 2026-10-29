@@ -1,26 +1,46 @@
 #!/usr/bin/env bash
-# Run installer end-to-end checks in clean containers. This needs Docker, internet access
-# and a real sidecar build per distro, so run it manually or from a workflow rather than pytest.
-# Serve a finished release over loopback HTTP, the only address where the installer accepts plain http.
-# Check piped and saved installers as a non-root user with --with-nvim, install layout,
-# application version and the sidecar's version.
-# Check that the real `ssh-keygen -Y verify` path runs: every image has openssh-client, and the
-# script requires the "signature on SHA256SUMS: good" line, so losing openssh-client fails
-# loudly instead of silently degrading to checksum-only verification.
-# Check that an old distro nvim causes a private nvim to be installed without changing /usr/bin/nvim.
-# Check that reinstall reports up to date, legacy backend selection fails with a reason,
-# and uninstall preserves only config and state. Containers have no sudo, so attempts to use it fail.
-# For package installs, install as root and run setup as a non-root user. The setup mirror has
-# no SHA256SUMS, so successful setup shows it uses the installed RELEASE without fetching checksums.
-# Check that package installation runs no maintainer script and setup refuses to run as root.
+# packaging/tests/e2e/run.sh -- the installer end to end, in
+# clean containers. Not part of the pytest suite (it is heavy, needs
+# docker and real internet, and builds a real sidecar per distro) -- run it by hand or from a
+# workflow, never from `python3 -m pytest packaging`.
+#
+# What this proves, per distro image, against a real release directory served on the host's own
+# 127.0.0.1:
+#   - the curl-piped and saved-then-`sh`-run install paths both work, non-interactively, as a
+#     non-root user, with `--with-nvim`;
+#   - the real `ssh-keygen -Y verify` path runs (openssh-client is in every image,
+#     and this script greps for the non-degraded "signature on SHA256SUMS: good" line, so a future
+#     accidental removal of openssh-client fails loudly instead of silently degrading to
+#     checksum-only);
+#   - the install layout, `eitri --version`, and the built sidecar's own `--version`
+#     (host_cli, protocol 3, the pinned Node);
+#   - on Ubuntu's own 0.9.5-nvim variant: Eitri's private nvim is fetched and used, and the
+#     distro's /usr/bin/nvim is byte-for-byte untouched;
+#   - a second run says "up to date"; `eitri --legacy` / `EITRI_AGENT_BACKEND=legacy eitri`
+#     both exit 1 naming the reason; `--uninstall` leaves nothing outside
+#     ~/.config/eitri and the state directory; there is no `sudo` in any image, so a maintainer
+#     script that tried to use it would fail loudly, and there is no maintainer script at all (REL-2
+#     below);
+#   - REL-1: `apt install ./eitri_*.deb` / `dnf install ./eitri-*.rpm` as root, then
+#     `eitri setup --yes` as the created non-root user, builds the sidecar reading only
+#     /usr/lib/eitri/RELEASE -- proved behaviourally, not just read off the source: the mirror
+#     `eitri setup` is pointed at carries no SHA256SUMS at all, so a fetch of it would 404 and the
+#     run would fail;
+#   - REL-2: the installed package ran no maintainer script, and `eitri setup` refuses as root.
 #
 # Usage: packaging/tests/e2e/run.sh --release-dir DIR [--release-signers FILE]
 #                                   [--only NAME[,NAME...]] [--out DIR]
-# --release-dir names a finished signed release directory and is read only. It is required.
-# --release-signers names the allowed_signers file used to check SHA256SUMS.sig, mounted read only.
-# It defaults to DIR/release-signers; release.sh does not write that file, so supply it for a release.
-# --only selects ubuntu-no-nvim, ubuntu-0.9.5, ubuntu-piped, ubuntu-pkg, fedora, fedora-pkg or arch.
-# --out sets the directory for logs and the summary.
+#   --release-dir      a finished, signed release directory (release.sh's output: RELEASE,
+#                      SHA256SUMS, SHA256SUMS.sig and the assets RELEASE lists). Required: there is
+#                      no default, so a run always names the release it tested. Only ever read.
+#   --release-signers  the allowed_signers file the installer checks SHA256SUMS.sig against
+#                      (install.sh --release-signers), bind-mounted read-only into every curl-flow
+#                      container. Default: DIR/release-signers. A real release directory carries none
+#                      (release.sh never writes one) -- pass the signers file of the key it was
+#                      signed with, e.g. a release candidate's release.sh --release-signers FILE.
+#   --only             a comma-separated subset of: ubuntu-no-nvim, ubuntu-0.9.5, ubuntu-piped,
+#                      ubuntu-pkg, fedora, fedora-pkg, arch (default: all)
+#   --out              where logs and the summary go (default ~/.cache/nv-v1dist-t15/results)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -110,8 +130,9 @@ mkdir -p -- "$SCRATCH/serve/full/releases/latest/download" "$SCRATCH/serve/full/
 	"$SCRATCH/serve/setuponly/releases/download/v$VERSION" "$SCRATCH/homes" "$SCRATCH/scripts"
 
 log "preparing the release mirror from $RELEASE_DIR"
-# Mirror releases/latest/download/ and releases/download/v<X>/ for --base-url, plus a bare
-# install.sh for the piped example. Use symlinks so the large source asset is not copied.
+# releases/latest/download/ + releases/download/v<X>/ (GitHub's own layout, as the
+# --base-url doc describes) plus a bare install.sh for the piped example -- symlinks, so the ~150MB source
+# asset is never copied.
 for f in "$RELEASE_DIR"/*; do
 	name="$(basename "$f")"
 	ln -s -- "$f" "$SCRATCH/serve/full/releases/download/v$VERSION/$name"
@@ -234,7 +255,7 @@ fi
 
 say "disk usage after the first install (sidecar + nvim included, before --uninstall reclaims it): $(du -sh "$HOME" 2>/dev/null | awk '{print $1}')"
 
-say "=== installed layout ==="
+say "=== install layout ==="
 for p in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-setup RELEASE; do
 	[ -f "$HOME/.local/lib/eitri/$p" ] || fail "missing $HOME/.local/lib/eitri/$p"
 done

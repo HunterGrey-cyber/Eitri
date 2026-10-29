@@ -1,37 +1,48 @@
-//! Keep a project's workspace layouts between launches.
+//! The layouts a project was left in, kept between launches.
 //!
-//! State files are `$XDG_STATE_HOME/eitri/layout/<hash>.v2.json`, where `<hash>` is the first
-//! 16 hex characters of `sha256(canonical project root)`, matching
-//! `agent::conversation_id_for_cwd`. The state root defaults to `~/.local/state`.
-//! Nothing is written into the project directory.
+//! **Where:** `$XDG_STATE_HOME/eitri/layout/<first 16 hex of sha256(canonical project root)>.v2.json`
+//! (`~/.local/state` when `XDG_STATE_HOME` is unset, as `agent::state_dirs` resolves its own two).
+//! The hash is `agent::conversation_id_for_cwd`'s, cut to 16: the same digest of the same canonical
+//! path. Nothing is written into the project directory -- that is a standing rule.
 //!
-//! Version 1 builds use `<hash>.json`. A separate version 2 name lets both builds use the
-//! same project without setting aside each other's state. Read version 1 for migration
-//! only when no usable version 2 file exists. Never write, rename or delete version 1.
+//! **Why a second name.** Builds before workspaces read and write `<hash>.json` (version 1), and an
+//! installed release and a development build can run on one project. Had this build written version 2
+//! under that name, the older build would find a file it cannot read and set it aside, and each build
+//! would keep destroying the other's state. So this build writes only `<hash>.v2.json`, and reads the
+//! version 1 file to migrate it only while there is no usable version 2 file; **nothing here writes,
+//! renames or deletes the version 1 file**, so the older build keeps its own.
 //!
-//! Store `{version: 2, project_root, current, workspaces: [{name, focus, hidden, tiled,
-//! floating, float_memory}]}`. Shares and pinned pixel lengths preserve the layout.
-//! Write `floating` in bottom-first order and remembered rectangles in `float_memory`
-//! only when present, keeping files without floats compatible with earlier output.
-//! Zoom, MRU order, the mark, last preset, undo slot and container ids are not saved;
-//! a window opens unzoomed with fresh ids.
+//! **What:** `{version: 2, project_root, current, workspaces: [{name, focus, hidden, tiled, floating,
+//! float_memory}]}`, every workspace of the window. Shares are stored, and a pinned child's pixels
+//! (keeping a bottom row's height IS a pixel length). A workspace's floats (`floating`, bottom first)
+//! and the rectangles it remembers for modules not floating now (`float_memory`, by module) are
+//! written only when there are any, so a layout without floats is written exactly as the build before
+//! floats wrote it. Zoom, the MRU order, the mark, the last preset, the undo slot and container ids are
+//! not stored: a window opens unzoomed, with fresh ids.
 //!
-//! Read by walking the JSON rather than deriving `Deserialize` on the model. Every id
-//! passes `ModuleId::parse`, and each tree passes `reconcile` and `Layout::from_parts`,
-//! so input cannot introduce an unknown module kind or skip an invariant.
+//! **Read through a walk of the JSON, never by deriving `Deserialize` on the model**: every id goes
+//! through `ModuleId::parse`, and each workspace's tree through `reconcile`, which ends in
+//! `Layout::from_parts` -- so a file can neither name a module kind that does not exist nor skip an
+//! invariant.
 //!
-//! An unusable file falls back with one log line instead of preventing startup. This
-//! includes corruption, a different version or project root, or no usable workspace.
-//! A missing file is silent; `init.lua` errors still prevent startup. Before each write,
-//! `shell` reads again and moves an unusable file to `<hash>.v2.json.unusable` with
-//! [`set_aside_v2`]. If only part is unusable, load the rest and use [`copy_aside_v2`] to
-//! preserve the original text as `<hash>.v2.json.partial` before overwriting it.
-//! The two backup names keep complete and partial failures from replacing each other.
+//! **This is state, not config:** a file that cannot be used -- corrupt, from another version,
+//! written for another project root, or with no workspace that can be used -- degrades with one log
+//! line instead of refusing to start (a missing file is simply a project whose layout has not been
+//! changed, and says nothing). That exception to the project's hard-fail discipline covers this file
+//! only; `init.lua` still fails hard. **Such a file is never overwritten**: `shell` reads the file
+//! again before every write, and one it cannot use then is moved whole by [`set_aside_v2`] to
+//! `<hash>.v2.json.unusable`. A file only part of which cannot be carried -- a workspace that cannot
+//! be used, a container layout this build does not know, a key inside a tree it does not know -- is
+//! opened with the rest, and its text is copied by [`copy_aside_v2`] to `<hash>.v2.json.partial`
+//! before it is written over, so what was lost can still be found. The two names differ so that
+//! neither ever replaces the other.
 //!
-//! Keep unknown top-level and workspace-level keys verbatim in [`Workspaces`] and write
-//! them back after this build's keys, preserving later builds' data while version stays 2.
-//! Drop an unknown workspace-level key that names a module already placed in this
-//! window's trees or floats, to avoid placing it twice, and copy the file aside.
+//! **What a later build wrote is carried, not dropped.** The version stays 2 while later builds add
+//! keys. A top-level key or a workspace-level key this build does not know is kept verbatim in
+//! [`Workspaces`] and written back after the keys this build writes, so a save by this build does not
+//! erase a later build's data. One exception: a workspace-level key naming a module this window
+//! places in its own trees or floats is not kept (it would put that module in two places), and the
+//! file is copied aside instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

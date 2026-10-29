@@ -1,5 +1,5 @@
 //! The shell's embedded Lua extension kernel -- a separate, independent runtime from Neovim's
-//! own internal Lua. Exposes exactly four v1
+//! own internal Lua (the two never share state). Exposes exactly four v1
 //! extension points under an `eitri` global table: `panel.register`, `command.register`, `on`,
 //! `config.get`/`config.set`, plus `keymap.prefix`/`keymap.set`/`keymap.del`.
 //!

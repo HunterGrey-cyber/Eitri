@@ -1,5 +1,5 @@
 # A minimal Arch image carrying only what
-# a real end user's machine has -- the installer hint table's runtime libraries, plus openssh so
+# a real end user's machine has -- the arch hint row's runtime libraries, plus openssh so
 # the real `ssh-keygen -Y verify` path actually runs. No sudo, no base-devel: this
 # is the prebuilt/curl install.sh path, which needs neither (the AUR packages build
 # separately and are not exercised here -- no archlinux target through nfpm, so there is no
@@ -15,9 +15,8 @@ ARG UID=1000
 ARG GID=1000
 
 # archlinux:latest ships no package database by default -- pacman -Sy populates it, a real network
-# round trip like every other image's package-manager bootstrap here. Arch's hint row lists
-# gtk4, webkitgtk-6.0. Plus curl/xz/ca-certificates and openssh for ssh-keygen.
-# `shadow` provides useradd/groupadd (archlinux:latest already carries it, named explicitly so
+# round trip like every other image's package-manager bootstrap here. Arch's own hint row:
+# gtk4, webkitgtk-6.0. Plus curl/xz/ca-certificates and openssh for ssh-keygen. `shadow` provides useradd/groupadd (archlinux:latest already carries it, named explicitly so
 # a minimal base image change cannot silently drop it).
 RUN pacman -Sy --noconfirm \
 	&& pacman -S --noconfirm --needed \

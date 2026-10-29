@@ -232,17 +232,15 @@ through the pump loop rather than executed inline.
   16ms timer poll's actual cost was burning idle CPU on a fixed cadence even
   when nothing was happening on the Wayland socket — and that specific
   failure mode has since been fixed a different way, in the real
-  `neovide_embed_live`/`shell_composed` crates (P11's idle-render fix,
-  `poc/idle-render-fix`: gate `queue_render()` on the
+  `neovide_embed_live`/`shell_composed` crates (the idle-render fix:
+  gate `queue_render()` on the
   renderer's own `animating`/`redraw_batches_seen()` signal instead of
-  firing unconditionally on every tick — see
-  those two crates). FD-driven wakeup
+  firing unconditionally on every tick). FD-driven wakeup
   would only ever have bought the same thing that fix already bought: waking
   the GLib loop only when the Wayland socket actually has data, instead of
   polling it on a fixed interval regardless. It does **not** touch the
   separate, still-open scroll-CPU gap (~37–38% higher than stock Neovide
-  during active scrolling):
-  that gap is not a "we're polling more often than we
+  during active scrolling): that gap is not a "we're polling more often than we
   need to" problem, it's that `GtkGLArea`'s `GdkFrameClock` is already
   driven 1:1 with real compositor frame-done callbacks throughout active
   scrolling — there is no coarser, cheaper cadence available to switch to

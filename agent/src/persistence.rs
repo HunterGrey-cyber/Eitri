@@ -173,16 +173,31 @@ pub struct ResumableSession {
     pub name: Option<String>,
 }
 
-/// Returns resumable sessions in this workspace, newest first, without a live provider.
-/// Filtering precedes ranking so an unavailable newest session does not hide an older
-/// resumable one. Missing, unreadable or ineligible records yield no offers.
-/// Sessions are deduplicated by `provider_session_id`, keeping the higher-ranked record.
-/// A session can have both a legacy flat record and a directory record written on resume.
-/// Only the directory record is still written, so its epoch-millisecond stamp is normally
-/// later. A backwards clock can instead retain the older metadata for the same session.
-/// This performs synchronous file I/O on the caller's thread, including the GTK main loop
-/// in `BackendGreeting::for_kind`: one `read_dir` and at most
-/// `MAX_RECORDS_PER_CONVERSATION` + 1 small JSON parses. The cap bounds that work.
+/// Every session in this workspace worth offering, newest first.
+///
+/// Answers "what is there to continue?" without needing a live provider -- the start screen has to
+/// decide before one exists. Filtering happens before ranking, so a workspace whose most recent
+/// session is not offerable still offers the most recent one that is, rather than nothing.
+///
+/// An empty vector covers every negative case (no records, unreadable records, no record whose
+/// provider advertised resume): none of them are failures a user can act on, and all of them mean
+/// exactly one thing to the caller -- there is nothing to offer.
+///
+/// **De-duplicated by `provider_session_id`**, keeping the higher-ranked record. One Claude session
+/// can legitimately be recorded twice (the pre-2026-09-15 single file, plus a per-session record
+/// written when it was later resumed); that was invisible while only the maximum was ever taken and
+/// would be two identical-looking rows in a list. The row kept is the right one because the flat
+/// file has had no writer since 2026-09-15 while the directory record for the same
+/// session is written on every adoption and resume -- so the directory record is stamped later by
+/// `epoch_millis`, and outranks it. (Wall-clock, therefore not a proof: a clock that moved backwards
+/// between the two writes would invert it. The cost of that is one row showing the older of two
+/// records for one session, which is a cosmetic wrong, not a wrong session.)
+///
+/// **This does synchronous file I/O on the caller's thread**, and its one product caller
+/// (`shell::agent_backend::BackendGreeting::for_kind`, from the agent panel's `Ready` handler) is on
+/// the GTK main loop. That is bounded, not free: one `read_dir` plus at most
+/// `MAX_RECORDS_PER_CONVERSATION` + 1 small JSON parses. The cap is what makes the bound true --
+/// before it existed this grew with every session the workspace had ever had.
 pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
     let mut records: Vec<ConversationRecord> = read_conversation_records(conversation_id)
         .into_iter()
@@ -206,12 +221,26 @@ pub fn resumable_sessions(conversation_id: &str) -> Vec<ResumableSession> {
         .collect()
 }
 
-/// Orders records by parsed `updated_at`, then by `provider_session_id`.
-/// Both legacy flat records and directory records use epoch milliseconds from
-/// `conversation::epoch_millis`. Numeric parsing avoids ordering different-width stamps
-/// as text and places invalid stamps below every parsed value.
-/// Session ids are unique within a conversation directory and break timestamp ties,
-/// so equal timestamps do not leave the result dependent on `read_dir` order.
+/// Orders records by `updated_at`, then by session id.
+///
+/// `updated_at` is parsed rather than compared as text. Every stamp this project has ever written
+/// is epoch milliseconds -- `conversation::epoch_millis`, the one and only writer since the first
+/// record was ever persisted (2026-09-11), including under the flat pre-2026-09-15
+/// layout -- but nothing pins that WIDTH, and a text compare puts a shorter number above a longer
+/// one. Parsing also means a stamp that is not a number at all (a hand-edited or corrupted record,
+/// which `read_conversation_records` deliberately tolerates rather than discards) yields `None`,
+/// which orders below every parsed value instead of winning on `'2' > '1'`.
+///
+/// This comment previously said the module's own older records carry ISO-8601 strings. They do not:
+/// only the earliest test fixtures in this file ever did, added when this module had
+/// no caller and wrote nothing.
+///
+/// The second component is `provider_session_id`, NOT `updated_at` again. Comparing `updated_at`
+/// against itself is not a tiebreak at all -- two records with byte-identical stamps would compare
+/// `Equal` and `max_by` would return whichever `read_dir` happened to yield last. Session ids are
+/// unique within a conversation directory (each one IS its filename), so this makes the order total
+/// and the answer genuinely reproducible. Which of two same-millisecond sessions wins is arbitrary;
+/// that it is the same one every time is the property being bought.
 fn updated_at_rank(record: &ConversationRecord) -> (Option<u128>, &str) {
     (
         record.updated_at.parse::<u128>().ok(),
@@ -1060,9 +1089,13 @@ mod tests {
         );
     }
 
-    /// The legacy single-file record is ranked by its own timestamp like any other.
-    /// Its writer used `conversation::epoch_millis`, so this fixture uses epoch milliseconds.
-    /// The legacy record has the greater timestamp here and must lead the list.
+    /// The pre-2026-09-15 single file is a row like any other, ranked by its own stamp.
+    ///
+    /// **Not "it sorts last".** A test here used to assert that, using an ISO-8601 fixture stamp and
+    /// reasoning that an unparseable stamp orders below everything. Production never wrote such a
+    /// stamp: the flat layout's only writer used `conversation::epoch_millis`, the same
+    /// as today's. So the fixture below is epoch millis, and the legacy record leads the list --
+    /// which is the real behaviour and the opposite of what was pinned before.
     #[test]
     fn the_old_single_file_record_is_ranked_by_its_stamp_like_any_other() {
         let conv = unique_conversation_id("list-legacy");
