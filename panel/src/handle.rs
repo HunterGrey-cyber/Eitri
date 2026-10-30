@@ -525,7 +525,8 @@ impl AgentPanelHandle {
         })
     }
 
-    /// The running tabs of the base view and the extra views that hold a running turn.
+    /// The tabs of the base view, and the extra views, holding work a close would end: a running turn, a
+    /// connect, a waiting question, a turn the CLI started, or live background work.
     pub fn running_chats(&self) -> Vec<(eitri_core::layout::ModuleId, Option<TabId>)> {
         self.wake();
         let state = self.state.borrow();
@@ -536,7 +537,13 @@ impl AgentPanelHandle {
             .tabs
             .tabs()
             .iter()
-            .filter(|t| t.turn_running() || matches!(t.backend(), TabBackend::Starting(_)))
+            .filter(|t| {
+                t.turn_running()
+                    || matches!(t.backend(), TabBackend::Starting(_))
+                    || t.question_waiting()
+                    || t.cli_unseen_busy()
+                    || t.background_calls() > 0
+            })
             .map(|t| {
                 let view = state.tabs.view_of(t.id);
                 (
@@ -2624,16 +2631,23 @@ mod tests {
         tick_handle_until(&handle, "background work", || handle.background_count() == 1);
         assert_eq!(handle.view_running_queued(ViewId::BASE), (0, 0));
         assert_eq!(handle.view_background_count(ViewId::BASE), 1);
+        // A window close that moves its running chats away moves this tab too, so its work is not ended.
+        assert_eq!(
+            handle.running_chats(),
+            vec![(eitri_core::layout::ModuleId::agent(), Some(tab))]
+        );
         let extra = ViewId::new(2).unwrap();
         assert_eq!(handle.view_background_count(extra), 0);
         state.borrow_mut().tabs.break_out(extra).unwrap();
         assert_eq!(state.borrow().tabs.tab_in(extra), Some(tab));
         assert_eq!(handle.view_background_count(ViewId::BASE), 0);
         assert_eq!(handle.view_background_count(extra), 1);
+        assert_eq!(handle.running_chats(), vec![(extra.module(), None)]);
         assert_eq!(handle.background_count(), 1);
         state.borrow_mut().shutting_down = true;
         assert_eq!(handle.background_count(), 0);
         assert_eq!(handle.view_background_count(extra), 0);
+        assert!(handle.running_chats().is_empty());
         for taken in state.borrow_mut().tabs.take_all() {
             if let Some(retired) = taken.retired {
                 retired.into_backend().shutdown();

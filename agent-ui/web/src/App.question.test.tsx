@@ -103,6 +103,19 @@ describe("questions in the page", () => {
     expect(answers()[1].answers).toEqual(answers()[0].answers);
   });
   const drafts = (tabId: number) => messages.filter((m) => m.type === "question_draft" && m.tab === tabId);
+  it("a move to the other window sends the question's unmirrored draft before its answer to view_export", () => {
+    const { container, press, root } = setup({ questions: [question] });
+    pause(300); press("i", {}, root);
+    pause(400); messages.length = 0;
+    press("2", {}, container.querySelector(".question-dock")!);
+    // Asked inside the mirror's delay, as a move right after a choice is.
+    dispatch({ kind: "view_export", request: 21, tab: 1 });
+    const draft = messages.findIndex((m) => m.type === "question_draft" && m.tab === 1);
+    const answer = messages.findIndex((m) => m.type === "view_exported" && m.request === 21);
+    expect(draft).toBeGreaterThanOrEqual(0);
+    expect(answer).toBeGreaterThan(draft);
+    expect(messages[draft]).toMatchObject({ interaction_id: "q1", draft: { answers: [{ options: [1] }] } });
+  });
   it("a question that settles after its answer sends no draft and leaves no error", () => {
     const { container, press, root, queryByText } = setup({ questions: [question] });
     pause(300); press("i", {}, root);

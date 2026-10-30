@@ -17,6 +17,8 @@ export type QuestionDraft = {
 export type QuestionDockHandle = {
   key: (event: KeyboardEvent<HTMLElement>) => void;
   focus: () => void;
+  /** Sends a draft still waiting out the mirror's delay now; nothing when none is pending. */
+  flush: () => void;
   reply: (payload: InboundPayload) => boolean;
 };
 type Props = {
@@ -235,6 +237,7 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
   useImperativeHandle(ref, () => ({
     key,
     focus: () => root.current?.focus({ preventScroll: true }),
+    flush: () => { if (mirrorTimer.current !== null) mirror(); },
     reply: (payload) => {
       // A restored request dropped while the page's record still read waiting can be answered later: its reply
       // still ends the wait the host's answering state holds the dock in.

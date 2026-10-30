@@ -3296,10 +3296,11 @@ export default function App() {
           const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
           if (list !== null && payload.tab === activeTabRef.current) settleListScroll(list);
           const view = exportView(viewStore.current, activeTabRef.current, payload.tab, () => captureView(list));
-          // What was typed into the box and is still waiting out its mirror's debounce goes ahead of the answer:
-          // the tab freezes once the answer is in, and a mirror sent after that reaches a tab that is no longer
-          // this window's, so the other window's box would come without it.
+          // What was typed into the box, or chosen in a waiting question, and is still waiting out its mirror's
+          // debounce goes ahead of the answer: the tab freezes once the answer is in, and a mirror sent after that
+          // reaches a tab that is no longer this window's, so the other window would get it without that edit.
           flushDraft();
+          if (payload.tab === activeTabRef.current) questionDock.current?.flush();
           postToRust({ type: "view_exported", request_id: nextRequestId(), request: payload.request, view });
           break;
         }
