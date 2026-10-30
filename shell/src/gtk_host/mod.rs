@@ -1899,6 +1899,7 @@ mod editor_reads_tests {
             cwd: None,
             clean: false,
             background: None,
+            open: vec![],
         };
         let restart = HostOp::Editor(EditorCall::Restart {
             win: WinId::MAIN,

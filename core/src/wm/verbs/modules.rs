@@ -773,11 +773,14 @@ pub fn restart_editor(w: &mut Window, _cx: &Cx, win: WinId, batch: &mut Batch) {
     }
     match w.editor_run {
         EditorRun::Ended => {
-            let Some(spawn) = w.editor_spawn.clone() else {
+            let Some(mut spawn) = w.editor_spawn.clone() else {
                 w.refuse(win, "the editor's launch settings are unavailable".into(), batch);
                 return;
             };
+            // Until the editor has been ready once, nothing has opened the launch's targets.
+            spawn.open = w.pending_open.clone();
             w.restart_wanted = false;
+            w.editor_ready = false;
             w.editor_run = EditorRun::Restarting;
             batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn }));
         }
@@ -1769,6 +1772,10 @@ mod restart_tests {
         }
         /// With `setup` as the window's module setup, and with the default keymap when `keys` is set.
         fn with(setup: Option<ModuleSetup>, keys: bool) -> Self {
+            Self::with_open(setup, keys, vec![])
+        }
+        /// As [`Rig::with`], the launch naming `open` for nvim to open.
+        fn with_open(setup: Option<ModuleSetup>, keys: bool, open: Vec<String>) -> Self {
             let mut r = rig(Layout::initial(&[]).unwrap());
             if let Some(setup) = setup {
                 r.controller.set_module_setup(WIN, setup);
@@ -1790,6 +1797,7 @@ mod restart_tests {
                 cwd: Some("/project".into()),
                 clean: true,
                 background: Some((0x12, 0x34, 0x56)),
+                open,
             };
             r.controller.start(WIN, StartStep::Feeds { spawn: spawn.clone() });
             r.controller.set_titles(
@@ -2107,6 +2115,83 @@ mod restart_tests {
         assert_eq!(r.restarts().len(), 2);
     }
 
+    fn targets() -> Vec<String> {
+        vec!["+3".into(), "/project/a b.rs".into()]
+    }
+
+    fn without_targets(spawn: &EditorSpawn) -> EditorSpawn {
+        EditorSpawn {
+            open: vec![],
+            ..spawn.clone()
+        }
+    }
+
+    #[test]
+    fn a_restart_before_ready_keeps_the_targets() {
+        let r = Rig::with_open(None, false, targets());
+        assert_eq!(r.driver.query(|c| c.open_state(WIN).unwrap().0), targets());
+        r.kill();
+        r.release();
+        r.key();
+        assert_eq!(
+            r.restarts(),
+            [r.spawn.clone()],
+            "nothing opened them, so the restart carries them"
+        );
+        assert_eq!(r.driver.query(|c| c.editor_spawn_open(WIN)), Some(vec![]));
+        assert_eq!(r.driver.query(|c| c.open_state(WIN).unwrap().0), targets());
+    }
+
+    #[test]
+    fn a_failed_restart_keeps_the_targets() {
+        let r = Rig::with_open(None, false, targets());
+        r.kill();
+        r.release();
+        r.key();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone(), r.spawn.clone()]);
+        assert_eq!(r.driver.query(|c| c.open_state(WIN).unwrap().0), targets());
+    }
+
+    #[test]
+    fn ready_clears_the_targets_and_a_later_restart_has_none() {
+        let r = Rig::with_open(None, false, targets());
+        assert!(!r.driver.query(|c| c.open_state(WIN).unwrap().1));
+        r.event(EditorEvent::Ready { win: WIN });
+        assert_eq!(r.driver.query(|c| c.open_state(WIN).unwrap()), (vec![], true, false));
+        r.kill();
+        assert!(
+            !r.driver.query(|c| c.open_state(WIN).unwrap().1),
+            "an editor that exited is not ready"
+        );
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [without_targets(&r.spawn)]);
+        assert!(
+            !r.driver.query(|c| c.open_state(WIN).unwrap().1),
+            "a restart begun is not ready"
+        );
+        r.event(EditorEvent::Ready { win: WIN });
+        assert!(r.driver.query(|c| c.open_state(WIN).unwrap().1));
+    }
+
+    #[test]
+    fn a_restart_that_is_ready_again_opens_nothing_even_after_a_second_restart() {
+        let r = Rig::with_open(None, false, targets());
+        r.kill();
+        r.release();
+        r.key();
+        r.event(EditorEvent::Ready { win: WIN });
+        r.kill();
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone(), without_targets(&r.spawn)]);
+    }
+
     #[test]
     fn a_restart_whose_launch_failed_leaves_the_editor_ended_and_the_next_show_tries_again() {
         let r = Rig::ended();
@@ -2266,6 +2351,7 @@ mod restart_tests {
             cwd: None,
             clean: false,
             background: None,
+            open: vec![],
         };
         for win in [WIN, crate::wm::WinId(2)] {
             let w = r.controller.window_mut(win).unwrap();

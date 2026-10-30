@@ -403,7 +403,7 @@ impl BackendKind {
 
 /// What [`BackendKind::choose`] returns when `--legacy`/`EITRI_AGENT_BACKEND=legacy` asked for a
 /// backend this build did not compile in. `message` is a finished, human-readable sentence for
-/// `main()` to print before exiting -- the same contract `eitri_core::project_root::resolve`'s
+/// `main()` to print before exiting -- the same contract `eitri_core::project_root::resolve_launch`'s
 /// `Result<_, String>` keeps, as a dedicated type here only so the error case cannot be confused
 /// with a real `BackendKind` at the call site.
 #[derive(Debug, Clone, PartialEq, Eq)]

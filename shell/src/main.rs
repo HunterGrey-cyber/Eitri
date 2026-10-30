@@ -236,7 +236,7 @@ fn main() -> glib::ExitCode {
     // detach right below, which is otherwise the very first thing this binary does: printing a
     // version line must never touch GTK, a display, or nvim's stdin.
     // `eitri_core::project_root::KNOWN_FLAGS` also lists `--version`, so `shell --version
-    // /some/project` is never a startup failure even though `main()` never reaches `resolve()` on
+    // /some/project` is never a startup failure even though `main()` never reaches `resolve_launch()` on
     // this path -- see that module's own tests.
     if has_flag("--version") {
         println!("{}", version::version_line());
@@ -292,10 +292,18 @@ fn main() -> glib::ExitCode {
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
     // `eitri_core::project_root`'s own module doc for why three separate `current_dir()` reads
     // were one process-global too many.
-    let project_root = match &start {
-        linked_window::WindowStart::Second { root, .. } => root.clone(),
-        linked_window::WindowStart::Full => match eitri_core::project_root::resolve() {
-            Ok(root) => root,
+    //
+    // What the command line names to open comes out of the same resolution as nvim's own arguments; window 2 has no
+    // editor and carries none.
+    let (project_root, open) = match &start {
+        linked_window::WindowStart::Second { root, .. } => (root.clone(), Vec::new()),
+        linked_window::WindowStart::Full => match eitri_core::project_root::resolve_launch() {
+            Ok(launch) => {
+                for note in &launch.notes {
+                    eprintln!("eitri: {note}");
+                }
+                (launch.root, eitri_core::project_root::nvim_open_args(&launch.open))
+            }
             Err(message) => {
                 eprintln!("eitri: {message}");
                 return glib::ExitCode::FAILURE;
@@ -441,6 +449,7 @@ fn main() -> glib::ExitCode {
             root_note.clone(),
             pair,
             start_note,
+            open.clone(),
         )
     });
     app.run_with_args::<&str>(&[])
@@ -470,6 +479,7 @@ fn build_application() -> Application {
         .build()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ui(
     app: &Application,
     want_clean: bool,
@@ -479,6 +489,7 @@ fn build_ui(
     root_note: Option<String>,
     pair: Rc<linked_window::spawn::Pair>,
     start_note: Option<String>,
+    open: Vec<String>,
 ) {
     use eitri_core::theme::start::{StartReport, StartTheme};
     use eitri_core::theme::store::ThemeWriter;
@@ -586,6 +597,7 @@ fn build_ui(
         cwd: Some(project_root.to_path_buf()),
         clean: want_clean,
         background: start_theme.editor_background(),
+        open,
     };
 
     // The window controller, behind its driver: the GTK host and the GLib scheduler, both attached to the
@@ -4104,7 +4116,7 @@ mod tests {
             at(concat!("companion::run(", "early_args")),
             at(concat!("drop_inherited", "_editor_env()")),
             at(concat!("tasks::install", "_guard(")),
-            at(concat!("project_root::", "resolve()")),
+            at(concat!("project_root::", "resolve_launch()")),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
         assert_eq!(

@@ -625,6 +625,10 @@ pub struct EditorSpawn {
     /// The colour the editor paints before nvim's UI is ready, from the remembered theme; `None` keeps the editor's
     /// own.
     pub background: Option<(u8, u8, u8)>,
+    /// What nvim opens at start, as the arguments it takes after its options (`+N`, then absolute paths); empty
+    /// opens nothing. Only the first start carries it: the controller keeps these apart from the spawn it restarts
+    /// with, and puts them back only until the editor has been ready once.
+    pub open: Vec<String>,
 }
 
 /// Why a module surface is released.

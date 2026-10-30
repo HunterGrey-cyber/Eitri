@@ -98,7 +98,7 @@ pub(crate) fn editor_options(spawn: &EditorSpawn) -> NeovideEditorPaneOptions {
         child_env: spawn.env.clone(),
         cwd: spawn.cwd.clone(),
         extra_nvim_args: spawn.args.clone(),
-        open: Vec::new(),
+        open: spawn.open.clone(),
     }
 }
 
@@ -664,6 +664,7 @@ mod tests {
             cwd: Some(PathBuf::from("/home/user/project")),
             clean: true,
             background: Some((0x1e, 0x1e, 0x2e)),
+            open: vec!["+3".into(), "/home/user/project/a b.rs".into()],
         };
         let start = editor_options(&spawn);
         assert_eq!(
@@ -674,7 +675,7 @@ mod tests {
                 child_env: spawn.env.clone(),
                 cwd: spawn.cwd.clone(),
                 extra_nvim_args: spawn.args.clone(),
-                open: Vec::new(),
+                open: vec!["+3".into(), "/home/user/project/a b.rs".into()],
             }
         );
         assert_eq!(editor_options(&spawn), start, "the restart's options are the start's");
@@ -812,6 +813,7 @@ mod tests {
                     cwd: None,
                     clean: false,
                     background: None,
+                    open: vec![],
                 },
             },
             SurfaceKind::Chat { view: ViewId::BASE },

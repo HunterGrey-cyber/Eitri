@@ -182,6 +182,7 @@ fn one_of_each_kind() -> Vec<(ModuleId, SurfaceKind)> {
                     cwd: None,
                     clean: true,
                     background: None,
+                    open: vec![],
                 },
             },
         ),

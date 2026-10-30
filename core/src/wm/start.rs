@@ -148,6 +148,7 @@ impl Controller {
             StartStep::Layout { parts, own_window } => {
                 state.own_window = own_window;
                 self.attach_parts(win, parts);
+                self.show_editor_for_targets(win);
             }
             StartStep::Surfaces { decls } => return self.create_surfaces(win, &decls),
             StartStep::Present {
@@ -310,6 +311,11 @@ mod tests {
     }
 
     fn setup() -> (Rc<Driver<Controller>>, Rc<FakeHost>) {
+        let (driver, host, _) = setup_with_scheduler();
+        (driver, host)
+    }
+
+    fn setup_with_scheduler() -> (Rc<Driver<Controller>>, Rc<FakeHost>, Rc<FakeScheduler>) {
         let host = FakeHost::new();
         let scheduler = FakeScheduler::new();
         let mut controller = Controller::new(scheduler.clone());
@@ -318,7 +324,7 @@ mod tests {
         let sink: Rc<dyn HostSink> = driver.clone();
         host.attach(Rc::downgrade(&sink));
         scheduler.attach(Rc::downgrade(&sink));
-        (driver, host)
+        (driver, host, scheduler)
     }
 
     fn spawn() -> EditorSpawn {
@@ -329,6 +335,7 @@ mod tests {
             cwd: Some("/project".into()),
             clean: true,
             background: None,
+            open: vec![],
         }
     }
 
@@ -424,6 +431,341 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn targeted() -> EditorSpawn {
+        EditorSpawn {
+            open: vec!["+3".into(), "/project/src/a b.rs".into()],
+            ..spawn()
+        }
+    }
+
+    fn frame() -> crate::layout::Frame<'static> {
+        crate::layout::Frame::new(crate::layout::Size { w: 1200, h: 800 }, 4)
+    }
+
+    /// The first-launch layout with the agent holding the keys, then the editor hidden.
+    fn editor_hidden() -> Layout {
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowRoot,
+        }])
+        .unwrap();
+        layout.set_focus(&ModuleId::agent()).unwrap();
+        crate::layout::hide(&mut layout, &ModuleId::editor(), &frame()).unwrap();
+        layout
+    }
+
+    /// A layout whose tree has no editor leaf, as a workspace that never held it.
+    fn editor_missing() -> Layout {
+        use crate::layout::{Axis, Node};
+        Layout::from_parts(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::agent()),
+                Node::Leaf(ModuleId::terminal()),
+            ),
+            Default::default(),
+            ModuleId::agent(),
+        )
+        .unwrap()
+    }
+
+    /// Walks a whole start over `layout` (with a real saver, so a save armed by the start shows) and returns the
+    /// shared layout.
+    fn walk_over(
+        driver: &Driver<Controller>,
+        host: &FakeHost,
+        spawn: EditorSpawn,
+        presence: EditorPresence,
+        layout: Layout,
+    ) -> Rc<RefCell<Layout>> {
+        walk_over_saving_in(
+            agent::state_dirs::test_workspace_dir("start-open"),
+            driver,
+            host,
+            spawn,
+            presence,
+            layout,
+        )
+    }
+
+    /// [`walk_over`] with the saver writing into `dir`.
+    fn walk_over_saving_in(
+        dir: std::path::PathBuf,
+        driver: &Driver<Controller>,
+        host: &FakeHost,
+        spawn: EditorSpawn,
+        presence: EditorPresence,
+        layout: Layout,
+    ) -> Rc<RefCell<Layout>> {
+        let workspaces = Workspaces::single();
+        let saver = crate::wm::persist::Saver::new(
+            Some(dir),
+            std::path::Path::new("/project"),
+            vec![],
+            None,
+            &layout,
+            &workspaces,
+        );
+        let parts = WindowParts {
+            layout: Rc::new(RefCell::new(layout)),
+            workspaces: Rc::new(RefCell::new(workspaces)),
+            saver: Some(saver),
+        };
+        let shared = parts.layout.clone();
+        for step in [
+            StartStep::Feeds { spawn },
+            StartStep::Window { spec: spec(presence) },
+            StartStep::Editor,
+            StartStep::Kernel,
+            config(),
+            StartStep::Layout {
+                parts,
+                own_window: None,
+            },
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        let decls = shared
+            .borrow()
+            .modules()
+            .iter()
+            .map(crate::wm::verbs::rig::decl)
+            .collect();
+        driver.start(WinId::MAIN, StartStep::Surfaces { decls });
+        driver.start(WinId::MAIN, StartStep::Chrome);
+        let first = shared.borrow().focus().clone();
+        host.with_surface(
+            WinId::MAIN,
+            first.clone(),
+            crate::wm::verbs::rig::decl(&first).kind,
+            true,
+        );
+        driver.start(
+            WinId::MAIN,
+            StartStep::Present {
+                activation: None,
+                first,
+                arrive: None,
+            },
+        );
+        driver.start(WinId::MAIN, StartStep::Requests);
+        shared
+    }
+
+    fn open_state(driver: &Driver<Controller>) -> (Vec<String>, bool, bool) {
+        driver.query(|c| c.open_state(WinId::MAIN).unwrap())
+    }
+
+    #[test]
+    fn a_start_with_targets_shows_a_hidden_editor_and_gives_it_the_keys() {
+        let (driver, host) = setup();
+        let layout = walk_over(&driver, &host, targeted(), EditorPresence::Owned, editor_hidden());
+        let editor = ModuleId::editor();
+        assert!(layout.borrow().is_shown(&editor));
+        assert_eq!(layout.borrow().focus(), &editor);
+        assert_eq!(host.focus_owner(WinId::MAIN), Some(editor.clone()));
+        assert!(
+            ops(&host).iter().any(|op| matches!(
+                op,
+                HostOp::Focus { to: FocusTo::Module(m), .. } if *m == editor
+            )),
+            "the first focus goes to the editor"
+        );
+        assert_eq!(
+            open_state(&driver).0,
+            targeted().open,
+            "the targets wait for the first Ready"
+        );
+    }
+
+    #[test]
+    fn the_editor_is_created_with_the_targets_and_the_window_keeps_the_spawn_without_them() {
+        let (driver, host) = setup();
+        walk_over(&driver, &host, targeted(), EditorPresence::Owned, editor_hidden());
+        assert_eq!(
+            ops(&host)
+                .iter()
+                .find_map(|op| match op {
+                    HostOp::CreateSurface {
+                        kind: SurfaceKind::Editor { spawn },
+                        ..
+                    } => Some(spawn.open.clone()),
+                    _ => None,
+                })
+                .unwrap(),
+            targeted().open,
+            "the first launch carries the targets"
+        );
+        assert_eq!(driver.query(|c| c.editor_spawn_open(WinId::MAIN)), Some(vec![]));
+    }
+
+    #[test]
+    fn a_start_with_targets_ends_a_zoom_on_another_module() {
+        let (driver, host) = setup();
+        let mut layout = editor_hidden();
+        layout.show(&ModuleId::editor()).unwrap();
+        layout.set_focus(&ModuleId::agent()).unwrap();
+        assert_eq!(
+            layout.toggle_zoom(&ModuleId::agent()),
+            crate::layout::ZoomChange::Zoomed
+        );
+        let shared = walk_over(&driver, &host, targeted(), EditorPresence::Owned, layout);
+        assert!(shared.borrow().zoom().is_none(), "the zoom over the editor is over");
+        assert_eq!(shared.borrow().focus(), &ModuleId::editor());
+        assert!(shared.borrow().is_shown(&ModuleId::editor()));
+    }
+
+    #[test]
+    fn a_start_with_targets_places_an_editor_the_workspace_lacks() {
+        let (driver, host) = setup();
+        let layout = editor_missing();
+        assert!(!layout.contains(&ModuleId::editor()));
+        let shared = walk_over(&driver, &host, targeted(), EditorPresence::Owned, layout);
+        let editor = ModuleId::editor();
+        assert!(shared.borrow().contains(&editor));
+        assert!(shared.borrow().is_shown(&editor));
+        assert_eq!(shared.borrow().focus(), &editor);
+        assert_eq!(host.focus_owner(WinId::MAIN), Some(editor));
+    }
+
+    #[test]
+    fn a_start_without_targets_moves_nothing() {
+        let (driver, host) = setup();
+        let shared = walk_over(&driver, &host, spawn(), EditorPresence::Owned, editor_hidden());
+        assert!(!shared.borrow().is_shown(&ModuleId::editor()), "no targets, no move");
+        assert_eq!(shared.borrow().focus(), &ModuleId::agent());
+        assert_eq!(open_state(&driver).0, Vec::<String>::new());
+        assert!(driver.query(|c| c.start_notes().is_empty()));
+    }
+
+    #[test]
+    fn targets_over_a_shown_editor_change_nothing_but_the_editor_spawn() {
+        let editor_first = || {
+            let mut layout = Layout::initial(&[ModuleDecl {
+                id: ModuleId::terminal(),
+                placement: Placement::BelowRoot,
+            }])
+            .unwrap();
+            layout.set_focus(&ModuleId::editor()).unwrap();
+            layout
+        };
+        let (plain_driver, plain_host) = setup();
+        walk_over(
+            &plain_driver,
+            &plain_host,
+            spawn(),
+            EditorPresence::Owned,
+            editor_first(),
+        );
+        let (driver, host) = setup();
+        walk_over(&driver, &host, targeted(), EditorPresence::Owned, editor_first());
+        let plain = ops(&plain_host);
+        let targeted_ops = ops(&host);
+        assert_eq!(plain.len(), targeted_ops.len());
+        for (plain, targeted_op) in plain.iter().zip(&targeted_ops) {
+            match (plain, targeted_op) {
+                (
+                    HostOp::CreateSurface {
+                        kind: SurfaceKind::Editor { spawn: plain_spawn },
+                        ..
+                    },
+                    HostOp::CreateSurface {
+                        kind: SurfaceKind::Editor { spawn: targeted_spawn },
+                        ..
+                    },
+                ) => assert_eq!(
+                    plain_spawn,
+                    &EditorSpawn {
+                        open: vec![],
+                        ..targeted_spawn.clone()
+                    },
+                    "the editor is created with the targets and otherwise as it always was"
+                ),
+                (plain, targeted_op) => assert_eq!(plain, targeted_op),
+            }
+        }
+        assert!(driver.query(|c| c.start_notes().is_empty()));
+    }
+
+    /// The user's close of the window, run through its teardown.
+    fn close(driver: &Driver<Controller>, scheduler: &FakeScheduler) {
+        driver.close_requested(WinId::MAIN, CloseBy::User);
+        scheduler.advance(std::time::Duration::ZERO);
+    }
+
+    /// The files the saver wrote into `dir`.
+    fn written(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// Starts over `layout` with targets, closes as the teardown does, and returns how many files the close wrote.
+    fn files_written_by_a_targeted_start_and_close(label: &str, layout: Layout) -> (usize, Rc<RefCell<Layout>>) {
+        let (driver, host, scheduler) = setup_with_scheduler();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        let shared = walk_over_saving_in(dir.clone(), &driver, &host, targeted(), EditorPresence::Owned, layout);
+        assert!(shared.borrow().is_shown(&ModuleId::editor()));
+        assert!(!open_state(&driver).2, "no save timer is armed by the launch");
+        close(&driver, &scheduler);
+        (written(&dir), shared)
+    }
+
+    #[test]
+    fn the_start_does_not_save_the_shown_editor() {
+        let (files, _) = files_written_by_a_targeted_start_and_close("start-save-hidden", editor_hidden());
+        assert_eq!(files, 0, "closing over the launch's own show writes nothing");
+    }
+
+    #[test]
+    fn the_start_does_not_save_the_placed_editor() {
+        let (files, _) = files_written_by_a_targeted_start_and_close("start-save-placed", editor_missing());
+        assert_eq!(files, 0, "closing over the launch's own placement writes nothing");
+    }
+
+    #[test]
+    fn a_change_after_the_targeted_start_is_saved() {
+        let (driver, host, scheduler) = setup_with_scheduler();
+        let dir = agent::state_dirs::test_workspace_dir("start-save-after");
+        let shared = walk_over_saving_in(
+            dir.clone(),
+            &driver,
+            &host,
+            targeted(),
+            EditorPresence::Owned,
+            editor_hidden(),
+        );
+        crate::layout::hide(&mut shared.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
+        close(&driver, &scheduler);
+        assert_eq!(written(&dir), 1, "a change the user made is written");
+    }
+
+    #[test]
+    fn a_refused_show_starts_without_moving_the_keys() {
+        let (driver, host) = setup();
+        let mut layout = editor_hidden();
+        layout.set_away(&ModuleId::editor(), true).unwrap();
+        let shared = walk_over(&driver, &host, targeted(), EditorPresence::Owned, layout);
+        assert!(!shared.borrow().is_shown(&ModuleId::editor()));
+        assert_eq!(shared.borrow().focus(), &ModuleId::agent());
+        assert!(driver.query(|c| c
+            .start_notes()
+            .iter()
+            .any(|note| note.contains("the launch's editor was not shown"))));
+        assert!(!open_state(&driver).2);
+    }
+
+    #[test]
+    fn window_2_carries_no_targets() {
+        let (driver, host) = setup();
+        let shared = walk_over(&driver, &host, targeted(), EditorPresence::Proxy, editor_hidden());
+        assert!(
+            !shared.borrow().is_shown(&ModuleId::editor()),
+            "a window with no editor shows none"
+        );
+        assert_eq!(shared.borrow().focus(), &ModuleId::agent());
+        assert!(driver.query(|c| c.start_notes().is_empty()));
     }
 
     /// Runs a window's start up to its editor phase with `spawn` as the feeds' settings, and returns the editor's

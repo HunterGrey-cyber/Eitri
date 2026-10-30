@@ -37,7 +37,7 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// directory, which is the trade this module exists to make. It takes no value; one that did
 /// would need more than a membership test here (see [`select_root_source`]'s doc).
 ///
-/// `--version` is intercepted before `resolve()`, but belongs here so all flag recognition agrees.
+/// `--version` is intercepted before `resolve_launch()`, but belongs here so all flag recognition agrees.
 /// `--legacy` is also intercepted in builds without the legacy backend (every release). Listing
 /// it in every build lets that path report `LEGACY_NOT_IN_BUILD`, rather than an unrecognized
 /// option or a silently opened cwd.
@@ -358,7 +358,8 @@ pub struct Launch {
     pub open: Vec<OpenTarget>,
     /// `--new-window` before `--`.
     pub new_window: bool,
-    /// Sentences for stderr: what was named and is not honoured in full.
+    /// Sentences for stderr, without the `eitri: ` the caller puts in front: what was named and is not honoured in
+    /// full.
     pub notes: Vec<String>,
 }
 
@@ -428,7 +429,7 @@ pub fn resolve_launch_in(
         if later.line.take().is_some() {
             later.col = None;
             notes.push(format!(
-                "eitri: a line applies to the first file only, dropped for {}",
+                "a line applies to the first file only, dropped for {}",
                 later.path.display()
             ));
         }
@@ -453,7 +454,7 @@ pub fn resolve_launch_in(
     for target in &open {
         if !target.path.starts_with(&root) {
             notes.push(format!(
-                "eitri: {} is outside the project {}",
+                "{} is outside the project {}",
                 target.path.display(),
                 root.display()
             ));
@@ -559,13 +560,11 @@ fn number(digits: &[u8]) -> Option<u32> {
 
 fn looks_like_a_command(token: &OsStr) -> String {
     let token = token.to_string_lossy();
-    format!(
-        "eitri: {token} looks like an nvim command. To open a file with that name use ./{token} or eitri -- {token}"
-    )
+    format!("{token} looks like an nvim command. To open a file with that name use ./{token} or eitri -- {token}")
 }
 
 fn needs_a_file(token: &OsStr) -> String {
-    format!("eitri: {} needs a file", token.to_string_lossy())
+    format!("{} needs a file", token.to_string_lossy())
 }
 
 /// What a path on the command line turned out to name.
@@ -781,7 +780,7 @@ mod tests {
 
     #[test]
     fn version_is_a_known_flag_and_never_a_project_directory() {
-        // `main()` intercepts `--version` before `resolve()`, but this module must still treat it
+        // `main()` intercepts `--version` before `resolve_launch()`, but this module must still treat it
         // as a known flag like `--clean`, never a project directory named "--version".
         assert_eq!(select(["--version"], None), Ok(RootSource::Cwd));
         // `shell --version /x` is not an error for the resolver -- the flag is skipped and the
@@ -791,7 +790,7 @@ mod tests {
 
     #[test]
     fn legacy_is_a_known_flag_in_every_build_and_never_a_project_directory() {
-        // `main()` intercepts `--legacy` before `resolve()` when legacy was not compiled in.
+        // `main()` intercepts `--legacy` before `resolve_launch()` when legacy was not compiled in.
         // Listing it here regardless of that feature preserves the real `LEGACY_NOT_IN_BUILD`
         // diagnostic instead of reporting an unrecognized option.
         assert_eq!(select(["--legacy"], None), Ok(RootSource::Cwd));
@@ -945,7 +944,7 @@ mod tests {
         assert!(err.contains("no such directory"), "got {err}");
     }
 
-    /// The seam between the two halves above: `resolve()` itself is only the three reads of
+    /// The seam between the two halves above: `resolve()` (which `resolve_launch()` extends) is only the three reads of
     /// process state, and this is everything it wires together. An args/env swap, or a source
     /// chosen and then a *different* one canonicalized, would show up only here.
     #[test]
@@ -1497,6 +1496,7 @@ mod tests {
         assert_eq!(launch.open, [plain(a), plain(b.clone())]);
         assert_eq!(launch.notes.len(), 1, "{:?}", launch.notes);
         assert!(launch.notes[0].contains(text(&b)), "{:?}", launch.notes);
+        assert!(!launch.notes[0].starts_with("eitri:"), "{:?}", launch.notes);
         // A name after the directory is relative to the cwd, as for nvim, never to the directory.
         let launch = at(&home, &["project", "other/b.rs"], &home).unwrap();
         assert_eq!(launch.open, [plain(b)]);
@@ -1552,10 +1552,7 @@ mod tests {
         );
         assert_eq!(
             at(&home, &["a.rs", "+42"], &home),
-            Err(
-                "eitri: +42 looks like an nvim command. To open a file with that name use ./+42 or eitri -- +42"
-                    .to_string()
-            )
+            Err("+42 looks like an nvim command. To open a file with that name use ./+42 or eitri -- +42".to_string())
         );
     }
 
@@ -1577,7 +1574,7 @@ mod tests {
         assert_eq!(
             at(&home, &["+page.svelte"], &home),
             Err(
-                "eitri: +page.svelte looks like an nvim command. To open a file with that name use \
+                "+page.svelte looks like an nvim command. To open a file with that name use \
                  ./+page.svelte or eitri -- +page.svelte"
                     .to_string()
             )
@@ -1586,7 +1583,7 @@ mod tests {
             assert_eq!(
                 at(&home, &[word, "a.rs"], &home),
                 Err(format!(
-                    "eitri: {word} looks like an nvim command. To open a file with that name use ./{word} or \
+                    "{word} looks like an nvim command. To open a file with that name use ./{word} or \
                      eitri -- {word}"
                 ))
             );
@@ -1603,10 +1600,10 @@ mod tests {
     #[test]
     fn plus_n_with_no_file_is_refused() {
         let (_s, home) = scratch_home("rl-nofile");
-        let needs = Err("eitri: +42 needs a file".to_string());
+        let needs = Err("+42 needs a file".to_string());
         assert_eq!(at(&home, &["+42"], &home), needs);
         assert_eq!(at(&home, &["+42", text(&home)], &home), needs);
-        assert_eq!(at(&home, &["+"], &home), Err("eitri: + needs a file".to_string()));
+        assert_eq!(at(&home, &["+"], &home), Err("+ needs a file".to_string()));
         // The variable is no file either, whatever it names.
         let launch = resolve_launch_in(
             &os(&["+42"]),
@@ -1618,6 +1615,23 @@ mod tests {
         assert_eq!(launch, needs);
     }
 
+    /// `main` prints a refusal or a note behind one `eitri: `, so the text itself carries none.
+    #[test]
+    fn a_refusal_prints_behind_one_prefix() {
+        let (_s, home) = scratch_home("rl-printed");
+        file(home.join("a.rs"));
+        let printed = |message: String| format!("eitri: {message}");
+        assert_eq!(
+            printed(at(&home, &["+page.svelte"], &home).unwrap_err()),
+            "eitri: +page.svelte looks like an nvim command. To open a file with that name use ./+page.svelte or \
+             eitri -- +page.svelte"
+        );
+        assert_eq!(
+            printed(at(&home, &["+42"], &home).unwrap_err()),
+            "eitri: +42 needs a file"
+        );
+    }
+
     #[test]
     fn plus_n_too_big_is_refused() {
         let (_s, home) = scratch_home("rl-big");
@@ -1626,7 +1640,7 @@ mod tests {
         assert_eq!(
             at(&home, &[token, "a.rs"], &home),
             Err(format!(
-                "eitri: {token} looks like an nvim command. To open a file with that name use ./{token} or \
+                "{token} looks like an nvim command. To open a file with that name use ./{token} or \
                  eitri -- {token}"
             ))
         );
@@ -1743,6 +1757,7 @@ mod tests {
         assert_eq!(launch.open, [plain(a.clone()), plain(b.clone())]);
         assert_eq!(launch.notes.len(), 1, "{:?}", launch.notes);
         assert!(launch.notes[0].contains(text(&b)), "{:?}", launch.notes);
+        assert!(!launch.notes[0].starts_with("eitri:"), "{:?}", launch.notes);
         // With a directory first, the first file is still the one with the line.
         let launch = at(&home, &[text(&home), "a.rs:3", "b.rs"], &home).unwrap();
         assert_eq!(launch.open, [placed(a, Some(3), None), plain(b)]);

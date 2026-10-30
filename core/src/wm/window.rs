@@ -188,7 +188,13 @@ pub struct Window {
     pub(super) quit: super::quit::QuitFlow,
     pub(super) quit_timer: Option<(TimerToken, u32)>,
     pub(super) release_exited: Option<TimerToken>,
+    /// The spawn a restart starts from; its `open` is always empty.
     pub(super) editor_spawn: Option<EditorSpawn>,
+    /// The editor's open arguments from the launch, until the editor has been ready once: a restart before that
+    /// carries them again, because nothing has opened them yet.
+    pub(super) pending_open: Vec<String>,
+    /// The editor has reported ready and has not exited, been released or begun a restart since.
+    pub(super) editor_ready: bool,
     pub(super) editor_run: EditorRun,
     pub(super) restart_wanted: bool,
     pub(super) release_refused_logged: bool,
@@ -266,6 +272,8 @@ impl Window {
             quit_timer: None,
             release_exited: None,
             editor_spawn: None,
+            pending_open: Vec::new(),
+            editor_ready: false,
             editor_run: EditorRun::Running,
             restart_wanted: false,
             release_refused_logged: false,
@@ -595,6 +603,12 @@ impl Window {
 
     pub fn presence(&self) -> &EditorPresence {
         &self.spec.presence
+    }
+
+    /// Keeps `spawn` as what a restart starts from, and its open arguments apart as the ones still to be opened.
+    pub(super) fn keep_spawn(&mut self, mut spawn: EditorSpawn) {
+        self.pending_open = std::mem::take(&mut spawn.open);
+        self.editor_spawn = Some(spawn);
     }
 
     /// How the shell described the window when it opened it.

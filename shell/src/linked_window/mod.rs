@@ -531,6 +531,7 @@ pub(crate) mod tests {
                         cwd: None,
                         clean: false,
                         background: None,
+                        open: vec![],
                     },
                 },
                 deferred: false,

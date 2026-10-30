@@ -483,10 +483,20 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         return;
     }
     use super::window::EditorRun;
+    // The editor is ready from `Ready` until it ends; a restart in flight clears it too, where it is begun.
+    if matches!(
+        event,
+        EditorEvent::Exited { .. } | EditorEvent::StartFailed { .. } | EditorEvent::Released { .. }
+    ) {
+        w.editor_ready = false;
+    }
     match &event {
         EditorEvent::Ready { .. } => {
+            // Nvim has now read its arguments, so a later restart opens nothing.
+            w.pending_open.clear();
             if matches!(w.editor_run, EditorRun::Running | EditorRun::Restarting) {
                 w.editor_run = EditorRun::Running;
+                w.editor_ready = true;
                 batch.push_effect(HostOp::Plugin(PluginOp::EditorBack { win }));
             }
             return;

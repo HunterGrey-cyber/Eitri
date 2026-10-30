@@ -49,6 +49,7 @@ fn decl(module: &ModuleId) -> SurfaceDecl {
                 cwd: None,
                 clean: true,
                 background: None,
+                open: vec![],
             },
         },
         ModuleKind::Agent => SurfaceKind::Chat {

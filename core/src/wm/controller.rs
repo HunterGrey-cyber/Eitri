@@ -536,7 +536,9 @@ impl Controller {
         if let Some(placement) = self.placements.remove(&win) {
             window.set_placement(placement);
         }
-        window.editor_spawn = self.starts.get(&win).and_then(|start| start.spawn.clone());
+        if let Some(spawn) = self.starts.get(&win).and_then(|start| start.spawn.clone()) {
+            window.keep_spawn(spawn);
+        }
         if let Some((keymap, module_keys)) = self.keymaps.get(&win) {
             window.keys.prefix = Some(Prefix::new(keymap.clone(), module_keys.clone()));
         }
@@ -545,7 +547,45 @@ impl Controller {
 
     pub(super) fn keep_editor_spawn(&mut self, win: WinId, spawn: EditorSpawn) {
         if let Some(window) = self.windows.get_mut(&win) {
-            window.editor_spawn = Some(spawn);
+            window.keep_spawn(spawn);
+        }
+    }
+
+    /// A launch with targets needs nvim to start now: the editor widget is what starts it, and only a shown
+    /// editor renders. Shows the editor (placing it beside the keys when this workspace lacks it), ends a zoom
+    /// over it and gives it the keys, on the layout itself: no ops go out and the saver measures from the layout
+    /// as shown, so no save is armed and the close does not write it: the saved arrangement is left as it was.
+    /// A refusal is a note and the keys stay where they are.
+    pub(super) fn show_editor_for_targets(&mut self, win: WinId) {
+        let Some(w) = self.windows.get_mut(&win) else { return };
+        if w.pending_open.is_empty() || *w.presence() != EditorPresence::Owned {
+            return;
+        }
+        let editor = ModuleId::editor();
+        let layout = w.layout.clone();
+        let Ok(mut l) = layout.try_borrow_mut() else {
+            self.start_note("[wm] BUG: the layout was borrowed when the launch's editor was shown".into());
+            return;
+        };
+        let shown = if l.contains(&editor) {
+            l.show(&editor).map(|_| ())
+        } else {
+            let keys = l.focus().clone();
+            crate::layout::ops::place(&mut l, &editor, &keys, crate::layout::Axis::Row)
+        };
+        let result = shown.and_then(|()| l.can_focus(&editor)).and_then(|()| {
+            if l.zoom_hides(&editor) {
+                l.unzoom();
+            }
+            l.set_focus(&editor)
+        });
+        // The show is part of the launch, not a change of the arrangement: the close must not write it.
+        if let (Some(saver), Ok(workspaces)) = (w.saver.as_mut(), w.workspaces.try_borrow()) {
+            saver.rebase(&l, &workspaces);
+        }
+        drop(l);
+        if let Err(err) = result {
+            self.start_note(format!("[wm] the launch's editor was not shown: {err:?}"));
         }
     }
 
@@ -553,6 +593,24 @@ impl Controller {
         eprintln!("{line}");
         #[cfg(test)]
         self.start_notes.push(line);
+    }
+
+    /// What `win` still has to open, whether its editor is ready, and whether a save timer is armed, for tests.
+    #[cfg(test)]
+    pub(super) fn open_state(&self, win: WinId) -> Option<(Vec<String>, bool, bool)> {
+        self.windows
+            .get(&win)
+            .map(|w| (w.pending_open.clone(), w.editor_ready, w.save_timer.is_some()))
+    }
+
+    /// The `open` of the spawn a restart of `win`'s editor starts from, for tests.
+    #[cfg(test)]
+    pub(super) fn editor_spawn_open(&self, win: WinId) -> Option<Vec<String>> {
+        self.windows
+            .get(&win)?
+            .editor_spawn
+            .as_ref()
+            .map(|spawn| spawn.open.clone())
     }
 
     #[cfg(test)]

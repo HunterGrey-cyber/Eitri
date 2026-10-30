@@ -450,6 +450,7 @@ mod tests {
                     cwd: None,
                     clean: true,
                     background: None,
+                    open: vec![],
                 },
             },
             deferred: false,

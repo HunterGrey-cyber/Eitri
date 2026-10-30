@@ -1262,6 +1262,20 @@ impl Saver {
         self
     }
 
+    /// Measures changes from `layout` and `workspaces` as they are now: for a launch that changed the layout it
+    /// opened on purpose after the saver was made (a file to open shows the editor), which is then no change, so
+    /// neither a timer nor the close writes it. Only a change made after this one is a change. With a write
+    /// outstanding, the measure is that write's entry and `base` stays: if the write succeeds, `collect` takes the
+    /// entry as the base; if it fails, what it was to write is still unwritten, and the close writes it, this
+    /// change with it.
+    pub fn rebase(&mut self, layout: &Layout, workspaces: &Workspaces) {
+        let now = Arrangement::of(workspaces, layout);
+        match self.submitted.last_mut() {
+            Some(last) => last.arrangement = now,
+            None => self.base = now,
+        }
+    }
+
     /// The close's save while the layout could not be read: nothing more is handed over (said so), and the
     /// writer is waited for as [`Saver::save_now`] waits.
     pub fn save_now_unread(&mut self) -> bool {
@@ -2454,8 +2468,20 @@ mod tests {
             self.saver.borrow().writer.flush(bound)
         }
 
+        fn rebase(&self) {
+            self.saver
+                .borrow_mut()
+                .rebase(&self.layout.borrow(), &self.workspaces.borrow());
+        }
+
         fn base(&self) -> Arrangement {
             self.saver.borrow().base.clone()
+        }
+
+        fn holds(&self) -> bool {
+            self.saver
+                .borrow()
+                .holds(&self.layout.borrow(), &self.workspaces.borrow())
         }
 
         fn shared(&self) -> Arc<WriterShared> {
@@ -2641,6 +2667,87 @@ mod tests {
             seconds,
             "the first window's click, then close: nothing written"
         );
+    }
+
+    #[test]
+    fn a_rebased_arrangement_is_no_change_also_against_a_write_still_outstanding() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-rebase");
+        persist::save(&dir, root(), &Workspaces::single(), &first_launch_layout(&[]).unwrap()).unwrap();
+        let layout = opened(&dir, &[]);
+        let saver = saver_for(&dir, &layout);
+        let show = || layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        let hide = || {
+            crate::layout::hide(&mut layout.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
+        };
+
+        // Nothing outstanding: the measure moves to the arrangement as it is now.
+        show();
+        assert!(saver.arrangement_changed());
+        saver.rebase();
+        assert!(!saver.arrangement_changed(), "the rebased arrangement is the measure");
+        hide();
+        assert!(saver.arrangement_changed(), "a change after the rebase is one");
+
+        // A write handed over before the rebase: the measure is that write's arrangement no longer.
+        assert!(saver.submit_if_changed());
+        show();
+        assert!(saver.arrangement_changed());
+        saver.rebase();
+        assert!(!saver.arrangement_changed());
+        hide();
+        assert!(saver.arrangement_changed());
+    }
+
+    /// A rebase moves what the next change is measured from, not what the file is known to hold: a write
+    /// outstanding at the rebase that then fails leaves its change unwritten, so the next save writes and
+    /// `holds` stays false until one did. The write is failed by a directory where the `.tmp` goes.
+    #[test]
+    fn a_write_outstanding_at_a_rebase_that_fails_is_still_unwritten() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-rebase-fails");
+        let path = dir.join(persist::file_name_v2(root()));
+        std::fs::create_dir_all(persist::temporary(&path).join("in the way")).unwrap();
+        let layout = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
+        let opened_with = Arrangement::of(&Workspaces::single(), &layout.borrow());
+        let saver = saver_for(&dir, &layout);
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        assert!(saver.submit_if_changed());
+        crate::layout::hide(&mut layout.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        saver.rebase();
+        assert!(!saver.arrangement_changed(), "the rebased arrangement is the measure");
+
+        assert!(saver.flush(Duration::from_secs(10)));
+        saver.collect();
+        assert!(!path.exists(), "the write failed");
+        assert_eq!(saver.base(), opened_with, "a failed write does not move the base");
+        assert!(saver.arrangement_changed(), "so the change is still unwritten");
+        assert!(!saver.holds(), "and the file is not taken to hold it");
+
+        std::fs::remove_dir_all(persist::temporary(&path)).unwrap();
+        saver.save_now();
+        assert_eq!(file_text(&dir), written_by(&layout));
+        assert!(saver.holds(), "a later write that succeeds settles it");
+    }
+
+    /// The same write succeeding: the arrangement rebased over it is the base, so the launch's change that
+    /// the write does not hold is not written by the close.
+    #[test]
+    fn a_write_outstanding_at_a_rebase_that_succeeds_leaves_the_rebased_arrangement_as_the_base() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-rebase-succeeds");
+        let layout = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
+        let saver = saver_for(&dir, &layout);
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        assert!(saver.submit_if_changed());
+        crate::layout::hide(&mut layout.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        saver.rebase();
+        assert!(saver.flush(Duration::from_secs(10)));
+        saver.collect();
+        assert_eq!(
+            saver.base(),
+            Arrangement::of(&Workspaces::single(), &layout.borrow()),
+            "the rebased arrangement, not the one the write was given"
+        );
+        assert!(!saver.arrangement_changed());
+        assert!(saver.holds());
     }
 
     /// A module this window does not have -- here a Lua panel only the other window registered --
@@ -3072,6 +3179,7 @@ mod tests {
                         cwd: None,
                         clean: true,
                         background: None,
+                        open: vec![],
                     },
                 },
             );

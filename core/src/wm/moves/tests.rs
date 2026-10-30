@@ -3532,6 +3532,7 @@ fn an_arriving_workspace_keeps_window_1s_ended_editor_off_screen() {
                 cwd: None,
                 clean: true,
                 background: None,
+                open: vec![],
             },
         },
     );
