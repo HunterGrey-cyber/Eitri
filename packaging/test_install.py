@@ -321,7 +321,7 @@ def test_desktop_exec_parses_back_with_glib():
     assert ok
     # Field codes are expanded after parsing; a literal % is %%.
     assert argv[0].replace("%%", "%") == home + "/.local/bin/eitri"
-    assert argv[1:] == ["--quiet", "%F"]
+    assert argv[1:] == ["--quiet", "--from-desktop", "%F"]
     if shutil.which("desktop-file-validate"):
         check = subprocess.run(["desktop-file-validate", str(desktop)], capture_output=True, text=True)
         assert check.returncode == 0, report(check)

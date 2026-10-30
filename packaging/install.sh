@@ -3322,7 +3322,7 @@ tidy_icon_dirs() {
 desktop_exec_line() {
 	case $2 in
 	cn.huntergrey.eitri.Panel.desktop) printf 'Exec=%s panel --quiet %%f\n' "$1" ;;
-	*) printf 'Exec=%s --quiet %%F\n' "$1" ;;
+	*) printf 'Exec=%s --quiet --from-desktop %%F\n' "$1" ;;
 	esac
 }
 

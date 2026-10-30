@@ -100,7 +100,7 @@ t_fresh_layout() {
 	# eitri-setup is this installer, byte for byte.
 	if ! cmp -s "$INSTALLER" "$TH/.local/lib/eitri/eitri-setup"; then fail "eitri-setup differs from install.sh"; fi
 	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
-		"Exec=\"$TH/.local/bin/eitri\" --quiet %F" "the desktop Exec line"
+		"Exec=\"$TH/.local/bin/eitri\" --quiet --from-desktop %F" "the desktop Exec line"
 	expect_absent "$TH/.cache"
 	expect_out 'installed Eitri 1.0.0'
 	expect_no_out 'restart open Eitri windows'
@@ -141,7 +141,7 @@ t_desktop_exec_space_percent() {
 	inst_net
 	expect_rc 0
 	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
-		"Exec=\"$T/my home 100%%/.local/bin/eitri\" --quiet %F" "the escaped Exec line"
+		"Exec=\"$T/my home 100%%/.local/bin/eitri\" --quiet --from-desktop %F" "the escaped Exec line"
 	# Every other line is the tarball's desktop file's.
 	if [ "$(grep -v '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" != "$(grep -v '^Exec=' "$PKG/cn.huntergrey.eitri.desktop")" ]; then
 		fail "the desktop file differs from the tarball's in more than Exec"
@@ -162,7 +162,7 @@ t_desktop_exec_all_specials() {
 	# backslash, then % becomes %%.
 	# shellcheck disable=SC2016 # literal characters, deliberately unexpanded
 	expect_eq "$(grep '^Exec=' "$TH/.local/share/applications/cn.huntergrey.eitri.desktop")" \
-		"Exec=\"$T/"'q\\"b\\`t\\$d\\\\s 5%%/.local/bin/eitri" --quiet %F' "the escaped Exec line"
+		"Exec=\"$T/"'q\\"b\\`t\\$d\\\\s 5%%/.local/bin/eitri" --quiet --from-desktop %F' "the escaped Exec line"
 	expect_exec "$TH/.local/bin/eitri"
 	expect_eq "$(installed_version)" 1.0.0 "installed into a HOME with every special character"
 }

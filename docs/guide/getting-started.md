@@ -19,13 +19,14 @@ eitri [DIR]
 ```
 
 `DIR` is the project directory. Without it Eitri uses `$EITRI_PROJECT_DIR` when that is set, and otherwise the
-directory you ran the command in. A path that does not exist, or an option Eitri does not know, stops the
-launch with a message instead of opening some other directory; to open a directory whose name starts with
-`-`, put `--` before it (`eitri -- -notes`). To open a file instead of a directory, see
+directory you ran the command in. A path in a folder that does not exist, or an option Eitri does not know, stops
+the launch with a message instead of opening some other directory; to open a directory whose name starts with
+`-`, put `--` before it (`eitri -- -notes`). A name that does not exist in a folder that does is a new file, so a
+mistyped directory name opens an empty buffer of that name. To open a file instead of a directory, see
 [Open a file](#open-a-file).
 
-Each launch is its own window with its own Neovim, its own sessions and its own project root, so you can have
-several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
+Each directory you open is its own window with its own Neovim, its own sessions and its own project root, so you can
+have several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
 the one on screen: `myproject — Eitri · docs`), which is what a window switcher or a compositor's window rule reads.
 
 The window holds your editor on one side and the agent panel on the other. The editor is your own Neovim, with
@@ -83,10 +84,13 @@ opens the file, the window comes to the front with the keys on the editor, and t
 window's editor was hidden or has not started yet, it is shown and the file opens when it is ready. Typed in an Eitri
 window's own bottom terminal, `eitri FILE` opens in that window, even after a `cd` into a subfolder, as long as the
 file is inside the window's project. `eitri DIR` and a bare `eitri` always start a new window, and so does
-`eitri --new-window FILE` (`--clean` and `--account` imply it). A file outside the project of
-every open window starts a new window, and so does a window that cannot take the file just now, for instance one
-sitting in a quit prompt with an unsaved buffer. When the buffer in the editor has unsaved
-changes, the file opens in a split and that buffer stays.
+`eitri --new-window FILE` (`--clean` and `--account` imply it). An account set in `VERDANDI_CLAUDE_ACCOUNT` does not
+imply it: the running window keeps the account it has. Outside a bottom terminal the window must be on the very
+project worked out above, not a wider one: `cd repo/crate; eitri src/x.rs` works out `crate`, so it starts a window on
+`crate` even with one open on `repo`, and a project not seen before gets its own trust question. Run it from `repo`,
+or from that window's bottom terminal, to reach that window. With no window on the project a new one starts, and so it
+does when the window cannot take the file just now, for instance one sitting in a quit prompt with an unsaved buffer.
+When the buffer in the editor has unsaved changes, the file opens in a split and that buffer stays.
 
 On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
 terminal does not have: there GNOME may show a "window is ready" notice instead of raising the window. Sway, Hyprland
@@ -101,7 +105,8 @@ anywhere in this folder.` It stays until you dismiss it. What that means for eac
 
 **From a file manager.** Eitri's desktop entry lists plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell
 scripts, so it appears under Open With for them (it does not become the default). Such a launch usually starts in your
-home directory, so the project comes from the file as described above.
+home directory, so the project comes from the file as described above. Several files selected together open as
+`eitri a.rs b.rs` does, and several folders open one window each.
 
 ## Your first turn
 

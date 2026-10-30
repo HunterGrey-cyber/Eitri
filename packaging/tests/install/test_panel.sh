@@ -32,7 +32,7 @@ t_panel_entry_and_plugin_installed() {
 	if ! grep -Fqx 'NoDisplay=true' "$p"; then fail "the panel entry is not hidden"; fi
 	# The main entry is unchanged.
 	expect_eq "$(grep '^Exec=' "$(data_of)/applications/cn.huntergrey.eitri.desktop")" \
-		"Exec=\"$TH/.local/bin/eitri\" --quiet %F" "the main entry's Exec line"
+		"Exec=\"$TH/.local/bin/eitri\" --quiet --from-desktop %F" "the main entry's Exec line"
 	for f in $(plugin_files); do
 		expect_file "$(data_of)/eitri/eitri.nvim/$f"
 		if ! cmp -s "$PKG/../nvim/eitri.nvim/$f" "$(data_of)/eitri/eitri.nvim/$f"; then

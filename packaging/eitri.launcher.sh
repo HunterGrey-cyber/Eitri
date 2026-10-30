@@ -95,6 +95,7 @@ ACCOUNT_FROM_FLAG=""
 PROJECT=""
 QUIET=""
 NEW_WINDOW=""
+FROM_DESKTOP=""
 FIRST=""
 # Window mode keeps what was typed, in order: BEFORE is everything ahead of the user's `--` (a `+N`
 # stays a line spec there), AFTER everything behind it (all paths). shell resolves them.
@@ -126,6 +127,9 @@ while [[ $# -gt 0 ]]; do
 		# below: reusing a window would drop the account the flag selects.
 		--new-window) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --new-window" >&2; exit 64; }
 		           NEW_WINDOW=1; shift ;;
+		# Only the desktop entry passes this, in front of its `%F` list: see the end of this file.
+		--from-desktop) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --from-desktop" >&2; exit 64; }
+		           FROM_DESKTOP=1; shift ;;
 		--account) ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   QUIET=1; shift ;;
 		-h|--help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -183,14 +187,23 @@ if [[ -z "$QUIET" ]] && ! sidecar_found; then
 	echo 'eitri: no sidecar built yet -- run "eitri setup" to build one' >&2
 fi
 
+# A launch that names a file may end in a running window, which keeps the account it has, so here nothing has been
+# picked yet. If it goes on to a window of its own, the binary says what it took.
+MAY_HAND_OVER=""
+if [[ $MODE == window && -z "$PROJECT" && -z "$NEW_WINDOW" && ${#SHELL_ARGS[@]} -eq 0 ]]; then
+	[[ $((${#BEFORE[@]} + ${#AFTER[@]})) -eq 1 && -d "$FIRST" ]] || MAY_HAND_OVER=1
+fi
+
 if [[ -z "$QUIET" ]]; then
 	{
 		if [[ $MODE != window || -n "$PROJECT" ]]; then
 			echo "eitri    project $PROJECT"
-		else
+		elif [[ -n "$FIRST" ]]; then
 			echo "eitri    open $FIRST"
 		fi
-		if [[ -n "$ACCOUNT_FROM_FLAG" ]]; then
+		if [[ -n "$MAY_HAND_OVER" ]]; then
+			:
+		elif [[ -n "$ACCOUNT_FROM_FLAG" ]]; then
 			echo "         account $ACCOUNT (--account)"
 		elif [[ -n "$ACCOUNT" ]]; then
 			echo "         account $ACCOUNT (from VERDANDI_CLAUDE_ACCOUNT in the environment)"
@@ -209,6 +222,30 @@ if [[ $MODE == panel ]]; then
 	exec "$LIBDIR/shell" panel "${PANEL_ARGS[@]}" -- "$PROJECT"
 fi
 [[ -n "$NEW_WINDOW" ]] && SHELL_ARGS+=(--new-window)
+# A file manager gives the desktop entry everything selected as one list, and a folder after the first path is a
+# refusal no screen would show. So each folder gets a window of its own, as it would from one launch per item, and
+# the files stay together so that they can share a window.
+if [[ -n "$FROM_DESKTOP" ]]; then
+	FOLDER_LATER=""
+	for a in "${BEFORE[@]:1}"; do
+		if [[ -d "$a" ]]; then FOLDER_LATER=1; fi
+	done
+	if [[ -n "$FOLDER_LATER" ]]; then
+		FILES=()
+		for a in "${BEFORE[@]}"; do
+			if [[ -d "$a" ]]; then
+				"$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "$a" &
+			else
+				FILES+=("$a")
+			fi
+		done
+		if [[ ${#FILES[@]} -gt 0 ]]; then
+			"$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "${FILES[@]}" &
+		fi
+		wait
+		exit 0
+	fi
+fi
 # shell reads its first argument as a subcommand before it reads any path. A directory or file typed
 # with one of those names (`eitri --quiet panel` in a folder called panel) would run the subcommand
 # instead of opening the path; spelling it ./name keeps it the path the user typed, relative to the

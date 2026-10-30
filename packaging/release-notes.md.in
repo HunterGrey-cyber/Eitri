@@ -22,8 +22,9 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   files, `+N` and `+` before the first file, `FILE:LINE` and `FILE:LINE:COL`, `--` and `eitri DIR FILE` work as
   `nvim` users expect; `+page.svelte` and similar are refused as nvim commands.
 - When a window of that project is already open, the file opens in it, the window comes to the front and the
-  command returns at once. Typed in Eitri's own bottom terminal, it opens in that window. `--new-window` always
-  starts a new window; so do `eitri DIR`, `--clean` and `--account`.
+  command returns at once. The window has to be on the project worked out for the file: from a subfolder of a
+  repository that is the subfolder. Typed in Eitri's own bottom terminal, it opens in that window. `--new-window`
+  always starts a new window; so do `eitri DIR`, `--clean` and `--account`.
 - A file with no project of its own (`eitri ~/notes.md`, `eitri /etc/hosts`, `eitri /tmp/x.py`) opens in its folder
   with no project boundary: a Claude tab asks before every file and command, a Codex tab can still write anywhere
   in that folder, and the panel says so in a note.
@@ -175,6 +176,9 @@ The agents guide's first section describes all of this.
   and so are Codex tabs: they keep their `workspace-write` sandbox over that whole folder.
 - **`eitri FILE` when a window of the project is open hands the file to that window** instead of starting one;
   `--new-window` is the way to get a new window.
+- **A mistyped path can open a window.** `eitri typo` used to stop with `no such directory`. In a folder that exists
+  it now opens an empty buffer named `typo`, with the project found from that folder, and `:w` creates the file. A
+  path in a folder that does not exist still stops the launch.
 - **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
   window's layout and then saves only its own, so closing it no longer changes what the first window opens with.
 

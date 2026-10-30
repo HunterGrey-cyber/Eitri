@@ -2,10 +2,11 @@
 //! instead of starting another window.
 //!
 //! A window that owns its editor binds `open-<16 hex project key>.sock` in the control directory. A
-//! client sends one JSON line for each file and reads one reply line: `ok`, `busy` or
-//! `refused: <why>`. `ok` means the window accepted the file, not that nvim has opened it: nvim may
-//! be sitting at a prompt. On `busy`, a refusal or a timeout the client starts a new window, so
-//! nothing here is ever fatal, to the window or to the command.
+//! client connects for each file and waits for `ready`, which the thread says when it turns to that
+//! connection; it then sends one JSON line and reads one reply line: `ok`, `busy` or `refused: <why>`.
+//! `ok` means the window accepted the file, not that nvim has opened it: nvim may be sitting at a
+//! prompt. On `busy`, a refusal or a timeout the client starts a new window, so nothing here is ever
+//! fatal, to the window or to the command.
 //!
 //! The socket is a way for a local process to act on a window that holds an agent, so it stays narrow:
 //!
@@ -20,14 +21,16 @@
 //!
 //! One atomic decides who owns a handed-over request. The thread stops waiting for the GTK side after
 //! [`ANSWER_WITHIN`] and says `busy`, and a request nobody took by then can no longer be taken. Nor
-//! can one whose client hung up in the meantime: a client's deadline runs from its connect, so time
-//! queued behind another client counts against it, and it can leave while its request waits here.
-//! Once the GTK side has taken it, the request will run, so a thread that hears nothing more says
-//! `ok`: `busy` could open the file twice.
+//! can one whose client was killed or interrupted in the meantime. Once the GTK side has taken it, the
+//! request will run, so a thread that hears nothing more says `ok`: `busy` could open the file twice.
 //!
-//! That leaves one way to open a file twice: the client's deadline passes after the take and before
-//! the reply reaches it, so it starts a new window as well. Only the client could close that, by
-//! waiting to hear the outcome past its deadline.
+//! The client settles the rest by holding its request back until `ready`. Connections wait behind each
+//! other, and a client that gives up in that queue has sent nothing, so its new window is the only
+//! place the file opens. One that has sent gets [`CLIENT_DEADLINE`] afresh, longer than everything the
+//! thread can still spend on the request, so it hears how the request ended.
+//!
+//! That leaves one way to open a file twice: a window stopped or starved for longer than that margin
+//! between a take and its reply, which no bounded wait on the client's side can tell from a dead one.
 //!
 //! A socket in the way is reclaimed only under `open-<key>.lock`, only when a connect is refused twice
 //! a moment apart (a claimant between `bind` and `listen` refuses the first one), and only the very
@@ -61,12 +64,14 @@ pub const READ_WITHIN: Duration = REQUEST_DEADLINE;
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 /// How much longer a taken request waits for its answer.
 pub const TAKEN_WITHIN: Duration = Duration::from_secs(1);
-/// How long a client waits for each target, connect included. Longer than the server's three waits
-/// together, so a request served as soon as it arrives gets its reply. It runs from the connect, and
-/// those waits do not count time in the accept queue, so a client that queued can give up on a request
-/// the server still holds: [`Incoming::take`] looks for that.
+/// How long a client waits at each of its two steps on a target: from the connect to [`READY`], and
+/// from the request to the reply. The first is what time in the accept queue counts against, and a
+/// client that gives up there has sent nothing. The second is longer than the server's three waits
+/// together, so a client that has sent a request hears how it ended.
 pub const CLIENT_DEADLINE: Duration = Duration::from_millis(4500);
 
+/// What the thread says when it turns to a connection, before anything else is read or written.
+const READY: &str = "ready";
 /// The one protocol version. A new capability is a new version, never an extra key.
 const PROTOCOL: u64 = 1;
 /// The one operation.
@@ -342,6 +347,10 @@ impl Serving {
             let _ = reply_line(&stream, "refused: not your process");
             return;
         }
+        // Nothing comes back from a client that gave up in the accept queue: it has not sent yet.
+        if reply_line(&stream, READY).is_err() {
+            return;
+        }
         let line = match read_line(&stream, Instant::now() + self.waits.read, MAX_LINE) {
             Ok(line) => line,
             Err(LineFail::TooLong) => {
@@ -360,8 +369,7 @@ impl Serving {
         };
         match self.judge(&line) {
             Ok(open) => {
-                // It may have waited behind another client long enough to give up and start a new
-                // window; opening the file here as well would open it twice.
+                // A client killed or interrupted since it sent this is no longer asking.
                 if !client_left(&stream) {
                     let reply = self.hand_over(open, &stream);
                     let _ = reply_line(&stream, reply);
@@ -681,8 +689,10 @@ pub enum Delivered {
     NotHere,
 }
 
-/// Connects to `sock`, checks that the process behind it is `me`, sends `line` and returns the reply
-/// line. One deadline covers all of it.
+/// Connects to `sock`, checks that the process behind it is `me`, waits to be served, sends `line` and
+/// returns the reply line. `within` covers the wait to be served, and again the request and its reply:
+/// a window can run a request once it is sent, so that is the point after which giving up costs a
+/// second open.
 fn exchange(sock: &Path, line: &str, me: u32, within: Duration) -> Result<String, String> {
     let deadline = Instant::now() + within;
     // A connect to a listener whose accept queue is full blocks on Linux, so it runs on a helper
@@ -703,14 +713,15 @@ fn exchange(sock: &Path, line: &str, me: u32, within: Duration) -> Result<String
         Ok(_) => return Err(format!("{} is served by another user", sock.display())),
         Err(e) => return Err(format!("could not read the peer of {}: {e}", sock.display())),
     }
-    let left = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(1));
+    let greeting = read_line(&stream, deadline, MAX_LINE).map_err(|why| format!("not served ({why:?})"))?;
+    if greeting != READY.as_bytes() {
+        return Err(format!("{} did not say it was ready", sock.display()));
+    }
     stream
-        .set_write_timeout(Some(left))
+        .set_write_timeout(Some(within))
         .and_then(|()| (&stream).write_all(line.as_bytes()))
         .map_err(|e| format!("could not send to {}: {e}", sock.display()))?;
-    let reply = read_line(&stream, deadline, MAX_LINE).map_err(|why| format!("no reply ({why:?})"))?;
+    let reply = read_line(&stream, Instant::now() + within, MAX_LINE).map_err(|why| format!("no reply ({why:?})"))?;
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
 
@@ -857,10 +868,17 @@ mod tests {
         json!({ "v": 1, "op": "open", "path": path }).to_string()
     }
 
+    /// A new connection the thread has turned to.
+    fn served(sock: &Path) -> UnixStream {
+        let stream = UnixStream::connect(sock).unwrap();
+        stream.set_read_timeout(Some(PATIENCE)).unwrap();
+        assert_eq!(read_reply(&stream), READY);
+        stream
+    }
+
     /// Sends one line on a new connection and reads the reply, if the server gives one.
     fn ask(sock: &Path, line: &str) -> String {
-        let mut stream = UnixStream::connect(sock).unwrap();
-        stream.set_read_timeout(Some(PATIENCE)).unwrap();
+        let mut stream = served(sock);
         // A refused oversize line may be answered before it has all been written.
         let _ = stream.write_all(format!("{line}\n").as_bytes());
         read_reply(&stream)
@@ -1143,16 +1161,14 @@ mod tests {
         );
 
         // Half a line, then the sender goes.
-        let stream = UnixStream::connect(server.socket()).unwrap();
+        let stream = served(server.socket());
         (&stream).write_all(b"{\"v\":1").unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
-        stream.set_read_timeout(Some(PATIENCE)).unwrap();
         assert_eq!(read_reply(&stream), "refused: malformed request");
 
         // Half a line, then the sender stays silent past the deadline.
-        let stream = UnixStream::connect(server.socket()).unwrap();
+        let stream = served(server.socket());
         (&stream).write_all(b"{\"v\":1").unwrap();
-        stream.set_read_timeout(Some(PATIENCE)).unwrap();
         assert_eq!(read_reply(&stream), "refused: request timed out");
         assert!(server.drain().is_empty());
     }
@@ -1288,10 +1304,10 @@ mod tests {
         let client = ask_later(server.socket(), request(&served));
         // The thread now waits on the first request, so the next connection stays in the accept queue.
         let first = next_request(&server);
-        {
-            let gone = UnixStream::connect(server.socket()).unwrap();
-            (&gone).write_all(format!("{}\n", request(&left)).as_bytes()).unwrap();
-        }
+        // Half closed and not closed, so `ready` goes out and it is the hangup check that drops this.
+        let gone = UnixStream::connect(server.socket()).unwrap();
+        (&gone).write_all(format!("{}\n", request(&left)).as_bytes()).unwrap();
+        gone.shutdown(std::net::Shutdown::Write).unwrap();
         let waiting = ask_later(server.socket(), request(&last));
         let (_, answering) = first.take().unwrap();
         answering.answer(Answer::Accepted);
@@ -1538,14 +1554,14 @@ mod tests {
     #[test]
     fn a_silent_window_opens_nothing_for_clients_that_gave_up_in_the_queue() {
         let fixture = fixture();
-        let files = [fixture.file("a"), fixture.file("b"), fixture.file("c")];
+        let files = ["a", "b", "c", "d"].map(|name| fixture.file(name));
         let server = fixture.server();
         let clients: Vec<_> = files
             .iter()
             .map(|file| deliver_later(&fixture, vec![target(file.clone())], None))
             .collect();
-        // Two waits of two seconds put the third hand-over past four seconds, so its client gives up
-        // with the request still in hand.
+        // Each wait of two seconds ends in `busy`. Three of them keep the fourth client queued past its
+        // deadline, so it leaves without having sent anything.
         for client in clients {
             assert_eq!(client.join().unwrap(), Delivered::NotHere);
         }
@@ -1556,23 +1572,42 @@ mod tests {
         );
     }
 
+    /// The request that opens the file twice if its client gives up on it: taken late, with the answer
+    /// coming later still.
     #[test]
-    fn a_client_that_gave_up_behind_a_held_request_gets_nothing_opened() {
+    fn a_client_behind_a_held_request_hears_what_became_of_it() {
         let fixture = fixture();
         let (first_file, second_file) = (fixture.file("a"), fixture.file("b"));
         let server = fixture.server();
         let first = deliver_later(&fixture, vec![target(first_file)], None);
         let (_, _held) = next_request(&server).take().unwrap();
+        let connected = Instant::now();
         let second = deliver_later(&fixture, vec![target(second_file)], None);
-        // The held request keeps the thread for three seconds, which leaves the second hand-over less
-        // time than its two-second wait before the client's deadline.
+        // The held request keeps the thread for three seconds.
         assert_eq!(first.join().unwrap(), Delivered::Opened);
-        assert_eq!(second.join().unwrap(), Delivered::NotHere);
+        let (_, answering) = next_request(&server).take().unwrap();
+        let past_a_deadline_from_the_connect = CLIENT_DEADLINE + Duration::from_millis(200);
+        std::thread::sleep(past_a_deadline_from_the_connect.saturating_sub(connected.elapsed()));
+        answering.answer(Answer::Accepted);
         assert_eq!(
-            taken(&server),
-            Vec::<PathBuf>::new(),
-            "this client went to a new window"
+            second.join().unwrap(),
+            Delivered::Opened,
+            "the window runs this request, so a new window would hold the file as well"
         );
+    }
+
+    #[test]
+    fn a_client_sends_nothing_until_it_is_served() {
+        let fixture = fixture();
+        let listener = UnixListener::bind(fixture.root_socket()).unwrap();
+        let open = vec![target(fixture.file("a.rs"))];
+        let within = Duration::from_millis(100);
+        let delivered = deliver_with(&open, &fixture.root, &fixture.dir, None, None, euid(), within);
+        assert_eq!(delivered, Delivered::NotHere);
+        let (stream, _) = listener.accept().unwrap();
+        let mut sent = Vec::new();
+        (&stream).read_to_end(&mut sent).unwrap();
+        assert_eq!(sent, b"", "a window that turned to this connection late would run it");
     }
 
     #[test]

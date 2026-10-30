@@ -339,12 +339,15 @@ mod tests {
     fn ask(sock: &Path, path: &Path) -> JoinHandle<String> {
         let (sock, path) = (sock.to_owned(), path.to_owned());
         std::thread::spawn(move || {
-            let mut stream = UnixStream::connect(sock).unwrap();
+            let stream = UnixStream::connect(sock).unwrap();
             stream.set_read_timeout(Some(PATIENCE)).unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut ready = String::new();
+            let _ = reader.read_line(&mut ready);
             let line = serde_json::json!({ "v": 1, "op": "open", "path": path });
-            stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+            (&stream).write_all(format!("{line}\n").as_bytes()).unwrap();
             let mut reply = String::new();
-            let _ = BufReader::new(&stream).read_line(&mut reply);
+            let _ = reader.read_line(&mut reply);
             reply.trim_end().to_owned()
         })
     }
@@ -423,10 +426,13 @@ mod tests {
                 serde_json::json!({ "v": 1, "op": "open", "path": file, "line": 4, "col": 2, "token": "t" }),
             );
             std::thread::spawn(move || {
-                let mut stream = UnixStream::connect(sock).unwrap();
-                stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+                let stream = UnixStream::connect(sock).unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut ready = String::new();
+                let _ = reader.read_line(&mut ready);
+                (&stream).write_all(format!("{line}\n").as_bytes()).unwrap();
                 let mut reply = String::new();
-                let _ = BufReader::new(&stream).read_line(&mut reply);
+                let _ = reader.read_line(&mut reply);
                 reply
             })
         };
