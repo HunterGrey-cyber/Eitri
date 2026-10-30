@@ -102,6 +102,21 @@ fn held_pair(label: &str) -> (Scratch, PairLock) {
     (layout, lock)
 }
 
+/// `OrphanSocket::bind`, tried again while the reclaim lock reads as held. The lock belongs to its open file
+/// description, so a process another test forks while the lock is up keeps it, after the claim that took it has
+/// ended, until that process execs; nothing else in this test's private directory takes it.
+fn bind_past_a_forks_copy_of_the_lock(dir: &Path, project_root: &Path) -> Result<OrphanSocket, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match OrphanSocket::bind(dir, project_root) {
+            Err(why) if why.contains("held by another claim") && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            bound => return bound,
+        }
+    }
+}
+
 /// A seqpacket socket bound at `path` that never listens: a connect to it is refused, as to a leftover's.
 fn bound_only(path: &Path) -> OwnedFd {
     let (addr, len) = address(path).unwrap();
@@ -138,7 +153,7 @@ fn an_orphaned_window_2_binds_its_socket_with_panel_controls_posture() {
     drop((client, conn));
 
     // A listener that is up keeps its socket: a second bind is refused and removes nothing.
-    let err = OrphanSocket::bind(&run.dir, &root()).unwrap_err();
+    let err = bind_past_a_forks_copy_of_the_lock(&run.dir, &root()).unwrap_err();
     assert!(err.contains("in use"), "{err}");
     assert!(is_socket(&path));
 
@@ -149,13 +164,13 @@ fn an_orphaned_window_2_binds_its_socket_with_panel_controls_posture() {
     assert!(!path.exists(), "a dropped socket removes its own file");
     std::fs::rename(path.with_extension("old"), &path).unwrap();
     drop(leftover);
-    let socket = OrphanSocket::bind(&run.dir, &root()).expect("the stale socket is reclaimed");
+    let socket = bind_past_a_forks_copy_of_the_lock(&run.dir, &root()).expect("the stale socket is reclaimed");
     assert!(connect_to(&path).is_ok());
     drop(socket);
 
     // What is not this user's socket is never touched.
     std::fs::write(&path, b"not a socket").unwrap();
-    let err = OrphanSocket::bind(&run.dir, &root()).unwrap_err();
+    let err = bind_past_a_forks_copy_of_the_lock(&run.dir, &root()).unwrap_err();
     assert!(err.contains("not this user's socket"), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
     std::fs::remove_file(&path).unwrap();

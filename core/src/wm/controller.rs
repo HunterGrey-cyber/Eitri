@@ -26,7 +26,9 @@ use super::host::*;
 use super::module::{Lifecycle, SurfaceDecl};
 use super::verbs::modules::{self as module_verbs, ModuleSetup};
 use super::verbs::{self, FloatGate, SelectionGate};
-use super::window::{EditorPresence, Monitor, PeerId, Timers, WinId, Window, WindowParts, WindowPlacement, WindowSpec};
+use super::window::{
+    EditorPresence, Monitor, PeerId, QueuedOpen, Timers, WinId, Window, WindowParts, WindowPlacement, WindowSpec,
+};
 use crate::keymap::action::Action;
 use crate::keymap::prefix::{Prefix, PrefixCommand, Press};
 use crate::keymap::Keymap;
@@ -1359,6 +1361,17 @@ impl Controller {
 impl Decide for Controller {
     fn handle(&mut self, event: HostEvent) -> Batch {
         let mut batch = Batch::default();
+        // An open with no window to take it is still owed its answer: left unanswered, its client would be told the
+        // window has it.
+        if let HostEvent::OpenFile { win, id, .. } = &event {
+            if !self.windows.contains_key(win) {
+                batch.push_effect(HostOp::OpenAnswer {
+                    id: *id,
+                    accepted: false,
+                });
+                return batch;
+            }
+        }
         if super::start::event_window(&event).is_some_and(|win| self.awaiting_layout(win, &event)) {
             return batch;
         }
@@ -1438,7 +1451,8 @@ impl Decide for Controller {
                 | EditorEvent::Exited { win, .. }
                 | EditorEvent::Unreachable { win }
                 | EditorEvent::QuitCancelled { win, .. }
-                | EditorEvent::QuitNotSent { win, .. }),
+                | EditorEvent::QuitNotSent { win, .. }
+                | EditorEvent::OpenFailed { win, .. }),
             ) => {
                 self.modules_event(win, &mut batch, |w, cx, batch| {
                     super::close::editor_event(w, cx, win, event, batch)
@@ -1526,6 +1540,17 @@ impl Decide for Controller {
                     self.view_empty.push((token, win, view));
                 }
             }
+            HostEvent::OpenFile {
+                win,
+                id,
+                path,
+                line,
+                col,
+                token,
+            } => self.modules_event(win, &mut batch, |w, cx, batch| {
+                let file = QueuedOpen { path, line, col };
+                module_verbs::open_file(w, cx, win, id, file, token, batch);
+            }),
             HostEvent::Chat(ChatEvent::ReviewOpen { win }) => self.modules_event(win, &mut batch, |w, cx, batch| {
                 verbs::chat::review_open(w, cx, win, batch)
             }),

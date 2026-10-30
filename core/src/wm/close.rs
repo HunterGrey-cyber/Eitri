@@ -483,6 +483,7 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         return;
     }
     use super::window::EditorRun;
+    let was_ready = w.editor_ready;
     // The editor is ready from `Ready` until it ends; a restart in flight clears it too, where it is begun.
     if matches!(
         event,
@@ -497,7 +498,9 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
             if matches!(w.editor_run, EditorRun::Running | EditorRun::Restarting) {
                 w.editor_run = EditorRun::Running;
                 w.editor_ready = true;
+                w.editor_lost = false;
                 batch.push_effect(HostOp::Plugin(PluginOp::EditorBack { win }));
+                modules::run_queued_opens(w, win, batch);
             }
             return;
         }
@@ -509,6 +512,7 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
                 w.cancel_timer(token);
             }
             w.editor_run = EditorRun::Ended;
+            w.editor_lost = false;
             // A show made before the release asked for the restart; a hide or a workspace switch since has taken the
             // editor off screen again, and the restart would bring it back unasked.
             let shown = w
@@ -537,7 +541,9 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         EditorEvent::RestartRefused { state, .. } => {
             if w.editor_run == EditorRun::Restarting {
                 w.editor_run = EditorRun::Ended;
-                w.refuse(win, super::feedback::restart_refused_text(state), batch);
+                let text = modules::drop_queued_opens(w);
+                let text = text.unwrap_or_else(|| super::feedback::restart_refused_text(state));
+                w.refuse(win, text, batch);
             }
             return;
         }
@@ -545,14 +551,21 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         // restarted again, so the editor is ended rather than left restarting with nothing to wait for, and the next
         // show tries again. The pane says why over itself; the toast says how to try again. A first start's failure
         // is not a restart and leaves the editor's run as it is. Either way the pane cannot take input now, so it
-        // does not keep the keys.
+        // does not keep the keys, and the files waiting for it are refused once, in one line.
         EditorEvent::StartFailed { why, .. } => {
+            let dropped = modules::drop_queued_opens(w);
             if w.editor_run == EditorRun::Restarting {
                 w.editor_run = EditorRun::Ended;
                 w.say(format!(
                     "[modules] editor: the restarted nvim could not be launched: {why}"
                 ));
-                w.refuse(win, super::feedback::restart_failed_text(cx.keymap), batch);
+                let text = dropped.unwrap_or_else(|| super::feedback::restart_failed_text(cx.keymap));
+                w.refuse(win, text, batch);
+            } else {
+                w.editor_lost = true;
+                if let Some(text) = dropped {
+                    w.refuse(win, text, batch);
+                }
             }
             keys_leave_a_failed_editor(w, cx, win, batch);
             return;
@@ -562,10 +575,23 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         // place again, to be released and started again, where a running editor's exit would close the window.
         EditorEvent::Exited { .. } if w.editor_run == EditorRun::Restarting => {
             with_quit(w, cx, win, batch, |quit, world| quit.restarted_nvim_exited(world));
+            if let Some(text) = modules::drop_queued_opens(w) {
+                w.refuse(win, text, batch);
+            }
             return;
         }
+        // The call may still run: at a blocking prompt it waits in nvim, so this never says the file will not open.
+        EditorEvent::OpenFailed { why, .. } => {
+            w.say(format!("[modules] editor: an open has no answer: {why}"));
+            w.refuse(win, super::feedback::open_failed_text(why), batch);
+            return;
+        }
+        // Its process lives on where nothing reaches it, so no `Ready` comes; its `Exited` comes only once it is gone.
+        // What is said about it is the quit flow's, below.
+        EditorEvent::Unreachable { .. } => w.editor_lost = true,
         _ => {}
     }
+    let never_ready = !was_ready && matches!(event, EditorEvent::Exited { .. } | EditorEvent::Unreachable { .. });
     with_quit(w, cx, win, batch, |quit, world| match event {
         EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled),
         EditorEvent::Unreachable { .. } => quit.nvim_unreachable(world),
@@ -593,6 +619,11 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         }
         _ => {}
     });
+    if never_ready {
+        if let Some(text) = modules::drop_queued_opens(w) {
+            w.refuse(win, text, batch);
+        }
+    }
 }
 
 pub(super) fn kill_editor(w: &mut Window, cx: &Cx, win: WinId, scope: KillScope, batch: &mut Batch) {

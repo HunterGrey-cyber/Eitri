@@ -25,6 +25,7 @@ mod layout_state;
 mod linked_window;
 mod lua;
 mod module_grid;
+mod open_requests;
 mod pane_switch;
 mod panel_super;
 mod plugin_page;
@@ -229,6 +230,10 @@ fn main() -> glib::ExitCode {
     // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's
     // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the
     // agent, its tools and the bottom shell.
+    //
+    // What a launch hands a file over with is read first: the scrub takes the one, GTK the other.
+    let open_hint = open_requests::hint_from_env();
+    let open_token = open_requests::token_from_env();
     eitri_core::companion::env::drop_inherited_editor_env();
     let has_flag = |flag: &str| eitri_core::project_root::flag_given(early_args.iter().map(OsString::as_os_str), flag);
 
@@ -301,6 +306,17 @@ fn main() -> glib::ExitCode {
             Ok(launch) => {
                 for note in &launch.notes {
                     eprintln!("eitri: {note}");
+                }
+                // Ahead of everything a window needs: a launch a running window takes ends here, with no GTK, no
+                // display and no nvim. The one thread this may start only connects, and never reads the environment.
+                if let Some(code) = open_requests::hand_over(
+                    &launch,
+                    want_clean,
+                    backend_kind,
+                    open_hint.as_deref(),
+                    open_token.as_deref(),
+                ) {
+                    return code;
                 }
                 (launch.root, eitri_core::project_root::nvim_open_args(&launch.open))
             }
@@ -472,6 +488,9 @@ fn main() -> glib::ExitCode {
 /// never open the one that was asked for. Turning the singleton off is the mechanism that matches
 /// what this binary is -- `shell` is the first product binary in this workspace to need it for
 /// what a real second launch does, rather than to survive a sandbox that already has one running.
+///
+/// `eitri FILE` going to a running window changes none of this: the launch that hands its file over exits before it
+/// gets here (`open_requests::hand_over`), so every window is still a process of its own.
 fn build_application() -> Application {
     Application::builder()
         .application_id(APP_ID)
@@ -630,6 +649,14 @@ fn build_ui(
     // `window.new` starts the second window through the pair; the link it makes reaches the controller once linked.
     wm_host.set_linked_windows(pair.clone());
     let (wm_role, editor_presence) = pair.wm_spec_role();
+    // Bound here because the terminals made below are told its name; nothing is taken from it until the watch at the
+    // end of this function, once the window can act on a request.
+    let incoming_opens = matches!(editor_presence, eitri_core::wm::EditorPresence::Owned)
+        .then(|| {
+            let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+            open_requests::OpenRequests::claim(project_root, Rc::downgrade(&sink))
+        })
+        .flatten();
     driver.start(
         WinId::MAIN,
         StartStep::Window {
@@ -884,11 +911,13 @@ fn build_ui(
     let terminal_zoom = Rc::new(std::cell::Cell::new(1.0_f32));
     let make_terminal_pane: Rc<dyn Fn() -> terminal::TerminalPane> = {
         let root = project_root.to_path_buf();
+        let shell_env = open_requests::shell_env(incoming_opens.as_deref(), project_root);
         let colors = terminal_colors.clone();
         let face = terminal_face.clone();
         let zoom = terminal_zoom.clone();
         Rc::new(move || {
             let pane = terminal::TerminalPane::new(root.clone());
+            pane.set_shell_env(shell_env.clone());
             // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to
             // zero reports a 1-row grid to its shell.
             pane.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
@@ -1645,9 +1674,22 @@ fn build_ui(
     // `apply`, whose lifecycle effects come right after it.
     // What the teardown ends beyond the modules is handed over once the window's build has made all of it (below).
     let teardown: Rc<RefCell<Option<Rc<gtk_host_services::Teardown>>>> = Rc::default();
+    // One handle on this window's editor, shared: the window's own opens, the chat's turn review and every plugin
+    // page ask through it, with two refusals: the editor gone from the window, or its nvim not running (ended, or a
+    // restarted one still starting).
+    let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> = match &pane {
+        Some(pane) => {
+            let module_layout = module_layout.clone();
+            let editor_present: Rc<dyn Fn() -> bool> =
+                Rc::new(move || !module_layout.read().is_gone(&ModuleId::editor()));
+            Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present))
+        }
+        None => Rc::new(linked_window::NoEditor),
+    };
     wm_host.set_services(Rc::new(PanelServices {
         inner: gtk_host_services::Services {
             editor: pane.clone(),
+            editor_rpc: editor_rpc.clone(),
             terminals: terminals.clone(),
             plugin_panels: plugin_panels.clone(),
             agent: agent_panel_handle.clone(),
@@ -2564,16 +2606,20 @@ fn build_ui(
     // How either window of the pair comes forward from the other, the compositor's way.
     let pair_raise = PairRaise::new(config.companion_wm);
     // A restored window's first show asks for no focus of its own. Placement returns the keys to window 1 on
-    // sway and Hyprland after mapping, including when the compositor chooses the remembered output itself.
-    if pair.restored() {
-        pair_raise.keep_keys_at_next_show();
-    }
+    // sway and Hyprland after mapping, including when the compositor chooses the remembered output itself. Neither
+    // does the first show of a window outside a pair.
+    let raises = pair_raise.used_for_window(
+        pair.holds_pair() || pair.is_second(),
+        pair.restored(),
+        incoming_opens.is_some(),
+    );
     // A window put back on its monitor moves through the same adapter, whatever its part in a pair.
     wm_host.set_monitor_placer(Rc::new(pair_raise.clone()));
-    if pair.holds_pair() || pair.is_second() {
+    if raises {
         // Every present of a window of the pair goes through this raise, the startup's first show included: there
-        // too sway, Hyprland and niri focus the window by its pid, unless that show keeps the keys
-        // (`keep_keys_at_next_show` above, a window 2 started again at a launch).
+        // too sway, Hyprland and niri focus the window by its pid, unless that show keeps the keys (a window 2
+        // started again at a launch). So does the present of a file handed to this window, whatever its part in a
+        // pair.
         wm_host.set_pair_raise(Rc::new(pair_raise.clone()));
     }
     {
@@ -2653,18 +2699,8 @@ fn build_ui(
             }
         }));
     }
-    // Turn review's questions to the editor, with the same two refusals: the editor gone from the window,
-    // or its nvim not running (ended, or a restarted one still starting).
+    // Turn review's questions to the editor.
     {
-        let editor_present: Rc<dyn Fn() -> bool> = {
-            let module_layout = module_layout.clone();
-            Rc::new(move || !module_layout.read().is_gone(&ModuleId::editor()))
-        };
-        // One handle on this window's editor, shared: the chat's turn review and every plugin page ask through it.
-        let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> = match &pane {
-            Some(pane) => Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present)),
-            None => Rc::new(linked_window::NoEditor),
-        };
         panel_hooks.set_editor_rpc = Some(editor_rpc.clone());
         if let Some(one) = &window1_editor {
             one.set_rpc(editor_rpc.clone());
@@ -3507,8 +3543,13 @@ fn build_ui(
         nvim_keys_feed,
         follow_socket,
         tutor,
+        open_requests: incoming_opens.clone(),
         lua_engine: lua_engine.clone(),
     }));
+    // Last: the answer to a request goes through the teardown's handle, and a request is acted on as soon as it is read.
+    if let Some(requests) = &incoming_opens {
+        requests.watch();
+    }
 
     // A termination signal closes the window without its questions: nobody may be there to answer, and the process
     // was told to end. The controller tears the window down at once, nvim ended as a close ends it (never with
@@ -3730,6 +3771,9 @@ impl gtk_host::ServiceSet for PanelServices {
     }
     fn editor(&self, op: &eitri_core::wm::EditorCall) -> Result<(), String> {
         self.inner.editor(op)
+    }
+    fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
+        self.inner.open_answer(id, accepted)
     }
     fn restart_editor(&self, spawn: &eitri_core::wm::EditorSpawn) -> Result<(), gtk_host::RestartRefused> {
         self.inner.restart_editor(spawn)
@@ -4088,6 +4132,31 @@ mod tests {
             at(concat!("companion::run(", "early_args")),
             at(call),
             at(concat!("BackendKind::", "from_env")),
+            at(concat!("nvim_bin::", "resolve()")),
+            at(concat!("build_", "application()")),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+
+    /// What a launch hands a file over with is gone from the environment after the scrub and after GTK, and a launch
+    /// that hands its file over must end before anything of a window exists.
+    #[test]
+    fn main_reads_the_open_socket_before_the_scrub_and_delivers_before_gtk() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+        let end = start
+            + src[start..]
+                .find(concat!("fn build_", "application"))
+                .expect("build_application");
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
+        let order = [
+            at(concat!("open_requests::hint_", "from_env()")),
+            at(concat!("open_requests::token_", "from_env()")),
+            at(concat!("companion::env::drop_inherited", "_editor_env()")),
+            at(concat!("resolve_", "launch()")),
+            at(concat!("open_requests::hand_", "over(")),
             at(concat!("nvim_bin::", "resolve()")),
             at(concat!("build_", "application()")),
         ];

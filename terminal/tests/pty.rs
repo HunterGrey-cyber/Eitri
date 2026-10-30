@@ -49,6 +49,23 @@ fn is_reaped(pid: u32) -> bool {
     rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
+/// A spec's variables go on after the host's and the terminal's own, so each one is what the child reads.
+#[test]
+fn a_specs_env_reaches_the_child_and_beats_the_hosts() {
+    let mut spawn = spec(
+        "/bin/sh",
+        &["-c", r#"printf '%s|%s|%s' "$SPEC_ONLY" "$PATH" "$TERM_PROGRAM""#],
+    );
+    spawn.env = vec![
+        ("SPEC_ONLY".into(), "from the spec".into()),
+        ("PATH".into(), "/from/the/spec".into()),
+        ("TERM_PROGRAM".into(), "the spec".into()),
+    ];
+    let mut child = PtyChild::spawn(&spawn, size(80, 24)).unwrap();
+    assert_eq!(text(&read_to_end(&mut child)), "from the spec|/from/the/spec|the spec");
+    assert!(child.wait().unwrap().success());
+}
+
 #[test]
 fn the_child_gets_exactly_the_hosts_environment_minus_tmux_plus_three() {
     let term_before = std::env::var_os("TERM");

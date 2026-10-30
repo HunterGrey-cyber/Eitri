@@ -134,6 +134,8 @@ pub struct SpawnSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
+    /// Set on the child after [`child_environment`], so each one beats the host's and the terminal's own.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl SpawnSpec {
@@ -149,6 +151,7 @@ impl SpawnSpec {
             program,
             args: Vec::new(),
             cwd,
+            env: Vec::new(),
         }
     }
 }
@@ -256,6 +259,7 @@ impl PtyChild {
                 .current_dir(&spec.cwd)
                 .env_clear()
                 .envs(child_environment(std::env::vars_os()))
+                .envs(spec.env.iter().cloned())
                 .stdin(Stdio::from(pty.user.try_clone()?))
                 .stdout(Stdio::from(pty.user.try_clone()?))
                 .stderr(Stdio::from(pty.user));

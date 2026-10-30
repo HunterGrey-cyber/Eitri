@@ -200,6 +200,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::Lua(LuaEvent::LayoutRequests { win, .. })
         | HostEvent::Pair(PairEvent::LinkEnded { win, .. } | PairEvent::RestoreFailed { win })
         | HostEvent::AnswerRefused { win, .. }
+        | HostEvent::OpenFile { win, .. }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
         | HostEvent::TopBarLeft { win }
@@ -225,7 +226,8 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::QuitAnswered { win, .. }
             | EditorEvent::StartFailed { win, .. }
             | EditorEvent::Navigate { win, .. }
-            | EditorEvent::QuitCancelled { win, .. },
+            | EditorEvent::QuitCancelled { win, .. }
+            | EditorEvent::OpenFailed { win, .. },
         )
         | HostEvent::Plugin(
             PluginEvent::Frozen { win, .. } | PluginEvent::FreezeRefused { win, .. } | PluginEvent::Ready { win, .. },
@@ -285,6 +287,25 @@ mod tests {
     use crate::wm::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn event_window_covers_the_new_event() {
+        let win = WinId(2);
+        let open = HostEvent::OpenFile {
+            win,
+            id: 1,
+            path: "/project/a.rs".into(),
+            line: None,
+            col: None,
+            token: None,
+        };
+        let failed = HostEvent::Editor(EditorEvent::OpenFailed {
+            win,
+            why: "no answer".into(),
+        });
+        assert_eq!(event_window(&open), Some(win));
+        assert_eq!(event_window(&failed), Some(win));
+    }
 
     #[test]
     fn the_layout_phase_keeps_the_own_window_id() {

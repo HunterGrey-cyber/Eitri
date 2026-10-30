@@ -52,6 +52,7 @@
 //! Before metrics exist, only the face is kept.
 
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::panic;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -152,6 +153,8 @@ struct State {
     colors: TerminalColors,
     focused: bool,
     cwd: PathBuf,
+    /// What the window sets on this pane's shells ([`TerminalPane::set_shell_env`]).
+    shell_env: Vec<(OsString, OsString)>,
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
     on_shell_exit: Option<Rc<dyn Fn(u64) -> bool>>,
@@ -222,6 +225,7 @@ impl State {
             colors: TerminalColors::default(),
             focused: false,
             cwd,
+            shell_env: Vec::new(),
             on_shell_exit: None,
             on_shell_start: None,
             frozen: false,
@@ -786,6 +790,12 @@ impl TerminalPane {
         self.state.borrow_mut().on_shell_start = Some(Rc::new(f));
     }
 
+    /// What every shell this pane starts gets on top of the host's environment. A shell that is already
+    /// running keeps what it has.
+    pub(crate) fn set_shell_env(&self, env: Vec<(OsString, OsString)>) {
+        self.state.borrow_mut().shell_env = env;
+    }
+
     /// `prefix x` (or the shell's own end): the shell is hung up if it still runs, and the pane
     /// forgets it -- its screen, its cursor, anything queued behind a paste (and the input method is reset) -- so the
     /// next [`Self::start`] is a fresh shell on a blank pane, as the first one was. Does not wait:
@@ -963,7 +973,7 @@ fn build_metrics(allocation: Allocation, face: &TerminalFace, zoom: f32) -> Resu
 /// where the terminal's font metrics are built, the first time they are needed -- never at
 /// construction, so a window whose terminal is never shown never touches a font manager.
 fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
-    let (cwd, size, colors, focused) = {
+    let (cwd, shell_env, size, colors, focused) = {
         let mut s = state.borrow_mut();
         let size = match s.spawn_size(build_metrics) {
             None => return,
@@ -981,7 +991,7 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
                 return;
             }
         };
-        (s.cwd.clone(), size, s.colors, s.focused)
+        (s.cwd.clone(), s.shell_env.clone(), size, s.colors, s.focused)
     };
     let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
     let mut spec = SpawnSpec::user_shell(cwd.clone());
@@ -990,7 +1000,11 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
         let program = spec.program.clone();
         let wake = wake.clone();
         let config = SessionConfig {
-            spawn: spec,
+            // Here, for the shell tried first and for each fallback alike.
+            spawn: SpawnSpec {
+                env: shell_env.clone(),
+                ..spec
+            },
             size,
             colors,
             focused,

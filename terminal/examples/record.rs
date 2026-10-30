@@ -60,6 +60,7 @@ fn main() {
                 program: PathBuf::from(&program[0]),
                 args: program[1..].iter().map(Into::into).collect(),
                 cwd: std::env::current_dir().unwrap(),
+                env: Vec::new(),
             },
             size,
             colors: TerminalColors::default(),

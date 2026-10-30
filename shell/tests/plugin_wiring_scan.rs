@@ -1628,8 +1628,11 @@ fn the_links_end_and_the_restore_of_window_2_are_carried_out_by_the_window() {
         "held before anything can be restored"
     );
     assert!(
-        code.contains("pair_raise.keep_keys_at_next_show()"),
-        "a restored window 2's first show keeps window 1's keys"
+        code.contains(concat!(
+            "pair_raise.used_for_window(pair.holds_pair()||pair.is_second(),",
+            "pair.restored(),incoming_opens.is_some(),)"
+        )),
+        "a restored window 2's first show keeps window 1's keys, and a window holding the open socket can be raised"
     );
 }
 

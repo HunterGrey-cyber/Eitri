@@ -195,6 +195,11 @@ pub struct Window {
     pub(super) pending_open: Vec<String>,
     /// The editor has reported ready and has not exited, been released or begun a restart since.
     pub(super) editor_ready: bool,
+    /// Files accepted while the editor was not ready, oldest first; they open when it next is.
+    pub(super) queued_opens: VecDeque<QueuedOpen>,
+    /// No nvim can take a file and nothing brings one back as things stand: the first start failed, which has no
+    /// restart, or nvim went out of reach, which holds until it is ended. A queued open would wait for good.
+    pub(super) editor_lost: bool,
     pub(super) editor_run: EditorRun,
     pub(super) restart_wanted: bool,
     pub(super) release_refused_logged: bool,
@@ -274,6 +279,8 @@ impl Window {
             editor_spawn: None,
             pending_open: Vec::new(),
             editor_ready: false,
+            queued_opens: VecDeque::new(),
+            editor_lost: false,
             editor_run: EditorRun::Running,
             restart_wanted: false,
             release_refused_logged: false,
@@ -694,6 +701,14 @@ pub struct FrameMetrics {
     pub size: Size,
     /// The native scale.
     pub scale: f64,
+}
+
+/// A file waiting to open in the editor. `line` and `col` count from one, `col` in bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedOpen {
+    pub path: std::path::PathBuf,
+    pub line: Option<u32>,
+    pub col: Option<u32>,
 }
 
 /// An opaque native token authorizing presentation.

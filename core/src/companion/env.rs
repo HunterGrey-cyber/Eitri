@@ -36,6 +36,16 @@ pub const SET_ON_THE_NVIM_CHILD: [&str; 9] = [
     "EITRI_SCRATCH_LUA",
 ];
 
+/// The socket a terminal's shell gives an `eitri FILE` run inside it, so the file opens in the window
+/// that holds the terminal. A window reads it from its environment only to hand a file over, and only
+/// before it starts anything.
+pub const OPEN_SOCKET_ENV: &str = "EITRI_OPEN_SOCKET";
+
+/// What a window sets on its bottom terminals' shells alone. Left in this process, every child of an
+/// Eitri started from such a terminal -- the sidecar and each agent tool, its own shells -- could open
+/// files in the window that holds that terminal.
+pub const SET_ON_THE_TERMINAL_CHILD: [&str; 1] = [OPEN_SOCKET_ENV];
+
 /// The `TMUX`/`TMUX_PANE` pair a window's nvim child gets for the pane-switch shim, recognised by
 /// `TMUX`'s socket field (tmux's own `<socket>,<pid>,<session>` shape, the socket possibly holding a
 /// comma) naming the inherited pane-switch socket. A real tmux's `TMUX` names its own socket, never
@@ -58,6 +68,7 @@ pub fn inherited_editor_env(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'sta
     let mut names: Vec<&'static str> = EDITOR_RPC_ADDRESS
         .iter()
         .chain(&SET_ON_THE_NVIM_CHILD)
+        .chain(&SET_ON_THE_TERMINAL_CHILD)
         .copied()
         .collect();
     if is_the_shims_tmux(get("TMUX").as_deref(), get("EITRI_PANE_SWITCH_SOCKET").as_deref()) {
@@ -96,8 +107,9 @@ pub fn split_scrub_names(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'static
 /// and every child -- the sidecar and each agent tool under it, the bottom terminal's shell, the
 /// embedded nvim -- would inherit it in turn and could drive the outer editor over RPC. When that
 /// nvim is another window's, it also carries that window's socket variables
-/// ([`SET_ON_THE_NVIM_CHILD`]) and the shim's `TMUX`. The full window reads none of them, so they
-/// are removed from this process. `main` calls this before any thread or child exists.
+/// ([`SET_ON_THE_NVIM_CHILD`]) and the shim's `TMUX`; from a bottom terminal, it inherits
+/// [`OPEN_SOCKET_ENV`]. Nothing after this call reads any of them, so they are removed from this
+/// process. `main` calls this before any thread or child exists.
 pub fn drop_inherited_editor_env() {
     let names = inherited_editor_env(&|name| std::env::var_os(name));
     scrub(&names, &|name| {
@@ -146,9 +158,15 @@ mod tests {
                 }
             }
         }
-        assert!(found.len() >= 9, "{found:?}");
+        assert!(found.len() >= 10, "{found:?}");
         for name in &found {
-            assert!(SET_ON_THE_NVIM_CHILD.contains(&name.as_str()), "{name} is not dropped");
+            assert!(
+                SET_ON_THE_NVIM_CHILD
+                    .iter()
+                    .chain(&SET_ON_THE_TERMINAL_CHILD)
+                    .any(|listed| listed == name),
+                "{name} is not dropped"
+            );
         }
     }
 
@@ -170,6 +188,15 @@ mod tests {
         for kept in ["VIMRUNTIME", "VIM", "MYVIMRC", "PATH"] {
             assert!(!names.contains(&kept), "{kept}");
         }
+    }
+
+    /// An Eitri started in a terminal of another window, and that Eitri's agent and tools, must not
+    /// be able to open files in the window that started the terminal.
+    #[test]
+    fn a_window_drops_the_open_socket_of_the_terminal_it_was_started_from() {
+        let names = inherited_editor_env(&|_| None);
+        assert!(names.contains(&"EITRI_OPEN_SOCKET"), "{names:?}");
+        assert!(split_scrub_names(&|_| None).contains(&"EITRI_OPEN_SOCKET"));
     }
 
     /// A real tmux's `TMUX` stays: only the shim's names the pane-switch socket.

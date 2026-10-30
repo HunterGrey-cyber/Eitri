@@ -273,6 +273,24 @@ pub fn restart_failed_text(keymap: &crate::keymap::Keymap) -> String {
     format!("nvim could not start \u{2014} {key} tries again")
 }
 
+/// An editor that did not come up leaves the files that waited for it unopened, each client having been told they
+/// would open.
+pub fn opens_dropped_text(count: usize) -> String {
+    match count {
+        1 => "the editor did not start: the file was not opened".into(),
+        count => format!("the editor did not start: {count} files were not opened"),
+    }
+}
+
+/// An open with no answer in time, or an error. nvim's own text can run to a traceback; the toast takes its first
+/// line. "Not yet", because a call waiting at a blocking prompt runs when the prompt ends.
+pub fn open_failed_text(why: &str) -> String {
+    match why.lines().next().filter(|line| !line.is_empty()) {
+        Some(line) => format!("the file is not open yet: {line}"),
+        None => "the file is not open yet".into(),
+    }
+}
+
 /// The pane reports why it could not restart, so the next show can try again.
 pub fn restart_refused_text(state: &str) -> String {
     format!("the editor could not start again: the pane is {state}")

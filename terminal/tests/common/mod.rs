@@ -33,6 +33,7 @@ pub fn spec(program: &str, args: &[&str]) -> SpawnSpec {
         program: PathBuf::from(program),
         args: args.iter().map(OsString::from).collect(),
         cwd: std::env::temp_dir(),
+        env: Vec::new(),
     }
 }
 

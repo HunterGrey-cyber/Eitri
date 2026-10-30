@@ -496,6 +496,8 @@ pub enum HostOp {
         win: WinId,
         activation: Option<ActivationToken>,
     },
+    /// What the window says to the [`HostEvent::OpenFile`] of this `id`: `false` sends its client to a new window.
+    OpenAnswer { id: u64, accepted: bool },
     /// Sets window presentation flags: the state the window's mode toggle (`window.immersive`) leads to. A host
     /// whose window also changes mode without the controller hearing (a bare F11, the editor's own setting, the
     /// compositor) carries it out as that toggle, since the state asked for may be out of date there.
@@ -696,6 +698,14 @@ pub enum EditorCall {
     Restart { win: WinId, spawn: EditorSpawn },
     /// Types keys into the editor, in the editor's own key notation.
     SendKeys { win: WinId, keys: String },
+    /// Opens a file in the running editor. `line` and `col` count from one, `col` in bytes; a line past the end is
+    /// the last line. What it comes to is reported as [`EditorEvent::OpenFailed`] when it does not open.
+    Open {
+        win: WinId,
+        path: std::path::PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
 }
 
 /// Commands sent to the chat service.
@@ -1039,6 +1049,16 @@ pub enum HostEvent {
     AnswerRefused { win: WinId, text: String },
     /// A process termination signal arrived.
     EndSignal { name: &'static str },
+    /// Another process asks this window to open a file. Always answered with one [`HostOp::OpenAnswer`] of this `id`.
+    OpenFile {
+        win: WinId,
+        id: u64,
+        path: std::path::PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+        /// The asking launcher's activation token, opaque.
+        token: Option<String>,
+    },
     /// A module surface ended.
     SurfaceEnded { win: WinId, module: ModuleId, why: Ended },
     /// An editor service event.
@@ -1189,6 +1209,9 @@ pub enum EditorEvent {
     Navigate { win: WinId, direction: Direction },
     /// A generation cancelled quitting.
     QuitCancelled { win: WinId, generation: u64 },
+    /// An [`EditorCall::Open`] answered an error or has not answered in time. At a blocking prompt it stays queued
+    /// in nvim and runs when the prompt ends, so this never means the file will not open.
+    OpenFailed { win: WinId, why: String },
 }
 
 /// Facts reported by chat services.
@@ -1582,6 +1605,8 @@ pub enum OpTag {
     OpenWindow,
     /// Identifies Present operations.
     Present,
+    /// Identifies OpenAnswer operations.
+    OpenAnswer,
     /// Identifies SetMode operations.
     SetMode,
     /// Identifies PlaceWindow operations.
@@ -1649,6 +1674,7 @@ impl OpTag {
         match op {
             HostOp::OpenWindow { .. } => Self::OpenWindow,
             HostOp::Present { .. } => Self::Present,
+            HostOp::OpenAnswer { .. } => Self::OpenAnswer,
             HostOp::SetMode { .. } => Self::SetMode,
             HostOp::PlaceWindow { .. } => Self::PlaceWindow,
             HostOp::RestoreLinkedWindow { .. } => Self::RestoreLinkedWindow,
@@ -1740,6 +1766,17 @@ impl Batch {
     /// Adds a Lua call after all layout and service work.
     pub fn push_lua(&mut self, op: LuaOp) {
         self.lua.push(op);
+    }
+
+    /// Adds layout work ahead of the first grab of the keys in this batch, or at the end of its layout work when
+    /// none is asked for: a window comes up before the keys land in it.
+    pub fn push_layout_before_keys(&mut self, op: HostOp) {
+        let at = self
+            .layout
+            .iter()
+            .position(|op| matches!(op, HostOp::Focus { .. }))
+            .unwrap_or(self.layout.len());
+        self.layout.insert(at, op);
     }
 
     /// Reports whether every segment is empty.
@@ -1922,6 +1959,7 @@ mod tests {
             OpenWindow
         );
         tag!(HostOp::Present { win, activation: None }, Present);
+        tag!(HostOp::OpenAnswer { id: 1, accepted: true }, OpenAnswer);
         tag!(
             HostOp::SetMode {
                 win,

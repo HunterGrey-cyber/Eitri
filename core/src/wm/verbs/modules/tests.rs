@@ -1708,3 +1708,57 @@ fn a_plugin_module_opens_by_its_own_rule_with_the_keys_as_asked() {
     let rule = with(rules(), Some(own), Some(false));
     assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Down)), false));
 }
+
+fn open_request(id: u64) -> HostEvent {
+    HostEvent::OpenFile {
+        win: WIN,
+        id,
+        path: "/project/a.rs".into(),
+        line: None,
+        col: None,
+        token: None,
+    }
+}
+
+#[test]
+fn an_open_in_a_window_that_does_not_own_the_editor_answers_busy() {
+    for presence in [EditorPresence::None, EditorPresence::Proxy] {
+        let r = driven_as(three(agent()), &[], WindowRole::Main, presence.clone());
+        let mark = r.mark();
+        r.driver.post(open_request(1));
+        assert_eq!(
+            r.ops_since(mark)
+                .into_iter()
+                .filter(|op| !matches!(op, HostOp::Chrome { .. }))
+                .collect::<Vec<_>>(),
+            [HostOp::OpenAnswer { id: 1, accepted: false }],
+            "{presence:?}"
+        );
+    }
+}
+
+#[test]
+fn an_open_in_a_workspace_that_lacks_the_editor_places_it_beside_the_keys_and_answers() {
+    let r = driven(three(agent()));
+    r.host.set_editor_running(true);
+    r.driver.post(HostEvent::Editor(EditorEvent::Ready { win: WIN }));
+    *r.layout.borrow_mut() = Layout::new(
+        Node::split(Axis::Row, 0.5, Node::Leaf(agent()), Node::Leaf(terminal())),
+        agent(),
+    )
+    .unwrap();
+    let mark = r.mark();
+    r.driver.post(open_request(1));
+    let ops = r.ops_since(mark);
+    assert!(r.layout.borrow().is_shown(&editor()));
+    assert_eq!(r.layout.borrow().focus(), &editor());
+    let present = ops.iter().position(|op| matches!(op, HostOp::Present { .. }));
+    let focus = ops.iter().position(|op| matches!(op, HostOp::Focus { .. }));
+    assert!(present.is_some() && present < focus, "{ops:#?}");
+    assert!(ops.contains(&HostOp::OpenAnswer { id: 1, accepted: true }), "{ops:#?}");
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::Open { .. }))),
+        "{ops:#?}"
+    );
+}

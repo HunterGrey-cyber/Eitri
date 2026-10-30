@@ -23,6 +23,7 @@ pub mod display_env;
 pub mod editor_context;
 pub mod editor_feeds;
 pub mod editor_lines;
+pub mod editor_open;
 pub mod editor_rpc;
 pub mod hint;
 pub mod instance_dir;

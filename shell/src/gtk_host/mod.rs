@@ -163,7 +163,8 @@ pub(crate) trait HintPort {
 /// does those, so a controller that emits one learns it went nowhere.
 pub(crate) const NOT_CARRIED_OUT: &str = "not carried out by this shell yet";
 
-/// The pair's compositor-aware presentation, supplied by the binary so the host can also run alone.
+/// The compositor-aware presentation of a window of a pair or one that takes files from outside, supplied by the binary
+/// so the host can also run alone.
 pub(crate) trait PairRaise {
     fn raise(&self, window: &gtk4::Window, token: Option<&str>);
 }
@@ -424,6 +425,12 @@ pub(crate) trait ServiceSet {
     /// feeds). A set that holds none of them carries none out.
     fn cleanup(&self, op: &CleanupOp) -> Result<(), String> {
         let _ = op;
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// What the window decided about the open request `id`, for its client. A set that holds no open socket has no
+    /// request to answer.
+    fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
+        let _ = (id, accepted);
         Err(NOT_CARRIED_OUT.into())
     }
     /// What the pair file and the pages are told once the controller took back what a window held for the other
@@ -1368,6 +1375,7 @@ impl Host for GtkHost {
             HostOp::Chat(call) => self.service(op, |s| s.chat(call)),
             HostOp::OpenWindow { win, spec } => self.open_window(op, *win, spec),
             HostOp::Present { win, activation } => self.present(op, *win, activation.as_ref()),
+            HostOp::OpenAnswer { id, accepted } => self.service(op, |s| s.open_answer(*id, *accepted)),
             HostOp::Lua(call) => self.lua(op, call),
             HostOp::OpenLinkedWindow { win } => self.open_linked_window(op, *win),
             HostOp::RestoreLinkedWindow { win } => self.restore_linked_window(op, *win),
@@ -1828,6 +1836,42 @@ mod editor_reads_tests {
             ]
         ));
         assert_eq!(services.0.borrow().len(), 2, "both calls reached the service");
+    }
+
+    /// An open's answer goes to the service that holds the socket; with none, it is refused as any op is.
+    #[test]
+    fn an_open_answer_reaches_the_service() {
+        use eitri_core::wm::conformance::RecordingSink;
+        #[derive(Default)]
+        struct Services(RefCell<Vec<(u64, bool)>>);
+        impl ServiceSet for Services {
+            fn editor(&self, _: &EditorCall) -> Result<(), String> {
+                unreachable!()
+            }
+            fn terminal(&self, _: &TermOp) -> Result<(), String> {
+                unreachable!()
+            }
+            fn plugin(&self, _: &PluginOp) -> Result<(), String> {
+                unreachable!()
+            }
+            fn chat(&self, _: &ChatOp) -> Result<(), String> {
+                unreachable!()
+            }
+            fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
+                self.0.borrow_mut().push((id, accepted));
+                Ok(())
+            }
+        }
+        let host = GtkHost::new();
+        let sink = Rc::new(RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        let answer = HostOp::OpenAnswer { id: 7, accepted: true };
+        assert_eq!(host.apply(&answer), Applied::Refused, "no services yet");
+        let services = Rc::new(Services::default());
+        host.set_services(services.clone());
+        assert_eq!(host.apply(&answer), Applied::Done);
+        assert_eq!(*services.0.borrow(), [(7, true)]);
     }
 
     /// A release nvim's living process refused, and a restart the pane refused from the state it was in, are each

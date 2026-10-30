@@ -21,7 +21,7 @@
 //! ([`tab_break`]), whose new chat view takes the base view's active tab.
 
 use super::super::chrome::{self, Prompt};
-use super::super::close::{self, KillScope, PromptKey};
+use super::super::close::{self, CloseState, KillScope, PromptKey};
 use super::super::feedback;
 use super::super::focus::{self, arrive_tail, focus_and_arrive, give_keys};
 use super::super::grid::order;
@@ -29,7 +29,9 @@ use super::super::host::*;
 use super::super::instances::plan_new_instance;
 use super::super::module::{ModuleState, SurfaceDecl};
 use super::super::moves;
-use super::super::window::{EditorPresence, EditorRun, LinkSide, PeerId, WinId, Window, WindowRole};
+use super::super::window::{
+    ActivationToken, EditorPresence, EditorRun, LinkSide, PeerId, QueuedOpen, WinId, Window, WindowRole,
+};
 use crate::keymap::action::{Action, SplitCwd};
 use crate::keymap::Keymap;
 use crate::layout::rules::{without_keys, At, OpenPoint};
@@ -532,9 +534,9 @@ fn chip(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) {
     open_module(w, cx, win, id, action, batch);
 }
 
-/// The other window asked for `id`'s keys: brought on screen as a tray chip brings it (shown when hidden, placed when
-/// this workspace lacks it, never hidden) and given the keys. Its refusal is returned for the caller to log: the
-/// user pressed nothing here.
+/// Something other than a key here asked for `id`'s keys (the other window, a file opened from outside): brought on
+/// screen as a tray chip brings it (shown when hidden, placed when this workspace lacks it, never hidden) and given
+/// the keys. Its refusal is returned for the caller to log: the user pressed nothing here.
 pub(in crate::wm) fn reveal_and_focus(
     w: &mut Window,
     cx: &Cx,
@@ -546,7 +548,7 @@ pub(in crate::wm) fn reveal_and_focus(
         Ok(layout) => layout::key_action(&layout, id, false),
         Err(_) => return Ok(()),
     };
-    w.say(format!("[modules] {id}: {action:?}, for the other window"));
+    w.say(format!("[modules] {id}: {action:?}, asked from outside this window"));
     match action {
         KeyAction::Place | KeyAction::ShowAndFocus if starts_hidden(cx, id) => {
             open_plugin_module(w, cx, win, id, Some(true), batch)
@@ -787,6 +789,98 @@ pub fn restart_editor(w: &mut Window, _cx: &Cx, win: WinId, batch: &mut Batch) {
         EditorRun::Ending => w.restart_wanted = true,
         EditorRun::Restarting | EditorRun::Running => {}
     }
+}
+
+/// How many files may wait for the editor at once; one more is refused and its client opens a new window.
+const MAX_QUEUED_OPENS: usize = 16;
+
+/// Why this window cannot take a file now. The client then opens a new window, so anything that would leave the file
+/// waiting on nothing belongs here: a window on its way out, an nvim asked to quit, and an editor nothing brings back
+/// (`Window::editor_lost`).
+fn open_refusal(w: &Window) -> Option<String> {
+    if w.close.state != CloseState::Idle {
+        return Some("the window is closing".into());
+    }
+    if w.quit.is_running() {
+        return Some("nvim is quitting".into());
+    }
+    if *w.presence() != EditorPresence::Owned {
+        return Some("the window does not own its editor".into());
+    }
+    if w.editor_lost {
+        return Some("the editor did not start or cannot be reached".into());
+    }
+    (w.queued_opens.len() >= MAX_QUEUED_OPENS).then(|| format!("{MAX_QUEUED_OPENS} files wait already"))
+}
+
+/// A file another process asks this window to open: refused, or brought on screen, the window raised with `token`,
+/// the keys given to the editor and the file sent to it, in the order an open by hand would go. An editor that is
+/// not ready, because it has not started, is starting or is restarted here, gets the file when it is
+/// ([`run_queued_opens`]). The one answer closes the batch: the file is on its way or waiting by then.
+pub fn open_file(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    id: u64,
+    file: QueuedOpen,
+    token: Option<String>,
+    batch: &mut Batch,
+) {
+    let refusal = open_refusal(w);
+    let accepted = match refusal {
+        Some(why) => {
+            w.say(format!("[modules] editor: an open was refused: {why}"));
+            false
+        }
+        None => take_open(w, cx, win, file, token, batch),
+    };
+    batch.push_effect(HostOp::OpenAnswer { id, accepted });
+}
+
+fn take_open(w: &mut Window, cx: &Cx, win: WinId, file: QueuedOpen, token: Option<String>, batch: &mut Batch) -> bool {
+    let editor = ModuleId::editor();
+    if let Err(err) = reveal_and_focus(w, cx, win, &editor, batch) {
+        w.say(format!("[modules] editor: an open was refused: {err}"));
+        return false;
+    }
+    // A show or a place restarts an ended editor; keys moving to one still on screen do not.
+    restart_editor(w, cx, win, batch);
+    if w.editor_run == EditorRun::Ended {
+        return false;
+    }
+    batch.push_layout_before_keys(HostOp::Present {
+        win,
+        activation: token.map(ActivationToken),
+    });
+    if w.editor_ready && w.editor_run == EditorRun::Running {
+        batch.push_effect(open_call(win, file));
+    } else {
+        w.queued_opens.push_back(file);
+    }
+    true
+}
+
+fn open_call(win: WinId, file: QueuedOpen) -> HostOp {
+    HostOp::Editor(EditorCall::Open {
+        win,
+        path: file.path,
+        line: file.line,
+        col: file.col,
+    })
+}
+
+/// The editor is ready: every file waiting for it, oldest first.
+pub(in crate::wm) fn run_queued_opens(w: &mut Window, win: WinId, batch: &mut Batch) {
+    for file in std::mem::take(&mut w.queued_opens) {
+        batch.push_effect(open_call(win, file));
+    }
+}
+
+/// The editor did not come up: the files waiting for it are forgotten, and the one line to say so, if any waited.
+pub(in crate::wm) fn drop_queued_opens(w: &mut Window) -> Option<String> {
+    let dropped = w.queued_opens.len();
+    w.queued_opens.clear();
+    (dropped > 0).then(|| feedback::opens_dropped_text(dropped))
 }
 
 /// Hides `id`: when it holds the keys, the module the layout chooses is mapped and given them before `id` is
@@ -1917,6 +2011,432 @@ mod restart_tests {
             r.release();
             r
         }
+    }
+
+    /// What the fake host logged for the opens: the answers by id, the files sent to the editor in order.
+    impl Rig {
+        fn open(&self, id: u64, name: &str) {
+            self.open_with(id, name, None);
+        }
+        fn open_with(&self, id: u64, name: &str, token: Option<&str>) {
+            self.driver.post(HostEvent::OpenFile {
+                win: WIN,
+                id,
+                path: format!("/project/{name}").into(),
+                line: None,
+                col: None,
+                token: token.map(str::to_string),
+            });
+        }
+        fn answers(&self) -> Vec<(u64, bool)> {
+            self.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    HostOp::OpenAnswer { id, accepted } => Some((id, accepted)),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn opened(&self) -> Vec<std::path::PathBuf> {
+            self.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    HostOp::Editor(EditorCall::Open { path, .. }) => Some(path),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn ready(&self) {
+            self.host.set_editor_running(true);
+            self.event(EditorEvent::Ready { win: WIN });
+        }
+        /// The editor taken off screen by the hide verb, the keys going to the module the layout chooses.
+        fn hide_editor(&self) {
+            self.driver
+                .run(WIN, Action::Module(ModuleId::editor()), Origin::Key { keycode: 7 });
+            self.driver.run(WIN, Action::ModuleHide, Origin::Key { keycode: 7 });
+            assert!(!self.layout.borrow().is_shown(&ModuleId::editor()));
+        }
+        fn flashes(&self) -> u64 {
+            self.driver.query(|c| c.chrome(WIN).top_bar.flash)
+        }
+        fn toast(&self) -> Option<String> {
+            self.driver.query(|c| c.chrome(WIN).toast.map(|toast| toast.text))
+        }
+    }
+
+    fn project(name: &str) -> std::path::PathBuf {
+        format!("/project/{name}").into()
+    }
+
+    #[test]
+    fn an_open_shows_ends_zoom_presents_gives_keys_and_answers() {
+        let r = Rig::new();
+        r.ready();
+        r.driver
+            .run(WIN, Action::Module(ModuleId::agent()), Origin::Key { keycode: 7 });
+        r.driver.run(WIN, Action::Zoom, Origin::Key { keycode: 7 });
+        assert!(r.layout.borrow().zoom_hides(&ModuleId::editor()));
+        let at = r.ops().len();
+        r.driver.post(HostEvent::OpenFile {
+            win: WIN,
+            id: 7,
+            path: project("a.rs"),
+            line: Some(42),
+            col: Some(3),
+            token: Some("token".into()),
+        });
+        let ops = r.ops()[at..].to_vec();
+        let at_op = |what: &str, found: &dyn Fn(&HostOp) -> bool| {
+            ops.iter()
+                .position(found)
+                .unwrap_or_else(|| panic!("no {what} in {ops:#?}"))
+        };
+        let map = at_op(
+            "map",
+            &|op| matches!(op, HostOp::Map { module, .. } if *module == ModuleId::editor()),
+        );
+        let present = at_op("present", &|op| {
+            *op == HostOp::Present {
+                win: WIN,
+                activation: Some(crate::wm::ActivationToken("token".into())),
+            }
+        });
+        let focus = at_op(
+            "focus",
+            &|op| matches!(op, HostOp::Focus { to: FocusTo::Module(to), .. } if *to == ModuleId::editor()),
+        );
+        let open = at_op("open", &|op| {
+            *op == HostOp::Editor(EditorCall::Open {
+                win: WIN,
+                path: project("a.rs"),
+                line: Some(42),
+                col: Some(3),
+            })
+        });
+        let answer = at_op("answer", &|op| *op == HostOp::OpenAnswer { id: 7, accepted: true });
+        assert!(
+            map < present && present < focus && focus < open && open < answer,
+            "{ops:#?}"
+        );
+        assert_eq!(r.layout.borrow().zoom(), None, "the zoom over the editor ended");
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+    }
+
+    #[test]
+    fn an_open_with_the_editor_on_screen_and_the_keys_elsewhere_moves_only_the_keys() {
+        let r = Rig::new();
+        r.ready();
+        r.driver
+            .run(WIN, Action::Module(ModuleId::agent()), Origin::Key { keycode: 7 });
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        let ops = r.ops()[at..].to_vec();
+        assert!(!ops.iter().any(|op| matches!(op, HostOp::Map { .. })), "{ops:#?}");
+        let present = ops.iter().position(|op| matches!(op, HostOp::Present { .. })).unwrap();
+        let focus = ops.iter().position(|op| matches!(op, HostOp::Focus { .. })).unwrap();
+        assert!(present < focus, "{ops:#?}");
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+        assert_eq!(r.opened(), [project("a.rs")]);
+        assert_eq!(r.answers(), [(1, true)]);
+    }
+
+    #[test]
+    fn an_open_with_the_keys_on_the_editor_presents_and_opens() {
+        let r = Rig::new();
+        r.ready();
+        r.driver
+            .run(WIN, Action::Module(ModuleId::editor()), Origin::Key { keycode: 7 });
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        let ops = r.ops()[at..].to_vec();
+        assert!(ops.iter().any(|op| matches!(op, HostOp::Present { .. })), "{ops:#?}");
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()), "an open never hides");
+        assert_eq!(r.opened(), [project("a.rs")]);
+    }
+
+    #[test]
+    fn an_open_while_closing_answers_busy() {
+        let r = Rig::new();
+        r.ready();
+        r.host.set_chat_kill_counts(
+            ViewId::BASE,
+            ChatKillCounts {
+                running: 1,
+                ..Default::default()
+            },
+        );
+        r.driver.close_requested(WIN, CloseBy::User);
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        assert_eq!(r.answers(), [(1, false)]);
+        assert_eq!(
+            r.ops()[at..],
+            [HostOp::OpenAnswer { id: 1, accepted: false }],
+            "a window on its way out is not raised"
+        );
+    }
+
+    #[test]
+    fn an_open_during_the_quit_flow_answers_busy() {
+        let r = Rig::new();
+        r.ready();
+        r.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+        r.answer("y");
+        assert!(r
+            .ops()
+            .iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::Quit { .. }))));
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 1, accepted: false }]);
+    }
+
+    #[test]
+    fn an_open_before_ready_is_accepted_and_runs_on_ready() {
+        let r = Rig::new();
+        r.open(1, "a.rs");
+        assert_eq!(r.answers(), [(1, true)]);
+        assert!(r.opened().is_empty(), "an nvim that is not ready takes no call");
+        r.ready();
+        assert_eq!(r.opened(), [project("a.rs")]);
+        r.ready();
+        assert_eq!(r.opened().len(), 1, "the queue runs once");
+    }
+
+    #[test]
+    fn an_open_into_a_hidden_never_started_editor_shows_it_and_runs_on_ready() {
+        let r = Rig::new();
+        r.hide_editor();
+        r.open(1, "a.rs");
+        assert!(
+            r.layout.borrow().is_shown(&ModuleId::editor()),
+            "only a shown editor starts"
+        );
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+        assert_eq!(r.answers(), [(1, true)]);
+        assert!(r.opened().is_empty());
+        assert!(
+            r.restarts().is_empty(),
+            "an editor never started has nothing to restart"
+        );
+        r.ready();
+        assert_eq!(r.opened(), [project("a.rs")]);
+    }
+
+    #[test]
+    fn an_open_after_the_editor_ended_restarts_it_and_runs_on_ready() {
+        let r = Rig::ended();
+        r.open(1, "a.rs");
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        assert_eq!(r.answers(), [(1, true)]);
+        assert!(r.opened().is_empty());
+        r.ready();
+        assert_eq!(r.opened(), [project("a.rs")]);
+    }
+
+    #[test]
+    fn an_open_while_the_ended_editor_is_being_released_restarts_it_after_the_release() {
+        let r = Rig::new();
+        r.kill();
+        r.open(1, "a.rs");
+        assert_eq!(r.answers(), [(1, true)]);
+        assert!(r.restarts().is_empty(), "the old harness is still being let go");
+        r.release();
+        assert_eq!(r.restarts().len(), 1);
+        r.ready();
+        assert_eq!(r.opened(), [project("a.rs")]);
+    }
+
+    #[test]
+    fn two_queued_opens_run_in_order() {
+        let r = Rig::new();
+        r.open(1, "a.rs");
+        r.open(2, "b.rs");
+        let at = r.ops().len();
+        r.ready();
+        let opened: Vec<_> = r.ops()[at..]
+            .iter()
+            .filter_map(|op| match op {
+                HostOp::Editor(EditorCall::Open { path, .. }) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [project("a.rs"), project("b.rs")]);
+    }
+
+    #[test]
+    fn the_seventeenth_queued_open_answers_busy() {
+        let r = Rig::new();
+        for id in 0..17 {
+            r.open(id, &format!("{id}.rs"));
+        }
+        let answers = r.answers();
+        assert_eq!(answers.len(), 17);
+        assert!(answers[..16].iter().all(|(_, accepted)| *accepted));
+        assert_eq!(answers[16], (16, false));
+        r.ready();
+        assert_eq!(r.opened().len(), 16);
+    }
+
+    #[test]
+    fn a_start_that_fails_drops_the_queue_with_a_refusal() {
+        let r = Rig::new();
+        r.open(1, "a.rs");
+        r.open(2, "b.rs");
+        let before = r.flashes();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        assert_eq!(r.flashes(), before + 1, "one refusal for the whole queue");
+        assert_eq!(r.toast().unwrap(), "the editor did not start: 2 files were not opened");
+        r.ready();
+        assert!(r.opened().is_empty(), "a dropped open does not come back");
+    }
+
+    #[test]
+    fn a_restart_that_fails_drops_the_queue_and_keeps_the_way_to_try_again() {
+        let r = Rig::ended();
+        r.open(1, "a.rs");
+        let before = r.flashes();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        assert_eq!(
+            r.flashes(),
+            before + 1,
+            "one refusal, for the restart and the queue together"
+        );
+        assert_eq!(r.toast().unwrap(), "the editor did not start: the file was not opened");
+        r.key();
+        assert_eq!(r.restarts().len(), 2, "the next show tries again");
+        r.ready();
+        assert!(r.opened().is_empty());
+    }
+
+    #[test]
+    fn a_refused_restart_drops_the_queue_with_a_refusal() {
+        let r = Rig::ended();
+        r.open(1, "a.rs");
+        let before = r.flashes();
+        r.event(EditorEvent::RestartRefused {
+            win: WIN,
+            state: "Ready".into(),
+        });
+        assert_eq!(r.flashes(), before + 1);
+        assert_eq!(r.toast().unwrap(), "the editor did not start: the file was not opened");
+        r.key();
+        r.ready();
+        assert!(r.opened().is_empty());
+    }
+
+    #[test]
+    fn a_restarted_nvim_that_exits_before_ready_drops_the_queue_with_a_refusal() {
+        let r = Rig::ended();
+        r.open(1, "a.rs");
+        r.event(EditorEvent::Exited {
+            win: WIN,
+            settled: None,
+        });
+        assert_eq!(r.toast().unwrap(), "the editor did not start: the file was not opened");
+        r.release();
+        r.key();
+        r.ready();
+        assert!(r.opened().is_empty());
+    }
+
+    #[test]
+    fn an_exit_of_a_ready_editor_with_nothing_queued_refuses_nothing() {
+        let r = Rig::new();
+        r.ready();
+        r.open(1, "a.rs");
+        r.kill();
+        assert!(r.toast().is_none_or(|text| !text.contains("not opened")));
+    }
+
+    #[test]
+    fn an_open_after_a_failed_first_start_answers_busy() {
+        let r = Rig::new();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        assert_eq!(
+            r.ops()[at..],
+            [HostOp::OpenAnswer { id: 1, accepted: false }],
+            "no restart follows a first start's failure, so a queued file would wait for good"
+        );
+    }
+
+    #[test]
+    fn an_open_after_a_ready_nvim_went_out_of_reach_answers_busy() {
+        let r = Rig::new();
+        r.ready();
+        r.event(EditorEvent::Unreachable { win: WIN });
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        assert_eq!(
+            r.ops()[at..],
+            [HostOp::OpenAnswer { id: 1, accepted: false }],
+            "that nvim takes no call, so an accepted file would never open"
+        );
+    }
+
+    #[test]
+    fn an_open_after_a_starting_nvim_went_out_of_reach_answers_busy_and_does_not_wait() {
+        let r = Rig::new();
+        r.event(EditorEvent::Unreachable { win: WIN });
+        let at = r.ops().len();
+        r.open(1, "a.rs");
+        assert_eq!(
+            r.ops()[at..],
+            [HostOp::OpenAnswer { id: 1, accepted: false }],
+            "no ready follows, so a queued file would wait for good"
+        );
+    }
+
+    #[test]
+    fn an_editor_out_of_reach_takes_files_again_once_it_was_ended() {
+        let r = Rig::new();
+        r.ready();
+        r.event(EditorEvent::Unreachable { win: WIN });
+        r.kill();
+        r.release();
+        r.open(1, "a.rs");
+        assert_eq!(r.answers(), [(1, true)]);
+        assert_eq!(r.restarts().len(), 1);
+        r.ready();
+        assert_eq!(r.opened(), [project("a.rs")]);
+    }
+
+    #[test]
+    fn a_failed_open_says_the_file_is_not_open_yet() {
+        let r = Rig::new();
+        r.ready();
+        r.event(EditorEvent::OpenFailed {
+            win: WIN,
+            why: "nvim did not answer\nstack traceback:".into(),
+        });
+        assert_eq!(r.toast().unwrap(), "the file is not open yet: nvim did not answer");
+    }
+
+    #[test]
+    fn an_open_for_a_window_this_controller_does_not_hold_answers_busy() {
+        let r = Rig::new();
+        r.driver.post(HostEvent::OpenFile {
+            win: WinId(9),
+            id: 3,
+            path: project("a.rs"),
+            line: None,
+            col: None,
+            token: None,
+        });
+        assert_eq!(r.answers(), [(3, false)]);
     }
 
     #[test]

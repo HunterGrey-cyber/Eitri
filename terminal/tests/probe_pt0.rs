@@ -558,6 +558,7 @@ fn a_pty_master_handed_to_another_process_mid_flood_loses_and_doubles_nothing() 
         program: PathBuf::from("/bin/sh"),
         args: vec![OsString::from("-c"), OsString::from(script)],
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        env: Vec::new(),
     };
     let size = PtySize {
         cols: 80,

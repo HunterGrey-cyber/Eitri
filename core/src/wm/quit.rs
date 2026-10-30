@@ -71,6 +71,11 @@ pub struct QuitFlow {
 }
 
 impl QuitFlow {
+    /// nvim has been asked to quit and has not answered: it may end at any moment.
+    pub fn is_running(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
     /// Reveals and focuses the editor before sending an RPC quit, so its prompt can be answered.
     /// An unanswered older request is joined rather than nesting another confirmation dialog.
     pub fn ask(&mut self, world: &mut dyn QuitWorld, quit: EditorQuit, now: Instant) -> Result<AskedNvim, String> {

@@ -6,10 +6,11 @@ use eitri_core::wm::{HostEvent, Monitor, MonitorId, WinId};
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, ApplicationWindow};
 
-/// Brings a window of the pair forward after its first show, when the other window had the keys. GNOME lets a
-/// window take the keys from another only with an activation token naming that other window's surface, which the
-/// other window sends. sway, Hyprland and niri turn a token activation into an urgency hint, so there the window also
-/// has the compositor's own tool focus it, on a worker thread (the adapter is started on first use).
+/// Brings a window of the pair forward after its first show, when the other window had the keys, and any window a
+/// file was handed to. GNOME lets a window take the keys from another only with an activation token naming that other
+/// window's surface, which the other window sends. sway, Hyprland and niri turn a token activation into an urgency
+/// hint, so there the window also has the compositor's own tool focus it, on a worker thread (the adapter is started
+/// on first use).
 #[derive(Clone)]
 pub(crate) struct PairRaise {
     wm: eitri_core::compositor::Wm,
@@ -35,6 +36,17 @@ impl PairRaise {
     /// The next show only presents the window: no compositor tool focuses it.
     pub(crate) fn keep_keys_at_next_show(&self) {
         self.keep_keys_once.set(true);
+    }
+
+    /// Readies the raise for this window's first show, and says whether the host presents through it. A window of a
+    /// pair always does. One outside a pair does when it takes files from outside: a file handed to it while another
+    /// application has the keys must bring it forward. Nothing asks such a window forward at its first show, so that
+    /// show stays a plain present, as a restored window's does.
+    pub(crate) fn used_for_window(&self, in_pair: bool, restored: bool, takes_opens: bool) -> bool {
+        if restored || !in_pair {
+            self.keep_keys_at_next_show();
+        }
+        in_pair || takes_opens
     }
 
     /// Whether this show has the compositor's own tool focus the window: on sway, Hyprland and niri, unless the
@@ -176,5 +188,33 @@ mod tests {
         }
         let gnome = PairRaise::with_wm(Wm::None);
         assert!(!gnome.focuses(), "without a compositor tool the token alone raises");
+    }
+
+    #[test]
+    fn a_window_outside_a_pair_comes_forward_for_a_file_and_not_at_its_first_show() {
+        for wm in [Wm::Sway, Wm::Hyprland, Wm::Niri] {
+            let raise = PairRaise::with_wm(wm);
+            assert!(
+                raise.used_for_window(false, false, true),
+                "{wm:?}: without the raise a file handed over stays behind whatever has the keys"
+            );
+            assert!(!raise.focuses(), "{wm:?}: the first show stays a plain present");
+            assert!(raise.focuses(), "{wm:?}: the file's show is focused");
+        }
+    }
+
+    #[test]
+    fn a_window_outside_a_pair_that_takes_no_files_presents_for_itself() {
+        assert!(!PairRaise::with_wm(Wm::Sway).used_for_window(false, false, false));
+    }
+
+    #[test]
+    fn a_window_of_a_pair_is_focused_at_its_first_show_unless_it_was_restored() {
+        let raise = PairRaise::with_wm(Wm::Sway);
+        assert!(raise.used_for_window(true, false, false));
+        assert!(raise.focuses());
+        let restored = PairRaise::with_wm(Wm::Sway);
+        assert!(restored.used_for_window(true, true, true));
+        assert!(!restored.focuses());
     }
 }

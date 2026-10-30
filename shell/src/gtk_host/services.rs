@@ -27,6 +27,10 @@
 //! the application held for what they still finish. What those last steps act on is made late in the window's build,
 //! so it is handed over once, as [`Teardown`].
 //!
+//! A file another process asked this window to open arrives here twice: its client's answer (`open_answer`, from
+//! [`Teardown`]'s requests) and, in the same batch or once nvim is ready, the call to nvim, followed from a bounded
+//! timer by `crate::open_requests::watch_open`.
+//!
 //! Given to the GTK host once, before the startup layout's first batch (`GtkHost::set_services`).
 //! An op this shell does not carry out yet is answered with the host's refusal.
 //!
@@ -283,6 +287,8 @@ pub(crate) struct Teardown {
     pub(crate) follow_socket: Option<eitri_core::plugin::follow_feed::FollowSocket>,
     /// The tutorial's lessons, written for this window's nvim; the next window's sweep is only a backstop.
     pub(crate) tutor: Option<Rc<crate::tutor::Tutor>>,
+    /// The window's open socket and what waits on it; `None` in a window that holds none.
+    pub(crate) open_requests: Option<Rc<crate::open_requests::OpenRequests>>,
     /// Nothing else holds the window's Lua engine once its build returns; this keeps it for the window's life, and
     /// is never read.
     #[allow(dead_code)]
@@ -312,9 +318,9 @@ impl Teardown {
         }
     }
 
-    /// The editor's feeds, the plugins' follow socket and the tutorial's lessons: each removes its socket or directory
-    /// now, not at a `Drop` that may never come (a directory a close leaves behind is swept by the next launch, as a
-    /// backstop only).
+    /// The editor's feeds, the plugins' follow socket, the open socket and the tutorial's lessons: each removes its
+    /// socket or directory now, not at a `Drop` that may never come (a directory a close leaves behind is swept by the
+    /// next launch, as a backstop only).
     fn feeds(&self) {
         if let Some(feed) = &self.theme_feed {
             feed.cleanup();
@@ -328,6 +334,9 @@ impl Teardown {
         if let Some(socket) = &self.follow_socket {
             socket.cleanup();
         }
+        if let Some(requests) = &self.open_requests {
+            requests.close();
+        }
         if let Some(tutor) = &self.tutor {
             tutor.cleanup();
         }
@@ -340,6 +349,8 @@ pub(crate) struct Services {
     /// refused. Every full window has the editor (a Lua `main` panel hides it), so `main.rs` passes
     /// `Some`, and a write of `g:neovide_scale_factor` before nvim has started is buffered by the pane.
     pub(crate) editor: Option<Rc<NeovideEditorPane>>,
+    /// The handle every question to this window's nvim goes through; in a window with no editor it answers that.
+    pub(crate) editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>,
     pub(crate) terminals: Rc<Registry<TerminalPane>>,
     pub(crate) plugin_panels: Rc<PluginPanels>,
     pub(crate) agent: AgentPanelHandle,
@@ -637,8 +648,24 @@ impl ServiceSet for Services {
                 editor.set_scale_factor_setting(*scale as f32);
                 Ok(())
             }
+            // Carried out either way: a call that could not be made is an error in its answer, reported as any is.
+            EditorCall::Open { win, path, line, col } => {
+                let pending = eitri_core::editor_open::open(self.editor_rpc.as_ref(), path, *line, *col);
+                crate::open_requests::watch_open(pending, *win, self.sink.clone());
+                Ok(())
+            }
             EditorCall::Reveal { .. } => Err(NOT_CARRIED_OUT.into()),
         }
+    }
+
+    fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
+        let teardown = self.teardown()?;
+        let requests = teardown
+            .open_requests
+            .as_ref()
+            .ok_or("this window holds no open socket")?;
+        requests.answer(id, accepted);
+        Ok(())
     }
 
     // The same pane and widget, so every clone the window holds of it reaches the new nvim; the callbacks it has
