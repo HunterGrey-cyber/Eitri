@@ -136,6 +136,7 @@ fn main() {
         cwd: Some(scratch.clone()),
         child_env: vec![("EITRI_PACING_READY".into(), ready.to_string_lossy().into_owned())],
         extra_nvim_args: vec!["-i".into(), "NONE".into(), "-c".into(), init.into()],
+        open: Vec::new(),
     }));
     let size = |name, fallback| {
         std::env::var(name)

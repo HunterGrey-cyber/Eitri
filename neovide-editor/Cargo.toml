@@ -78,6 +78,12 @@ harness = false
 name = "multi_nvim"
 harness = false
 
+# Opens files as nvim arguments after `--embed` against real nvims; each case starts its own harness in
+# a child copy of this binary, like `multi_nvim`.
+[[test]]
+name = "open_at_start"
+harness = false
+
 [[test]]
 name = "shared_watch"
 harness = false

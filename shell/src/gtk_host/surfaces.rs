@@ -98,6 +98,7 @@ pub(crate) fn editor_options(spawn: &EditorSpawn) -> NeovideEditorPaneOptions {
         child_env: spawn.env.clone(),
         cwd: spawn.cwd.clone(),
         extra_nvim_args: spawn.args.clone(),
+        open: Vec::new(),
     }
 }
 
@@ -673,6 +674,7 @@ mod tests {
                 child_env: spawn.env.clone(),
                 cwd: spawn.cwd.clone(),
                 extra_nvim_args: spawn.args.clone(),
+                open: Vec::new(),
             }
         );
         assert_eq!(editor_options(&spawn), start, "the restart's options are the start's");

@@ -758,6 +758,14 @@ pub struct NeovideEditorPaneOptions {
     /// `--cmd` that loads its theme feed (see `shell/src/theme/feed.rs`); `--cmd` runs before the
     /// user's own config, so what it installs is autocommands, not settings.
     pub extra_nvim_args: Vec<String>,
+    /// What nvim opens at start, as the arguments `nvim` takes after its options: an optional
+    /// `+N`/`+`/`+call cursor(L,C)` and then absolute file paths. Empty (the default) opens nothing
+    /// and leaves the argument list exactly as it was.
+    ///
+    /// They are real nvim arguments, so `argc()`, `:args`, `VimEnter` and the cursor command behave as
+    /// for `nvim file`. This crate does not validate or quote them; the host builds them from paths
+    /// that start with `/`, so none can read as an option or a command.
+    pub open: Vec<String>,
 }
 
 /// The `--cmd` that hides the cursor while the pane does not have keyboard focus.
@@ -774,15 +782,26 @@ pub const HIDE_UNFOCUSED_CURSOR_CMD: &str = "let g:neovide_cursor_unfocused_outl
 
 /// The whole argument list this pane hands to `LiveHarnessOptions::extra_nvim_args`: `--clean`
 /// if asked for, then this pane's own default (`HIDE_UNFOCUSED_CURSOR_CMD`), then the host's
-/// extras -- so a host's `--cmd` can override the default too.
-fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
-    let mut args = Vec::with_capacity(extra.len() + 3);
+/// extras -- so a host's `--cmd` can override the default too. When there is something to open, the
+/// list ends with `--embed` and then those arguments.
+///
+/// `--embed` is spelled here, only when `open` is not empty, because nvim loads a positional file
+/// only after it has seen `--embed`: a file before it lands in the argument list and is never read.
+/// The fork appends `--embed` to the end of whatever it is given, and only when it is absent, so
+/// arguments placed after our own `--embed` stay after it. With nothing to open the fork's own
+/// append is left to do its work and the list is what it always was.
+fn nvim_args(clean: bool, extra: &[String], open: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra.len() + open.len() + 4);
     if clean {
         args.push("--clean".to_string());
     }
     args.push("--cmd".to_string());
     args.push(HIDE_UNFOCUSED_CURSOR_CMD.to_string());
     args.extend(extra.iter().cloned());
+    if !open.is_empty() {
+        args.push("--embed".to_string());
+        args.extend(open.iter().cloned());
+    }
     args
 }
 
@@ -1627,7 +1646,7 @@ impl NeovideEditorPane {
                         let (clean, cwd) = (spawn.clean, spawn.cwd.clone());
                         let options = LiveHarnessOptions {
                             os_scale_factor,
-                            extra_nvim_args: nvim_args(clean, &spawn.extra_nvim_args),
+                            extra_nvim_args: nvim_args(clean, &spawn.extra_nvim_args, &spawn.open),
                             // Cloned rather than moved because a restart may start from these
                             // options again; this arm runs once per start, so the clone does too.
                             child_env: spawn.child_env.clone(),
@@ -3043,12 +3062,43 @@ mod tests {
         let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
         let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
         assert_eq!(
-            nvim_args(true, &extra),
+            nvim_args(true, &extra, &[]),
             vec!["--clean", "--cmd", hide, "--cmd", "lua print(1)"]
         );
-        assert_eq!(nvim_args(false, &extra), vec!["--cmd", hide, "--cmd", "lua print(1)"]);
-        assert_eq!(nvim_args(true, &[]), vec!["--clean", "--cmd", hide]);
-        assert_eq!(nvim_args(false, &[]), vec!["--cmd", hide]);
+        assert_eq!(
+            nvim_args(false, &extra, &[]),
+            vec!["--cmd", hide, "--cmd", "lua print(1)"]
+        );
+        assert_eq!(nvim_args(true, &[], &[]), vec!["--clean", "--cmd", hide]);
+        assert_eq!(nvim_args(false, &[], &[]), vec!["--cmd", hide]);
+    }
+
+    #[test]
+    fn targets_follow_an_embed_the_pane_spells_and_nothing_else_changes() {
+        let hide = super::HIDE_UNFOCUSED_CURSOR_CMD;
+        let extra = vec!["--cmd".to_string(), "lua print(1)".to_string()];
+        let open = vec!["+42".to_string(), "/a b".to_string()];
+        assert_eq!(
+            nvim_args(true, &extra, &open),
+            vec![
+                "--clean",
+                "--cmd",
+                hide,
+                "--cmd",
+                "lua print(1)",
+                "--embed",
+                "+42",
+                "/a b"
+            ]
+        );
+        assert_eq!(
+            nvim_args(false, &[], &open),
+            vec!["--cmd", hide, "--embed", "+42", "/a b"]
+        );
+        assert_eq!(
+            nvim_args(true, &[], &["/f".to_string()]),
+            vec!["--clean", "--cmd", hide, "--embed", "/f"]
+        );
     }
 
     /// A scale-factor change alone, with no animation, content, resize or keypress, must queue
