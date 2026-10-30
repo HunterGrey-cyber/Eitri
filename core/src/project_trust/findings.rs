@@ -142,8 +142,9 @@ pub(super) fn hooks(file: &Path, events: &Map<String, Value>, out: &mut Vec<Find
     }
 }
 
-/// One event's hooks line by line, or `None` as soon as their text would pass `limit` bytes; the
-/// count is taken before each line is built, so a refused event never allocates past it.
+/// One event's hooks line by line, or `None` as soon as their text would pass `limit` bytes. Each
+/// line is built before it is counted, so a refused event builds the line that crosses the limit
+/// and none after it, and keeps none of its lines.
 fn event_lines(file: &Path, event: &str, groups: &[Value], limit: usize) -> Option<Vec<Finding>> {
     let mut lines = Vec::new();
     let mut size = 0usize;

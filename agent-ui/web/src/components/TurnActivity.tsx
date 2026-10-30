@@ -9,17 +9,10 @@ type Props = {
   clock: TurnClock | null;
 };
 
-/**
- * The in-flight motion indicator. A caller mounts this only while `ActivityLine`'s own `working`
- * predicate is true (`ActivityLine` took this over from the old `StatusLine`) -- this component does
- * not re-derive that condition,
- * so mounting it at all is the caller's claim that a turn is in flight.
- *
- * The phase word and the elapsed clock. The motion that says a turn is in flight is the activity line's
- * star (`ActivityLine`), which holds still while `phase.kind === "blocked"`: a pending permission means
- * the AGENT is not working, so animating a claim that it is would be a lie. The word and the
- * clock still render in that phase -- only the motion stops.
- */
+/** The caller mounts this only while ActivityLine's working predicate holds; mounting claims a
+ *  turn is in flight, so this component must not re-derive that condition. The phase and elapsed
+ *  clock stay visible while blocked, but ActivityLine's star holds still: a permission wait means
+ *  the agent is not working. */
 export function TurnActivity({ phase, clock }: Props) {
   // One tick a second, local to this leaf: `setState` here re-renders only this component, not the
   // whole panel, which is what keeps a long-running turn's elapsed clock from adding a second

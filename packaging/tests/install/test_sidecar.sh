@@ -2,19 +2,16 @@
 # Sourced by harness.sh. Every test here that wants a real (stubbed) build redirects Node's own
 # download to the local fixture server with sc_inst_net/sc_inst_setup -- by default (plain
 # inst/inst_net, used by every other test file) EITRI_INSTALL_TEST_NODE_BASE_URL is unset, and
-# node_dist_base's own test-mode default (http://127.0.0.1:1, nothing listening) makes the very first
-# download refuse instantly, so every pre-existing test's sidecar-less installs are unaffected by
-# this file.
+# node_dist_base's test-mode default (http://127.0.0.1:1, nothing listening) refuses the first
+# download instantly, keeping other test files' installs sidecar-less.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
 # sc_inst_net [--set K=V]...: a normal inst_net network install/upgrade, with Node's own download
 # redirected to the fixture server's copy of the fake tarball setup_sidecar_fixtures built (served at
 # the same dist/vX.Y.Z/ layout the real nodejs.org uses). Every caller here passes only extra --set
-# overrides, never installer arguments -- inst()'s own "a --set must sit before install.sh's own
-# arguments" rule (every pre-existing caller in this suite ends its own --set run with a bare --,
-# for exactly this reason) is satisfied by always appending our own -- --base-url ... afterwards,
-# which also supplies the normal network install's --base-url/--release-signers.
+# overrides, never installer arguments. Append -- --base-url ... so the overrides stay before
+# inst()'s boundary and --base-url/--release-signers reach the installer.
 sc_inst_net() {
 	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" "$@" \
 		-- --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
@@ -99,7 +96,7 @@ t_sidecar_verdandi_source_checksum_refuses() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# The SDK notice (LIC-8)
+# The SDK notice.
 
 TESTS="$TESTS t_sidecar_sdk_notice"
 t_sidecar_sdk_notice() {
@@ -111,11 +108,9 @@ t_sidecar_sdk_notice() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# One line before the slow run, and nothing for the quick steps (decided 2026-10-01: do not print too
-# much, only what really takes time). Measured with a cold npm cache: Node's download, npm ci (~120 MB) and the
-# TypeScript build plus the single binary take about a minute together, network-bound; every other
-# step (checksums, unpacking, copying) takes a second or two. So the installer says one line before
-# the downloads, covering the whole run, and nothing else of its own.
+# One line before the slow run, nothing for quick steps. With a cold npm cache, Node's download,
+# npm ci (~120 MB), TypeScript and the single binary take about a minute together, network-bound;
+# checksums, unpacking and copying take a second or two. Announce the whole run before downloading.
 
 SLOW_LINE='downloading Node and the Claude Agent SDK, then building the sidecar (1-3 min)'
 
@@ -235,7 +230,7 @@ t_sidecar_workdir_layout_and_cleanup() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# set -e inside build_sidecar (SH-2): a stub npm that fails, reached through main's real call path
+# set -e inside build_sidecar: a stub npm that fails, reached through main's real call path
 # during an upgrade, gives a non-zero exit, no swap, and an old install left byte-identical.
 
 TESTS="$TESTS t_sidecar_npm_ci_failure_blocks_upgrade"
@@ -267,12 +262,12 @@ t_sidecar_build_binary_failure_blocks_upgrade() {
 
 # ---------------------------------------------------------------------------------------------
 # ensure_sidecar's own tolerance of a failed Node download
-# ("a release with no sidecar still installs") is only for a FIRST install. Before this
-# fix it was unconditional, so an upgrade whose new release pins a different Verdandi rev swapped in
-# the new install and exited 0 even though the new sidecar's Node download never happened -- the old
-# rev's sidecar was left on disk under the old REV7, but nothing looks for it there any more
-# (agent::EXPECTED_VERDANDI_REVISION names the new rev), so a working agent panel silently became "no
-# sidecar" on a machine with no network to nodejs.org at upgrade time.
+# ("a release with no sidecar still installs") holds only where no working install is replaced: a
+# first install, or an upgrade from one whose own sidecar is absent. An upgrade over a working
+# install whose new release pins a different Verdandi rev refuses instead: the old rev's sidecar
+# would stay on disk under the old REV7, but nothing looks for it there
+# (agent::EXPECTED_VERDANDI_REVISION names the new rev), so a working agent panel would silently
+# become "no sidecar" on a machine with no network to nodejs.org at upgrade time.
 
 TESTS="$TESTS t_sidecar_upgrade_node_unreachable_refuses"
 t_sidecar_upgrade_node_unreachable_refuses() {
@@ -294,9 +289,8 @@ t_sidecar_upgrade_node_unreachable_refuses() {
 
 TESTS="$TESTS t_sidecar_first_install_node_unreachable_still_succeeds"
 t_sidecar_first_install_node_unreachable_still_succeeds() {
-	# The other half of F1's fix: TOLERANT is still 1 on a first install (there is no working
-	# install being replaced), so a machine with no network to nodejs.org still gets Eitri, with a
-	# warning, exactly as a release with no sidecar promises.
+	# A first install has no working sidecar to replace, so TOLERANT stays 1 and an unreachable
+	# nodejs.org still permits installing Eitri with a warning.
 	serve 1.0.0
 	inst_net --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:1/dist" --
 	expect_rc 0
@@ -337,12 +331,9 @@ t_sidecar_prune_after_real_build() {
 
 TESTS="$TESTS t_prune_sidecars_symlinked_root_refused"
 t_prune_sidecars_symlinked_root_refused() {
-	# The same symlinked-sidecar-root gap as
-	# do_uninstall's own (t_uninstall_symlinked_sidecar_root, test_uninstall.sh), reachable here in
-	# a normal upgrade's own prune step. A symlinked $XDG_DATA_HOME/eitri/sidecar, planted by the
-	# user in their own data directory, was followed with no check at all: any 7-hex-named directory
-	# behind the link that is not this upgrade's own new/old/system rev -- a user's own, unrelated
-	# directory that merely happens to be named like a short git sha -- was removed.
+	# Pruning must not follow a sidecar-root symlink to an unrelated directory. A 7-hex-named child
+	# there may be a user's unrelated backup, not an Eitri sidecar, even if it resembles a short git sha.
+	# Exercise this on upgrade as test_uninstall.sh's t_uninstall_symlinked_sidecar_root does on removal.
 	serve 1.0.0
 	sc_inst_net
 	expect_rc 0
@@ -354,9 +345,8 @@ t_prune_sidecars_symlinked_root_refused() {
 	ln -s "$TH/backup" "$sc"
 	serve 1.1.0 1.0.0
 	# Node unreachable at the default (nothing serves it): tolerated, since neither old nor new
-	# sidecar can be found present behind the now-symlinked root (F1's TOLERANT=1 case) -- so the
-	# upgrade itself still succeeds with no sidecar build at all, keeping this test to prune_sidecars
-	# alone.
+	# sidecar is present behind the symlinked root (TOLERANT=1), so the upgrade succeeds without a
+	# sidecar build, keeping this test focused on prune_sidecars.
 	inst_net
 	expect_rc 0
 	expect_file "$TH/backup/abcdef0/keep"
@@ -439,18 +429,14 @@ t_sidecar_only_present_reports_and_returns() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# --tarball builds a sidecar too
+# --tarball builds a sidecar too.
 
 TESTS="$TESTS t_tarball_install_builds_sidecar_from_beside_file"
 t_tarball_install_builds_sidecar_from_beside_file() {
-	# obtain_release's own --tarball branch never set NV_REL_URL, and --base-url is refused together
-	# with --tarball (parse_args), so nothing else did either: a --tarball install whose sidecar was
-	# not already present crashed with "NV_REL_URL: unbound variable" the moment ensure_sidecar tried
-	# to build one. Node's download is still redirected to the fixture server, matching the report's
-	# own repro (a machine that can reach nodejs.org); the Verdandi source is never fetched over the
-	# network at all here -- mk_release plants verdandi-aaaaaaa-source.tar.gz beside every --tarball
-	# fixture (the release's own asset layout), and do_install now uses it through
-	# NV_VERDANDI_SOURCE_TARBALL_OVERRIDE.
+	# A --tarball install must set NV_REL_URL for a sidecar build even though --base-url is refused
+	# with --tarball. Redirect Node to the fixture server. Verdandi needs no network here:
+	# mk_release plants verdandi-aaaaaaa-source.tar.gz beside the tarball, and do_install uses it
+	# through NV_VERDANDI_SOURCE_TARBALL_OVERRIDE.
 	d=$S/fix/v1.0.0
 	srv_mark
 	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
@@ -465,17 +451,11 @@ t_tarball_install_builds_sidecar_from_beside_file() {
 
 TESTS="$TESTS t_tarball_verdandi_source_beside_file_copied_before_use"
 t_tarball_verdandi_source_beside_file_copied_before_use() {
-	# A TOCTOU finding: use_verdandi_source_beside_tarball used to point
-	# NV_VERDANDI_SOURCE_TARBALL_OVERRIDE straight at the file beside --tarball, which
-	# sidecar_download_verdandi_source then hashed in place and sidecar_build_core reopened a SECOND
-	# time (after Node's own extraction) to extract -- a file in --tarball's own, possibly shared,
-	# directory swapped between those two reads ran unverified source and its npm scripts despite
-	# every checksum passing. It is copied into this run's own 0700 $NV_DL first now, and only the
-	# copy is ever read again. --tarball's own directory is this test's own private $d (never the
-	# shared fixture under $S/fix), so the corruption below never leaks into another test; the
-	# cp-swap stub corrupts the ORIGINAL beside-tarball file the instant AFTER this installer's own
-	# (single) read of it, the same "swap right after the read" shape test_verify.sh's own
-	# --tarball/--sums races use for sha256sum/cat.
+	# Copy the Verdandi source beside --tarball into this run's 0700 $NV_DL before hashing and
+	# extracting it; reopening the original in a shared directory would allow a swap to run unverified
+	# source and npm scripts after a valid checksum. Only the private copy may be read again.
+	# Use a private tarball directory so corruption cannot reach shared fixtures. cp-swap corrupts the
+	# original immediately after the real cp reads it, as the --tarball/--sums races in test_verify.sh do.
 	d=$T/tarball-race
 	mkdir -p "$d"
 	cp -- "$S/fix/v1.0.0/eitri-1.0.0-x86_64-linux.tar.gz" "$S/fix/v1.0.0/SHA256SUMS" \
@@ -497,15 +477,10 @@ t_tarball_verdandi_source_beside_file_copied_before_use() {
 
 TESTS="$TESTS t_tarball_install_falls_back_to_network_without_beside_file"
 t_tarball_install_falls_back_to_network_without_beside_file() {
-	# Test the network fallback: every existing --tarball test above plants
-	# verdandi-<rev>-source.tar.gz beside --tarball (mk_release's own fixture layout), so
-	# obtain_release's --tarball branch's own NV_REL_URL assignment (the fix for the original
-	# "NV_REL_URL: unbound variable" crash) has never actually been exercised by a real fetch. A
-	# user who downloaded only the tarball, SHA256SUMS and .sig has no such file beside it. --tarball
-	# refuses --base-url (parse_args), so NV_REL_URL here is genuinely NV_DEFAULT_BASE_URL
-	# (github.com) -- the curl-mirror stub (stubs-net) strips scheme and host from any URL and
-	# serves its path from $S/srv, so staging the genuine asset at that literal path lets this run
-	# with no real network access, exactly as the report's own suggested fix says.
+	# Without verdandi-<rev>-source.tar.gz beside --tarball, fetch it through NV_REL_URL.
+	# --tarball refuses --base-url, so this uses NV_DEFAULT_BASE_URL (github.com). The curl-mirror
+	# stub strips scheme and host and serves the path from $S/srv; staging the asset at that path
+	# exercises the fallback with no real network.
 	mkdir -p "$S/srv/HunterGrey-cyber/eitri/releases/download/v1.0.0"
 	cp -- "$S/fix/v1.0.0/verdandi-aaaaaaa-source.tar.gz" \
 		"$S/srv/HunterGrey-cyber/eitri/releases/download/v1.0.0/verdandi-aaaaaaa-source.tar.gz"
@@ -550,18 +525,10 @@ t_build_sidecar_into() {
 
 TESTS="$TESTS t_build_sidecar_into_node_cache_versioned_name"
 t_build_sidecar_into_node_cache_versioned_name() {
-	# Regression:
-	# the --node copy do_build_sidecar_into makes used to keep the generic basename node.tar.xz.
-	# sidecar_build_core's own node-cache priming ("buildBinary.mjs reuses this
-	# exact cache and re-verifies it against its own pinned checksum") preserves whatever basename
-	# it is handed, but buildBinary.mjs itself looks in that cache only for the versioned name
-	# sidecar_download_node's own network path already writes -- so the AUR build() path found
-	# nothing under the name it actually checks and downloaded Node a second time from nodejs.org,
-	# discarding the byte-verified copy sitting right next to it. --keep-build (this mode's own
-	# workdir lives under NV_CACHE_NV regardless of --build-sidecar-into's own DIR argument, the
-	# same layout install_sidecar_for_rev uses) leaves the workdir behind so the cache's own
-	# filename can be asserted directly, the same way t_sidecar_workdir_layout_and_cleanup does for
-	# the network path.
+	# Prime buildBinary.mjs's Node cache with the versioned filename, not node.tar.xz: it preserves
+	# the basename handed to it but only looks up the versioned name. A different name would cause a
+	# second download, discarding the verified copy. --keep-build leaves this mode's workdir under
+	# NV_CACHE_NV so the cache filename can be asserted, as on the network path.
 	serve 1.0.0
 	sc_setup_release 1.0.0 "$REV_A"
 	dest=$T/aur-sidecar-cache-name
@@ -575,17 +542,11 @@ t_build_sidecar_into_node_cache_versioned_name() {
 
 TESTS="$TESTS t_build_sidecar_into_node_swapped_after_hash"
 t_build_sidecar_into_node_swapped_after_hash() {
-	# --node and --verdandi-source used to be hashed
-	# where they lay, then extracted from that same path by sidecar_build_core -- a file swapped for
-	# a different one right after the hash was extracted unverified. They are copied into the work
-	# directory first now and hashed and used from the copy alone, the same discipline --tarball
-	# already holds (t_offline_tarball_swapped_after_hash, test_verify.sh). The sha256sum-swap stub
-	# swaps the file at --node's own path for evil content right after the first sha256sum call
-	# (do_build_sidecar_into's own hash of the copy, since resolve_setup_release/parse_release hash
-	# nothing) -- with the fix, that swap changes nothing, because nothing reads --node's own path a
-	# second time. A private copy of the shared NODE_FIXTURE_TARBALL is used as --node's own
-	# argument, so the swap (which really does move a file onto that path) never corrupts the one
-	# fixture every other test in this file shares.
+	# Copy --node and --verdandi-source into the work directory before hashing and extracting them;
+	# reopening the original after its hash would allow unverified content to be swapped in.
+	# sha256sum-swap replaces --node's original path immediately after the first hash (of the copy;
+	# resolve_setup_release/parse_release hash nothing). The build must use the genuine private copy.
+	# Use a private copy of NODE_FIXTURE_TARBALL as --node so the swap cannot corrupt the shared fixture.
 	serve 1.0.0
 	sc_setup_release 1.0.0 "$REV_A"
 	dest=$T/aur-sidecar-swap
@@ -599,9 +560,8 @@ t_build_sidecar_into_node_swapped_after_hash() {
 	expect_rc 0
 	if [ ! -s "$S/logs/swap.log" ]; then fail "--node was never swapped: the test did not run the race"; fi
 	expect_exec "$dest/verdandi-claude-sidecar"
-	# --node's own path itself now holds the evil content (the swap really happened): confirms
-	# sidecar_build_core never read it a second time, since the build still succeeded on genuine
-	# content copied out before the swap.
+	# The original --node path holds the evil content, proving the swap happened; the successful
+	# build must have used the genuine copy read before the swap.
 	if ! grep -qF EVIL "$node_copy"; then fail "the --node path was not actually swapped: the test did not run the race"; fi
 }
 
@@ -631,13 +591,9 @@ t_build_sidecar_into_needs_node_and_source() {
 
 TESTS="$TESTS t_build_sidecar_into_ignores_xdg_data_home_outside_home"
 t_build_sidecar_into_ignores_xdg_data_home_outside_home() {
-	# check_data_home used to gate
-	# every mode except --uninstall, including --build-sidecar-into -- which never reads or writes
-	# anything under NV_DATA/XDG_DATA_HOME (its workdir is under NV_CACHE_NV, and its output goes
-	# to the caller's own --build-sidecar-into DIR, never $XDG_DATA_HOME). The AUR package's
-	# build() runs exactly this mode, in a sandbox that may set XDG_DATA_HOME outside $HOME with
-	# no reason this mode would care. It used to refuse with a message naming the desktop entry,
-	# licences, private nvim and sidecar -- none of which this mode touches.
+	# --build-sidecar-into reads and writes no NV_DATA/XDG_DATA_HOME: its workdir is under NV_CACHE_NV
+	# and its output is the caller's DIR. AUR's build() may set XDG_DATA_HOME outside HOME, so this mode
+	# must not refuse on account of desktop entries, licences, private nvim or sidecars it never touches.
 	serve 1.0.0
 	sc_setup_release 1.0.0 "$REV_A"
 	dest=$T/aur-sidecar-outside-data

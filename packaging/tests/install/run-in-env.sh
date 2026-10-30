@@ -12,9 +12,9 @@
 #              it (each overridable with --set, or dropped with --unset);
 #   LANG       the caller's, else C.UTF-8;
 #   whatever --set names, which must be EITRI_INSTALL_TEST or an EITRI_INSTALL_TEST_* variable,
-#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR (F3's
-#              own reproduction: a caller's CARGO_TARGET_DIR must not move where --from-source's
-#              build lands, since staging always reads <src>/target/release).
+#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR.
+#              A caller's CARGO_TARGET_DIR must not move the --from-source build, since staging
+#              always reads <src>/target/release.
 # Nothing else is inherited: this host exports VERDANDI_CLAUDE_CLI_PATH and VERDANDI_CLAUDE_ACCOUNT,
 # and neither may reach an installer run.
 #

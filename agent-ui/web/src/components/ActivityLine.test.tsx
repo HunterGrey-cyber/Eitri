@@ -66,9 +66,7 @@ it("counts the queue, names the interrupt key, and names a card that waits", () 
   expect(container.textContent).not.toContain("queued");
 });
 
-/** The card row reads differently by mode -- BROWSE can
- *  answer `a`/`d` directly, INPUT's keys go to the composer so it says `Esc` first. Defaults to
- *  BROWSE for every caller that predates this (`mode?`'s own doc comment). */
+/** BROWSE answers `a`/`d` on the card; INPUT must leave the composer with `Esc` first. Defaults to BROWSE. */
 it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   const onInterrupt = vi.fn();
   const { container } = render(
@@ -77,10 +75,7 @@ it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, a / d alone");
 });
 
-/** With a card waiting the activity line must keep the approval keys visible. The old
- *  wording drew the phase word and the card side by side, and at
- *  520px both were cut to `waiti… ⚑ Write needs …` -- the keys that answer the card were the part
- *  lost. */
+/** A phase word beside a waiting card cuts off its approval keys at 520px, so the card owns the line. */
 it("with a card waiting, the card is the line: no phase word or clock beside it", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
@@ -90,11 +85,8 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
   expect(container.querySelector("button.stop")).not.toBeNull();
 });
 
-/** The old "a / d" /
- *  "Esc, then a / d" said neither that the cursor check narrows `a`/`d` to the card under the cursor (never
- *  "the only card, from any row") nor that the typing guard makes them wait `TYPING_GUARD_MS` since the last key.
- *  A user who moved off the card with `k`, or pressed `a` a beat after `Esc`, followed a hint that
- *  did not explain either refusal. */
+/** The hint must name the cursor target and the `TYPING_GUARD_MS` pause: `a`/`d` only answer the card
+ *  under the cursor, and a key too soon after `Esc` is still typing. */
 it("the hint names both the navigation key and the typing pause, in both modes", () => {
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
@@ -110,9 +102,7 @@ it("the hint names both the navigation key and the typing pause, in both modes",
   expect(text()).toContain("alone");
 });
 
-/** "the activity line already ends in `ctrl+c interrupt` ...; it is kept and
- *  pinned by a test, including while a card waits." Pins the button's own text, not just its
- *  presence -- CC's own words, unchanged by a card taking over the rest of the line. */
+/** The Stop button keeps its own interrupt text while a card owns the rest of the line. */
 it("keeps ctrl+c interrupt as the Stop button's own text, even while a card waits", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,

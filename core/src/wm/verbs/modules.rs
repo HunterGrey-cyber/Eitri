@@ -1,4 +1,5 @@
-//! The module verbs: a module's key with each kind's rule, `module.hide`, `module.kill` and its y/n, a new terminal
+//! The module verbs: a module's key with each kind's rule, `module.hide`, the hide key's module key, `module.kill` and
+//! its y/n, a new terminal
 //! or chat view (`instance.new`, a split key's new instance, `eitri.layout.open`), a split key's placement of a
 //! module that exists, the covered chat's answer gate and its reveal, a plugin's follow commands, a tray chip, and
 //! the Lua requests that name a module. Each is decided on the window's layout and answered with the batch that
@@ -28,7 +29,7 @@ use super::super::host::*;
 use super::super::instances::plan_new_instance;
 use super::super::module::{ModuleState, SurfaceDecl};
 use super::super::moves;
-use super::super::window::{WinId, Window};
+use super::super::window::{EditorPresence, EditorRun, LinkSide, PeerId, WinId, Window, WindowRole};
 use crate::keymap::action::{Action, SplitCwd};
 use crate::keymap::Keymap;
 use crate::layout::rules::{without_keys, At, OpenPoint};
@@ -64,11 +65,17 @@ impl Default for ModuleSetup {
     }
 }
 
-/// What a window's module verbs wait for: the module the shown y/n would kill, the new instances whose surface
-/// was asked for, and the splits waiting for the directory of the terminal they were pressed in.
+/// What a window's module verbs wait for: the module the shown y/n would kill (or whether it asks to start the
+/// editor window), the new instances whose surface was asked for, and the splits waiting for the directory of the
+/// terminal they were pressed in.
 #[derive(Debug, Default)]
 pub struct ModuleVerbs {
-    kill: Option<ModuleId>,
+    pub(in crate::wm) kill: Option<ModuleId>,
+    /// The other window the shown y/n would end: asked instead of a kill while a module is frozen for a move that
+    /// window stopped answering.
+    pub(in crate::wm) end_peer: Option<PeerId>,
+    /// The shown y/n asks whether to start the editor window, in a window 2 left without one.
+    start_editor: bool,
     opens: Vec<PendingOpen>,
     cwd_reads: Vec<PendingCwd>,
     /// The next directory read's own number, which its answer carries back.
@@ -76,6 +83,14 @@ pub struct ModuleVerbs {
 }
 
 impl ModuleVerbs {
+    /// The y/n's question is about to change: whatever an earlier one would have done on `y` (a kill, ending the
+    /// other window, starting the editor window) is forgotten, so a later `y` answers only the question shown.
+    pub(in crate::wm) fn clear_question(&mut self) {
+        self.kill = None;
+        self.end_peer = None;
+        self.start_editor = false;
+    }
+
     /// The new instances whose surface was asked for and has not come yet; their numbers are not free.
     pub(crate) fn pending_ids(&self) -> Vec<ModuleId> {
         self.opens.iter().map(|open| open.id.clone()).collect()
@@ -123,11 +138,10 @@ pub struct Cx<'a> {
     pub setup: &'a ModuleSetup,
 }
 
-/// Whether a verb was carried out here or is the shell's: the last module's kill, which is the window close.
+/// A module verb was decided by the controller, including the last module's close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ran {
     Done,
-    Shell,
 }
 
 /// The module family's action from the runner, `origin` saying who asked: a chip shows and focuses and never
@@ -147,6 +161,8 @@ pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, origin: &Origin
                 open_module(w, cx, win, &target, KeyAction::Hide, batch);
             }
         }
+        // The hide key waits for a module key in the prefix (`hide_by_key`); on its own it hides nothing.
+        Action::ModuleHideByKey => {}
         Action::ModuleKill => return kill_asked(w, cx, win, batch),
         Action::InstanceNew { kind } => {
             let how = OpenHow::Rule {
@@ -369,6 +385,10 @@ fn change_then_give(w: &mut Window, win: WinId, changed: bool, to: &ModuleId, ta
 /// going first to the module the layout chooses. Every case ends a zoom first: hiding a zoomed terminal without
 /// that hid everything.
 fn terminal_key(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) {
+    let target = w.layout.try_borrow().ok().map(|l| layout::module_target(&l, id));
+    if target.as_ref().is_some_and(|id| peer_key(w, cx, win, id, batch)) {
+        return;
+    }
     let layout = w.layout.clone();
     let Ok(mut l) = layout.try_borrow_mut() else {
         w.warn(format!("[wm] BUG: the layout was borrowed when {id}'s key ran"));
@@ -436,10 +456,17 @@ fn module_key(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Ba
         w.warn(format!("[wm] BUG: the layout was borrowed when {id}'s key ran"));
         return;
     };
+    if peer_key(w, cx, win, &id, batch) {
+        return;
+    }
     if !has_host(w, &id) {
         let text = feedback::not_here_yet_text(&id);
         w.say(format!("[prefix] {text}"));
         w.refuse(win, text, batch);
+        return;
+    }
+    if id == ModuleId::editor() && w.editor_run != EditorRun::Running {
+        open_module(w, cx, win, &id, KeyAction::ShowAndFocus, batch);
         return;
     }
     let keys = has_keys(w, &id);
@@ -453,9 +480,45 @@ fn module_key(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Ba
     open_module(w, cx, win, &id, action, batch);
 }
 
+/// A key naming the peer's module gives it the intent before any local host is required.
+pub(in crate::wm) fn peer_key(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) -> bool {
+    let editor_elsewhere = *id == ModuleId::editor() && *w.presence() != EditorPresence::Owned;
+    let (away, local) = match w.layout.try_borrow() {
+        Ok(layout) => (layout.is_away(id), layout.contains(id)),
+        Err(_) => return false,
+    };
+    let held = !local && w.peer.as_ref().is_some_and(|p| p.held.contains(id));
+    if editor_elsewhere || away || held {
+        if moves::raise_for(
+            w,
+            win,
+            crate::window_link::FocusTarget::Module { id: id.to_string() },
+            batch,
+        ) {
+            return true;
+        }
+        if editor_elsewhere {
+            if *w.role() == (WindowRole::Linked { side: LinkSide::Second }) {
+                ask_start_editor(w, cx, win, batch);
+            } else {
+                w.refuse(win, feedback::EDITOR_WINDOW_CLOSED_TEXT.into(), batch);
+            }
+            return true;
+        }
+        if away {
+            refuse_layout(w, win, &LayoutError::Away(id.clone()), batch);
+            return true;
+        }
+    }
+    false
+}
+
 /// A tray chip: `prefix <key>` for its module from the top bar, which never holds the keys itself, so a chip never
 /// hides its module. It meets neither the selection's gate nor the float's and never goes to a chat's waiting card.
 fn chip(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) {
+    if peer_key(w, cx, win, id, batch) {
+        return;
+    }
     let Ok(action) = w
         .layout
         .try_borrow()
@@ -469,6 +532,35 @@ fn chip(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) {
     open_module(w, cx, win, id, action, batch);
 }
 
+/// The other window asked for `id`'s keys: brought on screen as a tray chip brings it (shown when hidden, placed when
+/// this workspace lacks it, never hidden) and given the keys. Its refusal is returned for the caller to log: the
+/// user pressed nothing here.
+pub(in crate::wm) fn reveal_and_focus(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    id: &ModuleId,
+    batch: &mut Batch,
+) -> Result<(), LayoutError> {
+    let action = match w.layout.try_borrow() {
+        Ok(layout) => layout::key_action(&layout, id, false),
+        Err(_) => return Ok(()),
+    };
+    w.say(format!("[modules] {id}: {action:?}, for the other window"));
+    match action {
+        KeyAction::Place | KeyAction::ShowAndFocus if starts_hidden(cx, id) => {
+            open_plugin_module(w, cx, win, id, Some(true), batch)
+        }
+        KeyAction::ShowAndFocus => {
+            show_on_screen(w, cx, win, id, batch).and_then(|()| focus_and_arrive(w, win, id, batch))
+        }
+        KeyAction::Focus => focus_and_arrive(w, win, id, batch),
+        KeyAction::Place => place_and_arrive(w, cx, win, id, Axis::Row, batch),
+        // Not asked with the keys on it, so never; kept to the keys if it ever is.
+        KeyAction::Hide => focus_and_arrive(w, win, id, batch),
+    }
+}
+
 /// A module key's four cases for `id`; a refusal flashes the app name and the toast says why. A plugin module that
 /// starts hidden is opened by its own rule rather than split beside the keys, and takes the keys as every module key
 /// gives them.
@@ -479,6 +571,9 @@ fn open_module(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, action: KeyAc
             open_plugin_module(w, cx, win, id, Some(true), batch)
         }
         KeyAction::ShowAndFocus => {
+            show_on_screen(w, cx, win, id, batch).and_then(|()| focus_and_arrive(w, win, id, batch))
+        }
+        KeyAction::Focus if *id == ModuleId::editor() => {
             show_on_screen(w, cx, win, id, batch).and_then(|()| focus_and_arrive(w, win, id, batch))
         }
         KeyAction::Focus => focus_and_arrive(w, win, id, batch),
@@ -637,6 +732,9 @@ pub fn show_on_screen(
     drop(l);
     match shown {
         Ok(showed) => {
+            if *id == ModuleId::editor() {
+                restart_editor(w, cx, win, batch);
+            }
             if unzoomed || showed {
                 w.changed_by_controller(win, batch);
             }
@@ -648,6 +746,43 @@ pub fn show_on_screen(
             }
             Err(err)
         }
+    }
+}
+
+/// A show restarts only a released pane owned by this window. Shows while its harness is being
+/// released remember the request; shows during startup keep the one restart already in flight.
+pub fn restart_editor(w: &mut Window, _cx: &Cx, win: WinId, batch: &mut Batch) {
+    if *w.presence() != EditorPresence::Owned {
+        return;
+    }
+    let shown = w
+        .layout
+        .try_borrow_mut()
+        .map(|mut layout| layout.show(&ModuleId::editor()));
+    match shown {
+        Ok(Ok(true)) => w.changed_by_controller(win, batch),
+        Ok(Ok(false)) => {}
+        Ok(Err(err)) => {
+            refuse_layout(w, win, &err, batch);
+            return;
+        }
+        Err(_) => {
+            w.warn("[wm] BUG: the layout was borrowed when the editor was restarted".into());
+            return;
+        }
+    }
+    match w.editor_run {
+        EditorRun::Ended => {
+            let Some(spawn) = w.editor_spawn.clone() else {
+                w.refuse(win, "the editor's launch settings are unavailable".into(), batch);
+                return;
+            };
+            w.restart_wanted = false;
+            w.editor_run = EditorRun::Restarting;
+            batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn }));
+        }
+        EditorRun::Ending => w.restart_wanted = true,
+        EditorRun::Restarting | EditorRun::Running => {}
     }
 }
 
@@ -664,8 +799,53 @@ pub fn hide(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batc
         order::hide_layout(&mut l, id, frame)
     })?;
     drop(l);
+    // A show before the editor's release asked for a restart; this hide takes it back.
+    if *id == ModuleId::editor() {
+        w.restart_wanted = false;
+    }
     w.changed_with_focus(win, next.map(|next| (next, vec![])), batch);
     Ok(())
+}
+
+/// The hide key's module key: the module `named` names ([`layout::hide_target`]) hidden wherever the keys are, the keys
+/// moving only when it held them, by [`hide`]'s rule. It acts on one module, so a selected container refuses it as it
+/// refuses `module.hide`; so are a module held away in the other window, one this layout does not hold, one hidden
+/// already and the last one on screen, each with the flash and its reason. It never reaches the other window: a hide
+/// is about this window's screen.
+pub fn hide_by_key(w: &mut Window, cx: &Cx, win: WinId, named: &ModuleId, batch: &mut Batch) {
+    let Ok((id, selection, away, held, shown)) = w.layout.try_borrow().map(|layout| {
+        let id = layout::hide_target(&layout, named);
+        let (away, held, shown) = (layout.is_away(&id), layout.contains(&id), layout.is_shown(&id));
+        (id, layout.selection(), away, held, shown)
+    }) else {
+        w.warn(format!(
+            "[wm] BUG: the layout was borrowed when the hide key's {named} ran"
+        ));
+        return;
+    };
+    w.say(format!("[modules] {id}: hidden by its key"));
+    if super::selection_gate(&Action::ModuleHide, selection) == super::SelectionGate::Refuse {
+        refusal(w, win, None, super::one_module_text(cx.keymap), batch);
+        return;
+    }
+    let refused = if away {
+        Some(LayoutError::Away(id.clone()))
+    } else if !held {
+        Some(LayoutError::NotInTree(id.clone()))
+    } else {
+        None
+    };
+    if let Some(err) = refused {
+        refuse_layout(w, win, &err, batch);
+        return;
+    }
+    if !shown {
+        refusal(w, win, None, feedback::already_hidden_text(&id), batch);
+        return;
+    }
+    if let Err(err) = hide(w, cx, win, &id, batch) {
+        refuse_layout(w, win, &err, batch);
+    }
 }
 
 /// `id` into a new split after the module with the keys, along `axis`, moved there if it is elsewhere, and given the
@@ -692,6 +872,11 @@ pub fn place_and_arrive(
     let target = l.focus().clone();
     layout::place(&mut l, id, &target, axis)?;
     drop(l);
+    // A split puts the editor on screen as a show does, so an ended editor starts again here too: placed with no
+    // nvim, its pane would take the keys and run nothing.
+    if *id == ModuleId::editor() {
+        restart_editor(w, cx, win, batch);
+    }
     if starts_hidden(cx, id) {
         let placement = plugin_hidden_placement(cx, id);
         if let Ok(mut workspaces) = w.workspaces.try_borrow_mut() {
@@ -815,7 +1000,12 @@ pub fn instance_new(
                 .chain(moves::arriving(w))
                 .collect();
             Some(match kind {
-                ModuleKind::Terminal | ModuleKind::Agent => plan_new_instance(kind, &here, &reserved, &[]),
+                ModuleKind::Terminal | ModuleKind::Agent => plan_new_instance(
+                    kind,
+                    &here,
+                    &reserved,
+                    w.peer.as_ref().map(|p| p.held.as_slice()).unwrap_or_default(),
+                ),
                 other => Err(feedback::no_new_instance_text(other)),
             })
         }
@@ -906,8 +1096,22 @@ pub fn scratch_new(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &m
             Some(format!("{id}: it is being made"))
         } else if moves::arriving(w).contains(id) {
             Some(format!("{id}: it is arriving from the other window"))
+        } else if w.peer.as_ref().is_some_and(|p| p.held.contains(id)) {
+            Some(format!("{id}: the other window holds it"))
         } else {
-            None
+            let here: Vec<&Layout> = workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
+            // A named scratchpad pins its candidate: the allocator must not pick a different free number.
+            let reserved: Vec<ModuleId> = (2..=9)
+                .filter(|n| *n != id.number())
+                .map(|n| ModuleId::instance(id.kind(), n).expect("a numbered terminal or chat view"))
+                .collect();
+            plan_new_instance(
+                id.kind(),
+                &here,
+                &reserved,
+                w.peer.as_ref().map(|p| p.held.as_slice()).unwrap_or_default(),
+            )
+            .err()
         }),
         _ => None,
     };
@@ -1156,18 +1360,45 @@ fn scratch_shown(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut
 }
 
 /// A kill already confirmed, with no y/n: a terminal whose shell ended by itself, which closes as `prefix x` closes
-/// it. [`Ran::Shell`] when it is the last module on screen, whose close is the window's.
+/// it. The last module on screen enters the window close flow.
 pub fn kill_confirmed(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) -> Ran {
     kill_now(w, cx, win, id, batch)
 }
 
-/// `prefix x` with the keys on a module that is not the editor: refused at once if the layout would refuse the
-/// kill; the last module on screen is the window close, whose question is the shell's; any other is asked in the
-/// window's y/n, naming what its kill ends.
+/// `prefix x` asks one question about the module's consequences. For the last module it also confirms the
+/// window consequences; the editor's answer still goes through nvim's unsaved-buffer prompt.
 fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
     let Some(id) = target(w) else {
         return Ran::Done;
     };
+    if let Some((peer, other)) = moves::silent_peer(w, &id) {
+        // The module cannot be killed while the other window may hold its session; ending that window can, and the
+        // link's end gives the module back here. Only window 1 started the other window and can end it: window 2
+        // says how the module comes back instead of asking a question whose `y` could do nothing.
+        if other == 1 {
+            let text = feedback::not_answering_text(other);
+            w.say(format!("[modules] {id}: not killed: {text}"));
+            w.refuse(win, text, batch);
+            return Ran::Done;
+        }
+        let (running, queued) = moves::peer_counts(w);
+        let text = feedback::close_peer_text(other, running, queued);
+        w.say(format!(
+            "[modules] {id}: frozen for window {other}, which is not answering: {text}"
+        ));
+        w.modules.clear_question();
+        w.modules.end_peer = Some(peer);
+        chrome::set_prompt(
+            w,
+            Some(Prompt {
+                text,
+                closes_window: false,
+                offers_move: false,
+            }),
+        );
+        close::superseded(w, cx, win, batch);
+        return Ran::Done;
+    }
     if moves::moving(w, &id) {
         w.say(format!("[modules] {id}: not killed: {}", feedback::MOVING_TEXT));
         w.refuse(win, feedback::MOVING_TEXT.to_owned(), batch);
@@ -1183,7 +1414,8 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
         Err(_) => return Ran::Done,
     };
     if scope == KillScope::Window {
-        return Ran::Shell;
+        close::ask_last_module(w, cx, win, id, batch);
+        return Ran::Done;
     }
     let title = chrome::title(w, &id);
     let text = match ViewId::of_module(&id).filter(|view| !view.is_base()) {
@@ -1209,26 +1441,84 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
         }
     };
     w.say(format!("[modules] {id}: {text}"));
+    w.modules.clear_question();
     w.modules.kill = Some(id);
     chrome::set_prompt(
         w,
         Some(Prompt {
             text,
             closes_window: false,
+            offers_move: false,
         }),
     );
+    close::superseded(w, cx, win, batch);
     Ran::Done
 }
 
-/// The y/n's answer: it closes either way, and `y` kills the module it asked about.
+/// The editor key in a window 2 with no window 1 to raise: the editor runs in window 1, so the question is
+/// whether to start it. The window has no editor to show in the meantime. Like a kill's question, it takes the
+/// window close's place on the overlay.
+fn ask_start_editor(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    w.say(format!("[modules] editor: {}", feedback::START_EDITOR_PROMPT));
+    w.modules.clear_question();
+    w.modules.start_editor = true;
+    chrome::set_prompt(
+        w,
+        Some(Prompt {
+            text: feedback::START_EDITOR_PROMPT.to_owned(),
+            closes_window: false,
+            offers_move: false,
+        }),
+    );
+    close::superseded(w, cx, win, batch);
+}
+
+/// The other window went: a shown question about ending it names a window that is not there any more (and a new
+/// window 2 could take its number), so it goes, and a `y` meant for it does nothing.
+pub(in crate::wm) fn peer_gone(w: &mut Window) {
+    if w.modules.end_peer.take().is_some() && w.chrome.prompt.as_ref().is_some_and(|p| !p.closes_window) {
+        w.say("[modules] the other window went; its question is gone".into());
+        chrome::set_prompt(w, None);
+    }
+}
+
+/// The y/n's answer: it closes either way, and `y` kills the module it asked about, or starts the editor window.
 pub fn prompt_answer(w: &mut Window, cx: &Cx, win: WinId, answer: PromptKey, batch: &mut Batch) -> Ran {
+    if answer == PromptKey::Ignore {
+        return Ran::Done;
+    }
+    if w.chrome.prompt.as_ref().is_some_and(|prompt| prompt.closes_window) {
+        close::answer(w, cx, win, answer, batch);
+        return Ran::Done;
+    }
     chrome::set_prompt(w, None);
+    if let Some(peer) = w.modules.end_peer.take() {
+        if answer == PromptKey::Yes {
+            w.say("[modules] ending the other window, which is not answering".into());
+            batch.push_effect(HostOp::EndPeer { win, peer });
+        }
+        return Ran::Done;
+    }
+    if std::mem::take(&mut w.modules.start_editor) {
+        if answer != PromptKey::Yes {
+            return Ran::Done;
+        }
+        // The editor window may have linked while the question was shown: its editor is then raised instead.
+        let editor = crate::window_link::FocusTarget::Module {
+            id: ModuleId::editor().to_string(),
+        };
+        if !moves::raise_for(w, win, editor, batch) {
+            w.say("[modules] editor: the editor window is started".into());
+            batch.push_effect(HostOp::StartEditorWindow { win });
+        }
+        return Ran::Done;
+    }
     let Some(id) = w.modules.kill.take() else {
         return Ran::Done;
     };
     match answer {
         PromptKey::Yes => kill_now(w, cx, win, &id, batch),
-        PromptKey::No | PromptKey::Ignore => Ran::Done,
+        PromptKey::No | PromptKey::Move | PromptKey::Ignore => Ran::Done,
     }
 }
 
@@ -1252,7 +1542,10 @@ fn kill_now(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batc
     let scope = w.layout.try_borrow().map(|layout| layout::can_kill(&layout, id));
     match scope {
         Ok(Ok(KillScope::Module)) => {}
-        Ok(Ok(KillScope::Window)) => return Ran::Shell,
+        Ok(Ok(KillScope::Window)) => {
+            close::request(w, cx, win, close::CloseCause::LastTerminalExit(id.clone()), batch);
+            return Ran::Done;
+        }
         Ok(Err(err)) => {
             w.say(format!("[modules] {id}: not killed: {err}"));
             w.refuse(win, String::new(), batch);
@@ -1323,8 +1616,8 @@ fn kill_now(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batc
             w.say(format!("[modules] {id}: killed, its tabs closed"));
         }),
         ModuleKind::Editor => {
-            debug_assert!(false, "the editor's kill is its quit, which is the shell's");
-            return Ran::Shell;
+            close::kill_editor(w, cx, win, KillScope::Module, batch);
+            return Ran::Done;
         }
         ModuleKind::Canvas => Err(feedback::not_here_yet_text(id)),
     };
@@ -1370,7 +1663,7 @@ fn leave_killed(
 }
 
 /// Every extra chat view the window's workspaces still hold, ascending and once each.
-fn remaining_views(w: &Window) -> Vec<ViewId> {
+pub(super) fn remaining_views(w: &Window) -> Vec<ViewId> {
     let (layout, workspaces) = match (w.layout.try_borrow(), w.workspaces.try_borrow()) {
         (Ok(layout), Ok(workspaces)) => (layout, workspaces),
         _ => return Vec::new(),
@@ -1448,3 +1741,730 @@ pub fn lua_open(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use crate::keymap::{prefix::Press, KeySpec};
+    use crate::lua::layout::LayoutRequest;
+    use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
+    use crate::wm::start::StartStep;
+    use crate::wm::verbs::rig::{rig, WIN};
+    use crate::wm::{Driver, EditorPresence};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    struct Rig {
+        driver: Rc<Driver>,
+        host: Rc<FakeHost>,
+        scheduler: Rc<FakeScheduler>,
+        layout: Rc<RefCell<Layout>>,
+        spawn: EditorSpawn,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            Self::with(None, false)
+        }
+        /// With `setup` as the window's module setup, and with the default keymap when `keys` is set.
+        fn with(setup: Option<ModuleSetup>, keys: bool) -> Self {
+            let mut r = rig(Layout::initial(&[]).unwrap());
+            if let Some(setup) = setup {
+                r.controller.set_module_setup(WIN, setup);
+            }
+            if keys {
+                let keymap = Keymap::defaults();
+                let module_keys = crate::layout::ModuleKeys::build(&[], &keymap).unwrap();
+                r.controller.set_keymap(WIN, Rc::new(keymap), Rc::new(module_keys));
+            }
+            let dir = std::path::Path::new("/private");
+            let pane = agent::socket_path::in_dir(dir, "pane.sock").unwrap();
+            let context = agent::socket_path::in_dir(dir, "context.sock").unwrap();
+            let spawn = EditorSpawn {
+                env: vec![
+                    ("EITRI_PANE_SWITCH_SOCKET".into(), pane.to_str().unwrap().into()),
+                    ("EITRI_EDITOR_SOCKET".into(), context.to_str().unwrap().into()),
+                ],
+                args: vec!["--cmd".into(), "let g:feed = 1".into(), "file.rs".into()],
+                cwd: Some("/project".into()),
+                clean: true,
+                background: Some((0x12, 0x34, 0x56)),
+            };
+            r.controller.start(WIN, StartStep::Feeds { spawn: spawn.clone() });
+            r.controller.set_titles(
+                WIN,
+                crate::wm::chrome::ChromeTitles {
+                    tray: vec![ModuleId::editor(), ModuleId::agent()],
+                    ..Default::default()
+                },
+            );
+            for d in r.layout.borrow().modules().iter().map(crate::wm::verbs::rig::decl) {
+                r.host.with_surface(WIN, d.module, d.kind, false);
+            }
+            let driver = Driver::new(r.controller, r.host.clone(), r.scheduler.clone());
+            let sink: Rc<dyn HostSink> = driver.clone();
+            r.host.attach(Rc::downgrade(&sink));
+            r.scheduler.attach(Rc::downgrade(&sink));
+            for op in r.first.ops() {
+                r.host.apply(op);
+            }
+            Self {
+                driver,
+                host: r.host,
+                scheduler: r.scheduler,
+                layout: r.layout,
+                spawn,
+            }
+        }
+        fn ops(&self) -> Vec<HostOp> {
+            self.host
+                .log()
+                .into_iter()
+                .filter_map(|l| match l {
+                    Logged::Op(op, _) if !matches!(op, HostOp::Chrome { .. }) => Some(op),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn event(&self, event: EditorEvent) {
+            self.driver.post(HostEvent::Editor(event));
+        }
+        fn key(&self) {
+            self.driver
+                .run(WIN, Action::Module(ModuleId::editor()), Origin::Key { keycode: 7 });
+        }
+        fn answer(&self, key: &str) {
+            let spec = KeySpec::parse(key).unwrap();
+            self.driver.key(
+                WIN,
+                &KeyStage::Window,
+                KeyPress {
+                    keycode: 42,
+                    press: Press::Key(spec),
+                    key: Some(spec.key),
+                    mods: Mods::default(),
+                    super_or_hyper: false,
+                    super_or_meta: false,
+                },
+            );
+        }
+        fn press(&self, key: &str, keycode: u32) {
+            let spec = KeySpec::parse(key).unwrap();
+            self.driver.key(
+                WIN,
+                &KeyStage::Window,
+                KeyPress {
+                    keycode,
+                    press: Press::Key(spec),
+                    key: Some(spec.key),
+                    mods: Mods {
+                        ctrl: spec.ctrl,
+                        alt: spec.meta,
+                        shift: spec.shift,
+                    },
+                    super_or_hyper: false,
+                    super_or_meta: false,
+                },
+            );
+            self.host.post(HostEvent::KeyReleased { win: WIN, keycode });
+        }
+        fn kill(&self) {
+            self.host.set_editor_running(true);
+            self.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+            self.answer("y");
+            self.host.set_editor_facts(EditorFacts {
+                exited: true,
+                ..Default::default()
+            });
+            self.event(EditorEvent::Exited {
+                win: WIN,
+                settled: Some(crate::wm::close::NvimAnswer {
+                    sent_at: self.scheduler.now(),
+                    done: true,
+                    returned: false,
+                    last: None,
+                }),
+            });
+            self.scheduler.advance(Duration::ZERO);
+        }
+        fn release(&self) {
+            self.event(EditorEvent::Released { win: WIN });
+        }
+        fn restarts(&self) -> Vec<EditorSpawn> {
+            self.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    HostOp::Editor(EditorCall::Restart { spawn, .. }) => Some(spawn),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn ended() -> Self {
+            Self::ended_with(false)
+        }
+        fn ended_with(keys: bool) -> Self {
+            let r = Self::with(None, keys);
+            r.kill();
+            r.release();
+            r
+        }
+    }
+
+    #[test]
+    fn prefix_e_restarts_nvim_after_prefix_x_retired_it() {
+        let r = Rig::ended();
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert!(!r.layout.borrow().is_gone(&ModuleId::editor()));
+        let ops = r.ops();
+        let focus = ops
+            .iter()
+            .position(|op| matches!(op, HostOp::Focus { to: FocusTo::Module(m), .. } if *m == ModuleId::agent()))
+            .unwrap();
+        let unmap = ops
+            .iter()
+            .position(|op| matches!(op, HostOp::Unmap { module, .. } if *module == ModuleId::editor()))
+            .unwrap();
+        assert!(focus < unmap);
+        assert!(matches!(
+            ops.last(),
+            Some(HostOp::Editor(EditorCall::ReleaseExited { .. }))
+        ));
+        let at = r.ops().len();
+        r.key();
+        assert_eq!(
+            &r.ops()[at..],
+            &[
+                HostOp::Map {
+                    win: WIN,
+                    module: ModuleId::editor()
+                },
+                HostOp::Allocate { win: WIN },
+                HostOp::Focus {
+                    win: WIN,
+                    to: FocusTo::Module(ModuleId::editor()),
+                    on_grab: vec![]
+                },
+                HostOp::Editor(EditorCall::Restart {
+                    win: WIN,
+                    spawn: r.spawn.clone()
+                }),
+                HostOp::Editor(EditorCall::SetFocused {
+                    win: WIN,
+                    focused: true
+                }),
+                HostOp::Chat(ChatOp::EditorHasKeys {
+                    win: WIN,
+                    has_keys: true
+                }),
+                HostOp::Chat(ChatOp::PaneFocused {
+                    win: WIN,
+                    view: ViewId::BASE,
+                    focused: false
+                }),
+            ]
+        );
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+    }
+
+    #[test]
+    fn prefix_e_restarts_nvim_after_a_declined_close() {
+        let r = Rig::new();
+        r.host.set_chat_kill_counts(
+            ViewId::BASE,
+            ChatKillCounts {
+                running: 1,
+                ..Default::default()
+            },
+        );
+        r.host.set_editor_facts(EditorFacts {
+            exited: true,
+            ..Default::default()
+        });
+        r.event(EditorEvent::Exited {
+            win: WIN,
+            settled: None,
+        });
+        r.answer("n");
+        assert_eq!(
+            r.driver.query(|c| c.chrome(WIN).toast.unwrap().text),
+            "nvim exited — C-b e starts it again"
+        );
+        r.scheduler.advance(Duration::ZERO);
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+    }
+
+    #[test]
+    fn a_plain_q_with_nothing_to_ask_still_closes_the_window() {
+        let r = Rig::new();
+        r.host.set_editor_facts(EditorFacts {
+            exited: true,
+            ..Default::default()
+        });
+        r.event(EditorEvent::Exited {
+            win: WIN,
+            settled: None,
+        });
+        r.scheduler.advance(Duration::ZERO);
+        assert!(matches!(r.ops().last(), Some(HostOp::CloseWindow { .. })));
+        assert!(r.restarts().is_empty());
+    }
+
+    #[test]
+    fn a_second_prefix_e_while_the_editor_restarts_starts_nothing_more() {
+        let r = Rig::ended();
+        r.key();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+    }
+
+    #[test]
+    fn a_prefix_e_before_the_release_restarts_once_the_pane_is_released() {
+        let r = Rig::new();
+        r.kill();
+        r.key();
+        r.key();
+        assert!(r.restarts().is_empty());
+        r.release();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::editor());
+    }
+
+    #[test]
+    fn a_close_while_the_editor_restarts_shuts_it_down_and_waits_for_nothing() {
+        let r = Rig::ended();
+        r.key();
+        r.host.set_editor_running(true);
+        let at = r.ops().len();
+        r.driver.close_requested(WIN, CloseBy::User);
+        r.scheduler.advance(Duration::ZERO);
+        let ops = r.ops();
+        let ops = &ops[at..];
+        assert!(ops.contains(&HostOp::Editor(EditorCall::Shutdown { win: WIN })));
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::Quit { .. }))));
+        assert!(matches!(ops.last(), Some(HostOp::CloseWindow { .. })));
+        r.release();
+        r.event(EditorEvent::Ready { win: WIN });
+        r.key();
+        assert_eq!(r.restarts().len(), 1);
+    }
+
+    #[test]
+    fn an_editor_request_is_refused_while_the_editor_is_not_running() {
+        let r = Rig::new();
+        r.kill();
+        for stage in 0..3 {
+            assert_eq!(
+                r.driver.query(|c| c.editor_request_refusal(WIN)),
+                Some(feedback::EDITOR_NOT_RUNNING_TEXT.into())
+            );
+            if stage == 0 {
+                r.release();
+            } else if stage == 1 {
+                r.key();
+            }
+        }
+        r.host.set_editor_running(true);
+        r.event(EditorEvent::Ready { win: WIN });
+        assert_eq!(r.driver.query(|c| c.editor_request_refusal(WIN)), None);
+    }
+
+    #[test]
+    fn the_follow_snippet_is_asked_for_again_when_the_restarted_editor_is_ready() {
+        let r = Rig::ended();
+        r.key();
+        let at = r.ops().len();
+        r.event(EditorEvent::Ready { win: WIN });
+        assert_eq!(&r.ops()[at..], &[HostOp::Plugin(PluginOp::EditorBack { win: WIN })]);
+    }
+
+    #[test]
+    fn a_refused_restart_leaves_the_editor_ended_and_says_why() {
+        let r = Rig::ended();
+        r.key();
+        let at = r.ops().len();
+        r.event(EditorEvent::RestartRefused {
+            win: WIN,
+            state: "Ready".into(),
+        });
+        assert_eq!(r.ops().len(), at, "only chrome changes on a refusal");
+        assert_eq!(
+            r.driver.query(|c| c.chrome(WIN).toast.unwrap().text),
+            "the editor could not start again: the pane is Ready"
+        );
+        r.key();
+        assert_eq!(r.restarts().len(), 2);
+    }
+
+    #[test]
+    fn a_restart_whose_launch_failed_leaves_the_editor_ended_and_the_next_show_tries_again() {
+        let r = Rig::ended();
+        r.key();
+        let at = r.ops().len();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        let failed = r.ops()[at..].to_vec();
+        assert!(
+            !failed
+                .iter()
+                .any(|op| matches!(op, HostOp::Editor(call) if !matches!(call, EditorCall::SetFocused { .. }))),
+            "the editor is asked nothing more when the launch fails, but told it lost the keys: {failed:#?}"
+        );
+        assert!(
+            failed
+                .iter()
+                .any(|op| matches!(op, HostOp::Focus { to: FocusTo::Module(to), .. } if *to == ModuleId::agent())),
+            "the restarted editor held the keys, and a pane with no nvim does not keep them: {failed:#?}"
+        );
+        assert_eq!(
+            r.driver.query(|c| c.chrome(WIN).toast.unwrap().text),
+            "nvim could not start \u{2014} C-b e tries again"
+        );
+        assert_eq!(
+            r.driver.query(|c| c.editor_request_refusal(WIN)),
+            Some(feedback::EDITOR_NOT_RUNNING_TEXT.into()),
+            "a pane with no nvim takes no requests"
+        );
+        r.key();
+        assert_eq!(r.restarts().len(), 2, "the next show restarts the failed pane");
+        r.host.set_editor_running(true);
+        r.event(EditorEvent::Ready { win: WIN });
+        assert_eq!(r.driver.query(|c| c.editor_request_refusal(WIN)), None);
+    }
+
+    #[test]
+    fn a_first_starts_failure_changes_nothing_in_the_controller() {
+        let r = Rig::new();
+        let at = r.ops().len();
+        r.event(EditorEvent::StartFailed {
+            win: WIN,
+            why: "nvim was not found".into(),
+        });
+        assert_eq!(r.ops().len(), at);
+        assert!(
+            r.driver.query(|c| c.chrome(WIN).toast.is_none()),
+            "a first start's failure toasts nothing"
+        );
+        r.key();
+        assert!(
+            r.restarts().is_empty(),
+            "an editor that was never ended is not restarted"
+        );
+    }
+
+    #[test]
+    fn a_refused_release_is_retried_and_logged_once() {
+        let r = Rig::new();
+        r.kill();
+        let releases = || {
+            r.ops()
+                .iter()
+                .filter(|op| matches!(op, HostOp::Editor(EditorCall::ReleaseExited { .. })))
+                .count()
+        };
+        for n in 1..=2 {
+            r.event(EditorEvent::ReleaseRefused { win: WIN });
+            r.scheduler.advance(Duration::from_millis(999));
+            assert_eq!(releases(), n);
+            r.scheduler.advance(Duration::from_millis(1));
+            assert_eq!(releases(), n + 1);
+        }
+        assert_eq!(
+            r.driver
+                .query(|c| c.notes(WIN))
+                .iter()
+                .filter(|s| s.contains("nvim's process is still alive"))
+                .count(),
+            1
+        );
+        r.release();
+        r.scheduler.advance(Duration::from_secs(2));
+        assert_eq!(releases(), 3);
+    }
+
+    #[test]
+    fn every_show_of_an_ended_editor_restarts_it() {
+        for case in 0..5 {
+            let r = Rig::ended();
+            match case {
+                0 => r.driver.run(WIN, Action::Module(ModuleId::editor()), Origin::Chip),
+                1 => crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Show(ModuleId::editor())),
+                2 => crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Focus(ModuleId::editor())),
+                3 => r.driver.follow(WIN, &ModuleId::editor(), true),
+                _ => r.driver.post(HostEvent::Chat(ChatEvent::ReviewOpen { win: WIN })),
+            }
+            assert_eq!(r.restarts(), [r.spawn.clone()], "show {case}");
+            assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        }
+    }
+
+    #[test]
+    fn switching_to_a_workspace_that_showed_the_ended_editor_keeps_it_hidden() {
+        let r = Rig::new();
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Hide(ModuleId::agent()));
+        r.driver.run(WIN, Action::WorkspaceNew, Origin::Lua);
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Show(ModuleId::agent()));
+        r.kill();
+        r.release();
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Switch("main".into()));
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert!(!r.layout.borrow().is_gone(&ModuleId::editor()));
+        assert!(!r.layout.borrow().saved_hidden().contains(&ModuleId::editor()));
+        assert!(r.layout.borrow().is_shown(&ModuleId::agent()));
+        assert!(r.restarts().is_empty());
+    }
+
+    #[test]
+    fn the_ended_editor_keeps_its_tray_chip() {
+        let r = Rig::ended();
+        assert!(crate::layout::tray(&r.layout.borrow()).contains(&ModuleId::editor()));
+        assert!(r.driver.query(|c| c
+            .chrome(WIN)
+            .tray
+            .iter()
+            .any(|chip| chip.module == ModuleId::editor() && chip.shown)));
+        r.driver.run(WIN, Action::Module(ModuleId::editor()), Origin::Chip);
+        assert_eq!(r.restarts().len(), 1);
+    }
+
+    #[test]
+    fn an_editor_in_the_other_window_is_never_restarted_here() {
+        let mut r = rig(Layout::initial(&[]).unwrap());
+        let w = r.controller.window_spec(WIN).unwrap().clone();
+        // A second window owns no nvim and must leave the first window's session alone.
+        let parts = crate::wm::WindowParts {
+            layout: r.layout.clone(),
+            workspaces: Rc::new(RefCell::new(crate::layout::Workspaces::single())),
+            saver: None,
+        };
+        r.controller.open_window(
+            crate::wm::WinId(2),
+            crate::wm::WindowSpec {
+                presence: EditorPresence::Proxy,
+                ..w
+            },
+            parts,
+        );
+        // Each window's editor as an ended one with a spawn to restart it with, so only the window's presence
+        // decides whether its show restarts it.
+        let spawn = EditorSpawn {
+            env: vec![],
+            args: vec![],
+            cwd: None,
+            clean: false,
+            background: None,
+        };
+        for win in [WIN, crate::wm::WinId(2)] {
+            let w = r.controller.window_mut(win).unwrap();
+            w.editor_run = EditorRun::Ended;
+            w.editor_spawn = Some(spawn.clone());
+        }
+        let restarts = |batch: &Batch| {
+            batch
+                .ops()
+                .filter(|op| matches!(op, HostOp::Editor(EditorCall::Restart { .. })))
+                .count()
+        };
+        let batch = r.controller.follow(crate::wm::WinId(2), &ModuleId::editor(), true);
+        assert_eq!(restarts(&batch), 0, "the proxy window starts no nvim");
+        assert_eq!(
+            r.controller.window_mut(crate::wm::WinId(2)).unwrap().editor_run,
+            EditorRun::Ended
+        );
+        let batch = r.controller.follow(WIN, &ModuleId::editor(), true);
+        assert_eq!(
+            restarts(&batch),
+            1,
+            "the owning window's show restarts its ended editor"
+        );
+    }
+
+    #[test]
+    fn a_restarted_nvim_that_exits_before_it_is_ready_ends_in_place_again() {
+        let r = Rig::ended();
+        r.key();
+        r.host.set_chat_kill_counts(
+            ViewId::BASE,
+            ChatKillCounts {
+                running: 1,
+                ..Default::default()
+            },
+        );
+        let at = r.ops().len();
+        r.event(EditorEvent::Exited {
+            win: WIN,
+            settled: None,
+        });
+        r.scheduler.advance(Duration::ZERO);
+        let ops = r.ops();
+        let ops = &ops[at..];
+        assert!(!ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
+        assert!(ops.contains(&HostOp::Editor(EditorCall::ReleaseExited { win: WIN })));
+        assert!(
+            r.driver.query(|c| c.chrome(WIN).prompt.is_none()),
+            "nothing asks to close the window"
+        );
+        assert_eq!(
+            r.driver.query(|c| c.chrome(WIN).toast.unwrap().text),
+            "nvim exited — C-b e starts it again"
+        );
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert!(!r.layout.borrow().is_gone(&ModuleId::editor()));
+        r.release();
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone(), r.spawn.clone()]);
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+    }
+
+    #[test]
+    fn prefix_x_on_an_editor_shown_before_its_release_hides_it_and_takes_back_its_restart() {
+        let r = Rig::new();
+        r.kill();
+        r.key();
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        r.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+        r.answer("y");
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert!(!r.layout.borrow().saved_hidden().contains(&ModuleId::editor()));
+        r.release();
+        assert!(r.restarts().is_empty(), "the show's restart went with the kill");
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+    }
+
+    #[test]
+    fn prefix_x_on_an_editor_whose_restart_was_refused_hides_it() {
+        let r = Rig::ended();
+        r.key();
+        r.event(EditorEvent::RestartRefused {
+            win: WIN,
+            state: "Ready".into(),
+        });
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        r.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+        r.answer("y");
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        r.key();
+        assert_eq!(r.restarts().len(), 2);
+    }
+
+    #[test]
+    fn a_hide_after_a_show_before_the_release_keeps_the_editor_hidden_once_released() {
+        let r = Rig::new();
+        r.kill();
+        r.key();
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Hide(ModuleId::editor()));
+        r.release();
+        assert!(r.restarts().is_empty(), "the hide took back the show's restart");
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+    }
+
+    #[test]
+    fn a_workspace_switch_after_a_show_before_the_release_restarts_nothing() {
+        let r = Rig::new();
+        r.driver.run(WIN, Action::WorkspaceNew, Origin::Lua);
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Switch("main".into()));
+        r.kill();
+        r.key();
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Switch("2".into()));
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        r.release();
+        assert!(r.restarts().is_empty());
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+    }
+
+    #[test]
+    fn a_split_that_places_the_ended_editor_restarts_it() {
+        for lua in [false, true] {
+            let r = Rig::ended_with(true);
+            if lua {
+                crate::wm::fake::lua(
+                    &r.driver,
+                    WIN,
+                    LayoutRequest::Split(ModuleId::editor(), crate::layout::Axis::Row),
+                );
+            } else {
+                let split = Keymap::defaults()
+                    .bindings()
+                    .iter()
+                    .find(|b| {
+                        matches!(
+                            b.action,
+                            Action::Split {
+                                axis: crate::layout::Axis::Row,
+                                ..
+                            }
+                        )
+                    })
+                    .expect("a default split.right key")
+                    .clone();
+                r.press("C-b", 50);
+                r.press(&split.key.to_string(), 51);
+                r.press("e", 52);
+            }
+            assert_eq!(r.restarts(), [r.spawn.clone()], "lua {lua}");
+            assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+        }
+    }
+
+    #[test]
+    fn a_split_that_places_the_editor_before_its_release_restarts_it_once_released() {
+        let r = Rig::new();
+        r.kill();
+        crate::wm::fake::lua(
+            &r.driver,
+            WIN,
+            LayoutRequest::Split(ModuleId::editor(), crate::layout::Axis::Row),
+        );
+        assert!(r.restarts().is_empty());
+        r.release();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+    }
+
+    #[test]
+    fn a_workspace_first_made_after_the_editor_ended_keeps_it_hidden() {
+        let template = crate::lua::layout::LuaTree {
+            tiled: crate::layout::Node::split(
+                crate::layout::Axis::Column,
+                0.3,
+                crate::layout::Node::Leaf(ModuleId::agent()),
+                crate::layout::Node::Leaf(ModuleId::editor()),
+            ),
+            floats: Vec::new(),
+        };
+        let r = Rig::with(
+            Some(ModuleSetup {
+                workspaces: vec![("study".into(), Ok(template))],
+                ..Default::default()
+            }),
+            false,
+        );
+        r.kill();
+        r.release();
+        crate::wm::fake::lua(&r.driver, WIN, LayoutRequest::Switch("study".into()));
+        assert!(r.layout.borrow().contains(&ModuleId::editor()));
+        assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+        assert!(!r.layout.borrow().is_gone(&ModuleId::editor()));
+        assert!(r.layout.borrow().is_shown(&ModuleId::agent()));
+        assert!(r.restarts().is_empty());
+        r.key();
+        assert_eq!(r.restarts(), [r.spawn.clone()]);
+        assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+    }
+}

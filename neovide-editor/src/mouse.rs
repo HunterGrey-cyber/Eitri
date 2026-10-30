@@ -136,7 +136,7 @@ pub(crate) fn handle_mouse_button(
     let position_from_event = pixel_to_grid_pos(
         x,
         y,
-        gl_area.scale_factor(),
+        session.device_scale(),
         &content_region,
         session.harness.grid_scale(),
         session.harness.get_grid_size(),
@@ -176,7 +176,6 @@ pub(crate) fn handle_mouse_button(
 /// explicitly enabled (default off), which this crate has no equivalent setting for.
 pub(crate) fn handle_mouse_motion(
     live_state: &Rc<RefCell<LiveState>>,
-    gl_area: &GLArea,
     controller: &EventControllerMotion,
     x: f64,
     y: f64,
@@ -201,7 +200,7 @@ pub(crate) fn handle_mouse_motion(
     let grid_pos = pixel_to_grid_pos(
         x,
         y,
-        gl_area.scale_factor(),
+        session.device_scale(),
         &content_region,
         session.harness.grid_scale(),
         session.harness.get_grid_size(),
@@ -234,7 +233,6 @@ pub(crate) fn handle_mouse_motion(
 /// The GDK/Wayland backend drops those events before this handler is called.
 pub(crate) fn handle_mouse_scroll(
     live_state: &Rc<RefCell<LiveState>>,
-    gl_area: &GLArea,
     controller: &EventControllerScroll,
     dx: f64,
     dy: f64,
@@ -269,7 +267,7 @@ pub(crate) fn handle_mouse_scroll(
     let grid_pos = pixel_to_grid_pos(
         px,
         py,
-        gl_area.scale_factor(),
+        session.device_scale(),
         &content_region,
         session.harness.grid_scale(),
         session.harness.get_grid_size(),

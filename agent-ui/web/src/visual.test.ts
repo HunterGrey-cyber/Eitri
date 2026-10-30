@@ -98,7 +98,7 @@ describe("visual.ts: the modify() calls of h/l/0/$", () => {
     runMotion(l, cursor, "l", null);
     expect(l.calls).toEqual(["move forward character"]);
 
-    // w/e/b follow vim's own word rules over the DOM text (2026-10-01), never WebKit's `word`
+    // w/e/b follow vim's own word rules over the DOM text, never WebKit's `word`
     // granularity, whose boundaries are not vim's (`has_flag` is one ICU word, `=`/`|` none).
     for (const motion of ["w", "e", "b"] as const) {
       const sel = fakeSelection(path);
@@ -569,8 +569,7 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     expect(model.pastEnd).toBeUndefined();
   });
 
-  // Re-centering the caret's parent after every j/k step was
-  // jumping the view on every key; nothing in a step may call scrollIntoView now.
+  // Re-centering the caret's parent after each j/k step jumps the view; steps must not call scrollIntoView.
   it("stepOnce's j/k never call scrollIntoView", () => {
     const root = document.createElement("div");
     root.innerHTML = '<div class="row-body">one</div><div class="row-body">two</div>';
@@ -864,7 +863,7 @@ describe("visual.ts: revealCaret, the least scroll", () => {
     try {
       expect(revealCaret(caret, list)).toBe(true);
       expect(scroll.box).toBe(100); // caret bottom 160 brought to the box's bottom, 60
-      // With the rect measured once (the old body), the list scrolled another 60px it never needed.
+      // Reusing the rect measured before the inner scroll would move the list by an unnecessary 60px.
       expect(scroll.list).toBe(0);
     } finally {
       restore();
@@ -883,10 +882,9 @@ describe("visual.ts: revealCaret, the least scroll", () => {
   });
 });
 
-/* CARET/VISUAL `w`/`e`/`b` follow vim's own word rules over the DOM text. Previously,
-   on the real panel, in a code block showing the line below: the first `w` landed before `has`,
-   the second did not move -- WebKit's `Selection.modify(..., "word")` steps, composed, returned to
-   their start. Every expected sequence here is nvim's own, measured headless (`nvim --headless
+/* CARET/VISUAL `w`/`e`/`b` follow vim's word rules over DOM text. Composing WebKit's
+   `Selection.modify(..., "word")` steps can return to the start instead of advancing through code.
+   Every expected sequence here is nvim's own, measured headless (`nvim --headless
    --clean`, a `normal! w`/`e`/`b` loop printing the cursor until it stops moving) on the same text,
    written in nvim's own `line:byte-col` form and converted to this DOM's UTF-16 offsets. */
 describe("visual.ts: w/e/b follow vim's word rules", () => {

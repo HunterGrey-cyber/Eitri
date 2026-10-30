@@ -353,7 +353,52 @@ mod tests {
             raw_output: None,
             locations: None,
             content,
+            content_given: true,
         }
+    }
+
+    #[test]
+    fn a_carried_empty_content_list_clears_earlier_text() {
+        let start = ToolCallFields::parse(&json!({
+            "toolCallId": "c1", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "working"}}]
+        }))
+        .unwrap();
+        let update = ToolCallFields::parse(&json!({
+            "toolCallId": "c1", "status": "completed", "content": [], "rawOutput": "final"
+        }))
+        .unwrap();
+        let mut fold = Fold::default();
+        let mut events = Vec::new();
+        fold.apply("t1", &Update::ToolCall(start), &mut |event| events.push(event));
+        fold.apply("t1", &Update::ToolCallUpdate(update), &mut |event| events.push(event));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, content, is_error: false, .. }
+                if tool_use_id == "c1" && content == "final"
+        )));
+    }
+
+    #[test]
+    fn an_update_without_content_keeps_earlier_text() {
+        let start = ToolCallFields::parse(&json!({
+            "toolCallId": "c1", "status": "in_progress",
+            "content": [{"type": "content", "content": {"type": "text", "text": "working"}}]
+        }))
+        .unwrap();
+        let update = ToolCallFields::parse(&json!({
+            "toolCallId": "c1", "status": "completed", "rawOutput": "final"
+        }))
+        .unwrap();
+        let mut fold = Fold::default();
+        let mut events = Vec::new();
+        fold.apply("t1", &Update::ToolCall(start), &mut |event| events.push(event));
+        fold.apply("t1", &Update::ToolCallUpdate(update), &mut |event| events.push(event));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentDomainEvent::ToolCallCompleted { tool_use_id, content, is_error: false, .. }
+                if tool_use_id == "c1" && content == "working"
+        )));
     }
 
     #[test]

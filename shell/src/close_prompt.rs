@@ -1,17 +1,20 @@
-//! The window's y/n, tmux's `confirm-before`: shown when a window close would interrupt a
-//! running tab, and for `prefix x`'s `kill-pane`. `y` runs what was asked; any other key cancels,
-//! as tmux's `confirm-before` does; a bare modifier is neither.
+//! The window's y/n, tmux's `confirm-before`: `y` runs what was asked, any other key cancels, as tmux's
+//! `confirm-before` does, and a bare modifier is neither.
 //!
-//! Two questions share the overlay. The window close's is this file's own: its text, its answer and what `y` runs.
-//! `prefix x`'s is the controller's: its text comes from the chrome model, drawn here through
-//! [`ClosePrompt::show_model`], and while it shows every key goes to the controller's window stage, which answers it.
-//! One shows at a time, the newest: the other is withdrawn, so no key answers a question that is no longer on screen.
+//! In the main window it is the controller's question -- a window close that would interrupt a running tab or a
+//! terminal's job, `prefix x`'s `kill-pane` -- drawn on the window's overlay from its chrome model
+//! (`gtk_host::chrome::reconcile` shows, places and hides it). There the overlay has no question or answer of its
+//! own: while the question shows, every key but a bare modifier goes to the controller's window stage, which answers
+//! it. Built with [`ClosePrompt::new`], it holds no window, so it cannot ask anything itself.
+//!
+//! The companion window has no controller: its prompt ([`ClosePrompt::install`]) asks its own window close's
+//! question ([`ClosePrompt::ask_to_close_window`]) and answers it here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use eitri_core::wm::close::{prompt_key, prompt_origin, PromptState};
-use eitri_core::wm::{Controller, Driver, HostEvent, KeyStage, Verdict, WinId};
+use eitri_core::wm::close::{prompt_key, prompt_origin, PromptKey};
+use eitri_core::wm::{Controller, Driver, KeyStage, Verdict, WinId};
 use gtk4::glib;
 use gtk4::graphene;
 use gtk4::prelude::*;
@@ -19,11 +22,38 @@ use gtk4::prelude::*;
 use crate::gtk_host::chrome::PromptMeasures;
 use crate::gtk_host::keys::key_press;
 
+/// The companion window's own window-close question: whether it is up, and whether a `y` confirmed the close.
+#[derive(Default)]
+struct OwnClose {
+    open: Cell<bool>,
+    confirmed: Cell<bool>,
+}
+
+impl OwnClose {
+    /// What `key` does to the question: `None` when it is not up or the key is a bare modifier, and the key goes on;
+    /// otherwise the question goes, and `Some(true)` for a `y`, which confirms the close, `Some(false)` for any other
+    /// key, which cancels it.
+    fn answer(&self, key: PromptKey) -> Option<bool> {
+        if !self.open.get() || key == PromptKey::Ignore {
+            return None;
+        }
+        self.open.set(false);
+        let yes = key == PromptKey::Yes;
+        if yes {
+            self.confirmed.set(true);
+        }
+        Some(yes)
+    }
+}
+
 pub(crate) struct ClosePrompt {
     label: gtk4::Label,
-    state: PromptState,
-    window: gtk4::ApplicationWindow,
-    /// The top bar: hidden in Immersive mode ([`prompt_origin`]'s `bar_shown`).
+    /// The controller's question shows: its keys are the controller's.
+    open: Cell<bool>,
+    /// The window whose close the prompt asks about itself: the companion's alone.
+    window: Option<glib::WeakRef<gtk4::ApplicationWindow>>,
+    own: OwnClose,
+    /// The top bar: hidden in Immersive mode (`prompt_origin`'s `bar_shown`).
     bar: gtk4::Widget,
     /// The prefix strip: the prompt's left edge sits at its position while the bar is shown.
     strip: gtk4::Widget,
@@ -34,7 +64,7 @@ pub(crate) struct ClosePrompt {
 }
 
 impl ClosePrompt {
-    /// Hidden until [`ClosePrompt::ask`], with its capture controller on `window` added at once: for a window
+    /// Hidden until [`ClosePrompt::show_model`], with its capture controller on `window` added at once: for a window
     /// whose prefix was installed before it, which is what makes its capture see a key before the prefix's (GTK
     /// runs a widget's controllers most-recently-added first). The main window builds its prompt with
     /// [`ClosePrompt::new`] and adds the capture where its declared key layers say
@@ -45,17 +75,21 @@ impl ClosePrompt {
         bar: &gtk4::Widget,
         strip: &gtk4::Widget,
     ) -> Rc<ClosePrompt> {
-        let prompt = ClosePrompt::new(overlay, window, bar, strip);
+        let prompt = ClosePrompt::build(overlay, Some(window), bar, strip);
         crate::gtk_host::keys::PromptLayer::add_capture(&prompt, window.upcast_ref());
         prompt
     }
 
-    /// Hidden until [`ClosePrompt::ask`], with no capture yet: its key layer is added separately
+    /// Hidden until [`ClosePrompt::show_model`], with no capture yet: its key layer is added separately
     /// ([`PromptLayer::add_capture`](crate::gtk_host::keys::PromptLayer::add_capture)), and sees keys before every
-    /// module and the prefix, only while the prompt is open.
-    pub(crate) fn new(
+    /// module and the prefix, only while the question shows.
+    pub(crate) fn new(overlay: &gtk4::Overlay, bar: &gtk4::Widget, strip: &gtk4::Widget) -> Rc<ClosePrompt> {
+        ClosePrompt::build(overlay, None, bar, strip)
+    }
+
+    fn build(
         overlay: &gtk4::Overlay,
-        window: &gtk4::ApplicationWindow,
+        window: Option<&gtk4::ApplicationWindow>,
         bar: &gtk4::Widget,
         strip: &gtk4::Widget,
     ) -> Rc<ClosePrompt> {
@@ -69,8 +103,9 @@ impl ClosePrompt {
         overlay.add_overlay(&label);
         Rc::new(ClosePrompt {
             label,
-            state: PromptState::default(),
-            window: window.clone(),
+            open: Cell::new(false),
+            window: window.map(|window| window.downgrade()),
+            own: OwnClose::default(),
             bar: bar.clone(),
             strip: strip.clone(),
             overlay: overlay.clone(),
@@ -84,13 +119,11 @@ impl ClosePrompt {
     }
 
     /// Shows the controller's question, `text`, as plain text, where it was last placed; the chrome's reconcile
-    /// places it from [`ClosePrompt::measures`] right after. A window close's question it replaces is withdrawn,
-    /// and the window stays as a `no` would have left it.
+    /// places it from [`ClosePrompt::measures`] right after. Shown before it is measured: GTK measures a hidden
+    /// widget as 0 high, which centred the prompt's top edge on the bar's middle and hung half of it over the pane
+    /// below (`tests/close_prompt_placement.rs`).
     pub(crate) fn show_model(&self, text: &str) {
-        if let Some(declined) = self.state.show_model() {
-            // On the loop's next turn: this draw is part of a batch being applied, and the hook changes the layout.
-            glib::idle_add_local_once(move || declined());
-        }
+        self.open.set(true);
         self.label.set_label(text);
         self.label.set_visible(true);
     }
@@ -117,73 +150,35 @@ impl ClosePrompt {
         self.label.set_margin_top(y);
     }
 
-    /// The controller's question is answered or gone. The window close's, if one is open, keeps the overlay.
+    /// The controller's question is answered or gone.
     pub(crate) fn hide_model(&self) {
-        if self.state.hide_model() {
-            self.label.set_visible(false);
-        }
+        self.open.set(false);
+        self.label.set_visible(false);
     }
 
-    /// Closes the window as a `y` to its own question would have: the close handler sees
-    /// [`ClosePrompt::confirmed`] and does not ask. For a question already asked and answered in
-    /// another form (`prefix x` on the last module, `eitri_core::wm::close`).
-    pub(crate) fn close_window_confirmed(&self) {
-        self.state.set_confirmed(true);
-        self.window.close();
-    }
-
-    pub(crate) fn confirmed(&self) -> bool {
-        self.state.confirmed()
-    }
-
-    /// Takes back a `y` the window close had, once the close hands the decision to nvim: from then
-    /// on the answer travels with the quit (`eitri_core::wm::close::EditorQuit::Window`), so a close after nvim
-    /// exits asks again if what is running changed meanwhile (`eitri_core::wm::close::close_is_confirmed`), and
-    /// a close after nvim's prompt was cancelled asks again at all.
-    pub(crate) fn withdraw_confirmation(&self) {
-        self.state.set_confirmed(false);
-    }
-
-    /// `hook` runs whenever the window close's own y/n is answered with anything but `y`.
-    pub(crate) fn connect_window_close_declined(&self, hook: impl Fn() + 'static) {
-        self.state.connect_window_close_declined(hook);
-    }
-
-    /// The window close's y/n: `y` closes the window again, and the close handler sees
-    /// [`ClosePrompt::confirmed`].
+    /// The companion window's close question: `y` closes the window again, and its close handler then sees
+    /// [`ClosePrompt::confirmed`]. A prompt built without a window (the main window's) asks nothing.
     pub(crate) fn ask_to_close_window(&self, text: &str) {
-        let window = self.window.clone();
-        self.show(text, Box::new(move || window.close()), true);
-    }
-
-    /// Shows `text` and runs `on_yes` if the next key is `y`. A second ask while one is open
-    /// replaces it, the controller's question too. ASSUMES the strip is empty/hidden while the prompt is open (the prefix is done
-    /// by then) -- if the strip can still hold pieces, hide it while the prompt is open.
-    pub(crate) fn ask(&self, text: &str, on_yes: impl FnOnce() + 'static) {
-        self.show(text, Box::new(on_yes), false);
-    }
-
-    fn show(&self, text: &str, on_yes: Box<dyn FnOnce()>, closes_window: bool) {
-        self.label.set_label(text);
-        // Shown BEFORE it is measured: GTK measures a hidden widget as 0 high, which centred the
-        // prompt's top edge on the bar's middle and hung half of it over the pane below
-        // (`tests/close_prompt_placement.rs`).
-        self.label.set_visible(true);
+        if self.window.is_none() {
+            eprintln!("[window] BUG: a close question asked of a prompt with no window of its own");
+            return;
+        }
+        self.show_model(text);
         let at = self.measures();
         let (x, y) = prompt_origin(at.bar_shown, at.strip_x, at.bar_height, at.label_height.max(0));
         self.place(x, y);
-        if self.state.open(on_yes, closes_window) {
-            // The controller's question was on the overlay: withdrawn there too, or its next key would answer it.
-            let driver = self.driver.borrow().upgrade();
-            if let Some(driver) = driver {
-                driver.post(HostEvent::PromptWithdrawn { win: WinId::MAIN });
-            }
-        }
+        self.open.set(false);
+        self.own.open.set(true);
+    }
+
+    /// Whether a `y` to [`ClosePrompt::ask_to_close_window`] confirmed the window close.
+    pub(crate) fn confirmed(&self) -> bool {
+        self.own.confirmed.get()
     }
 }
 
-/// The prompt's key layer: a capture controller that answers the key while the prompt is open and lets every key
-/// through while it is not.
+/// The prompt's key layer: a capture controller that hands the key to the controller's window stage while the
+/// question shows and lets every key through while it does not.
 impl crate::gtk_host::keys::PromptLayer for Rc<ClosePrompt> {
     fn add_capture(&self, window: &gtk4::Window) {
         let controller = gtk4::EventControllerKey::new();
@@ -197,34 +192,53 @@ impl crate::gtk_host::keys::PromptLayer for Rc<ClosePrompt> {
                 .current_event()
                 .and_then(|e| e.downcast::<gtk4::gdk::KeyEvent>().ok())
                 .is_some_and(|e| e.is_modifier());
-            if !prompt.state.is_open() {
-                // The controller's question: its window stage answers it before the prefix sees the key. A bare
-                // modifier answers nothing and goes on to the prefix's layer, which hands it to the same stage once.
-                if !prompt.state.model_open() || is_modifier {
-                    return glib::Propagation::Proceed;
-                }
-                let Some(driver) = prompt.driver.borrow().upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                // Every other key answers the question, and is the window stage's once: going on to the prefix's
-                // layer, it would be decided a second time.
-                let verdict = driver.key(WinId::MAIN, &KeyStage::Window, key_press(key, code, state));
-                if verdict != Verdict::Consumed {
-                    eprintln!("[wm] the y/n's key was not taken by the window stage ({verdict:?}); it goes no further");
+            let press = key_press(key, code, state);
+            if let Some(yes) = prompt.own.answer(prompt_key(&press, is_modifier, false)) {
+                prompt.label.set_visible(false);
+                if yes {
+                    if let Some(window) = prompt.window.as_ref().and_then(|window| window.upgrade()) {
+                        window.close();
+                    }
                 }
                 return glib::Propagation::Stop;
             }
-            if prompt
-                .state
-                .answer(prompt_key(&key_press(key, code, state), is_modifier), || {
-                    prompt.label.set_visible(false)
-                })
-            {
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
+            // A bare modifier answers nothing and goes on to the prefix's layer, which hands it to the same stage
+            // once.
+            if !prompt.open.get() || is_modifier {
+                return glib::Propagation::Proceed;
             }
+            let Some(driver) = prompt.driver.borrow().upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            // Every other key answers the question, and is the window stage's once: going on to the prefix's layer,
+            // it would be decided a second time.
+            let verdict = driver.key(WinId::MAIN, &KeyStage::Window, press);
+            if verdict != Verdict::Consumed {
+                eprintln!("[wm] the y/n's key was not taken by the window stage ({verdict:?}); it goes no further");
+            }
+            glib::Propagation::Stop
         });
         window.add_controller(controller);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The companion's own question waits through a bare modifier, and goes with the next key: `y` confirms the
+    /// close, anything else cancels it and leaves it unconfirmed; with no question up, every key goes on.
+    #[test]
+    fn the_companions_close_question_confirms_on_y_and_goes_on_any_other_key() {
+        let own = OwnClose::default();
+        assert_eq!(own.answer(PromptKey::Yes), None, "no question up: the key goes on");
+        own.open.set(true);
+        assert_eq!(own.answer(PromptKey::Ignore), None, "a bare modifier waits");
+        assert_eq!(own.answer(PromptKey::No), Some(false));
+        assert!(!own.confirmed.get(), "a cancel confirms nothing");
+        assert_eq!(own.answer(PromptKey::No), None, "the cancel took the question down");
+        own.open.set(true);
+        assert_eq!(own.answer(PromptKey::Yes), Some(true));
+        assert!(own.confirmed.get(), "y confirms the close");
     }
 }

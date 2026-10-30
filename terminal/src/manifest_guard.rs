@@ -57,9 +57,8 @@ fn offenders(manifest: &str) -> Vec<String> {
             // names its package in the header itself. That sub-table's *body* is also a dependency
             // table -- it is the two-line spelling of the same thing `name = { ... }` says inline,
             // so `package = "gtk4"` on the line below `[dependencies.ui]` is exactly as much a
-            // rename as `ui = { package = "gtk4" }` is, and must be scanned the same way. Checking
-            // only the header's own name let this shape pass with zero offenders, because
-            // `in_dependency_table` stayed `false` for it.
+            // rename as `ui = { package = "gtk4" }` is. Scan the body too, or checking only the
+            // header's local name misses the forbidden package in a renamed dependency.
             if let Some((_, name)) = header.rsplit_once("dependencies.") {
                 in_dependency_table = true;
                 if forbidden(name) {

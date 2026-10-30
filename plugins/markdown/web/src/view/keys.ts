@@ -24,6 +24,7 @@ export const FIND_EXCLUDE = ".katex-mathml, .mdp-diagram svg";
 
 /* One step of sideways scrolling: a few characters of code, enough to make progress without losing the column. */
 const SIDEWAYS_PX = 60;
+const WIDE = ".mdp-wide, .katex-display";
 const HEADING = /^H[1-6]$/;
 
 /** Moves nvim's cursor to the source line at `y` (the reading position by default) and gives nvim the keys. Enter
@@ -105,7 +106,7 @@ export function jumpTo(p: Preview, el: Element): void {
    what is past its right edge. */
 function sideways(p: Preview, dx: number): void {
   const box = currentBlock(p);
-  const wide = box ? (box.el.closest(".mdp-wide") ?? box.el.querySelector(".mdp-wide")) : null;
+  const wide = box ? (box.el.closest(WIDE) ?? box.el.querySelector(WIDE)) : null;
   wide?.scrollBy({ left: dx, behavior: "smooth" });
 }
 

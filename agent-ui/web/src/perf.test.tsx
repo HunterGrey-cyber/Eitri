@@ -10,9 +10,8 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 
-/** A `j` press re-renders the whole
- *  panel; before the memo, every message was re-parsed (marked + highlight.js + DOMPurify) on every
- *  press. Counted, not timed: jsdom's timing is not WebKitGTK's, and a count cannot be flaky. */
+/** A `j` press must not re-parse every message through marked, highlight.js and DOMPurify.
+ *  Counted, not timed: jsdom's timing is not WebKitGTK's, and a count cannot be flaky. */
 it("parses no message again when j moves the cursor through 500 of them", () => {
   const posted: unknown[] = [];
   (window as unknown as { webkit: unknown }).webkit = { messageHandlers: { eitriAgent: { postMessage: (m: string) => posted.push(m) } } };

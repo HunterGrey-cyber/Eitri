@@ -1,6 +1,4 @@
-/* The page's own furniture around the document: notices, boxes for what was not shown, the markers beside blocks.
-   Text is drawn in --nv-fg, --nv-muted or a surface's own text colour; signal colours only on borders, fills and
-   decorations. */
+/* Use foreground, muted or surface text colours for text; reserve signal colours for borders, fills and decorations. */
 .mdp-notice {
   margin: 0 0 1em;
   padding: 8px 12px;

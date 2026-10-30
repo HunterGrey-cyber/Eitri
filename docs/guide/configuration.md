@@ -55,7 +55,9 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
 | `review.enabled` | `true` / `"on"` or `false` / `"off"` | `true` | Whether [turn review](turn-review.md) runs at all. `false` takes no snapshots and offers no review. |
 | `review.hint` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a finished turn that edited files adds a one-line hint to the status band, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
+| `terminal.font` | a font in `guifont`'s form, `"<families>:h<points>"` | your `guifont` | The terminal's font, for every terminal of the window: `"Iosevka:h12"` sets both, `"Iosevka"` only the family (the size still follows your `guifont`), `":h12"` only the size. Families are comma-separated and tried in order, `_` or `\ ` stand for a space, as in `guifont`. Unset, the terminal draws in the editor's families and size, so a terminal under the editor looks like it; an empty `guifont` draws in `monospace`. The size is zoomed with the editor's, see [Keys](keys.md). |
 | `keymap.from_tmux` | `true` / `"on"` or `false` / `"off"` | `"on"` | Whether Eitri reads your tmux prefix and prefix-table keys from your tmux configuration. See [Keys](#keys). |
+| `window.restore` | `true` / `"on"` or `false` / `"off"` | `true` | Whether the window that holds a pair brings window 2 back at the next start when it was open when the pair last ended. With `false`, window 1 takes back what window 2 held and offers its saved tabs. See [Two windows](two-windows.md). |
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
 The settings are read once, when the window starts. Change `init.lua` and open a new window to apply a change.
@@ -289,9 +291,10 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   `below` and `above` become `bottom`, with a note in the log for a rule that asked for them.
 - **What a rule never decides.** Anything that says where itself always wins: a split key, a move, a drag,
   `eitri.layout.float`. A saved layout is never changed by a rule, and a layout from `eitri.layout.default` or
-  `eitri.layout.workspace` places the modules it names. A module that a saved layout or a template lacks, and that a
-  rule would float, comes back tiled at its fallback place, hidden, with a note naming the place. A new module is
-  added hidden to the other workspaces, at the place its rule or kind gives it.
+  `eitri.layout.workspace` places the modules it names (in a [plugin's own window](#plugins), the plugin's own
+  layout comes first, and its page is put back at each start). A module that a saved layout or a template lacks,
+  and that a rule would float, comes back tiled at its fallback place, hidden, with a note naming the place. A new
+  module is added hidden to the other workspaces, at the place its rule or kind gives it.
 
 ## Plugins
 
@@ -322,6 +325,12 @@ eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- by path
   stops Eitri at startup with a message listing every directory it looked in.
 - The options are the plugin's own settings, plus `key` (a module key after the prefix) and `position` (`"side"`,
   `"bottom"` or `"main"`). A plugin opens where [open rules](#where-a-new-module-opens) say, as `lua:<id>`.
+- A plugin may name a directory of its own in its manifest (`[window]`). Start Eitri in that directory and the window
+  is the plugin's: the top bar and the window title show the plugin's title instead of the project's name. With no
+  saved layout, the plugin's layout is used before your `eitri.layout.default`, and the editor or chat it leaves out
+  start hidden (their keys bring them back). A saved layout still wins, with one exception: if it lacks the plugin's
+  page, or has it hidden, the page is put back at its place at every start. To get the plugin's whole layout back,
+  delete that directory's saved layout file ([where the layout is kept](#layout-from-lua)).
 - Loading a plugin trusts it as you trust any program you run: it is your own local directory. Load only plugins you
   trust. Plugins are not available in the companion window.
 

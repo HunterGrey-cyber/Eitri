@@ -22,6 +22,8 @@ import { CursorBand, type BandBox } from "../cursorBand";
 import { conversationRows } from "../nav";
 
 type Props = {
+  /** The conversation's identity: row keys can be shared by different tabs. */
+  tab?: number | null;
   state: AgentUiState;
   /** How long each finished turn ran (`turnTimes.ts`): the "Worked for" line under a turn's last row, and
    *  the duration on a turn-ending row. Absent: no turn has a known time. */
@@ -111,22 +113,15 @@ function toolSign(call: ToolCallRecord, abandoned: boolean): string {
   return call.result.isError ? "✗" : "✓";
 }
 
-/** Whether a `null` result can never arrive: the call predates the restored-history boundary (a
- * resume/reload only ever replays what a transcript actually recorded, so a call from before that
- * cut that has no result now never will), the session itself has ended, or the call's own turn is
- * no longer the active one. Without this, `null`
- * meant only "still running" -- so a tool call abandoned by a killed/interrupted session, or one
- * that outlived the transcript it was restored from, rendered a permanent spinner.
- * A call still genuinely running (an active turn, inside the live span) is untouched: this is never
- * true for it, matching the pre-fix "◐" rendering exactly. */
+/** A call with no result is abandoned before the restored-history cut, after the session ends,
+ *  or outside its active turn. Rendering those cases as running would leave a permanent spinner;
+ *  an active call in the live span must still show as running. */
 function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded: boolean): boolean {
   if (call.result !== null) return false;
   if (sessionEnded) return true;
   if (state.history !== null && call.seq < state.history.uptoSeq) return true;
-  // A result only ever arrives inside the call's own turn (both backends stamp every event of a
-  // turn with its id). Once that turn is not the active one -- interrupted, failed, or followed by
-  // another -- it never will (an interrupted turn once left `◐ Running…`
-  // forever). A call with no turn id on it falls back to "no turn is in flight at all".
+  // Results belong to the call's turn. Once that turn ends or is replaced, none can arrive.
+  // Without a turn id, fall back to whether any turn is active.
   return call.turnId ? call.turnId !== state.activeTurnId : state.activeTurnId === null;
 }
 
@@ -172,11 +167,9 @@ function isTextEntry(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 }
 
-/** Whether an upward wheel or key aimed at `target` would scroll `list` ITSELF: not when the list is
- *  already at its top, and not when a box between `target` and the list -- an expanded tool result's
- *  own 260px box -- can still scroll up and takes the gesture first. A prediction: the engine decides,
- *  and can latch a whole gesture onto an inner box after this has looked, which is why the stop it
- *  leads to is provisional (`provisionalStopRef` below). */
+/** Whether an upward wheel or key can scroll the list itself: neither at its top nor when an
+ *  inner scroll box can take it. The engine can latch the gesture elsewhere after this prediction,
+ *  so `provisionalStopRef` must be taken back if the list never moves up. */
 function listTakesUpward(list: HTMLElement, target: EventTarget | null): boolean {
   if (list.scrollTop <= 0) return false;
   for (let el = target instanceof Element ? target : null; el !== null && el !== list; el = el.parentElement) {
@@ -206,6 +199,7 @@ export function bandBox(row: HTMLElement, listWidth: number): BandBox {
 }
 
 export function MessageList({
+  tab = null,
   state,
   turnDurations = NO_TURN_DURATIONS,
   sessionEnded,
@@ -226,47 +220,26 @@ export function MessageList({
   visual = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
-  /** The one `ResizeObserver`, on the list and on every child of it (see "Correction (the GUI pass)"
-   *  below), and which children it is watching. `null` where there is none (jsdom). */
+  /** One observer for the list and its children, and the set it watches; `null` without one (jsdom). */
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedChildrenRef = useRef<Set<Element>>(new Set());
-  /** The CURRENT render's `onScroll`, for the observer below, which is made once. Calling the first
-   *  render's own `onScroll` from there ran that render's `updatePill`, which slices that render's
-   *  timeline: every row that arrived since was invisible to it, so a row settling its size after a
-   *  card landed below a reader rewrote `↓ ⚑ approval` as `↓ Jump to bottom` (seen in a GUI pass,
-   *  2026-09-25). Assigned right after `onScroll` is defined, on every render. */
+  /** Current `onScroll` for the once-created observer. A stale closure reads an old timeline and
+   *  overwrites an approval label when a new card settles its size. Assigned on every render. */
   const onScrollRef = useRef<() => void>(() => {});
-  /** The cursor's fill (`../cursorBand`): the element, its animator, and the row it was last put on, by
-   *  timeline key. `placeBandRef` is the current render's placement, for the observer below. */
+  /** Cursor fill: its element, animator and row key. `placeBandRef` keeps placement current for
+   *  the once-created observer. */
   const bandElRef = useRef<HTMLDivElement>(null);
   const bandRef = useRef<CursorBand | null>(null);
   const bandRowKeyRef = useRef<string | null>(null);
+  const bandTabRef = useRef(tab);
   const placeBandRef = useRef<(glide: boolean) => void>(() => {});
 
-  /* The list and its rows, watched for size (2026-09-24). Until 2026-10-13 this observer also wrote the
-     list's content-box width to `--list-inline-size`, from which every wide-content escape in `index.css`
-     took the row's width -- the replacement for a CSS size query container on `.row`, which in
-     WebKitGTK 2.52.6 made the engine reset this list's `scrollTop` every time the status line's elapsed
-     counter ticked while a reply streamed (`shell/tests/panel_stream_scroll.rs` is the regression test,
-     against the real engine). The chat page's rows fill the panel between margins written against
-     the viewport, so nothing reads a measured width any more and the write is
-     gone; no size container came back with it.
-
-     A GUI pass on 2026-09-24 found that when this observer only wrote the width, the follow
-     snap below ran only on a state change -- so a resize with nothing streaming behind it
-     left a following view short: narrowing the panel reflows the reply taller while `scrollTop` stays
-     put (482px short after a divider drag, 651px after an unzoom, measured in the sandbox), and a
-     shorter list (the bottom terminal shown, the composer growing, the which-key strip appearing as
-     INPUT becomes BROWSE) hides the tail the same way, for as long as a tool call runs, a permission
-     card waits, or the turn is over. The same observer now also watches every child of the list (the
-     rows), because the rows can change size with the list's box unchanged -- a side margin set on the
-     list alone, say, or anything else restyling the conversation alone. (A font push from the theme
-     is caught either way: the status line and the composer grow with the same
-     `--nv-font-size`, so the list's own box gets shorter too -- measured, the real-engine test with the rows left
-     unobserved failed only on its row-only restyle, then `--prose-measure`.) Either way, while following, the
-     callback snaps the view to its end: after layout and before paint, the same frame. Snapping is
-     all it adds; a parked reader, or a pending provisional stop, is left exactly where it is.
-     `shell/tests/panel_stream_scroll.rs` is the real-engine test. */
+  /* Watch both the list and its rows: reflow can leave a following view 482px short after a divider
+     drag or 651px after unzooming (measured). A shorter list hides the tail too, even while a card
+     waits or a turn is over. Row-only restyles change content height without changing the list box;
+     watching just the list misses those. Snap after layout and before paint, leaving parked readers
+     and provisional stops alone. Rows use viewport margins, without a measured width or size query
+     container: on WebKitGTK 2.52.6 a row size container resets scrollTop on status-clock ticks. */
   useLayoutEffect(() => {
     const list = listRef.current;
     if (list === null) return;
@@ -290,8 +263,9 @@ export function MessageList({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  /** Puts every child of the list under the observer above, and lets go of any that left. Run on
-   *  every state change, which is the only way a row mounts or goes away. */
+  /** Puts every child of the list under the observer above, and lets go of any that left. Run after
+   *  every change of `state` and of the timeline (an expanded run mounts rows that no `state` change
+   *  announced). */
   const observeChildren = (list: HTMLElement) => {
     const observer = resizeObserverRef.current;
     if (observer === null) return;
@@ -316,44 +290,34 @@ export function MessageList({
     }
   };
 
-  // Following uses scroll position rather than cursor position so mouse and touch readers can
-  // follow replies without moving the keyboard cursor. New prompts, rows, and streamed growth
-  // must all be followed, but incoming content must leave a reader who scrolled up in place.
-  // Distance measured after new content mounts cannot tell whether the reader was following.
-  // Engine clamps can also move `scrollTop`, so upward movement alone is not evidence of intent.
-  // A size query container on `.row` caused such jumps when the status line clock changed.
-  // Wheel, touch, pointer, focus, and native scroll keys mark a steering window. Panel scrolls
-  // announce intent through `noteUserScroll`; `k`, `Ctrl+u`, and `gg` stop following immediately.
-  // A mostly vertical upward wheel or native key stops provisionally only if `listTakesUpward`
-  // says the list can scroll. Upward movement while steering confirms the stop. If the gesture
-  // ends without moving the list up, take the stop back so an inner box consuming the gesture
-  // does not leave following disabled. `scheduleSettle` handles this even if no more state arrives;
-  // later gestures extend the window, and a held pointer defers settlement until release.
-  // The true bottom re-arms following; a downward user scroll near the bottom does too.
-  // While following, snap before paint for both new rows and growing text. Smooth scrolling
-  // leaves new rows temporarily hidden and would restart on every streamed text update.
-  // The `ResizeObserver` also follows size changes that arrive without a state update.
-  // jsdom has no layout or automatic scroll events, so tests dispatch scroll events explicitly.
+  // Following tracks scroll intent, not the cursor: mouse readers expect auto-follow even when
+  // the cursor stays at 0. Engine-originated clamps can move scrollTop on a status-clock tick with
+  // no content change, so neither direction alone nor "no content changed" identifies user input.
+  //
+  // A mostly vertical upward wheel/key stops following provisionally only if the list can take it.
+  // Native scroll keys from focused controls and focus reveals also steer; keys in text boxes move
+  // the caret. The panel announces its own scrolls with `noteUserScroll`; k/Ctrl+u/gg stop outright.
+  // A pointer held on the list or an event within `STEER_WINDOW_MS` counts as steering.
+  //
+  // At the true bottom (`AT_BOTTOM_PX`) following re-arms; a downward user scroll within
+  // `BOTTOM_FOLLOW_THRESHOLD_PX` also re-arms it. A pending gesture with no movement cannot re-arm:
+  // WebKitGTK can emit a wheel scroll at 0-1ms before motion (measured in 2 of 8 wheels at the tail).
+  //
+  // Provisional stops prevent a delta between intent and animated motion from snapping over it.
+  // If the gesture ends without an upward list move, take the stop back: the engine may have
+  // latched onto an inner box. A timer settles even if a card arrives then the stream goes silent;
+  // further wheels extend the window, and a held pointer waits until its release window ends.
+  //
+  // New rows and streamed growth snap before paint: smooth arrival leaves new text below the edge
+  // for 1-2 frames (measured), and restarting animation on each 33ms pump batch never finishes.
+  // ResizeObserver handles size changes without new state. jsdom has no layout or automatic scroll
+  // events; `MessageList.test.tsx` sets dimensions and dispatches them explicitly.
 
-  /* One ordered sequence, not three lists one after another.
-
-     Until 2026-09-15 this component mapped `transcript`, then `toolCalls`, then
-     `pendingPermissions`, so every tool card rendered below every assistant message however the
-     turn really went. `buildTimeline` merges them on `seq`, an ordering key Rust's projection
-     assigns and its snapshot ships -- so a reload or a `UiDelivery::Resync`, which rebuild this
-     whole state from that snapshot, produce the same order as the live path did.
-
-     Memoised on `state`, which the reducer replaces wholesale on every folded event -- so this
-     recomputes exactly as often as the conversation changes, and not on a re-render caused by
-     anything else (a `sessionEnded` flip, a parent re-render while the user types). The merge
-     allocates four mapped arrays, a Map and a Set and then sorts the whole conversation, which
-     during streaming would otherwise run on every 33ms pump batch.
-
-     A reply's markdown is rendered by `MarkdownBody` (end of this file), once per text, so a render
-     of this list no longer runs marked, highlight.js and DOMPurify over every reply.
-
-     Declared here, above `onScroll` (moved for the pill): the pill's `updatePill` closure, defined
-     below alongside `onScroll`, reads `timeline` too, and both need the same binding in scope. */
+  /* Merge by Rust's seq rather than by item kind, so interleaved calls keep the same order live
+     and after snapshots or resync. Memoization avoids allocating mapped arrays, a Map and a Set
+     and sorting the whole conversation on unrelated renders during streaming. MarkdownBody
+     renders replies once per text rather than parsing and sanitising every reply on each render.
+     Keep this binding above onScroll and updatePill: both closures need the same timeline. */
   const timeline = useMemo(
     () =>
       given ??
@@ -365,35 +329,24 @@ export function MessageList({
   const lastScrollTopRef = useRef(0);
   const steerUntilRef = useRef(0);
   const pointerSteeringRef = useRef(false);
-  /** Where a wheel or key stopped following on a prediction, until the gesture shows whether the list
-   *  really went up; `null` when no such stop is pending. See the correction on provisional stops above. (Its `missedRow` flag went
-   *  with the smooth scroll, the GUI pass: a take-back snaps to the end whatever arrived meanwhile.) */
+  /** Where predicted upward scrolling provisionally stopped following; `null` without a pending
+   *  stop. Keep it until the gesture confirms movement or settles without moving up. */
   const provisionalStopRef = useRef<{ from: number } | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const steering = () => pointerSteeringRef.current || performance.now() <= steerUntilRef.current;
-  /** Brings the newest content into view: a snap to the end, whether a new row arrived, the last one
-   *  grew, or the list or a row changed size (see the correction above for why never a smooth scroll). */
+  /** Snap to the newest content, whether a row arrived, grew or resized. Smooth scroll leaves
+   *  new text below the edge for frames; see the following model above. */
   const follow = (list: HTMLElement | null) => {
     if (list !== null && list.scrollHeight - list.scrollTop - list.clientHeight > 0) {
       list.scrollTop = list.scrollHeight;
-      // Record where the snap put the view. Found in review: this ref kept the PRE-snap value, so
-      // a `k` pressed before the snap's own scroll event arrived ended above the snap but not above
-      // the stale value, was not seen as a scroll up, and the next delta snapped the view back.
+      // Record the post-snap position: a k before the snap's scroll event must compare against
+      // that position, or it can go unnoticed and be undone by the next delta.
       lastScrollTopRef.current = list.scrollTop;
     }
   };
-  /** The largest `seq` on screen when following last stopped; `null` while following.
-   *
-   *  This used to be a timeline INDEX (`unseenFromRef`, the timeline's length at the
-   *  moment following stopped), sliced off the CURRENT timeline with `timeline.slice(from)`. That
-   *  broke two ways. First, a tab switch reuses this component (`App.tsx` never remounts it), so the
-   *  first `updatePill` after a restore reset `from` to the just-restored (short) timeline's own
-   *  length -- every row that had arrived while the tab was away sat BELOW that length and was
-   *  silently never counted. Second, even within one tab, `buildTimeline` does not keep the array in
-   *  `seq` order: a permission card anchored to an older tool call is spliced in right after that
-   *  call (see `timeline.ts`), which can land it BEFORE the old length cutoff even though its own
-   *  `seq` -- when it actually arrived -- is far newer than everything after it. A `seq` threshold
-   *  does not care where an item landed in the array, only when it happened. */
+  /** Largest `seq` when following stops; `null` while following. An array cutoff misses cards
+   *  anchored beside older calls: arrival order and display order differ. A tab switch reuses this
+   *  component, so restore the saved seq threshold rather than reset it to the restored length. */
   const unseenAfterSeqRef = useRef<number | null>(null);
   const [pill, setPill] = useState<string | null>(null);
   const updatePill = () => {
@@ -438,7 +391,7 @@ export function MessageList({
     followingRef.current = true;
     return stop;
   };
-  /** Settle a pending stop when its gesture ends, even if no further state change arrives. */
+  /** Settle a pending stop at gesture end even when no next state change arrives. */
   const settleWhenGestureEnds = () => {
     settleTimerRef.current = null;
     const list = listRef.current;
@@ -468,21 +421,15 @@ export function MessageList({
   const onScroll = () => {
     const list = listRef.current;
     if (list === null) return;
-    // The order matters (2026-09-19): the threshold used to be checked
-    // FIRST, so a `k` step that ended within the threshold of the bottom turned following straight
-    // back ON and the next streamed delta snapped the view back down. A user's scroll UP always
-    // stops following unless it left the view at the TRUE bottom, which is also where the browser
-    // clamps `scrollTop` after content shrinks (a resolved permission card's row going away) -- a
-    // user at the bottom stays followed through that. The threshold only re-arms on a scroll that
-    // went DOWN, never on the effect's own synchronous call below, where nothing moved.
+    // Check upward movement before the near-bottom threshold: a short k must stop following
+    // even inside that threshold, unless it ends at the TRUE bottom (also where content shrinkage
+    // clamps the view). The threshold re-arms only on downward scrolling, never this function's
+    // synchronous read when nothing moved.
     //
-    // An event that finds the list where a pending gesture found it says nothing about
-    // that gesture, so at the bottom it neither re-arms following nor clears the stop. WebKitGTK
-    // animates a wheel's scroll, and its FIRST scroll event, 0-1ms after the wheel, can report no
-    // movement yet (seen in 2 of 8 wheels at the tail); re-arming on it let the next delta's snap, or
-    // a new row's smooth scroll, cancel the wheel's scroll -- the case the provisional stop exists to
-    // prevent. A pending stop always has its gesture's timer armed (or a pointer held, whose release
-    // arms it), so the stop is still settled when the gesture ends (`settleWhenGestureEnds`).
+    // A pending gesture with no movement says nothing yet. WebKitGTK's first wheel scroll can
+    // arrive at 0-1ms without motion (2 of 8 wheels measured at the tail). Re-arming then lets a
+    // delta snap cancel the animation. Keep the gesture timer armed, or a held pointer whose
+    // release arms it, so `settleWhenGestureEnds` still resolves the stop.
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
     const stop = provisionalStopRef.current;
     const gestureNotYetMoved = stop !== null && Math.abs(list.scrollTop - stop.from) <= AT_BOTTOM_PX;
@@ -540,7 +487,7 @@ export function MessageList({
       pointerSteeringRef.current = false;
       // Scroll events still in flight from a scrollbar drag or a selection autoscroll are the user's.
       steer();
-      // Settle a stop held open by the pointer after the release steering window ends.
+      // Pointer release starts a new window for the drag's pending scroll events, then settles the stop.
       scheduleSettle();
     };
     const onUserScroll = (event: Event) => {
@@ -567,9 +514,8 @@ export function MessageList({
     // Focus landing on something inside the list (Tab, a click) scrolls it into view, either way.
     list.addEventListener("focusin", steer, { passive: true });
     list.addEventListener("touchmove", steer, { passive: true });
-    // Listen for both pointer and mouse presses to detect scrollbar dragging.
-    // Whether WebKitGTK delivers either event to the list for its own scrollbar is unverified.
-    // An undetected drag would be undone by the next streamed delta.
+    // Listen for both pointer and mouse events: whether WebKitGTK sends either for its own
+    // scrollbar is not yet checked on a screen. An unseen drag is undone by the next delta.
     list.addEventListener("pointerdown", onPointerDown, { passive: true });
     list.addEventListener("mousedown", onPointerDown, { passive: true });
     list.addEventListener(USER_SCROLL_EVENT, onUserScroll);
@@ -594,13 +540,12 @@ export function MessageList({
       settleTimerRef.current = null;
     };
   }, []);
-  // While following, every state update snaps to the end for both new rows and streamed growth.
-  // Use a layout effect so new text is visible before paint. Smooth scrolling would leave a new
-  // row hidden during its animation and restart repeatedly as streamed text arrives.
-  // Read `onScroll()` first to catch user movement whose scroll event has not arrived yet.
-  // `noteUserScroll` also stops following before upward panel navigation scrolls.
-  // `observeChildren` registers new rows with the `ResizeObserver`, which follows later size
-  // changes even when no state update occurs.
+  // Follow every state change, including streamed growth. Read the scroll position first: a user
+  // scroll in the steering window may be ahead of its event. k also stops through `noteUserScroll`.
+  // Run before paint: a passive effect leaves freshly streamed lines below the fold for a frame.
+  // Measured lag with this timing is 30-50ms; without it, one run saw 255/424ms, but a repeat passed
+  // at 73-85ms, so that failure was load-sensitive rather than reliably reproduced.
+  // Observe new children too, to follow row-only size changes without another state change.
   useLayoutEffect(() => {
     onScroll();
     const list = listRef.current;
@@ -647,10 +592,9 @@ export function MessageList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unseenSeed?.tick]);
 
-  /* Match pending permissions to tool calls by `tool_use_id`, since several calls of the same
-     tool can be in flight. Use the shared `isUsableLink` predicate from `../timeline` to exclude
-     `null` and "", matching `PermissionCard` without duplicating the guard. Legacy permissions
-     carry null, so this marker does not render on that backend. */
+  /* Link waiting decisions to calls by tool_use_id: several calls of one tool can be in flight.
+     Share isUsableLink with PermissionCard so null and empty proto3 ids cannot drift between
+     callers. Legacy permissions have no id, so this set is empty and the marker never renders. */
   /* The cursor's band goes on the cursor's row, found by structure (`conversationRows`), as every other
      cursor-to-row lookup is. It glides when the cursor moved from a row that is still in the list; a row
      that is gone (a tab switch, a cleared conversation) or a first placement puts it there at once. */
@@ -663,6 +607,10 @@ export function MessageList({
     band.place(row === undefined ? null : bandBox(row, list.clientWidth), glide);
   };
   useLayoutEffect(() => {
+    if (bandTabRef.current !== tab) {
+      bandTabRef.current = tab;
+      bandRowKeyRef.current = null;
+    }
     const key = timeline[cursor]?.key ?? null;
     const before = bandRowKeyRef.current;
     bandRowKeyRef.current = key;
@@ -749,8 +697,6 @@ export function MessageList({
             </Fragment>
           );
         })}
-        {/* No end-of-list sentinel any more: it existed for the smooth `scrollIntoView` a new row used
-            to get, and following is a snap to `scrollHeight` now (the GUI pass, 2026-09-24). */}
         {/* The cursor's fill, behind the rows (`../cursorBand`). Hidden from assistive technology and from
             VISUAL's selection (`[aria-hidden="true"]` is chrome there). */}
         <div className="cursor-band" aria-hidden="true" ref={bandElRef} />
@@ -956,12 +902,8 @@ const TimelineRow = memo(function TimelineRow({
       );
     }
     default: {
-      // Exhaustiveness guard. Without it, a fifth `TimelineItem` kind gaining no case here
-      // renders as nothing: this component has no pinned return type, a missing case
-      // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
-      // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
-      // long time. Assigning `item` to `never` turns
-      // that same mistake into a compile error instead of an invisible blank row.
+      // An exhaustive never check makes a missing TimelineItem case a compile error. Without it,
+      // undefined is a valid ReactNode and tsc accepts a silently blank row.
       const _exhaustive: never = item;
       return _exhaustive;
     }
@@ -1029,9 +971,10 @@ function ThinkingBody({
 }
 
 /** One reply's rendered HTML, made when the reply first shows and again only when its text changes.
- *  The list renders every row on every update (a cursor move, a streamed batch), and leaving that to
- *  `renderMarkdown`'s bounded cache alone re-parsed every reply on every render once a conversation
- *  held more replies than the cache holds: each pass in order evicted the next entry it needed.
+ *  Rows are memoized, but a change of a prop every row shares (`detailed`, the thinking level) still
+ *  renders them all, and leaving that to `renderMarkdown`'s bounded cache alone re-parses every reply
+ *  on such a pass once a conversation holds more replies than the cache holds: each pass in order
+ *  evicts the next entry it needed.
  *
  *  A reply that is still streaming changes text on every batch; its earlier text is dropped from the
  *  shared cache as it is replaced, so a long streamed reply does not leave one cached copy of the

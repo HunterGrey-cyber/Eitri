@@ -70,11 +70,9 @@ type Props = {
    *  textarea that is already mounted is focused again; a fresh one takes focus through
    *  `autoFocus` as before. */
   focusRequest?: number;
-  /** Which end the NEXT `focusRequest` bump should place the caret at -- `"kept"`
-   *  (the default) leaves `caretRef` alone (wherever the box was last left, or the end of the draft
-   *  the first time), `"end"` is `A`'s own promise (`:h A`) and forces it there regardless of
-   *  `caretRef`. Read once per bump, alongside `focusRequest` itself; a caller that never sets this
-   *  (every existing one before C1a) keeps today's "kept" behaviour exactly. */
+  /** Which end the NEXT `focusRequest` bump places the caret at: `"kept"` defaults to the saved
+   *  position or the end of a fresh draft; `"end"` is `A`'s promise and overrides that position.
+   *  Read once per bump; an absent prop keeps the saved position. */
   caretOnFocus?: "kept" | "end";
   /** Whether the global `f` HINT may label this box (`../nav`'s `HINT_COMPOSER_ATTR`). `App.tsx`
    *  passes the negation of `disabled`: a landing on a textarea that cannot take focus would put the
@@ -125,9 +123,8 @@ type Props = {
   /** The keys the `Ctrl+r` search stops before they bubble, handed
    *  to the host's typing guard (`HistorySearch`'s own `onLineKey`). */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
-  /** The key BROWSE's stand-in names at its right end, the way the start screen's menu shows its keys: the
-   *  key that opens the box. Since 2026-10-15 it replaces the "i or Ctrl+j to type" sentence that followed
-   *  the placeholder (`Ctrl+j` is in the `?` sheet). */
+  /** The INPUT entry key at the BROWSE box's right end, like the start menu's keys.
+   *  `Ctrl+j` is described in the `?` sheet. */
   browseKey?: string;
   /** What the empty box says while the panel does not hold the keys (the start screen: how to reach it).
    *  Only then: with the keys here the caret is the sign, and grey text behind an input method's preedit
@@ -208,8 +205,7 @@ export function Composer({
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
      message is gone with no trace, which is the one outcome this must never produce. */
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  /** Where the caret should go the next time the box takes focus: the end, unless the user left it
-   *  somewhere in the same text (a landing used to put it at the start). */
+  /** Where the caret goes on focus: the end, unless the user left it elsewhere in the same text. */
   const caretRef = useRef<number | null>(null);
 
   /** The caret `setBox` has decided on and not yet placed in the box. React reports a `select` for a
@@ -250,8 +246,7 @@ export function Composer({
 
   useEffect(() => {
     if (mode === "input") {
-      // C1a: `A` forces the caret to the end regardless of where the box was last left; `i`/`o`
-      // (and every caller that predates C1a) leave `caretRef` alone, i.e. "kept".
+      // `A` forces the caret to the end; `i`/`o` leave `caretRef` alone ("kept").
       if (caretOnFocus === "end") caretRef.current = null;
       focusAtCaret();
     }
@@ -274,13 +269,9 @@ export function Composer({
 
   useEffect(() => {
     if (restoredDraft === null) return;
-    // This effect only ever shows what the host already decided to put
-    // in the box -- it does NOT mirror it back to Rust itself. `restoredDraft` fires on every tab
-    // switch too (cleared to "", `App.tsx`'s `tabs` arm) and on every inbound `draft` echo from
-    // Rust, and mirroring unconditionally here re-echoed both of those back out as a fresh `draft`
-    // post nobody asked for (mirroring unconditionally once caused a regression: a leader
-    // sequence test with no composer in play at all started posting one). The host mirrors the
-    // RECOVERED text itself, once, right where it computes it (`App.tsx`'s send-refusal handler).
+    // This effect shows the host's text without mirroring it back. Tab switches and inbound `draft`
+    // echoes also set `restoredDraft`; echoing them would post an unrequested draft back to Rust.
+    // The host mirrors recovered text once, in its send-refusal handler.
     setText(restoredDraft.text);
     caretRef.current = null;
     setCaret(restoredDraft.text.length);
@@ -408,8 +399,7 @@ export function Composer({
         return;
       }
     }
-    // Shift+Tab used to be claimed here (`onShiftTab`); it is now caught by
-    // App.tsx's document-capture router (`modeKey.ts`) before it ever reaches this handler.
+    // `modeKey.ts` claims Shift+Tab in document capture before this handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       // Alt+Enter and a backslash right before the caret are Claude Code's own
@@ -529,7 +519,7 @@ export function Composer({
               onWheel={(by) => selectMenu(Math.max(0, Math.min(matches.length - 1, selected + by)))}
             />
           )}
-          {/* No prompt glyph: the tinted block the composer is drawn as (`index.css`) is its mark. */}
+          {/* No prompt glyph: the framed box the composer is drawn as (`index.css`) is its mark. */}
           <textarea
             ref={textareaRef}
             {...NO_TEXT_ASSIST}
@@ -606,25 +596,11 @@ export function Composer({
            already says "Press r…", and a failed tab read it twice. */
         <div className="composer-browse-hint">This session has ended.</div>
       ) : (
-        // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here
-        // for a stray keystroke to land in. `tabIndex` makes it a real focus target, so THREE
-        // things converge on the same `onModeChange("input")`: a click (which focuses it, like any
-        // focusable element), `i` (handled by the panel's own keydown table, which moves DOM focus
-        // here indirectly by mounting the textarea below with `autoFocus`), and Tab -- ordinary
-        // keyboard focus-navigation landing on this control the same way it would on a real
-        // textarea. That third one is deliberate, not an overlooked side door: a focusable control
-        // that does not become active when focus actually reaches it would be the surprising
-        // behaviour, not this.
-        // It reads like the empty box it stands in for, not like an instruction: a "press i to type"
-        // line went away (2026-09-19) while `Ctrl+l` was the only route into the box. That premise
-        // ended once `Ctrl+l` (and `prefix a`, and a tab switch) landed BROWSE, not INPUT, so a reader
-        // can once again land here with no on-screen route into the box at all. So it is back: a dim `i or Ctrl+j to
-        // type`, after the placeholder or the draft alike, in BOTH cases -- never in INPUT (the caret is the sign
-        // there), on an ended session (its own branch above says `r` instead), or while a scratch round trip owns the
-        // draft (`editingInNvim`: typing here would only be lost to nvim's own buffer). `i`, a click and Tab still
-        // reach INPUT from here exactly as before. Since 2026-10-15 the reminder is the key alone at the box's right
-        // end (`browseKey`), as the start screen's menu shows its keys, not the sentence. The same card INPUT draws,
-        // so the bottom keeps its shape across `i`/`Esc`; the band's mode block is the mode.
+        // A focusable BROWSE stand-in lets a click, Tab and the panel's `i` route agree on INPUT.
+        // It names the entry key (`browseKey`) at the right end, since arrivals land in BROWSE.
+        // INPUT needs no reminder (the caret is its sign); an ended session offers `r` instead,
+        // and a scratch round trip owns the draft, so typing there would be lost to nvim's buffer.
+        // The same card shape in both modes keeps the bottom steady across `i`/`Esc`; the band names the mode.
         <>
           <div className="composer-browse-hint" tabIndex={0} onFocus={() => onModeChange("input")}>
             {text.trim() === "" ? (
@@ -641,11 +617,8 @@ export function Composer({
           </div>
         </>
       )}
-      {/* No Send/Stop buttons here (a document, not a form):
-          Enter still sends and Shift+Enter still inserts a newline (both handled above), and Stop
-          survives for mouse users in `ActivityLine` instead (formerly
-          `StatusLine`) -- gated the same way this one was, on the provider's advertised
-          `interrupt` capability, never on the backend's name. */}
+      {/* Enter sends and Shift+Enter inserts a newline. Stop stays in ActivityLine for mouse users,
+          gated on the provider's interrupt capability rather than its backend name. */}
     </div>
   );
 }

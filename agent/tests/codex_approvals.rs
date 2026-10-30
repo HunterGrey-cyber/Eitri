@@ -872,6 +872,53 @@ fn deny_sends_decline_and_turn_continues() {
 }
 
 #[test]
+fn a_request_arriving_after_interrupt_is_cancelled_without_a_card() {
+    let (thread, turn) = ("th-interrupt-request", "tu-interrupt-request");
+    let provider = running(
+        thread,
+        turn,
+        Reviewer::User,
+        vec![
+            item_started(thread, turn, command_item("exec-late", "touch /x")),
+            expect_request(5, "turn/interrupt"),
+            request(
+                json!("r-late"),
+                "item/commandExecution/requestApproval",
+                json!({"threadId": thread, "turnId": turn, "itemId": "exec-late", "command": "touch /x"}),
+            ),
+            expect_answer(json!("r-late"), r#"{"decision":"cancel"}"#),
+            write(json!({"method": "item/completed", "params": {
+                "threadId": thread, "turnId": turn,
+                "item": {"type": "commandExecution", "id": "exec-late", "command": "touch /x",
+                         "cwd": "/work/proj", "status": "declined"}
+            }})),
+            turn_completed(thread, turn, "interrupted"),
+        ],
+    );
+    let events = pump_until(&provider, |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AgentDomainEvent::ToolCallStarted { tool_use_id, .. } if tool_use_id == "exec-late"
+            )
+        })
+    });
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.into(),
+        })
+        .expect("the interrupt is taken");
+    let events = pump_on(&provider, events, |events| {
+        assert_eq!(cards(events), 0, "a stopped turn must not ask for approval");
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    });
+    let note = note_on(&events, Some("exec-late"));
+    assert!(note.contains("interrupted") && note.contains("cancelled"), "{note}");
+}
+
+#[test]
 fn interrupt_sends_cancel() {
     let provider = running(
         "th-c4",

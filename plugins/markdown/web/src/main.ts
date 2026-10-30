@@ -12,7 +12,6 @@ import { yankCurrentBlock } from "./view/clipboard";
 import { installKeys } from "./view/keys";
 import { installLinks } from "./view/links";
 import { Preview } from "./view/preview";
-import { lineToY, yToLine } from "./view/sync";
 
 function hasKeysOf(data: unknown): boolean | undefined {
   return data !== null && typeof data === "object" && typeof (data as { has_keys?: unknown }).has_keys === "boolean"
@@ -59,7 +58,7 @@ async function start(): Promise<void> {
     const draft = searchInput()?.value ?? search;
     // No document shown and none waiting: no position, so the successor is ready without a render.
     if (!restored && p.shownBuf() === null) return { v: 1, topLine: 0, fraction: 0, search: draft, noDocument: true };
-    const line = restored ? restored.topLine + restored.fraction : yToLine(p.index(), window.scrollY);
+    const line = restored ? restored.topLine + restored.fraction : p.readingLine();
     const topLine = Math.floor(line);
     return { v: 1, topLine, fraction: line - topLine, search: draft };
   }, post));
@@ -115,11 +114,7 @@ async function start(): Promise<void> {
   // The source map exists only after rendering. Say ready after that position has had a frame to draw.
   const offRestored = p.afterUpdate((why) => {
     if (!restored || (why !== "render" && why !== "notice")) return;
-    if (why === "render") {
-      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-      window.scrollTo({ top: lineToY(p.index(), restored.topLine + restored.fraction, max),
-        behavior: "instant" as ScrollBehavior });
-    }
+    if (why === "render") p.showLine(restored.topLine + restored.fraction);
     restored = null;
     offRestored();
     if (ready) requestAnimationFrame(ready);

@@ -1,11 +1,13 @@
 //! Pure allocation and child ordering policies used by the module grid.
 
+pub mod drag;
 pub mod order;
 pub mod throttle;
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
-use crate::layout::{Layout, LayoutError, ModuleId, Size};
+use crate::layout::{Axis, Divider, Layout, LayoutError, ModuleId, Rect, Size};
 
 pub use crate::layout::DEFAULT_STRIP_PX;
 
@@ -227,11 +229,88 @@ pub fn strip_assignments(pool: usize, strips: usize) -> (usize, Vec<usize>) {
     (strips.saturating_sub(pool), (0..strips).collect())
 }
 
+/// Where a divider drag puts the first child: the divider as it is allocated **now**, plus the
+/// drag's offset. GTK reports that offset in the handle's own coordinates, and the handle moves
+/// under the pointer as the drag re-allocates it, so the offset is how far the pointer is from where
+/// the handle now is, not from where it was grabbed. `begin.first_px + offset` -- the grab's divider
+/// plus that offset -- lags: at one motion event per frame the divider crawls after the pointer at
+/// about half its speed, 200px short of a 400px drag. `GtkPaned` avoids the same trap by gesturing on
+/// itself, which never moves. `None` if the handle now draws another split than the grabbed one.
+pub fn dragged_first_px(begin: &Divider, now: &Divider, dx: f64, dy: f64) -> Option<i32> {
+    if now.con != begin.con || now.index != begin.index || now.axis != begin.axis {
+        return None;
+    }
+    let offset = match now.axis {
+        Axis::Row => dx,
+        Axis::Column => dy,
+    };
+    Some(now.first_px + offset.round() as i32)
+}
+
+/// Where a dragged bar (`grip: false`) or grip puts the float: the float's whole rectangle as allocated
+/// **now** plus the drag's offset -- moved by a bar, resized from the bottom-right by a grip. The offset
+/// is in the moving widget's own coordinates, and the bar or grip moves under the pointer as the drag
+/// re-allocates it, so it is how far the pointer is from where that widget now is (as
+/// [`dragged_first_px`] explains for a divider). Core's `set_float_rect` then fits the result into the
+/// grid and above the float's minimum.
+pub fn dragged_float_rect(now: Rect, dx: f64, dy: f64, grip: bool) -> Rect {
+    let (dx, dy) = (dx.round() as i32, dy.round() as i32);
+    if grip {
+        Rect {
+            w: now.w.saturating_add(dx),
+            h: now.h.saturating_add(dy),
+            ..now
+        }
+    } else {
+        Rect {
+            x: now.x.saturating_add(dx),
+            y: now.y.saturating_add(dy),
+            ..now
+        }
+    }
+}
+
+/// The grip's side in pixels.
+pub const GRIP_PX: i32 = 12;
+
+/// Where a float's grip goes: the square at the bottom-right corner of its whole rectangle.
+pub fn grip_rect(rect: Rect) -> Rect {
+    let w = GRIP_PX.min(rect.w).max(0);
+    let h = GRIP_PX.min(rect.h).max(0);
+    Rect {
+        x: rect.x + rect.w - w,
+        y: rect.y + rect.h - h,
+        w,
+        h,
+    }
+}
+
+/// How a pool of `pool` pieces of chrome draws `spots` floats: how many new pieces to make first, and
+/// which slots to hide. The pool grows only when more floats are on screen than it has ever drawn at
+/// once; the slots past the last float are hidden, never dropped.
+pub fn chrome_plan(pool: usize, spots: usize) -> (usize, Range<usize>) {
+    (spots.saturating_sub(pool), spots..pool.max(spots))
+}
+
+/// Which float each slot of the pool draws (slot `i` draws the `i`-th): the floats it drew before that
+/// are still in `floats`, in the slots' order, then the floats that are new, in z-order. So a raise,
+/// which changes only the order of `floats`, moves no float to another piece of chrome; a float that
+/// leaves frees its slot, and the ones above it close up.
+pub fn chrome_owners(drew: &[ModuleId], floats: &[ModuleId]) -> Vec<ModuleId> {
+    let mut owners: Vec<ModuleId> = drew.iter().filter(|id| floats.contains(id)).cloned().collect();
+    for id in floats {
+        if !owners.contains(id) {
+            owners.push(id.clone());
+        }
+    }
+    owners
+}
+
 #[cfg(test)]
 mod tests {
     use super::throttle::WebThrottle;
     use super::*;
-    use crate::layout::{arrange, covering, Arrangement, Axis, FloatRect, Frame, Node};
+    use crate::layout::{arrange, covering, Arrangement, FloatRect, Frame, Node};
 
     /// One child of the grid, in the model below.
     #[derive(Debug, Clone, PartialEq)]
@@ -851,6 +930,343 @@ mod tests {
             "a click inside the editor's own drawn area must not resolve to the agent's stale \
              allocation {:?} (editor's real area: {editor_target:?})",
             held.rect,
+        );
+    }
+
+    /// The divider stays under the pointer for a whole drag. This replays what GTK hands
+    /// `drag-update` -- the pointer in the handle's CURRENT coordinates, less where it was grabbed --
+    /// one motion event per frame, the grid re-arranging between events as it does. Adding the offset
+    /// to the divider the drag began with instead leaves it at 960px: half the drag, 200px behind a
+    /// pointer at 1160.
+    #[test]
+    fn a_dragged_divider_stays_under_the_pointer() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        let frame = Frame::new(UNALLOCATED, 1);
+        let begin = arrange(&layout, &frame).dividers[0].clone();
+        let grabbed_at = 0;
+        let pointer_start = begin.rect.x + grabbed_at;
+        for step in 1..=20 {
+            let pointer = pointer_start + 20 * step;
+            let now = arrange(&layout, &frame).dividers[0].clone();
+            let dx = f64::from(pointer - now.rect.x - grabbed_at);
+            let first_px = dragged_first_px(&begin, &now, dx, 0.0).unwrap();
+            layout.set_ratio(&now, now.ratio_for(first_px)).unwrap();
+        }
+        assert_eq!(arrange(&layout, &frame).dividers[0].rect.x, pointer_start + 400);
+
+        let other_container = Divider {
+            con: crate::layout::ConId::fresh(),
+            ..begin.clone()
+        };
+        assert_eq!(
+            dragged_first_px(&begin, &other_container, 5.0, 0.0),
+            None,
+            "another container"
+        );
+        let other_divider = Divider {
+            index: begin.index + 1,
+            ..begin.clone()
+        };
+        assert_eq!(
+            dragged_first_px(&begin, &other_divider, 5.0, 0.0),
+            None,
+            "another divider of the same container"
+        );
+    }
+
+    /// The same drag on a divider inside a split that does not start at the grid's origin, where
+    /// the handle's grid x (`rect.x`) and the split's own `first_px` differ by everything left of
+    /// the split. A root split starts at 0, so only a nested split distinguishes adding the offset
+    /// to `rect.x` from adding it to `first_px`.
+    #[test]
+    fn a_dragged_divider_inside_a_nested_split_stays_under_the_pointer() {
+        use crate::layout::Node;
+        let l = ModuleId::lua;
+        let root = Node::split(
+            Axis::Row,
+            0.4,
+            Node::Leaf(l("a")),
+            Node::split(Axis::Row, 0.5, Node::Leaf(l("b")), Node::Leaf(l("c"))),
+        );
+        let mut layout = Layout::new(root, l("b")).unwrap();
+        let frame = Frame::new(UNALLOCATED, 1);
+        let outer = layout.root().id;
+        let inner = |layout: &Layout| {
+            arrange(layout, &frame)
+                .dividers
+                .into_iter()
+                .find(|d| d.con != outer)
+                .unwrap()
+        };
+        let begin = inner(&layout);
+        assert_ne!(begin.rect.x, begin.first_px, "the premise: the split starts right of 0");
+        let pointer_start = begin.rect.x;
+        for step in 1..=10 {
+            let pointer = pointer_start + 15 * step;
+            let now = inner(&layout);
+            let dx = f64::from(pointer - now.rect.x);
+            let first_px = dragged_first_px(&begin, &now, dx, 0.0).unwrap();
+            layout.set_ratio(&now, now.ratio_for(first_px)).unwrap();
+        }
+        assert_eq!(inner(&layout).rect.x, pointer_start + 150);
+    }
+
+    /// The drag on the bottom terminal's divider, which is pinned: the divider stays under the pointer,
+    /// and what the drag leaves is a height in pixels that a taller window keeps. That divider is nested
+    /// one level in (below the editor's own leaf, not the root split), so it is found by its `Column` axis
+    /// rather than an empty path.
+    #[test]
+    fn a_dragged_pinned_divider_stays_under_the_pointer_and_keeps_its_height() {
+        let mut layout = crate::wm::persist::first_launch_layout(&[]).unwrap();
+        layout.show(&ModuleId::terminal()).unwrap();
+        let frame = Frame::new(UNALLOCATED, 1);
+        assert!(crate::layout::settle_pins(&mut layout, &frame));
+        let terminal_divider = |layout: &Layout| {
+            arrange(layout, &frame)
+                .dividers
+                .into_iter()
+                .find(|d| d.axis == Axis::Column)
+                .unwrap()
+        };
+        let begin = terminal_divider(&layout);
+        assert_eq!(begin.rect.y, 480, "the terminal's first show, a third of 721");
+        for step in 1..=10 {
+            let pointer = begin.rect.y - 10 * step;
+            let now = terminal_divider(&layout);
+            let dy = f64::from(pointer - now.rect.y);
+            let first_px = dragged_first_px(&begin, &now, 0.0, dy).unwrap();
+            crate::layout::move_divider(&mut layout, &now, first_px).unwrap();
+        }
+        assert_eq!(terminal_divider(&layout).rect.y, 380);
+        let taller = Frame::new(crate::layout::Size { w: 1280, h: 1041 }, 1);
+        assert_eq!(
+            arrange(&layout, &taller).rect_of(&ModuleId::terminal()).map(|r| r.h),
+            Some(340),
+            "dragged to 340px, and kept at 340 when the window grows"
+        );
+    }
+
+    /// The pool's plan: chrome is made only when more floats are on screen than the pool has ever
+    /// drawn, the rest is hidden and reused, and nothing is ever unparented (the pool never shrinks).
+    /// A raise keeps every float on its own piece, so a bar being dragged keeps drawing its float.
+    #[test]
+    fn float_chrome_grows_with_the_floats_and_idles_what_it_does_not_use() {
+        assert_eq!(chrome_plan(0, 2), (2, 2..2), "the first two floats");
+        assert_eq!(chrome_plan(2, 1), (0, 1..2), "a stow or a sink: one spot fewer");
+        assert_eq!(chrome_plan(2, 2), (0, 2..2), "back to two: slot 1 reused");
+        assert_eq!(chrome_plan(2, 0), (0, 0..2), "none: all hidden, none dropped");
+        assert_eq!(chrome_plan(1, 3), (2, 3..3), "only the missing ones are made");
+        for pool in 0..5 {
+            for spots in 0..5 {
+                let (make, hide) = chrome_plan(pool, spots);
+                assert_eq!(pool + make, pool.max(spots), "the pool never shrinks");
+                assert_eq!(hide, spots..pool + make, "every slot past the floats is hidden");
+            }
+        }
+
+        let (a, b, c) = (ModuleId::agent(), ModuleId::terminal(), ModuleId::lua("c"));
+        let drew = chrome_owners(&[], &[a.clone(), b.clone()]);
+        assert_eq!(drew, [a.clone(), b.clone()]);
+        assert_eq!(
+            chrome_owners(&drew, &[b.clone(), a.clone()]),
+            drew,
+            "a raise moves no float to another piece"
+        );
+        assert_eq!(
+            chrome_owners(&drew, std::slice::from_ref(&b)),
+            std::slice::from_ref(&b),
+            "a float leaving frees its slot"
+        );
+        assert_eq!(
+            chrome_owners(&drew, &[c.clone(), b.clone(), a.clone()]),
+            [a.clone(), b.clone(), c.clone()],
+            "a new float takes the next slot"
+        );
+        assert_eq!(
+            chrome_owners(std::slice::from_ref(&b), std::slice::from_ref(&a)),
+            std::slice::from_ref(&a),
+            "a swap hands the slot the old float freed to the new one"
+        );
+    }
+
+    /// A drag on a float's bar keeps the bar under the pointer, and a drag on its grip keeps the grip
+    /// there, both ways. This replays what GTK hands `drag-update` -- the pointer in the bar's (or the
+    /// grip's) CURRENT coordinates, less where it was grabbed -- one motion event per frame, the grid
+    /// re-arranging between events as it does.
+    #[test]
+    fn a_dragged_float_bar_stays_under_the_pointer() {
+        let terminal = ModuleId::terminal();
+        let frame = Frame::new(UNALLOCATED, 1);
+        let rect_now = |layout: &Layout| arrange(layout, &frame).float_spot(&terminal).unwrap().rect;
+        let float = FloatRect {
+            cx: 0.5,
+            cy: 0.5,
+            w: 400,
+            h: 300,
+        };
+        for (grip, step) in [(false, (15, 7)), (false, (-10, -5)), (true, (10, 6)), (true, (-8, -4))] {
+            let mut layout = with_a_float(float, &terminal);
+            let start = rect_now(&layout);
+            // Where on the bar or the grip the press landed, in its own coordinates.
+            let grabbed = (5, 5);
+            let handle = |r: Rect| if grip { grip_rect(r) } else { r };
+            let origin = handle(start);
+            let pointer_start = (origin.x + grabbed.0, origin.y + grabbed.1);
+            for n in 1..=10 {
+                let pointer = (pointer_start.0 + step.0 * n, pointer_start.1 + step.1 * n);
+                let now = rect_now(&layout);
+                let widget = handle(now);
+                let dx = f64::from(pointer.0 - widget.x - grabbed.0);
+                let dy = f64::from(pointer.1 - widget.y - grabbed.1);
+                let next = dragged_float_rect(now, dx, dy, grip);
+                crate::layout::set_float_rect(&mut layout, &terminal, next, &frame);
+            }
+            let end = rect_now(&layout);
+            let (mx, my) = (step.0 * 10, step.1 * 10);
+            if grip {
+                assert_eq!(
+                    end,
+                    Rect {
+                        w: start.w + mx,
+                        h: start.h + my,
+                        ..start
+                    },
+                    "a grip drag of {mx},{my}"
+                );
+            } else {
+                assert_eq!(
+                    end,
+                    Rect {
+                        x: start.x + mx,
+                        y: start.y + my,
+                        ..start
+                    },
+                    "a bar drag of {mx},{my}"
+                );
+            }
+        }
+        // The rule on its own: a bar moves the rectangle, a grip sizes it from the bottom-right.
+        let r = Rect {
+            x: 100,
+            y: 50,
+            w: 300,
+            h: 200,
+        };
+        assert_eq!(dragged_float_rect(r, -20.4, 9.6, false), Rect { x: 80, y: 60, ..r });
+        assert_eq!(dragged_float_rect(r, -20.4, 9.6, true), Rect { w: 280, h: 210, ..r });
+    }
+
+    /// What a pointer press finds over a grid with floats, as [`pick_slot`] models it.
+    #[derive(Debug, PartialEq)]
+    enum Picked {
+        Host(ModuleId),
+        Handle(usize),
+        Bar(ModuleId),
+        Grip(ModuleId),
+    }
+
+    fn pick_slot(children: &[Slot], arrangement: &Arrangement, chrome: &[ModuleId], x: i32, y: i32) -> Option<Picked> {
+        let contains = |r: Rect| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+        children.iter().rev().find_map(|slot| match slot {
+            Slot::Host(id) => arrangement
+                .rect_of(id)
+                .or_else(|| arrangement.float_spot(id).map(|s| s.host))
+                .is_some_and(contains)
+                .then(|| Picked::Host(id.clone())),
+            Slot::Handle(n) => arrangement
+                .dividers
+                .get(*n)
+                .is_some_and(|d| contains(d.rect))
+                .then_some(Picked::Handle(*n)),
+            Slot::Strip(_) => None,
+            Slot::Chrome(i) => {
+                let spot = chrome.get(*i).and_then(|id| arrangement.float_spot(id))?;
+                // The grip is after the bar in the child list: it is picked first.
+                if contains(grip_rect(spot.rect)) {
+                    Some(Picked::Grip(spot.id.clone()))
+                } else if contains(spot.bar) {
+                    Some(Picked::Bar(spot.id.clone()))
+                } else {
+                    None
+                }
+            }
+        })
+    }
+
+    /// A float over the root divider takes every press inside it: on the divider's pixels its host
+    /// does, on its bar the bar, on its grip the grip; outside it the divider is still the handle's.
+    #[test]
+    fn a_press_inside_a_float_reaches_its_host_not_the_split_below() {
+        let terminal = ModuleId::terminal();
+        let layout = with_a_float(
+            FloatRect {
+                cx: 0.6,
+                cy: 0.5,
+                w: 400,
+                h: 300,
+            },
+            &terminal,
+        );
+        let arrangement = arrange(&layout, &Frame::new(UNALLOCATED, 1));
+        let spot = arrangement.float_spot(&terminal).unwrap().clone();
+        let divider = arrangement.dividers[0].clone();
+        assert_eq!(divider.axis, Axis::Row, "the premise: the editor | agent split");
+        assert!(
+            spot.host.x < divider.rect.x && divider.rect.x < spot.host.x + spot.host.w,
+            "the premise: the float's host covers the divider ({spot:?}, {divider:?})"
+        );
+
+        let ids = [ModuleId::editor(), ModuleId::agent(), terminal.clone()];
+        let mut children: Vec<Slot> = stack_as_add_builds(&ids)
+            .into_iter()
+            .map(|c| match c {
+                Child::Host(id) => Slot::Host(id),
+                Child::Handle(n) => Slot::Handle(n),
+            })
+            .collect();
+        let floats = [terminal.clone()];
+        let chrome = chrome_owners(&[], &floats);
+        children.push(Slot::Chrome(0));
+        let children = apply_moves(&children, &restack_moves(&children, &floats, &chrome));
+
+        let r = divider.rect;
+        let middle = spot.host.y + spot.host.h / 2;
+        for x in [r.x, r.x + r.w] {
+            assert_eq!(
+                pick_slot(&children, &arrangement, &chrome, x, middle),
+                Some(Picked::Host(terminal.clone())),
+                "a press at ({x}, {middle}) on the divider under the float"
+            );
+        }
+        let above = spot.rect.y - 10;
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, r.x, above),
+            Some(Picked::Handle(0)),
+            "the divider outside the float is the handle's"
+        );
+        let bar = (spot.bar.x + spot.bar.w / 2, spot.bar.y + spot.bar.h / 2);
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, bar.0, bar.1),
+            Some(Picked::Bar(terminal.clone()))
+        );
+        let grip = grip_rect(spot.rect);
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, grip.x + 6, grip.y + 6),
+            Some(Picked::Grip(terminal.clone()))
+        );
+
+        // Negative control: the same float left in the host band, where it was tiled, loses the
+        // divider's pixels to the handle above it.
+        let unstacked = stack_as_add_builds(&ids)
+            .into_iter()
+            .map(|c| match c {
+                Child::Host(id) => Slot::Host(id),
+                Child::Handle(n) => Slot::Handle(n),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pick_slot(&unstacked, &arrangement, &chrome, r.x, middle),
+            Some(Picked::Handle(0))
         );
     }
 }

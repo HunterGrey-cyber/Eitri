@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Box } from "./lineindex";
-import { createThrottle, leader, lineToY, OWN_TOKENS, OwnTokens, REVEAL_THROTTLE_MS, yToLine } from "./sync";
+import { createThrottle, leader, lineToY, OWN_TOKENS, OwnTokens, REVEAL_THROTTLE_MS, scrollTarget, yToLine } from "./sync";
 
 const el = document.createElement("div");
 const box = (line: number, end: number, top: number, height: number): Box => ({ line, end, top, height, el });
@@ -26,6 +26,12 @@ describe("editor to preview", () => {
     expect(lineToY(INDEX, 11, 150)).toBe(150);
     expect(lineToY([], 5, FAR)).toBe(0);
   });
+  it("spreads the lines above the first block over the space above it", () => {
+    const index = [box(102, 103, 2400, 1)];
+    expect(lineToY(index, 0, FAR)).toBe(0);
+    expect(lineToY(index, 51, FAR)).toBe(1200);
+    expect(Math.abs(yToLine(index, lineToY(index, 25, FAR)) - 25)).toBeLessThan(1);
+  });
   it("puts a line where one block ends and the next begins at the next block's top", () => {
     expect(lineToY([box(0, 3, 0, 60), box(3, 4, 80, 20)], 3, FAR)).toBe(80);
   });
@@ -46,6 +52,22 @@ describe("preview to editor", () => {
     }
     for (let y = 0; y <= 401; y += 7) {
       expect(Math.abs(lineToY(INDEX, yToLine(INDEX, y), FAR) - y), String(y)).toBeLessThan(1);
+    }
+  });
+});
+
+describe("the offset scrolled to", () => {
+  it("takes a y a rounding error from a whole pixel for that pixel, and keeps any other fraction", () => {
+    expect(scrollTarget(64413.99999999999)).toBe(64414);
+    expect(scrollTarget(64414.00000000001)).toBe(64414);
+    expect(scrollTarget(64413.557291666664)).toBe(64413.557291666664);
+    expect(scrollTarget(0.5)).toBe(0.5);
+    expect(scrollTarget(0)).toBe(0);
+  });
+  it("gives back a whole-pixel offset through yToLine and lineToY over a box at a fraction of a pixel", () => {
+    const index = [box(2498, 2499, 64370.671875, 44), box(2500, 2501, 64438.671875, 33.546875)];
+    for (let y = 64371; y < 64470; y++) {
+      expect(Math.trunc(scrollTarget(lineToY(index, yToLine(index, y), FAR))), String(y)).toBe(y);
     }
   });
 });

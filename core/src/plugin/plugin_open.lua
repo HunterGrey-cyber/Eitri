@@ -16,29 +16,62 @@ end
 if realpath(path) ~= path then
   error('plugin_open: the path no longer resolves to itself')
 end
+local tab = vim.api.nvim_get_current_tabpage()
+local owned, owner = pcall(vim.api.nvim_tabpage_get_var, tab, 'eitri_plugin_diff')
+if opts.owner and owned and owner == opts.owner then
+  local ok, from = pcall(vim.api.nvim_tabpage_get_var, tab, 'eitri_plugin_diff_from')
+  if ok and type(from) == 'number' and vim.api.nvim_tabpage_is_valid(from) then
+    vim.api.nvim_set_current_tabpage(from)
+  end
+end
 -- Each buffer before the edit, by its name as well: an empty unnamed buffer is reused by :edit under the new name.
 local existing = {}
 for _, buf in ipairs(vim.api.nvim_list_bufs()) do
   existing[buf] = { loaded = vim.api.nvim_buf_is_loaded(buf), name = vim.api.nvim_buf_get_name(buf) }
 end
 
--- The byte offset of the first `chars` Unicode scalar values of `text`, stopping at its end.
-local function byte_col(text, chars)
-  local i, n = 1, 0
-  while n < chars and i <= #text do
-    local b = text:byte(i)
-    if b >= 0xF0 then
-      i = i + 4
-    elseif b >= 0xE0 then
-      i = i + 3
-    elseif b >= 0xC0 then
-      i = i + 2
-    else
-      i = i + 1
+-- The length in bytes of the character at byte `i` of `s`, counted as the page counts it: the page gets the text
+-- with each maximal ill-formed UTF-8 subsequence replaced by one U+FFFD, so such a subsequence is one character.
+local function char_len(s, i)
+  local b = s:byte(i)
+  local need, lo, hi
+  if b < 0x80 then
+    return 1
+  elseif b >= 0xC2 and b <= 0xDF then
+    need, lo, hi = 1, 0x80, 0xBF
+  elseif b == 0xE0 then
+    need, lo, hi = 2, 0xA0, 0xBF
+  elseif b == 0xED then
+    need, lo, hi = 2, 0x80, 0x9F
+  elseif b >= 0xE1 and b <= 0xEF then
+    need, lo, hi = 2, 0x80, 0xBF
+  elseif b == 0xF0 then
+    need, lo, hi = 3, 0x90, 0xBF
+  elseif b >= 0xF1 and b <= 0xF3 then
+    need, lo, hi = 3, 0x80, 0xBF
+  elseif b == 0xF4 then
+    need, lo, hi = 3, 0x80, 0x8F
+  else
+    return 1
+  end
+  for j = 1, need do
+    local c = s:byte(i + j)
+    if c == nil or c < lo or c > hi then
+      return j
     end
+    lo, hi = 0x80, 0xBF
+  end
+  return need + 1
+end
+
+-- The byte offset of the first `chars` characters of `s`, stopping at its end.
+local function byte_col(s, chars)
+  local i, n = 1, 0
+  while n < chars and i <= #s do
+    i = i + char_len(s, i)
     n = n + 1
   end
-  return math.min(i - 1, #text)
+  return math.min(i - 1, #s)
 end
 
 local how
@@ -83,6 +116,8 @@ if realpath(vim.api.nvim_buf_get_name(buf)) ~= path then
   end
   error('plugin_open: the opened file no longer resolves to the checked path')
 end
+-- An explicitly opened preload belongs to the user, even if it is hidden again later.
+vim.b[buf].eitri_plugin_preload = nil
 local count = vim.api.nvim_buf_line_count(buf)
 local line = tonumber(opts.line) or 1
 if line < 1 then

@@ -229,9 +229,10 @@ function askRuleText(rule: MatchedAskRule): string {
 /** What the call would do, for a person deciding whether to allow it.
  *
  * A file-changing tool gets a real diff (`EditDiff`, its own component so a conversation row can
- * fold it too); everything else gets its input as JSON, which for a `Bash`
- * or an `mcp__*` call is the honest rendering. The data for both has always been in the request --
- * `PreToolUse` carries the whole tool-input object -- so this is a rendering change and nothing
+ * fold it too); a `Bash` call its command as the shell will read it, its description and any other
+ * input fields; a Codex or ACP call its own view (`ExternalInput`); everything else its input as
+ * JSON, which for an `mcp__*` call is the honest rendering. The data for each has always been in the
+ * request -- `PreToolUse` carries the whole tool-input object -- so this is a rendering change and nothing
  * more: no new event, no wire field, no protocol work.
  */
 function ToolInput({ toolName, input, createsFile }: { toolName: string; input: unknown; createsFile?: boolean }) {

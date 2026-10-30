@@ -809,3 +809,125 @@ fn a_real_codex_turn_with_an_approval_pending_completes_after_adoption() {
     close(&destination, &thread);
     no_answer_twice(&stdin_lines(&logs));
 }
+
+// ---------------------------------------------------------------- the move as a window makes it
+
+/// What one window does with a chat's provider and the other window with what came: frozen through the face every
+/// provider moves by, its record carried as JSON and copies of its descriptors, taken up again by the kind the
+/// record names and committed, the source letting go once the other holds it.
+fn moved_by_its_kind(source: &CodexProvider) -> std::sync::Arc<dyn AgentProvider + Send + Sync> {
+    let mover = AgentProvider::mover(source).expect("a Codex chat moves");
+    let frozen = mover.freeze_for_chat_move().expect("the provider freezes");
+    let record: Value = serde_json::from_str(&frozen.record.to_string()).expect("the record reads back");
+    let copies = frozen.copies().expect("copies of the descriptors");
+    let kind = agent::chat_mover::MovedKind::from_wire(frozen.kind.wire()).expect("a kind this build moves");
+    let adopted = agent::chat_mover::adopt(kind, &record, copies).expect("the destination takes it up");
+    assert!(adopted.agent.pump().is_empty(), "nothing is reported before the commit");
+    adopted
+        .agent
+        .mover()
+        .expect("the adopted provider moves too")
+        .commit_chat_move()
+        .expect("the commit starts it");
+    mover.forget_chat_move();
+    // The source's own descriptors close: the destination holds its copies.
+    drop(frozen);
+    adopted.agent
+}
+
+#[test]
+fn a_codex_tab_moves_mid_turn_with_its_approval_under_the_same_card_number_and_no_reply_twice() {
+    let dir = scratch("approval-by-kind");
+    let (thread, turn) = ("th-k1", "tu-k1");
+    let source = running(
+        &dir,
+        thread,
+        turn,
+        vec![
+            item_started(thread, turn, command_item("exec-1", "inProgress")),
+            write(
+                json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": {
+                "kind": "command", "threadId": thread, "turnId": turn, "itemId": "exec-1",
+                "reason": "May I?", "command": "touch x", "cwd": "/work/proj"}}),
+            ),
+            expect_answer(json!(0), r#"{"decision":"accept"}"#),
+            item_completed(thread, turn, command_item("exec-1", "completed")),
+            turn_completed(thread, turn, "completed"),
+        ],
+    );
+    let before = pump_until(&source, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+    });
+    let card = before
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::PermissionRequested { permission_id, .. } => Some(permission_id.clone()),
+            _ => None,
+        })
+        .expect("a card");
+
+    let destination = moved_by_its_kind(&source);
+    assert!(source.pump().is_empty(), "the source folds nothing more");
+    destination
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: thread.to_string(),
+            permission_id: card.clone(),
+            decision: PermissionDecision::Allow,
+        })
+        .expect("the card waits in the destination under the number it had");
+    let end = Instant::now() + Duration::from_secs(20);
+    let mut after = Vec::new();
+    while completed(&after).is_none() {
+        assert!(Instant::now() < end, "timed out; the events so far: {after:#?}");
+        after.extend(destination.pump());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed(&after), Some(TurnOutcome::Completed));
+    assert!(after.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::Allowed } if *permission_id == card
+    )));
+    destination
+        .close_session(CloseSessionRequest {
+            session_id: thread.to_string(),
+        })
+        .expect("closes");
+    let lines = stdin_lines(&dir);
+    assert_eq!(
+        count_containing(&lines, r#"{"id":0,"result""#),
+        1,
+        "the approval is answered once: {lines:#?}"
+    );
+    no_answer_twice(&lines);
+}
+
+#[test]
+fn a_record_of_another_kind_or_with_the_wrong_descriptors_is_refused_whole() {
+    use agent::chat_mover::{adopt, MovedKind};
+    let pipe = || -> std::os::fd::OwnedFd { std::io::pipe().unwrap().0.into() };
+    let refused = |kind, record: Value, fds: Vec<std::os::fd::OwnedFd>| match adopt(kind, &record, fds) {
+        Ok(_) => panic!("{record} was taken up"),
+        Err(why) => why,
+    };
+    assert!(refused(MovedKind::Codex, json!({}), vec![pipe(), pipe()]).contains("3 descriptors"));
+    assert!(refused(
+        MovedKind::Codex,
+        json!({ "provider": 7, "link": null }),
+        vec![pipe(), pipe(), pipe()]
+    )
+    .contains("not readable"));
+    assert!(refused(MovedKind::Acp, json!("a string"), vec![pipe(), pipe(), pipe()]).contains("not readable"));
+    assert!(refused(
+        MovedKind::Claude,
+        json!({ "socket_path": 3 }),
+        vec![pipe(), pipe(), pipe()]
+    )
+    .contains("not readable"));
+    assert_eq!(
+        MovedKind::from_wire("gemini"),
+        None,
+        "a kind this build does not move names nothing"
+    );
+}

@@ -31,9 +31,8 @@ describe("renderMarkdown", () => {
     // sanitize-then-parse) sanitizes the harmless source string and hands its output straight to
     // marked with no sanitize afterwards, so the dangerous href survives untouched.
     //
-    // Confirmed by mutating `renderMarkdown` to that swapped order: this assertion fails
-    // (`href="javascript:alert(1)"` comes through) while the three tests above still pass -- this
-    // is the one test in this file that pins the ORDER, not just that sanitizing happens at all.
+    // Swapping the order lets the dangerous href through while the other tests above still pass:
+    // this is the one test in this file that pins the ORDER, not just that sanitizing happens.
     const html = renderMarkdown("[x](javascript:alert(1))");
     expect(html).not.toContain("javascript:");
   });
@@ -160,7 +159,7 @@ describe("renderMarkdown keeps model content inert", () => {
 });
 
 // The sanitizer must also preserve safe markup while refusing remote-loading
-// attributes (a legacy `background=` vector FORBID_ATTR missed), GFM checkboxes
+// attributes (including the `background=` load vector), GFM checkboxes
 // must survive, image alt text must not be double-escaped, a badge-style `[![img](url)](url)` keeps its
 // real link, and the class allowlist keeps highlight.js's own `class_`/`function_` modifiers.
 describe("renderMarkdown: further remote-loading attributes, with safe markup kept", () => {
@@ -279,8 +278,8 @@ describe("renderMarkdown: overlays, invokers and link destinations", () => {
   it("an image link resolves entities exactly as an ordinary link to the same destination does", () => {
     // CommonMark: entity references are decoded in link destinations, so `&amp;` in the source is
     // `&` in the URL. marked's own link renderer gets that by emitting the (encodeURI-cleaned)
-    // destination raw into the attribute; the image branches used to escape it a second time,
-    // renaming the query parameter `b` to `amp;b`.
+    // destination raw into the attribute; escaping it a second time in an image branch
+    // renames the query parameter `b` to `amp;b`.
     const destinations = [
       "https://x.example/?a=1&amp;b=2",
       "https://x.example/?a=1&b=2",

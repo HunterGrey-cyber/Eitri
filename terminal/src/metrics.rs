@@ -1,20 +1,11 @@
-//! Moved from the frozen `terminal-pane/src/metrics.rs` (2026-09-23),
-//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120`, and for
-//! one change: a private-use codepoint falls back through the terminal's own family
-//! ([`TerminalMetrics::font_for`], GUI pass 2026-09-23, defect 4). Where it says "Verdandi" or "the
-//! handoff", the contract now lives in this workspace's `terminal-render/`.
-//!
 //! The single cell lattice every op is placed on.
 //!
-//! Verdandi emits cells and has no opinion on fonts, cell size, baseline or DPI — the handoff says
-//! so explicitly and carries none of them. That makes the grid-to-pixel transform entirely this
-//! side's responsibility, and it makes having exactly ONE of it the whole ballgame: backgrounds,
-//! glyphs, the cursor and the overlay notice must land on the same lattice or a cursor sits half a
-//! pixel off its character and an underline misses the glyph it belongs to.
+//! terminal-render emits cells without fonts, cell size, baseline or DPI. One grid-to-pixel transform
+//! must place backgrounds, glyphs, cursor and overlay on the same lattice, or a cursor sits half a
+//! pixel off its character and an underline misses its glyph.
 //!
-//! The same object also decides the PTY size. That is deliberate rather than convenient: if text
-//! layout and PTY geometry each computed a cell size, the terminal would be told it has a number of
-//! columns that does not match the number being drawn, and every wrap would land in the wrong place.
+//! The same metrics decide the PTY size: computing layout and PTY geometry separately would tell
+//! the terminal a column count different from the one drawn, breaking every wrap.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -25,7 +16,7 @@ use skia_safe::{Font, FontMgr, FontStyle, TextBlob};
 ///
 /// All pixel values are DEVICE pixels. There is no canvas transform anywhere in this crate: the
 /// font is sized in device pixels up front, exactly as the editor pane does it
-/// (`CachingShaper::new` multiplies the point size by the scale factor rather than scaling the
+/// (`CachingShaper::new` multiplies the logical pixel size by the scale factor rather than scaling the
 /// canvas). Mixing the two conventions in one window is how text ends up crisp in one pane and
 /// blurred in the other.
 #[derive(Clone)]
@@ -36,8 +27,9 @@ pub struct TerminalMetrics {
     /// terminal draws thousands of glyphs a frame.
     font_mgr: FontMgr,
     family: String,
-    /// Point size BEFORE the scale factor. Kept so a rescale can rebuild from the same intent.
-    size_pt: f32,
+    families: Vec<String>,
+    /// Logical pixel size BEFORE the scale factor, so a rescale can rebuild from the same intent.
+    size_px: f32,
     scale: f32,
     cell_width: f32,
     cell_height: f32,
@@ -47,11 +39,9 @@ pub struct TerminalMetrics {
     /// Faces for graphemes the primary face has no glyph for, memoised by `(character, bold,
     /// italic)`.
     ///
-    /// This is not a micro-optimisation. `FontMgr::match_family_style_character` is a fontconfig
-    /// query, and the first measured full-frame benchmark spent **~600ms of a ~610ms frame** in it:
-    /// a screen of CJK asks the system font database once per glyph per frame. It was a real defect
-    /// found by measuring, and worth recording because damage tracking -- the optimisation this
-    /// crate was going to reach for -- would not have fixed it.
+    /// `FontMgr::match_family_style_character` queries fontconfig. Cache it so CJK output does
+    /// not query the system font database once per glyph per frame; damage tracking alone cannot
+    /// remove that cost from a full frame.
     ///
     /// `RefCell` rather than `&mut self` so that rendering stays a `&TerminalMetrics` operation; a
     /// cache is not a semantic change and should not propagate mutability through the paint path.
@@ -72,7 +62,7 @@ const BLOB_CACHE_CAP: usize = 4096;
 /// the whole cell model assumes every ASCII advance is identical, and a proportional face silently
 /// breaks that while still rendering something that looks like text.
 const DEFAULT_FAMILY: &str = "monospace";
-const DEFAULT_SIZE_PT: f32 = 13.0;
+const DEFAULT_SIZE_PX: f32 = 13.0;
 
 impl TerminalMetrics {
     /// Builds metrics for a pane of `width_px` x `height_px` DEVICE pixels.
@@ -82,20 +72,36 @@ impl TerminalMetrics {
     /// fine to feed in, because the same value is used on both sides of every conversion, so the
     /// lattice stays self-consistent even when it disagrees with the compositor's true fraction.
     pub fn new(width_px: f32, height_px: f32, scale: f32) -> Self {
-        Self::with_font(DEFAULT_FAMILY, DEFAULT_SIZE_PT, width_px, height_px, scale)
+        Self::with_font(DEFAULT_FAMILY, DEFAULT_SIZE_PX, width_px, height_px, scale)
     }
 
-    pub fn with_font(family: &str, size_pt: f32, width_px: f32, height_px: f32, scale: f32) -> Self {
+    pub fn with_font(family: &str, size_px: f32, width_px: f32, height_px: f32, scale: f32) -> Self {
+        Self::with_families(&[family.to_owned()], size_px, width_px, height_px, scale)
+    }
+
+    /// Tries families in preference order, retaining the list so a device-scale change can rebuild
+    /// the same face. Glyph fallback uses the family that matched, including its system aliases.
+    pub fn with_families(families: &[String], size_px: f32, width_px: f32, height_px: f32, scale: f32) -> Self {
         let font_mgr = FontMgr::new();
-        // A named family, then the generic monospace alias, then whatever the system will give us.
+        // Named families, then the generic monospace alias, then whatever the system will give us.
         // The last step matters: a machine with no fontconfig monospace alias would otherwise panic
         // during window construction, which is a very confusing way to learn about a font problem.
-        let typeface = font_mgr
-            .match_family_style(family, FontStyle::normal())
-            .or_else(|| font_mgr.match_family_style(DEFAULT_FAMILY, FontStyle::normal()))
-            .or_else(|| font_mgr.legacy_make_typeface(None, FontStyle::normal()))
+        let (family, typeface) = families
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(DEFAULT_FAMILY))
+            .find_map(|family| {
+                font_mgr
+                    .match_family_style(family, FontStyle::normal())
+                    .map(|typeface| (family.to_owned(), typeface))
+            })
+            .or_else(|| {
+                font_mgr
+                    .legacy_make_typeface(None, FontStyle::normal())
+                    .map(|typeface| (typeface.family_name(), typeface))
+            })
             .expect("no usable font: the system font manager offered nothing at all");
-        let font = Font::from_typeface(typeface, size_pt * scale);
+        let font = Font::from_typeface(typeface, size_px * scale);
 
         // The advance of a representative ASCII glyph IS the cell width for a monospace face. `M` is
         // the conventional probe; on a monospace font every ASCII advance agrees, and `advance_ascii`
@@ -111,12 +117,12 @@ impl TerminalMetrics {
         let cell_width = if cell_width > 0.0 {
             cell_width
         } else {
-            size_pt * scale * 0.6
+            size_px * scale * 0.6
         };
         let cell_height = if cell_height > 0.0 {
             cell_height
         } else {
-            (size_pt * scale * 1.2).ceil()
+            (size_px * scale * 1.2).ceil()
         };
 
         let (cols, rows) = Self::grid_for(width_px, height_px, cell_width, cell_height);
@@ -125,8 +131,9 @@ impl TerminalMetrics {
             blobs: RefCell::default(),
             font,
             font_mgr,
-            family: family.to_string(),
-            size_pt,
+            family,
+            families: families.to_vec(),
+            size_px,
             scale,
             cell_width,
             cell_height,
@@ -148,8 +155,8 @@ impl TerminalMetrics {
         (cols.min(u16::MAX as f32) as u16, rows.min(u16::MAX as f32) as u16)
     }
 
-    /// Recomputes the grid for a new pane size, keeping the same font. Returns whether the cell
-    /// dimensions changed, which is the only thing a PTY needs to be told about.
+    /// Recomputes the grid for a new pane size, keeping the same font. Returns whether the grid's
+    /// columns or rows changed, which is the only thing a PTY needs to be told about.
     pub fn resize(&mut self, width_px: f32, height_px: f32) -> bool {
         let (cols, rows) = Self::grid_for(width_px, height_px, self.cell_width, self.cell_height);
         let changed = (cols, rows) != (self.cols, self.rows);
@@ -158,9 +165,9 @@ impl TerminalMetrics {
         changed
     }
 
-    /// Rebuilds for a new device scale, preserving the requested point size and pane size.
+    /// Rebuilds for a new device scale, preserving the requested families, logical size and pane size.
     pub fn rescale(&self, width_px: f32, height_px: f32, scale: f32) -> Self {
-        Self::with_font(&self.family, self.size_pt, width_px, height_px, scale)
+        Self::with_families(&self.families, self.size_px, width_px, height_px, scale)
     }
 
     pub fn font(&self) -> &Font {
@@ -275,6 +282,12 @@ impl TerminalMetrics {
     pub fn baseline(&self) -> f32 {
         self.baseline
     }
+    pub fn size(&self) -> f32 {
+        self.size_px
+    }
+    pub fn families(&self) -> &[String] {
+        &self.families
+    }
     pub fn scale(&self) -> f32 {
         self.scale
     }
@@ -287,9 +300,8 @@ impl TerminalMetrics {
 
     /// THE conversion. `col`/`row` are window cells, exactly as every op carries them.
     ///
-    /// Deliberately the only place cells become pixels in this crate. The handoff's rule -- "use one
-    /// metrics object for backgrounds, glyphs, cursor and overlay or they will land on different
-    /// lattices" -- is enforceable only if there is one function to point at.
+    /// Keep one cell-to-pixel transform for backgrounds, glyphs, cursor and overlay so they
+    /// cannot land on different lattices.
     pub fn cell_rect(&self, row: u16, col: u16, cols: u16) -> skia_safe::Rect {
         let x = col as f32 * self.cell_width;
         let y = row as f32 * self.cell_height;
@@ -309,8 +321,8 @@ impl TerminalMetrics {
 ///
 /// A private-use codepoint means only what the font that defines it says: U+F43A is a clock in a
 /// Nerd Font and something else in DejaVu Sans, which also maps it. Asked with no family, fontconfig
-/// answers from the `sans-serif` alias -- DejaVu Sans, on the machine where lualine's clock came out
-/// as another pictogram (seen in a GUI pass, 2026-09-23). Asked in the terminal's own family, it
+/// answers from the `sans-serif` alias, which can turn a Nerd Font clock into another pictogram.
+/// Asked in the terminal's own family, it
 /// answers from that family's alias list, which is where a user puts the Nerd Font whose icons their
 /// tools print -- the fallback chain foot takes too (fcft sorts from the primary font's pattern).
 ///
@@ -338,7 +350,8 @@ impl std::fmt::Debug for TerminalMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalMetrics")
             .field("family", &self.family)
-            .field("size_pt", &self.size_pt)
+            .field("families", &self.families)
+            .field("size_px", &self.size_px)
             .field("scale", &self.scale)
             .field("cell", &(self.cell_width, self.cell_height))
             .field("baseline", &self.baseline)
@@ -350,6 +363,38 @@ impl std::fmt::Debug for TerminalMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_families_fall_through_to_the_next_match_then_monospace() {
+        let expected = TerminalMetrics::with_font("monospace", 16.0, 800.0, 600.0, 1.0);
+        for families in [
+            vec!["NoSuchFamily-Eitri-Test".to_owned(), "monospace".to_owned()],
+            vec![
+                "NoSuchFamily-Eitri-Test".to_owned(),
+                "NoSuchFamily-Eitri-Test-2".to_owned(),
+            ],
+            vec![],
+        ] {
+            let metrics = TerminalMetrics::with_families(&families, 16.0, 800.0, 600.0, 1.0);
+            assert_eq!(metrics.cell_width(), expected.cell_width());
+            assert_eq!(metrics.cell_height(), expected.cell_height());
+            assert_eq!(metrics.families(), families);
+            assert_eq!(fallback_family('\u{f43a}', &metrics.family), "monospace");
+        }
+    }
+
+    #[test]
+    fn rescale_keeps_the_requested_families_and_logical_pixel_size() {
+        let families = vec!["NoSuchFamily-Eitri-Test".to_owned(), "monospace".to_owned()];
+        let metrics = TerminalMetrics::with_families(&families, 16.0, 800.0, 600.0, 1.0);
+        let scaled = metrics.rescale(800.0, 600.0, 2.0);
+        let expected = TerminalMetrics::with_font("monospace", 16.0, 800.0, 600.0, 2.0);
+        assert_eq!(scaled.families(), families);
+        assert_eq!(scaled.size(), 16.0);
+        assert_eq!(scaled.font().size(), 32.0);
+        assert_eq!(scaled.cell_width(), expected.cell_width());
+        assert_eq!(scaled.cell_height(), expected.cell_height());
+    }
 
     /// A grapheme's blob is built once per style and reused: the same blob, not a new one with the
     /// same glyphs, so Skia sees one identity across frames. Another style is another blob, and the
@@ -461,8 +506,7 @@ mod tests {
     ///
     /// This depends on the fonts installed, and says so: on a machine where the two lookups agree
     /// for every codepoint below, nothing here can tell the fix from its absence, and the test
-    /// prints that instead of passing silently. On the machine the defect was found on they
-    /// disagree for U+F43A (DejaVu Sans against Maple Mono NF CN), and this was checked red there.
+    /// prints that instead of passing silently.
     #[test]
     fn a_private_use_glyph_falls_back_through_the_terminals_own_family() {
         let metrics = TerminalMetrics::new(800.0, 600.0, 1.0);

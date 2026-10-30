@@ -137,6 +137,11 @@ window {{
     background-color: {bg};
 }}
 
+window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-area {{
+    background-color: transparent;
+    background-image: none;
+}}
+
 {grid}.content-area > separator {{
     background-color: transparent;
     background-image: none;
@@ -295,9 +300,8 @@ window {{
     font-size: 12px;
 }}
 
-/* The window-close y/n and `prefix x`'s kill y/n (2026-09-26):
-   `.module-toast`'s own colours, `shell::close_prompt`'s own widget. Sized to sit inside
-   the top bar's own strip, where the prefix strip just drew (`eitri_core::wm::close::prompt_origin`). */
+/* The window-close y/n and `prefix x`'s kill y/n: `.module-toast`'s own colours, `shell::close_prompt`'s own
+   widget. Sized to sit inside the top bar's own strip, where the prefix strip just drew (`eitri_core::wm::close::prompt_origin`). */
 .close-prompt {{
     background-color: {chrome};
     color: {chrome_fg};
@@ -345,7 +349,7 @@ pub(crate) struct ThemeCss {
 }
 
 impl ThemeCss {
-    pub(crate) fn install(tokens: &ThemeTokens) -> Self {
+    pub(crate) fn install(tokens: &ThemeTokens, prefer_dark: Option<bool>) -> Self {
         let provider = CssProvider::new();
         provider.load_from_string(&gtk_css(tokens));
         let display = gtk4::gdk::Display::default().expect("no default GDK display");
@@ -360,6 +364,9 @@ impl ThemeCss {
         // is not "GTK providing windowing only" — it's a second, uncontrolled theme leaking through
         // the one this crate exists to paint. A GUI pass checks this against a real `gtk.css`.
         gtk4::style_context_add_provider_for_display(&display, &provider, gtk4::STYLE_PROVIDER_PRIORITY_USER);
+        if let Some(dark) = prefer_dark {
+            apply_prefer_dark(dark);
+        }
         ThemeCss { provider }
     }
 

@@ -305,7 +305,7 @@ fn a_chat_on_an_undrawn_tab_has_no_chip_while_its_title_is_on_a_strip() {
 fn a_hidden_chats_card_marks_its_chip() {
     let r = driven(three(editor()));
     hide(&mut r.layout.borrow_mut(), &agent(), &Frame::new(GRID, 1)).unwrap();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let chip = |r: &Rig| r.chrome().tray.into_iter().find(|chip| chip.module == agent()).unwrap();
     assert!(chip(&r).shown && !chip(&r).attention, "{:?}", chip(&r));
     assert_eq!(chip(&r).label, "agent");
@@ -394,7 +394,7 @@ fn a_field_whose_inputs_did_not_change_is_not_derived() {
     assert_eq!(after.top_bar, before.top_bar);
     assert_eq!(after, before, "nothing at all was derived again");
     assert_eq!(chrome_ops(&r.ops_since(mark)), 0);
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     assert!(
         r.derivations().top_bar > before.top_bar,
         "a change of the layout is derived again"
@@ -404,6 +404,9 @@ fn a_field_whose_inputs_did_not_change_is_not_derived() {
 #[test]
 fn pointer_motion_during_a_drag_derives_no_label() {
     let r = driven(three(editor()));
+    Allocator::allocate(&*r.driver, WIN, GRID);
+    r.host.press_on(WIN, PointerTarget::Divider(0));
+    let start = r.layout.borrow().clone();
     let before = r.derivations();
     let mark = r.mark();
     for i in 0..100 {
@@ -416,8 +419,94 @@ fn pointer_motion_during_a_drag_derives_no_label() {
             },
         });
     }
+    assert_ne!(*r.layout.borrow(), start, "the motions moved the divider");
     assert_eq!(r.derivations(), before);
     assert_eq!(chrome_ops(&r.ops_since(mark)), 0);
+}
+
+/// A float over the chat makes the chat the covered module: its place reads `Covered`, it gets the
+/// chip, and the float on screen gets none. The floats the grid names are not what is covered.
+#[test]
+fn a_float_over_the_chat_covers_the_chat_not_itself() {
+    use crate::attention::AgentPlace;
+    use crate::layout::{arrange, covering, tray_covered, view_place, Axis, FloatRect, Frame, Layout, Node, Size};
+    let size = Size { w: 1280, h: 721 };
+    let t2 = ModuleId::parse("terminal#2").unwrap();
+    let chat = ModuleId::agent();
+    let mut layout = Layout::new(
+        Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Leaf(chat.clone())),
+        ModuleId::editor(),
+    )
+    .unwrap();
+    layout.add_float(&t2, FloatRect::centred(size, 0.9), false).unwrap();
+    let frame = Frame::new(size, 1);
+    let floats = covering(&arrange(&layout, &frame), &chat);
+    assert_eq!(floats, vec![t2.clone()], "the float is over the chat");
+    let covered: Vec<_> = covered_views(&layout, &arrange(&layout, &frame))
+        .into_iter()
+        .map(ViewId::module)
+        .collect();
+    assert_eq!(covered, vec![chat.clone()]);
+    assert_eq!(view_place(&layout, &chat, &covered), AgentPlace::Covered);
+    let chips = tray_covered(&layout, &covered);
+    assert!(chips.contains(&chat), "{chips:?}");
+    assert!(!chips.contains(&t2), "{chips:?}");
+    let clear = Layout::new(
+        Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Leaf(chat.clone())),
+        ModuleId::editor(),
+    )
+    .unwrap();
+    assert_eq!(
+        covered_views(&clear, &arrange(&clear, &frame)),
+        Vec::<ViewId>::new(),
+        "nothing over it: nothing covered"
+    );
+}
+
+/// Each chat view is judged by the floats over its own module: a float over `agent#2` covers view 2
+/// and leaves the base view, beside it, clear -- so an answer from the base page is taken while one
+/// from view 2's page is refused.
+#[test]
+fn a_covered_view_is_judged_by_its_own_floats() {
+    use crate::attention::AgentPlace;
+    use crate::layout::{arrange, covering, view_place, Axis, FloatRect, Frame, Layout, Node, Rect, Size};
+    let size = Size { w: 1280, h: 721 };
+    let frame = Frame::new(size, 1);
+    let two = ModuleId::parse("agent#2").unwrap();
+    let t2 = ModuleId::parse("terminal#2").unwrap();
+    let mut layout = Layout::new(
+        Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::agent()), Node::Leaf(two.clone())),
+        ModuleId::agent(),
+    )
+    .unwrap();
+    let rect_of_two = arrange(&layout, &frame).rect_of(&two).expect("view 2 is tiled");
+    // A small float well inside view 2, clear of the base view on its left.
+    let over_two = Rect {
+        x: rect_of_two.x + rect_of_two.w / 4,
+        y: rect_of_two.y + rect_of_two.h / 4,
+        w: rect_of_two.w / 2,
+        h: rect_of_two.h / 2,
+    };
+    layout
+        .add_float(&t2, FloatRect::of_rect(over_two, size), false)
+        .unwrap();
+    let now = |id: &ModuleId| covering(&arrange(&layout, &frame), id);
+    let view2 = ViewId::of_module(&two).unwrap();
+    assert_eq!(now(&view2.module()), vec![t2.clone()], "covered for view 2");
+    assert_eq!(
+        now(&ViewId::BASE.module()),
+        Vec::<ModuleId>::new(),
+        "the base view is clear"
+    );
+    let covered: Vec<_> = covered_views(&layout, &arrange(&layout, &frame))
+        .into_iter()
+        .map(ViewId::module)
+        .collect();
+    assert_eq!(covered, vec![two.clone()], "only view 2 is covered");
+    assert_eq!(view_place(&layout, &two, &covered), AgentPlace::Covered);
+    assert_eq!(view_place(&layout, &ModuleId::agent(), &covered), AgentPlace::OnScreen);
+    let three = ViewId::new(3).unwrap();
+    assert_eq!(now(&three.module()), Vec::<ModuleId>::new(), "a view not in the layout");
 }
 
 /// The ops the coverage judgement left: the coverage the panel was told, and the pages it was told were seen.
@@ -515,36 +604,6 @@ fn a_refusal_flashes_and_toasts_through_the_model() {
     assert_eq!(after.toast.map(|toast| toast.text), Some(text.to_string()));
 }
 
-/// An arm still in the shell refuses through the same model: its words on the toast and the app name's flash,
-/// or the flash alone for none.
-#[test]
-fn a_shell_arms_refusal_flashes_and_toasts_through_the_model() {
-    let mut r = rig(Layout::new(leaf(editor()), editor()).unwrap());
-    let before = r.controller.chrome(WIN);
-    let batch = r.controller.handle(HostEvent::ShellRefused {
-        win: WIN,
-        text: "the scratchpad is empty".into(),
-    });
-    let ops: Vec<HostOp> = batch.ops().cloned().collect();
-    assert!(matches!(ops.as_slice(), [HostOp::Chrome { win: WIN, .. }]), "{ops:#?}");
-    let after = r.controller.chrome(WIN);
-    assert_eq!(after.top_bar.flash, before.top_bar.flash + 1);
-    let toast = after.toast.expect("the refusal's words are up");
-    assert_eq!(toast.text, "the scratchpad is empty");
-    let batch = r.controller.handle(HostEvent::ShellRefused {
-        win: WIN,
-        text: String::new(),
-    });
-    assert!(batch.ops().all(|op| matches!(op, HostOp::Chrome { .. })));
-    let flashed = r.controller.chrome(WIN);
-    assert_eq!(flashed.top_bar.flash, after.top_bar.flash + 1, "a bare refusal flashes");
-    assert_eq!(
-        flashed.toast.map(|t| t.serial),
-        Some(toast.serial),
-        "and says nothing new"
-    );
-}
-
 #[test]
 fn a_container_verb_with_no_container_flashes_without_a_toast() {
     let mut r = rig(Layout::new(leaf(editor()), editor()).unwrap());
@@ -559,7 +618,6 @@ fn a_container_verb_with_no_container_flashes_without_a_toast() {
 fn window_immersive_toggles_the_mode_and_conceals_the_bar() {
     let mut r = rig(three(editor()));
     let batch = r.run(Action::WindowImmersive);
-    assert_eq!(batch.shell_verb(), None, "decided here");
     let ops: Vec<HostOp> = batch.ops().cloned().collect();
     assert_eq!(
         ops[0],
@@ -598,29 +656,47 @@ fn window_immersive_toggles_the_mode_and_conceals_the_bar() {
     assert_eq!(r.controller.chrome(WIN).modes.mode, modes::WindowMode::Windowed);
 }
 
+/// A host that does not carry the window's mode out refuses it as any op it cannot carry out: the mode the model
+/// toggled stays, and nothing is asked of the host in its place.
 #[test]
-fn a_host_that_refuses_the_mode_gets_the_shells_arm() {
-    let mut r = rig(three(editor()));
-    r.run(Action::WindowImmersive);
-    let batch = r.controller.handle(HostEvent::Refused {
-        what: OpTag::SetMode,
-        why: "not carried out by this shell yet".into(),
-        surface: None,
-    });
-    assert_eq!(
-        batch.shell_verb(),
-        Some(&ShellVerb {
-            win: WIN,
-            call: ShellCall::Action(Action::WindowImmersive),
-            keycode: 0,
-        })
+fn a_refused_set_mode_hands_nothing_back() {
+    let r = driven(three(editor()));
+    r.host.refuse_op(|op| matches!(op, HostOp::SetMode { .. }));
+    let mark = r.mark();
+    r.driver.run(WIN, Action::WindowImmersive, Origin::Lua);
+    let log = r.host.log()[mark..].to_vec();
+    assert!(
+        log.iter().any(|entry| matches!(
+            entry,
+            Logged::Event(HostEvent::Refused {
+                what: OpTag::SetMode,
+                ..
+            })
+        )),
+        "the host refused the mode: {log:#?}"
     );
-    let again = r.controller.handle(HostEvent::Refused {
-        what: OpTag::SetMode,
-        why: "not carried out by this shell yet".into(),
-        surface: None,
-    });
-    assert_eq!(again.shell_verb(), None, "one toggle, one arm");
+    let ops: Vec<_> = log
+        .iter()
+        .filter_map(|entry| match entry {
+            Logged::Op(op, applied) => Some((op, *applied)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            ops.as_slice(),
+            [
+                (HostOp::SetMode { .. }, Applied::Refused),
+                (HostOp::Chrome { .. }, Applied::Done)
+            ]
+        ),
+        "the toggle's own batch and nothing for its refusal: {log:#?}"
+    );
+    assert_eq!(
+        r.chrome().modes.mode,
+        modes::WindowMode::Immersive { from_fullscreen: false },
+        "the model keeps the mode it toggled"
+    );
 }
 
 #[test]
@@ -657,7 +733,7 @@ fn the_top_bar_reads_the_selection_the_mark_and_the_workspace() {
         .selection
         .is_some_and(|text| text.starts_with("selected: ")));
     r.workspaces.borrow_mut().create("study", three(editor())).unwrap();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     assert_eq!(r.chrome().top_bar.workspace.as_deref(), Some("main"));
 }
 
@@ -669,7 +745,7 @@ fn a_float_on_screen_has_its_bar_named() {
         .borrow_mut()
         .add_float(&float, FloatRect::centred(GRID, 0.5), false)
         .unwrap();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     assert_eq!(
         r.chrome().float_bars,
         vec![FloatLabel {
@@ -712,7 +788,7 @@ fn a_float_leaving_a_chat_tells_the_panel_once_the_queue_drains() {
         .add_float(&float, FloatRect::centred(GRID, 0.6), false)
         .unwrap();
     let mark = r.mark();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let ops = r.ops_since(mark);
     let (told, _) = judged(&ops);
     assert_eq!(
@@ -724,7 +800,7 @@ fn a_float_leaving_a_chat_tells_the_panel_once_the_queue_drains() {
 
     *r.layout.borrow_mut() = pair(editor(), agent(), editor());
     let mark = r.mark();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let ops = r.ops_since(mark);
     let (told, seen) = judged(&ops);
     assert_eq!(
@@ -740,7 +816,7 @@ fn a_float_leaving_a_chat_tells_the_panel_once_the_queue_drains() {
     assert!(seen.is_empty(), "no page came on screen by a map");
 
     let mark = r.mark();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let ops = r.ops_since(mark);
     assert_eq!(
         judged(&ops),
@@ -763,7 +839,7 @@ fn a_resize_that_moves_a_float_onto_a_chat_puts_its_chip_up() {
         h: 400,
     };
     r.layout.borrow_mut().add_float(&float, rect, false).unwrap();
-    r.host.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let allocator: &dyn Allocator = &*r.driver;
     allocator.allocate(WIN, GRID);
     r.scheduler.advance(Duration::ZERO);
@@ -807,4 +883,28 @@ fn a_resize_with_no_float_up_derives_nothing() {
         "no idle for a resize nothing floats over"
     );
     assert_eq!(r.derivations(), before);
+}
+
+#[test]
+fn the_top_bar_text_shows_the_other_windows_marks() {
+    let r = driven(three(editor()));
+    let peer = PeerId(2);
+    r.driver.attach_peer(WIN, peer, crate::wm::fake::FakePeerPort::new());
+    assert_eq!(r.driver.query(|c| c.chrome(WIN)).top_bar.other, None);
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer,
+        summary: crate::window_link::Summary {
+            waiting: 1,
+            unseen: 2,
+            running: 3,
+            queued: 4,
+            workspaces: vec![],
+        },
+    }));
+    assert_eq!(
+        r.driver.query(|c| c.chrome(WIN)).top_bar.other.as_deref(),
+        Some("2: ⚑1 •2 ●3 +4")
+    );
+    r.driver.detach_peer(WIN);
+    assert_eq!(r.driver.query(|c| c.chrome(WIN)).top_bar.other, None);
 }

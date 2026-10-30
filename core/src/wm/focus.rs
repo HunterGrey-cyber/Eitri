@@ -249,6 +249,30 @@ pub fn move_focus(
             true
         }
         Nav::Nothing => {
+            use crate::window_link::edge::{edge_route, EdgeRoute, MonitorRect};
+            let rect = |connector: Option<&str>| {
+                connector.and_then(|id| {
+                    w.monitors.iter().find(|m| m.id.0 == id).map(|m| MonitorRect {
+                        x: m.rect.x,
+                        y: m.rect.y,
+                        w: m.rect.w,
+                        h: m.rect.h,
+                    })
+                })
+            };
+            let mine = rect(w.monitor.as_ref().map(|id| id.0.as_str()));
+            let other = rect(w.peer.as_ref().and_then(|p| p.monitor.as_deref()));
+            if edge_route(mine, other, direction.into()) == EdgeRoute::OtherWindow
+                && super::moves::raise_for(
+                    w,
+                    win,
+                    crate::window_link::FocusTarget::Edge { side: direction.into() },
+                    batch,
+                )
+            {
+                w.say(format!("[pane_switch] {from} {direction:?} -> the other window"));
+                return true;
+            }
             w.say(format!(
                 "[pane_switch] {from} {direction:?} -> no module that way, not moving"
             ));
@@ -462,6 +486,19 @@ fn cursor_signal(win: WinId, id: &ModuleId, has_keys: bool, modules: &[ModuleId]
     }
 }
 
+/// The `?` sheet opened in chat view `view`'s page from where `opened` says the keys were: kept as the window's way
+/// back unless the keys were in that view already. The opening's number, which the page quotes when the sheet
+/// closes, so a close of an earlier opening is told apart.
+pub fn keys_opened(w: &mut Window, view: ViewId, opened: crate::keymap::keys_return::Opened) -> u64 {
+    w.focus.keys_return.opened(opened, &view.module())
+}
+
+/// A request newer than an open `?` sheet (the command line, a workspace switch) took over: the sheet's way back is
+/// forgotten, so its close does not move the keys out from under the newer request.
+pub fn keys_superseded(w: &mut Window) {
+    w.focus.keys_return.superseded();
+}
+
 /// The `?` sheet of opening `opening` was closed (`forced` when something other than its own keys or a click
 /// outside it closed it). When the latest opening's sheet closed by its own keys and the keys are still in the
 /// chat, they go back to the module that held them: the chat hidden again if the opening showed it (the keys to
@@ -569,7 +606,7 @@ pub(super) fn grab_refused(w: &mut Window, module: &ModuleId) {
     }
 }
 
-fn put_zoom_back(w: &mut Window, win: WinId, zoom: &Zoom, keeps: &ModuleId, batch: &mut Batch) {
+pub(super) fn put_zoom_back(w: &mut Window, win: WinId, zoom: &Zoom, keeps: &ModuleId, batch: &mut Batch) {
     let restored = w
         .layout
         .clone()

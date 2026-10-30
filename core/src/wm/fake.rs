@@ -3,7 +3,8 @@
 use super::{host::*, window::*};
 use crate::keymap::action::Action;
 use crate::layout::{Direction, ModuleId, Size};
-use crate::tabs::ViewId;
+use crate::tabs::{TabId, ViewId};
+use crate::window_link::moves::MoveId;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::RawFd;
@@ -15,20 +16,37 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 type ApplyHook = Rc<dyn Fn(&FakeHost, usize, &HostOp)>;
-type ShellArm = Rc<dyn Fn(&FakeHost, WinId, &ShellCall, u32)>;
 type RefuseKind = Rc<dyn Fn(&SurfaceKind) -> bool>;
 type RefuseOp = Rc<dyn Fn(&HostOp) -> bool>;
+
+#[cfg(test)]
+pub(crate) fn lua(driver: &super::Driver, win: WinId, request: crate::lua::layout::LayoutRequest) {
+    driver.post(HostEvent::Lua(LuaEvent::LayoutRequests {
+        win,
+        requests: vec![request],
+    }));
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Logged {
     Op(HostOp, Applied),
-    ShellVerb(ShellVerb),
     Event(HostEvent),
+    /// A read whose moment matters, among the ops and events: `plugin_keys_help(<module>)`.
+    Read(String),
 }
 
 struct Surface {
     kind: SurfaceKind,
     mapped: bool,
+}
+
+/// A terminal pane's shell as the fake host runs it: which shell it is, the directory it is in and whether
+/// anything else runs in its session. What a read reports and what a restart in place checks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FakeShell {
+    pub shell: ShellStart,
+    pub cwd: Result<std::path::PathBuf, String>,
+    pub busy: bool,
 }
 
 pub struct FakeHost {
@@ -38,7 +56,6 @@ pub struct FakeHost {
     focus: RefCell<BTreeMap<WinId, FocusOwner>>,
     closed: RefCell<BTreeSet<WinId>>,
     log: RefCell<Vec<Logged>>,
-    shell_arm: RefCell<Option<ShellArm>>,
     apply_hook: RefCell<Option<ApplyHook>>,
     apply_index: Cell<usize>,
     refuse_kind: RefCell<Option<RefuseKind>>,
@@ -49,20 +66,44 @@ pub struct FakeHost {
     stacking: RefCell<BTreeMap<WinId, Vec<ModuleId>>>,
     /// How many allocations each window's grid was asked for.
     allocations: RefCell<BTreeMap<WinId, usize>>,
+    font_sizes: RefCell<BTreeMap<WinId, f32>>,
+    /// The terminals whose shells the fake runs: only these answer a job read or a restart in place by themselves.
+    shells: RefCell<BTreeMap<(WinId, ModuleId), FakeShell>>,
+    page_zooms: RefCell<BTreeMap<(WinId, ModuleId), f32>>,
+    terminal_zooms: RefCell<BTreeMap<WinId, f32>>,
 }
 
 /// What the fake answers as [`HostReads`]: [`NoReads`]' values until a test sets one.
 struct Reads {
     grid_size: Size,
     editor_cell: Option<(f64, f64)>,
-    editor_running: bool,
+    editor_facts: EditorFacts,
+    terminal_jobs: usize,
+    running_chats: Vec<(ModuleId, Option<TabId>)>,
+    terminal_job_modules: Vec<ModuleId>,
+    pages_with_tasks: Vec<ModuleId>,
+    base_tabs: Vec<TabId>,
+    active_base_tab: Option<TabId>,
+    tab_moves: BTreeMap<TabId, Result<ChatMoveFacts, String>>,
+    arrived_tabs: BTreeMap<MoveId, TabId>,
+    moved_tab_keys: BTreeMap<TabId, crate::window_link::base_tabs::MovedTabKey>,
     chat_claims: Vec<(ViewId, Direction)>,
     module_min: BTreeMap<ModuleId, Size>,
     attention: BTreeMap<ViewId, crate::attention::Attention>,
     oldest_card_view: Option<ViewId>,
     kill_counts: BTreeMap<ViewId, ChatKillCounts>,
+    chat_summary: ChatSummary,
     first_tab_refused: Option<String>,
     module_size: BTreeMap<ModuleId, Size>,
+    tab_steps: BTreeMap<i32, bool>,
+    tab_last: bool,
+    tab_places: BTreeMap<u16, crate::tab_set::TabPlace>,
+    page_built: BTreeSet<ModuleId>,
+    plugin_help: BTreeMap<ModuleId, crate::plugin::keys::PluginKeysHelp>,
+    chat_views: Vec<ViewId>,
+    break_out: Result<(), String>,
+    chat_moves: BTreeMap<ViewId, Result<ChatMoveFacts, String>>,
+    sessions: BTreeMap<String, ViewId>,
 }
 
 impl Default for Reads {
@@ -70,19 +111,85 @@ impl Default for Reads {
         Reads {
             grid_size: super::grid::UNALLOCATED,
             editor_cell: None,
-            editor_running: false,
+            editor_facts: EditorFacts::default(),
+            terminal_jobs: 0,
+            running_chats: Vec::new(),
+            terminal_job_modules: Vec::new(),
+            pages_with_tasks: Vec::new(),
+            base_tabs: Vec::new(),
+            active_base_tab: None,
+            tab_moves: BTreeMap::new(),
+            arrived_tabs: BTreeMap::new(),
+            moved_tab_keys: BTreeMap::new(),
             chat_claims: Vec::new(),
             module_min: BTreeMap::new(),
             attention: BTreeMap::new(),
             oldest_card_view: None,
             kill_counts: BTreeMap::new(),
+            chat_summary: ChatSummary::default(),
             first_tab_refused: None,
             module_size: BTreeMap::new(),
+            tab_steps: BTreeMap::new(),
+            tab_last: false,
+            tab_places: BTreeMap::new(),
+            page_built: BTreeSet::new(),
+            plugin_help: BTreeMap::new(),
+            chat_views: Vec::new(),
+            break_out: Err(NOT_CARRIED_OUT.into()),
+            chat_moves: BTreeMap::new(),
+            sessions: BTreeMap::new(),
         }
     }
 }
 
 impl FakeHost {
+    pub fn set_tab_can_step(&self, delta: i32, answer: bool) {
+        self.reads.borrow_mut().tab_steps.insert(delta, answer);
+    }
+    pub fn set_tab_has_last(&self, answer: bool) {
+        self.reads.borrow_mut().tab_last = answer;
+    }
+    pub fn set_tab_place(&self, n: u16, place: Option<crate::tab_set::TabPlace>) {
+        let mut reads = self.reads.borrow_mut();
+        if let Some(place) = place {
+            reads.tab_places.insert(n, place);
+        } else {
+            reads.tab_places.remove(&n);
+        }
+    }
+    /// The `?` sheet's section the plugin page `module` declares from now on; `None`, it declares none.
+    pub fn set_plugin_keys_help(&self, module: ModuleId, help: Option<crate::plugin::keys::PluginKeysHelp>) {
+        let mut reads = self.reads.borrow_mut();
+        match help {
+            Some(help) => reads.plugin_help.insert(module, help),
+            None => reads.plugin_help.remove(&module),
+        };
+    }
+    /// The chat views holding a tab from now on, as the panel would list them.
+    pub fn set_chat_views(&self, views: Vec<ViewId>) {
+        self.reads.borrow_mut().chat_views = views;
+    }
+    /// Whether the base view's tab can break out from now on, as the panel would answer.
+    pub fn set_can_break_out(&self, answer: Result<(), String>) {
+        self.reads.borrow_mut().break_out = answer;
+    }
+    /// Whether the plugin page `module` has been built from now on, as the window's plugin host would answer.
+    pub fn set_page_built(&self, module: ModuleId, built: bool) {
+        if built {
+            self.reads.borrow_mut().page_built.insert(module);
+        } else {
+            self.reads.borrow_mut().page_built.remove(&module);
+        }
+    }
+    /// What a move of view `view`'s tab would take from now on, as the panel would answer it.
+    pub fn set_chat_move(&self, view: ViewId, answer: Result<ChatMoveFacts, String>) {
+        self.reads.borrow_mut().chat_moves.insert(view, answer);
+    }
+    /// The view holding session `session` from now on.
+    pub fn set_view_of_session(&self, session: &str, view: ViewId) {
+        self.reads.borrow_mut().sessions.insert(session.to_owned(), view);
+    }
+
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             sink: RefCell::new(None),
@@ -91,7 +198,6 @@ impl FakeHost {
             focus: RefCell::new(BTreeMap::new()),
             closed: RefCell::new(BTreeSet::new()),
             log: RefCell::new(vec![]),
-            shell_arm: RefCell::new(None),
             apply_hook: RefCell::new(None),
             apply_index: Cell::new(0),
             refuse_kind: RefCell::new(None),
@@ -99,7 +205,20 @@ impl FakeHost {
             reads: RefCell::new(Reads::default()),
             stacking: RefCell::new(BTreeMap::new()),
             allocations: RefCell::new(BTreeMap::new()),
+            font_sizes: RefCell::new(BTreeMap::new()),
+            shells: RefCell::new(BTreeMap::new()),
+            page_zooms: RefCell::new(BTreeMap::new()),
+            terminal_zooms: RefCell::new(BTreeMap::new()),
         })
+    }
+    pub fn font_size(&self, win: WinId) -> Option<f32> {
+        self.font_sizes.borrow().get(&win).copied()
+    }
+    pub fn page_zoom(&self, win: WinId, module: &ModuleId) -> Option<f32> {
+        self.page_zooms.borrow().get(&(win, module.clone())).copied()
+    }
+    pub fn terminal_zoom(&self, win: WinId) -> Option<f32> {
+        self.terminal_zooms.borrow().get(&win).copied()
     }
     pub fn set_grid_size(&self, size: Size) {
         self.reads.borrow_mut().grid_size = size;
@@ -108,7 +227,30 @@ impl FakeHost {
         self.reads.borrow_mut().editor_cell = cell;
     }
     pub fn set_editor_running(&self, running: bool) {
-        self.reads.borrow_mut().editor_running = running;
+        let mut reads = self.reads.borrow_mut();
+        reads.editor_facts.running = running;
+    }
+    pub fn set_running_chats(&self, chats: Vec<(ModuleId, Option<TabId>)>) {
+        self.reads.borrow_mut().running_chats = chats;
+    }
+    pub fn set_terminal_job_modules(&self, modules: Vec<ModuleId>) {
+        self.reads.borrow_mut().terminal_job_modules = modules;
+    }
+    pub fn set_pages_with_tasks(&self, modules: Vec<ModuleId>) {
+        self.reads.borrow_mut().pages_with_tasks = modules;
+    }
+    pub fn set_base_tabs(&self, tabs: Vec<ChatMoveFacts>, active: Option<TabId>) {
+        let mut reads = self.reads.borrow_mut();
+        reads.base_tabs = tabs.iter().map(|t| t.tab).collect();
+        reads.active_base_tab = active;
+        reads.tab_moves = tabs.into_iter().map(|t| (t.tab, Ok(t))).collect();
+    }
+    pub fn set_terminal_jobs(&self, jobs: usize) {
+        self.reads.borrow_mut().terminal_jobs = jobs;
+    }
+    pub fn set_editor_facts(&self, facts: EditorFacts) {
+        let mut reads = self.reads.borrow_mut();
+        reads.editor_facts = facts;
     }
     pub fn set_chat_claims(&self, view: ViewId, direction: Direction, claims: bool) {
         let mut reads = self.reads.borrow_mut();
@@ -127,6 +269,11 @@ impl FakeHost {
     /// The chat view holding the oldest waiting card from now on, as the panel would report it.
     pub fn set_oldest_card_view(&self, view: Option<ViewId>) {
         self.reads.borrow_mut().oldest_card_view = view;
+    }
+    /// The window's chat counts from now on (waiting, unseen, running, queued), as the panel would sum them for the
+    /// summary the other window is sent.
+    pub fn set_chat_summary(&self, counts: ChatSummary) {
+        self.reads.borrow_mut().chat_summary = counts;
     }
     /// What killing chat view `view` would end from now on, as the panel would count it.
     pub fn set_chat_kill_counts(&self, view: ViewId, counts: ChatKillCounts) {
@@ -152,8 +299,20 @@ impl FakeHost {
     pub fn set_model(&self, on: bool) {
         self.model.set(on);
     }
-    pub fn on_shell_verb(&self, arm: impl Fn(&FakeHost, WinId, &ShellCall, u32) + 'static) {
-        *self.shell_arm.borrow_mut() = Some(Rc::new(arm));
+    /// The shell `module`'s pane runs from now on (`None`: the fake answers nothing for it, and a test posts the
+    /// answers itself). A terminal with one answers [`TermOp::ReadJob`] with what it holds, and carries out
+    /// [`TermOp::Respawn`] only while it runs the shell the op expects, given nothing since: a new shell under the
+    /// next start, in the op's directory and idle, reported as [`TermEvent::Started`]; otherwise refused.
+    pub fn set_shell(&self, win: WinId, module: ModuleId, shell: Option<FakeShell>) {
+        let mut shells = self.shells.borrow_mut();
+        match shell {
+            Some(shell) => shells.insert((win, module), shell),
+            None => shells.remove(&(win, module)),
+        };
+    }
+    /// The shell `module`'s pane runs now, as [`FakeHost::set_shell`] or a restart left it.
+    pub fn shell(&self, win: WinId, module: &ModuleId) -> Option<FakeShell> {
+        self.shells.borrow().get(&(win, module.clone())).cloned()
     }
     pub fn on_apply(&self, f: impl Fn(&FakeHost, usize, &HostOp) + 'static) {
         *self.apply_hook.borrow_mut() = Some(Rc::new(f));
@@ -181,6 +340,35 @@ impl FakeHost {
     }
     pub fn is_closed(&self, win: WinId) -> bool {
         self.closed.borrow().contains(&win)
+    }
+    /// A primary press on `on`, as the grid's gesture posts the begin of a drag there.
+    pub fn press_on(&self, win: WinId, on: PointerTarget) {
+        self.post(HostEvent::Pointer {
+            win,
+            on,
+            ev: PointerEv::Press {
+                x: 0.0,
+                y: 0.0,
+                button: 1,
+            },
+        });
+    }
+    /// One step of the drag begun on `on`: the pointer `(dx, dy)` from where it was grabbed, in the dragged
+    /// widget's coordinates as it is drawn now.
+    pub fn drag_by(&self, win: WinId, on: PointerTarget, dx: f64, dy: f64) {
+        self.post(HostEvent::Pointer {
+            win,
+            on,
+            ev: PointerEv::Motion { x: dx, y: dy },
+        });
+    }
+    /// The end of the drag begun on `on`.
+    pub fn release_on(&self, win: WinId, on: PointerTarget) {
+        self.post(HostEvent::Pointer {
+            win,
+            on,
+            ev: PointerEv::Release { x: 0.0, y: 0.0 },
+        });
     }
     pub fn post(&self, event: HostEvent) {
         let sink = attached(&self.sink, &event);
@@ -229,6 +417,106 @@ impl FakeHost {
             return self.refuse(op);
         }
         match op {
+            HostOp::Chat(ChatOp::Forget {
+                view, tab: Some(tab), ..
+            }) if view.is_base() => {
+                let mut reads = self.reads.borrow_mut();
+                reads.base_tabs.retain(|id| id != tab);
+                reads.tab_moves.remove(tab);
+                if reads.base_tabs.is_empty() {
+                    reads.base_tabs.push(TabId(1));
+                }
+                if reads.active_base_tab == Some(*tab) {
+                    reads.active_base_tab = reads.base_tabs.first().copied();
+                }
+            }
+            HostOp::OrderBaseTabs { tabs, active, .. } => {
+                let mut reads = self.reads.borrow_mut();
+                reads.base_tabs = tabs.clone();
+                if active.is_some() {
+                    reads.active_base_tab = *active;
+                }
+            }
+            HostOp::AdoptMoved {
+                record,
+                kind: super::moves::MoveKind::Chat,
+                ..
+            } => {
+                if let Some(mv) = record["workspace_move_id"].as_u64() {
+                    let mut reads = self.reads.borrow_mut();
+                    let tab = TabId(1000 + mv);
+                    if reads.base_tabs == [TabId(1)]
+                        && reads
+                            .tab_moves
+                            .get(&TabId(1))
+                            .is_none_or(|f| matches!(f, Ok(f) if f.session.is_none() && !f.running))
+                    {
+                        reads.base_tabs.clear();
+                    }
+                    reads.base_tabs.push(tab);
+                    reads.tab_moves.insert(
+                        tab,
+                        Ok(ChatMoveFacts {
+                            tab,
+                            session: None,
+                            live: true,
+                            running: false,
+                        }),
+                    );
+                    reads.arrived_tabs.insert(MoveId(mv), tab);
+                }
+            }
+
+            HostOp::Terminal(TermOp::ReadJob { win, module, read }) => {
+                let shell = self.shell(*win, module);
+                if let Some(shell) = shell {
+                    self.post(HostEvent::Terminal(TermEvent::Job {
+                        win: *win,
+                        module: module.clone(),
+                        read: *read,
+                        shell: shell.shell,
+                        cwd: shell.cwd,
+                        busy: shell.busy,
+                    }));
+                }
+            }
+            HostOp::Terminal(TermOp::Respawn {
+                win,
+                module,
+                dir,
+                expect,
+            }) => {
+                let shell = self.shell(*win, module);
+                if let Some(shell) = shell {
+                    if !expect.untouched(Some(shell.shell)) {
+                        return self.refuse(op);
+                    }
+                    let pid = shell.shell.pid.map_or(1, |pid| pid + 1);
+                    let fresh = FakeShell {
+                        shell: ShellStart::of(shell.shell.generation + 1, Some(pid)),
+                        cwd: Ok(dir.clone()),
+                        busy: false,
+                    };
+                    self.set_shell(*win, module.clone(), Some(fresh));
+                    self.post(HostEvent::Terminal(TermEvent::Started {
+                        win: *win,
+                        module: module.clone(),
+                        pid,
+                    }));
+                }
+            }
+            HostOp::Chat(ChatOp::SetFontSize { win, px }) => {
+                self.font_sizes.borrow_mut().insert(*win, *px);
+            }
+            HostOp::Plugin(PluginOp::Build { module, .. }) => {
+                self.set_page_built(module.clone(), true);
+            }
+            HostOp::Plugin(PluginOp::SetZoom { win, module, level }) => {
+                self.page_zooms.borrow_mut().insert((*win, module.clone()), *level);
+            }
+            HostOp::Terminal(TermOp::SetZoom { win, level }) => {
+                self.terminal_zooms.borrow_mut().insert(*win, *level);
+            }
             HostOp::Focus { win, to, .. } => {
                 let owner = match to {
                     FocusTo::Module(module) => {
@@ -261,6 +549,9 @@ impl FakeHost {
                     let kind = match module.kind() {
                         crate::layout::ModuleKind::Agent => SurfaceKind::Chat {
                             view: ViewId::of_module(module).unwrap_or(ViewId::BASE),
+                        },
+                        crate::layout::ModuleKind::LuaWebview => SurfaceKind::PluginPage {
+                            plugin: module.as_str().trim_start_matches("lua:").to_owned(),
                         },
                         _ => SurfaceKind::Terminal { cwd: ".".into() },
                     };
@@ -339,17 +630,6 @@ impl Host for FakeHost {
         }
         applied
     }
-    fn run_shell_verb(&self, win: WinId, call: &ShellCall, keycode: u32) {
-        self.log.borrow_mut().push(Logged::ShellVerb(ShellVerb {
-            win,
-            call: call.clone(),
-            keycode,
-        }));
-        let arm = self.shell_arm.borrow().clone();
-        if let Some(arm) = arm {
-            arm(self, win, call, keycode);
-        }
-    }
     fn monitors(&self) -> Vec<Monitor> {
         vec![]
     }
@@ -362,9 +642,54 @@ impl super::conformance::GridObserve for FakeHost {
     fn stacking(&self, win: WinId) -> Vec<ModuleId> {
         self.stacking.borrow().get(&win).cloned().unwrap_or_default()
     }
+    fn window_open(&self, win: WinId) -> bool {
+        !self.is_closed(win)
+    }
 }
 
 impl HostReads for FakeHost {
+    fn running_chats(&self, _: WinId) -> Vec<(ModuleId, Option<TabId>)> {
+        self.reads.borrow().running_chats.clone()
+    }
+    fn terminal_job_modules(&self, _: WinId) -> Vec<ModuleId> {
+        self.reads.borrow().terminal_job_modules.clone()
+    }
+    fn pages_with_tasks(&self, _: WinId) -> Vec<ModuleId> {
+        self.reads.borrow().pages_with_tasks.clone()
+    }
+    fn base_tabs(&self, _: WinId) -> Vec<TabId> {
+        self.reads.borrow().base_tabs.clone()
+    }
+    fn active_base_tab(&self, _: WinId) -> Option<TabId> {
+        self.reads.borrow().active_base_tab
+    }
+    fn tab_move(&self, win: WinId, tab: TabId) -> Result<ChatMoveFacts, String> {
+        self.reads
+            .borrow()
+            .tab_moves
+            .get(&tab)
+            .cloned()
+            .unwrap_or_else(|| self.chat_move(win, ViewId::BASE, None))
+    }
+    fn arrived_tab(&self, _: WinId, mv: MoveId) -> Option<TabId> {
+        self.reads.borrow().arrived_tabs.get(&mv).copied()
+    }
+    fn moved_tab_key(&self, _: WinId, tab: TabId) -> Option<crate::window_link::base_tabs::MovedTabKey> {
+        self.reads.borrow().moved_tab_keys.get(&tab).cloned()
+    }
+    fn terminal_jobs(&self, _: WinId) -> usize {
+        self.reads.borrow().terminal_jobs
+    }
+    fn tab_can_step(&self, _: WinId, delta: i32) -> bool {
+        self.reads.borrow().tab_steps.get(&delta).copied().unwrap_or(false)
+    }
+    fn tab_has_last(&self, _: WinId) -> bool {
+        self.reads.borrow().tab_last
+    }
+    fn tab_place(&self, _: WinId, n: u16) -> Option<crate::tab_set::TabPlace> {
+        self.reads.borrow().tab_places.get(&n).copied()
+    }
+
     fn grid_size(&self, _: WinId) -> Size {
         self.reads.borrow().grid_size
     }
@@ -380,8 +705,11 @@ impl HostReads for FakeHost {
     fn editor_cell(&self, _: WinId) -> Option<(f64, f64)> {
         self.reads.borrow().editor_cell
     }
+    fn editor_facts(&self, _: WinId) -> EditorFacts {
+        self.reads.borrow().editor_facts.clone()
+    }
     fn editor_running(&self, _: WinId) -> bool {
-        self.reads.borrow().editor_running
+        self.reads.borrow().editor_facts.running
     }
     fn chat_claims(&self, view: ViewId, direction: Direction) -> bool {
         self.reads.borrow().chat_claims.contains(&(view, direction))
@@ -392,6 +720,9 @@ impl HostReads for FakeHost {
     fn oldest_card_view(&self, _: WinId) -> Option<ViewId> {
         self.reads.borrow().oldest_card_view
     }
+    fn chat_summary(&self, _: WinId) -> ChatSummary {
+        self.reads.borrow().chat_summary
+    }
     fn chat_kill_counts(&self, view: ViewId) -> ChatKillCounts {
         self.reads.borrow().kill_counts.get(&view).cloned().unwrap_or_default()
     }
@@ -400,6 +731,32 @@ impl HostReads for FakeHost {
     }
     fn module_size(&self, _: WinId, module: &ModuleId) -> Option<Size> {
         self.reads.borrow().module_size.get(module).copied()
+    }
+    fn page_built(&self, _: WinId, module: &ModuleId) -> bool {
+        self.reads.borrow().page_built.contains(module)
+    }
+    fn plugin_keys_help(&self, _: WinId, module: &ModuleId) -> Option<crate::plugin::keys::PluginKeysHelp> {
+        self.log
+            .borrow_mut()
+            .push(Logged::Read(format!("plugin_keys_help({module})")));
+        self.reads.borrow().plugin_help.get(module).cloned()
+    }
+    fn chat_views(&self) -> Vec<ViewId> {
+        self.reads.borrow().chat_views.clone()
+    }
+    fn can_break_out(&self, _: WinId) -> Result<(), String> {
+        self.reads.borrow().break_out.clone()
+    }
+    fn chat_move(&self, _: WinId, view: ViewId, _: Option<&str>) -> Result<ChatMoveFacts, String> {
+        self.reads
+            .borrow()
+            .chat_moves
+            .get(&view)
+            .cloned()
+            .unwrap_or_else(|| Err(NOT_CARRIED_OUT.into()))
+    }
+    fn view_of_session(&self, _: WinId, session: &str) -> Option<ViewId> {
+        self.reads.borrow().sessions.get(session).copied()
     }
 }
 
@@ -604,7 +961,6 @@ pub enum Call {
     /// A key at a capture stage: the module whose stage it was, `None` for the window's.
     Key(WinId, Option<ModuleId>, KeyPress),
     Run(WinId, Action, Origin),
-    Focus(WinId, ModuleId),
     Close(WinId, CloseBy),
 }
 
@@ -614,7 +970,6 @@ pub struct ScriptedDecide {
     handles: VecDeque<Batch>,
     keys: VecDeque<(Verdict, Batch)>,
     runs: VecDeque<Batch>,
-    focuses: VecDeque<Batch>,
     closes: VecDeque<(CloseVerdict, Batch)>,
 }
 
@@ -627,9 +982,6 @@ impl ScriptedDecide {
     }
     pub fn then_run(&mut self, batch: Batch) {
         self.runs.push_back(batch);
-    }
-    pub fn then_focus(&mut self, batch: Batch) {
-        self.focuses.push_back(batch);
     }
     pub fn then_close(&mut self, verdict: CloseVerdict, batch: Batch) {
         self.closes.push_back((verdict, batch));
@@ -653,10 +1005,6 @@ impl Decide for ScriptedDecide {
     fn run(&mut self, win: WinId, action: Action, origin: Origin) -> Batch {
         self.calls.push(Call::Run(win, action, origin));
         self.runs.pop_front().unwrap_or_default()
-    }
-    fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch {
-        self.calls.push(Call::Focus(win, module.clone()));
-        self.focuses.pop_front().unwrap_or_default()
     }
     fn close_requested(&mut self, win: WinId, by: CloseBy) -> (CloseVerdict, Batch) {
         self.calls.push(Call::Close(win, by));
@@ -795,18 +1143,9 @@ mod tests {
             )),
             "a refused create names the surface it was for"
         );
-        h.on_shell_verb(|host, win, _, _| {
-            host.apply(&HostOp::CloseWindow { win });
-        });
-        let call = ShellCall::Action(Action::FloatToggle);
-        h.run_shell_verb(WinId::MAIN, &call, 42);
+        h.apply(&HostOp::CloseWindow { win: WinId::MAIN });
         assert!(h.is_closed(WinId::MAIN));
-        assert_eq!(sink.close_requests(), 0);
-        assert!(h.log().contains(&Logged::ShellVerb(ShellVerb {
-            win: WinId::MAIN,
-            call,
-            keycode: 42
-        })));
+        assert_eq!(sink.close_requests(), 0, "a close by op asks no close request");
     }
 
     #[test]
@@ -931,7 +1270,6 @@ mod tests {
         d.then_handle(Batch::default());
         d.then_key(Verdict::Consumed, batch.clone());
         d.then_run(batch.clone());
-        d.then_focus(batch.clone());
         d.then_close(CloseVerdict::Stop, batch.clone());
         let w = WinId::MAIN;
         let m = ModuleId::agent();
@@ -944,19 +1282,17 @@ mod tests {
             super_or_meta: false,
         };
         assert_eq!(d.handle(HostEvent::Wake), batch);
-        assert!(d.handle(HostEvent::MonitorsChanged).is_empty());
+        assert!(d.handle(HostEvent::MonitorsChanged { monitors: vec![] }).is_empty());
         assert_eq!(d.key(w, &KeyStage::Window, &key), (Verdict::Consumed, batch.clone()));
         assert_eq!(d.run(w, Action::FocusParent, Origin::Lua), batch);
-        assert_eq!(d.focus(w, &m), batch);
         assert_eq!(d.close_requested(w, CloseBy::User), (CloseVerdict::Stop, batch.clone()));
         assert_eq!(
             d.calls(),
             vec![
                 Call::Handle(HostEvent::Wake),
-                Call::Handle(HostEvent::MonitorsChanged),
+                Call::Handle(HostEvent::MonitorsChanged { monitors: vec![] }),
                 Call::Key(w, None, key.clone()),
                 Call::Run(w, Action::FocusParent, Origin::Lua),
-                Call::Focus(w, m.clone()),
                 Call::Close(w, CloseBy::User)
             ]
         );
@@ -966,7 +1302,6 @@ mod tests {
             (Verdict::PassThrough, Batch::default())
         );
         assert!(d.run(w, Action::FocusChild, Origin::Chip).is_empty());
-        assert!(d.focus(w, &m).is_empty());
         assert_eq!(
             d.close_requested(w, CloseBy::Compositor),
             (CloseVerdict::Proceed, Batch::default())

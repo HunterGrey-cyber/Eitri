@@ -333,6 +333,73 @@ pub fn functions<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The bodies of inherent and trait `impl` blocks whose self type is named `type_name`.
+/// Pass [`code_only`] text so comments and literals cannot contribute braces or names. Generic arguments,
+/// bounds and trait names do not count as the self type; qualified self types use their final path segment.
+pub fn impl_blocks<'a>(code: &'a str, type_name: &str) -> Vec<&'a str> {
+    word_ends(code, "impl")
+        .into_iter()
+        .filter_map(|after| {
+            let rest = &code[after..];
+            let mut angles = 0usize;
+            let mut groups = 0usize;
+            let mut header_end = None;
+            for (at, c) in rest.char_indices() {
+                match c {
+                    '<' => angles += 1,
+                    '>' if angles > 0 && !rest[..at].ends_with('-') => angles -= 1,
+                    '(' | '[' => groups += 1,
+                    ')' | ']' if groups > 0 => groups -= 1,
+                    '{' if angles == 0 && groups == 0 => {
+                        header_end = Some(at);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let open = after + header_end?;
+            let mut header = code[after..open].trim_start();
+            if header.starts_with('<') {
+                let mut depth = 0;
+                let end = header.char_indices().find_map(|(at, c)| {
+                    match c {
+                        '<' => depth += 1,
+                        '>' if !header[..at].ends_with('-') => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(at + c.len_utf8())
+                })?;
+                header = header[end..].trim_start();
+            }
+            // Only top-level `for` and `where` delimit the self type: a bound may mention either word.
+            let mut depth = 0usize;
+            let mut self_start = 0;
+            let mut self_end = header.len();
+            let wheres = word_ends(header, "where");
+            let fors = word_ends(header, "for");
+            for (at, c) in header.char_indices() {
+                match c {
+                    '<' | '(' | '[' => depth += 1,
+                    '>' if depth > 0 && !header[..at].ends_with('-') => depth -= 1,
+                    ')' | ']' if depth > 0 => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && wheres.contains(&(at + 5)) {
+                    self_end = at;
+                    break;
+                }
+                if depth == 0 && fors.contains(&(at + 3)) {
+                    self_start = at + 3;
+                }
+            }
+            let self_type = header[self_start..self_end].trim();
+            let path_end = self_type.find('<').unwrap_or(self_type.len());
+            let name = self_type[..path_end].rsplit("::").next()?.trim();
+            (name == type_name).then(|| braced(code, open))
+        })
+        .collect()
+}
+
 /// The body of every `mod NAME`.
 pub fn modules<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
     word_ends(code, "mod")
@@ -382,6 +449,50 @@ pub fn calls(code: &str, name: &str) -> usize {
 #[cfg(test)]
 mod walker_tests {
     use super::*;
+
+    #[test]
+    fn impl_blocks_finds_only_the_named_self_type_across_headers_and_bodies() {
+        let code = code_only(
+            r#"
+            impl Driver { fn first() { if true { nested(); } } }
+            impl<T: Decide> Driver<T> where T: Other { fn second() {} }
+            impl<T> HostSink for crate::wm::Driver<T> { fn third() {} }
+            impl Controller { fn fourth() {} }
+            impl DriverExtra { fn wrong() {} }
+            impl Driver for Other { fn wrong() {} }
+            impl Wrapper<Driver> { fn wrong() {} }
+            impl<T: Trait<Driver>> Other<T> { fn wrong() {} }
+            impl<T: Fn() -> Driver> Other<T> { fn wrong() {} }
+            // impl Driver { fn wrong() {} }
+            const TEXT: &str = "impl Driver { fn wrong() {} }";
+            "#,
+        );
+        let blocks = impl_blocks(&code, "Driver");
+        assert_eq!(blocks.len(), 3);
+        for (body, name) in blocks.iter().zip(["first", "second", "third"]) {
+            assert_eq!(functions(body, name).len(), 1);
+            assert!(functions(body, "wrong").is_empty());
+        }
+        assert_eq!(impl_blocks(&code, "Controller").len(), 1);
+        assert!(impl_blocks(&code, "Missing").is_empty());
+    }
+
+    #[test]
+    fn impl_blocks_uses_braces_instead_of_line_boundaries() {
+        for code in [
+            "impl Driver{fn kept(){}}impl Driver{fn gone(){}}",
+            "impl\nDriver\n{\nfn\nkept()\n{}\n}\nimpl\nDriver\n{fn gone(){}}",
+            "impl<T> SomeTrait<T> for Driver<T> where T: Bound {fn kept(){}} impl Driver{fn gone(){}}",
+            "impl<const N: usize> Driver<{ N + 1 }> {fn kept(){}} impl Driver{fn gone(){}}",
+            "impl<T: Fn() -> ()> Driver<T> {fn kept(){}} impl Driver{fn gone(){}}",
+        ] {
+            let code = code_only(code);
+            let blocks = impl_blocks(&code, "Driver");
+            assert_eq!(blocks.len(), 2, "{code}");
+            assert_eq!(functions(blocks[0], "kept").len(), 1);
+            assert_eq!(functions(blocks[1], "gone").len(), 1);
+        }
+    }
 
     #[test]
     fn function_in_finds_one_function_across_files_and_refuses_two() {

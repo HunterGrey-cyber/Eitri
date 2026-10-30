@@ -1465,6 +1465,12 @@ impl AgentConversation {
         self.ingest.unfreeze();
     }
 
+    /// The provider's way to move with the conversation to another process, when it has one.
+    #[cfg(target_os = "linux")]
+    pub fn mover(&self) -> Option<&dyn crate::chat_mover::ChatMover> {
+        self.provider.mover()
+    }
+
     /// The session lease's descriptor for the window the conversation moves to (a second descriptor
     /// on the same open file, close-on-exec). `None` when the conversation holds no lease.
     pub fn lease_descriptor(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {

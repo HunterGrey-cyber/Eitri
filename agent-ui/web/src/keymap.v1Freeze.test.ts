@@ -46,7 +46,7 @@ const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> =
 
 /** `CARET_KEYS`/`VISUAL_KEYS`' own token spelling -> a `KeyLike`, the same rule `keymap.test.ts`'s
  *  `parseVisualToken` uses: `"Esc"` is the display spelling of the real `key: "Escape"`, `"1-9"` a
- *  representative digit, `"gg"` (added for 3a) the FIRST of its two presses (a non-`pending` case
+ *  representative digit, `"gg"` the FIRST of its two presses (a non-`pending` case
  *  below covers the second), `"Ctrl+x"` -> Ctrl held with `x` (needed by
  *  the "Ctrl+e / Ctrl+y" row), and every bare uppercase letter or `?` carries Shift. */
 function visualToken(token: string): KeyLike {
@@ -165,7 +165,7 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
     event: key("c", { ctrlKey: true }),
     ctx: { sessionEnded: false, turnRunning: true },
   },
-  // INPUT's Ctrl+y, an ADDED key under the freeze, appended so the
+  // INPUT's Ctrl+y is appended so the
   // regenerated fixture diffs as additions only. BROWSE's own "Ctrl+y" row above is unchanged; the
   // Shift pin says only the exact chord approves.
   { label: "Ctrl+y, input", mode: "input", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },

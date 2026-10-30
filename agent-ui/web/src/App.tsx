@@ -78,7 +78,7 @@ import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
 import { isExternalTool, agentTitle } from "./externalTools";
-import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, forgetClosed, isExternalAgent, saveView, tabPermissionModes, takeView } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, exportView, forgetClosed, importView, isExternalAgent, saveView, tabPermissionModes, takeView } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -595,6 +595,8 @@ export default function App() {
    *  Rust. Saved just before a switch resets the render state, and handed back through `restoreRef` once the new
    *  tab's own `snapshot` arrives. */
   const viewStore = useRef(new Map<TabId, TabViewState>());
+  /** An arriving tab keeps its moved cursor even when its scroll follows the end. */
+  const arrivedTabsRef = useRef(new Set<TabId>());
   /** The view to restore once the switch's `snapshot` is applied; read and cleared by the `snapshot` arm and the
    *  scroll-restoring layout effect. */
   const restoreRef = useRef<TabViewState | null>(null);
@@ -3098,6 +3100,7 @@ export default function App() {
           break;
         }
         case "snapshot": {
+          const arrived = arrivedTabsRef.current.delete(payload.tab);
           // The view a switch saved for this tab, if it had one: cursor and expansions now (never the mode: the
           // switch lands BROWSE), the scroll position in the layout effect keyed on `restoreTick`, since it needs
           // the row this cursor lands on to exist in the DOM first.
@@ -3106,9 +3109,9 @@ export default function App() {
             // `landingRef` is set before the cursor moves so the `[cursor]` reveal effect does not fight this
             // restore with its own scroll -- and only when the cursor really moves: a `"keep"` for a move that
             // changes nothing fires no effect, so nothing consumes it, and it swallowed the next move's reveal. A
-            // view that was following the end comes back on the last row instead (below), since rows kept
-            // arriving while the tab was away.
-            if (!view.atBottom) {
+            // view following the end lands on the newest row after a plain switch. An arrival already carries
+            // its current rows, so it keeps the cursor from the other window while the scroll follows the end.
+            if (!view.atBottom || arrived) {
               if (view.cursor !== cursorRef.current) landingRef.current = "keep";
               setCursor(view.cursor);
             }
@@ -3130,7 +3133,7 @@ export default function App() {
           // goes to the last row, where the view is; the card landing still wins over it.
           if (switchedRef.current) {
             switchedRef.current = false;
-            if (restoreRef.current === null || restoreRef.current.atBottom) landOnLastRef.current = true;
+            landOnLastRef.current = restoreRef.current === null || (restoreRef.current.atBottom && !arrived);
             if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
           }
           break;
@@ -3287,6 +3290,27 @@ export default function App() {
           showFlash(payload.text);
           break;
         }
+        case "view_export": {
+          // A move to the other window takes this tab: its view goes with it, read from the live list when it is
+          // the tab on screen, else the one a switch parked.
+          const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+          if (list !== null && payload.tab === activeTabRef.current) settleListScroll(list);
+          const view = exportView(viewStore.current, activeTabRef.current, payload.tab, () => captureView(list));
+          // What was typed into the box and is still waiting out its mirror's debounce goes ahead of the answer:
+          // the tab freezes once the answer is in, and a mirror sent after that reaches a tab that is no longer
+          // this window's, so the other window's box would come without it.
+          flushDraft();
+          postToRust({ type: "view_exported", request_id: nextRequestId(), request: payload.request, view });
+          break;
+        }
+        case "view_import": {
+          // The tab arrived from the other window: shown here as it was left there, once a switch shows it.
+          arrivedTabsRef.current.add(payload.tab);
+          if (!importView(viewStore.current, payload.tab, payload.view)) {
+            console.warn("agent-ui: the moved tab's view was not one to keep", payload.tab);
+          }
+          break;
+        }
         case "draft": {
           // The page this tab just left sent its last mirror after the tab arrived here, and the box has been
           // edited since: that edit is newer, and its own mirror tells Rust so.
@@ -3305,9 +3329,18 @@ export default function App() {
       }
     });
     requestHello();
+    // The host keeps this view nearly hidden until the page says it has painted, so WebKit's first
+    // buffer, drawn before the page has anything in it, never shows. The second frame callback runs
+    // once a frame holding the mounted page has been produced.
+    let paintFrame = requestAnimationFrame(() => {
+      paintFrame = requestAnimationFrame(() => postToRust({ type: "painted" }));
+    });
     // A page mounted again in the same document (a dev reload) starts unslowed; a real reload is a
     // new document, which has no attribute to begin with, and Rust tells it again on `ready`.
-    return () => applyEditorTyping(document.documentElement, false, 0);
+    return () => {
+      cancelAnimationFrame(paintFrame);
+      applyEditorTyping(document.documentElement, false, 0);
+    };
   }, []);
 
   /** The composer mirror. `browse`/`input` mean a live BROWSE/INPUT (this tab's
@@ -6253,6 +6286,7 @@ export default function App() {
           postToRust({ type: "view_in_editor", request_id: requestId, title: "Workflow script", text });
         } }}>
           <MessageList
+            tab={activeTabId}
             state={frozenSnapshot?.state ?? state}
             turnDurations={frozenSnapshot?.turnDurations ?? turnDurations}
             sessionEnded={frozenSnapshot?.sessionEnded ?? sessionEnded}

@@ -2,9 +2,10 @@
 //! and off, the text pulls with their rate limits, and the page's own editor operations. Pure: it holds no
 //! editor and no clock; the host tells it what happened and asks `next` with the time.
 //!
-//! One call is out at a time. The embedded editor serves each request on a thread of its own, so two calls
-//! sent back to back may reach nvim in either order: a `follow {on = false}` overtaken by the
-//! `follow {on = true}` sent after it would leave nvim reporting views to a hidden page.
+//! One call is out at a time. The embedded editor writes calls in order on one call line, but nvim-rs can
+//! still write a later call first in a rare race (`crate::editor_rpc`), so two calls sent back to back may
+//! reach nvim in either order: a `follow {on = true}` overtaken by the `follow {on = false}` sent after it
+//! would leave nvim reporting views to a hidden page.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -22,6 +23,16 @@ pub const MAX_TEXT_LINES: u64 = 50_000;
 /// How long after an install nvim answered too early (before it had read the user's config) it is asked
 /// again; also how long the queue rests after a call that failed, so a broken editor is not asked in a loop.
 pub const INSTALL_RETRY: Duration = Duration::from_millis(250);
+/// Links wait in order, but a blocked editor must not let a page grow the queue without bound.
+pub const MAX_PARKED_LINKS: usize = 16;
+
+/// What `FollowState::park` did with a page's op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parked {
+    Queued,
+    Replaced(u64),
+    Full,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FollowOp {
@@ -215,29 +226,47 @@ impl FollowState {
         }
     }
 
-    /// A page's Reveal/Jump/OpenLink, in order, or Teardown. At most one Reveal waits: a newer one takes the
-    /// waiting one's place in line (only where the page wants to be now matters, and a page scrolling fast
-    /// would otherwise queue a reveal per frame), and the `re` of the one it replaced is returned.
-    pub fn park(&mut self, op: FollowOp) -> Option<u64> {
+    /// Queues a page's Reveal/Jump/OpenLink, or requests Teardown. A new Reveal takes the waiting one's
+    /// place; a new Jump replaces the waiting one at the back. Returns the replaced op's `re`, or Full
+    /// without queuing a link when `MAX_PARKED_LINKS` links already wait.
+    pub fn park(&mut self, op: FollowOp) -> Parked {
         if op == FollowOp::Teardown {
             self.teardown = true;
-            return None;
+            return Parked::Queued;
         }
         if self.stopped {
-            return None;
+            return Parked::Queued;
         }
         if matches!(op, FollowOp::Reveal { .. }) {
             if let Some(waiting) = self.parked.iter_mut().find(|p| matches!(p, FollowOp::Reveal { .. })) {
-                let replaced = match waiting {
-                    FollowOp::Reveal { re, .. } => Some(*re),
-                    _ => None,
-                };
-                *waiting = op;
-                return replaced;
+                if let FollowOp::Reveal { re, .. } = waiting {
+                    let replaced = *re;
+                    *waiting = op;
+                    return Parked::Replaced(replaced);
+                }
             }
         }
+        if matches!(op, FollowOp::Jump { .. }) {
+            if let Some(i) = self.parked.iter().position(|p| matches!(p, FollowOp::Jump { .. })) {
+                if let Some(FollowOp::Jump { re, .. }) = self.parked.remove(i) {
+                    // The newest jump is where the reader asked to be last, so it follows anything asked before it.
+                    self.parked.push_back(op);
+                    return Parked::Replaced(re);
+                }
+            }
+        }
+        if matches!(op, FollowOp::OpenLink { .. })
+            && self
+                .parked
+                .iter()
+                .filter(|p| matches!(p, FollowOp::OpenLink { .. }))
+                .count()
+                >= MAX_PARKED_LINKS
+        {
+            return Parked::Full;
+        }
         self.parked.push_back(op);
-        None
+        Parked::Queued
     }
 
     /// Takes back every page's op still waiting (not the one out), for a document that was replaced: what it
@@ -511,8 +540,8 @@ mod tests {
             focus: false,
             re: 9,
         };
-        assert_eq!(f.park(reveal(1)), None);
-        assert_eq!(f.park(jump.clone()), None);
+        assert_eq!(f.park(reveal(1)), Parked::Queued);
+        assert_eq!(f.park(jump.clone()), Parked::Queued);
         assert_eq!(f.next(t0 + ms(10)), Next::Idle, "the pull is still out");
         f.done(
             Done::Pulled {
@@ -562,10 +591,10 @@ mod tests {
             focus: true,
             re: 3,
         };
-        assert_eq!(f.park(reveal(1)), None);
-        assert_eq!(f.park(reveal(2)), Some(1));
-        assert_eq!(f.park(jump.clone()), None);
-        assert_eq!(f.park(reveal(4)), Some(2));
+        assert_eq!(f.park(reveal(1)), Parked::Queued);
+        assert_eq!(f.park(reveal(2)), Parked::Replaced(1));
+        assert_eq!(f.park(jump.clone()), Parked::Queued);
+        assert_eq!(f.park(reveal(4)), Parked::Replaced(2));
         f.done(
             Done::Pulled {
                 buf: 3,
@@ -579,6 +608,63 @@ mod tests {
         f.done(Done::Other, t0);
         assert_eq!(f.next(t0), Next::Send(jump));
         f.done(Done::Other, t0);
+        assert_eq!(f.next(t0), Next::Idle);
+    }
+
+    #[test]
+    fn only_the_newest_parked_jump_is_kept_and_goes_after_what_was_asked_before_it() {
+        let t0 = Instant::now();
+        let mut f = following(t0);
+        f.view(3, 41);
+        assert_eq!(f.next(t0), Next::Send(FollowOp::Text { buf: 3 }));
+        f.done(
+            Done::Pulled {
+                buf: 3,
+                tick: 41,
+                bytes: 100,
+            },
+            t0,
+        );
+        f.page_has(3, 41);
+        let jump = |re| FollowOp::Jump {
+            buf: 3,
+            line: 5,
+            col: 0,
+            focus: false,
+            re,
+        };
+        let link = FollowOp::OpenLink {
+            path: PathBuf::from("/p/a.md"),
+            line: None,
+            re: 2,
+        };
+        assert_eq!(f.park(jump(1)), Parked::Queued);
+        assert_eq!(f.park(link.clone()), Parked::Queued);
+        assert_eq!(f.park(jump(3)), Parked::Replaced(1));
+        assert_eq!(f.next(t0), Next::Send(link));
+        f.done(Done::Other, t0);
+        assert_eq!(f.next(t0), Next::Send(jump(3)));
+        f.done(Done::Other, t0);
+        assert_eq!(f.next(t0), Next::Idle);
+    }
+
+    #[test]
+    fn links_past_the_cap_are_refused() {
+        let t0 = Instant::now();
+        let mut f = following(t0);
+        let link = |re| FollowOp::OpenLink {
+            path: PathBuf::from("/p/a.md"),
+            line: None,
+            re,
+        };
+        for re in 1..=16 {
+            assert_eq!(f.park(link(re)), Parked::Queued);
+        }
+        assert_eq!(f.park(link(17)), Parked::Full);
+        for re in 1..=16 {
+            assert_eq!(f.next(t0), Next::Send(link(re)));
+            f.done(Done::Other, t0);
+        }
         assert_eq!(f.next(t0), Next::Idle);
     }
 

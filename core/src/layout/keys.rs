@@ -260,6 +260,26 @@ pub fn module_target(layout: &Layout, id: &ModuleId) -> ModuleId {
     }
 }
 
+/// The module a hide key's module key hides: for a base id of a kind with instances, the instance with the keys when
+/// the keys are in that kind, else the most recently used instance still shown, else [`module_target`]'s; any other
+/// id is itself. [`module_target`]'s most recent instance may be hidden already, where a hide would do nothing while
+/// another instance of the kind is on screen.
+pub fn hide_target(layout: &Layout, id: &ModuleId) -> ModuleId {
+    if id.number() == 1 && id.kind().has_instances() {
+        if layout.focus().kind() == id.kind() {
+            return layout.focus().clone();
+        }
+        if let Some(shown) = layout
+            .mru()
+            .iter()
+            .find(|m| m.kind() == id.kind() && layout.is_shown(m))
+        {
+            return shown.clone();
+        }
+    }
+    module_target(layout, id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitChoice {
     NewInstance(ModuleKind),
@@ -309,6 +329,20 @@ pub fn strip(keys: &ModuleKeys, layout: &Layout) -> Vec<StripEntry> {
             dimmed: !layout.is_shown(module),
             count: instance_count(layout, module),
             new_instance: new_terminal(layout, module),
+        })
+        .collect()
+}
+
+/// What the top bar lists while the hide key waits: [`strip`]'s entries, each dimmed by whether the module its key
+/// would hide ([`hide_target`]) is hidden already, not the base id: with the base terminal hidden and another
+/// terminal shown, `t` still hides one, so it is not dimmed. A hide makes nothing, so no entry offers a new instance.
+pub fn strip_for_hide(keys: &ModuleKeys, layout: &Layout) -> Vec<StripEntry> {
+    strip(keys, layout)
+        .into_iter()
+        .map(|entry| StripEntry {
+            dimmed: !layout.is_shown(&hide_target(layout, &entry.module)),
+            new_instance: false,
+            ..entry
         })
         .collect()
 }
@@ -425,14 +459,10 @@ mod tests {
     #[test]
     fn a_stock_tmux_key_eitri_does_not_bind_stays_reserved() {
         // Bound keys fail `Bound` before the stock-key reservation check: `[` and `PPage`
-        // enter copy mode, `;` and `o` select modules, `q` is `select.number`, and `s` is
-        // `workspace.choose`. `D` (`choose-client`) remains an unbound stock key.
-        for (key, command) in [
-            ('d', "detach-client"),
-            ('D', "choose-client"),
-            (']', "paste-buffer"),
-            ('C', "customize-mode"),
-        ] {
+        // enter copy mode, `;` and `o` select modules, `q` is `select.number`, `s` is
+        // `workspace.choose` and `d` is `module.hide-by-key`. `D` (`choose-client`) remains an
+        // unbound stock key.
+        for (key, command) in [('D', "choose-client"), (']', "paste-buffer"), ('C', "customize-mode")] {
             let err = build_one(&key.to_string(), &Keymap::defaults()).unwrap_err();
             assert_eq!(
                 err,
@@ -674,6 +704,80 @@ mod tests {
         assert_eq!(module_target(&layout, &t2), t2);
         assert_eq!(module_target(&layout, &ModuleId::terminal()), t3);
         assert_eq!(module_target(&layout, &ModuleId::editor()), ModuleId::editor());
+    }
+
+    /// A hide key's module key hides the instance with the keys, else the most recently used one still shown, which
+    /// may differ from the module key's target: that one may be hidden already, and hiding it would do nothing.
+    #[test]
+    fn a_hide_key_hides_the_shown_instance_most_recently_used() {
+        let mut layout = instances();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        layout.set_focus(&t2).unwrap();
+        assert_eq!(
+            hide_target(&layout, &ModuleId::terminal()),
+            t2,
+            "the instance with the keys"
+        );
+        layout.set_focus(&t3).unwrap();
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        assert_eq!(hide_target(&layout, &ModuleId::terminal()), t3);
+        hide(&mut layout, &t3, &frame).unwrap();
+        assert_eq!(
+            module_target(&layout, &ModuleId::terminal()),
+            t3,
+            "the module key would show it again"
+        );
+        assert_eq!(
+            hide_target(&layout, &ModuleId::terminal()),
+            t2,
+            "the hide key hides one still shown"
+        );
+        assert_eq!(hide_target(&layout, &t3), t3, "a numbered id is its own instance");
+        assert_eq!(hide_target(&layout, &ModuleId::editor()), ModuleId::editor());
+    }
+
+    /// The hide key's strip dims a kind by the instance its key would hide: with the base terminal and the base chat
+    /// hidden and `terminal#2` and `agent#2` shown, `t` and `a` hide those, so neither is dimmed (the split key's strip,
+    /// which names the base ids, dims both); once no instance of a kind is shown, its key is dimmed.
+    #[test]
+    fn the_hide_strip_dims_a_kind_by_the_instance_its_key_would_hide() {
+        let decl = |name: &str, placement| ModuleDecl {
+            id: ModuleId::parse(name).unwrap(),
+            placement,
+        };
+        let mut layout = Layout::initial(&[
+            decl("terminal", Placement::BelowEditor),
+            decl("terminal#2", Placement::BelowEditor),
+            decl("agent#2", Placement::RightOfRoot),
+        ])
+        .unwrap();
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        hide(&mut layout, &ModuleId::terminal(), &frame).unwrap();
+        hide(&mut layout, &ModuleId::agent(), &frame).unwrap();
+        let dimmed = |entries: Vec<StripEntry>| -> Vec<(String, bool)> {
+            entries.into_iter().map(|e| (e.key, e.dimmed)).collect()
+        };
+        let keys = ModuleKeys::built_in();
+        let (e, a, t) = ("e".to_string(), "a".to_string(), "t".to_string());
+        assert_eq!(
+            dimmed(strip(&keys, &layout)),
+            [(e.clone(), false), (a.clone(), true), (t.clone(), true)],
+            "the premise: the split key's strip dims the base ids"
+        );
+        assert_eq!(
+            dimmed(strip_for_hide(&keys, &layout)),
+            [(e.clone(), false), (a.clone(), false), (t.clone(), false)]
+        );
+        assert!(strip_for_hide(&keys, &layout).iter().all(|entry| !entry.new_instance));
+        hide(&mut layout, &ModuleId::parse("terminal#2").unwrap(), &frame).unwrap();
+        hide(&mut layout, &ModuleId::parse("agent#2").unwrap(), &frame).unwrap();
+        assert_eq!(
+            dimmed(strip_for_hide(&keys, &layout)),
+            [(e, false), (a, true), (t, true)]
+        );
     }
 
     #[test]

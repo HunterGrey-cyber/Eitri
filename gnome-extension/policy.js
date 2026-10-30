@@ -56,8 +56,8 @@ export const OWN_ACTIVATION_SHADOW_MS = 1000;
 
 export const METHODS = Object.freeze(['FocusDirection', 'FocusSelfIfNeighbour', 'ActivateOwn', 'ActivatePartner']);
 
-// The extension's version: what `Version` answers and metadata.json's "version" states. Version 2 added
-// MoveOwnToMonitor; a caller that finds the method missing is talking to version 1.
+// The extension's version: what `Version` answers and metadata.json's "version" states.
+// MoveOwnToMonitor requires version 2; version 1 has no such method.
 export const EXTENSION_VERSION = 2;
 
 // The longest connector name MoveOwnToMonitor takes. Real ones ("DP-1", "HDMI-A-2", "eDP-1", "Meta-0") are a dozen

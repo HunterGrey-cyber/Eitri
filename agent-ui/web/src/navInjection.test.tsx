@@ -7,7 +7,7 @@
  * DOM query found.
  *
  * Every case runs twice: once through the real sanitizer (`renderMarkdown`), and once with it
- * bypassed, rendering the reply's raw HTML, so the structural fix is shown to stand on its own
+ * bypassed, rendering the reply's raw HTML, so the structural rule stands on its own
  * whatever the sanitizer does or does not strip.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -69,7 +69,7 @@ const answered = () => posted.filter((m) => m.type === "permission_response");
 const text = (el: Element | null | undefined) => (el?.textContent ?? "").replace(/\s+/g, " ");
 const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
 
-/** Two hidden elements that claim to be conversation rows, the verdict's probe. */
+/** Two hidden elements that claim to be conversation rows. */
 const TWO_HIDDEN_ROWS = '<div data-nav-stop="row" hidden></div><div data-nav-stop="row" hidden></div>';
 
 /** A prompt, a reply carrying `injected`, then two gated Bash calls: `rm -rf important` first,

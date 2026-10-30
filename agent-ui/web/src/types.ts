@@ -940,6 +940,8 @@ export type ChooserRecord = {
   createdAt: string;
   updatedAt: string;
   heldElsewhere: boolean;
+  heldByPartner?: boolean;
+  partnerWindow?: number | null;
 };
 export type ChooserEnvelope = { open: ChooserTab[]; records: ChooserRecord[] };
 

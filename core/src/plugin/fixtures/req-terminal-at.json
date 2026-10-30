@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": 55,
+  "verb": "terminal.at",
+  "args": {
+    "dir": "/w/work/rust/ch04-02-fix-total-len"
+  }
+}

@@ -149,7 +149,7 @@ fn alternate_drawing() -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The state Step 1 leaves: a `Term` back on its primary screen after the alternate one was drawn and read.
+/// A `Term` back on its primary screen after the alternate screen was drawn and read.
 struct AfterAlternate {
     term: Term<VoidListener>,
     primary_before: Vec<Vec<Cell>>,

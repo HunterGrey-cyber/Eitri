@@ -291,6 +291,26 @@ impl SessionLease {
         }
     }
 
+    /// Whether the held lease names this live process. Read on a worker because lock and file probes can wait
+    /// on the filesystem; the start time keeps a reused process id from identifying the linked peer.
+    #[cfg(target_os = "linux")]
+    pub fn is_held_by(provider: &str, canonical_cwd: &str, session: &str, pid: u32, start: u64) -> bool {
+        if !Self::is_held(provider, canonical_cwd, session).unwrap_or(false) {
+            return false;
+        }
+        let Ok(dir) = leases_dir() else {
+            return false;
+        };
+        let path = dir.join(format!("{}.lock", lease_key_hash(provider, canonical_cwd, session)));
+        let Ok(text) = crate::private_fs::read_private_to_string_capped(&path, 4096) else {
+            return false;
+        };
+        let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        metadata["owner_pid"].as_u64() == Some(pid as u64) && crate::child::start_time(pid).ok() == Some(start)
+    }
+
     /// Prepares this lease's fd for inheritance across `fork`+`exec` and hands ownership to the
     /// caller as a raw fd number -- clears `FD_CLOEXEC` (Rust's `std::fs::File` sets it by default
     /// on open, which would otherwise close the fd at `exec` time and silently drop the lock) and
@@ -576,6 +596,42 @@ mod tests {
         assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-free").unwrap());
         let _taken = SessionLease::try_acquire("claude", "/tmp/project", "prov-free")
             .expect("a probe must leave the lease free to take");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_held_by_names_the_live_owner_by_pid_and_start_time() {
+        let _dir = IsolatedLeasesDir::new();
+        let me = std::process::id();
+        let start = crate::child::start_time(me).unwrap();
+        assert!(
+            !SessionLease::is_held_by("claude", "/tmp/project", "prov-holder", me, start),
+            "a lease nobody holds names no one"
+        );
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-holder").unwrap();
+        assert!(SessionLease::is_held_by(
+            "claude",
+            "/tmp/project",
+            "prov-holder",
+            me,
+            start
+        ));
+        assert!(
+            !SessionLease::is_held_by("claude", "/tmp/project", "prov-holder", me, start + 1),
+            "the same pid started at another time is another process"
+        );
+        assert!(!SessionLease::is_held_by(
+            "claude",
+            "/tmp/project",
+            "prov-holder",
+            me + 1,
+            start
+        ));
+        std::fs::write(lease.path(), "{\"owner_pid\":").unwrap();
+        assert!(
+            !SessionLease::is_held_by("claude", "/tmp/project", "prov-holder", me, start),
+            "metadata that does not read names no one"
+        );
     }
 
     fn owner_in(path: &Path) -> serde_json::Value {

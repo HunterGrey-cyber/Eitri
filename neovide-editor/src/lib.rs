@@ -20,6 +20,18 @@ mod dmabuf_target;
 mod editor_area;
 #[doc(hidden)]
 pub mod fd_watch;
+#[doc(hidden)]
+pub mod subsurface_testing {
+    pub use crate::subsurface::{
+        BufferKey, ConnectionProbe, DmabufFeedback, FrameData, Globals, PaneId, PresentEvent, PresentSink,
+        PresenterThread, TestCommand,
+    };
+
+    /// Whether this display provides a foreign Wayland connection, for display-isolated tests.
+    pub fn connection_for(display: &gtk4::gdk::Display) -> Option<wayland_client::Connection> {
+        crate::subsurface::connection_for(display)
+    }
+}
 mod frame_clock;
 mod gl_interop;
 mod keyboard;
@@ -28,6 +40,7 @@ mod mouse;
 mod nvim_child;
 mod nvim_rpc;
 mod stdin;
+mod subsurface;
 mod tick_driver;
 
 /// Unit tests that acquire the default main context take this first: two at once would make the
@@ -37,6 +50,7 @@ pub(crate) static DEFAULT_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 
 pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
+pub use subsurface::Presentation;
 
 /// The priority of the one watch on the editors' shared event-loop fd, `None` while no editor pane
 /// on this thread has a live harness. Diagnostic: the multi-pane tests read it.
@@ -81,6 +95,148 @@ use tick_driver::{
     WantsFrame,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameReason {
+    Batch,
+    Animation,
+    Focus,
+    Theme,
+    Map,
+    Scale,
+    Restart,
+}
+
+fn subsurface_on(widget: &GLArea) -> Option<Rc<subsurface::SubsurfacePane>> {
+    widget.downcast_ref::<editor_area::EditorGlArea>()?.subsurface()
+}
+
+fn request_frame_on(widget: &GLArea, reason: FrameReason) {
+    if reason == FrameReason::Restart {
+        if let Some(log) = widget
+            .downcast_ref::<editor_area::EditorGlArea>()
+            .and_then(|area| area.present_log())
+        {
+            log.missing();
+        }
+    }
+    if let Some(pane) = subsurface_on(widget) {
+        pane.request(reason);
+    } else {
+        widget.queue_render();
+    }
+}
+
+fn set_clear_color_and_request(clear_color: &Cell<Color4f>, color: (u8, u8, u8), request: impl FnOnce(FrameReason)) {
+    clear_color.set(rgb_color(color));
+    request(FrameReason::Theme);
+}
+
+fn set_focused_and_request(
+    focused: &Cell<Option<bool>>,
+    live_state: &RefCell<LiveState>,
+    value: bool,
+    request: impl FnOnce(FrameReason),
+) {
+    focused.set(Some(value));
+    if let LiveState::Ready(session) = &mut *live_state.borrow_mut() {
+        session.harness.set_focused(value);
+        session.wants_frame.set(true);
+    }
+    request(FrameReason::Focus);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RenderTarget {
+    GtkFramebuffer {
+        os_scale: f64,
+    },
+    OwnTexture {
+        os_scale: f64,
+    },
+    Subsurface {
+        framebuffer: u32,
+        buffer: (i32, i32),
+        content: (i32, i32),
+        os_scale: f64,
+    },
+}
+
+type RenderFn = Rc<dyn Fn(&GLArea, RenderTarget) -> glib::Propagation>;
+
+fn current_target(widget: &GLArea) -> RenderTarget {
+    let os_scale = f64::from(widget.scale_factor().max(1));
+    if widget
+        .downcast_ref::<editor_area::EditorGlArea>()
+        .is_some_and(editor_area::EditorGlArea::draws_into_own_buffer)
+    {
+        RenderTarget::OwnTexture { os_scale }
+    } else {
+        RenderTarget::GtkFramebuffer { os_scale }
+    }
+}
+
+struct PaneShared {
+    skia_state: Rc<RefCell<Option<SkiaState>>>,
+    live_state: Rc<RefCell<LiveState>>,
+    fb_size: Rc<Cell<(i32, i32)>>,
+    device_scale: Rc<Cell<f64>>,
+}
+
+impl PaneShared {
+    fn device_scale(&self) -> f64 {
+        self.device_scale.get()
+    }
+}
+
+fn framebuffer_resized(state: &PaneShared, width: i32, height: i32, os_scale: f64) {
+    let PaneShared {
+        skia_state,
+        live_state,
+        fb_size,
+        device_scale,
+    } = state;
+    device_scale.set(os_scale.max(1.0));
+    // Keep the framebuffer and its scale together, including before nvim starts.
+    fb_size.set((width, height));
+    let mut live = live_state.borrow_mut();
+    let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
+        session.wants_frame.set(true);
+        // The cell size must match the new framebuffer before computing its grid.
+        sync_os_scale(&mut session.harness, state.device_scale());
+        let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
+            grid_size_for_content_region(&session.harness, r)
+        })
+        .grid;
+        let resized_grid = if new_grid_size != session.last_grid_size.get() {
+            session.harness.resize_grid(new_grid_size);
+            session.last_grid_size.set(new_grid_size);
+            Some(new_grid_size)
+        } else {
+            None
+        };
+        (true, resized_grid)
+    } else {
+        (false, None)
+    };
+    drop(live);
+    println!(
+        "[resize] fb={}x{}px scale_factor={} logical={}x{} forced_next_frame={} resized_grid={:?}",
+        width,
+        height,
+        state.device_scale(),
+        f64::from(width) / state.device_scale(),
+        f64::from(height) / state.device_scale(),
+        forced_next_frame,
+        resized_grid.map(|g| (g.width, g.height)),
+    );
+    if let Some(state) = skia_state.borrow_mut().as_mut() {
+        state.fb_width = width;
+        state.fb_height = height;
+        // A resize invalidates the surface even if GL reused its framebuffer name.
+        state.gtk_surface = None;
+    }
+}
+
 /// Log a frame-pacing line every N frames instead of spamming stdout every frame.
 const LOG_EVERY_N_FRAMES: u64 = 60;
 
@@ -104,6 +260,35 @@ const OUTSIDE_COLOR: Color4f = Color4f::new(0.102, 0.106, 0.122, 1.0);
 /// real, observed blocking call in this crate) -- distinct from both `OUTSIDE_COLOR` and anything
 /// the real renderer would draw, so it's obvious on screen which phase is showing.
 const STARTING_COLOR: Color4f = Color4f::new(0.12, 0.12, 0.16, 1.0);
+
+/// Converts RGB bytes to an opaque colour for drawing.
+fn rgb_color((r, g, b): (u8, u8, u8)) -> Color4f {
+    Color4f::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0)
+}
+
+/// Uses the host's starting colour when supplied, otherwise the pane's own placeholder colour.
+fn placeholder_color(starting: Option<Color4f>) -> Color4f {
+    starting.unwrap_or(STARTING_COLOR)
+}
+
+/// The colour the subsurface path paints where the editor's hole is closed: the frame's clear colour once nvim is
+/// ready, and before that the same placeholder the GTK path shows.
+fn hole_cover_color(nvim_ready: bool, clear: Color4f, starting: Option<(u8, u8, u8)>) -> Color4f {
+    if nvim_ready {
+        clear
+    } else {
+        placeholder_color(starting.map(rgb_color))
+    }
+}
+
+/// Covers incomplete nvim frames with the host's starting colour until the UI is ready.
+fn pre_ready_cover(starting: Option<Color4f>, nvim_ready: bool) -> Option<Color4f> {
+    if nvim_ready {
+        None
+    } else {
+        starting
+    }
+}
 /// Painted across `content_region` if `LiveHarness::with_options` itself returned `Err` (e.g. no
 /// `nvim` on `$PATH`) -- distinct from every other state color here.
 const FAILED_COLOR: Color4f = Color4f::new(0.5, 0.05, 0.05, 1.0);
@@ -113,16 +298,17 @@ const FAILED_COLOR: Color4f = Color4f::new(0.5, 0.05, 0.05, 1.0);
 /// *before* the one real, observed blocking call in this crate (`LiveHarness::with_options`) runs.
 /// `NotStarted` -> one placeholder frame painted+presented -> `Starting` -> next render callback
 /// performs the blocking construction -> `Ready`/`Failed`. A restart
-/// ([`NeovideEditorPane::restart`]) takes an `Exited` pane back to `NotStarted`, and the same path
-/// runs again on the same widget.
+/// ([`NeovideEditorPane::restart`]) takes an `Exited` or `Failed` pane back to `NotStarted`, and the
+/// same path runs again on the same widget.
 pub enum LiveState {
     NotStarted,
     Starting,
     Ready(Box<LiveSession>),
     Failed(String),
-    /// nvim quit and the host let this pane go ([`NeovideEditorPane::release_exited`]): the harness
-    /// is shut down and dropped, so nothing -- a focus report, a resize, a key -- can reach its
-    /// closed command channel (`send_ui` panics on one). The process can start another
+    /// nvim quit and the host let this pane go ([`NeovideEditorPane::release_exited`]), or the host
+    /// shut the pane down before it launched its nvim ([`NeovideEditorPane::shutdown`]): the harness
+    /// is shut down and dropped (or was never built), so nothing -- a focus report, a resize, a
+    /// key -- can reach its closed command channel (`send_ui` panics on one). The process can start another
     /// `nvim --embed`: harnesses share one event loop per thread, so a new one joins it rather than
     /// building a second winit `EventLoop`. [`NeovideEditorPane::restart`] starts one in this pane.
     Exited,
@@ -141,8 +327,8 @@ impl LiveState {
     }
 }
 
-/// Why [`NeovideEditorPane::restart`] did nothing: the pane was not [`LiveState::Exited`]. `state`
-/// is the name of the state it was in ([`LiveState::name`]).
+/// Why [`NeovideEditorPane::restart`] did nothing: the pane was neither [`LiveState::Exited`] nor
+/// [`LiveState::Failed`]. `state` is the name of the state it was in ([`LiveState::name`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartRefused {
     pub state: &'static str,
@@ -152,7 +338,7 @@ impl std::fmt::Display for RestartRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the editor pane is {}, and only a pane whose nvim ended and was released can restart",
+            "the editor pane is {}, and only a pane whose nvim ended and was released, or whose launch failed, can restart",
             self.state
         )
     }
@@ -161,11 +347,12 @@ impl std::fmt::Display for RestartRefused {
 impl std::error::Error for RestartRefused {}
 
 /// The refusal [`NeovideEditorPane::restart`] returns from `state`, or `None` when it may restart:
-/// only from `Exited`. Every other state still has, or is about to have, a harness of its own, and
-/// a second one started over it would leave the first running with nothing to end it.
+/// only from `Exited` or `Failed`, the two states that hold no harness (a failed launch never made
+/// one). Every other state still has, or is about to have, a harness of its own, and a second one
+/// started over it would leave the first running with nothing to end it.
 fn restart_refusal(state: &LiveState) -> Option<RestartRefused> {
     match state {
-        LiveState::Exited => None,
+        LiveState::Exited | LiveState::Failed(_) => None,
         other => Some(RestartRefused { state: other.name() }),
     }
 }
@@ -243,6 +430,7 @@ pub struct LiveSession {
     /// the mouse handlers hit-test against exactly the size the frame was drawn at
     /// (`gl_interop::current_content_region`); see `gl_interop::GridLayout`.
     pub(crate) fb_size: Rc<Cell<(i32, i32)>>,
+    device_scale: Rc<Cell<f64>>,
     /// `(fb_w, fb_h, cell_w bits, cell_h bits, cols, rows)` as the `[layout]` line last printed
     /// it, so the line is printed when the layout changes and never per frame. Bits, not f32, so
     /// a NaN cell before nvim reports a font does not count as a change every frame.
@@ -284,10 +472,15 @@ impl Drop for LiveSession {
 }
 
 impl LiveSession {
+    fn device_scale(&self) -> f64 {
+        self.device_scale.get()
+    }
+
     fn new(
         harness: LiveHarness,
         grid_size: GridSize<u32>,
         fb_size: Rc<Cell<(i32, i32)>>,
+        device_scale: Rc<Cell<f64>>,
         nvim_process: Arc<nvim_child::NvimProcess>,
         driver: &Rc<TickDriver>,
     ) -> Self {
@@ -312,6 +505,7 @@ impl LiveSession {
             scroll_position: Cell::new((0.0, 0.0)),
             last_pointer_pos: Cell::new((0.0, 0.0)),
             fb_size,
+            device_scale,
             last_logged_layout: Cell::new(None),
             nvim_process,
             watched: None,
@@ -474,6 +668,8 @@ type ScaleFactorCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f32)>>>>;
 type CellSizeCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f64, f64)>>>>;
 /// See [`NeovideEditorPane::on_start_failed`].
 type StartFailedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
+/// See [`NeovideEditorPane::on_session_ready`].
+type SessionReadyCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -483,6 +679,9 @@ type StartFailedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
 /// window is shown, and wire its own window's `connect_close_request` to `.shutdown()`.
 pub struct NeovideEditorPane {
     widget: GLArea,
+    shared: Rc<PaneShared>,
+    hole_changed_callbacks: Rc<RefCell<Vec<Rc<dyn Fn()>>>>,
+    presentation: Rc<Cell<Option<Presentation>>>,
     /// Kept alive here (rather than only living inside the closures set up in `new()`) so
     /// `grab_focus()` can call `im_context.focus_in()` after the host actually shows/focuses this
     /// pane's widget -- mirroring the reference probe's own `gl_area.grab_focus()` +
@@ -512,6 +711,8 @@ pub struct NeovideEditorPane {
     cell_size_callback: CellSizeCallbackSlot,
     /// See [`NeovideEditorPane::on_start_failed`].
     start_failed_callback: StartFailedCallbackSlot,
+    /// See [`NeovideEditorPane::on_session_ready`].
+    session_ready_callback: SessionReadyCallbackSlot,
     /// See [`NeovideEditorPane::connect_key_activity`].
     key_activity: keyboard::KeyActivity,
     /// The tick callback's registration and the event-loop fd watch (`tick_driver`).
@@ -522,11 +723,13 @@ pub struct NeovideEditorPane {
 }
 
 /// Construction-time options for [`NeovideEditorPane::with_options`], and a restart's for
-/// [`NeovideEditorPane::restart`]. Each field is forwarded to
+/// [`NeovideEditorPane::restart`]. Except for the pane's `starting_color`, each field is forwarded to
 /// the `LiveHarnessOptions` field of the same name, so this crate stays a pass-through rather than
 /// growing a `with_this_and_that` constructor per combination a host happens to need.
-#[derive(Default)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct NeovideEditorPaneOptions {
+    /// The colour the pane paints before nvim's UI is ready; `None` keeps the crate's own colour.
+    pub starting_color: Option<(u8, u8, u8)>,
     /// Launch nvim with `--clean` (no user plugins/config), for deterministic verification runs.
     pub clean: bool,
     /// Extra `(name, value)` environment variables set on the spawned `nvim --embed` child process
@@ -855,21 +1058,10 @@ fn sessionless_tick_should_render(state: &LiveState, failed_painted: bool) -> bo
     }
 }
 
-/// The OS-scale value [`sync_os_scale`] should hand `LiveHarness::set_os_scale_factor`, given GTK's
-/// raw `Widget::scale_factor()` right now -- or `None` if `current` (the harness's own
-/// `os_scale_factor()`) already agrees with it. Pure and split out for the same
-/// reason `tick_should_render`/`cell_size_changed` are: no unit test here can construct a real
-/// `LiveHarness`.
-///
-/// `widget_scale_factor` is GTK's own rounded-up integer (the same basis every hit-test in this
-/// crate already uses -- `pixel_to_grid_pos`, `cell_size`, the tick's own `widget_size` computation
-/// -- never `Surface::scale()`'s fraction). A widget not yet realized on a surface reports `0` (and
-/// never negative in practice), so this treats anything below `1` as `1`, matching every other
-/// `.max(1)` in this crate. Compared against `current` by bits, exactly like
-/// `LiveHarness::set_os_scale_factor` compares internally, so this and that call always agree on
-/// whether anything actually changed.
-fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
-    let target = f64::from(widget_scale_factor.max(1));
+/// The device scale to apply to the harness, or `None` when it already agrees by bits.
+/// The framebuffer's producer supplies this scale; values below one count as one.
+fn os_scale_to_apply(current: f64, scale: f64) -> Option<f64> {
+    let target = scale.max(1.0);
     if target.to_bits() == current.to_bits() {
         None
     } else {
@@ -877,24 +1069,12 @@ fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
     }
 }
 
-/// Applies GTK's current `Widget::scale_factor()` to `harness` when it disagrees with the harness's
-/// own record ([`os_scale_to_apply`]) -- the whole of the scale sync. Called from the two sites that
-/// see a new framebuffer, `connect_resize`'s `Ready` branch and the render callback's `Ready` arm, both
-/// **before** any grid is computed from `harness.grid_scale()`: `set_os_scale_factor` moves the
-/// renderer's cell size synchronously, so calling this before the grid read means a scale change and
-/// the framebuffer resize that always accompanies it (GTK reallocates `GtkGLArea`'s buffers and
-/// fires `resize` on its next snapshot) land in the very same GTK callback, and no tick ever computes
-/// a grid from a cell size and a framebuffer that belong to different scales (see `gl_interop`'s
-/// `snap_tests::a_scale_change_applied_with_its_framebuffer_resizes_nothing` for the invariant this
-/// keeps, and its counter-example for the transient grid it prevents).
-///
-/// Returns exactly what `LiveHarness::set_os_scale_factor` returns: `true` only on a real, applied
-/// change. Never called from `connect_scale_factor_notify` itself -- that handler only asks for
-/// a frame; this runs once GTK actually hands over the matching new framebuffer. Prints one
-/// `[hidpi]` line on an applied change, for a GUI pass to read; the common case (nothing changed
-/// this frame) costs one bit comparison and prints nothing, so an idle pane stays idle.
-fn sync_os_scale(harness: &mut LiveHarness, widget_scale_factor: i32) -> bool {
-    let Some(new_scale) = os_scale_to_apply(harness.os_scale_factor(), widget_scale_factor) else {
+/// Applies the framebuffer's device scale before any grid is computed from the harness's cells.
+/// The resize and render paths call this with the scale of the framebuffer they received;
+/// scale notification only asks for a frame, because it does not yet have that framebuffer.
+/// Returns whether the harness applied a change and logs only that change.
+fn sync_os_scale(harness: &mut LiveHarness, scale: f64) -> bool {
+    let Some(new_scale) = os_scale_to_apply(harness.os_scale_factor(), scale) else {
         return false;
     };
     let old_scale = harness.os_scale_factor();
@@ -992,14 +1172,8 @@ impl NeovideEditorPane {
     /// Takes straight RGB bytes rather than a `Color4f` so a host does not need `skia_safe` in its
     /// own dependency graph to call it; alpha is always opaque, since a translucent band would let
     /// through whatever GTK last painted there.
-    pub fn set_clear_color(&self, (r, g, b): (u8, u8, u8)) {
-        self.clear_color.set(Color4f::new(
-            f32::from(r) / 255.0,
-            f32::from(g) / 255.0,
-            f32::from(b) / 255.0,
-            1.0,
-        ));
-        self.widget.queue_render();
+    pub fn set_clear_color(&self, color: (u8, u8, u8)) {
+        set_clear_color_and_request(&self.clear_color, color, |reason| self.request_frame(reason));
     }
 
     /// Builds the `GtkGLArea` and wires every resize/IME/keyboard/mouse/tick/render callback onto
@@ -1034,8 +1208,49 @@ impl NeovideEditorPane {
 
         let skia_state: Rc<RefCell<Option<SkiaState>>> = Rc::new(RefCell::new(None));
         let live_state: Rc<RefCell<LiveState>> = Rc::new(RefCell::new(LiveState::NotStarted));
+        if let Some(log) = gl_area
+            .downcast_ref::<editor_area::EditorGlArea>()
+            .and_then(|area| area.present_log())
+        {
+            let keys = gtk4::EventControllerKey::new();
+            keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let live = Rc::downgrade(&live_state);
+            keys.connect_key_pressed(move |_, keyval, keycode, _| {
+                use glib::translate::IntoGlib;
+                let epoch = live.upgrade().and_then(|live| {
+                    let live = live.try_borrow().ok()?;
+                    match &*live {
+                        LiveState::Ready(session) => Some(session.harness.redraw_batches_seen()),
+                        _ => None,
+                    }
+                });
+                log.key(epoch, keyval.into_glib(), keycode);
+                glib::Propagation::Proceed
+            });
+            gl_area.add_controller(keys);
+        }
         let tick_driver: Rc<TickDriver> = Rc::new(TickDriver::default());
         let clear_color = Rc::new(Cell::new(OUTSIDE_COLOR));
+        let presentation = Rc::new(Cell::new(None));
+        let hole_changed_callbacks: Rc<RefCell<Vec<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(Vec::new()));
+        if let Some(area) = gl_area.downcast_ref::<editor_area::EditorGlArea>() {
+            let callbacks = hole_changed_callbacks.clone();
+            area.set_hole_changed(Rc::new(move || {
+                let callbacks = callbacks.borrow().clone();
+                for callback in callbacks {
+                    callback();
+                }
+            }));
+            let clear = clear_color.clone();
+            let options = spawn_options.clone();
+            let live = live_state.clone();
+            area.set_cover(Rc::new(move || {
+                let ready = live
+                    .try_borrow()
+                    .is_ok_and(|live| matches!(&*live, LiveState::Ready(session) if session.harness.is_ready()));
+                hole_cover_color(ready, clear.get(), options.borrow().starting_color)
+            }));
+        }
         let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
         let unreachable_callback: UnreachableCallbackSlot = Rc::new(RefCell::new(None));
@@ -1052,10 +1267,11 @@ impl NeovideEditorPane {
         let last_fullscreen_setting: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
         let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
-        // Set once, the first time the `Failed` arm below actually paints `FAILED_COLOR` and
-        // the message -- read by the tick callback ([`failed_tick_should_render`]) to stop asking for
-        // more frames once that one paint has happened. `Failed` never leaves itself, so this is
-        // never reset.
+        let session_ready_callback: SessionReadyCallbackSlot = Rc::new(RefCell::new(None));
+        // Set the first time the `Failed` arm below actually paints `FAILED_COLOR` and the message
+        // -- read by the tick callback ([`failed_tick_should_render`]) to stop asking for more
+        // frames once that one paint has happened. `Failed` leaves itself only through a restart,
+        // and the `NotStarted` arm clears this then, so a launch that fails again paints again.
         let failed_painted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Only the render closure below ever reads this -- not stored on `Self`, unlike
         // `cell_size_callback`, which a host registers *after* construction.
@@ -1064,6 +1280,12 @@ impl NeovideEditorPane {
         // testing all derive from -- GTK's own, as `GLArea::resize` reports it, so none of them can
         // drift from the others; see `gl_interop::GridLayout`.
         let fb_size: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+        let shared = Rc::new(PaneShared {
+            skia_state: skia_state.clone(),
+            live_state: live_state.clone(),
+            fb_size: fb_size.clone(),
+            device_scale: Rc::new(Cell::new(f64::from(gl_area.scale_factor().max(1)))),
+        });
 
         // GtkWidget::unrealize is RUN_LAST: this normal handler runs before GtkGLArea deletes
         // its framebuffer and clears its GL context. Keep the nvim session across re-realization,
@@ -1071,6 +1293,13 @@ impl NeovideEditorPane {
         {
             let skia_state = skia_state.clone();
             gl_area.connect_unrealize(move |widget| {
+                if let Some(area) = widget.downcast_ref::<editor_area::EditorGlArea>() {
+                    let pane = area.subsurface();
+                    area.set_subsurface(None);
+                    if let Some(pane) = pane {
+                        pane.stop();
+                    }
+                }
                 let Some(state) = skia_state.borrow_mut().take() else {
                     return;
                 };
@@ -1090,60 +1319,12 @@ impl NeovideEditorPane {
         // (in grid *cells*, not raw pixels) from what nvim was last told, call
         // `LiveHarness::resize_grid` so nvim's own viewport tracks the real host size.
         {
-            let skia_state = skia_state.clone();
-            let live_state = live_state.clone();
-            let fb_size = fb_size.clone();
+            let shared = shared.clone();
             gl_area.connect_resize(move |widget, width, height| {
-                // Outside the `Ready` check, so a resize before nvim exists is kept too.
-                fb_size.set((width, height));
-                let mut live = live_state.borrow_mut();
-                let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
-                    session.wants_frame.set(true);
-                    // Before any grid is computed from `grid_scale()`, so a scale change and
-                    // the framebuffer this very `resize` signal hands over always land together.
-                    sync_os_scale(&mut session.harness, widget.scale_factor());
-                    let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
-                        grid_size_for_content_region(&session.harness, r)
-                    })
-                    .grid;
-                    let resized_grid = if new_grid_size != session.last_grid_size.get() {
-                        session.harness.resize_grid(new_grid_size);
-                        session.last_grid_size.set(new_grid_size);
-                        Some(new_grid_size)
-                    } else {
-                        None
-                    };
-                    (true, resized_grid)
-                } else {
-                    (false, None)
-                };
-                drop(live);
-                println!(
-                    "[resize] fb={}x{}px scale_factor={} logical={}x{} forced_next_frame={} \
-                     resized_grid={:?}",
-                    width,
-                    height,
-                    widget.scale_factor(),
-                    widget.width(),
-                    widget.height(),
-                    forced_next_frame,
-                    resized_grid.map(|g| (g.width, g.height)),
-                );
-                let mut state = skia_state.borrow_mut();
-                match state.as_mut() {
-                    Some(state) => {
-                        state.fb_width = width;
-                        state.fb_height = height;
-                        // Force rebuild against GTK's resized framebuffer.
-                        state.gtk_surface = None;
-                        // The render target is reallocated only if its pixel size changed. GTK can
-                        // emit resize after an allocation whose dimensions stayed exactly the same.
-                    }
-                    None => {
-                        // GrContext not created yet; render() will pick up the GLArea's current
-                        // size directly.
-                    }
+                if subsurface_on(widget).is_some_and(|pane| pane.owns_snapshot()) {
+                    return;
                 }
+                framebuffer_resized(&shared, width, height, f64::from(widget.scale_factor().max(1)));
             });
         }
 
@@ -1158,6 +1339,10 @@ impl NeovideEditorPane {
                 if let LiveState::Ready(session) = &mut *live_state.borrow_mut() {
                     session.animation_clock.reset();
                 }
+                if let Some(pane) = subsurface_on(widget).filter(|pane| pane.is_active()) {
+                    pane.map();
+                    return;
+                }
                 let widget = widget.downgrade();
                 let live_state = live_state.clone();
                 kick.schedule(REMAP_RENDER_DELAY, move || {
@@ -1169,10 +1354,16 @@ impl NeovideEditorPane {
                             session.wants_frame.set(true);
                         }
                     }
-                    widget.queue_render();
+                    request_frame_on(&widget, FrameReason::Map);
                 });
             });
         }
+
+        gl_area.connect_unmap(|widget| {
+            if let Some(pane) = subsurface_on(widget) {
+                pane.unmap();
+            }
+        });
 
         // --- scale-factor notify: `GtkGLArea` reallocates its own buffers and fires
         // `resize` (with the new framebuffer) only on its NEXT snapshot after this notify fires --
@@ -1194,7 +1385,7 @@ impl NeovideEditorPane {
                         session.wants_frame.set(true);
                     }
                 }
-                widget.queue_render();
+                request_frame_on(widget, FrameReason::Scale);
             });
         }
 
@@ -1233,16 +1424,14 @@ impl NeovideEditorPane {
             let motion = EventControllerMotion::new();
             {
                 let live_state = live_state.clone();
-                let gl_area = gl_area.clone();
                 motion.connect_motion(move |controller, x, y| {
-                    mouse::handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+                    mouse::handle_mouse_motion(&live_state, controller, x, y);
                 });
             }
             {
                 let live_state = live_state.clone();
-                let gl_area = gl_area.clone();
                 motion.connect_enter(move |controller, x, y| {
-                    mouse::handle_mouse_motion(&live_state, &gl_area, controller, x, y);
+                    mouse::handle_mouse_motion(&live_state, controller, x, y);
                 });
             }
             gl_area.add_controller(motion);
@@ -1251,17 +1440,16 @@ impl NeovideEditorPane {
         {
             let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
             let live_state = live_state.clone();
-            let gl_area_for_scroll = gl_area.clone();
-            scroll.connect_scroll(move |controller, dx, dy| {
-                mouse::handle_mouse_scroll(&live_state, &gl_area_for_scroll, controller, dx, dy)
-            });
+            scroll
+                .connect_scroll(move |controller, dx, dy| mouse::handle_mouse_scroll(&live_state, controller, dx, dy));
             gl_area.add_controller(scroll);
         }
 
         // --- render: build (lazily) and drive one LiveHarness frame every tick. See the
         // `LiveState` doc for why construction is deliberately split across two render callbacks
         // instead of happening inline here.
-        {
+        let render: RenderFn = {
+            let shared = shared.clone();
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
             // This closure is the only place `LiveHarness` is ever constructed, so it is the one
@@ -1278,21 +1466,53 @@ impl NeovideEditorPane {
             let cell_size_callback_for_render = cell_size_callback.clone();
             let last_cell_size = last_cell_size.clone();
             let start_failed_callback_for_render = start_failed_callback.clone();
+            let session_ready_callback_for_render = session_ready_callback.clone();
             let failed_painted_for_render = failed_painted.clone();
-            gl_area.connect_render(move |widget, _gl_ctx| {
+            Rc::new(move |widget: &GLArea, target: RenderTarget| {
+                let separate = match target {
+                    RenderTarget::Subsurface {
+                        framebuffer,
+                        buffer,
+                        content,
+                        os_scale,
+                    } => {
+                        if shared.fb_size.get() != content || shared.device_scale() != os_scale {
+                            framebuffer_resized(&shared, content.0, content.1, os_scale);
+                        }
+                        Some((framebuffer, buffer))
+                    }
+                    RenderTarget::GtkFramebuffer { os_scale } | RenderTarget::OwnTexture { os_scale } => {
+                        let content = (
+                            (f64::from(widget.width()) * os_scale).round() as i32,
+                            (f64::from(widget.height()) * os_scale).round() as i32,
+                        );
+                        if shared.fb_size.get() != content || shared.device_scale() != os_scale {
+                            framebuffer_resized(&shared, content.0, content.1, os_scale);
+                        }
+                        None
+                    }
+                };
+                let (os_scale, own_buffer) = match target {
+                    RenderTarget::GtkFramebuffer { os_scale } => (os_scale, false),
+                    RenderTarget::OwnTexture { os_scale } => (os_scale, true),
+                    RenderTarget::Subsurface { os_scale, .. } => (os_scale, true),
+                };
+                shared.device_scale.set(os_scale.max(1.0));
+
                 let mut state_slot = skia_state.borrow_mut();
 
                 if state_slot.is_none() {
                     let interface = make_gl_interface();
-                    let gr_context =
-                        direct_contexts::make_gl(interface, None).expect("failed to create Skia GL DirectContext");
-                    let width = widget.width() * widget.scale_factor();
-                    let height = widget.height() * widget.scale_factor();
+                    let Some(gr_context) = direct_contexts::make_gl(interface, None) else {
+                        return glib::Propagation::Proceed;
+                    };
+                    let width = (f64::from(widget.width()) * shared.device_scale()).round() as i32;
+                    let height = (f64::from(widget.height()) * shared.device_scale()).round() as i32;
                     println!(
                         "[init] Skia DirectContext created; initial fb={}x{}px scale_factor={}",
                         width,
                         height,
-                        widget.scale_factor()
+                        shared.device_scale()
                     );
                     *state_slot = Some(SkiaState::new(gr_context, width, height));
                     // The same computation GTK 4.22.5 uses for its own buffers and `resize`
@@ -1301,7 +1521,9 @@ impl NeovideEditorPane {
                     fb_size.set((width, height));
                 }
 
-                let state = state_slot.as_mut().unwrap();
+                let Some(state) = state_slot.as_mut() else {
+                    return glib::Propagation::Proceed;
+                };
                 // Must come before anything draws this frame: GTK shares this GL context with us
                 // and rebinds textures behind Skia's back (on a resize in particular), which makes
                 // every glyph paint as a solid block until Skia is told to distrust its state
@@ -1311,14 +1533,39 @@ impl NeovideEditorPane {
                 state.invalidate_cached_gl_state();
                 // `EditorGlArea`'s own tiled buffer is bound (`editor_area`): Skia draws straight
                 // into it, with no intermediate and no copy. Otherwise `GtkGLArea`'s.
-                let own_buffer = widget
-                    .downcast_ref::<editor_area::EditorGlArea>()
-                    .is_some_and(editor_area::EditorGlArea::draws_into_own_buffer);
-                state.ensure_gtk_surface(own_buffer);
-                state.ensure_render_surface(own_buffer);
+                let mut separate_surface = if let Some((framebuffer, buffer)) = separate {
+                    use skia_safe::gpu::{backend_render_targets, gl::FramebufferInfo, surfaces, SurfaceOrigin};
+                    let target = backend_render_targets::make_gl(
+                        buffer,
+                        0,
+                        8,
+                        FramebufferInfo {
+                            fboid: framebuffer,
+                            format: skia_safe::gpu::gl::Format::RGBA8.into(),
+                            ..Default::default()
+                        },
+                    );
+                    let surface = surfaces::wrap_backend_render_target(
+                        &mut state.gr_context,
+                        &target,
+                        SurfaceOrigin::BottomLeft,
+                        skia_safe::ColorType::RGBA8888,
+                        None,
+                        None,
+                    );
+                    if surface.is_none() {
+                        return glib::Propagation::Proceed;
+                    }
+                    state.render_surface = None;
+                    surface
+                } else {
+                    state.ensure_gtk_surface(own_buffer);
+                    state.ensure_render_surface(own_buffer);
+                    None
+                };
 
-                let Some(gtk_surface) = state.gtk_surface.as_mut() else {
-                    return glib::Propagation::Stop;
+                let Some(gtk_surface) = separate_surface.as_mut().or(state.gtk_surface.as_mut()) else {
+                    return glib::Propagation::Proceed;
                 };
 
                 let (fb_w, fb_h) = fb_size.get();
@@ -1345,12 +1592,16 @@ impl NeovideEditorPane {
                 let mut cell_size_changed_to: Option<(f64, f64)> = None;
                 // Set from inside the `Starting` arm's `Err` case below, fired only *after*
                 // `live` is dropped -- same reentrancy rule. Unlike `cell_size_changed_to` this fires
-                // at most once per pane, since `Starting` -> `Failed` happens exactly once.
+                // at most once per launch, since each launch goes `Starting` -> `Failed` at most once.
                 let mut start_failed_message: Option<String> = None;
+                // Set where the `Starting` arm's launch makes a session, fired only *after* `live` is
+                // dropped -- same reentrancy rule. Once per session: the first start and each restart.
+                let mut session_became_ready = false;
                 // Set in the `Ready`, `Failed` and `Exited` arms, acted on after `live` is dropped:
                 // whether the tick callback is still wanted once this frame is committed (F2/F3).
                 let mut tick_wanted_after_render: Option<bool> = None;
 
+                let starting = spawn_options.borrow().starting_color.map(rgb_color);
                 let mut live = live_state.borrow_mut();
                 match &mut *live {
                     LiveState::NotStarted => {
@@ -1362,13 +1613,16 @@ impl NeovideEditorPane {
                             "[live] showing 'starting nvim...' placeholder; LiveHarness::with_options \
                              will run (and block this thread) on the next frame"
                         );
-                        fill_content_region(canvas, &content_region, STARTING_COLOR);
+                        fill_content_region(canvas, &content_region, placeholder_color(starting));
+                        // A restart of a failed pane starts here too: its failure, if it comes
+                        // again, needs its own paint.
+                        failed_painted_for_render.set(false);
                         *live = LiveState::Starting;
                     }
                     LiveState::Starting => {
-                        fill_content_region(canvas, &content_region, STARTING_COLOR);
+                        fill_content_region(canvas, &content_region, placeholder_color(starting));
 
-                        let os_scale_factor = widget.scale_factor() as f64;
+                        let os_scale_factor = shared.device_scale();
                         let spawn = spawn_options.borrow();
                         let (clean, cwd) = (spawn.clean, spawn.cwd.clone());
                         let options = LiveHarnessOptions {
@@ -1484,9 +1738,11 @@ impl NeovideEditorPane {
                                     harness,
                                     grid_size,
                                     fb_size.clone(),
+                                    shared.device_scale.clone(),
                                     nvim_process,
                                     &tick_driver_for_render,
                                 )));
+                                session_became_ready = true;
                             }
                             Ok(Err(err)) => {
                                 let elapsed = t0.elapsed();
@@ -1523,11 +1779,27 @@ impl NeovideEditorPane {
                         // Up to and including the first frame that shows nvim, everything is placed,
                         // not animated: nothing was on screen to move from (`AnimationClock::place`).
                         let dt = if session.logged_ready {
-                            session
-                                .animation_clock
-                                .advance(frame_time, refresh_interval, session.last_animating.get())
+                            if let Some(pane) =
+                                subsurface_on(widget).filter(|pane| pane.is_active() && separate.is_some())
+                            {
+                                session.animation_clock.advance_subsurface(
+                                    glib::monotonic_time(),
+                                    pane.period(),
+                                    session.last_animating.get(),
+                                )
+                            } else {
+                                session.animation_clock.advance(
+                                    frame_time,
+                                    refresh_interval,
+                                    session.last_animating.get(),
+                                )
+                            }
                         } else {
-                            session.animation_clock.place(frame_time)
+                            session.animation_clock.place(if separate.is_some() {
+                                glib::monotonic_time()
+                            } else {
+                                frame_time
+                            })
                         };
                         // Covers a re-realized widget, or any GTK whose snapshot does not
                         // re-emit `resize` -- `connect_resize` above is the OTHER call site, and
@@ -1535,7 +1807,7 @@ impl NeovideEditorPane {
                         // that belong to different scales. Unlike `connect_resize`, nothing else on
                         // this path already sets `wants_frame` for a plain scale change, so fold the
                         // "did this frame actually apply one" result in here.
-                        if sync_os_scale(&mut session.harness, widget.scale_factor()) {
+                        if sync_os_scale(&mut session.harness, shared.device_scale()) {
                             session.wants_frame.set(true);
                         }
                         // Snapped HERE rather than where `content_region` is computed above,
@@ -1550,6 +1822,15 @@ impl NeovideEditorPane {
                         });
                         session.log_layout_if_changed(fb_w, fb_h, snapped_scale, &layout);
                         let animating = session.harness.render_frame(canvas, Some(&layout.region), dt);
+                        if let Some(log) = widget
+                            .downcast_ref::<editor_area::EditorGlArea>()
+                            .and_then(|area| area.present_log())
+                        {
+                            log.rendered(session.harness.redraw_batches_seen());
+                        }
+                        if let Some(c) = pre_ready_cover(starting, session.harness.is_ready()) {
+                            fill_content_region(canvas, &content_region, c);
+                        }
                         // `render_frame` pumped every pane's batches outside the watch.
                         live_watch::after_outside_pump(Some(Rc::as_ptr(&session.live)));
                         if !same_grid_scale(snapped_scale, session.harness.grid_scale()) {
@@ -1567,7 +1848,7 @@ impl NeovideEditorPane {
                         // reported -- see `cell_size_changed`'s own doc for why `None` always
                         // counts as a change.
                         let current_scale = session.harness.grid_scale();
-                        let factor = f64::from(widget.scale_factor().max(1));
+                        let factor = shared.device_scale();
                         let new_cell_size = (
                             f64::from(current_scale.width()) / factor,
                             f64::from(current_scale.height()) / factor,
@@ -1579,6 +1860,9 @@ impl NeovideEditorPane {
                         // Share this frame's "do we still need more frames" signals with the tick
                         // callback.
                         session.last_animating.set(animating);
+                        if let Some(pane) = subsurface_on(widget).filter(|pane| pane.is_active()) {
+                            pane.animating(animating);
+                        }
                         session.last_seen_batches.set(session.harness.redraw_batches_seen());
                         // F2: `render_frame` pumped, and an exit, a fullscreen change or a scale
                         // change it consumed is reported only by the tick's service. If this frame
@@ -1663,6 +1947,12 @@ impl NeovideEditorPane {
                     }
                 }
 
+                if session_became_ready {
+                    if let Some(cb) = session_ready_callback_for_render.borrow().as_ref() {
+                        cb();
+                    }
+                }
+
                 if let Some((width, height)) = cell_size_changed_to {
                     if let Some(cb) = cell_size_callback_for_render.borrow().as_ref() {
                         cb(width, height);
@@ -1685,6 +1975,72 @@ impl NeovideEditorPane {
                 state.gr_context.flush_and_submit();
 
                 glib::Propagation::Stop
+            })
+        };
+        {
+            let render = render.clone();
+            gl_area.connect_render(move |widget, _| {
+                let log = widget
+                    .downcast_ref::<editor_area::EditorGlArea>()
+                    .and_then(|area| area.present_log());
+                if let Some(log) = &log {
+                    log.begin_render();
+                }
+                let result = render(widget, current_target(widget));
+                if result == glib::Propagation::Stop {
+                    if let Some(log) = log {
+                        log.commit(0);
+                    }
+                }
+                result
+            });
+        }
+
+        {
+            let presentation = presentation.clone();
+            let render = render.clone();
+            gl_area.connect_realize(move |widget| {
+                use subsurface::{decide, effective, Decision, Facts};
+                let stored = presentation.get().unwrap_or(Presentation::DEFAULT);
+                let setting = match effective(stored) {
+                    Ok(setting) => setting,
+                    Err(reason) => {
+                        eprintln!("[editor] subsurface: {reason}; falls back to the GTK path");
+                        return;
+                    }
+                };
+                let wayland = widget.display().type_().name() == "GdkWaylandDisplay";
+                if !wayland || setting == Presentation::Gtk {
+                    return;
+                }
+                widget.make_current();
+                let facts = Facts {
+                    wayland,
+                    gtk: (gtk4::major_version(), gtk4::minor_version(), gtk4::micro_version()),
+                    egl_vendor: if widget.error().is_none() {
+                        dmabuf_target::egl_vendor()
+                    } else {
+                        None
+                    },
+                };
+                if decide(setting, &facts) == Decision::Gtk {
+                    return;
+                }
+                if let Some(error) = widget.error() {
+                    eprintln!(
+                        "[editor] subsurface: the editor's GL context failed: {error}; falls back to the GTK path"
+                    );
+                    return;
+                }
+                let Some(thread) = subsurface::PresenterThread::for_display(&widget.display()) else {
+                    eprintln!(
+                        "[editor] subsurface: the presentation thread could not start; falls back to the GTK path"
+                    );
+                    return;
+                };
+                if let Some(area) = widget.downcast_ref::<editor_area::EditorGlArea>() {
+                    subsurface::SubsurfacePane::start(area, thread, render.clone());
+                }
             });
         }
 
@@ -1713,6 +2069,7 @@ impl NeovideEditorPane {
             let scale_factor_callback_for_tick = scale_factor_callback.clone();
             let scale_watch_for_tick = scale_watch.clone();
             let last_fullscreen_for_tick = last_fullscreen_setting.clone();
+            let shared = shared.clone();
             let tick_stats = Rc::new(TickStats::new());
             let fb_size = fb_size.clone();
             // One-shot: `[layout] note:` is printed at most once per pane.
@@ -1797,18 +2154,12 @@ impl NeovideEditorPane {
                         // drawn widget, which would mean a GTK whose buffers follow some other
                         // size.
                         //
-                        // A live OS-scale change is exactly this kind of mismatch between GTK's
-                        // `notify::scale-factor` -- which moves `widget.scale_factor()` while the
-                        // harness is still at the old scale and `fb_size` still holds the old
-                        // framebuffer -- and the next snapshot, whose `resize` sets `fb_size` and then
-                        // syncs the harness in the same callback (so the harness never runs ahead of
-                        // `fb_size`). The gap lasts one frame on a drawn widget and longer while the
-                        // pane is hidden. Expected, not the anomaly this note exists for: the added
-                        // `os_scale_factor()` comparison below skips the note while it is open.
+                        // Device scale advances with the framebuffer, so a scale notification
+                        // alone leaves both at their previous values until resize or render.
                         let (width, height) = fb_size.get();
                         let widget_size = (
-                            widget.width() * widget.scale_factor(),
-                            widget.height() * widget.scale_factor(),
+                            (f64::from(widget.width()) * shared.device_scale()).round() as i32,
+                            (f64::from(widget.height()) * shared.device_scale()).round() as i32,
                         );
                         if !layout_note_logged.get()
                             && widget.is_drawable()
@@ -1817,7 +2168,7 @@ impl NeovideEditorPane {
                             && widget_size.0 > 0
                             && widget_size.1 > 0
                             && widget_size != (width, height)
-                            && session.harness.os_scale_factor() == f64::from(widget.scale_factor().max(1))
+                            && session.harness.os_scale_factor() == shared.device_scale()
                         {
                             layout_note_logged.set(true);
                             println!(
@@ -1928,7 +2279,13 @@ impl NeovideEditorPane {
                 }
 
                 if issued {
-                    widget.queue_render();
+                    request_frame_on(
+                        widget,
+                        match source {
+                            ServiceSource::Tick => FrameReason::Animation,
+                            ServiceSource::FdWatch => FrameReason::Batch,
+                        },
+                    );
                 }
                 tick_stats.record(source, issued);
 
@@ -1951,6 +2308,9 @@ impl NeovideEditorPane {
 
         Self {
             widget: gl_area,
+            shared,
+            hole_changed_callbacks,
+            presentation,
             im_context,
             live_state,
             exited_callback,
@@ -1963,9 +2323,23 @@ impl NeovideEditorPane {
             scale_watch,
             cell_size_callback,
             start_failed_callback,
+            session_ready_callback,
             key_activity,
             tick_driver,
             spawn_options,
+        }
+    }
+
+    pub(crate) fn request_frame(&self, reason: FrameReason) {
+        request_frame_on(&self.widget, reason);
+    }
+
+    /// Stores this pane's preference across nvim restarts. A realized area keeps its current
+    /// presentation until it is realized again.
+    pub fn set_presentation(&self, value: Presentation) {
+        self.presentation.set(Some(value));
+        if self.widget.is_realized() {
+            eprintln!("[editor] subsurface: presentation set after realize; applies at the next realize");
         }
     }
 
@@ -1994,6 +2368,16 @@ impl NeovideEditorPane {
             .unwrap_or_default()
     }
 
+    /// The rectangle exposed for separate editor presentation, absent on the GTK path.
+    pub fn presentation_hole(&self) -> Option<gtk4::graphene::Rect> {
+        subsurface_on(&self.widget)?.hole_rect()
+    }
+
+    /// Registers a callback for changes to the editor's presentation hole.
+    pub fn connect_hole_changed(&self, callback: impl Fn() + 'static) {
+        self.hole_changed_callbacks.borrow_mut().push(Rc::new(callback));
+    }
+
     /// Tells the editor whether it has keyboard focus through `LiveHarness::set_focused`.
     /// This updates the cursor and sends `nvim_ui_set_focus` so nvim can fire `FocusGained` and
     /// `FocusLost`. `HIDE_UNFOCUSED_CURSOR_CMD` hides the unfocused cursor unless the user restores
@@ -2003,12 +2387,9 @@ impl NeovideEditorPane {
     /// requires both this pane to hold the window's focus widget and the window to be active.
     /// Calls before nvim starts are saved, and the harness drops repeated focus notifications.
     pub fn set_focused(&self, focused: bool) {
-        self.focused.set(Some(focused));
-        if let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() {
-            session.harness.set_focused(focused);
-            session.wants_frame.set(true);
-        }
-        self.widget.queue_render();
+        set_focused_and_request(&self.focused, &self.live_state, focused, |reason| {
+            self.request_frame(reason)
+        });
     }
 
     pub fn grab_focus(&self) {
@@ -2107,6 +2488,12 @@ impl NeovideEditorPane {
     /// scratch round trips answer "the editor is not ready yet" instead of doing nothing).
     pub fn is_ready(&self) -> bool {
         matches!(&*self.live_state.borrow(), LiveState::Ready(_))
+    }
+
+    /// Whether the pane is on its way to an nvim it has not launched yet: built, or restarted, and
+    /// waiting for the frames that paint its placeholder and then launch it.
+    pub fn is_starting(&self) -> bool {
+        matches!(&*self.live_state.borrow(), LiveState::NotStarted | LiveState::Starting)
     }
 
     /// Whether nvim is up and has not exited, as of the last service run's pump (tick or fd watch). Unlike
@@ -2338,7 +2725,7 @@ impl NeovideEditorPane {
             return None;
         };
         let scale = session.harness.grid_scale();
-        let factor = f64::from(self.widget.scale_factor().max(1));
+        let factor = self.shared.device_scale();
         Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))
     }
 
@@ -2386,16 +2773,26 @@ impl NeovideEditorPane {
         *self.unreachable_callback.borrow_mut() = Some(Box::new(callback));
     }
 
-    /// Registers `callback`, called at most once, with the human-readable reason
+    /// Registers `callback`, called once for each launch that fails, with the human-readable reason
     /// ([`build_start_failure_message`] or [`build_start_panic_message`]) if `LiveHarness::with_options`
-    /// returns `Err` or panics. Errors include nvim missing from `PATH` or older than this fork's
-    /// floor; panics can also come from the window system before nvim starts. Fired from the render
-    /// callback, after `live` is dropped -- the same reentrancy rule
-    /// [`NeovideEditorPane::on_exited_unrequested`]'s own
+    /// returns `Err` or panics. Errors include nvim missing from `PATH` or older than this fork's floor;
+    /// panics can also come from the window system before nvim starts. Fired from the render callback,
+    /// after `live` is dropped -- the same reentrancy rule [`NeovideEditorPane::on_exited_unrequested`]'s own
     /// callback follows, so a host's handler (`shell` drawing a label over this pane and moving focus
     /// elsewhere) is free to call back into this pane's own methods. Replaces any earlier callback.
     pub fn on_start_failed(&self, callback: impl Fn(&str) + 'static) {
         *self.start_failed_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Registers `callback`, called once for each nvim this pane launches, the moment its session
+    /// is made ([`is_ready`](Self::is_ready) answers `true` from then on): at the first start and at
+    /// every [`restart`](Self::restart), so a host can install again into a new nvim what it
+    /// installed into the one before. Not called for a launch that failed
+    /// ([`on_start_failed`](Self::on_start_failed)). Fired from the render callback, after `live` is
+    /// dropped -- the same reentrancy rule `on_start_failed`'s callback follows. Replaces any
+    /// earlier callback.
+    pub fn on_session_ready(&self, callback: impl Fn() + 'static) {
+        *self.session_ready_callback.borrow_mut() = Some(Box::new(callback));
     }
 
     /// After nvim quit on its own ([`NeovideEditorPane::on_exited_unrequested`]), for a host that
@@ -2431,18 +2828,19 @@ impl NeovideEditorPane {
         true
     }
 
-    /// Starts a new nvim in a pane whose nvim ended and was released ([`release_exited`]), with
-    /// `options` in place of the ones the pane was built with (they are kept for any later
-    /// restart). The pane goes back to [`LiveState::NotStarted`] on the widget it has -- no new
+    /// Starts a new nvim in a pane whose nvim ended and was released ([`release_exited`]), or whose
+    /// launch failed ([`on_start_failed`]), with `options` in place of the ones the pane was built
+    /// with (they are kept for any later restart). The pane goes back to [`LiveState::NotStarted`] on the widget it has -- no new
     /// `GtkGLArea`, nothing reparented or unrealized -- and the next render paints the placeholder
     /// and then launches nvim, exactly as at first start, so the launch blocks this thread as that
     /// one does. The callbacks the host registered stay registered and report on the new nvim.
     /// Returns at once; a pane that is not shown starts once it is drawn.
     ///
-    /// Refused, changing nothing, unless the pane is [`LiveState::Exited`]: the error names the
-    /// state it found.
+    /// Refused, changing nothing, unless the pane is [`LiveState::Exited`] or [`LiveState::Failed`]:
+    /// the error names the state it found.
     ///
     /// [`release_exited`]: Self::release_exited
+    /// [`on_start_failed`]: Self::on_start_failed
     pub fn restart(&self, options: NeovideEditorPaneOptions) -> Result<(), RestartRefused> {
         {
             let mut live = self.live_state.borrow_mut();
@@ -2457,7 +2855,7 @@ impl NeovideEditorPane {
         // The tick stopped when the pane was released; the service asks for frames again while
         // the pane is not started, and the render advances the start one frame at a time.
         self.tick_driver.kick();
-        self.widget.queue_render();
+        self.request_frame(FrameReason::Restart);
         Ok(())
     }
 
@@ -2470,8 +2868,17 @@ impl NeovideEditorPane {
     /// (`LiveHarness::shutdown`, which closes stdin too and sends nothing). A host asks nvim first
     /// (`shell` sends `:confirm qall` and calls this once nvim has exited), so it normally returns at
     /// once. Returns whether the fork saw nvim exit -- `true` if `LiveState` never reached `Ready`.
+    ///
+    /// A pane still to launch its nvim (built or restarted, `NotStarted` or `Starting`) is left
+    /// [`LiveState::Exited`] instead, so no later frame launches one: a window closed while its
+    /// editor restarts leaves no nvim behind it.
     pub fn shutdown(&self) -> bool {
         let mut live = self.live_state.borrow_mut();
+        if matches!(&*live, LiveState::NotStarted | LiveState::Starting) {
+            *live = LiveState::Exited;
+            println!("[live] shutdown(): nvim had not been launched yet; the pane will not launch it");
+            return true;
+        }
         if let LiveState::Ready(session) = &mut *live {
             // Set before anything below so the tick callback's own guard (see
             // `LiveSession::close_requested`'s doc) is already tripped when nvim actually exits: a
@@ -2503,6 +2910,74 @@ impl NeovideEditorPane {
 
 #[cfg(test)]
 mod tests {
+    use super::{rgb_color, set_clear_color_and_request, set_focused_and_request, FrameReason, OUTSIDE_COLOR};
+    use std::cell::RefCell;
+    #[test]
+    fn set_clear_color_requests_a_frame_through_the_funnel() {
+        let clear_color = Cell::new(OUTSIDE_COLOR);
+        let requests = Cell::new(0);
+        set_clear_color_and_request(&clear_color, (50, 100, 150), |reason| {
+            assert_eq!(reason, FrameReason::Theme);
+            assert_eq!(clear_color.get(), rgb_color((50, 100, 150)));
+            requests.set(requests.get() + 1);
+        });
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[test]
+    fn set_focused_requests_a_frame_through_the_funnel() {
+        let focused = Cell::new(None);
+        let live = RefCell::new(LiveState::NotStarted);
+        let requests = Cell::new(0);
+        set_focused_and_request(&focused, &live, true, |reason| {
+            assert_eq!(reason, FrameReason::Focus);
+            assert_eq!(focused.get(), Some(true));
+            assert!(live.try_borrow_mut().is_ok());
+            requests.set(requests.get() + 1);
+        });
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[test]
+    fn the_placeholder_is_the_starting_colour_when_given() {
+        let c = skia_safe::Color4f::new(0.2, 0.4, 0.6, 1.0);
+        assert_eq!(super::placeholder_color(Some(c)), c);
+    }
+
+    #[test]
+    fn without_one_the_placeholder_is_starting_color() {
+        assert_eq!(super::placeholder_color(None), super::STARTING_COLOR);
+    }
+
+    #[test]
+    fn the_cover_is_the_starting_colour_only_before_nvim_is_ready() {
+        let c = skia_safe::Color4f::new(0.2, 0.4, 0.6, 1.0);
+        assert_eq!(super::pre_ready_cover(Some(c), false), Some(c));
+        assert_eq!(super::pre_ready_cover(Some(c), true), None);
+        assert_eq!(super::pre_ready_cover(None, false), None);
+    }
+
+    #[test]
+    fn the_hole_cover_is_the_placeholder_until_nvim_is_ready_then_the_clear_colour() {
+        let clear = skia_safe::Color4f::new(0.9, 0.8, 0.7, 1.0);
+        let starting = (0x33, 0x66, 0x99);
+        assert_eq!(
+            super::hole_cover_color(false, clear, Some(starting)),
+            super::rgb_color(starting)
+        );
+        assert_eq!(super::hole_cover_color(false, clear, None), super::STARTING_COLOR);
+        assert_eq!(super::hole_cover_color(true, clear, Some(starting)), clear);
+    }
+
+    #[test]
+    fn rgb_color_maps_bytes_to_unit_floats() {
+        let c = super::rgb_color((0xfa, 0xf4, 0xed));
+        assert_eq!(c.r, 250.0 / 255.0);
+        assert_eq!(c.g, 244.0 / 255.0);
+        assert_eq!(c.b, 237.0 / 255.0);
+        assert_eq!(c.a, 1.0);
+    }
+
     use super::{
         build_start_failure_message, build_start_panic_message, cell_size_changed, exit_events,
         failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal, run_detached,
@@ -2690,19 +3165,39 @@ mod tests {
         assert_eq!(watch.take_pending_for_ready(), Some(1.6));
     }
 
-    // --- os_scale_to_apply follows GTK's integer scale only when it differs. This is the pure
+    // --- os_scale_to_apply follows the supplied scale only when it differs. This is the pure
     // half of `sync_os_scale`, whose real `LiveHarness` cannot be constructed in a unit test. ---
 
-    /// GTK's `scale_factor()` is the source of truth; a harness already there needs nothing.
+    /// Integer scales supplied by GTK apply only when the harness differs.
     #[test]
     fn os_scale_to_apply_follows_gtks_integer_factor() {
-        assert_eq!(os_scale_to_apply(1.0, 2), Some(2.0));
-        assert_eq!(os_scale_to_apply(2.0, 2), None);
-        assert_eq!(os_scale_to_apply(2.0, 1), Some(1.0));
+        assert_eq!(os_scale_to_apply(1.0, 2.0), Some(2.0));
+        assert_eq!(os_scale_to_apply(2.0, 2.0), None);
+        assert_eq!(os_scale_to_apply(2.0, 1.0), Some(1.0));
         // A widget not yet on a surface reports 0 (and never negative in practice): treat as 1, the
         // same `.max(1)` every other scale read in this crate uses.
-        assert_eq!(os_scale_to_apply(1.0, 0), None);
-        assert_eq!(os_scale_to_apply(f64::NAN, 1), Some(1.0));
+        assert_eq!(os_scale_to_apply(1.0, 0.0), None);
+        assert_eq!(os_scale_to_apply(f64::NAN, 1.0), Some(1.0));
+    }
+
+    #[test]
+    fn framebuffer_resize_keeps_its_fractional_scale_before_nvim_starts() {
+        let state = super::PaneShared {
+            skia_state: Rc::new(RefCell::new(None)),
+            live_state: Rc::new(RefCell::new(LiveState::NotStarted)),
+            fb_size: Rc::new(Cell::new((0, 0))),
+            device_scale: Rc::new(Cell::new(1.0)),
+        };
+        super::framebuffer_resized(&state, 1200, 900, 1.5);
+        assert_eq!(state.device_scale(), 1.5);
+        assert_eq!(state.fb_size.get(), (1200, 900));
+    }
+
+    #[test]
+    fn os_scale_to_apply_keeps_a_fractional_scale() {
+        assert_eq!(os_scale_to_apply(1.5, 1.5), None);
+        assert_eq!(os_scale_to_apply(2.0, 1.5), Some(1.5));
+        assert_eq!(os_scale_to_apply(1.0, 0.0), None);
     }
 
     // --- build_start_failure_message names what failed, the version floor and where to get nvim.
@@ -2852,16 +3347,17 @@ mod tests {
         );
     }
 
-    /// Only a released pane may start a new nvim: any other state has, or is about to have, a
-    /// harness, and the refusal says which state it found.
+    /// Only a released pane or one whose launch failed may start a new nvim: any other state has,
+    /// or is about to have, a harness, and the refusal says which state it found.
     #[test]
-    fn only_an_exited_pane_may_restart() {
+    fn only_an_exited_or_failed_pane_may_restart() {
         assert_eq!(restart_refusal(&LiveState::Exited), None);
-        for (state, name) in [
-            (LiveState::NotStarted, "NotStarted"),
-            (LiveState::Starting, "Starting"),
-            (LiveState::Failed("nvim could not start".into()), "Failed"),
-        ] {
+        assert_eq!(
+            restart_refusal(&LiveState::Failed("nvim could not start".into())),
+            None,
+            "a failed launch made no harness, so it can be tried again"
+        );
+        for (state, name) in [(LiveState::NotStarted, "NotStarted"), (LiveState::Starting, "Starting")] {
             assert_eq!(restart_refusal(&state), Some(RestartRefused { state: name }));
         }
         let refused = RestartRefused { state: "Ready" };

@@ -8,9 +8,8 @@ description: |
   It runs the Claude Code you installed; Eitri never touches your credentials.
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-# SPDX. The public expression (packaging/nfpm-public.yaml) plus
-# LicenseRef-Anthropic-Claude-Agent-SDK: unlike the public profile, this one ships the sidecar
-# (a standing decision, 2026-09-19), so its notice must name the SDK's own licence too.
+# The SPDX expression adds LicenseRef-Anthropic-Claude-Agent-SDK to the public profile's
+# expression: this profile ships the sidecar, so its notice must also name the SDK's licence.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0 AND LicenseRef-Anthropic-Claude-Agent-SDK
 
 # Direct links only -- gtk4 and webkitgtk pull in the other ~100 transitively, and listing those
@@ -18,33 +17,22 @@ license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0 AND LicenseRef-Anthrop
 # PATH rather than link-time: nvim is a real package, `claude` is not in any distro and is named in
 # the description instead of pretended to be resolvable.
 #
-# `neovim` itself is a top-level (Arch/pacman-default) `depends`, not a `recommends`: nfpm's
-# archlinux packager writes `depend` lines only -- no `optdepend` -- so there is no soft-dependency
-# spelling to move it to there (the KNOWN LIMIT note below this file already established that for
-# the font). The `.deb` moves it to `recommends` instead: a distro `neovim` package satisfying
-# `Depends:` and then being too old to run (Ubuntu 24.04 ships 0.9.5) is the failure to avoid on
-# Debian/Ubuntu hosts specifically; pacman has no such floor problem recorded, so its hard
-# `depends` is left as is.
+# Arch keeps neovim in depends: nfpm writes depend lines but offers no optdepend spelling.
+# The .deb recommends it because Ubuntu 24.04 supplies 0.9.5, below the required 0.10;
+# a hard dependency would resolve successfully yet leave Eitri unable to launch.
 depends:
   - gtk4
   - webkitgtk-6.0
   - neovim
-# A soft dependency (nfpm's `recommends` field, mirroring `depends`'s own base+per-packager shape):
-# the band's mode pill draws `⏵⏵` (U+23F5), which FiraCode Nerd Font does not carry (`fc-list
-# ':charset=23f5'`, 2026-09-26; `index.css`'s `.mode-glyph` falls through several fonts for the same
-# reason). Without one of them the band shows the font's `.notdef` box instead of the glyph -- never
-# a missing package, so `depends` would be too strong. Verified on this host, 2026-09-26:
-# `pacman -Fl noto-fonts | grep Symbols2` -> `usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf`.
-# Debian's `fonts-noto-core` (bookworm) checked online the same day, its own file list page:
-# `/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf`.
+# The mode pill draws U+23F5, absent from FiraCode Nerd Font (`fc-list ':charset=23f5'`).
+# Without a fallback such as NotoSansSymbols2 it shows a .notdef box, so the font is optional.
+# `pacman -Fl noto-fonts | grep Symbols2` gives usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf;
+# Debian bookworm's fonts-noto-core lists /usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf.
 #
-# KNOWN LIMIT: this reaches the .deb only. nfpm's archlinux packager writes `depend` lines and
-# nothing else -- no `optdepend`, and `recommends`/`suggests` are dropped (checked 2026-09-26 by
-# building a throwaway package with this host's nfpm: the .deb's control had `Recommends:`, the
-# .pkg.tar.zst's `.PKGINFO` had only `depend = bash`). So the pacman package declares no font, and
-# on an Arch machine without noto-fonts (or Symbola) the glyph falls to whatever fontconfig picks.
-# A hard `depends: noto-fonts` would close it but is omitted, since a missing font costs
-# one glyph, not a working install.
+# KNOWN LIMIT: nfpm emits Recommends in .deb control but only depend lines in .PKGINFO;
+# recommends/suggests produce no optdepend. The Arch package therefore declares no font and uses
+# whatever fontconfig selects. Keep this provisional: a hard font dependency would close the gap,
+# but a missing font costs one glyph rather than a working install.
 recommends:
   - noto-fonts # NotoSansSymbols2: the ⏵⏵ mode glyph
 overrides:
@@ -52,19 +40,16 @@ overrides:
     depends:
       - libgtk-4-1
       - libwebkitgtk-6.0-4
-    # neovim moved here from `depends`: Ubuntu 24.04's own neovim is 0.9.5, below
-    # the fork's floor of 0.10, so a hard `Depends:` would resolve, install, and then fail at first
-    # launch with no useful error (the same reasoning as the public `.deb`, packaging/nfpm-public.yaml).
+    # Recommend neovim because Ubuntu 24.04 ships 0.9.5, below the fork's 0.10 floor:
+    # a hard dependency would resolve and install, then fail at launch.
     recommends:
       - fonts-noto-core
       - neovim
 
 contents:
-  # All five must land in ONE directory: each companion is located as a sibling of the running
-  # executable (`current_exe()`'s parent). Splitting them produces a build that starts and then
-  # silently has no pane switching or supervisor. There were five here and `agent-hook` (legacy's
-  # PreToolUse relay); it is gone -- no release contains the legacy backend, the
-  # private one included, so there is no gate left for it to relay for.
+  # All five must land in one directory: companions are found beside current_exe(). Splitting
+  # them leaves pane switching or the supervisor unavailable. No agent-hook is needed because
+  # release builds exclude the legacy backend whose PreToolUse gate it relays.
   - src: ./target/release/shell
     dst: /usr/lib/eitri/shell
   - src: ./target/release/eitri-supervisor
@@ -77,25 +62,22 @@ contents:
     dst: /usr/lib/eitri/eitri-claude-handoff
 
   # The Verdandi sidecar, as a self-contained executable with no Node runtime dependency (its own
-  # build bundles one). Installed as a FIFTH sibling, under a versionless name: the artifact's own
-  # file name carries its version and architecture, which is right for a download and wrong for an
+  # build bundles one). Installed beside the five binaries above, under a versionless name: the
+  # artifact's own file name carries its version and architecture, which is right for a download and wrong for an
   # installed path -- encoding it here would make every sidecar upgrade a change to this file. The
   # compatibility statement lives in the handshake (protocol major plus sidecar_version).
   #
-  # Its presence is what makes the sidecar the default: `BackendKind::choose` asks whether a shipped
-  # artifact sits beside the binary, so nothing here has to be flipped when it starts shipping.
+  # The sidecar is the default with or without it: `BackendKind::choose` reads whether a shipped
+  # artifact sits beside the binary only to word the hint it prints when none does.
   #
   # `publish.sh` stages it; see that script for where it comes from and why the build refuses rather
-  # than quietly producing a package that silently falls back to legacy.
+  # than producing a package whose Claude tabs fail for want of a sidecar.
   - src: ./dist/verdandi-claude-sidecar
     dst: /usr/lib/eitri/verdandi-claude-sidecar
 
-  # Which Verdandi revision that sidecar was built from, spelled as the PUBLIC twin rev (the one
-  # `EXPECTED_VERDANDI_REVISION` in the extracted `shell` names), not the private rev it was
-  # actually built from -- publish.sh asserts the private pin's public export equals this rev before
-  # writing the file, so a private-rev mismatch never reaches a package. A
-  # missing or mismatched `.rev` beside the sidecar sibling is what makes `spawn.rs`'s skew warning
-  # fire.
+  # The public twin revision must match EXPECTED_VERDANDI_REVISION in the extracted shell.
+  # publish.sh checks that the private pin exports to this revision before writing the file.
+  # A missing or mismatched .rev beside the sidecar triggers spawn.rs's skew warning.
   - src: ./dist/verdandi-claude-sidecar.rev
     dst: /usr/lib/eitri/verdandi-claude-sidecar.rev
     file_info:
@@ -103,9 +85,8 @@ contents:
 
   - src: ./packaging/eitri.launcher.sh
     dst: /usr/bin/eitri
-  # The desktop entry is named by the application id (`cn.huntergrey.eitri`, shell/src/main.rs's
-  # APP_ID), the name the compositor matches a window to; it replaced `eitri.desktop`, which an
-  # upgrade drops by this package no longer listing it. `Icon=` names the theme icon below.
+  # The compositor matches the desktop entry by APP_ID, cn.huntergrey.eitri.
+  # This package omits eitri.desktop so upgrades drop it; Icon= names the theme icon below.
   - src: ./packaging/cn.huntergrey.eitri.desktop
     dst: /usr/share/applications/cn.huntergrey.eitri.desktop
   # The panel's own entry: `eitri panel` is a second window class, so it gets its own (hidden) entry.
@@ -150,8 +131,8 @@ contents:
     dst: /usr/share/eitri/plugins/markdown
     type: tree
 
-  # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree
-  # (packaging/icons/README.md; its notice, CC BY 4.0, is printed in THIRD-PARTY-LICENSES).
+  # Install every size in packaging/icons/hicolor under the icon theme's tree.
+  # The CC BY 4.0 notice is printed in THIRD-PARTY-LICENSES.
   - src: ./packaging/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png
     dst: /usr/share/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png
   - src: ./packaging/icons/hicolor/24x24/apps/cn.huntergrey.eitri.png
@@ -171,12 +152,10 @@ contents:
   - src: ./packaging/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg
     dst: /usr/share/icons/hicolor/scalable/apps/cn.huntergrey.eitri.svg
 
-  # The AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs before WebKit's sandbox
-  # can start (packaging/apparmor/eitri).
-  # The .deb only: no rpm-based distribution restricts user namespaces this way. A conffile
-  # (config|noreplace), so a site's edit survives an upgrade, and nothing loads it -- this package has
-  # no maintainer scripts: the next restart does, or `sudo apparmor_parser -r /etc/apparmor.d/eitri`,
-  # which Eitri itself prints in the agent panel's place until it is loaded.
+  # Ubuntu 23.10+'s user-namespace restriction needs this AppArmor profile for WebKit's sandbox.
+  # Ship it in .deb only; rpm distributions do not impose this restriction. config|noreplace
+  # preserves local edits. There are no maintainer scripts to load it: restart, or run
+  # `sudo apparmor_parser -r /etc/apparmor.d/eitri`, as the agent panel instructs.
   - src: ./packaging/apparmor/eitri
     dst: /etc/apparmor.d/eitri
     type: config|noreplace
@@ -193,14 +172,13 @@ contents:
     dst: /usr/share/licenses/eitri/LICENSE
   - src: ./dist/THIRD-PARTY-LICENSES
     dst: /usr/share/licenses/eitri/THIRD-PARTY-LICENSES
-  # The LGPL-3.0 sec 4(d)(0) / GPL-3.0 sec 6(d) Corresponding Source notice: these packages ship the
-  # public release's own binaries, extracted rather than rebuilt, so this is
-  # the same `SOURCE` file the public tarball carries, taken from it unmodified.
+  # LGPL-3.0 4(d)(0) / GPL-3.0 6(d) require the Corresponding Source notice. These packages
+  # extract the public release's binaries, so carry its tarball's SOURCE file unmodified.
   - src: ./dist/SOURCE
     dst: /usr/share/licenses/eitri/SOURCE
 
-  # What `eitri setup` reads on a private install too:
-  # the public release's own manifest, taken from its tarball unmodified. 0644: read, never executed.
+  # eitri setup reads the public release's manifest on private installs too.
+  # Take it from the tarball unmodified; mode 0644 permits reading, never execution.
   - src: ./dist/RELEASE
     dst: /usr/lib/eitri/RELEASE
     file_info:

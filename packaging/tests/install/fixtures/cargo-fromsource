@@ -1,10 +1,10 @@
 #!/bin/sh
 # Test double for `cargo`, standing in for the whole `cargo build --release --locked -p shell -p
 # agent -p supervisor --bins` recipe --from-source runs: no test here ever runs a real multi-crate release compile. Records its argv (one line per
-# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the four binaries install.sh's own
-# NV_BINARIES names into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
+# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the binaries install.sh's own
+# NV_BINARIES names, and agent-hook, into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
 # behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
-# do_from_source ever runs. "skip" (a coverage gap for the --target-dir case, found 2026-09-28) exits 0 without writing anything at all into
+# do_from_source ever runs. "skip" exits 0 without writing anything at all into
 # <target-dir> -- standing in for a build genuinely redirected elsewhere (build.target,
 # CARGO_BUILD_TARGET) or one cargo decided needed no work, so a test can prove do_from_source's own
 # pre-build rm loop (which deletes each shipped binary from <src>/target/release before this stub
@@ -13,7 +13,7 @@
 # "no-plugin-site" writes the binaries but not the plugin's site, standing in for a tree whose
 # shell/build.rs did not build plugins/markdown/web (a build that never reached it).
 #
-# Real cargo (checked 2026-09-28) honours --target-dir first, then
+# Real cargo honours --target-dir first, then
 # CARGO_TARGET_DIR, then falls back to target/ under the workspace root (run_in's cwd, the
 # cloned/checked-out source tree) -- this stub follows the same first two, so a test can prove
 # do_from_source's own --target-dir flag really does win over a caller's CARGO_TARGET_DIR rather
@@ -23,8 +23,8 @@ S=$(cd "$(dirname "$0")/.." && pwd)
 	printf 'cargo'
 	printf ' %s' "$@"
 	printf '\n'
-	# The URL is also recorded, so a test can assert the pinned, checksummed Skia archive
-	# (never skia-bindings' own unauthenticated download) is what the build actually saw.
+	# Record the Skia URL so a test can assert that the build sees the pinned, checksummed archive,
+	# never skia-bindings' unauthenticated download.
 	printf 'SKIA_BINARIES_URL=%s\n' "${SKIA_BINARIES_URL:-<unset>}"
 } >>"$S/logs/cargo.log"
 case $1 in

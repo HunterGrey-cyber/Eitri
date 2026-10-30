@@ -27,8 +27,7 @@ function state(overrides: Partial<AgentUiState>): AgentUiState {
   return { ...initialState(), ...overrides };
 }
 
-/* Test fixtures were written before items carried a `seq`, so they are written here as they read
-   best and given ascending seqs. Order-sensitive tests below assign their own seqs explicitly. */
+/* Fixtures omit `seq` for readability; the helper assigns it to preserve their written order. */
 function texts(...values: string[]) {
   return values.map((text, i) => ({ seq: i, text }));
 }
@@ -39,12 +38,9 @@ function texts(...values: string[]) {
    none of their rows render as current, preserving exactly the rendering these tests already
    assert on. The cursor-highlight behaviour itself is its own describe block, at the bottom. */
 
-/* Every conversation item is now a row on one sign-column
-   grid (`.row.row-<kind>`, `.row-sign`, `.row-body`), and the row's state is never colour alone --
-   the glyph in `data-sign` differs too. This is the one test asserting the glyphs themselves.
-   The two finished calls sit apart, each with something else between them: two
-   ADJACENT finished calls collapse into one `run` row now, which would leave only one glyph on
-   screen for both -- exactly the wrong fixture for a test about telling states apart by glyph. */
+/* Rows share a sign-column grid and distinguish state by glyph as well as colour. Keep the
+   finished calls apart: adjacent finished calls collapse into a run, hiding the separate glyphs
+   this fixture must compare. */
 describe("MessageList row structure", () => {
   it("gives every row a sign column, and distinguishes state by glyph not only colour", () => {
     render(
@@ -105,13 +101,8 @@ describe("MessageList transcript rendering", () => {
   });
 });
 
-/* The defect this closes (2026-09-15). This component mapped `transcript`, then `toolCalls`, then
-   `pendingPermissions` -- three sequential maps -- so however a turn really went, the DOM read as
-   every message, then every tool card, then every permission card. A turn with several tool calls
-   read in the wrong order, which is the panel's most visible untruth about what the agent did.
-
-   The order now comes from `seq`, which Rust's projection assigns and its snapshot ships, so this
-   renders the same sequence after a reload as it did live. */
+/* Rust's `seq` gives messages, tool calls and cards one order, shared by live events and snapshots.
+   Rendering separate lists by kind would misrepresent turns with interleaved calls. */
 describe("MessageList interleaves the conversation in its real order", () => {
   /** Every rendered row, in DOM order, as a short label. */
   function rendered(container: HTMLElement): string[] {
@@ -119,9 +110,8 @@ describe("MessageList interleaves the conversation in its real order", () => {
       if (el.classList.contains("row-assistant")) return `text:${el.textContent?.trim()}`;
       if (el.classList.contains("row-permission")) return "perm";
       if (el.classList.contains("row-tool")) return `tool:${el.querySelector(".tool-call")?.getAttribute("data-tool-name") ?? "?"}`;
-      // This helper only knows the three kinds these tests mix (text/perm/tool). A silent
-      // `else -> tool:` used to swallow anything else (a `row-prompt` fixture added later, say)
-      // into a mislabelled "tool:?" instead of a failure -- fail loudly instead.
+      // This helper knows only text/permission/tool fixtures. Fail loudly for another row kind
+      // rather than silently mislabelling it as "tool:?".
       throw new Error(`rendered(): row has none of the classes this helper knows about: "${el.className}"`);
     });
   }
@@ -178,8 +168,8 @@ describe("MessageList interleaves the conversation in its real order", () => {
     expect(rendered(container)).toEqual(["text:before", "tool:Bash", "perm", "tool:Read", "text:after"]);
   });
 
-  /* The legacy backend -- still the default -- sends no `tool_use_id`, so this is the ordinary case
-     on a default install, not an edge case. The card still has to land where it arrived. */
+  /* The legacy backend sends no `tool_use_id`, so a card with no tool-call link is that backend's
+     ordinary case, not an edge case. The card still has to land where it arrived. */
   it("still places a permission card with no tool-call link, by its own arrival position", () => {
     const { container } = render(
       <MessageList
@@ -272,10 +262,8 @@ describe("MessageList tool calls and permissions", () => {
           ],
         })}
         sessionEnded={false}
-        // t-0 is still running, which always renders regardless of `expanded` -- see
-        // `renderToolCall`. t-1 is finished, and this test is about tool_use_id keying, not about
-        // the result fold, so it is expanded here to keep asserting the state it always
-        // asserted rather than the folded placeholder.
+        // t-0 is running and always expanded. Expand finished t-1 explicitly: this test checks
+        // tool_use_id keying rather than the folded placeholder.
         expanded={{ "t-1": true }}
         cursor={-1}
         onAnswerPermission={vi.fn()}
@@ -336,10 +324,8 @@ describe("MessageList tool calls and permissions", () => {
     expect(awaiting[0].textContent).not.toContain("rm -rf /");
   });
 
-  /* The legacy backend's hook-relay shape specifically (new on 2026-09-15): permissionId and
-     toolUseId are the same string, because the `PreToolUse` payload's own `tool_use_id` is both.
-     The marker must still land on the right call -- it is matched on toolUseId, and the fact that
-     the card is ALSO keyed on that value changes nothing. */
+  /* In the legacy hook-relay shape, permissionId and toolUseId are the same string from the
+     PreToolUse payload. The waiting marker still matches by toolUseId; card keying must not affect it. */
   it("marks the right call when the permission's id is also its tool_use_id", () => {
     const { container } = render(
       <MessageList
@@ -441,11 +427,9 @@ describe("MessageList tool calls and permissions", () => {
   });
 });
 
-/* A `null` result used to mean "still running" unconditionally, so a tool call
-   abandoned by session end or a resume that restored a call from before its own history boundary
-   rendered a permanent spinner. `MessageList` is what has both the call's `seq` and `state.history`
-   /`sessionEnded` in scope, so it is where the "can this ever complete?" verdict is actually made
-   (`isAbandonedCall`) before it reaches `renderToolCall`/`ToolResult`. */
+/* A null result can mean abandoned rather than running. MessageList has the call's seq, the
+   history boundary and sessionEnded together, so isAbandonedCall decides before ToolResult renders.
+   Otherwise replay or an ended turn leaves a permanent spinner. */
 describe("MessageList: an abandoned tool result never spins forever (sw-panel-render-6)", () => {
   const restoredTo = (uptoSeq: number) => ({
     source: "claude_transcript" as const,
@@ -459,9 +443,8 @@ describe("MessageList: an abandoned tool result never spins forever (sw-panel-re
   });
 
   it("draws a static notice, not a spinner, for a null result that predates the restored-history boundary", () => {
-    // Probe lifted from the verdict: `history.uptoSeq=3`, a tool call at seq 2 with `result:null` --
-    // a resume/reload can never see a `tool_call_completed` for a call that already existed when
-    // history was cut, so this can never complete.
+    // With history.uptoSeq 3 and a call at seq 2 whose result is null, replay cannot deliver
+    // a completion for a call that already existed when history was cut.
     const { container } = render(
       <MessageList
         state={state({
@@ -560,24 +543,16 @@ describe("MessageList: an abandoned tool result never spins forever (sw-panel-re
   });
 });
 
-/* The other half of `j` not scrolling inside a long output: before this, a new ROW unconditionally scrolled the
-   view to the bottom, which fought the cursor the moment a user had used `j`/`k` to read something
-   further up. (Not every streamed delta, as this comment first said: deltas merge into one
-   transcript entry and never re-ran the effect -- see `MessageList.tsx`'s own comment.) The guard is
-   driven by scroll events on `.message-list`, not by the cursor and not by a measurement taken after
-   the new row is already in the DOM -- see that same comment for why each of those was wrong. jsdom
-   implements no layout and fires no scroll events on its own, so these tests set the three
-   dimensions and dispatch `scroll` themselves. */
+/* New rows must not pull a parked reader away from j/k navigation. The cursor alone cannot say
+   whether a mouse reader is following, and measuring after growth mistakes a tall new row for
+   scrolling away. jsdom has no layout or automatic scroll events: set dimensions and dispatch them. */
 function setScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight: number; scrollTop: number }) {
   Object.defineProperty(list, "scrollHeight", { value: dims.scrollHeight, configurable: true });
   Object.defineProperty(list, "clientHeight", { value: dims.clientHeight, configurable: true });
   Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
 }
 
-/* Correction (the GUI pass, 2026-09-24): the tests in this block asserted that a new
-   row was followed by a call to `scrollIntoView` -- the smooth scroll a new row used to get. That scroll
-   left the row below the edge for the frame or two its animation took, so following is a snap to the
-   end now, new row or not, and these tests assert where the list ends up instead. */
+/* Following snaps to the end: a smooth animation leaves a new row below the edge for 1-2 frames. */
 describe("MessageList auto-follow", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
@@ -593,10 +568,8 @@ describe("MessageList auto-follow", () => {
     expect(list.scrollTop).toBe(1680);
   });
 
-  /* The first guard measured AFTER the new row was in the DOM, so a row taller
-     than the 24px threshold made a user sitting exactly at the bottom look scrolled away. Here the
-     user is at the very bottom, and the new row grows the list by 600px with no scroll event -- which
-     is what real content growth does. Checked against the old guard: it fails this test. */
+  /* Measuring after a new row mounts mistakes growth beyond the 24px threshold for scrolling
+     away. Grow by 600px without a scroll event while the reader is at the bottom. */
   it("still follows when the new row alone is taller than the threshold", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
@@ -609,9 +582,8 @@ describe("MessageList auto-follow", () => {
     expect(list.scrollTop).toBe(2200);
   });
 
-  /* The GUI pass's F-c, red on the earlier follow snap: the new row is at the end in the SAME commit -- before
-     paint -- rather than after a smooth scroll's animation, which is what left the user's own prompt
-     the last row with text for a frame or two as a reply's first row mounted. */
+  /* Snap in the mounting commit, before paint: animation leaves the user's prompt as the last
+     visible text for a frame or two when the reply's first row appears. */
   it("brings a new row into view in the same commit, by a snap and never a smooth scroll", () => {
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     const { container, rerender } = render(<MessageList state={state({ userPrompts: texts("why?") })} {...props} />);
@@ -632,8 +604,7 @@ describe("MessageList auto-follow", () => {
     const list = container.querySelector(".message-list") as HTMLElement;
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
     fireEvent.scroll(list);
-    // A real wheel: the `wheel` event, then the scroll it causes (2026-09-24: the intent is what
-    // counts, not the direction of the scroll alone).
+    // A real wheel: intent first, then its scroll. Direction alone cannot identify user input.
     fireEvent.wheel(list, { deltaY: -100 });
     setScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 800 });
     fireEvent.scroll(list);
@@ -804,9 +775,8 @@ describe("MessageList follow guard: a scroll up always wins", () => {
   });
 });
 
-/* Change B of the 2026-09-24 fix: leaving the bottom takes something the USER did. WebKitGTK once
-   dropped `scrollTop` by itself on every clock tick mid-reply, and the old
-   rule -- "a scroll event saw scrollTop go down" -- read each drop as the reader leaving. */
+/* Following ends on user intent: an engine-originated scrollTop drop, including one on a
+   status-clock tick, must not be mistaken for the reader leaving the bottom. */
 describe("MessageList follows by intent, not by the direction of a scroll", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
@@ -912,15 +882,8 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
   });
 });
 
-/* The follow guard must distinguish a wheel intent from a successful scroll. Change B
-   recognised a wheel, a held pointer, a touch drag and the panel's own keys, and read every other
-   scroll as the engine's -- so (a) a reader who scrolled up by a route it did not list (the
-   browser's own PageUp/arrow scroll with a control inside the list focused, a Tab reveal) was put
-   back at the bottom by the next delta, a trap the base did not have; and (b) any wheel with a
-   negative `deltaY` ended following even when the list never moved (a sideways touchpad swipe with
-   a sub-pixel vertical jitter, a wheel an expanded tool result's own box took, a wheel with nothing
-   to scroll up to), which the base did not do either. Each test below that is not marked as a
-   guard fails on the earlier follow logic. */
+/* A wheel intent is not necessarily a successful scroll: an inner box or a sideways gesture
+   can consume it while the list must keep following. */
 describe("MessageList: a send resumes following", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
@@ -1173,16 +1136,8 @@ describe("MessageList: every route a user scrolls by is theirs, and a gesture th
   });
 });
 
-/* A provisional stop was previously taken back only inside the
-   follow effect, which runs on a state change. A misprediction (a wheel the engine sent somewhere
-   else) followed, inside its window, by a new row and then silence -- a permission card, after which
-   the turn waits -- left that row below the view until something else arrived, which may be nothing.
-   The take-back now also runs when the gesture's window runs out, and catches up with what the stop
-   held back. The five tests below that are not marked as guards fail on the earlier take-back; so does the unmount
-   guard, which counts the new timer itself. The other three guards pass on both.
-
-   Correction (the GUI pass, 2026-09-24): the catch-up for a new row is a snap now, as every follow is,
-   so the tests below read `scrollTop` where they read a call to `scrollIntoView`. */
+/* Settle provisional stops even with no next state change: a card can arrive inside the
+   gesture window and then leave the turn waiting, with nothing else to trigger a follow. */
 describe("MessageList: a stop on a gesture that moved nothing is settled when the gesture ends", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
   const scrollIntoView = () => Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -1331,12 +1286,8 @@ describe("MessageList: a stop on a gesture that moved nothing is settled when th
     expect(list.scrollTop).toBe(1600);
   });
 
-  /* Found while building the real-engine test for the above: WebKitGTK performs the
-     default scroll for a wheel event and animates it over about 200ms, and its FIRST scroll event,
-     0-1ms after the wheel, can report the list exactly where the wheel found it -- seen in 2 of 8
-     wheels at the tail. At the bottom, that event re-armed following and cleared the provisional
-     stop, so the next delta (or a new row's smooth scroll) cancelled the wheel's scroll: the very
-     case the stop exists for. The first two fail on the earlier take-back; the three after them are guards. */
+  /* WebKitGTK can emit the first wheel scroll before anything moves; that event must not
+     re-arm following and let the next delta cancel the wheel's animation. */
   it("keeps a wheel's stop through the wheel's own first scroll event when it reports no movement", () => {
     const pass = fakeTime();
     const { list, dims, show } = mount({ scrollHeight: 2000, scrollTop: 1600 });
@@ -1526,11 +1477,8 @@ function stubResizeObserver(): FakeObserver[] {
 const resize = (observer: FakeObserver, target: Element, width: number) =>
   observer.callback([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
 
-/* The list's observer (2026-09-24). From then until 2026-10-13 it also wrote the list's width to
-   `--list-inline-size` for the rows' escapes (the replacement for a CSS size container on `.row`, which in
-   WebKitGTK made the list lose its reader whenever the status line's clock ticked during a streamed
-   reply). The chat page's rows spend no measured width, so nothing is written; what still matters is
-   that the observer is made once, watches the list and its rows, and does nothing per streamed delta. */
+/* Make the observer once, watch the list and its rows, and do no extra work per streamed delta.
+   Rows use no measured width; CSS size containers can make WebKitGTK reset scrollTop on clock ticks. */
 describe("MessageList watches its own size without writing a width", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
 
@@ -1619,14 +1567,10 @@ describe("MessageList watches rows that mount without a new state", () => {
   });
 });
 
-/* The follow snap ran only on a state change, so
-   a resize with nothing streaming -- a divider drag, an unzoom, the bottom terminal shown, the composer
-   growing -- left a following view short (482px and 651px, measured), for as long as a tool call ran,
-   a permission card waited, or the turn was over. Rows can change size with the list's box unchanged
-   too (`--column-w` set on the list; a font push also shortens the list, since the
-   status line and composer grow with it). The `ResizeObserver` watches the list and every row, and
-   snaps a following view to its end. The four tests not marked
-   as guards fail on the earlier follow snap, which observed the list alone and only wrote its width. */
+/* Resizing without streaming can leave the view 482px short after a divider drag or 651px after
+   unzooming (measured). The terminal or growing composer can shorten the list too; restyling rows
+   alone can change content height without changing its box. Watch both list and rows and snap
+   a following view to its end, even when no new state arrives. */
 describe("MessageList keeps a following view at its end when the list or a row changes size", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
 
@@ -1677,7 +1621,7 @@ describe("MessageList keeps a following view at its end when the list or a row c
 
   it("snaps to the end when the list narrows and its reply reflows taller, with nothing streaming", () => {
     const { list, dims, observer } = mount();
-    dims.content(2482); // the GUI pass's divider drag: 482px of reflow below the view
+    dims.content(2482); // divider drag: 482px of reflow below the view
 
     resize(observer, list, 330);
 
@@ -1764,10 +1708,8 @@ describe("MessageList keeps a following view at its end when the list or a row c
   });
 });
 
-/** The last `(label, jump, afterSeq)` triple `onUnreadChange` was called with.
- *  The pill no longer floats itself (`NewPill`, deleted); it reports upward instead, and the
- *  band (`App.tsx`) holds the latest value the way this reads it back for a test. `afterSeq`
- *  is the `seq` threshold itself; see `MessageList`'s own doc comment on the prop. */
+/** Latest `(label, jump, afterSeq)` reported by `onUnreadChange`, as the status band holds it.
+ *  `afterSeq` is the sequence threshold, not a position in the timeline. */
 function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jump: () => void; afterSeq: number | null } {
   const call = mock.mock.calls[mock.mock.calls.length - 1] as [string | null, () => void, number | null];
   return { label: call[0], jump: call[1], afterSeq: call[2] };
@@ -1811,10 +1753,9 @@ describe("MessageList: the jump-to-bottom pill (reported upward)", () => {
   });
 
   it("keeps approval after a row resizes -- the observer read the first render's timeline", () => {
-    // Seen in the sandbox: a Bash card landed below a reader and the pill said "Jump to bottom". The
-    // `ResizeObserver`, made once, called the FIRST render's `onScroll`, whose `updatePill` sliced the
-    // first render's timeline -- nothing past the reader's mark -- and overwrote the right label the
-    // moment the new rows' size settled. jsdom has no observer; the fake below delivers that resize.
+    // The once-created observer needs the latest onScroll: a stale closure slices an old
+    // timeline and replaces an approval label with an empty jump label when the card resizes.
+    // jsdom has no observer, so deliver that resize through the fake.
     const observers = stubResizeObserver();
     const onUnreadChange = vi.fn();
     const { container, rerender } = render(
@@ -1859,11 +1800,8 @@ describe("MessageList: the jump-to-bottom pill (reported upward)", () => {
   });
 });
 
-/* The old threshold was a timeline INDEX (the length at the moment following
-   stopped), sliced off the CURRENT timeline. `buildTimeline` does not keep the array in `seq` order
-   -- a card anchored to an older tool call is spliced in right after that call, which can land it
-   BEFORE the old length cutoff even though it arrived (its own `seq`) long after. A `seq` threshold
-   fixes that: what matters is when an item happened, never where `buildTimeline` chose to draw it. */
+/* An anchored permission can sit before older items in the display array. Count by arrival
+   seq, not an array cutoff, so a newly arrived card is still unread wherever it is drawn. */
 describe("MessageList: the unread threshold is a seq, not an index", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 

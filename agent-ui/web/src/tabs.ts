@@ -134,6 +134,61 @@ export function takeView(store: Map<TabId, TabViewState>, tab: TabId): TabViewSt
   return store.get(tab);
 }
 
+/** The page's view of `tab` for a move to the other window: the live view when `tab` is the one on screen (`live`
+ *  reads it), the view parked for it by a switch otherwise, `null` when the page holds none. */
+export function exportView(
+  store: Map<TabId, TabViewState>,
+  active: TabId | null,
+  tab: TabId,
+  live: () => TabViewState,
+): TabViewState | null {
+  if (tab === active) return live();
+  return store.get(tab) ?? null;
+}
+
+const VIEW_MODES: readonly string[] = ["browse", "input", "hint", "caret", "visual", "vline"];
+
+/** The largest number a moved view may carry for a cursor, a row or a sequence number. */
+const VIEW_NUMBER_MAX = 1_000_000_000;
+
+/** The most expanded blocks a moved view may name. */
+const VIEW_EXPANDED_MAX = 10_000;
+
+/** A moved view read back: the other window's page wrote it, so anything but the shape `captureView` writes is
+ *  refused whole (`null`). */
+export function parseView(raw: unknown): TabViewState | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const count = (v: unknown): v is number =>
+    typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= VIEW_NUMBER_MAX;
+  if (!count(r.cursor)) return null;
+  if (typeof r.mode !== "string" || !VIEW_MODES.includes(r.mode)) return null;
+  if (typeof r.scrollTop !== "number" || !Number.isFinite(r.scrollTop) || r.scrollTop < 0) return null;
+  if (typeof r.atBottom !== "boolean" || typeof r.detailed !== "boolean") return null;
+  if (r.unseenAfterSeq !== null && !count(r.unseenAfterSeq)) return null;
+  if (typeof r.expanded !== "object" || r.expanded === null || Array.isArray(r.expanded)) return null;
+  const entries = Object.entries(r.expanded as Record<string, unknown>);
+  if (entries.length > VIEW_EXPANDED_MAX || entries.some(([, open]) => typeof open !== "boolean")) return null;
+  return {
+    cursor: r.cursor,
+    mode: r.mode as PanelMode,
+    expanded: Object.fromEntries(entries) as Record<string, boolean>,
+    scrollTop: r.scrollTop,
+    atBottom: r.atBottom,
+    detailed: r.detailed,
+    unseenAfterSeq: r.unseenAfterSeq as number | null,
+  };
+}
+
+/** The other window's page's view of `tab`, which moved here: kept for the tab as a switch parks one, so the tab is
+ *  shown as it was left there. A view of any other shape is dropped and the tab is shown from its start. */
+export function importView(store: Map<TabId, TabViewState>, tab: TabId, raw: unknown): boolean {
+  const view = parseView(raw);
+  if (view === null) return false;
+  store.set(tab, view);
+  return true;
+}
+
 export function forgetClosed(store: Map<TabId, TabViewState>, open: TabId[]): void {
   for (const tab of Array.from(store.keys())) if (!open.includes(tab)) store.delete(tab);
 }

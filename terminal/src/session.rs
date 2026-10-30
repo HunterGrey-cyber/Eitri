@@ -7,8 +7,7 @@
 //!   straight back from this thread, so it never waits on the GTK main loop;
 //! - **backpressure is by construction**: while this thread parses it does not read, so the
 //!   kernel's PTY buffer fills and the child blocks. There is no unbounded queue of output anywhere
-//!   (the frozen pipeline and the spike's `mpsc` both buffered all 15 MB while falling behind), and
-//!   what waits to be WRITTEN is bounded too: answers the program does not read stop at
+//!   and what waits to be WRITTEN is bounded too: answers the program does not read stop at
 //!   [`crate::REPLY_CAP`] (`outbox.rs`);
 //! - **rendering** follows [`RenderClock`]: a leading edge, then at most one per frame, and none
 //!   while idle or hidden. The frame goes into a latest-wins slot, so a stalled host costs one frame
@@ -153,7 +152,7 @@ pub enum SessionCommand {
     /// shape.
     Focus(bool),
     /// A mouse press, release, motion or wheel notch, encoded on the session thread against the
-    /// live `TermMode` (bottom-terminal phase 3c). See [`crate::mouse`].
+    /// live `TermMode`. See [`crate::mouse`].
     Mouse(crate::mouse::MouseInput),
     /// Focus reporting (`CSI I`/`CSI O`, DECSET 1004), sent through the pane's door, unlike
     /// [`SessionCommand::Focus`] (see its own doc).
@@ -246,13 +245,13 @@ impl ExitInfo {
 #[derive(Default)]
 pub struct Update {
     pub frame: Option<PaintList>,
-    /// Where the cursor is on `frame`, visible or not (bottom-terminal phase 2): set with every
+    /// Where the cursor is on `frame`, visible or not: set with every
     /// frame the session renders, and cleared with a contained panic's failure frame, so the two
     /// always agree.
     pub cursor: Option<CursorCell>,
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
-    /// The live mouse-mode summary (bottom-terminal phase 3c), latest-wins like `cursor`, and
+    /// The live mouse-mode summary, latest-wins like `cursor`, and
     /// `Option` for the same reason: `take_update` is `mem::take`, so an update with no mode change
     /// (a bell, a title) must not overwrite the host's last-known modes with `MouseModes::default()`
     /// and silently switch reporting off. Applied only when `Some`; see [`Worker::publish_mouse_modes`].
@@ -266,8 +265,8 @@ pub struct SessionConfig {
     pub colors: TerminalColors,
     pub focused: bool,
     /// Called on the session thread with every chunk read from the PTY, before it is parsed. The
-    /// frozen design's "one raw stream, any number of readers" contract, reduced to what phase 1
-    /// needs: the corpus recorder. Must not block -- it runs where the parsing does.
+    /// raw stream lets a corpus recorder observe the same bytes as the parser. Must not block --
+    /// it runs where the parsing does.
     pub tap: Option<Box<dyn FnMut(&[u8]) + Send>>,
 }
 
@@ -331,6 +330,8 @@ pub struct TerminalSession {
     commands: Sender<SessionCommand>,
     doorbell: PipeWriter,
     pid: u32,
+    /// The start time the move's record gave the shell this session took over; `None` for one it spawned.
+    adopted_start: Option<u64>,
     thread: Option<JoinHandle<Option<ExitInfo>>>,
 }
 
@@ -368,7 +369,7 @@ impl TerminalSession {
         let Detached {
             master,
             pid,
-            start: _,
+            start,
             replay,
             tail,
             outbox,
@@ -383,7 +384,9 @@ impl TerminalSession {
             outbox,
             view,
         };
-        Self::start(pty, config, wake, origin)
+        let mut session = Self::start(pty, config, wake, origin)?;
+        session.adopted_start = Some(start);
+        Ok(session)
     }
 
     /// The move this session was adopted from is committed: write what the source owed (its
@@ -482,6 +485,7 @@ impl TerminalSession {
             commands,
             doorbell: bell_tx,
             pid,
+            adopted_start: None,
             thread: Some(thread),
         })
     }
@@ -503,6 +507,13 @@ impl TerminalSession {
     /// The child's pid, captured at spawn.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The start time of the shell this session took over from another process, as the move's record gave it and
+    /// its pidfd was checked against: with the pid it names that process and no later one given the same pid.
+    /// `None` for a shell this session spawned.
+    pub fn adopted_start(&self) -> Option<u64> {
+        self.adopted_start
     }
 
     /// How many frames the session has rendered. The idle guard's first counter.
@@ -659,7 +670,7 @@ struct Worker<'w> {
     /// nothing the frame shows (`Screen::feed` no longer marks the screen dirty for them), and the
     /// host shows a bell itself.
     frame_owed: bool,
-    /// The mouse-mode summary last published (bottom-terminal phase 3c): `None` until
+    /// The mouse-mode summary last published: `None` until
     /// [`Worker::publish_mouse_modes`] first runs, then always `Some`. Compared against the live
     /// mode every loop turn so a change is published at once rather than waiting for the next frame
     /// -- a synchronized update can hold a frame back for up to 150ms, and a host still routing
@@ -1203,23 +1214,17 @@ impl Worker<'_> {
         Flow::Continue
     }
 
-    /// Title, bell and the two copies from the reads just done, merged into the pending update:
-    /// latest title and copy win, bells fold into one.
-    /// Folds title/bell/clipboard/selection into the pending update. Rides the render clock out
-    /// rather than ringing the host itself: a stream with an
-    /// event on most reads (a bell in a `cat` of a binary, say) used to wake the host once per loop
-    /// turn instead of once per rendered frame, and did so even while hidden, where phase 1's pump
-    /// does nothing with the wake anyway. Clipboard is the one exception: it is the one event this
-    /// pump already acts on, so hidden or not it rings at once rather than waiting for a clock this
-    /// pane, while hidden, never polls. A copy to the primary selection is the same kind of event
-    /// (phase 2), and so is a finished host selection: the user's clipboard should not
-    /// wait behind a clock for a gesture that already ended.
+    /// Merge title, bell, clipboard and selection events into the pending update: latest title
+    /// and copy win, bells fold into one. Titles and bells ride the render clock so an event on
+    /// every read cannot wake the host per read or while hidden. Clipboard, primary selection and
+    /// finished host selections ring at once, even hidden: a completed gesture must not wait for
+    /// a render clock the hidden host never polls.
     fn publish_events(&mut self, now: Instant) {
         let events = self.screen.take_events();
         if events == HostEvents::default() {
             return;
         }
-        // Any of the three: the pump puts them on the desktop at once (bottom-terminal phases 2/3).
+        // All three clipboard events are delivered at once, even while hidden.
         let has_clipboard = events.clipboard.is_some() || events.primary.is_some() || events.selection.is_some();
         self.apply_pending(|update| {
             if events.title.is_some() {
@@ -1319,8 +1324,8 @@ impl Worker<'_> {
     }
 
     /// The live mouse-mode summary, published (and the host rung) the moment it changes, called
-    /// once per loop turn regardless of whether a frame renders this turn (bottom-terminal phase
-    /// 3c). Change-detected rather than tied to a frame: a synchronized update can hold every frame
+    /// once per loop turn regardless of whether a frame renders this turn. Change-detected rather
+    /// than tied to a frame: a synchronized update can hold every frame
     /// back for up to [`SYNC_UPDATE_TIMEOUT`], and a host still routing a click on stale modes
     /// during that gap would start a selection in a program (`htop`) that just turned mouse
     /// reporting on.

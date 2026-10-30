@@ -3,11 +3,8 @@
 //! assertion still cleans up (a bare `remove_dir_all` written at the end of the test body would not
 //! run in that case) and so a crate-wide test run never leaves anything behind in `/tmp`.
 //!
-//! Grown out of three call sites (`agent_prefs`, `permission_store`, `prompt_history`) that each had
-//! their own copy of a `scratch(label) -> PathBuf` helper which created a
-//! `<prefix>-<label>-<uuid>` directory and never removed it -- 194/510/850 of them respectively were
-//! found still sitting in `/tmp` before this existed. Once three files wanted the same guard, this
-//! module replaced the three copies rather than adding a fourth.
+//! Shared by tests in `agent_prefs`, `permission_store` and `prompt_history` so each gets
+//! cleanup on unwinding without duplicating the guard.
 
 #![cfg(test)]
 

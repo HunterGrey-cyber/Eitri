@@ -168,8 +168,7 @@ describe("KeymapOverlay", () => {
       const section = sectionTitled(overlay().container, "This panel");
       expect(section.querySelectorAll("p")).toHaveLength(1);
       const note = section.querySelector("p")!;
-      // The modes' consequence lines moved here from the start screen (2026-10-15), word for word.
-      // Manual's line (2026-10-14) joins them, in Shift+Tab's order.
+      // Consequence lines follow Shift+Tab's mode order.
       expect(note.textContent).toBe(
         `Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): manual — ${MODE_CONSEQUENCE.manual} auto — ${MODE_CONSEQUENCE.auto} bypass — ${MODE_CONSEQUENCE.bypass}`,
       );
@@ -315,13 +314,9 @@ describe("KeymapOverlay", () => {
       );
     });
 
-    // CARET_KEYS and VISUAL_KEYS used to render as one table
-    // with no sub-heading -- 21 rows, duplicates (a key both modes bind, e.g. `gg`) indistinguishable,
-    // and two conflicting `Esc` rows with nothing saying which mode either belongs to. Assert the
-    // grouping itself -- each table's own rows, in order, exactly match its own source array -- not
-    // just that every row's text is present somewhere in the section (`toContain` alone cannot tell
-    // CARET's rows apart from VISUAL's, since several `what` strings are shared verbatim between the
-    // two, e.g. "Previous / next character").
+    // Each mode needs its own headed table: shared keys such as gg and Esc otherwise read as
+    // duplicates with conflicting meanings. Compare each table to its source array, in order;
+    // whole-section text checks cannot distinguish shared descriptions between CARET and VISUAL.
     it("renders CARET's table then VISUAL's, each under its own sub-heading, never merged", () => {
       const section = selectingSection(overlay(() => {}, TABLE).container);
       const headings = Array.from(section.querySelectorAll("h3")).map((h) => h.textContent);
@@ -346,8 +341,7 @@ describe("KeymapOverlay", () => {
       expect(section.textContent).toContain("v is your leader: V selects lines, Esc there gives the caret");
     });
 
-    // A plain panel binding on `v` is not a leader -- the
-    // note used to say "v is your leader" for it anyway, naming a leader the user does not have.
+    // A plain binding on v is not a leader; the note must name which one actually claims the key.
     it("says v is bound elsewhere (not that it is the leader) when a plain binding takes v", () => {
       const panel: PanelTable = { ...TABLE, bindings: [binding(["v"], "tab.prev")] };
       const section = selectingSection(overlay(() => {}, panel).container);

@@ -1,5 +1,4 @@
 use super::*;
-use crate::keymap::keys_return::Opened;
 use crate::keymap::Action;
 use crate::layout::{Axis, Child, Con, ConLayout, Float, FloatRect, Frame, Layout, Node, Size, Zoom};
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
@@ -161,10 +160,17 @@ impl Rig {
         (out.take().expect("the batch ran"), batch)
     }
 
-    /// Records a `prefix ?` opening that found the keys on `from`, as the `prefix ?` arm does once the sheet is
-    /// shown: through the driver's own entry.
-    fn open_sheet(&self, opened: Opened) -> u64 {
-        self.driver.keymap_opened(WIN, crate::tabs::ViewId::BASE, opened)
+    /// Opens the sheet through the same runner the prefix uses, keeping the page's opening number.
+    fn open_sheet(&self) -> u64 {
+        let mark = self.mark();
+        self.driver.run(WIN, Action::PanelKeymap, Origin::Key { keycode: 0 });
+        self.ops_since(mark)
+            .into_iter()
+            .find_map(|op| match op {
+                HostOp::Chat(ChatOp::OpenKeymap { opening, .. }) => Some(opening),
+                _ => None,
+            })
+            .expect("the sheet opened")
     }
 
     fn close_sheet(&self, opening: u64, forced: bool) {
@@ -340,8 +346,9 @@ fn native_focus_not_the_request_drives_the_cursors() {
     let r = driven(layout);
     r.native(&editor());
     let mark = r.mark();
+    r.batch(|_, _, batch| batch.push_layout(focus_op(&a, vec![])));
     assert!(
-        !r.driver.focus_now(WIN, &a),
+        r.host.log()[mark..].contains(&Logged::Op(focus_op(&a, vec![]), Applied::Refused)),
         "the host refuses the keys for a module it does not show"
     );
     assert!(
@@ -372,7 +379,7 @@ fn a_module_given_the_keys_before_its_declaration_hears_them_once_declared() {
     let t2 = ModuleId::parse("terminal#2").unwrap();
     r.host.with_surface(WIN, t2.clone(), decl(&t2).kind, true);
     crate::layout::place(&mut r.layout.borrow_mut(), &t2, &editor(), Axis::Column).unwrap();
-    r.post(HostEvent::LayoutChangedByShell { win: WIN });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     let mark = r.mark();
     r.native(&t2);
     let ops = r.ops_since(mark);
@@ -502,17 +509,7 @@ fn a_grab_the_batch_went_past_leaves_the_layouts_tab_and_zoom_alone() {
     );
     let r = driven(layout);
     r.native(&editor());
-    // `prefix ?` showed the sheet, ending the zoom, and gave it the keys.
-    r.batch(|w, _, batch| {
-        w.layout.borrow_mut().show(&agent()).unwrap();
-        w.layout.borrow_mut().unzoom();
-        assert!(give_keys(w, WIN, &agent(), vec![], batch));
-    });
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: Some(Zoom::Module(editor())),
-        showed_sheet: true,
-    });
+    let opening = r.open_sheet();
     assert_eq!(r.host.focus_owner(WIN), Some(agent()));
     let mark = r.mark();
     r.close_sheet(opening, false);
@@ -556,11 +553,7 @@ fn focus_moved_is_reported_only_for_an_accepted_move() {
     hide(&mut layout, &hidden);
     let r = driven(layout);
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     r.native(&lua("ghost"));
     r.post(native(&hidden, Some(0)));
@@ -577,11 +570,7 @@ fn focus_moved_is_reported_only_for_an_accepted_move() {
     // Hidden only by a later op of the same batch: noted, and reported, so the way back is gone.
     let r = driven(three(editor()));
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     r.batch(|w, _, batch| {
         give_keys(w, WIN, &terminal(), vec![], batch);
@@ -942,11 +931,7 @@ fn a_keyboard_move_into_a_chat_keeps_the_readers_place_and_a_strip_entry_goes_to
 fn the_keys_return_after_the_sheet_closes_where_they_were() {
     let r = driven(three(editor()));
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     let mark = r.mark();
     r.close_sheet(opening, false);
@@ -954,11 +939,7 @@ fn the_keys_return_after_the_sheet_closes_where_they_were() {
 
     // A forced close moves nothing.
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     let mark = r.mark();
     r.close_sheet(opening, true);
@@ -969,16 +950,7 @@ fn the_keys_return_after_the_sheet_closes_where_they_were() {
     hide(&mut layout, &agent());
     let r = driven(layout);
     r.native(&editor());
-    r.batch(|w, _, batch| {
-        w.layout.borrow_mut().show(&agent()).unwrap();
-        w.changed_by_controller(WIN, batch);
-        give_keys(w, WIN, &agent(), vec![], batch);
-    });
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: true,
-    });
+    let opening = r.open_sheet();
     assert_eq!(r.host.focus_owner(WIN), Some(agent()));
     let mark = r.mark();
     r.close_sheet(opening, false);
@@ -993,13 +965,9 @@ fn the_keys_return_after_the_sheet_closes_where_they_were() {
 fn a_sheet_superseded_by_a_newer_request_returns_nothing_on_its_close() {
     let r = driven(three(editor()));
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
-    r.driver.keymap_superseded(WIN);
+    r.driver.run(WIN, Action::PanelCommandLine, Origin::Key { keycode: 0 });
     let mark = r.mark();
     r.close_sheet(opening, false);
     assert!(
@@ -1010,20 +978,15 @@ fn a_sheet_superseded_by_a_newer_request_returns_nothing_on_its_close() {
 
 #[test]
 fn a_sheet_close_of_an_earlier_opening_returns_nothing() {
-    let r = driven(three(editor()));
+    let mut layout = three(editor());
+    hide(&mut layout, &agent());
+    layout.toggle_zoom(&editor());
+    let r = driven(layout);
     r.native(&editor());
-    let first = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: Some(Zoom::Module(editor())),
-        showed_sheet: true,
-    });
+    let first = r.open_sheet();
     r.native(&agent());
     r.native(&editor());
-    let second = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: None,
-        showed_sheet: false,
-    });
+    let second = r.open_sheet();
     r.native(&agent());
     let mark = r.mark();
     r.close_sheet(first, false);
@@ -1040,13 +1003,11 @@ fn a_sheet_close_of_an_earlier_opening_returns_nothing() {
 
 #[test]
 fn the_keys_go_back_before_the_zoom_after_the_sheet_closes() {
-    let r = driven(three(editor()));
+    let mut layout = three(editor());
+    layout.toggle_zoom(&editor());
+    let r = driven(layout);
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: Some(Zoom::Module(editor())),
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     let mark = r.mark();
     r.close_sheet(opening, false);
@@ -1068,13 +1029,11 @@ fn the_keys_go_back_before_the_zoom_after_the_sheet_closes() {
 
 #[test]
 fn a_refused_return_grab_leaves_the_zoom_off_and_the_chat_on_screen() {
-    let r = driven(three(editor()));
+    let mut layout = three(editor());
+    layout.toggle_zoom(&editor());
+    let r = driven(layout);
     r.native(&editor());
-    let opening = r.open_sheet(Opened {
-        from: Some(editor()),
-        ended_zoom: Some(Zoom::Module(editor())),
-        showed_sheet: false,
-    });
+    let opening = r.open_sheet();
     r.native(&agent());
     // The host refuses the editor's grab: its surface is not on screen there.
     let kind = decl(&editor()).kind;
@@ -1106,4 +1065,63 @@ fn a_refused_return_grab_leaves_the_zoom_off_and_the_chat_on_screen() {
     // A later report of the editor taking the keys is not the return's grab: the zoom stays off.
     r.native(&editor());
     assert_eq!(r.layout.borrow().zoom(), None);
+}
+
+#[test]
+fn the_edge_goes_to_the_other_window_only_when_its_monitor_lies_that_way() {
+    use crate::window_link::{FocusTarget, Msg, Side};
+    use crate::wm::fake::FakePeerPort;
+    for (other, known, peer, crosses) in [
+        ("right", true, true, true),
+        ("same", true, true, false),
+        ("above", true, true, false),
+        ("right", false, true, false),
+        ("right", true, false, false),
+    ] {
+        let r = driven(two());
+        let port = FakePeerPort::new();
+        if peer {
+            r.driver.attach_peer(WIN, PeerId(2), port.clone());
+        }
+        let monitor = |name: &str, x, y| Monitor {
+            id: MonitorId(name.into()),
+            rect: crate::layout::Rect { x, y, w: 1200, h: 800 },
+            scale: 1.0,
+            name: name.into(),
+        };
+        r.post(HostEvent::MonitorsChanged {
+            monitors: vec![
+                monitor("mine", 0, 0),
+                monitor("right", 1200, 0),
+                monitor("above", 0, -800),
+            ],
+        });
+        if known {
+            r.post(HostEvent::WindowMonitor {
+                win: WIN,
+                monitor: Some(MonitorId("mine".into())),
+            });
+        }
+        if peer {
+            r.post(HostEvent::Peer(PeerEvent::Monitor {
+                peer: PeerId(2),
+                connector: if other == "same" { "mine" } else { other }.into(),
+            }));
+        }
+        let (consumed, _) = r.batch(|w, reads, batch| move_focus(w, reads, WIN, &agent(), Direction::Right, batch));
+        assert_eq!(consumed, crosses, "{other}, known={known}, peer={peer}");
+        if crosses {
+            r.post(HostEvent::Peer(PeerEvent::Raised {
+                peer: PeerId(2),
+                token: Some("edge".into()),
+            }));
+            assert_eq!(
+                port.sent().last().unwrap().msg,
+                Msg::Focus {
+                    target: FocusTarget::Edge { side: Side::Right },
+                    token: Some("edge".into())
+                }
+            );
+        }
+    }
 }

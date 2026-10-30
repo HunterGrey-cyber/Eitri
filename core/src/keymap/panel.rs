@@ -176,11 +176,9 @@ impl PanelSeq {
     }
 }
 
-/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A`
-/// joined `i` the same day as its own two INPUT
-/// aliases but were never added here, so an `eitri.keymap.set("panel", "o"/"A", ...)` -- or an
-/// nvim `mapleader`/mapping on either -- silently shadowed a frozen key instead of being refused.
-/// `:` opens the panel's own command line, so it is refused the same way.
+/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A` enter INPUT
+/// like `i`, so a panel binding or nvim `mapleader`/mapping must not shadow them. `:` opens the
+/// panel's own command line and is protected the same way.
 const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789";
 const PENDING: &str = "gz[]";
 /// The BROWSE pairs a reserved prefix already completes, or will (the web side's `FIXED_PAIRS`):
@@ -304,15 +302,13 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Tab(TabAction::Info),
             source: PanelSource::Default,
         },
-        // eitri-only: the handoff button leaves the bottom bar, so the leader key `Space t` takes
-        // its place
+        // eitri-only: handoff is on the leader key `Space t` rather than a bottom-bar button.
         PanelBinding {
             seq: parse_seq("<leader>t").unwrap(),
             action: PanelAction::Handoff,
             source: PanelSource::Default,
         },
-        // eitri-only, the same effect as Shift+Tab (Claude Code, docs: permission-modes.md);
-        // mock: leader.html draws `m ➜ mode: auto, fixed`
+        // eitri-only: cycle the permission mode, like Shift+Tab.
         PanelBinding {
             seq: parse_seq("<leader>m").unwrap(),
             action: PanelAction::ModeCycle,

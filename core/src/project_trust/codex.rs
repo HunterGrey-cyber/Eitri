@@ -153,7 +153,9 @@ pub(super) fn project_fallback_names(bytes: &[u8]) -> Vec<String> {
 }
 
 /// The MCP servers a project's `.codex/config.toml` defines, by name with each one's definition, in
-/// the file's order. A file that is not UTF-8 TOML defines none here (it is reported as unparsed).
+/// the order of their names, not the file's (a `toml::Table` keeps its keys sorted, and this crate
+/// does not enable toml's `preserve_order`). A file that is not UTF-8 TOML defines none here (it is
+/// reported as unparsed).
 pub(super) fn project_server_definitions(bytes: &[u8]) -> Vec<(String, ServerDefinition)> {
     let Some(table) = std::str::from_utf8(bytes)
         .ok()

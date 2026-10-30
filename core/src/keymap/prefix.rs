@@ -5,7 +5,9 @@
 //!
 //! After a split key (`split.right`/`split.below`, `%`/`"` by default) the prefix waits for a module
 //! key -- `e a t` and each Lua panel's `key` -- and a capital is taken for its lowercase when no Lua
-//! panel registered the capital itself (`"` is Shift+' on a US layout). A Lua panel's key also
+//! panel registered the capital itself (`"` is Shift+' on a US layout). The hide key
+//! (`module.hide-by-key`, `d` by default) waits for a module key the same way, read the same way, and
+//! names the module to hide. A Lua panel's key also
 //! runs its module directly, since no binding can have it (the reserved-set check,
 //! `ModuleKeys::build`).
 //!
@@ -58,6 +60,10 @@ pub enum PrefixCommand {
         axis: Axis,
         cwd: SplitCwd,
     },
+    /// After the hide key and a module key: hide the module that key names.
+    Hide {
+        module: ModuleId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +94,8 @@ enum State {
         axis: Axis,
         cwd: SplitCwd,
     },
+    /// After the hide key: the next key names the module to hide.
+    AwaitHide,
     AwaitWorkspace {
         deleting: bool,
     },
@@ -107,6 +115,8 @@ pub enum Waiting {
     No,
     Command,
     Module(Axis),
+    /// After the hide key: a module key names the module to hide.
+    Hide,
     Number,
     Workspace {
         deleting: bool,
@@ -142,6 +152,7 @@ impl Prefix {
             State::Armed => Waiting::Command,
             State::AwaitNumber { .. } => Waiting::Number,
             State::AwaitModule { axis, .. } => Waiting::Module(axis),
+            State::AwaitHide => Waiting::Hide,
             State::Idle | State::Repeat { .. } => Waiting::No,
         }
     }
@@ -186,6 +197,17 @@ impl Prefix {
     /// [`Prefix::release`] acts on, so a host need report no other.
     pub fn holds(&self, keycode: u32) -> bool {
         self.held == Some(keycode)
+    }
+
+    /// The module a key names while a wait for a module key is up: the exact key first (a Lua panel may own a
+    /// capital), then a capital's lowercase.
+    fn module_named(&self, press: Press) -> Option<ModuleId> {
+        let Press::Key(key) = press else { return None };
+        let c = key.as_char()?;
+        self.module_keys
+            .module(c)
+            .or_else(|| self.module_keys.module(c.to_ascii_lowercase()))
+            .cloned()
     }
 
     fn repeatable(&self, press: Press) -> Option<Action> {
@@ -276,6 +298,10 @@ impl Prefix {
                             self.state = State::AwaitModule { axis, cwd };
                             Outcome::Swallow
                         }
+                        Action::ModuleHideByKey => {
+                            self.state = State::AwaitHide;
+                            Outcome::Swallow
+                        }
                         ref action => {
                             if binding.repeatable {
                                 self.state = State::Repeat {
@@ -299,23 +325,19 @@ impl Prefix {
                 }
                 self.held = Some(keycode);
                 self.state = State::Idle;
-                let Some(c) = (match press {
-                    Press::Key(key) => key.as_char(),
-                    _ => None,
-                }) else {
+                match self.module_named(press) {
+                    Some(module) => Outcome::Run(PrefixCommand::Place { module, axis, cwd }),
+                    None => Outcome::Swallow,
+                }
+            }
+            State::AwaitHide => {
+                if press == Press::Modifier {
                     return Outcome::Swallow;
-                };
-                // The exact key first (a Lua panel may own a capital), then a capital's lowercase.
-                match self
-                    .module_keys
-                    .module(c)
-                    .or_else(|| self.module_keys.module(c.to_ascii_lowercase()))
-                {
-                    Some(module) => Outcome::Run(PrefixCommand::Place {
-                        module: module.clone(),
-                        axis,
-                        cwd,
-                    }),
+                }
+                self.held = Some(keycode);
+                self.state = State::Idle;
+                match self.module_named(press) {
+                    Some(module) => Outcome::Run(PrefixCommand::Hide { module }),
                     None => Outcome::Swallow,
                 }
             }
@@ -396,12 +418,12 @@ mod tests {
         assert_eq!(p.waiting(), Waiting::Command);
     }
 
-    /// Every default binding but the two split keys runs its own action, from the table itself.
+    /// Every default binding but the two split keys and the hide key runs its own action, from the table itself.
     #[test]
     fn every_default_binding_after_the_prefix_runs_its_action_and_disarms() {
         let t = Instant::now();
         for binding in Keymap::defaults().bindings() {
-            if matches!(binding.action, Action::Split { .. }) {
+            if matches!(binding.action, Action::Split { .. } | Action::ModuleHideByKey) {
                 continue;
             }
             let mut p = armed(defaults(), t);
@@ -412,6 +434,43 @@ mod tests {
                 binding.key
             );
             assert!(!p.is_armed(), "{}", binding.key);
+        }
+    }
+
+    /// `d` waits for a module key and hides the module it names: a capital reads as its lowercase, a Lua panel's
+    /// key names its panel, a modifier keeps the wait, and `Esc` or any other key ends it with nothing run.
+    #[test]
+    fn the_hide_key_waits_for_a_module_key_and_names_its_module() {
+        let t = Instant::now();
+        let hide = |module: ModuleId| Outcome::Run(PrefixCommand::Hide { module });
+        let mut p = with(Keymap::defaults(), &[("notes", "g")]);
+        for (text, module) in [
+            ("t", ModuleId::terminal()),
+            ("E", ModuleId::editor()),
+            ("g", ModuleId::lua("notes")),
+            ("a", ModuleId::agent()),
+        ] {
+            p = armed(p, t);
+            assert_eq!(p.press(key("d"), K1, t), Outcome::Swallow);
+            assert_eq!(p.waiting(), Waiting::Hide);
+            p.release(K1);
+            assert_eq!(
+                p.press(Press::Modifier, SHIFT_L, t),
+                Outcome::Swallow,
+                "a modifier keeps the wait"
+            );
+            assert_eq!(p.waiting(), Waiting::Hide);
+            assert_eq!(p.press(key(text), K2, t), hide(module), "{text}");
+            assert_eq!(p.waiting(), Waiting::No, "{text}");
+            p.release(K2);
+        }
+        for cancel in [Press::Escape, key("z"), key("d"), key("C-b"), Press::Other] {
+            p = armed(p, t);
+            assert_eq!(p.press(key("d"), K1, t), Outcome::Swallow);
+            p.release(K1);
+            assert_eq!(p.press(cancel, K2, t), Outcome::Swallow, "{cancel:?}");
+            assert_eq!(p.waiting(), Waiting::No, "{cancel:?}");
+            p.release(K2);
         }
     }
 

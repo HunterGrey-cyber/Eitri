@@ -1,5 +1,6 @@
 //! The nvim report: `mapleader`, `timeoutlen`/
-//! `timeout`, and every global Normal-mode mapping, read off a fourth nvim->shell push socket
+//! `timeout`, and the global Normal-mode mappings but `<Plug>` and `<SNR>` ones (at most 2,000),
+//! read off an nvim->host push socket
 //! (`feed` builds the socket itself; this module only shapes and classifies the JSON line it
 //! carries). `v: 1` is the only wire version this reads; anything else -- a `v` this
 //! crate does not know, or JSON it cannot parse at all -- is dropped whole, and the caller keeps

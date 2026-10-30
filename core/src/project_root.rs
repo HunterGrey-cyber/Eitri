@@ -1,22 +1,9 @@
 //! Where `shell` believes the project it is editing lives -- resolved exactly once, in `main()`,
 //! and then carried as a value.
 //!
-//! Before this existed, `build_ui` read `std::env::current_dir()` separately for the agent panel
-//! and for the terminal pane, and the editor pane read nothing at all (its `nvim --embed` child
-//! simply inherited the process cwd). Three reads of one process-global is one read too many in a
-//! process that may hold more than one window's worth of state: whatever a later `chdir` or a
-//! second `activate` does, the panes must not be able to disagree about which directory they
-//! are looking at. Resolving once and passing the answer down makes that disagreement
-//! unrepresentable rather than merely unlikely, and gives `shell <dir>` somewhere to land.
-//!
-//! The count in that paragraph is history, and is deliberately left at what it was: the terminal
-//! pane was frozen out of this line of development on 2026-09-19 (`freeze/terminal-stack`), so the
-//! resolved root reached **two** panes -- the `nvim --embed` child and the agent panel -- plus the
-//! top bar's project-name label, which is not a pane. The invariant is the same at any count, which
-//! is why the mechanism did not change with it.
-//!
-//! **Three again since 2026-09-23**: the bottom terminal came back (`shell/src/terminal/`), and its
-//! shell starts in this root. `canonicalize_source`'s own comment below names all three.
+//! Resolving once and passing the answer to the editor, agent panel and bottom terminal prevents
+//! them from disagreeing about their project after a later `chdir` or a second activation. It also
+//! gives `shell <dir>` one place to select that root.
 //!
 //! Everything here works in `OsStr`/`OsString`, never `String`. `std::env::args()` is documented
 //! to panic on an argument that is not valid UTF-8, and a filesystem path is exactly the argument
@@ -41,18 +28,10 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// directory, which is the trade this module exists to make. It takes no value; one that did
 /// would need more than a membership test here (see [`select_root_source`]'s doc).
 ///
-/// `--version` joined this list rather than being handled some
-/// other way, for exactly the reason above: `main()` intercepts it and exits before `resolve()`
-/// is ever called, but a flag `main()` matches and this module does not know about is still the
-/// silent-wrong-project failure this module exists to rule out -- this list is the one place that
-/// distinction is made, whether or not the caller happens to reach it on a given run.
-///
-/// `--legacy` joined it for the identical reason: `main()`
-/// also intercepts it and exits before `resolve()` is reached, on any build that did not compile
-/// the legacy backend in (every release). Listed in **every** build regardless -- this module has
-/// no notion of the `legacy-backend` cargo feature, and the point is the same either way: a release
-/// user who types `shell --legacy` gets `LEGACY_NOT_IN_BUILD`'s real reason, never "unrecognized
-/// option --legacy" from this module, nor a silently opened cwd.
+/// `--version` is intercepted before `resolve()`, but belongs here so all flag recognition agrees.
+/// `--legacy` is also intercepted in builds without the legacy backend (every release). Listing
+/// it in every build lets that path report `LEGACY_NOT_IN_BUILD`, rather than an unrecognized
+/// option or a silently opened cwd.
 const KNOWN_FLAGS: [&str; 3] = ["--clean", "--version", "--legacy"];
 
 /// The conventional end-of-flags separator. The first token after it is the project directory
@@ -62,15 +41,9 @@ const END_OF_FLAGS: &str = "--";
 /// Whether `flag` appears in `args` *before* the first `--` -- the same end-of-flags rule
 /// [`select_root_source`] itself applies.
 ///
-/// `shell/src/main.rs` used to run its own early `--version`/`--legacy`/`--clean` scans as three
-/// separate `args_os().any(|a| a == "...")` loops, none of which knew about `--` at all. So
-/// `shell -- --version` printed the version line instead of opening a directory literally named
-/// `--version`, and (on a build that did not compile the legacy backend in -- every release)
-/// `shell -- --legacy` was refused before ever reaching the directory step instead of opening a
-/// directory literally named `--legacy`. Routing all three scans through this
-/// one function -- rather than three ad-hoc loops that could each get `--` handling right or wrong
-/// independently -- is what keeps `main()` and [`select_root_source`] from being able to disagree
-/// about where flag parsing ends.
+/// Sharing this end-of-flags check with the early `--version`/`--legacy`/`--clean` dispatch
+/// prevents disagreement with [`select_root_source`]. `shell -- --version` and
+/// `shell -- --legacy` name directories, so neither may trigger an early flag action.
 pub fn flag_given<'a>(args: impl IntoIterator<Item = &'a OsStr>, flag: &str) -> bool {
     for arg in args {
         if arg == OsStr::new(END_OF_FLAGS) {
@@ -114,9 +87,8 @@ impl RootSource {
 
 /// Resolves the project root from this process's real arguments and environment.
 ///
-/// `Err` carries a finished, human-readable sentence for `main()` to print before exiting -- this
-/// replaced an `.expect("cwd")` whose panic output named neither the failing path nor what `shell`
-/// had been trying to do with it.
+/// `Err` carries a finished, human-readable sentence for `main()` to print before exiting,
+/// naming the failing path and what `shell` is trying to do rather than panicking.
 ///
 /// This function is nothing but the three reads of process state; [`resolve_from`] is the part
 /// with behaviour in it, and is what the tests drive.
@@ -130,7 +102,7 @@ pub fn resolve() -> Result<PathBuf, String> {
     )
 }
 
-/// [`resolve`] over an explicit argument list (argv[0] already stripped), for a command line that
+/// [`resolve`] over an explicit argument list (`argv[0]` already stripped), for a command line that
 /// is not the process's own: `eitri panel` hands its leftover arguments here after taking its own
 /// options out. The environment and the cwd are the process's, exactly as in [`resolve`].
 pub fn resolve_args(args: &[OsString]) -> Result<PathBuf, String> {
@@ -264,7 +236,7 @@ fn resolve_from<'a>(
 
 /// Precedence: an explicit argument beats the environment, which beats the cwd.
 ///
-/// `args` must already have argv[0] stripped. A token that starts with `-` is a flag, and is
+/// `args` must already have `argv[0]` stripped. A token that starts with `-` is a flag, and is
 /// either one of [`KNOWN_FLAGS`] (skipped) or an error -- it is never silently ignored, because
 /// "ignored, and the cwd was opened instead" is precisely the outcome this module exists to make
 /// unreachable: `shell -myproj` and `shell --clen` would both have opened whatever directory the
@@ -398,8 +370,7 @@ mod tests {
 
     #[test]
     fn an_unrecognized_option_is_an_error_rather_than_a_silent_fallback_to_the_cwd() {
-        // The failure this replaces: `shell -myproj` (or a mistyped `--clen`) used to be dropped
-        // on the floor and the cwd opened instead, with nothing printed anywhere.
+        // `shell -myproj` and a mistyped `--clen` must report an error, never silently open cwd.
         let err = select(["-myproj"], None).expect_err("a leading-dash token must not be ignored");
         assert!(err.contains("-myproj"), "got {err}");
         assert!(err.contains("--"), "the message must point at the escape hatch: {err}");
@@ -419,11 +390,7 @@ mod tests {
         // `select_root_source` and `shell -- --clean` silently swallows the token as a flag and
         // opens the cwd instead of the directory literally named `--clean` -- the exact
         // silent-wrong-project outcome this module exists to make unreachable.
-        //
-        // This case used to be spelled with `--terminal`, which was a known flag until the
-        // terminal pane was frozen out on 2026-09-19. Once `KNOWN_FLAGS` lost it, that spelling
-        // stopped testing anything the `-myproj` line above did not already cover, so it is kept
-        // below as the *unknown*-token case and `--clean` carries the known-token one.
+        // `--clean` exercises a known flag after the separator; `--terminal` below is unknown.
         assert_eq!(select(["--", "--clean"], None), Ok(argument("--clean")));
         assert_eq!(
             select(["--clean", "--", "--terminal"], None),
@@ -439,8 +406,7 @@ mod tests {
     #[test]
     fn a_non_utf8_argument_is_a_path_like_any_other() {
         use std::os::unix::ffi::OsStringExt;
-        // `std::env::args()` panics outright on this; `args_os()` is why the module is built on
-        // `OsString`. The old code could not even represent this input, let alone report it.
+        // `std::env::args()` panics on this input; `args_os()` and `OsString` preserve it for reporting.
         let raw = OsString::from_vec(b"/tmp/\xff-not-valid-utf8".to_vec());
         let args = [raw.clone()];
         assert_eq!(
@@ -483,7 +449,7 @@ mod tests {
 
     #[test]
     fn flag_given_does_not_find_a_flag_after_the_double_dash() {
-        // The exact defect this function replaces: `shell -- --version` must open a directory
+        // `shell -- --version` must open a directory
         // literally named `--version`, not have `main()`'s own early scan still detect the flag
         // past the `--`.
         let args: Vec<OsString> = ["--", "--version"].iter().map(OsString::from).collect();

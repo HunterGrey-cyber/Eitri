@@ -48,16 +48,10 @@ describe("phaseOf", () => {
     expect(phaseOf(state)).toEqual({ kind: "replying" });
   });
 
-  /* An unfinished call stays current when a later sibling finishes
-     Rule 2 used to require `openTool.seq === lastItemSeq`. The four tests below are the four cases
-     that settle the amendment; the first three were each reproduced RED against that qualifier
-     before it was replaced, and the fourth is the regression guard that the replacement did not
-     break the ordinary path. */
+  /* An unfinished call stays current when a later sibling finishes. */
 
   it("names the newest UNFINISHED call when a sibling that started later finishes first", () => {
-    // Reproduced against the old qualifier: B's record was the highest-seq ITEM, so A -- genuinely
-    // running -- failed `openTool.seq === lastItemSeq` and the phase read `sent`, whose own
-    // definition is "nothing has come back yet". A sibling completing is not evidence about A.
+    // B has the highest item sequence, but its completion says nothing about A still running.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "a", name: "Bash", input: {} });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "b", name: "Read", input: {} });
@@ -77,10 +71,7 @@ describe("phaseOf", () => {
   });
 
   it("a DENIED call leaves 'running <Tool>' as soon as the model thinks", () => {
-    // Reproduced against the old qualifier: `permission_resolved` creates no item, so the tool call
-    // was still `lastItemSeq` and rule 2 -- which sat ahead of rule 3 -- kept matching. The panel
-    // animated "running Bash" for a call the user had just REFUSED, for as long as the model
-    // thought about what to do instead.
+    // Denial creates no item; thinking must displace the refused call even while it is the latest item.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
@@ -92,9 +83,7 @@ describe("phaseOf", () => {
   });
 
   it("a DENIED call leaves 'running <Tool>' as soon as the model answers", () => {
-    // The other half of the same case. This one the old qualifier already handled (text opens a
-    // new, higher-seq transcript entry), so it is a guard on the amendment rather than a repro:
-    // the replacement clause must keep answering it the same way.
+    // Text creates a higher-sequence transcript entry and must displace the denied call too.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
@@ -105,9 +94,7 @@ describe("phaseOf", () => {
   });
 
   it("an ordinary single call reads 'running <Tool>' from start to result, approval included", () => {
-    // The regression guard for the amendment: the common path must be unchanged. Note the middle
-    // two steps -- a permission asked and ALLOWED -- are events that create no item either, so
-    // before and after them the phase has to be the same words on the screen.
+    // Asking and allowing permission create no item: once allowed, the same running words return.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "hi" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
@@ -120,13 +107,9 @@ describe("phaseOf", () => {
     expect(phaseOf(state).kind).not.toBe("tool");
   });
 
-  /* A new PROMPT displaces the previous turn's tool call
-     The first amendment dropped `lastItemSeq` outright, which left a call that never completed --
-     an interrupt or a denial, both of which leave `result: null` FOREVER -- as "the newest
-     unfinished call" into the following turn. `toolCalls` is never cleared between turns, and a
-     user prompt is not assistant text, so nothing displaced it. The three tests below are that
-     defect's three shapes; each was checked RED against the code before `lastPromptSeq` was added,
-     reporting `{kind: "tool", toolName: ...}` where it now reports `sent`. */
+  /* A new prompt must displace an interrupted or denied call: both can keep `result: null`
+     forever, and `toolCalls` survives turn boundaries. A prompt is not assistant text, so it needs
+     its own check to keep a stale tool out of the next turn's `sent` phase. */
 
   it("an INTERRUPTED call does not claim 'running <Tool>' into the next turn", () => {
     // After an interrupt the model may emit nothing further, so
@@ -163,7 +146,7 @@ describe("phaseOf", () => {
   });
 
   it("a DENIED call does not claim 'running <Tool>' into the next turn", () => {
-    // The same defect by the other route to `result: null`. Here not even a first delta precedes
+    // The other route to `result: null`. Here not even a first delta precedes
     // the call, so `lastMessageSeq` is -1 throughout and the prompt is the only displacer there is.
     let state = applyEvent(initialState(), { type: "user_prompt_submitted", text: "run the build" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });

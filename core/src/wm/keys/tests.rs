@@ -171,16 +171,6 @@ impl Rig {
         self.applied_since(mark).into_iter().map(|(op, _)| op).collect()
     }
 
-    fn shell_verbs_since(&self, mark: usize) -> Vec<ShellVerb> {
-        self.host.log()[mark..]
-            .iter()
-            .filter_map(|logged| match logged {
-                Logged::ShellVerb(verb) => Some(verb.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The host reports `module` holds the keys, outside any batch.
     fn native(&self, module: &ModuleId) {
         self.host.post(HostEvent::NativeFocus {
@@ -550,30 +540,44 @@ fn a_pass_through_key_allocates_nothing_in_either_stage_or_on_release() {
 
 #[test]
 fn the_prefix_runs_its_command_through_the_runner_with_the_keycode() {
-    let r = driven(three(agent()));
+    let r = driven(three(editor()));
     let mark = r.mark();
     assert_eq!(r.prefix_then(&bound(&Action::Zoom), K1), Verdict::Consumed);
-    assert_eq!(r.layout.borrow().zoomed(), Some(&agent()), "the tiling verb ran here");
-    assert!(r.shell_verbs_since(mark).is_empty());
+    assert_eq!(r.layout.borrow().zoomed(), Some(&editor()), "the tiling verb ran here");
     assert!(
         r.ops_since(mark).contains(&HostOp::Unmap {
             win: WIN,
-            module: editor()
+            module: agent()
         }),
         "the zoom's own batch: {:?}",
         r.ops_since(mark)
     );
 
+    // Text size is decided by the same runner when a hardware key invokes it.
+    r.driver.set_text_size(WIN, 14.0, 1.0);
+    r.native(&editor());
+    let action = Action::Text(crate::keymap::action::TextChange::Larger);
     let mark = r.mark();
-    assert_eq!(r.prefix_then(&bound(&Action::FloatToggle), K2), Verdict::Consumed);
+    assert_eq!(r.prefix_then(&bound(&action), K2), Verdict::Consumed);
+    let writes: Vec<_> = r
+        .ops_since(mark)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                op,
+                HostOp::Editor(EditorCall::SetScale { .. }) | HostOp::Chat(ChatOp::SetFontSize { .. })
+            )
+        })
+        .collect();
     assert_eq!(
-        r.shell_verbs_since(mark),
-        vec![ShellVerb {
-            win: WIN,
-            call: ShellCall::Action(Action::FloatToggle),
-            keycode: K2,
-        }],
-        "an unmoved family goes to the shell with the key that ran it"
+        writes,
+        [
+            HostOp::Editor(EditorCall::SetScale {
+                win: WIN,
+                scale: 1.1_f32 as f64
+            }),
+            HostOp::Chat(ChatOp::SetFontSize { win: WIN, px: 14.0 }),
+        ]
     );
 }
 
@@ -594,11 +598,9 @@ fn a_split_key_places_here_and_a_chooser_pick_is_answered_here() {
     );
 
     let r = driven(three(editor()));
-    let mark = r.mark();
     assert_eq!(r.prefix_then(&split.key.to_string(), K1), Verdict::Consumed);
     assert_eq!(r.waiting(), Waiting::Module(Axis::Row));
     assert_eq!(r.window_key(key("t", K2)), Verdict::Consumed);
-    assert!(r.shell_verbs_since(mark).is_empty(), "the split is decided here");
     {
         let layout = r.layout.borrow();
         assert_eq!(layout.focus(), &terminal(), "the placed module takes the keys");
@@ -618,12 +620,132 @@ fn a_split_key_places_here_and_a_chooser_pick_is_answered_here() {
     r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
     r.driver.test_batch(|c| c.await_workspace(WIN));
     assert_eq!(r.waiting(), Waiting::Workspace { deleting: false });
-    let mark = r.mark();
     assert_eq!(r.window_key(key("2", K3)), Verdict::Consumed);
-    assert!(r.shell_verbs_since(mark).is_empty());
     assert_eq!(r.chrome().toast.unwrap().text, "no workspace 2");
     assert!(r.notes().contains(&"[modules] refused: no workspace 2".into()));
     assert_eq!(r.waiting(), Waiting::No);
+}
+
+/// `prefix d` then a module key hides that module wherever the keys are: the keys stay put unless the hidden module
+/// held them, and then go to its neighbour; `Esc` after `d` hides nothing.
+#[test]
+fn the_hide_key_hides_the_named_module_and_moves_the_keys_only_off_it() {
+    let r = driven(three(editor()));
+    let hide = bound(&Action::ModuleHideByKey);
+    assert_eq!(hide, "d");
+    assert_eq!(r.prefix_then(&hide, K1), Verdict::Consumed);
+    assert_eq!(r.waiting(), Waiting::Hide);
+    let mark = r.mark();
+    assert_eq!(r.window_key(key("t", K2)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
+    assert_eq!(r.waiting(), Waiting::No);
+    {
+        let layout = r.layout.borrow();
+        assert!(!layout.is_shown(&terminal()), "the terminal is hidden");
+        assert_eq!(layout.focus(), &editor(), "the keys stay where they were");
+    }
+    assert!(focus_to(&r.ops_since(mark)).is_empty(), "no module is given the keys");
+
+    assert_eq!(r.prefix_then(&hide, K1), Verdict::Consumed);
+    assert_eq!(r.window_key(escape_key(K2)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
+    assert_eq!(r.waiting(), Waiting::No, "Esc ends the wait");
+    assert!(r.layout.borrow().is_shown(&editor()) && r.layout.borrow().is_shown(&agent()));
+
+    assert_eq!(r.prefix_then(&hide, K1), Verdict::Consumed);
+    let mark = r.mark();
+    assert_eq!(r.window_key(key("e", K2)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
+    {
+        let layout = r.layout.borrow();
+        assert!(!layout.is_shown(&editor()), "the module with the keys is hidden");
+        assert_eq!(layout.focus(), &agent(), "and its neighbour has the keys");
+    }
+    assert_eq!(focus_to(&r.ops_since(mark)), vec![agent()]);
+}
+
+/// While the hide key waits, the chrome's strip dims a kind by the instance its key would hide: the base terminal and
+/// the base chat hidden, `terminal#2` and `agent#2` shown, so `t` and `a` are not dimmed, and `t` hides `terminal#2`.
+#[test]
+fn the_hide_keys_strip_dims_by_the_instance_the_key_hides() {
+    use crate::layout::{Frame, ModuleDecl, Placement};
+    use crate::wm::prefix_strip::StripPiece;
+    let (t2, a2) = (
+        ModuleId::parse("terminal#2").unwrap(),
+        ModuleId::parse("agent#2").unwrap(),
+    );
+    let decl = |id: &ModuleId, placement| ModuleDecl {
+        id: id.clone(),
+        placement,
+    };
+    let mut layout = Layout::initial(&[
+        decl(&terminal(), Placement::BelowEditor),
+        decl(&t2, Placement::BelowEditor),
+        decl(&a2, Placement::RightOfRoot),
+    ])
+    .unwrap();
+    let frame = Frame::new(GRID, 1);
+    layout.set_focus(&editor()).unwrap();
+    crate::layout::hide(&mut layout, &terminal(), &frame).unwrap();
+    crate::layout::hide(&mut layout, &agent(), &frame).unwrap();
+    let r = driven(layout);
+    assert_eq!(r.prefix_then(&bound(&Action::ModuleHideByKey), K1), Verdict::Consumed);
+    let strip = r.chrome().prefix_strip.expect("the strip while the hide key waits");
+    let run = |key: &str| {
+        strip
+            .iter()
+            .find_map(|piece| match piece {
+                StripPiece::Run { text, dimmed } if text.starts_with(&format!("{key} ")) => Some(*dimmed),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {key} run: {strip:?}"))
+    };
+    assert!(!run("t"), "t hides terminal#2, which is shown: {strip:?}");
+    assert!(!run("a"), "a hides agent#2, which is shown: {strip:?}");
+    assert_eq!(r.window_key(key("t", K2)), Verdict::Consumed);
+    assert!(!r.layout.borrow().is_shown(&t2), "t hid terminal#2");
+}
+
+/// The hide key refuses, with the flash and a toast saying why: a module the layout does not hold, one hidden already,
+/// the last module on screen, and any module while a container is selected.
+#[test]
+fn the_hide_key_refuses_what_it_cannot_hide() {
+    let r = driven(pair(editor(), agent(), editor()));
+    let hide = bound(&Action::ModuleHideByKey);
+    let hide_then = |text: &str| {
+        assert_eq!(r.prefix_then(&hide, K1), Verdict::Consumed);
+        assert_eq!(r.window_key(key(text, K2)), Verdict::Consumed);
+        r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
+    };
+    let toast = || r.chrome().toast.map(|toast| toast.text);
+
+    hide_then("t");
+    assert_eq!(toast().as_deref(), Some("module 'terminal' is not in the layout"));
+
+    r.arm();
+    assert_eq!(r.window_key(key(&bound(&Action::FocusParent), K3)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K3 });
+    assert!(matches!(
+        r.layout.borrow().selection(),
+        crate::layout::Selection::Con(_)
+    ));
+    hide_then("a");
+    assert_eq!(toast().as_deref(), Some("acts on one module: Ctrl+b Alt+d"));
+    assert!(
+        r.layout.borrow().is_shown(&agent()),
+        "nothing is hidden under a container selection"
+    );
+    r.arm();
+    assert_eq!(r.window_key(key(&bound(&Action::FocusChild), K3)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K3 });
+
+    hide_then("a");
+    assert!(!r.layout.borrow().is_shown(&agent()));
+    hide_then("a");
+    assert_eq!(toast().as_deref(), Some("agent is hidden already"));
+    hide_then("e");
+    assert_eq!(toast().as_deref(), Some("'editor' is the last module on screen"));
+    assert!(r.layout.borrow().is_shown(&editor()));
 }
 
 #[test]
@@ -810,16 +932,15 @@ fn a_digit_for_a_module_gone_during_the_wait_moves_nothing() {
     let r = driven(Layout::new(root, editor()).unwrap());
     r.prefix_then(&bound(&Action::SelectNumber), K1);
     assert_eq!(r.plan()[2], ('3', agent2()), "the premise: the plan names agent#2");
-    {
-        let layout = r.layout.clone();
-        r.host.on_shell_verb(move |_, _, _, _| {
-            layout.borrow_mut().remove(&agent2()).unwrap();
-        });
-    }
-    // An agent's close while the digits show, through an arm the shell still runs.
-    r.driver.run(WIN, Action::ModuleKill, Origin::Lua);
+    // A module can leave the layout while the digit plan is waiting.
+    r.layout.borrow_mut().remove(&agent2()).unwrap();
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
     assert!(!r.layout.borrow().contains(&agent2()));
-    assert_eq!(r.waiting(), Waiting::Number, "the kill does not end the wait");
+    assert_eq!(
+        r.waiting(),
+        Waiting::Number,
+        "removing the module does not end the wait"
+    );
     let mark = r.mark();
     assert_eq!(r.window_key(key("3", K2)), Verdict::Consumed);
     let ops = r.ops_since(mark);
@@ -912,7 +1033,6 @@ fn hint_toggles_through_an_op_with_the_keycode() {
             .collect::<Vec<_>>(),
         vec![HostOp::Hint(HintOp::Toggle { keycode: K2 })]
     );
-    assert!(r.shell_verbs_since(mark).is_empty());
 }
 
 #[test]

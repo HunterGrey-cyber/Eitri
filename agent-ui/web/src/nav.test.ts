@@ -262,7 +262,7 @@ describe("hintTargets", () => {
   it("judges a start-screen choice by its own scrolling list, not by the root", () => {
     // `.chooser-list` (the launch chooser) scrolls its own content (index.css): a choice
     // scrolled out of it is still inside the root, and must not get a label drawn over the controls
-    // below the list. `.session-choice`, the old resumable-session picker's own list, is gone.
+    // below the list.
     document.body.innerHTML = `
       <div id="root">
         <div class="chooser-list" id="list">

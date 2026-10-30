@@ -1,6 +1,6 @@
 //! The closed set of things a key can do, named the way tmux names its commands. A new
-//! action is a change to this enum and to `shell`'s own closed `match` (`shell/src/main.rs`), never
-//! a plugin -- the same discipline as `ModuleKind`.
+//! action is a change to this enum and to the exhaustive `match`es over it
+//! (`crate::wm::verbs::family` among them), never a plugin -- the same discipline as `ModuleKind`.
 
 use std::fmt;
 
@@ -179,6 +179,8 @@ pub enum Action {
     /// `Row` is tmux's `even-horizontal` (every module side by side); `Column` is `even-vertical`.
     Even(Axis),
     ModuleHide,
+    /// Wait for a module key, then hide that module wherever the keys are; on its own it hides nothing.
+    ModuleHideByKey,
     /// tmux's `kill-pane`: close the module with the keys and end what runs in it, after a y/n,
     /// since what it ends cannot be brought back. `ModuleHide` stays an action of its own for a
     /// config that wants it.
@@ -189,8 +191,8 @@ pub enum Action {
     PanelReload,
     PanelKeymap,
     /// tmux `command-prompt` (`prefix :`): show the chat with the keys and
-    /// open the panel's `:` command line, which runs nothing. Before it was bound, an armed prefix
-    /// swallowed the `:` and the letters typed after it ran as panel keys.
+    /// open the panel's `:` command line, which runs nothing. Without this binding, an armed prefix
+    /// swallows the `:` and the letters typed after it run as panel keys.
     PanelCommandLine,
     WindowImmersive,
     /// The pane with the keys only (not bound by default).
@@ -462,6 +464,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "layout.even-horizontal" => (Action::Even(Axis::Row), &[]),
         "layout.even-vertical" => (Action::Even(Axis::Column), &[]),
         "module.hide" => (Action::ModuleHide, &[]),
+        "module.hide-by-key" => (Action::ModuleHideByKey, &[]),
         "module.kill" => (Action::ModuleKill, &[]),
         "tab.new" => (Action::Tab(TabAction::New), &[]),
         "tab.next" => (Action::Tab(TabAction::Next), &[]),
@@ -582,6 +585,7 @@ impl Action {
             | Action::ScratchpadMove
             | Action::ModuleKill
             | Action::ModuleHide
+            | Action::ModuleHideByKey
             | Action::SwapMarked
             | Action::MarkToggle
             | Action::SendPrefix
@@ -636,6 +640,7 @@ impl Action {
             | Action::ScratchpadMove
             | Action::ModuleKill
             | Action::ModuleHide
+            | Action::ModuleHideByKey
             | Action::Swap(_)
             | Action::SwapMarked
             | Action::MarkToggle
@@ -700,6 +705,7 @@ impl Action {
             | Action::Swap(_)
             | Action::Even(_)
             | Action::ModuleHide
+            | Action::ModuleHideByKey
             | Action::ModuleKill
             | Action::Module(_)
             | Action::MoveFar(_)
@@ -804,6 +810,7 @@ impl Action {
             Action::Even(Axis::Row) => "layout.even-horizontal".into(),
             Action::Even(Axis::Column) => "layout.even-vertical".into(),
             Action::ModuleHide => "module.hide".into(),
+            Action::ModuleHideByKey => "module.hide-by-key".into(),
             Action::ModuleKill => "module.kill".into(),
             Action::Module(id) => format!("module.{}", id.as_str().trim_start_matches("lua:")),
             Action::Tab(tab) => match tab {
@@ -962,8 +969,12 @@ impl Action {
             Action::Even(Axis::Row) => "Every module in one row, at equal sizes".into(),
             Action::Even(Axis::Column) => "Every module in one column, at equal sizes".into(),
             Action::ModuleHide => "Hide this module; it keeps running (not the last one on screen)".into(),
-            // Killing the last module closes the window (`KillScope::Window`), as tmux's `kill-pane` does
-            // on its last pane. Hiding still refuses the last module.
+            Action::ModuleHideByKey => format!(
+                "Then a module key ({module_keys}): hide that module; it keeps running, and the keys stay unless it \
+                 had them"
+            ),
+            // Killing the last module closes the window (`KillScope::Window`), as tmux's `kill-pane`
+            // on a window's last pane does; hiding the last module is refused.
             Action::ModuleKill => {
                 "Close this module and end what runs in it, after y/n (the last one on screen closes Eitri)".into()
             }
@@ -1373,8 +1384,24 @@ mod tests {
         assert!(err.contains("module.nope") && err.contains("Lua panel"), "{err}");
     }
 
-    /// The `?` overlay once said the kill refused the last module on screen; since
-    /// 2026-09-26 that kill closes the window instead. The hide still refuses it.
+    /// `module.hide-by-key` waits for a module key, so on its own it is ruled as `module.hide` is: a layout action
+    /// that acts on a float and is refused under a container selection. Its `?` row names the module keys.
+    #[test]
+    fn hide_by_key_parses_and_is_ruled_as_module_hide() {
+        let parsed = parse("module.hide-by-key", &[], &[]).unwrap();
+        assert_eq!(parsed.action, Action::ModuleHideByKey);
+        assert!(!parsed.repeatable);
+        assert_eq!(Action::ModuleHideByKey.name(), "module.hide-by-key");
+        assert_eq!(Action::ModuleHideByKey.on_a_float(), Action::ModuleHide.on_a_float());
+        assert_eq!(Action::ModuleHideByKey.selection_rule(), SelectionRule::Refuses);
+        assert!(Action::ModuleHideByKey.is_layout());
+        let row = Action::ModuleHideByKey.describe("Ctrl+b", "e / a / t");
+        assert!(row.contains("(e / a / t)") && row.contains("keeps running"), "{row}");
+        assert!(row.contains("the keys stay unless it had them"), "{row}");
+    }
+
+    /// The `?` overlay must say that killing the last module on screen closes the window,
+    /// while hiding it is refused.
     #[test]
     fn the_kill_row_says_the_last_module_closes_eitri() {
         let kill = Action::ModuleKill.describe("Ctrl+b", "e / a / t");
@@ -1385,9 +1412,8 @@ mod tests {
             .contains("not the last one on screen"));
     }
 
-    /// Bindings added 2026-09-29 for tmux's `last-pane` and `select-pane -t :.+`. `parse`'s `select.`
-    /// fallback reads only a direction, so both names need arms of their own -- and the fallback must
-    /// keep reading the directions.
+    /// tmux's `last-pane` and `select-pane -t :.+` need explicit names: `parse`'s `select.` fallback
+    /// reads only a direction and must keep reading the directions.
     #[test]
     fn select_last_and_next_parse_by_name_and_take_no_options() {
         assert_eq!(parse("select.last", &[], &[]).unwrap().action, Action::SelectLast);

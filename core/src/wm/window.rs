@@ -3,14 +3,16 @@
 
 use super::chrome::{ChromeModel, ChromeState};
 use super::focus::FocusState;
+use super::grid::drag::Drag;
 use super::grid::{floats_need_restack, shown_floats};
+use super::host::EditorSpawn;
 use super::host::{Batch, FocusTo, HostOp, RestackMove, Scheduler, TimerToken};
 use super::keys::KeyState;
 use super::module::{Lifecycle, ModuleState};
 use super::persist::{Fired, Saver};
-use crate::layout::{Layout, ModuleId, Rect as LayoutRect, Size, Workspaces};
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use crate::layout::{Arrangement, Layout, ModuleId, Rect as LayoutRect, Size, Workspaces};
+use std::cell::{Cell, Ref, RefCell};
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -69,15 +71,86 @@ pub struct WindowSpec {
     pub title: String,
 }
 
-/// What the shell hands the controller when it opens a window: the live layout its grid shares, every workspace
-/// beside it, and the saver of its state file (`None` for a window that keeps no layout file).
+/// What the shell hands the controller when it opens a window: the layout it starts with, every workspace beside
+/// it, and the saver of its state file (`None` for a window that keeps no layout file). The shell gives the two by
+/// value and keeps only [`LayoutView`] and [`WorkspacesView`] on them: from then on the controller is the one
+/// writer of both.
 pub struct WindowParts {
     /// The current workspace's layout, the one on screen.
-    pub layout: Rc<RefCell<Layout>>,
+    pub(crate) layout: Rc<RefCell<Layout>>,
     /// Every workspace of the window; the current one's layout is `layout`.
-    pub workspaces: Rc<RefCell<Workspaces>>,
+    pub(crate) workspaces: Rc<RefCell<Workspaces>>,
     /// Writes the window's layouts to the project's state file.
-    pub saver: Option<Saver>,
+    pub(crate) saver: Option<Saver>,
+}
+
+impl WindowParts {
+    /// The parts of a window that starts with `layout` and `workspaces`.
+    pub fn new(layout: Layout, workspaces: Workspaces, saver: Option<Saver>) -> WindowParts {
+        WindowParts {
+            layout: Rc::new(RefCell::new(layout)),
+            workspaces: Rc::new(RefCell::new(workspaces)),
+            saver,
+        }
+    }
+
+    /// Read-only handles on the layout and the workspaces these parts carry, live once the controller has them.
+    pub fn views(&self) -> (LayoutView, WorkspacesView) {
+        (LayoutView(self.layout.clone()), WorkspacesView(self.workspaces.clone()))
+    }
+}
+
+/// A read-only handle on a window's live layout: what the grid draws and every reader in the shell holds. The
+/// controller writes the layout only while it decides, never while its ops are carried out, so a read from a
+/// toolkit callback finds it free; [`LayoutView::try_read`] answers `None` in the moment it is not.
+#[derive(Clone)]
+pub struct LayoutView(Rc<RefCell<Layout>>);
+
+impl LayoutView {
+    /// The layout as it is now. Panics if the controller is writing it, which no read from an op or a toolkit
+    /// callback can meet; a reader that cannot rule it out asks [`LayoutView::try_read`].
+    pub fn read(&self) -> Ref<'_, Layout> {
+        self.0.borrow()
+    }
+
+    /// The layout as it is now, or `None` while the controller writes it.
+    pub fn try_read(&self) -> Option<Ref<'_, Layout>> {
+        self.0.try_borrow().ok()
+    }
+
+    /// A copy of the layout as it is now, or `None` while the controller writes it: what a reader takes that must
+    /// hold no borrow while it works (Lua building `eitri.layout.get`'s table).
+    pub fn copy(&self) -> Option<Layout> {
+        self.try_read().map(|layout| layout.clone())
+    }
+
+    /// A view on a layout of its own, with the cell a test writes it through.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(layout: Layout) -> (LayoutView, Rc<RefCell<Layout>>) {
+        let cell = Rc::new(RefCell::new(layout));
+        (LayoutView(cell.clone()), cell)
+    }
+}
+
+/// A read-only handle on a window's workspaces, as [`LayoutView`] is on its layout.
+#[derive(Clone)]
+pub struct WorkspacesView(Rc<RefCell<Workspaces>>);
+
+impl WorkspacesView {
+    /// The workspaces as they are now; panics only where [`LayoutView::read`] would.
+    pub fn read(&self) -> Ref<'_, Workspaces> {
+        self.0.borrow()
+    }
+
+    /// The workspaces as they are now, or `None` while the controller writes them.
+    pub fn try_read(&self) -> Option<Ref<'_, Workspaces>> {
+        self.0.try_borrow().ok()
+    }
+
+    /// A copy of the workspaces as they are now, or `None` while the controller writes them.
+    pub fn copy(&self) -> Option<Workspaces> {
+        self.try_read().map(|workspaces| workspaces.clone())
+    }
 }
 
 /// Where a window's timers come from: the controller's scheduler, and the counter every window's tokens are
@@ -96,9 +169,33 @@ impl Timers {
     }
 }
 
-/// The controller's record of one window. The shell's remaining arms still write the layout and the workspaces,
-/// so the controller reads them with `try_borrow` and never waits for a shell closure that holds them.
+/// Whether this window's editor can receive requests or needs its pane released and restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorRun {
+    Running,
+    Ending,
+    Ended,
+    Restarting,
+}
+
+/// The controller's record of one window. It is the one writer of the window's layout and workspaces; the shell
+/// reads them through [`LayoutView`] and [`WorkspacesView`], and the controller still reads them with `try_borrow`,
+/// so a read from inside one of its own writes is a logged mistake, never a panic.
 pub struct Window {
+    /// The plugin whose declared root is this window's project, absent in window 2.
+    pub own_window: Option<String>,
+    pub(super) close: super::close::CloseFlow,
+    pub(super) quit: super::quit::QuitFlow,
+    pub(super) quit_timer: Option<(TimerToken, u32)>,
+    pub(super) release_exited: Option<TimerToken>,
+    pub(super) editor_spawn: Option<EditorSpawn>,
+    pub(super) editor_run: EditorRun,
+    pub(super) restart_wanted: bool,
+    pub(super) release_refused_logged: bool,
+    /// Allocations are heard from an idle; a close must hear their pin lengths before saving.
+    pub(super) unheard_settles: VecDeque<crate::layout::Con>,
+    /// Decided one at a time, after the previous batch's events and judgments have applied.
+    pub(super) lua_pending: VecDeque<crate::lua::layout::LayoutRequest>,
     pub(super) spec: WindowSpec,
     pub(super) lifecycle: Lifecycle,
     pub(super) layout: Rc<RefCell<Layout>>,
@@ -107,15 +204,20 @@ pub struct Window {
     /// The save's debounce timer, while one is armed.
     pub(super) save_timer: Option<TimerToken>,
     timers: Timers,
-    /// The hosted modules the grid shows, as the last layout batch (or the shell's last change) left them.
+    /// The hosted modules the grid shows, as the last layout batch left them.
     pub(super) mapped: BTreeSet<ModuleId>,
     /// The floats the grid's float band holds, as its last restack put them.
     pub(super) float_band: BTreeSet<ModuleId>,
     /// The size of the window's last allocation; `None` before its first.
     pub(super) allocated: Option<Size>,
-    /// A shell verb the runner handed over and whose re-read has not come yet: whether the selection is to be
-    /// put back on the module with the keys once its arm has run.
-    pub(super) after_verb: Option<bool>,
+    /// What the window's last allocation arranged: where each divider and float is on screen now. A copy of
+    /// what the grid was given, read only by the drags, which move a divider or a float from where it is drawn.
+    pub(super) arranged: Option<Rc<Arrangement>>,
+    /// The divider or float a press began dragging (a float's only by the primary button), until its release or
+    /// the next press.
+    pub(super) drag: Option<Drag>,
+    /// The sending page supplies the keys' view for one tab verb only.
+    pub(super) tab_view: Option<crate::tabs::ViewId>,
     /// Who holds the keys as the host reports it, and what follows from it.
     pub(super) focus: FocusState,
     /// The window's prefix and the timer of its digit wait.
@@ -125,12 +227,32 @@ pub struct Window {
     pub(super) modules: super::verbs::modules::ModuleVerbs,
     /// The link to the other window of the pair and the moves on it, while a peer is attached.
     pub(super) peer: Option<super::moves::PeerMoves>,
+    /// Output facts shared by navigation and the linked window.
+    pub(super) monitors: Vec<Monitor>,
+    pub(super) monitor: Option<MonitorId>,
+    /// The output this window is to be put back on, asked for at most once, when it exists.
+    pub(super) monitor_memory: crate::window_link::edge::MonitorMemory,
+    pub(super) placement_role: PlacementRole,
+    pub(super) placement_focus_pending: bool,
+    /// Window 2 is started again after this window's start: the idle armed for it, until it fires.
+    pub(super) restore_second: bool,
+    pub(super) restore_idle: Option<TimerToken>,
     /// What the window's chrome shows, as the controller decided it.
     pub(super) chrome: ChromeModel,
     /// Bumped by every change of `chrome`, so the shell can tell an announced model from one it drew.
     pub(super) chrome_rev: u64,
     /// What the chrome's fields are derived from, and when each was last derived.
     pub(super) chrome_state: ChromeState,
+    /// The window's text size; its verbs clone it, step the clone and store the result, since
+    /// (2026-09-23) `TextSize` holds a `Vec` (`burst`) and so is no longer `Copy`.
+    pub(super) text_size: Option<super::text_size::TextSize>,
+    pub(super) zoom_pages: BTreeSet<ModuleId>,
+    /// The running base terminal's reads out for plugin pages' `terminal.at`, oldest first.
+    pub(super) pending_at: Vec<super::terminal_at::PendingAt>,
+    /// A restart in place of the base terminal waiting for its new shell.
+    pub(super) pending_restart: Option<super::terminal_at::PendingRestart>,
+    /// The next `terminal.at` read's own number, which its answer carries back.
+    pub(super) next_job_read: u64,
     #[cfg(test)]
     notes: Vec<String>,
 }
@@ -138,6 +260,17 @@ pub struct Window {
 impl Window {
     pub fn new(spec: WindowSpec, parts: WindowParts, timers: Timers) -> Window {
         Window {
+            own_window: None,
+            close: Default::default(),
+            quit: Default::default(),
+            quit_timer: None,
+            release_exited: None,
+            editor_spawn: None,
+            editor_run: EditorRun::Running,
+            restart_wanted: false,
+            release_refused_logged: false,
+            unheard_settles: VecDeque::new(),
+            lua_pending: VecDeque::new(),
             lifecycle: Lifecycle::default(),
             spec,
             layout: parts.layout,
@@ -148,20 +281,34 @@ impl Window {
             mapped: BTreeSet::new(),
             float_band: BTreeSet::new(),
             allocated: None,
-            after_verb: None,
+            arranged: None,
+            drag: None,
+            tab_view: None,
             focus: FocusState::default(),
             keys: KeyState::default(),
             modules: Default::default(),
             peer: None,
+            monitors: Vec::new(),
+            monitor: None,
+            monitor_memory: crate::window_link::edge::MonitorMemory::new(None),
+            placement_role: PlacementRole::Main,
+            placement_focus_pending: false,
+            restore_second: false,
+            restore_idle: None,
             chrome: ChromeModel::default(),
             chrome_rev: 0,
             chrome_state: ChromeState::default(),
+            text_size: None,
+            zoom_pages: BTreeSet::new(),
+            pending_at: Vec::new(),
+            pending_restart: None,
+            next_job_read: 0,
             #[cfg(test)]
             notes: vec![],
         }
     }
 
-    /// Prints a verb's line on stdout, as the shell's arms print theirs.
+    /// Prints a verb's line on stdout.
     pub(super) fn say(&mut self, line: String) {
         println!("{line}");
         #[cfg(test)]
@@ -288,6 +435,40 @@ impl Window {
         self.layout_touched();
     }
 
+    /// Takes the window's start placement: the output it is put back on, and whether it starts window 2 again.
+    pub(super) fn set_placement(&mut self, placement: WindowPlacement) {
+        self.monitor_memory = crate::window_link::edge::MonitorMemory::new(placement.remembered);
+        self.restore_second = placement.restore_second;
+        self.placement_role = placement.role;
+        self.placement_focus_pending = matches!(placement.role, PlacementRole::RestoredSecond { .. });
+    }
+
+    /// Asks the window's remembered output whether it is to move there now: only once it is on an output (so it is
+    /// shown and the window manager can move it), and at most once, when the remembered output exists and the window
+    /// is not already on it. A restored window also returns the keys after its first mapped output, even without
+    /// a move, because the compositor can focus a newly mapped window by itself.
+    pub(super) fn put_back_on_its_monitor(&mut self, win: WinId, batch: &mut Batch) {
+        let Some(current) = self.monitor.clone() else {
+            return;
+        };
+        let available: Vec<String> = self.monitors.iter().map(|m| m.id.0.clone()).collect();
+        let monitor = self.monitor_memory.decide(Some(&current.0), &available).map(MonitorId);
+        if let Some(monitor) = &monitor {
+            self.say(format!("[window] moving to {}, the monitor it was last on", monitor.0));
+        }
+        // Mapping can give a restored window the keys even when no output move is needed.
+        if monitor.is_some() || self.placement_focus_pending {
+            self.placement_focus_pending = false;
+            batch.push_effect(HostOp::PlaceWindow {
+                win,
+                monitor,
+                role: self.placement_role,
+            });
+        }
+        // Only the first mapped placement decision may focus; an output appearing later must not take the keys.
+        self.placement_role = PlacementRole::Main;
+    }
+
     /// Arms an idle below painting on the window's scheduler, with a token no other timer of the process has.
     pub(super) fn arm_idle(&mut self) -> TimerToken {
         let token = self.timers.token();
@@ -328,15 +509,24 @@ impl Window {
         });
     }
 
-    /// What the shell's own apply left on screen, taken as the grid's state: the visible hosted modules and the
-    /// floats it shows. A shell arm moves hosts without telling the controller which.
-    pub(super) fn reset_mapped(&mut self) {
+    /// A test's own write of the layout or the workspaces, taken as already drawn: the modules' lifecycle effects
+    /// follow it, the grid is taken to show what the layout shows (the test asks for no layout op), the chrome is
+    /// derived again from it all, and the saver says whether the save's debounce is to be armed. What a test sets up
+    /// by hand behind the controller reaches it this way; nothing outside a test writes the layout.
+    #[cfg(test)]
+    pub(super) fn written_in_test(&mut self, win: WinId, batch: &mut Batch) {
         let layout = self.layout.clone();
         let Ok(layout) = layout.try_borrow() else {
+            self.warn("[wm] BUG: the layout was borrowed when a test's write was heard".into());
             return;
         };
+        self.lifecycle.after_change(win, &layout, batch);
+        self.layout_touched();
+        self.chrome_state.dirty.workspaces += 1;
         self.mapped = self.hosted_visible(&layout).into_iter().collect();
         self.float_band = shown_floats(&layout).into_iter().collect();
+        drop(layout);
+        self.saver_changed();
     }
 
     /// Puts the selection back on the module with the keys; `true` if a container was selected. A layout
@@ -392,6 +582,11 @@ impl Window {
             self.timers.scheduler.cancel(old);
         }
         self.timers.scheduler.after(delay, token);
+    }
+
+    /// Read-only handles on the window's layout and workspaces.
+    pub fn views(&self) -> (LayoutView, WorkspacesView) {
+        (LayoutView(self.layout.clone()), WorkspacesView(self.workspaces.clone()))
     }
 
     pub fn role(&self) -> &WindowRole {
@@ -452,6 +647,30 @@ pub struct Monitor {
     pub scale: f64,
     /// The displayed output name.
     pub name: String,
+}
+
+/// Which window receives the keys after startup placement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlacementRole {
+    /// An ordinary placement adds no focus beyond the compositor's move.
+    #[default]
+    Main,
+    /// A window opened explicitly receives the keys after moving.
+    NewSecond,
+    /// A window reopened at launch returns the keys to window 1 after mapping or moving.
+    RestoredSecond { first_pid: u32 },
+}
+
+/// Where a window goes at its start, from what the pair file kept of the last run: the output it was on, and,
+/// for the window that holds the pair, whether it starts the second window again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowPlacement {
+    /// Whether placement keeps the keys here or returns them to window 1.
+    pub role: PlacementRole,
+    /// The connector of the output this window was last on, if the pair file names one.
+    pub remembered: Option<String>,
+    /// Whether this window starts window 2 again once its own start is done.
+    pub restore_second: bool,
 }
 
 /// The current content area and scale of a window.

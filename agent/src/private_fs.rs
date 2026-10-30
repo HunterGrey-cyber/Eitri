@@ -592,10 +592,88 @@ mod lock_test_hooks {
     }
 }
 
+/// Reads private UTF-8 state within a byte cap, checked before reading and while the file may grow.
+pub fn read_private_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is not a regular file of this user", path.display()),
+        ));
+    }
+    let over_cap = |n| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("{} is {n} bytes, over the {max_bytes}-byte cap", path.display()),
+        )
+    };
+    if meta.len() > max_bytes {
+        return Err(over_cap(meta.len()));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(over_cap(bytes.len() as u64));
+    }
+    String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_capped_read_refuses_a_file_over_the_cap_before_reading_it() {
+        let dir = scratch("capped-large");
+        let path = dir.join("theme.json");
+        std::fs::File::create(&path).unwrap().set_len(257).unwrap();
+        let err = read_private_to_string_capped(&path, 256).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("257 bytes, over the 256-byte cap"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_capped_read_reads_a_file_exactly_at_the_cap() {
+        let dir = scratch("capped-exact");
+        let path = dir.join("theme.json");
+        let text = "é".repeat(128);
+        write_private(&path, text.as_bytes()).unwrap();
+        assert_eq!(read_private_to_string_capped(&path, 256).unwrap(), text);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_capped_read_refuses_a_fifo() {
+        let dir = scratch("capped-fifo");
+        let path = dir.join("theme.json");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path remains valid for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            read_private_to_string_capped(&path, 256).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_capped_read_of_a_missing_file_is_not_found() {
+        let dir = scratch("capped-missing");
+        assert_eq!(
+            read_private_to_string_capped(&dir.join("missing"), 256)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn mode(path: &Path) -> u32 {
         path.symlink_metadata().unwrap().mode() & 0o777

@@ -112,6 +112,23 @@ const twoTurnState = () =>
   });
 
 describe("Worked for", () => {
+  it.each([true, false])("repairs a dropped request live only with fold revisions: %s", (tagged) => {
+    const { container } = started();
+    dispatch({
+      kind: "events", tab: 1, fromRevision: 0, throughRevision: 6,
+      ...(tagged ? { revisions: [1, 2, 3, 5, 6] } : {}),
+      events: [
+        { type: "turn_started", turn_id: "t1" },
+        { type: "user_prompt_submitted", text: "read the file" },
+        { type: "tool_call_started", turn_id: "t1", tool_use_id: "read", name: "Read", input: { file_path: "main.rs" } },
+        { type: "content_delta", turn_id: "t1", kind: "text", text: "reply" },
+        { type: "turn_completed", turn_id: "t1", outcome: "completed", result_text: "", stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } },
+      ],
+      turnTimes: [turn("t1", 8_000, 4)],
+    });
+    expect(lines(container)).toEqual(tagged ? ["Worked for 8s"] : []);
+  });
+
   it("a snapshot's turnTimes draw a line under each finished turn, and the next snapshot replaces them", () => {
     const { container } = started();
     dispatch({

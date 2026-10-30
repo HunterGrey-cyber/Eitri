@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 51,
+  "verb": "editor.preload",
+  "args": {
+    "path": "/w/work/rust/ch04-02-port-upper/src/lib.rs",
+    "diagnostics": "on",
+    "inlay_hints": "off"
+  }
+}

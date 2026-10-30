@@ -145,7 +145,7 @@ export function editPreview(toolName: string, input: unknown): EditPreview | nul
   // batch, a scroll), and a 400-by-400-line diff is 160,000 comparisons. A tool call's input never
   // changes once it arrived, so the preview is kept with the input object itself -- and kept only
   // while every top-level field is still the very value it was computed from, so even an input
-  // changed in place afterwards can never be shown with a preview of what it used to say.
+  // changed in place afterwards can never be shown with a preview of its earlier contents.
   const keys = Object.keys(input);
   const values = keys.map((key) => (input as Record<string, unknown>)[key]);
   const held = previews.get(input);

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # packaging/aur/bump-bin.sh -- fills packaging/aur/eitri-bin/PKGBUILD's pkgver, _verdandi_source,
 # _nodever and sha256sums from a real release directory (RELEASE + SHA256SUMS, as
-# release.sh writes them), then regenerates .SRCINFO. Never runs git -- it only ever *prints* the commit an
-# operator would run by hand, because the AUR is public git with visible authorship and the
-# global git identity on this machine is private.
+# release.sh writes them), then regenerates .SRCINFO. It only prints the commit command:
+# the AUR has public authorship, so publishing requires an explicit public identity.
 #
 # Usage: packaging/aur/bump-bin.sh <release-dir> [--allow-prerelease] [--pkgbuild-dir DIR]
 #
@@ -26,7 +25,7 @@ ALLOW_PRERELEASE=0
 RELEASE_DIR=""
 
 usage() {
-	sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -210,10 +209,9 @@ EOF
 	exit 0
 fi
 
-# The printed commit command is not executed here. Its GIT_AUTHOR_* and GIT_COMMITTER_*
-# environment prefix overrides inherited identity values, which take precedence over
-# `git -c user.name=...`. It also disables hooks, signing and templates, uses --no-verify,
-# and checks the resulting commit identity afterward.
+# Identity isolation for the printed commit: GIT_AUTHOR_*/GIT_COMMITTER_* override inherited
+# identity variables, which outrank `git -c user.name=...`. Disable hooks, signing and templates,
+# then check the recorded identity before pushing, so local git configuration cannot expose a private identity.
 cat <<EOF
 $PKGBUILD_FILE and $SRCINFO_FILE updated for $VERSION.
 

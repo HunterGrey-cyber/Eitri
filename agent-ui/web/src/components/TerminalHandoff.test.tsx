@@ -8,10 +8,8 @@ afterEach(cleanup);
 
 type Overrides = Partial<Parameters<typeof ContinueInTerminal>[0]>;
 
-/** `ContinueInTerminal` is controlled now -- `open`
- *  defaults to `true` here, since every test below is about what it draws once something (`<leader>t`,
- *  the detail popover's trailing row) has already asked to open it; the "closed" state (`open`
- *  `false`, drawing nothing) is its own small describe block below. */
+/** Default open: these tests exercise a confirmation already requested by a key or the details
+ *  row. The closed case (`open` false, nothing drawn) has its own describe block. */
 function renderControl(overrides: Overrides = {}) {
   const onHandoff = vi.fn();
   const onClose = vi.fn();
@@ -145,9 +143,8 @@ describe("ContinueInTerminal once a handoff is in flight", () => {
     const { button, onHandoff } = renderControl();
     fireEvent.click(button("Close it and show me the command")!);
     expect(onHandoff).toHaveBeenCalledTimes(1);
-    // The host sets `handingOff` synchronously when it posts the command, so the very next render
-    // is already blocked -- checked here as a fresh render standing in for that next render, the
-    // same way the old version of this test did.
+    // The host sets handingOff synchronously when posting the command. A fresh render stands
+    // in for that next render and must already block another handoff.
     cleanup();
     const second = renderControl({ handingOff: true });
     expect(second.container.querySelector(".handoff-confirm")).toBeNull();
@@ -156,16 +153,9 @@ describe("ContinueInTerminal once a handoff is in flight", () => {
 });
 
 describe("ContinueInTerminal confirmation and a changing world", () => {
-  /* With a `confirming` state of its own,
-     this component used to remember a dismissed-by-blocking confirmation and NOT bring it back once
-     the block cleared -- the bug that guarded against was a stale re-open with no new click behind
-     it. Now `open` is the host's own explicit fact (only `<leader>t`/the popover row set it, and
-     only `Esc`/Cancel/a finished handoff clear it) rather than this component's memory of a click,
-     so while the host keeps it open across a transient block, this always shows a dialog that is
-     true of the CURRENT world rather than a stale one -- and does reappear once the block clears,
-     which is correct for what `open` means now: the confirmation is not a guess about whether the
-     block matches what this component last saw, it is what `open && blocked === null` says right
-     now. */
+  /* The host owns open. While it stays true across a transient block, show the current reason
+     and restore the confirmation when the block clears. The component must not remember a stale
+     dismissed state instead of drawing the host's current request. */
   it("reflects the current block on every render, rather than remembering a stale dismissal", () => {
     const onHandoff = vi.fn();
     const props = { open: true, onClose: vi.fn(), providerSessionId: "1857dcd5", canResume: false, handingOff: false, onHandoff };

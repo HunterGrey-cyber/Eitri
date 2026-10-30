@@ -1,6 +1,6 @@
 #!/bin/sh
-# Tests for the repository's root install.sh (the dev-loop wrapper over
-# packaging/install.sh --from-source --checkout). Standalone: `sh packaging/tests/install/test_root_wrapper.sh`
+# Tests for the root install.sh development wrapper over packaging/install.sh --from-source --checkout.
+# Standalone: `sh packaging/tests/install/test_root_wrapper.sh`
 # (or `bash` -- it is plain POSIX sh either way, matching the file under test).
 #
 # Not sourced by harness.sh: the root wrapper needs none of that fixture machinery (real releases,
@@ -9,9 +9,8 @@
 # packaging/install.sh run from here would attempt a real --from-source build, which is exactly what
 # this suite must never do.
 #
-# The root wrapper used to prepend `--from-source --checkout $here` unconditionally,
-# so `sh install.sh --uninstall` (and --nvim-only, --sidecar-only) died
-# "--from-source and --uninstall cannot be combined" in the real installer.
+# Explicit modes such as --uninstall, --nvim-only and --sidecar-only must pass through without
+# --from-source --checkout, because the installer refuses conflicting modes.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -121,9 +120,7 @@ out=$(run_wrapper -h)
 assert_contains "$out" "STUB_ARG:-h" "-h reached the stub"
 assert_not_contains "$out" "STUB_ARG:--from-source" "--from-source was not prepended for -h"
 
-# --nvim-offer was added to packaging/install.sh (and to the usage
-# text `./install.sh --help` prints) without adding it here, so `./install.sh --nvim-offer` still
-# died "--from-source and --nvim-offer cannot be combined".
+# --nvim-offer must also pass through without the conflicting --from-source mode.
 echo "== './install.sh --nvim-offer' passes straight through =="
 out=$(run_wrapper --nvim-offer)
 assert_contains "$out" "STUB_ARG:--nvim-offer" "--nvim-offer reached the stub"
@@ -166,9 +163,8 @@ for mode in $modes; do
 	assert_not_contains "$out" "STUB_ARG:--checkout" "'./install.sh $mode' prepended no --checkout"
 done
 
-# `./install.sh --help` printed only packaging/install.sh's usage, whose
-# "(no option)" line ("install or upgrade to the latest release") is not what this script does with
-# no option. It now says so first, in plain words.
+# The wrapper defaults to building its checkout, not installing the latest release.
+# Its help must explain that default before the underlying installer's usage.
 echo "== './install.sh --help' first says what this script does with no option =="
 out=$(run_wrapper --help)
 assert_contains "$out" "With no option, it builds and installs this checkout from source" \

@@ -45,6 +45,8 @@ mod wire_guard;
 
 pub mod account;
 #[cfg(target_os = "linux")]
+pub mod chat_mover;
+#[cfg(target_os = "linux")]
 pub mod child;
 pub mod external;
 pub mod external_link;

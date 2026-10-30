@@ -15,12 +15,9 @@ export type Seg = {
   id: SegId;
   text: string;
   side: "left" | "right";
-  /** Set only on `"prompt"`/`"message"`, and only when the FULL text (never truncated any more) does not fit the band's one row at the measured
-   *  width. `StatusBand` reads this to switch the band from its fixed one-editor-row height to a
-   *  wrapping, auto-height one for as long as this text is shown -- a y/n prompt's own trailing
-   *  `(y/n)`, or the flash explaining what `y` does, used to be exactly the part `bandLayout`'s
-   *  old `cut()` truncated away. Absent (not merely `false`) on every other segment, which keeps
-   *  the existing drop-by-priority degrade instead. */
+  /** Set only on `"prompt"`/`"message"` when their full text does not fit the measured row.
+   *  `StatusBand` wraps it at auto height so a prompt keeps its trailing `(y/n)` and a flash keeps
+   *  its explanation. Absent on every other segment, which still degrades by priority. */
   wraps?: boolean;
 };
 
@@ -49,12 +46,12 @@ export type BandFacts = {
   /** The card INPUT's `Ctrl+y` would approve -- the active tab's
    *  oldest waiting card -- set by `App.tsx` only while one waits and the composer has the keys, so
    *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
-   *  name", which every caller that predates this field means. */
+   *  name". */
   approve?: ApproveFact | null;
   /** Companion mode: where the panel stands with the editor beside it. `null`, or absent, is the
    *  one-window mode, which has no such thing and never sends one. While it is set and not
    *  `attached`, its text takes the place of the context segment: with no editor attached no file
-   *  can be named. Optional so every caller that predates companion mode compiles unchanged. */
+   *  can be named. */
   link?: EditorLink | null;
   /** Turn review: a finished turn of this tab changed `files` files on disk, and `c` opens them. `null`,
    *  or absent, says nothing. Never drawn over a prompt. A narrow band drops it right after the usage
@@ -251,17 +248,10 @@ export function textWidth(text: string): number {
   return n;
 }
 
-/** This module used to have a `cut(text, n)` truncator here, appending `…` to a message/prompt
- *  that did not fit. **Removed 2026-09-27, after a sandbox GUI pass:** at
- *  WebKit zoom 1.5 (a 47-column band), it truncated the bypass prompt (then in
- *  Chinese; English now, `Switch to bypass and approve the 1 waiting card? (y/n)`, which is
- *  wider than 47 columns too) mid-sentence, losing its own `(y/n)`, and did the same to the
- *  flash explaining what `y` does -- exactly the two things a y/n prompt/flash must stay legible
- *  for. Neither a prompt nor a message is ever cut any more; a segment that would have been reads
- *  `wraps: true` instead (below), and `StatusBand`/`index.css`'s `.status-band--wrap` let the band
- *  grow upward and wrap it onto more rows for as long as it is shown, returning to the fixed
- *  one-editor-row height the moment the prompt/flash ends. Ordinary segments (mode, pill, cards,
- *  queue, context, model, position, unread) are untouched: they still degrade by priority, below. */
+/** Prompts and messages wrap rather than truncate: at WebKit zoom 1.5 a 47-column band must still
+ *  show a prompt's `(y/n)` and the flash explaining what `y` does. `wraps: true` lets `StatusBand`
+ *  and `.status-band--wrap` grow upward until the prompt or flash ends, then return to one editor row.
+ *  Ordinary segments still degrade by priority. */
 
 const PAD = 2; // one character of padding each side
 /** The mode block's separator arrow, one cell after it (`index.css`, `.band-mode::after`). */
@@ -269,7 +259,7 @@ const MODE_ARROW = 1;
 // CARET / VISUAL / V-LINE (V-LINE's own word from lualine: utils/mode.lua:17,19, what a LazyVim
 // statusline says; CARET has no lualine precedent -- Eitri-only, qutebrowser's own caret mode is the
 // source), narrow C / V / VL.
-// INPUT reads INSERT (2026-10-15): the band's mode block sits beside the editor's and is drawn like it, so
+// The typing mode reads INSERT: the band's mode block sits beside the editor's and is drawn like it, so
 // the mode where typing lands is called what vim calls it there.
 const MODE_TEXT: Record<PanelMode, string> = { input: "INSERT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
 const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
@@ -359,7 +349,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   return segs;
 }
 
-/** The model without its leading `claude-`, which every model shares: `"claude-sonnet-5"` ->
+/** The model without its leading `claude-`, which every Claude model carries: `"claude-sonnet-5"` ->
  *  `"sonnet-5"`. A model that never carried the prefix (or `null`, before a session reports one)
  *  passes through unchanged. */
 export function shortModel(model: string | null): string | null {

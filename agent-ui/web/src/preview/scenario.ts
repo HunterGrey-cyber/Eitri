@@ -1,4 +1,5 @@
 // A scripted conversation for the preview page: the envelopes Rust would send, in order.
+import { EMPTY_PANEL_TABLE } from "../keymap";
 
 const cwd = "/home/me/src/shop";
 
@@ -88,7 +89,7 @@ function turnTime(turnId: string, anchorSeq: number | null, durationMs: number) 
   return { turnId, startedAtMs, endedAtMs: startedAtMs + durationMs, anchorSeq };
 }
 
-export type Scenario = "running" | "permission" | "done" | "long" | "empty";
+export type Scenario = "running" | "permission" | "done" | "long" | "empty" | "empty-none";
 export type ThinkingLevel = "collapsed" | "preview" | "expanded" | "hidden";
 
 /** Whose tab the page shows, for the `/` menu: a Claude tab (the built-in table), an ACP tab that listed
@@ -165,7 +166,7 @@ function renumber(snapshot: { throughRevision?: number; state?: Record<string, u
 }
 
 export function scenarioPackets(scenario: Scenario, theme: Record<string, string>, level: ThinkingLevel = "collapsed"): unknown[] {
-  if (scenario === "empty") return emptyPackets(theme);
+  if (scenario === "empty" || scenario === "empty-none") return emptyPackets(theme, scenario === "empty");
   const packets = scenario === "long" ? longPackets(theme) : basePackets(scenario, theme);
   renumber(packets.find((p) => (p as { kind: string }).kind === "snapshot") as { state: Record<string, unknown> });
   // How thinking is shown reaches the page as the host sends it: a `display` envelope after `hello`.
@@ -297,15 +298,31 @@ function longPackets(theme: Record<string, string>): unknown[] {
   return base;
 }
 
-/** The start screen: a tab with no session yet, in a project with an earlier session to resume. */
-function emptyPackets(theme: Record<string, string>): unknown[] {
+/** The start screen: a tab with no session yet. With `sessions`, the project has earlier sessions to resume
+ *  and the last window's tabs to bring back; without, it is a fresh project. */
+function emptyPackets(theme: Record<string, string>, sessions: boolean): unknown[] {
   const tab = { id: 1, number: 1, label: "1", name: null, state: "not_started", mode: "auto", marker: null,
     pending: 0, resumable: false, failure: null, title: null };
+  // Stamped against the page's own clock, so the start screen's "12 min ago" reads as it would on the day.
+  const record = (id: string, title: string, minutesAgo: number) => {
+    const at = String(Date.now() - minutesAgo * 60_000);
+    return { provider: "claude", providerSessionId: id, createdAt: at, updatedAt: at, title, name: null };
+  };
+  const resumableSessions = sessions
+    ? [
+        record("s1", "登录页窄屏时按钮换行，帮我看看 flex 布局", 12),
+        record("s2", "Add retry with backoff to the payment webhook", 180),
+        record("s3", "Why does the cart total round twice?", 1500),
+      ]
+    : [];
   return [
     { kind: "theme", vars: theme },
     { kind: "hello", backend: "legacy", projectDir: cwd, permissionModes: ["manual", "auto", "bypass"],
-      resumableSessions: [{ sessionId: "s1", title: "登录页窄屏", name: null, updatedAtMs: 1_760_000_000_000 }],
-      expectedVerdandiRevision: null, account: "me@example.com" },
+      resumableSessions, expectedVerdandiRevision: null, account: "me@example.com",
+      restore: sessions ? { labels: ["api", "docs", "tests"], bypass: 0 } : null },
+    // The window's keys as Rust sends them: the start screen's box names the key that moves into the panel.
+    { kind: "keymap", prefix: "Ctrl+b", window: [{ keys: "Ctrl+h / Ctrl+l", what: "Module left / right" }],
+      prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "Ctrl+b c" },
     { kind: "tabs", active: 1, tabs: [tab] },
     { kind: "pane_focus", focused: true },
   ];

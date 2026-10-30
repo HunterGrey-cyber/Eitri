@@ -3,22 +3,15 @@ import { useProjectRelative } from "../projectPath";
 import { countEscapes, revealHidden } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
 
-/** What an `Edit`/`Write` call would do, rendered for a person to review.
+/** What an `Edit`/`Write` call would do, shared by folded conversation rows (`maxLines`) and
+ *  permission cards (the whole change, `maxLines` unset). `PreToolUse` carries the whole input.
  *
- * Moved out of `PermissionCard`'s `ToolInput` so the same view can sit in a
- * conversation row (folded to `maxLines`) as well as in the card that gates the call (the whole
- * change, `maxLines` unset). The data has always been in the request -- `PreToolUse` carries the
- * whole tool-input object -- so this stays a rendering component with no wire of its own.
+ *  Signal colours belong on the gutter, never on the text: `--nv-ok`/`--nv-error` are guarded at
+ *  3:1 for non-text UI; text drawn in them measures 2.05-3.84:1 on rose-pine dawn. The code stays
+ *  `--nv-fg`, enforced by `indexCss.test.ts`.
  *
- * **Signal colours are on the gutter, never on the text.** `--nv-ok`/`--nv-error` are guarded at
- * 3:1 for non-text UI, and drawing diff lines in them measured 2.05-3.84:1 on rose-pine dawn when
- * the same mistake was made in this file's banners. The `+`/`-` gutter carries the colour; the code
- * stays `--nv-fg`, and `indexCss.test.ts` enforces that.
- *
- * The file name and every line of the change are drawn through `revealHidden`, as a `Bash` card's
- * command is: a card is raised for exactly the edits that need a human (outside the project, a
- * protected path), and a right-to-left override in a file name could make it read as another file.
- * `data-path` keeps the real path, so opening it opens the file the call names.
+ *  The file name and every diff line use `revealHidden`: a direction override can disguise the
+ *  file being approved. `data-path` keeps the real path so opening it opens the file the call names.
  */
 /** The most lines an expanded transcript row draws of one change. */
 const ROW_MAX_LINES = 2 * MAX_DIFF_LINES;

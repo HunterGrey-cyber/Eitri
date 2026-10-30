@@ -13,9 +13,9 @@ type Props = {
   lead?: string;
   /** The box's accessible name. */
   label?: string;
-  /** Bumped to hand the box the keys again while it is already open -- `:` or `/`
-   *  typed where the keys went instead (a click took them), which used to wipe the line and leave
-   *  them there. The box also takes them when it mounts. A number, so no request is coalesced away. */
+  /** Bumped to refocus an already open line without wiping it: `:` or `/` may be typed
+   *  after a click takes the keys elsewhere. The line also focuses on mount; a number keeps
+   *  repeated requests distinct. */
   focusRequest?: number;
 };
 

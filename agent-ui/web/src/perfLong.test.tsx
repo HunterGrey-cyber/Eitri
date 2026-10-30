@@ -11,7 +11,7 @@ import { timelineRowRenderCount } from "./components/MessageList";
 
 /* The panel's cost over a long conversation, counted rather than timed: jsdom's timing is not
    WebKitGTK's, and a count cannot be flaky. A conversation of more replies than the markdown cache
-   holds, with 100 finished 400-line Edit calls in it, is the case each count below once grew with. */
+   holds, with 100 finished 400-line Edit calls in it, must not make the per-key counts below grow. */
 
 afterEach(cleanup);
 beforeAll(() => {

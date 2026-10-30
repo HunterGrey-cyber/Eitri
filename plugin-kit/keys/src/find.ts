@@ -155,7 +155,7 @@ function highlightApi(): { registry: HighlightRegistry; make: (ranges: readonly 
   const css = (globalThis as { CSS?: { highlights?: HighlightRegistry } }).CSS;
   const ctor = (globalThis as { Highlight?: new () => { add(range: Range): unknown } }).Highlight;
   // Built empty and filled one range at a time: a search for one letter in a long document has more matches than an
-  // engine takes as arguments to one call (JavaScriptCore stops at 65,535), and spreading them threw.
+  // engine takes as arguments to one call (JavaScriptCore stops at 65,535), so spreading them can throw.
   const make = (ranges: readonly Range[]) => {
     const highlight = new ctor!();
     for (const range of ranges) highlight.add(range);
@@ -284,8 +284,9 @@ const SIDE_MARGIN = 24;
 /** Brings the match into view horizontally in every enclosing scroller that scrolls sideways, innermost first, then
  *  the window. Like the vertical pass, an outer scroller moves only if the match is still outside its view after the
  *  inner moves, and each move is taken into account before the next is worked out. A match already in view stays
- *  where it is, and one that is not is moved the least that leaves `SIDE_MARGIN` between it and the edge it came
- *  from (a match wider than the view is lined up with the left edge). Sideways moves are always jumps. */
+ *  where it is, and one that is not is moved the least that leaves a margin between it and the edge it came from:
+ *  `SIDE_MARGIN`, or a quarter of the view when that is less. A match wider than the view less both margins is
+ *  lined up one margin from the left edge. Sideways moves are always jumps. */
 function revealSideways(range: Range, rect: DOMRect): void {
   let left = rect.left;
   let el = hScrollerOf(range.startContainer.parentElement);

@@ -105,11 +105,20 @@ pub fn switch(w: &mut Window, win: WinId, name: &str, setup: &ModuleSetup, batch
         batch.push_effect(op);
     }
     change.lua().iter().for_each(|op| batch.push_lua(op.clone()));
-    if let Some(verb) = change.shell_verb() {
-        batch.set_shell_verb(verb.clone());
-    }
     w.say(format!("[workspace] switched to {name}"));
     Ok(true)
+}
+
+/// A new workspace keeps an ended editor off screen in place until a show starts it again.
+pub(in crate::wm) fn hide_ended_editor(layout: &mut Layout, frame: &layout::Frame<'_>) {
+    let editor = ModuleId::editor();
+    if layout.contains(&editor) && !layout.is_away(&editor) {
+        if let Err(layout::LayoutError::LastVisible(_)) = layout::kill(layout, &editor, layout::Reopen::InPlace, frame)
+        {
+            let _ = layout.show(&ModuleId::agent());
+            let _ = layout::kill(layout, &editor, layout::Reopen::InPlace, frame);
+        }
+    }
 }
 
 /// A named workspace is made from its definition, or a fresh copy of the current arrangement.
@@ -148,6 +157,10 @@ pub fn switch_or_make(
             (made, notes, gone, spread)
         };
         let size = reads.grid_size(win);
+        let ended_editor = matches!(
+            w.editor_run,
+            crate::wm::window::EditorRun::Ending | crate::wm::window::EditorRun::Ended
+        );
         let mut notes_live = Vec::new();
         {
             let mut workspaces = w
@@ -158,6 +171,10 @@ pub fn switch_or_make(
                 .layout
                 .try_borrow_mut()
                 .map_err(|_| "layout is borrowed".to_string())?;
+            let mut made = made;
+            if ended_editor {
+                frame_with(reads, win, size, |frame| hide_ended_editor(&mut made, frame));
+            }
             workspaces.create(name, made).map_err(|err| err.to_string())?;
             frame_with(reads, win, size, |frame| {
                 for id in gone {
@@ -254,6 +271,21 @@ pub fn pick(
     setup: &ModuleSetup,
     batch: &mut Batch,
 ) {
+    if let WorkspacePick::Switch(index) = choice {
+        let local = w.workspaces.borrow().order().len();
+        if index >= local {
+            let name = w
+                .peer
+                .as_ref()
+                .and_then(|p| p.summary())
+                .and_then(|s| s.workspaces.get(index - local))
+                .cloned();
+            if let Some(name) = name {
+                crate::wm::moves::raise_for(w, win, crate::wm::moves::Raise::Workspace(name), batch);
+                return;
+            }
+        }
+    }
     let picked = {
         let ws = w.workspaces.borrow();
         resolve_pick(ws.order(), ws.current(), choice)
@@ -268,6 +300,7 @@ pub fn pick(
             let result = w.workspaces.borrow_mut().delete(&name).map_err(|err| err.to_string());
             if result.is_ok() {
                 w.say(format!("[workspace] deleted {name}"));
+                crate::wm::moves::workspace::workspace_deleted(w, &name);
                 changed(w);
             }
             result
@@ -288,10 +321,12 @@ pub fn entry(w: &mut Window, win: WinId, ev: EntryEv, batch: &mut Batch) {
         focus::return_to_pane(w, win, batch);
     }
     if let EntryEv::Enter(to) = ev {
+        let from = w.workspaces.borrow().current().to_owned();
         let result = w.workspaces.borrow_mut().rename_current(&to);
         match result {
             Ok(()) => {
                 w.say(format!("[workspace] renamed to {to}"));
+                crate::wm::moves::workspace::workspace_renamed(w, &from, &to);
                 changed(w);
             }
             Err(err) => refuse(w, win, Refusal::Text(err.to_string()), batch),
@@ -628,7 +663,6 @@ mod tests {
 
     /// Nothing moved and nothing ran but the chrome's announcement.
     fn chrome_only(batch: &Batch) {
-        assert_eq!(batch.shell_verb(), None);
         assert!(batch.ops().all(|op| matches!(op, HostOp::Chrome { .. })), "{batch:?}");
     }
 
@@ -747,7 +781,6 @@ mod tests {
                 super_or_meta: false,
             },
         );
-        assert_eq!(batch.shell_verb(), None);
         assert_eq!(
             r.controller.prefix_shown(rig::WIN).unwrap().0,
             crate::keymap::prefix::Waiting::No

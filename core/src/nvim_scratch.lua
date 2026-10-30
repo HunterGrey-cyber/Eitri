@@ -94,10 +94,9 @@ local function read_only_buffer(path, lines)
   return buf
 end
 
--- A view holds text the user never chose to treat as a file (a tool's output, a reply), so it is
--- not read the way `:split` reads a file: a modeline in it would be obeyed at read time. The text is
--- read here and put into a buffer whose 'modeline' is already off. The buffer still carries the
--- file's name, so `:ls` says what it is and the editor-context feed knows it as a scratch buffer.
+-- Tool output and replies must not execute modelines at read time: put their text into a buffer
+-- whose 'modeline' is already off. Keep the file's name for `:ls` and scratch-buffer recognition
+-- by the editor-context feed.
 local function view(path)
   path = absolute(path)
   local buf = read_only_buffer(path, read_lines(path))

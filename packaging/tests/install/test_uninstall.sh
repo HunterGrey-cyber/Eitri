@@ -2,7 +2,7 @@
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
-# populate: create an install with files to remove and config and state to preserve.
+# populate: a complete install, plus files uninstall must keep.
 populate() {
 	serve 1.0.0
 	inst_net
@@ -85,10 +85,9 @@ t_uninstall_keeps_system_rev() {
 
 TESTS="$TESTS t_unreadable_system_release_stops"
 t_unreadable_system_release_stops() {
-	# A system RELEASE that exists but cannot be read: which sidecar its install uses cannot be
-	# told, so none may be removed on a guess. Under bash outside POSIX mode (this harness's bash
-	# half runs `bash install.sh`), errexit is off inside $(...), so the read failure was once lost
-	# there and the uninstall removed that install's sidecar.
+	# An unreadable system RELEASE makes its sidecar rev unknowable: do not remove any on a guess.
+	# Under bash outside POSIX mode, errexit is off inside $(...), so that read failure must be
+	# propagated explicitly to prevent removing the system install's sidecar.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -141,9 +140,8 @@ refused_with_system_release() {
 
 TESTS="$TESTS t_malformed_system_release_stops"
 t_malformed_system_release_stops() {
-	# A system RELEASE that can be read but names no valid rev is the unreadable case again: which
-	# sidecar that install uses cannot be told, so none is removed on a guess. A quoted value once
-	# read as "names no sidecar", and --uninstall removed ddddddd.
+	# A readable system RELEASE with no valid rev is as unsafe as an unreadable one: which sidecar
+	# it needs is unknown, so none may be removed on a guess. A quoted rev must not mean "no sidecar".
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -195,9 +193,8 @@ t_purge_removes_the_config_directory_xdg_config_home_names() {
 
 TESTS="$TESTS t_purge_trims_a_trailing_slash_from_xdg_config_home"
 t_purge_trims_a_trailing_slash_from_xdg_config_home() {
-	# An XDG_CONFIG_HOME ending in slashes names the same directory as one without them. Left in, the
-	# settings path held `//`, so it never matched EITRI_CONFIG_DIR naming that same directory: the
-	# purge removed it and still said it had left EITRI_CONFIG_DIR alone.
+	# Trailing slashes in XDG_CONFIG_HOME name the same directory. Trim them so the settings path
+	# compares equal to EITRI_CONFIG_DIR naming that directory, rather than falsely reporting it kept.
 	for trailing in / //; do
 		populate
 		mkdir -p "$TH/xdgconf/eitri"
@@ -220,8 +217,8 @@ TESTS="$TESTS t_purge_ignores_a_relative_or_empty_xdg_config_home"
 t_purge_ignores_a_relative_or_empty_xdg_config_home() {
 	# A relative or empty XDG_CONFIG_HOME is ignored, as every XDG reader ignores one: the settings
 	# are ~/.config/eitri, never a directory under wherever the installer happens to run.
-	# The values tried are recorded and checked after the loop: a helper that reuses the loop's
-	# variable (sh has no locals) once made both rounds run with another value, and nothing noticed.
+	# Record and check the tried values after the loop: sh has no locals, so a helper reusing the
+	# loop variable could silently make both rounds exercise another value.
 	_pr_ran=
 	for _pr_xdg in '' xdgconf; do
 		populate
@@ -350,11 +347,10 @@ inst_nl() {
 
 TESTS="$TESTS t_xdg_newline_refused"
 t_xdg_newline_refused() {
-	# An XDG_DATA_HOME/XDG_CACHE_HOME/XDG_STATE_HOME holding a newline once split the uninstall's
-	# newline-joined target list: XDG_DATA_HOME="$HOME/Documents<NL>$HOME/y" removed ~/Documents,
-	# with nothing of Eitri installed at all. It is refused as a newline in HOME is -- never
-	# replaced by the default, where the Rust side, which takes the value as given, would disagree.
-	# XDG_CONFIG_HOME names the settings a purge removes, so it is refused the same way.
+	# A newline in an XDG_*_HOME must be refused like a newline in HOME: it would split uninstall's
+	# newline-joined target list and could remove unrelated directories even with nothing installed.
+	# Do not replace it with a default that disagrees with the Rust side, which takes the given value.
+	# This includes XDG_CONFIG_HOME, which names the settings a purge removes.
 	populate
 	mkdir -p "$TH/Documents" "$TH/y"
 	echo mine >"$TH/Documents/keep"
@@ -380,10 +376,9 @@ t_xdg_newline_refused() {
 
 TESTS="$TESTS t_uninstall_through_foreign_symlink"
 t_uninstall_through_foreign_symlink() {
-	# $XDG_DATA_HOME/eitri made a link to ~/.config: removing its nvim once removed ~/.config/nvim,
-	# the user's own editor config (uninstall never touches anything named nvim outside
-	# Eitri's own directory). What is under a link that does not lead to a directory named
-	# eitri is left alone, and said so; the rest is uninstalled.
+	# A link at $XDG_DATA_HOME/eitri pointing to ~/.config must not let private-nvim removal reach
+	# ~/.config/nvim, the user's own editor config. Leave a link target not named eitri alone and say
+	# so, while uninstalling the rest.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -414,13 +409,9 @@ t_uninstall_through_foreign_symlink() {
 
 TESTS="$TESTS t_uninstall_symlinked_sidecar_root"
 t_uninstall_symlinked_sidecar_root() {
-	# Unlike $NV_DATA/eitri itself (the test just
-	# above), $NV_SIDECAR_ROOT ($NV_DATA/eitri/sidecar) had no link check of its own at all -- a
-	# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed with no
-	# check, so a 7-hex-named directory BEHIND the link (a user's own, unrelated directory that
-	# merely happens to be named like a short git sha, e.g. a backup folder) was removed as if it
-	# were one of Eitri's own sidecars. Reproduced (the verifier's
-	# t_vprobe_symlinked_sidecar_root_uninstall): ~/backup/abcdef0/ was deleted.
+	# A symlinked $NV_SIDECAR_ROOT must not expose unrelated directories to removal: a 7-hex name
+	# behind a link may be a backup folder, not an Eitri sidecar. Exercise ~/backup/abcdef0/ as the
+	# unrelated child, separately from the link check on $NV_DATA/eitri itself.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -449,10 +440,9 @@ t_uninstall_symlinked_sidecar_root() {
 
 TESTS="$TESTS t_uninstall_outside_cache_untouched"
 t_uninstall_outside_cache_untouched() {
-	# With XDG_CACHE_HOME outside HOME and Eitri's cache directories there, uninstall refuses and
-	# says nothing was removed -- and nothing is: its exit cleanup once removed the download and
-	# unpack directories it had just refused to touch. Once they are gone (removed by hand, as the
-	# message says), the uninstall goes through.
+	# When XDG_CACHE_HOME is outside HOME, uninstall refuses and must remove nothing, including in
+	# exit cleanup. Once its download/unpack directories are removed by hand as advised, uninstall
+	# can proceed.
 	populate
 	oc=$T/outside-cache
 	for p in download unpack sidecar-build; do

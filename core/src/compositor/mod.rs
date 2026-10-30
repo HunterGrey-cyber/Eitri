@@ -201,9 +201,8 @@ pub fn valid_output_name(name: &str) -> bool {
 
 /// The command that moves `target`'s window to the output `output` (GDK's connector name, which is the
 /// compositor's own output name). niri needs the window id. Hyprland's Lua `move` names the window, so it is one
-/// command; its legacy `movewindow` acts on the focused window, so that batch focuses the window by pid first: this
-/// runs when a window opens or its monitor appears, never while the user works in another window. `form` is read
-/// for Hyprland only.
+/// command; its legacy `movewindow` acts on the focused window, so that batch focuses the window by pid first.
+/// sway's move alone leaves focus on the previous output. `form` is read for Hyprland only.
 pub fn move_to_output_argv(wm: Wm, form: HyprForm, target: &WindowRef, output: &str) -> Option<Vec<String>> {
     let output = OutputName::new(output)?;
     match wm {
@@ -227,6 +226,41 @@ pub fn move_to_output_argv(wm: Wm, form: HyprForm, target: &WindowRef, output: &
         }),
         Wm::Gnome | Wm::None => None,
     }
+}
+
+/// Places a mapped window and leaves the keys with the window its launch role names. The focus follows the move
+/// in the same command batch, so a restore cannot race a separate worker returning the keys to window 1.
+/// `form` is read for Hyprland only.
+pub fn placement_argv(
+    wm: Wm,
+    form: HyprForm,
+    target: &WindowRef,
+    output: Option<&str>,
+    role: crate::wm::PlacementRole,
+) -> Option<Vec<String>> {
+    use crate::wm::PlacementRole;
+    let focus_pid = match role {
+        PlacementRole::NewSecond => Some(target.pid),
+        PlacementRole::RestoredSecond { first_pid } => Some(first_pid),
+        PlacementRole::Main => None,
+    }
+    .filter(|_| matches!(wm, Wm::Sway | Wm::Hyprland));
+    let focus = focus_pid.and_then(|pid| focus_window_argv(wm, form, &WindowRef { pid, ..*target }));
+    let Some(output) = output else { return focus };
+    if wm == Wm::Hyprland {
+        let output = OutputName::new(output)?;
+        let mut dispatches = vec![HyprDispatch::MoveToOutput {
+            pid: target.pid,
+            output,
+        }];
+        dispatches.extend(focus_pid.map(HyprDispatch::FocusPid));
+        return hyprland_argv(form, &dispatches);
+    }
+    let mut command = move_to_output_argv(wm, form, target, output)?;
+    if let (Wm::Sway, Some(focus)) = (wm, focus) {
+        command[1].push_str(&format!("; {}", focus[1]));
+    }
+    Some(command)
 }
 
 pub fn parse_windows(wm: Wm, json: &str) -> Result<Vec<WindowRef>, String> {
@@ -562,6 +596,66 @@ mod tests {
         );
         let sway = move_focus_argv(Wm::Sway, HyprForm::Legacy, Direction::Left).unwrap();
         assert_eq!(dispatch_reply_failure(Wm::Sway, &sway, r#"[{"success": true}]"#), None);
+    }
+
+    #[test]
+    fn a_hyprland_placement_ends_with_the_focus_its_role_names_in_either_form() {
+        use crate::wm::PlacementRole;
+        let v = |parts: &[&str]| Some(parts.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let w = WindowRef {
+            pid: 4242,
+            id: None,
+            focused: false,
+            visible: true,
+            rect: None,
+        };
+        let restored = PlacementRole::RestoredSecond { first_pid: 101 };
+        for (role, focus_pid) in [(PlacementRole::NewSecond, 4242), (restored, 101)] {
+            assert_eq!(
+                placement_argv(Wm::Hyprland, HyprForm::Legacy, &w, Some("DP-2"), role),
+                Some(vec![
+                    "hyprctl".to_string(),
+                    "--batch".to_string(),
+                    format!(
+                        "dispatch focuswindow pid:4242 ; dispatch movewindow mon:DP-2 ; dispatch focuswindow pid:{focus_pid}"
+                    )
+                ])
+            );
+            assert_eq!(
+                placement_argv(Wm::Hyprland, HyprForm::Lua, &w, Some("DP-2"), role),
+                Some(vec![
+                    "hyprctl".to_string(),
+                    "--batch".to_string(),
+                    format!(
+                        "dispatch hl.dsp.window.move({{ window = 'pid:4242', monitor = 'DP-2' }}) ; dispatch hl.dsp.focus({{ window = 'pid:{focus_pid}' }})"
+                    )
+                ])
+            );
+        }
+        assert_eq!(
+            placement_argv(Wm::Hyprland, HyprForm::Legacy, &w, Some("DP-2"), PlacementRole::Main),
+            v(&[
+                "hyprctl",
+                "--batch",
+                "dispatch focuswindow pid:4242 ; dispatch movewindow mon:DP-2"
+            ])
+        );
+        assert_eq!(
+            placement_argv(Wm::Hyprland, HyprForm::Lua, &w, Some("DP-2"), PlacementRole::Main),
+            move_to_output_argv(Wm::Hyprland, HyprForm::Lua, &w, "DP-2")
+        );
+        assert_eq!(
+            placement_argv(Wm::Hyprland, HyprForm::Legacy, &w, None, restored),
+            v(&["hyprctl", "dispatch", "focuswindow", "pid:101"])
+        );
+        assert_eq!(
+            placement_argv(Wm::Hyprland, HyprForm::Lua, &w, None, restored),
+            v(&["hyprctl", "dispatch", "hl.dsp.focus({ window = 'pid:101' })"])
+        );
+        for form in [HyprForm::Legacy, HyprForm::Lua] {
+            assert_eq!(placement_argv(Wm::Hyprland, form, &w, None, PlacementRole::Main), None);
+            assert_eq!(placement_argv(Wm::Hyprland, form, &w, Some("DP-2; x"), restored), None);
+        }
     }
 
     #[test]

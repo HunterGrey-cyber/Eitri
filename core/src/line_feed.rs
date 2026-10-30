@@ -1,10 +1,7 @@
 //! The bounded, newest-wins line reader every nvim->host push socket in this crate shares.
 //!
-//! Extracted verbatim from `editor_context::feed`,
-//! where it was written and reviewed first; the only generalization is that the "is this line
-//! valid" decision is the caller's `accept` closure rather than one fixed parser. Read the doc on
-//! [`NewestLineReader`] before changing a bound: each one exists because a stalled or oversized
-//! sender must not monopolize the GTK driver that polls this.
+//! The caller's `accept` closure decides which lines are valid. Read [`NewestLineReader`] before
+//! changing a bound: a stalled or oversized sender must not monopolize the GTK driver that polls it.
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};

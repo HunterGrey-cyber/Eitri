@@ -44,6 +44,46 @@ mod own_x_server;
 #[path = "../src/plugin_page.rs"]
 mod plugin_page;
 
+#[allow(dead_code, unused_imports)]
+#[path = "../src/editor_hole.rs"]
+mod editor_hole;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/gtk_host/mod.rs"]
+mod gtk_host;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/module_grid.rs"]
+mod module_grid;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/terminal/mod.rs"]
+mod terminal;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/text_size.rs"]
+mod text_size;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/web_host.rs"]
+mod web_host;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/wheel_zoom.rs"]
+mod wheel_zoom;
+
+#[allow(dead_code, unused_imports)]
+#[path = "../src/layout.rs"]
+mod layout;
+
+// The terminal's compiled move-test helpers refer to the link driver; this run creates no link.
+#[allow(dead_code, unused_imports)]
+#[path = "../src/linked_window/driver.rs"]
+pub(crate) mod link_driver;
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinkEnd {
+    Bye { why: String },
+    Eof,
+}
+mod linked_window {
+    pub(crate) use super::link_driver as driver;
+}
+
 const INDEX: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>t</title>
 <script>window.webkit.messageHandlers.eitriPlugin.postMessage(JSON.stringify({v:1,id:900,verb:"log.append",args:{stream:"probe",items:[{inline:true}]}}));</script>
 <script src="/app.js"></script></head><body><a id="ext" href="https://example.invalid/x"
@@ -1036,6 +1076,166 @@ fn run_proxy_probe() -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// Drives the same guarded restart as the terminal service, with the real pane and host.
+#[allow(deprecated)]
+fn terminal_at_restarts_the_base_terminal_in_place() -> Result<Vec<String>, String> {
+    use eitri_core::layout::{Axis, Layout, ModuleId, Node};
+    use eitri_core::wm::{Applied, ChatOp, EditorCall, Host, HostOp, PluginOp, ShellStart, TermOp, WinId};
+
+    #[derive(Clone)]
+    struct Pane(terminal::TerminalPane);
+    impl gtk_host::RespawnPane for Pane {
+        fn shell_start(&self) -> ShellStart {
+            ShellStart::of(self.0.generation(), self.0.shell_pid()).typed(self.0.typed())
+        }
+        fn close(&self) {
+            self.0.close();
+        }
+        fn set_start_dir(&self, dir: PathBuf) {
+            self.0.set_start_dir(dir);
+        }
+        fn start(&self) {
+            self.0.start();
+        }
+    }
+    impl gtk_host::ServiceSet for Pane {
+        fn editor(&self, _: &EditorCall) -> Result<(), String> {
+            unreachable!()
+        }
+        fn plugin(&self, _: &PluginOp) -> Result<(), String> {
+            unreachable!()
+        }
+        fn chat(&self, _: &ChatOp) -> Result<(), String> {
+            unreachable!()
+        }
+        fn terminal(&self, op: &TermOp) -> Result<(), String> {
+            match op {
+                TermOp::Respawn { expect, dir, .. } => gtk_host::respawn_pane(Some(self.clone()), *expect, dir.clone()),
+                _ => unreachable!(),
+            }
+        }
+    }
+    fn wait_for(mut predicate: impl FnMut() -> bool) -> Result<(), String> {
+        let context = gtk4::glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while context.iteration(false) {}
+            if predicate() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("terminal restart did not settle in 5 s".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let root = scratch_root("terminal-at")?;
+    let target = root.join("next");
+    std::fs::create_dir(&target).map_err(|e| e.to_string())?;
+    // No interactive user configuration or user startup commands enter these shells.
+    std::env::set_var("SHELL", "/bin/sh");
+    std::env::remove_var("ENV");
+    std::env::remove_var("BASH_ENV");
+    let mut report = Vec::new();
+    for (page_has_keys, only_terminal) in [(false, false), (true, false), (false, true)] {
+        let terminal_id = ModuleId::terminal();
+        let page_id = ModuleId::lua("demo");
+        let owner = if page_has_keys {
+            page_id.clone()
+        } else {
+            terminal_id.clone()
+        };
+        let root_node = if only_terminal {
+            Node::Leaf(terminal_id.clone())
+        } else {
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(terminal_id.clone()),
+                Node::Leaf(page_id.clone()),
+            )
+        };
+        let layout = Layout::new(root_node, owner).map_err(|e| e.to_string())?;
+        let (view, _) = eitri_core::wm::LayoutView::for_test(layout);
+        let grid = module_grid::ModuleGrid::new(view);
+        let pane = terminal::TerminalPane::new(root.clone());
+        let page = webkit6::WebView::new();
+        page.load_html("<!doctype html><input autofocus>", None);
+        let page_host = web_host::WebHost::new(&page);
+        grid.add(
+            terminal_id.clone(),
+            pane.widget(),
+            pane.widget(),
+            module_grid::HostKind::Direct,
+        );
+        grid.add(page_id.clone(), &page_host, &page, module_grid::HostKind::Web);
+        let window = gtk4::Window::new();
+        window.set_default_size(900, 600);
+        window.set_child(Some(&grid));
+        let host = gtk_host::GtkHost::new();
+        host.adopt_window(WinId::MAIN, &window);
+        host.register_surface(WinId::MAIN, terminal_id, pane.widget().upcast_ref());
+        host.set_services(Rc::new(Pane(pane.clone())));
+        grid.apply();
+        window.present();
+        pane.start();
+        wait_for(|| pane.shell_pid().is_some() && !page.is_loading())?;
+        let focus: gtk4::Widget = if page_has_keys {
+            page.clone().upcast()
+        } else {
+            pane.widget().clone().upcast()
+        };
+        if !focus.grab_focus() {
+            return Err("the module could not take the keys".into());
+        }
+        wait_for(|| focus.has_focus() || GtkWindowExt::focus(&window).is_some_and(|w| w.is_ancestor(&focus)))?;
+        let keys = GtkWindowExt::focus(&window);
+        let geometry = (grid.allocation(), pane.widget().allocation(), page_host.allocation());
+        let shell = ShellStart::of(pane.generation(), pane.shell_pid()).typed(pane.typed());
+        let op = HostOp::Terminal(TermOp::Respawn {
+            win: WinId::MAIN,
+            module: ModuleId::terminal(),
+            dir: target.clone(),
+            expect: shell,
+        });
+        if host.apply(&op) != Applied::Done {
+            return Err("the live pane refused its restart".into());
+        }
+        wait_for(|| pane.shell_pid().is_some_and(|pid| Some(pid) != shell.pid))?;
+        if geometry != (grid.allocation(), pane.widget().allocation(), page_host.allocation())
+            || keys != GtkWindowExt::focus(&window)
+            || !window.is_visible()
+            || terminal::exit_is_current(shell.generation, pane.generation())
+            || (only_terminal && page_host.is_child_visible())
+        {
+            return Err(format!("restart changed geometry, keys, visibility or accepted an old exit: page_keys={page_has_keys} only_terminal={only_terminal}"));
+        }
+        let found = Rc::new(RefCell::new(None));
+        let answer = found.clone();
+        let pid = pane.shell_pid().unwrap();
+        gtk4::glib::spawn_future_local(async move {
+            *answer.borrow_mut() =
+                Some(gtk4::gio::spawn_blocking(move || std::fs::read_link(format!("/proc/{pid}/cwd"))).await);
+        });
+        wait_for(|| found.borrow().is_some())?;
+        let cwd = found
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .map_err(|_| "the cwd worker panicked".to_string())?
+            .map_err(|e| e.to_string())?;
+        if cwd != target {
+            return Err(format!("the restarted shell is in {}", cwd.display()));
+        }
+        report.push(format!("terminal_at: restart keeps allocation and keys (page={page_has_keys}, alone={only_terminal}); old exit is stale"));
+        pane.close();
+        window.destroy();
+    }
+    let _ = std::fs::remove_dir_all(root);
+    Ok(report)
+}
+
 fn main() {
     // Mirrors `#[ignore]` under a plain `main`: `cargo test --workspace` needs no display.
     let args: Vec<String> = std::env::args().collect();
@@ -1044,13 +1244,18 @@ fn main() {
         return;
     }
     let server = own_x_server::init_gtk("plugin_page", "1280x800x24");
-    let outcome = run(server.display()).and_then(|mut report| {
-        let (theme, live) = run_theme()?;
-        report.extend(theme);
-        report.push(format!("P2 live restyle: {}", if live { "live" } else { "not live" }));
-        report.extend(run_proxy_probe()?);
-        Ok(report)
-    });
+    let outcome = if args.iter().any(|arg| arg == "terminal_at") {
+        terminal_at_restarts_the_base_terminal_in_place()
+    } else {
+        run(server.display()).and_then(|mut report| {
+            let (theme, live) = run_theme()?;
+            report.extend(theme);
+            report.push(format!("P2 live restyle: {}", if live { "live" } else { "not live" }));
+            report.extend(run_proxy_probe()?);
+            report.extend(terminal_at_restarts_the_base_terminal_in_place()?);
+            Ok(report)
+        })
+    };
     match outcome {
         Ok(report) => {
             for line in report {

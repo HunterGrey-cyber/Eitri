@@ -1,7 +1,7 @@
-//! Mouse reporting, focus reporting and alternate scroll (bottom-terminal phase 3c).
+//! Mouse reporting, focus reporting and alternate scroll.
 //!
-//! GTK-free, like every other file in this crate but `session.rs`'s host-facing types: nothing here
-//! names a toolkit, so it is tested with no display. Encodes exactly what xterm's own "Mouse
+//! GTK-free, like the whole crate: nothing here names a toolkit, so it is tested with no display.
+//! Encodes exactly what xterm's own "Mouse
 //! Tracking" section (`ctlseqs.txt`) and `alacritty_terminal`'s `input/mod.rs` (`mouse_report`,
 //! `sgr_mouse_report`, `normal_mouse_report`) describe, against the live [`TermMode`] the session
 //! thread already holds -- the same way a key is encoded against it (`terminal_input::encode`).

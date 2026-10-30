@@ -197,12 +197,8 @@ function KeyTable({ heading, rows }: { heading: string; rows: KeyHelp[] }) {
   );
 }
 
-/** One section, "Selecting (v)", between "This panel" and
- *  "Leader and tab keys" -- CARET's table then VISUAL's (CARET_KEYS/VISUAL_KEYS, the same
- *  source `keymap.test.ts` ties to `resolveKey`'s region branches both ways). These used to be ONE table with no
- *  sub-heading, so a "gg"/"Esc" pair that looks the same in both modes (or any two rows sharing a key) rendered as 21
- *  indistinguishable rows with two conflicting `Esc` lines and no way to tell which mode either belonged to. Two
- *  separate tables, each headed by its own mode name, so CARET's rows and VISUAL's rows are never merged. */
+/** Selecting shows CARET then VISUAL under separate headings. Shared keys such as gg and Esc
+ *  have different meanings in the two modes, so one merged table is ambiguous. */
 function Selecting({ panel }: { panel: PanelTable }) {
   return (
     <section>
@@ -214,13 +210,9 @@ function Selecting({ panel }: { panel: PanelTable }) {
   );
 }
 
-/** The `?` overlay's "Slash commands" section, listing the commands that work. A plain list rather than the
- *  two-column `Section` layout above -- nothing here is a keybinding, and a bare `<ul>` keeps this section out of
- *  every existing `tr`-counting test in this file's own test suite (`KeymapOverlay.test.tsx`'s "lists every row...").
- *  Names come from `../slashCommands`'s own table (a real-CLI record), in that table's order, less what Enter holds
- *  back: `/config` is left out (`listedSlashCommands`; a GUI pass on 2026-09-27 saw the held-back flash send the
- *  reader here to find `/config`). `/model` reads plainly now: a bare `/model` sends too, and opens a picker
- *  (`../SlashPicker`). */
+/** Slash commands that work, in `listedSlashCommands` order, with held-back commands such as
+ *  `/config` omitted. A plain list stays outside the key-table row counts in `KeymapOverlay.test.tsx`.
+ *  A bare `/model` sends and opens a picker (`../slashPicker`). */
 function SlashCommands() {
   return (
     <section>
@@ -270,15 +262,10 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         {" "}PageDown/PageUp or Space a page{prefixLabel === "Ctrl+b" ? " (Ctrl+b is the prefix)" : ""};
         gg/G top/bottom. ? / Esc / q close.
       </p>
-      {/* `Ctrl+j` here is Rust's mirror (`install_module_nav`) claiming the chord
-          ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
-          added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
-          on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
-          "Typing" section below already does the same for its own two GTK-decided rows.
-          "`Ctrl+[` is Esc" is one document listener (`../ctrlBracket`), not a key `resolveKey`
-          sees, so it is this group's `note` -- not a row of `BROWSE_KEYS` either. What each permission
-          mode does is said here too: the start screen used to say it under its mode row, and that row is
-          gone (the status band names the mode). */}
+      {/* Rust's mirror claims Ctrl+j ahead of resolveKey, so it is spliced in rather than added to
+          BROWSE_KEYS, which keymap.test.ts ties to resolveKey both ways. Typing does the same for
+          its GTK-decided rows. Ctrl+[ is a document listener, so it belongs in the note rather than
+          that table. Mode consequences live here; the status band names the current mode. */}
       {/* The page the keys were in when the sheet was asked for comes first: those are the keys the reader
           was just using. Its title and rows are the page's own text, so they go through `Section`, which
           draws text nodes only. */}

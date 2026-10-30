@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "re": 51,
+  "ok": true,
+  "result": {
+    "buf": 7,
+    "replaced": true,
+    "stopped_clients": 1
+  }
+}

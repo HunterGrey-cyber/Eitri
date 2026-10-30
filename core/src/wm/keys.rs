@@ -123,12 +123,13 @@ pub fn copy_mode_entry(focused: Option<ModuleKind>) -> bool {
     matches!(literal_target(focused), LiteralTarget::Terminal)
 }
 
-/// The window stage while the controller's y/n is shown: the key answers it before the prefix sees it, `y` or `Y`
+/// The window stage while the controller's y/n is shown: the window close flow or the module kill receives
+/// the answer before the prefix sees it, `y` or `Y`
 /// yes and anything else no, the prefix key included, so a kill is never started by the key meant to leave it. A
 /// bare modifier answers nothing and goes on. `None` while no y/n is shown.
 pub(super) fn prompt_press(w: &Window, press: &KeyPress) -> Option<PromptKey> {
-    w.chrome.prompt.as_ref()?;
-    match prompt_key(press, press.press == Press::Modifier) {
+    let prompt = w.chrome.prompt.as_ref()?;
+    match prompt_key(press, press.press == Press::Modifier, prompt.offers_move) {
         PromptKey::Ignore => None,
         answer => Some(answer),
     }

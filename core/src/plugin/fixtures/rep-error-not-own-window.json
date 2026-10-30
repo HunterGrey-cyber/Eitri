@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "re": 50,
+  "ok": false,
+  "error": {
+    "code": "not_own_window",
+    "message": "This verb acts only in the plugin's own window"
+  }
+}

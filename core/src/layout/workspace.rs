@@ -405,11 +405,21 @@ impl Workspaces {
     /// Retires a module in every stored layout, showing the chat when nothing else would remain. One
     /// away in a layout is left as it is there: the other window holds it.
     pub fn retire_everywhere(&mut self, id: &ModuleId, frame: &Frame) {
+        self.kill_everywhere(id, Reopen::Never, frame);
+    }
+
+    /// Ends a module in place in every stored layout, showing the chat when nothing else would remain. One
+    /// away in a layout is left as it is there: the other window holds it.
+    pub fn end_everywhere(&mut self, id: &ModuleId, frame: &Frame) {
+        self.kill_everywhere(id, Reopen::InPlace, frame);
+    }
+
+    fn kill_everywhere(&mut self, id: &ModuleId, reopen: Reopen, frame: &Frame) {
         for layout in self.stored.values_mut() {
             if layout.contains(id) && !layout.is_gone(id) && !layout.is_away(id) {
-                if let Err(LayoutError::LastVisible(_)) = kill(layout, id, Reopen::Never, frame) {
+                if let Err(LayoutError::LastVisible(_)) = kill(layout, id, reopen, frame) {
                     let _ = layout.show(&ModuleId::agent());
-                    let _ = kill(layout, id, Reopen::Never, frame);
+                    let _ = kill(layout, id, reopen, frame);
                 }
             }
         }
@@ -423,6 +433,16 @@ impl Workspaces {
             if layout.contains(id) {
                 // Refused only when nothing else could be shown, and every layout holds the chat.
                 let _ = layout.set_away(id, away);
+            }
+        }
+    }
+
+    /// Takes `id` back hidden in every stored layout that holds it, keeping its place in each. The live layout
+    /// remains the caller's.
+    pub fn set_back_hidden_everywhere(&mut self, id: &ModuleId) {
+        for layout in self.stored.values_mut() {
+            if layout.contains(id) {
+                let _ = layout.set_back_hidden(id);
             }
         }
     }

@@ -2,25 +2,22 @@
 //! every event that arrives while a batch applies in one queue, so nothing re-enters the decider.
 //!
 //! The rules, in the order a caller meets them:
-//! - An event posted while no batch applies is handled at once. One posted while a batch applies (or while a shell
-//!   verb's arm runs) joins the queue, which holds events and nested batches together and drains in arrival order
-//!   after the batch. `NativeFocus` and `Chat(PageShown)` queued while op `i` applies are stamped `op_index: Some(i)`,
-//!   so their handler can judge by what was true when they fired.
+//! - An event posted while no batch applies is handled at once. One posted while a batch applies joins the queue,
+//!   which holds events and nested batches together and drains in arrival order after the batch. `NativeFocus` and
+//!   `Chat(PageShown)` queued while op `i` applies are stamped `op_index: Some(i)`, so their handler can judge by what
+//!   was true when they fired.
 //! - `post_deferred` never runs inside the call that posted it: its events wait on their own queue for the reserved
 //!   idle ([`TimerToken::DRIVER_IDLE`]).
-//! - A batch applies its layout ops, then its effects, then its Lua ops, then its shell verb, and after a shell verb
-//!   the driver posts `LayoutChangedByShell` last, so everything the arm caused is heard before the layout is re-read.
-//!   A `Focus` op's `on_grab` ops run right after it, and only when the grab took; a `HostOp::Lua` among them waits
-//!   for the end of the batch's Lua ops, so Lua never runs in the middle of a batch.
+//! - A batch applies its layout ops, then its effects, then its Lua ops. A `Focus` op's `on_grab` ops run right after
+//!   it, and only when the grab took; a `HostOp::Lua` among them waits for the end of the batch's Lua ops, so Lua
+//!   never runs in the middle of a batch.
 //! - A `CreateSurface` op the host carried out is answered with `Created`, and a `PrepareSurface` with `Prepared`,
 //!   each queued behind what the op itself caused: besides a `Focus` op's tail, the one place an op's answer is
 //!   read.
 //! - `key` and `close_requested` answer synchronously. A key that arrives while the driver is busy is answered from
 //!   the decider as it stands, its batch queued, and counted; every close request prints the count, so a run's log
 //!   shows whether a key ever arrived re-entrantly.
-//! - `focus_now` is for a shell verb's arm, which still moves keys itself between a map and an unmap: it applies the
-//!   decider's focus batch at once and answers whether the grab took. It is refused while a batch's ops apply.
-//! - The decider is never borrowed while the host runs an op or an arm, and `query` copies its answer out.
+//! - The decider is never borrowed while the host runs an op, and `query` copies its answer out.
 //! - Each time the queue empties the decider is asked what it judges against the state the batches left
 //!   ([`Decide::after_drain`]); its batch applies like any other, and the queue drains again after it.
 //! - The grid's allocation ([`Allocator`]) is answered at once from inside the toolkit's allocation, and may come
@@ -32,7 +29,6 @@ use super::host::*;
 use super::window::WinId;
 use crate::keymap::action::Action;
 use crate::layout::{Arrangement, ModuleId, Size};
-use crate::lua::layout::LayoutRequest;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -48,7 +44,7 @@ pub struct Driver<C: Decide = Controller> {
     decide: RefCell<C>,
     host: Rc<dyn Host>,
     scheduler: Rc<dyn Scheduler>,
-    /// Something is being applied or drained: a batch, a shell verb's arm, or the queue after them.
+    /// Something is being applied or drained: a batch, or the queue after it.
     busy: Cell<bool>,
     /// The index of the op being applied, while a batch's ops apply.
     op_index: Cell<Option<u32>>,
@@ -140,19 +136,18 @@ impl<C: Decide> Driver<C> {
     }
 
     /// Reads the decider. The answer is returned by value, so no borrow outlives the call.
-    pub fn query<T: 'static>(&self, f: impl FnOnce(&C) -> T) -> T {
-        f(&self.decide.borrow())
+    /// A query made during a controller borrow logs a bug and answers the type's default without calling `f`.
+    pub fn query<T: Default + 'static>(&self, f: impl FnOnce(&C) -> T) -> T {
+        self.query_or(T::default(), f)
     }
 
-    /// Moves the keys to a module now, for a shell verb's arm that still hides a module itself right after; answers
-    /// whether the grab took. Refused while a batch's ops apply, since the batch's own order would be broken.
-    pub fn focus_now(&self, win: WinId, module: &ModuleId) -> bool {
-        if self.op_index.get().is_some() {
-            self.note("[wm] BUG: focus_now while a batch applies".into());
-            return false;
-        }
-        let batch = self.decide.borrow_mut().focus(win, module);
-        self.exclusive(|| self.apply(batch)) == Some(Applied::Done)
+    /// Reads with an explicit fallback, so a gate whose answer is uncertain can refuse.
+    pub fn query_or<T: 'static>(&self, fallback: T, f: impl FnOnce(&C) -> T) -> T {
+        let Ok(controller) = self.decide.try_borrow() else {
+            self.note("[wm] BUG: query while the controller is borrowed".into());
+            return fallback;
+        };
+        f(&controller)
     }
 
     /// How many keys arrived while the driver was busy.
@@ -262,31 +257,18 @@ impl<C: Decide> Driver<C> {
         result
     }
 
-    /// Applies one batch in its fixed order and answers how its first `Focus` op went, if it had one. Called only
-    /// while the driver is busy.
-    fn apply(&self, batch: Batch) -> Option<Applied> {
+    /// Applies one batch in its fixed order. Called only while the driver is busy.
+    fn apply(&self, batch: Batch) {
         let outer = self.op_index.get();
         let mut index = 0;
-        let mut focus = None;
         let mut grab_lua = Vec::new();
         for op in batch.ops() {
-            let applied = self.apply_op(op, &mut index, &mut grab_lua);
-            if matches!(op, HostOp::Focus { .. }) && focus.is_none() {
-                focus = Some(applied);
-            }
+            self.apply_op(op, &mut index, &mut grab_lua);
         }
         for lua in batch.lua().iter().cloned().chain(grab_lua) {
             self.apply_op(&HostOp::Lua(lua), &mut index, &mut Vec::new());
         }
         self.op_index.set(outer);
-        if let Some(verb) = batch.shell_verb() {
-            self.host.run_shell_verb(verb.win, &verb.call, verb.keycode);
-            // Behind everything the arm caused, so the decider hears where the keys went before it re-reads.
-            self.queue
-                .borrow_mut()
-                .push_back(Item::Event(HostEvent::LayoutChangedByShell { win: verb.win }));
-        }
-        focus
     }
 
     /// Applies one op and, when it is a `Focus` that took, its `on_grab` tail. A Lua call in the tail is not run
@@ -295,6 +277,12 @@ impl<C: Decide> Driver<C> {
     fn apply_op(&self, op: &HostOp, index: &mut u32, grab_lua: &mut Vec<LuaOp>) -> Applied {
         self.op_index.set(Some(*index));
         *index += 1;
+        // A window ended by the controller's own teardown (a termination signal, the last terminal's exit) asks no
+        // close request, so the count is printed at every `CloseWindow` and every window's end records it; a close
+        // the user asked for prints it twice, once at its request and once here.
+        if let HostOp::CloseWindow { .. } = op {
+            self.note(format!("[wm] nested={}", self.nested_keys()));
+        }
         let applied = self.host.apply(op);
         // A surface made at run time is added to the layout only once it exists: the batch that adds it is decided
         // after this one, from the event, which waits its turn behind whatever this batch causes.
@@ -335,15 +323,14 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
+    /// Seeds the window's text size before the shell installs its reporting hooks.
+    pub fn set_text_size(&self, win: WinId, base: f32, reported_s: f32) {
+        self.decide.borrow_mut().set_text_size(win, base, reported_s);
+    }
+
     /// The window's first layout batch over the hosts the shell placed ([`Controller::first_apply`]).
     pub fn first_apply(&self, win: WinId, hosted: Vec<super::module::SurfaceDecl>) {
         let batch = self.decide.borrow_mut().first_apply(win, &hosted);
-        self.submit(batch);
-    }
-
-    /// One `eitri.layout.*` request whose family has moved into the controller ([`Controller::lua_request`]).
-    pub fn lua_request(&self, win: WinId, request: LayoutRequest) {
-        let batch = self.decide.borrow_mut().lua_request(win, request);
         self.submit(batch);
     }
 
@@ -354,20 +341,60 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
+    /// Returns an editor request's outcome to its caller, so a linked panel receives refusals in its own window.
+    /// A borrowed controller refuses because the request cannot be checked while another decision is in progress.
+    pub fn editor_request(&self, win: WinId, keys: String) -> Result<(), String> {
+        let Ok(mut controller) = self.decide.try_borrow_mut() else {
+            self.note("[wm] BUG: an editor request while the controller decides; refused".into());
+            return Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
+        };
+        let (answer, batch) = controller.editor_request(win, keys);
+        drop(controller);
+        self.submit(batch);
+        answer
+    }
+
+    /// A plugin page's `layout.focus` ([`Controller::plugin_focus`]): its batch carried out, and the answer the page
+    /// is given. Asked while the controller decides, it is refused, as a gate whose answer cannot be read is.
+    pub fn plugin_focus(&self, win: WinId, module: &ModuleId) -> Result<(), String> {
+        let Ok(mut controller) = self.decide.try_borrow_mut() else {
+            self.note("[wm] BUG: a plugin's focus while the controller decides; refused".into());
+            return Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
+        };
+        let (answer, batch) = controller.plugin_focus(win, module);
+        drop(controller);
+        self.submit(batch);
+        answer
+    }
+
+    /// A plugin page's `terminal.at` ([`Controller::plugin_terminal_at`]): its batch carried out, and whether it was
+    /// taken; the answer itself comes back as an op. Asked while the controller decides, it is refused, as
+    /// `plugin_focus` is.
+    pub fn plugin_terminal_at(
+        &self,
+        win: WinId,
+        plugin: &str,
+        dir: std::path::PathBuf,
+        ticket: u64,
+    ) -> Result<(), String> {
+        let Ok(mut controller) = self.decide.try_borrow_mut() else {
+            self.note("[wm] BUG: a plugin's terminal.at while the controller decides; refused".into());
+            return Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
+        };
+        let (answer, batch) = controller.plugin_terminal_at(win, plugin, dir, ticket);
+        drop(controller);
+        self.submit(batch);
+        answer
+    }
+
     /// What `win`'s module verbs place and kill by ([`Controller::set_module_setup`]).
     pub fn set_module_setup(&self, win: WinId, setup: super::verbs::modules::ModuleSetup) {
         self.decide.borrow_mut().set_module_setup(win, setup);
     }
 
-    /// A named terminal or chat view made straight into the scratchpad ([`Controller::scratch_new`]).
-    pub fn scratch_new(&self, win: WinId, module: &ModuleId) {
-        let batch = self.decide.borrow_mut().scratch_new(win, module);
-        self.submit(batch);
-    }
-
-    /// `tab.break`'s new chat view ([`Controller::tab_break`]).
-    pub fn tab_break(&self, win: WinId) {
-        let batch = self.decide.borrow_mut().tab_break(win);
+    /// Where `win` goes at its start ([`Controller::set_placement`]).
+    pub fn set_placement(&self, win: WinId, placement: super::window::WindowPlacement) {
+        let batch = self.decide.borrow_mut().set_placement(win, placement);
         self.submit(batch);
     }
 
@@ -383,18 +410,11 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
-    /// A kill with no y/n ([`Controller::kill_confirmed`]).
+    /// A kill with no y/n ([`Controller::kill_confirmed`]). The grid probe's (`--features probe`), which kills a chat
+    /// view it opened without asking; a terminal whose shell ended posts its end instead, which the controller judges.
     pub fn kill_confirmed(&self, win: WinId, module: &ModuleId) {
         let batch = self.decide.borrow_mut().kill_confirmed(win, module);
         self.submit(batch);
-    }
-
-    /// The covered chat view `view` revealed ([`Controller::reveal_chat`]): the scratch floats over it put away,
-    /// and what still covers it, as the refusal's text, when one does.
-    pub fn reveal_chat(&self, win: WinId, view: crate::tabs::ViewId) -> Option<String> {
-        let (batch, still) = self.decide.borrow_mut().reveal_chat(win, view);
-        self.submit(batch);
-        still
     }
 
     /// What the window's chrome names things by ([`Controller::set_titles`]).
@@ -410,61 +430,10 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
-    /// The `?` sheet opened ([`Controller::keymap_opened`]); its opening's number, for the page to quote back.
-    pub fn keymap_opened(
-        &self,
-        win: WinId,
-        view: crate::tabs::ViewId,
-        opened: crate::keymap::keys_return::Opened,
-    ) -> u64 {
-        self.decide.borrow_mut().keymap_opened(win, view, opened)
-    }
-
-    /// A newer request took over from an open `?` sheet ([`Controller::keymap_superseded`]).
-    pub fn keymap_superseded(&self, win: WinId) {
-        self.decide.borrow_mut().keymap_superseded(win);
-    }
-
     #[cfg(test)]
     pub(super) fn test_batch(&self, decide: impl FnOnce(&mut Controller) -> Batch) {
         let batch = decide(&mut self.decide.borrow_mut());
         self.submit(batch);
-    }
-
-    /// Saves `win`'s layouts now and waits for the write, cancelling a pending debounce timer: the close
-    /// handler's call, the one synchronous save there is. It stays until the window's own teardown, decided
-    /// here, saves as part of its batch. The window's settles still waiting for the idle are heard first. Whether
-    /// the file now holds the window's arrangement (see [`Controller::persist_now`]).
-    pub fn persist_now(&self, win: WinId) -> bool {
-        let settles = self.take_settles(win);
-        let (finished, batches) = match self.decide.try_borrow_mut() {
-            Ok(mut controller) => {
-                let batches: Vec<Batch> = settles.into_iter().map(|event| controller.handle(event)).collect();
-                (controller.persist_now(win), batches)
-            }
-            Err(_) => {
-                self.note("[wm] BUG: persist_now while the controller decides".into());
-                self.deferred.borrow_mut().extend(settles);
-                (false, Vec::new())
-            }
-        };
-        for batch in batches {
-            self.submit(batch);
-        }
-        finished
-    }
-
-    /// Takes `win`'s settles still waiting for the driver's idle, for the close's save to hear first. A close can
-    /// come before that idle (a termination signal right after the first allocation), and a settle the saver never
-    /// heard would make the pinned lengths it gave pass for an arrangement change, writing a file for a window
-    /// nobody changed. Every other deferred event keeps waiting for the idle.
-    fn take_settles(&self, win: WinId) -> Vec<HostEvent> {
-        let mut deferred = self.deferred.borrow_mut();
-        let (settles, rest): (VecDeque<_>, VecDeque<_>) = deferred
-            .drain(..)
-            .partition(|event| matches!(event, HostEvent::Settled { win: of, .. } if *of == win));
-        *deferred = rest;
-        settles.into()
     }
 }
 
@@ -482,9 +451,9 @@ impl Allocator for Driver<Controller> {
         let Some((arrangement, settled)) = answer else {
             return self.arranged.borrow().get(&win).cloned().unwrap_or_default();
         };
-        if let Some(root) = settled {
+        if settled.is_some() {
             // Heard from the idle: no batch is computed inside an allocation.
-            self.post_deferred(HostEvent::Settled { win, root });
+            self.post_deferred(HostEvent::Settled { win });
         }
         self.arranged.borrow_mut().insert(win, arrangement.clone());
         arrangement
@@ -523,16 +492,15 @@ mod tests {
 
     const WIN: WinId = WinId::MAIN;
 
-    /// One entry of a run's merged record: what the host did, what the decider was asked, and the test's own marks,
-    /// in the order they happened.
+    /// One entry of a run's merged record: what the host did and what the decider was asked, in the order they
+    /// happened.
     #[derive(Debug, Clone, PartialEq)]
     enum Seen {
         Host(Logged),
         Asked(Call),
-        Mark(&'static str),
     }
 
-    /// Places the decider's calls and the test's marks among the host's log by the log's length when they happened.
+    /// Places the decider's calls among the host's log by the log's length when they happened.
     struct Trace {
         host: Rc<FakeHost>,
         marks: RefCell<Vec<(usize, Seen)>>,
@@ -582,10 +550,6 @@ mod tests {
             self.trace
                 .mark(Seen::Asked(Call::Run(win, action.clone(), origin.clone())));
             self.inner.run(win, action, origin)
-        }
-        fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch {
-            self.trace.mark(Seen::Asked(Call::Focus(win, module.clone())));
-            self.inner.focus(win, module)
         }
     }
 
@@ -644,11 +608,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_query_while_the_controller_is_borrowed_logs_a_bug_and_returns_the_default() {
+        let r = rig(|_| {});
+        let _borrow = r.driver.decide.borrow_mut();
+        let answer: Option<f32> = r.driver.query(|_| panic!("a borrowed controller must not be queried"));
+        assert_eq!(answer, None);
+        assert_eq!(r.driver.notes(), ["[wm] BUG: query while the controller is borrowed"]);
+    }
+
+    #[test]
+    fn a_gate_query_while_borrowed_refuses_without_calling_the_controller() {
+        let r = rig(|_| {});
+        let _borrow = r.driver.decide.borrow_mut();
+        let answer: Result<(), String> = r.driver.query_or(Err("layout is changing".into()), |_| {
+            panic!("a borrowed controller must not be queried")
+        });
+        assert_eq!(answer, Err("layout is changing".into()));
+        assert_eq!(r.driver.notes(), ["[wm] BUG: query while the controller is borrowed"]);
+    }
+
+    #[test]
+    fn a_scale_echo_during_set_scale_waits_for_the_whole_batch() {
+        let scale = HostOp::Editor(EditorCall::SetScale { win: WIN, scale: 1.1 });
+        let font = HostOp::Chat(ChatOp::SetFontSize { win: WIN, px: 15.4 });
+        let zoom = HostOp::Plugin(PluginOp::SetZoom {
+            win: WIN,
+            module: x(),
+            level: 1.1,
+        });
+        let echo = HostEvent::Editor(EditorEvent::ScaleReported { win: WIN, scale: 1.1 });
+        let start = HostEvent::TextSize(TextSizeEvent::Both {
+            win: WIN,
+            step: super::super::text_size::TextStep::Larger,
+        });
+        let r = rig(|d| {
+            let mut batch = Batch::default();
+            for op in [&scale, &font, &zoom] {
+                batch.push_effect(op.clone());
+            }
+            d.then_handle(batch);
+        });
+        let weak = r.weak();
+        let posted = echo.clone();
+        r.host.on_apply(move |_, _, op| {
+            let driver = weak.upgrade().unwrap();
+            assert!(!driver
+                .query(|d| d.inner.calls())
+                .contains(&Call::Handle(posted.clone())));
+            if matches!(op, HostOp::Editor(EditorCall::SetScale { .. })) {
+                driver.post(posted.clone());
+            }
+        });
+        r.driver.post(start.clone());
+        assert_eq!(r.asked(), [Call::Handle(start), Call::Handle(echo.clone())]);
+        let timeline = r.trace.timeline();
+        let last_write = position(&timeline, |seen| {
+            *seen == Seen::Host(Logged::Op(zoom.clone(), Applied::Done))
+        });
+        let heard = position(&timeline, |seen| *seen == Seen::Asked(Call::Handle(echo.clone())));
+        assert!(
+            last_write < heard,
+            "the echo is decided after every write: {timeline:?}"
+        );
+        assert!(
+            r.driver.notes().is_empty(),
+            "queries during apply find no controller borrow"
+        );
+    }
+
     fn a() -> ModuleId {
         ModuleId::agent()
-    }
-    fn b() -> ModuleId {
-        ModuleId::terminal()
     }
     fn x() -> ModuleId {
         ModuleId::lua("x")
@@ -677,9 +707,6 @@ mod tests {
     fn map(module: ModuleId) -> HostOp {
         HostOp::Map { win: WIN, module }
     }
-    fn unmap(module: ModuleId) -> HostOp {
-        HostOp::Unmap { win: WIN, module }
-    }
     fn native_focus(module: ModuleId, op_index: Option<u32>) -> HostEvent {
         HostEvent::NativeFocus {
             win: WIN,
@@ -707,13 +734,6 @@ mod tests {
             mods: Mods::default(),
             super_or_hyper: false,
             super_or_meta: false,
-        }
-    }
-    fn verb(keycode: u32) -> ShellVerb {
-        ShellVerb {
-            win: WIN,
-            call: ShellCall::Action(Action::FloatToggle),
-            keycode,
         }
     }
     fn position(timeline: &[Seen], what: impl Fn(&Seen) -> bool) -> usize {
@@ -853,6 +873,15 @@ mod tests {
     }
 
     #[test]
+    fn a_window_closed_by_its_teardown_logs_the_nested_count() {
+        let r = rig(|d| {
+            d.then_run(layout(vec![HostOp::CloseWindow { win: WIN }]));
+        });
+        r.driver.run(WIN, Action::FocusParent, Origin::Lua);
+        assert_eq!(r.driver.notes(), vec!["[wm] nested=0".to_string()]);
+    }
+
+    #[test]
     fn a_refused_focus_runs_no_arrive() {
         let arrive = HostOp::Chat(ChatOp::Arrive {
             win: WIN,
@@ -930,98 +959,6 @@ mod tests {
         );
     }
 
-    /// A shell verb whose arm moves the keys to `b` through `focus_now`, then hides `a` itself, marking the record
-    /// after each step. Returns the rig and what `focus_now` answered.
-    fn shell_verb_arm() -> (Rig, Rc<Cell<Option<bool>>>) {
-        let r = rig(|d| {
-            let mut batch = Batch::default();
-            batch.set_shell_verb(verb(0));
-            d.then_run(batch);
-            d.then_focus(layout(vec![focus(b())]));
-        });
-        r.host.with_surface(WIN, a(), page("a"), true);
-        r.host.with_surface(WIN, b(), page("b"), true);
-        let answered = Rc::new(Cell::new(None));
-        let (weak, trace, out) = (r.weak(), r.trace.clone(), answered.clone());
-        r.host.on_shell_verb(move |host, win, _, _| {
-            out.set(Some(weak.upgrade().unwrap().focus_now(win, &b())));
-            trace.mark(Seen::Mark("focus_now returned"));
-            host.apply(&unmap(a()));
-            trace.mark(Seen::Mark("unmapped"));
-        });
-        r.driver.run(WIN, Action::FocusParent, Origin::Key { keycode: 0 });
-        (r, answered)
-    }
-
-    #[test]
-    fn a_shell_verbs_focus_lands_before_its_unmap() {
-        let (r, answered) = shell_verb_arm();
-        assert_eq!(answered.get(), Some(true), "the grab took");
-        assert_eq!(
-            r.host.log(),
-            vec![
-                Logged::ShellVerb(verb(0)),
-                Logged::Op(focus(b()), Applied::Done),
-                Logged::Event(native_focus(b(), None)),
-                Logged::Op(unmap(a()), Applied::Done),
-            ],
-            "the keys move to the arriving module before the leaving one is hidden"
-        );
-        assert!(
-            r.driver.notes().iter().all(|n| !n.contains("BUG")),
-            "{:?}",
-            r.driver.notes()
-        );
-    }
-
-    #[test]
-    fn a_native_focus_posted_inside_focus_now_is_handled_after_it_returns() {
-        let (r, _) = shell_verb_arm();
-        let timeline = r.trace.timeline();
-        let returned = position(&timeline, |s| *s == Seen::Mark("focus_now returned"));
-        let unmapped = position(&timeline, |s| *s == Seen::Mark("unmapped"));
-        let handled = position(
-            &timeline,
-            |s| matches!(s, Seen::Asked(Call::Handle(e)) if is_native_focus_on(e, &b())),
-        );
-        let reread = position(&timeline, |s| {
-            *s == Seen::Asked(Call::Handle(HostEvent::LayoutChangedByShell { win: WIN }))
-        });
-        assert!(
-            returned < unmapped && unmapped < handled && handled < reread,
-            "the grab's fact waits for the arm and is heard before the layout is re-read: {timeline:#?}"
-        );
-    }
-
-    #[test]
-    fn a_shell_verb_is_the_last_item_of_its_batch_and_is_re_read() {
-        let start = HostOp::Terminal(TermOp::Start {
-            win: WIN,
-            module: ModuleId::lua("t"),
-        });
-        let emit = LuaOp::Emit { event: "e".into() };
-        let r = rig(|d| {
-            let mut batch = Batch::default();
-            batch.push_layout(map(x()));
-            batch.push_layout(HostOp::Lua(emit.clone()));
-            batch.push_effect(start.clone());
-            batch.set_shell_verb(verb(0));
-            d.then_run(batch);
-        });
-        r.driver.run(WIN, Action::FocusParent, Origin::Lua);
-        assert_eq!(
-            r.trace.timeline(),
-            vec![
-                Seen::Asked(Call::Run(WIN, Action::FocusParent, Origin::Lua)),
-                Seen::Host(Logged::Op(map(x()), Applied::Done)),
-                Seen::Host(Logged::Op(start, Applied::Done)),
-                Seen::Host(Logged::Op(HostOp::Lua(emit), Applied::Done)),
-                Seen::Host(Logged::ShellVerb(verb(0))),
-                Seen::Asked(Call::Handle(HostEvent::LayoutChangedByShell { win: WIN })),
-            ]
-        );
-    }
-
     #[test]
     fn lua_ops_run_after_every_other_op_of_their_batch() {
         let lua = |n: &str| LuaOp::Emit { event: n.into() };
@@ -1046,43 +983,6 @@ mod tests {
                 HostOp::Lua(invoke),
             ]
         );
-    }
-
-    #[test]
-    fn focus_now_while_an_op_applies_is_refused_and_logged() {
-        let r = rig(|d| d.then_run(layout(vec![HostOp::Allocate { win: WIN }])));
-        r.host.with_surface(WIN, b(), page("b"), true);
-        let answered = Rc::new(Cell::new(None));
-        let (weak, out) = (r.weak(), answered.clone());
-        r.host.on_apply(move |_, i, _| {
-            if i == 0 {
-                out.set(Some(weak.upgrade().unwrap().focus_now(WIN, &b())));
-            }
-        });
-        r.driver.run(WIN, Action::FocusParent, Origin::Lua);
-        assert_eq!(answered.get(), Some(false));
-        assert!(
-            !r.asked().contains(&Call::Focus(WIN, b())),
-            "a refused focus_now asks the decider nothing"
-        );
-        assert_eq!(
-            r.driver.notes(),
-            vec!["[wm] BUG: focus_now while a batch applies".to_string()]
-        );
-    }
-
-    #[test]
-    fn a_controller_shell_verb_carries_the_keys_keycode() {
-        let mut c = Controller::new(FakeScheduler::new());
-        let from_key = c.run(WIN, Action::FloatToggle, Origin::Key { keycode: 38 });
-        assert_eq!(from_key.shell_verb(), Some(&verb(38)));
-        assert_eq!(
-            from_key.ops().count() + from_key.lua().len(),
-            0,
-            "the shell verb is the whole batch"
-        );
-        let from_lua = c.run(WIN, Action::FloatToggle, Origin::Lua);
-        assert_eq!(from_lua.shell_verb(), Some(&verb(0)));
     }
 
     /// A driver over the controller holding `layout` as the main window, every module of it hosted and its first
@@ -1223,36 +1123,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_arm_change_resets_what_the_controller_thinks_is_mapped() {
-        let terminal = ModuleId::terminal();
-        let (driver, host, _scheduler, layout) = driven(crate::layout::fixture::fixture(
-            "row(editor focus, column(agent, terminal hidden))",
-        ));
-        let shown = layout.clone();
-        let t = terminal.clone();
-        // An arm that shows the terminal and tells nobody but the layout, as a shell arm does.
-        host.on_shell_verb(move |_, _, _, _| {
-            shown.borrow_mut().show(&t).unwrap();
-        });
-        driver.run(WIN, Action::FloatToggle, Origin::Lua);
-        assert!(layout.borrow().is_visible(&terminal), "the premise: the arm showed it");
-        let from = host.log().len();
-        driver.run(WIN, Action::Rotate { down: true }, Origin::Lua);
-        let later: Vec<HostOp> = host.log()[from..]
-            .iter()
-            .filter_map(|entry| match entry {
-                Logged::Op(op, _) => Some(op.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(later.contains(&HostOp::Allocate { win: WIN }), "{later:#?}");
-        assert!(
-            !later.contains(&map(terminal)),
-            "the shell's apply already mapped it: {later:#?}"
-        );
-    }
-
-    #[test]
     fn the_driver_drives_the_controller_by_default() {
         let host = FakeHost::new();
         let scheduler = FakeScheduler::new();
@@ -1260,12 +1130,15 @@ mod tests {
         let sink: Rc<dyn HostSink> = driver.clone();
         host.attach(Rc::downgrade(&sink));
         scheduler.attach(Rc::downgrade(&sink));
-        driver.run(WIN, Action::FloatToggle, Origin::Lua);
-        assert_eq!(host.log(), vec![Logged::ShellVerb(verb(0))]);
-        assert_eq!(
-            driver.query(|c| c.shell_revision(WIN)),
-            1,
-            "the layout the arm left is re-read once"
+        driver.run(WIN, Action::PanelReload, Origin::Lua);
+        assert!(
+            host.log().is_empty(),
+            "a window the controller does not hold has nothing to apply"
+        );
+        driver.post(HostEvent::Pair(PairEvent::RestoreFailed { win: WIN }));
+        assert!(
+            host.log().is_empty(),
+            "a fact for a window the controller does not hold changes nothing"
         );
     }
 }

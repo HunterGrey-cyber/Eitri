@@ -18,6 +18,7 @@ pub mod ops;
 pub mod persist;
 pub mod reconcile;
 pub mod rules;
+pub mod spec;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tray;
@@ -37,8 +38,8 @@ pub use geometry::{
     Direction, FloatSpot, Frame, Nav, Rect, Size, Strip, DEFAULT_STRIP_PX,
 };
 pub use keys::{
-    choose_instance, key_action, module_target, split_choice, strip, strip_direct, KeyAction, KeyError, ModuleKeys,
-    SplitChoice, StripEntry,
+    choose_instance, hide_target, key_action, module_target, split_choice, strip, strip_direct, strip_for_hide,
+    KeyAction, KeyError, ModuleKeys, SplitChoice, StripEntry,
 };
 pub use kill::{can_kill, kill, KillScope, Reopen};
 pub use module::{declared_placement, ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};

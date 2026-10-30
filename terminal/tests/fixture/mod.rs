@@ -1,7 +1,7 @@
 //! Parses Verdandi's golden op dump back into `PaintList`s.
 //!
 //! The dump is a readable one-line-per-op rendering of the exact ops Verdandi's builder produced for
-//! each scenario. Parsing it here rather than depending on the builder keeps this crate's tests free
+//! each scenario. Parsing it here rather than depending on the builder keeps the tests that use it free
 //! of `terminal-frame`, `alacritty_terminal` and any `Term` -- the same ignorance property the
 //! backend itself has, applied to its tests.
 //!

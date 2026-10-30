@@ -1,14 +1,15 @@
 //! The y/n prompt sits inside the top bar, in real GTK -- where it did not (the integration GUI pass,
 //! 2026-09-26).
 //!
-//! **What this holds.** `ClosePrompt::ask` centres its label on the bar's height from the label's
-//! own measured height (`prompt_origin`). The label is hidden until that call, and GTK's
-//! `gtk_widget_measure` answers 0 for a widget that is not visible -- so the prompt was placed as if
-//! it had no height: its top edge at the bar's middle, its lower half hanging over the pane below
-//! (seen in Windowed and Fullscreen; Immersive places it at a fixed corner and was fine). This drives
-//! the product's own `ClosePrompt` (compiled in from `src/` below) in a window shaped like the real
-//! one -- a top bar of the real height with the prefix strip in it, over an overlay -- and reads
-//! where the label was really allocated.
+//! **What this holds.** The chrome's reconcile shows the controller's question (`ClosePrompt::show_model`), then
+//! centres its label on the bar's height from the label's own measured height (`ClosePrompt::measures`,
+//! `prompt_origin`, `ClosePrompt::place`). The label is hidden until it shows, and GTK's `gtk_widget_measure`
+//! answers 0 for a widget that is not visible -- so a prompt measured before it shows is placed as if it had no
+//! height: its top edge at the bar's middle, its lower half hanging over the pane below (seen in Windowed and
+//! Fullscreen; Immersive places it at a fixed corner and was fine). This drives the product's own `ClosePrompt`
+//! (compiled in from `src/` below) in a window shaped like the real one -- a top bar of the real height with the
+//! prefix strip in it, over an overlay -- through the reconcile's three steps, and reads where the label was
+//! really allocated.
 //!
 //! Needs a display, and never the real desktop: **it starts its own** (2026-09-29,
 //! `support/own_x_server.rs`) -- an `Xvfb` with a 1024x768 screen, pointed to before GTK
@@ -61,7 +62,7 @@ fn pump(ms: u64) {
     }
 }
 
-/// `(top, bottom)` of the prompt's label in the overlay's coordinates, after `ask`.
+/// `(top, bottom)` of the prompt's label in the overlay's coordinates, once it shows and is placed.
 fn prompt_box() -> Result<(f32, f32), String> {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(CSS);
@@ -95,7 +96,11 @@ fn prompt_box() -> Result<(f32, f32), String> {
     pump(300);
 
     let prompt = close_prompt::ClosePrompt::install(&overlay, &window, bar.upcast_ref(), strip.upcast_ref());
-    prompt.ask("kill-pane editor? nvim cannot be reopened in this window (y/n)", || {});
+    // What the chrome's reconcile does for a model whose prompt changed: show, then measure, then place.
+    prompt.show_model("kill-pane editor? nvim cannot be reopened in this window (y/n)");
+    let at = prompt.measures();
+    let (x, y) = eitri_core::wm::close::prompt_origin(at.bar_shown, at.strip_x, at.bar_height, at.label_height.max(0));
+    prompt.place(x, y);
     pump(300);
 
     let label = overlay

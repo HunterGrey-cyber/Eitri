@@ -585,7 +585,8 @@ pub struct Window1Editor {
     feeds: RefCell<FeedForward>,
     rpc: RefCell<Option<Rc<dyn EditorRpc>>>,
     own_session: RefCell<OwnSession>,
-    window2_plugins: RefCell<BTreeMap<String, PathBuf>>,
+    window2_plugins: RefCell<BTreeMap<String, BTreeMap<String, PathBuf>>>,
+    plugin_follows: RefCell<BTreeMap<String, eitri_core::window_link::editor_ops::FollowConfig>>,
     drawn_for_window2: RefCell<Option<DrawnForWindow2>>,
     overlay: RefCell<Option<OverlayHook>>,
     drive: RefCell<Option<Drive>>,
@@ -612,6 +613,7 @@ impl Window1Editor {
             rpc: RefCell::default(),
             own_session: RefCell::new(Rc::new(|_: &str| false)),
             window2_plugins: RefCell::default(),
+            plugin_follows: RefCell::default(),
             drawn_for_window2: RefCell::default(),
             overlay: RefCell::default(),
             drive: RefCell::default(),
@@ -656,13 +658,18 @@ impl Window1Editor {
         *self.drawn_for_window2.borrow_mut() = Some(drawn);
     }
 
-    /// The plugin `owner`'s page is in window 2 (`tree` its work tree, from this window's plugin table), or no
+    /// What the plugin `owner` follows in this window's editor (its socket, its filetypes and commands), kept for
+    /// when its page is in window 2 and its follow lines go there.
+    pub fn set_plugin_follow(&self, owner: &str, config: eitri_core::window_link::editor_ops::FollowConfig) {
+        self.plugin_follows.borrow_mut().insert(owner.to_owned(), config);
+    }
+
+    /// The plugin `owner`'s page is in window 2 (`roots` from this window's plugin table), or no
     /// longer is.
-    #[cfg_attr(not(test), allow(dead_code))] // Set as a plugin page moves between the windows.
-    pub fn set_plugin_in_window2(&self, owner: &str, tree: Option<PathBuf>) {
+    pub fn set_plugin_in_window2(&self, owner: &str, roots: Option<BTreeMap<String, PathBuf>>) {
         let mut plugins = self.window2_plugins.borrow_mut();
-        match tree {
-            Some(tree) => plugins.insert(owner.to_owned(), tree),
+        match roots {
+            Some(roots) => plugins.insert(owner.to_owned(), roots),
             None => plugins.remove(owner),
         };
     }
@@ -1011,7 +1018,11 @@ impl OpContext for Ctx<'_> {
         !(self.0.own_session.borrow())(session)
     }
 
-    fn plugin_tree_in_window2(&self, plugin: &str) -> Option<PathBuf> {
+    fn plugin_follow(&self, plugin: &str) -> Option<eitri_core::window_link::editor_ops::FollowConfig> {
+        self.0.plugin_follows.borrow().get(plugin).cloned()
+    }
+
+    fn plugin_roots_in_window2(&self, plugin: &str) -> Option<BTreeMap<String, PathBuf>> {
         self.0.window2_plugins.borrow().get(plugin).cloned()
     }
 
@@ -1151,6 +1162,132 @@ struct WaitingDraft {
 }
 
 type Consumer<T> = RefCell<Option<Rc<dyn Fn(T)>>>;
+
+/// A plugin host in window 2 translates its fixed local calls into typed requests; no Lua crosses the link.
+pub(crate) struct PluginEditorRpc {
+    owner: String,
+    roots: eitri_core::plugin::roots::Roots,
+    ops: Rc<EditorOps>,
+}
+
+impl PluginEditorRpc {
+    pub(crate) fn new(owner: String, roots: eitri_core::plugin::roots::Roots, ops: Rc<EditorOps>) -> Self {
+        Self { owner, roots, ops }
+    }
+
+    fn operation(&self, code: &'static str, args: &[rmpv::Value]) -> Result<EditorOp, String> {
+        use eitri_core::plugin::editor::{PLUGIN_ASSIST_LUA, PLUGIN_FOLLOW_LUA, PLUGIN_OPEN_LUA};
+        let plugin = self.owner.clone();
+        let map = args
+            .iter()
+            .find_map(rmpv::Value::as_map)
+            .ok_or("the plugin call has no fields")?;
+        let get = |name: &str| {
+            map.iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value)
+        };
+        let number = |name: &str| {
+            get(name)
+                .and_then(rmpv::Value::as_u64)
+                .ok_or_else(|| format!("missing {name}"))
+        };
+        let boolean = |name: &str| {
+            get(name)
+                .and_then(rmpv::Value::as_bool)
+                .ok_or_else(|| format!("missing {name}"))
+        };
+        let line = || {
+            get("line")
+                .and_then(rmpv::Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|e| e.to_string())
+        };
+        if std::ptr::eq(code, PLUGIN_OPEN_LUA) {
+            let value = get("path").ok_or("missing path")?;
+            let bytes = value
+                .as_slice()
+                .or_else(|| value.as_str().map(str::as_bytes))
+                .ok_or("invalid path")?;
+            let path = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+            if let Some((name, root)) = self.roots.iter().find(|(_, root)| Path::new(path).starts_with(root)) {
+                let path = Path::new(path)
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_str()
+                    .ok_or("path is not UTF-8")?
+                    .to_owned();
+                return Ok(EditorOp::PluginOpen {
+                    plugin,
+                    root: name.clone(),
+                    path,
+                    line: line()?,
+                    col: get("col")
+                        .and_then(rmpv::Value::as_u64)
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|e| e.to_string())?,
+                });
+            }
+            return Ok(EditorOp::PluginOpenLink {
+                plugin,
+                path: path.into(),
+                line: line()?,
+            });
+        }
+        if std::ptr::eq(code, PLUGIN_ASSIST_LUA) {
+            return match args.first().and_then(rmpv::Value::as_str) {
+                Some("apply") => Ok(EditorOp::PluginAssistApply {
+                    plugin,
+                    diagnostics: boolean("diagnostics")?,
+                    inlay_hints: boolean("inlay_hints")?,
+                }),
+                Some("clear") => Ok(EditorOp::PluginAssistClear { plugin }),
+                _ => Err("unknown assist operation".into()),
+            };
+        }
+        if std::ptr::eq(code, PLUGIN_FOLLOW_LUA) {
+            let buf = || number("buf");
+            return match args.first().and_then(rmpv::Value::as_str) {
+                Some("install") => Ok(EditorOp::PluginInstall { plugin }),
+                Some("follow") => Ok(EditorOp::PluginFollow {
+                    plugin,
+                    on: boolean("on")?,
+                }),
+                Some("text") => Ok(EditorOp::PluginText { plugin, buf: buf()? }),
+                Some("reveal") => Ok(EditorOp::PluginReveal {
+                    plugin,
+                    buf: buf()?,
+                    line: line()?.ok_or("missing line")?,
+                    token: number("token")?,
+                }),
+                Some("jump") => Ok(EditorOp::PluginJump {
+                    plugin,
+                    buf: buf()?,
+                    line: line()?.ok_or("missing line")?,
+                    col: u32::try_from(number("col")?).map_err(|e| e.to_string())?,
+                }),
+                // The snippet and its commands stay window 1's: a page ending here only stops following.
+                Some("teardown") => Ok(EditorOp::PluginFollow { plugin, on: false }),
+                _ => Err("unknown follow operation".into()),
+            };
+        }
+        Err("the plugin call is outside the editor operation table".into())
+    }
+}
+
+impl eitri_core::editor_rpc::EditorRpc for PluginEditorRpc {
+    fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>) -> Pending {
+        match self.operation(code, &args) {
+            Ok(op) => self.ops.send(op),
+            Err(why) => Pending::failed(RpcError::Encode(why)),
+        }
+    }
+    fn target(&self) -> Option<u64> {
+        self.ops.is_linked().then_some(1)
+    }
+}
 
 /// Window 2's side: the context, theme and keys window 1 tells it, its editor operations, and its editor requests.
 pub struct Window2Editor {
@@ -1782,6 +1919,227 @@ mod tests {
     }
 
     #[test]
+    fn a_page_ending_in_window_2_turns_its_following_off_and_leaves_window_1s_snippet() {
+        use eitri_core::plugin::{editor, roots::Roots};
+        let w = windows("plugin-teardown");
+        let proxy = PluginEditorRpc::new("markdown".into(), Roots::new(BTreeMap::new()), w.two.ops());
+        let args = vec![
+            rmpv::Value::from("teardown"),
+            rmpv::Value::Map(vec![(rmpv::Value::from("owner"), rmpv::Value::from("ignored"))]),
+        ];
+        assert_eq!(
+            proxy.operation(editor::PLUGIN_FOLLOW_LUA, &args),
+            Ok(EditorOp::PluginFollow {
+                plugin: "markdown".into(),
+                on: false
+            })
+        );
+    }
+
+    #[derive(Default)]
+    struct BufferPage(RefCell<Vec<serde_json::Value>>);
+
+    impl eitri_core::plugin::host::PagePort for BufferPage {
+        fn send(&self, text: &str) {
+            self.0.borrow_mut().push(serde_json::from_str(text).unwrap());
+        }
+        fn set_theme(&self, _: &eitri_core::plugin::theme::PageTheme) {}
+    }
+
+    fn window_two_plugin(w: &Windows) -> (eitri_core::plugin::host::PluginHost, Rc<BufferPage>) {
+        use eitri_core::plugin::{host::PluginHost, load::load_plugin};
+        let dir = w.root.join("plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("eitri-plugin.toml"),
+            r#"
+            id = "demo"
+            title = "Demo"
+            protocol = 1
+            site = "site"
+            entry = "index.html"
+            capabilities = ["editor.buffers", "editor.cwd"]
+            [roots]
+            work = "${plugin}"
+            [window]
+            root = "${plugin}"
+            title = "Demo"
+            layout = { module = "editor" }
+        "#,
+        )
+        .unwrap();
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &BTreeMap::new(), None).unwrap());
+        let page = Rc::new(BufferPage::default());
+        let host = PluginHost::new(plugin.clone(), page.clone(), std::sync::Arc::new(|| {}), None, vec![]);
+        host.set_editor(Rc::new(PluginEditorRpc::new(
+            "demo".into(),
+            plugin.roots.clone(),
+            w.two.ops(),
+        )));
+        (host, page)
+    }
+
+    #[test]
+    fn window_two_editor_buffers_verbs_answer_editor_unavailable_and_send_no_editor_op() {
+        let w = windows("buffers-refused");
+        let rpc = Rc::new(Answering {
+            calls: RefCell::default(),
+            answer: rmpv::Value::Nil,
+        });
+        w.one.set_rpc(rpc.clone());
+        // Give window 1 a valid holding: a refusal must come from the missing operation itself.
+        w.one
+            .set_plugin_in_window2("demo", Some(BTreeMap::from([("work".into(), w.root.join("plugin"))])));
+        let (host, page) = window_two_plugin(&w);
+        let root = w.root.join("plugin");
+        let path = root.join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let text = serde_json::json!({"title": "Attempt", "text": "a\n", "filetype": "rust"});
+        for (verb, args) in [
+            (
+                "editor.preload",
+                serde_json::json!({"path": path, "diagnostics": "on", "inlay_hints": "off"}),
+            ),
+            ("editor.modified", serde_json::json!({"root": root})),
+            ("editor.reload", serde_json::json!({"root": root})),
+            (
+                "editor.diff",
+                serde_json::json!({"left": text, "right": {"path": path}}),
+            ),
+        ] {
+            host.page_message(
+                &serde_json::json!({"v": 1, "id": 1, "verb": verb, "args": args}).to_string(),
+                Instant::now(),
+            );
+            assert!(w.settle(|| {
+                host.pump(Instant::now());
+                !page.0.borrow().is_empty()
+            }));
+            assert_eq!(
+                page.0.borrow_mut().remove(0)["error"]["code"],
+                "editor_unavailable",
+                "{verb}"
+            );
+        }
+        assert!(w.two.ops().waiting.borrow().is_empty(), "no editor op was queued");
+        assert!(rpc.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn window_two_editor_cd_answers_not_own_window() {
+        let w = windows("cd-refused");
+        let (host, page) = window_two_plugin(&w);
+        host.page_message(
+            &serde_json::json!({"v": 1, "id": 1, "verb": "editor.cd", "args": {"dir": w.root.join("plugin")}})
+                .to_string(),
+            Instant::now(),
+        );
+        assert_eq!(page.0.borrow()[0]["error"]["code"], "not_own_window");
+        assert!(w.two.ops().waiting.borrow().is_empty());
+    }
+
+    #[test]
+    fn window_two_hello_says_own_window_false() {
+        let w = windows("hello-own-false");
+        let (host, page) = window_two_plugin(&w);
+        host.page_message(r#"{"v":1,"id":1,"verb":"host.hello","args":{}}"#, Instant::now());
+        assert_eq!(page.0.borrow()[0]["result"]["own_window"], false);
+    }
+
+    #[test]
+    fn a_plugin_open_carries_the_matched_root_name_and_relative_path() {
+        use eitri_core::plugin::{editor::PLUGIN_OPEN_LUA, roots::Roots};
+        use rmpv::Value;
+        let roots = BTreeMap::from([
+            ("a".into(), PathBuf::from("/work/one")),
+            ("b".into(), PathBuf::from("/work/two")),
+        ]);
+        let proxy = PluginEditorRpc::new(
+            "demo".into(),
+            Roots::new(roots),
+            EditorOps::new(Steps::default().repeat()),
+        );
+        let args = vec![Value::Map(vec![
+            ("path".into(), Value::Binary(b"/work/two/src/lib.rs".to_vec())),
+            ("line".into(), 3.into()),
+            ("col".into(), 2.into()),
+        ])];
+        assert_eq!(
+            proxy.operation(PLUGIN_OPEN_LUA, &args).unwrap(),
+            EditorOp::PluginOpen {
+                plugin: "demo".into(),
+                root: "b".into(),
+                path: "src/lib.rs".into(),
+                line: Some(3),
+                col: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_plugins_fixed_calls_in_window_2_are_typed_and_answered_by_window_1() {
+        use eitri_core::plugin::{editor, roots::Roots};
+        let w = windows("plugin-ops");
+        w.one
+            .set_plugin_in_window2("markdown", Some(BTreeMap::from([("work".into(), w.root.clone())])));
+        w.one.set_plugin_follow(
+            "markdown",
+            eitri_core::window_link::editor_ops::FollowConfig {
+                socket: w.root.join("own-feed"),
+                scratch: None,
+                filetypes: vec!["markdown".into()],
+                commands: vec![("MarkdownPreview".into(), "toggle")],
+                auto: true,
+            },
+        );
+        let rpc = Rc::new(Answering {
+            calls: RefCell::default(),
+            answer: rmpv::Value::from(true),
+        });
+        w.one.set_rpc(rpc.clone());
+        let proxy = PluginEditorRpc::new(
+            "markdown".into(),
+            Roots::new(BTreeMap::from([("work".into(), w.root.clone())])),
+            w.two.ops(),
+        );
+        let requests = vec![
+            editor::open(&proxy, &w.root.join("src/a.rs"), Some(1), None),
+            editor::assist_apply(&proxy, "ignored", Path::new("/ignored"), true, false),
+            editor::assist_clear(&proxy, "ignored"),
+            editor::follow_install(
+                &proxy,
+                &editor::FollowInstall {
+                    owner: "ignored",
+                    socket: Path::new("/ignored"),
+                    filetypes: &[],
+                    auto: false,
+                    commands: &[],
+                    scratch_dir: None,
+                },
+            ),
+            editor::follow_on(&proxy, "ignored", true),
+            editor::follow_text(&proxy, "ignored", 3, 1, 1),
+            editor::follow_reveal(&proxy, "ignored", 3, 2, 8),
+            editor::follow_jump(&proxy, "ignored", 3, 2, 1),
+            editor::follow_teardown(&proxy, "ignored"),
+        ];
+        for request in requests {
+            let got = RefCell::new(None);
+            assert!(w.settle(|| {
+                if got.borrow().is_none() {
+                    *got.borrow_mut() = request.try_take();
+                }
+                got.borrow().is_some()
+            }));
+            assert!(got.into_inner().unwrap().is_ok());
+        }
+        assert_eq!(rpc.calls.borrow().len(), 9);
+        assert!(rpc.calls.borrow()[3..]
+            .iter()
+            .all(|code| std::ptr::eq(*code, editor::PLUGIN_FOLLOW_LUA)));
+    }
+
+    #[test]
     fn an_editor_op_from_window_2_is_answered_through_window_1s_dispatch() {
         let w = windows("ops");
         let rpc = Rc::new(Answering {
@@ -2109,6 +2467,60 @@ mod tests {
         scratch.cleanup();
     }
 
+    #[test]
+    fn a_failed_editor_show_reports_to_the_requesting_window_2() {
+        use eitri_core::layout::{Layout, LayoutError, ModuleId, Node, Workspaces};
+        use eitri_core::wm::fake::{FakeHost, FakeScheduler, Logged};
+        use eitri_core::wm::*;
+
+        let w = windows("show-refused");
+        let host = FakeHost::new();
+        host.set_editor_running(true);
+        let scheduler = FakeScheduler::new();
+        let mut controller = Controller::new(scheduler.clone());
+        controller.set_reads(host.clone());
+        controller.open_window(
+            WinId::MAIN,
+            WindowSpec {
+                role: WindowRole::Linked { side: LinkSide::First },
+                presence: EditorPresence::Owned,
+                title: "window 1".into(),
+            },
+            WindowParts::new(
+                Layout::new(Node::Leaf(ModuleId::agent()), ModuleId::agent()).unwrap(),
+                Workspaces::single(),
+                None,
+            ),
+        );
+        let driver = Driver::new(controller, host.clone(), scheduler);
+        assert_eq!(driver.query(|c| c.editor_request_refusal(WinId::MAIN)), None);
+        let drive = driver.clone();
+        w.one.set_drive(Rc::new(move |act: EditorAct<'_>, _: Option<String>| {
+            let keys = match act {
+                EditorAct::Request(request) => request.input_keys(),
+                EditorAct::Focus => String::new(),
+            };
+            drive.editor_request(WinId::MAIN, keys)
+        }));
+        w.two.set_draft_tab(Rc::new(|_| Some((TabId(4), None))));
+        let mut scratch = ScratchDir::in_dir(w.two.scratch.as_deref().unwrap()).unwrap();
+        let (request, edit) = scratch.prepare_edit("kept draft").unwrap();
+        w.two.request(&request, &|| None).unwrap();
+        assert!(w.settle(|| edit.poll().is_some()));
+        assert_eq!(
+            edit.poll(),
+            Some(EditDone::Failed(eitri_core::wm::feedback::layout_refusal_text(
+                &LayoutError::NotInTree(ModuleId::editor())
+            )))
+        );
+        assert_eq!(driver.query(|c| c.chrome(WinId::MAIN).toast), None);
+        assert!(!host.log().iter().any(|entry| matches!(
+            entry,
+            Logged::Op(HostOp::Editor(EditorCall::SendKeys { .. }) | HostOp::Focus { .. }, _)
+        )));
+        scratch.cleanup();
+    }
+
     /// What nvim does with a draft edit window 1 handed it: writes the text and the marker.
     fn nvim_writes(ask: &ScratchAsk, text: &str) {
         let ScratchAsk::Edit { body, done } = ask else {
@@ -2353,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_lines_reach_the_window_holding_the_page() {
+    fn a_follow_line_for_a_page_the_other_window_holds_goes_there() {
         let w = windows("follow");
         let got: Rc<RefCell<Vec<FollowBatch>>> = Rc::default();
         {
@@ -2385,8 +2797,10 @@ mod tests {
         // No page in window 2: every line is window 1's.
         assert_eq!(w.one.route_follow(both.clone()), both);
 
-        w.one
-            .set_plugin_in_window2("markdown", Some(w.root.join("work/markdown")));
+        w.one.set_plugin_in_window2(
+            "markdown",
+            Some(BTreeMap::from([("work".into(), w.root.join("work/markdown"))])),
+        );
         let here = w.one.route_follow(both);
         assert_eq!(
             here.views, other.views,
@@ -2404,6 +2818,14 @@ mod tests {
             lines[1..].iter().flat_map(|b| b.ordered.clone()).collect::<Vec<_>>(),
             batch("markdown").ordered,
             "and its commands, in their order"
+        );
+        drop(lines);
+        w.one.set_plugin_in_window2("markdown", None);
+        let back = batch("markdown");
+        assert_eq!(
+            w.one.route_follow(back.clone()),
+            back,
+            "a returned page keeps its next view and command here"
         );
         assert!(
             follow_batch("snotra", &view_line(&view("markdown", 1, ViewCause::User, None))).is_none(),

@@ -1,5 +1,4 @@
-//! Selection: drag, double/triple click, and turning the region into a copyable string
-//! (bottom-terminal phase 3b).
+//! Selection: drag, double/triple click, and turning the region into a copyable string.
 //!
 //! **Adopt, don't build**: `alacritty_terminal` 0.26 already carries the whole
 //! model -- `selection::{Selection, SelectionType}`, `Side`, `Term::selection` (a public field the

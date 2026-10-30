@@ -12,7 +12,8 @@ if reg == nil then
   reg = { owners = {}, buffers = {}, seq = 0, last = {} }
   rawset(_G, '__eitri_plugin_assist', reg)
 end
--- A registry left by a copy of this chunk from before `last` existed.
+-- A registry an older copy of this chunk made has no `last`: the registry is a global of the nvim, which can
+-- outlive one Eitri and be attached to by another.
 reg.last = reg.last or {}
 local all, shared = reg.owners, reg.buffers
 
@@ -101,7 +102,31 @@ local function assert_on(state, bufnr)
     local d, h = read(bufnr)
     -- Before any server attaches, hints read as off whatever the configuration will do; that is no value to
     -- restore, so the hint baseline waits for the first look after an attach.
-    b = { base_d = d, base_h = h, hint_pending = h ~= nil and not attached(bufnr), owners = {} }
+    local pending = h ~= nil and not attached(bufnr)
+    local own = vim.b[bufnr].eitri_plugin_preload_own
+    if own ~= nil then
+      -- A preload's record holds the buffer's values from before the preload changed them. A hint value it
+      -- has not learned yet is still the configuration's, as the preload writes none until it has.
+      d = own.diagnostics
+      if not own.hint_pending then
+        h, pending = own.inlay_hints, false
+      end
+      vim.b[bufnr].eitri_plugin_preload_own = nil
+      vim.b[bufnr].eitri_plugin_preload = nil
+      -- The assist now holds this buffer's values, so neither its preload's attach nor delayed holds may write.
+      local removed = {}
+      for _, autocmd in ipairs(vim.api.nvim_get_autocmds({ buffer = bufnr })) do
+        local name = autocmd.group_name or ''
+        if name:sub(1, #'eitri_plugin_preload_') == 'eitri_plugin_preload_' and not removed[autocmd.group] then
+          removed[autocmd.group] = true
+          vim.api.nvim_clear_autocmds({ group = autocmd.group, buffer = bufnr })
+          if #vim.api.nvim_get_autocmds({ group = autocmd.group }) == 0 then
+            pcall(vim.api.nvim_del_augroup_by_id, autocmd.group)
+          end
+        end
+      end
+    end
+    b = { base_d = d, base_h = h, hint_pending = pending, owners = {} }
     shared[bufnr] = b
   end
   b.owners[state.owner] = true

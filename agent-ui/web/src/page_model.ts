@@ -124,8 +124,8 @@ export type PageModel = {
   keymapHelp: KeymapHelp;
   /** The trust question Rust sent last, held until it can take the keys. It is not drawn on arrival: Rust asks
    *  again whenever a tab waiting for the answer is on screen without its question, including the moment after a
-   *  close prompt, a rename field or the chooser took the keys, and drawn at once it took the `y` meant for that
-   *  prompt or typed into that field. */
+   *  close prompt, a rename field or the chooser took the keys. Drawing it at once could take the `y` meant for
+   *  that prompt or typed into that field. */
   heldTrust: TrustPromptEnvelope | null;
   confirm: Confirmation;
   /** The inline rename field's tab and prefilled text (`prefix ,`), or `null`. The tab bar is shown even with
@@ -142,8 +142,8 @@ export type PageModel = {
    *  session -- across a switch away and back too, since Rust sends no snapshot for a failed tab. Dropped once
    *  the tab is no longer failed (`r`) or is closed. */
   keptStates: ReadonlyMap<TabId, AgentUiState>;
-  /** A fatal, session-ending failure, shown in the panel. It replaced `window.alert`, which cannot be copied,
-   *  cannot show the sidecar's own multi-line startup diagnostics, and blocks the WebView. */
+  /** A fatal, session-ending failure, shown in the panel so it can be copied and can carry multi-line
+   *  startup diagnostics without blocking the WebView as `window.alert` would. */
   fatalError: string | null;
   /** The command for a conversation that has just been closed here and moved to a terminal, set by the `handoff`
    *  envelope, which Rust sends only after the real session close finished.
@@ -158,13 +158,11 @@ export type PageModel = {
    *  An entry means that tab's conversation is CLOSING: Rust has already taken the backend out of its own state
    *  and a worker thread is running the real shutdown. Nothing is torn down here until the `handoff` envelope
    *  arrives, so without this the composer would stay live and a typed Enter would clear the box into a session
-   *  that no longer exists. Per tab, not per window: one window-wide id locked the composer of whichever tab was
-   *  on screen, so handing off tab 1 and switching to a live tab 2 left tab 2 refusing input until tab 1's close
-   *  answered. An entry is removed by its own `command_result` (Rust owes one for every handoff, including one
+   *  that no longer exists. Per tab, so handing off tab 1 does not lock a live tab 2's composer while tab 1's
+   *  close is pending. An entry is removed by its own `command_result` (Rust owes one for every handoff, including one
    *  whose tab was closed), or by a `handoff`/`error` envelope naming its tab. */
   handoffRequests: ReadonlyMap<TabId, string>;
-  /** A refused command, in words, on screen. Rust's refusals carry real human-readable reasons, and every one of
-   *  them used to reach a `console.warn` and nothing else. */
+  /** A refused command, in words, on screen so Rust's human-readable reason reaches the user. */
   commandNotice: string | null;
   /** See `CommandRecord`. Bookkeeping that nothing draws: the page records an outgoing request without a render
    *  and reads this only when the answer is reduced. */
@@ -402,7 +400,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         }
       }
       return {
-        ...model, state: applyCallNotes(applyEvents(model.state, envelope.events), envelope),
+        ...model, state: applyCallNotes(applyEvents(model.state, envelope.events, envelope.revisions), envelope),
         turnClock, turnDurations: durationsWith(model.turnDurations, envelope.turnTimes),
       };
     }

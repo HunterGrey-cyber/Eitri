@@ -55,9 +55,8 @@ def _install_sh_fixture(block=_SIGNERS_BLOCK):
             + "EITRI_RELEASE_SIGNERS\n}\n")
 
 
-# release_check.py's `twins` preflight requires fresh README and INSTALL translation pairs.
-# Build minimal README.md/README.zh-CN.md and INSTALL.md/INSTALL.zh-CN.md pairs here so the
-# fixture does not depend on the contents of publish/files/.
+# The preflight twins check requires fresh README and INSTALL language pairs in every source tree.
+# Build minimal pairs here so the fixture is independent of the public documentation's contents.
 def _twin_zh(english_name, english_text):
     digest = hashlib.sha256(english_text.encode("utf-8")).hexdigest()
     return f"[English]({english_name}) | 简体中文\n<!-- translated-from: {english_name} sha256={digest} -->\n\n# 中文\n"
@@ -101,8 +100,7 @@ class _Env:
         self.marker = os.path.join(root, "docker-calls")
         os.makedirs(os.path.join(self.home, ".ssh"))
         gitconfig = os.path.join(root, "gitconfig")
-        # Every fixture commit carries the public identity: preflight refuses a release commit that
-        # does not (F7, PublicCommitsRule).
+        # Every fixture commit carries the public identity because preflight refuses any other identity.
         _write(gitconfig, textwrap.dedent(f"""\
             [user]
             \tname = {_PUBLIC_NAME}
@@ -552,9 +550,8 @@ class EmbeddedKeyBindsRcSigning(ReleaseShTestCase):
         self.assertIn("packaging/release-signers already holds a release key", proc.stderr)
 
     def test_a_release_signers_override_naming_the_same_key_is_not_refused(self):
-        # The review's own wording: refuse an override "whose key is not in the embedded block" --
-        # one that names the *same* key the embedded block already holds is not what this rule
-        # exists to stop, and install.sh could verify it just as well as signing with no override.
+        # An override naming the same key as the embedded block is safe: install.sh can verify that
+        # signature just as it can without an override. Only an override outside the block must be refused.
         key = self.commit_a_real_key()
         same_key_signers = os.path.join(self.scratch, "same-key-signers")
         shutil.copy2(os.path.join(self.clone, "packaging", "release-signers"), same_key_signers)
@@ -620,8 +617,7 @@ class TwinFreshnessRule(ReleaseShTestCase):
     is refused first, by release_check's own message, with no docker call."""
 
     def test_editing_the_english_guide_without_its_twin_is_refused(self):
-        # The exact scenario the plan's acceptance line names: README.md changes, README.zh-CN.md
-        # (and its stale marker hash) does not follow.
+        # README.md changes while README.zh-CN.md and its marker hash stay stale: preflight must refuse.
         self.edit("README.md", "# fixture readme", "# fixture readme, edited")
         self.commit()
         proc = self.run_release("--unsigned")
@@ -740,9 +736,8 @@ class PublicCommitsRule(ReleaseShTestCase):
     read from it (git ls-remote; here the fixture's bare repo, through EITRI_PUBLIC_REPO_URL), never
     from the clone's own refs/remotes/origin/*, and HEAD is scanned even when the public repo has it."""
 
-    # Construct a synthetic address in two pieces to test commit-message scanning
-    # without placing a full address in this source file. The scanner also checks joined literals
-    # for private values, so splitting a real private value would not hide it.
+    # An invented address refused by the commit-message leak scan, split so this file passes it.
+    # Never use a real private value, even pieced: the scan joins pieced literals before checking them.
     LEAK = "someone@" + "mail.co.uk"
     SOMEONE = ("Someone Else", "someone@example.com")
 
@@ -792,8 +787,8 @@ class PublicCommitsRule(ReleaseShTestCase):
         self.assertIn("1 commit(s)", proc.stderr)
 
     def test_the_clones_own_origin_refs_do_not_say_what_is_public(self):
-        # A clone of a local clone (the plan's own rc.1 recipe): its origin/main is the release commit
-        # itself, while the public repo has none of these commits. The old range was empty.
+        # A clone of a local clone has origin/main at the release commit, while the public repo has
+        # none of these commits. Scanning only the origin/main range would miss them all.
         self.commit_as(f"Tidy up {self.LEAK}")
         self.commit_as("Release candidate 1.0.0-rc.1")
         self.env.git(self.clone, "update-ref", "refs/remotes/origin/main", "HEAD")
@@ -830,9 +825,8 @@ class PublicCommitsRule(ReleaseShTestCase):
         new = git_out("hash-object", "-t", "commit", "-w", "--stdin", stdin=text).strip()
         self.env.git(self.clone, "update-ref", ref_base + sha, new)
 
-    # A replacement changes what git log, rev-list and cat-file read, never what
-    # a push sends, so a commit "fixed" with `git replace --edit` was scanned as its stand-in and pushed
-    # as the original.
+    # Git replacements alter log, rev-list and cat-file reads but never what a push sends.
+    # Scan original objects so `git replace --edit` cannot hide content that will be published.
     def test_a_replacement_hiding_a_leaky_commit_is_refused(self):
         self.commit_as(f"Tidy up {self.LEAK}")
         self.stand_in("HEAD", "Tidy up")
@@ -1442,8 +1436,8 @@ class VerifyReleaseSignature(unittest.TestCase):
 
     def test_an_override_whose_blob_the_tracked_file_lists_under_another_principal_is_refused(self):
         _write(self.tracked, f'someone@else namespaces="eitri-release" {self.pubkey}\n')
-        # Both checks preflight and the old host_main made pass: the blob is listed in the tracked
-        # file, and the signature verifies against the override.
+        # Listing the blob in the tracked file and verifying against the override is insufficient:
+        # the embedded key must also match.
         self.assertEqual(subprocess.run(["bash", "-c", f'source "{_RELEASE_SH}"; '
                                          f'signers_list_blob "{self.tracked}" "{self.pubkey.split()[1]}"'],
                                         env=self.env.vars).returncode, 0)
@@ -1466,7 +1460,7 @@ class VerifyReleaseSignature(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_a_throwaway_rc_with_no_key_in_the_tracked_file_is_checked_against_the_override_only(self):
-        # rc.1's shape: nothing embedded yet, a throwaway key named by --release-signers.
+        # An rc with nothing embedded and a throwaway key named by --release-signers.
         _write(self.tracked, "# no key line yet\n")
         proc = self.verify(self.override)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1517,7 +1511,7 @@ class VerdandiPublicRevision(unittest.TestCase):
     def test_a_revision_only_a_mirror_had_fails_although_the_cache_still_holds_it(self):
         self.assertEqual(self.fetch("file://" + self.mirror, self.unpublished), 0)
         self.assertEqual(self.fetch("file://" + self.public, self.unpublished), 1)
-        # The old check -- the object is present -- would have passed here.
+        # The object being present alone does not establish that the branch was published.
         present = subprocess.run(["git", "-C", self.cache, "cat-file", "-e", self.unpublished + "^{commit}"],
                                  env=self.env.vars)
         self.assertEqual(present.returncode, 0)
@@ -1532,7 +1526,15 @@ class HostScans(unittest.TestCase):
     """host_scans, with the real publish/scan.sh, over a fixture of every view it builds. The asset install.sh is
     packaging/install.sh copied to the release's top level, where scan.sh's citation rule would read it under the root
     install.sh's path and allowance; that rule belongs to the source view alone, which holds the same file at its own
-    path, so the asset views pass and a citing comment added to the source view still fails."""
+    path, so the asset views pass and a citing comment added to the source view still fails. The scan's report-only
+    classes (dated history, unshipped-path pointers) print to stderr without changing the exit status; those lines
+    and their closing counts are reports, so only the other `[citation]` lines count as refusals here."""
+
+    _REPORT = re.compile(r"\[citation\] \(path, report\) |^scan\.sh: \d+ \[citation\] \(path\) report\(s\)$")
+
+    def refusals(self, proc):
+        return [line for line in (proc.stdout + proc.stderr).splitlines()
+                if "[citation]" in line and not self._REPORT.search(line)]
 
     def run_scans(self, extra_source_line=""):
         scan = os.path.join(_PACKAGING, "..", "publish", "scan.sh")
@@ -1561,13 +1563,13 @@ class HostScans(unittest.TestCase):
     def test_the_asset_views_pass_with_the_shipped_installer_at_the_top(self):
         proc = self.run_scans()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("[citation]", proc.stdout + proc.stderr)
+        self.assertEqual(self.refusals(proc), [])
 
     def test_a_citing_comment_added_to_the_source_view_still_fails(self):
         proc = self.run_scans(extra_source_line="# " + "spec \u00a74.2 says so\n")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("packaging/install.sh:", proc.stdout + proc.stderr)
-        self.assertIn("[citation]", proc.stdout + proc.stderr)
+        self.assertTrue(any(line.startswith("packaging/install.sh:") for line in self.refusals(proc)),
+                        proc.stdout + proc.stderr)
 
 
 class ReleaseNotes(unittest.TestCase):
@@ -1615,26 +1617,23 @@ class ReleaseNotes(unittest.TestCase):
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_no_release_signers_file_at_all_renders_the_no_key_variant(self):
-        # No packaging/release-signers in the fixture (the default rc.1 shape before the
-        # drift check would even let a real build reach this far): treated the same as an empty one.
+        # No packaging/release-signers in the fixture is treated the same as an empty file.
         notes = self.render()
         self.assertIn("carries no release key", notes)
         self.assertNotIn("built into it", notes)
 
     def test_an_empty_release_signers_file_never_claims_a_built_in_key(self):
-        # An --unsigned rc (RS_SIGN_KEY empty) with no key embedded: nothing signed, nothing to
-        # verify with. The signed case is the next test.
+        # An --unsigned rc (RS_SIGN_KEY empty) with no embedded key has no signature to verify.
+        # The signed case follows.
         notes = self.render(signers_text="# no key line yet\n")
         self.assertIn("carries no release key", notes)
         self.assertNotIn("built into it", notes)
         self.assertNotIn("ssh-keygen -Y verify -f release-signers", notes)
 
     def test_a_throwaway_signed_rc_with_no_embedded_key_never_claims_a_built_in_key(self):
-        # A signed release candidate with no embedded key: SHA256SUMS.sig exists
-        # (--sign with a throwaway key, checked against --release-signers), but the block
-        # install.sh embeds holds no key. rc.1's notes said "install.sh does both itself, with the
-        # release key built into it" -- a condition reading only RS_SIGN_KEY renders that again,
-        # and this is the test that says so (no other test does).
+        # SHA256SUMS.sig exists, signed by a throwaway key checked against --release-signers, while
+        # install.sh embeds no key. RS_SIGN_KEY alone must not make the notes claim the installer
+        # verifies the signature with a built-in key; that claim would be false.
         for signers_text in ("# no key line yet\n", None):
             with self.subTest(release_signers="comment only" if signers_text else "absent"):
                 notes = self.render(signers_text=signers_text, RS_SIGN_KEY="/a/throwaway/key")

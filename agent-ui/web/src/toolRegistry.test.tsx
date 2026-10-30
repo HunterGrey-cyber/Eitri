@@ -256,9 +256,8 @@ describe("renderToolCall", () => {
   });
 });
 
-/* The defect these cover: every registered renderer used to ignore the result entirely, so a
-   finished Bash call and one still executing rendered byte-identical markup. "Did that command
-   already run?" was unanswerable from the panel. */
+/* A finished call must be distinguishable from one still executing, so the panel answers
+   "Did that command already run?". */
 describe("a tool call's result", () => {
   it("marks a call with no result yet as still running", () => {
     const { container } = render(<>{renderToolCall(call({ result: null }))}</>);
@@ -285,8 +284,8 @@ describe("a tool call's result", () => {
   });
 
   it("renders a static notice instead of a permanent spinner for a call the panel knows is abandoned", () => {
-    // Before the fix, `result === null` meant "still running" unconditionally, so a call abandoned
-    // by session end or a resume/reload past its history boundary spun forever. `opts.abandoned` is
+    // A call abandoned by session end or a resume/reload past its history boundary must not spin
+    // forever just because its result is null. `opts.abandoned` is
     // `MessageList.tsx`'s own `isAbandonedCall` verdict, passed in here rather than recomputed --
     // this level only asserts what `renderToolCall`/`ToolResult` draw once told.
     const { container } = render(<>{renderToolCall(call({ result: null }), true, { abandoned: true })}</>);
@@ -396,7 +395,7 @@ describe("truncateResult counts and cuts in whole characters", () => {
     const hiddenPoints = 1_000;
     const text = `${"H".repeat(RESULT_HEAD_CHARS)}${ASTRAL.repeat(hiddenPoints)}${"T".repeat(RESULT_TAIL_CHARS)}`;
     const { hiddenChars } = truncateResult(text);
-    // The old code-unit arithmetic returned 2,000 here -- twice the truth.
+    // The 1,000 hidden astral characters occupy 2,000 code units; report characters.
     expect(hiddenChars).toBe(hiddenPoints);
   });
 
@@ -470,10 +469,8 @@ describe("a tool named after an Object.prototype member", () => {
 
 /* Named tools, a muted ToolSearch line and collapsed finished runs also share checks with
    an edit's diff (folded to a one-line path+counts summary anywhere except the detailed view
-   or an expanded row -- this replaced the original 6-line fold once Write/
-   Edit/NotebookEdit stopped folding into count-only runs and every one of them needed to be this
-   compact by default), a gated row (it says it waits rather than repeating the call) and the
-   detailed view's wider cuts. */
+   or an expanded row, since each edit draws its own row and needs a compact default), a gated row
+   (it says it waits rather than repeating the call) and the detailed view's wider cuts. */
 describe("the registry: runs, edits, gated calls and the detailed view", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
@@ -486,8 +483,8 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
   });
 
   /* CLI 2.1.283 renamed `Task` to `Agent` (permission_policy.rs's NEVER_ASK_TOOLS keeps both for
-     the same reason). Registering only the old name drew every subagent launch on the new CLI as
-     the generic pretty-printed JSON fallback. */
+     the same reason). Both names need a one-line view to avoid generic pretty-printed JSON for
+     subagent launches. */
   it("draws the subagent tool as a one-line row under both its names (Task on CLI 2.1.272, Agent on 2.1.283+)", () => {
     for (const name of ["Task", "Agent"]) {
       expect(lookupTool(name), name).toBeDefined();
@@ -523,14 +520,12 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
     expect(folded.replace(/<[^>]*>/g, "")).toContain("+10 −10");
     expect((folded.match(/class="diff-line/g) ?? []).length).toBe(0);
     // `expanded` is the same per-row flag `Enter` (`toggle-expand`, MessageList.tsx) already
-    // toggles for every tool row -- no new key, just a lower default fold.
+    // toggles for every tool row.
     const full = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Edit", input, result: null }, true, { expanded: true }));
     expect((full.match(/class="diff-line/g) ?? []).length).toBe(20);
   });
 
-  /** `opts.detailed` (`Ctrl+o`) used to reach only `ToolResult`'s own
-   *  head/tail cut, never `editConfig`'s `maxLines` -- a folded row stayed folded in the detailed
-   *  view too, so `Ctrl+o` alone never showed the diff `editConfig`'s own doc promised it would. */
+  /** `opts.detailed` (`Ctrl+o`) must expand the invocation diff as well as the result's head/tail cut. */
   it("Ctrl+o (opts.detailed) widens a folded edit's diff too, not only Enter", () => {
     const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
     const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
@@ -576,7 +571,7 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
 
   /** A deleted cell reads as a deletion, not a
    *  content-free "Writes the whole cell" note (`PermissionCard` and a completed row share this
-   *  same `EditDiff` view, so the fix at `editPreview` reaches both). */
+   *  same `EditDiff` view, so `editPreview` serves both). */
   it("names a deleted notebook cell instead of drawing an empty diff for it", () => {
     const out = html(
       renderToolCall(
@@ -606,9 +601,8 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
   });
 });
 
-/* A folded tool row used to be its invocation alone, so nothing said how much output a finished
-   `Bash`/`Read` had produced or whether it failed. It now shows the first lines of the result and how many
-   more there are -- Claude Code's own fold: three lines, then a muted `… +N lines (Enter to expand,
+/* A folded tool row shows the first result lines and how many more there are, so a finished
+   `Bash`/`Read` says how much output it produced and whether it failed. Claude Code's own fold: three lines, then a muted `… +N lines (Enter to expand,
    Ctrl+o for all)`, and a failed call in the error colour with its first line. The preview never scrolls on
    its own; `Enter` (the row's own expansion) and `Ctrl+o` (the detailed view) show the whole result. */
 describe("a folded result's preview", () => {

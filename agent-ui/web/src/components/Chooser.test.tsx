@@ -774,3 +774,18 @@ describe("the cursor follows its row when the rows change under a filter", () =>
     expect(props.onResume).toHaveBeenCalledWith("c-0000");
   });
 });
+
+
+it("a partner's session is named and selectable as plain text", () => {
+  for (const window of [1, 2]) {
+    const { root, props, getByText, unmount } = renderChooser({
+      envelope: { open: [], records: [{ providerSessionId: "partner", name: "<b>peer</b>", title: null, createdAt: "1", updatedAt: "2", heldElsewhere: true, heldByPartner: true, partnerWindow: window }] },
+    });
+    expect(getByText(`in window ${window}`)).toBeTruthy();
+    expect(getByText("<b>peer</b>").querySelector("b")).toBeNull();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(props.onResume).toHaveBeenCalledWith("partner");
+    unmount();
+  }
+});

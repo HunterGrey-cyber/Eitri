@@ -18,7 +18,8 @@
 //! - end-of-file on the lifetime pipe (the holder closed it, or the holder died and the kernel closed it): SIGTERM
 //!   to the task's group, SIGKILL two seconds later, the exit written, and the guard exits.
 //!
-//! A task that cannot start, or a command that does not arrive whole, is reported as `spawn-failed <why>`. Moving a task to another window moves the lifetime
+//! A task that cannot start, or a command that does not arrive whole, is reported as `spawn-failed <why>`.
+//! Moving a task to another window moves the lifetime
 //! write end and the status read end with its output pipes, so the task lives exactly as long as its holder and its
 //! status is never lost.
 

@@ -1,32 +1,20 @@
 #!/usr/bin/env bash
-# packaging/tests/e2e/run.sh -- the installer end to end, in
-# clean containers. Not part of the pytest suite (it is heavy, needs
-# docker and real internet, and builds a real sidecar per distro) -- run it by hand or from a
-# workflow, never from `python3 -m pytest packaging`.
+# packaging/tests/e2e/run.sh -- the installer end to end in clean containers.
+# Run by hand or from a workflow, never from `python3 -m pytest packaging`: it needs Docker,
+# real internet and a real sidecar build per distro.
 #
-# What this proves, per distro image, against a real release directory served on the host's own
-# 127.0.0.1:
-#   - the curl-piped and saved-then-`sh`-run install paths both work, non-interactively, as a
-#     non-root user, with `--with-nvim`;
-#   - the real `ssh-keygen -Y verify` path runs (openssh-client is in every image,
-#     and this script greps for the non-degraded "signature on SHA256SUMS: good" line, so a future
-#     accidental removal of openssh-client fails loudly instead of silently degrading to
-#     checksum-only);
-#   - the install layout, `eitri --version`, and the built sidecar's own `--version`
-#     (host_cli, protocol 3, the pinned Node);
-#   - on Ubuntu's own 0.9.5-nvim variant: Eitri's private nvim is fetched and used, and the
-#     distro's /usr/bin/nvim is byte-for-byte untouched;
-#   - a second run says "up to date"; `eitri --legacy` / `EITRI_AGENT_BACKEND=legacy eitri`
-#     both exit 1 naming the reason; `--uninstall` leaves nothing outside
-#     ~/.config/eitri and the state directory; there is no `sudo` in any image, so a maintainer
-#     script that tried to use it would fail loudly, and there is no maintainer script at all (REL-2
-#     below);
-#   - REL-1: `apt install ./eitri_*.deb` / `dnf install ./eitri-*.rpm` as root, then
-#     `eitri setup --yes` as the created non-root user, builds the sidecar reading only
-#     /usr/lib/eitri/RELEASE -- proved behaviourally, not just read off the source: the mirror
-#     `eitri setup` is pointed at carries no SHA256SUMS at all, so a fetch of it would 404 and the
-#     run would fail;
-#   - REL-2: the installed package ran no maintainer script, and `eitri setup` refuses as root.
+# Against a real release directory served on the host's 127.0.0.1 (where plain http is allowed), check:
+# - curl-piped and saved-then-`sh` installs as a non-root user, non-interactively, with `--with-nvim`;
+# - real `ssh-keygen -Y verify`: every image has openssh-client, and the required
+#   "signature on SHA256SUMS: good" line prevents silent degradation to checksum-only verification;
+# - the install layout, `eitri --version`, and the sidecar's `--version` (host_cli, protocol 3, pinned Node);
+# - Ubuntu's 0.9.5 nvim stays byte-identical while Eitri fetches and uses its private copy;
+# - a second run is up to date; `eitri --legacy` and `EITRI_AGENT_BACKEND=legacy eitri` exit 1
+#   with a reason; uninstall keeps only ~/.config/eitri and the state directory. No image has sudo,
+#   so an attempt to run it fails;
+# - REL-1: root installs the .deb/.rpm, then a non-root `eitri setup --yes` builds the sidecar from
+#   /usr/lib/eitri/RELEASE. Its mirror has no SHA256SUMS, so fetching that file would fail;
+# - REL-2: the package runs no maintainer script, and `eitri setup` refuses as root.
 #
 # Usage: packaging/tests/e2e/run.sh --release-dir DIR [--release-signers FILE]
 #                                   [--only NAME[,NAME...]] [--out DIR]
@@ -69,7 +57,7 @@ while [ $# -gt 0 ]; do
 		shift 2
 		;;
 	-h | --help)
-		sed -n '2,43p' "$0"
+		sed -n '2,31p' "$0"
 		exit 0
 		;;
 	*)
@@ -130,9 +118,8 @@ mkdir -p -- "$SCRATCH/serve/full/releases/latest/download" "$SCRATCH/serve/full/
 	"$SCRATCH/serve/setuponly/releases/download/v$VERSION" "$SCRATCH/homes" "$SCRATCH/scripts"
 
 log "preparing the release mirror from $RELEASE_DIR"
-# releases/latest/download/ + releases/download/v<X>/ (GitHub's own layout, as the
-# --base-url doc describes) plus a bare install.sh for the piped example -- symlinks, so the ~150MB source
-# asset is never copied.
+# releases/latest/download/ + releases/download/v<X>/ match GitHub's layout for --base-url.
+# A bare install.sh serves the piped example; symlinks avoid copying the ~150MB source asset.
 for f in "$RELEASE_DIR"/*; do
 	name="$(basename "$f")"
 	ln -s -- "$f" "$SCRATCH/serve/full/releases/download/v$VERSION/$name"

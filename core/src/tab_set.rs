@@ -18,7 +18,7 @@ use agent::{AgentDomainEvent, PromptOrigin, RevisedDelivery};
 pub use crate::agent_backend::AgentId;
 use crate::agent_backend::{AgentBackend, BackendError, BackendKind, QuestionSend};
 use crate::agent_bridge::{
-    serialize_events_with_notes_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
+    serialize_events_with_notes_and_revisions_for_js, serialize_handoff_for_js, serialize_snapshot_with_notes_for_js,
     serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView, TurnTime,
 };
 use crate::attention::{Attention, AttentionTracker};
@@ -32,6 +32,13 @@ pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHando
 
 #[cfg(test)]
 mod move_tests;
+
+/// The work held by one chat view, including its background tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewActivity {
+    pub running: u32,
+    pub queued: u32,
+}
 
 /// The first turn of a session started by it, composed when Enter was pressed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1309,6 +1316,10 @@ pub struct TabSet {
     /// Tabs frozen for a move to the other window: they take no input and answer no card until the
     /// move is done ([`TabSet::hand_over`]) or does not happen ([`TabSet::unfreeze`]).
     moving: BTreeSet<u64>,
+    /// Chats arriving from the other window, by move id: each session and the tab id held for it.
+    /// Presence counts each hold before the other window lets go, until that move's drop after adoption
+    /// ([`TabSet::hold_arrival`], [`TabSet::drop_arrival`]).
+    arrivals: BTreeMap<u64, (String, TabId)>,
     /// When a tab's move was first refused because its running turn's session is not known yet, and when
     /// it was last refused so: the move waits for it a bounded while, then is refused for good.
     unbound_since: BTreeMap<u64, (std::time::Instant, std::time::Instant)>,
@@ -1396,6 +1407,7 @@ impl TabSet {
             untracked_turns: BTreeMap::new(),
             presence_false_owed: false,
             moving: BTreeSet::new(),
+            arrivals: BTreeMap::new(),
             unbound_since: BTreeMap::new(),
             project_root: None,
             held_pump: None,
@@ -1527,6 +1539,7 @@ impl TabSet {
             .collect();
         running.extend(self.retiring.keys().copied());
         running.extend(self.starting.iter().copied());
+        running.extend(self.arrivals.values().map(|(_, tab)| tab.0));
         running
     }
 
@@ -1710,6 +1723,36 @@ impl TabSet {
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
     }
+    /// Reorders the base view's complete tab list, preserving extra views and their numbers. A tab that was here
+    /// keeps its own number while that number is free and still follows the tab before it; a tab in `arrived`, and
+    /// one whose number cannot be kept, takes the lowest free number after the tab before it.
+    pub fn order_base_tabs(&mut self, order: &[TabId], arrived: &[TabId]) -> bool {
+        let base = self.base_tabs();
+        let wanted: std::collections::BTreeSet<_> = order.iter().copied().collect();
+        if order.len() != base.len() || wanted.len() != base.len() || base.iter().any(|id| !wanted.contains(id)) {
+            return false;
+        }
+        let used: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.view.is_base())
+            .map(|t| t.number)
+            .collect();
+        let mut number = 1;
+        for id in order {
+            let own = self.get(*id).unwrap().number;
+            if !arrived.contains(id) && own >= number && !used.contains(&own) {
+                number = own;
+            }
+            while used.contains(&number) {
+                number += 1;
+            }
+            self.get_mut(*id).unwrap().number = number;
+            number += 1;
+        }
+        self.tabs.sort_by_key(|t| t.number);
+        true
+    }
     pub fn get(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|t| t.id == id)
     }
@@ -1788,9 +1831,14 @@ impl TabSet {
     /// caller selects it or binds it. A tab opened straight into an extra view goes through here so
     /// it is never the base view's active tab, not even for a moment.
     fn insert_tab(&mut self, agent: AgentId, told: bool) -> TabId {
-        let used: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
         let id = TabId(self.next_id);
         self.next_id += 1;
+        self.insert_tab_as(id, agent, told)
+    }
+
+    /// [`TabSet::insert_tab`] under an id already taken from `next_id` (an arrival's, held for it).
+    fn insert_tab_as(&mut self, id: TabId, agent: AgentId, told: bool) -> TabId {
+        let used: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
         let number = tabs::lowest_free_number(&used);
         let mode = if told {
             self.mode_offered_to(&agent, self.default_mode, number)
@@ -1852,6 +1900,11 @@ impl TabSet {
         self.select(id);
         debug_assert!(self.v1_holds());
         Some(id)
+    }
+
+    pub fn has_last(&self) -> bool {
+        self.last_active
+            .is_some_and(|id| self.get(id).is_some_and(|t| t.view.is_base()))
     }
 
     pub fn select_last(&mut self) -> Option<TabId> {
@@ -1979,6 +2032,23 @@ impl TabSet {
         let mut views: Vec<ViewId> = self.tabs.iter().filter(|t| !t.view.is_base()).map(|t| t.view).collect();
         views.sort();
         views
+    }
+
+    /// Activity of every view holding a tab, in view order.
+    pub fn view_activity(&self) -> Vec<(ViewId, ViewActivity)> {
+        let mut activity = BTreeMap::new();
+        for tab in &self.tabs {
+            let entry = activity
+                .entry(tab.view)
+                .or_insert(ViewActivity { running: 0, queued: 0 });
+            entry.running = entry.running.saturating_add(u32::from(
+                matches!(tab.backend, TabBackend::Starting(_)) || tab.turn_running(),
+            ));
+            entry.queued = entry
+                .queued
+                .saturating_add(tab.session.queue.len().try_into().unwrap_or(u32::MAX));
+        }
+        activity.into_iter().collect()
     }
 
     /// The base view's tabs, in tab order.
@@ -3160,7 +3230,7 @@ impl TabSet {
         let from_revision = tagged
             .get(shown)
             .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
-        let events: Vec<AgentDomainEvent> = tagged.into_iter().map(|(_, event)| event).collect();
+        let (revisions, events): (Vec<u64>, Vec<AgentDomainEvent>) = tagged.into_iter().unzip();
         let (in_snapshot, fresh) = events.split_at(shown);
         for event in &events {
             match event {
@@ -3247,7 +3317,14 @@ impl TabSet {
             // on their own.
             if !fresh.is_empty() || !fresh_notes.is_empty() {
                 arm.delivered = Some((
-                    serialize_events_with_notes_for_js(live.id, from_revision, through_revision, fresh, &fresh_notes),
+                    serialize_events_with_notes_and_revisions_for_js(
+                        live.id,
+                        from_revision,
+                        through_revision,
+                        fresh,
+                        &fresh_notes,
+                        Some(&revisions[shown..]),
+                    ),
                     crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty()),
                 ));
             }
@@ -6032,6 +6109,32 @@ mod tests {
     }
 
     #[test]
+    fn tab_has_last_only_when_the_previous_tab_still_belongs_to_the_base_view() {
+        let mut set = set();
+        assert!(!set.has_last());
+        assert_eq!(set.select_last(), None);
+
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let active = set.active();
+        assert!(set.has_last());
+        assert_eq!(set.active(), active);
+        assert_eq!(set.last_active, Some(one));
+        assert_eq!(set.select_last(), Some(one));
+
+        assert_eq!(set.break_out(view(2)), Ok(one));
+        set.last_active = Some(one);
+        assert!(!set.has_last());
+        assert_eq!(set.select_last(), None);
+
+        set.remove(one).unwrap();
+        set.last_active = Some(one);
+        assert!(!set.has_last());
+        assert_eq!(set.select_last(), None);
+        assert_eq!(set.active(), two);
+    }
+
+    #[test]
     fn next_and_previous_wrap_last_goes_back_and_a_missing_number_selects_nothing() {
         let mut set = set();
         let one = set.active();
@@ -6712,6 +6815,32 @@ mod tests {
             !payload.as_deref().unwrap_or_default().contains("permission_requested"),
             "the snapshot drew the card; the tick does not send it again: {payload:?}"
         );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn view_activity_counts_running_and_queued_per_view() {
+        let dir = workspace("tabs-view-activity");
+        let mut set = set();
+        let base = set.active();
+        let queued = set.open(AgentId::Claude);
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(two), Ok(queued));
+        let (provider, backend) = live(&dir);
+        set.get_mut(base).unwrap().backend = TabBackend::Live(backend);
+        let (_queued_provider, backend) = live(&dir);
+        set.get_mut(queued).unwrap().backend = TabBackend::Live(backend);
+        set.queue_message(queued, "later", "later".into(), 1, false).unwrap();
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        until("the turn starts", || set.running_count() == 1);
+        assert_eq!(
+            set.view_activity(),
+            vec![
+                (ViewId::BASE, ViewActivity { running: 1, queued: 0 }),
+                (two, ViewActivity { running: 0, queued: 1 }),
+            ]
+        );
+        assert_eq!(set.queued_count(), 1);
         shut_down_all(&mut set);
     }
 
@@ -8550,6 +8679,57 @@ mod tests {
             "the snapshot carries every recorded turn, oldest first"
         );
         assert_eq!(all[0]["endedAtMs"].as_u64().unwrap(), ended_at);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn an_auto_answered_request_keeps_the_reply_revision_and_duration_anchor() {
+        let dir = workspace("tabs-turn-times-revision-gap");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        // Leave a folded event queued while its snapshot is drawn: only the suffix needs tags.
+        provider.queue(text_delta("t1", "covered"));
+        wait_for_fold(&set, tab, "covered");
+        set.active_state_payloads();
+        let base = set.get(tab).unwrap().live().unwrap().projection().last_revision;
+        provider.queue(call_started(
+            "read",
+            "Read",
+            serde_json::json!({ "file_path": "main.rs" }),
+        ));
+        provider.queue(read("perm-read"));
+        provider.queue(text_delta("t1", "done"));
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        until("the whole batch to fold before delivery", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision >= base + 4
+        });
+        let payload = set.pump(&dir, true).active_payload.expect("the completed batch");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let events = value["events"].as_array().unwrap();
+        let revisions = value["revisions"].as_array().unwrap();
+        assert_eq!(events.len(), revisions.len());
+        assert_eq!(
+            revisions,
+            &vec![
+                serde_json::json!(base + 1),
+                serde_json::json!(base + 3),
+                serde_json::json!(base + 4)
+            ]
+        );
+        assert!(events.iter().all(|event| event["type"] != "permission_requested"));
+        assert_eq!(provider.resolutions(), vec![("perm-read".into(), true)]);
+        let reply = events
+            .iter()
+            .position(|event| event["type"] == "content_delta")
+            .unwrap();
+        assert_eq!(
+            value["turnTimes"][0]["anchorSeq"],
+            revisions[reply].as_u64().unwrap() - 1
+        );
         shut_down_all(&mut set);
     }
 
@@ -16774,6 +16954,30 @@ mod steer_tests {
         let (_dir, mut set, tab, _provider) = running_codex("steer-envelope-no", false);
         assert_eq!(set.get(tab).unwrap().steers(), Some(false));
         shut_down(&mut set);
+    }
+
+    #[test]
+    fn ordering_base_tabs_keeps_the_numbers_of_tabs_already_here_and_numbers_arrivals_after_them() {
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+        let one = tabs.active();
+        let two = tabs.open(AgentId::Claude);
+        let three = tabs.open(AgentId::Claude);
+        tabs.remove(two).unwrap();
+        // The lowest free number is the gap, so the first arrival lands between the tabs that were here.
+        let a = tabs.open(AgentId::Claude);
+        let b = tabs.open(AgentId::Claude);
+        assert_eq!(tabs.get(a).unwrap().number, 2);
+        assert!(tabs.order_base_tabs(&[one, three, a, b], &[a, b]));
+        let numbers: Vec<_> = [one, three, a, b]
+            .iter()
+            .map(|t| tabs.get(*t).unwrap().number)
+            .collect();
+        assert_eq!(numbers, vec![1, 3, 4, 5]);
+        assert_eq!(tabs.base_tabs(), vec![one, three, a, b]);
+        assert!(
+            !tabs.order_base_tabs(&[one, three, a], &[]),
+            "an order missing a tab is refused"
+        );
     }
 }
 

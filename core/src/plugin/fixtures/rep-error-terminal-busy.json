@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "re": 55,
+  "ok": false,
+  "error": {
+    "code": "busy",
+    "message": "a program is running in the terminal"
+  }
+}

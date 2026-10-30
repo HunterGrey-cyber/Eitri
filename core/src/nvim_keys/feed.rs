@@ -1,10 +1,10 @@
-//! The transport half of the nvim report: a fourth
-//! nvim->host push socket, nvim writing one JSON line per changed report, the host polling.
+//! The nvim report's push socket: nvim writes one JSON line per changed report, the host polls.
 //!
-//! Deliberately a structural copy of `crate::editor_context::feed` -- same instance directory
-//! scheme, same `--cmd` loader, same non-blocking listener drained from the host's main loop, and
-//! the same bounded reader (`crate::line_feed`) -- because that protocol is in production and its
-//! failure modes are already paid for. Read that module's comments before changing anything here.
+//! A structural copy of `crate::editor_context::feed`, whose protocol is in production: both build
+//! their instance directory with the shared `crate::instance_dir` helpers and read through the
+//! shared bounded reader (`crate::line_feed`); the guarded `--cmd` loader and the non-blocking
+//! listener's setup are parallel copies. Both feeds therefore obey the same bounds and handle the
+//! same failure modes. Read that module's comments before changing anything here.
 //!
 //! What crosses this socket is nvim-supplied bytes, so the reader treats it as untrusted: a line
 //! that is not a v1 report ([`super::parse_report`]), or is larger than the line cap, is dropped

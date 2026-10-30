@@ -1,6 +1,5 @@
 /* The agent panel's mapping of highlight.js classes onto the editor's syntax colours, copied so code reads the same in
    both. */
-/* Syntax keeps the editor's language palette. */
 .hljs-keyword, .hljs-selector-tag {
   color: var(--nv-syn-keyword);
 }

@@ -7,8 +7,8 @@
 //! [`inbound_event`] turns what the link thread passed on into the controller's [`PeerEvent`]s: the move protocol's
 //! messages and the link's end. The descriptors of a `move` move into the event; any that arrive with another
 //! message are closed here and logged, as a move's machine treats a packet out of turn. The pair's other messages
-//! (the editor's feeds, review, the raise on `focus`, `away`) keep their own handlers on the link and are not the
-//! controller's.
+//! (the editor's feeds and review) keep their own handlers on the link. Pair focus and output facts go through
+//! [`pair_event`], called by the pair's single handler for each kind.
 
 use std::io;
 use std::os::fd::OwnedFd;
@@ -23,14 +23,21 @@ use eitri_core::wm::moves::MoveKind;
 use eitri_core::wm::{Descriptors, Handoff, HostEvent, PeerEvent, PeerId, PeerPort};
 
 /// The kinds of message the controller hears from the other window: the move protocol's.
-pub(crate) const MOVE_KINDS: [&str; 6] = [
+pub(crate) const MOVE_KINDS: [&str; 9] = [
     "move_offer",
     "move_ready",
     "move_refused",
     "move",
     "move_done",
     "move_abort",
+    "move_ask",
+    "workspace_move",
+    "swap",
 ];
+
+/// The longest session id a `move_ask` may name: a provider's session or thread id is far shorter, and anything
+/// longer is not one.
+const SESSION_MAX: usize = 256;
 
 /// One window's end of the link as the port sends on it: the link's handle, or what wraps it on the GTK thread.
 pub(crate) trait LinkSend {
@@ -127,6 +134,21 @@ pub(crate) fn inbound_event(peer: PeerId, inbound: Inbound) -> Option<HostEvent>
                 None
             }
         },
+        Msg::WorkspaceMove {
+            group,
+            name,
+            tree,
+            moves,
+            swap,
+        } => Some(PeerEvent::WorkspaceMove {
+            peer,
+            group,
+            name,
+            tree,
+            moves,
+            swap,
+        }),
+        Msg::Swap { move_a, move_b } => Some(PeerEvent::Swap { peer, move_a, move_b }),
         Msg::MoveReady { mv } => Some(PeerEvent::MoveReady { peer, id: MoveId(mv) }),
         Msg::MoveRefused { mv, why } => Some(PeerEvent::MoveRefused {
             peer,
@@ -139,6 +161,11 @@ pub(crate) fn inbound_event(peer: PeerId, inbound: Inbound) -> Option<HostEvent>
             id: MoveId(mv),
             why,
         }),
+        Msg::MoveAsk {
+            module,
+            session,
+            follow,
+        } => asked(peer, module, session, follow),
         _ => None,
     };
     if !fds.is_empty() {
@@ -147,6 +174,29 @@ pub(crate) fn inbound_event(peer: PeerId, inbound: Inbound) -> Option<HostEvent>
     }
     drop(fds);
     event.map(HostEvent::Peer)
+}
+
+/// A `move_ask` as the controller hears it; `None`, logged, for one naming a module this build cannot read or a session
+/// no provider would have, which is dropped as a key for a missing module is.
+fn asked(peer: PeerId, module: Option<String>, session: Option<String>, follow: bool) -> Option<PeerEvent> {
+    let module = match module.as_deref().map(ModuleId::parse) {
+        None => None,
+        Some(Ok(module)) => Some(module),
+        Some(Err(err)) => {
+            eprintln!("[link] the other window asked for a module this window cannot read: {err}");
+            return None;
+        }
+    };
+    if session.as_ref().is_some_and(|s| s.len() > SESSION_MAX) {
+        eprintln!("[link] the other window asked for a session id over {SESSION_MAX} bytes; dropped");
+        return None;
+    }
+    Some(PeerEvent::MoveAsk {
+        peer,
+        module,
+        session,
+        follow,
+    })
 }
 
 /// The refusal the other window gets for an offer this window cannot read (a module or a kind this build does not
@@ -162,6 +212,44 @@ fn offered(module: &str, kind: &str) -> Result<(ModuleId, MoveKind), String> {
     let module = ModuleId::parse(module).map_err(|e| format!("the module {module:?}: {e}"))?;
     let kind = MoveKind::from_wire(kind).ok_or_else(|| format!("this window does not know a {kind:?} to move"))?;
     Ok((module, kind))
+}
+
+/// Pair messages retain their single link handler and report their facts to the controller through it.
+pub(crate) fn pair_event(peer: PeerId, msg: &Msg) -> Option<PeerEvent> {
+    match msg {
+        Msg::Summary(summary) => Some(PeerEvent::Summary {
+            peer,
+            summary: summary.clone(),
+        }),
+        Msg::Workspace { name, token } => Some(PeerEvent::Workspace {
+            peer,
+            name: name.clone(),
+            token: token.clone(),
+        }),
+        Msg::Focus { target, token } => Some(PeerEvent::FocusIntent {
+            peer,
+            target: target.clone(),
+            token: token.clone(),
+        }),
+        Msg::Away { ids } => Some(PeerEvent::Held {
+            peer,
+            ids: ids
+                .iter()
+                .filter_map(|id| match ModuleId::parse(id) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        eprintln!("[link] a held module id {id:?} could not be read: {err}");
+                        None
+                    }
+                })
+                .collect(),
+        }),
+        Msg::Monitor { connector, .. } => Some(PeerEvent::Monitor {
+            peer,
+            connector: connector.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// The event posted once a wake of `peer`'s link has been drained: a confirmed send may have been answered.
@@ -273,6 +361,37 @@ mod tests {
                 why: "gone".into()
             })
         );
+        assert_eq!(
+            peer_event(msg(Msg::MoveAsk {
+                module: Some("terminal#2".into()),
+                session: None,
+                follow: true,
+            })),
+            Some(PeerEvent::MoveAsk {
+                peer: PEER,
+                module: Some(ModuleId::parse("terminal#2").unwrap()),
+                session: None,
+                follow: true,
+            })
+        );
+        for unreadable in [
+            Msg::MoveAsk {
+                module: Some("terminal#1".into()),
+                session: None,
+                follow: false,
+            },
+            Msg::MoveAsk {
+                module: None,
+                session: Some("s".repeat(SESSION_MAX + 1)),
+                follow: false,
+            },
+        ] {
+            assert_eq!(
+                peer_event(msg(unreadable)),
+                None,
+                "an ask this window cannot read is dropped"
+            );
+        }
         assert_eq!(peer_event(Inbound::Closed), Some(PeerEvent::LinkClosed { peer: PEER }));
         assert_eq!(
             peer_event(Inbound::Refused(LinkError::UnknownKind("helo".into()))),
@@ -410,5 +529,113 @@ mod tests {
             .send(Msg::MoveAbort { mv: 3, why: "x".into() }, Some(foreign))
             .is_err());
         assert_eq!(sent.0.borrow().len(), 3, "nothing goes out without the descriptors");
+    }
+    #[test]
+    fn pair_messages_reach_the_controller_as_peer_events() {
+        use eitri_core::window_link::{FocusTarget, Side};
+        let summary = Summary {
+            waiting: 1,
+            unseen: 2,
+            running: 3,
+            queued: 4,
+            workspaces: vec!["<peer>".into()],
+        };
+        assert_eq!(
+            pair_event(PEER, &Msg::Summary(summary.clone())),
+            Some(PeerEvent::Summary { peer: PEER, summary })
+        );
+        assert_eq!(
+            pair_event(
+                PEER,
+                &Msg::Workspace {
+                    name: "<peer>".into(),
+                    token: Some("token".into())
+                }
+            ),
+            Some(PeerEvent::Workspace {
+                peer: PEER,
+                name: "<peer>".into(),
+                token: Some("token".into())
+            })
+        );
+        let workspace = Msg::WorkspaceMove {
+            group: 9,
+            name: "work".into(),
+            tree: serde_json::json!({"tiled": "agent"}),
+            moves: vec![1, 3],
+            swap: Some(8),
+        };
+        assert_eq!(
+            peer_event(msg(workspace)),
+            Some(PeerEvent::WorkspaceMove {
+                peer: PEER,
+                group: 9,
+                name: "work".into(),
+                tree: serde_json::json!({"tiled": "agent"}),
+                moves: vec![1, 3],
+                swap: Some(8)
+            })
+        );
+        assert_eq!(
+            peer_event(msg(Msg::Swap { move_a: 9, move_b: 8 })),
+            Some(PeerEvent::Swap {
+                peer: PEER,
+                move_a: 9,
+                move_b: 8
+            })
+        );
+        assert!(MOVE_KINDS.contains(&"workspace_move") && MOVE_KINDS.contains(&"swap"));
+        let targets = [
+            FocusTarget::Window,
+            FocusTarget::Module { id: "editor".into() },
+            FocusTarget::Edge { side: Side::Left },
+            FocusTarget::Edge { side: Side::Right },
+            FocusTarget::Edge { side: Side::Up },
+            FocusTarget::Edge { side: Side::Down },
+        ];
+        for target in targets {
+            for token in [None, Some("activation".to_string())] {
+                assert_eq!(
+                    pair_event(
+                        PEER,
+                        &Msg::Focus {
+                            target: target.clone(),
+                            token: token.clone()
+                        }
+                    ),
+                    Some(PeerEvent::FocusIntent {
+                        peer: PEER,
+                        target: target.clone(),
+                        token
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            pair_event(
+                PEER,
+                &Msg::Away {
+                    ids: vec!["terminal#2".into(), "terminal#1".into(), "editor".into()]
+                }
+            ),
+            Some(PeerEvent::Held {
+                peer: PEER,
+                ids: vec![ModuleId::parse("terminal#2").unwrap(), ModuleId::editor()]
+            })
+        );
+        assert_eq!(
+            pair_event(
+                PEER,
+                &Msg::Monitor {
+                    connector: "DP-1".into(),
+                    description: "Left".into()
+                }
+            ),
+            Some(PeerEvent::Monitor {
+                peer: PEER,
+                connector: "DP-1".into()
+            })
+        );
+        assert_eq!(pair_event(PEER, &Msg::MoveReady { mv: 1 }), None);
     }
 }

@@ -28,7 +28,7 @@ import { NONCE_ATTR } from "./env";
 
 /* The languages READMEs and notes are written in, registered from `lib/core` rather than the default bundle of
    about 190, and never guessed: a fence without a known language is plain text. The set adds at most five times
-   highlight.js's own core to the page (about 88 KB minified over a 21 KB core when it was chosen);
+   highlight.js's own core to the page (about 88 KB minified over a 21 KB core);
    `highlight.size.test.ts` holds that, so a grammar added later is weighed against the same budget. */
 const GRAMMARS = [
   ["bash", bash], ["c", c], ["cpp", cpp], ["csharp", csharp], ["css", css], ["diff", diff],

@@ -200,6 +200,7 @@ fn decided_here(action: &Action) -> bool {
         | Action::WindowImmersive
         | Action::Module(_)
         | Action::ModuleHide
+        | Action::ModuleHideByKey
         | Action::ModuleKill
         | Action::InstanceNew { .. }
         | Action::Split { .. }
@@ -213,8 +214,8 @@ fn decided_here(action: &Action) -> bool {
         | Action::WindowOther
         | Action::MoveToWindow { .. }
         | Action::WorkspaceToWindow { .. }
-        | Action::WorkspaceSwapWindow => true,
-        Action::FloatToggle
+        | Action::WorkspaceSwapWindow
+        | Action::FloatToggle
         | Action::FocusModeToggle
         | Action::ScratchpadMove
         | Action::ScratchpadShow { .. }
@@ -223,7 +224,7 @@ fn decided_here(action: &Action) -> bool {
         | Action::PanelCommandLine
         | Action::Tab(_)
         | Action::TabBreak
-        | Action::Text(_) => false,
+        | Action::Text(_) => true,
     }
 }
 
@@ -287,6 +288,7 @@ fn one_of_each() -> Vec<Action> {
         Action::Swap(SwapTarget::Next),
         Action::Even(Axis::Column),
         Action::ModuleHide,
+        Action::ModuleHideByKey,
         Action::ModuleKill,
         Action::Module(agent()),
         Action::Tab(TabAction::Next),
@@ -301,7 +303,7 @@ fn one_of_each() -> Vec<Action> {
 }
 
 #[test]
-fn every_action_is_answered_by_the_runner_or_shell_verb() {
+fn every_action_is_answered_by_the_runner() {
     let actions = one_of_each();
     let kinds: BTreeSet<String> = actions
         .iter()
@@ -311,34 +313,23 @@ fn every_action_is_answered_by_the_runner_or_shell_verb() {
     for action in actions {
         // A tile with the keys and no container selected: no gate refuses anything.
         let mut r = rig(three(terminal()));
-        let batch = r.run(action.clone());
-        if decided_here(&action) {
-            assert_eq!(batch.shell_verb(), None, "{action:?} is decided by the runner");
-            let toast = r.controller.chrome(WIN).toast.map(|toast| toast.text);
-            assert!(
-                !toast.is_some_and(|text| text.starts_with("a float") || text.starts_with("acts on")),
-                "{action:?} met no gate"
-            );
-        } else {
-            assert_eq!(
-                batch.shell_verb(),
-                Some(&ShellVerb {
-                    win: WIN,
-                    call: ShellCall::Action(action.clone()),
-                    keycode: 7,
-                }),
-                "{action:?} goes to the shell"
-            );
-            assert!(
-                ops(&batch).is_empty() && batch.lua().is_empty(),
-                "{action:?}: the shell verb alone"
-            );
-        }
+        r.run(action.clone());
+        assert!(decided_here(&action), "{action:?} is decided by the runner");
+        assert!(
+            !r.controller.notes(WIN).iter().any(|note| note.contains("BUG")),
+            "{action:?} ran: {:?}",
+            r.controller.notes(WIN)
+        );
+        let toast = r.controller.chrome(WIN).toast.map(|toast| toast.text);
+        assert!(
+            !toast.is_some_and(|text| text.starts_with("a float") || text.starts_with("acts on")),
+            "{action:?} met no gate"
+        );
     }
 }
 
 #[test]
-fn a_move_with_the_keys_on_a_float_and_the_editors_kill_are_the_shells() {
+fn a_move_with_the_keys_on_a_float_and_the_editors_kill_are_decided_here() {
     let float = ModuleId::lua("x");
     let layout = Layout::from_parts_floating(
         Node::split(Axis::Row, 0.5, Node::Leaf(editor()), Node::Leaf(agent())),
@@ -358,17 +349,16 @@ fn a_move_with_the_keys_on_a_float_and_the_editors_kill_are_the_shells() {
     )
     .unwrap();
     let mut r = rig(layout);
-    let moved = r.run(Action::Move(Direction::Left));
+    r.run(Action::Move(Direction::Left));
+    assert_eq!(family_of(&Action::Move(Direction::Left), true, false), Family::Floats);
     assert!(
-        matches!(
-            moved.shell_verb(),
-            Some(ShellVerb {
-                call: ShellCall::Action(Action::Move(_)),
-                ..
-            })
-        ),
-        "a float's move is the floats' verb: {moved:?}"
+        !r.controller.notes(WIN).iter().any(|note| note.contains("BUG")),
+        "a float's move is decided here: {:?}",
+        r.controller.notes(WIN)
     );
+    let mut editor_rig = rig(three(editor()));
+    editor_rig.run(Action::ModuleKill);
+    assert!(editor_rig.controller.chrome(WIN).prompt.is_some());
     assert_eq!(family_of(&Action::ModuleKill, false, true), Family::Close);
     assert_eq!(family_of(&Action::ModuleKill, false, false), Family::Modules);
     assert_eq!(family_of(&Action::Move(Direction::Up), false, false), Family::Tiling);
@@ -403,7 +393,6 @@ fn a_selection_refusal_says_how_to_get_back_and_runs_nothing() {
     let batch = r.run(Action::ModuleKill);
     let text = one_module_text(&Keymap::defaults());
     r.assert_refused(&batch, &said, &text);
-    assert_eq!(batch.shell_verb(), None);
     assert_eq!(*r.layout.borrow(), before, "a refused action leaves the selection too");
     assert!(
         r.controller
@@ -415,27 +404,14 @@ fn a_selection_refusal_says_how_to_get_back_and_runs_nothing() {
 }
 
 #[test]
-fn a_shell_verbs_selection_reset_waits_for_its_re_read() {
+fn a_text_steps_selection_reset_is_in_its_own_batch() {
     let mut r = rig(three_with_a_container_selected());
-    let batch = r.run(Action::Tab(TabAction::Next));
-    assert!(batch.shell_verb().is_some());
-    assert!(ops(&batch).is_empty(), "the shell verb is the whole batch");
-    assert!(
-        matches!(r.layout.borrow().selection(), Selection::Con(_)),
-        "the selection stays until the arm has run"
-    );
-    let reread = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
+    let batch = r.run(Action::Text(TextChange::Larger));
     assert_eq!(r.layout.borrow().selection(), Selection::Module);
-    assert!(announced(&reread), "the selection's text went");
+    assert!(announced(&batch), "the selection's text went");
     assert_eq!(r.controller.chrome(WIN).top_bar.selection, None);
-    let again = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
-    assert!(
-        !announced(&again),
-        "a later change of the shell's own is not the verb's"
-    );
     // With no container selected, the reset changes nothing.
-    r.run(Action::Tab(TabAction::Next));
-    let quiet = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
+    let quiet = r.run(Action::Text(TextChange::Larger));
     assert!(!announced(&quiet));
 }
 
@@ -493,24 +469,14 @@ fn a_lua_request_meets_the_selection_gate_only_and_logs_its_refusal() {
     r.assert_refused(&by_key, &said, &text);
 }
 
-/// The Lua requests the controller decides (the runner's actions, marks, the module requests and a workspace switch)
-/// are moved here; only a float's is still the shell's, and one handed here anyway changes nothing and is logged as a
-/// bug.
+/// The controller decides every Lua layout request, and the shell posts every one of them, floats included,
+/// to the controller in one event per drain: the shell keeps no route of its own for any of them.
 #[test]
-fn lua_requests_are_the_controllers_but_a_float() {
+fn every_lua_request_is_decided_and_sent_to_the_controller() {
     let mut r = rig(three(editor()));
-    let before = r.layout.borrow().clone();
-    let batch = r.controller.lua_request(WIN, LayoutRequest::Float(terminal(), None));
-    assert!(batch.is_empty());
-    assert_eq!(*r.layout.borrow(), before);
-    assert!(r
-        .controller
-        .notes(WIN)
-        .iter()
-        .any(|line| line.starts_with("[wm] BUG: lua_request for the shell's")));
-    assert!(crate::wm::lua::moved(&LayoutRequest::Run(Action::Zoom)));
-    assert!(crate::wm::lua::moved(&LayoutRequest::Mark(terminal())));
-    // The module requests and a switch are decided here, and the shell's loop sends them here.
+    assert!(crate::wm::lua::decided(&LayoutRequest::Run(Action::Zoom)));
+    assert!(crate::wm::lua::decided(&LayoutRequest::Mark(terminal())));
+    // The module requests, a switch and a float are decided here; the shell posts one event per drain.
     for request in [
         LayoutRequest::Show(terminal()),
         LayoutRequest::Hide(terminal()),
@@ -518,15 +484,11 @@ fn lua_requests_are_the_controllers_but_a_float() {
         LayoutRequest::Split(terminal(), Axis::Row),
         LayoutRequest::Open(ModuleKind::Terminal, None),
         LayoutRequest::Switch("two".into()),
+        LayoutRequest::Float(terminal(), None),
     ] {
         assert!(crate::wm::lua::decided(&request), "{request:?}");
-        assert!(crate::wm::lua::moved(&request), "{request:?}");
     }
-    // A float's request is the floats' family, still the shell's.
-    let float = LayoutRequest::Float(terminal(), None);
-    assert!(!crate::wm::lua::decided(&float) && !crate::wm::lua::moved(&float));
-    let batch = r.controller.lua_request(WIN, LayoutRequest::Switch("two".into()));
-    assert_eq!(batch.shell_verb(), None);
+    r.controller.lua_request(WIN, LayoutRequest::Switch("two".into()));
     assert_eq!(r.controller.chrome(WIN).top_bar.workspace.as_deref(), Some("two"));
     assert!(r.controller.notes(WIN).contains(&"[workspace] made two".into()));
 }

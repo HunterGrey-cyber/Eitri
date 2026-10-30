@@ -4,8 +4,7 @@
 # plants a read-only, empty "pid" file inside it -- so install.sh's own
 # `printf '%s\n' "$$" >"$NV_LOCK/pid"` fails to even open it for writing (EACCES) while leaving a
 # regular, empty file behind at that path, exactly the shape a real write that fails mid-flight
-# (e.g. ENOSPC right after the file was created) would leave. Reproduces the bug
-# without needing real disk exhaustion.
+# (e.g. ENOSPC right after creation) would leave, without needing real disk exhaustion.
 last=
 for a do
 	case $a in

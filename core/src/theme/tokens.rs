@@ -612,6 +612,38 @@ impl ThemeTokens {
     }
 }
 
+/// Plain `guifont` families for a font manager, in preference order, each read as Neovide reads it
+/// (`font_options.rs`, `parse_font_name`): trimmed, then a backslash takes the next character as it
+/// is and `_` is a space, so `\_` is an underscore and `\L` an `L`. Options begin at the first `:`
+/// (a value that starts with `:` names no family; the editor then draws its default face). These
+/// names never enter CSS, so they keep all other characters and have no CSS family or list limits.
+pub fn guifont_families(guifont: &str) -> Vec<String> {
+    guifont
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim_ascii)
+        .filter(|family| !family.is_empty())
+        .map(unescape_font_name)
+        .filter(|family| !family.is_empty())
+        .collect()
+}
+
+/// One `guifont` family as Neovide reads it: `\x` is `x`, `_` is a space, anything else itself.
+fn unescape_font_name(family: &str) -> String {
+    let mut out = String::with_capacity(family.len());
+    let mut chars = family.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.extend(chars.next()),
+            '_' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// `guifont` as a CSS `font-family` list, parsed the way Neovide does (`font_options.rs`): options
 /// start at the first `:`, families are comma-separated, and `_` or `\ ` stand for a space.
 ///
@@ -1567,6 +1599,28 @@ mod tests {
         for block in [plain.status_normal, plain.status_insert, plain.status_visual] {
             assert_eq!(block, (plain.cursorline, plain.fg));
             assert!(block.0.contrast(block.1) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn guifont_families_are_plain_names_for_the_font_manager() {
+        for (value, expected) in [
+            ("", vec![]),
+            (
+                "Fira\\ Code,Symbols_Nerd_Font:h12:b",
+                vec!["Fira Code", "Symbols Nerd Font"],
+            ),
+            (":h12", vec![]),
+            ("a,,b", vec!["a", "b"]),
+            ("  a  , , b_ :h12", vec!["a", "b "]),
+            ("a(b)\";{}", vec!["a(b)\";{}"]),
+            // A backslash takes the next character as it is, as in the editor.
+            ("\\Liberation_Mono:h12", vec!["Liberation Mono"]),
+            ("Under\\_Score,Back\\\\slash", vec!["Under_Score", "Back\\slash"]),
+            ("trailing\\", vec!["trailing"]),
+            ("\\", vec![]),
+        ] {
+            assert_eq!(guifont_families(value), expected, "{value:?}");
         }
     }
 

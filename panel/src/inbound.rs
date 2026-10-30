@@ -394,6 +394,9 @@ pub(super) fn handle_inbound_message(
                 );
                 // Whether the page may speak of a turn's changes, before the tabs it would speak of.
                 window.insert(1, review_settings_payload(state));
+                // The other window's page's view of a tab that arrived before this document was ready, before
+                // the tabs whose switch takes it up.
+                window.extend(chat_moves::take_held_imports(state, view));
                 // A new document starts from this strip whatever an older one queued before it said:
                 // it goes as it is, and counts as delivered with the rest of the greeting.
                 let tabs = tabs_payload_recorded(state, view);
@@ -1371,6 +1374,13 @@ pub(super) fn handle_inbound_message(
             opening, return_keys, ..
         } => {
             run_keymap_closed(opening, return_keys, &mut out);
+            ok(&mut out);
+        }
+        // The page's view of a tab a move takes; only the freeze that asked for it reads it.
+        InboundMessage::ViewExported {
+            request, view: blob, ..
+        } => {
+            chat_moves::view_exported(state, view, request, blob, &mut out);
             ok(&mut out);
         }
         // `gx` -- a web link out to the system browser. The page's own check

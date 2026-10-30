@@ -64,9 +64,8 @@ describe("buildTimeline", () => {
     expect(labels(state({ transcript: [msg(3, "partial")], turnEndings: [ending] }))).toEqual(["text:partial", "ending:failed"]);
   });
 
-  /* The defect this closes. Rendering the three collections one after another put every tool card
-     below every assistant message, so a turn that went text/tool/text/tool read as text/text/tool/tool
-     -- which is not what happened, and is the panel's most visible wrong statement about a turn. */
+  /* Rendering collections separately would turn text/tool/text/tool into text/text/tool/tool,
+     misrepresenting the order of the conversation. */
   it("interleaves messages and tool calls into the order they actually happened", () => {
     expect(
       labels(

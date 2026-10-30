@@ -370,6 +370,8 @@ struct State {
     /// The calls of `running` that were still running when the tab's turn last ended: put in the background
     /// by the agent. A running turn's own calls join them only when it ends.
     background: HashSet<(String, String)>,
+    /// Open rows of calls left running by a completed turn, with the turn that drew each row.
+    background_rows: HashMap<(String, String), (String, String)>,
     /// `running_unread` was set when a turn ended: something unreadable may be running in the background.
     background_unread: bool,
     /// The count last sent as `BackgroundCalls`.
@@ -467,6 +469,8 @@ pub struct CodexProviderHandoff {
     interrupts: Vec<MovedInterrupt>,
     stopped_whole: bool,
     background: HashSet<(String, String)>,
+    /// By thread and item, as a list so the pair keys have a JSON form.
+    background_rows: Vec<((String, String), (String, String))>,
     background_unread: bool,
     background_reported: u32,
     start_abandoned: bool,
@@ -1456,6 +1460,30 @@ impl CodexProvider {
                     link.respond_error(id, METHOD_NOT_FOUND, "method not found");
                 }
             }
+            // A request about a thread outside the family, after a tripwire, or from a turn that is not running
+            // falls to the arm below, which declines it without drawing a row.
+            Handling::Card {
+                ref thread_id,
+                ref turn_id,
+                ref item_id,
+                ref card,
+                ref form,
+            } if ours
+                && st.blocked.is_none()
+                && st.turn.as_ref().is_some_and(|t| t.interrupting)
+                && Self::asks_from_a_running_turn(st, thread_id, turn_id.as_deref()) =>
+            {
+                let said = match form {
+                    AnswerForm::Decision => "cancelled it",
+                    AnswerForm::ToolForm => "declined it",
+                    AnswerForm::ToolQuestion { .. } => "left it unanswered",
+                };
+                let note = format!("Codex asked while the turn was being interrupted; Eitri {said}");
+                eprintln!("agent: {note} ({method})");
+                st.calls.mark_asked(thread_id, item_id);
+                self.respond(id, form.reply(CardAnswer::Interrupt));
+                Self::note_answered(st, Some(thread_id), Some(item_id.clone()), card.tool_name(), note);
+            }
             // Nor is a card for a turn that is not running: none at all, or an earlier one of that thread.
             Handling::Card {
                 form,
@@ -1752,6 +1780,7 @@ impl CodexProvider {
             return;
         }
         st.dead = true;
+        end_background_rows(st, "Codex ended while it ran");
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed);
         self.drop_steers(st, "Codex ended before it read it");
@@ -1804,11 +1833,17 @@ impl CodexProvider {
                     }
                 } else if name == method::ITEM_COMPLETED {
                     if let (Some(thread), Some(id)) = (&thread_id, &item_id) {
-                        st.running.remove(&(thread.clone(), id.clone()));
+                        let key = (thread.clone(), id.clone());
+                        st.running.remove(&key);
                         // The call is over even though its end could not be read; its row says so rather
                         // than reading as running until the turn ends.
                         let row = row_of(st, thread, id);
-                        if let (Some(turn_id), true) = (Self::tab_turn_id(st), st.open_tools.remove(&row)) {
+                        let ended = st.background_rows.remove(&key).or_else(|| {
+                            Self::tab_turn_id(st)
+                                .filter(|_| st.open_tools.remove(&row))
+                                .map(|turn_id| (row, turn_id))
+                        });
+                        if let Some((row, turn_id)) = ended {
                             st.events.push_back(AgentDomainEvent::ToolCallCompleted {
                                 turn_id,
                                 tool_use_id: row,
@@ -2261,7 +2296,20 @@ impl CodexProvider {
     fn on_item_completed(&self, st: &mut State, n: ItemNotification) {
         self.note_delivered(st, &n.thread_id, &n.turn_id, &n.item);
         if let Some(id) = n.item.id() {
-            st.running.remove(&(n.thread_id.clone(), id.to_string()));
+            let key = (n.thread_id.clone(), id.to_string());
+            st.running.remove(&key);
+            if let Some((row, turn_id)) = st.background_rows.remove(&key) {
+                st.calls.forget(&n.thread_id, id);
+                if let Some((content, is_error)) = translate::tool_result(&n.item) {
+                    st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+                        turn_id,
+                        tool_use_id: row,
+                        content,
+                        is_error,
+                    });
+                }
+                return;
+            }
         }
         if self.announced(st, &n.thread_id, &n.item) {
             return;
@@ -2457,6 +2505,21 @@ impl CodexProvider {
         let Some(turn) = st.turn.take() else { return };
         let Some(turn_id) = turn.id else { return };
         let usage = turn.usage.as_ref().map(|u| translate::usage_of(u, st.model.as_deref()));
+        // A call can finish after this turn, so keep the row's original turn until its result arrives.
+        let left: Vec<(String, String)> = st
+            .running
+            .iter()
+            .filter(|(_, kind)| kind.kept_doing().is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (thread, item) in &left {
+            let row = row_of(st, thread, item);
+            if st.open_tools.contains(&row) && st.background_rows.len() < RUNNING_CALLS_KEPT {
+                st.background_rows
+                    .entry((thread.clone(), item.clone()))
+                    .or_insert_with(|| (row, turn_id.clone()));
+            }
+        }
         st.items.clear();
         st.message_text.clear();
         st.open_tools.clear();
@@ -2467,12 +2530,6 @@ impl CodexProvider {
         }
         self.drop_cards(st, PermissionOutcome::CancelledByInterrupt);
         // What is still running now outlives the turn: a command the model put in the background.
-        let left: Vec<(String, String)> = st
-            .running
-            .iter()
-            .filter(|(_, kind)| kind.kept_doing().is_some())
-            .map(|(key, _)| key.clone())
-            .collect();
         st.background.extend(left);
         st.background_unread |= st.running_unread;
         report_background(st);
@@ -2582,6 +2639,7 @@ impl CodexProvider {
             }
         }
         st.running.clear();
+        end_background_rows(st, "stopped with the session");
         st.running_unread = false;
         self.end_family_turn(st);
         report_background(st);
@@ -2618,8 +2676,11 @@ impl CodexProvider {
 fn report_background(st: &mut State) {
     let running = &st.running;
     st.background.retain(|key| running.contains_key(key));
+    st.background_rows.retain(|key, _| st.background.contains(key));
     if st.dead || st.closed {
         st.background.clear();
+        // A session being stopped is dead before its child is gone, and no completion is read after that.
+        end_background_rows(st, "stopped with the session");
         st.background_unread = false;
     }
     let count = u32::try_from(st.background.len())
@@ -2629,6 +2690,21 @@ fn report_background(st: &mut State) {
         st.background_reported = count;
         st.events
             .push_back(AgentDomainEvent::BackgroundCalls { running: count });
+    }
+}
+
+/// Ends the rows of calls a completed turn left running, under the turn that drew each, when the session ends
+/// before they do: no completion comes for them any more, and a row left open would read as abandoned.
+fn end_background_rows(st: &mut State, said: &str) {
+    let mut rows: Vec<(String, String)> = st.background_rows.drain().map(|(_, row)| row).collect();
+    rows.sort();
+    for (row, turn_id) in rows {
+        st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+            turn_id,
+            tool_use_id: row,
+            content: Value::String(said.to_string()),
+            is_error: true,
+        });
     }
 }
 
@@ -2864,6 +2940,7 @@ impl CodexProvider {
             interrupts,
             stopped_whole,
             background,
+            background_rows,
             background_unread,
             background_reported,
             start_abandoned,
@@ -2909,6 +2986,7 @@ impl CodexProvider {
             interrupts: interrupts.into_iter().map(|sent| sent.into_moved(now)).collect(),
             stopped_whole,
             background,
+            background_rows: background_rows.into_iter().collect(),
             background_unread,
             background_reported,
             start_abandoned,
@@ -3020,6 +3098,7 @@ impl CodexProvider {
             interrupts,
             stopped_whole,
             background,
+            background_rows,
             background_unread,
             background_reported,
             start_abandoned,
@@ -3082,6 +3161,7 @@ impl CodexProvider {
             interrupts,
             stopped_whole,
             background,
+            background_rows: background_rows.into_iter().collect(),
             background_unread,
             background_reported,
             start_abandoned,
@@ -3348,6 +3428,7 @@ impl AgentProvider for CodexProvider {
             self.drop_cards(&mut st, PermissionOutcome::CancelledBySessionClose);
             self.drop_steers(&mut st, "the session was closed before Codex read it");
             st.closed = true;
+            end_background_rows(&mut st, "the session was closed while it ran");
             st.events.push_back(AgentDomainEvent::SessionClosed {
                 reason: "closed_by_host".to_string(),
             });
@@ -3390,6 +3471,10 @@ impl AgentProvider for CodexProvider {
         follow_thought(&mut st);
         st.thought_scanned = 0;
         st.events.drain(..).collect()
+    }
+    #[cfg(target_os = "linux")]
+    fn mover(&self) -> Option<&dyn crate::chat_mover::ChatMover> {
+        Some(self)
     }
 }
 

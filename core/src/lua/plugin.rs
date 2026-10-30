@@ -13,7 +13,7 @@ use mlua::{Lua, Table, Value};
 
 use super::panel::PanelSlot;
 use crate::layout::rules::{At, OpenRule, RuleSize};
-use crate::plugin::load::{load_plugin_with, LoadedPlugin};
+use crate::plugin::load::{check_window_roots, load_plugin_with, LoadedPlugin};
 use crate::plugin::manifest::{ModuleStart, SettingValue};
 use crate::plugin::search::{classify, find_plugin, LoadArg, SearchEnv};
 use crate::plugin::state::PluginStore;
@@ -246,8 +246,10 @@ fn install_with_log(
     let refusals = super::kernel::init_refusals(lua);
     registry.borrow_mut().init_refusals = Some(refusals.clone());
     let table = lua.create_table()?;
+    // Each loaded plugin with the call that loaded it, so a refusal that involves two loads can name both.
+    let calls: RefCell<Vec<(Rc<LoadedPlugin>, String)>> = RefCell::new(Vec::new());
     // Plain values let validation name the argument that cannot be loaded.
-    let load = super::kernel::registering_function(lua, "eitri.plugin.load", move |_, (arg, opts): (Value, Value)| {
+    let load = super::kernel::registering_function(lua, "eitri.plugin.load", move |l, (arg, opts): (Value, Value)| {
         // The window reads the loaded plugins once, when `init.lua` has run: a load after that would say it
         // loaded and show nothing.
         if !refusals.borrow().in_init() {
@@ -263,17 +265,30 @@ fn install_with_log(
                     .iter()
                     .any(|p| p.plugin.manifest.id == registration.plugin.manifest.id);
                 if twice {
-                    Err(format!(
+                    return Err(format!(
                         "{PREFIX}: plugin {} is loaded twice",
                         registration.plugin.manifest.id
-                    ))
-                } else {
-                    Ok((registration, label))
+                    ));
                 }
+                // Two plugins that own one directory's window would each claim it; neither may win silently.
+                let call = format!(
+                    "plugin {} (loaded at {})",
+                    registration.plugin.manifest.id,
+                    call_site(l)
+                );
+                let earlier = calls.borrow();
+                let mut all: Vec<(&LoadedPlugin, &str)> = earlier
+                    .iter()
+                    .map(|(plugin, call)| (&**plugin, call.as_str()))
+                    .collect();
+                all.push((&*registration.plugin, call.as_str()));
+                check_window_roots(&all).map_err(|e| format!("{PREFIX}: {e}"))?;
+                Ok((registration, label, call))
             },
         );
         match outcome {
-            Ok((registration, label)) => {
+            Ok((registration, label, call)) => {
+                calls.borrow_mut().push((registration.plugin.clone(), call));
                 log(&format!(
                     "[plugin {}] loaded {} ({label})",
                     registration.plugin.manifest.id,
@@ -287,6 +302,30 @@ fn install_with_log(
     })?;
     table.set("load", load)?;
     eitri.set("plugin", table)
+}
+
+/// Where the running `eitri.plugin.load` was called from: the nearest Lua frame's chunk and line (the call may
+/// go through `pcall`, a C frame with no line), or `?` when no Lua frame has one.
+fn call_site(lua: &Lua) -> String {
+    (1..)
+        .map_while(|level| {
+            lua.inspect_stack(level, |frame| {
+                let line = frame.current_line()?;
+                let source = frame.source();
+                // The window names `init.lua`'s chunk by its path; Lua's own short form would quote and
+                // truncate it.
+                let named = source
+                    .source
+                    .as_deref()
+                    .map(|name| name.strip_prefix(['@', '=']).unwrap_or(name))
+                    .filter(|name| !name.contains('\n'));
+                let chunk = named.or(source.short_src.as_deref()).unwrap_or("?").to_string();
+                Some(format!("{chunk}:{line}"))
+            })
+        })
+        .flatten()
+        .next()
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// For a window with no Lua panels (the companion window, `eitri-mac`): the call logs once and is ignored,
@@ -694,6 +733,52 @@ mod tests {
         assert!(err.contains("eitri-plugin.toml"), "{err}");
         assert!(registry.borrow().plugins().is_empty());
         assert!(lines.borrow().is_empty(), "{:?}", lines.borrow());
+    }
+
+    #[test]
+    fn two_plugins_with_one_window_root_fail_at_startup_naming_both_calls() {
+        let s = Scratch::new("lua-window-root-twice");
+        let first = s.0.join("a/demo");
+        let work = demo_at(&s.0.join("a"), &first);
+        let second = s.0.join("b/other");
+        demo_at(&s.0.join("b"), &second);
+        for (dir, id) in [(&first, "demo"), (&second, "other")] {
+            let path = dir.join("eitri-plugin.toml");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.starts_with("id = \"demo\""), "the demo manifest opens with its id");
+            let text = text.replacen("id = \"demo\"", &format!("id = \"{id}\""), 1);
+            std::fs::write(
+                path,
+                format!("{text}\n[window]\nroot = \"${{work}}\"\ntitle = 'Demo'\nlayout = {{ module = 'page' }}\n"),
+            )
+            .unwrap();
+        }
+        let (lua, registry, _) = engine_with(&s.0.join("state"), search_in(&s.0));
+        let load = |dir: &std::path::Path| {
+            format!(
+                "eitri.plugin.load({:?}, {{ work = {work:?} }})",
+                dir.display().to_string()
+            )
+        };
+        let err = lua
+            .load(format!("{}\n{}", load(&first), load(&second)))
+            .set_name("/home/u/init.lua")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugin demo (loaded at /home/u/init.lua:1)")
+                && err.contains("plugin other (loaded at /home/u/init.lua:2)")
+                && err.contains("is declared twice"),
+            "{err}"
+        );
+        let loaded: Vec<String> = registry
+            .borrow()
+            .plugins
+            .iter()
+            .map(|p| p.plugin.manifest.id.clone())
+            .collect();
+        assert_eq!(loaded, ["demo"], "the second plugin is not loaded");
     }
 
     #[test]

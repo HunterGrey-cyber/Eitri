@@ -354,6 +354,11 @@ impl LinkDriver {
         }
     }
 
+    /// Whether `other` is this same link.
+    pub fn same(&self, other: &LinkDriver) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn partner(&self) -> Option<Partner> {
         self.inner.partner.get()
     }
@@ -655,7 +660,7 @@ pub(crate) mod tests {
     }
 
     /// A window controller holding one window, on the fake host, for the link to attach to.
-    fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
+    pub(crate) fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
         use eitri_core::layout::{Layout, ModuleDecl, ModuleId, ModuleKeys, Placement, Workspaces};
         use eitri_core::wm::fake::{FakeHost, FakeScheduler};
         use eitri_core::wm::start::StartStep;
@@ -675,6 +680,7 @@ pub(crate) mod tests {
                     args: vec![],
                     cwd: None,
                     clean: true,
+                    background: None,
                 },
             },
             StartStep::Window {
@@ -688,17 +694,16 @@ pub(crate) mod tests {
             StartStep::Kernel,
             StartStep::Config { keymap, module_keys },
             StartStep::Layout {
-                parts: WindowParts {
-                    layout: Rc::new(RefCell::new(
-                        Layout::initial(&[ModuleDecl {
-                            id: ModuleId::terminal(),
-                            placement: Placement::BelowRoot,
-                        }])
-                        .unwrap(),
-                    )),
-                    workspaces: Rc::new(RefCell::new(Workspaces::single())),
-                    saver: None,
-                },
+                own_window: None,
+                parts: WindowParts::new(
+                    Layout::initial(&[ModuleDecl {
+                        id: ModuleId::terminal(),
+                        placement: Placement::BelowRoot,
+                    }])
+                    .unwrap(),
+                    Workspaces::single(),
+                    None,
+                ),
             },
         ] {
             driver.start(WinId::MAIN, step);
@@ -764,8 +769,11 @@ pub(crate) mod tests {
         let mut refused = None;
         while refused.is_none() && Instant::now() < deadline {
             driver.pump();
+            // The attach sends this window's counts at once; only the refusal is the point here.
             if let Ok(Inbound::Msg { msg, .. }) = their_inbound.recv_timeout(Duration::from_millis(20)) {
-                refused = Some(msg);
+                if !matches!(msg, Msg::Summary(_)) {
+                    refused = Some(msg);
+                }
             }
         }
         assert!(

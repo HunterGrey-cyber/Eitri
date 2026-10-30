@@ -1,7 +1,6 @@
 #!/bin/sh
-# Test double for `uname`: reports aarch64 for `-m` (the fixture for the aarch64 GTK and nvim-offer bugs -- neither
-# check_platform, which refuses a prebuilt install off x86_64 before either finding is reachable,
-# nor check_glibc calls uname at all), and passes every other invocation through to the real one.
+# Test double for `uname`: reports aarch64 for `-m`, passing other calls to the real utility.
+# Neither check_platform (which refuses prebuilt installs off x86_64) nor check_glibc calls uname.
 case "$*" in
 -m) printf 'aarch64\n' ;;
 *)

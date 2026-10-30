@@ -88,6 +88,8 @@ pub(super) enum Effect {
         after: Attention,
         handed: Vec<ViewId>,
     },
+    /// Running or queued work changed in these views.
+    Busy { changed: Vec<(ViewId, bool)> },
     /// A draft edited in nvim came back: the keys return to this chat view.
     EditorDone(ViewId),
     /// The editor opened a file for the review: the window brings the editor to the user.
@@ -107,6 +109,8 @@ pub(super) enum Effect {
     AskEditor { request: ScratchRequest, then: EditorThen },
     /// What the link owes the other window of a linked pair, for the window's link.
     PairOutbound(super::PairOutbound),
+    /// A move's answer for the window: a tab frozen or not, a presence held or not.
+    ChatMove(super::ChatMoveEvent),
 }
 
 /// What one step owes, in order. A trust step also keeps its toast and whether it started a restore apart
@@ -220,18 +224,33 @@ impl Outbox {
         if restored.is_some() {
             eprintln!("[agent_panel] a restore's result reached delivery unsettled; its band line is dropped");
         }
+        let mut run: Option<(ViewId, Vec<String>)> = None;
+        let flush_run = |run: &mut Option<(ViewId, Vec<String>)>| {
+            if let Some((view, payloads)) = run.take() {
+                pages.send_many(view, &payloads.iter().map(String::as_str).collect::<Vec<_>>());
+            }
+        };
         for effect in effects.into_iter().chain(toast.map(Effect::Toast)) {
+            // A hook may switch tabs and deliver a newer strip before this outbox continues.
+            if !matches!(&effect, Effect::Send(..)) {
+                flush_run(&mut run);
+            }
             match effect {
                 Effect::Send(dest, payload) => {
                     let view = super::dest_view(&state.borrow(), dest);
-                    match payload {
-                        Payload::Plain(text) => pages.send(view, &text),
-                        Payload::Tabs(strip) => {
-                            if super::strip_still_current(&mut state.borrow_mut(), view, strip.seq) {
-                                pages.send(view, &strip.payload);
-                            }
-                        }
+                    if run.as_ref().is_some_and(|(before, _)| *before != view) {
+                        flush_run(&mut run);
                     }
+                    let text = match payload {
+                        Payload::Plain(text) => text,
+                        Payload::Tabs(strip) => {
+                            if !super::strip_still_current(&mut state.borrow_mut(), view, strip.seq) {
+                                continue;
+                            }
+                            strip.payload
+                        }
+                    };
+                    run.get_or_insert_with(|| (view, Vec::new())).1.push(text);
                 }
                 Effect::Toast(text) => {
                     let hook = state.borrow().toast_hook.clone();
@@ -257,6 +276,12 @@ impl Outbox {
                         hook(before, after, &handed);
                     }
                 }
+                Effect::Busy { changed } => {
+                    let hook = state.borrow().busy_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(&changed);
+                    }
+                }
                 Effect::EditorDone(view) => {
                     let hook = state.borrow().editor_done_hook.clone();
                     if let Some(hook) = hook {
@@ -267,6 +292,13 @@ impl Outbox {
                     let hook = state.borrow().pair_outbound_hook.clone();
                     if let Some(hook) = hook {
                         hook(outbound);
+                    }
+                }
+                Effect::ChatMove(event) => {
+                    let hook = state.borrow().chat_moves.hook.clone();
+                    match hook {
+                        Some(hook) => hook(event),
+                        None => eprintln!("[chat_move] BUG: {event:?} for a window that moves no chat"),
                     }
                 }
                 Effect::EditorOpened => {
@@ -314,6 +346,7 @@ impl Outbox {
                 }
             }
         }
+        flush_run(&mut run);
     }
 }
 
@@ -355,4 +388,63 @@ impl Screen {
 pub(super) fn ask_gate(state: &Rc<RefCell<AgentPanelState>>, view: ViewId) -> Result<(), String> {
     let gate = state.borrow().answer_gate.clone();
     gate.map_or(Ok(()), |gate| gate(view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_panel::tests::*;
+
+    #[test]
+    fn consecutive_payloads_for_one_page_go_in_one_send() {
+        let (handle, page, _) = handle_with_recording_page();
+        let mut out = Outbox::default();
+        out.send(
+            ViewId::BASE,
+            Strip {
+                seq: 1,
+                payload: "tabs".into(),
+            },
+        );
+        out.send_all(ViewId::BASE, ["snapshot".to_owned(), "draft".to_owned()]);
+        out.deliver(&handle.state, &handle.pages);
+        assert_eq!(*page.batches.borrow(), [vec!["tabs", "snapshot", "draft"]]);
+    }
+
+    #[test]
+    fn an_effect_between_payloads_splits_the_send() {
+        let (handle, page, _) = handle_with_recording_page();
+        let during_hook = page.clone();
+        let state = handle.state.clone();
+        let pages = handle.pages.clone();
+        handle.state.borrow_mut().toast_hook = Some(Rc::new(move |_| {
+            assert_eq!(*during_hook.batches.borrow(), [vec!["before"]]);
+            let mut nested = Outbox::default();
+            nested.send(
+                ViewId::BASE,
+                Strip {
+                    seq: 2,
+                    payload: "new tabs".into(),
+                },
+            );
+            nested.deliver(&state, &pages);
+        }));
+        let mut out = Outbox::default();
+        out.send(ViewId::BASE, "before".to_owned());
+        out.effect(Effect::Toast("switch".into()));
+        out.send(
+            ViewId::BASE,
+            Strip {
+                seq: 1,
+                payload: "stale tabs".into(),
+            },
+        );
+        out.send(ViewId::BASE, "after".to_owned());
+        out.deliver(&handle.state, &handle.pages);
+        handle.state.borrow_mut().toast_hook = None;
+        assert_eq!(
+            *page.batches.borrow(),
+            [vec!["before"], vec!["new tabs"], vec!["after"]]
+        );
+    }
 }

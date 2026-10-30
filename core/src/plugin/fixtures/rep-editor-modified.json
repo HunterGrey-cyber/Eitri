@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "re": 52,
+  "ok": true,
+  "result": {
+    "paths": [
+      "/w/work/rust/ch04-02-fix-total-len/src/lib.rs"
+    ]
+  }
+}

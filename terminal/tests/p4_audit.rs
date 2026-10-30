@@ -1,13 +1,7 @@
-//! Narrowing a pane while a scrollback anchor is
-//! pinned into saturated history can silently substitute a different retained line for the
-//! evicted one, with no expiry notice -- `Screen::resize` resized `Term` but never called
-//! `ScrollView::observe`, so the anchor's `oldest_ordinal` alignment was left stale until the next
-//! `feed()`. `RawViewport::resolve`'s own doc comment already named this exact risk but only
-//! guarded the crash case (`index` out of the *current* bounds), not the wrong-content case (a
-//! stale `index` that still happens to be in range after a resize reflows the grid).
-//!
-//! The integration test narrows the pane with saturated history and checks retained content,
-//! so an in-range stale index cannot hide behind a successful bounds check.
+//! Narrowing saturated history can evict a pinned scrollback anchor. Resize must realign it
+//! immediately: a stale index can still be in bounds while pointing at different content.
+//! Checking retained content and the expiry notice catches that silent substitution, which
+//! a bounds check alone cannot detect.
 
 use eitri_terminal::{PtySize, Screen, ScrollRequest, TerminalColors};
 use terminal_render::PaintOp;

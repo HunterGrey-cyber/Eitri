@@ -6,9 +6,9 @@ publish.workspace = true
 license = "MIT"
 description = "The bottom terminal's engine: an owned PTY, one session thread per terminal, and the Skia paint of a terminal-render PaintList. GTK-free by construction (src/manifest_guard.rs)."
 
-# Never gtk4/glib/gdk/webkit6, used or not -- `src/manifest_guard.rs` fails the build's tests on the
-# commit that adds one. `shell/src/terminal/` is the GTK half; the macOS track hosts this crate in an
-# NSView instead, which is the reason the line is drawn here and not at `shell`.
+# Never gtk4/glib/gdk/webkit6, used or not -- `src/manifest_guard.rs` rejects those dependencies.
+# The GTK half lives in `shell/src/terminal/`; macOS hosts this crate in an NSView, so the
+# toolkit boundary belongs here rather than at shell.
 [dependencies]
 terminal-render = { path = "../terminal-render" }
 terminal-frame = { path = "../terminal-frame" }

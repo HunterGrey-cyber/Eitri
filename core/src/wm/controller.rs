@@ -3,20 +3,20 @@
 //! them.
 //!
 //! Every action from a key, a Lua call or a panel tab verb goes through one runner, [`Decide::run`]: the
-//! container selection's gate and the float's first (a tray chip meets neither), then the action's family. A
-//! family that has moved here (the tiling verbs, [`super::verbs::tiling`], the focus verbs,
-//! [`super::verbs::focus`], the keys verbs, [`super::verbs::keys`], and the module verbs,
-//! [`super::verbs::modules`]) is decided on the window's layout and answered with the batch that shows its change;
-//! every other action goes back to the shell as the batch's [`ShellVerb`], and the controller counts how often the
-//! shell changed the layout behind it.
+//! container selection's gate and the float's first (a tray chip meets neither), then the action's family. Every
+//! family is decided here (the tiling verbs, [`super::verbs::tiling`], the focus verbs, [`super::verbs::focus`], the
+//! keys verbs, [`super::verbs::keys`], the module verbs, [`super::verbs::modules`], and the rest of
+//! [`super::verbs`]) on the window's layout and answered with the batch that shows its change. Nothing else writes a
+//! window's layout or its workspaces: the shell reads them through views, and the facts it reports (a link's end, a
+//! window 2 that did not come back) are changed here.
 //!
 //! Who holds the keys is decided here too ([`super::focus`]): the requests that give them, and what follows the
 //! host's report of where they are. So are the keys themselves ([`super::keys`]): each capture stage's answer, the
 //! window's prefix and what its commands do, and the chrome the prefix shows. It also decides each window's module
 //! lifecycle and layout persistence: a change derives the modules' service effects and arms the save's debounce on
 //! the scheduler. The timer writes through the window's [`Saver`](super::persist::Saver), and the close's save is
-//! [`Controller::persist_now`]. Each family that moves adds its state and its decisions here and deletes the shell
-//! code that made them.
+//! the teardown's own ([`super::close::save_for_close`]), the first step of the batch that ends the window. Each
+//! family that moves adds its state and its decisions here and deletes the shell code that made them.
 //!
 //! What each window's chrome shows is derived here too ([`super::chrome`]): every entry that returns a batch ends
 //! by deriving the fields whose inputs moved, and announces the model once when a value changed.
@@ -26,9 +26,9 @@ use super::host::*;
 use super::module::{Lifecycle, SurfaceDecl};
 use super::verbs::modules::{self as module_verbs, ModuleSetup};
 use super::verbs::{self, FloatGate, SelectionGate};
-use super::window::{EditorPresence, PeerId, Timers, WinId, Window, WindowParts, WindowSpec};
+use super::window::{EditorPresence, Monitor, PeerId, Timers, WinId, Window, WindowParts, WindowPlacement, WindowSpec};
 use crate::keymap::action::Action;
-use crate::keymap::prefix::{Prefix, PrefixCommand};
+use crate::keymap::prefix::{Prefix, PrefixCommand, Press};
 use crate::keymap::Keymap;
 use crate::layout::{Arrangement, Con, ModuleId, ModuleKeys, Size};
 use crate::lua::layout::LayoutRequest;
@@ -48,14 +48,17 @@ pub struct Controller {
     /// Each window's open rules, module declarations, start-hidden plugins and project root, which its module
     /// verbs place and kill by.
     setups: BTreeMap<WinId, Rc<ModuleSetup>>,
-    /// How many `LayoutChangedByShell` reports each window had: a verb arm's, the grid's change hook's and a
-    /// workspace rename's or delete's alike, so an arm that changes the grid is counted twice.
-    shell_revisions: BTreeMap<WinId, u64>,
     /// Where every window's timers come from; the driver's own token is the largest there is.
     timers: Timers,
     /// Specs are retained here only until the live layout is attached.
     declared: BTreeMap<WinId, WindowSpec>,
     pub(super) starts: BTreeMap<WinId, super::start::StartState>,
+    /// The latest output list, also given to windows attached later.
+    monitors: Vec<Monitor>,
+    /// Each window's placement given before its layout phase attached it, kept until then.
+    placements: BTreeMap<WinId, WindowPlacement>,
+    /// The idles that judge an extra chat view the panel said holds no tab, each with its window and view.
+    view_empty: Vec<(TimerToken, WinId, ViewId)>,
     #[cfg(test)]
     start_notes: Vec<String>,
 }
@@ -72,12 +75,32 @@ impl Controller {
             windows: BTreeMap::new(),
             keymaps: BTreeMap::new(),
             setups: BTreeMap::new(),
-            shell_revisions: BTreeMap::new(),
             declared: BTreeMap::new(),
             starts: BTreeMap::new(),
+            monitors: Vec::new(),
+            placements: BTreeMap::new(),
+            view_empty: Vec::new(),
             #[cfg(test)]
             start_notes: vec![],
         }
+    }
+
+    /// Seeds the text-size model from the shell's current font and editor scale.
+    pub fn set_text_size(&mut self, win: WinId, base: f32, reported_s: f32) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.text_size = Some(super::text_size::TextSize::new(base, reported_s));
+        }
+    }
+
+    /// The zoom for a page that has had a view this session, when this window has a text-size
+    /// model. A killed page's module still answers: its factor is kept for a view rebuilt in its
+    /// place.
+    pub fn page_zoom(&self, win: WinId, module: &ModuleId) -> Option<f32> {
+        let window = self.windows.get(&win)?;
+        if !window.zoom_pages.contains(module) {
+            return None;
+        }
+        Some(window.text_size.as_ref()?.page_scale(module))
     }
 
     /// What the controller reads of the shell from now on; until it is given, [`NoReads`]' answers.
@@ -100,6 +123,30 @@ impl Controller {
     /// the current directory as the project root.
     pub fn set_module_setup(&mut self, win: WinId, setup: ModuleSetup) {
         self.setups.insert(win, Rc::new(setup));
+    }
+
+    /// Where `win` goes at its start ([`WindowPlacement`]): the output it is put back on, once that output exists
+    /// and the window is on another one, and whether it starts window 2 again at its requests phase. Given before the
+    /// window is attached it waits for the attach; given later it applies at once.
+    pub fn set_placement(&mut self, win: WinId, placement: WindowPlacement) -> Batch {
+        let mut batch = Batch::default();
+        match self.windows.get_mut(&win) {
+            Some(window) => {
+                window.set_placement(placement);
+                window.put_back_on_its_monitor(win, &mut batch);
+            }
+            None => {
+                self.placements.insert(win, placement);
+            }
+        }
+        batch
+    }
+
+    /// At the requests phase: a window whose placement starts window 2 again does so on an idle.
+    pub(super) fn arm_second_restore(&mut self, win: WinId) {
+        if let Some(window) = self.windows.get_mut(&win).filter(|window| window.restore_second) {
+            window.restore_idle = Some(window.arm_idle());
+        }
     }
 
     /// A chooser pick, by the key `keycode` that made it, uses the same workspace decisions as the action runner.
@@ -132,6 +179,8 @@ impl Controller {
         };
         let side = super::moves::side_of(window.role());
         window.peer = Some(super::moves::PeerMoves::new(peer, port, side));
+        super::moves::say_monitor(window);
+        super::moves::summary_at_attach(window, win, &*self.reads);
         window.say(format!("[window] linked to the other window ({peer:?})"));
         batch
     }
@@ -218,27 +267,69 @@ impl Controller {
         module_verbs::answer_gate(self.windows.get(&win), &cx, win, view)
     }
 
-    /// The covered chat view `view` revealed before something opens in it with the keys: the scratch floats over it
-    /// that do not hold the keys stowed, the keys staying where they are; with the refusal's text when a float still
-    /// covers it.
-    pub fn reveal_chat(&mut self, win: WinId, view: ViewId) -> (Batch, Option<String>) {
-        let mut batch = Batch::default();
-        if self.awaiting_layout(win, ("reveal_chat", view)) {
-            return (batch, Some(super::feedback::LAYOUT_CHANGING_TEXT.into()));
-        }
-        let (reads, keymap, setup) = self.module_parts(win);
-        let Some(window) = self.windows.get_mut(&win) else {
-            // A window it does not hold is one it cannot judge, so the card waits as the answer gate's would.
-            return (batch, Some(super::feedback::LAYOUT_CHANGING_TEXT.into()));
+    /// The attention policy's choice for a view handed a card, from this window's current layout.
+    pub fn attention(
+        &self,
+        win: WinId,
+        view: ViewId,
+        policy: crate::attention::ChatOnPermission,
+        mine: crate::attention::Attention,
+    ) -> verbs::chat::AttentionChoice {
+        let Some(w) = self.windows.get(&win) else {
+            return verbs::chat::AttentionChoice::Toast;
         };
+        let (reads, keymap, setup) = self.module_parts(win);
         let cx = module_verbs::Cx {
             reads: &*reads,
             keymap: &keymap,
             setup: &setup,
         };
-        let still = module_verbs::reveal_chat(window, &cx, win, view, &mut batch);
+        verbs::chat::attention(w, &cx, win, view, policy, mine)
+    }
+
+    /// The choice after the host handled the reveal: coverage and the tab with the keys may still keep it away.
+    pub fn attention_revealed(&self, event: &ChatEvent) -> verbs::chat::AttentionChoice {
+        let win = match event {
+            ChatEvent::Covered { win, .. } | ChatEvent::Reveal { win, .. } => *win,
+            _ => return verbs::chat::AttentionChoice::None,
+        };
+        let Some(w) = self.windows.get(&win) else {
+            return verbs::chat::AttentionChoice::Toast;
+        };
+        let (reads, keymap, setup) = self.module_parts(win);
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        verbs::chat::attention_revealed(w, &cx, event)
+    }
+
+    /// Whether a chat's request to `win`'s editor is refused, asked while the page waits for the answer: the
+    /// refusal's words, or `None` when it may go through [`Self::editor_request`]. A window it does not
+    /// hold refuses, since nothing there can be judged.
+    pub fn editor_request_refusal(&self, win: WinId) -> Option<String> {
+        let (reads, keymap, setup) = self.module_parts(win);
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        match self.windows.get(&win) {
+            Some(window) => verbs::chat::editor_request_refusal(window, &cx, win),
+            None => Some(super::feedback::LAYOUT_CHANGING_TEXT.into()),
+        }
+    }
+
+    /// Checks and carries out a panel's editor request, returning any refusal to the requesting panel.
+    pub fn editor_request(&mut self, win: WinId, keys: String) -> (Result<(), String>, Batch) {
+        let mut batch = Batch::default();
+        let mut answer = Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
+        self.modules_event(win, &mut batch, |w, cx, batch| {
+            answer = verbs::chat::editor_request(w, cx, win, keys, batch);
+        });
         self.settle_chrome(&mut batch);
-        (batch, still)
+        (answer, batch)
     }
 
     /// A plugin's follow command for `module`, through the runner's gates as the module key (a show) or
@@ -254,6 +345,141 @@ impl Controller {
         batch
     }
 
+    /// A plugin page's `layout.focus` on `module`: shown where it was hidden from (a start-hidden plugin's module
+    /// this workspace does not hold yet opened by its rule), then given the keys and arrived at, as the module key
+    /// lands. The answer the page is given: the refusal's text, or `Ok`.
+    pub fn plugin_focus(&mut self, win: WinId, module: &ModuleId) -> (Result<(), String>, Batch) {
+        let mut batch = Batch::default();
+        let mut answer = Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
+        self.modules_event(win, &mut batch, |w, cx, batch| {
+            answer = module_verbs::show_on_screen(w, cx, win, module, batch)
+                .and_then(|()| super::focus::focus_and_arrive(w, win, module, batch))
+                .map_err(|err| err.to_string());
+        });
+        self.settle_chrome(&mut batch);
+        (answer, batch)
+    }
+
+    /// A plugin page's `terminal.at` on `win`'s base terminal, `dir` checked by the plugin host and `ticket` naming the
+    /// answer ([`super::terminal_at`]): the directory kept for a terminal with no shell running, or the running
+    /// shell read first, the answer coming back as [`PluginOp::TerminalAtAnswer`]. `Err` is a refusal now.
+    pub fn plugin_terminal_at(
+        &mut self,
+        win: WinId,
+        plugin: &str,
+        dir: std::path::PathBuf,
+        ticket: u64,
+    ) -> (Result<(), String>, Batch) {
+        let mut batch = Batch::default();
+        let answer = match self.windows.get_mut(&win) {
+            Some(window) => super::terminal_at::request(window, win, plugin, dir, ticket, &mut batch),
+            None => Err("the window is gone".to_string()),
+        };
+        self.settle_chrome(&mut batch);
+        (answer, batch)
+    }
+
+    /// Read-only handles on `win`'s layout and workspaces, for what reads them outside a decision: the Lua kernel's
+    /// `eitri.layout.get` and `export`, which copy what they read. `None` for a window it does not hold.
+    pub fn views(&self, win: WinId) -> Option<(super::window::LayoutView, super::window::WorkspacesView)> {
+        self.windows.get(&win).map(Window::views)
+    }
+
+    /// The pair's end as `win` sees it ([`PairEvent`]): what it held away for the other window comes back in every
+    /// workspace, or goes when it ended with that window, laid out as any change of the controller's; then the pair
+    /// file is told what the end left. A returned plugin's holding reopens at once and reloads a kept view; a
+    /// missing view waits for its show. Other pages reload through their lifecycle or an explicit reload.
+    fn pair_event(&mut self, event: PairEvent, batch: &mut Batch) {
+        let win = match &event {
+            PairEvent::LinkEnded { win, .. } | PairEvent::RestoreFailed { win } => *win,
+        };
+        let Some(window) = self.windows.get_mut(&win) else {
+            return;
+        };
+        let (layout, workspaces) = (window.layout.clone(), window.workspaces.clone());
+        let plan = {
+            let (Ok(mut layout), Ok(mut workspaces)) = (layout.try_borrow_mut(), workspaces.try_borrow_mut()) else {
+                window.warn(format!(
+                    "[window] BUG: the layout was borrowed when {event:?} arrived; nothing came back"
+                ));
+                return;
+            };
+            let away = crate::window_link::end::away_everywhere(&layout, &workspaces);
+            let kind = match event {
+                PairEvent::LinkEnded { .. } => crate::window_link::end::EndKind::LinkEnded,
+                PairEvent::RestoreFailed { .. } => crate::window_link::end::EndKind::RestoreFailed,
+            };
+            let plan = crate::window_link::end::end_plan(&away, kind);
+            crate::window_link::end::apply_end(&plan, &mut layout, &mut workspaces);
+            plan
+        };
+        match &event {
+            PairEvent::LinkEnded { who, .. } => window.say(format!(
+                "[window] the other window ({who}) ended: back {:?}, back hidden {:?}, dropped {:?}",
+                plan.back, plan.back_hidden, plan.dropped
+            )),
+            PairEvent::RestoreFailed { .. } => window.say(format!(
+                "[window] window 2 is not restored: back {:?}, dropped {:?}",
+                plan.back, plan.dropped
+            )),
+        }
+        // Hosted again before the change is laid out, so its layout ops map what came back; the lifecycle's own
+        // pass after them decides what each gets (a Lua panel reopened from its producer, a terminal started once it
+        // is shown).
+        for id in plan.back.iter().chain(&plan.back_hidden) {
+            if matches!(window.lifecycle.kind(id), Some(SurfaceKind::PluginPage { .. })) {
+                // Hidden pages must answer their follow feed and commands as soon as they are held here again.
+                batch.push_effect(HostOp::Plugin(PluginOp::Hold {
+                    win,
+                    module: id.clone(),
+                }));
+            }
+        }
+        for id in &plan.back {
+            window.lifecycle.returned(id);
+        }
+        for id in &plan.back_hidden {
+            window.lifecycle.returned(id);
+            window.lifecycle.reload_at_show(id);
+        }
+        // Killed pages are reopened by the lifecycle when shown; a second load here would replace that fresh
+        // document. Pages taken back hidden defer their ReloadPage until shown; a deferred page with no view
+        // stays unbuilt while hidden, because its first show builds it.
+        let pages: Vec<_> = crate::window_link::end::pages_back(&plan)
+            .into_iter()
+            .filter(|id| !matches!(window.lifecycle.state(id), Some(super::module::ModuleState::Killed(_))))
+            .filter(|id| {
+                !(window.lifecycle.deferred_holding(id)
+                    && !self.reads.page_built(win, id)
+                    && layout.try_borrow().is_ok_and(|layout| !layout.is_shown(id)))
+            })
+            .collect();
+        // The end changed the stored workspaces too, in whatever way the chrome shows them.
+        window.chrome_state.dirty.workspaces += 1;
+        window.changed_by_controller(win, batch);
+        match event {
+            // Orphaned, window 2 keeps the pair file from now on, naming what it holds once the end has been carried
+            // out.
+            PairEvent::LinkEnded { .. }
+                if *window.role()
+                    == super::window::WindowRole::Linked {
+                        side: super::window::LinkSide::Second,
+                    } =>
+            {
+                let held = match (layout.try_borrow(), workspaces.try_borrow()) {
+                    (Ok(layout), Ok(workspaces)) => crate::window_link::end::held(&layout, &workspaces),
+                    _ => Default::default(),
+                };
+                batch.push_effect(HostOp::Pair(PairOp::Orphaned { win, held }));
+            }
+            PairEvent::LinkEnded { .. } => {}
+            PairEvent::RestoreFailed { .. } => batch.push_effect(HostOp::Pair(PairOp::Unrestored { win })),
+        }
+        for module in pages {
+            batch.push_effect(HostOp::Pair(PairOp::ReloadPage { win, module }));
+        }
+    }
+
     /// Whether `module` is shown in `win`'s layout, and whether it is on screen too (not behind a zoom, not on a tab
     /// its container does not draw): what a plugin's follow commands read before they show or hide it. Neither for
     /// a window it does not hold, or a layout being written right now.
@@ -266,47 +492,15 @@ impl Controller {
             })
     }
 
-    /// `scratchpad.show` named the terminal or chat view `module`, which does not exist yet: it is made under that
-    /// number and put straight into the scratchpad, shown and given the keys.
-    pub fn scratch_new(&mut self, win: WinId, module: &ModuleId) -> Batch {
-        let mut batch = Batch::default();
-        if self.awaiting_layout(win, ("scratch_new", module)) {
-            return batch;
-        }
-        self.modules_event(win, &mut batch, |window, cx, batch| {
-            module_verbs::scratch_new(window, cx, win, module, batch)
-        });
-        self.settle_chrome(&mut batch);
-        batch
-    }
-
-    /// `tab.break` from the base view: a new chat view, where the open rules put a broken-out tab, holding the
-    /// base view's active tab.
-    pub fn tab_break(&mut self, win: WinId) -> Batch {
-        let mut batch = Batch::default();
-        if self.awaiting_layout(win, "tab_break") {
-            return batch;
-        }
-        self.modules_event(win, &mut batch, |window, cx, batch| {
-            module_verbs::tab_break(window, cx, win, batch)
-        });
-        self.settle_chrome(&mut batch);
-        batch
-    }
-
     /// Kills `module` with no y/n, as a `y` to its kill's question would: a terminal whose shell ended by itself.
-    /// The last module on screen is the window close, which is the caller's, and is left alone here.
+    /// The last module on screen enters the same close flow as a native close request.
     pub fn kill_confirmed(&mut self, win: WinId, module: &ModuleId) -> Batch {
         let mut batch = Batch::default();
         if self.awaiting_layout(win, ("kill_confirmed", module)) {
             return batch;
         }
         self.modules_event(win, &mut batch, |window, cx, batch| {
-            if module_verbs::kill_confirmed(window, cx, win, module, batch) == module_verbs::Ran::Shell {
-                window.say(format!(
-                    "[modules] {module}: the last module on screen; its close is the window's"
-                ));
-            }
+            module_verbs::kill_confirmed(window, cx, win, module, batch);
         });
         self.settle_chrome(&mut batch);
         batch
@@ -325,7 +519,6 @@ impl Controller {
             self.scheduler.cancel(token);
         }
         self.declared.insert(win, spec);
-        self.shell_revisions.insert(win, 0);
     }
 
     /// Attaches the shared model and saver to a previously declared window.
@@ -338,10 +531,22 @@ impl Controller {
             saver.set_waker(self.scheduler.waker());
         }
         let mut window = Window::new(spec, parts, self.timers.clone());
+        window.own_window = self.starts.get(&win).and_then(|start| start.own_window.clone());
+        window.monitors = self.monitors.clone();
+        if let Some(placement) = self.placements.remove(&win) {
+            window.set_placement(placement);
+        }
+        window.editor_spawn = self.starts.get(&win).and_then(|start| start.spawn.clone());
         if let Some((keymap, module_keys)) = self.keymaps.get(&win) {
             window.keys.prefix = Some(Prefix::new(keymap.clone(), module_keys.clone()));
         }
         self.windows.insert(win, window);
+    }
+
+    pub(super) fn keep_editor_spawn(&mut self, win: WinId, spawn: EditorSpawn) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.editor_spawn = Some(spawn);
+        }
     }
 
     pub(super) fn start_note(&mut self, line: String) {
@@ -374,6 +579,21 @@ impl Controller {
     /// The lifecycle facts recorded for a window, without borrowing its layout.
     pub fn lifecycle(&self, win: WinId) -> Option<&Lifecycle> {
         self.windows.get(&win).map(|window| &window.lifecycle)
+    }
+
+    /// `win`'s `terminal.at` reads out and its restart in place waiting, for tests.
+    #[cfg(test)]
+    pub(super) fn terminal_at_state(
+        &self,
+        win: WinId,
+    ) -> (
+        Vec<super::terminal_at::PendingAt>,
+        Option<super::terminal_at::PendingRestart>,
+    ) {
+        self.windows
+            .get(&win)
+            .map(|w| (w.pending_at.clone(), w.pending_restart.clone()))
+            .unwrap_or_default()
     }
 
     /// The lifecycle of a window, for tests that set up what it holds without its effects.
@@ -482,8 +702,20 @@ impl Controller {
             LayoutRequest::Hide(id) => {
                 module_verbs::hide(window, &cx, win, id, &mut batch).map_err(|err| err.to_string())
             }
+            LayoutRequest::Focus(id)
+                if window.peer.is_some() && module_verbs::peer_key(window, &cx, win, id, &mut batch) =>
+            {
+                Ok(())
+            }
             LayoutRequest::Focus(id) => {
-                super::focus::focus_and_arrive(window, win, id, &mut batch).map_err(|err| err.to_string())
+                let shown = if *id == ModuleId::editor() && window.editor_run != super::window::EditorRun::Running {
+                    module_verbs::lua_show(window, &cx, win, id, &mut batch)
+                } else {
+                    Ok(())
+                };
+                shown
+                    .and_then(|()| super::focus::focus_and_arrive(window, win, id, &mut batch))
+                    .map_err(|err| err.to_string())
             }
             LayoutRequest::Split(id, axis) => {
                 module_verbs::place_and_arrive(window, &cx, win, id, *axis, &mut batch).map_err(|err| err.to_string())
@@ -504,7 +736,10 @@ impl Controller {
             LayoutRequest::Switch(name) => {
                 verbs::workspaces::switch_or_make(window, win, name, &setup, &*reads, &mut batch).map(|_| ())
             }
-            LayoutRequest::Run(_) | LayoutRequest::Float(..) => {
+            LayoutRequest::Float(id, rect) => {
+                verbs::floats::float_at(window, &cx, win, id, *rect, &mut batch).map_err(|err| err.to_string())
+            }
+            LayoutRequest::Run(_) => {
                 unreachable!("only the requests decided here get here")
             }
         };
@@ -518,9 +753,33 @@ impl Controller {
         batch
     }
 
+    /// Empty refusals must not leave later requests waiting for an event that might never come.
+    fn next_lua_request(&mut self, win: WinId) -> Batch {
+        loop {
+            let Some(window) = self.windows.get_mut(&win) else {
+                return Batch::default();
+            };
+            if matches!(
+                window.close.state,
+                super::close::CloseState::TearingDown | super::close::CloseState::Closed
+            ) {
+                window.lua_pending.clear();
+                return Batch::default();
+            }
+            let Some(request) = window.lua_pending.pop_front() else {
+                return Batch::default();
+            };
+            let batch = self.lua_request(win, request);
+            if !batch.is_empty() {
+                return batch;
+            }
+        }
+    }
+
     /// The window's allocation at `size`: the pinned splits shown for the first time settled (with the tree as
     /// the settle left it, for the saver to hear later), then the layout arranged in the frame the grid's
-    /// measures give. `None` for a window never opened or a layout borrowed right now.
+    /// measures give, kept as the window's last arrangement. `None` for a window never opened or a layout borrowed
+    /// right now.
     pub fn allocate(&mut self, win: WinId, size: Size) -> Option<(Rc<Arrangement>, Option<Con>)> {
         let reads = self.reads.clone();
         let window = self.windows.get_mut(&win)?;
@@ -546,12 +805,16 @@ impl Controller {
         if settled.is_some() {
             // The settle wrote the pins' lengths: its `Settled` event, heard from the idle, derives what they move.
             window.layout_touched();
+            window.unheard_settles.push_back(settled.as_ref().unwrap().clone());
         }
         if window.allocated != Some(size) {
             window.allocated = Some(size);
             chrome::resized(window);
         }
-        Some((Rc::new(arrangement), settled))
+        let arrangement = Rc::new(arrangement);
+        // Kept for the drags, which move a divider or a float from where this allocation drew it.
+        window.arranged = Some(arrangement.clone());
+        Some((arrangement, settled))
     }
 
     /// What `win`'s chrome shows, as a copy; a window never opened shows nothing.
@@ -586,27 +849,9 @@ impl Controller {
     fn settle_chrome(&mut self, batch: &mut Batch) {
         let reads = self.reads.clone();
         for (win, window) in &mut self.windows {
+            super::moves::observe_summary(window, *win, &*reads);
             chrome::settle(window, *win, &*reads, self.keymaps.get(win), batch);
         }
-    }
-
-    /// The shell's host refused a window mode the controller asked for: a shell that does not carry out
-    /// `SetMode` yet toggles its own mode through its arm, as before the chrome's verb moved here.
-    fn mode_refused(&mut self, batch: &mut Batch) {
-        let Some((win, window)) = self
-            .windows
-            .iter_mut()
-            .find(|(_, window)| window.chrome_state.mode_asked)
-        else {
-            return;
-        };
-        window.chrome_state.mode_asked = false;
-        window.say("[window_mode] the host refused the mode; the shell's arm sets it".into());
-        batch.set_shell_verb(ShellVerb {
-            win: *win,
-            call: ShellCall::Action(Action::WindowImmersive),
-            keycode: 0,
-        });
     }
 
     /// The chat facts the chrome shows: a view's attention or busy state, a page that came on screen (judged once
@@ -627,6 +872,7 @@ impl Controller {
         };
         match chat {
             ChatEvent::Attention { view, .. } | ChatEvent::Busy { view, .. } => {
+                super::moves::counts_changed(window);
                 chrome::attention_changed(window, *view)
             }
             ChatEvent::PageShown { view, .. } => chrome::page_shown(window, *view),
@@ -653,27 +899,9 @@ impl Controller {
         batch
     }
 
-    /// The `?` sheet opened in chat view `view`'s page from where `opened` says the keys were: kept as the
-    /// window's way back unless the keys were in that view already, and the opening's number returned for the
-    /// page to quote when the sheet closes ([`ChatEvent::KeymapClosed`]). The `prefix ?` arm calls this while the
-    /// panel verbs are still the shell's; 0 for a window never opened, whose close then returns nothing.
-    pub fn keymap_opened(&mut self, win: WinId, view: ViewId, opened: crate::keymap::keys_return::Opened) -> u64 {
-        match self.windows.get_mut(&win) {
-            Some(window) => window.focus.keys_return.opened(opened, &view.module()),
-            None => 0,
-        }
-    }
-
-    /// A request newer than an open `?` sheet (the command line, a workspace switch) took over: the sheet's way
-    /// back is forgotten, so its close does not move the keys out from under the newer request.
-    pub fn keymap_superseded(&mut self, win: WinId) {
-        if let Some(window) = self.windows.get_mut(&win) {
-            window.focus.keys_return.superseded();
-        }
-    }
-
     /// A command the window's prefix finished: an action through the runner as a key's, a digit landing in what
-    /// `select.number` numbered, a split's placement, and a chooser's pick against the workspace order.
+    /// `select.number` numbered, a split's placement, the hide key's hide, and a chooser's pick against the workspace
+    /// order.
     fn prefix_command(&mut self, win: WinId, command: PrefixCommand, keycode: u32) -> Batch {
         let mut batch = Batch::default();
         match command {
@@ -693,6 +921,18 @@ impl Controller {
                         setup: &setup,
                     };
                     module_verbs::place(window, &cx, win, &module, axis, cwd, &mut batch);
+                }
+                batch
+            }
+            PrefixCommand::Hide { module } => {
+                let (reads, keymap, setup) = self.module_parts(win);
+                if let Some(window) = self.windows.get_mut(&win) {
+                    let cx = module_verbs::Cx {
+                        reads: &*reads,
+                        keymap: &keymap,
+                        setup: &setup,
+                    };
+                    module_verbs::hide_by_key(window, &cx, win, &module, &mut batch);
                 }
                 batch
             }
@@ -768,6 +1008,30 @@ impl Controller {
             .unwrap_or_default()
     }
 
+    /// The chat's tab verbs with the keys in `keys`, as a key's tab verb runs them, for tests that name where the
+    /// keys are without a host to report them.
+    #[cfg(test)]
+    pub(crate) fn run_tab(&mut self, win: WinId, tab: crate::keymap::TabAction, keys: Option<ModuleId>) -> Batch {
+        let mut batch = Batch::default();
+        let setup = self.setups.get(&win).cloned().unwrap_or_default();
+        let keymap = self
+            .keymaps
+            .get(&win)
+            .map(|(keymap, _)| keymap.clone())
+            .unwrap_or_else(|| Rc::new(Keymap::defaults()));
+        let reads = self.reads.clone();
+        if let Some(window) = self.windows.get_mut(&win) {
+            let cx = module_verbs::Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            verbs::tabs::run(window, &cx, win, tab, keys, &mut batch);
+        }
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
     fn verb_note(&mut self, win: WinId, line: String) {
         match self.windows.get_mut(&win) {
             Some(window) => window.warn(line),
@@ -788,13 +1052,7 @@ impl Controller {
             return;
         };
         match window.layout.try_borrow() {
-            Ok(layout) => {
-                if matches!(event, HostEvent::LayoutChangedByShell { .. }) {
-                    window.lifecycle.after_change(win, &layout, batch);
-                } else {
-                    window.lifecycle.on_event(win, event, &layout, batch);
-                }
-            }
+            Ok(layout) => window.lifecycle.on_event(win, event, &layout, batch),
             Err(_) => {
                 eprintln!("[wm] BUG: the layout was borrowed when {event:?} arrived; no lifecycle effect");
                 window.lifecycle.record_event(win, event);
@@ -802,63 +1060,65 @@ impl Controller {
         }
     }
 
-    /// How many `LayoutChangedByShell` reports the window had, from whichever hook posted them; 0 for a window
-    /// never heard of.
-    pub fn shell_revision(&self, win: WinId) -> u64 {
-        self.shell_revisions.get(&win).copied().unwrap_or(0)
-    }
-
-    /// The close's save of `win`'s layouts: a pending debounce timer cancelled, a change still unwritten
-    /// handed to the writer, and a wait for the writer to finish. Whether the file now holds the window's
-    /// arrangement: `false` for a window with no saver or no state directory, a writer still writing when the wait
-    /// ran out, a write that failed (or an earlier one that did and was not written since), or a layout that could
-    /// not be read. A caller that forgets something only the file is to keep from now on needs that, not merely a
-    /// finished writer.
-    pub fn persist_now(&mut self, win: WinId) -> bool {
-        let Some(window) = self.windows.get_mut(&win) else {
-            return false;
-        };
-        if let Some(token) = window.save_timer.take() {
-            self.scheduler.cancel(token);
+    /// A test's own write of `win`'s layout or workspaces ([`Window::written_in_test`]), with the chrome derived
+    /// again at the batch's end.
+    #[cfg(test)]
+    pub(super) fn changed_in_test(&mut self, win: WinId) -> Batch {
+        let mut batch = Batch::default();
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.written_in_test(win, &mut batch);
         }
-        let Some(saver) = window.saver.as_mut() else {
-            return false;
-        };
-        saver.collect(window.workspaces.try_borrow_mut().ok().as_deref_mut());
-        let finished = match (window.layout.try_borrow(), window.workspaces.try_borrow()) {
-            (Ok(layout), Ok(workspaces)) => saver.save_now(&layout, &workspaces),
-            _ => saver.save_now_unread(),
-        };
-        saver.collect(window.workspaces.try_borrow_mut().ok().as_deref_mut());
-        let holds = match (window.layout.try_borrow(), window.workspaces.try_borrow()) {
-            (Ok(layout), Ok(workspaces)) => saver.holds(&layout, &workspaces),
-            _ => false,
-        };
-        finished && holds
-    }
-
-    /// The shell changed `win`'s layout or workspaces: what its apply left on screen is the grid's state now, a
-    /// shell verb the runner handed over gets its selection reset, the chrome is derived again from it all, and the
-    /// saver says whether the save's debounce is to be armed.
-    fn layout_changed(&mut self, win: WinId) {
-        let Some(window) = self.windows.get_mut(&win) else {
-            return;
-        };
-        // The arm may have changed the layout and the workspaces in any way the chrome shows.
-        window.layout_touched();
-        window.chrome_state.dirty.workspaces += 1;
-        // A selection the verb ended is put back here, after its arm; the chrome derived below reads it.
-        if window.after_verb.take() == Some(true) {
-            window.clear_selection();
-        }
-        window.reset_mapped();
-        window.saver_changed();
+        self.settle_chrome(&mut batch);
+        batch
     }
 
     /// A timer fired: the save's debounce of whichever window armed it, armed again or written, a window's
     /// restack after a float took the keys, the end of a window's digit wait, a toast's time up, or the idle that
     /// derives what a resize changed.
     fn timer_fired(&mut self, token: TimerToken, batch: &mut Batch) {
+        let fired = self.windows.iter_mut().find_map(|(win, window)| {
+            match super::terminal_at::timer(window, *win, token, batch) {
+                super::terminal_at::Fired::No => None,
+                fired => Some(fired),
+            }
+        });
+        match fired {
+            None => {}
+            Some(super::terminal_at::Fired::Replay(Some(held))) => {
+                batch.append(self.handle(HostEvent::Terminal(held)));
+                return;
+            }
+            Some(_) => return,
+        }
+        if let Some((win, window)) = self
+            .windows
+            .iter_mut()
+            .find(|(_, window)| window.restore_idle == Some(token))
+        {
+            window.restore_idle = None;
+            window.say("[window] starting window 2 again, as the pair last ended".to_string());
+            batch.push_effect(HostOp::RestoreLinkedWindow { win: *win });
+            return;
+        }
+        if let Some(at) = self.view_empty.iter().position(|(armed, ..)| *armed == token) {
+            let (_, win, view) = self.view_empty.remove(at);
+            self.modules_event(win, batch, |window, cx, batch| {
+                verbs::chat::view_empty(window, cx, win, view, batch)
+            });
+            return;
+        }
+        let wins: Vec<_> = self.windows.keys().copied().collect();
+        for win in wins {
+            let (reads, keymap, setup) = self.module_parts(win);
+            let cx = module_verbs::Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            if super::close::timer(self.windows.get_mut(&win).unwrap(), &cx, win, token, batch) {
+                return;
+            }
+        }
         if let Some(window) = self
             .windows
             .values_mut()
@@ -870,6 +1130,8 @@ impl Controller {
         for (win, window) in &mut self.windows {
             if super::focus::raise_timer_fired(window, *win, token, batch)
                 || super::moves::deadline_fired(window, *win, token, batch)
+                || super::moves::page_timer(window, *win, token, batch)
+                || super::moves::summary_fired(window, token)
                 || super::keys::number_timer_fired(window, token, batch)
                 || chrome::toast_timer_fired(window, token)
                 || chrome::resize_idle_fired(window, token)
@@ -922,7 +1184,12 @@ impl Controller {
                 op_index,
                 ..
             } => super::focus::on_native_focus(w, win, owner.clone(), *active, *op_index, batch),
-            HostEvent::Active { active, .. } => super::focus::on_active(w, win, *active, batch),
+            HostEvent::Active { active, .. } => {
+                if !*active {
+                    super::grid::drag::release(w);
+                }
+                super::focus::on_active(w, win, *active, batch);
+            }
             HostEvent::Chat(ChatEvent::KeymapClosed {
                 view, opening, forced, ..
             }) => super::focus::keymap_closed(w, &*reads, win, *view, *opening, *forced, batch),
@@ -955,6 +1222,25 @@ impl Controller {
         }
     }
 
+    /// The grid's presses and drags ([`super::grid::drag`]), after the strip entry's landing and the end of the
+    /// prefix's wait that every press makes: a press on a float's bar or grip raises it and gives it the keys and
+    /// begins its drag, a press on a divider begins that divider's, any other press ends a drag; a motion moves
+    /// what is dragged; a release or cancellation ends the drag.
+    fn pointer_event(&mut self, event: &HostEvent, batch: &mut Batch) {
+        let HostEvent::Pointer { win, on, ev } = event else {
+            return;
+        };
+        let reads = self.reads.clone();
+        let Some(window) = self.windows.get_mut(win) else {
+            return;
+        };
+        match ev {
+            PointerEv::Press { button, .. } => super::grid::drag::press(window, *win, on, *button, batch),
+            PointerEv::Motion { x, y } => super::grid::drag::motion(window, &*reads, *win, *x, *y, batch),
+            PointerEv::Release { .. } | PointerEv::Cancel => super::grid::drag::release(window),
+        }
+    }
+
     /// The window's record, for tests that drive one of its families directly.
     #[cfg(test)]
     pub(crate) fn window_mut(&mut self, win: WinId) -> Option<&mut Window> {
@@ -981,12 +1267,18 @@ impl Controller {
         self.reads.clone()
     }
 
-    /// A pinned split of `win` got its length on screen, which is not a change. `root` is the tree as the
-    /// settle left it, not the layout as it is now: a change made between the allocation and this idle is
+    /// A pinned split of `win` got its length on screen, which is not a change. The queued `unheard_settles`
+    /// entry is the tree as the settle left it: a change made between the allocation and this idle is
     /// still a change.
-    fn settled(&mut self, win: WinId, root: &Con) {
-        if let Some(saver) = self.windows.get_mut(&win).and_then(|window| window.saver.as_mut()) {
-            saver.settled(root);
+    fn settled(&mut self, win: WinId) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            // A settle without a queued allocation is ignored, including one already heard by the close.
+            let Some(root) = window.unheard_settles.pop_front() else {
+                return;
+            };
+            if let Some(saver) = window.saver.as_mut() {
+                saver.settled(&root);
+            }
         }
     }
 
@@ -1012,9 +1304,26 @@ impl Decide for Controller {
         if super::start::event_window(&event).is_some_and(|win| self.awaiting_layout(win, &event)) {
             return batch;
         }
+        // While the base terminal is restarted in place, the end of the shell being replaced is not a kill.
+        if let HostEvent::Terminal(ended @ TermEvent::Exited { win, module }) = &event {
+            if let Some(window) = self.windows.get_mut(win) {
+                if super::terminal_at::hold_exited(window, module, ended) {
+                    return batch;
+                }
+            }
+        }
         match &event {
-            HostEvent::LayoutChangedByShell { win }
-            | HostEvent::SurfaceEnded { win, .. }
+            HostEvent::SurfaceEnded { win, module, .. }
+            | HostEvent::Terminal(TermEvent::Started { win, module, .. } | TermEvent::Exited { win, module }) => {
+                let started = matches!(event, HostEvent::Terminal(TermEvent::Started { .. }));
+                if let Some(window) = self.windows.get_mut(win) {
+                    super::terminal_at::shell_changed(window, *win, module, started, &mut batch);
+                }
+            }
+            _ => {}
+        }
+        match &event {
+            HostEvent::SurfaceEnded { win, .. }
             | HostEvent::Terminal(TermEvent::Started { win, .. } | TermEvent::Exited { win, .. })
             | HostEvent::Refused {
                 what: OpTag::CreateSurface,
@@ -1029,17 +1338,163 @@ impl Decide for Controller {
             _ => {}
         }
         match event {
-            HostEvent::LayoutChangedByShell { win } => {
-                // A verb run before the window was declared still changed its layout, so the count starts there.
-                *self.shell_revisions.entry(win).or_insert(0) += 1;
-                self.layout_changed(win);
+            HostEvent::Lua(LuaEvent::LayoutRequests { win, requests }) => {
+                // Queued only: `after_drain` decides the front once every event queued ahead of it and every
+                // judgment of the batch before it has been heard, so neither an older pending request nor this
+                // event's first one is decided against a state those have not caught up with.
+                if let Some(window) = self.windows.get_mut(&win) {
+                    window.lua_pending.extend(requests);
+                }
+                return Batch::default();
+            }
+            HostEvent::TextSize(event) => {
+                let win = match &event {
+                    TextSizeEvent::Both { win, .. }
+                    | TextSizeEvent::Pane { win, .. }
+                    | TextSizeEvent::PageAttached { win, .. }
+                    | TextSizeEvent::Base { win, .. } => *win,
+                };
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::text_size::event(window, event, &mut batch);
+                }
+            }
+            HostEvent::Editor(EditorEvent::ScaleReported { win, scale }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::text_size::reported(window, win, scale, &mut batch);
+                }
+            }
+            HostEvent::EndSignal { name } => {
+                let wins: Vec<_> = self.windows.keys().copied().collect();
+                for win in wins {
+                    self.modules_event(win, &mut batch, |w, cx, batch| {
+                        super::close::request(w, cx, win, super::close::CloseCause::Signal(name), batch)
+                    });
+                }
+            }
+            HostEvent::Editor(
+                event @ (EditorEvent::Ready { win }
+                | EditorEvent::Released { win }
+                | EditorEvent::ReleaseRefused { win }
+                | EditorEvent::RestartRefused { win, .. }
+                | EditorEvent::StartFailed { win, .. }
+                | EditorEvent::Exited { win, .. }
+                | EditorEvent::Unreachable { win }
+                | EditorEvent::QuitCancelled { win, .. }
+                | EditorEvent::QuitNotSent { win, .. }),
+            ) => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    super::close::editor_event(w, cx, win, event, batch)
+                });
+            }
+            HostEvent::Terminal(TermEvent::Exited { win, module }) => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    if matches!(
+                        w.close.state,
+                        super::close::CloseState::TearingDown | super::close::CloseState::Closed
+                    ) {
+                        return;
+                    }
+                    let scope = w
+                        .layout
+                        .try_borrow()
+                        .ok()
+                        .map(|layout| crate::layout::can_kill(&layout, &module));
+                    match scope {
+                        Some(Ok(scope)) => match super::close::on_shell_exit(scope) {
+                            super::close::OnExit::CloseWindow => {
+                                w.say(format!(
+                                    "[terminal] {module}: the shell ended; the last module on screen closes Eitri"
+                                ));
+                                super::close::request(
+                                    w,
+                                    cx,
+                                    win,
+                                    super::close::CloseCause::LastTerminalExit(module),
+                                    batch,
+                                )
+                            }
+                            // The kill's own hang-up closes the pane, so the shell's hook never closes it too.
+                            super::close::OnExit::CloseModule => {
+                                w.say(format!("[terminal] {module}: the shell ended; the terminal is closed"));
+                                module_verbs::kill_confirmed(w, cx, win, &module, batch);
+                            }
+                        },
+                        Some(Err(err)) => w.say(format!(
+                            "[terminal] {module}: the shell ended, and the terminal stays: {err}"
+                        )),
+                        None => w.warn(format!(
+                            "[terminal] BUG: the layout was borrowed when {module}'s shell ended"
+                        )),
+                    }
+                });
+            }
+            // A session the other window holds, picked here: that window is asked to move it here.
+            HostEvent::Chat(ChatEvent::ChooserPartnerPick { win, session, .. }) => {
+                if let Some(w) = self.windows.get_mut(&win) {
+                    super::moves::ask_session(w, session);
+                }
+            }
+            HostEvent::Chat(ChatEvent::TabVerb { win, view, action }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    window.tab_view = Some(view);
+                }
+                batch.append(self.run_action(win, action, Origin::PanelTab));
+                if let Some(window) = self.windows.get_mut(&win) {
+                    window.tab_view = None;
+                    super::moves::tab_verb(window);
+                }
+            }
+            // A card arrived under a float: reveal it without moving the keys before the shell checks its toast.
+            HostEvent::Chat(ChatEvent::Covered { win, view }) => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    module_verbs::reveal_chat(w, cx, win, view, batch);
+                });
+            }
+            HostEvent::Chat(ChatEvent::Reveal { win, view }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::chat::reveal(window, win, view, &mut batch);
+                }
+            }
+            HostEvent::Chat(ChatEvent::ShowView { win, view }) => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    verbs::chat::show_view(w, cx, win, view, batch)
+                })
+            }
+            // Judged from an idle: the panel says so in the middle of its own call, which may give the view a tab
+            // again before it returns.
+            HostEvent::Chat(ChatEvent::ViewEmpty { win, view }) => {
+                if let Some(window) = self.windows.get_mut(&win).filter(|_| !view.is_base()) {
+                    let token = window.arm_idle();
+                    self.view_empty.push((token, win, view));
+                }
+            }
+            HostEvent::Chat(ChatEvent::ReviewOpen { win }) => self.modules_event(win, &mut batch, |w, cx, batch| {
+                verbs::chat::review_open(w, cx, win, batch)
+            }),
+            HostEvent::Chat(ChatEvent::EditorDone { win, view }) => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    verbs::chat::editor_done(w, cx, win, view, batch)
+                })
+            }
+            // The chat calls that name a module when refused are a join back and a move's freeze.
+            HostEvent::Refused {
+                what: OpTag::Chat,
+                why,
+                surface: Some((win, module)),
+            } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    match super::moves::chat_freezing(window, &module) {
+                        Some(mv) => {
+                            let of = super::moves::FreezeOf::Move(mv);
+                            super::moves::freeze_refused(window, win, of, why, &mut batch);
+                        }
+                        None => verbs::chat::join_refused(window, win, &why, &mut batch),
+                    }
+                }
             }
             HostEvent::Timer(token) => self.timer_fired(token, &mut batch),
-            HostEvent::Settled { win, root } => self.settled(win, &root),
+            HostEvent::Settled { win } => self.settled(win),
             HostEvent::Wake => self.collect_saves(),
-            HostEvent::Refused {
-                what: OpTag::SetMode, ..
-            } => self.mode_refused(&mut batch),
             HostEvent::Created { win, module } => self.modules_event(win, &mut batch, |window, cx, batch| {
                 module_verbs::created(window, cx, win, &module, batch);
             }),
@@ -1054,16 +1509,86 @@ impl Decide for Controller {
                     window.refuse(win, text, &mut batch);
                 }
             }
-            HostEvent::PromptWithdrawn { win } => self.modules_event(win, &mut batch, |window, cx, batch| {
-                // A `no` kills nothing, so nothing is left for the shell.
-                module_verbs::prompt_answer(window, cx, win, super::close::PromptKey::No, batch);
-            }),
+            HostEvent::Terminal(TermEvent::Job {
+                win,
+                module,
+                read,
+                shell,
+                cwd,
+                busy,
+            }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::terminal_at::job(window, win, &module, read, shell, cwd, busy, &mut batch);
+                }
+            }
+            // The pane no longer runs the shell the restart would have ended: an `Exited` held meanwhile is taken now
+            // as it would have been.
+            HostEvent::Refused {
+                what: OpTag::Respawn,
+                why,
+                surface: Some((win, module)),
+            } => {
+                let held = self
+                    .windows
+                    .get_mut(&win)
+                    .and_then(|window| super::terminal_at::respawn_refused(window, win, &module, &why, &mut batch));
+                if let Some(held) = held {
+                    batch.append(self.handle(HostEvent::Terminal(held)));
+                }
+            }
             HostEvent::Terminal(TermEvent::Cwd { win, module, read, dir }) => {
                 self.modules_event(win, &mut batch, |window, cx, batch| {
                     module_verbs::cwd_read(window, cx, win, &module, read, dir, batch)
                 })
             }
+            HostEvent::MonitorsChanged { monitors } => {
+                self.monitors = monitors;
+                for (win, window) in self.windows.iter_mut() {
+                    window.monitors = self.monitors.clone();
+                    // A remembered output that has just appeared is where the window goes.
+                    window.put_back_on_its_monitor(*win, &mut batch);
+                }
+            }
+            HostEvent::WindowMonitor { win, monitor } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    if window.monitor != monitor {
+                        window.monitor = monitor;
+                        super::moves::say_monitor(window);
+                    }
+                    window.put_back_on_its_monitor(win, &mut batch);
+                }
+            }
+            // Neither is the user's doing, so neither is toasted: the window stays where the window manager put it,
+            // and a window 2 that is not started again has had what it held given back here by the host.
+            HostEvent::Refused {
+                what: OpTag::PlaceWindow,
+                why,
+                ..
+            } => eprintln!("[window] the window could not be put back on its monitor: {why}"),
+            HostEvent::Refused {
+                what: OpTag::RestoreLinkedWindow,
+                why,
+                ..
+            } => eprintln!("[window] window 2 could not be started again: {why}"),
+            // Asked for only by a window 2's own question, so its refusal is toasted there.
+            HostEvent::Refused {
+                what: what @ OpTag::StartEditorWindow,
+                why,
+                ..
+            } => {
+                for (win, window) in &mut self.windows {
+                    if matches!(
+                        window.role(),
+                        super::window::WindowRole::Linked {
+                            side: super::window::LinkSide::Second
+                        }
+                    ) {
+                        verbs::windows::refused(window, *win, &what, &why, &mut batch);
+                    }
+                }
+            }
             HostEvent::Peer(event) => self.peer_event(event, &mut batch),
+            HostEvent::Pair(event) => self.pair_event(event, &mut batch),
             HostEvent::Terminal(TermEvent::Detached {
                 win,
                 module,
@@ -1072,8 +1597,72 @@ impl Decide for Controller {
                 handoff,
             }) => {
                 if let Some(window) = self.windows.get_mut(&win) {
-                    super::moves::detached(window, win, &module, mv, record, handoff, &mut batch);
+                    let kind = super::moves::MoveKind::Terminal;
+                    super::moves::frozen(window, win, kind, &module, mv, record, handoff, &mut batch);
                 }
+            }
+            HostEvent::Plugin(PluginEvent::Frozen {
+                win,
+                module,
+                mv,
+                record,
+                handoff,
+            }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::frozen(
+                        window,
+                        win,
+                        super::moves::MoveKind::PluginPage,
+                        &module,
+                        mv,
+                        record,
+                        handoff,
+                        &mut batch,
+                    );
+                }
+            }
+            HostEvent::Plugin(PluginEvent::FreezeRefused { win, module, mv, why }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::page_freeze_refused(window, win, &module, mv, why, &mut batch);
+                }
+            }
+            HostEvent::Plugin(PluginEvent::Ready { win, module }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::page_ready(window, win, &module, &mut batch);
+                }
+            }
+            HostEvent::Chat(ChatEvent::Frozen {
+                win,
+                view,
+                mv,
+                record,
+                handoff,
+            }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    let kind = super::moves::MoveKind::Chat;
+                    super::moves::frozen(window, win, kind, &view.module(), mv, record, handoff, &mut batch);
+                }
+            }
+            HostEvent::Chat(ChatEvent::FreezeRefused { win, mv, why, .. }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::freeze_refused(window, win, super::moves::FreezeOf::Move(mv), why, &mut batch);
+                }
+            }
+            HostEvent::Chat(ChatEvent::PresenceHeld { win, mv }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::presence_answered(window, win, mv, Ok(()), &mut batch);
+                }
+            }
+            HostEvent::Chat(ChatEvent::PresenceRefused { win, mv, why }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::presence_answered(window, win, mv, Err(why), &mut batch);
+                }
+            }
+            // A chat's move that waited for its turn's end goes now.
+            HostEvent::Chat(ChatEvent::Busy { win, view, busy: false }) => {
+                self.modules_event(win, &mut batch, |window, cx, batch| {
+                    super::moves::turn_ended(window, cx, win, view, batch);
+                })
             }
             HostEvent::Prepared { win, module } => {
                 if let Some(window) = self.windows.get_mut(&win) {
@@ -1086,7 +1675,7 @@ impl Decide for Controller {
                 surface: Some((win, module)),
             } => {
                 if let Some(window) = self.windows.get_mut(&win) {
-                    super::moves::prepare_refused(window, &module, why);
+                    super::moves::prepare_refused(window, win, &module, why, &mut batch);
                 }
             }
             // Of the terminal's ops only a freeze names its module when refused.
@@ -1096,16 +1685,27 @@ impl Decide for Controller {
                 surface: Some((win, module)),
             } => {
                 if let Some(window) = self.windows.get_mut(&win) {
-                    super::moves::detach_refused(window, win, &module, why, &mut batch);
+                    let of = super::moves::FreezeOf::Module(module);
+                    super::moves::freeze_refused(window, win, of, why, &mut batch);
                 }
             }
             HostEvent::Refused {
                 what: OpTag::AdoptMoved,
                 why,
                 surface: Some((win, module)),
+            } => self.modules_event(win, &mut batch, |window, cx, batch| {
+                super::moves::adopt_refused(window, cx, win, &module, why, batch);
+            }),
+            HostEvent::Refused {
+                what: OpTag::EndPeer,
+                why,
+                surface: None,
             } => {
-                if let Some(window) = self.windows.get_mut(&win) {
-                    super::moves::adopt_refused(window, win, &module, why, &mut batch);
+                for (win, window) in &mut self.windows {
+                    if window.peer.is_some() {
+                        window.say(format!("[move] the other window could not be ended: {why}"));
+                        window.refuse(*win, why.clone(), &mut batch);
+                    }
                 }
             }
             HostEvent::Refused {
@@ -1113,12 +1713,6 @@ impl Decide for Controller {
                 why,
                 ..
             } => self.window_op_refused(what, &why, &mut batch),
-            // A refusal from an arm still in the shell flashes and toasts through the model, as the runner's do.
-            HostEvent::ShellRefused { win, text } => {
-                if let Some(window) = self.windows.get_mut(&win) {
-                    chrome::refused(window, &text);
-                }
-            }
             event => {
                 if let HostEvent::Refused {
                     what: OpTag::CreateSurface,
@@ -1132,6 +1726,7 @@ impl Decide for Controller {
                 }
                 self.keys_event(&event, &mut batch);
                 self.focus_event(&event, &mut batch);
+                self.pointer_event(&event, &mut batch);
                 self.chat_chrome(&event);
             }
         }
@@ -1148,6 +1743,14 @@ impl Decide for Controller {
         }
         let reads = self.reads.clone();
         if *stage == KeyStage::Window {
+            if press.press == Press::Escape
+                && self
+                    .windows
+                    .get_mut(&win)
+                    .is_some_and(|window| window.drag.take().is_some())
+            {
+                return (Verdict::Consumed, batch);
+            }
             let answer = self
                 .windows
                 .get(&win)
@@ -1160,15 +1763,10 @@ impl Decide for Controller {
                         keymap: &keymap,
                         setup: &setup,
                     };
-                    // The kill the y/n asked about turned out to be the last module's: the window close's own
-                    // question is the shell's.
-                    if module_verbs::prompt_answer(window, &cx, win, answer, &mut batch) == module_verbs::Ran::Shell {
-                        window.after_verb = Some(false);
-                        batch.set_shell_verb(ShellVerb {
-                            win,
-                            call: ShellCall::Action(Action::ModuleKill),
-                            keycode: press.keycode,
-                        });
+                    if window.chrome.prompt.as_ref().is_some_and(|prompt| prompt.closes_window) {
+                        super::close::answer(window, &cx, win, answer, &mut batch);
+                    } else {
+                        module_verbs::prompt_answer(window, &cx, win, answer, &mut batch);
                     }
                 }
                 self.settle_chrome(&mut batch);
@@ -1197,8 +1795,23 @@ impl Decide for Controller {
     }
 
     fn close_requested(&mut self, win: WinId, by: CloseBy) -> (CloseVerdict, Batch) {
-        self.awaiting_layout(win, ("close_requested", by));
-        (CloseVerdict::Proceed, Batch::default())
+        let mut batch = Batch::default();
+        if !self.awaiting_layout(win, ("close_requested", &by)) {
+            self.modules_event(win, &mut batch, |w, cx, batch| {
+                super::close::request(
+                    w,
+                    cx,
+                    win,
+                    match by {
+                        CloseBy::User => super::close::CloseCause::User,
+                        CloseBy::Compositor => super::close::CloseCause::Compositor,
+                    },
+                    batch,
+                )
+            });
+        }
+        self.settle_chrome(&mut batch);
+        (CloseVerdict::Stop, batch)
     }
 
     /// The one runner ([`Controller::run_action`]), and the chrome its batch leaves.
@@ -1208,28 +1821,43 @@ impl Decide for Controller {
         batch
     }
 
-    fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch {
-        let mut batch = Batch::default();
-        if self.awaiting_layout(win, ("focus", module)) {
-            return batch;
-        }
-        batch.push_layout(HostOp::Focus {
-            win,
-            to: FocusTo::Module(module.clone()),
-            on_grab: vec![],
-        });
-        batch
-    }
-
     /// The coverage the batches the queue held left, judged when the layout or the size moved or a chat page came
-    /// on screen; a window's answer from the host to a mode it asked for has come by now, if the host gave one.
+    /// on screen; once those judgments answer nothing, the front of a window's pending Lua layout requests.
     fn after_drain(&mut self) -> Batch {
         let mut batch = Batch::default();
         let reads = self.reads.clone();
         for (win, window) in &mut self.windows {
-            window.chrome_state.mode_asked = false;
+            super::moves::after_batch(window, *win, &*reads);
+            let keymap = self
+                .keymaps
+                .get(win)
+                .map(|(keymap, _)| keymap.clone())
+                .unwrap_or_else(|| Rc::new(Keymap::defaults()));
+            let setup = self.setups.get(win).cloned().unwrap_or_default();
+            let cx = module_verbs::Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            super::moves::workspace::progress(window, &cx, *win, &mut batch);
+            super::close::moves_progress(window, &cx, *win, &mut batch);
             if chrome::coverage_due(window) {
                 chrome::reconcile_coverage(window, *win, &*reads, &mut batch);
+            }
+        }
+        self.settle_chrome(&mut batch);
+        // A request must see the state left by all judgments of the preceding batch.
+        if !batch.is_empty() {
+            return batch;
+        }
+        while let Some(win) = self
+            .windows
+            .iter()
+            .find_map(|(win, window)| (!window.lua_pending.is_empty()).then_some(*win))
+        {
+            let batch = self.next_lua_request(win);
+            if !batch.is_empty() {
+                return batch;
             }
         }
         batch
@@ -1238,10 +1866,12 @@ impl Decide for Controller {
 
 impl Controller {
     /// The one runner: the selection's gate (a refusal says how to get back to one module), then the float's (a
-    /// refusal says how to sink the float), then the action's family, decided here when it has moved and handed
-    /// to the shell otherwise, then the gate's selection reset, whose text the chrome derives again.
-    /// A shell verb's reset waits for its re-read, so it comes after the arm as it comes after a verb decided
-    /// here. [`Decide::run`] derives the chrome once the whole batch is built.
+    /// refusal says how to sink the float), then the action's family, decided here, then the gate's selection
+    /// reset, whose text the chrome derives again. [`Decide::run`] derives the chrome once the whole batch is built.
+    // Every key action, every `eitri.layout.run` and every panel tab verb goes through the controller's one
+    // runner, so a key and a Lua call cannot drift apart; the runner meets the container selection's and the
+    // float's rules and decides every family. The focus and keys verbs are the controller's too: what holds
+    // the keys is reported from the host, for the verbs that act on it.
     fn run_action(&mut self, win: WinId, action: Action, origin: Origin) -> Batch {
         self.run_gated(win, action, origin, None)
     }
@@ -1257,14 +1887,9 @@ impl Controller {
             Origin::Key { keycode } => keycode,
             _ => 0,
         };
-        let shell_verb = |action: Action| ShellVerb {
-            win,
-            call: ShellCall::Action(action),
-            keycode,
-        };
         if !self.windows.contains_key(&win) {
-            // A window the controller does not hold has only the shell's arms.
-            batch.set_shell_verb(shell_verb(action));
+            // Nothing else decides a verb: one for a window the controller does not hold has nowhere to run.
+            eprintln!("[wm] BUG: {} ran in {win:?}, which is not held", action.name());
             return batch;
         }
         let setup = self.setups.get(&win).cloned().unwrap_or_default();
@@ -1309,6 +1934,15 @@ impl Controller {
             verbs::Family::Keys => verbs::keys::run(window, win, &action, keycode, &keymap(), &mut batch),
             verbs::Family::Chrome => verbs::chrome::run(window, win, &action, &mut batch),
             verbs::Family::Workspaces => verbs::workspaces::run(window, &*reads, win, &action, &setup, &mut batch),
+            verbs::Family::Floats => {
+                let keymap = keymap();
+                let cx = module_verbs::Cx {
+                    reads: &*reads,
+                    keymap: &keymap,
+                    setup: &setup,
+                };
+                verbs::floats::run(window, &cx, win, &action, &mut batch);
+            }
             verbs::Family::Windows => {
                 let keymap = keymap();
                 let cx = module_verbs::Cx {
@@ -1318,33 +1952,38 @@ impl Controller {
                 };
                 verbs::windows::run(window, &cx, win, &action, &mut batch);
             }
-            verbs::Family::Modules => {
+            verbs::Family::Modules | verbs::Family::Close => {
                 let keymap = keymap();
                 let cx = module_verbs::Cx {
                     reads: &*reads,
                     keymap: &keymap,
                     setup: &setup,
                 };
-                let ran = match subject {
+                match subject {
                     Some(module) => {
                         let show = matches!(action, Action::Module(_));
                         module_verbs::follow(window, &cx, win, module, show, &mut batch);
-                        module_verbs::Ran::Done
                     }
-                    None => module_verbs::run(window, &cx, win, &action, &origin, &mut batch),
-                };
-                if ran == module_verbs::Ran::Shell {
-                    // The last module's kill is the window close, whose question the shell asks.
-                    batch.set_shell_verb(shell_verb(action));
-                    window.after_verb = Some(reset);
-                    return batch;
+                    None => {
+                        module_verbs::run(window, &cx, win, &action, &origin, &mut batch);
+                    }
                 }
             }
-            family => {
-                debug_assert!(!verbs::moved(family), "{family:?} has moved but has no runner arm");
-                batch.set_shell_verb(shell_verb(action));
-                window.after_verb = Some(reset);
-                return batch;
+            verbs::Family::Panel => {
+                let keymap = keymap();
+                let cx = module_verbs::Cx {
+                    reads: &*reads,
+                    keymap: &keymap,
+                    setup: &setup,
+                };
+                verbs::chat::run(window, &cx, win, &action, &mut batch);
+            }
+            verbs::Family::TextSize => {
+                if let Action::Text(change) = action {
+                    // The module that holds the keys right now, where a key typed now would go.
+                    let keys = window.focus.native_module().cloned();
+                    verbs::text_size::run(window, win, change, keys.as_ref(), &mut batch);
+                }
             }
         }
         if reset && window.clear_selection() {
@@ -1368,52 +2007,624 @@ mod tests {
         Controller::new(FakeScheduler::new())
     }
 
-    #[test]
-    fn a_layout_changed_by_the_shell_counts_a_revision_and_asks_for_nothing() {
-        let mut c = controller();
-        let win = WinId::MAIN;
-        c.open_window(
-            win,
-            WindowSpec {
-                role: WindowRole::Main,
-                presence: EditorPresence::Owned,
-                title: "main".into(),
-            },
-            WindowParts {
-                layout: Rc::new(RefCell::new(first_launch_layout(&[]).unwrap())),
-                workspaces: Rc::new(RefCell::new(Workspaces::single())),
-                saver: None,
-            },
-        );
-        assert_eq!(c.window_spec(win).map(|spec| spec.title.as_str()), Some("main"));
-        assert_eq!(c.shell_revision(win), 0);
-        // The shell's change may change what the chrome shows, so its batch may announce the model; nothing else.
-        let announce_only = |batch: Batch| batch.ops().all(|op| matches!(op, HostOp::Chrome { .. }));
-        assert!(announce_only(c.handle(HostEvent::LayoutChangedByShell { win })));
-        assert!(
-            c.handle(HostEvent::LayoutChangedByShell { win }).is_empty(),
-            "the same layout again changes no chrome value"
-        );
-        assert_eq!(c.shell_revision(win), 2);
-        assert!(c.handle(HostEvent::MonitorsChanged).is_empty());
-        assert_eq!(c.shell_revision(win), 2, "other facts change nothing yet");
-        assert_eq!(c.shell_revision(WinId(9)), 0);
+    fn lua_driver() -> (Rc<super::super::Driver>, Rc<super::super::fake::FakeHost>) {
+        use crate::wm::verbs::rig::{decl, rig, WIN};
+        let r = rig(first_launch_layout(&[]).unwrap());
+        r.host.set_grid_size(Size { w: 1200, h: 800 });
+        for module in r.layout.borrow().modules() {
+            r.host.with_surface(WIN, module.clone(), decl(&module).kind, false);
+        }
+        let driver = super::super::Driver::new(r.controller, r.host.clone(), r.scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        r.host.attach(Rc::downgrade(&sink));
+        r.scheduler.attach(Rc::downgrade(&sink));
+        driver.test_batch(|_| r.first);
+        driver.test_batch(|_| {
+            let mut batch = Batch::default();
+            batch.push_layout(HostOp::Focus {
+                win: WIN,
+                to: FocusTo::Module(ModuleId::editor()),
+                on_grab: vec![],
+            });
+            batch
+        });
+        (driver, r.host)
+    }
+
+    fn lua_event(requests: Vec<LayoutRequest>) -> HostEvent {
+        HostEvent::Lua(LuaEvent::LayoutRequests {
+            win: WinId::MAIN,
+            requests,
+        })
+    }
+
+    fn lua_ops(host: &super::super::fake::FakeHost, from: usize) -> Vec<HostOp> {
+        host.log()[from..]
+            .iter()
+            .filter_map(|entry| match entry {
+                super::super::fake::Logged::Op(op, Applied::Done) => Some(op.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn individually_applied(requests: Vec<LayoutRequest>) -> Vec<HostOp> {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        for request in requests {
+            driver.test_batch(|c| c.lua_request(WinId::MAIN, request));
+        }
+        lua_ops(&host, from)
     }
 
     #[test]
-    fn the_first_controller_focuses_passes_keys_through_and_lets_closes_proceed() {
+    fn the_kernels_requests_run_in_order_through_one_event() {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        let requests = vec![
+            LayoutRequest::Run(Action::Zoom),
+            LayoutRequest::Mark(ModuleId::agent()),
+            LayoutRequest::Show(ModuleId::terminal()),
+        ];
+        let expected = individually_applied(requests.clone());
+        assert!(expected
+            .iter()
+            .any(|op| matches!(op, HostOp::Map { module, .. } if *module == ModuleId::terminal())));
+        driver.post(lua_event(requests));
+        assert_eq!(lua_ops(&host, from), expected);
+        assert_eq!(
+            driver.query(|c| c.chrome(WinId::MAIN).top_bar.mark),
+            Some("marked: agent".into())
+        );
+    }
+
+    #[test]
+    fn a_lua_focus_then_hide_hides_the_module_the_focus_reached() {
+        let (driver, host) = lua_driver();
+        assert_eq!(host.focus_owner(WinId::MAIN), Some(ModuleId::editor()));
+        let from = host.log().len();
+        let requests = vec![
+            LayoutRequest::Focus(ModuleId::agent()),
+            LayoutRequest::Run(Action::ModuleHide),
+        ];
+        driver.post(lua_event(requests.clone()));
+        let ops = lua_ops(&host, from);
+        assert_eq!(ops, individually_applied(requests));
+        assert!(ops.contains(&HostOp::Unmap {
+            win: WinId::MAIN,
+            module: ModuleId::agent()
+        }));
+        assert!(!ops.contains(&HostOp::Unmap {
+            win: WinId::MAIN,
+            module: ModuleId::editor()
+        }));
+    }
+
+    #[test]
+    fn a_request_drained_while_a_batch_applies_runs_after_it() {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        let weak = Rc::downgrade(&driver);
+        host.on_apply(move |host, _, op| {
+            if matches!(op, HostOp::Focus { to: FocusTo::Module(module), .. } if *module == ModuleId::agent()) {
+                host.on_apply(|_, _, _| {});
+                let driver = weak.upgrade().unwrap();
+                let before = driver.query(|c| c.notes(WinId::MAIN).to_vec());
+                host.post(lua_event(vec![
+                    LayoutRequest::Mark(ModuleId::agent()),
+                    LayoutRequest::Focus(ModuleId::terminal()),
+                    LayoutRequest::Run(Action::ModuleHide),
+                ]));
+                assert_eq!(driver.query(|c| c.notes(WinId::MAIN).to_vec()), before);
+            }
+        });
+        driver.post(lua_event(vec![
+            LayoutRequest::Focus(ModuleId::agent()),
+            LayoutRequest::Show(ModuleId::terminal()),
+        ]));
+        let expected = individually_applied(vec![
+            LayoutRequest::Focus(ModuleId::agent()),
+            LayoutRequest::Show(ModuleId::terminal()),
+            LayoutRequest::Mark(ModuleId::agent()),
+            LayoutRequest::Focus(ModuleId::terminal()),
+            LayoutRequest::Run(Action::ModuleHide),
+        ]);
+        assert_eq!(lua_ops(&host, from), expected);
+        assert!(driver.query(|c| c.notes(WinId::MAIN).iter().any(|note| note.contains("Mark("))));
+    }
+
+    /// A drain posted while an earlier drain's requests wait decides none of them itself: the events queued
+    /// behind it by the batch that is applying are heard first, so the waiting hide meets the focus they report.
+    #[test]
+    fn a_drain_posted_behind_pending_requests_waits_for_the_queued_events() {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        host.on_apply(move |host, _, op| {
+            if matches!(op, HostOp::Focus { to: FocusTo::Module(module), .. } if *module == ModuleId::agent()) {
+                host.on_apply(|_, _, _| {});
+                host.post(lua_event(vec![LayoutRequest::Mark(ModuleId::agent())]));
+                // The focus moves on before the queue drains, as a click elsewhere during the apply would.
+                host.post(HostEvent::NativeFocus {
+                    win: WinId::MAIN,
+                    owner: Some(FocusOwner::Module(ModuleId::editor())),
+                    chain: FocusChain(vec![ModuleId::editor()]),
+                    active: true,
+                    op_index: None,
+                });
+            }
+        });
+        driver.post(lua_event(vec![
+            LayoutRequest::Focus(ModuleId::agent()),
+            LayoutRequest::Run(Action::ModuleHide),
+        ]));
+        let unmapped: Vec<_> = lua_ops(&host, from)
+            .into_iter()
+            .filter_map(|op| match op {
+                HostOp::Unmap { module, .. } => Some(module),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unmapped,
+            vec![ModuleId::editor()],
+            "the hide reads the focus the queued events left"
+        );
+    }
+
+    #[test]
+    fn a_refused_request_does_not_stall_the_ones_after_it() {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        let refused = LayoutRequest::Hide(ModuleId::lua("missing"));
+        assert!(individually_applied(vec![refused.clone()]).is_empty());
+        driver.post(lua_event(vec![refused, LayoutRequest::Show(ModuleId::terminal())]));
+        assert_eq!(
+            lua_ops(&host, from),
+            individually_applied(vec![LayoutRequest::Show(ModuleId::terminal())])
+        );
+        assert!(lua_ops(&host, from).contains(&HostOp::Map {
+            win: WinId::MAIN,
+            module: ModuleId::terminal()
+        }));
+    }
+
+    #[test]
+    fn the_drain_judges_coverage_before_deciding_the_next_request() {
+        let (driver, host) = lua_driver();
+        let from = host.log().len();
+        let requests = vec![
+            LayoutRequest::Hide(ModuleId::agent()),
+            LayoutRequest::Show(ModuleId::agent()),
+            LayoutRequest::Hide(ModuleId::agent()),
+        ];
+        let expected = individually_applied(requests.clone());
+        assert!(expected
+            .iter()
+            .any(|op| matches!(op, HostOp::Chat(ChatOp::PageShown { .. }))));
+        driver.post(lua_event(requests));
+        assert_eq!(lua_ops(&host, from), expected);
+    }
+
+    #[test]
+    fn the_lua_store_reads_through_the_controller() {
+        use crate::lua::layout::{install, LayoutStore, Query};
+        let (driver, host) = lua_driver();
+        let (layout, workspaces) = driver.query(|c| c.views(WinId::MAIN)).expect("the window is held");
+        let lua = Rc::new(mlua::Lua::new());
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(LayoutStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        store.borrow_mut().attach(Query::new(move || layout.copy()));
+        store
+            .borrow_mut()
+            .attach_workspaces(Query::new(move || workspaces.copy()));
+        store.borrow_mut().accept_requests();
+        let hidden = |lua: &mlua::Lua| -> String {
+            lua.load("return table.concat(eitri.layout.get().hidden, ',') .. '|' .. eitri.layout.get().workspace")
+                .eval()
+                .unwrap()
+        };
+        assert_eq!(hidden(&lua), "terminal|main", "the first launch hides the terminal");
+        // A Lua call made while the show's batch is carried out reads the layout the batch's decision left: the
+        // copy is taken when it asks, and the controller is not in the middle of deciding then.
+        let during: Rc<RefCell<Option<String>>> = Rc::default();
+        {
+            let (lua, during) = (lua.clone(), during.clone());
+            host.on_apply(move |_, _, op| {
+                if matches!(op, HostOp::Map { module, .. } if *module == ModuleId::terminal()) {
+                    *during.borrow_mut() = Some(hidden(&lua));
+                }
+            });
+        }
+        driver.post(lua_event(vec![LayoutRequest::Show(ModuleId::terminal())]));
+        assert_eq!(during.borrow().as_deref(), Some("|main"));
+        host.on_apply(|_, _, _| {});
+        assert_eq!(hidden(&lua), "|main", "after the batch: its result");
+    }
+
+    /// A window holding `layout` in role `role` behind a driver over the fake host, every module of it hosted.
+    fn pair_driver(
+        layout: crate::layout::Layout,
+        role: WindowRole,
+    ) -> (
+        Rc<super::super::Driver>,
+        Rc<super::super::fake::FakeHost>,
+        super::super::LayoutView,
+    ) {
+        use crate::wm::verbs::rig::decl;
+        let host = super::super::fake::FakeHost::new();
+        host.set_grid_size(Size { w: 1200, h: 800 });
+        let scheduler = FakeScheduler::new();
+        let mut c = Controller::new(scheduler.clone());
+        c.set_reads(host.clone());
+        let hosted: Vec<_> = layout.modules().iter().map(decl).collect();
+        for d in &hosted {
+            host.with_surface(WinId::MAIN, d.module.clone(), d.kind.clone(), false);
+        }
+        let presence = if role == WindowRole::Main {
+            EditorPresence::Owned
+        } else {
+            EditorPresence::None
+        };
+        c.open_window(
+            WinId::MAIN,
+            WindowSpec {
+                role,
+                presence,
+                title: "project".into(),
+            },
+            WindowParts::new(layout, Workspaces::single(), None),
+        );
+        let first = c.first_apply(WinId::MAIN, &hosted);
+        let (view, _) = c.views(WinId::MAIN).unwrap();
+        let driver = super::super::Driver::new(c, host.clone(), scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        host.attach(Rc::downgrade(&sink));
+        scheduler.attach(Rc::downgrade(&sink));
+        driver.test_batch(|_| first);
+        (driver, host, view)
+    }
+
+    /// `editor | (agent / lua:notes / terminal#2)`, the page and the terminal instance held away for the other
+    /// window.
+    fn held_away() -> crate::layout::Layout {
+        use crate::layout::{Axis, Layout, Node};
+        let (notes, t2) = (ModuleId::lua("notes"), ModuleId::parse("terminal#2").unwrap());
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::split(Axis::Column, 0.5, Node::Leaf(notes.clone()), Node::Leaf(t2.clone())),
+                ),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        layout.set_away(&notes, true).unwrap();
+        layout.set_away(&t2, true).unwrap();
+        layout
+    }
+
+    fn applied_since(host: &super::super::fake::FakeHost, from: usize) -> Vec<HostOp> {
+        lua_ops(host, from)
+            .into_iter()
+            .filter(|op| !matches!(op, HostOp::Chrome { .. }))
+            .collect()
+    }
+
+    fn position_of(ops: &[HostOp], what: impl Fn(&HostOp) -> bool) -> usize {
+        ops.iter()
+            .position(what)
+            .unwrap_or_else(|| panic!("not in the batch: {ops:#?}"))
+    }
+
+    #[test]
+    fn pair_returns_reopen_plugin_holdings_before_any_show_or_reload() {
+        use crate::layout::{Layout, ModuleDecl, Placement};
+        let page = ModuleId::lua("page");
+        for event in [
+            PairEvent::LinkEnded {
+                win: WinId::MAIN,
+                who: "process 7".into(),
+            },
+            PairEvent::RestoreFailed { win: WinId::MAIN },
+        ] {
+            for (deferred, built) in [(false, true), (true, false), (true, true)] {
+                let mut layout = Layout::initial(&[ModuleDecl {
+                    id: page.clone(),
+                    placement: Placement::RightOfRoot,
+                }])
+                .unwrap();
+                if deferred {
+                    crate::layout::hide(
+                        &mut layout,
+                        &page,
+                        &crate::layout::Frame::new(Size { w: 1200, h: 800 }, 1),
+                    )
+                    .unwrap();
+                }
+                layout.set_away(&page, true).unwrap();
+                let mut c = controller();
+                let host = super::super::fake::FakeHost::new();
+                host.set_page_built(page.clone(), built);
+                c.set_reads(host);
+                c.open_window(
+                    WinId::MAIN,
+                    WindowSpec {
+                        role: WindowRole::Main,
+                        presence: EditorPresence::Owned,
+                        title: "project".into(),
+                    },
+                    WindowParts::new(layout, Workspaces::single(), None),
+                );
+                c.first_apply(
+                    WinId::MAIN,
+                    &[SurfaceDecl {
+                        module: page.clone(),
+                        kind: SurfaceKind::PluginPage { plugin: "page".into() },
+                        deferred,
+                    }],
+                );
+                let batch = c.handle(HostEvent::Pair(event.clone()));
+                let ops: Vec<_> = batch.ops().cloned().collect();
+                let hold = HostOp::Plugin(PluginOp::Hold {
+                    win: WinId::MAIN,
+                    module: page.clone(),
+                });
+                assert_eq!(ops.iter().filter(|op| **op == hold).count(), 1, "{event:?}: {batch:?}");
+                let held = position_of(&ops, |op| *op == hold);
+                for (index, op) in ops.iter().enumerate() {
+                    if matches!(op,
+                        HostOp::Plugin(PluginOp::Build { module, .. })
+                        | HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == &page
+                    ) {
+                        assert!(held < index, "{event:?}: {batch:?}");
+                    }
+                }
+                if deferred || matches!(event, PairEvent::LinkEnded { .. }) {
+                    assert_eq!(c.module_shown(WinId::MAIN, &page), (false, false));
+                    assert!(!ops.iter().any(|op| matches!(op,
+                        HostOp::Plugin(PluginOp::Build { module, .. }) if module == &page
+                    )));
+                }
+                if deferred && !built {
+                    assert!(
+                        !ops.iter().any(|op| matches!(op,
+                            HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == &page
+                        )),
+                        "a hidden page with no view waits for its first show: {batch:?}"
+                    );
+                    let batch = c.lua_request(WinId::MAIN, LayoutRequest::Show(page.clone()));
+                    assert_eq!(
+                        batch
+                            .ops()
+                            .filter(|op| matches!(op,
+                                HostOp::Plugin(PluginOp::Build { module, .. }) if module == &page
+                            ))
+                            .count(),
+                        1,
+                        "{batch:?}"
+                    );
+                    let batch = c.lua_request(WinId::MAIN, LayoutRequest::Hide(page.clone()));
+                    assert!(!batch
+                        .ops()
+                        .any(|op| matches!(op, HostOp::Plugin(PluginOp::Build { .. }))));
+                    let batch = c.lua_request(WinId::MAIN, LayoutRequest::Show(page.clone()));
+                    assert!(!batch
+                        .ops()
+                        .any(|op| matches!(op, HostOp::Plugin(PluginOp::Build { .. }))));
+                } else if matches!(event, PairEvent::RestoreFailed { .. }) {
+                    assert_eq!(
+                        ops.iter()
+                            .filter(|op| matches!(op,
+                                HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == &page
+                            ))
+                            .count(),
+                        1,
+                        "a kept view remains available for reload: {batch:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_end_brings_pages_back_hidden_and_defers_their_reload_op_until_show() {
+        use crate::layout::{Layout, ModuleDecl, Placement};
+        use crate::wm::module::SurfaceDecl;
+        let (panel, page) = (ModuleId::lua("panel"), ModuleId::lua("page"));
+        let mut layout = Layout::initial(&[panel.clone(), page.clone()].map(|id| ModuleDecl {
+            id,
+            placement: Placement::RightOfRoot,
+        }))
+        .unwrap();
+        for id in [&panel, &page] {
+            layout.set_away(id, true).unwrap();
+        }
+        let mut c = controller();
+        c.open_window(
+            WinId::MAIN,
+            WindowSpec {
+                role: WindowRole::Main,
+                presence: EditorPresence::Owned,
+                title: "project".into(),
+            },
+            WindowParts::new(layout, Workspaces::single(), None),
+        );
+        c.first_apply(
+            WinId::MAIN,
+            &[
+                SurfaceDecl {
+                    module: panel.clone(),
+                    kind: SurfaceKind::LuaPanel {
+                        url: "eitri://panel".into(),
+                        title: "panel".into(),
+                    },
+                    deferred: false,
+                },
+                SurfaceDecl {
+                    module: page.clone(),
+                    kind: SurfaceKind::PluginPage { plugin: "page".into() },
+                    deferred: false,
+                },
+            ],
+        );
+        let batch = c.handle(HostEvent::Pair(PairEvent::LinkEnded {
+            win: WinId::MAIN,
+            who: "process 7".into(),
+        }));
+        assert_eq!(
+            batch
+                .ops()
+                .filter_map(|op| match op {
+                    HostOp::Plugin(PluginOp::Hold { module, .. }) => Some(module),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [&page],
+            "only the plugin page takes a holding; the Lua panel reopens through its lifecycle"
+        );
+        assert!(!batch.ops().any(|op| matches!(
+            op,
+            HostOp::Plugin(PluginOp::Reload { .. }) | HostOp::Pair(PairOp::ReloadPage { .. })
+        )));
+        for id in [&panel, &page] {
+            assert_eq!(c.module_shown(WinId::MAIN, id), (false, false));
+            let batch = c.lua_request(WinId::MAIN, LayoutRequest::Show(id.clone()));
+            let loads = batch.ops().filter(|op| matches!(op,
+                HostOp::Plugin(PluginOp::Reload { module, .. }) | HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == id
+            )).count();
+            assert_eq!(loads, 1, "{id}: {batch:?}");
+            let ops: Vec<_> = batch.ops().cloned().collect();
+            let allocated = position_of(&ops, |op| matches!(op, HostOp::Allocate { .. }));
+            let loaded = position_of(&ops, |op| {
+                matches!(op,
+                    HostOp::Plugin(PluginOp::Reload { module, .. }) | HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == id
+                )
+            });
+            assert!(allocated < loaded, "{batch:?}");
+            if id == &panel {
+                assert!(batch.ops().any(|op| matches!(op,
+                    HostOp::Plugin(PluginOp::Reload { module, reset_guard: true, .. }) if module == id
+                )));
+            } else {
+                assert!(batch.ops().any(|op| matches!(op,
+                    HostOp::Pair(PairOp::ReloadPage { module, .. }) if module == id
+                )));
+            }
+            c.lua_request(WinId::MAIN, LayoutRequest::Hide(id.clone()));
+            let batch = c.lua_request(WinId::MAIN, LayoutRequest::Show(id.clone()));
+            assert!(!batch.ops().any(|op| matches!(
+                op,
+                HostOp::Plugin(PluginOp::Reload { .. }) | HostOp::Pair(PairOp::ReloadPage { .. })
+            )));
+        }
+    }
+
+    #[test]
+    fn a_link_end_brings_the_modules_back_through_the_controller() {
+        let (notes, t2) = (ModuleId::lua("notes"), ModuleId::parse("terminal#2").unwrap());
+        for (role, orphaned) in [
+            (WindowRole::Main, false),
+            (
+                WindowRole::Linked {
+                    side: super::super::LinkSide::Second,
+                },
+                true,
+            ),
+        ] {
+            let (driver, host, layout) = pair_driver(held_away(), role.clone());
+            let from = host.log().len();
+            driver.post(HostEvent::Pair(PairEvent::LinkEnded {
+                win: WinId::MAIN,
+                who: "process 7".into(),
+            }));
+            {
+                let layout = layout.read();
+                assert!(
+                    !layout.is_shown(&notes) && !layout.is_away(&notes),
+                    "{role:?}: the page is back"
+                );
+                assert!(
+                    !layout.contains(&t2),
+                    "{role:?}: the terminal ended with the other window"
+                );
+            }
+            let ops = applied_since(&host, from);
+            assert!(!ops.iter().any(|op| matches!(op,
+                HostOp::Map { module, .. } if module == &notes
+            )));
+            assert!(!ops.iter().any(|op| matches!(
+                op,
+                HostOp::Plugin(PluginOp::Reload { .. }) | HostOp::Pair(PairOp::ReloadPage { .. })
+            )));
+            let allocated = position_of(&ops, |op| *op == HostOp::Allocate { win: WinId::MAIN });
+            let told = ops
+                .iter()
+                .position(|op| matches!(op, HostOp::Pair(PairOp::Orphaned { .. })));
+            assert_eq!(
+                told.is_some(),
+                orphaned,
+                "{role:?}: only an orphaned window 2 keeps the file: {ops:#?}"
+            );
+            if let Some(told) = told {
+                assert!(allocated < told, "{ops:#?}");
+                let HostOp::Pair(PairOp::Orphaned { held, .. }) = &ops[told] else {
+                    unreachable!()
+                };
+                assert!(held.contains("lua:notes") && held.contains("agent"), "{held:?}");
+                assert!(!held.contains("terminal#2"), "{held:?}");
+            }
+            assert!(
+                !ops.iter().any(|op| format!("{op:?}").contains("terminal#2")),
+                "{role:?}: nothing is done for a module that did not come back: {ops:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_2_that_does_not_come_back_returns_its_modules_through_the_controller() {
+        let (notes, t2) = (ModuleId::lua("notes"), ModuleId::parse("terminal#2").unwrap());
+        let (driver, host, layout) = pair_driver(held_away(), WindowRole::Main);
+        let from = host.log().len();
+        driver.post(HostEvent::Pair(PairEvent::RestoreFailed { win: WinId::MAIN }));
+        assert!(layout.read().is_shown(&notes) && !layout.read().contains(&t2));
+        let ops = applied_since(&host, from);
+        let allocated = position_of(&ops, |op| *op == HostOp::Allocate { win: WinId::MAIN });
+        let unrestored = position_of(&ops, |op| *op == HostOp::Pair(PairOp::Unrestored { win: WinId::MAIN }));
+        let reload = position_of(&ops, |op| {
+            *op == HostOp::Plugin(PluginOp::Reload {
+                win: WinId::MAIN,
+                module: notes.clone(),
+                reset_guard: true,
+            })
+        });
+        assert!(allocated < reload && reload < unrestored, "{ops:#?}");
+        assert!(
+            !ops.iter().any(|op| format!("{op:?}").contains("terminal#2")),
+            "nothing is done for a module that did not come back: {ops:#?}"
+        );
+        let from = host.log().len();
+        driver.post(HostEvent::Pair(PairEvent::RestoreFailed { win: WinId::MAIN }));
+        let again = applied_since(&host, from);
+        assert!(
+            !again
+                .iter()
+                .any(|op| matches!(op, HostOp::Pair(PairOp::ReloadPage { .. }))),
+            "nothing is away any more: {again:#?}"
+        );
+    }
+
+    #[test]
+    fn the_controller_passes_keys_through_and_stops_native_closes() {
         let mut c = controller();
         let win = WinId::MAIN;
-        let focus = c.focus(win, &ModuleId::terminal());
-        assert_eq!(
-            focus.ops().cloned().collect::<Vec<_>>(),
-            vec![HostOp::Focus {
-                win,
-                to: FocusTo::Module(ModuleId::terminal()),
-                on_grab: vec![],
-            }]
-        );
-        assert!(focus.shell_verb().is_none());
         let press = KeyPress {
             keycode: 38,
             press: Press::Other,
@@ -1428,7 +2639,7 @@ mod tests {
         );
         assert_eq!(
             c.close_requested(win, CloseBy::User),
-            (CloseVerdict::Proceed, Batch::default())
+            (CloseVerdict::Stop, Batch::default())
         );
     }
 }

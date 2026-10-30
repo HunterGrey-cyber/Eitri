@@ -7,9 +7,8 @@ import { onRemove } from "./bridge";
  *  come), and then eases to rest from the speed it had. Every write is an instant one, so neither the engine's own
  *  smooth scrolling nor a page's `scroll-behavior` can restart a motion underneath it.
  *
- *  The numbers below match the agent panel's held-key glide so that the two places feel alike. Only the numbers are
- *  shared: the panel's motion follows a cursor over conversation rows and lives in a separate bundle, while a plugin
- *  page has no rows, only a scroll position. */
+ *  Match the agent panel's glide timing so both feel alike; keep motion separate because a plugin page scrolls
+ *  positions while the panel follows a cursor over rows. */
 import { currentSettings } from "./settings";
 
 /** How long a press from rest takes to ease out. */

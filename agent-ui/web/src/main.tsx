@@ -8,8 +8,8 @@ const container = document.getElementById("root");
 if (!container) {
   throw new Error("agent-ui: #root element missing from index.html");
 }
-// A throw while rendering used to unmount everything -- `#root` empty, every key dead,
-// nothing logged -- until `prefix r`. The conversation lives in Rust, so a reload brings all of it back.
+// A throw while rendering would unmount everything -- `#root` empty, every key dead, nothing logged --
+// until `prefix r`. The conversation lives in Rust, so a reload brings all of it back.
 createRoot(container).render(
   <StrictMode>
     <PanelErrorBoundary

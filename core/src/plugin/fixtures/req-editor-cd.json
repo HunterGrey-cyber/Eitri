@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": 50,
+  "verb": "editor.cd",
+  "args": {
+    "dir": "/w/work/rust/ch04-02-fix-total-len"
+  }
+}

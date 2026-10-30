@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "id": 54,
+  "verb": "editor.diff",
+  "args": {
+    "left": {
+      "title": "第 3 次尝试 · src/lib.rs",
+      "text": "fn total_len(v: Vec<String>) -> usize {\n    0\n}\n",
+      "filetype": "rust"
+    },
+    "right": {
+      "path": "/w/work/rust/ch04-02-fix-total-len/src/lib.rs"
+    }
+  }
+}

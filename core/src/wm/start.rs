@@ -38,6 +38,22 @@ pub fn start_plan() -> &'static [StartPhase] {
     ]
 }
 
+/// Both sides are canonical paths supplied by project selection and plugin loading. Comparing them here
+/// performs no filesystem work on the window's thread; a child directory is a different project.
+pub fn own_window(
+    project_root: &std::path::Path,
+    plugins: &[(String, std::path::PathBuf)],
+    role: crate::window_link::pair::Role,
+) -> Option<String> {
+    if role == crate::window_link::pair::Role::Second {
+        return None;
+    }
+    plugins
+        .iter()
+        .find(|(_, root)| root == project_root)
+        .map(|(id, _)| id.clone())
+}
+
 pub enum StartStep {
     Feeds {
         spawn: EditorSpawn,
@@ -54,6 +70,7 @@ pub enum StartStep {
     },
     Layout {
         parts: WindowParts,
+        own_window: Option<String>,
     },
     Surfaces {
         decls: Vec<SurfaceDecl>,
@@ -87,7 +104,8 @@ impl StartStep {
 #[derive(Default)]
 pub(super) struct StartState {
     next: usize,
-    spawn: Option<EditorSpawn>,
+    pub(super) own_window: Option<String>,
+    pub(super) spawn: Option<EditorSpawn>,
 }
 
 impl Controller {
@@ -101,13 +119,16 @@ impl Controller {
         state.next += 1;
         let mut batch = Batch::default();
         match step {
-            StartStep::Feeds { spawn } => state.spawn = Some(spawn),
+            StartStep::Feeds { spawn } => {
+                state.spawn = Some(spawn.clone());
+                self.keep_editor_spawn(win, spawn);
+            }
             StartStep::Window { spec } => {
                 self.declare_window(win, spec.clone());
                 batch.push_layout(HostOp::OpenWindow { win, spec });
             }
             StartStep::Editor => {
-                let spawn = state.spawn.take();
+                let spawn = state.spawn.clone();
                 if self
                     .window_spec(win)
                     .is_some_and(|spec| spec.presence == EditorPresence::Owned)
@@ -124,7 +145,10 @@ impl Controller {
             StartStep::Kernel => batch.push_lua(LuaOp::LoadInit),
             StartStep::Config { keymap, module_keys } => self.set_keymap(win, keymap, module_keys),
             StartStep::Chrome => {}
-            StartStep::Layout { parts } => self.attach_parts(win, parts),
+            StartStep::Layout { parts, own_window } => {
+                state.own_window = own_window;
+                self.attach_parts(win, parts);
+            }
             StartStep::Surfaces { decls } => return self.create_surfaces(win, &decls),
             StartStep::Present {
                 activation,
@@ -147,9 +171,14 @@ impl Controller {
                         .collect(),
                 });
             }
-            StartStep::Requests => batch.push_lua(LuaOp::Emit {
-                event: "shell:ready".into(),
-            }),
+            StartStep::Requests => {
+                batch.push_lua(LuaOp::Emit {
+                    event: "shell:ready".into(),
+                });
+                // Window 2 starts once this window's own start has finished, `shell:ready` included: on an idle,
+                // since a batch carries its Lua last.
+                self.arm_second_restore(win);
+            }
         }
         batch
     }
@@ -163,13 +192,13 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::NativeFocus { win, .. }
         | HostEvent::Active { win, .. }
         | HostEvent::Resized { win, .. }
+        | HostEvent::WindowMonitor { win, .. }
         | HostEvent::MinSize { win, .. }
         | HostEvent::Settled { win, .. }
-        | HostEvent::LayoutChangedByShell { win }
         | HostEvent::Prepared { win, .. }
-        | HostEvent::ShellRefused { win, .. }
+        | HostEvent::Lua(LuaEvent::LayoutRequests { win, .. })
+        | HostEvent::Pair(PairEvent::LinkEnded { win, .. } | PairEvent::RestoreFailed { win })
         | HostEvent::AnswerRefused { win, .. }
-        | HostEvent::PromptWithdrawn { win }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
         | HostEvent::TopBarLeft { win }
@@ -177,20 +206,37 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             surface: Some((win, _)),
             ..
         }
+        | HostEvent::TextSize(
+            TextSizeEvent::Both { win, .. }
+            | TextSizeEvent::Pane { win, .. }
+            | TextSizeEvent::PageAttached { win, .. }
+            | TextSizeEvent::Base { win, .. },
+        )
         | HostEvent::Editor(
-            EditorEvent::Exited { win }
+            EditorEvent::Ready { win }
+            | EditorEvent::Released { win }
+            | EditorEvent::ReleaseRefused { win }
+            | EditorEvent::RestartRefused { win, .. }
+            | EditorEvent::Exited { win, .. }
+            | EditorEvent::Unreachable { win }
+            | EditorEvent::QuitNotSent { win, .. }
             | EditorEvent::ScaleReported { win, .. }
             | EditorEvent::QuitAnswered { win, .. }
             | EditorEvent::StartFailed { win, .. }
             | EditorEvent::Navigate { win, .. }
             | EditorEvent::QuitCancelled { win, .. },
         )
+        | HostEvent::Plugin(
+            PluginEvent::Frozen { win, .. } | PluginEvent::FreezeRefused { win, .. } | PluginEvent::Ready { win, .. },
+        )
         | HostEvent::Chat(
             ChatEvent::Attention { win, .. }
             | ChatEvent::Busy { win, .. }
             | ChatEvent::TabVerb { win, .. }
+            | ChatEvent::ChooserPartnerPick { win, .. }
             | ChatEvent::KeysReturn { win, .. }
             | ChatEvent::Covered { win, .. }
+            | ChatEvent::Reveal { win, .. }
             | ChatEvent::PageShown { win, .. }
             | ChatEvent::ShowView { win, .. }
             | ChatEvent::ViewEmpty { win, .. }
@@ -200,22 +246,25 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | ChatEvent::Hint { win, .. }
             | ChatEvent::Toast { win, .. }
             | ChatEvent::KeymapClosed { win, .. }
-            | ChatEvent::EditorRequest { win, .. },
+            | ChatEvent::Frozen { win, .. }
+            | ChatEvent::FreezeRefused { win, .. }
+            | ChatEvent::PresenceHeld { win, .. }
+            | ChatEvent::PresenceRefused { win, .. },
         )
         | HostEvent::Terminal(
             TermEvent::Started { win, .. }
             | TermEvent::Exited { win, .. }
             | TermEvent::Bell { win, .. }
             | TermEvent::Cwd { win, .. }
+            | TermEvent::Job { win, .. }
             | TermEvent::Detached { win, .. },
         )
         | HostEvent::Hint(HintEvent::Active { win, .. } | HintEvent::Landed { win, .. }) => win,
         // The editor's surface is made before the window's layout exists; its creation waits for nothing.
         HostEvent::Created { .. }
         | HostEvent::EndSignal { .. }
-        | HostEvent::Lua(_)
         | HostEvent::Peer(_)
-        | HostEvent::MonitorsChanged
+        | HostEvent::MonitorsChanged { .. }
         | HostEvent::Timer(_)
         | HostEvent::Fd(_)
         | HostEvent::Wake
@@ -236,10 +285,36 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[test]
+    fn the_layout_phase_keeps_the_own_window_id() {
+        let mut controller = Controller::new(FakeScheduler::new());
+        for step in [
+            StartStep::Feeds { spawn: spawn() },
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+            StartStep::Editor,
+            StartStep::Kernel,
+            config(),
+            StartStep::Layout {
+                parts: parts(),
+                own_window: Some("demo".into()),
+            },
+        ] {
+            controller.start(WinId::MAIN, step);
+        }
+        assert_eq!(
+            controller.window_mut(WinId::MAIN).unwrap().own_window.as_deref(),
+            Some("demo")
+        );
+    }
+
     fn setup() -> (Rc<Driver<Controller>>, Rc<FakeHost>) {
         let host = FakeHost::new();
         let scheduler = FakeScheduler::new();
-        let driver = Driver::new(Controller::new(scheduler.clone()), host.clone(), scheduler.clone());
+        let mut controller = Controller::new(scheduler.clone());
+        controller.set_reads(host.clone());
+        let driver = Driver::new(controller, host.clone(), scheduler.clone());
         let sink: Rc<dyn HostSink> = driver.clone();
         host.attach(Rc::downgrade(&sink));
         scheduler.attach(Rc::downgrade(&sink));
@@ -253,6 +328,7 @@ mod tests {
             args: vec!["--embed".into()],
             cwd: Some("/project".into()),
             clean: true,
+            background: None,
         }
     }
 
@@ -308,7 +384,10 @@ mod tests {
             StartStep::Editor,
             StartStep::Kernel,
             config(),
-            StartStep::Layout { parts: parts() },
+            StartStep::Layout {
+                parts: parts(),
+                own_window: None,
+            },
             StartStep::Surfaces {
                 decls: vec![SurfaceDecl {
                     module: ModuleId::agent(),
@@ -345,6 +424,157 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Runs a window's start up to its editor phase with `spawn` as the feeds' settings, and returns the editor's
+    /// surface creation.
+    fn editor_launched_with(spawn: EditorSpawn) -> HostOp {
+        let (driver, host) = setup();
+        for step in [
+            StartStep::Feeds { spawn },
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+            StartStep::Editor,
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        ops(&host)
+            .into_iter()
+            .find(|op| {
+                matches!(
+                    op,
+                    HostOp::CreateSurface {
+                        kind: SurfaceKind::Editor { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("an owned editor is created in the editor phase")
+    }
+
+    #[test]
+    fn a_restarted_editor_gets_the_feeds_env_again() {
+        let (driver, host) = setup();
+        let mut settings = spawn();
+        settings
+            .args
+            .extend(["--cmd".into(), "let g:feed = 1".into(), "file.rs".into()]);
+        driver.start(
+            WinId::MAIN,
+            StartStep::Feeds {
+                spawn: settings.clone(),
+            },
+        );
+        driver.start(
+            WinId::MAIN,
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+        );
+        driver.start(WinId::MAIN, StartStep::Editor);
+        driver.start(WinId::MAIN, StartStep::Kernel);
+        driver.start(WinId::MAIN, config());
+        driver.start(
+            WinId::MAIN,
+            StartStep::Layout {
+                parts: parts(),
+                own_window: None,
+            },
+        );
+        driver.start(
+            WinId::MAIN,
+            StartStep::Surfaces {
+                decls: vec![
+                    crate::wm::verbs::rig::decl(&ModuleId::editor()),
+                    crate::wm::verbs::rig::decl(&ModuleId::agent()),
+                ],
+            },
+        );
+        host.set_editor_facts(EditorFacts {
+            exited: true,
+            ..Default::default()
+        });
+        driver.run(
+            WinId::MAIN,
+            crate::keymap::Action::ModuleKill,
+            Origin::Key { keycode: 7 },
+        );
+        let key = crate::keymap::KeySpec::parse("y").unwrap();
+        driver.key(
+            WinId::MAIN,
+            &KeyStage::Window,
+            KeyPress {
+                keycode: 42,
+                press: crate::keymap::prefix::Press::Key(key),
+                key: Some(key.key),
+                mods: Mods::default(),
+                super_or_hyper: false,
+                super_or_meta: false,
+            },
+        );
+        host.set_editor_facts(EditorFacts {
+            exited: true,
+            ..Default::default()
+        });
+        driver.post(HostEvent::Editor(EditorEvent::Released { win: WinId::MAIN }));
+        driver.run(
+            WinId::MAIN,
+            crate::keymap::Action::Module(ModuleId::editor()),
+            Origin::Key { keycode: 7 },
+        );
+        let log = ops(&host);
+        let initial = log
+            .iter()
+            .find_map(|op| match op {
+                HostOp::CreateSurface {
+                    kind: SurfaceKind::Editor { spawn },
+                    ..
+                } => Some(spawn),
+                _ => None,
+            })
+            .unwrap();
+        let restarted = log
+            .iter()
+            .find_map(|op| match op {
+                HostOp::Editor(EditorCall::Restart { spawn, .. }) => Some(spawn),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(initial, &settings);
+        assert_eq!(restarted, initial);
+    }
+
+    #[test]
+    fn the_editor_is_launched_with_the_feeds_spawns_background() {
+        let light = EditorSpawn {
+            background: Some((0xfa, 0xf4, 0xed)),
+            ..spawn()
+        };
+        assert_eq!(
+            editor_launched_with(light.clone()),
+            HostOp::CreateSurface {
+                win: WinId::MAIN,
+                module: ModuleId::editor(),
+                kind: SurfaceKind::Editor { spawn: light },
+            },
+            "the start colour reaches the editor exactly as the feeds phase gave it"
+        );
+    }
+
+    #[test]
+    fn without_a_remembered_theme_the_editor_keeps_its_own_placeholder() {
+        let plain = spawn();
+        assert_eq!(plain.background, None);
+        assert_eq!(
+            editor_launched_with(plain.clone()),
+            HostOp::CreateSurface {
+                win: WinId::MAIN,
+                module: ModuleId::editor(),
+                kind: SurfaceKind::Editor { spawn: plain },
+            },
+            "no start colour is invented when none was given"
+        );
     }
 
     #[test]
@@ -465,17 +695,33 @@ mod tests {
                 driver.query(|c| c.window_spec(WinId::MAIN).cloned()),
                 Some(spec(presence.clone()))
             );
-            driver.post(HostEvent::LayoutChangedByShell { win: WinId::MAIN });
-            assert_eq!(driver.query(|c| c.shell_revision(WinId::MAIN)), 0);
-            assert!(driver.query(|c| c.start_notes().iter().any(
-                |line| line.contains("LayoutChangedByShell") && line.ends_with("for a window with no layout yet")
-            )));
+            driver.post(HostEvent::Pair(PairEvent::RestoreFailed { win: WinId::MAIN }));
+            assert!(driver.query(|c| c
+                .start_notes()
+                .iter()
+                .any(|line| line.contains("RestoreFailed") && line.ends_with("for a window with no layout yet"))));
             assert_eq!(ops(&host).len(), 1);
+            let before = host.log().len();
+            driver.post(HostEvent::Lua(LuaEvent::LayoutRequests {
+                win: WinId::MAIN,
+                requests: vec![crate::lua::layout::LayoutRequest::Show(ModuleId::terminal())],
+            }));
+            assert_eq!(host.log().len(), before);
+            assert!(driver.query(|c| c
+                .start_notes()
+                .iter()
+                .any(|line| line.contains("LayoutRequests") && line.ends_with("for a window with no layout yet"))));
             driver.start(WinId::MAIN, StartStep::Editor);
             assert_eq!(ops(&host).len(), if presence == EditorPresence::Owned { 2 } else { 1 });
             driver.start(WinId::MAIN, StartStep::Kernel);
             driver.start(WinId::MAIN, config());
-            driver.start(WinId::MAIN, StartStep::Layout { parts: parts() });
+            driver.start(
+                WinId::MAIN,
+                StartStep::Layout {
+                    parts: parts(),
+                    own_window: None,
+                },
+            );
             driver.start(
                 WinId::MAIN,
                 StartStep::Surfaces {
@@ -486,8 +732,7 @@ mod tests {
                     }],
                 },
             );
-            driver.post(HostEvent::LayoutChangedByShell { win: WinId::MAIN });
-            assert_eq!(driver.query(|c| c.shell_revision(WinId::MAIN)), 1);
+            driver.test_batch(|c| c.changed_in_test(WinId::MAIN));
             assert!(ops(&host).contains(&HostOp::Terminal(TermOp::Start {
                 win: WinId::MAIN,
                 module: ModuleId::terminal()
@@ -496,9 +741,6 @@ mod tests {
                 driver.query(|c| c.lifecycle(WinId::MAIN).unwrap().state(&ModuleId::terminal()).cloned()),
                 Some(ModuleState::Shown)
             );
-            let before = host.log().len();
-            driver.post(HostEvent::Lua(LuaEvent::LayoutRequests));
-            assert_eq!(host.log().len(), before);
         }
     }
 
@@ -524,5 +766,349 @@ mod tests {
         assert_eq!(ops(&host).len(), 2);
         driver.start(WinId::MAIN, StartStep::Editor);
         assert_eq!(ops(&host).len(), 2);
+    }
+
+    /// [`setup`] with its scheduler, whose idles a test fires by advancing it.
+    fn setup_with_clock() -> (Rc<Driver<Controller>>, Rc<FakeHost>, Rc<FakeScheduler>) {
+        let host = FakeHost::new();
+        let scheduler = FakeScheduler::new();
+        let mut controller = Controller::new(scheduler.clone());
+        controller.set_reads(host.clone());
+        let driver = Driver::new(controller, host.clone(), scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        host.attach(Rc::downgrade(&sink));
+        scheduler.attach(Rc::downgrade(&sink));
+        (driver, host, scheduler)
+    }
+
+    fn restores(host: &FakeHost) -> usize {
+        ops(host)
+            .iter()
+            .filter(|op| matches!(op, HostOp::RestoreLinkedWindow { win } if *win == WinId::MAIN))
+            .count()
+    }
+
+    #[test]
+    fn window_2_is_restored_at_the_requests_phase_only_when_the_placement_says_so() {
+        for restore_second in [false, true] {
+            let (driver, host, scheduler) = setup_with_clock();
+            driver.set_placement(
+                WinId::MAIN,
+                WindowPlacement {
+                    role: PlacementRole::Main,
+                    remembered: None,
+                    restore_second,
+                },
+            );
+            walk(&driver, &host, ModuleId::editor(), None, true);
+            // Once the requests phase's own batch has gone, `shell:ready` with it.
+            assert_eq!(restores(&host), 0, "nothing is started inside the start's own batches");
+            let ready = host
+                .log()
+                .iter()
+                .position(|entry| {
+                    matches!(entry, Logged::Op(HostOp::Lua(LuaOp::Emit { event }), _) if event == "shell:ready")
+                })
+                .expect("the requests phase emits shell:ready");
+            scheduler.advance(std::time::Duration::ZERO);
+            assert_eq!(
+                restores(&host),
+                usize::from(restore_second),
+                "restore_second {restore_second}"
+            );
+            if restore_second {
+                let at = host
+                    .log()
+                    .iter()
+                    .position(|entry| matches!(entry, Logged::Op(HostOp::RestoreLinkedWindow { .. }, _)))
+                    .unwrap();
+                assert!(at > ready, "window 2 starts after shell:ready");
+            }
+            scheduler.advance(std::time::Duration::from_secs(1));
+            assert_eq!(restores(&host), usize::from(restore_second), "started at most once");
+            // A refusal is the host's to act on; the controller only logs it.
+            let before = host.log().len();
+            driver.post(HostEvent::Refused {
+                what: OpTag::RestoreLinkedWindow,
+                why: "the second window could not be started".into(),
+                surface: None,
+            });
+            assert_eq!(host.log().len(), before, "a refused restore applies nothing");
+        }
+    }
+
+    fn monitor(connector: &str, x: i32) -> Monitor {
+        Monitor {
+            id: MonitorId(connector.into()),
+            rect: crate::layout::Rect {
+                x,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            scale: 1.0,
+            name: connector.into(),
+        }
+    }
+
+    fn moves(host: &FakeHost) -> Vec<String> {
+        ops(host)
+            .into_iter()
+            .filter_map(|op| match op {
+                HostOp::PlaceWindow { win, monitor, .. } if win == WinId::MAIN => monitor.map(|m| m.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn on(driver: &Driver<Controller>, connector: Option<&str>) {
+        driver.post(HostEvent::WindowMonitor {
+            win: WinId::MAIN,
+            monitor: connector.map(|c| MonitorId(c.into())),
+        });
+    }
+
+    fn remembering(connector: Option<&str>) -> (Rc<Driver<Controller>>, Rc<FakeHost>) {
+        let (driver, host) = setup();
+        driver.set_placement(
+            WinId::MAIN,
+            WindowPlacement {
+                role: PlacementRole::Main,
+                remembered: connector.map(Into::into),
+                restore_second: false,
+            },
+        );
+        (driver, host)
+    }
+
+    fn placements(host: &FakeHost) -> Vec<(Option<MonitorId>, PlacementRole)> {
+        ops(host)
+            .into_iter()
+            .filter_map(|op| match op {
+                HostOp::PlaceWindow { monitor, role, .. } => Some((monitor, role)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn placement_carries_each_role_and_restores_focus_even_without_a_move() {
+        for role in [
+            PlacementRole::Main,
+            PlacementRole::NewSecond,
+            PlacementRole::RestoredSecond { first_pid: 123 },
+        ] {
+            for remembered in [None, Some("DP-1"), Some("DP-2")] {
+                let (driver, host) = setup();
+                driver.set_placement(
+                    WinId::MAIN,
+                    WindowPlacement {
+                        role,
+                        remembered: remembered.map(Into::into),
+                        restore_second: false,
+                    },
+                );
+                driver.post(HostEvent::MonitorsChanged {
+                    monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+                });
+                walk(&driver, &host, ModuleId::editor(), None, true);
+                on(&driver, None);
+                assert!(placements(&host).is_empty(), "wait until mapped onto an output");
+                on(&driver, Some("DP-1"));
+                let moves = remembered == Some("DP-2");
+                let expected = if moves || matches!(role, PlacementRole::RestoredSecond { .. }) {
+                    vec![(moves.then(|| MonitorId("DP-2".into())), role)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(placements(&host), expected, "{role:?}, {remembered:?}");
+                on(&driver, Some("DP-2"));
+                on(&driver, Some("DP-1"));
+                driver.post(HostEvent::MonitorsChanged {
+                    monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+                });
+                assert_eq!(placements(&host), expected, "later reports cannot take the keys again");
+            }
+        }
+    }
+
+    #[test]
+    fn a_restore_returns_focus_at_mapping_and_a_late_output_move_takes_no_focus() {
+        let (driver, host) = setup();
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, Some("DP-1"));
+        let role = PlacementRole::RestoredSecond { first_pid: 123 };
+        driver.set_placement(
+            WinId::MAIN,
+            WindowPlacement {
+                role,
+                remembered: Some("DP-2".into()),
+                restore_second: false,
+            },
+        );
+        assert_eq!(
+            placements(&host),
+            [(None, role)],
+            "late placement applies to a mapped window"
+        );
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0)],
+        });
+        assert_eq!(placements(&host), [(None, role)]);
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        let expected = [(None, role), (Some(MonitorId("DP-2".into())), PlacementRole::Main)];
+        assert_eq!(placements(&host), expected);
+        on(&driver, Some("DP-2"));
+        assert_eq!(placements(&host), expected);
+    }
+
+    #[test]
+    fn a_new_second_window_whose_output_appears_late_moves_without_focus() {
+        let (driver, host) = setup();
+        driver.set_placement(
+            WinId::MAIN,
+            WindowPlacement {
+                role: PlacementRole::NewSecond,
+                remembered: Some("DP-2".into()),
+                restore_second: false,
+            },
+        );
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, Some("DP-1"));
+        assert!(placements(&host).is_empty());
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        let expected = [(Some(MonitorId("DP-2".into())), PlacementRole::Main)];
+        assert_eq!(placements(&host), expected);
+        on(&driver, Some("DP-2"));
+        assert_eq!(placements(&host), expected);
+    }
+
+    #[test]
+    fn the_remembered_monitor_is_asked_for_once_when_it_exists() {
+        let (driver, host) = remembering(Some("DP-2"));
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        assert!(moves(&host).is_empty(), "not before the window is on an output");
+        on(&driver, Some("DP-1"));
+        assert_eq!(moves(&host), ["DP-2"]);
+        // The move itself, and the outputs changing after it, ask nothing again.
+        on(&driver, Some("DP-2"));
+        on(&driver, Some("DP-1"));
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920), monitor("HDMI-A-1", 3840)],
+        });
+        assert_eq!(moves(&host), ["DP-2"], "asked for once");
+
+        // Already there: nothing is asked, then or later.
+        let (driver, host) = remembering(Some("DP-2"));
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, Some("DP-2"));
+        on(&driver, Some("DP-1"));
+        assert!(moves(&host).is_empty(), "a window already on its monitor stays put");
+
+        // Nothing remembered, or the placement given once the window runs: the same rule.
+        let (driver, host) = remembering(None);
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, Some("DP-1"));
+        assert!(moves(&host).is_empty(), "no remembered monitor, no move");
+        driver.set_placement(
+            WinId::MAIN,
+            WindowPlacement {
+                role: PlacementRole::Main,
+                remembered: Some("DP-2".into()),
+                restore_second: false,
+            },
+        );
+        assert_eq!(moves(&host), ["DP-2"], "a placement given later applies at once");
+
+        // A refused move is logged and changes nothing.
+        let before = host.log().len();
+        driver.post(HostEvent::Refused {
+            what: OpTag::PlaceWindow,
+            why: "this window manager cannot move a window to an output".into(),
+            surface: None,
+        });
+        assert_eq!(host.log().len(), before, "a refused move applies nothing");
+    }
+
+    #[test]
+    fn a_missing_monitor_appearing_later_moves_the_window_once() {
+        let (driver, host) = remembering(Some("HDMI-A-1"));
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, Some("DP-1"));
+        assert!(
+            moves(&host).is_empty(),
+            "an absent monitor leaves the window where it is"
+        );
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("HDMI-A-1", 1920)],
+        });
+        assert_eq!(moves(&host), ["HDMI-A-1"], "moved when it appears");
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0)],
+        });
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("HDMI-A-1", 1920)],
+        });
+        on(&driver, Some("DP-1"));
+        assert_eq!(moves(&host), ["HDMI-A-1"], "moved once");
+    }
+}
+
+#[cfg(test)]
+mod own_window_tests {
+    use super::*;
+    use crate::window_link::pair::Role;
+    use std::path::Path;
+
+    #[test]
+    fn own_window_matches_by_canonical_root() {
+        let roots = vec![("demo".into(), Path::new("/project").to_owned())];
+        for role in [Role::Main, Role::Unpaired] {
+            assert_eq!(own_window(Path::new("/project"), &roots, role).as_deref(), Some("demo"));
+        }
+    }
+
+    #[test]
+    fn a_symlinked_work_dir_matches() {
+        let dir = agent::state_dirs::test_workspace_dir("own-window-link");
+        std::fs::create_dir(dir.join("project")).unwrap();
+        std::os::unix::fs::symlink(dir.join("project"), dir.join("alias")).unwrap();
+        let roots = vec![("demo".into(), dir.join("project").canonicalize().unwrap())];
+        // Project selection resolves the work directory before the window starts.
+        let root =
+            crate::project_root::resolve_in(&[dir.join("alias").into_os_string()], None, Ok(dir.clone())).unwrap();
+        assert_eq!(own_window(&root, &roots, Role::Main).as_deref(), Some("demo"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_subdirectory_does_not_match() {
+        let roots = vec![("demo".into(), Path::new("/project").to_owned())];
+        assert_eq!(own_window(Path::new("/project/child"), &roots, Role::Main), None);
+    }
+
+    #[test]
+    fn window_two_never_decides_own_window() {
+        let roots = vec![("demo".into(), Path::new("/project").to_owned())];
+        assert_eq!(own_window(Path::new("/project"), &roots, Role::Second), None);
     }
 }

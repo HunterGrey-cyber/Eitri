@@ -73,6 +73,10 @@ impl LayoutPort for Layout {
         self.0.borrow_mut().push(target);
         Ok(())
     }
+    // No test here asks for the terminal; the host's own tests cover that route.
+    fn terminal_at(&self, _dir: PathBuf, _ticket: u64) -> Result<(), String> {
+        Err("this layout has no terminal".into())
+    }
 }
 
 struct Rig {
@@ -1692,6 +1696,70 @@ fn a_view_hands_its_scrolloff_to_the_page_and_leaves_it_out_when_nvim_did_not_sa
     let last = last_view(&d.rig);
     assert_eq!(last["top"], 8);
     assert!(last.get("scrolloff").is_none(), "{last}");
+}
+
+#[test]
+fn a_jump_waiting_behind_a_newer_jump_is_answered_not_applied() {
+    let d = shown("host-jump-newest");
+    let t = d.t0 + ms(300);
+    d.rig.host.follow_view(named_view(&d.a, 3, 42), t);
+    d.rig.host.pump(t);
+    assert_eq!(last_call(&d.rig).0, "text");
+    let from = calls(&d.rig);
+    let jump = |line: u32| {
+        d.rig
+            .send("editor.jump", json!({"buf": 3, "line": line, "col": 0, "focus": false}))
+    };
+    let a = jump(10);
+    let b = jump(20);
+    assert_eq!(d.rig.page.replies_to(a)[0]["result"], json!({"applied": false}));
+    assert!(d.rig.page.replies_to(b).is_empty());
+    answer(&d.rig, lines(3, 42, &["# a", "b"]));
+    d.rig.host.pump(t);
+    assert_eq!(ops_since(&d.rig, from), ["jump"]);
+    let (_, opts) = last_call(&d.rig);
+    assert_eq!(opt(&opts, "line"), 20.into());
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(t);
+    assert_eq!(d.rig.page.replies_to(b)[0]["result"], json!({"applied": true}));
+    assert_eq!(d.rig.page.replies_to(a).len(), 1);
+    d.rig.host.pump(t + Duration::from_secs(1));
+    assert_eq!(ops_since(&d.rig, from), ["jump"]);
+}
+
+#[test]
+fn a_link_past_the_parked_cap_is_answered_editor_timeout_at_once() {
+    let d = shown("host-link-cap");
+    let t = d.t0 + ms(300);
+    d.rig.host.follow_view(named_view(&d.a, 3, 42), t);
+    d.rig.host.pump(t);
+    assert_eq!(last_call(&d.rig).0, "text");
+
+    let ids: Vec<_> = (0..17).map(|_| link(&d, "other.md")).collect();
+    let last = ids[16];
+    let deadline = Instant::now() + HANG_GUARD;
+    while d.rig.page.replies_to(last).is_empty() {
+        assert!(Instant::now() < deadline, "the link past the cap was never answered");
+        // Keep the host clock fixed so a deadline cannot supply the cap's reply.
+        d.rig.host.pump(t);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let replies = d.rig.page.replies_to(last);
+    assert_eq!(replies.len(), 1, "answered once");
+    assert_eq!(replies[0]["ok"], false);
+    assert_eq!(replies[0]["error"]["code"], "editor_timeout");
+    for id in &ids[..16] {
+        assert!(d.rig.page.replies_to(*id).is_empty(), "link {id} is still parked");
+    }
+    assert!(open_calls(&d.rig).is_empty());
+
+    let before = calls(&d.rig);
+    answer(&d.rig, lines(3, 42, &["# a", "b"]));
+    d.rig.host.pump(t);
+    assert_eq!(calls(&d.rig), before + 1);
+    let opened = open_calls(&d.rig);
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opt(&opened[0], "path"), binary(&d.proj.join("docs/other.md")));
 }
 
 #[test]

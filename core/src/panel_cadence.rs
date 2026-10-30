@@ -3,7 +3,7 @@
 //!
 //! **Why.** GDK's frame clock is one clock for the whole toplevel: a WebKit frame the panel causes
 //! delays the editor's next frame by up to one refresh, so a key pressed within ~8 ms of a panel
-//! frame lands two refreshes late (measured 2026-09-29).
+//! frame lands two refreshes late (measured).
 //! Eitri has no API to start a cycle early; the lever is to cause fewer, better-spaced panel
 //! cycles while the user types.
 //!
@@ -35,10 +35,11 @@ use agent::AgentDomainEvent;
 /// The config key (`init.lua`: `eitri.config.set("agent.typing_cadence_hz", "5")`).
 pub const CADENCE_KEY: &str = "agent.typing_cadence_hz";
 
-/// Default pushes per second while typing when `init.lua` supplies no value.
-/// With a 165 Hz display and a 30 ms/message stream, measured late keypresses were 6.2% at 5/s,
-/// 8.8% at 8/s, 9.9% at 12/s, and 20.9% at full rate. Perceived stream smoothness still needs
-/// manual verification.
+/// Pushes per second while typing when `init.lua` says nothing. 5: the lowest rate of late key
+/// presses whose stream still looks even, measured on a laptop's 165 Hz display with a
+/// 30 ms/message stream: 6.2 % of presses late at 5/s, 8.8 % at 8/s, 9.9 % at 12/s,
+/// 20.9 % at full rate. Whether the paced stream looks smooth to a person still needs a
+/// manual check.
 pub const DEFAULT_CADENCE_HZ: u32 = 5;
 
 /// What the config key accepts: a whole number of pushes per second in this range, or `"off"`.

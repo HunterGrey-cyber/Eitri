@@ -8,6 +8,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::layout::rules::{parse_at, At};
+use crate::layout::spec::{self, LuaTree, SpecNode, SplitKind};
+use crate::layout::ModuleId;
 
 /// The bridge protocol this build speaks.
 pub const PROTOCOL: u32 = 1;
@@ -39,10 +41,13 @@ pub enum Capability {
     Net,
     EditorFollow,
     EditorCommands,
+    EditorCwd,
+    EditorBuffers,
+    TerminalCwd,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 11] = [
         Capability::Tasks,
         Capability::EditorOpen,
         Capability::EditorAssist,
@@ -51,6 +56,9 @@ impl Capability {
         Capability::Net,
         Capability::EditorFollow,
         Capability::EditorCommands,
+        Capability::EditorCwd,
+        Capability::EditorBuffers,
+        Capability::TerminalCwd,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -63,6 +71,9 @@ impl Capability {
             Capability::Net => "net",
             Capability::EditorFollow => "editor.follow",
             Capability::EditorCommands => "editor.commands",
+            Capability::EditorCwd => "editor.cwd",
+            Capability::EditorBuffers => "editor.buffers",
+            Capability::TerminalCwd => "terminal.cwd",
         }
     }
 
@@ -330,6 +341,24 @@ pub struct TaskDecl {
     pub timeout: Option<Duration>,
 }
 
+/// Which module receives the keys when the plugin's own window opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowFocus {
+    #[default]
+    Page,
+    Editor,
+    Terminal,
+}
+
+/// A plugin's declaration of its own project window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowDecl {
+    pub root: Template,
+    pub title: String,
+    pub focus: WindowFocus,
+    pub layout: LuaTree,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     pub id: String,
@@ -348,6 +377,7 @@ pub struct Manifest {
     /// In name order.
     pub commands: Vec<CommandDecl>,
     pub module: Option<ModuleTable>,
+    pub window: Option<WindowDecl>,
     pub images: Option<NetImages>,
     /// `[page] handoff`: the page answers `host.save` with its state, which the page that replaces it in another
     /// window receives in its `host.hello` reply. False unless the manifest says so.
@@ -384,6 +414,88 @@ struct RawManifest {
     commands: BTreeMap<String, RawCommand>,
     module: Option<RawModule>,
     page: Option<RawPage>,
+    window: Option<RawWindow>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWindow {
+    root: String,
+    title: String,
+    focus: Option<String>,
+    layout: toml::Value,
+}
+
+/// Reads TOML's node spelling; the shared builder checks the resulting tree.
+fn window_node(value: &toml::Value, at: &str) -> Result<SpecNode, String> {
+    // A bare string is shorthand for `{ module = "<name>" }` with no share; the Lua grammar has no such spelling.
+    if let toml::Value::String(name) = value {
+        return Ok(SpecNode::Module {
+            name: name.clone(),
+            share: None,
+        });
+    }
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{at}: expected a module name or a table"))?;
+    let heads: Vec<&str> = ["module", "row", "column", "tabbed", "stacked"]
+        .into_iter()
+        .filter(|head| table.contains_key(*head))
+        .collect();
+    if heads.len() != 1 {
+        return Err(format!(
+            "{at}: exactly one of module, row, column, tabbed or stacked is required"
+        ));
+    }
+    let head = heads[0];
+    for key in table.keys() {
+        if key != head && key != "share" && !(key == "active" && matches!(head, "tabbed" | "stacked")) {
+            return Err(format!("{at}: unknown field {key}"));
+        }
+    }
+    let share = table
+        .get("share")
+        .map(|value| {
+            value
+                .as_float()
+                .or_else(|| value.as_integer().map(|n| n as f64))
+                .ok_or_else(|| format!("{at}: a share is a number, got {}", value.type_str()))
+        })
+        .transpose()?;
+    if head == "module" {
+        let name = table[head]
+            .as_str()
+            .ok_or_else(|| format!("{at}: module must be a string"))?;
+        return Ok(SpecNode::Module {
+            name: name.into(),
+            share,
+        });
+    }
+    let values = table[head]
+        .as_array()
+        .ok_or_else(|| format!("{at}: {head} must be an array of nodes"))?;
+    let children = values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| window_node(value, &format!("item {} of the {head}", i + 1)))
+        .collect::<Result<Vec<_>, _>>()?;
+    // An integral float names the same child as the integer, as it does in Lua; the range is checked by the
+    // builder, which words the refusal for both grammars.
+    let active = match table.get("active") {
+        None => None,
+        Some(toml::Value::Integer(n)) => Some(*n),
+        Some(toml::Value::Float(n)) if n.fract() == 0.0 && *n >= 1.0 && *n <= children.len() as f64 => Some(*n as i64),
+        Some(toml::Value::Float(n)) => {
+            return Err(format!("{at}: active = {n}: the {head} has {} items", children.len()));
+        }
+        Some(_) => return Err(format!("{at}: active must be an integer")),
+    };
+    Ok(SpecNode::Split {
+        kind: SplitKind::parse(head).unwrap(),
+        children,
+        share,
+        active,
+    })
 }
 
 #[derive(Deserialize)]
@@ -670,6 +782,60 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         roots.insert(name.clone(), template);
     }
 
+    for capability in [Capability::EditorCwd, Capability::TerminalCwd] {
+        if capabilities.contains(&capability) && raw.window.is_none() {
+            return fail(
+                "capabilities",
+                format!("{} needs a [window] table", capability.as_str()),
+            );
+        }
+    }
+    let window = raw
+        .window
+        .as_ref()
+        .map(|window| {
+            let title = &window.title;
+            if title.is_empty() || title.chars().count() > 40 || title.chars().any(super::keys::hidden) {
+                return Err(concat!(
+                    "eitri-plugin.toml: window.title: must be 1-40 characters ",
+                    "without controls or hidden characters"
+                )
+                .into());
+            }
+            let root = Template::parse(&window.root, &setting_names, &none)
+                .map_err(|e| format!("eitri-plugin.toml: window.root: {e}"))?;
+            dir_settings_only(&root, &settings, "window.root")?;
+            let focus = match window.focus.as_deref().unwrap_or("page") {
+                "page" => WindowFocus::Page,
+                "editor" => WindowFocus::Editor,
+                "terminal" => WindowFocus::Terminal,
+                other => {
+                    return Err(format!(
+                        "eitri-plugin.toml: window.focus: {other:?} must be page, editor or terminal"
+                    ))
+                }
+            };
+            let node = window_node(&window.layout, "the tree")
+                .map_err(|e| format!("eitri-plugin.toml: window.layout: {e}"))?;
+            let layout = spec::build(&node, &|name| match name {
+                "page" => Ok(ModuleId::lua(&raw.id)),
+                "editor" => Ok(ModuleId::editor()),
+                "terminal" => Ok(ModuleId::terminal()),
+                "chat" => Ok(ModuleId::agent()),
+                _ => Err(format!(
+                    "unknown module {name:?}; expected page, editor, terminal or chat"
+                )),
+            })
+            .map_err(|e| format!("eitri-plugin.toml: window.layout: {e}"))?;
+            Ok(WindowDecl {
+                root,
+                title: title.clone(),
+                focus,
+                layout,
+            })
+        })
+        .transpose()?;
+
     let (origins, images) = match (&raw.net, capabilities.contains(&Capability::Net)) {
         (Some(_), false) => return fail("[net]", "declared without the net capability".into()),
         (Some(net), true) => {
@@ -901,6 +1067,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         follow,
         commands,
         module,
+        window,
         images,
         handoff: raw.page.and_then(|p| p.handoff).unwrap_or(false),
     })
@@ -912,11 +1079,188 @@ mod tests {
 
     const EXAMPLE: &str = include_str!("testdata/demo-manifest.toml");
 
+    const WINDOW_BASE: &str = r#"id = "demo"
+title = "Demo"
+protocol = 1
+site = "site"
+entry = "index.html"
+[roots]
+work = "${plugin}"
+"#;
+
+    fn window_manifest(fields: &str) -> String {
+        format!("{WINDOW_BASE}\n[window]\nroot = \"${{plugin}}\"\n{fields}")
+    }
+
+    #[test]
+    fn window_parses_root_title_focus_and_layout() {
+        let m = parse_manifest(&window_manifest(
+            r#"title = "Study"
+focus = "editor"
+layout = { row = [{ module = "page", share = 0.55 }, { column = [{ module = "editor" }, { module = "terminal" }] }, { module = "chat", share = 0.1 }] }"#,
+        )).unwrap();
+        let window = m.window.unwrap();
+        assert_eq!(window.root, m.roots["work"]);
+        assert_eq!(window.title, "Study");
+        assert_eq!(window.focus, WindowFocus::Editor);
+        assert_eq!(
+            window.layout.tiled.leaves(),
+            vec![
+                crate::layout::ModuleId::lua("demo"),
+                crate::layout::ModuleId::editor(),
+                crate::layout::ModuleId::terminal(),
+                crate::layout::ModuleId::agent(),
+            ]
+        );
+        assert!(window.layout.floats.is_empty());
+    }
+
+    #[test]
+    fn window_focus_defaults_to_page() {
+        let m = parse_manifest(&window_manifest("title = 'Demo'\nlayout = { module = 'page' }")).unwrap();
+        assert_eq!(m.window.unwrap().focus, WindowFocus::Page);
+    }
+
+    #[test]
+    fn window_title_refuses_41_chars_a_control_and_a_hidden_character() {
+        for title in [
+            "x".repeat(41),
+            "".into(),
+            "line\nbreak".into(),
+            "hidden\u{200b}".into(),
+            "line\u{2028}".into(),
+            "paragraph\u{2029}".into(),
+            "direction\u{2066}".into(),
+            "filler\u{3164}".into(),
+            "delete\u{7f}".into(),
+        ] {
+            let fields = format!(
+                "title = {}\nlayout = {{ module = 'page' }}",
+                toml::Value::String(title).to_string()
+            );
+            let err = parse_manifest(&window_manifest(&fields)).unwrap_err();
+            assert!(err.contains("window.title"), "{err}");
+        }
+        let title = "字".repeat(40);
+        assert!(parse_manifest(&window_manifest(&format!(
+            "title = '{title}'\nlayout = {{ module = 'page' }}"
+        )))
+        .is_ok());
+    }
+
+    #[test]
+    fn window_focus_accepts_terminal_and_refuses_unknown_names() {
+        let fields = "title = 'Demo'\nfocus = 'terminal'\nlayout = { module = 'terminal' }";
+        assert_eq!(
+            parse_manifest(&window_manifest(fields)).unwrap().window.unwrap().focus,
+            WindowFocus::Terminal
+        );
+        let err = parse_manifest(&window_manifest(
+            &fields.replace("focus = 'terminal'", "focus = 'chat'"),
+        ))
+        .unwrap_err();
+        assert!(err.contains("window.focus") && err.contains("chat"), "{err}");
+    }
+
+    #[test]
+    fn window_capabilities_parse_with_a_window_and_round_trip() {
+        let text = window_manifest("title = 'Demo'\nlayout = { module = 'page' }").replacen(
+            "[roots]",
+            "capabilities = ['editor.cwd', 'editor.buffers', 'terminal.cwd']\n[roots]",
+            1,
+        );
+        let manifest = parse_manifest(&text).unwrap();
+        assert_eq!(
+            manifest.capabilities,
+            vec![
+                Capability::EditorCwd,
+                Capability::EditorBuffers,
+                Capability::TerminalCwd
+            ]
+        );
+        for capability in Capability::ALL {
+            assert_eq!(Capability::parse(capability.as_str()), Some(capability));
+        }
+    }
+
+    #[test]
+    fn window_layout_refuses_an_unknown_module_name() {
+        let err = parse_manifest(&window_manifest("title = 'Demo'\nlayout = { module = 'other' }")).unwrap_err();
+        assert!(err.contains("other") && err.contains("window.layout"), "{err}");
+    }
+
+    #[test]
+    fn window_layout_accepts_a_bare_string_as_a_module_node() {
+        let bare = parse_manifest(&window_manifest(
+            r#"title = "Study"
+layout = { row = [ { module = "page", share = 0.42 }, { column = [ "editor", { module = "terminal", share = 0.3 } ] } ] }"#,
+        ))
+        .unwrap();
+        let tables = parse_manifest(&window_manifest(
+            r#"title = "Study"
+layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "editor" }, { module = "terminal", share = 0.3 } ] } ] }"#,
+        ))
+        .unwrap();
+        assert_eq!(bare.window.unwrap().layout, tables.window.unwrap().layout);
+    }
+
+    #[test]
+    fn window_layout_accepts_a_bare_string_at_the_root() {
+        let bare = parse_manifest(&window_manifest("title = 'Demo'\nlayout = \"editor\"")).unwrap();
+        let table = parse_manifest(&window_manifest("title = 'Demo'\nlayout = { module = 'editor' }")).unwrap();
+        assert_eq!(bare.window.unwrap().layout, table.window.unwrap().layout);
+    }
+
+    #[test]
+    fn window_layout_refuses_a_bare_unknown_name_like_the_table_form() {
+        let refusal =
+            |layout: &str| parse_manifest(&window_manifest(&format!("title = 'Demo'\nlayout = {layout}"))).unwrap_err();
+        assert_eq!(refusal("'other'"), refusal("{ module = 'other' }"));
+        assert_eq!(
+            refusal("{ row = [ 'editor', 'other' ] }"),
+            refusal("{ row = [ { module = 'editor' }, { module = 'other' } ] }")
+        );
+    }
+
+    #[test]
+    fn window_layout_refuses_two_node_heads() {
+        let err = parse_manifest(&window_manifest(
+            "title = 'Demo'\nlayout = { module = 'page', row = [] }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+        let err = parse_manifest(&window_manifest(
+            "title = 'Demo'\nlayout = { module = 'page', module = 'editor' }",
+        ))
+        .unwrap_err();
+        assert!(err.contains("duplicate key"), "{err}");
+    }
+
+    #[test]
+    fn editor_cwd_without_window_is_refused_naming_it() {
+        let text = WINDOW_BASE.replace("[roots]", "capabilities = ['editor.cwd']\n[roots]");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.contains("editor.cwd") && err.contains("[window]"), "{err}");
+    }
+
+    #[test]
+    fn terminal_cwd_without_window_is_refused_naming_it() {
+        let text = WINDOW_BASE.replace("[roots]", "capabilities = ['terminal.cwd']\n[roots]");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.contains("terminal.cwd") && err.contains("[window]"), "{err}");
+    }
+
+    #[test]
+    fn editor_buffers_needs_no_window() {
+        let text = WINDOW_BASE.replace("[roots]", "capabilities = ['editor.buffers']\n[roots]");
+        assert!(parse_manifest(&text).unwrap().has(Capability::EditorBuffers));
+    }
+
     #[test]
     fn the_example_manifest_parses() {
         let m = parse_manifest(EXAMPLE).expect("the example is valid");
         assert_eq!(m.id, "demo");
-        assert_eq!(m.capabilities, Capability::ALL.to_vec());
+        assert_eq!(m.capabilities, Capability::ALL[..8].to_vec());
         assert_eq!(m.settings["work"].default, SettingValue::Text("~/demo-work".into()));
         assert_eq!(m.settings["work"].kind, SettingKind::Dir);
         assert_eq!(
@@ -963,7 +1307,7 @@ mod tests {
                 focus: false
             })
         );
-        assert_eq!(Capability::ALL.len(), 8);
+        assert_eq!(Capability::ALL.len(), 11);
         assert_eq!(Capability::parse("editor.follow"), Some(Capability::EditorFollow));
         assert_eq!(Capability::parse("editor.commands"), Some(Capability::EditorCommands));
         assert_eq!(
@@ -1129,7 +1473,7 @@ mod tests {
         );
         assert_eq!(t.vars(), ["course"]);
     }
-    /// Each edit of the example breaks one of the new rules and must be refused, naming what was wrong.
+    /// Each malformed example must be refused with a message naming what is wrong.
     #[test]
     fn every_new_rule_is_refused_by_name() {
         let cases: &[(&str, &str, &str)] = &[

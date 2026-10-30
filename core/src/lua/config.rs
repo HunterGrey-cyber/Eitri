@@ -66,6 +66,71 @@ pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
 }
 
+/// The editor's presentation preference, read after init.lua has run.
+pub const EDITOR_PRESENTATION_KEY: &str = "editor.presentation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorPresentation {
+    Auto,
+    Subsurface,
+    Gtk,
+}
+
+pub fn parse_editor_presentation(value: Option<&str>) -> Result<EditorPresentation, String> {
+    match value {
+        None | Some("auto") => Ok(EditorPresentation::Auto),
+        Some("subsurface") => Ok(EditorPresentation::Subsurface),
+        Some("gtk") => Ok(EditorPresentation::Gtk),
+        Some(value) => Err(format!(
+            "{EDITOR_PRESENTATION_KEY:?} must be auto, subsurface or gtk (got {value:?})"
+        )),
+    }
+}
+
+/// The terminal's optional family and height overrides, read after init.lua has run.
+pub const TERMINAL_FONT_KEY: &str = "terminal.font";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalFontSetting {
+    pub families: Vec<String>,
+    pub size_px: Option<f32>,
+}
+
+/// An omitted part follows the editor; an invalid explicit height refuses startup rather than
+/// silently substituting the editor's default.
+pub fn parse_terminal_font(value: Option<&str>) -> Result<Option<TerminalFontSetting>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let invalid =
+        || format!("{TERMINAL_FONT_KEY:?} must name font families or a height in (0, 100] points (got {value:?})");
+    let families = crate::theme::guifont_families(value);
+    let height = value
+        .split(':')
+        .skip(1)
+        .filter_map(|part| part.strip_prefix('h'))
+        .last();
+    let size_px = match height {
+        Some(height) => {
+            let points = height.parse::<f32>().map_err(|_| invalid())?;
+            if !points.is_finite() || points <= 0.0 || points > 100.0 {
+                return Err(invalid());
+            }
+            Some(if families.is_empty() {
+                // A placeholder family lets a height-only override use the editor's pixel conversion.
+                crate::theme::guifont_size_px(&format!("monospace:h{height}"))
+            } else {
+                crate::theme::guifont_size_px(value)
+            })
+        }
+        None => None,
+    };
+    if families.is_empty() && size_px.is_none() {
+        return Err(invalid());
+    }
+    Ok(Some(TerminalFontSetting { families, size_px }))
+}
+
 /// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     store.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
@@ -98,8 +163,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
             };
             let stored = match value {
                 // `nil` unsets the key, as assigning `nil` removes a Lua table's entry. It is also what
-                // `os.getenv` gives for an unset variable, and an empty string already means unset to
-                // every key Eitri reads.
+                // `os.getenv` gives for an unset variable.
                 Value::Nil => {
                     store_for_set.borrow_mut().values.remove(&key);
                     return Ok(());
@@ -133,6 +197,82 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_font_parses_optional_families_and_height() {
+        assert_eq!(TERMINAL_FONT_KEY, "terminal.font");
+        assert_eq!(parse_terminal_font(None), Ok(None));
+        for (value, families, size_px) in [
+            (
+                "Iosevka:h12",
+                vec!["Iosevka"],
+                Some(crate::theme::guifont_size_px("Iosevka:h12")),
+            ),
+            ("Iosevka", vec!["Iosevka"], None),
+            (":h12", vec![], Some(crate::theme::guifont_size_px("Iosevka:h12"))),
+            (
+                "Fira\\ Code,Symbols_Nerd_Font:h10:h13.5:b",
+                vec!["Fira Code", "Symbols Nerd Font"],
+                Some(crate::theme::guifont_size_px("Mono:h13.5")),
+            ),
+            (":h100", vec![], Some(crate::theme::guifont_size_px("Mono:h100"))),
+            (
+                "Mono:hx:h12",
+                vec!["Mono"],
+                Some(crate::theme::guifont_size_px("Mono:h12")),
+            ),
+        ] {
+            assert_eq!(
+                parse_terminal_font(Some(value)),
+                Ok(Some(TerminalFontSetting {
+                    families: families.into_iter().map(str::to_owned).collect(),
+                    size_px,
+                })),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_font_refuses_empty_settings_and_invalid_heights_naming_the_key_and_value() {
+        for value in [
+            "",
+            "  , ",
+            ":b",
+            ":h0",
+            ":hx",
+            ":h101",
+            ":h-1",
+            ":hNaN",
+            ":hinf",
+            ":h",
+            "Mono:h12:hx",
+            "Mono:h12:h",
+            "Mono:h101",
+        ] {
+            let error = parse_terminal_font(Some(value)).unwrap_err();
+            assert!(error.contains(TERMINAL_FONT_KEY), "{error}");
+            assert!(error.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn editor_presentation_parses_three_words_and_refuses_others() {
+        assert_eq!(parse_editor_presentation(None), Ok(EditorPresentation::Auto));
+        for (word, expected) in [
+            ("auto", EditorPresentation::Auto),
+            ("subsurface", EditorPresentation::Subsurface),
+            ("gtk", EditorPresentation::Gtk),
+        ] {
+            assert_eq!(parse_editor_presentation(Some(word)), Ok(expected));
+        }
+        for bad in ["x", "", "Auto", " gtk", "subsurface\n", "true"] {
+            let error = parse_editor_presentation(Some(bad)).unwrap_err();
+            for word in ["editor.presentation", "auto", "subsurface", "gtk"] {
+                assert!(error.contains(word), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn window_restore_takes_a_boolean_and_names_itself_otherwise() {

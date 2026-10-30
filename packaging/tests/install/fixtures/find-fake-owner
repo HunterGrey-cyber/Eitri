@@ -1,13 +1,9 @@
 #!/bin/sh
-# Test double for `find`: simulates a target directory being owned by a DIFFERENT user than the
-# installer's own uid, for the regression tests of the owner check (found 2026-09-28) --
-# this sandbox has no way to chown a real directory to another uid without root, which an installer
-# test must never use. When invoked as `find PATH ...-uid...` (or `find -H
-# PATH ...`) against the path a test named in <scratch>/logs/fake-owner-path, it reports that path
-# as a hit, exactly as
-# the real find would for `! -uid OUR_ID` against a directory owned by someone else. Every other
-# invocation -- including every OTHER predicate this same installer run checks against that same
-# path (permissions, symlink-ness) -- runs the real find, untouched.
+# Test double for `find`: reports a directory as owned by another user for ownership checks.
+# The sandbox cannot chown to another uid without root, which an installer test must never use.
+# For `find PATH ...-uid...` or `find -H PATH ...`, a path named in
+# <scratch>/logs/fake-owner-path is reported as a hit, as real find would for `! -uid OUR_ID`.
+# Every other invocation, including other predicates on the same path, runs the real find.
 S=$(cd "$(dirname "$0")/.." && pwd)
 real=
 for m in /usr/bin/find /bin/find; do

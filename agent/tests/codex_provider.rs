@@ -1885,6 +1885,101 @@ fn left_running(thread: &str, turn: &str, then: Vec<Value>) -> (Arc<CodexProvide
 }
 
 #[test]
+fn a_background_command_gets_its_result_after_its_turn_ends() {
+    background_result(false);
+}
+
+#[test]
+fn a_background_command_gets_its_result_under_its_original_turn_while_another_runs() {
+    background_result(true);
+}
+
+fn background_result(start_another_turn: bool) {
+    let (thread, turn) = ("th-background-result", "turn-background-result");
+    let mut completed = command("bg1", "completed");
+    completed["aggregatedOutput"] = json!("done");
+    let mut then = Vec::new();
+    if start_another_turn {
+        then.extend([expect_request(5, "turn/start"), turn_response(5, "turn-next")]);
+    }
+    then.push(item_note("item/completed", thread, turn, completed));
+    let (provider, id, events) = left_running(thread, turn, then);
+    if start_another_turn {
+        send(&provider, &id, "again").expect("the next turn starts");
+    }
+    let events = pump_on(&provider, events, |events| background_counts(events).contains(&0));
+    let end = position(
+        &events,
+        |e| matches!(e, AgentDomainEvent::TurnCompleted { turn_id, .. } if turn_id == turn),
+    )
+    .expect("the first turn ended");
+    let results: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id,
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == "bg1" => Some((index, turn_id.as_str(), content, *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "the background row gets one result: {events:#?}");
+    let (index, turn_id, content, is_error) = results[0];
+    assert!(index > end, "the result follows its turn's end");
+    assert_eq!(turn_id, turn);
+    assert_eq!(content, &json!("done"));
+    assert!(!is_error);
+    if start_another_turn {
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::TurnStarted { turn_id } if turn_id == "turn-next"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::TurnCompleted { turn_id, .. } if turn_id == "turn-next"
+        )));
+    }
+}
+
+#[test]
+fn a_background_command_whose_result_is_too_large_ends_its_original_row() {
+    let (thread, turn) = ("th-background-large", "turn-background-large");
+    let prefix = format!(
+        r#"{{"method":"item/completed","params":{{"threadId":"{thread}","turnId":"{turn}","item":{{"type":"commandExecution","id":"bg1","command":"yes","cwd":"/work/proj","status":"completed","aggregatedOutput":""#
+    );
+    let (provider, _, events) = left_running(
+        thread,
+        turn,
+        vec![json!({"write_big": {"prefix": prefix, "bytes": 17 * 1024 * 1024, "suffix": "\"}}}"}})],
+    );
+    let events = pump_on(&provider, events, |events| background_counts(events).contains(&0));
+    let end = position(
+        &events,
+        |e| matches!(e, AgentDomainEvent::TurnCompleted { turn_id, .. } if turn_id == turn),
+    )
+    .expect("the turn ended");
+    let results: Vec<_> = events[end + 1..]
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id,
+                tool_use_id,
+                content,
+                is_error: false,
+            } if tool_use_id == "bg1" => Some((turn_id.as_str(), content.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![(turn, Some("ended; its result was larger than 16 MiB and is not shown"))]
+    );
+}
+
+#[test]
 fn a_command_left_running_by_a_completed_turn_is_counted_before_the_turn_ends() {
     let (t, u) = ("th-60", "turn-60");
     let (provider, _, events) = left_running(
@@ -1948,6 +2043,15 @@ fn stopping_the_background_stops_the_session() {
     });
     assert!(!alive(pid), "the session ended before its child was gone");
     assert_eq!(background_counts(&events), vec![0]);
+    // The command's row, drawn by the turn that left it running, ends with the session.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentDomainEvent::ToolCallCompleted { turn_id, tool_use_id, content, is_error: true }
+                if turn_id == u && tool_use_id == "bg1" && content == "stopped with the session"
+        )),
+        "{events:#?}"
+    );
     assert!(events.iter().any(|e| matches!(
         e,
         AgentDomainEvent::SessionUnavailable { reason }

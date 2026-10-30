@@ -2701,6 +2701,10 @@ dependencies = [
  "serde_json",
  "skia-safe",
  "tokio",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-sys",
 ]
 
 [[package]]

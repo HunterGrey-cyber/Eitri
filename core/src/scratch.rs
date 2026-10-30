@@ -319,7 +319,7 @@ impl PendingEdit {
 /// Whether nvim's buffer name `file` lies inside the scratch directory `dir`: a `Ctrl+g` draft or a
 /// read-only row view, Eitri's own buffer and never a file the user is working on. The editor-context
 /// feed drops such a report, so the composer's editor-context line and the next turn keep naming the
-/// file the user was in (seen 2026-09-25). Compared by path component, so `<dir>x/…` is not inside.
+/// file the user is working in. Compared by path component, so `<dir>x/…` is not inside.
 pub fn holds(dir: &Path, file: &str) -> bool {
     !file.is_empty() && Path::new(file).starts_with(dir)
 }
@@ -495,8 +495,8 @@ mod tests {
         assert_eq!(value["line"], 42);
     }
 
-    /// Seen in a GUI pass on 2026-09-25: with a `Ctrl+g` split focused, the context line named
-    /// the draft's scratch file. A buffer in this directory is Eitri's own, never the user's file.
+    /// A focused `Ctrl+g` draft must not replace the user's file in editor context:
+    /// a buffer in this directory belongs to Eitri.
     #[test]
     fn only_files_inside_the_scratch_directory_are_scratch_buffers() {
         let mut dir = ScratchDir::in_dir(&tmp()).unwrap();

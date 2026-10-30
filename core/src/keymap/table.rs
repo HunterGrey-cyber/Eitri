@@ -203,9 +203,10 @@ fn parse_key(op: &KeymapOp, text: &str) -> Result<KeySpec, KeymapError> {
     KeySpec::parse(text).map_err(|error| KeymapError::BadKey { call: op.call(), error })
 }
 
-/// `v1`'s two tables: `"prefix"` (this file) and `"panel"` (`PanelUserTable::set`/`del`, called
-/// directly from the `Set`/`Del` arms below, since its key/action types differ from the prefix
-/// table's). Anything else is `UnknownTable`.
+/// The prefix table's check: `"prefix"` (this file) passes. `"panel"` (`PanelUserTable::set`/`del`)
+/// and `plugin:<id>` (`plugin_table`) are handled in the `Set`/`Del` arms below before this is
+/// called, since their key/action types differ from the prefix table's. Anything else is
+/// `UnknownTable`.
 fn prefix_table(op: &KeymapOp, table: &str) -> Result<(), KeymapError> {
     if table == "prefix" {
         Ok(())
@@ -298,7 +299,8 @@ fn default_bindings() -> Vec<Binding> {
     bind("}", Action::Swap(SwapTarget::Next), false);
     bind("M-1", Action::Even(Axis::Row), false);
     bind("M-2", Action::Even(Axis::Column), false);
-    // tmux's select-layout, next-layout, rotate-window, select-pane -m/-M and display-panes keys; vim's <C-w>H/J/K and i3's $mod+e after the prefix.
+    // tmux's select-layout, next-layout, rotate-window, select-pane -m/-M and display-panes keys;
+    // vim's <C-w>H/J/K and i3's $mod+e after the prefix.
     bind("M-3", Action::MainHorizontal, false);
     bind("M-4", Action::MainVertical, false);
     bind("M-5", Action::Tiled, false);
@@ -321,6 +323,8 @@ fn default_bindings() -> Vec<Binding> {
     bind("!", Action::TabBreak, false);
 
     bind("x", Action::ModuleKill, false);
+    // Stock tmux's `d` detaches the client: it goes, and what ran in it keeps running.
+    bind("d", Action::ModuleHideByKey, false);
     bind("c", Action::Tab(TabAction::New), false);
     bind("n", Action::Tab(TabAction::Next), false);
     bind("p", Action::Tab(TabAction::Prev), false);
@@ -364,7 +368,7 @@ fn default_bindings() -> Vec<Binding> {
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
-    // tmux `copy-mode` / `copy-mode -u`: `v` is deliberately not bound here any more --
+    // tmux `copy-mode` / `copy-mode -u`: `v` is deliberately not bound here --
     // reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`), not this table.
     bind("[", Action::CopyMode { up: false }, false);
     bind("PPage", Action::CopyMode { up: true }, false);
@@ -596,7 +600,7 @@ impl Keymap {
     /// This keymap with `init.lua`'s `ops` applied in order. Every rule is strict, as for the
     /// defaults alone, except toward what the tmux import did: a `set` on a key the import bound
     /// replaces it, and a `del` of a key the import unbound is no error -- `init.lua` comes last
-    /// and wins, and a snippet written before the import existed still applies on top of it.
+    /// and wins. Importing a deletion must not break a snippet that also deletes that key.
     pub fn then_user(self, ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
         let mut map = self;
         let mut prefix_call = None;
@@ -792,13 +796,13 @@ impl Keymap {
     }
 
     /// The verbs the top bar's strip lists after the module keys: the keys bound to
-    /// kill, hide, split right, split below, even, swap and the keys sheet, in that order, in tmux spelling.
-    /// A verb nothing is bound to is left out (`hide`, by default, since `x` kills).
+    /// kill, hide (`module.hide` and the hide key), split right, split below, even, swap and the keys sheet, in that
+    /// order, in tmux spelling. A verb nothing is bound to is left out.
     pub fn strip_verbs(&self) -> Vec<String> {
         type Is = fn(&Action) -> bool;
         let groups: [(&str, Is); 7] = [
             ("kill", |a| matches!(a, Action::ModuleKill)),
-            ("hide", |a| matches!(a, Action::ModuleHide)),
+            ("hide", |a| matches!(a, Action::ModuleHide | Action::ModuleHideByKey)),
             ("right", |a| matches!(a, Action::Split { axis: Axis::Row, .. })),
             ("below", |a| matches!(a, Action::Split { axis: Axis::Column, .. })),
             ("even", |a| matches!(a, Action::Even(_))),
@@ -929,6 +933,7 @@ mod tests {
         ("$", "workspace.rename", false),
         ("!", "tab.break", false),
         ("x", "module.kill", false),
+        ("d", "module.hide-by-key", false),
         ("c", "tab.new", false),
         ("n", "tab.next", false),
         ("p", "tab.prev", false),
@@ -1325,8 +1330,8 @@ mod tests {
         );
     }
 
-    /// Bindings added 2026-09-29: `;` and `o` sit right after the arrows, whose row means something else
-    /// ("that way"); each says what it does and neither joins it.
+    /// `;` and `o` sit right after the arrows, whose row means something else ("that way"); each
+    /// says what it does and neither joins it.
     #[test]
     fn help_gives_the_last_and_next_module_keys_rows_of_their_own() {
         let rows = Keymap::defaults().help(&ModuleKeys::built_in());
@@ -1365,12 +1370,24 @@ mod tests {
     fn the_strip_verbs_come_from_the_table() {
         assert_eq!(
             Keymap::defaults().strip_verbs(),
-            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap", "? keys"]
+            [
+                "x kill",
+                "d hide",
+                "% right",
+                "\" below",
+                "M-1 M-2 even",
+                "{ } swap",
+                "? keys"
+            ]
         );
         let map = Keymap::apply_user(&[set("X", "module.hide")], &[]).unwrap();
-        assert_eq!(map.strip_verbs()[..2], ["x kill".to_string(), "X hide".to_string()]);
+        assert_eq!(
+            map.strip_verbs()[..2],
+            ["x kill".to_string(), "d X hide".to_string()],
+            "both hides share the group, the default key first"
+        );
         let map = Keymap::apply_user(&[del("%"), set("\\", "split.right")], &[]).unwrap();
-        assert_eq!(map.strip_verbs()[1], "\\ right");
+        assert_eq!(map.strip_verbs()[2], "\\ right");
     }
 
     #[test]
@@ -1381,7 +1398,7 @@ mod tests {
         let unbound = Keymap::apply_user(&[del("?")], &[]).unwrap();
         assert_eq!(
             unbound.strip_verbs(),
-            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
+            ["x kill", "d hide", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
         );
     }
 

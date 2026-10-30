@@ -118,23 +118,32 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
  * and `nextSeq` is then moved on by the rest of the run, which is exactly what folding them one by
  * one does: the first either opens a message (at its own `seq`) or appends to the open one, and
  * every later one appends to that same message, which keeps the first's `seq`. Folding them one by
- * one copied the whole transcript once per delta; a batch of D deltas over M messages copied M x D
+ * one copies the whole transcript once per delta; a batch of D deltas over M messages copies M x D
  * entries for one render.
  *
  * A run of thinking deltas is folded the same way, with one difference: a thinking delta with no text
  * opens no block, so the empty ones at the head of a run only move `nextSeq` on, and the block the
  * joined delta opens takes the `seq` of the first one that has text, as folding one by one gives it.
  */
-export function applyEvents(state: AgentUiState, events: readonly AgentDomainEvent[]): AgentUiState {
+export function applyEvents(
+  state: AgentUiState, events: readonly AgentDomainEvent[], revisions?: readonly number[],
+): AgentUiState {
   let folded = state;
   let i = 0;
   while (i < events.length) {
+    // A host-answered request still consumed a Rust revision even though no card was sent here.
+    const revision = revisions?.[i];
+    if (revision !== undefined && revision - 1 > folded.nextSeq) {
+      folded = { ...folded, nextSeq: revision - 1 };
+    }
     const first = events[i];
     let end = i + 1;
     const kind = mergeableKind(first);
     if (kind !== null) {
       const turn = (first as ContentDelta).turn_id;
       while (end < events.length) {
+        if (revisions !== undefined &&
+          (revisions[end - 1] === undefined || revisions[end] !== revisions[end - 1] + 1)) break;
         const next = events[end];
         if (mergeableKind(next) !== kind || (next as ContentDelta).turn_id !== turn) break;
         end += 1;
@@ -177,20 +186,19 @@ export function transcriptEntriesCopiedCount(): number {
  * in the conversation.
  *
  * `nextSeq` advances by exactly one per call -- including for an event that creates nothing, which
- * is what `AgentSessionProjection::apply` does with `last_revision` too. Keeping the two in step
- * means a locally-folded item gets the number Rust would have given it, so the live path and a
- * later snapshot describe the same order rather than two schemes that merely happen to agree.
+ * is what `AgentSessionProjection::apply` does with `last_revision` too. `applyEvents` advances
+ * over omitted events using the envelope's per-event revisions before calling this fold. A locally
+ * folded item gets the number Rust would have given it, so the live path and a later snapshot
+ * describe the same order rather than two schemes that merely happen to agree.
  *
- * There is no exception any more. `permission_mode_changed` used to return `incoming` and advance
- * nothing, and a repeated thinking delta did the same; both drifted the page's numbering one behind
- * Rust's per such event, which nothing noticed until turn footers compared a seq Rust named with the
- * page's own. A batch of thinking deltas still costs one fold (`applyEvents`) and one render.
+ * Skipping a revision for a mode change or a repeated thinking delta drifts the page's numbering
+ * behind Rust's, so a turn footer cannot find the seq Rust names. Batching thinking deltas still
+ * costs one fold (`applyEvents`) and one render.
  *
  * The events in one `{kind:"events"}` batch arrive in fold order -- `UiDelivery::Events` is
  * documented as "apply these events, in order", and `ConversationIngest` queues one entry per event
- * it folds -- so arrival order here IS the authoritative order, not a guess at it. The one case
- * where it queues nothing is while a resync is owed, and that ends in a snapshot, which re-seeds
- * this counter rather than continuing it.
+ * it folds. The host can omit requests it answered itself; their revisions remain gaps in the
+ * delivered tags. A resync ends in a snapshot, which re-seeds this counter rather than continuing it.
  */
 export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
   const seq = incoming.nextSeq;
@@ -302,7 +310,7 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       };
     case "assistant_message_boundary":
       // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
-      // folds them (2026-09-25).
+      // folds them.
       return { ...state, assistantMessageOpen: false, thinkingOpen: false };
     case "user_prompt_submitted":
       // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
@@ -357,11 +365,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       // dead at runtime: a third variant added on the Rust side without a matching case here would
       // otherwise fall through into the text path below and append a transcript entry whose `text`
       // is `undefined`, which `MessageList` hands to `renderMarkdown`, which throws inside
-      // `marked` -- and this app has no error boundary, so the whole panel unmounts. This arm used
-      // to read `if (event.kind !== "text") return state;` and the in-flight motion change turned
-      // it into `if (event.kind === "thinking")`, dropping the guard, which was reproduced as an
-      // unmount on 2026-09-20. Same shape, and same reason, as the `default:` arm at
-      // the bottom of this switch.
+      // `marked` -- and this app has no error boundary, so the whole panel unmounts. Same shape,
+      // and same reason, as the `default:` arm at the bottom of this switch.
       if ((event.kind as string) !== "text") return state;
       // `event.kind` is narrowed to "text" here, the only other member of the union.
       // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single
@@ -452,10 +457,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
         ],
       };
     case "permission_resolved":
-      // The one authoritative source for "this permission card is gone".
-      // Replaces the deleted markPermissionAnswered: this now arrives as a real event from Rust
-      // the instant AgentSession::respond_permission or interrupt() resolves it, never as a
-      // frontend-local guess.
+      // The authoritative source for "this permission card is gone": Rust sends it when the
+      // request is resolved, never as a frontend-local guess.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
     case "turn_completed": {
       // A completion naming a turn this page is not running (another runs, or none does) ends nothing
@@ -465,8 +468,7 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       if (state.activeTurnId !== event.turn_id) {
         return { ...state, usage: event.usage ?? state.usage, cliUnseenBusy: false };
       }
-      // The one authoritative source for "no turn is in flight" -- replaces the deleted
-      // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
+      // The authoritative source for "no turn is in flight": a finished turn does
       // NOT end the conversation, only session_closed/session_unavailable do.
       //
       // `usage`, mirroring `AgentSessionProjection::apply`: a report REPLACES the figure whole
@@ -838,13 +840,10 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   // (the `Omit` of exactly those) rather than a full `AgentUiState` that would claim Rust sent
   // them. Supplying them here is the only reason this function exists.
   //
-  // `assistantMessageOpen` is NOT forced here (2026-09-27): it comes from the
-  // spread of `snapshot` below like every other field. It used to be force-reset to `false` on the
-  // theory that a snapshot always meant "start fresh" -- but Rust's own `AgentSessionProjection`
-  // keeps appending to the open message underneath a snapshot taken mid-reply, so forcing `false`
-  // here split one streaming reply into two transcript rows, with broken markdown at the seam, on
-  // every snapshot landing mid-reply (a tab switch back to a streaming reply, `prefix r`, a
-  // bounded-queue Resync). See that field's own doc comment on `AgentUiState`.
+  // `assistantMessageOpen` comes from the snapshot: Rust keeps appending to the open message
+  // underneath a mid-reply snapshot. Forcing it false would split that reply into two rows with
+  // broken markdown at the seam on a tab switch, `prefix r` or bounded-queue Resync. See the field
+  // on `AgentUiState`.
   //
   // Resetting `turnThinking` IS still forced: a thinking delta folded before the snapshot was taken
   // must not still read as "thinking now"; the invariant is that
@@ -900,8 +899,7 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   return reset.fromSnapshot(state, snapshot);
 }
 
-/** Whether a `resume_outcome` confirms the session that was actually asked for -- the same
- * predicate `applyEvent`'s own `resume_outcome` arm used to compute inline. Exported so `App.tsx`
+/** Whether a `resume_outcome` confirms the session that was actually asked for. Exported so `App.tsx`
  * can decide whether a resume outcome ends the in-flight-motion clock (`turnClock`)
  * without re-deriving this rule a second time; a forked attach is not a substitution because
  * forking legitimately returns a different id. */

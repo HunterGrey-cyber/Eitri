@@ -26,7 +26,12 @@ impl AgentPanelHandle {
     pub fn for_host_test(page: Rc<dyn crate::panel_page::PageSurface>) -> Self {
         let tabs =
             eitri_core::tab_set::TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
-        let state = bare_state(&HOST_TEST_DOCUMENT, Rc::new(NoHost), tabs);
+        let state = bare_state(
+            &HOST_TEST_DOCUMENT,
+            Rc::new(NoHost),
+            tabs,
+            eitri_core::theme::ThemeTokens::fallback(),
+        );
         AgentPanelHandle::over(Rc::new(RefCell::new(state)), Some(Rc::new(PanelPage::new(page))))
     }
 
@@ -96,6 +101,34 @@ pub struct AgentPanelHandle {
     pub(super) with_pages: bool,
     /// The wake's raise, held outside the state so raising it never needs the state's cell.
     pub(super) raise: Option<agent::UiWake>,
+    partner: Rc<RefCell<PartnerChooser>>,
+    arrived_moves: Rc<RefCell<BTreeMap<u64, TabId>>>,
+}
+
+/// The linked process, identified across process-id reuse, and the number its rows show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partner {
+    pub pid: u32,
+    pub start: u64,
+    pub window: u8,
+}
+
+impl From<(u32, u64, u8)> for Partner {
+    fn from((pid, start, window): (u32, u64, u8)) -> Self {
+        Self { pid, start, window }
+    }
+}
+
+type PartnerPick = Rc<dyn Fn(ViewId, String)>;
+
+#[derive(Default)]
+struct PartnerChooser {
+    partner: Option<Partner>,
+    generation: u64,
+    sessions: Vec<String>,
+    pick: Option<PartnerPick>,
+    pending: Option<std::sync::mpsc::Receiver<(u64, ViewId, String, Vec<String>)>>,
+    pending_tab: Option<TabId>,
 }
 
 /// Where the window's link to `eitri-supervisor` stands ([`AgentPanelHandle::supervisor_link`]).
@@ -116,9 +149,10 @@ pub struct PanelInit {
     pub scratch: Option<eitri_core::scratch::ScratchDir>,
     pub backend_kind: BackendKind,
     pub document: &'static PanelDocument,
-    /// Which saved tabs the panel offers back and which file it keeps them in: the window's role in the
-    /// project's pair decides it.
-    pub tab_files: eitri_core::saved_tabs::TabFiles,
+    pub theme: eitri_core::theme::ThemeTokens,
+    /// Whose saved-tabs file in the project's pair the panel keeps its tabs in. Which saved tabs it offers back
+    /// is given once `init.lua` has run ([`AgentPanelHandle::set_tab_files`]).
+    pub tab_role: eitri_core::window_link::pair::Role,
 }
 
 impl AgentPanelHandle {
@@ -132,6 +166,8 @@ impl AgentPanelHandle {
             pages: Pages::default(),
             with_pages: page.is_some(),
             raise,
+            partner: Rc::default(),
+            arrived_moves: Rc::default(),
         };
         if let Some(page) = page {
             handle.attach_page(ViewId::BASE, page);
@@ -191,6 +227,8 @@ impl AgentPanelHandle {
             pages: Pages::default(),
             with_pages,
             raise,
+            partner: Rc::default(),
+            arrived_moves: Rc::default(),
         }
     }
 
@@ -295,6 +333,26 @@ impl AgentPanelHandle {
         if self.state.borrow().shutting_down {
             return;
         }
+        self.poll_partner_chooser();
+        if let InboundMessage::Resume {
+            provider_session_id, ..
+        } = &message
+        {
+            let state = self.partner.borrow();
+            let pick = state
+                .pick
+                .clone()
+                .filter(|_| state.partner.is_some() && state.sessions.contains(provider_session_id));
+            drop(state);
+            if let Some(pick) = pick {
+                pick(view, provider_session_id.clone());
+                self.dispatch(
+                    view,
+                    eitri_core::agent_bridge::serialize_command_result_for_js(message.request_id(), Ok(())),
+                );
+                return;
+            }
+        }
         // What the window says about the message is asked before its arm runs, each with the state
         // released: which pages are on screen, and, for an answer the window must agree to, its gate.
         let screen = Screen::read(&self.state, &self.pages);
@@ -369,6 +427,171 @@ impl AgentPanelHandle {
     pub fn adopt_panel_tab(&self, tab: TabId, handoff: PanelTabHandoff) {
         self.wake();
         adopt_panel_tab(&mut self.state.borrow_mut(), tab, handoff);
+    }
+
+    /// Where a move's answers go: a freeze made or refused, a presence held or not. `main.rs` installs this once
+    /// in a window that has another window.
+    pub fn on_chat_move(&self, hook: impl Fn(ChatMoveEvent) + 'static) {
+        self.wake();
+        self.state.borrow_mut().chat_moves.hook = Some(Rc::new(hook));
+    }
+
+    /// What a move of `view`'s tab would take (in the base view the tab holding `session` when one is named), or
+    /// why the tab does not move now.
+    pub fn chat_move_facts(
+        &self,
+        view: ViewId,
+        session: Option<&str>,
+    ) -> Result<eitri_core::wm::ChatMoveFacts, String> {
+        self.wake();
+        super::chat_moves::chat_move_facts(&self.state.borrow(), view, session)
+    }
+
+    /// The view whose tabs hold `session`, when a tab here holds it.
+    pub fn view_of_session(&self, session: &str) -> Option<ViewId> {
+        self.wake();
+        super::chat_moves::view_of_session(&self.state.borrow(), session)
+    }
+
+    /// Freezes `view`'s tab (or `tab`) for move `mv`, answered later through [`Self::on_chat_move`]: the page is
+    /// asked for its view of the tab first, for at most a second.
+    pub fn freeze_for_move(&self, view: ViewId, tab: Option<TabId>, mv: u64) {
+        self.wake();
+        self.run(|state, out| super::chat_moves::begin_freeze(state, view, tab, mv, out));
+    }
+
+    /// The move of `view`'s tab (or `tab`) did not happen: the tab takes input and answers cards again.
+    pub fn resume_moved(&self, view: ViewId, tab: Option<TabId>) {
+        self.wake();
+        super::chat_moves::resume_moved(&mut self.state.borrow_mut(), view, tab);
+    }
+
+    /// The other window holds `view`'s frozen tab (or `tab`) now: it leaves this window, its session not ended.
+    pub fn forget_moved(&self, view: ViewId, tab: Option<TabId>) -> Result<(), String> {
+        self.wake();
+        self.run(|state, out| super::chat_moves::forget_moved(state, view, tab, out))
+    }
+
+    /// The commit of a move into `view`: the tab another window froze is taken up from `record` and `fds`.
+    pub fn adopt_moved(
+        &self,
+        view: ViewId,
+        record: &serde_json::Value,
+        fds: Vec<std::os::fd::OwnedFd>,
+    ) -> Result<TabId, String> {
+        self.wake();
+        let tab = self.run(|state, out| super::chat_moves::adopt_moved(state, view, record, fds, out))?;
+        if let Some(mv) = record["workspace_move_id"].as_u64() {
+            let state = self.state.borrow();
+            let mut arrived = self.arrived_moves.borrow_mut();
+            arrived.retain(|_, id| state.tabs.get(*id).is_some());
+            arrived.insert(mv, tab);
+        }
+        Ok(tab)
+    }
+
+    /// The local tab an arriving move created, after its adopt has run.
+    pub fn arrived_tab(&self, mv: u64) -> Option<TabId> {
+        self.wake();
+        self.arrived_moves
+            .borrow()
+            .get(&mv)
+            .copied()
+            .filter(|id| self.state.borrow().tabs.get(*id).is_some())
+    }
+
+    pub fn base_tabs(&self) -> Vec<TabId> {
+        self.wake();
+        self.state.borrow().tabs.base_tabs()
+    }
+
+    pub fn active_base_tab(&self) -> Option<TabId> {
+        self.wake();
+        Some(self.state.borrow().tabs.active())
+    }
+
+    pub fn tab_move_facts(&self, tab: TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
+        self.wake();
+        super::chat_moves::facts_for_tab(&self.state.borrow(), tab)
+    }
+
+    pub fn moved_tab_key(&self, tab: TabId) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
+        self.wake();
+        let state = self.state.borrow();
+        let tab = state.tabs.get(tab)?;
+        Some(eitri_core::window_link::base_tabs::MovedTabKey {
+            agent: tab.agent().clone(),
+            session: tab.provider_session_id()?,
+        })
+    }
+
+    /// The running tabs of the base view and the extra views that hold a running turn.
+    pub fn running_chats(&self) -> Vec<(eitri_core::layout::ModuleId, Option<TabId>)> {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Vec::new();
+        }
+        state
+            .tabs
+            .tabs()
+            .iter()
+            .filter(|t| t.turn_running() || matches!(t.backend(), TabBackend::Starting(_)))
+            .map(|t| {
+                let view = state.tabs.view_of(t.id);
+                (
+                    if view.is_base() {
+                        eitri_core::layout::ModuleId::agent()
+                    } else {
+                        view.module()
+                    },
+                    view.is_base().then_some(t.id),
+                )
+            })
+            .collect()
+    }
+
+    /// The controller supplies the complete order after every arrival in the workspace has decided.
+    pub fn order_base_tabs(&self, order: &[TabId], active: Option<TabId>) -> Result<(), String> {
+        self.wake();
+        self.run(|state, out| {
+            let existing: Vec<_> = state
+                .tabs
+                .base_tabs()
+                .into_iter()
+                .filter(|t| !order.contains(t))
+                .collect();
+            let tabs = eitri_core::window_link::base_tabs::order_after_arrival(&existing, None, order);
+            // The tabs a workspace brought are numbered after the ones here, which keep their numbers; once ordered
+            // they are this view's own, so a later ordering keeps their numbers too.
+            let arrived: Vec<_> = {
+                let mut moves = self.arrived_moves.borrow_mut();
+                let arrived = moves.values().copied().filter(|t| tabs.contains(t)).collect();
+                moves.retain(|_, t| !tabs.contains(t));
+                arrived
+            };
+            if !state.tabs.order_base_tabs(&tabs, &arrived) {
+                return Err("the arriving tabs have changed before they could be ordered".into());
+            }
+            if let Some(active) = active {
+                state.tabs.select(active);
+            }
+            switch_payloads(state, out);
+            Ok(())
+        })
+    }
+
+    /// Before the commit of move `mv`: this window's presence holds `session`'s running turn, answered through
+    /// [`Self::on_chat_move`].
+    pub fn hold_presence(&self, session: &str, mv: u64) {
+        self.wake();
+        self.run(|state, out| super::chat_moves::hold_presence(state, session, mv, out));
+    }
+
+    /// The arrival of `session` with move `mv` was given up.
+    pub fn drop_presence(&self, session: &str, mv: u64) {
+        self.wake();
+        super::chat_moves::drop_presence(&mut self.state.borrow_mut(), session, mv);
     }
 }
 
@@ -450,6 +673,7 @@ impl AgentPanelHandle {
     /// Then each page's `tabs` envelope and `hello` go out if what they describe changed, and the
     /// extra views left holding no tab are told to the window.
     pub fn tick(&self) -> bool {
+        self.poll_partner_chooser();
         let state = &self.state;
         let pages = &self.pages;
         // No page, no session ever starts and nothing could be shown: nothing to drive.
@@ -466,6 +690,8 @@ impl AgentPanelHandle {
         {
             state.borrow_mut().ticks_run += 1;
         }
+        // A move's freeze waits for its page's answer, and an arrival for its presence: both are read here.
+        self.run(super::chat_moves::poll_chat_moves);
         // Each chat view's host is unmapped while it is hidden or zoomed away; mapped under a float,
         // it is off screen too. Asked before the state is borrowed: the window's probe may read it.
         let live = pages.live_views();
@@ -926,6 +1152,50 @@ impl AgentPanelHandle {
         }
     }
 
+    /// Which saved tabs the window offers back, decided once `init.lua` has run (the pair's restore depends on
+    /// `window.restore`): read and claimed here, before the base page's first `ready` can use them. Given again
+    /// later with more files to offer (window 2 not coming back after all), only what was not offered yet is read,
+    /// and offered after what still is. Nothing is read when `agent.restore` is `"off"`.
+    pub fn set_tab_files(&self, files: eitri_core::saved_tabs::TabFiles) {
+        self.wake();
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+        if state.restore_policy == RestorePolicy::Off {
+            state.tab_files = Some(files);
+            return;
+        }
+        let tabs_dir = eitri_core::saved_tabs::state_dir(
+            state.review_roots.state_home.as_deref(),
+            state.review_roots.home.as_deref(),
+        );
+        let (offer, notes, takeovers) =
+            files.startup_beyond(state.tab_files.as_ref(), tabs_dir.as_deref(), &state.project_dir);
+        for note in notes {
+            eprintln!("{note}");
+        }
+        state.tab_memory.take_over_when_written(takeovers);
+        state.restore_source = match (state.restore_source.take(), offer) {
+            (Some(earlier), Some(later)) => Some(earlier.followed_by(later)),
+            (earlier, later) => earlier.or(later),
+        };
+        state.tab_files = Some(files);
+    }
+
+    /// Window 1 starting window 2 again at its launch: `agent.restore = "auto"` waits until window 2 is back or
+    /// is not ([`AgentPanelHandle::release_launch_restore`]), so the saved tabs of a window 2 that does not come
+    /// back return in the same restore as this window's own.
+    pub fn hold_launch_restore(&self) {
+        self.wake();
+        self.state.borrow_mut().launch_restore_held = true;
+    }
+
+    /// Window 2 is back, or is not (its saved tabs given first, [`AgentPanelHandle::set_tab_files`]): the launch
+    /// restore runs on the next tick if the base page was ready meanwhile.
+    pub fn release_launch_restore(&self) {
+        self.wake();
+        self.state.borrow_mut().launch_restore_held = false;
+    }
+
     /// `agent.default_mode` as `init.lua` left it (`None`: unset), applied once after it ran. A mode
     /// Shift+Tab left for this project keeps winning; otherwise the empty tab the window already has,
     /// and every new one, start in it (an agent that offers no manual mode starts in auto instead).
@@ -1299,6 +1569,12 @@ impl AgentPanelHandle {
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
     }
 
+    /// Called for views whose running state or queue changed, and with `false` for views that left.
+    pub fn on_busy(&self, hook: impl Fn(&[(ViewId, bool)]) + 'static) {
+        self.wake();
+        self.state.borrow_mut().busy_hook = Some(Rc::new(hook));
+    }
+
     /// Where a `tab_verb` message's mapped `TabAction` goes: the same code the prefix's own
     /// `Action::Tab` arm runs (`main.rs`'s `run_tab_action`). `None`
     /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
@@ -1374,6 +1650,55 @@ impl AgentPanelHandle {
             }
             Some(place)
         })
+    }
+
+    /// Whether stepping the base tabs can select a tab, without sending anything to a page.
+    pub fn can_step(&self, delta: i32) -> bool {
+        if !self.with_pages {
+            return false;
+        }
+        let Ok(state) = self.state.try_borrow() else {
+            return false;
+        };
+        if state.shutting_down {
+            return false;
+        }
+        let tabs = &state.tabs;
+        let numbers: Vec<u16> = tabs
+            .tabs()
+            .iter()
+            .filter(|tab| tab.view_id().is_base())
+            .map(|tab| tab.number)
+            .collect();
+        eitri_core::tabs::step(&numbers, tabs.active_tab().number, delta).is_some()
+    }
+
+    /// Whether the previous base tab can be selected, without sending anything to a page.
+    pub fn has_last(&self) -> bool {
+        if !self.with_pages {
+            return false;
+        }
+        let Ok(state) = self.state.try_borrow() else {
+            return false;
+        };
+        !state.shutting_down && state.tabs.has_last()
+    }
+
+    /// Where a numbered tab would be selected, without sending anything to a page.
+    pub fn tab_place(&self, n: u16) -> Option<TabPlace> {
+        if !self.with_pages {
+            return None;
+        }
+        let state = self.state.try_borrow().ok()?;
+        if state.shutting_down {
+            return None;
+        }
+        state
+            .tabs
+            .tabs()
+            .iter()
+            .find(|tab| tab.number == n)
+            .and_then(|tab| state.tabs.place_of(tab.id))
     }
 
     /// `prefix n` (+1) / `p` (-1), wrapping, over the base view's tabs.
@@ -1456,6 +1781,60 @@ impl AgentPanelHandle {
         self.dispatch(ViewId::BASE, payload);
     }
 
+    pub fn set_partner(&self, partner: Option<Partner>) {
+        self.wake();
+        let mut state = self.partner.borrow_mut();
+        state.partner = partner;
+        state.generation += 1;
+        state.sessions.clear();
+        state.pending = None;
+        state.pending_tab = None;
+    }
+
+    pub fn on_chooser_partner_pick(&self, pick: impl Fn(ViewId, String) + 'static) {
+        self.wake();
+        self.partner.borrow_mut().pick = Some(Rc::new(pick));
+    }
+
+    pub fn chat_summary(&self) -> eitri_core::wm::ChatSummary {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Default::default();
+        }
+        let attention = state.tabs.attention();
+        eitri_core::wm::ChatSummary {
+            waiting: attention.pending as u32,
+            unseen: state
+                .tabs
+                .tabs()
+                .iter()
+                .filter(|t| t.attention.attention().unread)
+                .count() as u32,
+            running: state.tabs.running_count() as u32,
+            queued: state.tabs.queued_count() as u32,
+        }
+    }
+
+    fn poll_partner_chooser(&self) {
+        let answer = self.partner.borrow().pending.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some((generation, view, payload, sessions)) = answer {
+            if generation != self.partner.borrow().generation {
+                return;
+            }
+            let tab = self.state.borrow().tab_of_page(view);
+            let mut state = self.partner.borrow_mut();
+            state.pending = None;
+            if state.pending_tab.take() != tab {
+                state.sessions.clear();
+                return;
+            }
+            state.sessions = sessions;
+            drop(state);
+            self.dispatch(view, payload);
+        }
+    }
+
     /// `prefix w` in `view`'s page: every open tab, and the records of that page's tab's agent.
     pub fn open_chooser(&self, view: ViewId) {
         self.wake();
@@ -1471,6 +1850,46 @@ impl AgentPanelHandle {
             let mut state = self.state.borrow_mut();
             state.chooser_listed = listed;
             state.chooser_view = view;
+        }
+        self.partner.borrow_mut().sessions.clear();
+        #[cfg(target_os = "linux")]
+        let partner = self.partner.borrow().partner;
+        #[cfg(target_os = "linux")]
+        if let Some(partner) = partner {
+            let generation = self.partner.borrow().generation + 1;
+            let mut value: serde_json::Value = serde_json::from_str(&payload).expect("a serialized chooser");
+            let state = self.state.borrow();
+            let tab = state.tab_of_page(view);
+            let agent = tab
+                .and_then(|id| state.tabs.get(id))
+                .map(|t| t.agent().record_name())
+                .unwrap_or_else(|| "claude".into());
+            let cwd = state.canonical_project_dir.clone();
+            drop(state);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = self.raise.clone();
+            std::thread::spawn(move || {
+                let mut records: Vec<eitri_core::agent_bridge::ChooserRecord> =
+                    serde_json::from_value(value["records"].take()).unwrap_or_default();
+                mark_partner_records(&mut records, Some(partner.window), |session| {
+                    agent::lease::SessionLease::is_held_by(&agent, &cwd, session, partner.pid, partner.start)
+                });
+                let sessions = records
+                    .iter()
+                    .filter(|r| r.held_by_partner)
+                    .map(|r| r.provider_session_id.clone())
+                    .collect();
+                value["records"] = serde_json::to_value(records).expect("chooser records serialize");
+                let _ = tx.send((generation, view, value.to_string(), sessions));
+                if let Some(wake) = wake {
+                    wake();
+                }
+            });
+            let mut state = self.partner.borrow_mut();
+            state.generation = generation;
+            state.pending = Some(rx);
+            state.pending_tab = tab;
+            return;
         }
         self.dispatch(view, payload);
     }
@@ -1867,6 +2286,126 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
 
+    #[test]
+    fn a_chooser_partner_pick_raises_without_starting_a_session() {
+        let (handle, _) = settled_panel();
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let seen = picked.clone();
+        handle.on_chooser_partner_pick(move |view, session| seen.borrow_mut().push((view, session)));
+        handle.set_partner(Some((7, 11, 2).into()));
+        handle.partner.borrow_mut().sessions.push("peer-session".into());
+        let tabs = handle.state.borrow().tabs.tabs().len();
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"resume","request_id":"pick","provider_session_id":"peer-session"}"#,
+        );
+        assert_eq!(*picked.borrow(), vec![(ViewId::BASE, "peer-session".into())]);
+        assert_eq!(handle.state.borrow().tabs.tabs().len(), tabs);
+        handle.set_partner(None);
+        assert!(handle.partner.borrow().sessions.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_partner_chooser(handle: &AgentPanelHandle) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.partner.borrow().pending.is_some() {
+            handle.poll_partner_chooser();
+            assert!(std::time::Instant::now() < deadline, "the chooser answer never came");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partner_chooser_answer_after_a_tab_switch_is_dropped() {
+        let (handle, page) = settled_panel();
+        handle.set_partner(Some((7, 11, 2).into()));
+        handle.new_tab_for(AgentId::Codex);
+        assert!(handle.step(-1));
+        let before = page.sent.borrow().len();
+        handle.open_chooser(ViewId::BASE);
+        assert!(handle.step(1));
+        wait_for_partner_chooser(&handle);
+        assert!(handle.partner.borrow().sessions.is_empty());
+        assert!(!page.sent.borrow()[before..]
+            .iter()
+            .any(|payload| kind_of(payload) == "chooser"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partner_chooser_answer_for_the_same_tab_is_dispatched_once() {
+        let (handle, page) = settled_panel();
+        handle.set_partner(Some((7, 11, 2).into()));
+        let before = page.sent.borrow().len();
+        handle.open_chooser(ViewId::BASE);
+        wait_for_partner_chooser(&handle);
+        handle.poll_partner_chooser();
+        assert_eq!(
+            page.sent.borrow()[before..]
+                .iter()
+                .filter(|payload| kind_of(payload) == "chooser")
+                .count(),
+            1
+        );
+    }
+
+    /// A settled panel with three base tabs, the third active, and a fourth bound to view 2: `last` has a base
+    /// tab to go back to, and one number names a tab in a view.
+    fn mixed_tabs() -> (AgentPanelHandle, std::rc::Rc<RecordingPage>) {
+        let (handle, page) = settled_panel();
+        handle.new_tab();
+        handle.new_tab();
+        handle.open_in(ViewId::new(2).unwrap()).unwrap();
+        (handle, page)
+    }
+
+    #[test]
+    fn the_read_only_tab_queries_answer_what_the_calls_would_do() {
+        // Each query is asked of one set and the acting call made on an identical one, so the call cannot have
+        // seen what the query left behind.
+        for twin in [settled_panel, mixed_tabs] {
+            for delta in [1, -1, 2] {
+                let (asked, page) = twin();
+                let sent = page.sent.borrow().len();
+                let answer = asked.can_step(delta);
+                assert_eq!(
+                    page.sent.borrow().len(),
+                    sent,
+                    "can_step({delta}) sends no page message"
+                );
+                assert_eq!(answer, twin().0.step(delta), "can_step({delta}) answers what step does");
+            }
+            let (asked, page) = twin();
+            let sent = page.sent.borrow().len();
+            let answer = asked.has_last();
+            assert_eq!(page.sent.borrow().len(), sent, "has_last sends no page message");
+            assert_eq!(answer, twin().0.select_last(), "has_last answers what select_last does");
+            for number in 0..=5 {
+                let (asked, page) = twin();
+                let sent = page.sent.borrow().len();
+                let answer = asked.tab_place(number);
+                assert_eq!(
+                    page.sent.borrow().len(),
+                    sent,
+                    "tab_place({number}) sends no page message"
+                );
+                assert_eq!(
+                    answer,
+                    twin().0.select_number(number),
+                    "tab_place({number}) answers what select_number does"
+                );
+            }
+        }
+        let (handle, _) = mixed_tabs();
+        assert!(handle.has_last(), "the set has a base tab to go back to");
+        assert!(handle.can_step(1), "the set has another base tab to step to");
+        assert!(
+            matches!(handle.tab_place(4), Some(TabPlace::View(..))),
+            "one number names the tab in view 2"
+        );
+    }
+
     /// The window controller asks a chat page whether it keeps a navigation key while it decides that key: the
     /// question reads the page's mode and changes nothing, sends the page nothing, and only the key itself, once
     /// decided, reaches the page, as one message.
@@ -2011,6 +2550,30 @@ mod tests {
         assert_eq!(state.borrow().tabs.active_tab().mode(), SessionModeChoice::Manual);
     }
 
+    #[test]
+    fn arriving_base_tabs_replace_an_untouched_empty_tab() {
+        let source = AgentPanelHandle::for_host_test(Rc::new(RecordingPage::default()));
+        let dest = AgentPanelHandle::for_host_test(Rc::new(RecordingPage::default()));
+        let records: Vec<_> = (0..2)
+            .map(|_| {
+                let tab = source.state.borrow().tabs.active();
+                let panel = source.panel_tab_handoff(tab).unwrap();
+                let frozen = source.state.borrow_mut().tabs.freeze_for_move(tab).unwrap();
+                source.state.borrow_mut().tabs.unfreeze(tab);
+                serde_json::json!({"version": 1, "tab": frozen.tab, "chat": null, "provider": null,
+                "lease": false, "panel": panel.to_value(), "view": null})
+            })
+            .collect();
+        let a = dest.adopt_moved(ViewId::BASE, &records[0], vec![]).unwrap();
+        let b = dest.adopt_moved(ViewId::BASE, &records[1], vec![]).unwrap();
+        dest.order_base_tabs(&[b, a], Some(a)).unwrap();
+        assert_eq!(dest.base_tabs(), vec![b, a]);
+        assert_eq!(dest.active_base_tab(), Some(a));
+        let state = dest.state.borrow();
+        assert_eq!(state.tabs.get(b).unwrap().number, 1);
+        assert!(matches!(state.tabs.get(a).unwrap().backend(), TabBackend::NotStarted));
+    }
+
     /// A note the tab set made before any page was ready (the configured ACP agent clamping the
     /// empty tab out of manual, as `init.lua` does at startup) is said once the page says `ready`,
     /// after the `tabs` that shows the tab, and not again on a later `tabs`.
@@ -2119,6 +2682,9 @@ mod tests {
             "supervisor_link",
             "panel_keys",
             "nav_claims",
+            "can_step",
+            "has_last",
+            "tab_place",
             "newest_card_label_in",
             "running_count",
             "background_count",
@@ -2180,6 +2746,34 @@ mod tests {
         assert_eq!(documents[0].1, PANEL_BASE_URI);
         assert!(documents[0].0.contains("<style id=\"nv-theme\">"));
         assert_eq!(page.backgrounds.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_first_document_is_loaded_in_the_panels_start_theme() {
+        use eitri_core::theme::payload::{HlAttrs, NvimThemePayload};
+        let mut payload = NvimThemePayload::empty();
+        payload.options.background = "light".into();
+        payload.options.colors_name = "rose-pine-dawn".into();
+        payload.options.guifont = "Mono:h14".into();
+        payload.groups.insert(
+            "Normal".into(),
+            HlAttrs {
+                fg: Some(0x575279),
+                bg: Some(0xfaf4ed),
+                reverse: false,
+            },
+        );
+        let theme = eitri_core::theme::ThemeTokens::derive(&payload);
+        let (handle, page, _host) = handle_with_recording_page_in_theme(theme);
+        assert!(page.sent.borrow().is_empty());
+        assert!(page.documents.borrow().is_empty());
+        assert!(page.backgrounds.borrow().is_empty());
+        handle.load_document(ViewId::BASE);
+        assert_eq!(*page.backgrounds.borrow(), [[0xfa, 0xf4, 0xed]]);
+        let documents = page.documents.borrow();
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0].0.contains("#faf4ed"));
+        assert!(page.sent.borrow().is_empty());
     }
 
     #[test]
@@ -2328,5 +2922,97 @@ mod tests {
             offenders.is_empty(),
             "inline script allowed by keyword in: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn tab_files_given_after_init_are_the_ones_offered() {
+        use eitri_core::saved_tabs::{self, SavedTab, SavedTabs, TabFiles};
+        use eitri_core::window_link::pair::Role;
+        let project = agent::state_dirs::test_workspace_dir("tab-files-late");
+        let state_home = project.join("state");
+        let tabs_dir = saved_tabs::state_dir(Some(state_home.as_os_str()), None).unwrap();
+        let one = |session: &str| {
+            SavedTabs::from_parts(
+                vec![SavedTab {
+                    agent: eitri_core::agent_backend::AgentId::Claude,
+                    conversation_id: "0123456789abcdef0123456789abcdef".into(),
+                    provider_session_id: session.into(),
+                    name: None,
+                    mode: Auto,
+                    view: None,
+                }],
+                0,
+                Vec::new(),
+                None,
+            )
+        };
+        saved_tabs::save_as(&tabs_dir, &project, Role::Main, &one("s-main")).unwrap();
+        saved_tabs::save_as(&tabs_dir, &project, Role::Second, &one("s-second")).unwrap();
+        let panel = || {
+            let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, Auto));
+            {
+                let mut s = state.borrow_mut();
+                s.review_roots.state_home = Some(state_home.clone().into_os_string());
+                s.project_dir = project.clone();
+            }
+            let handle = handle_for(&state);
+            (state, handle)
+        };
+        let offered = |state: &Rc<RefCell<AgentPanelState>>| -> Vec<String> {
+            state
+                .borrow()
+                .restore_source
+                .as_ref()
+                .map(|saved| saved.tabs.iter().map(|t| t.provider_session_id.clone()).collect())
+                .unwrap_or_default()
+        };
+        let own = TabFiles {
+            role: Role::Main,
+            also_offer: Vec::new(),
+            offers_own: true,
+        };
+        let with_second = TabFiles {
+            also_offer: vec![Role::Second],
+            ..own.clone()
+        };
+
+        // `agent.restore = "off"`, applied first, leaves every file unread and unclaimed.
+        let (state, handle) = panel();
+        handle.set_restore_policy(RestorePolicy::Off);
+        handle.set_tab_files(with_second.clone());
+        assert!(offered(&state).is_empty());
+        assert!(
+            tabs_dir.join(saved_tabs::file_name_as(&project, Role::Second)).exists(),
+            "window 2's file is not claimed"
+        );
+
+        let (state, handle) = panel();
+        assert!(
+            offered(&state).is_empty(),
+            "nothing is offered before the window says what"
+        );
+        handle.set_tab_files(own.clone());
+        assert_eq!(offered(&state), ["s-main"]);
+        // Window 2 does not come back after all: its saved tabs are offered after this window's own, once.
+        handle.set_tab_files(with_second.clone());
+        assert_eq!(offered(&state), ["s-main", "s-second"]);
+        handle.set_tab_files(with_second);
+        assert_eq!(offered(&state), ["s-main", "s-second"], "nothing is offered twice");
+
+        // Given once its own offer was used up, only the files not offered yet are read.
+        let (state, handle) = panel();
+        saved_tabs::save_as(&tabs_dir, &project, Role::Second, &one("s-later")).unwrap();
+        handle.set_tab_files(own.clone());
+        state.borrow_mut().restore_source = None;
+        handle.set_tab_files(TabFiles {
+            also_offer: vec![Role::Second],
+            ..own
+        });
+        assert!(
+            offered(&state).contains(&"s-later".to_string()) && !offered(&state).contains(&"s-main".to_string()),
+            "{:?}",
+            offered(&state)
+        );
+        let _ = std::fs::remove_dir_all(&project);
     }
 }

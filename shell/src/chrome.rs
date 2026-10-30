@@ -5,10 +5,9 @@
 //! called for it). Its last job was naming the focused pane, which the cursors do on their own
 //! (the focus report).
 
-use std::path::Path;
 use std::rc::Rc;
 
-use eitri_core::wm::titles::{project_display_name, window_title};
+use eitri_core::wm::titles::window_title;
 use eitri_core::wm::{EntryEv, HostEvent, WinId};
 use gtk4::{prelude::*, ApplicationWindow};
 
@@ -29,6 +28,8 @@ pub(crate) struct TopBar {
     pub(crate) tray: gtk4::Box,
     /// `marked: <title>`, left of the tray, shown only while a module is marked (the chrome model's `mark`).
     pub(crate) mark: gtk4::Label,
+    /// The linked window's counts, always drawn as plain text.
+    pub(crate) other: gtk4::Label,
     /// `selected: <kind> (<titles>)`, beside the mark, shown only while a container is selected
     /// (the chrome model's `selection`). Set with [`show_mark`]: the same plain-text segment.
     pub(crate) selection: gtk4::Label,
@@ -107,7 +108,7 @@ pub(crate) fn show_mark(label: &gtk4::Label, text: Option<&str>) {
 /// `Ctrl+k` reaches the bar from either pane because it is above both. `h` and `l` move
 /// between the tray chips and `↻`; `main.rs` joins the two lists. Window controls cannot take
 /// focus, so an accidental `Enter` after `Ctrl+k` cannot close the window.
-pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> TopBar {
+pub(crate) fn build_top_bar(window: &ApplicationWindow, project: &str) -> TopBar {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
     bar.set_valign(gtk4::Align::Fill);
@@ -115,7 +116,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let app_name = gtk4::Label::new(Some("Eitri"));
     app_name.add_css_class("topbar-app-name");
 
-    let project_name = gtk4::Label::new(Some(&project_display_name(project_root)));
+    let project_name = gtk4::Label::new(Some(project));
     project_name.add_css_class("topbar-project-name");
     project_name.set_hexpand(true);
     project_name.set_halign(gtk4::Align::Start);
@@ -145,6 +146,11 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let tray = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     tray.set_valign(gtk4::Align::Center);
     tray.set_margin_end(6);
+    let other = gtk4::Label::new(None);
+    other.add_css_class("topbar-mark");
+    other.set_valign(gtk4::Align::Center);
+    other.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    other.set_visible(false);
     let mark = gtk4::Label::new(None);
     mark.add_css_class("topbar-mark");
     mark.set_valign(gtk4::Align::Center);
@@ -185,6 +191,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     bar.append(&rename);
     bar.append(&selection);
     bar.append(&mark);
+    bar.append(&other);
     bar.append(&tray);
     bar.append(&reload_agent);
     bar.append(&controls);
@@ -199,6 +206,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         strip,
         tray,
         mark,
+        other,
         selection,
         workspace,
         workspace_label,

@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 57,
+  "verb": "editor.preload",
+  "args": {
+    "path": "/w/work/a.rs",
+    "diagnostics": "yes",
+    "inlay_hints": "off"
+  }
+}

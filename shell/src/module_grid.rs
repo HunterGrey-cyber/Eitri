@@ -14,9 +14,11 @@
 //!
 //! Rectangles come from `layout::arrange`. This container measures children to supply their
 //! minimum sizes, allocates the resulting geometry and holds web hosts at their settled size
-//! during resizing through `throttle`, then turns divider drags into ratios.
+//! during resizing through the grid throttle. Pointer gestures are reported to the controller.
 
+#[path = "module_grid/floatbars.rs"]
 pub(crate) mod floatbars;
+#[path = "module_grid/strips.rs"]
 pub(crate) mod strips;
 
 use std::cell::{Cell, RefCell};
@@ -28,27 +30,42 @@ use gtk4::graphene;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-use eitri_core::layout::{
-    arrange, covering, Arrangement, Axis, Direction, Divider, FloatChange, FloatRect, Frame, Layout, LayoutError,
-    ModuleId, OpenRule, Opened, Rect, Reopen, ScratchShow, Size, Strip, Zoom,
-};
+use eitri_core::layout::{arrange, covering, Arrangement, Axis, Divider, Frame, ModuleId, Rect, Size, Strip};
 
 use eitri_core::wm::chrome::{FloatLabel, StripLabels};
 use eitri_core::wm::grid::throttle::{WebThrottle, QUIET};
 #[cfg(test)]
-use eitri_core::wm::grid::SlotMove;
-#[cfg(test)]
 pub(crate) use eitri_core::wm::grid::UNALLOCATED;
 use eitri_core::wm::grid::{
-    band_insert_index, floats_need_restack, frame_size, placeable, restack_moves, shown_floats, strip_assignments,
-    Band, Slot, DEFAULT_STRIP_PX,
+    band_insert_index, chrome_owners, chrome_plan, floats_need_restack, frame_size, grip_rect, restack_moves,
+    shown_floats, strip_assignments, Band, Slot, DEFAULT_STRIP_PX,
 };
-use eitri_core::wm::{Allocator, WinId};
-use floatbars::{chrome_owners, chrome_plan, grip_rect, ChromeHooks, FloatChrome};
+use eitri_core::wm::{Allocator, HostEvent, HostSink, LayoutView, PointerEv, PointerTarget, WinId};
+use floatbars::{ChromeHooks, FloatChrome};
 use strips::ConStrip;
 
 use crate::gtk_host::GridPort;
 use crate::web_host::WebHost;
+
+/// The phases a native drag reports, without interpreting its coordinates.
+#[derive(Clone, Copy)]
+pub(crate) enum DragPhase {
+    Begin,
+    Update,
+    End,
+    Cancel,
+}
+
+/// Converts native drag coordinates to the controller's pointer events; updates remain offsets from the begin.
+pub(crate) fn pointer_event(win: WinId, on: PointerTarget, phase: DragPhase, x: f64, y: f64, button: u32) -> HostEvent {
+    let ev = match phase {
+        DragPhase::Begin => PointerEv::Press { x, y, button },
+        DragPhase::Update => PointerEv::Motion { x, y },
+        DragPhase::End => PointerEv::Release { x, y },
+        DragPhase::Cancel => PointerEv::Cancel,
+    };
+    HostEvent::Pointer { win, on, ev }
+}
 
 /// The grid's CSS node name. `theme::gtk_css` styles its dividers as `modulegrid.content-area >
 /// separator`, the rule `paned.content-area > separator` was before the grid replaced the paneds.
@@ -90,6 +107,31 @@ pub(crate) enum ProbePlace {
     At(Rect),
 }
 
+/// A prepared page stays mapped, drawn and covered, below every other child and under a cover of its own, until its
+/// committed arrangement can be allocated.
+#[derive(Clone, Copy)]
+struct Prepared {
+    rect: Rect,
+    reveal: bool,
+}
+
+fn prepared_rectangle(grid: Size, size: (u32, u32)) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        w: if size.0 == 0 {
+            grid.w.max(1)
+        } else {
+            (size.0.min(i32::MAX as u32) as i32).min(grid.w.max(1))
+        },
+        h: if size.1 == 0 {
+            grid.h.max(1)
+        } else {
+            (size.1.min(i32::MAX as u32) as i32).min(grid.h.max(1))
+        },
+    }
+}
+
 /// A module's host and its focus target. Generic over the widget only so [`focus_target_of`] is
 /// tested on these same records without a display; the grid holds `gtk4::Widget`s.
 struct Host<W = gtk4::Widget> {
@@ -100,7 +142,7 @@ struct Host<W = gtk4::Widget> {
     kind: HostKind,
 }
 
-/// A divider on screen, and the divider it currently draws (read by its drag).
+/// A divider on screen, and the divider it currently draws for drawing and the probe.
 struct Handle {
     widget: gtk4::Separator,
     current: Rc<RefCell<Option<Divider>>>,
@@ -111,7 +153,8 @@ mod imp {
 
     #[derive(Default)]
     pub struct ModuleGrid {
-        pub(super) layout: RefCell<Option<Rc<RefCell<Layout>>>>,
+        /// What the grid draws: the window's layout, read through its view, never written here.
+        pub(super) layout: RefCell<Option<LayoutView>>,
         pub(super) hosts: RefCell<Vec<Host>>,
         pub(super) handles: RefCell<Vec<Handle>>,
         /// The strip pool: every tabbed or stacked container on screen draws one, in arrangement order.
@@ -127,9 +170,12 @@ mod imp {
         pub(super) on_screen: RefCell<BTreeSet<ModuleId>>,
         /// Web hosts allocated at a held size this pass, with the rectangle each is clipped to.
         pub(super) clips: RefCell<Vec<(gtk4::Widget, Rect)>>,
-        /// Called after each change the grid applied itself ([`ModuleGrid::connect_changed`]), in the order
-        /// they were added.
-        pub(super) hooks: RefCell<Vec<ChangeHook>>,
+        pub(super) prepared: RefCell<BTreeMap<ModuleId, Prepared>>,
+        /// What a prepared page is painted over with until its reveal: the grid's own background, which the window
+        /// sets from its theme ([`ModuleGrid::set_page_cover`]). `None` paints no cover.
+        pub(super) page_cover: Cell<Option<gtk4::gdk::RGBA>>,
+        /// The open editor rectangle in grid coordinates, excluded from prepared-page paint.
+        pub(super) editor_hole: Cell<Option<graphene::Rect>>,
         /// Called after each allocation the window controller asked for, its change of the layout carried out
         /// ([`ModuleGrid::connect_changed_by_controller`]), in the order they were added.
         pub(super) controller_hooks: RefCell<Vec<ChangeHook>>,
@@ -138,7 +184,7 @@ mod imp {
         pub(super) allocator: RefCell<Option<(WinId, Weak<dyn Allocator>)>>,
         /// The float chrome pool: a bar and a grip per piece ([`floatbars`]).
         pub(super) chrome: RefCell<Vec<FloatChrome>>,
-        /// Which float each piece of chrome draws, slot by slot ([`floatbars::chrome_owners`]).
+        /// Which float each piece of chrome draws, slot by slot ([`chrome_owners`]).
         pub(super) chrome_owners: RefCell<Vec<ModuleId>>,
         /// The floats the last [`ModuleGrid::restack`] put in the float band: what `child_bands`
         /// classifies as float hosts, and what `apply` compares the layout's floats with.
@@ -148,9 +194,8 @@ mod imp {
         /// Each float bar's text by its module, as the window's chrome model says it
         /// ([`ModuleGrid::set_float_labels`]); a bar it does not name shows its module's id.
         pub(super) float_labels: RefCell<BTreeMap<ModuleId, String>>,
-        /// Called with a float's module after a primary press on its bar or grip raised it
-        /// ([`ModuleGrid::connect_float_bar_press`]).
-        pub(super) float_bar_press: RefCell<Vec<StripHook>>,
+        /// The window and its weak posting sink; gestures release this borrow before reporting an event.
+        pub(super) pointer_sink: RefCell<Option<(WinId, Weak<dyn HostSink>)>>,
         /// Hosts the probe places by hand instead of by the layout ([`ModuleGrid::probe_place`]).
         #[cfg(feature = "probe")]
         pub(super) probe_places: RefCell<std::collections::BTreeMap<ModuleId, ProbePlace>>,
@@ -227,7 +272,7 @@ glib::wrapper! {
 }
 
 impl ModuleGrid {
-    pub(crate) fn new(layout: Rc<RefCell<Layout>>) -> Self {
+    pub(crate) fn new(layout: LayoutView) -> Self {
         let grid: Self = glib::Object::new();
         // A held web host's allocation may reach past the grid's own edge (`throttle`'s module
         // doc, sw-layout-2). `Hidden` makes GTK's pick return nothing for a point outside the grid
@@ -242,8 +287,108 @@ impl ModuleGrid {
         grid
     }
 
-    /// The layout the grid draws: the same cell the window's readers hold.
-    pub(crate) fn layout(&self) -> Rc<RefCell<Layout>> {
+    /// Keeps the page in its own grid, laid out at its final rectangle and mapped at full opacity as the grid's
+    /// first child, drawn first and painted over at once with the grid's background ([`ModuleGrid::set_page_cover`]),
+    /// so it is unseen until the reveal whatever else is on screen: a layout that shows only floats leaves its
+    /// rectangle under no other host. It must be drawn while it is unseen: GTK does not draw a widget at zero
+    /// opacity, and WebKit runs a page's animation frames only for a view that is drawn, so a page that answers from
+    /// a frame callback could not say it is ready before it is revealed. The host never moves at the reveal, only its
+    /// stacking does: WebKit can retain a stale picture when an off-screen view is moved into the visible band. It
+    /// takes no pointer until it is revealed.
+    pub(crate) fn prepare_page(&self, id: &ModuleId, size: (u32, u32)) -> Result<(), String> {
+        let widget = self
+            .hosts()
+            .into_iter()
+            .find(|(module, _)| module == id)
+            .map(|(_, w)| w)
+            .ok_or("the plugin has no grid host")?;
+        let grid = Size {
+            w: self.width().max(1),
+            h: self.height().max(1),
+        };
+        let mut rect = prepared_rectangle(grid, size);
+        let mut future = self.layout().read().clone();
+        let _ = future.set_away(id, false);
+        let _ = future.show(id);
+        self.with_frame(grid, |frame| {
+            let arrangement = arrange(&future, frame);
+            if let Some((_, target)) = arrangement.modules.iter().find(|(module, _)| module == id) {
+                rect = *target;
+            }
+            if let Some(spot) = arrangement.floats.iter().find(|spot| spot.id == *id) {
+                rect = spot.host;
+            }
+        });
+        self.imp()
+            .prepared
+            .borrow_mut()
+            .insert(id.clone(), Prepared { rect, reveal: false });
+        widget.insert_after(self, None::<&gtk4::Widget>);
+        widget.set_opacity(1.0);
+        widget.set_can_target(false);
+        widget.set_child_visible(true);
+        // The ready answer may leave before GTK's next frame, so the host must have its size already.
+        let _ = widget.measure(gtk4::Orientation::Horizontal, -1);
+        let _ = widget.measure(gtk4::Orientation::Vertical, rect.w);
+        widget.size_allocate(&gtk4::Allocation::new(rect.x, rect.y, rect.w, rect.h), -1);
+        self.queue_allocate();
+        Ok(())
+    }
+
+    /// The colour a prepared page is covered with until it is revealed: the grid's own background, the colour that
+    /// rectangle shows with nothing on it, which is the theme's `bg` (`.content-area` in `theme::gtk_css`). The
+    /// window sets it from the theme it styles the grid with, and again on each change of that theme.
+    pub(crate) fn set_page_cover(&self, tokens: &eitri_core::theme::ThemeTokens) {
+        let bg = tokens.bg;
+        self.imp().page_cover.set(Some(gtk4::gdk::RGBA::new(
+            f32::from(bg.r) / 255.0,
+            f32::from(bg.g) / 255.0,
+            f32::from(bg.b) / 255.0,
+            1.0,
+        )));
+        if !self.imp().prepared.borrow().is_empty() {
+            self.queue_draw();
+        }
+    }
+
+    pub(crate) fn set_editor_hole(&self, hole: Option<graphene::Rect>) {
+        self.imp().editor_hole.set(hole);
+        self.queue_draw();
+    }
+
+    /// The hosts of prepared pages not yet revealed, each drawn under its cover.
+    fn covered_hosts(&self) -> Vec<gtk4::Widget> {
+        let prepared = self.imp().prepared.borrow();
+        self.imp()
+            .hosts
+            .borrow()
+            .iter()
+            .filter(|h| prepared.contains_key(&h.id))
+            .map(|h| h.widget.clone())
+            .collect()
+    }
+
+    pub(crate) fn map_prepared(&self, id: &ModuleId, mapped: bool) {
+        if !self.imp().prepared.borrow().contains_key(id) {
+            return;
+        }
+        if mapped {
+            if let Some(prepared) = self.imp().prepared.borrow_mut().get_mut(id) {
+                prepared.reveal = true;
+            }
+        } else if self.imp().prepared.borrow_mut().remove(id).is_some() {
+            if let Some((_, widget)) = self.hosts().into_iter().find(|(module, _)| module == id) {
+                widget.set_child_visible(false);
+                widget.set_opacity(1.0);
+                widget.set_can_target(true);
+            }
+        }
+        self.restack();
+        self.queue_allocate();
+    }
+
+    /// The layout the grid draws, through the same view the window's readers hold.
+    fn layout(&self) -> LayoutView {
         self.imp()
             .layout
             .borrow()
@@ -335,41 +480,42 @@ impl ModuleGrid {
         self.insert_in_band(widget.upcast_ref(), Band::Handle);
         widget.set_child_visible(false);
         let current: Rc<RefCell<Option<Divider>>> = Rc::new(RefCell::new(None));
-        // The divider the drag grabbed: which split it moves.
-        let dragging: Rc<RefCell<Option<Divider>>> = Rc::new(RefCell::new(None));
+        let on = PointerTarget::Divider(self.imp().handles.borrow().len() as u32);
         let drag = gtk4::GestureDrag::new();
         {
-            let current = current.clone();
-            let dragging = dragging.clone();
-            drag.connect_drag_begin(move |gesture, _, _| {
-                // Claimed: the press is the divider's, and nothing else acts on it.
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
-                *dragging.borrow_mut() = current.borrow().clone();
-            });
-        }
-        {
-            let current = current.clone();
-            let dragging = dragging.clone();
             let grid = self.downgrade();
-            drag.connect_drag_update(move |_, dx, dy| {
-                let Some(grid) = grid.upgrade() else { return };
-                let (Some(begin), Some(now)) = (dragging.borrow().clone(), current.borrow().clone()) else {
-                    return;
-                };
-                let Some(first_px) = dragged_first_px(&begin, &now, dx, dy) else {
-                    return;
-                };
-                // A ratio on a ratio split, pixels on a pinned one (`move_divider`): a dragged bottom
-                // row keeps the height it was dragged to when the window grows.
-                let moved = eitri_core::layout::move_divider(&mut grid.layout().borrow_mut(), &now, first_px);
-                if moved.is_ok() {
-                    grid.queue_allocate();
-                    grid.notify_changed();
+            let on = on.clone();
+            drag.connect_drag_begin(move |gesture, x, y| {
+                // The divider owns the press; the module beneath it must not act on it too.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                if let Some(grid) = grid.upgrade() {
+                    grid.post_pointer(on.clone(), DragPhase::Begin, x, y, gesture.current_button());
                 }
             });
         }
-        drag.connect_drag_end(move |_, _, _| {
-            dragging.borrow_mut().take();
+        {
+            let grid = self.downgrade();
+            let on = on.clone();
+            drag.connect_drag_update(move |gesture, dx, dy| {
+                if let Some(grid) = grid.upgrade() {
+                    grid.post_pointer(on.clone(), DragPhase::Update, dx, dy, gesture.current_button());
+                }
+            });
+        }
+        {
+            let grid = self.downgrade();
+            let on = on.clone();
+            drag.connect_cancel(move |gesture, _| {
+                if let Some(grid) = grid.upgrade() {
+                    grid.post_pointer(on.clone(), DragPhase::Cancel, 0.0, 0.0, gesture.current_button());
+                }
+            });
+        }
+        let grid = self.downgrade();
+        drag.connect_drag_end(move |gesture, x, y| {
+            if let Some(grid) = grid.upgrade() {
+                grid.post_pointer(on.clone(), DragPhase::End, x, y, gesture.current_button());
+            }
         });
         widget.add_controller(drag);
         Handle { widget, current }
@@ -501,7 +647,7 @@ impl ModuleGrid {
     pub(crate) fn restack(&self) {
         let floats = {
             let layout = self.layout();
-            let Ok(layout) = layout.try_borrow() else {
+            let Some(layout) = layout.try_read() else {
                 // Nothing restacks inside one of the layout's own writes; a mistake costs one idle.
                 self.queue_restack();
                 return;
@@ -556,16 +702,6 @@ impl ModuleGrid {
         }
     }
 
-    /// [`ModuleGrid::restack`] after a float went to the top of the layout's z-order, then the change
-    /// hooks: what a raised float covers changed (the chat may be under it now, or out from under the
-    /// float it rose above), and the tray's chip and the chat's attention follow it. No apply ran, so
-    /// nothing else would tell them. The state file's saver writes nothing for it: it compares floats
-    /// as a set.
-    pub(crate) fn restacked_after_raise(&self) {
-        self.restack();
-        self.notify_changed();
-    }
-
     /// Asks for one [`ModuleGrid::restack`] when the main loop is next idle.
     fn queue_restack(&self) {
         if self.imp().restack_queued.replace(true) {
@@ -580,64 +716,30 @@ impl ModuleGrid {
         });
     }
 
-    /// A new piece of float chrome, its press and drag wired back to this grid.
+    /// Reports to the same sink as the window's other native events; no gesture owns the controller.
+    pub(crate) fn set_pointer_sink(&self, win: WinId, sink: Weak<dyn HostSink>) {
+        *self.imp().pointer_sink.borrow_mut() = Some((win, sink));
+    }
+
+    fn post_pointer(&self, on: PointerTarget, phase: DragPhase, x: f64, y: f64, button: u32) {
+        let posting = self.imp().pointer_sink.borrow().clone();
+        if let Some((win, sink)) = posting {
+            if let Some(sink) = sink.upgrade() {
+                sink.post(pointer_event(win, on, phase, x, y, button));
+            }
+        }
+    }
+
+    /// A new piece of float chrome, wired only to report native events.
     fn new_chrome(&self) -> FloatChrome {
-        let press = {
-            let grid = self.downgrade();
-            Rc::new(move |id: &ModuleId| {
+        let grid = self.downgrade();
+        FloatChrome::new(&ChromeHooks {
+            post: Rc::new(move |on, phase, x, y, button| {
                 if let Some(grid) = grid.upgrade() {
-                    grid.float_bar_pressed(id);
+                    grid.post_pointer(on, phase, x, y, button);
                 }
-            })
-        };
-        let drag = {
-            let grid = self.downgrade();
-            Rc::new(move |id: &ModuleId, rect: Rect| {
-                if let Some(grid) = grid.upgrade() {
-                    grid.float_dragged(id, rect);
-                }
-            })
-        };
-        FloatChrome::new(&ChromeHooks { press, drag })
-    }
-
-    /// A primary press on a float's bar or grip: the float is raised and restacked, then the hooks run
-    /// with its module (they give it the keys).
-    fn float_bar_pressed(&self, id: &ModuleId) {
-        if self.raise_float(id) {
-            self.restacked_after_raise();
-        }
-        // Cloned out: a hook gives the module the keys, which re-enters the grid.
-        let hooks: Vec<StripHook> = self.imp().float_bar_press.borrow().clone();
-        for hook in hooks {
-            hook(id);
-        }
-    }
-
-    /// Puts the float `id` on top of the z-order (`Layout::raise`). Not a change for the state file: the
-    /// saver compares floats as a set. `false` if it is not a float, is on top already, or the layout is
-    /// being written.
-    fn raise_float(&self, id: &ModuleId) -> bool {
-        self.layout().try_borrow_mut().is_ok_and(|mut layout| layout.raise(id))
-    }
-
-    /// One step of a drag on a float's bar or grip: `rect` is stored as the float's own (core's
-    /// `set_float_rect` fits it into the grid), and the grid is allocated again.
-    fn float_dragged(&self, id: &ModuleId, rect: Rect) {
-        let size = self.size();
-        let moved = {
-            let layout = self.layout();
-            let Ok(mut layout) = layout.try_borrow_mut() else {
-                return;
-            };
-            self.with_frame(size, |frame| {
-                eitri_core::layout::set_float_rect(&mut layout, id, rect, frame)
-            })
-        };
-        if moved {
-            self.queue_allocate();
-            self.notify_changed();
-        }
+            }),
+        })
     }
 
     /// [`ModuleGrid::hosts`], as a function the caller keeps and asks again each time.
@@ -673,7 +775,7 @@ impl ModuleGrid {
     /// Every module and its host in the layout's tree order, then the floats bottom first: HINT's and
     /// `select.number`'s order.
     pub(crate) fn hosts_in_tree_order(&self) -> Vec<(ModuleId, gtk4::Widget)> {
-        let leaves = self.layout().borrow().modules();
+        let leaves = self.layout().read().modules();
         let hosts = self.hosts();
         leaves
             .into_iter()
@@ -681,10 +783,12 @@ impl ModuleGrid {
             .collect()
     }
 
-    /// Makes each host's visibility match the layout, then re-measures and re-allocates: a hide or a
-    /// zoom changes what the grid needs at the least (`measure`). Call after every layout change.
-    /// The layout is read, and released, before any child's visibility changes: hiding the focused
-    /// widget moves GTK focus, whose focus report re-enters the controller and writes the layout.
+    /// Makes each host's visibility match the layout, then re-measures and re-allocates: what a grid with no
+    /// window controller behind it (the companion window's, whose layout never changes) does once its hosts are
+    /// added, and what a host the grid probe placed by hand goes back to; a window controller's grid is otherwise
+    /// mapped and allocated by its ops. The layout is read, and
+    /// released, before any child's visibility changes: hiding the focused widget moves GTK focus, whose focus
+    /// report re-enters the controller.
     ///
     /// **It restacks whenever the set of floats on screen is not the one the last restack put in the
     /// float band** ([`floats_need_restack`]), so every verb that changes which modules float -- float
@@ -694,13 +798,13 @@ impl ModuleGrid {
     pub(crate) fn apply(&self) {
         let (wanted, floats): (Vec<(gtk4::Widget, bool)>, Vec<ModuleId>) = {
             let layout = self.layout();
-            let layout = layout.borrow();
+            let layout = layout.read();
             let wanted = self
                 .imp()
                 .hosts
                 .borrow()
                 .iter()
-                .filter(|h| !self.probe_places_host(&h.id))
+                .filter(|h| !self.probe_places_host(&h.id) && !self.imp().prepared.borrow().contains_key(&h.id))
                 .map(|h| (h.widget.clone(), layout.is_visible(&h.id)))
                 .collect();
             (wanted, shown_floats(&layout))
@@ -714,23 +818,11 @@ impl ModuleGrid {
             self.restack();
         }
         self.queue_resize();
-        self.notify_changed();
     }
 
-    /// `f` runs after every change the grid applies itself: each [`ModuleGrid::apply`] (what a verb
-    /// still carried out in the shell calls), a divider drag, a float's drag and raise. A pinned split
-    /// getting its length inside an allocation is not one: nothing moved on screen. What hangs off it is
-    /// the window controller's: it re-reads the layout the shell changed behind it, and the chrome and the
-    /// state file follow from there. A change the controller made runs none, since it knows it made it.
-    /// Runs with the layout released.
-    pub(crate) fn connect_changed(&self, f: impl Fn() + 'static) {
-        self.imp().hooks.borrow_mut().push(Rc::new(f));
-    }
-
-    /// `f` runs after every allocation the window controller asks for: every change it makes to the layout ends
-    /// with one, so this is the hook for what must follow the layout whoever changed it, and is not told to the
-    /// controller (the change is its own). Runs with the layout released; the hooks of
-    /// [`ModuleGrid::connect_changed`] do not run for it.
+    /// `f` runs after every allocation the window controller asks for: every change of the layout ends with one,
+    /// since the controller is the one that changes it, so this is the hook for what must follow the layout. Runs
+    /// with the layout released.
     pub(crate) fn connect_changed_by_controller(&self, f: impl Fn() + 'static) {
         self.imp().controller_hooks.borrow_mut().push(Rc::new(f));
     }
@@ -738,14 +830,6 @@ impl ModuleGrid {
     fn notify_changed_by_controller(&self) {
         // Cloned out: a hook may add another.
         let hooks: Vec<ChangeHook> = self.imp().controller_hooks.borrow().clone();
-        for hook in hooks {
-            hook();
-        }
-    }
-
-    fn notify_changed(&self) {
-        // Cloned out: a hook may add another.
-        let hooks: Vec<ChangeHook> = self.imp().hooks.borrow().clone();
         for hook in hooks {
             hook();
         }
@@ -773,7 +857,7 @@ impl ModuleGrid {
             .hosts
             .borrow()
             .iter()
-            .filter(|h| !self.probe_places_host(&h.id))
+            .filter(|h| !self.probe_places_host(&h.id) && !self.imp().prepared.borrow().contains_key(&h.id))
             .map(|h| h.widget.clone())
             .collect();
         for widget in widgets {
@@ -782,8 +866,8 @@ impl ModuleGrid {
     }
 
     /// `f` runs with a strip entry's module when a primary click lands on that entry. What it does --
-    /// switching to the tab, through [`ModuleGrid::switch_tab`] -- is the caller's, which knows how the
-    /// window gives a module the keys. Runs with the layout released.
+    /// telling the window controller, which switches to the tab and gives it the keys -- is the caller's. Runs
+    /// with the layout released.
     pub(crate) fn connect_strip_activate(&self, f: impl Fn(&ModuleId) + 'static) {
         self.imp().strip_activate.borrow_mut().push(Rc::new(f));
     }
@@ -837,43 +921,6 @@ impl ModuleGrid {
         }
     }
 
-    /// `f` runs with a float's module after a primary press on its bar or grip has raised it. What it
-    /// does -- giving the module the keys -- is the caller's, which knows how the window does that.
-    /// Runs with the layout released.
-    pub(crate) fn connect_float_bar_press(&self, f: impl Fn(&ModuleId) + 'static) {
-        self.imp().float_bar_press.borrow_mut().push(Rc::new(f));
-    }
-
-    /// Opens `id`, which the layout does not hold yet and whose host the grid does, where `rule` says
-    /// (`eitri_core::layout::open_by_rule`) at the grid's size now, `keys` being the module with the
-    /// keys. When a tile takes them, its host is mapped and `focus` gives them before `apply` unmaps
-    /// what the open hid -- a module in the editor's place hides the editor, and unmapping that first
-    /// would leave GTK's focus chain to choose where the keys go ([`leave_then_unmap`]'s order). A float
-    /// that takes them is given them after `apply` has mapped and restacked it, as a scratchpad show
-    /// is, so they never land under another float. A stowed or unfocused open only applies.
-    pub(crate) fn open_module(
-        &self,
-        id: &ModuleId,
-        rule: &OpenRule,
-        keys: Option<&ModuleId>,
-        focus: &dyn Fn(&ModuleId) -> bool,
-    ) -> Result<Opened, LayoutError> {
-        let hosted: Vec<ModuleId> = self.hosts().into_iter().map(|(id, _)| id).collect();
-        placeable(&hosted, id)?;
-        let size = self.size();
-        let opened = eitri_core::layout::open_by_rule(&mut self.layout().borrow_mut(), id, rule, keys, size)?;
-        let floats = self.layout().borrow().is_floating(id);
-        if opened.takes_keys && !floats {
-            self.map_arriving(id);
-            focus(id);
-        }
-        self.apply();
-        if opened.takes_keys && floats {
-            focus(id);
-        }
-        Ok(opened)
-    }
-
     /// The height of a strip row: a strip entry's own CSS size (`constrip > label`), or
     /// [`DEFAULT_STRIP_PX`] until the first strip has an entry to measure.
     fn strip_px(&self) -> i32 {
@@ -909,7 +956,7 @@ impl ModuleGrid {
             return allocator.min_size(win);
         }
         let layout = self.layout();
-        let Ok(layout) = layout.try_borrow() else {
+        let Some(layout) = layout.try_read() else {
             return Size::default();
         };
         self.with_frame(self.size(), |frame| eitri_core::layout::min_size(&layout, frame))
@@ -941,236 +988,14 @@ impl ModuleGrid {
         })
     }
 
-    /// Puts back a zoom something else ended, around `keeps` (`Layout::restore_zoom`). `false`, and
-    /// nothing redrawn, when the layout refuses it.
-    pub(crate) fn restore_zoom(&self, zoom: &Zoom, keeps: &ModuleId) -> bool {
-        let restored = self.layout().borrow_mut().restore_zoom(zoom, keeps);
-        if restored {
-            println!("[module_grid] zoom {zoom:?} put back around {keeps}");
-            self.apply();
-        }
-        restored
-    }
-
-    /// Ends a zoom, as tmux's `select-pane` and `resize-pane` do first. `false` if none was on.
-    pub(crate) fn unzoom(&self) -> bool {
-        let ended = self.layout().borrow_mut().unzoom();
-        if ended {
-            println!("[module_grid] unzoomed");
-            self.apply();
-        }
-        ended
-    }
-
-    /// Hides `id`. If it holds the keys, the module chosen by the layout receives them through
-    /// `focus` before `id` is unmapped, so GTK's focus chain cannot give them to the WebView instead.
-    /// [`hide_then_unmap`] enforces this order and is tested without a display; this method supplies
-    /// the grid's frame and the GTK effects.
-    /// Every hide uses this path: `Ctrl+a x`, the focused module's toggle key, `Ctrl+a t`, and the Lua hide API.
-    pub(crate) fn hide_module(&self, id: &ModuleId, focus: &dyn Fn(&ModuleId) -> bool) -> Result<(), LayoutError> {
-        let size = self.size();
-        let layout = self.layout();
-        self.with_frame(size, |frame| {
-            hide_then_unmap(
-                &layout,
-                id,
-                frame,
-                |next| self.map_arriving(next),
-                |next| {
-                    focus(next);
-                },
-                || self.apply(),
-            )
-        })
-    }
-
-    /// `prefix x` (`eitri_core::layout::kill`): `id` leaves the screen as a hide does -- the keys to
-    /// the module the layout chooses first, then the unmap, in [`hide_then_unmap`]'s order -- and is
-    /// left where `reopen` says. Ending what ran in it is the caller's.
-    pub(crate) fn kill_module(
-        &self,
-        id: &ModuleId,
-        reopen: Reopen,
-        focus: &dyn Fn(&ModuleId) -> bool,
-    ) -> Result<(), LayoutError> {
-        let size = self.size();
-        let layout = self.layout();
-        self.with_frame(size, |frame| {
-            leave_then_unmap(
-                &layout,
-                |layout| eitri_core::layout::kill(layout, id, reopen, frame),
-                |next| self.map_arriving(next),
-                |next| {
-                    focus(next);
-                },
-                || self.apply(),
-            )
-        })
-    }
-
-    /// Draws `to`'s tab and gives it the keys, wherever they were: a strip click, `Ctrl+h/j/k/l`, a
-    /// module key and `eitri.layout.focus` all choose a tab this way
-    /// (`eitri_core::layout::switch_tab`). In [`leave_then_unmap`]'s order: the layout switches,
-    /// `to`'s host is mapped, `focus` gives it the keys, and only then is the tab it replaced
-    /// unmapped. Unmapping first would leave the keys on a widget leaving the screen, and GTK's own
-    /// focus chain would choose where they go.
-    pub(crate) fn switch_tab(&self, to: &ModuleId, focus: &dyn Fn(&ModuleId) -> bool) -> Result<(), LayoutError> {
-        let layout = self.layout();
-        leave_then_unmap(
-            &layout,
-            |layout| eitri_core::layout::switch_tab(layout, to).map(Some),
-            |next| self.map_arriving(next),
-            |next| {
-                focus(next);
-            },
-            || self.apply(),
-        )
-    }
-
-    /// Maps `id`'s host if the layout now draws it and it is not on screen yet: a tab that became the
-    /// drawn one is still unmapped until the next [`ModuleGrid::apply`], and a widget that is not
-    /// mapped cannot take the keys. Runs with the layout released (it is read here).
-    fn map_arriving(&self, id: &ModuleId) {
-        if self.probe_places_host(id) {
-            return;
-        }
-        let drawn = self.layout().try_borrow().is_ok_and(|layout| layout.is_visible(id));
-        if !drawn {
-            return;
-        }
-        // Cloned out: mapping realizes the host, and nothing that runs then should find it borrowed.
-        let widget = self
-            .imp()
-            .hosts
-            .borrow()
-            .iter()
-            .find(|h| h.id == *id)
-            .map(|h| h.widget.clone());
-        if let Some(widget) = widget {
-            if !widget.is_child_visible() {
-                widget.set_child_visible(true);
-            }
-        }
-    }
-
-    /// Shows `id` where it was hidden from. `Ok(false)` if it was already shown. First caller:
-    /// `Ctrl+a t` showing the bottom terminal.
-    pub(crate) fn show_module(&self, id: &ModuleId) -> Result<bool, LayoutError> {
-        let shown = self.layout().borrow_mut().show(id)?;
-        if shown {
-            self.apply();
-        }
-        Ok(shown)
-    }
-
-    /// `float.toggle` (`eitri_core::layout::float_toggle`): floats a tile, or sinks a float beside the
-    /// most recent tile in view. `apply` restacks, since the set of floats changed.
-    pub(crate) fn float_toggle(&self, target: &ModuleId) -> Result<FloatChange, LayoutError> {
-        let size = self.size();
-        let change = {
-            let layout = self.layout();
-            let mut layout = layout.borrow_mut();
-            self.with_frame(size, |frame| {
-                eitri_core::layout::float_toggle(&mut layout, target, frame)
-            })
-        }?;
-        self.apply();
-        Ok(change)
-    }
-
-    /// `move.<dir>` on a float (`eitri_core::layout::move_float`): `px` that way, kept inside the grid.
-    /// `false` when it could not move.
-    pub(crate) fn move_float(&self, target: &ModuleId, dir: Direction, px: i32) -> bool {
-        let size = self.size();
-        let moved = {
-            let layout = self.layout();
-            let mut layout = layout.borrow_mut();
-            self.with_frame(size, |frame| {
-                eitri_core::layout::move_float(&mut layout, target, dir, px, frame)
-            })
-        };
-        if moved {
-            self.apply();
-        }
-        moved
-    }
-
-    /// `eitri.layout.float` (`eitri_core::layout::float_at`): floats `id` at `rect` (its remembered or
-    /// the default rectangle when `None`), or moves a float there. `Ok(false)` when nothing changed.
-    pub(crate) fn float_at(&self, id: &ModuleId, rect: Option<FloatRect>) -> Result<bool, LayoutError> {
-        let size = self.size();
-        let changed = {
-            let layout = self.layout();
-            let mut layout = layout.borrow_mut();
-            self.with_frame(size, |frame| eitri_core::layout::float_at(&mut layout, id, rect, frame))
-        }?;
-        if changed {
-            self.apply();
-        }
-        Ok(changed)
-    }
-
-    /// Stows `target` in [`leave_then_unmap`]'s order: the keys to the module the layout chooses, then
-    /// the unmap (`eitri_core::layout::scratchpad_move`), then the restack.
-    pub(crate) fn scratchpad_move(
-        &self,
-        target: &ModuleId,
-        focus: &dyn Fn(&ModuleId) -> bool,
-    ) -> Result<(), LayoutError> {
-        let size = self.size();
-        let layout = self.layout();
-        self.with_frame(size, |frame| {
-            leave_then_unmap(
-                &layout,
-                |layout| eitri_core::layout::scratchpad_move(layout, target, frame),
-                |next| self.map_arriving(next),
-                |next| {
-                    focus(next);
-                },
-                || self.apply(),
-            )
-        })?;
-        self.restack();
-        Ok(())
-    }
-
-    /// `scratchpad.show` (`eitri_core::layout::scratchpad_show`), in [`scratch_show_in_order`]'s order:
-    /// `Stowed` in [`leave_then_unmap`]'s, then the restack; `Raised`/`Shown`: mapped, restacked, then
-    /// given the keys through `focus`. `Missing` changes nothing: the caller makes the instance.
-    pub(crate) fn scratchpad_show(
-        &self,
-        module: Option<&ModuleId>,
-        focus: &dyn Fn(&ModuleId) -> bool,
-    ) -> Result<ScratchShow, LayoutError> {
-        let size = self.size();
-        let layout = self.layout();
-        self.with_frame(size, |frame| {
-            scratch_show_in_order(
-                &layout,
-                |layout| eitri_core::layout::scratchpad_show(layout, module, frame),
-                |id| self.map_arriving(id),
-                |id| {
-                    focus(id);
-                },
-                || self.apply(),
-                || self.restack(),
-            )
-        })
-    }
-
     /// The floats over `id` on a fresh arrangement at the grid's size now -- never a stale allocation's
     /// -- bottom first (`eitri_core::layout::covering`). Empty for a module off screen.
     pub(crate) fn covered_now(&self, id: &ModuleId) -> Vec<ModuleId> {
         let size = self.size();
         let layout = self.layout();
-        let layout = layout.borrow();
+        let layout = layout.read();
         let arrangement = self.with_frame(size, |frame| arrange(&layout, frame));
         covering(&arrangement, id)
-    }
-
-    /// Runs `f` with the frame the layout is allocated in now (a stored workspace's verbs need one).
-    pub(crate) fn with_current_frame<R>(&self, f: impl FnOnce(&Frame) -> R) -> R {
-        self.with_frame(self.size(), f)
     }
 
     fn allocate_children(&self, width: i32, height: i32) {
@@ -1200,7 +1025,7 @@ impl ModuleGrid {
         let tiled = arrangement.modules.iter().map(|(id, rect)| (id, *rect));
         let floating = arrangement.floats.iter().map(|spot| (&spot.id, spot.host));
         for (id, target) in tiled.chain(floating) {
-            if self.probe_places_host(id) {
+            if self.probe_places_host(id) || self.imp().prepared.borrow().contains_key(id) {
                 continue;
             }
             let hosts = imp.hosts.borrow();
@@ -1229,6 +1054,42 @@ impl ModuleGrid {
             let _ = host.widget.measure(gtk4::Orientation::Vertical, rect.w);
             host.widget
                 .size_allocate(&gtk4::Allocation::new(rect.x, rect.y, rect.w, rect.h), -1);
+        }
+        let prepared: Vec<_> = imp
+            .prepared
+            .borrow()
+            .iter()
+            .map(|(id, state)| (id.clone(), *state))
+            .collect();
+        for (id, state) in prepared {
+            let target = arrangement
+                .modules
+                .iter()
+                .find(|(module, _)| *module == id)
+                .map(|(_, r)| *r)
+                .or_else(|| {
+                    arrangement
+                        .floats
+                        .iter()
+                        .find(|spot| spot.id == id)
+                        .map(|spot| spot.host)
+                });
+            let rect = target.unwrap_or(state.rect);
+            if let Some(widget) = self
+                .hosts()
+                .into_iter()
+                .find(|(module, _)| *module == id)
+                .map(|(_, w)| w)
+            {
+                let _ = widget.measure(gtk4::Orientation::Horizontal, -1);
+                let _ = widget.measure(gtk4::Orientation::Vertical, rect.w);
+                widget.size_allocate(&gtk4::Allocation::new(rect.x, rect.y, rect.w, rect.h), -1);
+                if state.reveal {
+                    widget.set_opacity(1.0);
+                    widget.set_can_target(true);
+                    imp.prepared.borrow_mut().remove(&id);
+                }
+            }
         }
         *imp.clips.borrow_mut() = clips;
         self.allocate_probe_hosts();
@@ -1354,7 +1215,7 @@ impl ModuleGrid {
         }
     }
 
-    /// Draws each float on screen with the piece of chrome that owns it ([`floatbars::chrome_owners`]):
+    /// Draws each float on screen with the piece of chrome that owns it ([`chrome_owners`]):
     /// its bar across the float's top strip row, its grip in the bottom-right corner. Every other piece
     /// is hidden, and so is every piece while a zoom is on (a zoomed float fills the grid alone, with no
     /// bar). A float with no piece of its own yet -- the layout changed without an `apply` -- has none
@@ -1441,10 +1302,42 @@ impl ModuleGrid {
         *self.imp().settle.borrow_mut() = Some(source);
     }
 
+    /// Draws each prepared page first, then its cover over it, then every other child in order: whatever a restack
+    /// did to the child order meanwhile, nothing on screen is drawn under a page that is not revealed yet.
     fn snapshot_children(&self, snapshot: &gtk4::Snapshot) {
+        let covered = self.covered_hosts();
+        let cover = self.imp().page_cover.get();
+        let hole = self.imp().editor_hole.get();
+        for widget in &covered {
+            if hole.is_none() {
+                self.snapshot_child(widget, snapshot);
+                if let (Some(color), Some(bounds)) = (cover, widget.compute_bounds(self)) {
+                    snapshot.append_color(&color, &bounds);
+                }
+                continue;
+            }
+            let Some(bounds) = widget.compute_bounds(self) else {
+                self.snapshot_child(widget, snapshot);
+                continue;
+            };
+            // The page and its cover stay outside the editor: either could otherwise obscure its separate surface.
+            let page = gtk4::Snapshot::new();
+            self.snapshot_child(widget, &page);
+            let page = page.to_node();
+            page_outside_hole(bounds, hole, page.as_ref(), cover, |op| match op {
+                PageOp::Clip(rect) => snapshot.push_clip(&rect),
+                PageOp::Page(page) => snapshot.append_node(page),
+                PageOp::Cover(color, rect) => snapshot.append_color(&color, &rect),
+                PageOp::Pop => snapshot.pop(),
+            });
+        }
         let clips = self.imp().clips.borrow();
         let mut child = self.first_child();
         while let Some(widget) = child {
+            if covered.contains(&widget) {
+                child = widget.next_sibling();
+                continue;
+            }
             match clips.iter().find(|(held, _)| *held == widget) {
                 Some((_, r)) => {
                     snapshot.push_clip(&graphene::Rect::new(r.x as f32, r.y as f32, r.w as f32, r.h as f32));
@@ -1458,9 +1351,46 @@ impl ModuleGrid {
     }
 }
 
+/// One drawing call of [`page_outside_hole`], kept apart from `gtk4::Snapshot` so the sequence is tested without a
+/// display.
+#[derive(Debug, PartialEq)]
+enum PageOp<'a, P, C> {
+    Clip(graphene::Rect),
+    Page(&'a P),
+    Cover(C, graphene::Rect),
+    Pop,
+}
+
+/// Draws a prepared page and its cover only outside the editor's hole: each complement rectangle gets its own clip
+/// holding the page and then the cover, so neither ever lands on the editor's separate surface.
+fn page_outside_hole<'a, P, C: Copy>(
+    bounds: graphene::Rect,
+    hole: Option<graphene::Rect>,
+    page: Option<&'a P>,
+    cover: Option<C>,
+    mut draw: impl FnMut(PageOp<'a, P, C>),
+) {
+    for rect in crate::editor_hole::hole_complement(bounds, hole) {
+        draw(PageOp::Clip(rect));
+        if let Some(page) = page {
+            draw(PageOp::Page(page));
+        }
+        if let Some(color) = cover {
+            draw(PageOp::Cover(color, rect));
+        }
+        draw(PageOp::Pop);
+    }
+}
+
 /// The window controller's way into the grid, held weakly as the GTK host holds its windows: a grid gone
 /// with its window answers as one never allocated and does nothing.
 impl GridPort for glib::WeakRef<ModuleGrid> {
+    fn set_pointer_sink(&self, win: WinId, sink: Weak<dyn HostSink>) {
+        if let Some(grid) = self.upgrade() {
+            grid.set_pointer_sink(win, sink);
+        }
+    }
+
     fn size(&self) -> Size {
         self.upgrade()
             .map_or(eitri_core::wm::grid::UNALLOCATED, |grid| grid.size())
@@ -1500,30 +1430,34 @@ impl GridPort for glib::WeakRef<ModuleGrid> {
 }
 
 /// The arrangement the grid allocates at `size`: its allocator's, which settles the pinned splits shown for
-/// the first time itself, or, for a grid with none, `layout`'s own in the frame `with_frame` gives, a pinned
-/// split shown for the first time first given the length its ratio gives at this, the real allocation --
-/// never at `UNALLOCATED`'s stand-in size. Asked first, with no geometry, so a drag or a resize sweep arranges
-/// once per allocation.
+/// the first time itself, or, for a grid with none, `layout`'s own in the frame `with_frame` gives. A grid with
+/// none writes nothing: a pinned split shown for the first time is arranged on a copy given the length its ratio
+/// gives at this, the real allocation -- never at `UNALLOCATED`'s stand-in size. Asked first, with no geometry,
+/// so a drag or a resize sweep arranges once per allocation.
 pub(crate) fn arrangement_for(
     allocator: Option<&dyn Allocator>,
     win: WinId,
-    layout: &RefCell<Layout>,
+    layout: &LayoutView,
     size: Size,
     with_frame: impl Fn(&mut dyn FnMut(&Frame)),
 ) -> Rc<Arrangement> {
     if let Some(allocator) = allocator {
         return allocator.allocate(win, size);
     }
-    if size.w > 0 && size.h > 0 && layout.try_borrow().is_ok_and(|layout| layout.has_pin_to_settle()) {
-        if let Ok(mut layout) = layout.try_borrow_mut() {
-            with_frame(&mut |frame| {
-                eitri_core::layout::settle_pins(&mut layout, frame);
-            });
-        }
-    }
-    let layout = layout.borrow();
+    let Some(read) = layout.try_read() else {
+        return Rc::new(Arrangement::default());
+    };
     let mut arrangement = Arrangement::default();
-    with_frame(&mut |frame| arrangement = arrange(&layout, frame));
+    if size.w > 0 && size.h > 0 && read.has_pin_to_settle() {
+        let mut settled = read.clone();
+        drop(read);
+        with_frame(&mut |frame| {
+            eitri_core::layout::settle_pins(&mut settled, frame);
+            arrangement = arrange(&settled, frame);
+        });
+    } else {
+        with_frame(&mut |frame| arrangement = arrange(&read, frame));
+    }
     Rc::new(arrangement)
 }
 
@@ -1552,196 +1486,122 @@ fn handle_allocation(divider: &Divider) -> Rect {
     }
 }
 
-/// [`ModuleGrid::hide_module`]'s order, with its GTK effects passed in so that a test without a
-/// display can see it. `eitri_core::layout::hide` records the hide and chooses who gets the keys
-/// (the most recent module next to `id`, if `id` holds them; the tab drawn next, if `id` was a drawn
-/// tab). Then `map` puts that module's host on screen if it was an undrawn tab, `focus` gives it the
-/// keys, and only then does `unmap` take `id` off the screen (`ModuleGrid::apply`,
-/// `set_child_visible(false)`).
-///
-/// **Focus first is required, not only tidy** (the modules design). Unmapping the widget
-/// that holds the keys first lets GTK's own focus chain choose where they go, and it once chose the
-/// WebView. This order once sat inline in `hide_module`, and swapping
-/// its two statements left every test green.
-///
-/// The layout is released before either effect runs, because both re-enter it: a focus change
-/// reaches the focus report, which writes the layout's focus, and `apply` reads the layout.
-fn hide_then_unmap(
-    layout: &RefCell<Layout>,
-    id: &ModuleId,
-    frame: &Frame,
-    map: impl FnOnce(&ModuleId),
-    focus: impl FnOnce(&ModuleId),
-    unmap: impl FnOnce(),
-) -> Result<(), LayoutError> {
-    leave_then_unmap(
-        layout,
-        |layout| eitri_core::layout::hide(layout, id, frame),
-        map,
-        focus,
-        unmap,
-    )
-}
-
-/// [`hide_then_unmap`]'s order for any way of leaving the screen (a hide, a kill, a tab switch):
-/// `leave` changes the layout and names who gets the keys, `map` puts that module's host on screen
-/// (a tab that was not drawn a moment ago has no mapped widget to take them), `focus` gives them,
-/// `unmap` takes what left off screen.
-fn leave_then_unmap(
-    layout: &RefCell<Layout>,
-    leave: impl FnOnce(&mut Layout) -> Result<Option<ModuleId>, LayoutError>,
-    map: impl FnOnce(&ModuleId),
-    focus: impl FnOnce(&ModuleId),
-    unmap: impl FnOnce(),
-) -> Result<(), LayoutError> {
-    let next = leave(&mut layout.borrow_mut())?;
-    if let Some(next) = next {
-        map(&next);
-        focus(&next);
-    }
-    unmap();
-    Ok(())
-}
-
-/// [`ModuleGrid::scratchpad_show`]'s order, with its GTK effects passed in so that a test without a
-/// display can see it. `show` is core's verb. A stow (`Stowed`) leaves the screen in
-/// [`leave_then_unmap`]'s order -- the keys' next owner mapped and given them, then `apply` unmaps the
-/// stowed host -- and then the float band is restacked. A raise or a show (`Raised`/`Shown`) is the
-/// other way round: `apply` maps the shown host, the restack puts it on top, and only then is it given
-/// the keys, so they never land on a host still unmapped or under another float. `Missing` changed
-/// nothing, and nothing runs.
-fn scratch_show_in_order(
-    layout: &RefCell<Layout>,
-    show: impl FnOnce(&mut Layout) -> Result<ScratchShow, LayoutError>,
-    map: impl Fn(&ModuleId),
-    focus: impl Fn(&ModuleId),
-    apply: impl Fn(),
-    restack: impl FnOnce(),
-) -> Result<ScratchShow, LayoutError> {
-    let outcome: RefCell<Option<ScratchShow>> = RefCell::new(None);
-    leave_then_unmap(
-        layout,
-        |layout| {
-            let shown = show(layout)?;
-            let next = match &shown {
-                ScratchShow::Stowed(next) => next.clone(),
-                _ => None,
-            };
-            *outcome.borrow_mut() = Some(shown);
-            Ok(next)
-        },
-        &map,
-        &focus,
-        || {
-            if !matches!(*outcome.borrow(), Some(ScratchShow::Missing(_))) {
-                apply();
-            }
-        },
-    )?;
-    let shown = outcome.into_inner().expect("core's verb ran and answered");
-    match &shown {
-        ScratchShow::Stowed(_) => restack(),
-        ScratchShow::Raised(id) | ScratchShow::Shown(id) => {
-            restack();
-            map(id);
-            focus(id);
-        }
-        ScratchShow::Missing(_) => {}
-    }
-    Ok(shown)
-}
-
 /// [`ModuleGrid::focus_target`]'s choice, made on the grid's own host records (generic over the
 /// widget so it is tested without a display): the focus target recorded for `id`, never its host.
 fn focus_target_of<'a, W>(hosts: &'a [Host<W>], id: &ModuleId) -> Option<&'a W> {
     hosts.iter().find(|h| h.id == *id).map(|h| &h.focus)
 }
 
-/// Where a divider drag puts the first child: the divider as it is allocated **now**, plus the
-/// drag's offset. GTK reports that offset in the handle's own coordinates, and the handle moves
-/// under the pointer as the drag re-allocates it, so the offset is how far the pointer is from where
-/// the handle now is, not from where it was grabbed. `begin.first_px + offset` -- the grab's divider
-/// plus that offset -- lags: at one motion event per frame the divider crawls after the pointer at
-/// about half its speed, 200px short of a 400px drag. `GtkPaned` avoids the same trap by gesturing on
-/// itself, which never moves. `None` if the handle now draws another split than the grabbed one.
-fn dragged_first_px(begin: &Divider, now: &Divider, dx: f64, dy: f64) -> Option<i32> {
-    if now.con != begin.con || now.index != begin.index || now.axis != begin.axis {
-        return None;
-    }
-    let offset = match now.axis {
-        Axis::Row => dx,
-        Axis::Column => dy,
-    };
-    Some(now.first_px + offset.round() as i32)
-}
-
-/// Where a dragged bar (`grip: false`) or grip puts the float: the float's whole rectangle as allocated
-/// **now** plus the drag's offset -- moved by a bar, resized from the bottom-right by a grip. The offset
-/// is in the moving widget's own coordinates, and the bar or grip moves under the pointer as the drag
-/// re-allocates it, so it is how far the pointer is from where that widget now is (as
-/// [`dragged_first_px`] explains for a divider). Core's `set_float_rect` then fits the result into the
-/// grid and above the float's minimum.
-fn dragged_float_rect(now: Rect, dx: f64, dy: f64, grip: bool) -> Rect {
-    let (dx, dy) = (dx.round() as i32, dy.round() as i32);
-    if grip {
-        Rect {
-            w: now.w.saturating_add(dx),
-            h: now.h.saturating_add(dy),
-            ..now
-        }
-    } else {
-        Rect {
-            x: now.x.saturating_add(dx),
-            y: now.y.saturating_add(dy),
-            ..now
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eitri_core::layout::{Arrangement, Node};
+    use eitri_core::layout::{Arrangement, Layout, Node};
 
-    /// The divider stays under the pointer for a whole drag. This replays what GTK hands
-    /// `drag-update` -- the pointer in the handle's CURRENT coordinates, less where it was grabbed --
-    /// one motion event per frame, the grid re-arranging between events as it does. Adding the offset
-    /// to the divider the drag began with instead leaves it at 960px: half the drag, 200px behind a
-    /// pointer at 1160.
     #[test]
-    fn a_dragged_divider_stays_under_the_pointer() {
-        let mut layout = Layout::initial(&[]).unwrap();
-        let frame = Frame::new(UNALLOCATED, 1);
-        let begin = arrange(&layout, &frame).dividers[0].clone();
-        let grabbed_at = 0;
-        let pointer_start = begin.rect.x + grabbed_at;
-        for step in 1..=20 {
-            let pointer = pointer_start + 20 * step;
-            let now = arrange(&layout, &frame).dividers[0].clone();
-            let dx = f64::from(pointer - now.rect.x - grabbed_at);
-            let first_px = dragged_first_px(&begin, &now, dx, 0.0).unwrap();
-            layout.set_ratio(&now, now.ratio_for(first_px)).unwrap();
+    fn a_prepared_page_cover_is_clipped_out_of_the_hole() {
+        let cover = graphene::Rect::new(20.0, 30.0, 500.0, 400.0);
+        let hole = graphene::Rect::new(100.0, 120.0, 700.0, 600.0);
+        let rectangles = crate::editor_hole::hole_complement(cover, Some(hole));
+        assert_eq!(rectangles.len(), 2);
+        assert_eq!(
+            rectangles.iter().map(|r| r.width() * r.height()).sum::<f32>(),
+            500.0 * 400.0 - 420.0 * 310.0
+        );
+        for rect in rectangles {
+            assert!(cover.contains_rect(&rect));
+            assert!(rect.intersection(&hole).is_none_or(|r| r.width() * r.height() == 0.0));
         }
-        assert_eq!(arrange(&layout, &frame).dividers[0].rect.x, pointer_start + 400);
+    }
 
-        let other_container = Divider {
-            con: eitri_core::layout::ConId::fresh(),
-            ..begin.clone()
-        };
-        assert_eq!(
-            dragged_first_px(&begin, &other_container, 5.0, 0.0),
-            None,
-            "another container"
+    #[test]
+    fn a_prepared_page_and_its_cover_are_drawn_only_inside_clips_outside_the_hole() {
+        let bounds = graphene::Rect::new(20.0, 30.0, 500.0, 400.0);
+        let hole = graphene::Rect::new(100.0, 120.0, 700.0, 600.0);
+        let mut ops = Vec::new();
+        page_outside_hole(bounds, Some(hole), Some(&"page"), Some('c'), |op| ops.push(op));
+        let rects = crate::editor_hole::hole_complement(bounds, Some(hole));
+        assert_eq!(rects.len(), 2);
+        let expected: Vec<_> = rects
+            .iter()
+            .flat_map(|&r| {
+                [
+                    PageOp::Clip(r),
+                    PageOp::Page(&"page"),
+                    PageOp::Cover('c', r),
+                    PageOp::Pop,
+                ]
+            })
+            .collect();
+        assert_eq!(ops, expected, "each clip holds the page, then the cover, then closes");
+
+        let mut ops = Vec::new();
+        page_outside_hole(bounds, Some(hole), Some(&"page"), None::<char>, |op| ops.push(op));
+        assert!(
+            !ops.iter().any(|op| matches!(op, PageOp::Cover(..))),
+            "no cover colour, no cover"
         );
-        let other_divider = Divider {
-            index: begin.index + 1,
-            ..begin.clone()
-        };
+        assert_eq!(ops.iter().filter(|op| matches!(op, PageOp::Page(_))).count(), 2);
+
+        let mut ops = Vec::new();
+        page_outside_hole(bounds, Some(bounds), Some(&"page"), Some('c'), |op| ops.push(op));
+        assert!(ops.is_empty(), "a page wholly inside the hole is not drawn at all");
+    }
+
+    #[test]
+    fn a_prepared_rectangle_uses_the_offered_size_within_the_grid() {
+        let rect = prepared_rectangle(Size { w: 1000, h: 800 }, (600, 400));
         assert_eq!(
-            dragged_first_px(&begin, &other_divider, 5.0, 0.0),
-            None,
-            "another divider of the same container"
+            rect,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 600,
+                h: 400
+            }
         );
+    }
+
+    #[test]
+    fn a_drag_reports_its_begin_offsets_and_end() {
+        let win = WinId(7);
+        for on in [
+            PointerTarget::Divider(3),
+            PointerTarget::FloatBar(ModuleId::terminal()),
+            PointerTarget::FloatGrip(ModuleId::agent()),
+        ] {
+            for (phase, x, y, expected) in [
+                (
+                    DragPhase::Begin,
+                    12.5,
+                    8.0,
+                    PointerEv::Press {
+                        x: 12.5,
+                        y: 8.0,
+                        button: 2,
+                    },
+                ),
+                (
+                    DragPhase::Update,
+                    -400.0,
+                    23.5,
+                    PointerEv::Motion { x: -400.0, y: 23.5 },
+                ),
+                (DragPhase::End, 401.5, -18.0, PointerEv::Release { x: 401.5, y: -18.0 }),
+                (DragPhase::Cancel, 0.0, 0.0, PointerEv::Cancel),
+            ] {
+                let HostEvent::Pointer {
+                    win: got_win,
+                    on: got_on,
+                    ev,
+                } = pointer_event(win, on.clone(), phase, x, y, 2)
+                else {
+                    panic!("a drag must report a pointer event")
+                };
+                assert_eq!(got_win, win);
+                assert_eq!(got_on, on);
+                assert_eq!(ev, expected);
+            }
+        }
     }
 
     /// One child of the grid, in the model below.
@@ -1819,7 +1679,7 @@ mod tests {
             .collect();
         let mut ids = vec![ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()];
         ids.extend(decls.iter().map(|d| d.id.clone()));
-        let mut layout = crate::terminal::initial_layout(&decls).unwrap();
+        let mut layout = eitri_core::wm::persist::first_launch_layout(&decls).unwrap();
         if terminal_shown {
             layout.show(&ModuleId::terminal()).unwrap();
         }
@@ -2014,369 +1874,6 @@ mod tests {
         );
     }
 
-    /// What [`leave_then_unmap`] did, in order, as its effects saw the layout when each ran.
-    #[derive(Debug, PartialEq)]
-    enum Effect {
-        /// The layout changed, and named who gets the keys.
-        Leave,
-        /// A host that was off the screen was put on it.
-        Map(ModuleId),
-        Focus(ModuleId),
-        Unmap,
-    }
-
-    /// Runs `leave` on `layout` through [`leave_then_unmap`] and records each effect as it runs, with
-    /// the grid's mapped hosts modelled as the set of modules on screen before `leave`. Each effect
-    /// checks what the real one relies on: the layout is not borrowed (mapping reads it, a focus
-    /// change reaches the focus report, which writes it, and `apply` reads it). `map` records a map only
-    /// where the real one maps -- a module the layout now draws whose host is not on screen.
-    /// `focus` checks that its target is shown (`main.rs`'s `focus_module` refuses a hidden module)
-    /// and that its host is mapped, since an unmapped widget cannot take the keys. `unmap` checks
-    /// that `leaving` is off the screen in the layout, so `apply` unmaps it.
-    fn leave_and_record(
-        layout: &RefCell<Layout>,
-        leaving: &ModuleId,
-        leave: impl FnOnce(&mut Layout) -> Result<Option<ModuleId>, LayoutError>,
-    ) -> (Result<(), LayoutError>, Vec<Effect>) {
-        let effects = RefCell::new(Vec::new());
-        let mapped: RefCell<BTreeSet<ModuleId>> = RefCell::new(layout.borrow().visible_modules().into_iter().collect());
-        let result = leave_then_unmap(
-            layout,
-            |l| {
-                let next = leave(l)?;
-                effects.borrow_mut().push(Effect::Leave);
-                Ok(next)
-            },
-            |next| {
-                let l = layout
-                    .try_borrow_mut()
-                    .expect("the layout is released before a host maps");
-                if l.is_visible(next) && mapped.borrow_mut().insert(next.clone()) {
-                    effects.borrow_mut().push(Effect::Map(next.clone()));
-                }
-            },
-            |next| {
-                let l = layout
-                    .try_borrow_mut()
-                    .expect("the layout is released before the keys move");
-                assert!(
-                    !l.is_visible(leaving),
-                    "{leaving} is off screen in the layout before anything moves"
-                );
-                assert!(l.is_shown(next), "the keys go to a shown module, {next}");
-                assert!(
-                    mapped.borrow().contains(next),
-                    "{next}'s host is mapped before it gets the keys"
-                );
-                effects.borrow_mut().push(Effect::Focus(next.clone()));
-            },
-            || {
-                let l = layout
-                    .try_borrow_mut()
-                    .expect("the layout is released before the unmap");
-                assert!(!l.is_visible(leaving), "apply unmaps what the layout takes off screen");
-                effects.borrow_mut().push(Effect::Unmap);
-            },
-        );
-        (result, effects.into_inner())
-    }
-
-    /// Hides `id` in `layout` as [`hide_then_unmap`] does, recording each effect ([`leave_and_record`]).
-    fn hide_and_record(layout: &RefCell<Layout>, id: &ModuleId) -> (Result<(), LayoutError>, Vec<Effect>) {
-        leave_and_record(layout, id, |l| {
-            eitri_core::layout::hide(l, id, &Frame::new(UNALLOCATED, 1))
-        })
-    }
-
-    /// `Ctrl+a t` with the keys in the terminal gives them to the
-    /// module above it, and only then unmaps it. With the two effects swapped in
-    /// `hide_then_unmap` this fails; before the seam, the same swap inline in `hide_module` left
-    /// all 190 `shell` tests green. Both upper modules are tried as the one that had the keys last,
-    /// so a fixed choice cannot pass either.
-    #[test]
-    fn hiding_the_module_with_the_keys_gives_them_away_before_it_unmaps() {
-        for last_above in [ModuleId::agent(), ModuleId::editor()] {
-            let mut layout = crate::terminal::initial_layout(&[]).unwrap();
-            layout.show(&ModuleId::terminal()).unwrap();
-            layout.set_focus(&last_above).unwrap();
-            layout.set_focus(&ModuleId::terminal()).unwrap();
-            let layout = RefCell::new(layout);
-
-            let (result, effects) = hide_and_record(&layout, &ModuleId::terminal());
-            assert_eq!(result, Ok(()));
-            assert_eq!(
-                effects,
-                [Effect::Leave, Effect::Focus(last_above.clone()), Effect::Unmap]
-            );
-            assert_eq!(layout.borrow().focus(), &last_above);
-        }
-    }
-
-    /// `prefix x` takes the same door (2026-09-26): the keys leave the killed terminal before it
-    /// unmaps, and it is left hidden where a first launch puts it.
-    #[test]
-    fn killing_the_module_with_the_keys_gives_them_away_before_it_unmaps() {
-        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
-        layout.show(&ModuleId::terminal()).unwrap();
-        layout.set_focus(&ModuleId::agent()).unwrap();
-        layout.set_focus(&ModuleId::terminal()).unwrap();
-        let layout = RefCell::new(layout);
-        let id = ModuleId::terminal();
-        let (result, effects) = leave_and_record(&layout, &id, |l| {
-            eitri_core::layout::kill(
-                l,
-                &id,
-                Reopen::At(eitri_core::layout::Placement::BelowEditor),
-                &Frame::new(UNALLOCATED, 1),
-            )
-        });
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            effects,
-            [Effect::Leave, Effect::Focus(ModuleId::agent()), Effect::Unmap]
-        );
-        assert_eq!(
-            layout.borrow().root(),
-            crate::terminal::initial_layout(&[]).unwrap().root(),
-            "back where a first launch puts it"
-        );
-    }
-
-    /// A numbered terminal killed while it holds the keys as the drawn tab of a tabbed container: the
-    /// tab drawn next is mapped and given the keys before the killed one is unmapped, and the killed
-    /// one leaves the layout altogether (`Reopen::Remove`).
-    #[test]
-    fn killing_an_instance_gives_the_keys_away_before_it_unmaps() {
-        use eitri_core::layout::{Con, ConLayout};
-        let (two, base) = (ModuleId::parse("terminal#2").unwrap(), ModuleId::terminal());
-        let leaf = |id: ModuleId| eitri_core::layout::Child::new(Node::Leaf(id), 0.5);
-        let tabs = Con::new(ConLayout::Tabbed, vec![leaf(two.clone()), leaf(base.clone())]);
-        let root = Con::new(
-            ConLayout::SplitH,
-            vec![
-                leaf(ModuleId::editor()),
-                eitri_core::layout::Child::new(Node::Con(tabs), 0.5),
-            ],
-        );
-        let mut layout = Layout::new(Node::Con(root), ModuleId::editor()).unwrap();
-        layout.set_focus(&two).unwrap();
-        assert!(
-            layout.is_visible(&two) && !layout.is_visible(&base),
-            "the premise: #2 is drawn"
-        );
-        let layout = RefCell::new(layout);
-        let (result, effects) = leave_and_record(&layout, &two, |l| {
-            eitri_core::layout::kill(l, &two, Reopen::Remove, &Frame::new(UNALLOCATED, 1))
-        });
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            effects,
-            [
-                Effect::Leave,
-                Effect::Map(base.clone()),
-                Effect::Focus(base.clone()),
-                Effect::Unmap
-            ]
-        );
-        let layout = layout.borrow();
-        assert_eq!(layout.focus(), &base);
-        assert!(!layout.contains(&two), "an instance leaves the layout");
-        assert!(layout.is_visible(&base));
-    }
-
-    /// `editor` beside a tabbed container of `lua:a` (drawn) and `lua:b`, with the keys on `keys`.
-    fn editor_beside_tabs(keys: &str) -> RefCell<Layout> {
-        use eitri_core::layout::{Con, ConLayout};
-        let leaf = |id: ModuleId| eitri_core::layout::Child::new(Node::Leaf(id), 0.5);
-        let tabs = Con::new(
-            ConLayout::Tabbed,
-            vec![leaf(ModuleId::lua("a")), leaf(ModuleId::lua("b"))],
-        );
-        let root = Con::new(
-            ConLayout::SplitH,
-            vec![
-                leaf(ModuleId::editor()),
-                eitri_core::layout::Child::new(Node::Con(tabs), 0.5),
-            ],
-        );
-        let mut layout = Layout::new(Node::Con(root), ModuleId::lua("a")).unwrap();
-        layout.set_focus(&ModuleId::parse(keys).unwrap()).unwrap();
-        assert!(
-            layout.is_visible(&ModuleId::lua("a")),
-            "the premise: a is the drawn tab"
-        );
-        assert!(!layout.is_visible(&ModuleId::lua("b")), "the premise: b is not drawn");
-        RefCell::new(layout)
-    }
-
-    /// A tab switch gives the keys to the tab it draws, and that tab's host is mapped before it is
-    /// given them; the tab it replaced is unmapped last. With the keys on the tab being replaced, an
-    /// unmap first would leave GTK's focus chain to choose where they go; with the keys outside the
-    /// container, focusing a host that is still unmapped would leave them where they were. Both
-    /// starting places are tried, since a tab switch always moves the keys to the tab.
-    #[test]
-    fn a_tab_switch_maps_the_arriving_host_before_it_gets_the_keys() {
-        let (a, b) = (ModuleId::lua("a"), ModuleId::lua("b"));
-        for keys in ["lua:a", "editor"] {
-            let layout = editor_beside_tabs(keys);
-            let (result, effects) = leave_and_record(&layout, &a, |l| eitri_core::layout::switch_tab(l, &b).map(Some));
-            assert_eq!(result, Ok(()), "keys on {keys}");
-            assert_eq!(
-                effects,
-                [
-                    Effect::Leave,
-                    Effect::Map(b.clone()),
-                    Effect::Focus(b.clone()),
-                    Effect::Unmap
-                ],
-                "keys on {keys}"
-            );
-            let layout = layout.borrow();
-            assert_eq!(layout.focus(), &b, "keys on {keys}");
-            assert!(layout.is_visible(&b) && !layout.is_visible(&a), "keys on {keys}");
-        }
-
-        // The tab already drawn: nothing to map, and the keys still move to it.
-        let layout = editor_beside_tabs("editor");
-        let (result, effects) = leave_and_record(&layout, &b, |l| eitri_core::layout::switch_tab(l, &a).map(Some));
-        assert_eq!(result, Ok(()));
-        assert_eq!(effects, [Effect::Leave, Effect::Focus(a.clone()), Effect::Unmap]);
-        assert_eq!(layout.borrow().focus(), &a);
-
-        // A refused switch (a module not in the tree) does nothing at all.
-        let layout = editor_beside_tabs("editor");
-        let missing = ModuleId::lua("missing");
-        let (result, effects) =
-            leave_and_record(&layout, &a, |l| eitri_core::layout::switch_tab(l, &missing).map(Some));
-        assert_eq!(result, Err(LayoutError::NotInTree(missing)));
-        assert!(effects.is_empty(), "{effects:?}");
-    }
-
-    /// Hiding the drawn tab while it holds the keys gives them to the tab drawn next, which was
-    /// unmapped a moment ago: its host is mapped before it gets them, and the hidden tab is unmapped
-    /// last. A kill takes the same door, through the same `map` step.
-    #[test]
-    fn hiding_the_drawn_tab_maps_the_next_tab_before_it_gets_the_keys() {
-        let (a, b) = (ModuleId::lua("a"), ModuleId::lua("b"));
-        let layout = editor_beside_tabs("lua:a");
-        let (result, effects) = hide_and_record(&layout, &a);
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            effects,
-            [
-                Effect::Leave,
-                Effect::Map(b.clone()),
-                Effect::Focus(b.clone()),
-                Effect::Unmap
-            ]
-        );
-        assert_eq!(layout.borrow().focus(), &b);
-
-        // Hidden without the keys: the next tab is drawn and mapped by `apply`, and no keys move.
-        let layout = editor_beside_tabs("editor");
-        let (result, effects) = hide_and_record(&layout, &a);
-        assert_eq!(result, Ok(()));
-        assert_eq!(effects, [Effect::Leave, Effect::Unmap]);
-        assert_eq!(layout.borrow().focus(), &ModuleId::editor());
-    }
-
-    /// Hiding a module that does not hold the keys moves no keys, and still unmaps it. A hide the
-    /// layout refuses does neither: the last shown module (invariant 3), or one not in the tree.
-    #[test]
-    fn a_hide_without_the_keys_only_unmaps_and_a_refused_hide_does_nothing() {
-        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
-        layout.show(&ModuleId::terminal()).unwrap();
-        let layout = RefCell::new(layout);
-        assert_eq!(layout.borrow().focus(), &ModuleId::editor(), "the premise");
-        let (result, effects) = hide_and_record(&layout, &ModuleId::terminal());
-        assert_eq!(result, Ok(()));
-        assert_eq!(effects, [Effect::Leave, Effect::Unmap]);
-        assert_eq!(layout.borrow().focus(), &ModuleId::editor());
-
-        let (result, effects) = hide_and_record(&layout, &ModuleId::lua("nowhere"));
-        assert_eq!(result, Err(LayoutError::NotInTree(ModuleId::lua("nowhere"))));
-        assert!(effects.is_empty(), "{effects:?}");
-
-        let mut alone = Layout::initial(&[]).unwrap();
-        eitri_core::layout::hide(&mut alone, &ModuleId::agent(), &Frame::new(UNALLOCATED, 1)).unwrap();
-        let alone = RefCell::new(alone);
-        let (result, effects) = hide_and_record(&alone, &ModuleId::editor());
-        assert_eq!(result, Err(LayoutError::LastVisible(ModuleId::editor())));
-        assert!(effects.is_empty(), "{effects:?}");
-    }
-
-    /// Checks a drag inside a split that starts to the right of the grid's origin. The handle's
-    /// `rect.x` includes the space left of the split, while `first_px` is relative to the split.
-    /// The root-split replay cannot distinguish these coordinates because its split starts at zero,
-    /// so it does not catch an implementation that adds the offset to `rect.x`.
-    #[test]
-    fn a_dragged_divider_inside_a_nested_split_stays_under_the_pointer() {
-        use eitri_core::layout::Node;
-        let l = ModuleId::lua;
-        let root = Node::split(
-            Axis::Row,
-            0.4,
-            Node::Leaf(l("a")),
-            Node::split(Axis::Row, 0.5, Node::Leaf(l("b")), Node::Leaf(l("c"))),
-        );
-        let mut layout = Layout::new(root, l("b")).unwrap();
-        let frame = Frame::new(UNALLOCATED, 1);
-        let outer = layout.root().id;
-        let inner = |layout: &Layout| {
-            arrange(layout, &frame)
-                .dividers
-                .into_iter()
-                .find(|d| d.con != outer)
-                .unwrap()
-        };
-        let begin = inner(&layout);
-        assert_ne!(begin.rect.x, begin.first_px, "the premise: the split starts right of 0");
-        let pointer_start = begin.rect.x;
-        for step in 1..=10 {
-            let pointer = pointer_start + 15 * step;
-            let now = inner(&layout);
-            let dx = f64::from(pointer - now.rect.x);
-            let first_px = dragged_first_px(&begin, &now, dx, 0.0).unwrap();
-            layout.set_ratio(&now, now.ratio_for(first_px)).unwrap();
-        }
-        assert_eq!(inner(&layout).rect.x, pointer_start + 150);
-    }
-
-    /// Dragging the bottom terminal's pinned divider keeps it under the pointer and stores a
-    /// height in pixels that remains unchanged when the window grows taller.
-    /// This divider is nested below the editor's leaf rather than at the root, so the test finds it
-    /// by its `Column` axis instead of an empty path.
-    #[test]
-    fn a_dragged_pinned_divider_stays_under_the_pointer_and_keeps_its_height() {
-        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
-        layout.show(&ModuleId::terminal()).unwrap();
-        let frame = Frame::new(UNALLOCATED, 1);
-        assert!(eitri_core::layout::settle_pins(&mut layout, &frame));
-        let terminal_divider = |layout: &Layout| {
-            arrange(layout, &frame)
-                .dividers
-                .into_iter()
-                .find(|d| d.axis == Axis::Column)
-                .unwrap()
-        };
-        let begin = terminal_divider(&layout);
-        assert_eq!(begin.rect.y, 480, "the terminal's first show, a third of 721");
-        for step in 1..=10 {
-            let pointer = begin.rect.y - 10 * step;
-            let now = terminal_divider(&layout);
-            let dy = f64::from(pointer - now.rect.y);
-            let first_px = dragged_first_px(&begin, &now, 0.0, dy).unwrap();
-            eitri_core::layout::move_divider(&mut layout, &now, first_px).unwrap();
-        }
-        assert_eq!(terminal_divider(&layout).rect.y, 380);
-        let taller = Frame::new(eitri_core::layout::Size { w: 1280, h: 1041 }, 1);
-        assert_eq!(
-            arrange(&layout, &taller).rect_of(&ModuleId::terminal()).map(|r| r.h),
-            Some(340),
-            "dragged to 340px, and kept at 340 when the window grows"
-        );
-    }
-
     /// Module focus grabs what `add` was given as the focus target, never the host (2026-09-29): a
     /// web module's host is a `WebHost`, which is not focusable itself, and grabbing a `GtkBox` in its
     /// place left the keys where they were in the sandbox's first wrapped run. These are the grid's
@@ -2414,390 +1911,6 @@ mod tests {
             None,
             "a module this grid has no host for"
         );
-    }
-
-    // ---- Floats in the grid ----
-
-    /// `children` after `moves`, each applied as `gtk_widget_insert_after` does: the slot leaves its
-    /// place and goes right after `after` (first when `None`).
-    fn apply_moves(children: &[Slot], moves: &[SlotMove]) -> Vec<Slot> {
-        let mut now = children.to_vec();
-        for m in moves {
-            let at = now.iter().position(|s| *s == m.slot).expect("a move names a child");
-            now.remove(at);
-            let to = match &m.after {
-                None => 0,
-                Some(a) => now.iter().position(|s| s == a).expect("after names a child") + 1,
-            };
-            now.insert(to, m.slot.clone());
-        }
-        now
-    }
-
-    /// The pool's plan: chrome is made only when more floats are on screen than the pool has ever
-    /// drawn, the rest is hidden and reused, and nothing is ever unparented (the pool never shrinks).
-    /// A raise keeps every float on its own piece, so a bar being dragged keeps drawing its float.
-    #[test]
-    fn float_chrome_grows_with_the_floats_and_idles_what_it_does_not_use() {
-        assert_eq!(chrome_plan(0, 2), (2, 2..2), "the first two floats");
-        assert_eq!(chrome_plan(2, 1), (0, 1..2), "a stow or a sink: one spot fewer");
-        assert_eq!(chrome_plan(2, 2), (0, 2..2), "back to two: slot 1 reused");
-        assert_eq!(chrome_plan(2, 0), (0, 0..2), "none: all hidden, none dropped");
-        assert_eq!(chrome_plan(1, 3), (2, 3..3), "only the missing ones are made");
-        for pool in 0..5 {
-            for spots in 0..5 {
-                let (make, hide) = chrome_plan(pool, spots);
-                assert_eq!(pool + make, pool.max(spots), "the pool never shrinks");
-                assert_eq!(hide, spots..pool + make, "every slot past the floats is hidden");
-            }
-        }
-
-        let (a, b, c) = (ModuleId::agent(), ModuleId::terminal(), ModuleId::lua("c"));
-        let drew = chrome_owners(&[], &[a.clone(), b.clone()]);
-        assert_eq!(drew, [a.clone(), b.clone()]);
-        assert_eq!(
-            chrome_owners(&drew, &[b.clone(), a.clone()]),
-            drew,
-            "a raise moves no float to another piece"
-        );
-        assert_eq!(
-            chrome_owners(&drew, std::slice::from_ref(&b)),
-            std::slice::from_ref(&b),
-            "a float leaving frees its slot"
-        );
-        assert_eq!(
-            chrome_owners(&drew, &[c.clone(), b.clone(), a.clone()]),
-            [a.clone(), b.clone(), c.clone()],
-            "a new float takes the next slot"
-        );
-        assert_eq!(
-            chrome_owners(std::slice::from_ref(&b), std::slice::from_ref(&a)),
-            std::slice::from_ref(&a),
-            "a swap hands the slot the old float freed to the new one"
-        );
-    }
-
-    /// Floats `terminal` at `rect` over the default window with the terminal shown and the keys on
-    /// `keys`.
-    fn with_a_float(rect: FloatRect, keys: &ModuleId) -> Layout {
-        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
-        layout.show(&ModuleId::terminal()).unwrap();
-        let frame = Frame::new(UNALLOCATED, 1);
-        assert_eq!(
-            eitri_core::layout::float_at(&mut layout, &ModuleId::terminal(), Some(rect), &frame),
-            Ok(true)
-        );
-        layout.set_focus(keys).unwrap();
-        layout
-    }
-
-    /// A drag on a float's bar keeps the bar under the pointer, and a drag on its grip keeps the grip
-    /// there, both ways. This replays what GTK hands `drag-update` -- the pointer in the bar's (or the
-    /// grip's) CURRENT coordinates, less where it was grabbed -- one motion event per frame, the grid
-    /// re-arranging between events as it does.
-    #[test]
-    fn a_dragged_float_bar_stays_under_the_pointer() {
-        let terminal = ModuleId::terminal();
-        let frame = Frame::new(UNALLOCATED, 1);
-        let rect_now = |layout: &Layout| arrange(layout, &frame).float_spot(&terminal).unwrap().rect;
-        let float = FloatRect {
-            cx: 0.5,
-            cy: 0.5,
-            w: 400,
-            h: 300,
-        };
-        for (grip, step) in [(false, (15, 7)), (false, (-10, -5)), (true, (10, 6)), (true, (-8, -4))] {
-            let mut layout = with_a_float(float, &terminal);
-            let start = rect_now(&layout);
-            // Where on the bar or the grip the press landed, in its own coordinates.
-            let grabbed = (5, 5);
-            let handle = |r: Rect| if grip { grip_rect(r) } else { r };
-            let origin = handle(start);
-            let pointer_start = (origin.x + grabbed.0, origin.y + grabbed.1);
-            for n in 1..=10 {
-                let pointer = (pointer_start.0 + step.0 * n, pointer_start.1 + step.1 * n);
-                let now = rect_now(&layout);
-                let widget = handle(now);
-                let dx = f64::from(pointer.0 - widget.x - grabbed.0);
-                let dy = f64::from(pointer.1 - widget.y - grabbed.1);
-                let next = dragged_float_rect(now, dx, dy, grip);
-                eitri_core::layout::set_float_rect(&mut layout, &terminal, next, &frame);
-            }
-            let end = rect_now(&layout);
-            let (mx, my) = (step.0 * 10, step.1 * 10);
-            if grip {
-                assert_eq!(
-                    end,
-                    Rect {
-                        w: start.w + mx,
-                        h: start.h + my,
-                        ..start
-                    },
-                    "a grip drag of {mx},{my}"
-                );
-            } else {
-                assert_eq!(
-                    end,
-                    Rect {
-                        x: start.x + mx,
-                        y: start.y + my,
-                        ..start
-                    },
-                    "a bar drag of {mx},{my}"
-                );
-            }
-        }
-        // The rule on its own: a bar moves the rectangle, a grip sizes it from the bottom-right.
-        let r = Rect {
-            x: 100,
-            y: 50,
-            w: 300,
-            h: 200,
-        };
-        assert_eq!(dragged_float_rect(r, -20.4, 9.6, false), Rect { x: 80, y: 60, ..r });
-        assert_eq!(dragged_float_rect(r, -20.4, 9.6, true), Rect { w: 280, h: 210, ..r });
-    }
-
-    /// What GTK's pick finds over a grid with floats, as [`pick`] models it for hosts and handles.
-    #[derive(Debug, PartialEq)]
-    enum Picked {
-        Host(ModuleId),
-        Handle(usize),
-        Bar(ModuleId),
-        Grip(ModuleId),
-    }
-
-    fn pick_slot(children: &[Slot], arrangement: &Arrangement, chrome: &[ModuleId], x: i32, y: i32) -> Option<Picked> {
-        let contains = |r: Rect| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
-        children.iter().rev().find_map(|slot| match slot {
-            Slot::Host(id) => arrangement
-                .rect_of(id)
-                .or_else(|| arrangement.float_spot(id).map(|s| s.host))
-                .is_some_and(contains)
-                .then(|| Picked::Host(id.clone())),
-            Slot::Handle(n) => arrangement
-                .dividers
-                .get(*n)
-                .is_some_and(|d| contains(d.rect))
-                .then_some(Picked::Handle(*n)),
-            Slot::Strip(_) => None,
-            Slot::Chrome(i) => {
-                let spot = chrome.get(*i).and_then(|id| arrangement.float_spot(id))?;
-                // The grip is after the bar in the child list: it is picked first.
-                if contains(grip_rect(spot.rect)) {
-                    Some(Picked::Grip(spot.id.clone()))
-                } else if contains(spot.bar) {
-                    Some(Picked::Bar(spot.id.clone()))
-                } else {
-                    None
-                }
-            }
-        })
-    }
-
-    /// A float over the root divider takes every press inside it: on the divider's pixels its host
-    /// does, on its bar the bar, on its grip the grip; outside it the divider is still the handle's.
-    #[test]
-    fn a_press_inside_a_float_reaches_its_host_not_the_split_below() {
-        let terminal = ModuleId::terminal();
-        let layout = with_a_float(
-            FloatRect {
-                cx: 0.6,
-                cy: 0.5,
-                w: 400,
-                h: 300,
-            },
-            &terminal,
-        );
-        let arrangement = arrange(&layout, &Frame::new(UNALLOCATED, 1));
-        let spot = arrangement.float_spot(&terminal).unwrap().clone();
-        let divider = arrangement.dividers[0].clone();
-        assert_eq!(divider.axis, Axis::Row, "the premise: the editor | agent split");
-        assert!(
-            spot.host.x < divider.rect.x && divider.rect.x < spot.host.x + spot.host.w,
-            "the premise: the float's host covers the divider ({spot:?}, {divider:?})"
-        );
-
-        let ids = [ModuleId::editor(), ModuleId::agent(), terminal.clone()];
-        let mut children: Vec<Slot> = stack_as_add_builds(&ids)
-            .into_iter()
-            .map(|c| match c {
-                Child::Host(id) => Slot::Host(id),
-                Child::Handle(n) => Slot::Handle(n),
-            })
-            .collect();
-        let floats = [terminal.clone()];
-        let chrome = chrome_owners(&[], &floats);
-        children.push(Slot::Chrome(0));
-        let children = apply_moves(&children, &restack_moves(&children, &floats, &chrome));
-
-        let r = divider.rect;
-        let middle = spot.host.y + spot.host.h / 2;
-        for x in [r.x, r.x + r.w] {
-            assert_eq!(
-                pick_slot(&children, &arrangement, &chrome, x, middle),
-                Some(Picked::Host(terminal.clone())),
-                "a press at ({x}, {middle}) on the divider under the float"
-            );
-        }
-        let above = spot.rect.y - 10;
-        assert_eq!(
-            pick_slot(&children, &arrangement, &chrome, r.x, above),
-            Some(Picked::Handle(0)),
-            "the divider outside the float is the handle's"
-        );
-        let bar = (spot.bar.x + spot.bar.w / 2, spot.bar.y + spot.bar.h / 2);
-        assert_eq!(
-            pick_slot(&children, &arrangement, &chrome, bar.0, bar.1),
-            Some(Picked::Bar(terminal.clone()))
-        );
-        let grip = grip_rect(spot.rect);
-        assert_eq!(
-            pick_slot(&children, &arrangement, &chrome, grip.x + 6, grip.y + 6),
-            Some(Picked::Grip(terminal.clone()))
-        );
-
-        // Negative control: the same float left in the host band, where it was tiled, loses the
-        // divider's pixels to the handle above it.
-        let unstacked = stack_as_add_builds(&ids)
-            .into_iter()
-            .map(|c| match c {
-                Child::Host(id) => Slot::Host(id),
-                Child::Handle(n) => Slot::Handle(n),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            pick_slot(&unstacked, &arrangement, &chrome, r.x, middle),
-            Some(Picked::Handle(0))
-        );
-    }
-
-    /// Stowing the float that holds the keys -- `scratchpad.move`, or `scratchpad.show` on the shown
-    /// scratch float with the keys -- gives them to the most recent module in view before the float's
-    /// host is unmapped, through [`leave_then_unmap`], the door `ModuleGrid::scratchpad_move` and
-    /// `scratchpad_show`'s `Stowed` take. Both tiled modules are tried as the one with the keys last.
-    #[test]
-    fn stowing_the_float_with_the_keys_gives_them_away_before_it_unmaps() {
-        let terminal = ModuleId::terminal();
-        let frame = Frame::new(UNALLOCATED, 1);
-        let float = FloatRect::centred(UNALLOCATED, 0.6);
-        for last in [ModuleId::agent(), ModuleId::editor()] {
-            let mut layout = with_a_float(float, &last);
-            layout.set_focus(&terminal).unwrap();
-            let layout = RefCell::new(layout);
-            let (result, effects) = leave_and_record(&layout, &terminal, |l| {
-                eitri_core::layout::scratchpad_move(l, &terminal, &frame)
-            });
-            assert_eq!(result, Ok(()), "keys last on {last}");
-            assert_eq!(
-                effects,
-                [Effect::Leave, Effect::Focus(last.clone()), Effect::Unmap],
-                "keys last on {last}"
-            );
-            assert!(layout.borrow().is_stowed(&terminal));
-            assert_eq!(layout.borrow().focus(), &last);
-
-            // Shown again, given the keys, and stowed by `scratchpad.show` this time.
-            let shown = eitri_core::layout::scratchpad_show(&mut layout.borrow_mut(), None, &frame);
-            assert_eq!(shown, Ok(ScratchShow::Shown(terminal.clone())));
-            layout.borrow_mut().set_focus(&terminal).unwrap();
-            let (result, effects) =
-                leave_and_record(&layout, &terminal, |l| {
-                    match eitri_core::layout::scratchpad_show(l, None, &frame)? {
-                        ScratchShow::Stowed(next) => Ok(next),
-                        other => panic!("not a stow: {other:?}"),
-                    }
-                });
-            assert_eq!(result, Ok(()), "keys last on {last}");
-            assert_eq!(
-                effects,
-                [Effect::Leave, Effect::Focus(last.clone()), Effect::Unmap],
-                "keys last on {last}"
-            );
-            assert!(layout.borrow().is_stowed(&terminal));
-        }
-    }
-
-    /// What [`scratch_show_in_order`] did, in order.
-    #[derive(Debug, PartialEq)]
-    enum Step {
-        Map(ModuleId),
-        Focus(ModuleId),
-        Apply,
-        Restack,
-    }
-
-    fn show_and_record(
-        layout: &RefCell<Layout>,
-        module: Option<&ModuleId>,
-    ) -> (Result<ScratchShow, LayoutError>, Vec<Step>) {
-        let steps = RefCell::new(Vec::new());
-        let frame = Frame::new(UNALLOCATED, 1);
-        let released = |what: &str| {
-            assert!(layout.try_borrow_mut().is_ok(), "the layout is released before {what}");
-        };
-        let result = scratch_show_in_order(
-            layout,
-            |l| eitri_core::layout::scratchpad_show(l, module, &frame),
-            |id| {
-                released("a map");
-                steps.borrow_mut().push(Step::Map(id.clone()));
-            },
-            |id| {
-                released("the keys move");
-                steps.borrow_mut().push(Step::Focus(id.clone()));
-            },
-            || {
-                released("apply");
-                steps.borrow_mut().push(Step::Apply);
-            },
-            || {
-                released("the restack");
-                steps.borrow_mut().push(Step::Restack);
-            },
-        );
-        (result, steps.into_inner())
-    }
-
-    /// `scratchpad.show`'s other answers: a float shown or raised is mapped by `apply` and restacked on
-    /// top before it gets the keys; a stow gives the keys away before `apply` unmaps it; an instance
-    /// that does not exist changes nothing at all.
-    #[test]
-    fn a_shown_scratch_float_is_mapped_and_raised_before_it_gets_the_keys() {
-        let terminal = ModuleId::terminal();
-        let layout = RefCell::new(with_a_float(FloatRect::centred(UNALLOCATED, 0.6), &ModuleId::agent()));
-        let (result, steps) = show_and_record(&layout, Some(&terminal));
-        assert_eq!(result, Ok(ScratchShow::Shown(terminal.clone())));
-        assert_eq!(
-            steps,
-            [
-                Step::Apply,
-                Step::Restack,
-                Step::Map(terminal.clone()),
-                Step::Focus(terminal.clone())
-            ]
-        );
-        layout.borrow_mut().set_focus(&terminal).unwrap();
-
-        let (result, steps) = show_and_record(&layout, None);
-        assert!(matches!(result, Ok(ScratchShow::Stowed(Some(_)))), "{result:?}");
-        let Ok(ScratchShow::Stowed(Some(next))) = result else {
-            unreachable!()
-        };
-        assert_eq!(
-            steps,
-            [
-                Step::Map(next.clone()),
-                Step::Focus(next.clone()),
-                Step::Apply,
-                Step::Restack
-            ]
-        );
-
-        let missing = ModuleId::parse("terminal#3").unwrap();
-        let (result, steps) = show_and_record(&layout, Some(&missing));
-        assert_eq!(result, Ok(ScratchShow::Missing(missing)));
-        assert!(steps.is_empty(), "{steps:?}");
     }
 
     /// A module title is the user's text: a float's bar shows `<b>x</b>` as those characters. Read off
@@ -2871,14 +1984,15 @@ mod tests {
     }
 
     /// With an allocator, its arrangement is the one allocated and the grid settles no pin of its own (the
-    /// allocator does, and tells the saver); with none, the grid settles the pin and arranges its layout.
+    /// allocator does, and tells the saver); with none, the grid arranges its layout with the pin settled, and
+    /// writes nothing.
     #[test]
     fn the_grid_arranges_through_its_allocator_when_it_has_one() {
         let size = Size { w: 1200, h: 800 };
         let frame = |f: &mut dyn FnMut(&Frame)| f(&Frame::new(size, 1));
-        let layout = RefCell::new(pinned_row());
+        let (layout, cell) = LayoutView::for_test(pinned_row());
         assert!(
-            layout.borrow().has_pin_to_settle(),
+            layout.read().has_pin_to_settle(),
             "the premise: a pin waits for its length"
         );
         let answers = Answers {
@@ -2888,14 +2002,17 @@ mod tests {
         let got = arrangement_for(Some(&answers), WinId::MAIN, &layout, size, frame);
         assert!(Rc::ptr_eq(&got, &answers.arrangement), "the allocator's arrangement");
         assert_eq!(answers.asked.get(), 1);
-        assert!(layout.borrow().has_pin_to_settle(), "no pin was settled by the grid");
+        assert!(layout.read().has_pin_to_settle(), "no pin was settled by the grid");
 
         let own = arrangement_for(None, WinId::MAIN, &layout, size, frame);
         assert!(
-            !layout.borrow().has_pin_to_settle(),
-            "a grid with no allocator settles its pin"
+            layout.read().has_pin_to_settle(),
+            "a grid with no allocator writes nothing"
         );
-        assert_eq!(*own, arrange(&layout.borrow(), &Frame::new(size, 1)));
+        let mut settled = layout.read().clone();
+        eitri_core::layout::settle_pins(&mut settled, &Frame::new(size, 1));
+        assert_eq!(*own, arrange(&settled, &Frame::new(size, 1)));
         assert_eq!(own.modules.len(), 2);
+        assert!(cell.borrow().has_pin_to_settle());
     }
 }

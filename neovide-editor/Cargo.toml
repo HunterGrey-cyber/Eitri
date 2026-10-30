@@ -7,6 +7,9 @@ publish.workspace = true
 [lib]
 name = "neovide_editor"
 
+[features]
+fault-injection = []
+
 [dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_14"] }
 # `fstat` and `dup2` for `stdin::detach_stdin_from_nvim`, which std does not expose. Already in the
@@ -25,6 +28,12 @@ neovide = { path = "../neovide" }
 # `rmpv::Value`, the type nvim-rs speaks (the fork already links this same version, so nothing new
 # is built or shipped). `nvim_child`'s ending tests use it too, to talk to nvim over a pipe.
 rmpv = "1"
+# Winit already brings this version, so nothing new is built or shipped.
+wayland-client = "=0.31.15"
+# Winit already enables client_system at this version, so nothing new is built or shipped.
+wayland-backend = { version = "=0.3.17", features = ["client_system"] }
+# Winit already enables client at this version, so nothing new is built or shipped.
+wayland-protocols = { version = "=0.32.13", features = ["client"] }
 
 # `nvim_rpc`'s real-nvim test: a request and its watch made from plain threads over an nvim-rs
 # connection that lives on a tokio runtime, as the fork's does. Both crates are already in the tree
@@ -39,6 +48,8 @@ serde_json = "1"
 # display-guard scan (`shell/tests/own_display_scan.rs`) does not read them as opening one. The
 # version gtk4 0.11.4 already resolves.
 glib = "0.22"
+# Winit already brings this version and these features; the foreign-display stand-in adds no code.
+wayland-sys = { version = "=0.31.11", features = ["client", "dlopen"] }
 
 # A plain `main`, not libtest: each real `LiveHarness` case runs in a fresh child copy of this
 # binary, one case per child, so it can start its own Xvfb before anything connects to a display and
@@ -73,4 +84,14 @@ harness = false
 
 [[test]]
 name = "realized_restart"
+harness = false
+
+[[test]]
+name = "subsurface_x11"
+harness = false
+
+# Each case runs in a child copy of this binary: an abort in one (libwayland aborts on an event for a
+# freed queue) fails that case alone, and the parent reads the child's stderr for libwayland's warnings.
+[[test]]
+name = "presenter_thread"
 harness = false

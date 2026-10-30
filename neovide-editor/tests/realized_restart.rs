@@ -7,7 +7,7 @@
 //!
 //! - `a_realized_pane_restarts_on_its_own_widget`: nvim quits, the host releases the pane and,
 //!   once it has stopped drawing, restarts it; the same widget, never unrealized, shows a new nvim that takes keys and was
-//!   started with the restart's options.
+//!   started with the restart's options, and the host hears once that its session is ready.
 //! - `restart_is_refused_unless_the_pane_exited`: a pane whose nvim is running refuses, and names
 //!   the state it is in.
 //! - `a_restarted_pane_hears_nothing_from_its_ended_harness`: the release and the restart happen in
@@ -22,6 +22,12 @@
 //! - `an_ending_timer_leaves_the_restarted_nvim_alone`: nvim is ended while a watched request is
 //!   outstanding (SIGTERM now, its stdin closed a second later); it exits at once and the pane is
 //!   restarted inside that second, and the late hang-up does not reach the new nvim.
+//! - `a_pane_shut_down_while_restarting_leaves_no_nvim`: the window closes after the restart was
+//!   asked and before the new nvim started; the pane's shutdown leaves no nvim of this process
+//!   running, and no later frame starts one.
+//! - `a_pane_whose_launch_failed_starts_again`: a restart whose nvim cannot be launched leaves the
+//!   pane failed, the host told why once; a later restart of that failed pane starts a new nvim on
+//!   the same widget, and the host hears once that its session is ready.
 //!
 //! Each case runs in a child copy of this binary on its own `Xvfb` (GTK, winit and the clipboard all
 //! connect to a display); the parent connects to nothing. Ignored unless asked for, because it spawns
@@ -46,6 +52,8 @@ const CASES: &[&str] = &[
     "a_restarted_pane_hears_nothing_from_its_ended_harness",
     "a_restarted_pane_reports_its_new_nvims_fullscreen_setting",
     "an_ending_timer_leaves_the_restarted_nvim_alone",
+    "a_pane_shut_down_while_restarting_leaves_no_nvim",
+    "a_pane_whose_launch_failed_starts_again",
 ];
 
 /// Runs the default main context without blocking until `done` holds; `false` at `limit`.
@@ -142,6 +150,48 @@ fn ask(pane: &NeovideEditorPane, code: &'static str, limit: Duration) -> Option<
     answer.take()
 }
 
+/// The `nvim` processes descending from this one that still run, by pid. A zombie (ended, waiting
+/// for its parent to reap it) runs nothing and is not one.
+fn running_nvims() -> Vec<u32> {
+    let mut procs = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid ...`: the name may hold spaces and parentheses, so it ends at the
+        // last `)`.
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
+        let name = stat[open + 1..close].to_string();
+        let mut rest = stat[close + 1..].split_whitespace();
+        let state = rest.next().unwrap_or_default().to_string();
+        let Some(parent) = rest.next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        procs.push((pid, parent, name, state));
+    }
+    let mut ours = vec![std::process::id()];
+    let mut nvims = Vec::new();
+    let mut next = 0;
+    while next < ours.len() {
+        let parent = ours[next];
+        next += 1;
+        for (pid, ppid, name, state) in &procs {
+            if *ppid == parent && !ours.contains(pid) {
+                ours.push(*pid);
+                if name == "nvim" && state != "Z" {
+                    nvims.push(*pid);
+                }
+            }
+        }
+    }
+    nvims
+}
+
 fn a_realized_pane_restarts_on_its_own_widget() {
     let (_window, pane, unrealized) = realized_pane();
     let exits = count_exits(&pane);
@@ -156,12 +206,28 @@ fn a_realized_pane_restarts_on_its_own_widget() {
     assert!(!pane.is_ready(), "a released pane has no nvim");
     // A host restarts whenever the user asks, long after the released pane stopped drawing.
     settle(&pane, Duration::from_millis(800));
+    let readies = Rc::new(Cell::new(0u32));
+    {
+        let readies = readies.clone();
+        pane.on_session_ready(move || readies.set(readies.get() + 1));
+    }
 
+    assert!(!pane.is_starting(), "a released pane is not starting");
     pane.restart(second_options())
         .expect("a released pane whose nvim ended should accept a restart");
     assert!(
+        pane.is_starting(),
+        "a restarted pane is starting until its nvim is launched"
+    );
+    assert!(
         run_until(Duration::from_secs(10), || pane.is_ready()),
         "the restarted pane should have a ready nvim within 10 s"
+    );
+    assert!(!pane.is_starting());
+    assert_eq!(
+        readies.get(),
+        1,
+        "the host hears of the new session once, as it becomes ready"
     );
     assert_eq!(
         pane.widget().as_ptr(),
@@ -198,6 +264,7 @@ fn a_realized_pane_restarts_on_its_own_widget() {
         1,
         "the new nvim has not exited, so no second exit is reported"
     );
+    assert_eq!(readies.get(), 1, "one session, one report");
 
     assert!(pane.shutdown(), "the new nvim should exit when shut down");
 }
@@ -402,6 +469,118 @@ fn an_ending_timer_leaves_the_restarted_nvim_alone() {
     assert!(pane.shutdown(), "the new nvim should exit when shut down");
 }
 
+fn a_pane_shut_down_while_restarting_leaves_no_nvim() {
+    let (_window, pane, _unrealized) = realized_pane();
+    let exits = count_exits(&pane);
+    assert!(
+        !running_nvims().is_empty(),
+        "the first nvim should be seen as this process's own, or the check below proves nothing"
+    );
+
+    pane.send_keys(":q!<CR>");
+    assert!(
+        run_until(Duration::from_secs(10), || exits.get() == 1),
+        "the first nvim should report its own exit"
+    );
+    assert!(pane.release_exited(), "the exited nvim should be released");
+    pane.restart(second_options())
+        .expect("a released pane whose nvim ended should accept a restart");
+    assert!(!pane.is_ready(), "the restart's nvim starts on a later frame");
+    // The window closes now, its editor restarting: the close shuts the pane down.
+    pane.shutdown();
+
+    // Read every tenth of a second: a closer look buys nothing, and `/proc` is the whole system's.
+    let mut started = false;
+    let mut left = running_nvims();
+    let mut looked = Instant::now();
+    let gone = run_until(Duration::from_secs(10), || {
+        started |= pane.is_ready();
+        if looked.elapsed() >= Duration::from_millis(100) {
+            looked = Instant::now();
+            left = running_nvims();
+        }
+        left.is_empty()
+    });
+    assert!(gone, "an nvim outlived the pane's shutdown: pids {left:?}");
+    // The widget is still shown, so frames keep coming if anything asks for them: none may start
+    // the nvim the restart asked for.
+    let quiet_until = Instant::now() + Duration::from_secs(2);
+    run_until(Duration::from_secs(3), || {
+        started |= pane.is_ready();
+        if looked.elapsed() >= Duration::from_millis(100) {
+            looked = Instant::now();
+            left = running_nvims();
+        }
+        !left.is_empty() || Instant::now() >= quiet_until
+    });
+    assert!(
+        left.is_empty(),
+        "an nvim started after the pane's shutdown: pids {left:?}"
+    );
+    assert!(!started, "the shut-down pane started the restart's nvim");
+}
+
+/// Options whose launch fails: the child's `PATH` names a directory that does not exist, so no
+/// `nvim` is found for it.
+fn unlaunchable_options() -> NeovideEditorPaneOptions {
+    NeovideEditorPaneOptions {
+        clean: true,
+        child_env: vec![("PATH".into(), "/eitri-realized-restart-has-no-nvim".into())],
+        ..Default::default()
+    }
+}
+
+fn a_pane_whose_launch_failed_starts_again() {
+    let (_window, pane, unrealized) = realized_pane();
+    let exits = count_exits(&pane);
+    let failures = Rc::new(Cell::new(0u32));
+    {
+        let failures = failures.clone();
+        pane.on_start_failed(move |_| failures.set(failures.get() + 1));
+    }
+    let readies = Rc::new(Cell::new(0u32));
+    {
+        let readies = readies.clone();
+        pane.on_session_ready(move || readies.set(readies.get() + 1));
+    }
+
+    pane.send_keys(":q!<CR>");
+    assert!(
+        run_until(Duration::from_secs(10), || exits.get() == 1),
+        "the first nvim should report its own exit"
+    );
+    assert!(pane.release_exited(), "the exited nvim should be released");
+    pane.restart(unlaunchable_options())
+        .expect("a released pane whose nvim ended should accept a restart");
+    assert!(
+        run_until(Duration::from_secs(10), || failures.get() == 1),
+        "a launch with no nvim to find should be reported failed"
+    );
+    assert!(
+        !pane.is_ready() && !pane.is_starting(),
+        "the failed pane has no nvim and starts none"
+    );
+    assert_eq!(readies.get(), 0, "a failed launch is never reported ready");
+    // A failed pane stops drawing once its failure is painted, so the restart must ask for frames.
+    settle(&pane, Duration::from_millis(800));
+
+    pane.restart(second_options())
+        .expect("a pane whose launch failed should accept a restart");
+    assert!(
+        run_until(Duration::from_secs(10), || pane.is_ready()),
+        "the failed pane's restart should have a ready nvim within 10 s"
+    );
+    assert_eq!(readies.get(), 1, "the new session is reported ready once");
+    assert_eq!(failures.get(), 1, "the launch that worked is not reported failed");
+    let marker = ask(&pane, "return vim.g.restart_marker", Duration::from_secs(5));
+    assert!(
+        matches!(&marker, Some(Ok(value)) if value.as_str() == Some("second")),
+        "the new nvim should be started with the second restart's options; g:restart_marker is {marker:?}"
+    );
+    assert_eq!(unrealized.get(), 0, "neither restart may unrealize the widget");
+    assert!(pane.shutdown(), "the new nvim should exit when shut down");
+}
+
 fn main() {
     if let Some(case) = std::env::var_os(CASE_ENV) {
         if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
@@ -420,6 +599,10 @@ fn main() {
             Some("an_ending_timer_leaves_the_restarted_nvim_alone") => {
                 an_ending_timer_leaves_the_restarted_nvim_alone()
             }
+            Some("a_pane_shut_down_while_restarting_leaves_no_nvim") => {
+                a_pane_shut_down_while_restarting_leaves_no_nvim()
+            }
+            Some("a_pane_whose_launch_failed_starts_again") => a_pane_whose_launch_failed_starts_again(),
             other => panic!("unknown case {other:?}"),
         }
         println!("RESULT pass");

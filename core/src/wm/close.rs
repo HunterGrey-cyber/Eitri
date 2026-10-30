@@ -3,7 +3,7 @@
 //! `prefix x` is tmux's `kill-pane`: it ends the module, it does not hide it. Stock tmux binds `x` to
 //! `confirm-before -p "kill-pane #P? (y/n)" kill-pane` (checked against a throwaway
 //! `tmux -L xprobe -f /dev/null` server, tmux next-3.7), so Eitri asks first too, in the window's one
-//! y/n ([`PromptState`]), naming the module where tmux names the pane's number.
+//! y/n (the chrome's [`Prompt`]), naming the module where tmux names the pane's number.
 //!
 //! What a kill ends, per module:
 //! - **terminal**: its shell is hung up (SIGHUP, as closing a terminal does) and the module goes back
@@ -25,7 +25,9 @@
 //!   nothing on the last module would leave the key dead exactly where it is most likely pressed. One
 //!   question: it names what the window close would have asked about (`N running, M queued`), and
 //!   `y` is taken as the answer to both. The editor still goes through `:confirm qall` first, and the
-//!   window closes when nvim exits.
+//!   window closes when nvim exits. The `y` reads the layout again: if another module came on screen
+//!   meanwhile, it kills only the module it named, as any kill. A window close arriving while the
+//!   question is up (nvim exiting on its own, the top bar's) takes the question's place.
 //!
 //! - **every window close** never discards unsaved editor changes silently: the top bar's close, the
 //!   compositor's, the last module's kill, the terminal's `exit` as the last module -- each asks nvim
@@ -47,14 +49,11 @@
 //!
 //! This file holds the pieces decided without a display or a toolkit: the prompt's text and keys,
 //! where each kind of module is left ([`reopen`]), and each single decision of the editor's quit,
-//! read from what nvim answered ([`NvimAnswer`]). The flow that strings those decisions together is
-//! the shell's `editor_quit` (also display-free, tested against a fake host); the shell's
-//! `kill_pane` turns the editor pane's request watch into those facts. Every other module's kill is
-//! carried out by [`crate::wm::verbs::modules`]; only the editor's quit is still carried out by the
-//! shell's `main.rs`.
+//! read from what nvim answered ([`NvimAnswer`]). [`CloseFlow`] joins native closes, the last module's
+//! kill and termination signals. [`QuitFlow`] guards the editor's buffers; its callbacks become
+//! intents so completing a quit never re-enters a borrowed flow. The host carries out the resulting
+//! ordered operations and posts the editor's answers.
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub use crate::layout::KillScope;
@@ -63,6 +62,858 @@ use crate::layout::{declared_placement, Layout, ModuleDecl, ModuleId, ModuleKind
 use super::KeyPress;
 use crate::keymap::KeyName;
 
+#[cfg(test)]
+#[path = "close/tests.rs"]
+mod flow_tests;
+
+use super::chrome::{self, Prompt};
+use super::host::*;
+use super::quit::{QuitFlow, QuitWorld, WindowClose};
+use super::toasts::ToastKind;
+use super::verbs::modules::{self, Cx};
+use super::window::{WinId, Window};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseState {
+    #[default]
+    Idle,
+    Asking,
+    Moving,
+    Quitting,
+    TearingDown,
+    Closed,
+}
+
+#[derive(Default)]
+pub struct CloseFlow {
+    pub state: CloseState,
+    teardown: Option<TimerToken>,
+    pending: Option<PendingClose>,
+    confirmed: bool,
+    repeated: bool,
+    moving: Vec<crate::window_link::moves::MoveId>,
+    move_pending: Vec<(ModuleId, Option<crate::tabs::TabId>)>,
+    move_wait_noted: std::collections::BTreeSet<ModuleId>,
+}
+
+pub enum PendingClose {
+    Window {
+        confirmed: Option<String>,
+    },
+    LastModule {
+        module: ModuleId,
+        confirmed: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum CloseCause {
+    User,
+    Compositor,
+    NvimExited,
+    LastTerminalExit(ModuleId),
+    Signal(&'static str),
+}
+
+/// A signal never waits for an answer. Ordinary closes let nvim guard unsaved buffers before an idle tears down.
+pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &mut Batch) {
+    // Not even for the moves `m` started: the teardown's goodbye ends the link, which settles them.
+    if matches!(cause, CloseCause::Signal(_)) && w.close.state == CloseState::Moving {
+        w.say("[window] an end signal closes without waiting for the moves".into());
+        stop_moving(w);
+    }
+    if ended(w) {
+        return;
+    }
+    // The signal's own handler has said so, through a write that never blocks.
+    if let CloseCause::Signal(_) = cause {
+        teardown(w, win, batch);
+        return;
+    }
+    if w.close.teardown.is_some() {
+        return;
+    }
+    if w.close.state == CloseState::Asking {
+        // The last module's question is only about a kill; a close that arrives meanwhile (nvim exiting on its own,
+        // the top bar's close) is the window's own and takes its place, or nothing would answer it: a `no` to the
+        // kill's question would leave an exited editor on screen holding the keys.
+        if !matches!(w.close.pending, Some(PendingClose::LastModule { .. })) {
+            return;
+        }
+        w.say("[window] a window close replaces the last module's kill question".into());
+        w.close.pending = None;
+        chrome::set_prompt(w, None);
+    }
+    w.close.state = CloseState::Quitting;
+    let now = w.now();
+    let proceed = with_quit(w, cx, win, batch, |quit, world| quit.window_close(world, now));
+    if proceed == WindowClose::Proceed && !ended(w) && w.close.teardown.is_none() {
+        w.close.teardown = Some(w.arm_idle());
+    }
+}
+
+fn ended(w: &mut Window) -> bool {
+    if !matches!(
+        w.close.state,
+        CloseState::Moving | CloseState::TearingDown | CloseState::Closed
+    ) {
+        return false;
+    }
+    if !w.close.repeated {
+        w.close.repeated = true;
+        w.say("[window] the window is already closing".into());
+    }
+    true
+}
+
+/// The last module's one question also confirms the window consequences at this moment.
+pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: ModuleId, _batch: &mut Batch) {
+    if ended(w) {
+        return;
+    }
+    let (running, queued, background) = window_counts(cx);
+    let text = window_prompt(w, cx, win)
+        .filter(|_| w.peer.is_some())
+        .unwrap_or_else(|| {
+            prompt(
+                &module,
+                &chrome::title(w, &module),
+                KillScope::Window,
+                running,
+                queued,
+                cx.reads.terminal_jobs(win),
+                background,
+            )
+        });
+    let confirmed = window_prompt(w, cx, win);
+    w.say(format!("[modules] {module}: {text}"));
+    w.modules.clear_question();
+    w.close.pending = Some(PendingClose::LastModule { module, confirmed });
+    w.close.state = CloseState::Asking;
+    chrome::set_prompt(
+        w,
+        Some(Prompt {
+            text,
+            closes_window: true,
+            offers_move: w.peer.is_some() && !movable(cx, win).is_empty(),
+        }),
+    );
+}
+
+impl CloseFlow {
+    /// The pending action is taken before it runs, so a callback may ask a fresh question in the same batch.
+    pub fn answer(&mut self, w: &mut Window, cx: &Cx, win: WinId, answer: PromptKey, batch: &mut Batch) {
+        if answer == PromptKey::Ignore || self.state != CloseState::Asking {
+            return;
+        }
+        let answer = if answer == PromptKey::Move && !w.chrome.prompt.as_ref().is_some_and(|p| p.offers_move) {
+            PromptKey::No
+        } else {
+            answer
+        };
+        let pending = self.pending.take();
+        let closes_window = w.chrome.prompt.as_ref().is_some_and(|prompt| prompt.closes_window);
+        chrome::set_prompt(w, None);
+        self.state = CloseState::Idle;
+        // Quit callbacks must see the live close flow, including any new prompt they open.
+        std::mem::swap(self, &mut w.close);
+        match (answer, pending) {
+            (PromptKey::Move, Some(_)) => begin_moves(w, cx, win, batch),
+            (PromptKey::Yes, Some(PendingClose::Window { .. })) => {
+                w.close.confirmed = true;
+                request(w, cx, win, CloseCause::User, batch);
+            }
+            (PromptKey::Yes, Some(PendingClose::LastModule { module, confirmed })) => {
+                last_module_confirmed(w, cx, win, module, confirmed, batch);
+            }
+            // The last module's question never was the window close's own: declining it leaves the editor as it is.
+            (_, Some(PendingClose::Window { .. })) if runs_decline_hook(answer, closes_window) => {
+                with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+            }
+            _ => {}
+        }
+        std::mem::swap(self, &mut w.close);
+    }
+}
+
+/// Something may have come on screen since the last module's question (a chip, a Lua show): the `y` then kills only
+/// what it asked about, as any other kill, and the window stays with what is now shown.
+fn last_module_confirmed(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    module: ModuleId,
+    confirmed: Option<String>,
+    batch: &mut Batch,
+) {
+    let scope = w
+        .layout
+        .try_borrow()
+        .map(|layout| crate::layout::can_kill(&layout, &module));
+    match scope {
+        Ok(Ok(KillScope::Window)) => {}
+        Ok(Ok(KillScope::Module)) => {
+            w.say(format!(
+                "[modules] {module}: no longer the last module on screen; killed as any other is"
+            ));
+            modules::kill_confirmed(w, cx, win, &module, batch);
+            return;
+        }
+        Ok(Err(err)) => {
+            w.say(format!("[modules] {module}: not killed: {err}"));
+            w.refuse(win, String::new(), batch);
+            return;
+        }
+        Err(_) => {
+            w.warn(format!(
+                "[wm] BUG: the layout was borrowed when {module}'s kill was answered"
+            ));
+            return;
+        }
+    }
+    w.close.state = CloseState::Quitting;
+    with_quit(w, cx, win, batch, |quit, world| {
+        if module == ModuleId::editor() {
+            let now = world.w.now();
+            if let Err(text) = quit.kill_editor(world, KillScope::Window, confirmed, now) {
+                world.w.say(format!("[modules] editor: not killed: {text}"));
+                world.feedback(super::feedback::CloseOutcome::KillRefused);
+            }
+        } else {
+            quit.close_after(world, confirmed);
+        }
+    });
+}
+
+/// Another question takes the window close's place on the overlay. The close is left as a `no` to it leaves it, so
+/// the next close asks again instead of waiting on a question nobody can answer any more.
+pub(super) fn superseded(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if w.close.state != CloseState::Asking {
+        return;
+    }
+    let declined = matches!(w.close.pending.take(), Some(PendingClose::Window { .. }));
+    w.close.state = CloseState::Idle;
+    if declined {
+        with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+    }
+}
+
+pub(super) fn answer(w: &mut Window, cx: &Cx, win: WinId, key: PromptKey, batch: &mut Batch) {
+    let mut flow = std::mem::take(&mut w.close);
+    flow.answer(w, cx, win, key, batch);
+    w.close = flow;
+}
+
+fn movable(cx: &Cx, win: WinId) -> Vec<(ModuleId, Option<crate::tabs::TabId>)> {
+    let mut modules = cx.reads.running_chats(win);
+    modules.extend(cx.reads.terminal_job_modules(win).into_iter().map(|id| (id, None)));
+    modules.extend(cx.reads.pages_with_tasks(win).into_iter().map(|id| (id, None)));
+    let mut seen = std::collections::BTreeSet::new();
+    modules.retain(|item| seen.insert(item.clone()));
+    modules
+}
+
+fn begin_moves(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    w.close.state = CloseState::Moving;
+    w.close.confirmed = true;
+    w.close.move_pending = movable(cx, win);
+    w.close.moving = super::moves::active_source_moves(w);
+    for id in w.close.moving.clone() {
+        super::moves::workspace::watch(w, id);
+    }
+    moves_progress(w, cx, win, batch);
+}
+
+/// The close no longer waits on any move; the moves themselves go on until the link's end settles them.
+fn stop_moving(w: &mut Window) {
+    let ids = std::mem::take(&mut w.close.moving);
+    super::moves::workspace::unwatch(w, &ids);
+    w.close.move_pending.clear();
+    w.close.state = CloseState::Idle;
+}
+
+/// Every verdict is known before nvim's quit or the idle teardown can start.
+pub(super) fn moves_progress(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if w.close.state != CloseState::Moving {
+        return;
+    }
+    let pending = std::mem::take(&mut w.close.move_pending);
+    for (module, tab) in pending {
+        let selected = match tab {
+            Some(tab) => Some(cx.reads.tab_move(win, tab)),
+            None if module.kind() == crate::layout::ModuleKind::Agent => Some(cx.reads.chat_move(
+                win,
+                crate::tabs::ViewId::of_module(&module).unwrap_or(crate::tabs::ViewId::BASE),
+                None,
+            )),
+            None => None,
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|f| matches!(f, Ok(f) if f.running && !f.live))
+        {
+            if w.close.move_wait_noted.insert(module.clone()) {
+                super::moves::note_turn_wait(w, &module);
+            }
+            w.close.move_pending.push((module, tab));
+            continue;
+        }
+        if let Some(id) = super::moves::offer_for_close(w, cx, win, &module, tab, selected, batch) {
+            super::moves::workspace::watch(w, id);
+            w.close.moving.push(id);
+        }
+    }
+    if !w.close.move_pending.is_empty() || w.close.moving.iter().any(|id| !super::moves::move_decided(w, *id)) {
+        return;
+    }
+    stop_moving(w);
+    request(w, cx, win, CloseCause::User, batch);
+}
+
+/// A dead link decides the remaining handovers, including chats waiting for a turn's end.
+pub(super) fn moves_link_ended(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if w.close.state != CloseState::Moving {
+        return;
+    }
+    stop_moving(w);
+    request(w, cx, win, CloseCause::User, batch);
+}
+
+/// An allocation's pin lengths are part of the launch baseline even before its deferred event is heard.
+pub fn save_for_close(w: &mut Window) -> bool {
+    if let Some(token) = w.save_timer.take() {
+        w.cancel_timer(token);
+    }
+    let Some(saver) = w.saver.as_mut() else {
+        w.unheard_settles.clear();
+        return false;
+    };
+    for root in w.unheard_settles.drain(..) {
+        saver.settled(&root);
+    }
+    saver.collect(w.workspaces.try_borrow_mut().ok().as_deref_mut());
+    let finished = match (w.layout.try_borrow(), w.workspaces.try_borrow()) {
+        (Ok(layout), Ok(workspaces)) => saver.save_now(&layout, &workspaces),
+        _ => saver.save_now_unread(),
+    };
+    saver.collect(w.workspaces.try_borrow_mut().ok().as_deref_mut());
+    let holds = match (w.layout.try_borrow(), w.workspaces.try_borrow()) {
+        (Ok(layout), Ok(workspaces)) => saver.holds(&layout, &workspaces),
+        _ => false,
+    };
+    finished && holds
+}
+
+/// Services end in dependency order; closing the native window is the final, non-asking operation.
+pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
+    if ended(w) {
+        return;
+    }
+    w.close.state = CloseState::TearingDown;
+    if let Some(token) = w.close.teardown.take() {
+        w.cancel_timer(token);
+    }
+    if let Some((token, _)) = w.quit_timer.take() {
+        w.cancel_timer(token);
+    }
+    if let Some(token) = w.release_exited.take() {
+        w.cancel_timer(token);
+    }
+    w.close.pending = None;
+    w.modules.clear_question();
+    chrome::set_prompt(w, None);
+    let layout_written = save_for_close(w);
+    super::moves::forget_sent_at_teardown(w, win, batch);
+    for op in [
+        HostOp::Cleanup(CleanupOp::PairOnClose { layout_written }),
+        HostOp::Editor(EditorCall::Shutdown { win }),
+        HostOp::Terminal(TermOp::ShutdownAll { win }),
+        HostOp::Cleanup(CleanupOp::ScratchDir),
+        HostOp::Cleanup(CleanupOp::PaneSwitchDir),
+        HostOp::Cleanup(CleanupOp::Feeds),
+        HostOp::Plugin(PluginOp::ShutdownAll { win }),
+        HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
+        HostOp::CloseWindow { win },
+    ] {
+        batch.push_effect(op);
+    }
+    w.close.state = CloseState::Closed;
+}
+
+/// The last terminal stays in the layout while its window close waits for confirmation or nvim's unsaved buffers;
+/// any other terminal can be removed as soon as its shell ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnExit {
+    CloseModule,
+    CloseWindow,
+}
+
+pub fn on_shell_exit(scope: KillScope) -> OnExit {
+    match scope {
+        KillScope::Module => OnExit::CloseModule,
+        KillScope::Window => OnExit::CloseWindow,
+    }
+}
+
+pub(super) fn timer(w: &mut Window, cx: &Cx, win: WinId, token: TimerToken, batch: &mut Batch) -> bool {
+    if w.close.teardown == Some(token) {
+        w.close.teardown = None;
+        teardown(w, win, batch);
+        return true;
+    }
+    if w.release_exited == Some(token) {
+        w.release_exited = None;
+        batch.push_effect(HostOp::Editor(EditorCall::ReleaseExited { win }));
+        return true;
+    }
+    if let Some((_, generation)) = w.quit_timer.filter(|(armed, _)| *armed == token) {
+        w.quit_timer = None;
+        let now = w.now();
+        let again = with_quit(w, cx, win, batch, |quit, world| quit.poll(world, generation, now));
+        if again {
+            w.quit_timer = Some((w.arm_after(Duration::from_secs(1)), generation));
+        }
+        return true;
+    }
+    false
+}
+
+pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEvent, batch: &mut Batch) {
+    if ended(w) {
+        return;
+    }
+    use super::window::EditorRun;
+    match &event {
+        EditorEvent::Ready { .. } => {
+            if matches!(w.editor_run, EditorRun::Running | EditorRun::Restarting) {
+                w.editor_run = EditorRun::Running;
+                batch.push_effect(HostOp::Plugin(PluginOp::EditorBack { win }));
+            }
+            return;
+        }
+        EditorEvent::Released { .. } => {
+            if w.editor_run != EditorRun::Ending {
+                return;
+            }
+            if let Some(token) = w.release_exited.take() {
+                w.cancel_timer(token);
+            }
+            w.editor_run = EditorRun::Ended;
+            // A show made before the release asked for the restart; a hide or a workspace switch since has taken the
+            // editor off screen again, and the restart would bring it back unasked.
+            let shown = w
+                .layout
+                .try_borrow()
+                .is_ok_and(|layout| layout.is_shown(&ModuleId::editor()));
+            if std::mem::take(&mut w.restart_wanted) && shown {
+                modules::restart_editor(w, cx, win, batch);
+            }
+            return;
+        }
+        EditorEvent::ReleaseRefused { .. } => {
+            if w.editor_run != EditorRun::Ending {
+                return;
+            }
+            if !w.release_refused_logged {
+                w.say("[modules] editor: nvim's process is still alive; the pane is released once it ends".into());
+                w.release_refused_logged = true;
+            }
+            if let Some(token) = w.release_exited.take() {
+                w.cancel_timer(token);
+            }
+            w.release_exited = Some(w.arm_after(Duration::from_secs(1)));
+            return;
+        }
+        EditorEvent::RestartRefused { state, .. } => {
+            if w.editor_run == EditorRun::Restarting {
+                w.editor_run = EditorRun::Ended;
+                w.refuse(win, super::feedback::restart_refused_text(state), batch);
+            }
+            return;
+        }
+        // A restart whose nvim could not be launched (gone from `PATH`, say) leaves a pane with no nvim that can be
+        // restarted again, so the editor is ended rather than left restarting with nothing to wait for, and the next
+        // show tries again. The pane says why over itself; the toast says how to try again. A first start's failure
+        // is not a restart and leaves the editor's run as it is. Either way the pane cannot take input now, so it
+        // does not keep the keys.
+        EditorEvent::StartFailed { why, .. } => {
+            if w.editor_run == EditorRun::Restarting {
+                w.editor_run = EditorRun::Ended;
+                w.say(format!(
+                    "[modules] editor: the restarted nvim could not be launched: {why}"
+                ));
+                w.refuse(win, super::feedback::restart_failed_text(cx.keymap), batch);
+            }
+            keys_leave_a_failed_editor(w, cx, win, batch);
+            return;
+        }
+        EditorEvent::Exited { .. } if matches!(w.editor_run, EditorRun::Ending | EditorRun::Ended) => return,
+        // A restarted nvim that ends before it is ready never ran for the user, so nothing was quit: the pane ends in
+        // place again, to be released and started again, where a running editor's exit would close the window.
+        EditorEvent::Exited { .. } if w.editor_run == EditorRun::Restarting => {
+            with_quit(w, cx, win, batch, |quit, world| quit.restarted_nvim_exited(world));
+            return;
+        }
+        _ => {}
+    }
+    with_quit(w, cx, win, batch, |quit, world| match event {
+        EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled),
+        EditorEvent::Unreachable { .. } => quit.nvim_unreachable(world),
+        // The window close's `y`, if it had one, was taken back when the close handed the quit to nvim, so a later
+        // exit asks again.
+        EditorEvent::QuitCancelled { generation, .. } => {
+            let cancel = u32::try_from(generation).map_or(super::quit::Cancel::Ignored, |g| quit.cancelled(g));
+            world.w.say(match cancel {
+                super::quit::Cancel::Cleared => {
+                    format!("[modules] editor: nvim's quit {generation} was cancelled; nothing is in flight")
+                }
+                super::quit::Cancel::CloseWithdrawn => format!(
+                    "[modules] editor: nvim's quit {generation}, a window close a later kill joined, was cancelled; \
+                     nvim's exit ends the editor only"
+                ),
+                super::quit::Cancel::Ignored => format!(
+                    "[modules] editor: a quit-cancelled letter for quit {generation}, not the one in flight; ignored"
+                ),
+            });
+        }
+        EditorEvent::QuitNotSent { generation, .. } => {
+            if let Some(text) = quit.quit_not_sent(world, generation) {
+                world.refuse(&text);
+            }
+        }
+        _ => {}
+    });
+}
+
+pub(super) fn kill_editor(w: &mut Window, cx: &Cx, win: WinId, scope: KillScope, batch: &mut Batch) {
+    if ended(w) {
+        return;
+    }
+    with_quit(w, cx, win, batch, |quit, world| {
+        let now = world.w.now();
+        if let Err(text) = quit.kill_editor(world, scope, None, now) {
+            world.w.say(format!("[modules] editor: not killed: {text}"));
+            world.feedback(super::feedback::CloseOutcome::KillRefused);
+        }
+    });
+}
+
+/// The window's running turns, queued messages and tabs with background work. The base view's running and queued
+/// counts already cover every tab of every chat view; adding each extra view's own tab would count it twice. Its
+/// background count covers the base view's own tabs only, so each extra chat view's is added.
+fn window_counts(cx: &Cx) -> (usize, usize, usize) {
+    let counts = cx.reads.chat_kill_counts(crate::tabs::ViewId::BASE);
+    let background = counts.background
+        + cx.reads
+            .chat_views()
+            .into_iter()
+            .filter(|view| !view.is_base())
+            .map(|view| cx.reads.chat_kill_counts(view).background)
+            .sum::<usize>();
+    (counts.running, counts.queued, background)
+}
+
+pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
+    let (running, queued, background) = window_counts(cx);
+    // Only a linked window offers `m`, so only its question counts the pages it would move as running work.
+    let running = running
+        + if w.peer.is_some() {
+            cx.reads.pages_with_tasks(win).len()
+        } else {
+            0
+        };
+    let other = w.peer.as_ref().map(|p| crate::tabs::OtherWindow {
+        name: super::moves::other_name(w),
+        running: p.summary().map_or(0, |s| s.running as usize),
+        queued: p.summary().map_or(0, |s| s.queued as usize),
+        stays_without_editor: matches!(w.presence(), super::window::EditorPresence::Owned),
+    });
+    crate::tabs::linked_window_close_prompt(
+        running,
+        queued,
+        cx.reads.terminal_jobs(win),
+        background,
+        other,
+        if w.peer.is_some() { movable(cx, win).len() } else { 0 },
+    )
+}
+
+/// Close callbacks are delayed until the quit value is back in the window; none re-enters a borrowed flow.
+enum CloseIntent {
+    Ask(String),
+    Withdraw,
+    Confirmed,
+    Close,
+}
+
+struct WindowQuit<'a, 'b> {
+    w: &'a mut Window,
+    cx: &'a Cx<'b>,
+    win: WinId,
+    batch: &'a mut Batch,
+    intents: Vec<CloseIntent>,
+}
+
+/// Where the keys go when nvim fails to start: a pane that cannot take input does not keep them. Construction is
+/// asynchronous, after the window is shown and the first focus chosen, so the editor can hold the keys when the
+/// failure lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysAfterFailure {
+    /// The keys were elsewhere, or nowhere: they stay.
+    Stay,
+    /// The editor held them: they move to the chat, shown if it was hidden.
+    ToChat,
+}
+
+pub fn keys_after_failure(focused: Option<&ModuleId>) -> KeysAfterFailure {
+    if focused == Some(&ModuleId::editor()) {
+        KeysAfterFailure::ToChat
+    } else {
+        KeysAfterFailure::Stay
+    }
+}
+
+/// A failed editor that held the keys gives them to the chat, shown first where it was hidden, and the chat is
+/// arrived at as its module key lands; keys anywhere else stay. Only where the host last reported the keys counts:
+/// a pane that never took them has nothing to give up.
+fn keys_leave_a_failed_editor(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    let focused = w.focus.native_module().cloned();
+    if keys_after_failure(focused.as_ref()) == KeysAfterFailure::Stay {
+        return;
+    }
+    let chat = ModuleId::agent();
+    if let Err(err) = modules::show_on_screen(w, cx, win, &chat, batch) {
+        w.say(format!(
+            "[modules] editor: start failed, and the chat could not be shown ({err})"
+        ));
+    }
+    if let Err(err) = super::focus::focus_and_arrive(w, win, &chat, batch) {
+        w.say(format!(
+            "[modules] editor: start failed, and the keys could not move to the chat ({err})"
+        ));
+    }
+}
+
+fn with_quit<T>(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    batch: &mut Batch,
+    call: impl FnOnce(&mut QuitFlow, &mut WindowQuit<'_, '_>) -> T,
+) -> T {
+    let mut quit = std::mem::take(&mut w.quit);
+    let mut world = WindowQuit {
+        w,
+        cx,
+        win,
+        batch,
+        intents: Vec::new(),
+    };
+    let result = call(&mut quit, &mut world);
+    let intents = std::mem::take(&mut world.intents);
+    world.w.quit = quit;
+    for intent in intents {
+        match intent {
+            CloseIntent::Ask(text) => {
+                world.w.say(format!("[window] {text}"));
+                let confirmed = Some(text.clone());
+                world.w.modules.clear_question();
+                world.w.close.pending = Some(PendingClose::Window { confirmed });
+                world.w.close.state = CloseState::Asking;
+                chrome::set_prompt(
+                    world.w,
+                    Some(Prompt {
+                        text,
+                        closes_window: true,
+                        offers_move: world.w.peer.is_some() && !movable(cx, win).is_empty(),
+                    }),
+                );
+            }
+            CloseIntent::Withdraw => world.w.close.confirmed = false,
+            CloseIntent::Confirmed => {
+                world.w.close.confirmed = true;
+                request(world.w, cx, win, CloseCause::NvimExited, world.batch);
+            }
+            CloseIntent::Close => request(world.w, cx, win, CloseCause::NvimExited, world.batch),
+        }
+    }
+    result
+}
+
+impl QuitWorld for WindowQuit<'_, '_> {
+    fn facts(&self) -> EditorFacts {
+        let mut facts = self.cx.reads.editor_facts(self.win);
+        facts.starting |= self.w.editor_run == super::window::EditorRun::Restarting;
+        if self.w.editor_run != super::window::EditorRun::Running {
+            facts.running = false;
+            facts.exit_pending = false;
+        }
+        facts
+    }
+    fn reveal(&self) -> Reveal {
+        self.w
+            .layout
+            .try_borrow()
+            .map(|layout| reveal_for_prompt(&layout, &ModuleId::editor()))
+            .unwrap_or(Reveal {
+                show: true,
+                rehide: false,
+            })
+    }
+    fn editor_gone(&self) -> bool {
+        self.w.editor_run != super::window::EditorRun::Running
+            || self
+                .w
+                .layout
+                .try_borrow()
+                .is_ok_and(|layout| layout.is_gone(&ModuleId::editor()))
+    }
+    fn close_confirmed(&self) -> bool {
+        self.w.close.confirmed
+    }
+    fn window_close_prompt(&self) -> Option<String> {
+        window_prompt(self.w, self.cx, self.win)
+    }
+    fn send_quit(&mut self, lua: String, generation: u32) {
+        self.batch.push_effect(HostOp::Editor(EditorCall::Quit {
+            win: self.win,
+            lua,
+            generation,
+        }));
+    }
+    fn end_nvim(&mut self) {
+        self.batch
+            .push_effect(HostOp::Editor(EditorCall::End { win: self.win }));
+    }
+    fn show_editor(&mut self) -> Result<(), crate::layout::LayoutError> {
+        modules::show_on_screen(self.w, self.cx, self.win, &ModuleId::editor(), self.batch)?;
+        let brought = self.w.layout.try_borrow_mut().is_ok_and(|mut layout| {
+            layout.is_tabbed_away(&ModuleId::editor()) && layout.bring_forward(&ModuleId::editor())
+        });
+        if brought {
+            self.w
+                .changed_with_focus(self.win, Some((ModuleId::editor(), vec![])), self.batch);
+        }
+        Ok(())
+    }
+    fn focus_editor(&mut self) {
+        super::focus::give_keys(self.w, self.win, &ModuleId::editor(), vec![], self.batch);
+    }
+    fn hide_editor(&mut self) -> Result<(), crate::layout::LayoutError> {
+        modules::hide(self.w, self.cx, self.win, &ModuleId::editor(), self.batch)
+    }
+    fn end_editor(&mut self) -> Result<(), crate::layout::LayoutError> {
+        use super::window::EditorRun;
+        match self.w.editor_run {
+            EditorRun::Running | EditorRun::Restarting => {}
+            // Ended already, so there is nothing to end or release again; an editor shown meanwhile (a show before
+            // the release, or after a refused restart) is still the user's to kill, and a restart that show asked
+            // for is taken back with it.
+            EditorRun::Ending | EditorRun::Ended => {
+                self.w.restart_wanted = false;
+                let shown = self
+                    .w
+                    .layout
+                    .try_borrow()
+                    .is_ok_and(|layout| layout.is_shown(&ModuleId::editor()));
+                if shown {
+                    self.kill_editor_layout(Reopen::InPlace)?;
+                    self.w.saver_changed();
+                }
+                return Ok(());
+            }
+        }
+        self.kill_editor_layout(Reopen::InPlace)?;
+        if let Ok(mut workspaces) = self.w.workspaces.try_borrow_mut() {
+            frame_with(self.cx.reads, self.win, self.cx.reads.grid_size(self.win), |frame| {
+                workspaces.end_everywhere(&ModuleId::editor(), frame)
+            });
+        }
+        self.w.editor_run = super::window::EditorRun::Ending;
+        self.w.restart_wanted = false;
+        self.w.release_refused_logged = false;
+        self.batch
+            .push_effect(HostOp::Plugin(PluginOp::EditorClosed { win: self.win }));
+        self.w.release_exited = Some(self.w.arm_idle());
+        self.w.saver_changed();
+        self.w
+            .say("[modules] editor: nvim quit; the editor can start again in place".into());
+        Ok(())
+    }
+    fn kill_editor_in_place(&mut self) -> Result<(), crate::layout::LayoutError> {
+        self.w.restart_wanted = false;
+        self.kill_editor_layout(Reopen::InPlace)
+    }
+    fn show_chat(&mut self) -> Result<(), crate::layout::LayoutError> {
+        modules::show_on_screen(self.w, self.cx, self.win, &ModuleId::agent(), self.batch)
+    }
+    fn ask_to_close_window(&mut self, text: &str) {
+        self.intents.push(CloseIntent::Ask(text.into()));
+    }
+    fn withdraw_close_confirmation(&mut self) {
+        self.intents.push(CloseIntent::Withdraw);
+    }
+    fn close_window_confirmed(&mut self) {
+        self.intents.push(CloseIntent::Confirmed);
+    }
+    fn close_window(&mut self) {
+        self.intents.push(CloseIntent::Close);
+    }
+    fn refuse(&mut self, text: &str) {
+        self.feedback(super::feedback::CloseOutcome::Refused(text));
+    }
+    fn toast(&mut self, text: &str) {
+        self.feedback(super::feedback::CloseOutcome::Toast(text));
+    }
+    fn editor_ended_text(&self) -> String {
+        super::feedback::editor_ended_text(self.cx.keymap)
+    }
+    fn every_second(&mut self, generation: u32) {
+        if let Some((token, _)) = self.w.quit_timer.take() {
+            self.w.cancel_timer(token);
+        }
+        self.w.quit_timer = Some((self.w.arm_after(Duration::from_secs(1)), generation));
+    }
+}
+
+impl WindowQuit<'_, '_> {
+    fn feedback(&mut self, outcome: super::feedback::CloseOutcome<'_>) {
+        let feedback = super::feedback::close(outcome);
+        if feedback.flash {
+            self.w.refuse(self.win, feedback.toast.unwrap_or_default(), self.batch);
+        } else if let Some(text) = feedback.toast {
+            chrome::show_toast(self.w, text, ToastKind::Other);
+        }
+    }
+
+    fn kill_editor_layout(&mut self, reopen: Reopen) -> Result<(), crate::layout::LayoutError> {
+        let next = {
+            let mut layout = self
+                .w
+                .layout
+                .try_borrow_mut()
+                .map_err(|_| crate::layout::LayoutError::NotInTree(ModuleId::editor()))?;
+            frame_with(self.cx.reads, self.win, self.cx.reads.grid_size(self.win), |frame| {
+                crate::layout::kill(&mut layout, &ModuleId::editor(), reopen, frame)
+            })?
+        };
+        let ended = HostEvent::SurfaceEnded {
+            win: self.win,
+            module: ModuleId::editor(),
+            why: if reopen == Reopen::Never {
+                Ended::Retired
+            } else {
+                Ended::Killed { reopen }
+            },
+        };
+        self.w.lifecycle.record_event(self.win, &ended);
+        self.w
+            .changed_with_focus(self.win, next.map(|next| (next, vec![])), self.batch);
+        super::focus::modules_changed(self.w, self.win, self.batch);
+        Ok(())
+    }
+}
+
 /// How far the window's overlay labels sit from the edge they are drawn over: the toast always, and
 /// this prompt at its corner when the top bar is hidden (Immersive). One value, so the two stay aligned.
 pub const TOAST_MARGIN: i32 = 8;
@@ -70,6 +921,7 @@ pub const TOAST_MARGIN: i32 = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKey {
     Yes,
+    Move,
     No,
     Ignore,
 }
@@ -80,9 +932,11 @@ pub fn runs_decline_hook(answer: PromptKey, closes_window: bool) -> bool {
 }
 
 /// A bare modifier waits; either case of y confirms, regardless of its modifiers.
-pub fn prompt_key(press: &KeyPress, is_modifier: bool) -> PromptKey {
+pub fn prompt_key(press: &KeyPress, is_modifier: bool, offers_move: bool) -> PromptKey {
     if is_modifier {
         PromptKey::Ignore
+    } else if offers_move && matches!(press.key, Some(KeyName::Char('m' | 'M'))) {
+        PromptKey::Move
     } else if matches!(press.key, Some(KeyName::Char('y' | 'Y'))) {
         PromptKey::Yes
     } else {
@@ -98,114 +952,6 @@ pub fn prompt_origin(bar_shown: bool, strip_x: i32, bar_height: i32, label_heigh
         (strip_x.max(0), ((bar_height - label_height) / 2).max(0))
     } else {
         (TOAST_MARGIN, TOAST_MARGIN)
-    }
-}
-
-/// The prompt state is separate from its label so callbacks can be checked without a display.
-#[derive(Default)]
-pub struct PromptState {
-    open: Cell<bool>,
-    confirmed: Cell<bool>,
-    /// What `y` runs; taken when the prompt closes either way.
-    on_yes: RefCell<Option<Box<dyn FnOnce()>>>,
-    /// The open prompt is the window close's: `y` sets `confirmed` before it closes again.
-    closes_window: Cell<bool>,
-    /// Runs when the window close's own question is answered with anything but `y`: the window
-    /// stays, and what the close was about to end may already be gone.
-    on_window_close_declined: RefCell<Option<Rc<dyn Fn()>>>,
-    /// The controller's question shows on the same overlay instead: its keys are the controller's to answer.
-    model_open: Cell<bool>,
-}
-
-impl PromptState {
-    /// Whether a yes has confirmed the window close.
-    pub fn confirmed(&self) -> bool {
-        self.confirmed.get()
-    }
-
-    /// Changes the confirmation when a close is handed to or returned from the editor.
-    pub fn set_confirmed(&self, confirmed: bool) {
-        self.confirmed.set(confirmed);
-    }
-
-    /// Registers the callback for a declined window close.
-    pub fn connect_window_close_declined(&self, hook: impl Fn() + 'static) {
-        *self.on_window_close_declined.borrow_mut() = Some(Rc::new(hook));
-    }
-
-    /// Opens the prompt, replacing one already open: `y` runs `on_yes`, and `closes_window` marks it
-    /// as the window close's own question. `true` when it replaced the controller's question, which the caller
-    /// must withdraw in the controller too: left pending there, a later key would answer a question no longer
-    /// on screen.
-    #[must_use = "a replaced controller question must be withdrawn in the controller"]
-    pub fn open(&self, on_yes: Box<dyn FnOnce()>, closes_window: bool) -> bool {
-        *self.on_yes.borrow_mut() = Some(on_yes);
-        self.closes_window.set(closes_window);
-        self.open.set(true);
-        self.model_open.replace(false)
-    }
-
-    /// The controller's question shows, replacing this prompt's own if one is open: that one closes unanswered,
-    /// running nothing `y` would. When it was the window close's, the window stays as a `no` would have left it,
-    /// so the decline hook is returned for the caller to run once nothing is being applied.
-    pub fn show_model(&self) -> Option<Rc<dyn Fn()>> {
-        self.model_open.set(true);
-        let was_open = self.open.replace(false);
-        self.on_yes.borrow_mut().take();
-        if was_open && self.closes_window.get() {
-            self.on_window_close_declined.borrow().clone()
-        } else {
-            None
-        }
-    }
-
-    /// The controller's question is answered or gone: `true` when nothing else shows, so the overlay hides.
-    pub fn hide_model(&self) -> bool {
-        self.model_open.set(false);
-        !self.open.get()
-    }
-
-    /// Whether the controller's question is the one showing.
-    pub fn model_open(&self) -> bool {
-        self.model_open.get()
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.open.get()
-    }
-
-    /// `answer` while the prompt is open. `false`, changing nothing, when it is not open or the key
-    /// is a bare modifier: the key goes on. Otherwise the prompt closes -- `hide` runs first, since
-    /// what runs next may ask again -- and `y` runs what was asked (confirming a window close first),
-    /// anything else cancels it and, for the window close's own question only, runs the decline hook.
-    pub fn answer(&self, answer: PromptKey, hide: impl FnOnce()) -> bool {
-        if !self.open.get() || answer == PromptKey::Ignore {
-            return false;
-        }
-        self.open.set(false);
-        hide();
-        // Taken out before anything runs: what runs may ask again.
-        let on_yes = self.on_yes.borrow_mut().take();
-        match answer {
-            PromptKey::Yes => {
-                if self.closes_window.get() {
-                    self.confirmed.set(true);
-                }
-                if let Some(on_yes) = on_yes {
-                    on_yes();
-                }
-            }
-            PromptKey::No | PromptKey::Ignore => {
-                if runs_decline_hook(answer, self.closes_window.get()) {
-                    // Cloned out first: the hook changes the layout, which may ask again.
-                    let declined = self.on_window_close_declined.borrow().clone();
-                    if let Some(declined) = declined {
-                        declined();
-                    }
-                }
-            }
-        }
-        true
     }
 }
 
@@ -308,7 +1054,7 @@ pub fn prompt_closing_tab(
                 consequences.push(format!("{background} with background tasks"));
             }
         }
-        ModuleKind::Editor => consequences.push("nvim cannot be reopened in this window".to_string()),
+        ModuleKind::Editor => {}
         ModuleKind::Terminal | ModuleKind::Canvas | ModuleKind::LuaWebview => {}
     }
     if consequences.is_empty() {
@@ -331,7 +1077,7 @@ pub enum EditorQuit {
 /// (the answer records how nvim is taking it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asked {
-    /// Bumped by `main.rs` before each send, so a cancel's own generation can be told apart from a
+    /// Bumped by the quit flow before each send, so a cancel's own generation can be told apart from a
     /// later, different quit of the same editor ([`clear_if_cancelled`]).
     pub generation: u32,
     /// What nvim's exit then does.
@@ -377,11 +1123,11 @@ pub fn clear_if_cancelled(quitting: &mut QuitInFlight, generation: u32) -> Optio
     None
 }
 
-/// What `main.rs`'s `ask_nvim_to_quit` does with the editor before nvim draws its prompt in it.
+/// What the quit flow does with the editor before nvim draws its prompt in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reveal {
     /// Not on screen (hidden, zoomed away, or on a tab its container does not draw): shown, which
-    /// ends a zoom and, for a tab, chooses it (`main.rs`'s `ShellQuitHost::show_editor`).
+    /// ends a zoom and, for a tab, chooses it (the quit flow's `QuitWorld::show_editor`).
     /// `Layout::is_visible`, not `is_shown`, which ignores a zoom and a tab -- a close with the agent
     /// zoomed left nvim's prompt waiting unseen while the editor took the keys, and the next `n` or
     /// `d` answered it blind.
@@ -417,7 +1163,7 @@ pub enum NvimState {
     /// nvim's loop has not answered for [`NVIM_QUIT_PATIENCE`]: stuck (a Lua busy loop, a stopped
     /// process), or waiting on an external command (`system()`, `:!`, a formatter a save hook runs),
     /// during which nvim answers nothing (see [`NvimState::Busy`]). A second request then ends it
-    /// (`editor_quit`'s `QuitHost::end_nvim`: SIGTERM and stdin closed, SIGKILL by pid after the
+    /// ([`EditorCall::End`]: SIGTERM and stdin closed, SIGKILL by pid after the
     /// patience), and [`not_answering_text`] says so.
     NotAnswering,
     /// Its `:confirm` dialog is up (`nvim_get_mode` says `r?`).
@@ -515,8 +1261,8 @@ pub fn not_answering_text(quit: &EditorQuit) -> &'static str {
     }
 }
 
-/// Whether a declined window close retires the editor: only once nvim has exited, and only
-/// if it is not retired already. A close declined while nvim runs leaves a working editor.
+/// Whether a declined window close ends the editor in place: only once nvim has exited, and only
+/// if it is not ended already. A close declined while nvim runs leaves a working editor.
 pub fn retire_on_declined_close(nvim_exited: bool, editor_gone: bool) -> bool {
     nvim_exited && !editor_gone
 }
@@ -551,7 +1297,7 @@ pub fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
         // workspace, its page waits idle under its id, and its number is free for the next new view.
         ModuleKind::Agent if id.number() >= 2 => Reopen::Remove,
         ModuleKind::Agent | ModuleKind::Canvas => Reopen::InPlace,
-        ModuleKind::Editor => Reopen::Never,
+        ModuleKind::Editor => Reopen::InPlace,
     }
 }
 
@@ -566,6 +1312,15 @@ mod tests {
         wm::{KeyPress, Mods},
     };
 
+    /// The keys leave a failed editor only if it held them.
+    #[test]
+    fn the_keys_leave_a_failed_editor_only_if_it_held_them() {
+        assert_eq!(keys_after_failure(Some(&ModuleId::editor())), KeysAfterFailure::ToChat);
+        assert_eq!(keys_after_failure(Some(&ModuleId::agent())), KeysAfterFailure::Stay);
+        assert_eq!(keys_after_failure(Some(&ModuleId::terminal())), KeysAfterFailure::Stay);
+        assert_eq!(keys_after_failure(None), KeysAfterFailure::Stay);
+    }
+
     fn press(key: Option<KeyName>) -> KeyPress {
         KeyPress {
             keycode: 42,
@@ -579,16 +1334,35 @@ mod tests {
 
     #[test]
     fn y_confirms_any_other_key_cancels_and_a_bare_modifier_waits() {
-        assert_eq!(prompt_key(&press(Some(KeyName::Char('y'))), false), PromptKey::Yes);
-        assert_eq!(prompt_key(&press(Some(KeyName::Char('Y'))), false), PromptKey::Yes);
-        assert_eq!(prompt_key(&press(Some(KeyName::Char('n'))), false), PromptKey::No);
-        assert_eq!(prompt_key(&press(None), false), PromptKey::No);
         assert_eq!(
-            prompt_key(&press(Some(KeyName::Enter)), false),
+            prompt_key(&press(Some(KeyName::Char('y'))), false, false),
+            PromptKey::Yes
+        );
+        assert_eq!(
+            prompt_key(&press(Some(KeyName::Char('Y'))), false, false),
+            PromptKey::Yes
+        );
+        assert_eq!(
+            prompt_key(&press(Some(KeyName::Char('n'))), false, false),
+            PromptKey::No
+        );
+        assert_eq!(prompt_key(&press(None), false, false), PromptKey::No);
+        assert_eq!(
+            prompt_key(&press(Some(KeyName::Enter)), false, false),
             PromptKey::No,
             "Enter is not yes"
         );
-        assert_eq!(prompt_key(&press(None), true), PromptKey::Ignore);
+        assert_eq!(prompt_key(&press(None), true, false), PromptKey::Ignore);
+        for key in ['m', 'M'] {
+            assert_eq!(
+                prompt_key(&press(Some(KeyName::Char(key))), false, true),
+                PromptKey::Move
+            );
+            assert_eq!(
+                prompt_key(&press(Some(KeyName::Char(key))), false, false),
+                PromptKey::No
+            );
+        }
     }
 
     /// Only a `No` to the window close's own question reaches its decline hook -- not a `y`,
@@ -599,103 +1373,6 @@ mod tests {
         assert!(!runs_decline_hook(PromptKey::Yes, true));
         assert!(!runs_decline_hook(PromptKey::Ignore, true));
         assert!(!runs_decline_hook(PromptKey::No, false));
-    }
-
-    /// Answers hide the prompt before running a callback, which may open another prompt.
-    #[test]
-    fn the_prompts_answers_run_what_they_say() {
-        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
-        let state = PromptState::default();
-        {
-            let log = log.clone();
-            *state.on_window_close_declined.borrow_mut() = Some(Rc::new(move || log.borrow_mut().push("declined")));
-        }
-        let on_yes = |log: &Rc<RefCell<Vec<&'static str>>>| -> Box<dyn FnOnce()> {
-            let log = log.clone();
-            Box::new(move || log.borrow_mut().push("yes"))
-        };
-        let hide = |log: &Rc<RefCell<Vec<&'static str>>>| {
-            let log = log.clone();
-            move || log.borrow_mut().push("hide")
-        };
-
-        assert!(
-            !state.answer(PromptKey::No, hide(&log)),
-            "no prompt open: the key goes on"
-        );
-        assert!(log.borrow().is_empty());
-
-        assert!(!state.open(on_yes(&log), true));
-        assert!(!state.answer(PromptKey::Ignore, hide(&log)), "a bare modifier waits");
-        assert!(state.is_open());
-        assert!(state.answer(PromptKey::No, hide(&log)));
-        assert_eq!(*log.borrow(), ["hide", "declined"]);
-        assert!(!state.confirmed.get() && !state.is_open());
-
-        log.borrow_mut().clear();
-        assert!(!state.open(on_yes(&log), true));
-        assert!(state.answer(PromptKey::Yes, hide(&log)));
-        assert_eq!(*log.borrow(), ["hide", "yes"]);
-        assert!(state.confirmed.get(), "the window close's y confirms it");
-
-        log.borrow_mut().clear();
-        state.confirmed.set(false);
-        assert!(!state.open(on_yes(&log), false));
-        assert!(state.answer(PromptKey::No, hide(&log)));
-        assert_eq!(*log.borrow(), ["hide"], "prefix x's question declined runs no hook");
-        assert!(!state.open(on_yes(&log), false));
-        assert!(state.answer(PromptKey::Yes, hide(&log)));
-        assert!(!state.confirmed.get(), "and its y confirms no window close");
-    }
-
-    /// The overlay holds one question at a time, the newest: the shell's own over the controller's says the
-    /// controller's must be withdrawn, and the controller's over the shell's closes the shell's unanswered, handing
-    /// back the decline hook only for a window close, since its window stays.
-    #[test]
-    fn the_newest_question_replaces_the_one_on_the_overlay() {
-        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
-        let state = PromptState::default();
-        {
-            let log = log.clone();
-            state.connect_window_close_declined(move || log.borrow_mut().push("declined"));
-        }
-        let on_yes = |log: &Rc<RefCell<Vec<&'static str>>>| -> Box<dyn FnOnce()> {
-            let log = log.clone();
-            Box::new(move || log.borrow_mut().push("yes"))
-        };
-
-        assert!(state.show_model().is_none(), "nothing of the shell's was open");
-        assert!(state.model_open());
-        assert!(
-            state.open(on_yes(&log), true),
-            "the window close over the controller's question withdraws it"
-        );
-        assert!(!state.model_open() && state.is_open());
-        assert!(
-            !state.hide_model(),
-            "the controller's going leaves the window close showing"
-        );
-        assert!(state.is_open());
-
-        let declined = state
-            .show_model()
-            .expect("a replaced window close stays, as a no leaves it");
-        assert!(!state.is_open() && state.model_open());
-        assert!(
-            !state.answer(PromptKey::Yes, || {}),
-            "the replaced question takes no key"
-        );
-        declined();
-        assert_eq!(*log.borrow(), ["declined"], "its y never runs");
-        assert!(state.hide_model(), "nothing else shows: the overlay hides");
-
-        log.borrow_mut().clear();
-        assert!(!state.open(on_yes(&log), false));
-        assert!(
-            state.show_model().is_none(),
-            "a replaced kill question has no decline hook"
-        );
-        assert!(log.borrow().is_empty());
     }
 
     /// The prompt stays in the strip or at the corner when the bar is hidden.
@@ -714,7 +1391,7 @@ mod tests {
         press.mods.ctrl = true;
         press.mods.shift = true;
         assert_eq!(press.press, Press::Other);
-        assert_eq!(prompt_key(&press, false), PromptKey::Yes);
+        assert_eq!(prompt_key(&press, false, false), PromptKey::Yes);
     }
 }
 
@@ -1047,10 +1724,10 @@ mod kill_tests {
     }
 
     #[test]
-    fn the_editors_prompt_says_it_will_not_come_back() {
+    fn the_editors_prompt_is_tmuxs_plain_kill_pane_prompt() {
         assert_eq!(
             prompt(&ModuleId::editor(), "editor", KillScope::Module, 5, 5, 0, 0),
-            "kill-pane editor? nvim cannot be reopened in this window (y/n)"
+            "kill-pane editor? (y/n)"
         );
     }
 
@@ -1131,7 +1808,7 @@ mod kill_tests {
         );
         assert_eq!(reopen(&ModuleId::lua("unknown"), &decls), Reopen::InPlace);
         assert_eq!(reopen(&ModuleId::agent(), &decls), Reopen::InPlace);
-        assert_eq!(reopen(&ModuleId::editor(), &decls), Reopen::Never);
+        assert_eq!(reopen(&ModuleId::editor(), &decls), Reopen::InPlace);
     }
 
     #[test]

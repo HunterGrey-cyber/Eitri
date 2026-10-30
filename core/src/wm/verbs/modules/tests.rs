@@ -94,6 +94,11 @@ struct Rig {
 }
 
 fn driven_without(layout: Layout, without: &[ModuleId]) -> Rig {
+    driven_as(layout, without, WindowRole::Main, EditorPresence::Owned)
+}
+
+/// [`driven_without`], the window opened in `role` with `presence`.
+fn driven_as(layout: Layout, without: &[ModuleId], role: WindowRole, presence: EditorPresence) -> Rig {
     let host = FakeHost::new();
     host.set_grid_size(GRID);
     let scheduler = FakeScheduler::new();
@@ -113,8 +118,8 @@ fn driven_without(layout: Layout, without: &[ModuleId]) -> Rig {
     controller.open_window(
         WIN,
         WindowSpec {
-            role: WindowRole::Main,
-            presence: EditorPresence::Owned,
+            role,
+            presence,
             title: "project".into(),
         },
         WindowParts {
@@ -198,16 +203,6 @@ impl Rig {
         self.applied_since(mark).into_iter().map(|(op, _)| op).collect()
     }
 
-    fn shell_verbs_since(&self, mark: usize) -> Vec<ShellVerb> {
-        self.host.log()[mark..]
-            .iter()
-            .filter_map(|logged| match logged {
-                Logged::ShellVerb(verb) => Some(verb.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The host reports `module` holds the keys, outside any batch.
     fn native(&self, module: &ModuleId) {
         self.host.post(HostEvent::NativeFocus {
@@ -221,6 +216,23 @@ impl Rig {
 
     fn run(&self, action: Action, origin: Origin) {
         self.driver.run(WIN, action, origin);
+    }
+
+    /// Drives the named-instance creation directly so its refusal text is checked independently of float gates.
+    fn make_scratch(&self, id: &ModuleId) {
+        self.driver.test_batch(|c| {
+            let (reads, keymap, setup) = c.module_parts(WIN);
+            let cx = Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            let mut batch = Batch::default();
+            scratch_new(c.window_mut(WIN).unwrap(), &cx, WIN, id, &mut batch);
+            // Direct family calls leave chrome dirty; a wake settles it before the host draws the batch.
+            batch.append(c.handle(HostEvent::Wake));
+            batch
+        });
     }
 
     /// A key pressed at the window stage and released.
@@ -281,22 +293,24 @@ fn grabs_of(ops: &[HostOp], module: &ModuleId) -> usize {
         .count()
 }
 
-/// `prefix x` on the only module on screen is the window close, whose question the shell still asks: the runner
-/// hands it back as the shell's verb and asks nothing itself.
+/// The last module's question belongs to the window close, so its answer can also confirm the window's work.
 #[test]
 fn prefix_x_on_the_last_module_asks_the_window_close() {
     let r = driven(Layout::new(Node::Leaf(agent()), agent()).unwrap());
     let mark = r.mark();
     r.run(Action::ModuleKill, Origin::Key { keycode: K1 });
     assert_eq!(
-        r.shell_verbs_since(mark),
-        vec![ShellVerb {
-            win: WIN,
-            call: ShellCall::Action(Action::ModuleKill),
-            keycode: K1,
-        }]
+        r.chrome().prompt,
+        Some(crate::wm::chrome::Prompt {
+            text: "kill-pane agent? closes Eitri (y/n)".into(),
+            closes_window: true,
+            offers_move: false,
+        })
     );
-    assert_eq!(r.chrome().prompt, None, "the window close's prompt is the shell's");
+    assert!(matches!(
+        r.ops_since(mark).as_slice(),
+        [HostOp::Chrome { win: WIN, .. }]
+    ));
     assert!(r.layout.borrow().is_shown(&agent()));
 }
 
@@ -310,29 +324,54 @@ fn the_answer_gate_refuses_while_a_float_covers_the_chat() {
     let r = driven(agent_under(&notes, false, editor()));
     let sink = super::super::key_text(&keymap, &Action::FloatToggle);
     let text = feedback::covered_text("agent", "notes", &sink, false);
-    assert_eq!(r.driver.query(|c| c.answer_gate(WIN, ViewId::BASE)), Err(text.clone()));
+    assert_eq!(
+        r.driver
+            .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                .answer_gate(WIN, ViewId::BASE)),
+        Err(text.clone())
+    );
 
     let scratch = driven(agent_under(&notes, true, editor()));
     let stow = super::super::key_text(&keymap, &Action::ScratchpadShow { module: None });
     assert_eq!(
-        scratch.driver.query(|c| c.answer_gate(WIN, ViewId::BASE)),
+        scratch
+            .driver
+            .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                .answer_gate(WIN, ViewId::BASE)),
         Err(feedback::covered_text("agent", "notes", &stow, true)),
         "a scratch float is stowed, not sunk"
     );
 
     let clear = driven(three(editor()));
-    assert_eq!(clear.driver.query(|c| c.answer_gate(WIN, ViewId::BASE)), Ok(()));
+    assert_eq!(
+        clear
+            .driver
+            .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                .answer_gate(WIN, ViewId::BASE)),
+        Ok(())
+    );
     {
         let _writing = clear.layout.borrow_mut();
         assert_eq!(
-            clear.driver.query(|c| c.answer_gate(WIN, ViewId::BASE)),
+            clear
+                .driver
+                .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                    .answer_gate(WIN, ViewId::BASE)),
             Err(feedback::LAYOUT_CHANGING_TEXT.to_string()),
             "a layout being written cannot be judged"
         );
     }
-    assert!(clear.driver.query(|c| c.answer_gate(WinId(9), ViewId::BASE)).is_err());
+    assert!(clear
+        .driver
+        .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+            .answer_gate(WinId(9), ViewId::BASE))
+        .is_err());
     let absent = ViewId::of_module(&agent2()).unwrap();
-    assert!(clear.driver.query(move |c| c.answer_gate(WIN, absent)).is_err());
+    assert!(clear
+        .driver
+        .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), move |c| c
+            .answer_gate(WIN, absent))
+        .is_err());
 
     // The toast is drawn from the model, by the event the shell posts for the refusal.
     let flashes = r.chrome().top_bar.flash;
@@ -600,7 +639,6 @@ fn a_split_key_on_an_existing_module_places_it_and_arrives_only_if_the_grab_took
             Nav::Module(agent()),
             "placed right of the module that had the keys"
         );
-        assert!(r.shell_verbs_since(0).is_empty());
     }
 }
 
@@ -629,30 +667,6 @@ fn the_kill_prompt_takes_y_before_the_prefix_and_any_other_key_closes_it() {
         win: WIN,
         module: terminal(),
     })));
-}
-
-/// The shell's own y/n replacing the kill's on the overlay withdraws the kill's: a `y` typed afterwards is not taken
-/// as its answer, and nothing is killed.
-#[test]
-fn a_withdrawn_kill_prompt_takes_no_later_key() {
-    let r = driven(three(terminal()));
-    r.run(Action::ModuleKill, Origin::Key { keycode: K1 });
-    assert!(r.chrome().prompt.is_some(), "the y/n is asked");
-    r.host.post(HostEvent::PromptWithdrawn { win: WIN });
-    assert_eq!(r.chrome().prompt, None, "the question is taken down");
-    let mark = r.mark();
-    assert_ne!(
-        r.window_key(key("y", K2)),
-        Verdict::Consumed,
-        "no question waits for the y"
-    );
-    assert!(r.layout.borrow().is_shown(&terminal()), "nothing was killed");
-    assert!(
-        !r.ops_since(mark)
-            .iter()
-            .any(|op| matches!(op, HostOp::Terminal(TermOp::HangUp { .. }))),
-        "no shell was hung up"
-    );
 }
 
 /// A terminal number killed before has its host left idle: `instance.new` takes that number again with no create,
@@ -1040,20 +1054,35 @@ fn each_directory_read_answers_its_own_split_whatever_order_they_come_back_in() 
 }
 
 /// A covered chat revealed: the scratch float over it that does not hold the keys is stowed, the keys staying where
-/// they are, and nothing is left to refuse; a plain float stays, and its refusal's text is returned.
+/// they are, and the answer gate allows answers; a plain float stays, and the gate gives its refusal's text.
 #[test]
 fn a_reveal_stows_the_scratch_floats_over_the_chat_and_names_what_stays() {
     let notes = ModuleId::lua("notes");
     let r = driven(agent_under(&notes, true, editor()));
-    assert_eq!(r.driver.reveal_chat(WIN, ViewId::BASE), None);
+    r.host.post(HostEvent::Chat(ChatEvent::Covered {
+        win: WIN,
+        view: ViewId::BASE,
+    }));
+    assert_eq!(
+        r.driver
+            .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                .answer_gate(WIN, ViewId::BASE)),
+        Ok(())
+    );
     assert!(!r.layout.borrow().is_shown(&notes), "stowed");
     assert_eq!(r.layout.borrow().focus(), &editor());
 
     let r = driven(agent_under(&notes, false, editor()));
     let sink = super::super::key_text(&Keymap::defaults(), &Action::FloatToggle);
+    r.host.post(HostEvent::Chat(ChatEvent::Covered {
+        win: WIN,
+        view: ViewId::BASE,
+    }));
     assert_eq!(
-        r.driver.reveal_chat(WIN, ViewId::BASE),
-        Some(feedback::covered_text("agent", "notes", &sink, false))
+        r.driver
+            .query_or(Err(crate::wm::feedback::LAYOUT_CHANGING_TEXT.to_string()), |c| c
+                .answer_gate(WIN, ViewId::BASE)),
+        Err(feedback::covered_text("agent", "notes", &sink, false))
     );
     assert!(r.layout.borrow().is_shown(&notes), "a reveal never sinks a plain float");
 }
@@ -1253,7 +1282,7 @@ fn prefix_a_picks_the_view_with_the_keys_before_the_oldest_card() {
     );
 }
 
-// --- The new instances the shell's remaining arms ask for, and the kill with no y/n.
+// --- Named scratch instances, a broken-out chat view, and the kill with no y/n.
 
 fn terminal3() -> ModuleId {
     ModuleId::instance(ModuleKind::Terminal, 3).unwrap()
@@ -1266,7 +1295,7 @@ fn terminal3() -> ModuleId {
 fn a_missing_scratchpad_instance_is_made_into_the_scratchpad_with_the_keys() {
     let r = driven(three(editor()));
     let mark = r.mark();
-    r.driver.scratch_new(WIN, &terminal3());
+    r.make_scratch(&terminal3());
     let ops = r.ops_since(mark);
     let create = ops
         .iter()
@@ -1307,7 +1336,7 @@ fn a_scratchpad_instance_is_refused_for_a_number_already_held() {
         crate::layout::place(two, &terminal3(), &editor(), Axis::Row).unwrap();
     }
     let mark = r.mark();
-    r.driver.scratch_new(WIN, &terminal3());
+    r.make_scratch(&terminal3());
     assert!(!r
         .ops_since(mark)
         .iter()
@@ -1317,7 +1346,7 @@ fn a_scratchpad_instance_is_refused_for_a_number_already_held() {
         vec!["terminal#3: another workspace holds it".to_string()]
     );
     let mark = r.mark();
-    r.driver.scratch_new(WIN, &ModuleId::lua("notes"));
+    r.make_scratch(&ModuleId::lua("notes"));
     assert_eq!(
         r.refusals_since(mark),
         vec![feedback::not_in_window_text(&ModuleId::lua("notes"))]
@@ -1329,8 +1358,10 @@ fn a_scratchpad_instance_is_refused_for_a_number_already_held() {
 #[test]
 fn a_tab_break_makes_a_view_that_takes_the_base_views_tab() {
     let r = driven(three(agent()));
+    r.host.set_can_break_out(Ok(()));
+    r.native(&agent());
     let mark = r.mark();
-    r.driver.tab_break(WIN);
+    r.run(Action::TabBreak, Origin::Key { keycode: 0 });
     let ops = r.ops_since(mark);
     let view = ViewId::of_module(&agent2()).unwrap();
     assert!(
@@ -1477,4 +1508,203 @@ fn killing_an_agent_view_with_background_shells_asks_and_names_them() {
         r.window_key(key("n", K2));
         assert!(r.layout.borrow().is_shown(&chat));
     }
+}
+
+#[test]
+fn new_instances_skip_the_other_windows_numbers_and_refuse_when_none_is_free() {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(three(editor()));
+    r.driver.attach_peer(WIN, PeerId(2), FakePeerPort::new());
+    let held = |last| {
+        (2..=last)
+            .map(|n| ModuleId::instance(ModuleKind::Terminal, n).unwrap())
+            .collect()
+    };
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(2),
+        ids: held(5),
+    }));
+    let mark = r.mark();
+    r.run(
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        Origin::Key { keycode: K1 },
+    );
+    assert!(r
+        .ops_since(mark)
+        .iter()
+        .any(|op| matches!(op, HostOp::CreateSurface { module, .. } if module.to_string() == "terminal#6")));
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(2),
+        ids: held(9),
+    }));
+    let mark = r.mark();
+    r.run(
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        Origin::Key { keycode: K1 },
+    );
+    assert_eq!(
+        r.refusals_since(mark),
+        vec!["no free terminal number: the two windows share terminal#2 to terminal#9"]
+    );
+    r.driver.detach_peer(WIN);
+    let r = driven(three(editor()));
+    for _ in 2..=9 {
+        r.run(
+            Action::InstanceNew {
+                kind: ModuleKind::Terminal,
+            },
+            Origin::Key { keycode: K1 },
+        );
+    }
+    let mark = r.mark();
+    r.run(
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        Origin::Key { keycode: K1 },
+    );
+    assert_eq!(r.refusals_since(mark), vec!["at most 9 terminals"]);
+}
+
+#[test]
+fn a_named_scratchpad_instance_cannot_take_a_number_held_by_the_peer() {
+    let r = driven(three(editor()));
+    r.driver
+        .attach_peer(WIN, PeerId(2), crate::wm::fake::FakePeerPort::new());
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(2),
+        ids: vec![terminal2()],
+    }));
+    let mark = r.mark();
+    r.make_scratch(&terminal2());
+    assert!(!r
+        .ops_since(mark)
+        .iter()
+        .any(|op| matches!(op, HostOp::CreateSurface { .. })));
+    assert_eq!(r.refusals_since(mark), vec!["terminal#2: the other window holds it"]);
+}
+
+/// A window 2 left without its editor window: the editor key asks whether to start it. `n` starts nothing, `y`
+/// asks the host to start it and a refusal says why, and once the editor window is linked again the key raises it.
+#[test]
+fn the_editor_key_in_an_unlinked_window_2_asks_to_start_the_editor() {
+    let layout = Layout::new(
+        Node::split(Axis::Row, 0.5, Node::Leaf(agent()), Node::Leaf(terminal())),
+        agent(),
+    )
+    .unwrap();
+    let r = driven_as(
+        layout,
+        &[],
+        WindowRole::Linked { side: LinkSide::Second },
+        EditorPresence::None,
+    );
+    let start = HostOp::StartEditorWindow { win: WIN };
+
+    r.run(Action::Module(editor()), Origin::Key { keycode: K1 });
+    let prompt = r.chrome().prompt.expect("the editor key asks");
+    assert_eq!(prompt.text, "start the editor? (y/n)");
+    assert!(!prompt.closes_window, "the window stays whatever the answer");
+    let mark = r.mark();
+    assert_eq!(r.window_key(key("n", K2)), Verdict::Consumed);
+    assert_eq!(r.chrome().prompt, None);
+    assert!(!r.ops_since(mark).contains(&start), "n starts nothing");
+
+    r.run(Action::Module(editor()), Origin::Key { keycode: K1 });
+    let mark = r.mark();
+    assert_eq!(r.window_key(key("y", K2)), Verdict::Consumed);
+    assert_eq!(r.chrome().prompt, None);
+    assert_eq!(
+        r.ops_since(mark).iter().filter(|op| **op == start).count(),
+        1,
+        "y asks for the editor window once"
+    );
+
+    let mark = r.mark();
+    r.host.post(HostEvent::Refused {
+        what: OpTag::StartEditorWindow,
+        why: "eitri could not be started".into(),
+        surface: None,
+    });
+    assert_eq!(r.refusals_since(mark), vec!["eitri could not be started".to_string()]);
+
+    r.driver
+        .attach_peer(WIN, PeerId(1), crate::wm::fake::FakePeerPort::new());
+    let mark = r.mark();
+    r.run(Action::Module(editor()), Origin::Key { keycode: K1 });
+    assert_eq!(r.chrome().prompt, None, "nothing is asked with the editor window there");
+    let ops = r.ops_since(mark);
+    assert!(ops.contains(&HostOp::RaisePeer {
+        win: WIN,
+        peer: PeerId(1)
+    }));
+    assert!(!ops.contains(&start));
+}
+
+/// A start-hidden plugin's module opens by the open rules, its own declared rule where none names it, with the
+/// keys as the way it was opened asks: a module key gives them, a show from nvim leaves them, and anything
+/// else follows the rule's own `focus`.
+#[test]
+fn a_plugin_module_opens_by_its_own_rule_with_the_keys_as_asked() {
+    use crate::layout::rules::{At, OpenRule, OpenRules, RuleTarget};
+    use crate::layout::{Direction, Placement};
+    let id = ModuleId::lua("preview");
+    let own = OpenRule {
+        at: Some(At::Beside(Direction::Right)),
+        focus: false,
+        ..OpenRule::default()
+    };
+    let keymap = crate::keymap::Keymap::defaults();
+    let with = |rules: OpenRules, own: Option<OpenRule>, take: Option<bool>| {
+        let setup = ModuleSetup {
+            rules,
+            start_hidden: vec![(id.clone(), own)],
+            ..ModuleSetup::default()
+        };
+        let cx = Cx {
+            reads: &NoReads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        plugin_open_rule(&cx, &id, take)
+    };
+    let none = OpenRules::default;
+    let rule = with(none(), Some(own.clone()), Some(true));
+    assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Right)), true));
+    let rule = with(none(), Some(own.clone()), Some(false));
+    assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Right)), false));
+    assert_eq!(with(none(), Some(own.clone()), None), own, "the rule's own focus");
+    // No declared rule: a Lua panel's built-in place, the side.
+    let rule = with(none(), None, None);
+    assert_eq!(
+        (rule.at, rule.focus),
+        (Some(At::Placement(Placement::RightOfRoot)), true)
+    );
+
+    let rules = || {
+        let mut rules = OpenRules::default();
+        rules
+            .add(
+                RuleTarget::Module(id.clone()),
+                OpenRule {
+                    at: Some(At::Beside(Direction::Down)),
+                    focus: true,
+                    ..OpenRule::default()
+                },
+            )
+            .unwrap();
+        rules
+    };
+    let rule = with(rules(), Some(own.clone()), None);
+    assert_eq!(
+        (rule.at, rule.focus),
+        (Some(At::Beside(Direction::Down)), true),
+        "a rule for the module wins"
+    );
+    let rule = with(rules(), Some(own), Some(false));
+    assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Down)), false));
 }

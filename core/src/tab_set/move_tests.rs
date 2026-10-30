@@ -1874,3 +1874,247 @@ fn a_live_move_keeps_the_opening_prompt_for_a_later_cli_cycle() {
     shut_down(&mut source);
     shut_down(&mut destination);
 }
+
+#[test]
+fn an_arrivals_presence_is_held_under_the_id_its_tab_then_takes() {
+    let scratch = scratch("move-arrival-presence");
+    let dir = scratch.join("project");
+    let review_dir = scratch.join("state/eitri/review/0123456789abcdef");
+    let mut source = set();
+    let (provider, tab) = live_tab(&mut source, &dir);
+    provider.queue_all(vec![opened(&dir), started("t1")]);
+    pump_until(&mut source, &dir, "the running turn", |s| {
+        s.get(tab).is_some_and(|t| t.turn_running())
+    });
+
+    let mut dest = set();
+    let pid = 4250;
+    holding_presence(&mut dest, &review_dir, pid);
+    let answer = dest
+        .hold_arrival("sess-move", 1)
+        .expect("a window holding its presence answers");
+    let held = answer
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the presence thread answers");
+    assert_eq!(held, crate::turn_review::Held::Yes);
+    let files = || -> Vec<String> {
+        std::fs::read_dir(review_dir.join("running"))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let held_files = files();
+    assert_eq!(held_files.len(), 1, "one file for the arriving turn: {held_files:?}");
+    assert!(
+        dest.presence_guard().unwrap().check() == Err(Blocked::TurnRunningHere),
+        "the window's own reverts wait for the arriving turn"
+    );
+
+    let arrived = moved(&mut source, tab, &mut dest, provider.clone(), ViewId::BASE);
+    assert_eq!(
+        held_files,
+        vec![format!("{pid}.{}", arrived.0)],
+        "the tab takes the id its arrival was held under"
+    );
+    for _ in 0..5 {
+        dest.pump(&dir, true);
+    }
+    assert_eq!(files(), held_files, "the file stays across the adoption");
+
+    // An arrival given up lets its file go.
+    let mut other = set();
+    let review_other = scratch.join("state/eitri/review/fedcba9876543210");
+    holding_presence(&mut other, &review_other, pid + 1);
+    let answer = other.hold_arrival("sess-gone", 2).unwrap();
+    assert_eq!(
+        answer.recv_timeout(Duration::from_secs(10)).unwrap(),
+        crate::turn_review::Held::Yes
+    );
+    assert!(
+        other.hold_arrival("sess-gone", 2).is_some(),
+        "the same move is held once"
+    );
+    other.drop_arrival(2);
+    until("the given-up arrival's file goes", || {
+        std::fs::read_dir(review_other.join("running"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn two_arrivals_of_one_session_id_are_held_and_given_up_apart() {
+    let scratch = scratch("move-arrivals-apart");
+    let review = scratch.join("review");
+    let mut dest = set();
+    holding_presence(&mut dest, &review, 4251);
+    for mv in [1, 2] {
+        assert_eq!(
+            dest.hold_arrival("s1", mv)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            crate::turn_review::Held::Yes
+        );
+    }
+    let second = dest.arrivals[&2].1;
+    dest.drop_arrival(1);
+    assert_eq!(
+        dest.hold_arrival("flush", 3)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap(),
+        crate::turn_review::Held::Yes
+    );
+    assert!(review.join(format!("running/4251.{}", second.0)).is_file());
+    assert_eq!(std::fs::read_dir(review.join("running")).unwrap().count(), 2);
+    drop(dest);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn adopting_one_arrival_keeps_the_hold_of_another_with_the_same_session() {
+    let scratch = scratch("move-adopt-keeps-arrival");
+    let dir = scratch.join("project");
+    let review = scratch.join("review");
+    let mut source = set();
+    let (provider, tab) = live_tab(&mut source, &dir);
+    provider.queue_all(vec![opened(&dir)]);
+    pump_until(&mut source, &dir, "the idle session", |s| {
+        s.get(tab)
+            .and_then(|t| t.live())
+            .and_then(|live| live.provider_session_id())
+            .is_some()
+    });
+    assert!(!source.get(tab).unwrap().turn_running());
+
+    let mut dest = set();
+    let guard = holding_presence(&mut dest, &review, 4252);
+    for mv in [1, 2] {
+        assert_eq!(
+            dest.hold_arrival("sess-move", mv)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            crate::turn_review::Held::Yes
+        );
+    }
+    let second = dest.arrivals[&2].1;
+    let arrived = moved(&mut source, tab, &mut dest, provider, ViewId::BASE);
+    assert!(!dest.get(arrived).unwrap().turn_running());
+    dest.drop_arrival(1);
+    assert_eq!(
+        dest.hold_arrival("flush", 3)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap(),
+        crate::turn_review::Held::Yes
+    );
+    assert!(review.join(format!("running/4252.{}", second.0)).is_file());
+    assert_eq!(std::fs::read_dir(review.join("running")).unwrap().count(), 2);
+    assert!(refuses_as_running(&guard));
+    dest.drop_arrival(3);
+    assert!(refuses_as_running(&guard), "the other arrival still blocks a revert");
+    drop(dest);
+    drop(source);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+/// A Codex or ACP tab's session lease crosses with it and, once the window that took the tab up commits the move,
+/// names that window's process, as a Claude tab's does: the rewrite belongs to the conversation, whichever agent
+/// drives it, so a window that later asks who holds the session finds the holder and not the window the tab left.
+#[test]
+fn a_moved_codex_or_acp_chats_lease_names_the_destination() {
+    for (label, agent, name) in [
+        ("lease-codex", AgentId::Codex, "codex"),
+        ("lease-acp", AgentId::Acp("gem".into()), "acp:gem"),
+    ] {
+        let scratch = scratch(label);
+        let dir = scratch.join("project");
+        let mut source = set();
+        let provider = Arc::new(ExternalRecordingProvider::named(name, true));
+        let backend = AgentBackend::start_external_with(
+            agent,
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .expect("a scripted external start succeeds");
+        let tab = source.active();
+        let t = source.get_mut(tab).unwrap();
+        t.agent = backend.agent();
+        t.backend = TabBackend::Live(backend);
+        // The start opens the session itself, as the agent's own answer to it does.
+        pump_until(&mut source, &dir, "the session opened", |s| {
+            s.get(tab).and_then(Tab::provider_session_id).is_some()
+        });
+
+        let frozen = freeze_settled(&mut source, tab).expect("the tab freezes");
+        let descriptor = source
+            .get(tab)
+            .and_then(Tab::live)
+            .expect("a frozen tab is still held")
+            .lease_descriptor()
+            .expect("its session holds a lease")
+            .unwrap();
+        let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+        let chat: FrozenChat =
+            serde_json::from_str(&serde_json::to_string(&frozen.chat.expect("a live tab's chat")).unwrap()).unwrap();
+        let cwd = chat.conversation.canonical_cwd.to_string_lossy().into_owned();
+        let session = chat.conversation.provider_session_id.clone().expect("the session's id");
+        let lease =
+            agent::lease::SessionLease::from_moved(descriptor, &chat.conversation.provider_name, &cwd, &session)
+                .expect("the descriptor is the session's own lease");
+        let path = lease.path().to_path_buf();
+        // As the file reads while the process of the window the tab left owns it.
+        std::fs::write(
+            &path,
+            r#"{"owner_pid":4194001,"instance_id":"first","started_at":"then"}"#,
+        )
+        .unwrap();
+        let owner = || -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap()["owner_pid"]
+                .clone()
+        };
+
+        let taken = Arc::new(ExternalRecordingProvider::named(name, true));
+        let backend = AgentBackend::adopt_moved(
+            chat.core,
+            chat.conversation,
+            chat.backend,
+            agent::MovedProvider {
+                agent: taken.clone(),
+                external: Some(taken),
+                lease: Some(lease),
+            },
+        )
+        .expect("the destination takes the conversation up");
+        let mut dest = set();
+        let arrived = dest.adopt_moved(record, backend, ViewId::BASE);
+        assert_eq!(
+            owner(),
+            serde_json::json!(4194001),
+            "{name}: nothing is rewritten before the commit"
+        );
+
+        dest.get_mut(arrived)
+            .and_then(Tab::live_mut)
+            .expect("the arrival is live")
+            .commit_moved()
+            .expect("the lease is rewritten");
+        assert_eq!(
+            owner(),
+            serde_json::json!(std::process::id()),
+            "{name}: the lease names the window that holds the tab now"
+        );
+        let _ = source.hand_over(tab);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}

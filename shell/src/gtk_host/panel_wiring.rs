@@ -24,12 +24,12 @@ use eitri_core::layout::Direction;
 use eitri_core::review_editor::Owner;
 use eitri_core::scratch::ScratchRequest;
 
-use crate::agent_panel::{AgentPanelHandle, HintInbound, ViewId};
+use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 14] = [
+pub(crate) const HOOKS: [&str; 15] = [
     "on_hint",
     "on_attention",
     "on_toast",
@@ -44,12 +44,14 @@ pub(crate) const HOOKS: [&str; 14] = [
     "on_keymap_closed",
     "on_show_view",
     "on_tab_verb",
+    "on_chat_move",
 ];
 
 /// The registrations the companion window leaves out. It has no tray, no chat view but the base one,
 /// no extra views and no `prefix ?` sheet of the window's own to give keys back from, so the attention,
-/// show-view, view-empty and keymap-closed hooks have nothing to act on; and with one chat view that
-/// nothing can float over, there is no covered chat for an answer gate to refuse.
+/// show-view, view-empty and keymap-closed hooks have nothing to act on; with one chat view that
+/// nothing can float over, there is no covered chat for an answer gate to refuse; and it is never one of a
+/// linked pair, so no chat moves out of it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const COMPANION_OMITS: &[&str] = &[
     "on_attention",
@@ -57,6 +59,7 @@ pub(crate) const COMPANION_OMITS: &[&str] = &[
     "on_view_empty",
     "on_keymap_closed",
     "set_answer_gate",
+    "on_chat_move",
 ];
 
 /// What the panel calls when cards arrive or clear: the window's attention before and after, and the
@@ -91,6 +94,7 @@ pub(crate) struct PanelHooks {
     pub(crate) on_keymap_closed: Option<Box<dyn Fn(u64, bool)>>,
     pub(crate) on_show_view: Option<Box<dyn Fn(ViewId)>>,
     pub(crate) on_tab_verb: Option<Box<dyn Fn(ViewId, TabAction)>>,
+    pub(crate) on_chat_move: Option<Box<dyn Fn(ChatMoveEvent)>>,
 }
 
 impl PanelHooks {
@@ -112,6 +116,7 @@ impl PanelHooks {
             self.on_keymap_closed.is_some(),
             self.on_show_view.is_some(),
             self.on_tab_verb.is_some(),
+            self.on_chat_move.is_some(),
         ];
         HOOKS
             .iter()
@@ -140,6 +145,7 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         on_keymap_closed,
         on_show_view,
         on_tab_verb,
+        on_chat_move,
     } = hooks;
     if let Some(hook) = on_hint {
         panel.on_hint(hook);
@@ -182,6 +188,9 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_tab_verb {
         panel.on_tab_verb(hook);
+    }
+    if let Some(hook) = on_chat_move {
+        panel.on_chat_move(hook);
     }
 }
 

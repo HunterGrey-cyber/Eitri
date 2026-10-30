@@ -2,30 +2,15 @@ import { createElement, Fragment } from "react";
 import type { ReactNode } from "react";
 import type { Problem } from "../problems";
 
-/** One row on the sign-column grid every item in this document renders on, as vim's sign column does.
+/** One sign-column grid for document rows. One `sign` argument supplies data and visible text,
+ *  so they cannot drift apart while tests read one and the user reads the other.
  *
- * **One component, not six.** This shape existed six times -- `MessageList`'s own module-private
- * copy plus five hand-written ones (`App.tsx`'s two session-ended rows, `TerminalHandoff`'s command
- * card, `ModeSelector`'s two choice rows -- `ModeSelector` itself is gone, replaced by
- * `EmptyTab`) -- and each hand-written copy wrote its glyph TWICE, once
- * as `data-sign` and once as the visible `.row-sign` text. Tests assert on `data-sign`; the user
- * reads the span. Nothing checked that the two agreed, so editing one and not the other drifts past
- * a green suite. Here there is one `sign` argument and both readings are derived from it, which is
- * what makes the disagreement unrepresentable rather than merely unlikely.
+ *  The visible glyph is aria-hidden: it repeats the row's text and role, so announcing it before
+ *  each prompt adds noise. `data-sign` still lets tests read state separately.
  *
- * `data-sign` carries the glyph as data, separately from the `aria-hidden` presentational copy, so
- * a test can assert state without reading rendered text and a screen reader is not told it twice --
- * the glyph repeats what the row's own text and role already say, and announcing "rangle" before
- * every prompt is noise.
- *
- * `current` is the conversation's cursor: `Enter` expands "the current item" and `y` copies it
- * (`App.tsx`'s `onKeyDown`), and a cursor nobody can see is not a cursor, it is a trap -- there was
- * no way to know which row either key would act on. `--nv-cursorline` is a BACKGROUND (nvim's own
- * `Visual` highlight, already used this way by `.row-choice:hover`), so the "no signal
- * colour as text" guard `indexCss.test.ts` enforces does not apply to it. Scroll/resync/
- * shrinking-timeline behaviour beyond just showing where the cursor is stays out of scope
- * here -- the cursor-clamping `App.tsx` already does when the timeline shrinks
- * is the one piece of that `y`/`Enter` themselves needed in order not to act on a stale index.
+ *  `current` shows the cursor that Enter and y act on. Its fill is a background (`--nv-cursorline`),
+ *  so signal-colour text guards do not apply. `App.tsx` clamps the cursor when the timeline shrinks;
+ *  this component only shows it.
  */
 type RowProps = {
   /** The row's kind, as the `row-<kind>` class the stylesheet keys on. */

@@ -7,7 +7,7 @@
 # `npm` resolved off PATH -- this fixture never needs to shadow a real npm.
 #
 # EITRI_INSTALL_TEST_NPM_MODE selects the behaviour (default "ok"):
-#   ok            both steps succeed, producing a spec-shaped artifact
+#   ok            both steps succeed, producing an artifact for the installer to validate
 #   fail-ci       `npm ci` exits 1
 #   fail-build    `npm run build:binary` exits 1
 #   bad-protocol  the built artifact reports the wrong protocol number

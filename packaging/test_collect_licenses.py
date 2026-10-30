@@ -353,13 +353,9 @@ class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
 _PINNED_SKIA_ARCHIVE_SHA256 = "ef41a8ff85bebeb06238df88e144eb04778a368fc1672a63155155d97f0caf10"
 
 
-# Where a pinned archive is cached, at fixed depths: release.sh's own checked cache,
-# then a skia-bindings build dir under some target/<profile>/build/. The recursive glob this
-# replaced walked every build and release tree under the cargo target root -- millions of files
-# once release.sh kept its work/, proof/ and target/ there -- and took more than ten minutes. Two entries once named a developer's own scratch disk explicitly
-# and were dropped because
-# `target/` (repo-relative, below) and a `~/.cache/eitri-release` symlink already reach the same
-# cache through paths this file never has to spell.
+# Search release.sh's checked cache and skia-bindings build outputs at fixed depths.
+# A recursive walk through millions of build/release files takes more than ten minutes;
+# repo-relative target/ and a ~/.cache/eitri-release symlink reach caches without private paths.
 _SKIA_CACHE_GLOBS = (
     "~/.cache/eitri-release/skia/skia-binaries-*.tar.gz",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -567,7 +563,7 @@ class SkiaArchiveNoticeEntries(unittest.TestCase):
         self.assertIn("UNICODE LICENSE", dict(by_title["ICU"]["files"])["icu.LICENSE"])
         self.assertEqual(dict(by_title["Skia"]["files"])["LICENSE_SKIA"], "fixture Skia licence text\n")
         self.assertIn("IJG", by_title["libjpeg-turbo"]["license"])
-        # Only Skia's own licence text comes from the archive; the other texts use packaging/license-texts/.
+        # Only Skia's own text comes from the archive, not packaging/license-texts/.
         self.assertIn("its own LICENSE_SKIA inside the archive", by_title["Skia"]["note"])
         self.assertNotIn("vendored", by_title["Skia"]["note"])
         self.assertIn("text vendored in packaging/license-texts/", by_title["expat"]["note"])
@@ -729,7 +725,7 @@ class BuildHeaderProfiles(unittest.TestCase):
         self.assertNotIn("/usr/lib/eitri/verdandi-claude-sidecar", text)
         self.assertIn("Eitri's own source is at https://example.invalid/release-asset.tar.gz.", text)
         self.assertNotIn("part 4", text)
-        # The Contents list must include the Skia archive section.
+        # The Contents list must include the archive-contents section as well as parts 1-3.
         self.assertIn("components inside the Skia prebuilt archive in the source asset      (9)", text)
 
     def test_sidecar_header_never_mentions_the_skia_archive_section(self):

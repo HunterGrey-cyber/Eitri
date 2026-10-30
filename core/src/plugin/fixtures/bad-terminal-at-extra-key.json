@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": 56,
+  "verb": "terminal.at",
+  "args": {
+    "dir": "/w/work",
+    "cwd": "/w"
+  }
+}

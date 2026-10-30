@@ -1,5 +1,5 @@
 //! Test-only log lines a GUI pass reads: off unless a `--features probe` build turns them on from its
-//! environment. Product code calls [`line`] at the points a pass checks; in every other build the call prints
+//! environment. Product code calls [`fn@line`] at the points a pass checks; in every other build the call prints
 //! nothing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,9 +26,29 @@ pub fn format_line(id: &str, event: &str, detail: &str) -> String {
 
 /// Prints one trace line on stdout when the trace is on.
 pub fn line(id: &str, event: &str, detail: &str) {
+    #[cfg(test)]
+    CAPTURED.with(|captured| {
+        if let Some(lines) = captured.borrow_mut().as_mut() {
+            lines.push(format_line(id, event, detail));
+        }
+    });
     if enabled() {
         println!("{}", format_line(id, event, detail));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and returns the trace lines this thread asked for meanwhile, whether or not the trace is on: a test
+/// reads its own lines without turning the process-wide switch on under the other tests.
+#[cfg(test)]
+pub fn capture(f: impl FnOnce()) -> Vec<String> {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    f();
+    CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default())
 }
 
 #[cfg(test)]

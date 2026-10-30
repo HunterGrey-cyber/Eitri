@@ -207,7 +207,8 @@ local function start_row(h)
 end
 
 -- Whether rows [row, row + n) of `buf` hold `lines` (one side of a hunk, `eols` naming each line's
--- ending) as this buffer would hold the file's lines, final newline included: a line without one must be the buffer's last with
+-- ending) as this buffer would hold the file's lines, final newline included:
+-- a line without one must be the buffer's last with
 -- 'eol' off, and a last line with one needs 'eol' on. A 'binary' buffer is never compared.
 local function holds_side(buf, row, n, lines, eols)
   if vim.bo[buf].binary then

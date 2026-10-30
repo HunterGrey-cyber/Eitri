@@ -114,7 +114,7 @@ impl Tree {
         }
     }
 
-    /// Whether a directory `name` at `depth`, in the directory named `parent`, is a skill.
+    /// Whether a directory at `depth`, in the directory named `parent`, is a skill.
     fn is_skill(self, depth: usize, parent: Option<&OsStr>) -> bool {
         match self {
             Tree::AgentsSkills => depth == 0,
@@ -520,7 +520,7 @@ impl Scan<'_> {
                             });
                         }
                         if depth + 1 > self.limits.max_depth {
-                            // Claude's wording is part of every existing record's fingerprint.
+                            // Keep Claude's wording stable: it is part of the record's fingerprint.
                             let under = match tree {
                                 Tree::Claude => ".claude/".to_string(),
                                 _ => format!("{}/", top_path.display()),
@@ -597,7 +597,9 @@ impl Scan<'_> {
 
     /// A directory that must be passed through to reach what an agent reads below it (`.agents/`,
     /// `.claude-plugin/`): opened without a link, and a link or anything else in its place reported
-    /// as something the agent would follow. Nothing is recorded for it when it is a plain directory.
+    /// as something the agent would follow or cannot read, except a regular file (or a kind `lstat`
+    /// does not name), which has nothing below it to read. Nothing is recorded for it when it is a
+    /// plain directory.
     fn pass_through(&mut self, parent: &DirHandle, name: &OsStr, path: PathBuf) -> Option<DirHandle> {
         match parent.lstat(name) {
             Err(Refusal::Missing) => None,
@@ -810,9 +812,11 @@ fn role_in(depth: usize, name: &OsStr) -> Role {
     }
 }
 
-/// The fingerprint over the top level's place relative to the root, every entry and the budget
-/// note. Each field ends in a NUL, which no path, link target, hex digest or tag holds, so no two
-/// different configurations feed the hash the same bytes.
+/// The fingerprint over the profile's header, the top level's place relative to the root, every
+/// entry and the budget note. The header and the place (only `..` and `/`) each end in a newline;
+/// each entry's path, tag and payload each end in a NUL, which no path, link target, hex digest or
+/// tag holds; the budget note comes last. So no two different configurations feed the hash the
+/// same bytes.
 fn fingerprint(
     profile: &Profile,
     root: &Path,

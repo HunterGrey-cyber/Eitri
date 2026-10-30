@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": 52,
+  "verb": "editor.modified",
+  "args": {
+    "root": "/w/work/rust/ch04-02-fix-total-len"
+  }
+}

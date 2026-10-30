@@ -56,6 +56,69 @@ pub(crate) struct CompanionWindow {
     pub(crate) pane_switch: Rc<RefCell<Option<PaneSwitchChannel>>>,
 }
 
+/// Text-size events use the same controller as a full window, over the companion's sole chat layout (`parts`,
+/// whose views the grid holds).
+fn text_size_driver(
+    parts: eitri_core::wm::WindowParts,
+    agent: &agent_panel::AgentPanelHandle,
+    panel_px: Rc<Cell<f32>>,
+    base: f32,
+) -> Rc<eitri_core::wm::Driver> {
+    use crate::gtk_host::{GtkHost, ServiceSet};
+    use eitri_core::wm::*;
+
+    struct TextServices {
+        agent: agent_panel::AgentPanelHandle,
+        panel_px: Rc<Cell<f32>>,
+    }
+    impl ServiceSet for TextServices {
+        fn editor(&self, _: &EditorCall) -> Result<(), String> {
+            Err("this window has no editor".into())
+        }
+        fn terminal(&self, op: &TermOp) -> Result<(), String> {
+            // Every size push carries the terminals' zoom; with none here it is done, not refused.
+            if let TermOp::SetZoom { .. } = op {
+                return Ok(());
+            }
+            Err("this window has no terminal".into())
+        }
+        fn plugin(&self, _: &PluginOp) -> Result<(), String> {
+            Err("this window has no plugin page".into())
+        }
+        fn chat(&self, op: &ChatOp) -> Result<(), String> {
+            if let ChatOp::SetFontSize { px, .. } = op {
+                self.panel_px.set(*px);
+                self.agent.set_panel_font_size_px(*px);
+                Ok(())
+            } else {
+                Err("not carried out by this shell yet".into())
+            }
+        }
+    }
+    let scheduler = crate::gtk_host::scheduler::GlibScheduler::new();
+    let host = GtkHost::new();
+    host.set_services(Rc::new(TextServices {
+        agent: agent.clone(),
+        panel_px,
+    }));
+    let mut controller = Controller::new(scheduler.clone());
+    controller.open_window(
+        WinId::MAIN,
+        WindowSpec {
+            role: WindowRole::Main,
+            presence: EditorPresence::None,
+            title: String::new(),
+        },
+        parts,
+    );
+    controller.set_text_size(WinId::MAIN, base, 1.0);
+    let driver = Driver::new(controller, host.clone(), scheduler.clone());
+    let sink: Rc<dyn HostSink> = driver.clone();
+    host.attach(Rc::downgrade(&sink));
+    scheduler.attach(Rc::downgrade(&sink));
+    driver
+}
+
 /// The prefix's tab verbs, run as the full window runs them: the chat takes the keys first for the
 /// verbs that read them, then the verb goes to the panel. Returns what the full window's
 /// `run_tab_action` returns to nobody: whether to say "no such tab".
@@ -67,7 +130,7 @@ fn run_tab(
     focus_module: &dyn Fn(&ModuleId) -> bool,
     toast: &Rc<Toast>,
 ) {
-    use eitri_core::tabs::{plan, TabVerb};
+    use eitri_core::tabs::plan;
     let keys_in = super::focus::focused_module(window, &grid.hosts())
         .as_ref()
         .map(ModuleId::kind);
@@ -76,42 +139,15 @@ fn run_tab(
     if plan.takes_the_keys {
         focus_module(&ModuleId::agent());
     }
-    let switched = match plan.verb {
-        TabVerb::New => {
-            agent.new_tab();
-            agent.enter_input(ViewId::BASE);
-            true
-        }
-        TabVerb::Step(delta) => agent.step(delta),
-        TabVerb::Last => agent.select_last(),
-        TabVerb::Select(n) => agent.select_number(n).is_some(),
-        TabVerb::Rename => {
-            agent.begin_rename(ViewId::BASE);
-            true
-        }
-        TabVerb::Close => {
-            agent.confirm_close(ViewId::BASE);
-            true
-        }
-        TabVerb::CloseOthers => {
-            agent.confirm_close_others();
-            true
-        }
-        TabVerb::Choose => {
-            agent.open_chooser(ViewId::BASE);
-            true
-        }
-        TabVerb::Info => {
-            agent.open_detail(ViewId::BASE);
-            true
-        }
-        TabVerb::Flash => false,
-        TabVerb::Nothing | TabVerb::Sibling(_) | TabVerb::Terminal(_) => return,
-    };
-    if !switched {
-        // tmux: "can't find window".
+    let answer = eitri_core::wm::verbs::tabs::base_call(&plan.verb)
+        .map(|call| crate::gtk_host_services::apply_tab_call(agent, &call));
+    if tab_failed(&plan.verb, answer) {
         toast.show("no such tab");
     }
+}
+
+pub(crate) fn tab_failed(verb: &eitri_core::tabs::TabVerb, answer: Option<bool>) -> bool {
+    matches!(verb, eitri_core::tabs::TabVerb::Flash) || answer == Some(false)
 }
 
 /// What the companion's panel hooks act on, each built by the window from its own pieces.
@@ -176,7 +212,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     crate::xft_dpi::ensure_xft_dpi();
     gtk4::Window::set_default_icon_name(crate::APP_ID);
     let fallback = eitri_core::theme::ThemeTokens::fallback();
-    let theme_css = crate::theme::gtk_css::ThemeCss::install(&fallback);
+    let theme_css = crate::theme::gtk_css::ThemeCss::install(&fallback, None);
 
     let config_dir = crate::config_dir();
     let lua = Rc::new(LuaEngine::without_plugins(config_dir.clone()).expect("LuaEngine construction must not fail"));
@@ -258,9 +294,12 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         start.backend_kind,
         start.panel_notice.as_deref(),
         None,
-        Default::default(),
+        eitri_core::window_link::pair::Role::Main,
+        fallback.clone(),
     );
     config.apply_to_panel(&agent);
+    // A companion window is never one of a pair: it offers its own saved tabs, once `agent.restore` is known.
+    agent.set_tab_files(Default::default());
     // The panel reads the context when its tick runs, and its tick runs only when woken.
     crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent);
     // The panel's own `Ctrl+h/j/k/l`, the prefix's Select and an edge letter from nvim all end here.
@@ -274,7 +313,9 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     tokens.font_size_px = config.panel_font_size;
     agent.set_theme(&tokens);
 
-    let grid = ModuleGrid::new(Rc::new(RefCell::new(Layout::companion())));
+    // The companion's one layout: the chat alone, given to its text-size controller below, the grid reading it.
+    let parts = eitri_core::wm::WindowParts::new(Layout::companion(), eitri_core::layout::Workspaces::single(), None);
+    let grid = ModuleGrid::new(parts.views().0);
     // The same cached decision `run` read for the notice, so the two cannot disagree.
     let kind = if crate::webkit_sandbox::decision().allows_webviews() {
         HostKind::Web
@@ -305,7 +346,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     agent_panel::install_reload_action(app, &agent, Rc::new(|| ViewId::BASE));
     let panel_px = Rc::new(std::cell::Cell::new(config.panel_font_size));
     // With no editor, a size change scales the panel alone.
-    let text_size = TextSizeController::install(app, None, agent.clone(), config.panel_font_size, panel_px.clone());
+    let text_driver = text_size_driver(parts, &agent, panel_px.clone(), config.panel_font_size);
+    let text_size = TextSizeController::install(app, None, text_driver);
     let agent_host = grid
         .hosts()
         .into_iter()
@@ -466,6 +508,12 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
                     }
+                    // A module key after the hide key: there is no layout to hide it from.
+                    super::prefix::PrefixCommand::Hide { module } => {
+                        println!("[companion] prefix: hide {module} refused");
+                        toast.show(companion_prefix::REFUSED_TEXT);
+                        return;
+                    }
                 };
                 match companion_prefix::classify(&action) {
                     CompanionVerb::Tab(tab) => run_tab(tab, &window_for_tabs, &grid, &agent, &*focus_module, &toast),
@@ -478,7 +526,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                         focus_module(&ModuleId::agent());
                         agent.open_command_line(ViewId::BASE);
                     }
-                    CompanionVerb::Text(change) => text_size.apply_panel(change.into()),
+                    CompanionVerb::Text(change) => text_size.pane_step(ModuleId::agent(), change.into()),
                     CompanionVerb::Hint => hint.toggle_from_prefix(keycode),
                     CompanionVerb::Literal => {
                         if let Some(key) = super::prefix::literal_for(&action, &keymap) {

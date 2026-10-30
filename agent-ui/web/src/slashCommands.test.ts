@@ -154,11 +154,9 @@ describe("worksSlashCommands (the ? overlay's list)", () => {
   });
 });
 
-/* `/config` typed and refused said "? lists the ones that do", and `?`
-   listed `/config`. The overlay lists only what Enter sends. */
+/* The overlay must list only what Enter sends, so its own discovery hint cannot recommend a refused command. */
 describe("listedSlashCommands (the ? overlay's list, what Enter would send)", () => {
-  /* /model is plain "model" now, like every other sendable row --
-   *  it no longer needs its own "<name>" form, since a bare /model sends too (and opens a picker). */
+  /* A bare /model sends and opens a picker, so list it plainly like every other sendable row. */
   it("leaves out /config and lists /model plainly", () => {
     expect(listedSlashCommands()).toEqual([
       "clear",

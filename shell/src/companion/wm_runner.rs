@@ -318,6 +318,56 @@ impl WmRunner {
         }
     }
 
+    /// Moves this process's own window to an output, as `how` says: a command on a worker thread, the window list
+    /// read there first for niri's window id, or GNOME's extension asked, its answer logged. Nothing waits here.
+    pub(crate) fn move_own(&self, how: crate::gtk_host::MonitorMove) {
+        use crate::gtk_host::MonitorMove;
+        match how {
+            MonitorMove::Unchanged => {}
+            MonitorMove::Gnome { connector } => match self.gnome() {
+                Some(gnome) => gnome.move_own_to_monitor(
+                    &connector.clone(),
+                    Box::new(move |done| match done {
+                        Some(true) => println!("[window] GNOME Shell put this window on {connector}"),
+                        Some(false) => println!("[window] GNOME Shell has no monitor {connector} for this window"),
+                        None => println!("[window] GNOME Shell could not be asked to move this window to {connector}"),
+                    }),
+                ),
+                None => println!("[window] the Eitri GNOME Shell extension is not there; the window stays put"),
+            },
+            MonitorMove::Command(argv) => {
+                let exec = self.exec.clone();
+                thread::spawn(move || {
+                    let _ = exec(argv);
+                });
+            }
+            MonitorMove::ById { pid, connector } => {
+                let (wm, exec) = (self.wm, self.exec.clone());
+                thread::spawn(move || {
+                    let Some(list) = compositor::list_windows_argv(wm) else {
+                        return;
+                    };
+                    let Ok(json) = exec(list) else { return };
+                    let windows = match compositor::parse_windows(wm, &json) {
+                        Ok(windows) => windows,
+                        Err(err) => {
+                            println!("[window] {} adapter: {err}", wm_name(wm));
+                            return;
+                        }
+                    };
+                    let argv = compositor::first_window_owner(&[pid], &windows)
+                        .and_then(|own| compositor::move_to_output_argv(wm, own, &connector));
+                    match argv {
+                        Some(argv) => {
+                            let _ = exec(argv);
+                        }
+                        None => println!("[window] no window of this process to move to {connector}"),
+                    }
+                });
+            }
+        }
+    }
+
     fn raise(&self, chain: impl FnOnce(&dyn Fn(u32) -> Option<String>) -> Vec<u32> + Send + 'static) {
         if matches!(self.wm, Wm::None | Wm::Gnome) {
             return;

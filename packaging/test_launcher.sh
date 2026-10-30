@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for packaging/eitri.launcher.sh. Standalone: `bash packaging/test_launcher.sh`.
 # Builds a fake install tree under ~/.cache/nv-v1dist-t8/launcher-test-XXXXXX/ (never /tmp), with a
-# `bin/eitri` symlink to the REAL launcher script and a stub `lib/eitri/shell` that records its
+# `bin/eitri` copy of the REAL launcher script and a stub `lib/eitri/shell` that records its
 # own argv and the environment this suite cares about, then runs the real launcher against it.
 #
 # Never touches the real $HOME: every invocation below runs with HOME pointed at a scratch
@@ -124,12 +124,9 @@ run_launcher() {
 }
 
 echo "== LIBDIR resolves through a symlinked bin/eitri =="
-# A real install's own bin/eitri is a plain copy (as built above), never a symlink -- but a user
-# or a distro's alternatives system may point a SEPARATE entry point at it (e.g.
-# `~/.local/bin/eitri -> /usr/bin/eitri`, or `~/bin/eitri -> ~/.local/bin/eitri`, F5's own
-# second case). The launcher follows that FILE's own symlink chain, so LIBDIR must come out as the
-# copy's OWN sibling `lib/eitri` -- the target's, not some unrelated directory next to wherever
-# the symlink itself happens to sit.
+# A real bin/eitri is a plain copy, but users or distro alternatives can point a separate
+# entry at it (~/bin/eitri -> ~/.local/bin/eitri, for example). Follow the launcher's file
+# symlinks so LIBDIR is the target copy's sibling lib/eitri, not the symlink entry's sibling.
 reset_state
 SYMLINK_ENTRY_DIR="$SCRATCH_ROOT/other-bin"
 mkdir -p "$SYMLINK_ENTRY_DIR"
@@ -140,10 +137,8 @@ assert_contains "$out" "STUB_SELF:$ROOT/lib/eitri/shell" "invoked through a syml
 assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the symlink"
 
 echo "== LIBDIR resolves through a RELATIVE symlink target (GNU stow's own shape) =="
-# The test above only ever used an ABSOLUTE
-# `ln -s "$ROOT/bin/eitri" ...` target. `resolve_launcher_path`'s relative branch
-# (`path="$(dirname "$path")/$target"`) is what a real GNU stow tree actually produces --
-# `~/bin/eitri -> ../.local/bin/eitri` -- and was never exercised until now.
+# Exercise a relative symlink target, as GNU stow uses ~/bin/eitri -> ../.local/bin/eitri.
+# The absolute-target case above does not exercise resolve_launcher_path's relative branch.
 reset_state
 RELSYM_ENTRY_DIR="$SCRATCH_ROOT/relsym-bin"
 mkdir -p "$RELSYM_ENTRY_DIR"
@@ -154,14 +149,10 @@ assert_contains "$out" "STUB_SELF:$ROOT/lib/eitri/shell" "a relative symlink tar
 assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the relative symlink"
 
 echo "== LIBDIR resolves when the launcher's own bindir is itself a symlinked directory =="
-# F5's other case: ~/.local/bin (or here, bin/) is a SYMLINKED DIRECTORY -- e.g. GNU stow folding
-# it into a dotfiles repo -- while the launcher FILE inside it is a plain copy, not a symlink, and
-# lib/eitri is a real sibling of the unresolved (logical) bindir. The old `readlink -f "$0"`
-# canonicalized straight through a symlinked directory component too, landing LIBDIR next to the
-# symlink's TARGET instead of this install's own lib/eitri, so `cd` died "No such file or
-# directory" on every launch. Only the FILE's own symlink chain may be followed; a directory
-# symlink earlier in the path must be left alone, and `cd`'s logical resolution of the appended
-# `../lib/eitri` then removes the bindir as named, landing on its own sibling.
+# GNU stow can symlink the bin directory while keeping the launcher file a plain copy.
+# Keep directory symlinks logical: readlink -f on the whole path would locate lib/eitri beside
+# the symlink target rather than beside the install's named bin directory. Only the launcher's
+# own file symlink chain may be followed; logical bin/../lib/eitri selects its sibling.
 reset_state
 SYMDIR_REALBIN="$SCRATCH_ROOT/symdir-realbin"
 SYMDIR_ROOT="$SCRATCH_ROOT/symdir-root"
@@ -179,25 +170,18 @@ assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the s
 assert_not_contains "$out" "No such file or directory" "no broken cd through the symlinked bindir"
 
 echo "== ... and still resolves under POSIXLY_CORRECT=1 =="
-# A guard, not a reproduction: this case has always passed. POSIX-mode `cd` resolves the `..` in
-# `bin/../lib/eitri` logically (it removes `bin` as named, symlinked or not), exactly as bash
-# does by default. What POSIX mode turns off is bash's extra physical retry when that logical path
-# does not exist. Only the unsupported inverse shape (lib/eitri next to the symlink's target, none
-# next to the bindir as named) would need that retry. This check pins that F5's own case never
-# comes to depend on it.
+# POSIX-mode cd resolves bin/../lib/eitri logically, removing bin as named even if symlinked.
+# Only its extra physical retry is disabled in POSIX mode. The supported install layout must
+# work without that retry; it would only help an unsupported layout with lib/eitri beside
+# the directory symlink's target and no lib/eitri beside the named bin directory.
 out="$(env -i HOME="$FAKE_HOME" POSIXLY_CORRECT=1 PATH="$PATH" "$SYMDIR_ROOT/bin/eitri" --version 2>&1)"
 assert_contains "$out" "STUB_SELF:$SYMDIR_ROOT/lib/eitri/shell" "a symlinked bindir resolves LIBDIR under POSIXLY_CORRECT=1 too"
 assert_not_contains "$out" "No such file or directory" "no broken cd through the symlinked bindir under POSIXLY_CORRECT=1"
 
 echo "== an exported CDPATH does not corrupt LIBDIR through a RELATIVE invocation =="
-# Reproduced on the launcher as first written: with $0 relative (an unpacked
-# release directory's own bin/eitri run in place, or any PATH entry that is itself relative --
-# both real shapes this launcher ships in, see its header comment),
-# `cd "$(dirname "$EITRI_LAUNCHER_PATH")/../lib/eitri"` without `CDPATH=''` handed `cd` a
-# relative directory, so an exported CDPATH containing a matching entry (here, `.`) made `cd` print
-# its destination to stdout on top of `pwd`'s own line -- two lines glued into one LIBDIR, and the
-# final `exec "$LIBDIR/shell"` died "No such file or directory". `CDPATH=''` on that one `cd`
-# closes it.
+# With a relative $0 (an unpacked bin/eitri or a relative PATH entry), an exported CDPATH
+# containing . makes cd print its destination before pwd. Those two lines corrupt LIBDIR,
+# so clear CDPATH for the directory lookup before exec "$LIBDIR/shell".
 reset_state
 CDPATH_ENTRY_DIR="$SCRATCH_ROOT/cdpath-relative"
 rm -rf "$CDPATH_ENTRY_DIR"
@@ -214,12 +198,8 @@ out="$(cd "$CDPATH_ENTRY_DIR" && env -i HOME="$FAKE_HOME" CDPATH=.: PATH="inst/b
 assert_contains "$out" "STUB_SELF:$CDPATH_ENTRY_DIR/inst/lib/eitri/shell" "a relative PATH entry under an exported CDPATH also resolves cleanly"
 
 echo "== LIBDIR resolves when the launcher's own directory is spelled '.' or ends in '/.' =="
-# Reproduced against the next version, which computed the parent of the bindir with a second `dirname`
-# instead of appending `..`: `dirname .` is `.`, not `..`, so running an unpacked release's
-# bin/eitri in place from inside bin/ (`./eitri`, $0's directory `.`) looked for `./lib/eitri`
-# inside bin/, and `bin/./eitri` run from the release root looked for `bin/lib/eitri`. Both died
-# "cd: ...: No such file or directory". Appending `..` to the directory as spelled is right for any
-# spelling of it.
+# Append .. to the bindir as spelled: dirname . is ., not .. . From inside bin/, ./eitri
+# must find ../lib/eitri, and from the release root bin/./eitri must find bin/./../lib/eitri.
 reset_state
 out="$(cd "$ROOT/bin" && env -i HOME="$FAKE_HOME" PATH=/usr/bin:/bin ./eitri --version 2>&1)"
 assert_contains "$out" "STUB_SELF:$ROOT/lib/eitri/shell" "./eitri run from inside bin/ resolves LIBDIR to the sibling lib/eitri"
@@ -290,9 +270,9 @@ sidecar_dir="$FAKE_HOME/.local/share/eitri/sidecar/abcdef0"
 mkdir -p "$sidecar_dir"
 printf '#!/bin/sh\n' >"$sidecar_dir/verdandi-claude-sidecar"
 chmod +x "$sidecar_dir/verdandi-claude-sidecar"
-# A RELATIVE XDG_DATA_HOME must be treated as though it were unset -- so the sidecar has to be found under $HOME/.local/share, not under a directory literally
-# named "relative/xdg" relative to wherever the launcher happens to run from. A naive
-# `${XDG_DATA_HOME:-default}` would miss it here and wrongly print the hint.
+# Treat a relative XDG_DATA_HOME as unset, so the sidecar is found in $HOME/.local/share.
+# Using ${XDG_DATA_HOME:-default} would search relative/xdg beneath the working directory
+# and wrongly print the missing-sidecar hint.
 EXTRA_ENV=("XDG_DATA_HOME=relative/xdg")
 out="$(run_launcher "$PROJECT_DIR")"
 assert_not_contains "$out" "no sidecar built yet" "a relative XDG_DATA_HOME falls back to \$HOME/.local/share, where the sidecar sits"
@@ -309,21 +289,14 @@ EXTRA_ENV=("XDG_DATA_HOME=$elsewhere")
 out="$(run_launcher "$PROJECT_DIR")"
 assert_contains "$out" "no sidecar built yet" "an absolute XDG_DATA_HOME is honoured, and the sidecar built under the old one is not found there"
 
-# `eitri setup` used to force
-# `--sidecar-only` onto every call, so `eitri setup --nvim-only`/`--uninstall`/`--sidecar-only`
-# all died "--sidecar-only and X cannot be combined" in the real installer -- exactly the recovery
-# command install.sh itself prints on a failed nvim download. These tests never reach
-# packaging/install.sh's own logic (the stub above just records its argv), so they hold the
-# launcher's own dispatch to account regardless of what install.sh does with it.
+# Explicit setup modes must pass through alone: prepending --sidecar-only to --nvim-only,
+# --uninstall or --sidecar-only makes the installer reject conflicting modes, including the
+# recovery command it prints for a failed nvim download. The stub records dispatch only.
 #
-# Plain `eitri setup` used to run --sidecar-only and then --nvim-only for
-# its second call -- do_nvim_only is the EXPLICIT ask (packaging/install.sh's own comment on it:
-# "an already-adequate PATH nvim does not suppress it ... a download failure is fatal"), so a plain
-# `eitri setup` with an adequate nvim already on PATH, or no network right now, turned "nothing to
-# do" into a hard failure. The second call is now --nvim-offer, the SAME conditional offer a normal
-# install runs (packaging/install.sh's own do_nvim_offer/maybe_offer_nvim); these argv-recording
-# tests cannot see that installer-side difference (the stub does not distinguish the two modes'
-# behaviour), so packaging/tests/install/test_nvim.sh holds do_nvim_offer itself to account.
+# Plain setup runs --sidecar-only followed by --nvim-offer. Unlike --nvim-only, the offer
+# skips an adequate PATH nvim and tolerates a download failure, so setup does not turn
+# nothing-to-do or a temporary network failure into a hard failure. The stub cannot check
+# that behaviour; packaging/tests/install/test_nvim.sh exercises the installer-side offer.
 echo "== plain 'eitri setup' builds the sidecar and then runs the nvim offer =="
 EXTRA_ENV=()
 out="$(run_launcher setup)"
@@ -375,10 +348,8 @@ out="$(run_launcher setup --sidecar-only)"
 assert_count "$out" "STUB_SETUP_CALL" 1 "eitri-setup ran once"
 assert_count "$out" "STUB_SETUP_ARG:--sidecar-only" 1 "--sidecar-only appears exactly once"
 
-# --nvim-offer was added to packaging/install.sh (and to its usage
-# text, which `eitri setup --help` prints) but not to the pass-through list above, so
-# `eitri setup --nvim-offer --dry-run` died "--sidecar-only and --nvim-offer cannot be combined" --
-# the very defect class this dispatch exists to close, recreated by a hand-kept subset.
+# An explicit --nvim-offer must pass through alone: prepending --sidecar-only creates
+# conflicting modes even though --nvim-offer --dry-run is valid installer usage.
 echo "== 'eitri setup --nvim-offer' passes straight through as its own mode =="
 out="$(run_launcher setup --nvim-offer --dry-run)"
 assert_count "$out" "STUB_SETUP_CALL" 1 "eitri-setup ran once"
@@ -417,8 +388,7 @@ assert_not_contains "$out" "LEGACY_NOT_IN_BUILD" "no Rust constant name in the h
 assert_not_contains "$out" "spec " "no \"spec sec/\$N\" reference in the help text"
 
 echo "== -h prints plain-word help, no internal ruling id =="
-# -h/--help prints the launcher's header comment. Keep its explanation of release behavior
-# in plain language so users can understand it without implementation details.
+# -h/--help prints the launcher's header, so its user-facing help must avoid internal labels.
 reset_state
 EXTRA_ENV=()
 out="$(run_launcher -h)"
@@ -429,8 +399,7 @@ assert_contains "$out" "--clean" "the help text lists --clean"
 assert_contains "$out" "eitri setup [args]" "the help text still ends with its last usage line"
 
 echo "== the startup banner's project and account lines line up =="
-# The 2026-09-30 rename shortened the name to "eitri"; the account lines are indented to the
-# column "project" starts in, so the name's padding has to keep that column at 9.
+# Pad eitri so account lines align with the project column at column 9.
 reset_state
 EXTRA_ENV=(VERDANDI_CLAUDE_ACCOUNT=work)
 out="$(run_launcher)"

@@ -47,6 +47,10 @@ type Props = {
   answerConfirm: (event: KeyboardEvent<HTMLDivElement>) => boolean;
 };
 
+function canChoose(row: ChooserRow): boolean {
+  return choosable(row) || (row.kind === "record" && row.record.heldByPartner === true);
+}
+
 /** An IME's own Enter/Esc: `isComposing`, or the legacy 229 some WebKit builds still report. */
 function composing(event: KeyboardEvent): boolean {
   return event.nativeEvent.isComposing || event.keyCode === 229;
@@ -275,7 +279,7 @@ export function Chooser({
   }
 
   function choose(row: ChooserRow | undefined) {
-    if (row === undefined || !choosable(row)) return;
+    if (row === undefined || !canChoose(row)) return;
     if (row.kind === "new") onNewSession();
     else if (row.kind === "tab") onSwitch(row.tab.tab);
     else onResume(row.record.providerSessionId);
@@ -484,7 +488,7 @@ function ChooserRowItem({
   onRenameCommit: () => void;
   onRenameCancel: () => void;
 }) {
-  const classes = ["chooser-row", current ? "current" : "", choosable(row) ? "" : "unchoosable"].filter(Boolean).join(" ");
+  const classes = ["chooser-row", current ? "current" : "", canChoose(row) ? "" : "unchoosable"].filter(Boolean).join(" ");
   // The current row's sign cell is the panel's cursor, a solid block holding `›`, in
   // place of whatever sign the row has (a GUI pass on 2026-09-26 found it was never drawn).
   const cursorSign = <span className="chooser-sign">›</span>;
@@ -567,7 +571,7 @@ function ChooserRowItem({
   const record = row.record;
   return (
     <div className={classes} onClick={onClick}>
-      {current ? cursorSign : <span className="chooser-sign">{record.heldElsewhere ? "⊘" : ""}</span>}
+      {current ? cursorSign : <span className="chooser-sign">{record.heldElsewhere && !record.heldByPartner ? "⊘" : ""}</span>}
       <span className="chooser-line1">
         <span className="chooser-lead">
           <RecordLead name={record.name} title={record.title} needle={needle} />
@@ -577,7 +581,7 @@ function ChooserRowItem({
       <span className="chooser-line2 chooser-muted">
         {/* No longer "sidecar · <id>" -- the backend carries nothing (every
             release build reads "sidecar"), the short id is what tells an untitled record apart. */}
-        {record.heldElsewhere ? "open in another window, can't be resumed here" : shortId(record.providerSessionId)}
+        {record.heldByPartner ? `in window ${record.partnerWindow ?? 2}` : record.heldElsewhere ? "open in another window, can't be resumed here" : shortId(record.providerSessionId)}
       </span>
     </div>
   );

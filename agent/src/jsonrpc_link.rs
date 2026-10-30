@@ -1304,7 +1304,7 @@ fn incoming_value(item: &Incoming) -> Value {
     serde_json::to_value(item).unwrap_or(Value::Null)
 }
 
-enum ChildState {
+pub(crate) enum ChildState {
     Running,
     /// Exited and not reaped: its pid stays reserved until `wait`.
     Exited,
@@ -1313,7 +1313,7 @@ enum ChildState {
 }
 
 /// Whether the child has exited, asked without reaping it, so its pid keeps naming its group.
-fn child_state(pid: u32) -> ChildState {
+pub(crate) fn child_state(pid: u32) -> ChildState {
     let pid: libc::id_t = pid;
     // SAFETY: an all-zero `siginfo_t` is a valid value, and `waitid` writes only into it.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };

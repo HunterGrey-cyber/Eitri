@@ -16,15 +16,12 @@ export type ToolRenderConfig = {
   quiet?: boolean;
   /** Renders the INVOCATION only -- what the model asked the tool to do.
    *
-   * This used to be `(input, result, isError)`, and all eight registered renderers ignored the last
-   * two arguments: a finished Bash call and one still executing produced byte-identical markup, and
-   * only an error was ever printed. The result is now rendered by `ToolResult` below, on one shared
-   * path for every tool, so "still running" and "finished" cannot end up distinguishable for some
-   * tools and not others. A per-tool result view can be added back as a separate optional field the
-   * day one is genuinely wanted -- what must not come back is a declared parameter nothing uses.
+   * `ToolResult` renders results on one shared path so running and finished calls remain
+   * distinguishable for every tool. A per-tool result view belongs in a separate optional field;
+   * invocation renderers must not declare result parameters they do not use.
    *
-   * `opts.expanded`: `editConfig` folds a diff to 6 lines when it is `false`
-   * and shows the whole thing when it is `true`, which is the only renderer today that reads it. */
+   * `opts.expanded`: a renderer that draws diffs (`editConfig`, Codex's file changes, an ACP call's
+   * diffs) folds them to a summary when it is `false` and shows the whole thing when it is `true`. */
   renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
   /** `false` for a tool whose own row already says what it did (`Edit`/`Write`/`NotebookEdit`: the diff),
    *  so a folded success draws no result preview under it. A failure is previewed whatever this says. */
@@ -166,8 +163,8 @@ function pathOf(input: unknown, key: string): string {
 
 /** A path rendered where `gf`/a click can reach it (`MessageList`'s `onClick`, `paths.ts`'s
  *  `pathsIn`). `data-path` carries the raw string a click reads back, separately from the visible
- *  label, which is project-relative under the project root -- the two were kept
- *  apart on purpose so that transform could not break what a click opens. */
+ *  label, which is project-relative under the project root, so transforming the label cannot
+ *  change what a click opens. */
 function PathLink({ path }: { path: string }) {
   return (
     <span className="path-link" data-path={path}>
@@ -201,18 +198,16 @@ function answeredRequest(label: string): ToolRenderConfig {
 
 /** A tool this registry recognizes by name only: one muted line, its own summary, nothing more.
  *  Every name in `TOOLS_OFFERED_BY_CLI_2_1_311` this file has no richer view for gets one of these,
- *  so "not in the table" (the 2026-09-19 defect: 18 of 26 real tools carded as unknown) cannot
- *  recur -- adding a tool to the CLI's own list and forgetting to register it here is caught by
+ *  so adding a tool to the CLI's list and forgetting to register it here is caught by
  *  `toolRegistry.test.tsx`'s own coverage check, not left to be noticed on a screen. */
 function oneLine(label: string): ToolRenderConfig {
   return { label, renderInvocation: (input) => <div className="tool-card">{label}: {summarizeInput(input)}</div> };
 }
 
 /** `Edit`/`Write`/`NotebookEdit`: a real diff (`EditDiff`). Folded to a one-line path+counts
- *  summary (`maxLines: 0`) everywhere except the detailed view and an expanded row (it was a 6-line
- *  fold until these three tools stopped ever folding into a
- *  count-only run -- every one of them now draws its own row, so each has to be this compact by
- *  default). `toolName` names the real tool this input belongs to (`editPreview`'s own first
+ *  summary (`maxLines: 0`) everywhere except the detailed view and an expanded row. Each edit
+ *  draws its own row rather than folding into a count-only run, so its default must be compact.
+ *  `toolName` names the real tool this input belongs to (`editPreview`'s own first
  *  argument), since `Write file` and `NotebookEdit` are display labels, not tool names. Falls back
  *  to a plain path line when the input carries no reviewable change (neither `old_string` nor
  *  `new_string`, `Write` with neither `content` nor a path, or `NotebookEdit` with neither
@@ -417,9 +412,8 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     label: "Web search",
     renderInvocation: (input) => <div className="tool-card">Search: {pathOf(input, "query")}</div>,
   },
-  // Deferred on this CLI, so nearly every action the agent takes reaches this one first (the
-  // 2026-09-19 defect that made auto mode still show a pile of popups once the policy started asking about it) --
-  // one muted line, no result row, never a card of its own worth expanding.
+  // Deferred on this CLI, so nearly every action reaches this first: keep it to one muted line,
+  // with no result row or card of its own worth expanding.
   ToolSearch: {
     label: "Load a tool",
     quiet: true,
@@ -681,7 +675,7 @@ function ChangedInputNote({ name, change }: { name: string; change: InputChange 
  * card asking whether to run it, read as approved already. `opts.detailed` (`Ctrl+o`) widens
  * the result's own cut and never folds it. `opts.expanded` is `Enter`'s own per-row toggle,
  * read by `editConfig` to show a folded diff's remaining lines; it defaults to `showResult` so a
- * caller that only ever passed the old two arguments keeps the old behaviour exactly. `opts.abandoned`
+ * caller passing only two arguments gets the same expansion for invocation and result. `opts.abandoned`
  * tells `ToolResult` a `null` result is never coming, rather than still running --
  * `MessageList.tsx`'s `isAbandonedCall` is what decides it, from state this function does not see. */
 export function renderToolCall(
@@ -692,11 +686,8 @@ export function renderToolCall(
   const config = lookupTool(call.name);
   const cardLine = opts.cardLine === undefined ? toolCardLine(call) : opts.cardLine;
   const specialInvocation = cardLine !== null && !["Bash", "Monitor", "Agent", "Task"].includes(call.name);
-  // `opts.detailed` (Ctrl+o) used to reach only `ToolResult`'s own head/tail
-  // cut, never `editConfig`'s `maxLines`, so a folded (unexpanded) Edit/Write/NotebookEdit row
-  // stayed folded even in the detailed view -- silently, since `EditDiff`'s own doc already
-  // promised "everywhere except the detailed view and an expanded row" (`editConfig`'s comment
-  // above). `Ctrl+o` now widens a diff exactly as it widens a `Bash`/`Read` result.
+  // Ctrl+o must widen the invocation diff as well as the result's head/tail cut, even when the
+  // row's own expansion flag is false.
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : specialInvocation ? (
@@ -730,15 +721,12 @@ export function renderToolCall(
 
   // A call still running has no result to fold -- `result === null` always goes through
   // `ToolResult`, which is what renders the "Running…" indicator. Folding only ever applies to a
-  // FINISHED call, which is also why the default `showResult = true` reproduces the pre-fold
-  // behaviour exactly: `call.result === null || showResult` is then always true. The detailed view
-  // never folds either, whatever the row's own expansion says.
-  // A folded result draws no marker line of its own (it used to be a line holding only `▸`,
-  // under every finished call). It shows its first lines and how many more there are instead
-  // (`ToolResultPreview`), as Claude Code's fold does. `data-folded` says it is folded, for `Enter` and
-  // for tests; the row itself is the handle.
+  // finished call. The detailed view never folds, whatever the row's own expansion says.
+  // A folded result shows its first lines and how many more there are (`ToolResultPreview`),
+  // as Claude Code's fold does. No separate marker line: `data-folded` supports Enter and tests,
+  // and the row itself is the handle.
   // A call a saved prefix rule answered says so, muted, under its invocation -- it
-  // otherwise looked exactly like one the user approved. Claude Code names the rule the same way
+  // otherwise looks exactly like one the user approved. Claude Code names the rule the same way
   // (`Bash(git log *)`, its own permission-rule syntax).
   const ruleNote =
     call.allowedByRule === undefined ? null : (

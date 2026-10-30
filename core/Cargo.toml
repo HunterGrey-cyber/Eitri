@@ -7,8 +7,8 @@ publish.workspace = true
 [features]
 # Lets `shell`'s tests use `test_providers`' doubles.
 test-support = []
-# The development-only legacy backend, off by default and in no release:
-# forwarded to `agent`, which holds every `cfg`. Without it,
+# The development-only legacy backend is off by default and absent from releases.
+# Forwarded to `agent`, which holds every `cfg`; without it,
 # `AgentBackend::Legacy` still compiles but can never be constructed.
 legacy-backend = ["agent/legacy-backend"]
 

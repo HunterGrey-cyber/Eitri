@@ -1,5 +1,4 @@
-# Checksums (MIN-3), version selection (MIN-1) and the signature (SIG-2). Sourced by
-# harness.sh.
+# Checksums, version selection and signatures. Sourced by harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
@@ -350,9 +349,8 @@ t_no_check_novalidate() {
 		'release@eitri eitri-release ' "the identity and namespace"
 }
 
-# The embedded-key branch, the one every final release's installer takes: $KEYED_INSTALLER
-# is the unkeyed installer with the test key added to its signers block (harness.sh's setup_keys),
-# run with no --release-signers at all.
+# The embedded-key branch every final release's installer takes: $KEYED_INSTALLER is the unkeyed
+# installer with the test key added (harness.sh's setup_keys), run without --release-signers.
 
 TESTS="$TESTS t_embedded_key_good_signature"
 t_embedded_key_good_signature() {
@@ -421,9 +419,8 @@ t_embedded_key_offline() {
 
 TESTS="$TESTS t_embedded_key_dry_run"
 t_embedded_key_dry_run() {
-	# A dry run writes nothing, so the embedded key never reaches the file ssh-keygen reads: it says
-	# it would check the .sig, as the network dry run does. It once ran ssh-keygen against the
-	# missing file and reported a good signature as one that "does not verify".
+	# A dry run writes nothing, so the embedded key never reaches the file ssh-keygen would read.
+	# Report that the .sig would be checked, as in the network dry run, without checking a missing file.
 	INSTALLER_UNDER_TEST=$KEYED_INSTALLER
 	d=$S/fix/v1.0.0
 	tb=$d/eitri-1.0.0-x86_64-linux.tar.gz
@@ -469,11 +466,9 @@ evil_dir() {
 
 TESTS="$TESTS t_offline_sums_swapped_after_read"
 t_offline_sums_swapped_after_read() {
-	# --tarball/--sums/--sig name files in a directory someone else can rename files in. The
-	# installer once read --sums twice: its text (which chose the tarball's hash) on the first
-	# read, the signature check on a second -- so SHA256SUMS swapped for the genuine one right after
-	# the first read passed the signature and installed the evil tarball. It reads, checks and uses
-	# only its own copy now. The cat stub makes the swap right after the file is read.
+	# --tarball/--sums/--sig may name files in a directory another user can rename files in.
+	# Reading --sums twice would let swapped content choose an evil hash but pass a genuine signature.
+	# Read, check and use only a private copy; the cat stub swaps the original just after the read.
 	INSTALLER_UNDER_TEST=$KEYED_INSTALLER
 	d=$T/shared
 	evil_dir "$d"
@@ -491,9 +486,8 @@ t_offline_sums_swapped_after_read() {
 
 TESTS="$TESTS t_offline_tarball_swapped_after_hash"
 t_offline_tarball_swapped_after_hash() {
-	# The same for --tarball: it was hashed on one read and unpacked on another, so a tarball
-	# swapped right after it was hashed was installed. The sha256sum stub makes the swap right after
-	# the first hash; the installer hashes and unpacks its own copy, so the swap changes nothing.
+	# Hash and unpack a private copy of --tarball, so replacing the original after the hash cannot
+	# install unverified content. sha256sum-swap makes that replacement immediately after the first hash.
 	INSTALLER_UNDER_TEST=$KEYED_INSTALLER
 	d=$T/shared
 	evil_dir "$d"
@@ -509,10 +503,8 @@ t_offline_tarball_swapped_after_hash() {
 
 TESTS="$TESTS t_release_signers_unusable_refused"
 t_release_signers_unusable_refused() {
-	# --release-signers replaces the key built in. A file that cannot be read was once taken for
-	# one that lists no key: signature checking was skipped -- even by an installer with a key
-	# built in, even with a --sig given -- and an evil tarball installed. A file that lists no key
-	# would turn checking off the same way, which is never what the option is for.
+	# --release-signers replaces the built-in key; an unreadable or empty file must not disable
+	# signature checks and permit an evil tarball, even with --sig supplied.
 	INSTALLER_UNDER_TEST=$KEYED_INSTALLER
 	d=$T/shared
 	evil_dir "$d"
@@ -617,9 +609,8 @@ own_private_group_here() {
 
 TESTS="$TESTS t_cache_group_writable_refused"
 t_cache_group_writable_refused() {
-	# The original check tested only the other-write bit (`-perm -0002`), so a
-	# group-writable (0770) cache passed it even though every member of that group can still replace
-	# a download between check and use.
+	# A group-writable (0770) cache lets every group member replace downloads between check and use;
+	# checking only the other-write bit (`-perm -0002`) would miss it.
 	serve 1.0.0
 	mkdir -p "$TH/.cache/eitri"
 	chmod 0770 "$TH/.cache/eitri"
@@ -636,9 +627,8 @@ t_cache_group_writable_refused() {
 
 TESTS="$TESTS t_cache_symlinked_refused"
 t_cache_symlinked_refused() {
-	# A symlink at <cache>/eitri -- planted by another
-	# user in a shared, sticky XDG_CACHE_HOME such as /tmp -- can be repointed at any time, after
-	# whatever the permission checks saw when they ran.
+	# A symlink at <cache>/eitri planted by another user in a shared sticky XDG_CACHE_HOME can be
+	# repointed after permission checks, so it must be refused.
 	serve 1.0.0
 	mkdir -p "$T/elsewhere" "$TH/.cache"
 	ln -s "$T/elsewhere" "$TH/.cache/eitri"
@@ -654,10 +644,8 @@ t_cache_symlinked_refused() {
 
 TESTS="$TESTS t_cache_parent_writable_without_sticky_refused"
 t_cache_parent_writable_without_sticky_refused() {
-	# A world-writable, non-sticky XDG_CACHE_HOME lets another user rename
-	# <cache>/eitri away and put their own directory of that name in its place between any two
-	# checks -- the original guard only ever looked at NV_CACHE_NV's own permissions, never its
-	# parent's.
+	# A world-writable, non-sticky XDG_CACHE_HOME lets another user rename <cache>/eitri away and
+	# replace it between checks. Check the parent's permissions as well as NV_CACHE_NV's own.
 	serve 1.0.0
 	mkdir -p "$TH/.cache"
 	chmod 0777 "$TH/.cache"
@@ -673,11 +661,8 @@ t_cache_parent_writable_without_sticky_refused() {
 
 TESTS="$TESTS t_cache_parent_group_writable_without_sticky_refused"
 t_cache_parent_group_writable_without_sticky_refused() {
-	# The parent check only ever tested the
-	# other-write bit (-perm -0002), the same gap already closed on
-	# NV_CACHE_NV's own permissions (t_cache_group_writable_refused) but never on its parent's -- a
-	# group-writable (0770), non-sticky XDG_CACHE_HOME lets any member of that group rename
-	# <cache>/eitri away between checks, exactly as a world-writable one does.
+	# A group-writable (0770), non-sticky XDG_CACHE_HOME lets a group member rename <cache>/eitri
+	# away between checks, just as a world-writable parent does. The parent's group bit matters too.
 	serve 1.0.0
 	mkdir -p "$TH/.cache"
 	chmod 0770 "$TH/.cache"
@@ -694,9 +679,8 @@ t_cache_parent_group_writable_without_sticky_refused() {
 
 TESTS="$TESTS t_cache_group_writable_own_private_group_allowed"
 t_cache_group_writable_own_private_group_allowed() {
-	# rc.2's e2e (2026-09-28): a default Ubuntu user has a group of their own and umask 002, so tools
-	# leave ~/.cache (and anything under it) at 0775. Refusing that refused `eitri setup` right
-	# after a plain .deb install. Group-write on the user's own private group lets no one else in.
+	# Ubuntu's default user-private group and umask 002 leave ~/.cache and children at 0775.
+	# Group-write for the user's private group lets no one else in, so `eitri setup` must accept it.
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -711,8 +695,8 @@ t_cache_group_writable_own_private_group_allowed() {
 
 TESTS="$TESTS t_cache_group_writable_shared_primary_gid_refused"
 t_cache_group_writable_shared_primary_gid_refused() {
-	# An account whose primary group matches this user's group may be absent from getent's
-	# member list yet still write a 0775 directory in that group. Check the account list too.
+	# Another account whose primary group is this user's group can write a 0775 directory of that
+	# group without appearing in getent's member list. The account list must also be checked.
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -728,9 +712,8 @@ t_cache_group_writable_shared_primary_gid_refused() {
 
 TESTS="$TESTS t_cache_parent_acl_named_writer_refused"
 t_cache_parent_acl_named_writer_refused() {
-	# An extended ACL entry for another user makes a directory writable to them
-	# while its mode reads 0775 (the group bits are the ACL mask), so the private-group allowance must
-	# never apply to a directory that has one.
+	# An extended ACL can grant another user write access while the mode reads 0775 (group bits
+	# are the ACL mask), so a directory with one must never receive the private-group allowance.
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -757,9 +740,8 @@ t_cache_parent_acl_named_writer_refused() {
 
 TESTS="$TESTS t_cache_symlinked_parent_acl_refused_without_getfacl"
 t_cache_symlinked_parent_acl_refused_without_getfacl() {
-	# With ~/.cache a symlink to a directory carrying an ACL, `ls -ld` described
-	# the link, not the directory, so without getfacl the ACL went unseen. A getfacl stub that reports
-	# no ACL leaves ls as the only check here.
+	# For ~/.cache symlinked to a directory with an ACL, `ls -ld` describes the link, not its target.
+	# Check the target too. A getfacl stub reporting no ACL leaves ls as the only check here.
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -993,8 +975,8 @@ t_cache_ancestor_owned_by_another_user_refused() {
 
 TESTS="$TESTS t_cache_group_writable_duplicate_gid_refused"
 t_cache_group_writable_duplicate_gid_refused() {
-	# A second group sharing the private group's GID gives its members the same
-	# access without appearing under the private group's name.
+	# A second group sharing the private group's GID gives its members the same access without
+	# appearing under the private group's name.
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -1010,8 +992,8 @@ t_cache_group_writable_duplicate_gid_refused() {
 
 TESTS="$TESTS t_cache_group_list_cut_short_refused"
 t_cache_group_list_cut_short_refused() {
-	# A group list that stops early (getent exiting non-zero after printing the
-	# user's own group) must not count as "exactly one group with this GID".
+	# A group list that stops early (getent fails after printing this user's group) cannot establish
+	# "exactly one group with this GID".
 	if ! own_private_group_here; then
 		printf 'note: the test user has no private group here; nothing to check\n'
 		return 0
@@ -1049,13 +1031,10 @@ t_cache_other_writable_own_private_group_still_refused() {
 
 TESTS="$TESTS t_cache_owned_by_another_user_refused"
 t_cache_owned_by_another_user_refused() {
-	# `mkdir -p` is a silent no-op on a
-	# <cache>/eitri that already exists, so one planted in advance by another user (in a shared
-	# XDG_CACHE_HOME) was never checked for who owns it, only for its own write bits -- which say
-	# nothing about whether that owner can already read, or later replace, whatever a download
-	# writes inside it. This sandbox cannot chown a real directory to another uid without root (an installer test
-	# never uses sudo), so find-fake-owner reports $TH/.cache/eitri itself as
-	# not ours, exactly as the real find would for one actually owned by someone else.
+	# `mkdir -p` does nothing when <cache>/eitri exists. A directory planted by another user must
+	# be checked for ownership as well as write bits: its owner can read or replace downloads inside.
+	# The sandbox cannot chown without root, which installer tests never use, so find-fake-owner
+	# reports $TH/.cache/eitri as another user's, as real find would.
 	serve 1.0.0
 	mkdir -p "$TH/.cache/eitri"
 	chmod 0700 "$TH/.cache/eitri"
@@ -1072,11 +1051,8 @@ t_cache_owned_by_another_user_refused() {
 
 TESTS="$TESTS t_cache_parent_owned_by_another_user_refused"
 t_cache_parent_owned_by_another_user_refused() {
-	# A sticky 1777 <cache> owned by another user
-	# passed the old check (which only ever looked at write bits): the sticky bit stops other
-	# non-owner users from renaming entries away, but never stops the directory's OWN owner from
-	# doing exactly that -- so a shared, sticky XDG_CACHE_HOME owned by someone else is still unsafe.
-	# Same sandbox limitation as the test above: find-fake-owner stands in for a real chown.
+	# A sticky 1777 <cache> owned by another user is unsafe: the sticky bit stops other non-owners
+	# from renaming entries, but never stops the owner. find-fake-owner stands in for a real chown.
 	serve 1.0.0
 	mkdir -p "$TH/.cache"
 	chmod 1777 "$TH/.cache"

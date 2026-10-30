@@ -1,6 +1,6 @@
-//! Text feedback for the tiling, focus, keys, chrome, module and window verbs. For the tiling verbs, the caller
-//! retains effects requiring values absent from [`VerbOutcome`]: successful preset cycling, mark toggling, marked
-//! swaps and zoom changes.
+//! Text feedback for the tiling, float, focus, keys, chrome, module, window and panel verbs. For the tiling verbs,
+//! the caller retains effects requiring values absent from [`VerbOutcome`]: successful preset cycling, mark
+//! toggling, marked swaps and zoom changes.
 //! Container no-ops also flash without a toast; their [`Feedback::Log`] carries only the line,
 //! so the caller must retain that flash separately.
 //!
@@ -30,6 +30,36 @@ pub enum VerbOutcome<'a> {
     /// The verb found nothing to change or select.
     Nothing,
     Failed(&'a LayoutError),
+}
+
+/// The close paths distinguish a window refusal from the module kill's bare flash and an informational toast.
+pub enum CloseOutcome<'a> {
+    Refused(&'a str),
+    KillRefused,
+    Toast(&'a str),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CloseFeedback {
+    pub flash: bool,
+    pub toast: Option<String>,
+}
+
+pub fn close(outcome: CloseOutcome<'_>) -> CloseFeedback {
+    match outcome {
+        CloseOutcome::Refused(text) => CloseFeedback {
+            flash: true,
+            toast: Some(text.into()),
+        },
+        CloseOutcome::KillRefused => CloseFeedback {
+            flash: true,
+            toast: None,
+        },
+        CloseOutcome::Toast(text) => CloseFeedback {
+            flash: false,
+            toast: Some(text.into()),
+        },
+    }
 }
 
 /// Feedback from the tiling arms, with `Move` referring only to a tiled module.
@@ -95,6 +125,50 @@ pub fn tiling(action: &Action, target: &ModuleId, outcome: VerbOutcome<'_>) -> O
     }
 }
 
+/// The float arms' feedback. Success lines needing the returned float change or focus destination stay
+/// with the caller; the scratchpad's empty refusal also needs the keymap and is [`floats_empty`].
+pub fn floats(action: &Action, target: &ModuleId, outcome: VerbOutcome<'_>) -> Option<Feedback> {
+    match (action, outcome) {
+        (Action::FloatToggle | Action::ScratchpadMove | Action::ScratchpadShow { .. }, VerbOutcome::Failed(err)) => {
+            Some(Feedback::Refuse {
+                log: format!("[modules] refused: {err}"),
+                text: layout_refusal_text(err),
+            })
+        }
+        (Action::Move(dir), VerbOutcome::Nothing) => Some(Feedback::Log(format!(
+            "[modules] {target}: the float is against the {dir:?} edge"
+        ))),
+        (Action::FocusModeToggle, VerbOutcome::Nothing) => {
+            let text = "focus.mode-toggle: nothing in view on the other layer";
+            Some(Feedback::Refuse {
+                log: format!("[modules] {text}"),
+                text: text.into(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Each scratchpad show reports its outcome; a missing instance is made by the module verbs next.
+pub fn floats_show(change: &crate::layout::ScratchShow) -> Feedback {
+    let line = match change {
+        crate::layout::ScratchShow::Missing(id) => {
+            format!("[modules] {id}: not made yet; the controller makes it for the scratchpad")
+        }
+        change => format!("[modules] scratchpad.show: {change:?}"),
+    };
+    Feedback::Log(line)
+}
+
+/// An empty scratchpad flashes and names the key that fills it in the toast.
+pub fn floats_empty(keymap: &crate::keymap::Keymap) -> Feedback {
+    let text = super::verbs::floats::scratch_empty_text(keymap);
+    Feedback::Refuse {
+        log: format!("[modules] refused: {text}"),
+        text,
+    }
+}
+
 /// Feedback from the focus verbs. `select.last` with no module before the current one that can take the keys,
 /// and `select.next` with no other module on screen, flash and toast; every landing is a log line its verb
 /// prints itself, and `select.<dir>` with nothing that way is the navigation's own line.
@@ -141,6 +215,11 @@ pub fn not_in_window_text(id: &ModuleId) -> String {
     format!("{id}: not in this window")
 }
 
+/// A hide key's module key for a module that is hidden already.
+pub fn already_hidden_text(id: &ModuleId) -> String {
+    format!("{id} is hidden already")
+}
+
 /// A module key for a module this window has no host for (the canvas before it exists, a module of the other
 /// window), and a kill of one.
 pub fn not_here_yet_text(id: &ModuleId) -> String {
@@ -167,30 +246,70 @@ pub fn covered_text(chat: &str, float: &str, key: &str, scratch: bool) -> String
     format!("{chat} is under {float}: {key} from {float} {verb} it")
 }
 
-/// A killed editor cannot return in this window, so its toast explains how to get it back.
-/// Other modules keep their own error text even if they are also marked gone.
+/// The editor is gone only from a window that never starts one (the pair's second window, whose editor is the first
+/// window's), so its refusals say that rather than offering a restart nothing there can carry out; other modules keep
+/// their own error text even if they are also marked gone.
 pub fn layout_refusal_text(err: &LayoutError) -> String {
     gone_editor_toast_text(err).unwrap_or_else(|| err.to_string())
 }
 
-/// What a retired editor's refusals say, here and in the shell's own toasts: nvim ended -- a `prefix x`, a
-/// `:qa` or a crash, which nothing here can tell apart -- and no second nvim starts in this window. A
-/// relaunch shows the editor again, so the text says that without naming a cause it does not know: a text
-/// naming `:qa` or `prefix x` would be wrong after a crash. One constant, so every refusal of the killed
-/// editor reads the same whichever side decided it.
-pub const RETIRED_EDITOR_TEXT: &str =
-    "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back";
+/// What the ended editor's toasts say, after a `prefix x`, a `:qa` or a crash, which nothing here can tell apart:
+/// nvim exited, and the key that starts it again. It names no cause it does not know -- a text naming `:qa` or
+/// `prefix x` would be wrong after a crash -- and it is one function, so every toast of the ended editor reads the
+/// same whichever path ended it. The key is the window's own (its prefix and the editor's module key), written in
+/// tmux's notation (`C-b e`) as tmux's own messages name keys; with no key bound, the action's name.
+pub fn editor_ended_text(keymap: &crate::keymap::Keymap) -> String {
+    let key = super::verbs::key_text(keymap, &Action::Module(ModuleId::editor())).replace("Ctrl+", "C-");
+    format!("nvim exited \u{2014} {key} starts it again")
+}
+
+/// Requests must wait until the restarted nvim can receive them.
+pub const EDITOR_NOT_RUNNING_TEXT: &str = "the editor is not running";
+
+/// A restart's launch failed; the pane shows why over itself, so this says only that it failed and the key that
+/// tries again, in the ended editor's own notation ([`editor_ended_text`]).
+pub fn restart_failed_text(keymap: &crate::keymap::Keymap) -> String {
+    let key = super::verbs::key_text(keymap, &Action::Module(ModuleId::editor())).replace("Ctrl+", "C-");
+    format!("nvim could not start \u{2014} {key} tries again")
+}
+
+/// The pane reports why it could not restart, so the next show can try again.
+pub fn restart_refused_text(state: &str) -> String {
+    format!("the editor could not start again: the pane is {state}")
+}
 
 fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
     match err {
-        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(RETIRED_EDITOR_TEXT.into()),
+        LayoutError::Gone(id) if *id == ModuleId::editor() => Some(NO_EDITOR_HERE_TEXT.into()),
         _ => None,
+    }
+}
+
+/// Feedback from the chat's tab verbs, the same with the keys in the base view or in an extra one. A switch that
+/// found no tab (a step or `last` with nowhere to go, a number no tab has), a key with nothing to do there (a step
+/// over the canvas's revisions, closing the others from a view that holds one tab) and a step to a sibling or
+/// terminal that is not there flash the app name alone: the `Refuse` has an empty line and an empty text, so nothing
+/// is printed and the toast stays as it was. A step the lone terminal swallows says nothing. A verb that first shows
+/// the base view to give it the keys, refused by the layout, says why on the toast, as every layout refusal does.
+/// Every switch and every call made is silent here.
+pub fn tabs(verb: &crate::tabs::TabVerb, outcome: VerbOutcome<'_>) -> Option<Feedback> {
+    match outcome {
+        VerbOutcome::Done => None,
+        VerbOutcome::Nothing if matches!(verb, crate::tabs::TabVerb::Nothing) => None,
+        VerbOutcome::Nothing => Some(Feedback::Refuse {
+            log: String::new(),
+            text: String::new(),
+        }),
+        VerbOutcome::Failed(err) => Some(Feedback::Refuse {
+            log: format!("[modules] refused: {err}"),
+            text: layout_refusal_text(err),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{chrome, focus, keys, layout_refusal_text, tiling, Feedback, VerbOutcome};
+    use super::{chrome, focus, keys, layout_refusal_text, tabs, tiling, Feedback, VerbOutcome};
     use crate::keymap::{Action, SwapTarget};
     use crate::layout::{Axis, Direction, LayoutError, ModuleId};
 
@@ -326,9 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn a_killed_editors_refusal_says_how_to_get_it_back() {
+    fn the_ended_editors_text_uses_the_configured_prefix() {
+        let keymap =
+            crate::keymap::Keymap::apply_user(&[crate::keymap::KeymapOp::Prefix { key: "C-a".into() }], &[]).unwrap();
+        assert_eq!(super::editor_ended_text(&keymap), "nvim exited — C-a e starts it again");
+    }
+
+    #[test]
+    fn a_gone_editors_refusal_says_the_window_has_none() {
         let err = LayoutError::Gone(ModuleId::editor());
-        let text = "nvim exited and cannot restart in this window — relaunch Eitri to get the editor back";
+        let text = "this window has no editor: it is in the first window";
         assert_eq!(layout_refusal_text(&err), text);
         assert_eq!(
             tiling(
@@ -491,6 +617,92 @@ mod tests {
     fn an_answer_the_gate_cannot_judge_is_asked_again() {
         assert_eq!(super::LAYOUT_CHANGING_TEXT, "the layout is changing: answer again");
     }
+
+    fn flash_alone() -> Option<Feedback> {
+        Some(Feedback::Refuse {
+            log: String::new(),
+            text: String::new(),
+        })
+    }
+
+    macro_rules! tab_nothing {
+        ($($name:ident: $verb:expr => $expected:expr),* $(,)?) => {$(
+            #[test]
+            fn $name() {
+                assert_eq!(tabs(&$verb, VerbOutcome::Nothing), $expected);
+            }
+        )*};
+    }
+
+    tab_nothing! {
+        feedback_tab_step_with_no_other_tab_flashes_alone: crate::tabs::TabVerb::Step(1) => flash_alone(),
+        feedback_tab_step_back_with_no_other_tab_flashes_alone: crate::tabs::TabVerb::Step(-1) => flash_alone(),
+        feedback_tab_last_with_no_last_tab_flashes_alone: crate::tabs::TabVerb::Last => flash_alone(),
+        feedback_tab_number_no_tab_has_flashes_alone: crate::tabs::TabVerb::Select(9) => flash_alone(),
+        feedback_tab_key_with_nothing_to_do_there_flashes_alone: crate::tabs::TabVerb::Flash => flash_alone(),
+        feedback_tab_sibling_step_with_no_sibling_flashes_alone: crate::tabs::TabVerb::Sibling(1) => flash_alone(),
+        feedback_tab_terminal_step_with_no_terminal_flashes_alone: crate::tabs::TabVerb::Terminal(-1) => flash_alone(),
+        feedback_tab_step_the_lone_terminal_swallows_says_nothing: crate::tabs::TabVerb::Nothing => None,
+    }
+
+    macro_rules! tab_failed {
+        ($($name:ident: $verb:expr),* $(,)?) => {$(
+            #[test]
+            fn $name() {
+                assert_eq!(
+                    tabs(&$verb, VerbOutcome::Failed(&LayoutError::NoScratch)),
+                    Some(Feedback::Refuse {
+                        log: "[modules] refused: the scratchpad is empty".into(),
+                        text: "the scratchpad is empty".into(),
+                    })
+                );
+            }
+        )*};
+    }
+
+    tab_failed! {
+        feedback_tab_new_with_the_base_view_refused_says_why: crate::tabs::TabVerb::New,
+        feedback_tab_rename_with_the_base_view_refused_says_why: crate::tabs::TabVerb::Rename,
+        feedback_tab_close_with_the_base_view_refused_says_why: crate::tabs::TabVerb::Close,
+        feedback_tab_close_others_with_the_base_view_refused_says_why: crate::tabs::TabVerb::CloseOthers,
+        feedback_tab_chooser_with_the_base_view_refused_says_why: crate::tabs::TabVerb::Choose,
+        feedback_tab_info_with_the_base_view_refused_says_why: crate::tabs::TabVerb::Info,
+        feedback_tab_number_of_a_base_tab_with_the_base_view_refused_says_why: crate::tabs::TabVerb::Select(1),
+    }
+
+    #[test]
+    fn feedback_tab_a_gone_editor_refusing_the_base_view_says_the_window_has_none() {
+        assert_eq!(
+            tabs(
+                &crate::tabs::TabVerb::New,
+                VerbOutcome::Failed(&LayoutError::Gone(ModuleId::editor()))
+            ),
+            Some(Feedback::Refuse {
+                log: format!("[modules] refused: {}", LayoutError::Gone(ModuleId::editor())),
+                text: super::NO_EDITOR_HERE_TEXT.into(),
+            })
+        );
+    }
+
+    #[test]
+    fn feedback_tab_every_switch_and_call_made_is_silent() {
+        use crate::tabs::TabVerb;
+        for verb in [
+            TabVerb::New,
+            TabVerb::Step(1),
+            TabVerb::Last,
+            TabVerb::Select(1),
+            TabVerb::Rename,
+            TabVerb::Close,
+            TabVerb::CloseOthers,
+            TabVerb::Choose,
+            TabVerb::Info,
+            TabVerb::Sibling(1),
+            TabVerb::Terminal(1),
+        ] {
+            assert_eq!(tabs(&verb, VerbOutcome::Done), None, "{verb:?} done says nothing");
+        }
+    }
 }
 
 /// A workspace verb's refusal: a step with only one workspace logs under the workspaces' own prefix, every other
@@ -506,10 +718,30 @@ pub fn workspaces(alone: bool, text: String) -> Feedback {
 
 // The window verbs' words.
 
+/// An editor key in a window that neither owns the editor nor has a peer to ask.
+pub const EDITOR_WINDOW_CLOSED_TEXT: &str = "the editor window is closed";
+
+/// The editor key's question in a window 2 whose editor window is closed.
+pub const START_EDITOR_PROMPT: &str = "start the editor? (y/n)";
+
 /// What a window verb says while the half of the pair it needs is not there: no other window attached, a module
 /// the other window holds asked for here, a workspace sent across, or a kind of module the other window cannot
 /// take yet.
 pub const NO_SECOND_WINDOW_TEXT: &str = "this window has no second window yet";
+/// The same in a window 2 whose window 1 has gone: it is the editor window that is missing, and the editor key is the
+/// way to start it again (running `eitri` on the project links a new one too).
+pub const ORPHAN_TEXT: &str = "the editor window is closed: the editor key starts it again";
+
+/// What a window verb that needs the other window says while none is attached: in window 2, that its window 1 is
+/// gone; anywhere else, that there is no second window yet.
+pub fn no_other_window_text(role: &super::window::WindowRole) -> &'static str {
+    use super::window::{LinkSide, WindowRole};
+    if *role == (WindowRole::Linked { side: LinkSide::Second }) {
+        ORPHAN_TEXT
+    } else {
+        NO_SECOND_WINDOW_TEXT
+    }
+}
 /// A move toward another window of the same process: the pair is two processes, and nothing else was chosen.
 pub const LOCAL_MOVE_TEXT: &str = "windows of one process were not chosen";
 /// A move of the editor, which stays with the nvim it runs.
@@ -518,13 +750,45 @@ pub const EDITOR_MOVE_TEXT: &str = "the editor stays in the window that runs nvi
 pub const MOVING_TEXT: &str = "the module is already moving to the other window";
 /// A move of a module this window does not hold.
 pub const NOT_HELD_TEXT: &str = "the module is not in this window";
+/// The destination's answer to an offer of a page or Lua panel it holds itself: one name is held by one window.
+pub const HELD_HERE_TEXT: &str = "the other window holds that module itself";
 /// The destination's answer to an offer it cannot take as one: a number that is not the other window's, or one
 /// already taken.
 pub const NOT_AN_OFFER_TEXT: &str = "not an offer this window can take";
 
-/// What the source says, once, when the other window has neither committed nor given back a move it was sent.
+/// What the source says, once, when the other window has neither committed nor given back a move it was sent: the
+/// module stays frozen. In window 1 the kill key is the way out, since window 1 started window 2 and can end it;
+/// window 2 did not start window 1, so there the way out is window 1's own close.
 pub fn not_answering_text(other: u8) -> String {
-    format!("window {other} is not answering")
+    if other == 1 {
+        "window 1 is not answering; closing it gives the module back here".to_owned()
+    } else {
+        format!("window {other} is not answering; prefix x closes it")
+    }
+}
+
+/// What a chat says when it is asked to move while its turn runs and its agent cannot keep a running turn across a
+/// move: it goes once the turn ends.
+pub fn moves_at_turn_end_text(other: u8) -> String {
+    format!("moves to window {other} when this turn ends")
+}
+
+/// Why a chat stays when its workspace moves: its running turn cannot move live, and a workspace waits for no turn.
+pub const TURN_RUNS_STAYS_TEXT: &str = "its turn is running and cannot move until it ends";
+
+/// Why a moved chat's arrival was given up when this window's presence could not hold its running turn in time.
+pub const PRESENCE_TOO_SLOW_TEXT: &str = "the moved chat's running turn could not be held here in time";
+
+/// The kill key's question about a module frozen for a window that stopped answering: that window ends, not the
+/// module, which the link's end gives back. What ends with it, as its last summary counted it, is named.
+pub fn close_peer_text(other: u8, running: u32, queued: u32) -> String {
+    let ends = match (running, queued) {
+        (0, 0) => String::new(),
+        (r, 0) => format!(" ({r} running end with it)"),
+        (0, q) => format!(" ({q} queued end with it)"),
+        (r, q) => format!(" ({r} running, {q} queued end with it)"),
+    };
+    format!("close window {other}{ends}? (y/n)")
 }
 
 #[cfg(test)]
@@ -536,7 +800,367 @@ mod window_tests {
 
     #[test]
     fn a_silent_destination_is_named_by_its_window_number() {
-        assert_eq!(super::not_answering_text(2), "window 2 is not answering");
-        assert_eq!(super::not_answering_text(1), "window 1 is not answering");
+        assert_eq!(
+            super::not_answering_text(2),
+            "window 2 is not answering; prefix x closes it"
+        );
+        assert_eq!(
+            super::not_answering_text(1),
+            "window 1 is not answering; closing it gives the module back here"
+        );
+        assert_eq!(super::close_peer_text(2, 0, 0), "close window 2? (y/n)");
+        assert_eq!(
+            super::close_peer_text(2, 2, 3),
+            "close window 2 (2 running, 3 queued end with it)? (y/n)"
+        );
+        assert_eq!(
+            super::close_peer_text(2, 1, 0),
+            "close window 2 (1 running end with it)? (y/n)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+    use crate::layout::{Direction, ScratchShow};
+
+    macro_rules! quiet {
+        ($($name:ident: $action:expr),* $(,)?) => {$(
+            #[test]
+            fn $name() {
+                assert_eq!(floats(&$action, &ModuleId::terminal(), VerbOutcome::Done), None);
+            }
+        )*};
+    }
+    quiet! {
+        feedback_float_toggle_done: Action::FloatToggle,
+        feedback_float_move_done: Action::Move(Direction::Left),
+        feedback_focus_mode_toggle_done: Action::FocusModeToggle,
+        feedback_scratchpad_move_done: Action::ScratchpadMove,
+        feedback_scratchpad_show_done: Action::ScratchpadShow { module: None },
+    }
+
+    macro_rules! failed {
+        ($($name:ident: $action:expr),* $(,)?) => {$(
+            #[test]
+            fn $name() {
+                assert_eq!(floats(&$action, &ModuleId::editor(), VerbOutcome::Failed(&LayoutError::EditorNeverFloats)),
+                    Some(Feedback::Refuse {
+                        log: format!("[modules] refused: {}", LayoutError::EditorNeverFloats),
+                        text: LayoutError::EditorNeverFloats.to_string(),
+                    }));
+            }
+        )*};
+    }
+    failed! {
+        feedback_float_toggle_failed: Action::FloatToggle,
+        feedback_scratchpad_move_failed: Action::ScratchpadMove,
+        feedback_scratchpad_show_failed: Action::ScratchpadShow { module: None },
+    }
+
+    #[test]
+    fn feedback_float_move_nothing() {
+        assert_eq!(
+            floats(
+                &Action::Move(Direction::Right),
+                &ModuleId::terminal(),
+                VerbOutcome::Nothing
+            ),
+            Some(Feedback::Log(
+                "[modules] terminal: the float is against the Right edge".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn feedback_focus_mode_toggle_nothing() {
+        let text = "focus.mode-toggle: nothing in view on the other layer";
+        assert_eq!(
+            floats(&Action::FocusModeToggle, &ModuleId::terminal(), VerbOutcome::Nothing),
+            Some(Feedback::Refuse {
+                log: format!("[modules] {text}"),
+                text: text.into()
+            })
+        );
+    }
+
+    macro_rules! shown {
+        ($($name:ident: $change:expr => $text:expr),* $(,)?) => {$(
+            #[test]
+            fn $name() {
+                assert_eq!(floats_show(&$change), Feedback::Log($text.into()));
+            }
+        )*};
+    }
+    shown! {
+        feedback_scratchpad_show_shown: ScratchShow::Shown(ModuleId::terminal()) =>
+            "[modules] scratchpad.show: Shown(ModuleId(\"terminal\"))",
+        feedback_scratchpad_show_raised: ScratchShow::Raised(ModuleId::terminal()) =>
+            "[modules] scratchpad.show: Raised(ModuleId(\"terminal\"))",
+        feedback_scratchpad_show_stowed: ScratchShow::Stowed(Some(ModuleId::editor())) =>
+            "[modules] scratchpad.show: Stowed(Some(ModuleId(\"editor\")))",
+        feedback_scratchpad_show_stowed_without_focus: ScratchShow::Stowed(None) =>
+            "[modules] scratchpad.show: Stowed(None)",
+        feedback_scratchpad_show_missing: ScratchShow::Missing(ModuleId::terminal()) =>
+            "[modules] terminal: not made yet; the controller makes it for the scratchpad",
+    }
+
+    #[test]
+    fn feedback_scratchpad_show_no_scratch() {
+        let keymap = crate::keymap::Keymap::defaults();
+        let text = format!(
+            "the scratchpad is empty ({} sends a module there)",
+            crate::wm::verbs::key_text(&keymap, &Action::ScratchpadMove)
+        );
+        assert_eq!(
+            floats_empty(&keymap),
+            Feedback::Refuse {
+                log: format!("[modules] refused: {text}"),
+                text
+            }
+        );
+    }
+}
+
+// The panel verbs' and the panel events' words.
+
+/// What a panel verb or a panel event says, as its arm or hook in the shell said it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanelOutcome<'a> {
+    /// The chat view a verb opens something in, a view the panel asked to show, or the editor a chat's request
+    /// drives could not be put on screen: the layout's refusal.
+    NotShown(&'a LayoutError),
+    /// A float still covers the chat view the verb would open something in.
+    Covered(&'a str),
+    /// The base view's active tab cannot go out into a view of its own now: the panel's words.
+    NoBreak(&'a str),
+    /// `tab.break` from an extra view that holds no tab.
+    NoTab(crate::tabs::ViewId),
+    /// `tab.break` with the keys in no chat view.
+    NoChatView(&'a Action),
+    /// The panel refused to bring an extra view's tab back: its words.
+    JoinRefused(&'a str),
+    /// An extra view left with no tab is the only module on screen, and the base view could not be shown beside
+    /// it, so the editor is tried.
+    BaseNotShown {
+        view: crate::tabs::ViewId,
+        err: &'a LayoutError,
+    },
+    /// An extra view left with no tab is the only module on screen, and nothing could be shown beside it: it
+    /// stays.
+    AloneStays {
+        view: crate::tabs::ViewId,
+        err: &'a LayoutError,
+    },
+    /// An extra view left with no tab was removed from the window.
+    Removed(crate::tabs::ViewId),
+    /// An extra view left with no tab could not be removed.
+    NotRemoved {
+        view: crate::tabs::ViewId,
+        err: &'a LayoutError,
+    },
+}
+
+/// The panel's lines and refusals. A refusal by the layout says the layout's words on the toast; a refusal with its
+/// own words says them; `tab.break` with the keys in no chat view logs under the prefix's own tag. What an empty
+/// view's removal does is a stdout line alone.
+pub fn panel(outcome: PanelOutcome<'_>) -> Feedback {
+    let refuse = |text: String| Feedback::Refuse {
+        log: format!("[modules] refused: {text}"),
+        text,
+    };
+    match outcome {
+        PanelOutcome::NotShown(err) => Feedback::Refuse {
+            log: format!("[modules] refused: {err}"),
+            text: layout_refusal_text(err),
+        },
+        PanelOutcome::Covered(text) | PanelOutcome::NoBreak(text) | PanelOutcome::JoinRefused(text) => {
+            refuse(text.to_string())
+        }
+        PanelOutcome::NoTab(view) => refuse(format!("agent {} shows no tab", view.number())),
+        PanelOutcome::NoChatView(action) => {
+            let text = format!("{}: the keys are in no chat view", action.name());
+            Feedback::Refuse {
+                log: format!("[prefix] {text}"),
+                text,
+            }
+        }
+        PanelOutcome::BaseNotShown { view, err } => Feedback::Log(format!(
+            "[chat] {}: the base view could not be shown ({err}); trying the editor",
+            view.module()
+        )),
+        PanelOutcome::AloneStays { view, err } => Feedback::Log(format!(
+            "[chat] {} holds no tab but is the only module on screen: {err}",
+            view.module()
+        )),
+        PanelOutcome::Removed(view) => Feedback::Log(format!("[chat] {} holds no tab; removed", view.module())),
+        PanelOutcome::NotRemoved { view, err } => Feedback::Log(format!(
+            "[chat] {} holds no tab and could not be removed: {err}",
+            view.module()
+        )),
+    }
+}
+
+/// What a panel event that could not be carried out says on stderr, with no flash and no toast: the page asked,
+/// not the user.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanelWarning<'a> {
+    /// The editor a review opened a file in could not be shown.
+    ReviewNotShown(&'a LayoutError),
+    /// The keys could not go back to the chat after an edit in the editor ended.
+    NoReturn(&'a LayoutError),
+}
+
+/// The stderr line of a [`PanelWarning`].
+pub fn panel_warning(warning: PanelWarning<'_>) -> String {
+    match warning {
+        PanelWarning::ReviewNotShown(err) => format!("[review] could not show the editor: {err}"),
+        PanelWarning::NoReturn(err) => format!("[scratch] could not return the keys to the chat: {err}"),
+    }
+}
+
+/// What a chat's request to an editor in the other window of the pair is refused with here.
+pub const NO_EDITOR_HERE_TEXT: &str = "this window has no editor: it is in the first window";
+/// What a chat's request to an editor whose nvim does not run is refused with.
+pub const EDITOR_NOT_READY_TEXT: &str = "the editor is not ready yet";
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use crate::tabs::ViewId;
+
+    fn two() -> ViewId {
+        ViewId::new(2).unwrap()
+    }
+
+    fn refusal(log: &str, text: &str) -> Feedback {
+        Feedback::Refuse {
+            log: log.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn feedback_panel_keymap_not_shown_says_the_layouts_words() {
+        let err = LayoutError::NotInTree(ModuleId::agent());
+        assert_eq!(
+            panel(PanelOutcome::NotShown(&err)),
+            refusal(&format!("[modules] refused: {err}"), &layout_refusal_text(&err))
+        );
+    }
+
+    #[test]
+    fn feedback_panel_keymap_covered_says_what_covers_the_chat() {
+        assert_eq!(
+            panel(PanelOutcome::Covered("x covers the chat")),
+            refusal("[modules] refused: x covers the chat", "x covers the chat")
+        );
+    }
+
+    #[test]
+    fn feedback_tab_break_no_break_says_the_panels_words() {
+        assert_eq!(
+            panel(PanelOutcome::NoBreak("one tab left")),
+            refusal("[modules] refused: one tab left", "one tab left")
+        );
+    }
+
+    #[test]
+    fn feedback_tab_break_no_tab_names_the_view() {
+        assert_eq!(
+            panel(PanelOutcome::NoTab(two())),
+            refusal("[modules] refused: agent 2 shows no tab", "agent 2 shows no tab")
+        );
+    }
+
+    #[test]
+    fn feedback_tab_break_no_chat_view_logs_under_the_prefix() {
+        assert_eq!(
+            panel(PanelOutcome::NoChatView(&Action::TabBreak)),
+            refusal(
+                "[prefix] tab.break: the keys are in no chat view",
+                "tab.break: the keys are in no chat view"
+            )
+        );
+    }
+
+    #[test]
+    fn feedback_tab_break_join_refused_says_the_panels_words() {
+        assert_eq!(
+            panel(PanelOutcome::JoinRefused("the window is closing")),
+            refusal("[modules] refused: the window is closing", "the window is closing")
+        );
+    }
+
+    #[test]
+    fn feedback_view_empty_base_not_shown_is_a_line_alone() {
+        let err = LayoutError::NotInTree(ModuleId::agent());
+        assert_eq!(
+            panel(PanelOutcome::BaseNotShown { view: two(), err: &err }),
+            Feedback::Log(format!(
+                "[chat] {}: the base view could not be shown ({err}); trying the editor",
+                two().module()
+            ))
+        );
+    }
+
+    #[test]
+    fn feedback_view_empty_alone_stays_is_a_line_alone() {
+        let err = LayoutError::NotInTree(ModuleId::editor());
+        assert_eq!(
+            panel(PanelOutcome::AloneStays { view: two(), err: &err }),
+            Feedback::Log(format!(
+                "[chat] {} holds no tab but is the only module on screen: {err}",
+                two().module()
+            ))
+        );
+    }
+
+    #[test]
+    fn feedback_view_empty_removed_is_a_line_alone() {
+        assert_eq!(
+            panel(PanelOutcome::Removed(two())),
+            Feedback::Log(format!("[chat] {} holds no tab; removed", two().module()))
+        );
+    }
+
+    #[test]
+    fn feedback_view_empty_not_removed_is_a_line_alone() {
+        let err = LayoutError::LastVisible(ModuleId::agent());
+        assert_eq!(
+            panel(PanelOutcome::NotRemoved { view: two(), err: &err }),
+            Feedback::Log(format!(
+                "[chat] {} holds no tab and could not be removed: {err}",
+                two().module()
+            ))
+        );
+    }
+
+    #[test]
+    fn feedback_review_open_not_shown_is_a_stderr_line() {
+        let err = LayoutError::NotInTree(ModuleId::editor());
+        assert_eq!(
+            panel_warning(PanelWarning::ReviewNotShown(&err)),
+            format!("[review] could not show the editor: {err}")
+        );
+    }
+
+    #[test]
+    fn feedback_editor_done_no_return_is_a_stderr_line() {
+        let err = LayoutError::NotInTree(ModuleId::agent());
+        assert_eq!(
+            panel_warning(PanelWarning::NoReturn(&err)),
+            format!("[scratch] could not return the keys to the chat: {err}")
+        );
+    }
+
+    #[test]
+    fn feedback_editor_request_refusals_say_what_the_shell_said() {
+        assert_eq!(
+            NO_EDITOR_HERE_TEXT,
+            "this window has no editor: it is in the first window"
+        );
+        assert_eq!(EDITOR_NOT_READY_TEXT, "the editor is not ready yet");
     }
 }

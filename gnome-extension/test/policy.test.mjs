@@ -288,7 +288,7 @@ test('decide: an editor that runs under X11 is still the partner when no pid in 
     const chain = [210, 211, 200];
     assert.deepEqual(decide(scene({patch: {...pressed(1), 2: {wayland: false}},
         call: {method: 'ActivatePartner', partnerChain: chain}})), {act: true, target: 2});
-    // With an X11 claimant on an earlier pid, that one is the first X11 owner and keeps today's behaviour.
+    // With an X11 claimant on an earlier pid, that one is the first X11 owner.
     const claimant = {id: 9, pid: 210, wayland: false, userTime: NOW - 100, rect: {x: 0, y: 0, w: 50, h: 50},
         minimized: false, type: 'normal', skipTaskbar: false, onWorkspace: true, monitor: 0, stack: 9, mru: 0};
     assert.deepEqual(decide(scene({patch: {...pressed(1), 2: {wayland: false}}, extra: [claimant],

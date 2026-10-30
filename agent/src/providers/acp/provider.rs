@@ -22,7 +22,9 @@
 
 use super::history::History;
 use super::translate::{self, Fold};
-use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, ToolCallFields, Update};
+use super::wire::{
+    self, method, ChunkKind, InitializeResponse, ModeReport, OptionKind, PermissionRequest, ToolCallFields, Update,
+};
 use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::external_link::{self, link_error, lock, provider_error, ClosingNotice};
 use crate::jsonrpc_link::{
@@ -182,7 +184,7 @@ struct State {
 /// What a wait during the start collects: the mode the agent last reported, and the replay.
 #[derive(Default)]
 struct Boot {
-    mode: Option<String>,
+    mode: Option<ModeReport>,
     /// The latest command list the agent sent before the session was open.
     commands: Option<Vec<SlashCommand>>,
     history: Option<History>,
@@ -217,6 +219,13 @@ fn note_commands(st: &mut State, commands: Vec<SlashCommand>) {
 /// A mode as a sentence for the tab.
 fn mode_words(mode: &str) -> String {
     format!("mode {mode}")
+}
+
+fn mode_report_words(report: &ModeReport) -> String {
+    match report {
+        ModeReport::Known(mode) => mode_words(mode),
+        ModeReport::Unreadable => "a mode report Eitri could not read".to_string(),
+    }
 }
 
 fn note_unknown(st: &mut State, what: &str, name: &str) {
@@ -417,8 +426,10 @@ impl AcpProvider {
                     return;
                 };
                 match &update {
-                    Update::Mode(mode) => boot.mode = Some(mode.clone()),
-                    Update::Options { mode: Some(mode) } => boot.mode = Some(mode.clone()),
+                    Update::Mode(mode) | Update::Options { mode: Some(mode) } => {
+                        boot.mode = Some(ModeReport::Known(mode.clone()));
+                    }
+                    Update::UnreadableMode => boot.mode = Some(ModeReport::Unreadable),
                     Update::Commands(commands) => boot.commands = Some(commands.clone()),
                     _ => {}
                 }
@@ -496,7 +507,7 @@ impl AcpProvider {
         if let Some(want) = &self.auto_mode {
             // A report that came after the answer is the newer one.
             let reported = boot.mode.take().or_else(|| setup.current_mode.clone());
-            if reported.as_deref() == Some(want.as_str()) {
+            if matches!(&reported, Some(ModeReport::Known(mode)) if mode == want) {
                 // Already in the mode asked for.
             } else {
                 let pending = self.request(method::SESSION_SET_MODE, wire::set_mode_params(&session_id, want))?;
@@ -504,13 +515,15 @@ impl AcpProvider {
                     // codex-acp sends no `current_mode_update` after `session/set_mode`, so an agent saying
                     // nothing has taken the change; a report that arrived says otherwise or agrees.
                     Ok(_) => {
-                        let now = boot.mode.take().unwrap_or_else(|| want.clone());
-                        if now != *want {
-                            mismatch = Some((mode_words(want), mode_words(&now)));
+                        let now = boot.mode.take().unwrap_or_else(|| ModeReport::Known(want.clone()));
+                        if !matches!(&now, ModeReport::Known(mode) if mode == want) {
+                            mismatch = Some((mode_words(want), mode_report_words(&now)));
                         }
                     }
                     Err(LinkError::Rpc { message, .. }) => {
-                        let was = reported.as_deref().map_or("no mode reported".to_string(), mode_words);
+                        let was = reported
+                            .as_ref()
+                            .map_or("no mode reported".to_string(), mode_report_words);
                         mismatch = Some((
                             mode_words(want),
                             format!("{was} (the agent refused to change it: {message})"),
@@ -594,10 +607,10 @@ impl AcpProvider {
 
     /// The agent reported its mode: it must be the one asked for. With no mode registered, nothing is asked
     /// and nothing is checked.
-    fn check_mode(&self, st: &mut State, reported: &str) {
+    fn check_mode(&self, st: &mut State, reported: &ModeReport) {
         let Some(want) = &self.auto_mode else { return };
-        if reported != want {
-            self.trip(st, mode_words(want), mode_words(reported));
+        if !matches!(reported, ModeReport::Known(mode) if mode == want) {
+            self.trip(st, mode_words(want), mode_report_words(reported));
         }
     }
 
@@ -703,8 +716,10 @@ impl AcpProvider {
         match update {
             Update::Context { used, size } => st.context = Some(ContextGauge { used, size }),
             Update::Commands(commands) => note_commands(st, commands),
-            Update::Mode(mode) => self.check_mode(st, &mode),
-            Update::Options { mode: Some(mode) } => self.check_mode(st, &mode),
+            Update::Mode(mode) | Update::Options { mode: Some(mode) } => {
+                self.check_mode(st, &ModeReport::Known(mode));
+            }
+            Update::UnreadableMode => self.check_mode(st, &ModeReport::Unreadable),
             Update::Options { mode: None } | Update::Ignored(_) => {}
             Update::Unknown(kind) => note_unknown(st, "an update", &kind),
             // The live stream carries no user messages: only a replay does.
@@ -860,6 +875,7 @@ impl AcpProvider {
                     raw_output: None,
                     locations: None,
                     content: Vec::new(),
+                    content_given: false,
                 };
                 let call = turn
                     .fold
@@ -1418,6 +1434,10 @@ impl AgentProvider for AcpProvider {
         // Also once the host has closed the session: a child that ended first still says why.
         self.finish_closing_notice(&mut st);
         st.events.drain(..).collect()
+    }
+    #[cfg(target_os = "linux")]
+    fn mover(&self) -> Option<&dyn crate::chat_mover::ChatMover> {
+        Some(self)
     }
 }
 

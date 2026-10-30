@@ -218,6 +218,12 @@ impl Shared {
                 self.actions.toast(NOT_IN_THIS_WINDOW);
                 return;
             }
+            // A module key after the hide key: there is no layout to hide it from.
+            PrefixCommand::Hide { module } => {
+                crate::log_line!("[mac] prefix: hide {module} refused");
+                self.actions.toast(NOT_IN_THIS_WINDOW);
+                return;
+            }
         };
         if action == Action::Zoom {
             // The zoom is the user's choice and is kept whatever the width; asked to show a panel the window is too
@@ -353,13 +359,16 @@ pub fn assemble(
         scratch: editor.take_scratch(),
         backend_kind,
         document,
-        tab_files: Default::default(),
+        tab_role: eitri_core::window_link::pair::Role::Main,
+        theme: ThemeTokens::fallback(),
     };
     let panel = AgentPanelHandle::new(init, page.is_some(), host);
     if let Some(page) = page {
         panel.attach_page(ViewId::BASE, page);
     }
     config.apply_to_panel(&panel);
+    // This window is never one of a pair: it offers its own saved tabs, once `agent.restore` is known.
+    panel.set_tab_files(Default::default());
     let mut tokens = ThemeTokens::fallback();
     tokens.font_size_px = config.panel_font_size;
     panel.set_theme(&tokens);

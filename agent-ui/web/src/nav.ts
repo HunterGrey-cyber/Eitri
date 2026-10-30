@@ -1,14 +1,12 @@
 /**
- * Keyboard reach for every control in the panel, by structure rather than by geometry
- * (2026-09-19). Every button has to be reachable in a way that is direct and intuitive, and `hjkl` was
- * chosen over geometric spatial navigation after the trade-off was laid out: the panel is a vertical document,
- * so its structure is known exactly, whereas "the nearest button in that direction" would have to
- * be inferred from pixels and would surprise.
+ * Keyboard reach for every control in the panel, by structure rather than by geometry.
+ * The panel is a vertical document with known structure; inferring the nearest button from pixels
+ * would make movement surprising.
  *
  * The model:
  *
  * - A **stop** is anything carrying `data-nav-stop`: a conversation row (`"row"`), a banner, the
- *   terminal-handoff area; on the start screen, each choice row and each mode button. The bottom
+ *   terminal-handoff area; on the start screen, each choice row. The bottom
  *   band is not one: `j` on the last stop goes nowhere, and the session's
  *   details are `<leader>i`, `prefix i` or a click on the band. `j`/`k` walk stops in document
  *   order, top to bottom. A stop with no usable control is
@@ -28,8 +26,7 @@ export const STOP_ATTR = "data-nav-stop";
 
 /** The label alphabet `eitri_core::hint` uses for the window-wide `f` HINT (no `f` itself, since
  *  that key starts the HINT). The `gf` path picker (`components/PathPick.tsx`) reuses it for its
- *  own letter-per-path footer list, and so does `gx`'s link picker (`components/LinkPick.tsx`) -- the panel has never
- *  needed its own copy of this until now. */
+ *  own letter-per-path footer list, and so does `gx`'s link picker (`components/LinkPick.tsx`). */
 export const HINT_ALPHABET = "asdjklghweruio";
 
 /** A web link as `web_url` (`panel/src/links.rs`) will re-check it -- `http(s)`
@@ -76,8 +73,9 @@ export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string
  *  the list) never opens with no pick.
  *
  *  **And only a link whose contents are plain text**: `textContent` counts
- *  what an element inside the anchor does not show -- the sanitizer keeps `hidden` and inline HTML in link
- *  text, so `<a href=".../good.example.evil.example/">https://good.example<span hidden>.evil.example</span>/</a>`
+ *  what an element inside the anchor does not show. The sanitizer strips `hidden`, but it keeps inline HTML in
+ *  link text, and a link whose inner element is not drawn --
+ *  `<a href=".../good.example.evil.example/">https://good.example<span hidden>.evil.example</span>/</a>` --
  *  READS `https://good.example/` and has a `textContent` equal to its real address. Text nodes are always
  *  drawn when their anchor is (a reply's `class` and `style` are stripped, so nothing it writes hides a text
  *  node by itself), so `childElementCount === 0` is exactly "what is drawn is `textContent`" -- marked's
@@ -138,31 +136,12 @@ export function linkClickNeedsLook(
   return url;
 }
 
-/** Whether `el` is, or sits inside, a control a key press ACTIVATES by default -- a `<button>`, a
- *  `<summary>`, a link, or anything wearing `role="button"`.
+/** Whether `el` is, or sits inside, a control a key press activates by default. Claiming Enter
+ *  with `preventDefault()` deletes a focused button's native activation; Space on a button and
+ *  Enter on `<summary>` need the same protection. `closest` also handles a `<strong>` or `<span>`
+ *  inside a button, while focus-then-Enter targets the button itself.
  *
- *  This is the second half of "the panel does not own every keystroke inside its own subtree", and
- *  it is not a theoretical one. Enter's default action on a focused `<button>` *is* its activation
- *  click; there is no separate click event to let through. So a keydown handler that claims Enter
- *  from any non-editable target and calls `preventDefault()` does not merely also do something
- *  else -- it silently DELETES the button's activation.
- *
- *  **Observed on an installed build before it was fixed** (2026-09-18: no key could reach Approve).
- *  Tab-to-Approve then Enter was then the only keyboard route to a permission
- *  decision -- the `a`/`d` allow/deny keys did not exist yet -- and this panel's own `onKeyDown` had taken it
- *  away. Before this branch nothing listened for Enter at all, so the route worked; the branch
- *  created the hole and the fix restores exactly what was there, rather than pulling the later
- *  keys forward to paper over it.
- *
- *  The same applies to Space on a button and to Enter on `<summary>` (the generic tool card's
- *  disclosure, `toolRegistry.tsx`), which is why this is a selector over activatable controls and
- *  not a special case for Enter. `closest`, not a tag check: a real click target is usually a
- *  `<strong>`/`<span>` INSIDE the button, and focus-then-Enter dispatches the keydown at the
- *  button itself -- both have to bail.
- *
- *  Moved here from `App.tsx` (Space never reached the leader engine on the empty tab's dashboard, because the leader
- *  engine lived only in `App.tsx` and could not be imported into `EmptyTab.tsx` without a circular import back into
- *  the component that renders it). `nav.ts` already sits below both without importing either. */
+ *  Shared below `App.tsx` and `EmptyTab.tsx` so both can use the leader engine without a circular import. */
 export function isActivatableControl(el: EventTarget | null): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
   return el.closest("button, summary, a[href], [role=button]") !== null;
@@ -197,13 +176,10 @@ export function controlsOf(stop: HTMLElement): HTMLElement[] {
  *
  * The panel's own stops never nest: every conversation row is a direct child of `.message-list`,
  * and the banners, the activity line, the handoff area and the empty tab's items sit beside them.
- * What can nest is model content: an assistant reply is rendered as HTML inside its row
- * (`MessageList`'s `renderMarkdown`, the one raw-HTML sink in this panel), so a reply carrying
- * `<div data-nav-stop="row" hidden>` put extra "rows" in a subtree-wide `querySelectorAll`. Every
- * row below them then sat at a DOM index that no longer matched its timeline index, and `a` on the
- * card the cursor visibly showed answered the card above it (the verdict's probe: `echo` shown,
- * `rm -rf` approved). Whatever the sanitizer strips, a reply can only ever add elements INSIDE its
- * own row, so this rule excludes all of them by structure.
+ * What can nest is model content: a reply's HTML can carry hidden `data-nav-stop="row"` elements.
+ * Counting those as rows shifts DOM indices away from timeline indices, so `a` can approve a call
+ * other than the one the cursor shows. A reply can only add elements inside its own row, so this
+ * rule excludes all of them by structure, whatever the sanitizer strips.
  *
  * The walk stops at `root`: a stop is judged only by its ancestors inside the region being walked.
  */
@@ -260,7 +236,7 @@ function stopCache(root: HTMLElement): StopCache {
 /** Every stop under `root`, in document order, whether or not it is worth landing on.
  *
  *  Read from the tree once and kept until the tree changes in a way that could change it (`stopCache`):
- *  a `j`/`k` press used to query the whole panel three times, about 6,000 elements on a long conversation.
+ *  querying the whole panel three times per `j`/`k` press visits about 6,000 elements on a long conversation.
  *  The answer is the same structural one either way (`isOwnStop`), which is what keeps `a` on the card the
  *  cursor shows. The array is shared and frozen: callers read it, never change it. */
 function ownStops(root: HTMLElement): HTMLElement[] {
@@ -332,8 +308,7 @@ export function currentStop(
  *  nobody has moved on yet), both land on the first stop.
  *
  *  `stops` defaults to a fresh `stopsIn(root)` (a DOM query). A caller that already holds that list
- *  may pass it; a counted repeat no longer calls this per step at all (`countedStop`, below, whose
- *  doc says why passing `stops` alone did not bound it). */
+ *  may pass it. Counted repeats use `countedStop`, which also caches the row indices to avoid per-step scans. */
 export function nextStop(
   root: HTMLElement,
   cursor: number | null,
@@ -372,15 +347,14 @@ export interface CountedLanding {
  * where a step makes no progress (`clampStep` clamps rather than failing there). `null` when the
  * region has no stop at all.
  *
- * **One scan of the tree, whatever `times` is.** The first version fetched
- * `stopsIn` once but still called `nextStop` per step, and each step went back to the tree twice:
- * `nextStop` -> `currentStop` -> `conversationRows`, then `rowIndexOf` -> `conversationRows`.
- * `1000j` from the first of 1,001 rows was 2,001 full-tree queries and about 2.3 s in jsdom. Here the stops, the rows
- * and each row's index are read once and the walk moves along the index, so a step costs no DOM work at all.
+ * One scan of the tree, whatever `times` is. With uncached lookups, fetching `stopsIn` once and
+ * calling `nextStop` -> `currentStop` -> `conversationRows` and `rowIndexOf` -> `conversationRows`
+ * per step measures 2,001 full-tree queries for `1000j` over 1,001 rows, about 2.3 s in jsdom. Reading the stops,
+ * rows and row indices once lets each step move along an index with no DOM work.
  *
  * Every step after the first starts from where the walk is, never from `document.activeElement`.
- * Per-step `currentStop` re-read focus each time, so with focus on a control inside a stop (after
- * `l` onto a card's Approve) every step re-started from that control's stop and `3j` moved once.
+ * Re-reading focus per step restarts at a focused control's stop, so `3j` after `l` onto a card's
+ * Approve moves only once.
  */
 export function countedStop(
   root: HTMLElement,
@@ -444,7 +418,7 @@ export type AnswerableItem =
  * approving the wrong call is exactly what a keyboard shortcut must not make easy.
  *
  * This is the ONLY rule `a`/`d`/`D` follow. There is
- * no "exactly one card anywhere, answered from any row" exception any more -- vim's operators act on
+ * no "exactly one card anywhere, answered from any row" exception -- vim's operators act on
  * what the cursor is on (`:h operator`), and an arrival already lands on the oldest card, so
  * the common case still needs no movement. With no target the panel says so with a flash rather
  * than doing nothing silently.
@@ -484,8 +458,7 @@ export const HINT_COMPOSER_ATTR = "data-hint-composer";
 /** The elements known to scroll their own content (index.css): the conversation's list, the tab
  *  bar (sideways), and the launch chooser's list. Named here as
  *  well as read off the computed style below, because jsdom loads no stylesheet and the tests must
- *  see these three. `.session-choice` is gone -- the old resumable-session picker it named was
- *  replaced by `EmptyTab` and the launch chooser (`.chooser-list`). */
+ *  see these three. */
 const SCROLL_CONTAINERS = ".message-list, .tab-bar, .chooser-list";
 
 function clips(el: HTMLElement): boolean {

@@ -1,8 +1,8 @@
 /** The panel's which-key sequence engine: leader-driven multi-key bindings over `PanelTable`
  *  (modelled on which-key.nvim's `lua/which-key/state.lua`).
  *
- * `resolveKey` (`./keymap`) still owns every fixed single-key row and the four reserved two-key
- * pairs (`gg`/`gf`/`zh`/`zl`/`[[`/`]]`/`[]`/`][`); this module owns the
+ * `resolveKey` (`./keymap`) still owns every fixed single-key row and the fixed two-key pairs under
+ * its reserved prefixes (`FIXED_PAIRS`: `g`, `z`, `[`, `]` and the chord `Ctrl+w`); this module owns the
  * leader and any longer sequence the table itself defines. `App.tsx` is expected to try
  * `startSequence`/`advanceSequence` first on a key `resolveKey` did not claim (a `{kind:"none"}`
  * result falls through to `resolveKey`, never the other way around), since the table's own
@@ -86,8 +86,8 @@ export function advanceSequence(table: PanelTable, typed: string[], key: string)
 }
 
 /** One row of the which-key popup box: a real binding's own key and description, or a group label
- *  (`+tab`) standing in for everything under it. `disabled` greys out `mode.cycle` once a session
- *  has started (cycling the empty tab's mode makes no sense once it is no longer empty). */
+ *  (`+tab`) standing in for everything under it. `disabled` greys out `mode.cycle` where cycling
+ *  makes no sense (`boxEntries`' `modeFixed`). */
 export type BoxEntry = { key: string; label: string; group: boolean; disabled: boolean };
 
 /** How a table key reads to a person: the leader as its label (`Space`), anything else as itself. */
@@ -101,9 +101,8 @@ function humanKey(table: PanelTable, k: string): string {
  *  if that pair is registered there, else a synthesized `+<key>`.
  *
  *  `modeFixed` (App.tsx's own const): whether `mode.cycle` would flash rather than post --
- *  it already means "cycling makes no sense any more", named for what it disables rather than for
- *  the tab-lifecycle reading `sessionStarted` used to invite (a live, switch-capable tab can still
- *  cycle; see `modeKey.ts`'s `modeKeyRoute`). */
+ *  it means cycling makes no sense, not merely that a session started: a live, switch-capable tab
+ *  can still cycle (`modeKey.ts`'s `modeKeyRoute`). */
 export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
@@ -149,7 +148,7 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
   z: [
     { key: "h", label: "scroll table left", group: false, disabled: false },
     { key: "l", label: "scroll table right", group: false, disabled: false },
-    // The six pairs `FIXED_PAIRS.z` gained (`leader.test.ts` holds the two lists to
+    // The six fold and row-scroll pairs in `FIXED_PAIRS.z` (`leader.test.ts` holds the two lists to
     // the same keys).
     { key: "t", label: "row to top", group: false, disabled: false },
     { key: "z", label: "row to middle", group: false, disabled: false },

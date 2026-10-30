@@ -1,10 +1,9 @@
 //! The child on a pseudo-terminal: opened, spawned, resized, hung up and reaped here, and nowhere
 //! else in Eitri.
 //!
-//! **Owned, not `alacritty_terminal::tty`.** That module works, and the spike used it, but each of
-//! its five behaviours below is wrong inside a GTK application that also runs nvim, WebKit and a
-//! sidecar, so this file does the same ~100 lines of work without them (each re-checked in
-//! `alacritty_terminal-0.26.0/src/tty/unix.rs`):
+//! **Owned, not `alacritty_terminal::tty`.** Its five behaviours below are wrong inside a GTK
+//! application that also runs nvim, WebKit and a sidecar, so this file handles PTYs without them
+//! (alacritty_terminal-0.26.0/src/tty/unix.rs):
 //!
 //! 1. it injects `WINDOWID` and `ALACRITTY_WINDOW_ID` into every child (lines 230, 234);
 //! 2. a failed `TIOCSWINSZ` calls `die!`, i.e. `std::process::exit(1)` -- the whole IDE (line 417);
@@ -67,8 +66,7 @@ pub const SET_ENV: [(&str, &str); 3] = [
 pub const HANGUP_GRACE: Duration = Duration::from_millis(500);
 
 /// The child's whole environment: the host's, minus [`REMOVED_ENV`], with [`SET_ENV`] on top.
-/// Nothing else is added or removed -- the old sidecar scrubbed its child to 14 variables and broke
-/// `wl-copy`, `ssh-agent` and D-Bus, which is what the in-process PTY exists to end. Computed as a
+/// Preserve everything else so `wl-copy`, `ssh-agent` and D-Bus keep their environment. Computed as a
 /// value and handed to `Command::env_clear().envs(..)`, never by `std::env::set_var`: this process
 /// is multi-threaded, and its own environment must not change.
 pub fn child_environment(host: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {

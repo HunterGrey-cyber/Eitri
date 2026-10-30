@@ -140,8 +140,17 @@ pub(super) fn chooser_records(
             created_at: s.created_at.clone(),
             updated_at: s.updated_at.clone(),
             held_elsewhere: held(&s.provider_session_id),
+            held_by_partner: false,
+            partner_window: None,
         })
         .collect()
+}
+
+pub(super) fn mark_partner_records(records: &mut [ChooserRecord], window: Option<u8>, held: impl Fn(&str) -> bool) {
+    for record in records {
+        record.held_by_partner = window.is_some() && record.held_elsewhere && held(&record.provider_session_id);
+        record.partner_window = window.filter(|_| record.held_by_partner);
+    }
 }
 
 /// `prefix i`'s rows for one tab, in the order they are shown, `—` for anything unknown. `trust_row` is the
@@ -559,6 +568,28 @@ mod tests {
             Some("Space k"),
         );
         assert_eq!(rows.iter().find(|r| r.label == "permission rules").unwrap().value, "—");
+    }
+
+    #[test]
+    fn the_chooser_names_a_session_held_by_the_other_window() {
+        let sessions = vec![agent::ResumableSession {
+            provider: "claude".into(),
+            provider_session_id: "peer".into(),
+            name: None,
+            title: Some("<b>work</b>".into()),
+            created_at: "1".into(),
+            updated_at: "2".into(),
+        }];
+        let mut records = chooser_records(&sessions, &[], |_| true);
+        mark_partner_records(&mut records, Some(2), |id| id == "peer");
+        assert!(records[0].held_by_partner);
+        let payload = eitri_core::agent_bridge::serialize_chooser_for_js(&[], &records);
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["records"][0]["heldByPartner"], true);
+        assert_eq!(payload["records"][0]["partnerWindow"], 2);
+        assert_eq!(payload["records"][0]["title"], "<b>work</b>");
+        mark_partner_records(&mut records, None, |_| true);
+        assert!(!records[0].held_by_partner);
     }
 
     #[test]

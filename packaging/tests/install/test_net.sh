@@ -1,4 +1,4 @@
-# --base-url and how downloads are made (NET-1). Sourced by harness.sh.
+# --base-url and how downloads are made. Sourced by harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
@@ -95,10 +95,9 @@ t_downloads_bounded() {
 
 TESTS="$TESTS t_wget_never_used"
 t_wget_never_used() {
-	# The design names `wget --https-only` for a system without curl, but wget scopes --https-only to
-	# recursive downloads: measured (GNU Wget 1.25.0), it follows an https -> http redirect, and
-	# fetches a plain http:// URL, with exit 0. So without curl the installer refuses, for any base
-	# URL, before any download; wget (a logging stub, first on PATH) is never run.
+	# GNU Wget 1.25.0 follows an https -> http redirect and fetches a plain http:// URL with exit 0:
+	# `wget --https-only` applies only to recursive downloads. Without curl the installer must refuse any
+	# base URL before downloading; the logging wget stub must never run.
 	serve 1.0.0
 	for u in https://mirror.example "http://127.0.0.1:$PORT"; do
 		inst --stubs "$S/stubs-wget" --path-tail "$S/path-no-curl" -- --base-url "$u" --release-signers "$SIGNERS"

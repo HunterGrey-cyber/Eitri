@@ -35,10 +35,10 @@ export function lineEdge(value: string, caret: number, edge: "start" | "end"): n
   return next === -1 ? value.length : next;
 }
 
-/** Claude Code's two newline keys, which used to send the draft. `Alt+Enter`
+/** Claude Code's two newline keys. `Alt+Enter`
  *  inserts a newline in place of the selection; a plain Enter with a backslash right before the caret
  *  (and no selection) removes that backslash and inserts a newline in its place. `null` for every other
- *  Enter -- Ctrl+Enter and Meta+Enter keep sending (now), a plain Enter with no such backslash sends,
+ *  Enter -- Ctrl+Enter and Meta+Enter keep sending, a plain Enter with no such backslash sends,
  *  and Shift+Enter never gets here (it is the textarea's own newline). */
 export function enterNewline(
   value: string,

@@ -4,9 +4,8 @@ import type { AgentDomainEvent, AgentUiSnapshot } from "./types";
 import fixture from "./fixtures/p1a2-mid-stream.json";
 
 /**
- * On the sidecar backend, text already inside a tab-switch or
- * reload snapshot could be delivered again by the very next pump, so the reply text rendered
- * twice. The fix is Rust-side and this reducer is unchanged: every queued event carries the
+ * Text inside a tab-switch or reload snapshot must not be delivered again by the next pump,
+ * or the reply renders twice. Every queued event carries the
  * projection revision its fold produced, the snapshot's own revision is noted on the backend
  * (`AgentBackend::note_ui_snapshot`), and `TabSet::pump` leaves every event at or below it out of
  * the next `events` payload (`core/src/tab_set.rs`).

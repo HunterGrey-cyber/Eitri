@@ -61,6 +61,10 @@ impl WorkspaceMove {
         &self.name
     }
 
+    pub fn rename(&mut self, to: &str) {
+        self.name = to.to_owned();
+    }
+
     /// False for a module not in this move or already decided.
     pub fn record(&mut self, module: &str, verdict: Verdict) -> bool {
         match self.modules.get_mut(module) {

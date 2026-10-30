@@ -27,13 +27,10 @@ import type {
  * (`agent/tests/projection.rs::no_single_event_ever_creates_more_than_one_item` pins that half),
  * and `reducer.ts` continues the same counter from a snapshot's `throughRevision`.
  *
- * The identities were tried first and each fails on the same proto3 hazard -- there is no
- * absent-string, so an unset id arrives as `""`. `MessageList` used to key a tool call on its
- * `toolUseId`, which can be `""` for several calls at once. A permission card keyed on
- * `permissionId` has exactly the same problem: Rust's `pending_permissions` HashMap collapses two
- * `""` ids into one entry so a snapshot can never carry two, but `reducer.ts` appends to a plain
- * array with no dedupe, so two live `permission_requested` events with `permission_id: ""` really
- * do coexist there. Two siblings with the key `p-` is a React error and a mis-reconciled DOM.
+ * Identity keys fail on the proto3 absent-string hazard: an unset id arrives as `""`, and several
+ * tool calls can have that id at once. Rust's `pending_permissions` HashMap collapses duplicate
+ * empty ids, but the reducer appends permission requests without deduplication, so two live cards
+ * can share `permissionId: ""`. Duplicate React keys mis-reconcile the DOM.
  *
  * What keying on `seq` does NOT fix, and is not claimed to: `reducer.ts`'s `permission_resolved`
  * still filters by `permissionId`, so resolving one of two `""` cards removes both. That is a
@@ -230,36 +227,45 @@ export function noticeText(notice: NoticeRecord): string {
 /** Whether a `toolUseId` can identify a tool call at all.
  *
  * Two values cannot, and both are real:
- *   null -- the legacy backend, still the default for a source build, sends no id
+ *   null -- the legacy backend (a `shell/legacy-backend` build only) sends no id
  *           (`agent/src/session.rs`).
  *   ""   -- proto3 has no absent-string, so an unset `tool_use_id` arrives as "" from the sidecar.
  *           A `ToolCallRecord.toolUseId` crosses the same boundary and can be "" for the same
  *           reason, so admitting it would anchor an arbitrary card to an arbitrary call.
  *
- * **Exported because three places need exactly this question and all three used to answer it
- * themselves**: this function, `MessageList`'s awaiting-permission marker (an inline `id !== null
- * && id !== ""`) and `PermissionCard`'s "for tool call …" line (a truthiness test). Each carried a
- * paragraph saying the other two guarded the identical case, which is documentation standing in
- * for a shared definition -- the same duplicated-guard defect this branch already fixed once for
- * the colour guard. One predicate, three call sites, so a change to the rule cannot reach two of
- * them and miss the third. */
+ * Shared by timeline anchoring, `MessageList`'s awaiting-permission marker and `PermissionCard`'s
+ * call label so their checks cannot drift apart. */
 export function isUsableLink(toolUseId: string | null): toolUseId is string {
   return toolUseId !== null && toolUseId !== "";
 }
 
 /**
- * Merge the collections by `seq`, assigned by Rust's `AgentSessionProjection::apply` and carried
- * in snapshots by `serialize_snapshot_for_js`. Reloads and `UiDelivery::Resync` rebuild from those
- * keys, preserving event order.
+ * The collections merged into the one sequence they actually formed.
  *
- * A pending permission linked by `toolUseId` to a known call is placed immediately after that call,
- * so cards stay with their invocation even when several calls use the same tool. Unlinked cards
- * and cards naming an absent call use their own `seq`; missing links never discard a card.
+ * Ordering comes from `seq`, which Rust's `AgentSessionProjection::apply` assigns and
+ * `serialize_snapshot_for_js` ships -- this function sorts by an authoritative key, it does not
+ * infer an order from the shape of the data. That is what makes the result survive a reload or a
+ * `UiDelivery::Resync`: both discard the frontend's whole state and rebuild it from a snapshot,
+ * and the snapshot carries these numbers.
  *
- * Legacy permissions have `toolUseId: null`, so `isUsableLink` rejects them and they all take the
- * unanchored path. Only the sidecar sends real ids for anchoring. The base merge still interleaves
- * transcript and tool entries on legacy. `timeline.test.ts` and `MessageList.test.tsx` cover the
- * linked-card behavior that legacy cannot exercise.
+ * The one placement that is NOT by `seq`: a pending permission whose `toolUseId` names a tool call
+ * present here is emitted immediately after that call, because the card is about that specific
+ * invocation and a turn can have several of the same tool in flight. Everything else -- an unlinked
+ * card, or one naming a call this state does not have -- falls back to its own `seq`, so nothing is
+ * ever dropped for want of a link.
+ *
+ * SAY IT PLAINLY, because a reader will otherwise assume this function is uniformly exercised: that
+ * anchoring branch -- `anchored`, `knownToolUseIds`, the per-call sibling sort, the `anchored.delete`
+ * guard, roughly half of what is below -- CANNOT RUN ON THE LEGACY BACKEND, which is what a source
+ * build still starts on. Every legacy permission carries `toolUseId: null` (`agent/src/session.rs`
+ * passes `tool_use_id: None`, deliberately, with its reasons written out there), so `isUsableLink`
+ * rejects all of them and every card takes the `unanchored` path.
+ *
+ * Only the sidecar backend sends a real id. That path was driven on a real screen against the
+ * installed CLI (2.1.272) and linked-permission anchoring was exercised there, so it is not covered
+ * by unit tests alone; `timeline.test.ts` and `MessageList.test.tsx` still cover it, and are the only
+ * coverage of the branch on the DEFAULT backend, where it is unreachable by construction.
+ * The transcript/tool merge and sort also run on legacy, where all cards are unanchored.
  */
 let timelineBuilds = 0;
 /** How many times `buildTimeline` has run in this page: the performance tests count it. */

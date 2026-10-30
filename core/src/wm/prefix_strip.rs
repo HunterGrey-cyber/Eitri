@@ -6,7 +6,7 @@ use crate::layout::{Axis, ModuleId, StripEntry};
 
 /// The strip's pieces, left to right. `entries` are the module keys for `waiting`: the keys that reach
 /// each module now while armed (`crate::layout::strip_direct`), the fixed module keys after a
-/// split key (`crate::layout::strip`). `focus_title` names the module with the keys (where `\`/`"`
+/// split key or the hide key (`crate::layout::strip`). `focus_title` names the module with the keys (where `\`/`"`
 /// put the next module); `title` names any module.
 pub fn strip_pieces(
     waiting: Waiting,
@@ -40,6 +40,7 @@ pub fn strip_pieces(
             }),
             modules.collect(),
         ),
+        Waiting::Hide => (Some("hide:".to_string()), modules.collect()),
     };
     let mut pieces: Vec<StripPiece> = heading.into_iter().map(StripPiece::Heading).collect();
     for (i, run) in runs.into_iter().enumerate() {
@@ -183,7 +184,7 @@ mod tests {
         let pieces = strip_pieces(Waiting::Command, &entries(), "editor", &title, &verbs());
         assert_eq!(
             reads(&pieces),
-            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x kill \u{b7} % right \u{b7} \" below \u{b7} \
+            "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x kill \u{b7} d hide \u{b7} % right \u{b7} \" below \u{b7} \
              M-1 M-2 even \u{b7} { } swap \u{b7} ? keys",
             "a hidden module is dimmed"
         );
@@ -199,6 +200,21 @@ mod tests {
         let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title, &verbs());
         assert_eq!(right[0], StripPiece::Heading("right of agent:".to_string()));
         assert!(strip_pieces(Waiting::No, &entries(), "agent", &title, &verbs()).is_empty());
+    }
+
+    /// While a hide key waits, the strip lists the module keys under `hide:`, a hidden module dimmed, and never
+    /// offers a new instance: a hide makes nothing.
+    #[test]
+    fn after_the_hide_key_it_lists_the_module_keys_under_hide() {
+        let mut entries = entries();
+        entries[2].count = 3;
+        entries[2].new_instance = true;
+        let pieces = strip_pieces(Waiting::Hide, &entries, "terminal", &title, &verbs());
+        assert_eq!(
+            reads(&pieces),
+            "hide: e editor \u{b7} a agent \u{b7} [t terminal \u{d7}3]"
+        );
+        assert!(!wait_needs_the_top_bar(Waiting::Hide));
     }
 
     #[test]
@@ -256,6 +272,7 @@ mod tests {
                 Waiting::Command,
                 Waiting::Module(Axis::Row),
                 Waiting::Module(Axis::Column),
+                Waiting::Hide,
             ] {
                 let pieces = strip_pieces(waiting, some, "agent", &title, &verbs());
                 let body: &[StripPiece] = match pieces.first() {

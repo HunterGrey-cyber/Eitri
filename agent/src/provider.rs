@@ -641,6 +641,12 @@ pub trait AgentProvider {
     fn event_signal(&self) -> Option<std::sync::Arc<EventSignal>> {
         None
     }
+    /// This provider's way to move with its chat to another process, if it has one (the default: none, and such a
+    /// chat does not move).
+    #[cfg(target_os = "linux")]
+    fn mover(&self) -> Option<&dyn crate::chat_mover::ChatMover> {
+        None
+    }
 }
 
 /// A counter one side raises and another waits on: "something may have changed since you last

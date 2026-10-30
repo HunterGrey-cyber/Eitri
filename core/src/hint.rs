@@ -3,8 +3,7 @@
 //! regions. No GTK and no WebView: `shell::hint` drives this with module ids, the panel with its
 //! own target indices, and neither can disagree with the other about which label is whose.
 //!
-//! **The window is a list of modules in tree order** since the layout became data: the regions used to be the
-//! three fixed slots (main, side, bottom), and a layout that is data has no fixed slots.
+//! The window is a list of modules in tree order; a data-defined layout has no fixed slots.
 
 use crate::layout::{ModuleId, ModuleKind};
 
@@ -204,10 +203,9 @@ pub struct TargetOrder {
     pub after: Vec<Slot>,
 }
 
-/// The label order: the visible top bar items, then the visible modules in tree
-/// order, with the agent's own labels where the agent sits. For the window as it was before the
-/// modules design -- `[editor | agent]`, with or without a panel below -- that is exactly the old
-/// order: top bar, main slot, panel, bottom slot.
+/// The label order: visible top bar items, then visible modules in tree order, with the agent
+/// supplying its own labels where it sits. For `[editor | agent]` over a bottom panel, this is
+/// top bar, editor, agent, bottom panel.
 pub fn order_targets(layout: &WindowLayout) -> TargetOrder {
     let mut before: Vec<Slot> = layout
         .top_visible

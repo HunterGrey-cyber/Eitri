@@ -18,16 +18,17 @@
 //!
 //! # Why a timer, and why no socket
 //!
-//! The precise fix is to tell nvim the moment a write lands. That needs a shell -> nvim channel,
-//! and every channel this workspace has runs the other way (nvim writes, the host polls). Building
-//! one would also cost a fourth Unix socket, against a budget with **three bytes left** across all
-//! future protocols (see `crate::editor_context::feed`'s exact-length test). A timer inside nvim
-//! costs neither, and the latency it trades away is bounded by [`RELOAD_INTERVAL_MS`].
+//! The precise fix is to tell nvim the moment a write lands. The host can call into nvim over the
+//! RPC link it already holds (`crate::editor_rpc::EditorRpc::exec_lua`), but it would first have to
+//! see the write, and the writes this wire is for (a `git checkout`, a formatter, another window)
+//! never pass through the host, which watches no files. A timer inside nvim catches every one of
+//! them, needs no new channel or socket, and the latency it trades away is bounded by
+//! [`RELOAD_INTERVAL_MS`].
 //!
 //! # Why `checktime` is safe to run unconditionally
 //!
-//! Measured on real nvim 2026-09-18 rather than reasoned about, because a modal prompt appearing
-//! unbidden inside an embedded editor would be worse than the bug:
+//! What follows was measured on real nvim rather than reasoned about, because an unbidden modal
+//! prompt inside an embedded editor would be worse than a stale buffer:
 //!
 //! - `autoread` defaults to **on** in nvim (unlike vim), and with it an **unmodified** buffer is
 //!   reloaded silently.
@@ -55,10 +56,9 @@ pub const RELOAD_INTERVAL_MS: u64 = 1000;
 ///   timer.
 /// - The timer handle is kept in a **Lua** global (`_G`), not in `vim.g`. A local would be
 ///   collected and the timer would stop at an unpredictable moment; `vim.g` is worse than either.
-///   **Measured 2026-09-18:** `vim.g.x = vim.uv.new_timer()` raises `__newindex` -- `vim.g` holds
-///   only values convertible to vimscript, and a uv handle is userdata. The timer was then never
-///   created at all, the `--cmd`'s error went by unread, and the unit test asserting
-///   `contains("vim.g.")` passed the whole time. The integration test is what caught it.
+///   `vim.g.x = vim.uv.new_timer()` raises `__newindex`: `vim.g` holds only values convertible
+///   to vimscript, and a uv handle is userdata. A text assertion can miss a timer that never
+///   starts; the real-nvim integration test checks that it runs.
 ///
 /// The same text is also what an injector loads into an nvim that is already running: the chunk
 /// returns a function that stops the timer, and leaves `_G.eitri_reload_timer` alone if it no longer
@@ -104,10 +104,9 @@ mod tests {
     }
 
     /// A local timer handle is collected and the timer stops at an unpredictable moment. It must be
-    /// a **Lua** global: the first draft used `vim.g`, which raises `__newindex` for a uv handle, so
-    /// the timer was never created -- and this test, then written as `contains("vim.g.")`, passed
-    /// against code that could not work even once. It is kept, narrowed, and openly not the proof:
-    /// `core/tests/buffer_reload_with_real_nvim.rs` is.
+    /// a **Lua** global: `vim.g` raises `__newindex` for a uv handle, so no timer starts there.
+    /// This text check only guards the spelling; `core/tests/buffer_reload_with_real_nvim.rs`
+    /// checks the running timer.
     #[test]
     fn the_timer_handle_is_kept_alive_in_a_lua_global_not_a_vim_one() {
         assert!(RELOAD_CMD.contains("_G."), "a local timer handle is collected");

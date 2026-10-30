@@ -212,6 +212,32 @@ impl PairReview {
         }
     }
 
+    /// A chat of `session` is moving between the windows: in window 1, which runs nvim, the editor's review events
+    /// of that session wait (`hold`) until the move has ended, then go to the window holding the session, this
+    /// one when `here`. Window 2 holds nothing: nvim's events reach it only through window 1.
+    pub fn hold_session(&self, session: &str, hold: bool, here: bool) -> Result<(), String> {
+        if !matches!(self.role, Role::One(_)) {
+            return Err("only the window that runs the editor holds its review events".into());
+        }
+        let mut done = false;
+        self.side.with(&mut |flow, _, _| {
+            if let Some(overlay) = flow.local_overlay() {
+                if hold {
+                    overlay.hold_session(session);
+                } else {
+                    overlay.release_session(session, if here { Window::One } else { Window::Two });
+                }
+                done = true;
+            }
+            ReviewSettled::default()
+        });
+        if done {
+            Ok(())
+        } else {
+            Err(NO_DRIVER.into())
+        }
+    }
+
     /// The turns running here now, as started edges: what this window's `welcome` carries.
     pub fn running_turns(&self) -> Vec<eitri_core::window_link::TurnEdge> {
         let mut edges = Vec::new();
@@ -1791,6 +1817,43 @@ mod tests {
             Some(u64::from(second)),
             "the turn the panel moved to: {:?}",
             show[1]
+        );
+        p.shut_down();
+    }
+
+    #[test]
+    fn a_hunk_reverted_in_nvim_during_the_freeze_reaches_the_destinations_draft() {
+        let mut p = Pair::new("held", false);
+        p.one_presence();
+        let n2 = p.turn(Window::Two, "b.txt", CHANGED);
+        let opened = p.request(Window::Two, "o2", open_in_editor("o2", p.two.tab, n2, "b.txt"));
+        assert_eq!(opened, Ok(Some("opened".to_string())));
+        // The session's chat is moving: the window that runs nvim holds its review events.
+        p.one_review
+            .hold_session(&p.two.session, true, true)
+            .expect("window 1 holds them");
+        p.nvim
+            .events
+            .borrow_mut()
+            .push(revert_event(&p.two, n2, "b.txt", 2, "two", "TWO"));
+        for _ in 0..40 {
+            p.step();
+        }
+        assert_eq!(p.two.draft_reverts(), 0, "held while the move is under way");
+        assert_eq!(p.one.draft_reverts(), 0, "and recorded by no window meanwhile");
+        // The move ends with the other window holding the session: what waited goes there, once.
+        p.one_review
+            .hold_session(&p.two.session, false, false)
+            .expect("window 1 releases them");
+        p.settle("the held revert", |p| p.two.draft_reverts() == 1);
+        for _ in 0..40 {
+            p.step();
+        }
+        assert_eq!(p.two.draft_reverts(), 1, "recorded once, by the session's holder");
+        assert_eq!(p.one.draft_reverts(), 0);
+        assert!(
+            p.two_review.hold_session(&p.two.session, true, true).is_err(),
+            "a window without the editor holds nothing"
         );
         p.shut_down();
     }

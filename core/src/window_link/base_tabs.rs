@@ -93,6 +93,16 @@ impl ArrivedTabs {
         }
     }
 
+    /// A workspace renamed from `old` to `new`: its record goes with it, and a stale record already under `new` (one
+    /// a deleted workspace of that name left) is dropped first. Renamed to its own name, nothing changes.
+    pub fn workspace_renamed(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        self.take_back(new, &[]);
+        self.rename_workspace(old, new);
+    }
+
     pub fn recorded(&self, workspace: &str) -> &[TabId] {
         self.by_workspace.get(workspace).map_or(&[], Vec::as_slice)
     }
@@ -142,6 +152,26 @@ pub fn order_after_arrival(existing: &[TabId], untouched_empty: Option<TabId>, a
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_workspace_renamed_keeps_its_record_even_to_its_own_name() {
+        let mut arrived = ArrivedTabs::new();
+        arrived.arrived("work", &[TabId(4)]);
+        arrived.workspace_renamed("work", "work");
+        assert_eq!(
+            arrived.recorded("work"),
+            &[TabId(4)],
+            "renamed to its own name, the record stays"
+        );
+        arrived.arrived("old", &[TabId(9)]);
+        arrived.workspace_renamed("work", "old");
+        assert_eq!(
+            arrived.recorded("old"),
+            &[TabId(4)],
+            "the record under the new name was a stale one"
+        );
+        assert!(arrived.recorded("work").is_empty());
+    }
 
     #[test]
     fn a_round_trip_takes_back_exactly_the_tabs_that_came_and_are_still_here() {

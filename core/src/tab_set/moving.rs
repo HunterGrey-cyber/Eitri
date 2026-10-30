@@ -1023,6 +1023,43 @@ impl TabSet {
         self.moving.contains(&tab.0)
     }
 
+    /// Why `tab` would not freeze for a move now, read without changing anything: what
+    /// [`TabSet::freeze_for_move`] refuses before it touches the tab. `None` does not promise the freeze:
+    /// its conversation and its review can still refuse it.
+    pub fn move_blocker(&self, tab: TabId) -> Option<MoveRefusedWhy> {
+        let Some(at) = self.position(tab) else {
+            return Some(MoveRefusedWhy::NoTab);
+        };
+        if self.moving.contains(&tab.0) {
+            return Some(MoveRefusedWhy::AlreadyMoving);
+        }
+        let t = &self.tabs[at];
+        // Ingestion can start the turn after the last pump checked `starting`. The final frozen
+        // pump reconciles that flag; a prompt still held for presence must stay here regardless.
+        if self.pending_sends.contains_key(&tab.0) || (self.starting.contains(&tab.0) && !t.turn_running()) {
+            return Some(MoveRefusedWhy::Starting);
+        }
+        if t.pending_handoff.is_some() {
+            return Some(MoveRefusedWhy::TerminalHandoff);
+        }
+        if t.session.queue.iter().any(|q| !q.is_held()) {
+            return Some(MoveRefusedWhy::Steered);
+        }
+        match &t.backend {
+            TabBackend::Starting(_) => Some(MoveRefusedWhy::Starting),
+            TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. }) => Some(MoveRefusedWhy::TrustRecording),
+            TabBackend::AwaitingTrust(AwaitingTrust {
+                start: DeferredStart::Restore { .. },
+                ..
+            }) => Some(MoveRefusedWhy::Restoring),
+            TabBackend::Live(AgentBackend::Legacy(_)) => Some(MoveRefusedWhy::Legacy),
+            TabBackend::NotStarted
+            | TabBackend::AwaitingTrust(_)
+            | TabBackend::Failed { .. }
+            | TabBackend::Live(AgentBackend::Conversation { .. }) => None,
+        }
+    }
+
     /// Freezes `tab` for a move to the other window and takes its record. From here on it takes no input
     /// (refused with [`MOVING`]) and answers no card, and nothing of it is delivered here. Its
     /// conversation stops folding, and the pump runs for it once more first, so what was folded and not
@@ -1036,32 +1073,11 @@ impl TabSet {
     /// two seconds, then for good. A conversation folding a batch, or writing after one, is refused as
     /// [`MoveRefusedWhy::Folding`] with nothing changed: this never waits for its ingest thread.
     pub fn freeze_for_move(&mut self, tab: TabId) -> Result<FrozenTab, MoveRefusedWhy> {
+        if let Some(why) = self.move_blocker(tab) {
+            return Err(why);
+        }
         let at = self.position(tab).ok_or(MoveRefusedWhy::NoTab)?;
-        if self.moving.contains(&tab.0) {
-            return Err(MoveRefusedWhy::AlreadyMoving);
-        }
-        let t = &self.tabs[at];
-        // Ingestion can start the turn after the last pump checked `starting`. The final frozen
-        // pump reconciles that flag; a prompt still held for presence must stay here regardless.
-        if self.pending_sends.contains_key(&tab.0) || (self.starting.contains(&tab.0) && !t.turn_running()) {
-            return Err(MoveRefusedWhy::Starting);
-        }
-        if t.pending_handoff.is_some() {
-            return Err(MoveRefusedWhy::TerminalHandoff);
-        }
-        if t.session.queue.iter().any(|q| !q.is_held()) {
-            return Err(MoveRefusedWhy::Steered);
-        }
-        match &t.backend {
-            TabBackend::Starting(_) => return Err(MoveRefusedWhy::Starting),
-            TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. }) => {
-                return Err(MoveRefusedWhy::TrustRecording)
-            }
-            TabBackend::AwaitingTrust(AwaitingTrust {
-                start: DeferredStart::Restore { .. },
-                ..
-            }) => return Err(MoveRefusedWhy::Restoring),
-            TabBackend::Live(AgentBackend::Legacy(_)) => return Err(MoveRefusedWhy::Legacy),
+        match &self.tabs[at].backend {
             TabBackend::NotStarted | TabBackend::AwaitingTrust(_) | TabBackend::Failed { .. } => {
                 self.moving.insert(tab.0);
                 return Ok(FrozenTab {
@@ -1069,7 +1085,8 @@ impl TabSet {
                     chat: None,
                 });
             }
-            TabBackend::Live(AgentBackend::Conversation { .. }) => {}
+            // Refused above: only a live conversation is left.
+            TabBackend::Starting(_) | TabBackend::Live(_) => {}
         }
         let project_root = self
             .project_root
@@ -1230,6 +1247,27 @@ impl TabSet {
         self.owe_flush_if_idle(tab);
     }
 
+    /// A chat holding `session` is arriving with move `mv`: presence counts a turn under a tab id held
+    /// for this move before the other window lets go. The hold stays until this move's drop after
+    /// adoption, even when another arrival has the same session id. The answer says once the presence
+    /// thread holds it; `None` when this window holds no presence. Holding the same move twice holds it once.
+    pub fn hold_arrival(&mut self, session: &str, mv: u64) -> Option<std::sync::mpsc::Receiver<Held>> {
+        if !self.arrivals.contains_key(&mv) {
+            let id = TabId(self.next_id);
+            self.next_id += 1;
+            self.arrivals.insert(mv, (session.to_owned(), id));
+        }
+        let running = self.running_set();
+        self.presence.as_ref().map(|holder| holder.sync_confirmed(&running))
+    }
+
+    /// Move `mv` was adopted or given up: only its arrival hold is let go.
+    pub fn drop_arrival(&mut self, mv: u64) {
+        if self.arrivals.remove(&mv).is_some() {
+            self.sync_presence();
+        }
+    }
+
     /// The move of `tab` is done (the other window took it up): it leaves this set without being ended.
     /// Its review watchers are cancelled first; its review goes without an end snapshot and without a
     /// job, its running turn going on as the partner's; nothing counts it as retiring, and the presence
@@ -1344,7 +1382,21 @@ impl TabSet {
         for (item, typed) in queue.iter_mut().zip(queue_typed_by_person) {
             item.typed_by_person = typed;
         }
-        let id = self.insert_tab(agent, false);
+        // Take the first matching hold's unused tab id in move order, so its turn's file stays across adoption.
+        // Every hold stays until its move's drop; another arrival may have the same session id.
+        let held = match &backend {
+            TabBackend::Live(live) => live.provider_session_id().and_then(|session| {
+                self.arrivals
+                    .values()
+                    .find(|(held_session, id)| *held_session == session && self.get(*id).is_none())
+                    .map(|(_, id)| *id)
+            }),
+            _ => None,
+        };
+        let id = match held {
+            Some(id) => self.insert_tab_as(id, agent, false),
+            None => self.insert_tab(agent, false),
+        };
         let at = self.position(id).expect("just inserted");
         let t = &mut self.tabs[at];
         t.name = name;

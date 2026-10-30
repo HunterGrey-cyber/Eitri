@@ -292,23 +292,21 @@ pub(crate) fn format_key_event(key: Key, state: ModifierType) -> Option<String> 
 ///    `content_region.min` offset `crate::gl_interop::pixel_to_grid_pos` has to *subtract* on the
 ///    way in is already *added* here on the way out; there is nothing more to apply.
 /// 2. That space is device pixels (`crate::gl_interop::current_content_region` builds
-///    `content_region` from `gl_area.width() * gl_area.scale_factor()`), whereas
+///    `content_region` from the pane's framebuffer size), whereas
 ///    `set_cursor_location` wants widget-local *logical* pixels -- the same units GTK4's own
 ///    `GestureClick`/`EventControllerMotion` report `x`/`y` in. Hence the single division by
 ///    `scale_factor`, the exact inverse of the multiplication `pixel_to_grid_pos` performs.
 /// 3. The rect's size is one grid cell (`grid_scale`, likewise device pixels -> logical), so the
 ///    input method knows the height of the line it must not cover.
 ///
-/// `scale_factor` is GTK's own rounded integer `Widget::scale_factor()`, matching every other
-/// coordinate conversion in this crate; the cross-scale click-accuracy work established that both
-/// sides of these conversions share that same rounded basis, so the rounded/true-fractional scale
-/// mismatch never enters the arithmetic.
+/// The device scale matches the rendered framebuffer and pointer conversions, including
+/// fractional scales, so the input method receives logical widget coordinates.
 pub(crate) fn im_cursor_rect_for_editor(
     cursor_pixel_pos: PixelPos<f32>,
     grid_scale: GridScale,
-    scale_factor: i32,
+    scale: f64,
 ) -> Rectangle {
-    let scale_factor = scale_factor.max(1) as f32;
+    let scale_factor = scale.max(1.0) as f32;
     Rectangle::new(
         (cursor_pixel_pos.x / scale_factor).round() as i32,
         (cursor_pixel_pos.y / scale_factor).round() as i32,
@@ -326,7 +324,7 @@ pub(crate) fn im_cursor_rect_for_editor(
 /// A no-op unless the session is `Ready` and nvim is alive -- there is no meaningful cursor to
 /// point at otherwise, and leaving the previously published location in place is strictly better
 /// than publishing a `(0, 0)` one.
-fn publish_cursor_location(im_context: &IMMulticontext, gl_area: &GLArea, live_state: &Rc<RefCell<LiveState>>) {
+fn publish_cursor_location(im_context: &IMMulticontext, live_state: &Rc<RefCell<LiveState>>) {
     let live = live_state.borrow();
     let LiveState::Ready(session) = &*live else {
         return;
@@ -337,7 +335,7 @@ fn publish_cursor_location(im_context: &IMMulticontext, gl_area: &GLArea, live_s
     let rect = im_cursor_rect_for_editor(
         session.harness.cursor_pixel_position(),
         session.harness.grid_scale(),
-        gl_area.scale_factor(),
+        session.device_scale(),
     );
     if std::env::var_os("NEOVIDE_EDITOR_LOG_IME").is_some() {
         println!(
@@ -399,23 +397,20 @@ pub(crate) fn attach_keyboard_input(
     // `im_cursor_rect_for_editor` for the coordinate reasoning.
     {
         let live_state = live_state.clone();
-        let area = gl_area.clone();
         im_context.connect_preedit_start(move |ctx| {
-            publish_cursor_location(ctx, &area, &live_state);
+            publish_cursor_location(ctx, &live_state);
         });
     }
     {
         let live_state = live_state.clone();
-        let area = gl_area.clone();
         im_context.connect_preedit_end(move |ctx| {
-            publish_cursor_location(ctx, &area, &live_state);
+            publish_cursor_location(ctx, &live_state);
         });
     }
     {
         let live_state = live_state.clone();
-        let area = gl_area.clone();
         im_context.connect_preedit_changed(move |ctx| {
-            publish_cursor_location(ctx, &area, &live_state);
+            publish_cursor_location(ctx, &live_state);
             if std::env::var_os("NEOVIDE_EDITOR_LOG_IME").is_some() {
                 let (text, _attrs, _cursor_pos) = ctx.preedit_string();
                 println!("[ime] preedit-changed: {text:?}");
@@ -451,12 +446,11 @@ pub(crate) fn attach_keyboard_input(
     // The composition does not move nvim's cursor, so the rectangle published then stays right.
     {
         let live_state = live_state.clone();
-        let area = gl_area.clone();
         let ctx = im_context.clone();
         let placement = EventControllerKey::new();
         placement.set_propagation_phase(gtk4::PropagationPhase::Capture);
         placement.connect_key_pressed(move |_controller, _key, _keycode, _state| {
-            publish_cursor_location(&ctx, &area, &live_state);
+            publish_cursor_location(&ctx, &live_state);
             glib::Propagation::Proceed
         });
         gl_area.add_controller(placement);
@@ -776,19 +770,19 @@ mod tests {
 
         // scale_factor 1: device pixels == logical pixels, and the position is used as-is
         // because `cursor_pixel_position()` already includes the content_region origin.
-        let rect = im_cursor_rect_for_editor(PixelPos::new(130.0, 76.0), grid_scale, 1);
+        let rect = im_cursor_rect_for_editor(PixelPos::new(130.0, 76.0), grid_scale, 1.0);
         assert_eq!((rect.x(), rect.y()), (130, 76));
         assert_eq!((rect.width(), rect.height()), (9, 18));
 
         // scale_factor 2 (HiDPI): the exact inverse of `pixel_to_grid_pos`'s own
         // `logical * scale_factor` conversion.
-        let rect = im_cursor_rect_for_editor(PixelPos::new(260.0, 152.0), grid_scale, 2);
+        let rect = im_cursor_rect_for_editor(PixelPos::new(260.0, 152.0), grid_scale, 2.0);
         assert_eq!((rect.x(), rect.y()), (130, 76));
         assert_eq!((rect.width(), rect.height()), (5, 9));
 
         // A sub-pixel cell still reports a usable, non-zero size.
         let tiny = GridScale::new(PixelSize::new(0.4, 0.4));
-        let rect = im_cursor_rect_for_editor(PixelPos::new(0.0, 0.0), tiny, 1);
+        let rect = im_cursor_rect_for_editor(PixelPos::new(0.0, 0.0), tiny, 1.0);
         assert_eq!((rect.width(), rect.height()), (1, 1));
     }
 }

@@ -82,9 +82,8 @@ pub enum Choice {
 
 /// What [`decide`] found on `PATH` when a private copy won, so the startup line says the true reason.
 ///
-/// Three values, not an `Option` of a version: an `Option` read "none" both for a `PATH` with no
-/// `nvim` and for one whose `--version` probe failed or timed out, so the line said "your PATH has
-/// none" to a user whose `PATH` does have an nvim.
+/// Three values distinguish an absent `nvim` from a present one whose version probe failed or
+/// timed out; `Option<Version>` would report both as absent and give a misleading startup line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathNvim {
     /// Nothing named `nvim` on `PATH` (the probe never ran).
@@ -859,13 +858,10 @@ mod tests {
         assert_eq!(result, Ok(Choice::Path));
     }
 
-    /// Writes and chmods `path` from inside a short-lived `sh` child, not this process (matching
-    /// `agent::process::tests::fake_binary_script`'s own fix for the identical flake):
-    /// a write fd this process held open here would be copied, still open, into any child a
-    /// concurrent test thread forks in the meantime, and running `path` fails with `ETXTBSY` until
-    /// that unrelated child execs and its copy of the fd finally closes -- reproduced here as one
-    /// `version_of_binary_*` test failing intermittently under `--test-threads=4` (reproduced with
-    /// `spawn err: Os { code: 26, kind: ExecutableFileBusy, .. }`).
+    /// Writes and chmods `path` in a short-lived `sh` child. A write fd held by this process
+    /// could be inherited by a concurrent test's child; executing `path` then fails with `ETXTBSY`
+    /// until that unrelated child execs and closes its copy. Under `--test-threads=4`, the
+    /// observed error is `spawn err: Os { code: 26, kind: ExecutableFileBusy, .. }`.
     fn write_executable_script(path: &Path, script: &str) {
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -900,11 +896,10 @@ mod tests {
 
     #[test]
     fn version_of_binary_caps_output_and_kills_a_binary_that_never_stops_printing() {
-        // An uncapped `Command::output()` here would let a PATH `nvim` that never stops printing
-        // grow that buffer without bound (this probe once worked that way). The capped reader must finish
-        // (and the child must be reaped) well inside `VERSION_PROBE_TIMEOUT`, not by hitting it --
-        // proving the cap actually bounds this case rather than merely bounding the separate
-        // "prints nothing at all" hang below.
+        // An uncapped `Command::output()` lets a PATH `nvim` that never stops printing grow the
+        // buffer without bound. The capped reader must finish and reap the child well inside
+        // `VERSION_PROBE_TIMEOUT`, proving the byte cap bounds an endless printer, not just the
+        // timeout meant for a child that prints nothing.
         let scratch = std::env::temp_dir().join(format!(
             "nvim-bin-test-version-infinite-{}-{}",
             std::process::id(),

@@ -14,8 +14,13 @@
 //! for a module with no host yet, the host left as it is for one that has one (a killed terminal's pane
 //! or a dropped chat view's page taken back out of its pool), and the end of what a kill or a
 //! retirement ends: a numbered terminal's pane and a numbered chat view's page left idle in their pools, a web
-//! module's web process ended. Where WebKit cannot start, a chat view the window already holds keeps the notice
-//! the base view shows, as at startup, and a new one is refused: it would hold nothing but the notice.
+//! module's web process ended. A terminal arriving from the other window gets its pane the same way, from its pool or
+//! new, made ready at the size it had there and kept off screen until the move commits, when the pane takes over the
+//! session the move carried. A numbered chat view arriving gets its page, wired and off screen, and at the commit the
+//! panel takes the moved tab up into it (a tab for the base view joins the base view, which is never prepared); a
+//! plugin page arriving gets its page built and laid out at its size, and takes its state up at the commit. Where
+//! WebKit cannot start, a chat view the window already holds keeps the notice the base view shows, as at startup, and
+//! a new one is refused: it would hold nothing but the notice.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -23,17 +28,16 @@ use std::rc::{Rc, Weak};
 
 use eitri_core::layout::{ModuleId, ModuleKind};
 use eitri_core::tabs::ViewId;
-use eitri_core::wm::{DropWhy, SurfaceKind, WinId};
+use eitri_core::wm::{DropWhy, EditorSpawn, SurfaceKind, WinId};
 use eitri_panel::panel_page::PanelPage;
 use gtk4::glib;
 use gtk4::prelude::*;
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
 use crate::agent_panel::{self, AgentPanelHandle};
-use crate::gtk_host::instance_pool::InstancePool;
 use crate::gtk_host::instance_pool::Reused;
 use crate::gtk_host::{GtkHost, SurfaceMaker};
-use crate::gtk_host_services::LuaPages;
+use crate::gtk_host_services::{LuaPages, Registry};
 use crate::module_grid::{HostKind, ModuleGrid};
 use crate::plugin_panels::PluginPanels;
 use crate::terminal::registry::Pane;
@@ -42,7 +46,7 @@ use crate::web_host::WebHost;
 use crate::wire::{wire_host, WireDeps, WireKind};
 
 /// Every extra chat view's page, keyed by its module id (`chat_views`'s module doc).
-pub(crate) type ChatPool = Rc<RefCell<InstancePool<(webkit6::WebView, Rc<PanelPage>)>>>;
+pub(crate) type ChatPool = Rc<Registry<(webkit6::WebView, Rc<PanelPage>)>>;
 
 /// Why a new chat view is refused where WebKit cannot start.
 pub(crate) const CHAT_VIEWS_NEED_WEBKIT: &str = "chat views need WebKit, which cannot start here";
@@ -58,7 +62,7 @@ pub(crate) struct Surfaces {
     pub(crate) grid: glib::WeakRef<ModuleGrid>,
     /// How a web module's host is allocated (`webkit_sandbox`).
     pub(crate) web_host: HostKind,
-    pub(crate) terminals: Rc<RefCell<InstancePool<TerminalPane>>>,
+    pub(crate) terminals: Rc<Registry<TerminalPane>>,
     pub(crate) make_terminal_pane: Rc<dyn Fn() -> TerminalPane>,
     pub(crate) chat_views: ChatPool,
     pub(crate) agent: AgentPanelHandle,
@@ -81,6 +85,20 @@ pub(crate) struct MadeEditor {
     pub(crate) pane: Rc<NeovideEditorPane>,
     pub(crate) host: gtk4::Overlay,
     pub(crate) failure: gtk4::Label,
+}
+
+/// What the editor's pane launches nvim with, from the spawn the controller computed at the start: the feeds' env and
+/// `--cmd`, the arguments, the directory and the colour before nvim draws. The first start and every restart
+/// (`EditorCall::Restart`) read it from the same spawn through this one conversion, so a restarted nvim is launched
+/// as the first one was.
+pub(crate) fn editor_options(spawn: &EditorSpawn) -> NeovideEditorPaneOptions {
+    NeovideEditorPaneOptions {
+        starting_color: spawn.background,
+        clean: spawn.clean,
+        child_env: spawn.env.clone(),
+        cwd: spawn.cwd.clone(),
+        extra_nvim_args: spawn.args.clone(),
+    }
 }
 
 /// The GTK host's `CreateSurface` before the window's layout exists, which only the editor's needs:
@@ -122,12 +140,7 @@ impl SurfaceMaker for EditorMaker {
         let Some(gtk_host) = self.host.upgrade() else {
             return Err("the GTK host is gone".into());
         };
-        let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
-            clean: spawn.clean,
-            child_env: spawn.env.clone(),
-            cwd: spawn.cwd.clone(),
-            extra_nvim_args: spawn.args.clone(),
-        }));
+        let pane = Rc::new(NeovideEditorPane::with_options(editor_options(spawn)));
         let (host, failure) = crate::editor_start_failure::install(pane.widget());
         gtk_host.register_surface(win, ModuleId::editor(), host.upcast_ref());
         *self.made.borrow_mut() = Some(MadeEditor { pane, host, failure });
@@ -268,10 +281,7 @@ impl Surfaces {
     /// A terminal the layout opens with: its pane from the registry, its host the pane itself.
     pub(crate) fn startup_terminal(&self, id: &ModuleId) -> Result<(), String> {
         let grid = self.grid()?;
-        let (pane, _) = self
-            .terminals
-            .borrow_mut()
-            .take_or_make(id, || (self.make_terminal_pane)());
+        let (pane, _) = self.terminals.take_or_make(id, || (self.make_terminal_pane)());
         self.place(&grid, id, pane.widget(), pane.widget(), HostKind::Direct);
         Ok(())
     }
@@ -282,7 +292,6 @@ impl Surfaces {
         let view = ViewId::of_module(id).ok_or_else(|| format!("{id} is not a chat view"))?;
         let ((webview, _), _) = self
             .chat_views
-            .borrow_mut()
             .take_or_make(id, || agent_panel::build_chat_page(&self.agent, view, Some(base)));
         let host = WebHost::new(&webview);
         self.place(&grid, id, &host, &webview, self.web_host);
@@ -313,10 +322,7 @@ impl Surfaces {
     /// it), `None` when the grid already held it.
     pub(crate) fn terminal(&self, id: &ModuleId, dir: PathBuf) -> Result<Option<TerminalPane>, String> {
         let grid = self.grid()?;
-        let (pane, reused) = self
-            .terminals
-            .borrow_mut()
-            .take_or_make(id, || (self.make_terminal_pane)());
+        let (pane, reused) = self.terminals.take_or_make(id, || (self.make_terminal_pane)());
         pane.set_start_dir(dir);
         if grid.has_host(id) {
             return Ok(None);
@@ -328,6 +334,21 @@ impl Surfaces {
         // Off screen until a placement shows it (`ModuleGrid::apply` maps it then).
         pane.widget().set_child_visible(false);
         Ok(Some(pane))
+    }
+
+    /// The pane a terminal arriving from the other window takes over, from the pool or new, with its host the first
+    /// time; off screen until the move commits and a placement shows it. Its start directory is left as the pane has
+    /// it, the project root for a new one: the shell it takes over runs in its own. The pane when its host was made now
+    /// (the caller wires it), `None` when the grid already held it, with the pane either way.
+    pub(crate) fn arriving_terminal(&self, id: &ModuleId) -> Result<(TerminalPane, bool), String> {
+        let grid = self.grid()?;
+        let (pane, _reused) = self.terminals.take_or_make(id, || (self.make_terminal_pane)());
+        if grid.has_host(id) {
+            return Ok((pane, false));
+        }
+        self.place(&grid, id, pane.widget(), pane.widget(), HostKind::Direct);
+        pane.widget().set_child_visible(false);
+        Ok((pane, true))
     }
 
     /// An extra chat view's page and host: its page from the pool -- the live one, else the idle one
@@ -343,10 +364,9 @@ impl Surfaces {
         let view = ViewId::of_module(id)
             .filter(|view| !view.is_base())
             .ok_or_else(|| format!("{id} is not an extra chat view"))?;
-        let was_live = self.chat_views.borrow().get(id).is_some();
+        let was_live = self.chat_views.holds(id);
         let ((webview, page), reused) = self
             .chat_views
-            .borrow_mut()
             .take_or_make(id, || agent_panel::build_chat_page(&self.agent, view, Some(base)));
         // Says which of the pool's two answers this was, so a log shows a page reused rather than built.
         println!(
@@ -374,7 +394,7 @@ impl Surfaces {
 
     /// A page that never got its view placed, or whose view left, waits idle under its id.
     pub(crate) fn retire_chat_page(&self, id: &ModuleId) {
-        if self.chat_views.borrow_mut().retire(id) {
+        if self.chat_views.retire(id) {
             if let Some(view) = ViewId::of_module(id) {
                 self.agent.idle_page(view);
             }
@@ -400,10 +420,10 @@ impl Surfaces {
 
 /// Whether `id`'s pane or page is in use. A killed terminal's pane and a dropped chat view's page wait
 /// idle in their pools; every other module's host is its whole surface.
-fn in_use<T: Pane + Clone, C: Clone>(id: &ModuleId, terminals: &InstancePool<T>, chat_views: &InstancePool<C>) -> bool {
+fn in_use<T: Pane + Clone, C: Clone>(id: &ModuleId, terminals: &Registry<T>, chat_views: &Registry<C>) -> bool {
     match id.kind() {
-        ModuleKind::Terminal => terminals.get(id).is_some(),
-        ModuleKind::Agent if ViewId::of_module(id).is_some_and(|view| !view.is_base()) => chat_views.get(id).is_some(),
+        ModuleKind::Terminal => terminals.holds(id),
+        ModuleKind::Agent if ViewId::of_module(id).is_some_and(|view| !view.is_base()) => chat_views.holds(id),
         _ => true,
     }
 }
@@ -455,18 +475,37 @@ pub(crate) struct SurfaceOps {
     pub(crate) wire_terminal: WireTerminal,
 }
 
+impl SurfaceOps {
+    /// A terminal pane's host just made, by a create or an arrival's prepare, gets its controllers and its shell's
+    /// hooks, once: the one place a later terminal host is wired.
+    fn wire_terminal_pane(&self, module: &ModuleId, pane: &TerminalPane) {
+        (self.wire_terminal)(module, pane);
+        wire_host(WireKind::Terminal, module, pane.widget().upcast_ref(), &self.wire_deps);
+    }
+
+    /// An extra chat view's page and host, by a create or an arrival's prepare: its host gets its controllers the
+    /// first time it is made, the one place a later chat view's host is wired.
+    fn chat_view_wired(&self, module: &ModuleId) -> Result<(), String> {
+        if let Some(host) = self.surfaces.chat_view(module, CHAT_VIEWS_NEED_WEBKIT)? {
+            wire_host(WireKind::Chat, module, &host, &self.wire_deps);
+        }
+        Ok(())
+    }
+}
+
 impl SurfaceMaker for SurfaceOps {
+    fn mapped(&self, module: &ModuleId, mapped: bool) {
+        if let Some(grid) = self.surfaces.grid.upgrade() {
+            grid.map_prepared(module, mapped);
+        }
+    }
+
     fn create(&self, win: WinId, module: &ModuleId, kind: &SurfaceKind) -> Result<(), String> {
         if win != WinId::MAIN {
             return Err(format!("{win:?}: this shell has one window"));
         }
         let held = self.surfaces.grid()?.has_host(module);
-        let live = held
-            && in_use(
-                module,
-                &self.surfaces.terminals.borrow(),
-                &self.surfaces.chat_views.borrow(),
-            );
+        let live = held && in_use(module, &self.surfaces.terminals, &self.surfaces.chat_views);
         match create_route(kind, held, live, self.surfaces.base_webview.is_some()) {
             CreateRoute::Keep | CreateRoute::HeldNotice => Ok(()),
             CreateRoute::Refuse => Err(match kind {
@@ -475,12 +514,7 @@ impl SurfaceMaker for SurfaceOps {
                 _ => format!("{module} is not a Lua panel this window registered"),
             }),
             CreateRoute::NoWebKit => Err(CHAT_VIEWS_NEED_WEBKIT.into()),
-            CreateRoute::ChatView => {
-                if let Some(host) = self.surfaces.chat_view(module, CHAT_VIEWS_NEED_WEBKIT)? {
-                    wire_host(WireKind::Chat, module, &host, &self.wire_deps);
-                }
-                Ok(())
-            }
+            CreateRoute::ChatView => self.chat_view_wired(module),
             CreateRoute::Terminal => {
                 if module.kind() != ModuleKind::Terminal {
                     return Err(format!("{module} is not a terminal"));
@@ -489,23 +523,87 @@ impl SurfaceMaker for SurfaceOps {
                     return Err(format!("{module}: only a terminal surface has a start directory"));
                 };
                 if let Some(pane) = self.surfaces.terminal(module, cwd.clone())? {
-                    (self.wire_terminal)(module, &pane);
-                    wire_host(WireKind::Terminal, module, pane.widget().upcast_ref(), &self.wire_deps);
+                    self.wire_terminal_pane(module, &pane);
                 }
                 Ok(())
             }
         }
     }
 
+    fn prepare(
+        &self,
+        win: WinId,
+        module: &ModuleId,
+        _shape: &eitri_core::window_link::Shape,
+        size: (u32, u32),
+    ) -> Result<(), String> {
+        if win != WinId::MAIN {
+            return Err(format!("{win:?}: this shell has one window"));
+        }
+        match module.kind() {
+            ModuleKind::Terminal => {
+                let (pane, made) = self.surfaces.arriving_terminal(module)?;
+                if made {
+                    self.wire_terminal_pane(module, &pane);
+                }
+                pane.prepare(size.0, size.1);
+                Ok(())
+            }
+            ModuleKind::LuaWebview if self.surfaces.plugin_panels.modules().contains(module) => {
+                let grid = self.surfaces.grid.upgrade().ok_or("the destination grid is gone")?;
+                self.surfaces.plugin_panels.prepare(module);
+                grid.prepare_page(module, size)
+            }
+            // A numbered chat view's page, off screen until the commit places it; its document loads now, so the
+            // tab's snapshot lands in a page that is ready. The base view is always here and is never prepared.
+            ModuleKind::Agent if module.number() >= 2 => self.chat_view_wired(module),
+            _ => Err(format!(
+                "{module} cannot arrive in this window: only a terminal, a chat view or a plugin page can"
+            )),
+        }
+    }
+
+    fn adopt(
+        &self,
+        _win: WinId,
+        module: &ModuleId,
+        kind: eitri_core::wm::moves::MoveKind,
+        record: &serde_json::Value,
+        fds: Vec<std::os::fd::OwnedFd>,
+    ) -> Result<(), String> {
+        match kind {
+            eitri_core::wm::moves::MoveKind::Terminal => {}
+            // The tab another window moved joins the view this module is: the base view, or the numbered view
+            // prepared for it.
+            eitri_core::wm::moves::MoveKind::Chat => {
+                let view = ViewId::of_module(module).ok_or_else(|| format!("{module} is not a chat view"))?;
+                return self.surfaces.agent.adopt_moved(view, record, fds).map(drop);
+            }
+            eitri_core::wm::moves::MoveKind::PluginPage => {
+                return self.surfaces.plugin_panels.adopt(module, record, fds)
+            }
+            eitri_core::wm::moves::MoveKind::LuaPanel => {
+                return Err("Lua panels reopen from their registered producer".into())
+            }
+        }
+        let pane = self
+            .surfaces
+            .terminals
+            .get(module)
+            .ok_or_else(|| format!("{module} has no pane prepared for it"))?;
+        pane.adopt(record, fds)
+    }
+
     fn drop_surface(&self, _win: WinId, module: &ModuleId, why: &DropWhy) -> Result<(), String> {
+        if *why == DropWhy::MoveGivenUp {
+            if let Some(grid) = self.surfaces.grid.upgrade() {
+                grid.map_prepared(module, false);
+            }
+        }
         match drop_route(module, why) {
             DropRoute::IdlePane => {
                 // Retiring hangs the pane's shell up, if it still runs, as it goes idle.
-                let retired = match self.surfaces.terminals.try_borrow_mut() {
-                    Ok(mut terminals) => terminals.retire(module),
-                    Err(_) => return Err(format!("{module}: the terminal registry was borrowed")),
-                };
-                if !retired {
+                if !self.surfaces.terminals.retire(module) {
                     println!("[terminal] {module}: its pane was idle already");
                 }
             }
@@ -555,6 +653,31 @@ mod tests {
         ModuleId::instance(kind, n).unwrap()
     }
 
+    /// The pane's first start and its restart read one spawn through one conversion, so a restarted nvim gets the
+    /// feeds' environment, `--cmd` and arguments, directory and colour the first one got.
+    #[test]
+    fn the_restart_uses_the_options_the_start_used() {
+        let spawn = EditorSpawn {
+            env: vec![("TMUX".into(), "/run/eitri/switch,1,0".into())],
+            args: vec!["--cmd".into(), "lua dofile('/run/eitri/theme.lua')".into()],
+            cwd: Some(PathBuf::from("/home/user/project")),
+            clean: true,
+            background: Some((0x1e, 0x1e, 0x2e)),
+        };
+        let start = editor_options(&spawn);
+        assert_eq!(
+            start,
+            NeovideEditorPaneOptions {
+                starting_color: Some((0x1e, 0x1e, 0x2e)),
+                clean: true,
+                child_env: spawn.env.clone(),
+                cwd: spawn.cwd.clone(),
+                extra_nvim_args: spawn.args.clone(),
+            }
+        );
+        assert_eq!(editor_options(&spawn), start, "the restart's options are the start's");
+    }
+
     /// Where WebKit cannot start, the surfaces phase builds no page: the extra chat view gets the notice, and
     /// the base view, each Lua panel and each plugin get the view made for them before the phase, which
     /// their own makers made a notice there.
@@ -597,8 +720,8 @@ mod tests {
 
     #[test]
     fn a_killed_pane_or_a_dropped_page_is_not_in_use_while_its_host_stays() {
-        let mut terminals = InstancePool::new();
-        let mut chat_views = InstancePool::new();
+        let terminals = Registry::new();
+        let chat_views = Registry::new();
         let terminal = instance(ModuleKind::Terminal, 2);
         let chat = instance(ModuleKind::Agent, 2);
         terminals.take_or_make(&terminal, || Idle);
@@ -686,6 +809,7 @@ mod tests {
                     args: Vec::new(),
                     cwd: None,
                     clean: false,
+                    background: None,
                 },
             },
             SurfaceKind::Chat { view: ViewId::BASE },

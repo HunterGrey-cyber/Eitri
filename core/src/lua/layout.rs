@@ -48,12 +48,10 @@ use std::rc::Rc;
 use mlua::{Lua, Table, Value};
 
 use crate::keymap::Action;
-use crate::layout::con::{unwritten_share, SHARE_SLACK};
 use crate::layout::rules::{OpenRule, OpenRules, RuleSize, RuleTarget};
-use crate::layout::tree::MIN_RATIO;
-use crate::layout::{
-    Axis, Child, Con, ConLayout, Float, FloatRect, Layout, ModuleId, ModuleKind, Node, Workspaces, MAX_FLOAT_PX,
-};
+pub use crate::layout::spec::LuaTree;
+use crate::layout::spec::{self, SpecNode, SplitKind};
+use crate::layout::{Axis, Con, Float, FloatRect, Layout, ModuleId, ModuleKind, Node, Workspaces, MAX_FLOAT_PX};
 
 /// One queued `eitri.layout` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,11 +72,26 @@ pub enum LayoutRequest {
     Float(ModuleId, Option<FloatRect>),
 }
 
-/// A default layout's tiled tree and its top table's floating modules.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LuaTree {
-    pub tiled: Node,
-    pub floats: Vec<Float>,
+/// How `get` and `export` read the window once it exists: a query its controller provides, answering a copy of
+/// what it reads as it is when asked, or `None` while the controller is writing it, which the call refuses. A copy,
+/// so building Lua's table holds no borrow of the window's layout and never meets a controller in the middle of a
+/// decision.
+pub struct Query<T>(Rc<dyn Fn() -> Option<T>>);
+
+impl<T> Query<T> {
+    pub fn new(read: impl Fn() -> Option<T> + 'static) -> Query<T> {
+        Query(Rc::new(read))
+    }
+
+    fn read(&self) -> Option<T> {
+        (self.0)()
+    }
+}
+
+impl<T> std::fmt::Debug for Query<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Query")
+    }
 }
 
 /// What `eitri.layout.*` recorded.
@@ -88,11 +101,11 @@ pub struct LayoutStore {
     defined: Vec<(String, Result<LuaTree, String>)>,
     rules: OpenRules,
     init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
-    workspaces: Option<Rc<RefCell<Workspaces>>>,
+    workspaces: Option<Query<Workspaces>>,
     requests: Vec<LayoutRequest>,
     accepting: bool,
     lua_panels: Vec<String>,
-    layout: Option<Rc<RefCell<Layout>>>,
+    layout: Option<Query<Layout>>,
     window: Option<&'static str>,
 }
 
@@ -125,13 +138,13 @@ impl LayoutStore {
         &self.defined
     }
 
-    /// The window's workspaces, so `get()` names them.
-    pub fn attach_workspaces(&mut self, workspaces: Rc<RefCell<Workspaces>>) {
+    /// How the window's workspaces are read, so `get()` names them.
+    pub fn attach_workspaces(&mut self, workspaces: Query<Workspaces>) {
         self.workspaces = Some(workspaces);
     }
 
-    /// The window's live layout, so `get` reads its current state.
-    pub fn attach(&mut self, layout: Rc<RefCell<Layout>>) {
+    /// How the window's live layout is read, so `get` reads its current state.
+    pub fn attach(&mut self, layout: Query<Layout>) {
         self.layout = Some(layout);
     }
 
@@ -459,17 +472,17 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 )
             })?;
             let layout = live
-                .try_borrow()
-                .map_err(|_| mlua::Error::RuntimeError("eitri.layout.export: the layout is being changed".into()))?;
+                .read()
+                .ok_or_else(|| mlua::Error::RuntimeError("eitri.layout.export: the layout is being changed".into()))?;
             let workspaces = store
                 .workspaces
                 .as_ref()
-                .map(|ws| ws.try_borrow())
+                .map(|ws| ws.read().ok_or(()))
                 .transpose()
                 .map_err(|_| {
                     mlua::Error::RuntimeError("eitri.layout.export: the workspaces are being changed".into())
                 })?;
-            Ok(crate::layout::export_lua(&layout, workspaces.as_deref()))
+            Ok(crate::layout::export_lua(&layout, workspaces.as_ref()))
         })?,
     )?;
 
@@ -482,7 +495,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     "eitri.layout.get: only once the window exists (in a command or an event handler)".to_string(),
                 )
             })?;
-            let layout = live.try_borrow().map_err(|_| {
+            let layout = live.read().ok_or_else(|| {
                 mlua::Error::RuntimeError(
                     "eitri.layout.get: the layout is being changed; call it from a command or an event handler"
                         .to_string(),
@@ -536,7 +549,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
             table.set("zoomed", zoomed.as_ref().map(ModuleId::as_str))?;
             table.set("marked", layout.mark().map(ModuleId::as_str))?;
             if let Some(workspaces) = &store.workspaces {
-                let workspaces = workspaces.try_borrow().map_err(|_| {
+                let workspaces = workspaces.read().ok_or_else(|| {
                     mlua::Error::RuntimeError("eitri.layout.get: the workspaces are being changed".to_string())
                 })?;
                 table.set("workspace", workspaces.current())?;
@@ -727,10 +740,8 @@ pub fn parse_tree(value: &Value) -> Result<LuaTree, String> {
     let Value::Table(table) = value else {
         return Err(format!("expected a table, got {}", value.type_name()));
     };
-    let (node, share) = parse_node(table, "the tree")?;
-    if share.is_some() {
-        return Err("the whole tree takes no share".to_string());
-    }
+    let root = parse_node(table, "the tree")?;
+    let node = spec::build(&root, &|name| ModuleId::parse(name).map_err(|e| e.to_string()))?.tiled;
     let floats = parse_floats(table.raw_get::<Value>("floating").map_err(|e| e.to_string())?)?;
     let leaves = node.leaves();
     let mut seen = BTreeSet::new();
@@ -855,8 +866,8 @@ fn parse_float_rect(table: &Table, at: &str, id: Option<&ModuleId>) -> Result<Fl
     })
 }
 
-/// A node and the share of its parent it asked for.
-fn parse_node(table: &Table, at: &str) -> Result<(Node, Option<f32>), String> {
+/// Reads Lua's representation without deciding container shares or module uniqueness.
+fn parse_node(table: &Table, at: &str) -> Result<SpecNode, String> {
     let head: Value = table.raw_get(1).map_err(|e| e.to_string())?;
     let Value::String(head) = head else {
         return Err(format!(
@@ -865,27 +876,21 @@ fn parse_node(table: &Table, at: &str) -> Result<(Node, Option<f32>), String> {
     };
     let head = head.to_str().map_err(|e| e.to_string())?.to_string();
     let len = table.raw_len();
-    let layout = match head.as_str() {
-        "row" => Some(ConLayout::SplitH),
-        "column" => Some(ConLayout::SplitV),
-        "tabbed" => Some(ConLayout::Tabbed),
-        "stacked" => Some(ConLayout::Stacked),
-        _ => None,
-    };
-    refuse_other_fields(table, len, layout.is_some(), &head, at)?;
-    let Some(layout) = layout else {
-        let id = ModuleId::parse(&head).map_err(|e| format!("{at}: {e}"))?;
+    let kind = SplitKind::parse(&head);
+    refuse_other_fields(table, len, kind.is_some(), &head, at)?;
+    let Some(kind) = kind else {
+        ModuleId::parse(&head).map_err(|e| format!("{at}: {e}"))?;
         let share = match len {
             1 => None,
             2 => Some(share_of(
                 table.raw_get(2).map_err(|e| e.to_string())?,
-                &format!("{at} ('{id}')"),
+                &format!("{at} ('{head}')"),
             )?),
-            _ => return Err(format!("{at}: a module is {{'{id}'}} or {{'{id}', share}}")),
+            _ => return Err(format!("{at}: a module is {{'{head}'}} or {{'{head}', share}}")),
         };
-        return Ok((Node::Leaf(id), share));
+        return Ok(SpecNode::Module { name: head, share });
     };
-    let children: Vec<(Node, Option<f32>)> = (2..=len)
+    let children = (2..=len)
         .map(|i| match table.raw_get::<Value>(i) {
             Ok(Value::Table(child)) => parse_node(&child, &format!("item {} of the {head}", i - 1)),
             Ok(other) => Err(format!(
@@ -895,36 +900,29 @@ fn parse_node(table: &Table, at: &str) -> Result<(Node, Option<f32>), String> {
             )),
             Err(e) => Err(e.to_string()),
         })
-        .collect::<Result<_, _>>()?;
-    let tabbed = layout.axis().is_none();
-    if children.len() < if tabbed { 1 } else { 2 } {
-        let count = if tabbed { "one" } else { "two" };
-        return Err(format!("{at}: a {head} needs {count} or more items"));
-    }
-    let active = if tabbed {
-        match table.raw_get::<Value>("active").map_err(|e| e.to_string())? {
-            Value::Nil => 1,
-            Value::Integer(n) if n >= 1 && n as usize <= children.len() => n as usize,
-            Value::Number(n) if n.fract() == 0.0 && n >= 1.0 && n <= children.len() as f64 => n as usize,
-            value => {
-                let n = match value {
-                    Value::Integer(n) => n.to_string(),
-                    Value::Number(n) => n.to_string(),
-                    other => format!("{other:?}"),
-                };
-                return Err(format!("{at}: active = {n}: the {head} has {} items", children.len()));
-            }
+        .collect::<Result<Vec<_>, _>>()?;
+    let active = match table.raw_get::<Value>("active").map_err(|e| e.to_string())? {
+        Value::Nil => None,
+        Value::Integer(n) => Some(n),
+        Value::Number(n) if n.fract() == 0.0 && n >= 1.0 && n <= children.len() as f64 => Some(n as i64),
+        value => {
+            let n = match value {
+                Value::Number(n) => n.to_string(),
+                other => format!("{other:?}"),
+            };
+            return Err(format!("{at}: active = {n}: the {head} has {} items", children.len()));
         }
-    } else {
-        1
     };
     let share = match table.raw_get::<Value>("share").map_err(|e| e.to_string())? {
         Value::Nil => None,
         other => Some(share_of(other, &format!("{at}'s share"))?),
     };
-    let mut c = container(layout, children, &head)?;
-    c.focus = active - 1;
-    Ok((Node::Con(c), share))
+    Ok(SpecNode::Split {
+        kind,
+        children,
+        share,
+        active,
+    })
 }
 
 /// Refuse unknown fields so misspelled shares and active indices cannot silently change a layout.
@@ -951,67 +949,13 @@ fn refuse_other_fields(table: &Table, len: usize, split: bool, head: &str, at: &
     Ok(())
 }
 
-fn share_of(value: Value, at: &str) -> Result<f32, String> {
+fn share_of(value: Value, at: &str) -> Result<f64, String> {
     let share = match value {
-        Value::Number(n) => n as f32,
-        Value::Integer(n) => n as f32,
+        Value::Number(n) => n,
+        Value::Integer(n) => n as f64,
         other => return Err(format!("{at}: a share is a number, got {}", other.type_name())),
     };
     Ok(share)
-}
-
-/// Each child keeps its share directly, so parsing never introduces another container.
-///
-/// Shares are accepted in the model's own range (`Con::check`'s), down to `SHARE_SLACK` below the
-/// minimum: an exported layout holds shares a rounding error short of 0.05 after a drag, and the
-/// text must read back. The unspecified share is computed in `f64`, so the `f32` rounding of the
-/// subtraction does not push a share at the minimum below the range.
-fn container(layout: ConLayout, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<Con, String> {
-    let lowest = MIN_RATIO - SHARE_SLACK;
-    for (i, (_, share)) in children.iter().enumerate() {
-        if let Some(share) = share {
-            if !(lowest..=1.0).contains(share) {
-                return Err(format!(
-                    "item {} of the {head} gets {share:.3}; a share is 0.05 to 1",
-                    i + 1
-                ));
-            }
-        }
-    }
-    let given: f64 = children.iter().filter_map(|(_, s)| s.map(f64::from)).sum();
-    let unset = children.iter().filter(|(_, s)| s.is_none()).count();
-    if unset == 0 && (given - 1.0).abs() > 0.001 {
-        return Err(format!("the {head}'s shares add up to {}, not 1", given as f32));
-    }
-    if unset > 0 && given >= 1.0 {
-        return Err(format!(
-            "the {head}'s shares add up to {}, leaving nothing for the rest",
-            given as f32
-        ));
-    }
-    let each = if unset > 0 {
-        let each = unwritten_share(children.iter().filter_map(|(_, s)| *s), unset);
-        // Rounding to `f32` cannot carry a value at or above an `f32` bound below it.
-        if each < f64::from(lowest) {
-            let i = children.iter().position(|(_, s)| s.is_none()).unwrap_or(0);
-            return Err(format!(
-                "item {} of the {head} gets {each:.3}; a share is 0.05 to 1",
-                i + 1
-            ));
-        }
-        each as f32
-    } else {
-        0.0
-    };
-    let shares: Vec<f32> = children.iter().map(|(_, s)| s.unwrap_or(each)).collect();
-    Ok(Con::new(
-        layout,
-        children
-            .into_iter()
-            .zip(shares)
-            .map(|((node, _), share)| Child::new(node, share))
-            .collect(),
-    ))
 }
 
 #[cfg(test)]
@@ -1098,7 +1042,7 @@ mod tests {
         let (lua, store, live) = attached(Layout::initial(&[]).unwrap());
         let mut ws = crate::layout::Workspaces::single();
         ws.create_copy(&live.borrow());
-        store.borrow_mut().attach_workspaces(Rc::new(RefCell::new(ws)));
+        store.borrow_mut().attach_workspaces(copied(&Rc::new(RefCell::new(ws))));
         let got: String = lua
             .load("local t = eitri.layout.get(); return t.workspace .. ':' .. table.concat(t.workspaces, ',')")
             .eval()
@@ -1162,7 +1106,8 @@ mod tests {
 
     use super::*;
     use crate::keymap::Action;
-    use crate::layout::{Direction, Float, FloatRect, Layout};
+    use crate::layout::tree::MIN_RATIO;
+    use crate::layout::{Child, ConLayout, Direction, Float, FloatRect, Layout};
 
     fn engine() -> (Lua, Rc<RefCell<LayoutStore>>) {
         let lua = Lua::new();
@@ -1173,10 +1118,16 @@ mod tests {
         (lua, store)
     }
 
+    /// A query over `cell` as a window's controller answers one: a copy when the cell is free, else none.
+    fn copied<T: Clone + 'static>(cell: &Rc<RefCell<T>>) -> Query<T> {
+        let cell = cell.clone();
+        Query::new(move || cell.try_borrow().ok().map(|value| value.clone()))
+    }
+
     fn attached(layout: Layout) -> (Lua, Rc<RefCell<LayoutStore>>, Rc<RefCell<Layout>>) {
         let (lua, store) = engine();
         let live = Rc::new(RefCell::new(layout));
-        store.borrow_mut().attach(live.clone());
+        store.borrow_mut().attach(copied(&live));
         store.borrow_mut().set_lua_panels(vec!["notes".to_string()]);
         store.borrow_mut().accept_requests();
         (lua, store, live)
@@ -1604,7 +1555,7 @@ mod tests {
             let (lua, store, _) = attached(layout);
             store
                 .borrow_mut()
-                .attach_workspaces(Rc::new(RefCell::new(Workspaces::single())));
+                .attach_workspaces(copied(&Rc::new(RefCell::new(Workspaces::single()))));
             let table: Table = lua.load("return eitri.layout.get()").eval().unwrap();
             for key in ["focus", "hidden", "away", "zoomed", "marked", "workspace", "workspaces"] {
                 table.raw_set(key, Value::Nil).unwrap();
@@ -1748,7 +1699,7 @@ mod tests {
         );
         drop(held);
         let ws = Rc::new(RefCell::new(crate::layout::Workspaces::single()));
-        store.borrow_mut().attach_workspaces(ws.clone());
+        store.borrow_mut().attach_workspaces(copied(&ws));
         let held = ws.borrow_mut();
         let err = lua.load("eitri.layout.export()").exec().unwrap_err().to_string();
         assert!(

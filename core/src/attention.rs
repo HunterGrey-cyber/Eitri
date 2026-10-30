@@ -11,12 +11,11 @@
 //! -- and drops each one the projection no longer holds, which is how an answer given from the panel
 //! (`respond_permission`, on legacy never a delivered event) stops counting.
 //!
-//! **That gap is closed as of 2026-09-27, not by counting less here.**
-//! [`AttentionTracker::resync`] still takes whatever set the caller hands it, but `TabSet::pump`
-//! now passes the projection's pending ids MINUS `Tab::host_answered` -- the ids Eitri
-//! itself already answered, in bypass or under the classifier -- so a request nobody needs to see
-//! a card for is never counted here either. The fix stays in the caller, not in `resync` itself:
-//! this tracker still counts exactly the set it is handed.
+//! **Resync excludes requests the host already answered.**
+//! [`AttentionTracker::resync`] counts exactly the set it is handed. `TabSet::pump` passes the
+//! projection's pending ids minus `SessionState::host_answered`, the ids Eitri already answered
+//! in bypass or under the classifier. Filtering belongs in the caller so a request nobody needs
+//! a card for never counts here either.
 //!
 //! **A session that ends owes nothing** ([`AttentionTracker::session_ended`]): its cards can no
 //! longer be answered, so they stop counting even though the panel still draws them -- the count is
@@ -311,9 +310,9 @@ pub struct Reaction {
 /// A card that arrives while the chat is not on screen: a toast, or with `Reveal` and nothing
 /// zoomed, the chat itself. A card that arrives while it is on screen is already in view. "Arrives"
 /// is [`Attention::arrived`] growing, not `pending`: a card answered and a new one in the same pump
-/// leave `pending` unchanged. A tracker reset for a new session starts
-/// `arrived` again at 0, which is a decrease, and never a reaction. And only a card still waiting
-/// reacts: one that arrived and was answered, cancelled or ended with its session in the same pump
+/// leave `pending` unchanged. A total that goes down is a decrease, never a reaction (a new session in
+/// the same tab does not lower it: [`AttentionTracker::restart`] keeps `arrived`). And only a card
+/// still waiting reacts: one that arrived and was answered, cancelled or ended with its session in the same pump
 /// has gone by the time `shell` looks, so a toast would say "0 permission cards waiting" and a
 /// reveal would show the chat for nothing.
 pub fn react(policy: ChatOnPermission, before: Attention, after: Attention, place: AgentPlace) -> Reaction {

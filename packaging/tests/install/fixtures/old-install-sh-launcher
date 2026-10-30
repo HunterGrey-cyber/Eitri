@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # neovibe, installed by install.sh. Everything it decides is printed before the window opens.
 set -euo pipefail
-# Test fixture for the launcher written by the old root install.sh.
-# The installer recognizes it by its second line alone.
+# Test fixture: a legacy launcher's opening lines. The installer recognises it by its second line alone.
 exec "$HOME/.local/lib/neovibe/shell" "$@"

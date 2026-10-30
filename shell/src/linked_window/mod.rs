@@ -10,7 +10,9 @@
 
 pub mod driver;
 pub mod editor;
+pub(crate) mod focus;
 pub mod pair_files;
+pub mod relink;
 pub mod review;
 pub mod spawn;
 
@@ -28,13 +30,16 @@ use eitri_core::window_link::start;
 use neovide_editor::NeovideEditorPane;
 
 pub use driver::LinkDriver;
+pub use eitri_core::window_link::end::{away_everywhere, held, hold_away};
 
 /// What `window.new` says in a window that runs unpaired.
 pub const UNPAIRED_REFUSAL: &str = "this project's second window belongs to another Eitri window";
 /// What `window.new` says in a window that could not take part in a pair at all.
 pub const ALONE_REFUSAL: &str = "this window cannot start a second window: it has no state directory for the pair";
-/// What window 2 shows once the link to window 1 is gone, by a clean close or not.
+/// What window 2's editor calls answer once the link to window 1 is gone, by a clean close or not.
 pub const UNLINKED_NOTE: &str = "the editor window is closed";
+/// The standing note window 2 shows meanwhile, and what its window verbs say: the way back is the editor key.
+pub const ORPHAN_NOTE: &str = eitri_core::wm::feedback::ORPHAN_TEXT;
 /// What `window.other` says when there is no other window to go to.
 pub const NO_OTHER_WINDOW: &str = "this project has no second window open";
 
@@ -164,6 +169,8 @@ pub enum WindowStart {
         root: PathBuf,
         sock: OwnedFd,
         token: Option<String>,
+        /// Started again by window 1's launch (`--restore`), as the pair last ended.
+        restore: bool,
     },
 }
 
@@ -190,6 +197,7 @@ pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
         root: parsed.root,
         sock,
         token: parsed.token,
+        restore: parsed.restore,
     })
 }
 
@@ -252,32 +260,6 @@ pub fn ignore_away(layout: &mut Layout, workspaces: &mut Workspaces) {
     }
 }
 
-/// Marks `id` away (or back) in the live layout and in every stored workspace that holds it.
-pub(crate) fn hold_away(layout: &mut Layout, workspaces: &mut Workspaces, id: &ModuleId, away: bool) {
-    if layout.contains(id) {
-        // Refused only when nothing else could be shown, and the chat is always there to be shown.
-        let _ = layout.set_away(id, away);
-    }
-    workspaces.set_away_everywhere(id, away);
-}
-
-/// The modules this window holds itself, in every workspace: every module its layouts name but those held
-/// away. What `away{ids}` tells the other window.
-pub fn held(layout: &Layout, workspaces: &Workspaces) -> BTreeSet<String> {
-    let away: BTreeSet<ModuleId> = workspaces
-        .each(layout)
-        .into_iter()
-        .flat_map(|(_, layout)| layout.away())
-        .collect();
-    workspaces
-        .each(layout)
-        .into_iter()
-        .flat_map(|(_, layout)| layout.modules())
-        .filter(|id| !away.contains(id) && !layout.is_gone(id))
-        .map(|id| id.as_str().to_string())
-        .collect()
-}
-
 /// How the link ended, as the window that did not ask for the end saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkEnd {
@@ -287,53 +269,9 @@ pub enum LinkEnd {
     Eof,
 }
 
-/// What a window does with its placeholders when the other window ends, cleanly or not.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EndPlan {
-    /// Back in this window: a plugin page or Lua panel is rebuilt here from its own store and producer, and a
-    /// window's own base module (one of the two every window has) is simply shown again.
-    pub back: Vec<ModuleId>,
-    /// A terminal or chat view the other window held: its process ended with that window, so its placeholder
-    /// goes. A chat is still in the other window's saved tabs.
-    pub dropped: Vec<ModuleId>,
-}
-
-/// The placeholders `away` (the modules this window holds away for the other window) as the other window's end
-/// leaves them.
-pub fn end_plan(away: &BTreeSet<ModuleId>) -> EndPlan {
-    let mut plan = EndPlan::default();
-    for id in away {
-        match id.kind() {
-            ModuleKind::Terminal | ModuleKind::Agent if id.number() >= 2 => plan.dropped.push(id.clone()),
-            _ => plan.back.push(id.clone()),
-        }
-    }
-    plan
-}
-
-/// Every module held away in any workspace of the window.
-pub fn away_everywhere(layout: &Layout, workspaces: &Workspaces) -> BTreeSet<ModuleId> {
-    workspaces
-        .each(layout)
-        .into_iter()
-        .flat_map(|(_, layout)| layout.away())
-        .collect()
-}
-
-/// The modules among `plan.back` whose page must be loaded again when it comes back: every plugin page and Lua
-/// panel. A page built before it was held away still shows what it read then, while the other window may have
-/// changed its store since; loading it again makes it a new document, which says hello and reads the store as it
-/// is now. A base module is the window's own all along and is only shown again.
-pub fn pages_back(plan: &EndPlan) -> Vec<ModuleId> {
-    plan.back
-        .iter()
-        .filter(|id| id.kind() == ModuleKind::LuaWebview)
-        .cloned()
-        .collect()
-}
-
-/// Loads `module`'s page again if it has one: a plugin's page once it is built (one that waits for its first
-/// show is built then, from the store as it is), a Lua panel's view always. Whether a load was started.
+/// Loads `module`'s page again, from its store as it is now: a plugin's page with no view here (never built, or
+/// dropped when it left for the other window) is built, an away host is reopened, and a page already loaded for
+/// this return is reused. A Lua panel's view always loads its URL. Whether the page is available.
 pub(crate) fn reload_page_back(
     plugin_panels: &crate::plugin_panels::PluginPanels,
     lua_pages: &crate::gtk_host_services::LuaPages,
@@ -341,15 +279,13 @@ pub(crate) fn reload_page_back(
 ) -> bool {
     use gtk4::prelude::*;
     use webkit6::prelude::*;
+    if plugin_panels.modules().contains(module) {
+        return plugin_panels.reload_back(module);
+    }
     let Some((_, widget, url, _)) = lua_pages.iter().find(|(m, _, _, _)| m == module) else {
         return false;
     };
-    let view = if plugin_panels.modules().contains(module) {
-        plugin_panels.webview(module)
-    } else {
-        widget.downcast_ref::<webkit6::WebView>().cloned()
-    };
-    match view {
+    match widget.downcast_ref::<webkit6::WebView>() {
         Some(view) => {
             view.load_uri(url);
             true
@@ -398,25 +334,6 @@ impl HeldSaid {
         }
         *self.0.borrow_mut() = Some(held);
         true
-    }
-}
-
-/// Carries out `plan` in the window's layouts: `back` comes back in every workspace where it was, `dropped` leaves
-/// every workspace. The caller applies the grid afterwards, which tells the controller, whose module lifecycle
-/// then rebuilds what came back as it is shown; a page that comes back is loaded again by the caller
-/// ([`pages_back`]).
-pub fn apply_end(plan: &EndPlan, layout: &mut Layout, workspaces: &mut Workspaces) {
-    for id in &plan.back {
-        hold_away(layout, workspaces, id, false);
-    }
-    for id in &plan.dropped {
-        if layout.contains(id) {
-            // An away module is hidden, so taking its leaf out never leaves the window with nothing shown.
-            if let Err(err) = layout.remove(id) {
-                eprintln!("[window] {id}'s placeholder could not be dropped: {err}");
-            }
-        }
-        workspaces.remove_everywhere(id);
     }
 }
 
@@ -600,66 +517,6 @@ pub(crate) mod tests {
         assert!(live.contains(&id("terminal#2")), "every module is this window's own");
     }
 
-    #[test]
-    fn window_1s_end_brings_its_pages_and_lua_panels_back_in_window_2_and_drops_its_terminals_placeholders() {
-        // Window 2 at its start, then a terminal instance and a chat view it handed to window 1 left as
-        // placeholders.
-        let mut live = window(&["lua:notes", "terminal#3", "agent#2"]);
-        let mut stored = window(&["lua:notes", "terminal#3"]);
-        stored.show(&id("lua:notes")).unwrap();
-        let mut workspaces = two_workspaces(stored);
-        start_second(&mut live, &mut workspaces, &frame()).unwrap();
-        hold_away(&mut live, &mut workspaces, &id("terminal#3"), true);
-        hold_away(&mut live, &mut workspaces, &id("agent#2"), true);
-
-        let plan = end_plan(&away_everywhere(&live, &workspaces));
-        assert_eq!(plan.back, vec![id("lua:notes")]);
-        assert_eq!(plan.dropped, vec![id("agent#2"), id("terminal#3")]);
-        apply_end(&plan, &mut live, &mut workspaces);
-
-        for (name, layout) in workspaces.each(&live) {
-            assert!(layout.contains(&id("lua:notes")), "{name}: the panel keeps its place");
-            assert!(!layout.is_away(&id("lua:notes")), "{name}: the panel is window 2's now");
-            assert!(
-                !layout.contains(&id("terminal#3")),
-                "{name}: the terminal ended with window 1"
-            );
-            assert!(
-                !layout.contains(&id("agent#2")),
-                "{name}: the chat view's placeholder goes"
-            );
-            assert!(layout.is_gone(&ModuleId::editor()), "{name}: still no editor here");
-        }
-        assert!(
-            workspaces.stored("2").unwrap().is_shown(&id("lua:notes")),
-            "shown again where it was shown when it left"
-        );
-        assert!(away_everywhere(&live, &workspaces).is_empty());
-    }
-
-    #[test]
-    fn window_2s_end_brings_its_modules_back_in_window_1() {
-        // Window 1 with a Lua panel and a terminal instance held away for window 2, and its own terminal.
-        let mut live = window(&["lua:notes", "terminal#2"]);
-        live.show(&id("lua:notes")).unwrap();
-        let mut workspaces = Workspaces::single();
-        hold_away(&mut live, &mut workspaces, &id("lua:notes"), true);
-        hold_away(&mut live, &mut workspaces, &id("terminal#2"), true);
-        hold_away(&mut live, &mut workspaces, &ModuleId::terminal(), true);
-
-        let plan = end_plan(&away_everywhere(&live, &workspaces));
-        assert_eq!(plan.back, vec![id("lua:notes"), ModuleId::terminal()]);
-        assert_eq!(plan.dropped, vec![id("terminal#2")]);
-        apply_end(&plan, &mut live, &mut workspaces);
-        assert!(live.is_shown(&id("lua:notes")), "the panel is rebuilt where it was");
-        assert!(
-            !live.is_away(&ModuleId::terminal()),
-            "the window's own terminal is back"
-        );
-        assert!(!live.contains(&id("terminal#2")));
-        assert!(live.contains(&ModuleId::editor()) && !live.is_gone(&ModuleId::editor()));
-    }
-
     fn startup_decls() -> Vec<eitri_core::wm::module::SurfaceDecl> {
         use eitri_core::tabs::ViewId;
         use eitri_core::wm::module::SurfaceDecl;
@@ -673,6 +530,7 @@ pub(crate) mod tests {
                         args: Vec::new(),
                         cwd: None,
                         clean: false,
+                        background: None,
                     },
                 },
                 deferred: false,
@@ -706,11 +564,7 @@ pub(crate) mod tests {
                 presence,
                 title: "w".into(),
             },
-            WindowParts {
-                layout: Rc::new(std::cell::RefCell::new(window(&[]))),
-                workspaces: Rc::new(std::cell::RefCell::new(Workspaces::single())),
-                saver: None,
-            },
+            WindowParts::new(window(&[]), Workspaces::single(), None),
         );
         controller
             .create_surfaces(WinId::MAIN, decls)
@@ -799,27 +653,6 @@ pub(crate) mod tests {
         assert!(
             !said.say(&unlinked, held),
             "nothing is said before the handshake is done"
-        );
-    }
-
-    #[test]
-    fn the_pages_that_come_back_are_loaded_again_and_the_base_modules_only_shown() {
-        // Window 2 at its start, with a plugin page built before it was held away and a terminal instance it
-        // handed to window 1.
-        let mut live = window(&["lua:notes", "lua:markdown", "terminal#3"]);
-        let mut workspaces = Workspaces::single();
-        start_second(&mut live, &mut workspaces, &frame()).unwrap();
-        hold_away(&mut live, &mut workspaces, &id("terminal#3"), true);
-        hold_away(&mut live, &mut workspaces, &ModuleId::terminal(), true);
-        let plan = end_plan(&away_everywhere(&live, &workspaces));
-        assert_eq!(pages_back(&plan), vec![id("lua:markdown"), id("lua:notes")]);
-        assert!(
-            plan.back.contains(&ModuleId::terminal()) && !pages_back(&plan).contains(&ModuleId::terminal()),
-            "the window's own terminal is shown again, not restarted"
-        );
-        assert!(
-            !pages_back(&plan).contains(&id("terminal#3")),
-            "a dropped placeholder is not loaded"
         );
     }
 

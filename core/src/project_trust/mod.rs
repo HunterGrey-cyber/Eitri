@@ -71,8 +71,8 @@ impl Default for Limits {
 /// keeps its own record, so trusting a project for one agent never trusts it for another.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Profile {
-    /// `.claude/`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`. Its fingerprint and record name are the
-    /// ones every record written before profiles existed was keyed by.
+    /// `.claude/`, `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`. Keep its fingerprint and record name
+    /// stable so existing records still match.
     Claude,
     /// `.codex/`, `.agents/skills/`, `.agents/plugins/`, `AGENTS.md`, `AGENTS.override.md`, the user's
     /// alternate memory names, and the plugin-marketplace listings at the top level.
@@ -121,8 +121,8 @@ impl Profile {
         matches!(self, Profile::Acp { .. })
     }
 
-    /// The first bytes of the fingerprint. Claude's is the header every existing record was hashed
-    /// with; every other profile names itself, so two profiles never hash to the same value.
+    /// The first bytes of the fingerprint. Keep Claude's header stable so existing records still
+    /// match; every other profile names itself, so two profiles never hash to the same value.
     pub(crate) fn fingerprint_header(&self) -> Vec<u8> {
         match self {
             Profile::Claude => b"eitri-trust-v1\n".to_vec(),
@@ -180,7 +180,8 @@ pub struct Discovery {
     pub top: PathBuf,
     /// The root, its parent, ... up to and including `top`.
     pub walked: Vec<PathBuf>,
-    /// Sorted by the bytes of `path`; empty exactly when there is nothing to trust.
+    /// Sorted by the bytes of `path`. Empty means nothing to trust, but nothing to trust can also hold
+    /// entries: the directories discovery names and leaves unread ([`Discovery::nothing_to_trust`]).
     pub entries: Vec<Entry>,
     pub findings: Vec<Finding>,
     pub fingerprint: Fingerprint,

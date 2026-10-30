@@ -34,6 +34,8 @@ pub(crate) const HANDLER: &str = "eitriPlugin";
 /// plugin's origin so a page loads it with an ordinary same-origin script tag under the CSP floor.
 const KIT_JS: &str = include_str!("../../plugin-kit/keys/dist/keys.js");
 
+/// Cloned for each build: a page that left the window is built afresh where it comes back.
+#[derive(Clone)]
 pub(crate) struct PageSpec {
     pub(crate) id: String,
     /// Canonical when the site is built; a missing site shows the static "not built" page.
@@ -52,6 +54,8 @@ pub(crate) struct PageSpec {
     pub(crate) console_to_stdout: bool,
 }
 
+/// Cloned for each build: a page that left the window is built afresh where it comes back.
+#[derive(Clone)]
 pub(crate) struct PageHooks {
     /// A message the page posted while on its own origin.
     pub(crate) on_message: Rc<dyn Fn(&str)>,
@@ -107,13 +111,8 @@ fn serve(request: &URISchemeRequest, site_root: &Path, id: &str, entry: &str, do
     // The kit is part of the host, not of the plugin's site: it is answered from memory, ahead of the site
     // lookup, so a site file of the same name can neither replace it nor be asked for through it. The
     // document route comes next, so a site file can never stand in for a document's image either.
-    let route = match doc_slot.map(|slot| slot.try_borrow()) {
-        None => route(id, &uri, None),
-        Some(Ok(slot)) => route(id, &uri, Some(&slot)),
-        // The slot is being written while this request arrives: no project is known for this request, so a
-        // document path is a 404 rather than a panic inside the scheme handler.
-        Some(Err(_)) => route(id, &uri, Some(&DocSlot::default())),
-    };
+    let slot = doc_slot.map(|slot| DocSlot::snapshot(slot));
+    let route = route(id, &uri, slot.as_ref());
     match route {
         Route::Kit => respond_static(request, KIT_JS, "text/javascript"),
         Route::NoDoc => not_found(request),

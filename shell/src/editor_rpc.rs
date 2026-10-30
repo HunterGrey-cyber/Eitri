@@ -19,7 +19,8 @@ use eitri_core::nvim_rpc::{Pending, RpcError};
 /// never decide anything by which kind of error it was.
 pub(crate) struct EmbeddedEditorRpc {
     pane: Rc<NeovideEditorPane>,
-    /// Whether the editor module is still in this window: `prefix x` quits it for good.
+    /// Whether the editor module is still in this window: a module marked gone never comes back. An editor whose
+    /// nvim ended is not gone; its pane answers that nvim is not running until a restart's nvim runs.
     editor_present: Rc<dyn Fn() -> bool>,
 }
 

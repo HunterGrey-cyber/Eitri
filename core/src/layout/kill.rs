@@ -11,23 +11,22 @@
 //! - [`Reopen::InPlace`]: its leaf stays where it was, hidden. The editor and the agent: every
 //!   layout has both (`reconcile` refuses one without them), and neither has a first-launch
 //!   placement of its own -- they ARE the first launch's root.
-//! - [`Reopen::Never`]: hidden where it was, and marked gone for the rest of this window
-//!   ([`Layout::is_gone`]): no show, no place, no tray chip. The editor after nvim quit: `shell`
-//!   starts no second `nvim --embed` in the window, although the editor pane itself can now start
-//!   one on its own widget (`neovide-editor`'s `NeovideEditorPane::restart`; every harness shares
-//!   the fork's one event loop). Gone is never written to the state
-//!   file, and neither is the hide the retirement itself made: a module retired while shown is
-//!   saved shown, so a relaunch opens with it where it was ([`Layout::saved_hidden`]; it used to be
-//!   saved hidden, and a relaunch opened without the editor until `prefix e`). One the user had
-//!   hidden stays hidden. The
+//!   The editor's kill reopens in place with a fresh nvim on the same pane. Its kill is saved
+//!   shown when it was shown, so a relaunch restores the user's arrangement. One the user had
+//!   hidden stays hidden; ending a process does not change the saved arrangement. The
 //!   precedent is this project's own rule for nvim's quit prompt ([`crate::wm::close::Reveal::
 //!   rehide`]): what the window saves is the user's arrangement, not what a close or a quit did to
 //!   it -- and a first launch, which is what `Reopen::At` restores for every other module, shows the
 //!   editor.
+//! - [`Reopen::Never`]: hidden where it was, and marked gone for the rest of this window
+//!   ([`Layout::is_gone`]): no show, no place, no tray chip, for kinds that cannot return.
+//!   Gone is never written to the state file; a module retired while shown is saved shown
+//!   ([`Layout::saved_hidden`]).
 //!
 //! The keys leave first, exactly as a hide's do (`super::hide`). The last module on screen is not the
 //! layout's to kill ([`kill`] refuses it, as a hide does): it is the window's ([`KillScope::Window`],
-//! 2026-09-26 later), and `shell` closes the window.
+//! 2026-09-26 later), and `shell` closes the window. A plain `:q` with nothing else to ask about
+//! still closes the window.
 
 use super::geometry::{hide, Frame};
 use super::module::{ModuleId, Placement};
@@ -142,7 +141,11 @@ pub fn kill(
                 layout.replace_root(root);
             }
         }
-        Reopen::InPlace => {}
+        Reopen::InPlace => {
+            if *id == ModuleId::editor() {
+                layout.editor_ended(was_shown);
+            }
+        }
         Reopen::Remove => layout.remove(id)?,
         Reopen::Never => layout.retire(id, was_shown),
     }
@@ -280,6 +283,21 @@ mod tests {
         assert_eq!(layout.root(), &before);
         assert_eq!(layout.visible_leaves(), [editor()]);
         assert_eq!(layout.show(&agent()), Ok(true), "it can come back");
+    }
+
+    #[test]
+    fn an_editor_killed_in_place_keeps_only_its_shown_arrangement_for_the_relaunch() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        let before = layout.root().clone();
+        kill(&mut layout, &editor(), Reopen::InPlace, &frame()).unwrap();
+        assert_eq!(layout.root(), &before);
+        assert!(!layout.is_gone(&editor()));
+        assert!(!layout.is_shown(&editor()));
+        assert!(!layout.saved_hidden().contains(&editor()));
+        layout.show(&editor()).unwrap();
+        hide(&mut layout, &editor(), &frame()).unwrap();
+        kill(&mut layout, &editor(), Reopen::InPlace, &frame()).unwrap();
+        assert!(layout.saved_hidden().contains(&editor()), "a deliberate hide is saved");
     }
 
     /// The editor is the root's only tile and the agent floats: a kill that reopens at a placement has

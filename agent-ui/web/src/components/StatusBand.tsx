@@ -4,16 +4,13 @@ import type { BandFacts, Seg } from "../band";
 
 type Props = {
   facts: BandFacts;
-  /** Same claim `Footer`'s old mode block made (moved here unchanged): dim,
-   *  never hidden, while this pane lacks the keys. */
+  /** Dim, never hidden, while the pane lacks the keys. */
   paneFocused: boolean;
   /** The key that brings the keyboard into this panel (`panelEntryKey`), named in the dim mode block's title.
    *  `null` or absent when the window lists none (a companion window, or before the keymap arrives): the
    *  title then says only that the pane lacks the keys, rather than naming a key that may not be bound. */
   entryKey?: string | null;
-  /** A click anywhere on the band except the `↓N` button: what `StatusRow`
-   *  used to do for its whole row. Absent on the start screen, which never opened the popover from
-   *  here either. */
+  /** Band click outside the unread button. Absent on the start screen, where no details open. */
   onOpenDetail?: () => void;
   /** The `↓N`/`↓ ⚑` button's own click. */
   onJump?: () => void;
@@ -83,12 +80,9 @@ function renderLeftSeg(
   );
 }
 
-/** The bottom band: replaces `StatusRow`, `Footer`, `NewPill`
- *  and `ContextLine` with one vim-statusline-style row. Purely a renderer over `bandLayout` (`../band`),
- *  which is what decides which segments fit -- this component's own job is measuring the width in
- *  pixels a mono character actually takes (a hidden `.band-measure` span, re-measured whenever its
- *  own box changes size -- a font-size or theme push included, since either changes what that span
- *  renders at) and the band's own content-box width, and turning each `Seg` into markup. */
+/** One bottom statusline, rendered from `bandLayout`'s segments. Measure its content-box width
+ *  and the mono character width to decide what fits. Re-measure the hidden `.band-measure` span
+ *  when its box changes, including font or theme pushes, then turn each segment into markup. */
 export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
@@ -134,10 +128,8 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
   const wrapping = segs.some((seg) => seg.wraps === true);
 
   return (
-    // The band stops being a `j`/`k` stop -- `data-nav-stop="status-band"` is gone
-    // -- because `j` reaching the last stop now flashes `i or Ctrl+j to type` there instead of
-    // landing the cursor on it. Its own details stay reachable on `<leader>i`, `prefix i` and a
-    // click (`onOpenDetail` below), none of which go through `nav.ts`'s stop list.
+    // The band is outside j/k stops: reaching the last stop flashes how to type instead.
+    // Details remain reachable by <leader>i, prefix i or a click, outside the stop list.
     <div className={wrapping ? "status-band status-band--wrap" : "status-band"} ref={bandRef}>
       {/* `aria-hidden`: not content, just this render's ruler. One character, at the band's own
           `--fs-sm`/mono font, so its rendered width IS one mono character's width. */}

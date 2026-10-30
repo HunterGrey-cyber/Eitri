@@ -13,6 +13,8 @@
 //! window, though GTK ignores `close()` from inside its own close-request emission. And a closed
 //! window must not outlive its close in the host, which would keep every window ever closed.
 //!
+//! `SetMode` is carried out through the shell's mode toggle, once per op, whatever state it names.
+//!
 //! A window's start adds three: `OpenWindow` builds the window for the application set on the host,
 //! created and not shown, and adopts it (a second one for the same window is refused); `Present` shows
 //! it; and a `Focus` goes through the shell's own focus function once one is set, answering what it
@@ -42,8 +44,8 @@ use eitri_core::layout::{ModuleId, Size};
 use eitri_core::wm::conformance::{self, EventMatch, Expect, Fixture, GridObserve, RecordingSink, Script};
 use eitri_core::wm::grid::{restack_moves, Slot};
 use eitri_core::wm::{
-    Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, EditorPresence, FocusTo, Host, HostOp, HostSink,
-    PluginOp, SurfaceKind, TermOp, WinId, WindowRole, WindowSpec,
+    Applied, ChatOp, CleanupOp, CloseBy, CloseVerdict, DropWhy, EditorCall, EditorPresence, FocusTo, Host, HostOp,
+    HostSink, PluginOp, SurfaceKind, TermOp, WinId, WindowMode, WindowRole, WindowSpec,
 };
 use gtk4::prelude::*;
 
@@ -56,6 +58,16 @@ mod own_x_server;
 #[allow(unused_imports)]
 #[path = "../src/gtk_host/mod.rs"]
 mod gtk_host;
+
+#[allow(dead_code, unused_imports)]
+#[path = "../src/editor_hole.rs"]
+mod editor_hole;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/module_grid.rs"]
+mod module_grid;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/web_host.rs"]
+mod web_host;
 
 fn pump(ms: u64) {
     let context = gtk4::glib::MainContext::default();
@@ -101,6 +113,21 @@ impl gtk_host::SurfaceMaker for StubMaker {
     fn drop_surface(&self, _win: WinId, _module: &ModuleId, _why: &DropWhy) -> Result<(), String> {
         Ok(())
     }
+    /// An arriving terminal's or chat view's place is built as its create builds that kind's host: off screen,
+    /// registered.
+    fn prepare(
+        &self,
+        win: WinId,
+        module: &ModuleId,
+        _shape: &eitri_core::window_link::Shape,
+        _size: (u32, u32),
+    ) -> Result<(), String> {
+        let kind = match eitri_core::tabs::ViewId::of_module(module) {
+            Some(view) => SurfaceKind::Chat { view },
+            None => SurfaceKind::Terminal { cwd: ".".into() },
+        };
+        self.create(win, module, &kind)
+    }
 }
 
 /// Carries out every service op by doing nothing.
@@ -116,16 +143,24 @@ impl gtk_host::ServiceSet for StubServices {
     fn plugin(&self, _op: &PluginOp) -> Result<(), String> {
         Ok(())
     }
-    fn chat(&self, _op: &ChatOp) -> Result<(), String> {
+    fn chat(&self, op: &ChatOp) -> Result<(), String> {
+        if matches!(op, ChatOp::JoinBack { .. }) {
+            return Err("the tab could not join the base view".into());
+        }
+        Ok(())
+    }
+    fn cleanup(&self, _op: &CleanupOp) -> Result<(), String> {
         Ok(())
     }
 }
 
 /// The window's grid as the host drives it: its children as slots, the fixture's hosts first, then a strip and
-/// a divider, as the grid puts every host below them.
+/// a divider, as the grid puts every host below them. It also answers whether the stage's window is still open, for
+/// the scripts that close it.
 struct StubGrid {
     children: RefCell<Vec<Slot>>,
     allocations: Cell<usize>,
+    window: RefCell<Option<gtk4::glib::WeakRef<gtk4::Window>>>,
 }
 
 impl StubGrid {
@@ -138,6 +173,7 @@ impl StubGrid {
         Rc::new(StubGrid {
             children: RefCell::new(children),
             allocations: Cell::new(0),
+            window: RefCell::new(None),
         })
     }
 }
@@ -178,6 +214,13 @@ impl gtk_host::GridPort for StubGrid {
 impl GridObserve for StubGrid {
     fn allocations_asked(&self, _win: WinId) -> usize {
         self.allocations.get()
+    }
+    fn window_open(&self, _win: WinId) -> bool {
+        self.window
+            .borrow()
+            .as_ref()
+            .and_then(|window| window.upgrade())
+            .is_some_and(|window| window.is_visible())
     }
     fn stacking(&self, _win: WinId) -> Vec<ModuleId> {
         self.children
@@ -235,6 +278,7 @@ fn recording_widgets(heard: &Rc<RefCell<Vec<String>>>) -> gtk_host::chrome::Chro
         move |line: String| heard.borrow_mut().push(line)
     };
     gtk_host::chrome::ChromeWidgets {
+        other: Box::new(|_| {}),
         workspace: Box::new({
             let say = say(heard);
             move |project, workspace| say(format!("workspace {project} {workspace:?}"))
@@ -323,6 +367,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     }
     buttons[2].set_child_visible(false);
     let grid = StubGrid::new(f);
+    *grid.window.borrow_mut() = Some(window.downgrade());
     host.set_surface_maker(Rc::new(StubMaker {
         host: Rc::downgrade(&host),
         column: column.downgrade(),
@@ -666,6 +711,42 @@ fn focus_goes_through_the_shells_function(f: &Fixture) -> Result<(), String> {
     Ok(())
 }
 
+/// `SetMode` goes through the shell's mode toggle, once per op, whatever state the op names: the window's real mode is
+/// the shell's, which a bare F11 also changes, so the op is carried out as the toggle that asked for it. Until the
+/// toggle is set, a `SetMode` is refused as not carried out.
+fn gtk_host_sets_the_mode_it_is_asked_for(f: &Fixture) -> Result<(), String> {
+    let s = stage(f)?;
+    let op = HostOp::SetMode {
+        win: f.win,
+        mode: WindowMode {
+            immersive: true,
+            fullscreen: true,
+            top_bar_revealed: false,
+        },
+    };
+    if s.host.apply(&op) != Applied::Refused {
+        return Err("a SetMode with no mode toggle set was carried out".into());
+    }
+    let toggled: Rc<RefCell<Vec<WinId>>> = Rc::default();
+    {
+        let toggled = toggled.clone();
+        s.host
+            .set_mode_toggle(Rc::new(move |win: WinId| toggled.borrow_mut().push(win)));
+    }
+    if s.host.apply(&op) != Applied::Done {
+        return Err("a SetMode with the mode toggle set was refused".into());
+    }
+    if *toggled.borrow() != vec![f.win] {
+        return Err(format!("the mode was toggled {:?}", toggled.borrow()));
+    }
+    // The same state asked again toggles again: what is carried out is the toggle, not the state.
+    if s.host.apply(&op) != Applied::Done || toggled.borrow().len() != 2 {
+        return Err(format!("a second SetMode toggled {:?}", toggled.borrow()));
+    }
+    finish(s);
+    Ok(())
+}
+
 /// What the controller's top-bar focus and digit ops reach: each the function the shell set for it, answering
 /// what that function answered, and nothing before one is set. A `Chrome` op reads the window's model and draws
 /// it on the window's widgets: everything the first time, then only what changed, which for the same model is
@@ -781,6 +862,8 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
     use eitri_core::wm::{HostEvent, PeerEvent, PeerId};
     struct Pair {
         opened: RefCell<Vec<WinId>>,
+        restored: RefCell<Vec<WinId>>,
+        started: RefCell<Vec<WinId>>,
         answer: RefCell<Result<(), String>>,
     }
     impl gtk_host::LinkedWindows for Pair {
@@ -788,10 +871,24 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
             self.opened.borrow_mut().push(win);
             self.answer.borrow().clone()
         }
+        fn end_peer(&self, win: WinId) -> Result<(), String> {
+            self.opened.borrow_mut().push(win);
+            self.answer.borrow().clone()
+        }
+        fn restore(&self, win: WinId) -> Result<(), String> {
+            self.restored.borrow_mut().push(win);
+            self.answer.borrow().clone()
+        }
+        fn start_editor(&self, win: WinId) -> Result<(), String> {
+            self.started.borrow_mut().push(win);
+            self.answer.borrow().clone()
+        }
     }
     let s = stage(f)?;
     let pair = Rc::new(Pair {
         opened: RefCell::default(),
+        restored: RefCell::default(),
+        started: RefCell::default(),
         answer: RefCell::new(Ok(())),
     });
     s.host.set_linked_windows(pair.clone());
@@ -806,6 +903,34 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
     if *pair.opened.borrow() != [f.win, f.win] {
         return Err(format!("the pair was asked for {:?}", pair.opened.borrow()));
     }
+    // A launch's restore of window 2 goes through the same pair, its refusal the pair's.
+    let restore = HostOp::RestoreLinkedWindow { win: f.win };
+    if s.host.apply(&restore) != Applied::Refused {
+        return Err("a RestoreLinkedWindow the pair refused was answered done".into());
+    }
+    *pair.answer.borrow_mut() = Ok(());
+    if s.host.apply(&restore) != Applied::Done || *pair.restored.borrow() != [f.win, f.win] {
+        return Err(format!("the pair was asked to restore {:?}", pair.restored.borrow()));
+    }
+    // A window 2's start of the editor window goes through the same pair, its refusal the pair's.
+    let start = HostOp::StartEditorWindow { win: f.win };
+    if s.host.apply(&start) != Applied::Done {
+        return Err("a StartEditorWindow the pair carried out was refused".into());
+    }
+    *pair.answer.borrow_mut() = Err("the editor window runs already".into());
+    if s.host.apply(&start) != Applied::Refused || *pair.started.borrow() != [f.win, f.win] {
+        return Err(format!(
+            "the pair was asked to start the editor {:?}",
+            pair.started.borrow()
+        ));
+    }
+    let start_refused = s.sink.events().into_iter().any(|(_, event)| {
+        matches!(event, HostEvent::Refused { what: eitri_core::wm::OpTag::StartEditorWindow, why, .. } if why == "the editor window runs already")
+    });
+    if !start_refused {
+        return Err("the editor start's refusal did not reach the sink with its reason".into());
+    }
+    *pair.answer.borrow_mut() = Err("this window cannot start a second window".into());
     let refused = s.sink.events().into_iter().any(|(_, event)| {
         matches!(event, HostEvent::Refused { why, .. } if why == "this window cannot start a second window")
     });
@@ -833,6 +958,263 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
     if raised.len() != 1 {
         return Err(format!("RaisePeer posted {:?}", &s.sink.events()[before..]));
     }
+    // Ending the other window goes through the pair too, and its refusal is posted with the pair's words.
+    let end = HostOp::EndPeer {
+        win: f.win,
+        peer: PeerId(2),
+    };
+    if s.host.apply(&end) != Applied::Refused {
+        return Err("an EndPeer the pair refused was answered done".into());
+    }
+    *pair.answer.borrow_mut() = Ok(());
+    if s.host.apply(&end) != Applied::Done {
+        return Err("an EndPeer the pair carried out was refused".into());
+    }
+    if pair.opened.borrow().len() != 4 {
+        return Err(format!("the pair was asked for {:?}", pair.opened.borrow()));
+    }
+    finish(s);
+    Ok(())
+}
+
+fn prepared_grid() -> Result<
+    (
+        gtk4::Window,
+        module_grid::ModuleGrid,
+        gtk4::Widget,
+        Rc<RefCell<eitri_core::layout::Layout>>,
+    ),
+    String,
+> {
+    use eitri_core::layout::{Axis, Layout, Node};
+    let module = ModuleId::lua("markdown");
+    let mut layout = Layout::new(
+        Node::split(
+            Axis::Row,
+            0.5,
+            Node::Leaf(ModuleId::agent()),
+            Node::Leaf(module.clone()),
+        ),
+        ModuleId::agent(),
+    )
+    .unwrap();
+    layout.set_away(&module, true).unwrap();
+    // The test writes the layout behind the grid's view, as the window controller would.
+    let (view, layout) = eitri_core::wm::LayoutView::for_test(layout);
+    let grid = module_grid::ModuleGrid::new(view);
+    let view = gtk4::Button::with_label("prepared page");
+    let host = web_host::WebHost::new(&view);
+    let agent = gtk4::Button::with_label("chat");
+    grid.add(ModuleId::agent(), &agent, &agent, module_grid::HostKind::Direct);
+    grid.add(module.clone(), &host, &view, module_grid::HostKind::Web);
+    let window = gtk4::Window::new();
+    window.set_default_size(1000, 700);
+    window.set_child(Some(&grid));
+    grid.apply();
+    window.present();
+    pump(50);
+    grid.prepare_page(&module, (500, 700))?;
+    Ok((window, grid, host.upcast(), layout))
+}
+
+fn a_prepared_host_is_allocated_at_its_final_size_drawn_and_covered() -> Result<(), String> {
+    let (window, grid, host, _) = prepared_grid()?;
+    let allocation = host.allocation();
+    // Drawn (a widget at zero opacity is not, and its page gets no animation frames) and below every other child.
+    if !host.is_child_visible()
+        || host.opacity() != 1.0
+        || host.can_target()
+        || grid.first_child().as_ref() != Some(&host)
+        || allocation.width() <= 0
+        || allocation.height() != 700
+    {
+        return Err(format!(
+            "prepared page: visible={} opacity={} first={} size={allocation:?}",
+            host.is_child_visible(),
+            host.opacity(),
+            grid.first_child().as_ref() == Some(&host)
+        ));
+    }
+    if host.parent().as_ref() != Some(grid.upcast_ref()) {
+        return Err("the prepared host left its grid".into());
+    }
+    window.close();
+    Ok(())
+}
+
+/// The colour and size of every colour node under `node`, whatever clips and transforms it sits in.
+fn colour_nodes(node: &gtk4::gsk::RenderNode, out: &mut Vec<(gtk4::gdk::RGBA, f32, f32)>) {
+    use gtk4::gsk;
+    if let Some(color) = node.downcast_ref::<gsk::ColorNode>() {
+        let bounds = node.bounds();
+        out.push((color.color(), bounds.width(), bounds.height()));
+    } else if let Some(container) = node.downcast_ref::<gsk::ContainerNode>() {
+        for i in 0..container.n_children() {
+            colour_nodes(&container.child(i), out);
+        }
+    } else if let Some(clip) = node.downcast_ref::<gsk::ClipNode>() {
+        colour_nodes(&clip.child(), out);
+    } else if let Some(clip) = node.downcast_ref::<gsk::RoundedClipNode>() {
+        colour_nodes(&clip.child(), out);
+    } else if let Some(transform) = node.downcast_ref::<gsk::TransformNode>() {
+        colour_nodes(&transform.child(), out);
+    } else if let Some(opacity) = node.downcast_ref::<gsk::OpacityNode>() {
+        colour_nodes(&opacity.child(), out);
+    } else if let Some(debug) = node.downcast_ref::<gsk::DebugNode>() {
+        colour_nodes(&debug.child(), out);
+    }
+}
+
+/// Whether the grid, drawn now, paints `cover` over the whole of `host`.
+fn painted_over(
+    window: &gtk4::Window,
+    grid: &module_grid::ModuleGrid,
+    host: &gtk4::Widget,
+    cover: &gtk4::gdk::RGBA,
+) -> bool {
+    grid.queue_draw();
+    let Some(bounds) = host.compute_bounds(grid) else {
+        return false;
+    };
+    let snapshot = gtk4::Snapshot::new();
+    window.snapshot_child(grid, &snapshot);
+    let Some(node) = snapshot.to_node() else {
+        return false;
+    };
+    let mut colours = Vec::new();
+    colour_nodes(&node, &mut colours);
+    let same = |a: &gtk4::gdk::RGBA| {
+        (a.red() - cover.red()).abs() < 0.01
+            && (a.green() - cover.green()).abs() < 0.01
+            && (a.blue() - cover.blue()).abs() < 0.01
+            && a.alpha() > 0.99
+    };
+    colours
+        .iter()
+        .any(|(c, w, h)| same(c) && (w - bounds.width()).abs() < 0.5 && (h - bounds.height()).abs() < 0.5)
+}
+
+fn a_prepared_page_is_covered_with_the_grids_background_until_it_is_revealed() -> Result<(), String> {
+    let (window, grid, host, layout) = prepared_grid()?;
+    let module = ModuleId::lua("markdown");
+    // A background nothing else in the window paints.
+    let mut tokens = eitri_core::theme::ThemeTokens::fallback();
+    tokens.bg = eitri_core::theme::color::Rgb { r: 64, g: 128, b: 191 };
+    let cover = gtk4::gdk::RGBA::new(64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0);
+    grid.set_page_cover(&tokens);
+    pump(50);
+    // Under its own cover, whether or not another host is drawn over its rectangle: a layout that shows only floats
+    // leaves it under none.
+    if !painted_over(&window, &grid, &host, &cover) {
+        return Err("a prepared page is drawn with no cover of its own".into());
+    }
+    layout.borrow_mut().set_away(&module, false).unwrap();
+    grid.map_prepared(&module, true);
+    grid.size_allocate(&gtk4::Allocation::new(0, 0, 1000, 800), -1);
+    if painted_over(&window, &grid, &host, &cover) {
+        return Err("the revealed page is still covered".into());
+    }
+    window.close();
+    Ok(())
+}
+
+fn the_swap_is_one_allocation_pass() -> Result<(), String> {
+    let (window, grid, host, layout) = prepared_grid()?;
+    let module = ModuleId::lua("markdown");
+    layout.borrow_mut().set_away(&module, false).unwrap();
+    grid.map_prepared(&module, true);
+    grid.size_allocate(&gtk4::Allocation::new(0, 0, 1000, 800), -1);
+    if host.opacity() != 1.0
+        || !host.can_target()
+        || host.allocation().x() <= 0
+        || host.parent().as_ref() != Some(grid.upcast_ref())
+    {
+        return Err(format!(
+            "the first committed allocation did not reveal the page: {:?}",
+            host.allocation()
+        ));
+    }
+    window.close();
+    Ok(())
+}
+
+fn a_plugin_page_prepare_is_carried_out_and_answered_prepared(f: &Fixture) -> Result<(), String> {
+    let s = stage(f)?;
+    let module = ModuleId::lua("markdown");
+    let op = HostOp::PrepareSurface {
+        win: f.win,
+        module: module.clone(),
+        shape: eitri_core::window_link::Shape::Tiled,
+        size: (640, 480),
+    };
+    if s.host.apply(&op) != Applied::Done {
+        return Err("plugin page prepare refused".into());
+    }
+    // Carried out is what the driver answers as `HostEvent::Prepared`: the page's place exists, registered in the
+    // grid, and is not revealed until the commit maps it. The stand-in maker builds that place here; the shell's own
+    // page arm (the page built and laid out in its grid) needs a real page and is checked with the window pair.
+    if !s.grid.children.borrow().contains(&Slot::Host(module.clone())) {
+        return Err("the prepared page has no place in the grid".into());
+    }
+    let column = s.window.child().ok_or("the stage has no column")?;
+    let mut child = column.first_child();
+    let mut placed = None;
+    while let Some(widget) = child {
+        let label = widget.downcast_ref::<gtk4::Button>().and_then(|button| button.label());
+        if label.is_some_and(|label| label == module.as_str()) {
+            placed = Some(widget.clone());
+        }
+        child = widget.next_sibling();
+    }
+    let placed = placed.ok_or("the prepared page's host was never built")?;
+    if placed.is_child_visible() {
+        return Err("the prepared page was revealed before its commit".into());
+    }
+    finish(s);
+    Ok(())
+}
+
+/// An arrival's place comes from the maker and is registered; its adoption takes the op's descriptors whatever comes
+/// of it, and a maker that builds no such arrival refuses it naming the module, as a host with no place for it does.
+fn an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(f: &Fixture) -> Result<(), String> {
+    use eitri_core::wm::{Descriptors, HostEvent, OpTag};
+    let s = stage(f)?;
+    let arriving = ModuleId::parse("terminal#4").unwrap();
+    let prepare = HostOp::PrepareSurface {
+        win: f.win,
+        module: arriving.clone(),
+        shape: eitri_core::window_link::Shape::Tiled,
+        size: (640, 480),
+    };
+    if s.host.apply(&prepare) != Applied::Done {
+        return Err("the stub maker's place was refused".into());
+    }
+    let adopt = |module: &ModuleId| {
+        let (read, _write) = std::io::pipe().unwrap();
+        let fds = Descriptors::new(vec![read.into()]);
+        let op = HostOp::AdoptMoved {
+            win: f.win,
+            module: module.clone(),
+            kind: eitri_core::wm::moves::MoveKind::Terminal,
+            record: serde_json::Value::Null,
+            fds: fds.clone(),
+        };
+        (s.host.apply(&op), fds.len())
+    };
+    for module in [arriving.clone(), ModuleId::parse("terminal#5").unwrap()] {
+        let (answer, left) = adopt(&module);
+        if answer != Applied::Refused || left != 0 {
+            return Err(format!(
+                "{module}: answered {answer:?} with {left} descriptors left in the op"
+            ));
+        }
+        let named = s.sink.events().into_iter().any(|(_, event)| {
+            matches!(event, HostEvent::Refused { what: OpTag::AdoptMoved, surface: Some((_, m)), .. } if m == module)
+        });
+        if !named {
+            return Err(format!("{module}: the refused adoption did not name its module"));
+        }
+    }
     finish(s);
     Ok(())
 }
@@ -845,11 +1227,16 @@ fn run_all() -> Result<Vec<String>, String> {
         hidden: ModuleId::editor(),
     };
     let mut passed = Vec::new();
-    // This host is given no pair here, and no kind of module can arrive in it yet: the pair's ops are refused.
+    // This host is given no pair here, so the pair's ops are refused; an arriving terminal's place is made by the stub
+    // maker, as the shell's maker makes its pane.
     let scripts = conformance::scripts(&f)
         .into_iter()
         .chain(conformance::pair_refusal_scripts(&f))
-        .chain(own_scripts(&f));
+        .chain(own_scripts(&f))
+        .chain([
+            conformance::join_back_refusal_script(f.win, "the tab could not join the base view"),
+            conformance::teardown_script(f.win),
+        ]);
     for script in scripts {
         let s = stage(&f)?;
         let result = conformance::run_observed(s.host.as_ref(), &s.sink, &script, Some(s.grid.as_ref()));
@@ -872,10 +1259,22 @@ fn run_all() -> Result<Vec<String>, String> {
     passed.push("open_window_builds_it_unshown_and_present_shows_it".into());
     focus_goes_through_the_shells_function(&f)?;
     passed.push("focus_goes_through_the_shells_focus_function_once_set".into());
+    gtk_host_sets_the_mode_it_is_asked_for(&f)?;
+    passed.push("gtk_host_sets_the_mode_it_is_asked_for".into());
     top_bar_chrome_and_hints_go_through_the_shells_functions(&f)?;
     passed.push("the_top_bar_chrome_and_hints_go_through_the_shells_functions_once_set".into());
     the_pair_starts_and_raises_through_the_shell(&f)?;
     passed.push("the_pair_starts_and_raises_through_the_shell".into());
+    a_prepared_host_is_allocated_at_its_final_size_drawn_and_covered()?;
+    passed.push("a_prepared_host_is_allocated_at_its_final_size_drawn_and_covered".into());
+    a_prepared_page_is_covered_with_the_grids_background_until_it_is_revealed()?;
+    passed.push("a_prepared_page_is_covered_with_the_grids_background_until_it_is_revealed".into());
+    the_swap_is_one_allocation_pass()?;
+    passed.push("the_swap_is_one_allocation_pass".into());
+    a_plugin_page_prepare_is_carried_out_and_answered_prepared(&f)?;
+    passed.push("a_plugin_page_prepare_is_carried_out_and_answered_prepared".into());
+    an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(&f)?;
+    passed.push("an_arrival_is_prepared_and_its_adoption_owns_the_descriptors".into());
     Ok(passed)
 }
 

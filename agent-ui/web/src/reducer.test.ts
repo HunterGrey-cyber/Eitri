@@ -37,8 +37,7 @@ describe("applyEvent", () => {
   });
 
   it("content_delta accumulates consecutive text into one message, ignoring thinking deltas", () => {
-    // This asserted ["first", "second"] until partial streaming landed. `transcript` holds assistant
-    // MESSAGES, and two consecutive text deltas with nothing between them are one message -- under
+    // `transcript` holds assistant messages, and consecutive text deltas are one message -- under
     // partial streaming they are two fragments of one sentence.
     let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "first" });
     state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "thinking", text: "pondering" });
@@ -46,7 +45,7 @@ describe("applyEvent", () => {
     expect(state.transcript.map((m) => m.text)).toEqual(["firstsecond"]);
   });
 
-  // The phase-3 GUI pass (2026-09-25): `After the table.TURN-1-DONE`. Mirrors the Rust projection.
+  // `After the table.TURN-1-DONE` is two messages when a boundary separates the deltas, as in Rust.
   it("assistant_message_boundary ends the message, so the next text is its own entry", () => {
     let state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "text", text: "After the table." });
     state = applyEvent(state, { type: "assistant_message_boundary", turn_id: "t1" });
@@ -196,10 +195,8 @@ describe("applyEvent", () => {
     expect(state.status).toEqual({ kind: "closed", reason: "window closed" });
   });
 
-  /* The forbidden failure mode, at the reducer level: a session that dies mid-turn used to leave
-     activeTurnId set forever, so App.tsx kept turnInProgress true, the composer stayed disabled
-     with a spinner, and the truncated reply above it looked like a reply that had simply finished
-     being short. */
+  /* A session that dies mid-turn must clear activeTurnId; leaving it set keeps the composer
+     disabled with a spinner and makes the truncated reply look complete. */
   it("session_unavailable mid-turn clears activeTurnId, because no turn_completed is ever coming", () => {
     let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
@@ -334,7 +331,7 @@ describe("applyEvent", () => {
     expect(state.pendingPermissions[1].providerPrompt?.unrecognizedOrigin).toBe(7);
   });
 
-  /* The legacy backend's own shape, new on 2026-09-15: its `PreToolUse` hook payload's
+  /* The legacy backend's `PreToolUse` hook payload's
      `tool_use_id` is BOTH the identity of the gated call and the id the request is answered by, so
      the two arrive as one string. Nothing in the reducer may assume they differ -- the card is
      keyed on one and linked by the other, and if either were derived from the other this pair
@@ -378,9 +375,8 @@ describe("applyEvent", () => {
   });
 
   it("permission_resolved removes only the matching permission, leaving others pending", () => {
-    // The direct replacement for the deleted markPermissionAnswered test -- this is now a real
-    // event pushed from Rust the instant AgentSession::respond_permission (or interrupt())
-    // resolves the request, not a frontend-local optimistic guess.
+    // Rust sends the event when AgentSession::respond_permission (or interrupt()) resolves the
+    // request; the frontend must wait for it rather than guess optimistically.
     let state = applyEvent(initialState(), { type: "permission_requested", permission_id: "r1", tool_use_id: null, tool_name: "Bash", input: {} });
     state = applyEvent(state, { type: "permission_requested", permission_id: "r2", tool_use_id: null, tool_name: "Read", input: {} });
     state = applyEvent(state, { type: "permission_resolved", permission_id: "r1", outcome: "allowed" });
@@ -535,9 +531,9 @@ describe("partial assistant streaming", () => {
   const delta = (text: string): AgentDomainEvent => ({ type: "content_delta", turn_id: "t1", kind: "text", text });
 
   it("accumulates a streamed reply into ONE transcript entry, not one per delta", () => {
-    // The defect this pins: under partial streaming a 600-word reply arrives as 400+ deltas. One
-    // transcript entry each renders 400 separate bubbles, every fragment markdown-parsed alone --
-    // so "`eitri_" or "**bold" is not valid standalone markdown and the formatting breaks.
+    // Under partial streaming a 600-word reply arrives as 400+ deltas. One transcript entry per
+    // delta renders 400 separate bubbles, each fragment markdown-parsed alone -- so "`eitri_"
+    // or "**bold" is not valid standalone markdown and the formatting breaks.
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     for (const chunk of ["The ", "quick ", "**brown** ", "fox"]) state = applyEvent(state, delta(chunk));
@@ -577,8 +573,7 @@ describe("partial assistant streaming", () => {
     state = applyEvent(state, delta("streaming"));
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
     expect(state.assistantMessageOpen).toBe(false);
-    // Built as the WIRE now genuinely carries it: `assistantMessageOpen`
-    // is on `AgentUiSnapshot`, and here it is truthfully `false` -- the tool call closed the
+    // The wire carries `assistantMessageOpen` on `AgentUiSnapshot`, here `false`: the tool call closed the
     // message before this snapshot was ever taken, on both sides.
     const { nextSeq: _seq, turnThinking: _think, ...wire } = { ...state, transcript: [{ seq: 0, text: "an earlier reply" }] };
     const restored = applySnapshot(state, wire, 1);
@@ -588,18 +583,15 @@ describe("partial assistant streaming", () => {
   });
 
   it("a mid-stream snapshot keeps the message open, so the next delta continues it rather than splitting it", () => {
-    // The defect this pins: `applySnapshot` used to force `assistantMessageOpen: false`
-    // unconditionally, on the theory a snapshot always meant "start fresh" -- but Rust's own
-    // projection keeps appending to the open message underneath a snapshot taken mid-reply
-    // (a tab switch back to a streaming reply, `prefix r`, a bounded-queue Resync), so forcing
-    // `false` here split one streaming reply into two transcript rows with broken markdown at the
-    // seam. Probe lifted from the verdict: fold `session_opened, turn_started, text 'Use **strong'`,
-    // apply a snapshot mid-message, then fold `text ' emphasis** here.'`.
+    // Rust keeps appending to the open message underneath a mid-reply snapshot (a tab switch,
+    // `prefix r`, a bounded-queue Resync). Forcing `assistantMessageOpen: false` would split the
+    // reply into rows with broken markdown at the seam. Fold `session_opened, turn_started,
+    // text 'Use **strong'`, apply a snapshot, then fold `text ' emphasis** here.'`.
     let state = applyEvent(initialState(), opened);
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });
     state = applyEvent(state, delta("Use **strong"));
     expect(state.assistantMessageOpen).toBe(true);
-    // The wire as Rust now sends it mid-stream: `assistantMessageOpen` present and `true`, matching
+    // The wire Rust sends mid-stream: `assistantMessageOpen` present and `true`, matching
     // the live projection this state was folded from.
     const { nextSeq: _seq, turnThinking: _think, ...wire } = state;
     const restored = applySnapshot(initialState(), wire, state.nextSeq);
@@ -620,9 +612,8 @@ describe("turnThinking", () => {
   });
 
   it("a repeated thinking delta keeps the bit and appends its text, advancing nextSeq like any other event", () => {
-    // It used to return the very same object, so a turn that merely kept thinking cost no render. The
-    // text is drawn now, so the fold must carry it; a batch of them is still one fold and one render
-    // (`applyEvents`).
+    // Thinking text is drawn, so the fold must carry it; `applyEvents` batches deltas into one fold
+    // and one render.
     const first = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
     const second = applyEvent(first, { type: "content_delta", turn_id: "t1", kind: "thinking", text: " still going" });
     expect(second.turnThinking).toBe(true);
@@ -637,12 +628,8 @@ describe("turnThinking", () => {
   });
 
   it("a content_delta of an UNKNOWN kind is a no-op, not a transcript entry with no text", () => {
-    // This arm used to open with `if (event.kind !== "text")
-    // return state;` and the in-flight motion change replaced it with `if (event.kind ===
-    // "thinking")`, so every other kind fell into the TEXT path. Reproduced there: folding a
-    // `redacted_thinking` delta appended `{seq: 1, text: undefined}`, which `MessageList` hands to
-    // `renderMarkdown`, which throws inside `marked` -- and this app has no error boundary, so the
-    // panel unmounts whole.
+    // An unknown kind such as `redacted_thinking` must not fall into the text path: its missing text
+    // would reach `renderMarkdown` and throw inside `marked`, unmounting the panel without an error boundary.
     //
     // Unreachable against today's Rust (`ContentKind` is `{Text, Thinking}` and `projection.rs`
     // matches per variant), which is exactly the point: this is the same defence-against-drift the
@@ -748,7 +735,7 @@ describe("resume outcome", () => {
   });
 });
 
-/* Interleaved ordering, the reducer's half (2026-09-15).
+/* Interleaved ordering, the reducer's half.
 
    Rust's projection is where the order originates -- these tests pin that the live path continues
    the same numbering rather than running a scheme of its own, because the two have to describe the
@@ -1861,5 +1848,37 @@ describe("nested subagent streams", () => {
     expect(parent.children?.transcript.map((row) => row.text)).toEqual(["child reply"]);
     expect(parent.children?.toolCalls.map((call) => call.toolUseId)).toEqual(["child"]);
     expect(state.toolCalls).toHaveLength(1);
+  });
+});
+
+describe("event fold revisions", () => {
+  it("assigns a reply the Rust seq after a dropped request", () => {
+    const events: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "reply" },
+    ];
+    expect(applyEvents(initialState(), events, [1, 3]).transcript[0].seq).toBe(2);
+    expect(applyEvents(initialState(), events).transcript[0].seq).toBe(1);
+  });
+
+  it("does not merge text or thinking deltas across a revision gap", () => {
+    for (const kind of ["text", "thinking"] as const) {
+      const events: AgentDomainEvent[] = [
+        { type: "content_delta", turn_id: "t1", kind, text: "" },
+        { type: "content_delta", turn_id: "t1", kind, text: "reply" },
+      ];
+      const state = applyEvents(initialState(), events, [2, 5]);
+      expect(state.nextSeq).toBe(5);
+      if (kind === "thinking") expect(state.thinking[0].seq).toBe(4);
+      else expect(state.transcript[0].seq).toBe(1);
+    }
+  });
+
+  it("never rewinds the sequence for stale tags", () => {
+    const state = applyEvents({ ...initialState(), nextSeq: 10 }, [
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "reply" },
+    ], [3]);
+    expect(state.transcript[0].seq).toBe(10);
+    expect(state.nextSeq).toBe(11);
   });
 });

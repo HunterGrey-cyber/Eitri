@@ -182,7 +182,7 @@ def _contents_by_dst(doc):
     return {entry["dst"]: entry for entry in doc.get("contents", [])}
 
 
-# --- the five binaries every release ships (no agent-hook anywhere) ------------------------
+# The five binaries every release ships; no legacy agent-hook.
 
 RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/shell",
@@ -192,14 +192,13 @@ RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/eitri-claude-handoff",
 }
 
-# Contents entries expected ONLY in the private (mirror) profile: the sidecar itself and the
-# rev file recording which Verdandi revision it was built from.
+# Private-profile entries: the sidecar and the revision it was built from.
 PRIVATE_ONLY_DSTS = {
     "/usr/lib/eitri/verdandi-claude-sidecar",
     "/usr/lib/eitri/verdandi-claude-sidecar.rev",
 }
 
-# Contents entries expected ONLY in the public profile: the installer, staged as `eitri setup`.
+# Public-profile entry: the installer, staged as eitri setup; the private profile has none.
 PUBLIC_ONLY_DSTS = {
     "/usr/lib/eitri/eitri-setup",
 }
@@ -262,9 +261,8 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
     `agent-hook` (legacy's PreToolUse relay binary) ships in neither profile."""
 
     def test_agent_hook_is_absent_from_both_files(self):
-        # On the parsed `contents` entries, not the raw text: both files' own comments legitimately
-        # explain, in prose, that agent-hook is absent and why -- a raw substring check would
-        # fail on that very sentence.
+        # Check parsed contents, since comments may explain why the legacy agent-hook is absent;
+        # a raw substring check would reject that explanation.
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             for entry in _load_yaml(path)["contents"]:
                 self.assertNotIn("agent-hook", entry["src"], (path, entry))
@@ -344,8 +342,8 @@ class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
             self.assertIn("${EITRI_SOURCE_URL}", last_line, (path, last_line))
 
 
-# Package descriptions appear in apt, dnf and pacman output.
-# Keep them understandable without access to internal documentation.
+# Package descriptions are read by apt show, dnf info and pacman -Si.
+# Internal labels and unpublished document names cannot explain the package to its users.
 RULING_CITATION_PATTERN = re.compile(
     r"spec §|spec \d{4}-\d{2}-\d{2}-[\w-]*\.md|\b[DRI]\d{1,3}(?:/[A-Z]?\d{0,3})?\b"
 )
@@ -387,7 +385,7 @@ class TheDebCarriesTheAppArmorProfile(unittest.TestCase):
                 self.assertNotIn("scripts", (doc.get("overrides") or {}).get(packager) or {}, (path, packager))
 
 
-# --- the desktop entry and the icon (app icon, 2026-10-01) ---------------------------------------
+# The desktop entry and application icon.
 
 DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.desktop"
 DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.desktop"

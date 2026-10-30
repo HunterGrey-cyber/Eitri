@@ -238,9 +238,9 @@ pub struct Layout {
     /// Hidden modules that can never be shown again in this window (`super::kill`'s
     /// `Reopen::Never`). A subset of `hidden`; never read from or written to a state file.
     gone: BTreeSet<ModuleId>,
-    /// The gone modules that were shown when they were retired: hidden now only because what ran in
+    /// The modules that were shown when their contents ended: hidden now only because what ran in
     /// them ended, not because the user hid them, so the state file writes them shown
-    /// ([`Layout::saved_hidden`]). A subset of `gone`.
+    /// ([`Layout::saved_hidden`]). A subset of `hidden`.
     retired_shown: BTreeSet<ModuleId>,
     /// Modules the other window of the pair holds now: hidden here, each leaf (or float) left where
     /// it was, so one that comes back is in its old place. Like a gone module they cannot be shown,
@@ -439,8 +439,8 @@ impl Layout {
     }
 
     /// What the state file keeps as hidden: [`Layout::hidden`] without the modules that were on
-    /// screen when they were retired (`super::kill`'s `Reopen::Never` -- the editor after nvim
-    /// ended). Their retirement is about the process, not the arrangement, so a relaunch shows them
+    /// screen when their contents ended (a retirement or the editor's kill in place after nvim
+    /// ended). Ending is about the process, not the arrangement, so a relaunch shows them
     /// where they were; one the user had hidden stays hidden.
     /// A module away in the other window is written as it was when it left, for the same reason: its
     /// absence here is about where it lives, not how the user arranged this window.
@@ -592,6 +592,19 @@ impl Layout {
     /// here, and so are their numbers.
     pub fn away(&self) -> BTreeSet<ModuleId> {
         self.away.clone()
+    }
+
+    /// Takes an away module back in its place without revealing it or taking keys. Its previous visibility is
+    /// forgotten so a later show chooses when to open it again.
+    pub fn set_back_hidden(&mut self, id: &ModuleId) -> Result<bool, LayoutError> {
+        if !self.contains(id) {
+            return Err(LayoutError::NotInTree(id.clone()));
+        }
+        if !self.away.remove(id) {
+            return Ok(false);
+        }
+        self.away_shown.remove(id);
+        Ok(true)
     }
 
     /// Marks `id` away (`true`) or back (`false`); `Ok(false)` when it already was. Away, it stays in
@@ -1044,6 +1057,7 @@ impl Layout {
         if self.away.contains(id) {
             return Err(LayoutError::Away(id.clone()));
         }
+        self.retired_shown.remove(id);
         let changed = self.hidden.remove(id);
         if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
             self.unzoom();
@@ -1106,9 +1120,17 @@ impl Layout {
         }
     }
 
+    /// Keeps the user's shown arrangement when ending nvim hides its pane temporarily.
+    pub(super) fn editor_ended(&mut self, was_shown: bool) {
+        if was_shown {
+            self.retired_shown.insert(ModuleId::editor());
+        }
+    }
+
     /// Takes `id` out of `hidden` without the checks [`Layout::show`] makes, for `super::ops`,
     /// which has just placed it. `true` if it was hidden.
     pub(super) fn unhide(&mut self, id: &ModuleId) -> bool {
+        self.retired_shown.remove(id);
         self.hidden.remove(id)
     }
 
@@ -1257,6 +1279,27 @@ mod tests {
 
     fn decl(id: &str, placement: Placement) -> ModuleDecl {
         ModuleDecl { id: lua(id), placement }
+    }
+
+    #[test]
+    fn a_module_set_back_hidden_stays_hidden_where_it_was() {
+        let id = lua("notes");
+        let mut layout = Layout::initial(&[decl("notes", Placement::RightOfRoot)]).unwrap();
+        layout.show(&id).unwrap();
+        let root = layout.root().clone();
+        let focus = layout.focus().clone();
+        layout.set_away(&id, true).unwrap();
+        assert_eq!(layout.set_back_hidden(&id), Ok(true));
+        assert!(!layout.is_away(&id) && !layout.is_shown(&id));
+        assert!(layout.saved_hidden().contains(&id));
+        assert_eq!(layout.root(), &root);
+        assert_eq!(layout.focus(), &focus);
+        assert_eq!(layout.set_back_hidden(&id), Ok(false));
+        layout.show(&id).unwrap();
+        assert!(layout.is_shown(&id));
+        layout.set_away(&id, true).unwrap();
+        layout.set_away(&id, false).unwrap();
+        assert!(layout.is_shown(&id));
     }
 
     #[test]

@@ -946,6 +946,85 @@ fn an_agent_that_ends_right_after_opening_the_session_ends_the_session() {
 // ---------------------------------------------------------------- modes
 
 #[test]
+fn an_unreadable_current_mode_report_trips_a_registered_mode() {
+    unreadable_mode_report(json!({"sessionUpdate": "current_mode_update"}));
+}
+
+#[test]
+fn an_unreadable_mode_option_trips_a_registered_mode() {
+    unreadable_mode_report(json!({"sessionUpdate": "config_option_update", "configOptions": [
+        {"id": "mode", "currentValue": 5}
+    ]}));
+}
+
+fn unreadable_mode_report(report: Value) {
+    let mut script = boot("workspace-write");
+    script.extend([expect_prompt(3, "x"), update("s1", report.clone())]);
+    let provider = started(script, Some("workspace-write"));
+    send(&provider, "x").expect("sends");
+    let events = pump_until(&provider, "the unreadable mode to be refused", |e| {
+        matches!(e, AgentDomainEvent::PolicyMismatch { .. })
+    });
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentDomainEvent::PolicyMismatch { requested, reported }
+            if requested == "mode workspace-write" && reported.contains("could not read")
+    )));
+    assert!(send(&provider, "again").is_err(), "the session takes no more turns");
+
+    let mut script = boot("agent");
+    script.extend([
+        expect_prompt(3, "x"),
+        update("s1", report),
+        reply(3, json!({"stopReason": "end_turn"})),
+    ]);
+    let provider = started(script, None);
+    send(&provider, "x").expect("sends without a registered mode");
+    let events = until_completed(&provider);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. })));
+}
+
+#[test]
+fn an_unreadable_mode_report_after_setting_the_mode_opens_and_trips() {
+    for report in [
+        json!({"sessionUpdate": "current_mode_update"}),
+        json!({"sessionUpdate": "config_option_update", "configOptions": [
+            {"id": "agent-mode", "category": "mode", "currentValue": 5}
+        ]}),
+    ] {
+        let mut script = boot("agent");
+        script.extend([
+            expect_request(
+                3,
+                "session/set_mode",
+                json!({"sessionId": "s1", "modeId": "workspace-write"}),
+            ),
+            update(
+                "s1",
+                json!({"sessionUpdate": "current_mode_update", "currentModeId": "workspace-write"}),
+            ),
+            update("s1", report),
+            reply(3, json!({})),
+        ]);
+        let provider = started(script, Some("workspace-write"));
+        let events = provider.pump();
+        let opened = events
+            .iter()
+            .position(|e| matches!(e, AgentDomainEvent::SessionOpened { .. }));
+        let tripped = events.iter().position(|e| {
+            matches!(
+                e,
+                AgentDomainEvent::PolicyMismatch { reported, .. } if reported.contains("could not read")
+            )
+        });
+        assert!(opened.is_some() && tripped.is_some() && opened < tripped, "{events:#?}");
+        assert!(send(&provider, "x").is_err());
+    }
+}
+
+#[test]
 fn mode_mismatch_trips() {
     // The registered mode is set when the session is in another, and a later report of a different mode
     // stops the session.

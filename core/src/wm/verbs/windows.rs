@@ -34,14 +34,15 @@ pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, batch: &mut Bat
             };
             moves::offer(w, cx, win, &module, *follow, batch);
         }
-        // A workspace has no plan of its own yet: what it shows would have to move together.
-        Action::WorkspaceToWindow { .. } | Action::WorkspaceSwapWindow => refuse(w, win, action, batch),
+        // The modules shown by a workspace move together, so their verdicts decide when its arrangement appears.
+        Action::WorkspaceToWindow { follow } => moves::workspace::offer(w, cx, win, *follow, false, batch),
+        Action::WorkspaceSwapWindow => moves::workspace::offer(w, cx, win, false, true, batch),
         _ => debug_assert!(false, "{action:?} is not a window verb"),
     }
 }
 
 fn refuse(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch) {
-    let text = feedback::NO_SECOND_WINDOW_TEXT;
+    let text = feedback::no_other_window_text(w.role());
     w.say(format!("[window] {}: {text}", action.name()));
     w.refuse(win, text.to_owned(), batch);
 }
@@ -95,7 +96,6 @@ mod tests {
             let mut r = rig(three());
             let before = r.said();
             let batch = r.run(action.clone());
-            assert_eq!(batch.shell_verb(), None, "{action:?} is decided here");
             r.assert_refused(&batch, &before, crate::wm::feedback::NO_SECOND_WINDOW_TEXT);
         }
     }
@@ -104,7 +104,6 @@ mod tests {
     fn window_new_asks_the_host_for_the_second_window_with_or_without_a_peer() {
         let mut r = rig(three());
         let batch = r.run(Action::WindowNew);
-        assert_eq!(batch.shell_verb(), None);
         assert_eq!(ops(&batch), vec![HostOp::OpenLinkedWindow { win: WIN }]);
     }
 

@@ -2,7 +2,7 @@
 //!
 //! The first change after an idle period renders at once, so a keystroke's echo waits for nothing.
 //! Further changes inside the interval fold into one render at its end. No change means no render
-//! at all -- the idle cost is zero (an unconditional redraw once cost this project 60x idle CPU).
+//! at all, so an idle terminal needs no redraw wakeups (an unconditional redraw costs about 60x idle CPU).
 //! Pure, so the rule is tested without a thread or a clock.
 
 use std::time::{Duration, Instant};

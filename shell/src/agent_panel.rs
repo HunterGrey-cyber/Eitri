@@ -10,15 +10,15 @@ use eitri_panel::panel_page::{PageSurface, PanelHost, PanelPage};
 use eitri_panel::panel_wake::{NextTick, TickSchedule};
 use gtk4::prelude::*;
 use gtk4::Application;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use webkit6::prelude::*;
 use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 // What the rest of `shell` reaches through `crate::agent_panel::`.
-pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, ViewId};
+pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs`
 /// guarantees this file exists and is current by the time `shell` itself compiles.
@@ -27,6 +27,42 @@ const AGENT_UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/.
 /// The bundle with its content security policy, computed once on first use.
 static PANEL_DOCUMENT: std::sync::LazyLock<PanelDocument> =
     std::sync::LazyLock::new(|| PanelDocument::new(AGENT_UI_HTML));
+
+/// How opaque a chat page's view is until its page has painted. WebKit's first buffer is drawn before
+/// the page has anything in it, black under any theme. Zero opacity makes GTK skip the widget's
+/// snapshot, which is where WebKit acknowledges a frame to its web process, so the web process would
+/// stall on that first buffer and show it the moment the view is revealed. At 1/255 GTK still
+/// snapshots the view, frames keep flowing, and the colour behind the view changes by at most one level.
+const NEARLY_HIDDEN: f64 = 1.0 / 255.0;
+
+/// Whether a chat page's view has been shown yet: once, by the first of the page's own `painted`
+/// message, the fallback timer counted from its first map and the end of its web process.
+struct FirstPaint {
+    built: Instant,
+    shown: Cell<bool>,
+    fallback_armed: Cell<bool>,
+}
+
+impl FirstPaint {
+    fn reveal(&self) -> Option<Duration> {
+        if self.shown.replace(true) {
+            None
+        } else {
+            Some(self.built.elapsed())
+        }
+    }
+}
+
+fn reveal_chat_page(first_paint: &FirstPaint, webview: &WebView, view: ViewId, reason: &str) {
+    if let Some(elapsed) = first_paint.reveal() {
+        webview.set_opacity(1.0);
+        eprintln!(
+            "[agent_panel] view {}: shown after {reason} at {} ms",
+            view.number(),
+            elapsed.as_millis()
+        );
+    }
+}
 
 /// Keeps the process alive until `watch` is done, WITHOUT anything waiting for it.
 ///
@@ -80,24 +116,40 @@ pub(crate) fn hold_until_done(app: &Application, watch: ShutdownWatch) {
 /// The panel's page in WebKitGTK.
 struct WebKitPage(WebView);
 
+/// Each dispatch has its own guard so one rejected envelope cannot drop the rest of a run.
+fn dispatch_script(envelopes: &[&str]) -> String {
+    let mut script = String::from("{ let failed = false, firstError;\n");
+    for envelope in envelopes {
+        script.push_str(&format!(
+            "try {{ window.__eitriDispatch && window.__eitriDispatch({}); }} catch (e) {{ if (!failed) {{ failed = true; firstError = e; }} }}\n",
+            serde_json::to_string(envelope).expect("a string serialises as JSON")
+        ));
+    }
+    script.push_str("if (failed) throw firstError;\n}");
+    script
+}
+
 impl PageSurface for WebKitPage {
     fn send(&self, envelope_json: &str) {
+        self.send_many(&[envelope_json]);
+    }
+
+    fn send_many(&self, envelopes: &[&str]) {
         // The grid probe judges what an idle page was sent from this line: a page that is not live can still show
         // an empty document while data reaches it, so the page's own inbound line cannot vouch for it. The page's
         // pointer is the identity the probe logs for each host.
         #[cfg(feature = "probe")]
-        eprintln!(
-            "[agent_panel] page {:#x}: sent {}",
-            gtk4::glib::object::ObjectType::as_ptr(&self.0) as usize,
-            serde_json::from_str::<serde_json::Value>(envelope_json)
-                .ok()
-                .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_owned)))
-                .unwrap_or_else(|| "unknown".to_owned())
-        );
-        let script = format!(
-            "window.__eitriDispatch && window.__eitriDispatch({});",
-            serde_json::to_string(envelope_json).unwrap_or_default()
-        );
+        for envelope_json in envelopes {
+            eprintln!(
+                "[agent_panel] page {:#x}: sent {}",
+                gtk4::glib::object::ObjectType::as_ptr(&self.0) as usize,
+                serde_json::from_str::<serde_json::Value>(envelope_json)
+                    .ok()
+                    .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_owned)))
+                    .unwrap_or_else(|| "unknown".to_owned())
+            );
+        }
+        let script = dispatch_script(envelopes);
         self.0
             .evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |result| {
                 if let Err(e) = result {
@@ -157,7 +209,8 @@ pub(crate) fn build_agent_panel(
     backend_kind: BackendKind,
     unavailable: Option<&str>,
     related: Option<&WebView>,
-    tab_files: eitri_core::saved_tabs::TabFiles,
+    tab_role: eitri_core::window_link::pair::Role,
+    theme: eitri_core::theme::ThemeTokens,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let init = PanelInit {
         project_dir,
@@ -165,7 +218,8 @@ pub(crate) fn build_agent_panel(
         scratch,
         backend_kind,
         document: &PANEL_DOCUMENT,
-        tab_files,
+        tab_role,
+        theme,
     };
     if let Some(notice) = unavailable {
         let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));
@@ -221,6 +275,13 @@ pub(crate) fn build_chat_page(
         // ignores a session given together with a related view (and logs a critical for it), so none is.
         Some(related) => builder.related_view(related).build(),
     };
+    // Shown once its page has painted (`reveal_chat_page`): until then what is behind the view shows.
+    webview.set_opacity(NEARLY_HIDDEN);
+    let first_paint = Rc::new(FirstPaint {
+        built: Instant::now(),
+        shown: Cell::new(false),
+        fallback_armed: Cell::new(false),
+    });
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     let page = Rc::new(PanelPage::new(Rc::new(WebKitPage(webview.clone()))));
@@ -269,6 +330,7 @@ pub(crate) fn build_chat_page(
     content_manager.register_script_message_handler("eitriAgent", None);
     {
         let handle = handle.clone();
+        let first_paint = first_paint.clone();
         // Weak: the page owns this handler, so a strong reference here would keep the page alive forever.
         let page_widget = webview.downgrade();
         // `view` is moved in here, once: whatever the page posts, it is this page's view's message.
@@ -284,7 +346,31 @@ pub(crate) fn build_chat_page(
                 }
                 return;
             }
+            if eitri_core::agent_bridge::is_first_paint(&raw) {
+                if let Some(widget) = page_widget.upgrade() {
+                    reveal_chat_page(&first_paint, &widget, view, "first paint");
+                }
+                return;
+            }
             handle.page_message(view, &raw);
+        });
+    }
+
+    // An off-screen page runs no animation frames, so it cannot report a paint until its view maps.
+    // Counting the fallback from the build would show the view before its page has painted.
+    {
+        let first_paint = first_paint.clone();
+        webview.connect_map(move |webview| {
+            if first_paint.shown.get() || first_paint.fallback_armed.replace(true) {
+                return;
+            }
+            let page_widget = webview.downgrade();
+            let first_paint = first_paint.clone();
+            gtk4::glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                if let Some(widget) = page_widget.upgrade() {
+                    reveal_chat_page(&first_paint, &widget, view, "fallback");
+                }
+            });
         });
     }
 
@@ -302,7 +388,8 @@ pub(crate) fn build_chat_page(
     // own doc. An end the host asked for itself is no crash.
     {
         let handle = handle.clone();
-        webview.connect_web_process_terminated(move |_webview, reason| {
+        webview.connect_web_process_terminated(move |webview, reason| {
+            reveal_chat_page(&first_paint, webview, view, "web process gone");
             if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
                 return;
             }
@@ -564,6 +651,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_paint_reveals_only_once() {
+        let first_paint = FirstPaint {
+            built: Instant::now(),
+            shown: Cell::new(false),
+            fallback_armed: Cell::new(false),
+        };
+        assert!(first_paint.reveal().is_some());
+        assert!(first_paint.reveal().is_none());
+        assert!(first_paint.reveal().is_none());
+    }
+
+    #[test]
+    fn nearly_hidden_still_allows_snapshots() {
+        assert!(NEARLY_HIDDEN * 255.0 >= 1.0);
+        assert!(NEARLY_HIDDEN * 255.0 < 2.0);
+    }
+
+    #[test]
+    fn chat_page_waits_for_paint_and_reveals_only_through_its_guard() {
+        use eitri_core::source_scan as scan;
+        let code = webkit_half();
+        let builds = scan::functions(&code, "build_chat_page");
+        assert_eq!(builds.len(), 1);
+        let build: String = builds[0].split_whitespace().collect();
+        assert_eq!(build.matches(".set_opacity(NEARLY_HIDDEN)").count(), 1);
+        assert!(build.find(".set_opacity(NEARLY_HIDDEN)").unwrap() < build.find("handle.load_document(view)").unwrap());
+        assert_eq!(build.matches("is_first_paint(").count(), 1);
+        let painted = build.find("is_first_paint(").unwrap();
+        assert!(painted < build.find(".page_message(").unwrap());
+        let open = painted + build[painted..].find('{').unwrap();
+        let branch = scan::braced(&build, open);
+        assert!(branch.contains("page_widget.upgrade()"));
+        assert!(branch.find("reveal_chat_page(").unwrap() < branch.find("return;").unwrap());
+        assert!(branch.ends_with("return;}"));
+        assert_eq!(build.matches("timeout_add_local_once(").count(), 1);
+        assert!(build.contains("Duration::from_secs(3)"));
+        let fallback_maps: Vec<&str> = build
+            .match_indices("connect_map(")
+            .map(|(at, _)| {
+                let open = at + build[at..].find('{').unwrap();
+                scan::braced(&build, open)
+            })
+            .filter(|body| body.contains("timeout_add_local_once("))
+            .collect();
+        assert_eq!(fallback_maps.len(), 1);
+        let mapped = fallback_maps[0];
+        assert!(!scan::without(&build, &fallback_maps).contains("timeout_add_local_once("));
+        assert!(mapped.contains("fallback_armed.replace(true)"));
+        let at = mapped.find("timeout_add_local_once(").unwrap();
+        let open = at + mapped[at..].find('{').unwrap();
+        let fallback = scan::braced(mapped, open);
+        assert!(fallback.contains("reveal_chat_page(&first_paint,&widget,view,"));
+        let at = build.find("connect_web_process_terminated(").unwrap();
+        let open = at + build[at..].find('{').unwrap();
+        let terminated = scan::braced(&build, open);
+        assert!(terminated.find("reveal_chat_page(").unwrap() < terminated.find("TerminatedByApi").unwrap());
+
+        let reveals = scan::functions(&code, "reveal_chat_page");
+        assert_eq!(reveals.len(), 1);
+        let reveal: String = reveals[0].split_whitespace().collect();
+        assert_eq!(reveal.matches(".set_opacity(1.0)").count(), 1);
+        let outside = scan::without(&code, &reveals);
+        let outside: String = outside.split_whitespace().collect();
+        assert!(!outside.contains(".set_opacity(1.0)"));
+    }
+
+    #[test]
+    fn one_script_dispatches_every_envelope_each_in_its_own_try() {
+        let envelopes = [r#"{"kind":"tabs"}"#, r#"{"); throw 1; ("}"#, "draft\nwith a newline"];
+        let script = dispatch_script(&envelopes);
+        assert_eq!(script.matches("__eitriDispatch(").count(), 3);
+        let lines: Vec<_> = script.lines().skip(1).take(envelopes.len()).collect();
+        assert_eq!(lines.len(), envelopes.len());
+        for (line, envelope) in lines.into_iter().zip(envelopes) {
+            let argument = line
+                .strip_prefix("try { window.__eitriDispatch && window.__eitriDispatch(")
+                .unwrap()
+                .strip_suffix("); } catch (e) { if (!failed) { failed = true; firstError = e; } }")
+                .unwrap();
+            assert_eq!(serde_json::from_str::<String>(argument).unwrap(), envelope);
+        }
+    }
+
+    #[test]
+    fn a_throwing_dispatch_still_delivers_the_rest_and_reports_the_first_error() {
+        let script = dispatch_script(&["first", "second", "third"]);
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(
+                r#"
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+for (const first of [new Error('first'), undefined, null, false, 0]) {
+    const seen = [];
+    const context = vm.createContext({window: {__eitriDispatch(envelope) {
+        seen.push(envelope);
+        if (envelope === 'first') throw first;
+        if (envelope === 'third') throw new Error('last');
+    }}});
+    for (let run = 0; run < 2; run++) {
+        let failed = false;
+        try { vm.runInContext(process.argv[1], context); }
+        catch (e) { failed = true; assert.equal(e, first); }
+        assert.equal(failed, true);
+    }
+    assert.deepEqual(seen, ['first', 'second', 'third', 'first', 'second', 'third']);
+}
+"#,
+            )
+            .arg(script)
+            .output()
+            .expect("Node.js runs the dispatch script");
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    #[test]
     fn agent_panel_puts_envelopes_in_the_page_only_through_the_funnel() {
         // `PanelPage::send` and `AgentPanelHandle::dispatch` hand over what the cadence holds
         // before they send; `set_theme`'s own send is the other direct one and carries no stream
@@ -591,6 +794,18 @@ mod tests {
             "the panel's logic sends to the page outside the funnel"
         );
         let flat: String = panel.split_whitespace().collect();
+        assert_eq!(flat.matches(".surface.send_many(").count(), 1);
+        let page = impl_blocks(panel, "implPanelPage");
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0]
+                .split_whitespace()
+                .collect::<String>()
+                .matches(".surface.send_many(")
+                .count(),
+            1
+        );
+        assert!(!flat.contains("sink().send_many("));
         assert!(
             flat.contains("page.flush();page.send_direct("),
             "AgentPanelHandle::dispatch hands over what is held first"
@@ -614,7 +829,8 @@ mod tests {
             text: text.to_owned(),
         };
         let funnel = "fn dispatch(page: &P) { page.flush(); page.send_direct(p); }\n\
-                      fn set_theme(page: &P) { page.send_direct(t); }\n";
+                      fn set_theme(page: &P) { page.send_direct(t); }\n\
+                      impl PanelPage { fn send_many(&self) { self.surface.send_many(p); } }\n";
         let clean = [file("panel/src/a.rs", funnel), file("panel/src/b.rs", "fn other() {}")];
         the_panels_logic_sends_only_through_the_funnel(&panel_code_of(&clean));
         let read = [

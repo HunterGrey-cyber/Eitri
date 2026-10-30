@@ -58,7 +58,15 @@ fn helper_script(dir: &Path, name: &str, exec: bool) -> PathBuf {
 fn spawn_and_read(exe: &Path, token: Option<&str>) -> String {
     for _ in 0..100 {
         let (mine, theirs) = fdpass::seqpacket_pair().unwrap();
-        match spawn_second(exe, theirs, Path::new("/home/someone/project"), token, false) {
+        match spawn_second(
+            exe,
+            theirs,
+            Path::new("/home/someone/project"),
+            token,
+            false,
+            false,
+            false,
+        ) {
             Ok(mut child) => {
                 let status = child.wait().unwrap();
                 let got = fdpass::recv(mine.as_fd(), 4096)

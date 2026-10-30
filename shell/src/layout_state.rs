@@ -1,11 +1,9 @@
 //! The shell's part of the window's layout persistence: the window's [`Saver`], built from the values `build_ui`
 //! starts with. Which layout a window opens with, what is written to the state file and when, and the writer
 //! thread are `eitri_core::wm::persist`'s; the controller arms the debounce on its scheduler, the shell's hooks
-//! only report what changed, and the close handler's save is `Driver::persist_now`.
+//! only report what changed, and the close's save is the first step of the controller's teardown.
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 #[cfg(test)]
 use eitri_core::layout::ModuleId;
@@ -14,7 +12,7 @@ use eitri_core::window_link::pair::Role;
 use eitri_core::wm::persist::Saver;
 
 /// The window's saver. `dir` is `persist::state_dir`'s answer (`None` saves nothing, said once);
-/// `layout` and `workspaces` are the ones the grid and the window share, read here as they are at startup,
+/// `layout` and `workspaces` are the ones the window starts with, read here as they are at startup,
 /// not yet changed: a launch is not a change. `keep_copy` is `choose_startup_layout`'s. `role` is the window's
 /// role in the project's pair, which names its file: the plain file is window 1's (or a window alone's), window 2
 /// writes `-w2` and an unpaired window `-u`, so no window writes over another's.
@@ -22,19 +20,12 @@ pub(crate) fn saver(
     dir: Option<PathBuf>,
     role: Role,
     project_root: &Path,
-    layout: &Rc<RefCell<Layout>>,
-    workspaces: &Rc<RefCell<Workspaces>>,
+    layout: &Layout,
+    workspaces: &Workspaces,
     lua: Vec<ModuleDecl>,
     keep_copy: Option<String>,
 ) -> Saver {
-    let mut saver = Saver::new(
-        dir,
-        project_root,
-        lua,
-        keep_copy,
-        &layout.borrow(),
-        &workspaces.borrow(),
-    );
+    let mut saver = Saver::new(dir, project_root, lua, keep_copy, layout, workspaces);
     saver.set_role(role);
     saver
 }
@@ -54,11 +45,8 @@ mod tests {
         PathBuf::from("/home/someone/project")
     }
 
-    fn shared(layout: Layout) -> (Rc<RefCell<Layout>>, Rc<RefCell<Workspaces>>) {
-        (
-            Rc::new(RefCell::new(layout)),
-            Rc::new(RefCell::new(Workspaces::single())),
-        )
+    fn shared(layout: Layout) -> (Layout, Workspaces) {
+        (layout, Workspaces::single())
     }
 
     #[test]
@@ -66,8 +54,8 @@ mod tests {
         let dir = Scratch::new("move-writes");
         let terminal = id("terminal#2");
         // Window 1 holds the instance; window 2 has its placeholder away.
-        let (one, one_ws) = shared(window(&["terminal#2"]));
-        let (two, two_ws) = shared({
+        let (mut one, one_ws) = shared(window(&["terminal#2"]));
+        let (mut two, two_ws) = shared({
             let mut l = window(&["terminal#2"]);
             l.set_away(&terminal, true).unwrap();
             l
@@ -90,16 +78,16 @@ mod tests {
             Vec::new(),
             None,
         );
-        first.save_now(&one.borrow(), &one_ws.borrow());
+        first.save_now(&one, &one_ws);
         assert!(
             !dir.0.join(persist::file_name_v2(&root())).exists(),
             "a launch is not a change"
         );
         // The move: the terminal is away in window 1 and back in window 2, nothing else changes.
-        one.borrow_mut().set_away(&terminal, true).unwrap();
-        two.borrow_mut().set_away(&terminal, false).unwrap();
-        assert!(first.save_now(&one.borrow(), &one_ws.borrow()));
-        assert!(second.save_now(&two.borrow(), &two_ws.borrow()));
+        one.set_away(&terminal, true).unwrap();
+        two.set_away(&terminal, false).unwrap();
+        assert!(first.save_now(&one, &one_ws));
+        assert!(second.save_now(&two, &two_ws));
         let read = |role| match persist::load_as(&dir.0, &root(), role, &[], &[]) {
             persist::Loaded::Restored(opened) => opened.current,
             other => panic!("{role:?}: {other:?}"),
@@ -115,7 +103,7 @@ mod tests {
     #[test]
     fn moving_the_keys_alone_still_writes_nothing() {
         let dir = Scratch::new("keys-only");
-        let (one, one_ws) = shared(window(&["terminal#2"]));
+        let (mut one, one_ws) = shared(window(&["terminal#2"]));
         let mut first = saver(
             Some(dir.0.clone()),
             Role::Main,
@@ -125,8 +113,8 @@ mod tests {
             Vec::new(),
             None,
         );
-        one.borrow_mut().set_focus(&ModuleId::terminal()).unwrap();
-        first.save_now(&one.borrow(), &one_ws.borrow());
+        one.set_focus(&ModuleId::terminal()).unwrap();
+        first.save_now(&one, &one_ws);
         assert!(!dir.0.join(persist::file_name_v2(&root())).exists());
     }
 }

@@ -21,6 +21,7 @@
       "which_key_delay": 200
     },
     "module_key": null,
+    "own_window": false,
     "prefix": "Ctrl+b",
     "protocol": 1,
     "restored": null,

@@ -35,6 +35,14 @@ impl DocSlot {
         self.generation += 1;
         true
     }
+
+    /// A copy of what `slot` holds now, for the scheme handler, which reads it per request: the guard ends inside
+    /// this call, so the handler never holds the slot while it answers.
+    pub fn snapshot(slot: &std::cell::RefCell<DocSlot>) -> DocSlot {
+        // The slot is being written while this request arrives: no project is known for this request, so a
+        // document path is a 404 rather than a panic inside the scheme handler.
+        slot.try_borrow().map(|slot| slot.clone()).unwrap_or_default()
+    }
 }
 
 /// The project a document's local images may come from: the window's root when it holds the document, else the

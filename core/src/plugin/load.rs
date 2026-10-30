@@ -24,6 +24,8 @@ pub struct LoadedPlugin {
     /// `[net] images` resolved to `https`: the page may load `https` images from any host.
     pub remote_images: bool,
     pub roots: Roots,
+    /// The own window's declared root, resolved and checked at load on the startup worker.
+    pub window_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +198,22 @@ pub fn load_plugin_with(
     }
     let roots = Roots::new(roots);
 
+    let window_root = manifest
+        .window
+        .as_ref()
+        .map(|window| {
+            let raw = expand(&window.root, &dir, &settings, &no_vars)?;
+            super::roots::lexical(&raw).map_err(|r| format!("window.root: {}", r.message(&raw)))?;
+            let canonical = std::fs::canonicalize(&raw).map_err(|e| format!("window.root = {raw:?}: {e}"))?;
+            if !roots.iter().any(|(_, root)| root == &canonical) {
+                return Err(format!(
+                    "window.root = {raw:?}: must equal a declared [roots] directory"
+                ));
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
+
     for (name, task) in &manifest.tasks {
         let cwd = expand(&task.cwd, &dir, &settings, &no_vars)?;
         dir_inside(&roots, &cwd).map_err(|r| format!("tasks.{name}.cwd: {}", r.message(&cwd)))?;
@@ -211,7 +229,25 @@ pub fn load_plugin_with(
         values,
         remote_images,
         roots,
+        window_root,
     })
+}
+
+/// Checks one kernel's loaded plugins, with the load call that declared each one.
+/// All paths were resolved on the startup worker; this check performs no filesystem work.
+pub fn check_window_roots(plugins: &[(&LoadedPlugin, &str)]) -> Result<(), String> {
+    let mut owners = BTreeMap::new();
+    for (plugin, call) in plugins {
+        if let Some(root) = &plugin.window_root {
+            if let Some(earlier) = owners.insert(root, call) {
+                return Err(format!(
+                    "{earlier} and {call}: [window] root {} is declared twice",
+                    root.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl LoadedPlugin {
@@ -298,6 +334,60 @@ mod tests {
             ("course".to_string(), course.to_string()),
             ("exercise".to_string(), exercise.to_string()),
         ])
+    }
+
+    fn with_window(dir: &Path, root: &str) {
+        let path = dir.join("eitri-plugin.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            format!("{text}\n[window]\nroot = {root:?}\ntitle = 'Demo'\nlayout = {{ module = 'page' }}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn window_root_must_equal_a_declared_root() {
+        let s = Scratch::new("window-root");
+        let (dir, settings) = demo_plugin(&s.0);
+        std::fs::create_dir_all(s.0.join("work/child")).unwrap();
+        with_window(&dir, "${work}/child");
+        let error = load_plugin(dir.to_str().unwrap(), &settings, None).unwrap_err();
+        assert!(
+            error.contains("window.root") && error.contains("equal a declared"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn window_root_equality_is_checked_after_expansion_and_canonicalization() {
+        let s = Scratch::new("window-link");
+        let (dir, settings) = demo_plugin(&s.0);
+        std::os::unix::fs::symlink(s.0.join("work"), dir.join("work-link")).unwrap();
+        with_window(&dir, "${plugin}/work-link");
+        let plugin = load_plugin(dir.to_str().unwrap(), &settings, None).unwrap();
+        assert_eq!(plugin.window_root, Some(s.0.join("work")));
+    }
+
+    #[test]
+    fn two_window_roots_on_one_directory_are_refused_naming_both_calls() {
+        let s = Scratch::new("window-duplicates");
+        let (dir, settings) = demo_plugin(&s.0);
+        with_window(&dir, "${work}");
+        let first = load_plugin(dir.to_str().unwrap(), &settings, None).unwrap();
+        let second = first.clone();
+        let calls = [
+            (&first, "eitri.plugin.load('demo') at init.lua:1"),
+            (&second, "eitri.plugin.load('other') at init.lua:2"),
+        ];
+        let error = check_window_roots(&calls).unwrap_err();
+        assert!(error.contains(calls[0].1) && error.contains(calls[1].1), "{error}");
+        assert!(check_window_roots(&calls[..1]).is_ok());
+        let mut other_root = second.clone();
+        other_root.window_root = Some(s.0.join("other"));
+        assert!(check_window_roots(&[calls[0], (&other_root, calls[1].1)]).is_ok());
+        other_root.window_root = None;
+        assert!(check_window_roots(&[calls[0], (&other_root, calls[1].1)]).is_ok());
     }
 
     #[test]

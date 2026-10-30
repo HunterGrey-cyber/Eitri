@@ -1,9 +1,9 @@
 //! The plugin host's editor snippets in a real `nvim --clean --embed --headless`: assist applies and
 //! clears exactly, keeps the first baseline, leaves a value the user changed, re-asserts after an
 //! `LspAttach` that turns hints on, and reports a missing API; open moves the cursor by characters and
-//! splits over a modified buffer; follow defines and removes only its own commands, reports only the buffers it
-//! may follow, scrolls only the followed window, holds a reveal's cursor without scrolling under 'scrolloff' and
-//! 'wrap', and refuses text past its caps.
+//! splits over a modified buffer; cwd restores tab baselines and leaves user changes alone; follow defines and
+//! removes only its own commands, reports only the buffers it may follow, scrolls only the followed window, holds a
+//! reveal's cursor without scrolling under 'scrolloff' and 'wrap', and refuses text past its caps.
 //!
 //! Every case is `#[ignore]`d: it needs `nvim` (>= 0.10) on `PATH`, spends no tokens and opens no window.
 
@@ -16,7 +16,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eitri_core::plugin::editor::{PLUGIN_ASSIST_LUA, PLUGIN_FOLLOW_LUA, PLUGIN_OPEN_LUA};
+use eitri_core::plugin::editor::{PLUGIN_ASSIST_LUA, PLUGIN_CWD_LUA, PLUGIN_FOLLOW_LUA, PLUGIN_OPEN_LUA};
 use embed_client::{opts_map, Embed};
 use rmpv::Value;
 
@@ -683,6 +683,27 @@ fn a_refused_split_restores_the_windows_and_preserves_an_already_loaded_buffer()
         c.nvim.lua("return vim.api.nvim_buf_get_lines(0, 0, -1, false)", vec![]),
         Value::Array(vec!["keep this edit".into()])
     );
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_counts_an_ill_formed_byte_sequence_as_one_character() {
+    let mut c = case("open-ill-formed");
+    let a = c.a.clone();
+    c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&a))])]);
+    // Set the bytes in the buffer because reading them from a file may convert them from latin1.
+    c.nvim.lua(
+        "local a, b = ... vim.api.nvim_buf_set_lines(0, 0, 2, true, { a, b })",
+        vec![Value::Binary(b"\xc0ab".to_vec()), Value::Binary(b"\xe2ab".to_vec())],
+    );
+    for line in [1, 2] {
+        let opened = c.nvim.lua(
+            PLUGIN_OPEN_LUA,
+            vec![opts_map(&[("path", s(&a)), ("line", line.into()), ("col", 2.into())])],
+        );
+        assert_eq!(field(&opened, "how").as_str(), Some("current"));
+        assert_eq!(cursor(&mut c), Value::Array(vec![line.into(), 1.into()]));
+    }
 }
 
 // ---- the follow snippet ----
@@ -1589,4 +1610,1152 @@ fn views_are_throttled_to_one_per_40_ms_and_the_last_one_is_sent() {
     let seen = views(&lines);
     assert!(!seen.is_empty() && seen.len() <= 3, "{lines:?}");
     assert_eq!(seen.last().unwrap()["cursor"]["line"], 20, "{lines:?}");
+}
+
+fn cwd_call(c: &mut Case, op: &str, dir: Option<&Path>) -> Value {
+    let mut opts = vec![("owner", Value::from("demo"))];
+    if let Some(dir) = dir {
+        opts.push(("dir", Value::Binary(dir.as_os_str().as_bytes().to_vec())));
+    }
+    c.nvim.lua(PLUGIN_CWD_LUA, vec![op.into(), opts_map(&opts)])
+}
+
+fn tab_cwd(c: &mut Case) -> Value {
+    c.nvim.lua(
+        "return {dir = vim.fn.getcwd(-1, 0), localdir = vim.fn.haslocaldir(-1, 0)}",
+        vec![],
+    )
+}
+
+fn tcd(c: &mut Case, dir: &Path) {
+    c.nvim.lua(
+        "vim.api.nvim_cmd({cmd = 'tcd', args = {...}, magic = {file = false}}, {})",
+        vec![s(dir)],
+    );
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn editor_cd_sets_the_tabs_directory() {
+    let mut c = case("cwd-set");
+    let root = c.root.clone();
+    let tab = c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]);
+    let reply = cwd_call(&mut c, "cd", Some(&root));
+    assert_eq!(field(&reply, "dir"), &s(&root));
+    assert_eq!(field(&reply, "tab"), &tab);
+    let cwd = tab_cwd(&mut c);
+    assert_eq!(field(&cwd, "dir"), &s(&root));
+    assert_eq!(field(&cwd, "localdir").as_u64(), Some(1));
+    let state = c.nvim.lua("return vim.t.eitri_plugin_cwd_demo", vec![]);
+    assert_eq!(field(&state, "baseline_local").as_u64(), Some(0));
+    assert_eq!(field(&state, "baseline_dir"), &s(&c.dir));
+    assert_eq!(field(&state, "last_set"), &s(&root));
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_restores_a_tab_local_baseline() {
+    let mut c = case("cwd-local");
+    let baseline = c.dir.clone();
+    tcd(&mut c, &baseline);
+    let root = c.root.clone();
+    cwd_call(&mut c, "cd", Some(&root));
+    // Repeated changes keep the first baseline.
+    let other = c.dir.join("work");
+    cwd_call(&mut c, "cd", Some(&other));
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(1));
+    assert_eq!(field(&reply, "moved").as_u64(), Some(0));
+    let cwd = tab_cwd(&mut c);
+    assert_eq!(field(&cwd, "dir"), &s(&baseline));
+    assert_eq!(field(&cwd, "localdir").as_u64(), Some(1));
+    assert!(c.nvim.lua("return vim.t.eitri_plugin_cwd_demo", vec![]).is_nil());
+    assert_eq!(field(&cwd_call(&mut c, "clear", None), "restored").as_u64(), Some(0));
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_restores_a_global_baseline_with_tcd_of_the_global_cwd() {
+    let mut c = case("cwd-global");
+    let root = c.root.clone();
+    cwd_call(&mut c, "cd", Some(&root));
+    // Another tab changes the global directory while the plugin's local one stays put.
+    c.nvim.command("tabnew");
+    c.nvim.lua(
+        "vim.api.nvim_cmd({cmd = 'cd', args = {...}, magic = {file = false}}, {})",
+        vec![s(&root)],
+    );
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(1));
+    assert_eq!(field(&reply, "moved").as_u64(), Some(0));
+    c.nvim.command("tabprevious");
+    let cwd = tab_cwd(&mut c);
+    assert_eq!(field(&cwd, "dir"), &s(&root), "restore the global cwd as it stands now");
+    assert_eq!(field(&cwd, "localdir").as_u64(), Some(1));
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_leaves_a_tab_the_user_moved_and_counts_it() {
+    let mut c = case("cwd-moved");
+    let root = c.root.clone();
+    cwd_call(&mut c, "cd", Some(&root));
+    let moved = c.dir.join("work");
+    tcd(&mut c, &moved);
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(0));
+    assert_eq!(field(&reply, "moved").as_u64(), Some(1));
+    assert_eq!(field(&tab_cwd(&mut c), "dir"), &s(&moved));
+    assert!(c.nvim.lua("return vim.t.eitri_plugin_cwd_demo", vec![]).is_nil());
+}
+
+/// The process directory, `getcwd()` and the tab's own directory as the current tab sees them.
+fn current_cwds(c: &mut Case) -> Value {
+    c.nvim.lua(
+        "return {uv = vim.uv.cwd(), plain = vim.fn.getcwd(), tab = vim.fn.getcwd(-1, 0)}",
+        vec![],
+    )
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn editor_cd_from_an_owners_diff_tab_acts_in_its_origin_tab() {
+    // Neither tab has a local directory, so the diff tab's directory is the process's own: a change made
+    // from it must not move the process directory under it.
+    let mut c = case("cwd-diff");
+    let origin = c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]);
+    c.nvim.command("tabnew");
+    let diff = c.nvim.lua(
+        "vim.t.eitri_plugin_diff = 'demo'; vim.t.eitri_plugin_diff_from = ...; return vim.api.nvim_get_current_tabpage()",
+        vec![origin.clone()],
+    );
+    let before = current_cwds(&mut c);
+    let old = s(&c.dir);
+    assert_eq!(field(&before, "uv"), &old);
+    let root = c.root.clone();
+    let reply = cwd_call(&mut c, "cd", Some(&root));
+    assert_eq!(field(&reply, "tab"), &origin);
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]),
+        origin,
+        "the change is made in the origin tab, which is left selected"
+    );
+    let now = current_cwds(&mut c);
+    for key in ["uv", "plain", "tab"] {
+        assert_eq!(field(&now, key), &s(&root), "{key} in the origin tab");
+    }
+    assert_eq!(
+        c.nvim.lua(
+            "return vim.fn.getcwd(-1, vim.api.nvim_tabpage_get_number(...))",
+            vec![diff.clone()]
+        ),
+        old,
+        "the diff tab keeps the old directory"
+    );
+    c.nvim.lua("vim.api.nvim_set_current_tabpage(...)", vec![diff]);
+    assert_eq!(
+        current_cwds(&mut c),
+        before,
+        "the diff tab, entered again, is untouched"
+    );
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn a_dir_with_a_newline_or_backslash_is_passed_as_an_argument() {
+    let mut c = case("cwd-argument");
+    for name in ["line\nbreak", r"back\slash | let g:injected = 1"] {
+        let dir = c.root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        cwd_call(&mut c, "cd", Some(&dir));
+        assert_eq!(field(&tab_cwd(&mut c), "dir"), &s(&dir));
+        assert_eq!(c.nvim.lua("return vim.g.injected == nil", vec![]), Value::from(true));
+    }
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_visits_every_owned_tab_and_leaves_the_current_tab_selected() {
+    let mut c = case("cwd-tabs");
+    let baseline = c.dir.clone();
+    let root = c.root.clone();
+    cwd_call(&mut c, "cd", Some(&root));
+    c.nvim.command("tabnew");
+    cwd_call(&mut c, "cd", Some(&root));
+    tcd(&mut c, &baseline);
+    let selected = c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]);
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(1));
+    assert_eq!(field(&reply, "moved").as_u64(), Some(1));
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]),
+        selected
+    );
+    assert_eq!(c.nvim.lua("for _, t in ipairs(vim.api.nvim_list_tabpages()) do if pcall(vim.api.nvim_tabpage_get_var, t, 'eitri_plugin_cwd_demo') then return false end end return true", vec![]), Value::from(true));
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn editor_cd_overtaken_by_its_clear_cannot_change_the_directory() {
+    let mut c = case("cwd-order");
+    let root = c.root.clone();
+    let before = tab_cwd(&mut c);
+    let opts = opts_map(&[("owner", "demo".into()), ("maker", "test".into()), ("order", 2.into())]);
+    c.nvim.lua(PLUGIN_CWD_LUA, vec!["clear".into(), opts]);
+    let opts = opts_map(&[
+        ("owner", "demo".into()),
+        ("maker", "test".into()),
+        ("order", 1.into()),
+        ("dir", s(&root)),
+    ]);
+    c.nvim.lua(PLUGIN_CWD_LUA, vec!["cd".into(), opts]);
+    assert_eq!(tab_cwd(&mut c), before);
+    assert!(c.nvim.lua("return vim.t.eitri_plugin_cwd_demo", vec![]).is_nil());
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn editor_cd_refuses_a_retargeted_directory_before_recording_a_baseline() {
+    let mut c = case("cwd-retargeted");
+    let dir = c.root.join("replaced");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&c.root, &dir).unwrap();
+    let before = tab_cwd(&mut c);
+    let result = c.nvim.lua(
+        "local src, dir = ... local ok, err = pcall(assert(loadstring(src)), 'cd', {owner = 'demo', dir = dir}) return {ok = ok, err = tostring(err)}",
+        vec![PLUGIN_CWD_LUA.into(), s(&dir)],
+    );
+    assert_eq!(field(&result, "ok"), &Value::from(false));
+    assert!(field(&result, "err")
+        .as_str()
+        .unwrap()
+        .contains("no longer resolves to itself"));
+    assert_eq!(tab_cwd(&mut c), before);
+    assert!(c.nvim.lua("return vim.t.eitri_plugin_cwd_demo", vec![]).is_nil());
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn editor_cd_from_a_diff_whose_origin_is_gone_acts_in_that_tab() {
+    let mut c = case("cwd-gone-origin");
+    let root = c.root.clone();
+    let tab = c.nvim.lua(
+        "vim.t.eitri_plugin_diff = 'demo'; vim.t.eitri_plugin_diff_from = 999999; return vim.api.nvim_get_current_tabpage()",
+        vec![],
+    );
+    let reply = cwd_call(&mut c, "cd", Some(&root));
+    assert_eq!(field(&reply, "tab"), &tab);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]), tab);
+    let cwd = tab_cwd(&mut c);
+    assert_eq!(field(&cwd, "dir"), &s(&root));
+    assert_eq!(field(&cwd, "localdir").as_u64(), Some(1));
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_goes_on_past_a_baseline_that_no_longer_resolves() {
+    let mut c = case("cwd-baseline-gone");
+    let root = c.root.clone();
+    let gone = c.dir.join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    tcd(&mut c, &gone);
+    cwd_call(&mut c, "cd", Some(&root));
+    // A new tab inherits the tab-local directory; this one starts from its own.
+    c.nvim.command("tabnew");
+    let kept = c.dir.clone();
+    tcd(&mut c, &kept);
+    cwd_call(&mut c, "cd", Some(&root));
+    std::fs::remove_dir(&gone).unwrap();
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(1), "{reply:?}");
+    assert_eq!(field(&reply, "moved").as_u64(), Some(1), "{reply:?}");
+    assert_eq!(
+        field(&tab_cwd(&mut c), "dir"),
+        &s(&c.dir),
+        "the later tab is still restored"
+    );
+    assert_eq!(c.nvim.lua("for _, t in ipairs(vim.api.nvim_list_tabpages()) do if pcall(vim.api.nvim_tabpage_get_var, t, 'eitri_plugin_cwd_demo') then return false end end return true", vec![]), Value::from(true));
+    c.nvim.command("tabprevious");
+    assert_eq!(
+        field(&tab_cwd(&mut c), "dir"),
+        &s(&root),
+        "the unrestorable tab stays where it is"
+    );
+}
+
+#[test]
+#[ignore = "runs a real headless nvim"]
+fn clear_leaves_a_tab_the_user_moved_with_a_global_cd() {
+    let mut c = case("cwd-global-cd");
+    let root = c.root.clone();
+    cwd_call(&mut c, "cd", Some(&root));
+    // A global :cd in the tab drops its tab-local directory, even to the same place.
+    c.nvim.lua(
+        "vim.api.nvim_cmd({cmd = 'cd', args = {...}, magic = {file = false}}, {})",
+        vec![s(&root)],
+    );
+    c.nvim.command("tabnew");
+    let reply = cwd_call(&mut c, "clear", None);
+    assert_eq!(field(&reply, "restored").as_u64(), Some(0));
+    assert_eq!(field(&reply, "moved").as_u64(), Some(1));
+    assert_eq!(field(&current_cwds(&mut c), "uv"), &s(&root));
+    c.nvim.command("tabprevious");
+    let cwd = tab_cwd(&mut c);
+    assert_eq!(field(&cwd, "dir"), &s(&root));
+    assert_eq!(
+        field(&cwd, "localdir").as_u64(),
+        Some(0),
+        "no tab-local directory is put back"
+    );
+}
+
+fn buffers(c: &mut Case, op: &str, pairs: &[(&str, Value)]) -> Value {
+    let mut args = vec![("owner", Value::from("demo"))];
+    args.extend_from_slice(pairs);
+    c.nvim.lua(
+        eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA,
+        vec![op.into(), opts_map(&args)],
+    )
+}
+
+fn preload(c: &mut Case, path: &Path, diagnostics: bool, hints: bool) -> Value {
+    buffers(
+        c,
+        "preload",
+        &[
+            ("path", s(path)),
+            ("diagnostics", diagnostics.into()),
+            ("inlay_hints", hints.into()),
+        ],
+    )
+}
+
+fn wipe(c: &mut Case) -> Value {
+    buffers(c, "wipe_preload", &[])
+}
+
+fn preload_server(c: &mut Case) {
+    c.nvim.lua(
+        "vim.api.nvim_create_autocmd('FileType', { pattern = 'rust', callback = function(ev) \
+         local seq = 0 local closing = false \
+         vim.lsp.start({ name = 'fake-preload', root_dir = vim.fs.dirname(vim.api.nvim_buf_get_name(ev.buf)), \
+           cmd = function(dispatchers) return { \
+           request = function(method, _, cb) seq = seq + 1 \
+             if method == 'initialize' then vim.schedule(function() cb(nil, { capabilities = { inlayHintProvider = true } }) end) \
+             elseif method == 'shutdown' then vim.schedule(function() cb(nil, nil) end) end \
+             return true, seq end, \
+           notify = function(method) if method == 'exit' then closing = true vim.schedule(function() dispatchers.on_exit(0, 0) end) end return true end, \
+           is_closing = function() return closing end, terminate = function() closing = true dispatchers.on_exit(0, 0) end } end \
+           }, { bufnr = ev.buf, reuse_client = function() return false end }) end })",
+        vec![],
+    );
+}
+
+fn wait_preload_server(c: &mut Case, buf: &Value) -> Value {
+    c.nvim.lua(
+        "local b = ... assert(vim.wait(2000, function() return #vim.lsp.get_clients({bufnr=b}) > 0 end)) \
+         vim.wait(600, function() return false end) return vim.lsp.get_clients({bufnr=b})[1].id",
+        vec![buf.clone()],
+    )
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn preload_loads_a_hidden_buffer_and_marks_it() {
+    let mut c = case("preload-hidden");
+    let path = c.a.clone();
+    let result = preload(&mut c, &path, false, false);
+    let buf = field(&result, "buf").clone();
+    let got = c.nvim.lua(
+        "local b = ... return {vim.api.nvim_buf_is_loaded(b), #vim.fn.win_findbuf(b), vim.b[b].eitri_plugin_preload}",
+        vec![buf],
+    );
+    assert_eq!(got, Value::Array(vec![true.into(), 0.into(), "demo".into()]));
+    assert_eq!(field(&result, "replaced"), &false.into());
+    assert_eq!(state(&mut c, &path), (false, false));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn preload_attaches_the_fake_language_server() {
+    let mut c = case("preload-attach");
+    preload_server(&mut c);
+    let path = c.a.clone();
+    let result = preload(&mut c, &path, false, false);
+    let buf = field(&result, "buf");
+    let id = wait_preload_server(&mut c, buf);
+    let got = c.nvim.lua(
+        "local b = ... return {vim.bo[b].filetype, vim.b[b].eitri_plugin_preload_clients}",
+        vec![buf.clone()],
+    );
+    assert_eq!(got, Value::Array(vec!["rust".into(), Value::Array(vec![id])]));
+    assert_eq!(state(&mut c, &path), (false, false));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_second_preload_wipes_the_first_if_still_hidden_unmodified_and_marked() {
+    let mut c = case("preload-replace");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let first = preload(&mut c, &a, true, false);
+    let next = preload(&mut c, &b, true, false);
+    assert_eq!(field(&next, "replaced"), &true.into());
+    assert_eq!(
+        c.nvim.lua(
+            "return vim.api.nvim_buf_is_valid(...)",
+            vec![field(&first, "buf").clone()]
+        ),
+        false.into()
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn an_opened_preload_keeps_its_buffer_and_is_never_wiped() {
+    let mut c = case("preload-open");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let first = preload(&mut c, &a, true, false);
+    c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&a))])]);
+    // Even after the user hides it again, opening surrendered the preload's right to wipe it.
+    c.nvim.command("enew");
+    let next = preload(&mut c, &b, true, false);
+    assert_eq!(field(&next, "replaced"), &false.into());
+    assert_eq!(
+        c.nvim.lua(
+            "local b = ... return {vim.api.nvim_buf_is_valid(b), vim.b[b].eitri_plugin_preload == nil}",
+            vec![field(&first, "buf").clone()]
+        ),
+        Value::Array(vec![true.into(), true.into()])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_modified_preload_is_not_wiped() {
+    let mut c = case("preload-modified");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let first = preload(&mut c, &a, true, false);
+    c.nvim.lua(
+        "vim.api.nvim_buf_set_lines(..., 0, -1, false, {'unsaved'})",
+        vec![field(&first, "buf").clone()],
+    );
+    let next = preload(&mut c, &b, true, false);
+    assert_eq!(field(&next, "replaced"), &false.into());
+    assert_eq!(
+        c.nvim.lua(
+            "return vim.api.nvim_buf_get_lines(..., 0, -1, false)",
+            vec![field(&first, "buf").clone()]
+        ),
+        Value::Array(vec!["unsaved".into()])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn assist_on_copy_a_then_preload_of_b_leaves_a_and_the_assist_record_unchanged() {
+    let mut c = case("preload-assist-independent");
+    let a = c.a.clone();
+    let other = c.dir.join("copy-b");
+    std::fs::create_dir(&other).unwrap();
+    let b = other.join("lib.rs");
+    std::fs::write(&b, "fn main() {}\n").unwrap();
+    edit(&mut c, &a);
+    attach(&mut c, &a);
+    apply(&mut c, "demo", false, false);
+    let before = c.nvim.lua("return vim.inspect(_G.__eitri_plugin_assist)", vec![]);
+    // A server for B, as a preload exists to start one: hints are held only once one is attached.
+    preload_server(&mut c);
+    let result = preload(&mut c, &b, true, true);
+    wait_preload_server(&mut c, field(&result, "buf"));
+    assert_eq!(
+        c.nvim.lua("return vim.inspect(_G.__eitri_plugin_assist)", vec![]),
+        before
+    );
+    assert_eq!(state(&mut c, &a), (false, false));
+    assert_eq!(state(&mut c, &b), (true, true));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn assist_on_a_preloaded_buffer_takes_its_own_values_from_the_preload_record() {
+    let mut c = case("preload-baseline");
+    preload_server(&mut c);
+    let a = c.a.clone();
+    c.nvim.lua("local b = vim.fn.bufadd(...) vim.diagnostic.enable(true, {bufnr=b}) vim.lsp.inlay_hint.enable(true, {bufnr=b})", vec![s(&a)]);
+    let result = preload(&mut c, &a, false, false);
+    wait_preload_server(&mut c, field(&result, "buf"));
+    apply(&mut c, "demo", false, false);
+    clear(&mut c, "demo");
+    c.nvim.lua("vim.wait(1100, function() return false end)", vec![]);
+    assert_eq!(state(&mut c, &a), (true, true));
+    let got = c.nvim.lua("local b = ... return {vim.b[b].eitri_plugin_preload_own == nil, not pcall(vim.api.nvim_get_autocmds, {group='eitri_plugin_preload_demo'})}", vec![field(&result, "buf").clone()]);
+    assert_eq!(got, Value::Array(vec![true.into(), true.into()]));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_preload_takes_the_hint_value_its_configuration_sets_when_a_server_attaches() {
+    let mut c = case("preload-config-hints");
+    // A configuration that turns hints on for every buffer a server attaches to.
+    c.nvim.lua(
+        "vim.api.nvim_create_autocmd('LspAttach', { callback = function(ev) \
+           vim.lsp.inlay_hint.enable(true, { bufnr = ev.buf }) end })",
+        vec![],
+    );
+    preload_server(&mut c);
+    let a = c.a.clone();
+    let result = preload(&mut c, &a, false, false);
+    wait_preload_server(&mut c, field(&result, "buf"));
+    assert_eq!(
+        state(&mut c, &a),
+        (false, false),
+        "the preload's policy holds after the attach"
+    );
+    apply(&mut c, "demo", false, false);
+    clear(&mut c, "demo");
+    c.nvim.lua("vim.wait(1100, function() return false end)", vec![]);
+    assert_eq!(
+        state(&mut c, &a),
+        (true, true),
+        "clear restores what the configuration wanted after the attach, not the unattached read"
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_wipe_stops_the_clients_only_its_preload_started() {
+    let mut c = case("preload-client-stop");
+    let outside = c.outside.clone();
+    edit(&mut c, &outside);
+    attach(&mut c, &outside);
+    preload_server(&mut c);
+    let a = c.a.clone();
+    let result = preload(&mut c, &a, true, false);
+    let id = wait_preload_server(&mut c, field(&result, "buf"));
+    assert_eq!(field(&wipe(&mut c), "stopped_clients"), &1.into());
+    let gone = c.nvim.lua(
+        "local id = ... return vim.wait(2000, function() return vim.lsp.get_client_by_id(id) == nil end)",
+        vec![id],
+    );
+    assert_eq!(gone, true.into());
+    assert_eq!(
+        c.nvim.lua(
+            "return #vim.lsp.get_clients({bufnr=vim.fn.bufnr(...)})",
+            vec![s(&outside)]
+        ),
+        1.into()
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_wipe_keeps_a_client_another_buffer_holds() {
+    let mut c = case("preload-client-shared");
+    preload_server(&mut c);
+    let (a, b) = (c.a.clone(), c.outside.clone());
+    let result = preload(&mut c, &a, true, false);
+    let id = wait_preload_server(&mut c, field(&result, "buf"));
+    c.nvim.lua(
+        "local p, id = ... local b = vim.fn.bufadd(p) vim.fn.bufload(b) assert(vim.lsp.buf_attach_client(b, id))",
+        vec![s(&b), id.clone()],
+    );
+    assert_eq!(field(&wipe(&mut c), "stopped_clients"), &0.into());
+    assert_eq!(
+        c.nvim.lua("return vim.lsp.get_client_by_id(...) ~= nil", vec![id]),
+        true.into()
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn stop_wipes_an_only_preloaded_buffer_and_stops_its_clients() {
+    let mut c = case("preload-stop");
+    preload_server(&mut c);
+    let a = c.a.clone();
+    let result = preload(&mut c, &a, true, false);
+    let id = wait_preload_server(&mut c, field(&result, "buf"));
+    let got = wipe(&mut c);
+    assert_eq!(field(&got, "replaced"), &true.into());
+    assert_eq!(field(&got, "stopped_clients"), &1.into());
+    assert_eq!(
+        c.nvim.lua(
+            "return vim.api.nvim_buf_is_valid(...)",
+            vec![field(&result, "buf").clone()]
+        ),
+        false.into()
+    );
+    assert_eq!(
+        c.nvim.lua(
+            "local id = ... return vim.wait(2000, function() return vim.lsp.get_client_by_id(id) == nil end)",
+            vec![id]
+        ),
+        true.into()
+    );
+    assert_eq!(field(&wipe(&mut c), "replaced"), &false.into());
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn modified_lists_unsaved_buffers_under_root_only() {
+    let mut c = case("buffers-modified");
+    let (a, outside, root) = (c.a.clone(), c.outside.clone(), c.root.clone());
+    for path in [&a, &outside] {
+        c.nvim.lua(
+            "local b = vim.fn.bufadd(...) vim.fn.bufload(b) vim.api.nvim_buf_set_lines(b, 0, -1, false, {'unsaved'})",
+            vec![s(path)],
+        );
+    }
+    assert_eq!(
+        field(&buffers(&mut c, "modified", &[("root", s(&root))]), "paths"),
+        &Value::Array(vec![s(&a)])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn reload_reloads_unmodified_changed_buffers_and_counts_kept_modified() {
+    let mut c = case("buffers-reload");
+    let (a, b, outside, root) = (c.a.clone(), c.b.clone(), c.outside.clone(), c.root.clone());
+    let unchanged = root.join("unchanged.rs");
+    std::fs::write(&unchanged, "unchanged\n").unwrap();
+    c.nvim.lua("vim.fn.bufload(vim.fn.bufadd(...))", vec![s(&unchanged)]);
+    for path in [&a, &b, &outside] {
+        c.nvim.lua("vim.fn.bufload(vim.fn.bufadd(...))", vec![s(path)]);
+        std::fs::write(path, "disk changed\n").unwrap();
+    }
+    c.nvim.lua(
+        "vim.api.nvim_buf_set_lines(vim.fn.bufnr(...), 0, -1, false, {'unsaved'})",
+        vec![s(&b)],
+    );
+    c.nvim.lua("vim.bo[vim.fn.bufnr(...)].autoread = false", vec![s(&a)]);
+    let got = buffers(&mut c, "reload", &[("root", s(&root))]);
+    assert_eq!(field(&got, "reloaded"), &1.into());
+    assert_eq!(field(&got, "kept_modified"), &1.into());
+    assert_eq!(
+        c.nvim.lua("return vim.bo[vim.fn.bufnr(...)].autoread", vec![s(&a)]),
+        false.into()
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "disk changed\n");
+    for (path, want) in [(&a, "disk changed"), (&b, "unsaved"), (&outside, "out")] {
+        assert_eq!(
+            c.nvim.lua(
+                "return vim.api.nvim_buf_get_lines(vim.fn.bufnr(...), 0, 1, false)[1]",
+                vec![s(path)]
+            ),
+            want.into()
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn reload_reloads_a_buffer_opened_through_a_symlink_to_a_file_under_the_root() {
+    let mut c = case("buffers-reload-symlink");
+    let root = c.root.clone();
+    let file = root.join("linked.rs");
+    std::fs::write(&file, "before\n").unwrap();
+    // nvim names a buffer opened through a symlinked file by the link, not by the file it points to.
+    let through = c.dir.join("linked.rs");
+    std::os::unix::fs::symlink(&file, &through).unwrap();
+    c.nvim.lua("vim.fn.bufload(vim.fn.bufadd(...))", vec![s(&through)]);
+    std::fs::write(&file, "disk changed\n").unwrap();
+    let got = buffers(&mut c, "reload", &[("root", s(&root))]);
+    assert_eq!(
+        field(&got, "reloaded"),
+        &1.into(),
+        "the file under the root is the same file: {got:?}"
+    );
+    assert_eq!(
+        c.nvim.lua(
+            "return vim.api.nvim_buf_get_lines(vim.fn.bufnr(...), 0, 1, false)[1]",
+            vec![s(&through)]
+        ),
+        "disk changed".into()
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_wipe_leaves_a_preexisting_client_running_even_without_another_buffer() {
+    let mut c = case("preload-client-preexisting");
+    let (a, outside) = (c.a.clone(), c.outside.clone());
+    edit(&mut c, &outside);
+    attach(&mut c, &outside);
+    c.nvim.lua(
+        "local p = ... local id = vim.lsp.get_clients({bufnr=vim.fn.bufnr(p)})[1].id \
+         _G.__preexisting = id \
+         vim.api.nvim_create_autocmd('FileType', {pattern='rust', callback=function(ev) \
+           assert(vim.lsp.buf_attach_client(ev.buf, id)) end})",
+        vec![s(&outside)],
+    );
+    preload(&mut c, &a, true, false);
+    c.nvim.lua(
+        "local p = ... vim.lsp.buf_detach_client(vim.fn.bufnr(p), _G.__preexisting)",
+        vec![s(&outside)],
+    );
+    assert_eq!(field(&wipe(&mut c), "stopped_clients"), &0.into());
+    assert_eq!(
+        c.nvim
+            .lua("return vim.lsp.get_client_by_id(_G.__preexisting) ~= nil", vec![]),
+        true.into()
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_preload_overtaken_by_its_wipe_never_loads_a_buffer() {
+    let mut c = case("preload-order");
+    buffers(&mut c, "wipe_preload", &[("maker", "m".into()), ("order", 2.into())]);
+    let a = c.a.clone();
+    buffers(
+        &mut c,
+        "preload",
+        &[
+            ("path", s(&a)),
+            ("diagnostics", true.into()),
+            ("inlay_hints", false.into()),
+            ("maker", "m".into()),
+            ("order", 1.into()),
+        ],
+    );
+    assert_eq!(c.nvim.lua("return vim.fn.bufnr(...)", vec![s(&a)]), (-1).into());
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn modified_includes_unsaved_buffers_whose_parent_directory_was_removed() {
+    let mut c = case("buffers-modified-removed");
+    let parent = c.root.join("src/nested");
+    std::fs::create_dir_all(&parent).unwrap();
+    let file = parent.join("lib.rs");
+    std::fs::write(&file, "original\n").unwrap();
+    c.nvim.lua(
+        "local b = vim.fn.bufadd(...) vim.fn.bufload(b) vim.api.nvim_buf_set_lines(b, 0, -1, false, {'unsaved'})",
+        vec![s(&file)],
+    );
+    std::fs::remove_dir_all(c.root.join("src")).unwrap();
+    let root = c.root.clone();
+    assert_eq!(
+        field(&buffers(&mut c, "modified", &[("root", s(&root))]), "paths"),
+        &Value::Array(vec![s(&file)])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn preload_rejects_a_retargeted_path_before_loading() {
+    let mut c = case("preload-retargeted");
+    let (a, outside) = (c.a.clone(), c.outside.clone());
+    std::fs::remove_file(&a).unwrap();
+    std::os::unix::fs::symlink(&outside, &a).unwrap();
+    let result = c.nvim.lua(
+        "local source, path = ... return pcall(assert(loadstring(source)), 'preload', \
+         {owner='demo', path=path, diagnostics=true, inlay_hints=false})",
+        vec![eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA.into(), s(&a)],
+    );
+    assert_eq!(result, false.into());
+    assert_eq!(c.nvim.lua("return vim.fn.bufnr(...)", vec![s(&outside)]), (-1).into());
+}
+
+fn diff_sides(c: &mut Case, left: Value, right: Value) -> Value {
+    buffers(c, "diff", &[("left", left), ("right", right)])
+}
+
+fn text_side() -> Value {
+    opts_map(&[
+        ("title", "Attempt".into()),
+        ("text", "fn main() { }\n".into()),
+        ("filetype", "rust".into()),
+    ])
+}
+
+fn file_side(path: &Path) -> Value {
+    opts_map(&[("path", s(path))])
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_of_a_file_opened_through_a_symlink_shows_that_buffer_with_its_unsaved_edits() {
+    let mut c = case("diff-symlink-unsaved");
+    let link = c.root.join("link.rs");
+    std::os::unix::fs::symlink(&c.a, &link).unwrap();
+    edit(&mut c, &link);
+    let buf = c.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, -1, false, {'unsaved edits'}) return vim.api.nvim_get_current_buf()",
+        vec![],
+    );
+    let a = c.a.clone();
+    let result = diff_sides(&mut c, text_side(), file_side(&a));
+    let got = c.nvim.lua(
+        "local buf, tab = ... assert(vim.api.nvim_buf_is_valid(buf)) \
+         local wins = vim.api.nvim_tabpage_list_wins(tab) \
+         return {vim.api.nvim_buf_get_name(buf), vim.bo[buf].modified, \
+         vim.api.nvim_buf_get_lines(buf, 0, -1, false), vim.api.nvim_win_get_buf(wins[2]) == buf}",
+        vec![buf, field(&result, "tab").clone()],
+    );
+    assert_eq!(
+        got,
+        Value::Array(vec![
+            s(&link),
+            true.into(),
+            Value::Array(vec!["unsaved edits".into()]),
+            true.into(),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_builds_a_new_tab_with_two_windows_in_diff_mode_the_right_one_vertical() {
+    let mut c = case("diff-layout");
+    let a = c.a.clone();
+    let result = diff_sides(&mut c, text_side(), file_side(&a));
+    let got = c.nvim.lua(
+        "local tab = ... assert(vim.api.nvim_get_current_tabpage() == tab) \
+         local w = vim.api.nvim_tabpage_list_wins(tab) local p = vim.api.nvim_win_get_position(w[1]) \
+         local q = vim.api.nvim_win_get_position(w[2]) return {#vim.api.nvim_list_tabpages(), #w, \
+         vim.wo[w[1]].diff, vim.wo[w[2]].diff, p[1] == q[1], p[2] < q[2], vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w[2]))}",
+        vec![field(&result, "tab").clone()],
+    );
+    assert_eq!(
+        got,
+        Value::Array(vec![
+            2.into(),
+            2.into(),
+            true.into(),
+            true.into(),
+            true.into(),
+            true.into(),
+            s(&a)
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn the_text_side_is_nofile_unmodifiable_and_named_plugin_id_title() {
+    let mut c = case("diff-text");
+    let a = c.a.clone();
+    diff_sides(&mut c, text_side(), file_side(&a));
+    let got = c.nvim.lua(
+        "local w = vim.api.nvim_tabpage_list_wins(0)[1] local b = vim.api.nvim_win_get_buf(w) \
+         return {vim.fn.bufname(b), vim.bo[b].buftype, vim.bo[b].bufhidden, vim.bo[b].swapfile, \
+         vim.bo[b].modifiable, vim.bo[b].filetype, vim.api.nvim_buf_get_lines(b, 0, -1, false)}",
+        vec![],
+    );
+    assert_eq!(
+        got,
+        Value::Array(vec![
+            "plugin:demo: Attempt".into(),
+            "nofile".into(),
+            "wipe".into(),
+            false.into(),
+            false.into(),
+            "rust".into(),
+            Value::Array(vec!["fn main() { }".into()])
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_text_side_without_a_filetype_gets_no_filetype_and_no_syntax() {
+    let mut c = case("diff-no-filetype");
+    let a = c.a.clone();
+    let side = opts_map(&[("title", "notes.md".into()), ("text", "# a\n".into())]);
+    diff_sides(&mut c, side, file_side(&a));
+    let got = c.nvim.lua(
+        "local b = vim.api.nvim_win_get_buf(vim.api.nvim_tabpage_list_wins(0)[1]) \
+         return {vim.fn.bufname(b), vim.bo[b].filetype, vim.bo[b].syntax, vim.api.nvim_buf_get_lines(b, 0, -1, false)}",
+        vec![],
+    );
+    assert_eq!(
+        got,
+        Value::Array(vec![
+            "plugin:demo: notes.md".into(),
+            "".into(),
+            "".into(),
+            Value::Array(vec!["# a".into()])
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diffs_leave_no_empty_listed_buffers_and_list_the_file_they_show() {
+    let mut c = case("diff-listed");
+    let a = c.a.clone();
+    let listed = "local l = {} for _, i in ipairs(vim.fn.getbufinfo({buflisted = 1})) do l[#l + 1] = i.name end \
+                  table.sort(l) return l";
+    let before = c.nvim.lua(listed, vec![]);
+    for _ in 0..2 {
+        diff_sides(&mut c, text_side(), file_side(&a));
+    }
+    let after = c.nvim.lua(listed, vec![]);
+    c.nvim.command("tabclose");
+    let closed = c.nvim.lua(listed, vec![]);
+    let mut want = before.as_array().unwrap().clone();
+    want.push(s(&a));
+    want.sort_by(|x, y| x.as_str().cmp(&y.as_str()));
+    assert_eq!(
+        after,
+        Value::Array(want.clone()),
+        "each diff must leave only the shown file listed"
+    );
+    assert_eq!(
+        closed,
+        Value::Array(want),
+        "closing a diff tab must not leave empty buffers listed"
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn a_file_side_failing_its_recheck_is_removed_though_a_longer_name_is_open() {
+    let mut c = case("diff-exact-name");
+    let a = c.a.clone();
+    let renamed = c.root.join("renamed.rs");
+    c.nvim.lua(
+        "local a, renamed = ... vim.fn.bufadd(a .. '.orig') \
+         vim.api.nvim_create_autocmd('BufReadPost', {pattern = a, once = true, \
+           callback = function(ev) vim.api.nvim_buf_set_name(ev.buf, renamed) end})",
+        vec![s(&a), s(&renamed)],
+    );
+    let got = c.nvim.lua(
+        "local source, left, right, renamed = ... \
+         local ok = pcall(assert(loadstring(source)), 'diff', {owner='demo', left=left, right=right}) \
+         local left_behind = false \
+         for _, b in ipairs(vim.api.nvim_list_bufs()) do \
+           if vim.api.nvim_buf_get_name(b) == renamed then left_behind = true end \
+         end \
+         return {ok, left_behind, #vim.api.nvim_list_tabpages()}",
+        vec![
+            eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA.into(),
+            text_side(),
+            file_side(&a),
+            s(&renamed),
+        ],
+    );
+    assert_eq!(
+        got,
+        Value::Array(vec![false.into(), false.into(), 1.into()]),
+        "a buffer the diff created must go, whatever other buffer a name pattern would match"
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn the_fake_server_does_not_attach_to_the_text_side() {
+    let mut c = case("diff-lsp");
+    preload_server(&mut c);
+    let a = c.a.clone();
+    diff_sides(&mut c, text_side(), file_side(&a));
+    let got = c.nvim.lua(
+        "local w = vim.api.nvim_tabpage_list_wins(0) local l, r = vim.api.nvim_win_get_buf(w[1]), vim.api.nvim_win_get_buf(w[2]) \
+         assert(vim.wait(2000, function() return #vim.lsp.get_clients({bufnr=r}) > 0 end)) \
+         return {#vim.lsp.get_clients({bufnr=l}), #vim.lsp.get_clients({bufnr=r})}", vec![]);
+    assert_eq!(got, Value::Array(vec![0.into(), 1.into()]));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn text_with_control_characters_and_a_path_with_a_newline_are_refused() {
+    let mut c = case("diff-controls");
+    let bad_path = c.root.join("a\nb.rs");
+    std::fs::write(&bad_path, "a").unwrap();
+    let bad_text = opts_map(&[
+        ("title", "Attempt".into()),
+        ("text", "a\u{7}b".into()),
+        ("filetype", "rust".into()),
+    ]);
+    for side in [bad_text, file_side(&bad_path)] {
+        let got = c.nvim.lua(
+            "local source, left, right = ... local ok = pcall(assert(loadstring(source)), 'diff', \
+             {owner='demo', left=left, right=right}) return {ok, #vim.api.nvim_list_tabpages()}",
+            vec![
+                eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA.into(),
+                side,
+                file_side(&c.a),
+            ],
+        );
+        assert_eq!(got, Value::Array(vec![false.into(), 1.into()]));
+    }
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn editor_open_from_an_owners_diff_tab_opens_in_its_origin_tab() {
+    let mut c = case("diff-open-origin");
+    let origin = c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]);
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let tab = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    c.nvim.lua(
+        PLUGIN_OPEN_LUA,
+        vec![opts_map(&[("owner", "demo".into()), ("path", s(&b))])],
+    );
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]), origin);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_buf_get_name(0)", vec![]), s(&b));
+    assert_eq!(
+        c.nvim
+            .lua("local t = ... return #vim.api.nvim_tabpage_list_wins(t)", vec![tab]),
+        Value::from(2)
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn stop_closes_the_owners_diff_tabs_except_the_current_one() {
+    let mut c = case("diff-close");
+    let a = c.a.clone();
+    let first = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    let current = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    let other = c.nvim.lua(
+        eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA,
+        vec![
+            "diff".into(),
+            opts_map(&[
+                ("owner", "other".into()),
+                ("left", text_side()),
+                ("right", file_side(&a)),
+            ]),
+        ],
+    );
+    c.nvim
+        .lua("vim.api.nvim_set_current_tabpage(...)", vec![current.clone()]);
+    assert_eq!(field(&buffers(&mut c, "close_diffs", &[]), "closed"), &Value::from(1));
+    let got = c.nvim.lua("local a,b,c = ... return {vim.api.nvim_tabpage_is_valid(a), vim.api.nvim_tabpage_is_valid(b), vim.api.nvim_tabpage_is_valid(c), vim.api.nvim_get_current_tabpage()}", vec![first, current.clone(), field(&other, "tab").clone()]);
+    assert_eq!(got, Value::Array(vec![false.into(), true.into(), true.into(), current]));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_cleanup_keeps_modified_file_buffers_and_closes_their_tabs() {
+    let mut c = case("diff-modified-close");
+    let origin = c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]);
+    let a = c.a.clone();
+    let tab = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    let buf = c.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, -1, false, {'unsaved'}) return vim.api.nvim_get_current_buf()",
+        vec![],
+    );
+    c.nvim.lua("vim.api.nvim_set_current_tabpage(...)", vec![origin]);
+    let result = buffers(&mut c, "close_diffs", &[]);
+    assert_eq!(field(&result, "closed"), &Value::from(1));
+    let got = c.nvim.lua("local t,b = ... return {vim.api.nvim_tabpage_is_valid(t), vim.api.nvim_buf_is_loaded(b), vim.bo[b].modified, vim.api.nvim_buf_get_lines(b, 0, -1, false)}", vec![tab, buf]);
+    assert_eq!(
+        got,
+        Value::Array(vec![
+            false.into(),
+            true.into(),
+            true.into(),
+            Value::Array(vec!["unsaved".into()])
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_overtaken_by_its_cleanup_never_creates_a_tab() {
+    let mut c = case("diff-order");
+    buffers(&mut c, "close_diffs", &[("maker", "m".into()), ("order", 2.into())]);
+    let a = c.a.clone();
+    buffers(
+        &mut c,
+        "diff",
+        &[
+            ("maker", "m".into()),
+            ("order", 1.into()),
+            ("left", text_side()),
+            ("right", file_side(&a)),
+        ],
+    );
+    assert_eq!(
+        c.nvim.lua("return #vim.api.nvim_list_tabpages()", vec![]),
+        Value::from(1)
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn editor_open_from_a_diff_whose_origin_is_gone_acts_in_that_tab() {
+    let mut c = case("diff-open-no-origin");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let tab = field(&diff_sides(&mut c, text_side(), file_side(&a)), "tab").clone();
+    c.nvim.command("tabclose 1");
+    c.nvim.lua(
+        PLUGIN_OPEN_LUA,
+        vec![opts_map(&[("owner", "demo".into()), ("path", s(&b))])],
+    );
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_tabpage()", vec![]), tab);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_buf_get_name(0)", vec![]), s(&b));
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_requests_arriving_out_of_order_both_create_tabs() {
+    let mut c = case("diff-reordered");
+    let a = c.a.clone();
+    for order in [2, 1] {
+        buffers(
+            &mut c,
+            "diff",
+            &[
+                ("maker", "m".into()),
+                ("order", order.into()),
+                ("left", text_side()),
+                ("right", file_side(&a)),
+            ],
+        );
+    }
+    assert_eq!(
+        c.nvim.lua("return #vim.api.nvim_list_tabpages()", vec![]),
+        Value::from(3)
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_cleanup_arriving_after_newer_diffs_leaves_them_open() {
+    let mut c = case("diff-newer-than-cleanup");
+    let a = c.a.clone();
+    for order in [1, 3, 4] {
+        buffers(
+            &mut c,
+            "diff",
+            &[
+                ("maker", "m".into()),
+                ("order", order.into()),
+                ("left", text_side()),
+                ("right", file_side(&a)),
+            ],
+        );
+    }
+    let result = buffers(&mut c, "close_diffs", &[("maker", "m".into()), ("order", 2.into())]);
+    assert_eq!(field(&result, "closed"), &Value::from(1));
+    assert_eq!(
+        c.nvim.lua("return #vim.api.nvim_list_tabpages()", vec![]),
+        Value::from(3)
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim; no display or tokens"]
+fn diff_refuses_a_path_retargeted_by_a_read_autocommand_and_removes_its_buffer() {
+    let mut c = case("diff-retargeted-on-read");
+    c.nvim.lua(
+        "local path, target = ... vim.api.nvim_create_autocmd('BufReadPost', {pattern='*', once=true, \
+         callback=function() assert(vim.uv.fs_unlink(path)) assert(vim.uv.fs_symlink(target, path)) end})",
+        vec![s(&c.a), s(&c.outside)],
+    );
+    let got = c.nvim.lua(
+        "local source, left, right = ... local ok = pcall(assert(loadstring(source)), 'diff', \
+         {owner='demo', left=left, right=right}) return {ok, #vim.api.nvim_list_tabpages(), vim.fn.bufnr(right.path)}",
+        vec![
+            eitri_core::plugin::editor::PLUGIN_BUFFERS_LUA.into(),
+            text_side(),
+            file_side(&c.a),
+        ],
+    );
+    assert_eq!(got, Value::Array(vec![false.into(), 1.into(), (-1).into()]));
 }

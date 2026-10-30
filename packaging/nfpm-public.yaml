@@ -11,33 +11,21 @@ description: |
   ours to redistribute, so this package never contains it).
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-# SPDX: this package (the tarball's five binaries, statically linking nvim-rs
-# LGPL-3.0-only) plus the collector's own MIT/Apache-2.0/MPL-2.0 findings. No
-# LicenseRef-Anthropic-Claude-Agent-SDK here -- this profile never carries the sidecar.
+# The licence expression covers this package (the tarball's five binaries, statically linking
+# nvim-rs LGPL-3.0-only) plus the MIT/Apache-2.0/MPL-2.0 licences the collector finds. No
+# LicenseRef-Anthropic-Claude-Agent-SDK here: this profile never carries the sidecar.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
 
-# This is the PUBLIC profile: what `release.sh` packages from the public commit built in the
-# Ubuntu 24.04 container. No sidecar, no `agent-hook` (no
-# release ships the legacy backend), no maintainer scripts (a postinst would build the sidecar as
-# root: the public packages have no maintainer scripts). The private mirror's
-# profile is packaging/nfpm.yaml; packaging/test_nfpm_profiles.py holds the two to differing only
-# in the contents entries and top-level keys that its `PRIVATE_ONLY_DSTS`, `PUBLIC_ONLY_DSTS` and
-# `ALLOWED_DIFFERING_TOP_LEVEL_KEYS` name.
+# The public release is built in Ubuntu 24.04. It ships no sidecar or legacy agent-hook and has
+# no maintainer scripts: a postinst would build the sidecar as root.
+# packaging/test_nfpm_profiles.py checks the permitted differences from packaging/nfpm.yaml.
 #
-# neovim is deliberately NOT a dependency of either the deb or the rpm: Ubuntu 24.04 ships
-# neovim 0.9.5 (`apt-cache policy` measured in the release container's base image --
-# the Neovide fork's own NEOVIM_REQUIRED_VERSION is (0, 10, 0)), so a `depends`/`Requires` on the
-# distro package would resolve, install, and then fail at first launch with no useful error.
-# Fedora's neovim tracks current upstream, so the rpm gets a soft `recommends`; on Arch many users
-# run bob or a self-built nvim, so the AUR packages (packaging/aur/) use `optdepends` instead of
-# either.
+# Do not depend on neovim: Ubuntu 24.04's 0.9.5 satisfies the package name but cannot run the
+# editor, which requires at least 0.10. Fedora gets a soft recommendation; Arch's AUR packages
+# use optdepends so bob and self-built nvim installations remain usable.
 #
-# No top-level `depends:`/`recommends:` here, unlike the private profile: this profile only ever
-# produces `deb` and `rpm` (no apk/archlinux target through nfpm; Arch ships through the AUR
-# PKGBUILDs instead), and both are fully covered by `overrides` below. Verified against this host's
-# nfpm, 2026-09-27: a profile with no top-level `depends:`/`recommends:` at all, only
-# `overrides.<packager>`, produces exactly that packager's list for both `deb` and `rpm` -- so
-# nothing here depends on whether `overrides` replaces or extends a top-level default.
+# Only deb and rpm are produced here; Arch uses the AUR recipes. Keep all dependency lists in
+# overrides so neither packager's result depends on whether nfpm replaces or extends defaults.
 overrides:
   deb:
     depends:
@@ -51,9 +39,7 @@ overrides:
       - neovim
 
 contents:
-  # The five binaries every release ships. No agent-hook (legacy's PreToolUse relay): the
-  # legacy backend is never compiled into a release build in the first place, so there is nothing
-  # for that binary to relay for.
+  # No agent-hook: releases never compile the legacy backend it would relay for.
   - src: ./target/release/shell
     dst: /usr/lib/eitri/shell
   - src: ./target/release/eitri-supervisor
@@ -65,10 +51,8 @@ contents:
   - src: ./target/release/eitri-claude-handoff
     dst: /usr/lib/eitri/eitri-claude-handoff
 
-  # The installer itself, staged under the install directory as `eitri setup`:
-  # `packaging/install.sh` and this copy must be byte-identical (release.sh's content
-  # check), which is why this entry names the tracked file directly rather
-  # than a build output.
+  # Use the tracked installer directly: the setup copy must be byte-identical to install.sh,
+  # which release.sh checks before packaging.
   - src: ./packaging/install.sh
     dst: /usr/lib/eitri/eitri-setup
     file_info:
@@ -84,9 +68,8 @@ contents:
 
   - src: ./packaging/eitri.launcher.sh
     dst: /usr/bin/eitri
-  # The desktop entry is named by the application id (`cn.huntergrey.eitri`, shell/src/main.rs's
-  # APP_ID), the name the compositor matches a window to; it replaced `eitri.desktop`, which an
-  # upgrade drops by this package no longer listing it. `Icon=` names the theme icon below.
+  # Match the application id from shell/src/main.rs so the compositor associates the window
+  # with this entry. An upgrade drops the unlisted eitri.desktop; Icon= names the theme icon below.
   - src: ./packaging/cn.huntergrey.eitri.desktop
     dst: /usr/share/applications/cn.huntergrey.eitri.desktop
   # The panel's own entry: `eitri panel` is a second window class, so it gets its own (hidden) entry.

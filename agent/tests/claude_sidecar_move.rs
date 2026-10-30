@@ -604,3 +604,58 @@ fn a_moved_sidecar_survives_the_spawners_terminal_hangup_and_sigint() {
     assert!(!handoff.socket_path.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_idle_claude_chat_moves_and_commits_with_no_new_event() {
+    let source = stand_in();
+    let session = open_session(&source);
+    let mut seen = Vec::new();
+    pump_until(&source, &mut seen, "the session opening", opened);
+
+    // As two windows move it: through the face every provider moves by, its record as JSON and copies of its
+    // descriptors, taken up again by the kind the record names.
+    let mover = AgentProvider::mover(&source).expect("a Claude chat moves");
+    let frozen = mover.freeze_for_chat_move().expect("the sidecar is handed over");
+    let record: serde_json::Value = serde_json::from_str(&frozen.record.to_string()).unwrap();
+    let kind = agent::chat_mover::MovedKind::from_wire(frozen.kind.wire()).unwrap();
+    let adopted = agent::chat_mover::adopt(kind, &record, frozen.copies().unwrap()).expect("taken up");
+    let destination = adopted.agent;
+    assert!(adopted.external.is_none());
+    // Nothing newer than what the source folded exists: a commit that waited for an event would never return.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let destination = &destination;
+        scope.spawn(move || {
+            done_tx
+                .send(destination.mover().unwrap().commit_chat_move().is_ok())
+                .unwrap()
+        });
+        assert_eq!(
+            done_rx.recv_timeout(HANG),
+            Ok(true),
+            "the commit returns without any event"
+        );
+    });
+    mover.forget_chat_move();
+    drop(frozen);
+    assert!(
+        destination.pump().is_empty(),
+        "nothing the source folded is delivered again"
+    );
+
+    destination
+        .send_turn(SendTurnRequest {
+            session_id: session.clone(),
+            text: "text m1 hello;end".to_string(),
+        })
+        .expect("the destination drives the session");
+    let start = Instant::now();
+    let mut after = Vec::new();
+    while !turn_completed(&after) {
+        assert!(start.elapsed() < HANG, "never saw the turn end; saw {after:#?}");
+        after.extend(destination.pump());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(after.iter().any(|event| text_of(event) == Some("hello")));
+    assert!(!opened(&after), "the session's opening is not replayed");
+}

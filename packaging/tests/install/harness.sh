@@ -216,8 +216,8 @@ setup_libs() {
 # nodejs.org one, so tar's own extraction is exercised for real. NODE_FIXTURE_SHA256_X64 is this
 # fixture's own real hash, embedded by mk_release into RELEASE -- never the real pinned Node's hash,
 # since no test unpacks the real Node. NODE_FIXTURE_SHA256_ARM64 is a matching real fixture too
-# (for the aarch64 tests): every other test's own `uname -m` is the real one
-# (x86_64 on this host), so nothing but those ever downloads or checks it.
+# for aarch64 tests; every other test uses the real `uname -m` (x86_64 on this host), so only those
+# fetch or check the ARM64 fixture.
 setup_sidecar_fixtures() {
 	NODE_FIXTURE_VERSION=v22.23.2
 	rm -rf "$S/fix/node-build"
@@ -396,9 +396,8 @@ setup_releases() {
 	mkdir -p "$S/srv"
 }
 
-# serve VERSION... : the served tree holds exactly these releases; `latest` is the first named.
-# Its loop variable has the helper's own prefix: sh has no locals, so a plain `v` here overwrote the
-# loop variable of any test that served a release inside its own `for v` loop.
+# serve VERSION...: the served tree holds exactly these releases; `latest` is the first named.
+# Prefix the loop variable: sh has no locals, so a plain `v` would overwrite a caller's `for v` loop.
 serve() {
 	rm -rf "$S/srv/releases"
 	mkdir -p "$S/srv/releases/latest/download" "$S/srv/releases/download"
@@ -563,7 +562,7 @@ snap_but_lock() {
 # that fails creates and removes its own entries in, leaving every file as it was: .local/lib
 # (eitri.new, a swap's renames), the ones the launcher, desktop entries, plugin, icons and licences are staged in
 # before the swap, and -- for a run against a HOME with no prior install at all -- .local itself,
-# whose own mtime changes the moment unpack_new's mkdir -p makes .local/lib the first time (reached once a fatal sidecar-build failure could die there too).
+# whose mtime changes when unpack_new first creates .local/lib, even if a sidecar-build failure follows.
 snap_but_staging() {
 	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/eitri(/eitri.nvim(/[^/]+(/eitri)?)?)?|share/gnome-shell(/extensions(/eitri@huntergrey.cn)?)?|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }

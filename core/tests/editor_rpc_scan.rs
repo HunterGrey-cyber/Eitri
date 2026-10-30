@@ -419,6 +419,8 @@ fn editor_rpc_callers_pass_only_constant_lua() {
     let mut forwarders: Vec<(String, usize)> = Vec::new();
     let mut install_seen = false;
     let mut follow_seen = false;
+    let mut cwd_seen = false;
+    let mut buffers_seen = false;
     for source in &read {
         let rel = source.path.clone();
         let report = scan(&rel, &source.text);
@@ -427,6 +429,12 @@ fn editor_rpc_callers_pass_only_constant_lua() {
         }
         if rel == "core/src/plugin/editor.rs" && report.constants.iter().any(|c| c == "PLUGIN_FOLLOW_LUA") {
             follow_seen = true;
+        }
+        if rel == "core/src/plugin/editor.rs" && report.constants.iter().any(|c| c == "PLUGIN_CWD_LUA") {
+            cwd_seen = true;
+        }
+        if rel == "core/src/plugin/editor.rs" && report.constants.iter().any(|c| c == "PLUGIN_BUFFERS_LUA") {
+            buffers_seen = true;
         }
         flagged.extend(report.flagged);
         if !report.forwarders.is_empty() {
@@ -440,6 +448,14 @@ fn editor_rpc_callers_pass_only_constant_lua() {
     assert!(
         follow_seen,
         "the follow snippet's calls (PLUGIN_FOLLOW_LUA in core/src/plugin/editor.rs) were not found"
+    );
+    assert!(
+        cwd_seen,
+        "the cwd snippet calls (PLUGIN_CWD_LUA in core/src/plugin/editor.rs) were not found"
+    );
+    assert!(
+        buffers_seen,
+        "the buffer snippet calls (PLUGIN_BUFFERS_LUA in core/src/plugin/editor.rs) were not found"
     );
     assert!(
         flagged.is_empty(),
@@ -499,10 +515,11 @@ fn the_scan_catches_built_lua_a_leak_and_a_bypass() {
 }
 
 /// Window 2 reaches the editor only through the editor-op dispatcher, so the dispatcher's product code may name
-/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call) and the plugin host's three
-/// editor functions, and nothing else that runs in the editor: no install or teardown, no review chunk (the review
-/// ops become calls on window 1's own review driver), no scratch call, no event drain, no navigation fallback,
-/// and no pane kill. Comments and literals are blanked and whitespace is dropped, so formatting changes nothing.
+/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call) and the plugin host's editor
+/// functions of its table, and nothing else that runs in the editor: no follow teardown (the snippet and its commands
+/// are window 1's, whatever window 2's page does), no review chunk (the review ops become calls on window 1's own
+/// review driver), no scratch call, no event drain, no navigation fallback, and no pane kill. Comments and literals
+/// are blanked and whitespace is dropped, so formatting changes nothing.
 #[test]
 fn the_editor_op_dispatcher_names_only_its_table() {
     use eitri_core::source_scan::{code_only, modules, read_required, without};
@@ -560,6 +577,13 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         }
         let rest = &squeezed[at + "editor::".len()..];
         let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+        if name == "FollowInstall" {
+            assert!(
+                rest[name.len()..].starts_with('{'),
+                "the follow installation is a typed record"
+            );
+            continue;
+        }
         assert!(
             rest[name.len()..].starts_with('('),
             "`editor::{name}` is not a call: the plugin functions are named only where they are called"
@@ -571,15 +595,25 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         BTreeSet::from([
             "assist_apply".to_string(),
             "assist_clear".to_string(),
-            "open".to_string()
+            "open".to_string(),
+            "follow_text".to_string(),
+            "follow_reveal".to_string(),
+            "follow_jump".to_string(),
+            "follow_install".to_string(),
+            "follow_on".to_string()
         ]),
         "the dispatcher calls a plugin editor function outside its table"
     );
     for (at, _) in squeezed.match_indices("plugin::") {
         let rest = &squeezed[at + "plugin::".len()..];
+        // The follow text's two bounds are the ones window 1's own pages are held to: constants, not functions.
+        let bound = ["follow::MAX_TEXT_BYTES", "follow::MAX_TEXT_LINES"].iter().any(|name| {
+            rest.strip_prefix(name)
+                .is_some_and(|after| !after.chars().next().is_some_and(is_ident))
+        });
         assert!(
-            rest.starts_with("editor::") || rest.starts_with("roots::"),
-            "the dispatcher reaches into the plugin host beyond its editor functions and path checks: {}",
+            rest.starts_with("editor::") || rest.starts_with("roots::") || bound,
+            "the dispatcher reaches into the plugin host beyond its editor functions, path checks and bounds: {}",
             &rest[..rest.len().min(40)]
         );
     }

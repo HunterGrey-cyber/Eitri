@@ -1,11 +1,7 @@
 //! The twin of `agent`'s `every_sock_path_in_this_crate_is_built_here`, over this crate.
 //!
-//! `agent`'s version walks `agent/src` and `agent/tests` only, and its doc promises that "a new
-//! construction site elsewhere fails a test rather than a Mac". Two construction sites were added
-//! here on 2026-09-17, outside that walk, and made that promise narrower than it reads. Today's two
-//! paths are each pinned by an exact-length test of their own, so nothing was broken -- but a
-//! *third* socket added to this crate later would have escaped the only systematic guard there
-//! is. This restores it rather than rewording the promise.
+//! `agent`'s guard walks only `agent/src` and `agent/tests`. This crate needs its own walk so
+//! every new socket construction site is checked, in addition to exact-length tests of known paths.
 
 use std::path::Path;
 
@@ -106,12 +102,9 @@ fn no_allowlist_entry_is_stale() {
 
 /// Whether the `.sock` name on line `n` is an argument of a `socket_path::in_dir(` call.
 ///
-/// The check used to be "the same line mentions `in_dir(`", which was true of every call site until
-/// `rustfmt.toml` landed (2026-09-19) and rustfmt wrapped the longer ones onto their own argument
-/// lines -- in `agent`, whose twin of this scanner had the same check, six correctly routed sites
-/// became offenders at once. The invariant was never about one line: it is that the name reaches
-/// `in_dir`, which owns the length cap. So walk back over the open argument list instead, stopping
-/// at the statement boundary a `;` or a blank line marks, and never further than a short window.
+/// The name must reach `in_dir`, which owns the length cap, regardless of line wrapping.
+/// Walk back over the open argument list, stopping at a `;` or blank-line statement boundary
+/// and never beyond a short window. A same-line check would reject correctly wrapped calls.
 fn routed_through_in_dir(lines: &[&str], n: usize) -> bool {
     for line in lines[n.saturating_sub(4)..=n].iter().rev() {
         let code = line.trim();

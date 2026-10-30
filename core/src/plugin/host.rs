@@ -4,7 +4,7 @@
 //! output, editor answers and store answers are taken by `pump`, which the window runs when the host's
 //! wake is raised or when `pump` asked for a timer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::doc_route::{self, DocSlot};
 use super::editor::{self, decode_apply, decode_clear, decode_open, read_applied, FollowInstall, PulledText};
-use super::follow::{Done, FollowOp, FollowState, Next, MAX_TEXT_BYTES, MAX_TEXT_LINES};
+use super::follow::{Done, FollowOp, FollowState, Next, Parked, MAX_TEXT_BYTES, MAX_TEXT_LINES};
 use super::follow_feed::ViewLine;
 use super::keys::{self, EffectiveRow, PluginKeyOp};
 use super::kit_settings::KeysSettings;
@@ -53,7 +53,21 @@ pub const STORE_DEADLINE: Duration = Duration::from_secs(5);
 /// default.
 pub const DEFAULT_TIMEOUTLEN: u32 = 1000;
 
+/// How long the window takes at most to answer a `terminal.at`, from the request: its read of the shell and a
+/// restart share it, and it answers whatever still waits at its end itself.
+pub const TERMINAL_AT_WAIT: Duration = Duration::from_secs(5);
+/// How long a `terminal.at` is owed its answer here: past the window's own deadline, so the window's answer, which
+/// says what it did, always comes first, and this one only stands for an answer that was lost.
+pub const TERMINAL_AT_DEADLINE: Duration = Duration::from_secs(6);
+
 const CHECK_TIMEOUT: &str = "the filesystem did not answer within 5 s";
+const TERMINAL_LATE: &str = "the terminal did not answer within 6 s";
+const _: () = assert!(
+    TERMINAL_AT_DEADLINE.as_secs() == 6 && TERMINAL_AT_WAIT.as_secs() < TERMINAL_AT_DEADLINE.as_secs(),
+    "the window answers before this deadline, and the late text names it"
+);
+/// The refusal of a verb that reshapes the window, asked by a page outside the plugin's own window.
+pub const NOT_OWN_WINDOW_TEXT: &str = "This verb acts only in the plugin's own window";
 const EDITOR_BUSY: &str = "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)";
 
 /// The page. `send` is asynchronous and never calls back into the host before it returns.
@@ -64,9 +78,23 @@ pub trait PagePort {
     fn set_theme(&self, theme: &PageTheme);
 }
 
-/// The window's layout: give the keys to the editor (showing it first if hidden) or to the plugin's module.
+/// The window's layout: give the keys to the editor (showing it first if hidden) or to the plugin's module, and put
+/// the window's base terminal in a directory.
 pub trait LayoutPort {
     fn focus(&self, target: FocusTarget) -> Result<(), String>;
+    /// Asks for the base terminal in `dir` (checked already), its answer to come back through
+    /// [`PluginHost::terminal_at_answered`] under `ticket`, possibly before this returns. `Err` is a refusal now.
+    fn terminal_at(&self, dir: PathBuf, ticket: u64) -> Result<(), String>;
+}
+
+/// What a page's `terminal.at` came to: the directory kept for the terminal's next shell (none runs), a fresh shell
+/// started there in place of an idle one, the shell already there or below it, or left alone with the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAtAnswer {
+    StartDir,
+    Restarted,
+    Already,
+    Busy(String),
 }
 
 /// A request the page is still owed an answer for, in whichever line it waits: the editor's calls, the assist
@@ -141,7 +169,15 @@ fn take_owed(owed: &mut Vec<Pending<()>>, re: u64) -> Option<Pending<()>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
+    Diff,
+    CloseDiffs,
+    Preload,
+    WipePreload,
+    Modified,
+    Reload,
     Open,
+    Cwd,
+    CwdClear,
     Assist,
     Clear,
 }
@@ -151,35 +187,33 @@ struct EditorCall {
     answer: nvim_rpc::Pending,
 }
 
-/// An assist call waiting behind an apply whose root is still being checked.
-///
-/// The editor writes calls in the order they were made (`EditorRpc`'s doc), so an assist call goes out as
-/// soon as nothing ahead of it is still being checked, whether or not the calls before it have been
-/// answered: a clear made after an apply reaches nvim after it and undoes it. In the rare case the embedded
-/// editor writes two of them swapped, each carries the order it was made in and the snippet skips one older
-/// than a call it has already run (`editor::assist_apply`), so the call made last is still the one in force.
-/// Only the check, which runs on the path checker's thread, can take longer than the calls made after it;
-/// the assist line keeps their order across it.
-enum AssistOp {
-    /// An apply whose root is still being checked: it holds its place in line, and nothing behind it is sent
-    /// until it is either an `Apply` or gone.
-    Checking {
-        ticket: u64,
-        raw: String,
-        diagnostics: bool,
-        inlay_hints: bool,
-    },
-    Apply {
-        root: PathBuf,
-        diagnostics: bool,
-        inlay_hints: bool,
-    },
+/// An editor operation waiting for its path check. Clears stay behind checks so a stop undoes
+/// every change already requested. The calls also carry their creation order to nvim, which can
+/// otherwise receive a clear before the change it should undo.
+enum ScopedOp {
+    CheckingDiff { ticket: u64 },
+    Diff(protocol::EditorDiff),
+    CloseDiffs,
+    Checking { ticket: u64, raw: String, op: DirOp },
+    Apply { root: PathBuf, op: DirOp },
     Clear,
+    CwdClear,
+    WipePreload,
+}
+
+#[derive(Clone, Copy)]
+enum DirOp {
+    Preload { diagnostics: bool, inlay_hints: bool },
+    Modified,
+    Reload,
+    Assist { diagnostics: bool, inlay_hints: bool },
+    Cwd,
 }
 
 /// What the path checker is asked. `canonicalize` and `metadata` can stall on a slow or hung filesystem, so
 /// they never run on the thread that calls the host.
 enum CheckJob {
+    Diff(protocol::EditorDiff),
     File(String),
     Dir(String),
     Task {
@@ -210,6 +244,7 @@ enum CheckJob {
 }
 
 enum Checked {
+    Diff(Result<protocol::EditorDiff, (PathRefusal, String)>),
     Path(Result<PathBuf, PathRefusal>),
     Task(Result<ResolvedTask, TaskRefusal>),
     /// The canonical project directory and the canonical directory of the document, or `None` with no project.
@@ -294,6 +329,18 @@ impl PathChecker {
                     let _ = gate.recv();
                 }
                 let checked = match job {
+                    CheckJob::Diff(mut args) => {
+                        let result = (|| {
+                            for side in [&mut args.left, &mut args.right] {
+                                if let protocol::DiffSide::Path { path } = side {
+                                    let raw = path.to_string_lossy().into_owned();
+                                    *path = roots::file_inside(&plugin.roots, &raw).map_err(|e| (e, raw))?;
+                                }
+                            }
+                            Ok(args)
+                        })();
+                        Checked::Diff(result)
+                    }
                     CheckJob::File(raw) => Checked::Path(roots::file_inside(&plugin.roots, &raw)),
                     CheckJob::Dir(raw) => Checked::Path(roots::dir_inside(&plugin.roots, &raw)),
                     CheckJob::Task { task, vars } => Checked::Task(plugin.resolve_task(&task, &vars)),
@@ -360,6 +407,8 @@ enum Then {
         line: Option<u32>,
         session: Option<u64>,
     },
+    /// A `terminal.at`: the directory as the page sent it.
+    TerminalAt { raw: String },
 }
 
 /// What [`PluginHost::take_saved`] found.
@@ -395,6 +444,8 @@ struct PluginHostState {
     /// The window is closing: the page may still be alive for a moment, but nothing it sends is acted on, so
     /// no run can start after the shutdown's list of runs to wait for was taken.
     closed: bool,
+    moving: bool,
+    moved_away: bool,
     /// Counts documents: raised by every reload and by a stop, so an answer still out for an older one
     /// is never sent into the document that replaced it.
     document: u64,
@@ -412,12 +463,17 @@ struct PluginHostState {
     calls: Vec<Pending<EditorCall>>,
     /// An assist was sent and not cleared since.
     assisted: bool,
-    /// Assist calls waiting behind an apply whose root is still being checked, in the order they were asked.
-    parked: VecDeque<Pending<AssistOp>>,
+    cwd_set: bool,
+    preloaded: bool,
+    diffed: bool,
+    /// Editor changes and clears in request order, held only while a path check is outstanding.
+    parked: VecDeque<Pending<ScopedOp>>,
     checker: Option<PathChecker>,
     checking: Vec<Pending<Checking>>,
     /// Handed to the checker when it starts: each check then waits for one message (tests only).
     check_gate: Option<mpsc::Receiver<()>>,
+    /// `terminal.at` requests handed to the window, each under its ticket, until the window answers.
+    terminal_at: Vec<Pending<u64>>,
     /// Whether the page's module holds the keys of an active window, as the window last said.
     has_keys: bool,
     /// The editor's `timeoutlen`, in milliseconds, as last reported.
@@ -480,9 +536,13 @@ struct PluginHostState {
     restored: Option<Value>,
     /// The current document said `page.ready` and nobody has taken it since.
     ready: bool,
+    /// How many documents the view has committed: the number a trace line gives the document it is about, so a
+    /// reader can tell the document a page built ahead of its state from the one that reloaded with it.
+    committed: u64,
 }
 
 pub struct PluginHost {
+    own_window: Cell<bool>,
     plugin: Rc<LoadedPlugin>,
     page: Rc<dyn PagePort>,
     wake: agent::UiWake,
@@ -636,6 +696,8 @@ impl PluginHost {
         let state = PluginHostState {
             hello: false,
             closed: false,
+            moving: false,
+            moved_away: false,
             document: 0,
             editor: None,
             layout: None,
@@ -647,10 +709,14 @@ impl PluginHost {
             next_ticket: 1,
             calls: Vec::new(),
             assisted: false,
+            cwd_set: false,
+            preloaded: false,
+            diffed: false,
             parked: VecDeque::new(),
             checker: None,
             checking: Vec::new(),
             check_gate: None,
+            terminal_at: Vec::new(),
             has_keys: false,
             timeoutlen: DEFAULT_TIMEOUTLEN,
             prefix_key: Chord::of(&stock_prefix),
@@ -681,8 +747,10 @@ impl PluginHost {
             save: None,
             restored: None,
             ready: false,
+            committed: 0,
         };
         PluginHost {
+            own_window: Cell::new(false),
             plugin,
             page,
             wake,
@@ -690,6 +758,15 @@ impl PluginHost {
             overrides,
             state: RefCell::new(state),
         }
+    }
+
+    /// Whether this host serves the plugin's own window, as set by the window controller.
+    pub fn own_window(&self) -> bool {
+        self.own_window.get()
+    }
+
+    pub fn set_own_window(&self, own: bool) {
+        self.own_window.set(own);
     }
 
     pub fn plugin(&self) -> &LoadedPlugin {
@@ -775,6 +852,7 @@ impl PluginHost {
     /// one that never commits (a download, an ignored response, a cancelled navigation) leaves the running
     /// document its hello, its table and its events.
     pub fn page_committed(&self) {
+        self.state.borrow_mut().committed += 1;
         self.new_document();
         self.send_theme();
     }
@@ -883,13 +961,28 @@ impl PluginHost {
     }
 
     /// Puts a page's reveal, jump or link in the follow queue, owed its answer by `deadline`. Returns what the
-    /// page is still owed for the reveal it replaced, if any.
-    fn park_page_op(&self, op: FollowOp, re: u64, deadline: Instant) -> Option<Pending<()>> {
+    /// page is still owed for the reveal or jump it replaced, or answers a link refused by the queue's cap.
+    fn park_page_op(&self, op: FollowOp, re: u64, deadline: Instant, replies: &mut Vec<Reply>) -> Option<Pending<()>> {
+        let audience = self.audience();
         let mut st = self.state.borrow_mut();
-        let replaced = st.follow.park(op);
+        let parked = st.follow.park(op);
         let document = st.document;
-        st.follow_owed.push(Pending::new(Some(re), document, deadline, ()));
-        replaced.and_then(|old| take_owed(&mut st.follow_owed, old))
+        let mut pending = Pending::new(Some(re), document, deadline, ());
+        if parked == Parked::Full {
+            answer_or_drop(
+                self.id(),
+                audience,
+                &mut pending,
+                |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
+                replies,
+            );
+            return None;
+        }
+        st.follow_owed.push(pending);
+        match parked {
+            Parked::Replaced(old) => take_owed(&mut st.follow_owed, old),
+            _ => None,
+        }
     }
 
     /// Tells the page about each reveal, jump or link still in the follow queue past its deadline. The op keeps
@@ -1097,7 +1190,8 @@ impl PluginHost {
         st.view.as_ref().is_some_and(|v| v.buf == buf) || st.last_text.as_ref().is_some_and(|t| t.buf == buf)
     }
 
-    /// The editor quit for good: a following page is told (`editor.closed {reason: "editor"}`).
+    /// The editor's nvim ended: a following page is told (`editor.closed {reason: "editor"}`). An nvim the pane
+    /// starts again later is a new session, which [`editor_session`](Self::editor_session) installs into.
     pub fn editor_closed(&self, _now: Instant) {
         let buf = {
             let st = self.state.borrow();
@@ -1638,7 +1732,7 @@ impl PluginHost {
     }
 
     fn new_document(&self) {
-        let (follows, dropped) = {
+        let (follows, dropped, preloaded) = {
             let mut st = self.state.borrow_mut();
             st.hello = false;
             st.document += 1;
@@ -1656,8 +1750,16 @@ impl PluginHost {
             if let Some(ask) = st.save.as_mut() {
                 ask.unanswerable |= ask.answer.is_none();
             }
-            (st.follow_socket.is_some(), std::mem::take(&mut st.follow_owed))
+            (
+                st.follow_socket.is_some(),
+                std::mem::take(&mut st.follow_owed),
+                std::mem::replace(&mut st.preloaded, false),
+            )
         };
+        if preloaded {
+            self.scoped_call(None, ScopedOp::WipePreload, Instant::now());
+            (self.wake)();
+        }
         let audience = self.audience();
         let mut replies = Vec::new();
         for mut owed in dropped {
@@ -1666,6 +1768,68 @@ impl PluginHost {
         self.send_replies(replies);
         if follows {
             (self.wake)();
+        }
+    }
+
+    /// Takes task ownership to a worker, since pausing readers waits for their acknowledgement.
+    pub fn take_move_runner(&self) -> Result<TaskRunner, String> {
+        let mut st = self.state.borrow_mut();
+        if st.moving {
+            return Err("the page already has a move in flight".into());
+        }
+        st.moving = true;
+        Ok(std::mem::replace(&mut st.tasks, TaskRunner::new(self.wake.clone())))
+    }
+
+    /// Puts the worker's runner back; a frozen source keeps refusing page calls until it resumes or leaves.
+    pub fn return_move_runner(&self, runner: TaskRunner, frozen: bool) {
+        let mut st = self.state.borrow_mut();
+        st.tasks = runner;
+        st.moving = frozen;
+        if !frozen {
+            st.closed = false;
+        }
+        drop(st);
+        (self.wake)();
+    }
+
+    /// Reopens the registered host for a document arriving from the other window.
+    pub fn accept_moved(&self) {
+        self.new_document();
+        let mut st = self.state.borrow_mut();
+        st.closed = false;
+        st.moved_away = false;
+        st.follow_stopped = false;
+        st.moving = true;
+    }
+
+    /// A resumed page can send requests again, including a page with no running tasks.
+    pub fn resume_moved(&self) {
+        self.state.borrow_mut().moving = false;
+        (self.wake)();
+    }
+
+    /// Forgets a transferred document without stopping its successor's tasks or writing page state to disk.
+    pub fn forget_moved(&self) {
+        self.new_document();
+        let mut st = self.state.borrow_mut();
+        st.closed = true;
+        st.moving = false;
+        st.moved_away = true;
+        let wipe_preload = st.parked.iter().any(|p| matches!(p.on, ScopedOp::WipePreload));
+        st.calls.clear();
+        st.parked.clear();
+        st.checking.clear();
+        st.follow_call = None;
+        st.follow = FollowState::new();
+        // The follow state starts off screen; so does the host's record of it, until the window tells it again.
+        st.on_screen = false;
+        st.view = None;
+        st.last_text = None;
+        drop(st);
+        if wipe_preload {
+            // The pending checks are gone; calls already sent reach the editor ahead of this wipe.
+            let _ = self.send_scoped(None, ScopedOp::WipePreload, Instant::now() + EDITOR_DEADLINE);
         }
     }
 
@@ -1701,6 +1865,9 @@ impl PluginHost {
             }
         };
         let re = request.id;
+        if self.state.borrow().moving && !matches!(&request.verb, Verb::PageSaved(_)) {
+            return self.reply(Reply::err(re, ErrorCode::Busy, "the page is moving to another window"));
+        }
         if let Some(capability) = request.verb.capability() {
             if !self.plugin.manifest.has(capability) {
                 let message = format!(
@@ -1749,6 +1916,19 @@ impl PluginHost {
                 })
             }
             Verb::EditorOpen(args) => self.editor_open(re, &args.path, args.line, args.col, now),
+            Verb::EditorDiff(args) => self.editor_diff(re, args, now),
+            Verb::EditorCd(args) => self.editor_cd(re, &args.dir, now),
+            Verb::EditorPreload(args) => self.directory_call(
+                re,
+                &args.path,
+                DirOp::Preload {
+                    diagnostics: args.diagnostics == OnOff::On,
+                    inlay_hints: args.inlay_hints == OnOff::On,
+                },
+                now,
+            ),
+            Verb::EditorModified(args) => self.directory_call(re, &args.root, DirOp::Modified, now),
+            Verb::EditorReload(args) => self.directory_call(re, &args.root, DirOp::Reload, now),
             Verb::EditorAssist(args) => self.editor_assist(re, &args.root, args.diagnostics, args.inlay_hints, now),
             Verb::EditorAssistClear(_) => self.editor_clear(Some(re), now),
             Verb::LayoutFocus(args) => Some(self.focus(re, args.target)),
@@ -1783,7 +1963,104 @@ impl PluginHost {
             Verb::EditorOpenLink(args) => self.editor_open_link(re, args, now),
             Verb::PageSaved(args) => Some(self.page_saved(re, args, now)),
             Verb::PageReady(_) => Some(self.page_ready(re)),
+            Verb::TerminalAt(args) => self.terminal_at(re, &args.dir, now),
         }
+    }
+
+    /// `terminal.at {dir}`: in the plugin's own window only, `dir` a directory inside a root, checked on the path
+    /// worker; then handed to the window.
+    fn terminal_at(&self, re: u64, raw: &str, now: Instant) -> Option<Reply> {
+        if !self.own_window() {
+            return Some(Reply::err(re, ErrorCode::NotOwnWindow, NOT_OWN_WINDOW_TEXT));
+        }
+        if let Err(refusal) = roots::lexical(raw) {
+            return Some(path_refusal(re, refusal, raw));
+        }
+        let then = Then::TerminalAt { raw: raw.to_owned() };
+        self.check_then(re, CheckJob::Dir(raw.to_owned()), then, now)
+    }
+
+    /// The directory passed its check: the window is asked under a fresh ticket, owed its answer for
+    /// [`TERMINAL_AT_DEADLINE`]. A refusal now is the page's `busy`, with the window's words.
+    fn terminal_at_checked(&self, re: u64, dir: PathBuf, now: Instant, replies: &mut Vec<Reply>) {
+        let layout = self.state.borrow().layout.clone();
+        let Some(layout) = layout else {
+            replies.push(Reply::err(re, ErrorCode::Busy, "this window has no terminal to move"));
+            return;
+        };
+        let ticket = {
+            let mut st = self.state.borrow_mut();
+            let ticket = st.next_ticket;
+            st.next_ticket += 1;
+            let document = st.document;
+            st.terminal_at
+                .push(Pending::new(Some(re), document, now + TERMINAL_AT_DEADLINE, ticket));
+            ticket
+        };
+        // No borrow is held here: the window may answer before the call returns.
+        let asked = layout.terminal_at(dir, ticket);
+        if let Err(why) = asked {
+            let pending = {
+                let mut st = self.state.borrow_mut();
+                let at = st.terminal_at.iter().position(|p| p.on == ticket);
+                at.map(|i| st.terminal_at.remove(i))
+            };
+            if let Some(mut pending) = pending {
+                let audience = self.audience();
+                let refused = |re| Some(Reply::err(re, ErrorCode::Busy, &why));
+                answer_or_drop(self.id(), audience, &mut pending, refused, replies);
+            }
+        }
+    }
+
+    /// The window's answer to the `terminal.at` asked under `ticket`. The page that asked hears it once, unless its
+    /// document was replaced (dropped with one log line) or it was already told the terminal did not answer in
+    /// time (dropped).
+    pub fn terminal_at_answered(&self, ticket: u64, answer: TerminalAtAnswer, now: Instant) {
+        let pending = {
+            let mut st = self.state.borrow_mut();
+            let at = st.terminal_at.iter().position(|p| p.on == ticket);
+            at.map(|i| st.terminal_at.remove(i))
+        };
+        let Some(mut pending) = pending else {
+            eprintln!(
+                "[plugin {}] terminal.at {ticket}: answered after the page was told it took too long; dropped",
+                self.id()
+            );
+            return;
+        };
+        let audience = self.audience();
+        let mut replies = Vec::new();
+        if now >= pending.deadline {
+            let late = |re| Some(Reply::err(re, ErrorCode::Busy, TERMINAL_LATE));
+            answer_or_drop(self.id(), audience, &mut pending, late, &mut replies);
+        } else {
+            let answered = |re| {
+                Some(match answer {
+                    TerminalAtAnswer::StartDir => Reply::ok(re, json!({"how": "start_dir"})),
+                    TerminalAtAnswer::Restarted => Reply::ok(re, json!({"how": "restarted"})),
+                    TerminalAtAnswer::Already => Reply::ok(re, json!({"how": "already"})),
+                    TerminalAtAnswer::Busy(why) => Reply::err(re, ErrorCode::Busy, &why),
+                })
+            };
+            answer_or_drop(self.id(), audience, &mut pending, answered, &mut replies);
+        }
+        self.send_replies(replies);
+    }
+
+    /// Tells the page whose `terminal.at` is past its deadline that the terminal did not answer; the window's
+    /// answer, when it comes, is then dropped.
+    fn expire_terminal_at(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let audience = self.audience();
+        let mut st = self.state.borrow_mut();
+        st.terminal_at.retain_mut(|pending| {
+            if now < pending.deadline {
+                return true;
+            }
+            let late = |re| Some(Reply::err(re, ErrorCode::Busy, TERMINAL_LATE));
+            answer_or_drop(self.id(), audience, pending, late, replies);
+            false
+        });
     }
 
     fn not_handoff(re: u64, verb: &str) -> Reply {
@@ -1850,6 +2127,14 @@ impl PluginHost {
         std::mem::take(&mut self.state.borrow_mut().ready)
     }
 
+    /// The running document, once it has said hello: `None` before then and from each new document on until it
+    /// does. A `page.ready` taken from a document is about that document alone, so a window that posts it later
+    /// checks first that this still names the same one.
+    pub fn hello_document(&self) -> Option<u64> {
+        let st = self.state.borrow();
+        st.hello.then_some(st.document)
+    }
+
     fn page_saved(&self, re: u64, args: PageSaved, now: Instant) -> Reply {
         if !self.plugin.manifest.handoff {
             return Self::not_handoff(re, "page.saved");
@@ -1879,15 +2164,20 @@ impl PluginHost {
 
     fn page_ready(&self, re: u64) -> Reply {
         if !self.plugin.manifest.handoff {
+            trace::line(self.id(), "page.ready refused", "no [page] handoff");
             return Self::not_handoff(re, "page.ready");
         }
-        {
+        let committed = {
             let mut st = self.state.borrow_mut();
             if !st.hello {
+                drop(st);
+                trace::line(self.id(), "page.ready refused", "before host.hello");
                 return Reply::err(re, ErrorCode::BadRequest, "page.ready before host.hello");
             }
             st.ready = true;
-        }
+            st.committed
+        };
+        trace::line(self.id(), "page.ready", &format!("document={committed}"));
         (self.wake)();
         Reply::ok(re, json!({}))
     }
@@ -1945,8 +2235,8 @@ impl PluginHost {
             cursor: args.cursor,
             re,
         };
-        if let Some(mut old) = self.park_page_op(op, re, now + EDITOR_DEADLINE) {
-            let mut replies = Vec::new();
+        let mut replies = Vec::new();
+        if let Some(mut old) = self.park_page_op(op, re, now + EDITOR_DEADLINE, &mut replies) {
             let audience = self.audience();
             answer_or_drop(
                 self.id(),
@@ -1955,8 +2245,8 @@ impl PluginHost {
                 |re| Some(Reply::ok(re, json!({ "applied": false }))),
                 &mut replies,
             );
-            self.send_replies(replies);
         }
+        self.send_replies(replies);
         self.wake_follow();
         None
     }
@@ -1975,8 +2265,18 @@ impl PluginHost {
             focus: args.focus,
             re,
         };
-        // A jump replaces nothing.
-        let _ = self.park_page_op(op, re, now + EDITOR_DEADLINE);
+        let mut replies = Vec::new();
+        if let Some(mut old) = self.park_page_op(op, re, now + EDITOR_DEADLINE, &mut replies) {
+            let audience = self.audience();
+            answer_or_drop(
+                self.id(),
+                audience,
+                &mut old,
+                |re| Some(Reply::ok(re, json!({ "applied": false }))),
+                &mut replies,
+            );
+        }
+        self.send_replies(replies);
         self.wake_follow();
         None
     }
@@ -2059,6 +2359,15 @@ impl PluginHost {
                 st.restored.take(),
             )
         };
+        let committed = self.state.borrow().committed;
+        trace::line(
+            self.id(),
+            "hello",
+            &format!(
+                "restored={} document={committed}",
+                if restored.is_some() { "yes" } else { "no" }
+            ),
+        );
         let manifest = &self.plugin.manifest;
         let capabilities: Vec<&str> = manifest.capabilities.iter().map(|c| c.as_str()).collect();
         let roots: BTreeMap<&String, String> = self
@@ -2075,6 +2384,7 @@ impl PluginHost {
             re,
             json!({
                 "host": "eitri",
+                "own_window": self.own_window(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "protocol": protocol::VERSION,
                 "capabilities": capabilities,
@@ -2135,6 +2445,9 @@ impl PluginHost {
         vars: &BTreeMap<String, String>,
         resolved: Result<ResolvedTask, TaskRefusal>,
     ) -> Reply {
+        if self.state.borrow().moving {
+            return Reply::err(re, ErrorCode::Busy, "the page is moving to another window");
+        }
         let started = {
             let mut st = self.state.borrow_mut();
             match resolved {
@@ -2210,11 +2523,65 @@ impl PluginHost {
             ));
             return;
         };
-        let answer = editor::open(&*editor, path, line, col);
+        let answer = editor::open_owned(&*editor, self.id(), path, line, col);
         self.push_call(Some(re), Call::Open, answer, deadline);
     }
 
+    fn editor_diff(&self, re: u64, args: protocol::EditorDiff, now: Instant) -> Option<Reply> {
+        if let Err((code, why)) = args.check() {
+            return Some(Reply::err(re, code, &why));
+        }
+        for side in [&args.left, &args.right] {
+            if let protocol::DiffSide::Path { path } = side {
+                let raw = path.to_string_lossy();
+                if let Err(refusal) = roots::lexical(&raw) {
+                    return Some(path_refusal(re, refusal, &raw));
+                }
+            }
+        }
+        if self.editor().is_none() {
+            return Some(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "this window has no editor running",
+            ));
+        }
+        let ticket = match self.submit_check(CheckJob::Diff(args)) {
+            Ok(ticket) => ticket,
+            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+        };
+        let mut st = self.state.borrow_mut();
+        st.diffed = true;
+        let document = st.document;
+        st.parked.push_back(Pending::new(
+            Some(re),
+            document,
+            now + EDITOR_DEADLINE,
+            ScopedOp::CheckingDiff { ticket },
+        ));
+        None
+    }
+
+    fn editor_cd(&self, re: u64, raw: &str, now: Instant) -> Option<Reply> {
+        if !self.own_window() {
+            return Some(Reply::err(re, ErrorCode::NotOwnWindow, NOT_OWN_WINDOW_TEXT));
+        }
+        self.directory_call(re, raw, DirOp::Cwd, now)
+    }
+
     fn editor_assist(&self, re: u64, raw: &str, diagnostics: OnOff, inlay_hints: OnOff, now: Instant) -> Option<Reply> {
+        self.directory_call(
+            re,
+            raw,
+            DirOp::Assist {
+                diagnostics: diagnostics == OnOff::On,
+                inlay_hints: inlay_hints == OnOff::On,
+            },
+            now,
+        )
+    }
+
+    fn directory_call(&self, re: u64, raw: &str, op: DirOp, now: Instant) -> Option<Reply> {
         if let Err(refusal) = roots::lexical(raw) {
             return Some(path_refusal(re, refusal, raw));
         }
@@ -2225,21 +2592,28 @@ impl PluginHost {
                 "this window has no editor running",
             ));
         }
-        let ticket = match self.submit_check(CheckJob::Dir(raw.to_owned())) {
+        let job = if matches!(op, DirOp::Preload { .. }) {
+            CheckJob::File(raw.to_owned())
+        } else {
+            CheckJob::Dir(raw.to_owned())
+        };
+        let ticket = match self.submit_check(job) {
             Ok(ticket) => ticket,
             Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
         };
-        // Marked now, not on the answer: a stop before the answer still clears it.
+        // Marked before the check finishes: a stop while it is pending still clears the change.
         let mut st = self.state.borrow_mut();
-        st.assisted = true;
-        // Parked even when nothing is outstanding, so a clear sent while the root is being checked waits
-        // behind it.
+        match op {
+            DirOp::Assist { .. } => st.assisted = true,
+            DirOp::Cwd => st.cwd_set = true,
+            DirOp::Preload { .. } => st.preloaded = true,
+            DirOp::Modified | DirOp::Reload => {}
+        }
         let document = st.document;
-        let op = AssistOp::Checking {
+        let op = ScopedOp::Checking {
             ticket,
             raw: raw.to_owned(),
-            diagnostics: diagnostics == OnOff::On,
-            inlay_hints: inlay_hints == OnOff::On,
+            op,
         };
         st.parked
             .push_back(Pending::new(Some(re), document, now + EDITOR_DEADLINE, op));
@@ -2252,12 +2626,12 @@ impl PluginHost {
             // With no editor running, nothing the plugin set is in force any more.
             return re.map(|re| Reply::err(re, ErrorCode::EditorUnavailable, "this window has no editor running"));
         }
-        self.assist_call(re, AssistOp::Clear, now);
+        self.scoped_call(re, ScopedOp::Clear, now);
         None
     }
 
-    /// Sends an assist call now when no apply ahead of it is still being checked, else parks it behind that.
-    fn assist_call(&self, re: Option<u64>, op: AssistOp, now: Instant) {
+    /// Sends a checked editor operation or clear unless a path ahead of it is still being checked.
+    fn scoped_call(&self, re: Option<u64>, op: ScopedOp, now: Instant) {
         let busy = !self.state.borrow().parked.is_empty();
         if busy {
             let mut st = self.state.borrow_mut();
@@ -2266,25 +2640,50 @@ impl PluginHost {
                 .push_back(Pending::new(re, document, now + EDITOR_DEADLINE, op));
             return;
         }
-        let _ = self.send_assist(re, op, now + EDITOR_DEADLINE);
+        let _ = self.send_scoped(re, op, now + EDITOR_DEADLINE);
     }
 
     /// The editor is asked now. Its absence is answered to the page, as nothing is then in force.
-    fn send_assist(&self, re: Option<u64>, op: AssistOp, deadline: Instant) -> Option<Reply> {
+    fn send_scoped(&self, re: Option<u64>, op: ScopedOp, deadline: Instant) -> Option<Reply> {
         let Some(editor) = self.editor() else {
             return re.map(|re| Reply::err(re, ErrorCode::EditorUnavailable, "this window has no editor running"));
         };
         let (call, answer) = match &op {
-            AssistOp::Checking { .. } => return None,
-            AssistOp::Apply {
+            ScopedOp::Checking { .. } | ScopedOp::CheckingDiff { .. } => return None,
+            ScopedOp::Diff(args) => (Call::Diff, editor::diff(&*editor, self.id(), args)),
+            ScopedOp::CloseDiffs => (Call::CloseDiffs, editor::close_diffs(&*editor, self.id())),
+            ScopedOp::Apply {
                 root,
-                diagnostics,
-                inlay_hints,
+                op: DirOp::Preload {
+                    diagnostics,
+                    inlay_hints,
+                },
+            } => (
+                Call::Preload,
+                editor::preload(&*editor, self.id(), root, *diagnostics, *inlay_hints),
+            ),
+            ScopedOp::Apply {
+                root,
+                op: DirOp::Modified,
+            } => (Call::Modified, editor::modified(&*editor, self.id(), root)),
+            ScopedOp::Apply {
+                root,
+                op: DirOp::Reload,
+            } => (Call::Reload, editor::reload(&*editor, self.id(), root)),
+            ScopedOp::WipePreload => (Call::WipePreload, editor::wipe_preload(&*editor, self.id())),
+            ScopedOp::Apply {
+                root,
+                op: DirOp::Assist {
+                    diagnostics,
+                    inlay_hints,
+                },
             } => (
                 Call::Assist,
                 editor::assist_apply(&*editor, self.id(), root, *diagnostics, *inlay_hints),
             ),
-            AssistOp::Clear => (Call::Clear, editor::assist_clear(&*editor, self.id())),
+            ScopedOp::Apply { root, op: DirOp::Cwd } => (Call::Cwd, editor::cwd(&*editor, self.id(), root)),
+            ScopedOp::CwdClear => (Call::CwdClear, editor::cwd_clear(&*editor, self.id())),
+            ScopedOp::Clear => (Call::Clear, editor::assist_clear(&*editor, self.id())),
         };
         self.push_call(re, call, answer, deadline);
         None
@@ -2358,7 +2757,41 @@ impl PluginHost {
     /// The page's reply to an editor call nvim answered.
     fn answered(call: Call, re: u64, value: &rmpv::Value) -> Reply {
         match call {
-            Call::Open => Reply::ok(re, json!({})),
+            Call::Open | Call::WipePreload | Call::CloseDiffs => Reply::ok(re, json!({})),
+            Call::Diff => match value
+                .as_map()
+                .and_then(|fields| fields.iter().find(|(k, _)| k.as_str() == Some("tab")))
+                .and_then(|(_, v)| v.as_u64())
+                .filter(|tab| *tab > 0)
+            {
+                Some(tab) => Reply::ok(re, json!({"tab": tab})),
+                None => Reply::err(re, ErrorCode::Io, "the editor diff answer has no tab"),
+            },
+            Call::Preload => match editor::decode_preload(value) {
+                Ok(p) => Reply::ok(
+                    re,
+                    json!({"buf": p.buf, "replaced": p.replaced, "stopped_clients": p.stopped_clients}),
+                ),
+                Err(why) => Reply::err(re, ErrorCode::Io, &why),
+            },
+            Call::Modified => match editor::decode_modified(value) {
+                Ok(paths) => Reply::ok(re, json!({"paths": paths})),
+                Err(why) => Reply::err(re, ErrorCode::Io, &why),
+            },
+            Call::Reload => match editor::decode_reload(value) {
+                Ok((reloaded, kept_modified)) => {
+                    Reply::ok(re, json!({"reloaded": reloaded, "kept_modified": kept_modified}))
+                }
+                Err(why) => Reply::err(re, ErrorCode::Io, &why),
+            },
+            Call::Cwd => match editor::decode_cwd(value) {
+                Ok(c) => Reply::ok(re, json!({ "dir": c.dir, "tab": c.tab })),
+                Err(why) => Reply::err(re, ErrorCode::Io, &why),
+            },
+            Call::CwdClear => match editor::decode_cwd_clear(value) {
+                Ok(c) => Reply::ok(re, json!({ "restored": c.restored, "moved": c.moved })),
+                Err(why) => Reply::err(re, ErrorCode::Io, &why),
+            },
             Call::Assist => match decode_apply(value) {
                 Ok(a) => Reply::ok(
                     re,
@@ -2381,6 +2814,9 @@ impl PluginHost {
     /// be run again if something is held for a time (a partial batch, an editor answer still out), else
     /// `None`: then only the wake runs it.
     pub fn pump(&self, now: Instant) -> Option<Instant> {
+        if self.state.borrow().moved_away {
+            return None;
+        }
         let (events, mut next) = {
             let mut st = self.state.borrow_mut();
             // Runs belong to the plugin: their events stay queued until a document can receive them.
@@ -2463,6 +2899,7 @@ impl PluginHost {
             next = Some(next.map_or(at, |n| n.min(at)));
         }
         self.take_store_answers(now, &mut replies);
+        self.expire_terminal_at(now, &mut replies);
         {
             let st = self.state.borrow();
             if !st.calls.is_empty() {
@@ -2479,11 +2916,12 @@ impl PluginHost {
                 .chain(
                     st.parked
                         .iter()
-                        .filter(|p| matches!(p.on, AssistOp::Checking { .. }))
+                        .filter(|p| matches!(p.on, ScopedOp::Checking { .. } | ScopedOp::CheckingDiff { .. }))
                         .map(|p| p.deadline),
                 )
                 .chain(st.store_waiting.values().map(|p| p.deadline))
-                .chain(st.follow_owed.iter().map(|p| p.deadline));
+                .chain(st.follow_owed.iter().map(|p| p.deadline))
+                .chain(st.terminal_at.iter().map(|p| p.deadline));
             for at in deadlines {
                 next = Some(next.map_or(at, |n| n.min(at)));
             }
@@ -2554,6 +2992,12 @@ impl PluginHost {
                     (Then::Link { target, .. }, Checked::Path(Err(refusal))) => {
                         replies.push(link_refusal(re, refusal, &target))
                     }
+                    (Then::TerminalAt { raw }, Checked::Path(Err(refusal))) => {
+                        replies.push(path_refusal(re, refusal, &raw))
+                    }
+                    (Then::TerminalAt { .. }, Checked::Path(Ok(dir))) => {
+                        self.terminal_at_checked(re, dir, now, replies)
+                    }
                     (Then::Link { line, session, .. }, Checked::Path(Ok(path))) => {
                         let current_session = self.state.borrow().follow.current_session();
                         if current_session != session {
@@ -2563,10 +3007,46 @@ impl PluginHost {
                         } else {
                             // Sent by the follow queue, after the call out and any parked before it, within what
                             // is left of the request's deadline. A link replaces nothing.
-                            let _ = self.park_page_op(FollowOp::OpenLink { path, line, re }, re, c.deadline);
+                            drop(self.park_page_op(FollowOp::OpenLink { path, line, re }, re, c.deadline, replies));
                         }
                     }
                     _ => {}
+                }
+                continue;
+            }
+            if let Checked::Diff(result) = checked {
+                let mut st = self.state.borrow_mut();
+                let at = st
+                    .parked
+                    .iter()
+                    .position(|p| matches!(p.on, ScopedOp::CheckingDiff { ticket: t } if t == ticket));
+                if let Some(i) = at {
+                    if now >= st.parked[i].deadline {
+                        if let Some(mut parked) = st.parked.remove(i) {
+                            answer_or_drop(
+                                self.id(),
+                                audience,
+                                &mut parked,
+                                |re| Some(Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT)),
+                                replies,
+                            );
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(args) => st.parked[i].on = ScopedOp::Diff(args),
+                        Err((refusal, raw)) => {
+                            if let Some(mut parked) = st.parked.remove(i) {
+                                answer_or_drop(
+                                    self.id(),
+                                    audience,
+                                    &mut parked,
+                                    |re| Some(path_refusal(re, refusal, &raw)),
+                                    replies,
+                                );
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -2575,7 +3055,7 @@ impl PluginHost {
             let at = st
                 .parked
                 .iter()
-                .position(|p| matches!(p.on, AssistOp::Checking { ticket: t, .. } if t == ticket));
+                .position(|p| matches!(p.on, ScopedOp::Checking { ticket: t, .. } if t == ticket));
             let Some(i) = at else { continue };
             if now >= st.parked[i].deadline {
                 let mut parked = st.parked.remove(i).expect("the parked check is present");
@@ -2591,17 +3071,8 @@ impl PluginHost {
             match result {
                 Ok(root) => {
                     let parked = &mut st.parked[i];
-                    if let AssistOp::Checking {
-                        diagnostics,
-                        inlay_hints,
-                        ..
-                    } = parked.on
-                    {
-                        parked.on = AssistOp::Apply {
-                            root,
-                            diagnostics,
-                            inlay_hints,
-                        };
+                    if let ScopedOp::Checking { op, .. } = parked.on {
+                        parked.on = ScopedOp::Apply { root, op };
                     }
                 }
                 Err(refusal) => {
@@ -2609,7 +3080,7 @@ impl PluginHost {
                         continue;
                     };
                     let raw = match &parked.on {
-                        AssistOp::Checking { raw, .. } => raw.clone(),
+                        ScopedOp::Checking { raw, .. } => raw.clone(),
                         _ => continue,
                     };
                     let refused = |re| Some(path_refusal(re, refusal, &raw));
@@ -2630,7 +3101,7 @@ impl PluginHost {
             false
         });
         st.parked.retain_mut(|p| {
-            if !matches!(p.on, AssistOp::Checking { .. }) || now < p.deadline {
+            if !matches!(p.on, ScopedOp::Checking { .. } | ScopedOp::CheckingDiff { .. }) || now < p.deadline {
                 return true;
             }
             answer_or_drop(self.id(), audience, p, timed_out, replies);
@@ -2673,7 +3144,7 @@ impl PluginHost {
         });
     }
 
-    /// Sends the assist calls at the head of the line, up to the first apply whose root is still being checked,
+    /// Sends the directory changes and clears at the head of the line, up to the first pending path check,
     /// and tells the page whose call has waited out its deadline that the editor is busy (the call itself still
     /// goes out, in its place).
     fn send_parked(&self, now: Instant, replies: &mut Vec<Reply>) {
@@ -2688,7 +3159,10 @@ impl PluginHost {
         loop {
             let next = {
                 let mut st = self.state.borrow_mut();
-                if matches!(st.parked.front().map(|p| &p.on), Some(AssistOp::Checking { .. })) {
+                if matches!(
+                    st.parked.front().map(|p| &p.on),
+                    Some(ScopedOp::Checking { .. } | ScopedOp::CheckingDiff { .. })
+                ) {
                     return;
                 }
                 st.parked.pop_front()
@@ -2696,32 +3170,40 @@ impl PluginHost {
             let Some(mut parked) = next else { return };
             // A replaced document's call still goes out in its place, answering nobody.
             answer_or_drop(self.id(), audience, &mut parked, |_| None, replies);
-            if let Some(reply) = self.send_assist(parked.re, parked.on, parked.deadline) {
+            if let Some(reply) = self.send_scoped(parked.re, parked.on, parked.deadline) {
                 replies.push(reply);
             }
         }
     }
 
-    /// The plugin's module was closed (prefix `x`): every run is stopped, the assist is put back and the follow
+    /// The plugin's module was closed (prefix `x`): every run is stopped, assist and cwd are restored and the follow
     /// snippet is taken down. The page is gone, so nothing is answered and nothing more is sent until a new page
     /// says hello. The stopped runs are not polled before then, so that page's hello lists them and their exits
     /// reach it; what they hold meanwhile is bounded by the runner's held-output cap.
     ///
-    /// The clear is made after every assist call already sent, so it undoes them whether or not they have been
-    /// answered, and stays in force even if the editor writes it ahead of one of them (`AssistOp`); the returned time is when `pump` must run to take its answer, as it does after any other
-    /// call that leaves an editor answer outstanding.
+    /// Each clear follows every change already requested, including those still waiting for a directory
+    /// check. Call order stamps keep the clear in force even if the editor writes calls out of order. The
+    /// returned time is when `pump` must run to take outstanding editor answers.
     pub fn stop(&self, now: Instant) -> Option<Instant> {
         self.new_document();
-        let assisted = {
+        let (assisted, cwd_set, diffed) = {
             let mut st = self.state.borrow_mut();
             st.tasks.stop_all();
             // The snippet's commands go with the module; the window's restart brings them back.
             st.follow_stopped = true;
             st.follow.park(FollowOp::Teardown);
-            st.assisted
+            let cwd_set = std::mem::replace(&mut st.cwd_set, false);
+            let diffed = st.diffed;
+            (st.assisted, cwd_set, diffed)
         };
         if assisted {
             let _ = self.editor_clear(None, now);
+        }
+        if cwd_set {
+            self.scoped_call(None, ScopedOp::CwdClear, now);
+        }
+        if diffed {
+            self.scoped_call(None, ScopedOp::CloseDiffs, now);
         }
         let waiting = {
             let st = self.state.borrow();
@@ -2831,6 +3313,658 @@ mod tests {
             let mut sent = self.page.take();
             assert_eq!(sent.len(), 1, "{sent:?}");
             sent.remove(0)
+        }
+    }
+
+    #[derive(Default)]
+    struct CwdEditor {
+        calls: RefCell<Vec<(&'static str, Vec<rmpv::Value>)>>,
+        answers: RefCell<Vec<nvim_rpc::Answer>>,
+    }
+
+    impl EditorRpc for CwdEditor {
+        fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>) -> nvim_rpc::Pending {
+            let (answer, pending) = nvim_rpc::Pending::pair();
+            self.calls.borrow_mut().push((code, args));
+            self.answers.borrow_mut().push(answer);
+            pending
+        }
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    fn cwd_rig() -> (Rig, Rc<CwdEditor>) {
+        let s = Scratch::new("host-cwd");
+        let (dir, settings) = demo_plugin(&s.0);
+        let manifest = std::fs::read_to_string(dir.join("eitri-plugin.toml")).unwrap();
+        let manifest = manifest.replace("\"editor.open\"", "\"editor.open\", \"editor.cwd\"");
+        std::fs::write(
+            dir.join("eitri-plugin.toml"),
+            format!(
+                "{manifest}\n[window]\nroot = \"${{work}}\"\ntitle = \"Demo\"\nlayout = {{ module = \"editor\" }}\n"
+            ),
+        )
+        .unwrap();
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+        let page = Rc::new(Page::default());
+        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), None, vec![]);
+        let editor = Rc::new(CwdEditor::default());
+        host.set_editor(editor.clone());
+        host.set_own_window(true);
+        (Rig { _s: s, host, page }, editor)
+    }
+
+    fn buffers_rig() -> (Rig, Rc<CwdEditor>) {
+        let (r, editor) = cwd_rig();
+        // The manifest was loaded already; give this rig only the buffer capability it exercises.
+        let mut plugin = (*r.host.plugin).clone();
+        plugin.manifest.capabilities.push(Capability::EditorBuffers);
+        let page = r.page.clone();
+        let host = PluginHost::new(Rc::new(plugin), page.clone(), Arc::new(|| {}), None, vec![]);
+        host.set_editor(editor.clone());
+        (Rig { _s: r._s, host, page }, editor)
+    }
+
+    fn buffer_args(r: &Rig, verb: &str) -> Value {
+        if verb == "editor.diff" {
+            return text_diff();
+        }
+        let root = r._s.0.join("work");
+        if verb == "editor.preload" {
+            let path = root.join("file.rs");
+            std::fs::write(&path, "fn main() {}\n").unwrap();
+            json!({"path": path, "diagnostics": "on", "inlay_hints": "off"})
+        } else {
+            json!({"root": root})
+        }
+    }
+
+    #[test]
+    fn buffer_verbs_need_editor_buffers() {
+        for verb in ["editor.preload", "editor.modified", "editor.reload", "editor.diff"] {
+            let r = rig(vec![]);
+            let args = buffer_args(&r, verb);
+            assert_eq!(error_code(&r.ask_at(Instant::now(), 1, verb, args)), "not_declared");
+        }
+    }
+
+    #[test]
+    fn buffer_verbs_reject_outside_roots_and_bad_policy() {
+        for verb in ["editor.preload", "editor.modified", "editor.reload"] {
+            let (r, editor) = buffers_rig();
+            let outside = r._s.0.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let args = if verb == "editor.preload" {
+                let path = outside.join("a.rs");
+                std::fs::write(&path, "a").unwrap();
+                json!({"path": path, "diagnostics": "on", "inlay_hints": "off"})
+            } else {
+                json!({"root": outside})
+            };
+            r.send_at(Instant::now(), 1, verb, args);
+            pump_until(&r, Instant::now(), || !r.page.0.borrow().is_empty());
+            assert_eq!(error_code(&r.page.take()[0]), "outside_roots");
+            assert!(editor.calls.borrow().is_empty());
+        }
+        let (r, _) = buffers_rig();
+        assert_eq!(
+            error_code(&r.ask_at(
+                Instant::now(),
+                2,
+                "editor.preload",
+                json!({"path": "/work/a.rs", "diagnostics": "yes", "inlay_hints": "off"})
+            )),
+            "bad_request"
+        );
+    }
+
+    #[test]
+    fn buffer_verbs_have_a_five_second_deadline() {
+        for verb in ["editor.preload", "editor.modified", "editor.reload"] {
+            let (r, editor) = buffers_rig();
+            let now = Instant::now();
+            r.send_at(now, 1, verb, buffer_args(&r, verb));
+            pump_until(&r, now, || {
+                !editor.calls.borrow().is_empty() || !r.page.0.borrow().is_empty()
+            });
+            assert_eq!(editor.calls.borrow().len(), 1);
+            assert!(r.page.take().is_empty());
+            r.host.pump(now + EDITOR_DEADLINE);
+            assert_eq!(error_code(&r.page.take()[0]), "editor_timeout");
+            r.host.pump(now + EDITOR_DEADLINE);
+            assert!(r.page.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn buffer_path_checks_expire_without_sending_the_late_operation() {
+        for verb in ["editor.preload", "editor.modified", "editor.reload"] {
+            let (r, editor) = buffers_rig();
+            let gate = r.host.gate_path_checks();
+            let now = Instant::now();
+            r.send_at(now, 1, verb, buffer_args(&r, verb));
+            r.host.pump(now + CHECK_DEADLINE);
+            assert_eq!(error_code(&r.page.take()[0]), "io");
+            gate.send(()).unwrap();
+            r.host.stop(now + CHECK_DEADLINE);
+            if verb == "editor.preload" {
+                pump_until(&r, now + CHECK_DEADLINE, || !editor.calls.borrow().is_empty());
+                assert_eq!(editor.calls.borrow().len(), 1);
+                assert_eq!(editor.calls.borrow()[0].1[0], rmpv::Value::from("wipe_preload"));
+            } else {
+                assert!(editor.calls.borrow().is_empty());
+            }
+            assert!(r.page.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn buffer_fixtures_gate_the_capability_and_decode_editor_answers() {
+        let (r, editor) = buffers_rig();
+        for (verb, request, response) in [
+            (
+                "editor.preload",
+                include_str!("fixtures/req-editor-preload.json"),
+                include_str!("fixtures/rep-editor-preload.json"),
+            ),
+            (
+                "editor.modified",
+                include_str!("fixtures/req-editor-modified.json"),
+                include_str!("fixtures/rep-editor-modified.json"),
+            ),
+            (
+                "editor.reload",
+                include_str!("fixtures/req-editor-reload.json"),
+                include_str!("fixtures/rep-editor-reload.json"),
+            ),
+            (
+                "editor.diff",
+                include_str!("fixtures/req-editor-diff.json"),
+                include_str!("fixtures/rep-editor-diff.json"),
+            ),
+        ] {
+            let Inbound::Request(req) = protocol::parse_request(request) else {
+                panic!("{verb}")
+            };
+            assert_eq!(req.verb.capability(), Some(Capability::EditorBuffers));
+            let fixture: Value = serde_json::from_str(response).unwrap();
+            let now = Instant::now();
+            r.send_at(now, req.id, verb, buffer_args(&r, verb));
+            pump_until(&r, now, || !editor.answers.borrow().is_empty());
+            let value = match verb {
+                "editor.preload" => rmpv::Value::Map(vec![
+                    ("buf".into(), 7.into()),
+                    ("replaced".into(), true.into()),
+                    ("stopped_clients".into(), 1.into()),
+                ]),
+                "editor.modified" => rmpv::Value::Map(vec![(
+                    "paths".into(),
+                    rmpv::Value::Array(vec![fixture["result"]["paths"][0].as_str().unwrap().into()]),
+                )]),
+                "editor.diff" => rmpv::Value::Map(vec![("tab".into(), 2.into())]),
+                _ => rmpv::Value::Map(vec![("reloaded".into(), 1.into()), ("kept_modified".into(), 0.into())]),
+            };
+            editor.answers.borrow_mut().pop().unwrap().send(Ok(value));
+            r.host.pump(now);
+            assert_eq!(r.page.take(), vec![fixture]);
+        }
+        assert!(matches!(
+            protocol::parse_request(include_str!("fixtures/bad-editor-preload-bad-policy.json")),
+            Inbound::Refused {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_new_document_wipes_the_previous_documents_only_preloaded_buffer() {
+        for finish in ["document", "stop", "shutdown"] {
+            let (r, editor) = buffers_rig();
+            let gate = r.host.gate_path_checks();
+            let now = Instant::now();
+            r.send_at(now, 1, "editor.preload", buffer_args(&r, "editor.preload"));
+            match finish {
+                "document" => r.host.page_committed(),
+                "stop" => {
+                    r.host.stop(now);
+                }
+                _ => {
+                    r.host.shutdown(now);
+                }
+            }
+            gate.send(()).unwrap();
+            pump_until(&r, now, || editor.calls.borrow().len() >= 2);
+            let calls = editor.calls.borrow();
+            assert_eq!(calls[0].1[0], rmpv::Value::from("preload"));
+            assert_eq!(calls[1].1[0], rmpv::Value::from("wipe_preload"));
+            assert!(r.page.take().iter().all(|reply| reply.get("re").is_none()));
+        }
+    }
+
+    #[test]
+    fn moving_a_page_away_sends_its_preload_wipe_past_discarded_path_checks() {
+        let (r, editor) = buffers_rig();
+        let gate = r.host.gate_path_checks();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.preload", buffer_args(&r, "editor.preload"));
+        gate.send(()).unwrap();
+        pump_until(&r, now, || !editor.calls.borrow().is_empty());
+        assert_eq!(editor.calls.borrow()[0].1[0], rmpv::Value::from("preload"));
+
+        r.send_at(now, 2, "editor.modified", buffer_args(&r, "editor.modified"));
+        r.host.forget_moved();
+        gate.send(()).unwrap();
+        for _ in 0..5 {
+            r.host.pump(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let calls = editor.calls.borrow();
+        assert_eq!(calls.last().unwrap().1[0], rmpv::Value::from("wipe_preload"));
+        assert_eq!(calls.len(), 2, "no buffer operation follows the wipe");
+    }
+
+    fn text_diff() -> Value {
+        json!({"left": {"title": "Attempt", "text": "fn main() {}\n", "filetype": "rust"},
+               "right": {"title": "Current", "text": "fn main() { }\n", "filetype": "rust"}})
+    }
+
+    #[test]
+    fn diff_refuses_a_title_over_80_chars_or_with_a_control_or_hidden_character() {
+        let (r, editor) = buffers_rig();
+        for title in [
+            "x".repeat(81),
+            "a\nb".into(),
+            "a\u{85}b".into(),
+            "a\u{202e}b".into(),
+            "a\u{3164}b".into(),
+            "".into(),
+        ] {
+            let mut args = text_diff();
+            args["left"]["title"] = title.into();
+            assert_eq!(
+                error_code(&r.ask_at(Instant::now(), 1, "editor.diff", args)),
+                "bad_request"
+            );
+        }
+        assert!(editor.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn diff_refuses_a_text_over_96_kib() {
+        let (r, editor) = buffers_rig();
+        let mut args = text_diff();
+        args["right"]["text"] = "x".repeat(96 * 1024 + 1).into();
+        assert_eq!(
+            error_code(&r.ask_at(Instant::now(), 1, "editor.diff", args)),
+            "bad_request"
+        );
+        assert!(editor.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn diff_refuses_a_filetype_outside_a_z0_9_underscore_1_to_32() {
+        let (r, editor) = buffers_rig();
+        for ft in ["", "Rust", "rust.lua", "rust|quit", "rust\n", &"x".repeat(33)] {
+            let mut args = text_diff();
+            args["left"]["filetype"] = ft.into();
+            assert_eq!(
+                error_code(&r.ask_at(Instant::now(), 1, "editor.diff", args)),
+                "bad_request"
+            );
+        }
+        assert!(editor.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn diff_path_outside_roots_answers_outside_roots() {
+        for side in ["left", "right"] {
+            let (r, editor) = buffers_rig();
+            let outside = r._s.0.join("outside.rs");
+            std::fs::write(&outside, "a\n").unwrap();
+            let mut args = text_diff();
+            args[side] = json!({"path": outside});
+            r.send_at(Instant::now(), 1, "editor.diff", args);
+            pump_until(&r, Instant::now(), || !r.page.0.borrow().is_empty());
+            assert_eq!(error_code(&r.page.take()[0]), "outside_roots");
+            assert!(editor.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn diff_cleanup_follows_pending_checks_on_stop_and_window_close() {
+        for shutdown in [false, true] {
+            let (r, editor) = buffers_rig();
+            let gate = r.host.gate_path_checks();
+            let now = Instant::now();
+            r.send_at(now, 1, "editor.diff", text_diff());
+            if shutdown {
+                r.host.shutdown(now);
+            } else {
+                r.host.stop(now);
+            }
+            gate.send(()).unwrap();
+            pump_until(&r, now, || editor.calls.borrow().len() >= 2);
+            let calls = editor.calls.borrow();
+            assert_eq!(calls[0].1[0], rmpv::Value::from("diff"));
+            assert_eq!(calls[1].1[0], rmpv::Value::from("close_diffs"));
+            assert!(r.page.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn diff_path_check_past_its_deadline_never_reaches_the_editor() {
+        let (r, editor) = buffers_rig();
+        let gate = r.host.gate_path_checks();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.diff", text_diff());
+        r.host.pump(now + CHECK_DEADLINE);
+        assert_eq!(error_code(&r.page.take()[0]), "io");
+        gate.send(()).unwrap();
+        r.host.stop(now + CHECK_DEADLINE);
+        pump_until(&r, now + CHECK_DEADLINE, || !editor.calls.borrow().is_empty());
+        assert_eq!(editor.calls.borrow().len(), 1);
+        assert_eq!(editor.calls.borrow()[0].1[0], rmpv::Value::from("close_diffs"));
+    }
+
+    #[test]
+    fn diff_text_limits_count_utf8_bytes_and_titles_count_characters() {
+        let (r, editor) = buffers_rig();
+        let now = Instant::now();
+        let mut args = text_diff();
+        args["left"]["title"] = "界".repeat(80).into();
+        args["left"]["text"] = "界".repeat(32 * 1024).into();
+        args["left"]["filetype"] = "x".repeat(32).into();
+        r.send_at(now, 1, "editor.diff", args.clone());
+        pump_until(&r, now, || !editor.calls.borrow().is_empty());
+        args["left"]["text"] = format!("{}x", "界".repeat(32 * 1024)).into();
+        assert_eq!(error_code(&r.ask_at(now, 2, "editor.diff", args)), "bad_request");
+        for control in ["\u{0}", "\r", "\u{7f}", "\u{85}"] {
+            let mut args = text_diff();
+            args["right"]["text"] = control.into();
+            assert_eq!(error_code(&r.ask_at(now, 3, "editor.diff", args)), "bad_request");
+        }
+    }
+
+    #[test]
+    fn diff_text_side_without_a_filetype_reaches_the_editor_without_one() {
+        let (r, editor) = buffers_rig();
+        let now = Instant::now();
+        let mut args = text_diff();
+        args["left"] = json!({"title": "notes.md", "text": "# a\n"});
+        r.send_at(now, 1, "editor.diff", args);
+        pump_until(&r, now, || !editor.calls.borrow().is_empty());
+        let calls = editor.calls.borrow();
+        assert_eq!(calls[0].1[0], rmpv::Value::from("diff"));
+        let side = |name: &str| {
+            calls[0].1[1]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let keys = |side: rmpv::Value| {
+            side.as_map()
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(side("left")),
+            ["title", "text"],
+            "an absent filetype must stay absent, not nil"
+        );
+        assert_eq!(keys(side("right")), ["title", "text", "filetype"]);
+    }
+
+    #[test]
+    fn diff_has_a_five_second_deadline_and_decodes_the_tab() {
+        for timeout in [false, true] {
+            let (r, editor) = buffers_rig();
+            let now = Instant::now();
+            r.send_at(now, 1, "editor.diff", text_diff());
+            pump_until(&r, now, || !editor.calls.borrow().is_empty());
+            if timeout {
+                r.host.pump(now + EDITOR_DEADLINE);
+                assert_eq!(error_code(&r.page.take()[0]), "editor_timeout");
+            } else {
+                editor
+                    .answers
+                    .borrow_mut()
+                    .pop()
+                    .unwrap()
+                    .send(Ok(rmpv::Value::Map(vec![("tab".into(), 2.into())])));
+                r.host.pump(now);
+                assert_eq!(r.page.take()[0]["result"], json!({"tab": 2}));
+            }
+        }
+    }
+
+    fn pump_until(r: &Rig, now: Instant, ready: impl Fn() -> bool) {
+        let guard = Instant::now() + Duration::from_secs(60);
+        while !ready() {
+            assert!(Instant::now() < guard, "the path worker did not answer");
+            r.host.pump(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn editor_cd_needs_editor_cwd() {
+        let r = rig(vec![]);
+        let reply = r.ask_at(Instant::now(), 1, "editor.cd", json!({"dir": "/work"}));
+        assert_eq!(error_code(&reply), "not_declared");
+        assert!(reply["error"]["message"].as_str().unwrap().contains("editor.cwd"));
+    }
+
+    #[test]
+    fn editor_cd_outside_the_own_window_answers_not_own_window() {
+        let (r, editor) = cwd_rig();
+        r.host.set_own_window(false);
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/rep-error-not-own-window.json")).unwrap();
+        let reply = r.ask_at(
+            Instant::now(),
+            fixture["re"].as_u64().unwrap(),
+            "editor.cd",
+            json!({"dir": "/work"}),
+        );
+        assert_eq!(reply, fixture);
+        assert_eq!(fixture["error"]["message"], NOT_OWN_WINDOW_TEXT);
+        assert!(editor.calls.borrow().is_empty());
+        assert!(r.host.state.borrow().checker.is_none());
+    }
+
+    #[test]
+    fn editor_cd_refuses_a_relative_dir_and_a_control_character() {
+        let (r, editor) = cwd_rig();
+        for dir in ["work/ex", "/work/line\nbreak", "/work/\u{7f}"] {
+            let reply = r.ask_at(Instant::now(), 1, "editor.cd", json!({"dir": dir}));
+            assert_eq!(error_code(&reply), "bad_request", "{reply}");
+        }
+        assert!(editor.calls.borrow().is_empty());
+        assert!(r.host.state.borrow().checker.is_none());
+    }
+
+    #[test]
+    fn editor_cd_outside_roots_answers_outside_roots() {
+        let (r, editor) = cwd_rig();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.cd", json!({"dir": r._s.0}));
+        pump_until(&r, now, || !r.page.0.borrow().is_empty());
+        assert_eq!(error_code(&r.page.take()[0]), "outside_roots");
+        assert!(editor.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn editor_cd_on_a_file_answers_io() {
+        let (r, editor) = cwd_rig();
+        let file = r._s.0.join("work/file");
+        std::fs::write(&file, "").unwrap();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.cd", json!({"dir": file}));
+        pump_until(&r, now, || !r.page.0.borrow().is_empty());
+        assert_eq!(error_code(&r.page.take()[0]), "io");
+        assert!(editor.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn editor_cd_past_5_s_answers_editor_timeout_once() {
+        let (r, editor) = cwd_rig();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.cd", json!({"dir": r._s.0.join("work")}));
+        pump_until(&r, now, || {
+            !editor.calls.borrow().is_empty() || !r.page.0.borrow().is_empty()
+        });
+        assert_eq!(editor.calls.borrow().len(), 1);
+        assert!(r.page.take().is_empty());
+        r.host.pump(now + EDITOR_DEADLINE);
+        let replies = r.page.take();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(error_code(&replies[0]), "editor_timeout");
+        editor.answers.borrow_mut().pop().unwrap().send(Ok(rmpv::Value::Nil));
+        assert_eq!(r.host.pump(now + EDITOR_DEADLINE), None);
+        assert!(r.page.take().is_empty());
+    }
+
+    #[test]
+    fn editor_cd_sends_canonical_bytes_and_decodes_the_reply_without_moving_keys() {
+        #[derive(Default)]
+        struct Layout(Cell<u64>);
+        impl LayoutPort for Layout {
+            fn focus(&self, _: FocusTarget) -> Result<(), String> {
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn terminal_at(&self, _: PathBuf, _: u64) -> Result<(), String> {
+                Err("not used by this test".to_string())
+            }
+        }
+        let (r, editor) = cwd_rig();
+        let layout = Rc::new(Layout::default());
+        r.host.set_layout(layout.clone());
+        let now = Instant::now();
+        let work = r._s.0.join("work");
+        let link = r._s.0.join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        r.send_at(now, 24, "editor.cd", json!({"dir": link}));
+        pump_until(&r, now, || !editor.calls.borrow().is_empty());
+        let calls = editor.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(std::ptr::eq(calls[0].0, editor::PLUGIN_CWD_LUA));
+        assert_eq!(calls[0].1[0], rmpv::Value::from("cd"));
+        let opts = calls[0].1[1].as_map().unwrap();
+        let arg = |name| &opts.iter().find(|(k, _)| k.as_str() == Some(name)).unwrap().1;
+        assert_eq!(arg("owner"), &rmpv::Value::from("demo"));
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(arg("dir"), &rmpv::Value::Binary(work.as_os_str().as_bytes().to_vec()));
+        drop(calls);
+        editor
+            .answers
+            .borrow_mut()
+            .pop()
+            .unwrap()
+            .send(Ok(rmpv::Value::Map(vec![
+                ("dir".into(), work.to_str().unwrap().into()),
+                ("tab".into(), 3.into()),
+            ])));
+        r.host.pump(now);
+        assert_eq!(layout.0.get(), 0, "cd leaves the keys where they were");
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "re": 24, "ok": true, "result": {"dir": work, "tab": 3}})]
+        );
+    }
+
+    #[test]
+    fn editor_cd_without_an_editor_answers_editor_unavailable() {
+        let (r, editor) = cwd_rig();
+        r.host.state.borrow_mut().editor = None;
+        let reply = r.ask_at(Instant::now(), 1, "editor.cd", json!({"dir": r._s.0.join("work")}));
+        assert_eq!(error_code(&reply), "editor_unavailable");
+        assert!(editor.calls.borrow().is_empty());
+        assert!(r.host.state.borrow().checker.is_none());
+    }
+
+    #[test]
+    fn editor_cd_path_check_times_out_once_and_never_sends_the_late_change() {
+        let (r, editor) = cwd_rig();
+        let gate = r.host.gate_path_checks();
+        let now = Instant::now();
+        r.send_at(now, 1, "editor.cd", json!({"dir": r._s.0.join("work")}));
+        r.host.pump(now + CHECK_DEADLINE);
+        let reply = r.page.take();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(error_code(&reply[0]), "io");
+        gate.send(()).unwrap();
+        r.host.stop(now + CHECK_DEADLINE);
+        pump_until(&r, now + CHECK_DEADLINE, || !editor.calls.borrow().is_empty());
+        assert_eq!(editor.calls.borrow().len(), 1, "only the clear may reach nvim");
+        assert_eq!(editor.calls.borrow()[0].1[0], rmpv::Value::from("clear"));
+        assert!(r.page.take().is_empty());
+    }
+
+    #[test]
+    fn editor_cd_stop_and_shutdown_clear_after_a_pending_check_without_waiting_for_answers() {
+        for closing in [false, true] {
+            let (r, editor) = cwd_rig();
+            let gate = r.host.gate_path_checks();
+            let now = Instant::now();
+            r.send_at(now, 1, "editor.cd", json!({"dir": r._s.0.join("work")}));
+            if closing {
+                r.host.shutdown(now);
+            } else {
+                assert!(r.host.stop(now).is_some());
+            }
+            assert!(editor.calls.borrow().is_empty());
+            gate.send(()).unwrap();
+            pump_until(&r, now, || editor.calls.borrow().len() == 2);
+            let calls = editor.calls.borrow();
+            assert!(calls
+                .iter()
+                .all(|(code, _)| std::ptr::eq(*code, editor::PLUGIN_CWD_LUA)));
+            assert_eq!(calls[0].1[0], rmpv::Value::from("cd"));
+            assert_eq!(calls[1].1[0], rmpv::Value::from("clear"));
+            let field = |at: usize, name: &str| {
+                calls[at].1[1]
+                    .as_map()
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(name))
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            assert_eq!(field(0, "maker"), field(1, "maker"));
+            assert!(field(0, "order").as_u64() < field(1, "order").as_u64());
+            drop(calls);
+            r.host.stop(now);
+            assert_eq!(editor.calls.borrow().len(), 2, "one clear per change");
+            assert_eq!(r.host.pump(now + EDITOR_DEADLINE), None);
+            assert!(r.page.take().is_empty(), "a stopped page gets no old answer");
+        }
+    }
+
+    #[test]
+    fn the_fixtures_parse() {
+        let req = include_str!("fixtures/req-editor-cd.json");
+        let Inbound::Request(req) = protocol::parse_request(req) else {
+            panic!("editor.cd must parse")
+        };
+        assert_eq!(req.verb.name(), "editor.cd");
+        assert_eq!(req.verb.capability(), Some(Capability::EditorCwd));
+        for fixture in [
+            include_str!("fixtures/rep-editor-cd.json"),
+            include_str!("fixtures/rep-error-not-own-window.json"),
+        ] {
+            let reply: Reply = serde_json::from_str(fixture).unwrap();
+            assert_eq!(
+                serde_json::to_value(reply).unwrap(),
+                serde_json::from_str::<Value>(fixture).unwrap()
+            );
         }
     }
 
@@ -2952,6 +4086,89 @@ mod tests {
             Value::Null,
             "a page without the table never asked for one"
         );
+    }
+
+    #[test]
+    fn the_hello_and_ready_trace_lines_name_the_document() {
+        let r = handoff_rig();
+        let lines = trace::capture(|| {
+            r.ask_at(Instant::now(), 3, "page.ready", json!({}));
+            r.host.page_committed();
+            r.page.take();
+            r.hello();
+            r.ask_at(Instant::now(), 4, "page.ready", json!({}));
+            r.host.set_restored(json!({"scroll": 12}));
+            r.host.page_committed();
+            r.page.take();
+            r.hello();
+            r.ask_at(Instant::now(), 5, "page.ready", json!({}));
+        });
+        assert_eq!(
+            lines,
+            [
+                "[plugin demo] trace: page.ready refused before host.hello",
+                "[plugin demo] trace: hello restored=no document=1",
+                "[plugin demo] trace: page.ready document=1",
+                "[plugin demo] trace: hello restored=yes document=2",
+                "[plugin demo] trace: page.ready document=2",
+            ]
+        );
+
+        let plain = rig(vec![]);
+        let lines = trace::capture(|| {
+            plain.hello();
+            plain.ask_at(Instant::now(), 6, "page.ready", json!({}));
+        });
+        assert_eq!(
+            lines,
+            [
+                "[plugin demo] trace: hello restored=no document=0",
+                "[plugin demo] trace: page.ready refused no [page] handoff",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forgotten_document_is_off_screen_until_the_window_says_again() {
+        let r = handoff_rig();
+        r.host.set_on_screen(true, Instant::now());
+        assert!(r.host.state.borrow().on_screen);
+        r.host.forget_moved();
+        assert!(!r.host.state.borrow().on_screen, "as its new follow state is");
+        r.host.set_on_screen(true, Instant::now());
+        assert!(r.host.state.borrow().on_screen);
+    }
+
+    #[test]
+    fn a_ready_names_the_document_that_said_it_until_another_starts() {
+        let r = handoff_rig();
+        assert_eq!(r.host.hello_document(), None, "no document has said hello");
+        r.host.page_committed();
+        r.page.take();
+        r.hello();
+        r.ask_at(Instant::now(), 3, "page.ready", json!({}));
+        assert!(r.host.take_ready());
+        let ready = r.host.hello_document();
+        assert!(ready.is_some());
+        assert_eq!(
+            r.host.hello_document(),
+            ready,
+            "the same document while nothing else happens"
+        );
+        r.host.page_committed();
+        assert_eq!(r.host.hello_document(), None, "a new document has not said hello yet");
+        r.page.take();
+        r.hello();
+        assert_ne!(r.host.hello_document(), ready, "a new document is another document");
+        r.host.accept_moved();
+        assert_eq!(r.host.hello_document(), None, "an arrival starts a new document");
+        // Its document answers once the move is over.
+        r.host.resume_moved();
+        r.page.take();
+        r.hello();
+        assert!(r.host.hello_document().is_some());
+        r.host.forget_moved();
+        assert_eq!(r.host.hello_document(), None, "a forgotten document is gone");
     }
 
     #[test]
@@ -3087,6 +4304,31 @@ mod tests {
     }
 
     #[test]
+    fn hello_says_own_window_false_until_told() {
+        let r = rig(vec![]);
+        assert!(!r.host.own_window());
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).unwrap();
+        assert_eq!(reply["result"]["own_window"], false);
+    }
+
+    #[test]
+    fn hello_says_own_window_true_after_set_own_window() {
+        let r = rig(vec![]);
+        r.host.set_own_window(true);
+        assert!(r.host.own_window());
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).unwrap();
+        assert_eq!(reply["result"]["own_window"], true);
+        r.host.new_document();
+        assert!(r.host.own_window());
+        r.host.set_own_window(false);
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).unwrap();
+        assert_eq!(reply["result"]["own_window"], false);
+    }
+
+    #[test]
     fn hello_says_the_kit_version_and_the_default_timeoutlen() {
         let r = rig(vec![]);
         let sent = r.hello();
@@ -3118,7 +4360,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_reply_keys_and_keyboard_values_match_the_shared_fixture() {
+    fn hello_reply_matches_the_shared_fixture() {
         let fixture: Value = serde_json::from_str(include_str!("fixtures/rep-hello.json")).unwrap();
         let r = rig(vec![]);
         r.send(fixture["re"].as_u64().unwrap(), "host.hello", json!({}));
@@ -3132,7 +4374,14 @@ mod tests {
             reply["result"].as_object().unwrap().keys().collect::<Vec<_>>(),
             fixture["result"].as_object().unwrap().keys().collect::<Vec<_>>()
         );
-        for key in ["keys_kit", "timeoutlen", "prefix", "module_key", "keys_settings"] {
+        for key in [
+            "keys_kit",
+            "timeoutlen",
+            "prefix",
+            "module_key",
+            "keys_settings",
+            "own_window",
+        ] {
             assert_eq!(reply["result"][key], fixture["result"][key], "{key}");
         }
         let fixture_vars = fixture["result"]["theme"]["vars"]
@@ -3511,5 +4760,243 @@ mod tests {
         let sent = r.hello();
         assert_eq!(sent[0]["result"]["prefix"], "Ctrl+a");
         assert_eq!(sent[0]["result"]["module_key"], "y");
+    }
+
+    /// The window's layout as `terminal.at` reaches it: what it was asked, and a refusal when one is set.
+    #[derive(Default)]
+    struct TermLayout {
+        asked: RefCell<Vec<(PathBuf, u64)>>,
+        refuse: RefCell<Option<String>>,
+    }
+
+    impl LayoutPort for TermLayout {
+        fn focus(&self, _target: FocusTarget) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminal_at(&self, dir: PathBuf, ticket: u64) -> Result<(), String> {
+            self.asked.borrow_mut().push((dir, ticket));
+            match self.refuse.borrow().clone() {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
+        }
+    }
+
+    struct TermRig {
+        _s: Scratch,
+        host: PluginHost,
+        page: Rc<Page>,
+        layout: Rc<TermLayout>,
+        work: PathBuf,
+    }
+
+    /// A plugin with a window and `capabilities`, its host told whether this is its own window (`own`): a window 2
+    /// of a pair is never told.
+    fn term_rig(capabilities: &str, own: Option<bool>) -> TermRig {
+        let s = Scratch::new("host-terminal-at");
+        let (dir, settings) = demo_plugin(&s.0);
+        std::fs::write(
+            dir.join("eitri-plugin.toml"),
+            format!(
+                "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\nsite = \"build/site\"\nentry = \"index.html\"\n\
+                 capabilities = [{capabilities}]\n\
+                 [settings]\nwork = {{ default = \"~/demo-work\", kind = \"dir\" }}\n\
+                 [roots]\nwork = \"${{work}}\"\n\
+                 [window]\nroot = \"${{work}}\"\ntitle = \"Study\"\n\
+                 layout = {{ row = [{{ module = \"page\" }}, {{ module = \"terminal\" }}] }}\n"
+            ),
+        )
+        .unwrap();
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+        let page = Rc::new(Page::default());
+        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), None, vec![]);
+        let layout = Rc::new(TermLayout::default());
+        host.set_layout(layout.clone());
+        if let Some(own) = own {
+            host.set_own_window(own);
+        }
+        let work = s.0.join("work");
+        std::fs::create_dir_all(work.join("ex/src")).unwrap();
+        std::fs::write(work.join("ex/src/lib.rs"), "").unwrap();
+        TermRig {
+            _s: s,
+            host,
+            page,
+            layout,
+            work,
+        }
+    }
+
+    const TERMINAL_CWD: &str = "\"terminal.cwd\"";
+
+    impl TermRig {
+        fn ask(&self, id: u64, dir: &Path) {
+            let text = json!({"v": 1, "id": id, "verb": "terminal.at", "args": {"dir": dir}}).to_string();
+            self.host.page_message(&text, Instant::now());
+        }
+
+        /// Pumps until the path check is back: the window was asked (its ticket), or the page was answered.
+        fn checked(&self) -> Option<u64> {
+            let before = self.layout.asked.borrow().len();
+            let guard = Instant::now() + Duration::from_secs(30);
+            loop {
+                self.host.pump(Instant::now());
+                if self.layout.asked.borrow().len() > before {
+                    return self.layout.asked.borrow().last().map(|(_, ticket)| *ticket);
+                }
+                if !self.page.0.borrow().is_empty() {
+                    return None;
+                }
+                assert!(Instant::now() < guard, "the path check never came back");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_at_needs_terminal_cwd() {
+        let r = term_rig("\"tasks\"", Some(true));
+        r.ask(55, &r.work.join("ex"));
+        let sent = r.page.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(error_code(&sent[0]), "not_declared", "{}", sent[0]);
+        assert!(r.layout.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn terminal_at_outside_the_own_window_answers_not_own_window() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        r.host.set_own_window(false);
+        r.ask(55, &r.work.join("ex"));
+        let sent = r.page.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            sent[0],
+            json!({"v": 1, "re": 55, "ok": false, "error": {"code": "not_own_window", "message": NOT_OWN_WINDOW_TEXT}})
+        );
+        assert_eq!(NOT_OWN_WINDOW_TEXT, "This verb acts only in the plugin's own window");
+        assert!(r.layout.asked.borrow().is_empty(), "nothing reaches the window");
+    }
+
+    #[test]
+    fn window_two_terminal_at_answers_not_own_window() {
+        // The second window of a pair never tells its hosts they are in their own window.
+        let r = term_rig(TERMINAL_CWD, None);
+        r.ask(56, &r.work.join("ex"));
+        let sent = r.page.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(error_code(&sent[0]), "not_own_window", "{}", sent[0]);
+        assert!(r.layout.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn terminal_at_checks_its_dir_like_any_page_path() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        r.ask(57, Path::new("relative/dir"));
+        assert_eq!(error_code(&r.page.take()[0]), "bad_request");
+        r.ask(58, &r.work.join("../.."));
+        assert_eq!(r.checked(), None);
+        assert_eq!(error_code(&r.page.take()[0]), "outside_roots");
+        r.ask(59, &r.work.join("ex/src/lib.rs"));
+        assert_eq!(r.checked(), None);
+        assert_eq!(error_code(&r.page.take()[0]), "io", "a file is not a directory");
+        assert!(r.layout.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_answer_reaches_the_page_once_through_terminal_at_answered() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        let answers = [
+            (
+                TerminalAtAnswer::Restarted,
+                json!({"v": 1, "re": 60, "ok": true, "result": {"how": "restarted"}}),
+            ),
+            (
+                TerminalAtAnswer::StartDir,
+                json!({"v": 1, "re": 61, "ok": true, "result": {"how": "start_dir"}}),
+            ),
+            (
+                TerminalAtAnswer::Already,
+                json!({"v": 1, "re": 62, "ok": true, "result": {"how": "already"}}),
+            ),
+            (
+                TerminalAtAnswer::Busy("a program is running in the terminal".into()),
+                json!({"v": 1, "re": 63, "ok": false,
+                       "error": {"code": "busy", "message": "a program is running in the terminal"}}),
+            ),
+        ];
+        for (id, (answer, reply)) in (60..).zip(answers) {
+            r.ask(id, &r.work.join("ex"));
+            let ticket = r.checked().expect("the window is asked");
+            assert_eq!(
+                r.layout.asked.borrow().last().unwrap().0,
+                r.work.join("ex"),
+                "the checked directory, canonical"
+            );
+            assert!(r.page.take().is_empty(), "nothing until the window answers");
+            r.host.terminal_at_answered(ticket, answer.clone(), Instant::now());
+            assert_eq!(r.page.take(), vec![reply]);
+            r.host.terminal_at_answered(ticket, answer, Instant::now());
+            r.host.pump(Instant::now() + EDITOR_DEADLINE * 2);
+            assert!(r.page.take().is_empty(), "answered once");
+        }
+        let tickets: Vec<u64> = r.layout.asked.borrow().iter().map(|(_, t)| *t).collect();
+        let mut unique = tickets.clone();
+        unique.dedup();
+        assert_eq!(tickets, unique, "each request has its own ticket");
+    }
+
+    #[test]
+    fn an_answer_for_a_replaced_document_is_dropped_with_one_log_line() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        r.ask(64, &r.work.join("ex"));
+        let ticket = r.checked().unwrap();
+        r.host.page_committed();
+        r.page.take();
+        r.host
+            .terminal_at_answered(ticket, TerminalAtAnswer::Restarted, Instant::now());
+        assert!(r.page.take().is_empty(), "the new document asked nothing");
+        r.host.pump(Instant::now() + EDITOR_DEADLINE * 2);
+        assert!(r.page.take().is_empty(), "and is not told of a deadline either");
+    }
+
+    #[test]
+    fn past_the_deadline_the_page_has_busy_the_terminal_did_not_answer_within_6_s_once() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        r.ask(65, &r.work.join("ex"));
+        let ticket = r.checked().unwrap();
+        let asked = Instant::now();
+        r.host.pump(asked);
+        assert!(r.page.take().is_empty());
+        r.host.pump(asked + TERMINAL_AT_WAIT + Duration::from_millis(1));
+        assert!(
+            r.page.take().is_empty(),
+            "the window answers by its own deadline; this one waits past it"
+        );
+        let late = asked + TERMINAL_AT_DEADLINE + Duration::from_millis(1);
+        r.host.pump(late);
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "re": 65, "ok": false,
+                        "error": {"code": "busy", "message": "the terminal did not answer within 6 s"}})]
+        );
+        r.host.pump(late);
+        r.host.terminal_at_answered(ticket, TerminalAtAnswer::Restarted, late);
+        assert!(r.page.take().is_empty(), "told once; the late answer is dropped");
+    }
+
+    #[test]
+    fn a_port_err_is_busy_with_its_text() {
+        let r = term_rig(TERMINAL_CWD, Some(true));
+        *r.layout.refuse.borrow_mut() = Some("the layout is changing; try again".into());
+        r.ask(66, &r.work.join("ex"));
+        r.checked();
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "re": 66, "ok": false,
+                        "error": {"code": "busy", "message": "the layout is changing; try again"}})]
+        );
+        r.host.pump(Instant::now() + EDITOR_DEADLINE * 2);
+        assert!(r.page.take().is_empty(), "a refusal is the one answer");
     }
 }

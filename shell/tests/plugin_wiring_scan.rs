@@ -25,12 +25,10 @@ fn file_code(path: &str) -> String {
         .collect()
 }
 
-/// What each `grid.connect_changed(` and `grid.connect_changed_by_controller(` in `code` (whitespace removed) is
-/// handed: the text up to its closing `)`. Both lists run after a layout change, so neither may hold what moved.
+/// What each `grid.connect_changed_by_controller(` in `code` (whitespace removed) is handed: the text up to its
+/// closing `)`. The hooks run after a layout change, so none may hold what moved.
 fn change_hooks(code: &str) -> Vec<&str> {
-    let mut hooks = call_texts(code, "grid.connect_changed(");
-    hooks.extend(call_texts(code, "grid.connect_changed_by_controller("));
-    hooks
+    call_texts(code, "grid.connect_changed_by_controller(")
 }
 
 /// Each call of `call` (ending in its `(`) in `code` (whitespace removed): its parenthesised arguments.
@@ -70,6 +68,19 @@ fn let_block<'a>(code: &'a str, anchor: &str) -> &'a str {
     scan::braced(code, at + code[at..].find('{').unwrap())
 }
 
+#[test]
+fn apply_layout_requests_decides_nothing() {
+    let code = build_ui_code();
+    let body = let_block(&code, "letapply_layout_requests:Rc<dynFn()>=");
+    assert!(body.contains("letrequests=lua_engine.layout.borrow_mut().take_requests();"));
+    assert!(body.contains("if!requests.is_empty(){driver.post(HostEvent::Lua("));
+    assert!(body.contains("LuaEvent::LayoutRequests{win:WinId::MAIN,requests,"));
+    assert_eq!(call_texts(body, "driver.post(").len(), 1);
+    for decision in ["LayoutRequest::", "lua_request(", "::moved(", "match", "forrequest"] {
+        assert!(!body.contains(decision), "the drain still decides with {decision}");
+    }
+}
+
 /// What the innermost block around `at` says before `at`: the bindings a closure made there captures, wherever among
 /// them they stand.
 fn enclosing_lets(code: &str, at: usize) -> &str {
@@ -78,10 +89,53 @@ fn enclosing_lets(code: &str, at: usize) -> &str {
 }
 
 #[test]
+fn build_ui_starts_every_module_from_the_start_theme() {
+    let code = build_ui_code();
+    for fallback in ["ThemeTokens::fallback(", "PageTheme::fallback("] {
+        assert!(!code.contains(fallback), "build_ui still starts from {fallback}");
+    }
+    assert_eq!(code.matches("StartTheme::read(").count(), 1);
+    assert_eq!(code.matches("ThemeCss::install(").count(), 1);
+    let read = code.find("StartTheme::read(").unwrap();
+    let install = code.find("ThemeCss::install(").unwrap();
+    let spawn = code.find("EditorSpawn{").expect("the editor spawn");
+    let window = code.find("StartStep::Window").expect("the window phase");
+    assert!(read < install && install < spawn && install < window);
+    let spawn = scan::braced(&code, spawn + code[spawn..].find('{').unwrap());
+    assert!(spawn.contains("background:start_theme.editor_background()"));
+    let panels = call_texts(&code, "build_agent_panel(");
+    assert_eq!(panels.len(), 1);
+    assert!(read < code.find("build_agent_panel(").unwrap());
+    assert!(panels[0].contains("start_theme"));
+}
+
+#[test]
+fn only_a_window_with_its_own_editor_and_without_clean_remembers_the_theme() {
+    let code = build_ui_code();
+    assert_eq!(code.matches("ThemeWriter::new(").count(), 1);
+    let writer = code.find("ThemeWriter::new(").unwrap();
+    let gate = &code[writer.saturating_sub(200)..writer];
+    assert!(gate.contains("owns_editor") && gate.contains("!want_clean"));
+    let at = code.find("listen_theme(").expect("the theme listener");
+    let listener = scan::braced(&code, at + code[at..].find('{').unwrap());
+    assert_eq!(listener.matches(".remember(").count(), 1);
+    let remembers: usize = scan::rust_sources(&["shell/src"])
+        .iter()
+        .map(|source| {
+            let code = scan::code_only(&source.text);
+            let code = scan::without(&code, &scan::modules(&code, "tests"));
+            let code: String = code.split_whitespace().collect();
+            code.matches(".remember(").count()
+        })
+        .sum();
+    assert_eq!(remembers, 1);
+}
+
+#[test]
 fn plugins_are_installed_before_the_lua_panels_are_read() {
     let code = build_ui_code();
     let install = code
-        .find("plugin_panels::PluginPanels::install(&lua_engine,&keymap,&PageTheme::fallback())")
+        .find("plugin_panels::PluginPanels::install(&lua_engine,&keymap,&PageTheme::from_tokens(&start_theme.tokens),)")
         .expect("installed");
     let panels = code.find("letlua_panels:").expect("the Lua panels are read");
     assert!(install < panels);
@@ -126,7 +180,10 @@ fn a_committed_document_gets_the_theme_and_a_host_its_module_key() {
         .collect();
     let at = code.find("on_committed:").expect("the commit hook");
     let hook = scan::braced(&code, at + code[at..].find('{').unwrap());
-    assert!(hook.contains("pump.host.page_committed()"), "{hook}");
+    assert!(hook.contains("pump.committed()"), "{hook}");
+    let committed = code.find("fncommitted(&self)").expect("the pump's commit handler");
+    let handler = scan::braced(&code, committed + code[committed..].find('{').unwrap());
+    assert!(handler.contains("self.host.page_committed()"), "{handler}");
     let new = code.find("PluginHost::new(").expect("the host is made");
     assert!(
         code[new..].contains("host.set_theme(theme);"),
@@ -153,7 +210,6 @@ fn plugins_share_the_windows_editor_handle_and_get_the_layout() {
 
 #[test]
 fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
-    let code = build_ui_code();
     // The kill is the controller's: off screen first, then its lifecycle hears the kill.
     let verbs = file_code("core/src/wm/verbs/modules.rs");
     assert!(verbs.contains("ModuleKind::LuaWebview=>leave_killed(w,cx,win,id,reopen,batch),"));
@@ -176,8 +232,12 @@ fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
     let end = scan::functions(&raw, "end_web_process");
     assert_eq!(end.len(), 1, "one end of a killed page's web process");
     assert!(end[0].contains("terminate_web_process()"));
-    let close = code.find("window.connect_close_request(").unwrap();
-    assert!(code[close..].contains("plugin_panels.shutdown(&app_for_close);"));
+    // The window's teardown ends every plugin task, with the application held for them; the controller's teardown
+    // batch asks for it.
+    assert!(file_code("core/src/wm/close.rs").contains("HostOp::Plugin(PluginOp::ShutdownAll{win}),"));
+    assert!(
+        arm(&services, "PluginOp::ShutdownAll{", "PluginOp::").contains("self.plugin_panels.shutdown(&self.app()?);")
+    );
 }
 
 #[test]
@@ -204,62 +264,161 @@ fn a_plugin_hears_its_focus_and_the_editors_timeoutlen() {
 }
 
 #[test]
-fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
+fn no_panel_verb_is_left_in_build_ui() {
     let code = build_ui_code();
-    let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
-    let read = code[arm..]
-        .find("keymap_plugins.declared_rows(&module)")
-        .expect("the plugin's rows are read");
-    let focus = code[arm..].find("give_keys(&chat);").expect("the chat takes the keys");
-    let open = code[arm..]
-        .find("agent.open_keymap(view,plugin,opening);")
-        .expect("opened with the section");
-    assert!(read < focus && focus < open);
+    for gone in [
+        "run_tab_action",
+        "tab_verb_view",
+        "tab_break(",
+        "reveal_chat(",
+        "keymap_opened(",
+        "keymap_superseded(",
+    ] {
+        assert!(!code.contains(gone), "build_ui still has {gone}");
+    }
+}
+
+/// Every action is the controller's, so nothing hands one back to the shell: the contract has no shell verb, the host
+/// runs none, and `build_ui` installs no arm for one. The window's mode, the last thing such an arm carried out, is
+/// the host's `SetMode`, toggled through the function `build_ui` gives it.
+#[test]
+fn the_shell_verb_path_is_gone() {
+    let code = build_ui_code();
+    for gone in ["letrun_verb", "set_shell_verb_arm(", "ShellCall"] {
+        assert!(!code.contains(gone), "build_ui still has `{gone}`");
+    }
+    let host = file_code("shell/src/gtk_host/mod.rs");
+    for gone in ["run_shell_verb", "shell_verb_arm", "ShellCall"] {
+        assert!(!host.contains(gone), "the GTK host still has `{gone}`");
+    }
+    let contract = file_code("core/src/wm/host.rs");
+    for gone in ["ShellVerb", "ShellCall", "run_shell_verb", "ShellRefused", "shell_verb"] {
+        assert!(!contract.contains(gone), "the contract still has `{gone}`");
+    }
+    assert!(
+        host.contains("HostOp::SetMode{win,..}=>self.set_mode(op,*win),"),
+        "the host carries out the window's mode"
+    );
+    let toggle = call_texts(&code, "wm_host.set_mode_toggle(");
+    assert_eq!(toggle.len(), 1, "one mode toggle");
+    assert!(toggle[0].contains("window_modes.toggle_immersive()"), "{}", toggle[0]);
+}
+
+/// The shell reports text-size inputs and carries out writes; the controller owns the model.
+#[test]
+fn no_text_size_decision_is_left_in_the_shell() {
+    let code = file_code("shell/src/text_size.rs").replace("HostEvent::TextSize", "HostEvent::");
+    for gone in ["TextSize", "apply_both", "apply_editor", "apply_panel", "apply_page"] {
+        let found = if gone == "TextSize" {
+            code.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == gone)
+        } else {
+            code.contains(gone)
+        };
+        assert!(!found, "text_size.rs still holds {gone}");
+    }
 }
 
 #[test]
-fn prefix_question_mark_keeps_what_it_opened_from() {
+fn no_panel_hook_decides_in_build_ui() {
     let code = build_ui_code();
-    let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
-    let body = &code[arm..];
-    let show = body.find("show_on_screen(&chat)").expect("the chat is put on screen");
-    let kept = body.find("driver.keymap_opened(").expect("what it opened from is kept");
-    let focus = body.find("give_keys(&chat);").expect("the chat takes the keys");
-    assert!(
-        show < kept && kept < focus,
-        "kept only after the chat is on screen, before it takes the keys"
-    );
-    // The sheet's view is the one holding the keys (else the base view's), read before anything moves, and the
-    // covered check and the opening use that same view.
-    let view = body
-        .find("letview=from.as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE);")
-        .expect("the view comes from the module that held the keys");
-    let chat = body
-        .find("letchat=view.module();")
-        .expect("the sheet's module is that view's");
-    let covered = body
-        .find("chat_covered(view)")
-        .expect("the covered check asks about that view");
-    let open = body
-        .find("agent.open_keymap(view,plugin,opening);")
-        .expect("the sheet opens in that view's page");
-    assert!(view < chat && chat < show && show < covered && covered < kept && kept < open);
+    for hook in [
+        "on_show_view",
+        "on_view_empty",
+        "on_review_open",
+        "on_editor_done",
+        "on_editor_request",
+        "on_tab_verb",
+    ] {
+        let calls = call_texts(&code, &format!("panel_hooks.{hook}=Some("));
+        assert_eq!(calls.len(), 1, "{hook}");
+        let body = calls[0];
+        for forbidden in PANEL_DECISIONS {
+            assert!(!body.contains(forbidden), "{hook}: {forbidden}");
+        }
+        if hook == "on_editor_request" {
+            assert!(
+                body.contains("returntwo.request(request,&||activation_token(&asking));"),
+                "a linked request uses its transport: {body}"
+            );
+            assert!(
+                body.ends_with("drive_editor(Some(request))}))"),
+                "a local request returns the editor drive's outcome: {body}"
+            );
+        } else {
+            assert!(body.contains("HostEvent::Chat(ChatEvent::"), "{hook} posts its event");
+        }
+    }
+    let drive = let_block(&code, "letdrive_editor:Rc<dynFn(");
+    assert!(editor_drive_returns_outcome(drive), "{drive}");
+}
 
-    let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
-    let arm_body = scan::braced(&code, arm + "Action::PanelKeymap=>".len());
-    assert!(
-        arm_body.contains("layout.zoom().cloned()") && !arm_body.contains("zoomed()"),
-        "the opening keeps either kind of zoom"
-    );
+const PANEL_DECISIONS: [&str; 5] = [
+    "give_keys(",
+    "show_on_screen(",
+    "focus_and_arrive(",
+    "drop_chat_view(",
+    "send_keys(",
+];
 
-    // A command line opened after the sheet forgets it, before the chat takes the keys.
-    let line = code.find("Action::PanelCommandLine=>{").expect("the prefix : arm");
-    let line_body = scan::braced(&code, line + "Action::PanelCommandLine=>".len());
-    let forget = line_body
-        .find("driver.keymap_superseded(WinId::MAIN);")
-        .expect("the newer request forgets the sheet's pending return");
-    let take = line_body.find("give_keys(&chat);").expect("the chat takes the keys");
-    assert!(forget < take);
+fn editor_drive_returns_outcome(body: &str) -> bool {
+    body.ends_with(
+        "driver.editor_request(WinId::MAIN,request.map(|request|request.input_keys()).unwrap_or_default(),)})}",
+    ) && !body.contains("driver.post(")
+        && !PANEL_DECISIONS.iter().any(|forbidden| body.contains(forbidden))
+}
+
+#[test]
+fn an_editor_drive_that_discards_the_outcome_is_rejected() {
+    let drive = "{ Rc::new(move |request| {
+        driver.editor_request(WinId::MAIN,
+            request.map(|request| request.input_keys()).unwrap_or_default(),)
+    }) }";
+    let code: String = scan::code_only(drive).split_whitespace().collect();
+    assert!(editor_drive_returns_outcome(&code));
+    let discarded = code.replace(")})}", ");Ok(())})}");
+    assert!(!editor_drive_returns_outcome(&discarded));
+    let posted = code.replace("driver.editor_request(", "driver.post(");
+    assert!(!editor_drive_returns_outcome(&posted));
+    for forbidden in PANEL_DECISIONS {
+        let deciding = code.replace(
+            "driver.editor_request(",
+            &format!("{forbidden});driver.editor_request("),
+        );
+        assert!(!editor_drive_returns_outcome(&deciding), "{forbidden}");
+    }
+}
+
+/// A page shuts its keys sheet, its `:` line and a tab's details whenever it is told where the keys are, and when
+/// the batch that opens one moved the keys into that chat, the page is told only after the batch: so all three open
+/// from an idle, never inside the batch, or they close the moment they open.
+#[test]
+fn the_keys_sheet_and_the_command_line_open_after_the_page_hears_it_has_the_keys() {
+    let code = file_code("shell/src/main.rs");
+    let services = code
+        .find("implgtk_host::ServiceSetforPanelServices{")
+        .expect("the window's panel services");
+    let chat = services + code[services..].find("fnchat(&self,").expect("its chat ops");
+    let body = scan::braced(&code, chat + code[chat..].find('{').unwrap());
+    for (pattern, next, call) in [
+        ("ChatOp::OpenKeymap{", "ChatOp::CommandLine{", "agent.open_keymap("),
+        ("ChatOp::CommandLine{", "ChatOp::Tab{", "agent.open_command_line("),
+        (
+            "ChatOp::Tab{call:eitri_core::wm::verbs::tabs::TabCall::Info(view),",
+            "ChatOp::Reload{",
+            "agent.open_detail(",
+        ),
+    ] {
+        let arm = arm(body, pattern, next);
+        let idle = arm
+            .find("glib::idle_add_local_once(")
+            .unwrap_or_else(|| panic!("{pattern} opens from an idle: {arm}"));
+        let opened = arm
+            .find(call)
+            .unwrap_or_else(|| panic!("{pattern} calls {call}: {arm}"));
+        assert!(opened > idle, "{pattern} opens inside the idle: {arm}");
+        assert_eq!(arm.matches(call).count(), 1, "{pattern} opens once: {arm}");
+    }
 }
 
 /// The sheet's close is the controller's: the hook posts the opening it closes, and whether its own keys closed it.
@@ -327,8 +486,8 @@ fn no_focus_or_key_decision_is_left_in_build_ui() {
         "a direction letter posts the editor's navigation"
     );
     assert!(
-        body[quit..].contains("editor_quitting.cancelled(g)"),
-        "a cancelled quit stays the editor quit's"
+        body[quit..].contains("EditorEvent::QuitCancelled{"),
+        "a cancelled quit is posted to the controller's quit flow"
     );
     let layers = code.matches("gtk_host::keys::install_window_layers(").count();
     assert_eq!(layers, 1, "the window's key layers are installed by one call");
@@ -536,6 +695,26 @@ fn every_answer_of_the_scheme_carries_nosniff() {
     );
 }
 
+#[test]
+fn a_page_with_no_view_here_is_built_before_it_is_given_the_keys_whatever_its_start() {
+    // A page that starts shown has no view either once it has left for the other window and come back: the grab
+    // and `PluginOp::Build` build any page that has none, never only one that starts hidden.
+    let code = build_ui_code();
+    let focus = code
+        .find("letgrab_module:Rc<dynFn(&ModuleId)->bool>=")
+        .expect("grab_module");
+    let focus = scan::braced(&code, focus + code[focus..].find('{').unwrap());
+    assert!(
+        focus.contains("if!plugin_panels.is_built(id){plugin_panels.activate_holding(id);plugin_panels.build_page(id,"),
+        "{focus}"
+    );
+    assert!(!focus.contains("starts_hidden("), "{focus}");
+    let services = file_code("shell/src/gtk_host/services.rs");
+    let build = arm(&services, "PluginOp::Build{", "PluginOp::");
+    assert!(build.contains("if!self.plugin_panels.is_built(module){"), "{build}");
+    assert!(!build.contains("starts_hidden("), "{build}");
+}
+
 /// A plugin whose module starts hidden: kept out of what the window places by itself, its page built when its
 /// module is first shown (a check right after startup for a layout that reopens it shown, then a change hook for
 /// every later route), and opened by its own rule through one function from every show path.
@@ -566,10 +745,12 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
     let services = file_code("shell/src/gtk_host/services.rs");
     let build = arm(&services, "PluginOp::Build{", "PluginOp::");
     assert!(build.contains("self.plugin_panels.build_page(module,"), "{build}");
-    assert!(
-        code.contains("eitri_core::layout::persist::load_for_role(dir,project_root,pair.pair_role(),&decls,&deferred)")
-    );
-    assert!(code.contains("layout_saver.set_deferred(deferred.clone());"));
+    assert!(code.contains(
+        "eitri_core::layout::persist::load_for_role(dir,project_root,pair.pair_role(),&layout_decls,&layout_deferred)"
+    ));
+    assert!(code.contains("layout_saver.set_deferred(layout_deferred.clone());"));
+    // The lists the file is read with are the window's own, with an own window's page read as deferred.
+    assert!(code.contains("own_window_lists(plugin_window.as_ref().map(|window|&window.page),&decls,&deferred)"));
     // A switch or an open gives the keys before the change hooks run: the grab, the controller's and the shell
     // arms' alike, builds the page first.
     let focus = code
@@ -587,16 +768,14 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         "a workspace made from a definition keeps a start-hidden module it names"
     );
 
-    let show = code
-        .find("letshow_on_screen:Rc<dynFn(&ModuleId)->Result<(),LayoutError>>=")
-        .expect("show_on_screen");
-    let show = scan::braced(&code, show + code[show..].find('{').unwrap());
+    // Every show of it is the controller's, which opens it by its rule: `eitri.layout.show`, its module key, a
+    // plugin page's `layout.focus` and a card's view alike go through `show_on_screen`.
+    let verbs = scan::rust_sources(&["core/src/wm/verbs"]);
+    let (_, show) = scan::function_in(&verbs, "show_on_screen");
     assert!(
         show.contains("open_plugin_module("),
         "show_on_screen opens a hidden plugin by its rule"
     );
-    // `eitri.layout.show` and its module key are the controller's, which opens it by its rule too.
-    let verbs = scan::rust_sources(&["core/src/wm/verbs"]);
     let (_, lua_show) = scan::function_in(&verbs, "lua_show");
     assert!(
         lua_show.contains("open_plugin_module("),
@@ -609,14 +788,13 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         "its module key opens it by its rule"
     );
 
-    let sources = scan::rust_sources(&["shell/src"]);
-    let (_, opener) = scan::function_in(&sources, "open_plugin_module");
+    let (_, opener) = scan::function_in(&verbs, "open_plugin_module");
     assert!(opener.contains("plugin_open_rule(") && opener.contains("add_everywhere_at("));
     assert!(
-        !opener.contains("build_page("),
-        "an open the grid refuses builds no page"
+        !opener.contains("build_page(") && !opener.contains("PluginOp::Build"),
+        "an open the layout refuses builds no page: the lifecycle builds it once it is shown"
     );
-    let (_, rule) = scan::function_in(&sources, "plugin_open_rule");
+    let (_, rule) = scan::function_in(&verbs, "plugin_open_rule");
     assert!(rule.contains("resolve_own("));
 
     // The page is built in one closure, which logs the build after it.
@@ -677,18 +855,27 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     let exit = code.find("pane.on_exited_unrequested(").expect("the editor's own exit");
     let body = scan::braced(&code, exit + code[exit..].find('{').unwrap());
     let told = body.find("plugin_panels.editor_closed();").expect("the hosts are told");
-    let acted = body.find(".nvim_exited();").expect("the exit is acted on");
+    let acted = body
+        .find("EditorEvent::Exited{")
+        .expect("the exit is posted to the quit flow");
     assert!(told < acted);
-    let retire = code
-        .find("letretire_editor:Rc<dynFn()->Result<(),LayoutError>>=")
-        .expect("retire_editor");
-    let body = scan::braced(&code, retire + code[retire..].find('{').unwrap());
-    let killed = body.find("grid.kill_module(").expect("the editor is killed");
-    let told = body.find("plugin_panels.editor_closed();").expect("the hosts are told");
+    // The editor's retirement is the controller's: the hosts hear it only once the layout took the kill.
+    let close = file_code("core/src/wm/close.rs");
+    let at = close
+        .find("fnend_editor(&mutself)->Result<(),crate::layout::LayoutError>{")
+        .expect("the controller ending of the editor");
+    let retire = scan::braced(&close, at + close[at..].find('{').unwrap());
+    let killed = retire.find("self.kill_editor_layout(").expect("the editor is killed");
+    let told = retire.find("PluginOp::EditorClosed{").expect("the hosts are told");
     assert!(killed < told, "told only once the kill succeeded");
+    let services = file_code("shell/src/gtk_host/services.rs");
+    assert!(arm(&services, "PluginOp::EditorClosed{", "PluginOp::").contains("self.plugin_panels.editor_closed();"));
 
-    let close = code.find("window.connect_close_request(").unwrap();
-    assert!(code[close..].contains("socket.cleanup();"));
+    // The plugins' follow socket goes with the editor's feeds, at the window's teardown.
+    let at = services.find("fnfeeds(&self){").expect("the teardown's feeds step");
+    let feeds = scan::braced(&services, at + services[at..].find('{').unwrap());
+    assert!(feeds.contains("socket.cleanup();"));
+    assert!(arm(&services, "CleanupOp::Feeds=>", "}").contains("teardown.feeds()"));
 
     // The switch's attribute and variable are literals, which the code-only text blanks: read the source.
     let (_, raw) = scan::function_in_raw(&scan::rust_sources(&["shell/src"]), "build_ui");
@@ -734,64 +921,46 @@ fn a_runtime_open_is_the_runners() {
             source.path
         );
     }
-    // The two arms still in the shell that need a new instance ask the controller for it.
+    // Both instance-making verbs reach the controller's module creation path.
+    assert!(!code.contains("driver.scratch_new("));
+    let floats = file_code("core/src/wm/verbs/floats.rs");
     assert!(
-        code.contains("driver.scratch_new(WinId::MAIN,&id);"),
+        floats.contains("modules::scratch_new("),
         "scratchpad.show's missing instance"
     );
-    assert!(code.contains("driver.tab_break(WinId::MAIN);"), "tab.break's new view");
+    let chat = file_code("core/src/wm/verbs/chat.rs");
+    assert!(chat.contains("modules::tab_break("), "tab.break's new view");
     // A plugin module is hosted from startup: its open makes nothing.
-    let sources = scan::rust_sources(&["shell/src"]);
-    let (_, opener) = scan::function_in(&sources, "open_plugin_module");
+    let (_, opener) = scan::function_in(&scan::rust_sources(&["core/src/wm/verbs"]), "open_plugin_module");
     assert!(!opener.contains("CreateSurface"));
 }
 
-/// The module verbs are the controller's: the shell's arm answers a module key, a hide, a new instance or a split
-/// key only as a bug, and its kill only for the editor (its quit) and the last module (the window close).
+/// The module verbs are the controller's: a module key, a hide, a kill, a new instance or a split key, the editor's
+/// kill (its quit) and the last module's (the window close) included.
 #[test]
-fn no_module_verb_is_left_in_run_verb() {
+fn no_module_verb_is_left_in_build_ui() {
     let code = build_ui_code();
-    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
-    let bug_arm = "Action::Module(_)|Action::ModuleHide|Action::InstanceNew{..}|Action::Split{..}=>{eprintln!(";
-    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
-    for verb in [
-        "Action::Module(",
-        "Action::ModuleHide",
-        "Action::InstanceNew",
-        "Action::Split",
-    ] {
-        assert_eq!(body.matches(verb).count(), 1, "`{verb}` only in the bug arm");
-    }
     for call in [
-        "open_module(",
         "place_and_arrive(",
         "place_split(",
         "kill_terminal(",
-        "grid.show_module(",
         "toggle_action(",
         "prompt_closing_tab(",
     ] {
-        assert!(!body.contains(call), "run_verb still calls `{call}`");
+        assert!(!code.contains(call), "build_ui still calls `{call}`");
     }
-    let kill = let_block(
-        &code,
-        "letkill_now:Rc<dynFn(&ModuleId,Option<String>)->Result<(),String>>=",
-    );
+    // The kill is the controller's too, the editor's (its quit) and the last module's (the window close) included:
+    // the shell keeps no kill of its own.
+    assert!(!code.contains("letkill_now"), "build_ui keeps a kill of its own");
     for call in [
         "grid.kill_module(",
         "close_view_tabs(",
         ".retire(",
         "HostEvent::SurfaceEnded{",
+        "close_prompt.ask(",
     ] {
-        assert!(!kill.contains(call), "the shell's kill still does `{call}`");
+        assert!(!code.contains(call), "build_ui still does `{call}`");
     }
-    assert!(kill.contains(
-        "(KillScope::Window,ModuleKind::Editor)=>editor_quitting.kill_editor(KillScope::Window,confirmed)?,"
-    ));
-    assert!(kill.contains("(KillScope::Window,_)=>editor_quitting.close_after(confirmed),"));
-    assert!(
-        kill.contains("(KillScope::Module,ModuleKind::Editor)=>editor_quitting.kill_editor(KillScope::Module,None)?,")
-    );
     assert!(
         !code.contains("ShellCall::Place"),
         "the split's placement is the controller's"
@@ -808,14 +977,11 @@ fn no_module_verb_is_left_in_run_verb() {
     assert!(follow.contains("driver.follow(WinId::MAIN,module,show);"), "{follow}");
 }
 
-/// The window verbs are the controller's: the shell's arm answers them only as a bug, and no longer refuses them
-/// itself. Starting the second window and raising it are the host's ops, carried out through the pair.
+/// The window verbs are the controller's: the shell neither runs nor refuses them itself. Starting the second window
+/// and raising it are the host's ops, carried out through the pair.
 #[test]
-fn no_window_verb_is_left_in_run_verb() {
+fn no_window_verb_is_left_in_build_ui() {
     let code = build_ui_code();
-    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
-    let bug_arm = "Action::WindowNew|Action::WindowOther|Action::MoveToWindow{..}|Action::WorkspaceToWindow{..}|Action::WorkspaceSwapWindow=>{eprintln!(";
-    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
     for verb in [
         "Action::WindowNew",
         "Action::WindowOther",
@@ -823,7 +989,7 @@ fn no_window_verb_is_left_in_run_verb() {
         "Action::WorkspaceToWindow",
         "Action::WorkspaceSwapWindow",
     ] {
-        assert_eq!(body.matches(verb).count(), 1, "`{verb}` only in the bug arm");
+        assert!(!code.contains(verb), "build_ui still names `{verb}`");
     }
     assert!(code.contains("wm_host.set_linked_windows(pair.clone());"));
     assert!(code.contains("link.attach_controller(WinId::MAIN,peer,&wm);"));
@@ -837,58 +1003,49 @@ fn the_answer_gate_is_the_controllers_query() {
     let gate = call_texts(&code, "panel_hooks.set_answer_gate=Some(");
     assert_eq!(gate.len(), 1);
     let gate = gate[0];
-    assert!(gate.contains("driver.query("), "{gate}");
+    assert!(gate.contains("driver.query_or("), "{gate}");
     assert!(gate.contains("c.answer_gate(WinId::MAIN,view)"), "{gate}");
     assert!(gate.contains("HostEvent::AnswerRefused{"), "{gate}");
     assert!(!gate.contains("module_layout"), "{gate}");
     assert!(!gate.contains("view_covering("), "{gate}");
 }
 
-/// The callers of the grid's own hide and kill outside the grid: each an arm still in the shell, whose layout write
-/// the controller re-reads. A new one is a deliberate edit of this list.
+/// Every hide, kill, show, open, tab switch and unzoom is the controller's: the grid has none of its own, and no
+/// shell code calls one, the grid probe's own driving included (it asks the controller as `eitri.layout.show` and
+/// `hide` do).
 #[test]
-fn every_remaining_hide_or_kill_caller_is_named() {
-    let mut found: Vec<(String, String)> = Vec::new();
+fn no_shell_code_hides_or_kills_through_the_grid() {
+    let grid = file_code("shell/src/module_grid.rs");
+    for gone in [
+        "fnhide_module(",
+        "fnkill_module(",
+        "fnshow_module(",
+        "fnopen_module(",
+        "fnswitch_tab(",
+        "fnunzoom(",
+        "fnhide_then_unmap(",
+        "fnleave_then_unmap(",
+        "pub(crate)fnlayout(",
+        "fnconnect_changed(",
+    ] {
+        assert!(!grid.contains(gone), "the grid still has `{gone}`");
+    }
     for source in scan::rust_sources(&["shell/src"]) {
-        let path = source.path.replace('\\', "/");
-        if path.ends_with("shell/src/module_grid.rs") {
-            continue;
-        }
         let code = scan::code_only(&source.text);
         let flat: String = scan::without(&code, &scan::modules(&code, "tests"))
             .split_whitespace()
             .collect();
-        let file = path.rsplit("shell/src/").next().unwrap_or(&path).to_string();
-        for method in [".hide_module(", ".kill_module("] {
-            for call in call_texts(&flat, method) {
-                found.push((file.clone(), format!("{}{call}", &method[1..method.len() - 1])));
-            }
+        for method in [
+            ".hide_module(",
+            ".kill_module(",
+            "grid.show_module(",
+            "grid.open_module(",
+            "grid.switch_tab(",
+            "grid.unzoom(",
+        ] {
+            assert!(!flat.contains(method), "{} calls `{method}`", source.path);
         }
     }
-    found.sort();
-    let mut named: Vec<(String, String)> = [
-        // The editor's quit: its hide in place and its kill once nvim is gone.
-        ("main.rs", "hide_module(&ModuleId::editor(),&*self.focus_module)"),
-        (
-            "main.rs",
-            "kill_module(&ModuleId::editor(),Reopen::InPlace,&*self.focus_module)",
-        ),
-        (
-            "main.rs",
-            "kill_module(&ModuleId::editor(),Reopen::Never,&*focus_module)",
-        ),
-        // An extra chat view the panel says holds no tab.
-        ("main.rs", "kill_module(id,Reopen::Remove,&*focus_module)"),
-        // `prefix ?`'s rollback of the chat it showed when a float still covers it.
-        ("main.rs", "hide_module(&chat,&*focus_module)"),
-        // The grid probe's own driving.
-        ("grid_probe/probes.rs", "hide_module(&term,&|id|self.give_keys(id))"),
-    ]
-    .iter()
-    .map(|(file, call)| (file.to_string(), call.to_string()))
-    .collect();
-    named.sort();
-    assert_eq!(found, named);
 }
 
 /// What starts a terminal's shell, builds a deferred page, tells a plugin it is drawn and brings a killed module
@@ -902,17 +1059,6 @@ fn no_lifecycle_hook_is_left_in_build_ui() {
         for call in [".start()", "build_page(", "set_on_screen(", "open_chooser("] {
             assert!(!hook.contains(call), "a change hook calls `{call}`: {hook}");
         }
-    }
-    // The editor's retirement and an empty chat view's removal, still the shell's, tell the controller after the
-    // grid's kill.
-    for anchor in [
-        "letretire_editor:Rc<dynFn()->Result<(),LayoutError>>=",
-        "letdrop_chat_view:Rc<dynFn(&ModuleId)->Result<bool,LayoutError>>=",
-    ] {
-        let body = let_block(&code, anchor);
-        let killed = body.find("grid.kill_module(").expect("the grid's kill");
-        let told = body.find("HostEvent::SurfaceEnded{").expect("told to the controller");
-        assert!(killed < told, "{anchor}");
     }
     let services = file_code("shell/src/gtk_host/services.rs");
     assert!(arm(&services, "TermOp::Start{", "TermOp::").contains("start_pane(&self.terminals,module)"));
@@ -995,6 +1141,25 @@ fn build_ui_walks_the_start_plan() {
         at.windows(2).all(|w| w[0] < w[1]),
         "the phases run in the plan's order: {at:?}"
     );
+    let own = code
+        .find("plugin_panels.set_own_window(")
+        .expect("the hosts learn window ownership");
+    let surfaces = code.find("StartStep::Surfaces").unwrap();
+    assert!(own < surfaces, "ownership is set before any surface can say hello");
+    assert!(code.find("wm::start::own_window(").unwrap() < own);
+    for (build, _) in code.match_indices("plugin_panels.build_page(") {
+        assert!(own < build, "page construction follows the ownership decision");
+    }
+    // The top bar and the window title name the window alike: both read the one name an own window takes from its
+    // declared title.
+    assert!(code.contains("chrome::build_top_bar(&window,&chrome_project)"));
+    assert!(code.contains("project:chrome_project.clone(),"));
+    let (_, install) = scan::function_in(&[scan::read_required("shell/src/plugin_panels.rs")], "install");
+    let install: String = install.split_whitespace().collect();
+    assert!(
+        !install.contains("build(theme)"),
+        "install registers hosts before building pages"
+    );
     let requests = *at.last().unwrap();
     let accept = code
         .find(".accept_requests();")
@@ -1024,9 +1189,8 @@ fn build_ui_walks_the_start_plan() {
 }
 
 /// Every key action, Lua run and panel tab verb reaches the controller's runner, and only through it: no
-/// shell runner of its own is left, the shell's arms are reached only as the runner's shell verbs, and
-/// each call of the runner names where it came from as one of the routes the shell has. A new route is a
-/// deliberate edit of this list.
+/// shell runner of its own is left, no arm of the shell's is reached at all, and each call of the runner names
+/// where it came from as one of the routes the shell has. A new route is a deliberate edit of this list.
 #[test]
 fn the_runner_is_the_only_door() {
     const ROUTES: &[&str] = &["Key", "PanelTab", "Lua", "Follow", "Chip"];
@@ -1064,9 +1228,7 @@ fn the_runner_is_the_only_door() {
             );
             runs += 1;
         }
-        if !path.ends_with("shell/src/main.rs") {
-            assert!(!flat.contains("run_verb("), "{path} calls the shell's arms");
-        }
+        assert!(!flat.contains("run_verb("), "{path} calls an arm of the shell's");
     }
     assert!(
         runs >= 2,
@@ -1078,14 +1240,9 @@ fn the_runner_is_the_only_door() {
         controller.contains("PrefixCommand::Run(action)=>returnself.run(win,action,Origin::Key{keycode}),"),
         "the prefix's command runs through the runner as a key's"
     );
-    let code = build_ui_code();
-    let arm = call_texts(&code, "wm_host.set_shell_verb_arm(");
-    assert_eq!(arm.len(), 1, "one shell verb arm");
-    assert_eq!(code.matches("run_verb(").count(), 1, "the shell's arms are called once");
     assert!(
-        arm[0].contains("run_verb("),
-        "and that call is the shell verb arm: {}",
-        arm[0]
+        !build_ui_code().contains("set_shell_verb_arm("),
+        "no arm is left for the runner to hand an action back to"
     );
 }
 
@@ -1137,23 +1294,70 @@ fn the_startup_host_check_is_built_by_hosted_at_start() {
     );
 }
 
-/// The link's end loads again every page `pages_back` picks from what came back, after the layout took it back:
-/// a page built before it was held away would otherwise show what its store said then.
+/// Returned pages read their stores at their next show; failed restores reload pages after taking them back.
 #[test]
 fn the_link_ended_hook_loads_again_every_page_that_comes_back() {
     let code = build_ui_code();
     let ended = let_block(&code, "letended:linked_window::spawn::OnEnded=");
-    let taken_back = ended
-        .find("linked_window::apply_end(&plan,")
-        .expect("the end plan is carried out in the layout");
-    let reloads = ended
-        .find(
-            "foridinlinked_window::pages_back(&plan){iflinked_window::reload_page_back(&plugin_panels,&lua_pages,&id)",
-        )
-        .expect("every page pages_back names is loaded again");
-    assert!(taken_back < reloads, "after the layout took them back");
     assert!(
-        code.contains("pair.set_hooks(linked_window::spawn::PairHooks{linked,raise,ended})"),
+        ended.contains("wm.post(HostEvent::Pair(eitri_core::wm::PairEvent::LinkEnded{"),
+        "the link's end is the controller's: {ended}"
+    );
+    for gone in [
+        "apply_end(",
+        "end_plan(",
+        "pages_back(",
+        "reload_page_back(",
+        "grid.apply()",
+    ] {
+        assert!(!ended.contains(gone), "the hook still carries out `{gone}`");
+    }
+    let (_, end) = scan::function_in(&scan::rust_sources(&["core/src/wm"]), "pair_event");
+    let end: String = end.split_whitespace().collect();
+    let taken_back = end
+        .find("crate::window_link::end::apply_end(&plan,")
+        .expect("the end plan is carried out in the layout");
+    let returned = end
+        .find("window.lifecycle.returned(id);")
+        .expect("returned modules rejoin the lifecycle before layout");
+    let hidden = end
+        .find("foridin&plan.back_hidden{")
+        .expect("hidden returns rejoin the lifecycle");
+    let marked = end
+        .find("window.lifecycle.reload_at_show(id);")
+        .expect("hidden pages reload at their next show");
+    assert!(taken_back < hidden && hidden < marked);
+    let pages = end
+        .find("letpages:Vec<_>=crate::window_link::end::pages_back(&plan)")
+        .expect("the returned pages are selected before the lifecycle reopens them");
+    let selection = &end[pages..];
+    let selection = &selection[..selection.find(".collect();").expect("the page selection is collected")];
+    assert!(
+        selection
+            .contains(".filter(|id|!matches!(window.lifecycle.state(id),Some(super::module::ModuleState::Killed(_))))"),
+        "a Lua panel reopened by the lifecycle must not also get ReloadPage: {selection}"
+    );
+    let laid_out = end.find("window.changed_by_controller(win,batch);").expect("laid out");
+    let reloads = end
+        .find("formoduleinpages{batch.push_effect(HostOp::Pair(PairOp::ReloadPage{win,module}));}")
+        .expect("every selected page gets one reload");
+    assert_eq!(
+        end.matches("PairOp::ReloadPage").count(),
+        1,
+        "only the selected pages reload"
+    );
+    assert!(
+        taken_back < returned && returned < pages && pages < laid_out && laid_out < reloads,
+        "select after the return, before the lifecycle reopens panels, and reload after layout"
+    );
+    let services = file_code("shell/src/gtk_host/services.rs");
+    let reload = arm(&services, "PairOp::ReloadPage{", "}Ok(())");
+    assert!(
+        reload.contains("crate::linked_window::reload_page_back(&self.plugin_panels,&self.lua_pages,module)"),
+        "{reload}"
+    );
+    assert!(
+        code.contains("pair.set_hooks(linked_window::spawn::PairHooks{linked,post,ended})"),
         "and that hook is the one the link's end runs"
     );
 }
@@ -1205,8 +1409,8 @@ fn window_2s_follow_lines_go_through_the_controllers_follow_window() {
 }
 
 /// The workspace verbs are the controller's: `build_ui` makes no closure that switches, makes, renames or deletes a
-/// workspace, reads no chooser pick, and its shell verb arm answers a workspace verb only as a bug; the grid has no
-/// switch of its own, and the shell keeps no second copy of the pick's or the made workspace's rules.
+/// workspace and reads no chooser pick; the grid has no switch of its own, and the shell keeps no second copy of the
+/// pick's or the made workspace's rules.
 #[test]
 fn no_workspace_verb_is_left_in_build_ui() {
     let code = build_ui_code();
@@ -1232,12 +1436,9 @@ fn no_workspace_verb_is_left_in_build_ui() {
     ] {
         assert!(!code.contains(call), "build_ui still does `{call}`");
     }
-    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
-    let bug_arm = "Action::WorkspaceStep{..}|Action::WorkspaceLast|Action::WorkspaceNew|Action::WorkspaceSwitch{..}|Action::WorkspaceChoose|Action::WorkspaceRename=>{eprintln!(";
-    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
-    // `eitri.layout.switch` goes whole to the controller, as every request but a float's.
-    assert!(code.contains("ifeitri_core::wm::lua::moved(&request){driver.lua_request(WinId::MAIN,request);continue;}"));
-    assert!(eitri_core::wm::lua::moved(
+    // Every Lua layout request goes whole to the controller, including a workspace switch.
+    assert!(code.contains("LuaEvent::LayoutRequests{win:WinId::MAIN,requests,"));
+    assert!(eitri_core::wm::lua::decided(
         &eitri_core::lua::layout::LayoutRequest::Switch("study".into())
     ));
     // A defined name is made from `init.lua`'s definitions, given to the controller once, after `init.lua` ran.
@@ -1290,4 +1491,221 @@ fn the_rename_entry_reports_and_never_renames_itself() {
     ] {
         assert!(!code.contains(call), "build_ui wires the entry itself: `{call}`");
     }
+}
+
+/// Float decisions belong to the controller, including a new named scratch instance and Lua floats.
+#[test]
+fn no_float_verb_is_left_in_build_ui() {
+    let code = build_ui_code();
+    for gone in ["move_float(", "scratch_new("] {
+        assert!(!code.contains(gone), "build_ui still has `{gone}`");
+    }
+    assert!(!code.contains("grid.float_at("));
+    assert!(eitri_core::wm::lua::decided(
+        &eitri_core::lua::layout::LayoutRequest::Float(eitri_core::layout::ModuleId::terminal(), None)
+    ));
+}
+
+/// Gesture callbacks only report pointer events; layout changes are computed by the controller.
+#[test]
+fn the_grids_gestures_write_no_layout() {
+    let mut handlers = 0;
+    for path in ["shell/src/module_grid.rs", "shell/src/module_grid/floatbars.rs"] {
+        let code = file_code(path);
+        for signal in ["connect_drag_begin(", "connect_drag_update(", "connect_drag_end("] {
+            for handler in call_texts(&code, signal) {
+                handlers += 1;
+                for forbidden in [
+                    "move_divider(",
+                    "set_float_rect(",
+                    ".raise(",
+                    "try_borrow_mut(",
+                    "float_dragged(",
+                    "float_bar_pressed(",
+                ] {
+                    assert!(!handler.contains(forbidden), "{path}: a gesture calls `{forbidden}`");
+                }
+            }
+        }
+        for gone in ["fnfloat_dragged(", "fnfloat_bar_pressed(", "fnraise_float("] {
+            assert!(
+                !code.contains(gone),
+                "{path}: `{gone}` still changes layout for a gesture"
+            );
+        }
+    }
+    assert!(handlers >= 6, "both divider and float gestures report every phase");
+}
+
+/// Whether window 2 comes back at a launch depends on `window.restore`, which `init.lua` sets: the pair file's
+/// decision and the saved tabs it chooses are made once the config phase has read it, and the panel is given its
+/// tabs then rather than reading them as it is built.
+#[test]
+fn window_restore_is_read_before_the_pair_files_decision() {
+    let code = build_ui_code();
+    let config = code.find("StartStep::Config").expect("the config phase");
+    let restore_key = code.find("WINDOW_RESTORE_KEY").expect("window.restore is read");
+    assert!(config < restore_key, "window.restore is read after init.lua ran");
+    for decision in ["read_for_restore(", "tab_files(", "second_restore("] {
+        let at: Vec<usize> = code.match_indices(decision).map(|(at, _)| at).collect();
+        assert!(!at.is_empty(), "build_ui calls `{decision}`");
+        assert!(
+            at.iter().all(|at| *at > restore_key),
+            "`{decision}` comes after window.restore is read"
+        );
+    }
+    let layout = code.find("StartStep::Layout").expect("the layout phase");
+    assert!(
+        code.find("read_for_restore(").unwrap() < code.find("load_for_role(").expect("the layout files are read"),
+        "the pair file is read before the layout files"
+    );
+    assert!(
+        code.find("set_tab_files(").unwrap() < layout,
+        "the panel has its tabs before the layout phase"
+    );
+    let panels = call_texts(&code, "build_agent_panel(");
+    assert!(
+        !panels[0].contains("tab_files"),
+        "the panel is built with no saved tabs chosen yet"
+    );
+}
+
+/// The link's end as the window carries it out: an orphaned window 2 waits for a new window 1, window 1 settles
+/// the pair file through the pair (which leaves it writing when its window 2 never linked), and a window 1 that
+/// held its automatic tab restore for a window 2 started again lets it go once that window is back or is not.
+#[test]
+fn the_links_end_and_the_restore_of_window_2_are_carried_out_by_the_window() {
+    let code = build_ui_code();
+    let between = |from: &str, to: &str| -> String {
+        let start = code.find(from).unwrap_or_else(|| panic!("`{from}` in build_ui"));
+        let end = start
+            + code[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("`{to}` after `{from}`"));
+        code[start..end].to_string()
+    };
+    let ended = between("letended:linked_window::spawn::OnEnded=", "pair.set_hooks(");
+    for call in ["pair.wait_for_relink(", "pair.window2_link_ended(link,end)"] {
+        assert!(ended.contains(call), "the `ended` hook calls `{call}`");
+    }
+    // An orphaned window 2 keeps the pair file once the controller has taken back what it held away.
+    let services = file_code("shell/src/gtk_host/services.rs");
+    let orphaned = arm(&services, "PairOp::Orphaned{", "PairOp::");
+    for call in ["writer.window2_holds(held);", "writer.take_over();"] {
+        assert!(orphaned.contains(call), "{orphaned}");
+    }
+    assert!(
+        !ended.contains("hand_over"),
+        "window 1's pair file at a link's end is the pair's to settle"
+    );
+    let linked = between("letlinked:linked_window::spawn::OnLinked=", "letpost:");
+    assert!(
+        linked.contains("panel.release_launch_restore()"),
+        "a linked window 2 lets the restore go"
+    );
+    let failed = between("pair.on_restore_failed(", "driver.start(");
+    assert!(
+        failed.contains("wm.post(HostEvent::Pair(eitri_core::wm::PairEvent::RestoreFailed{win:WinId::MAIN"),
+        "a window 2 that does not come back is the controller's: {failed}"
+    );
+    let unrestored = arm(&services, "PairOp::Unrestored{", "PairOp::");
+    assert!(unrestored.contains("pair_files::take_back_unrestored("), "{unrestored}");
+    let given = unrestored
+        .find("self.agent.set_tab_files(")
+        .expect("window 2's tabs are given back");
+    let released = unrestored
+        .rfind("self.agent.release_launch_restore()")
+        .expect("and the restore let go");
+    assert!(
+        given < released,
+        "window 2's tabs are given before the restore is let go"
+    );
+    let held = code
+        .find("hold_launch_restore()")
+        .expect("the restore is held for window 2");
+    assert!(
+        held < code.find("StartStep::Layout").unwrap(),
+        "held before anything can be restored"
+    );
+    assert!(
+        code.contains("pair_raise.keep_keys_at_next_show()"),
+        "a restored window 2's first show keeps window 1's keys"
+    );
+}
+
+/// Only the controller writes a window's layout: no shell code names a mutable layout or workspaces (a `RefCell` of
+/// either, or a `WindowParts` built by hand), the grid and every reader hold the controller's views, nothing posts a
+/// change made behind the controller, and `build_ui` hands the window's start values over by value.
+#[test]
+fn the_shell_names_no_mutable_layout() {
+    for source in scan::rust_sources(&["shell/src"]) {
+        let code = scan::code_only(&source.text);
+        let flat: String = scan::without(&code, &scan::modules(&code, "tests"))
+            .split_whitespace()
+            .collect();
+        for named in [
+            "RefCell<Layout>",
+            "RefCell<eitri_core::layout::Layout>",
+            "RefCell<Workspaces>",
+            "RefCell<eitri_core::layout::Workspaces>",
+            "RefCell<eitri_core::layout::workspace::Workspaces>",
+            "RefCell::new(Layout::",
+            "WindowParts{",
+            "LayoutChangedByShell",
+            "module_layout.borrow",
+            "module_layout.try_borrow",
+            "workspaces.borrow_mut(",
+            "workspaces.try_borrow_mut(",
+        ] {
+            assert!(!flat.contains(named), "{} names `{named}`", source.path);
+        }
+    }
+    let code = build_ui_code();
+    assert!(
+        code.contains("letparts=eitri_core::wm::WindowParts::new(start_layout,start_workspaces,Some(layout_saver));"),
+        "the window's start values go to the controller by value"
+    );
+    assert!(code.contains("let(module_layout,workspaces)=parts.views();"));
+    let contract = file_code("core/src/wm/host.rs");
+    assert!(
+        !contract.contains("LayoutChangedByShell"),
+        "the contract has no change made behind the controller"
+    );
+    let controller = file_code("core/src/wm/controller.rs");
+    for gone in ["shell_revision", "fnlayout_changed("] {
+        assert!(!controller.contains(gone), "the controller still has `{gone}`");
+    }
+}
+
+#[test]
+fn window_new_reads_only_the_monitor_of_the_pair_file() {
+    let code = build_ui_code();
+    let restore = &code[code.find("letsecond_restore=").unwrap()..code.find("letsecond_placement=").unwrap()];
+    assert!(restore.contains(".filter(|_|pair.is_second()&&pair.restored())"));
+    assert_eq!(call_texts(restore, "pair_files::second_restore(").len(), 1);
+    assert!(restore.contains("None=>linked_window::pair_files::SecondRestore::default(),"));
+    let placement = &code[code.find("letsecond_placement=").unwrap()..code.find("letwindow2_restored=").unwrap()];
+    assert!(placement.contains(".filter(|_|pair.is_second()&&!pair.restored()&&!want_clean)"));
+    assert_eq!(call_texts(placement, "pair::read_pair(").len(), 1);
+    assert_eq!(call_texts(placement, "pair_files::second_placement(").len(), 1);
+    for forbidden in ["second_restore(", ".holders", "tab_files(", "PairWriter", "write_pair("] {
+        assert!(!placement.contains(forbidden), "placement reads {forbidden}");
+    }
+    assert!(placement.contains("None=>None,"));
+    let start = &code[code.find("letstart=ifwriting").unwrap()..code.find("ifwriting||pair.is_second()").unwrap()];
+    assert!(start.contains("elseifpair.restored(){second_restore.file.clone()}"));
+    assert!(start.contains("PairFile{window2_open:true,..Default::default()}"));
+    let calls = call_texts(&code, "driver.set_placement(");
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("elseifpair.restored(){second_restore.remembered.clone()}else{second_placement}"));
+    assert!(code.find("letsecond_placement=").unwrap() < code.find("driver.set_placement(").unwrap());
+}
+
+#[test]
+fn the_busy_hook_posts_chat_busy() {
+    let code = build_ui_code();
+    let calls = call_texts(&code, "agent_panel_handle.on_busy(");
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("HostEvent::Chat(eitri_core::wm::ChatEvent::Busy{win:WinId::MAIN,view,busy,"));
+    assert!(calls[0].contains("for&(view,busy)inchanged"));
 }

@@ -1,7 +1,7 @@
 //! Turning what the editor is showing into the text that rides with one turn.
 //!
-//! Pure: no socket, no nvim, no GTK. The transport half is [`super::feed`]; this half is what
-//! decides what the model actually reads, and it is the half worth testing hardest.
+//! Pure: no socket, no nvim, no GTK. The transport half is [`super::feed`]; this half decides
+//! what the model reads.
 
 /// A live visual selection, as nvim reports it while the selection still exists.
 ///
@@ -55,13 +55,12 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 /// <name>`), a path (`/add-dir`), a `key=value` (`/config`), compaction instructions (`/compact`) or a
 /// goal (`/goal`). None of them wants it.
 ///
-/// **How it was read, not remembered.** `/scratch/auto-parity/cli-2.1.283.strings`: every object
-/// literal carrying `type:"local"`, in any key order, and its `aliases:[…]`. The first extraction
-/// matched only the literal `{type:"local",name:"…"` and missed four: two whose
-/// `name` comes before `type` (`keybindings`; `rewind`, with `checkpoint` and `undo`) and two whose name
-/// is a variable (`Sae` = `low-priority`, `MOt` = `claim-credit`). A re-read should search the same
-/// way. The lookup is exact (`e.name===n || e.aliases?.includes(n)`), and so is
-/// [`names_a_cli_local_command`]. Included whether or not the entry says `supportsNonInteractive`
+/// To refresh the list from the 2.1.283 bundle, search every object literal carrying `type:"local"`
+/// in any key order, and its `aliases:[…]`. Matching only `{type:"local",name:"…"` misses
+/// `keybindings` and `rewind` (aliases `checkpoint` and `undo`), whose `name` comes before `type`,
+/// and the variable names `Sae` = `low-priority` and `MOt` = `claim-credit`. The lookup is exact
+/// (`e.name===n || e.aliases?.includes(n)`), and so is [`names_a_cli_local_command`].
+/// Included whether or not the entry says `supportsNonInteractive`
 /// (nine do not: `claim-credit`, `install-slack-app`, `keybindings`, `low-priority`, `radio`,
 /// `rewind`, `stickers`, `update`, `voice`) -- a headless CLI answers those without the model either,
 /// so a block there is never read.
@@ -87,7 +86,7 @@ pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 /// reads, which is where the block goes on any ordinary turn; an unknown `/word` is either a
 /// user's skill or reaches the model as text. Its `type: "local-jsx"` commands (the interactive
 /// pickers and wizards: `/help`, `/export`, ...) reply "isn't available in this environment"
-/// headless without reading their argument (measured 2026-09-27), so
+/// headless without reading their argument, so
 /// they are left out rather than listed for no effect -- `/model` and `/effort` have a `local-jsx`
 /// twin too, and it is their `local` definition a headless CLI runs.
 ///
@@ -157,9 +156,8 @@ pub const CLI_LOCAL_COMMANDS: &[&str] = &[
 
 /// Whether the CLI would run `user_text` as one of [`CLI_LOCAL_COMMANDS`], argument or not: the
 /// CLI's own parse -- the text trimmed, a leading `/`, the name up to the first whitespace -- and
-/// its own exact match (`/Model` is not `/model` there, so not here). Replaces
-/// `is_bare_slash_picker_command`, which exempted only a bare `/model`/`/effort` and so
-/// left the argument form -- what the picker itself sends -- broken.
+/// its own exact match (`/Model` is not `/model` there, so not here). The picker sends commands
+/// with arguments, so exempting only bare `/model` and `/effort` would corrupt its choices too.
 fn names_a_cli_local_command(user_text: &str) -> bool {
     let Some(rest) = user_text.trim().strip_prefix('/') else {
         return false;
@@ -212,9 +210,7 @@ pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> St
 
 /// Truncates on a CHARACTER boundary, not a byte one.
 ///
-/// `&s[..CONTENT_LIMIT]` panics mid-codepoint, and a selection of CJK or emoji reaches this
-/// function as a matter of course in this project -- the editor's own IME work exists because CJK
-/// text is typed into it.
+/// `&s[..CONTENT_LIMIT]` panics mid-codepoint; selections can contain CJK or emoji.
 fn truncate(content: &str) -> String {
     if content.chars().count() <= CONTENT_LIMIT {
         return content.to_string();
@@ -437,8 +433,7 @@ mod tests {
     #[test]
     fn selected_text_longer_than_the_cli_s_own_limit_is_truncated_and_says_so() {
         // `Z`, not `a`: the templates themselves contain `a` ("related", "task"), so counting `a`
-        // counts the frame as well as the content. The first draft of this test did exactly that
-        // and failed against correct code.
+        // counts the frame as well as the content.
         let long = "Z".repeat(CONTENT_LIMIT + 50);
         let out = compose_turn_text(
             "q",
@@ -509,9 +504,8 @@ mod tests {
     /// prompt), kept beside the forward cases so
     /// the two directions cannot be changed independently.
     ///
-    /// It matters because the prompt text a transcript stores is the WIRE turn, not what the user
-    /// typed: measured 2026-09-20, 2 of the 6 SDK-driven sessions on this machine end with a block
-    /// this function appended. Rendering that as
+    /// The prompt text a transcript stores is the WIRE turn, not what the user typed: in a sample,
+    /// 2 of 6 SDK-driven sessions end with a block this function appends. Rendering that as
     /// `AgentDomainEvent::UserPromptSubmitted` -- whose own doc says `text` is "the text the user
     /// typed, deliberately NOT the text that went on the wire" -- would show a file path and a
     /// selection nobody wrote.

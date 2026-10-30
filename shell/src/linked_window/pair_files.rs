@@ -50,14 +50,40 @@ pub struct PairRestore {
     pub write_now: bool,
     /// An unusable pair file is in the way and could not be set aside: nothing is written over it.
     pub in_the_way: bool,
+    /// Window 2 is started again at this launch: it was open when the pair last ended, `window.restore` allows it
+    /// and its layout file can be used.
+    pub restore_second: bool,
     pub notes: Vec<String>,
 }
 
 /// [`main_restore`] of the pair file in `layout_dir`, an unusable one first moved, whole, to `<name>.unusable`
-/// beside it, for a person to read, as the layout and tabs files' are.
-pub fn read_for_restore(layout_dir: &Path, project_root: &Path, window2_restored: bool) -> PairRestore {
+/// beside it, for a person to read, as the layout and tabs files' are. Window 2 is started again when it was open
+/// at the pair's last end, `window_restore` (`window.restore`) allows it, and `second_layout_usable` says its
+/// layout file is not one it would have to set aside (asked only then).
+pub fn read_for_restore(
+    layout_dir: &Path,
+    project_root: &Path,
+    window_restore: bool,
+    second_layout_usable: &dyn Fn() -> bool,
+) -> PairRestore {
     let read = read_pair(layout_dir, project_root);
+    let was_open = matches!(&read, ReadPair::Read(file) if file.window2_open);
+    let mut refusal = None;
+    if was_open && !window_restore {
+        refusal = Some("[window] window.restore is off: window 2 is not started again");
+    } else if was_open && !second_layout_usable() {
+        refusal = Some("[window] window 2's layout file cannot be used: window 2 is not started again");
+    }
+    let window2_restored = was_open && refusal.is_none();
     let mut plan = main_restore(&read, window2_restored);
+    plan.restore_second = window2_restored;
+    plan.notes.extend(refusal.map(str::to_string));
+    set_aside_unusable(layout_dir, project_root, &read, &mut plan);
+    plan
+}
+
+/// An unusable pair file moved, whole, to `<name>.unusable` beside it; one that cannot be moved is not written over.
+fn set_aside_unusable(layout_dir: &Path, project_root: &Path, read: &ReadPair, plan: &mut PairRestore) {
     if matches!(read, ReadPair::Unusable(_)) {
         let path = layout_dir.join(pair_file_name(project_root));
         let aside = path.with_extension("json.unusable");
@@ -76,6 +102,80 @@ pub fn read_for_restore(layout_dir: &Path, project_root: &Path, window2_restored
             }
         }
     }
+}
+
+/// [`relink_restore`] of the pair file in `layout_dir`, an unusable one set aside as [`read_for_restore`] does.
+pub fn read_for_relink(layout_dir: &Path, project_root: &Path, holders: &BTreeMap<String, String>) -> PairRestore {
+    let read = read_pair(layout_dir, project_root);
+    let mut plan = relink_restore(&read, holders);
+    set_aside_unusable(layout_dir, project_root, &read, &mut plan);
+    plan
+}
+
+/// The restore of a window 1 that linked at its start to an orphaned window 2: what the orphan's `welcome` says it
+/// holds (`holders`, the other window's input: each entry checked, at most
+/// [`super::relink::MAX_WELCOME_HOLDERS`]) is held away here, the plugin pages and Lua panels it rebuilt when window
+/// 1 ended among it, and everything else is this window's, as the pair file gives it. Window 2 is open and is not
+/// started again; nothing of it is taken back. The pair file is this window's to write from now on, naming what the
+/// orphan holds.
+pub fn relink_restore(read: &ReadPair, holders: &BTreeMap<String, String>) -> PairRestore {
+    let mut plan = PairRestore::default();
+    let file = match read {
+        ReadPair::Read(file) => Some(file.clone()),
+        ReadPair::Missing => None,
+        ReadPair::Unusable(why) => {
+            plan.notes.push(format!(
+                "[window] the pair file is unusable ({why}); window 2 says what it holds"
+            ));
+            None
+        }
+    };
+    plan.start = file.clone().unwrap_or_default();
+    for (text, holder) in holders.iter().take(super::relink::MAX_WELCOME_HOLDERS) {
+        match ModuleId::parse(text) {
+            Ok(id) if holder == WINDOW_2 && (id.kind() == ModuleKind::LuaWebview || id.number() >= 2) => {
+                plan.away.insert(id);
+            }
+            _ => plan.notes.push(format!(
+                "[window] window 2 names {} held by {}; left out",
+                super::relink::shown(text),
+                super::relink::shown(holder)
+            )),
+        }
+    }
+    for (text, holder) in &plan.start.holders {
+        if holder != WINDOW_1 {
+            continue;
+        }
+        match ModuleId::parse(text) {
+            Ok(id) if !plan.away.contains(&id) => {
+                plan.build_here.insert(id);
+            }
+            Ok(_) => {}
+            Err(_) => plan.notes.push(format!(
+                "[window] the pair file names {text:?} held by {holder:?}; left out"
+            )),
+        }
+    }
+    let mut named: BTreeMap<String, String> = plan
+        .start
+        .holders
+        .iter()
+        .filter(|(text, holder)| *holder == WINDOW_1 && ModuleId::parse(text).is_ok_and(|id| !plan.away.contains(&id)))
+        .map(|(text, holder)| (text.clone(), holder.clone()))
+        .collect();
+    named.extend(
+        plan.away
+            .iter()
+            .map(|id| (id.as_str().to_string(), WINDOW_2.to_string())),
+    );
+    plan.start.holders = named;
+    plan.start.window2_open = true;
+    plan.write_now = file.as_ref() != Some(&plan.start);
+    plan.notes.push(format!(
+        "[window] linked to the waiting window 2: {} module(s) stay there",
+        plan.away.len()
+    ));
     plan
 }
 
@@ -161,11 +261,37 @@ pub fn apply_main_restore(
             super::hold_away(layout, workspaces, id, true);
         }
     }
+    let missing: Vec<&ModuleId> = plan.build_here.iter().filter(|id| !present.contains(*id)).collect();
+    notes.extend(place_missing(
+        layout,
+        workspaces,
+        &missing,
+        rules,
+        decls,
+        can_build,
+        "was in window 2",
+    ));
+    notes
+}
+
+/// Each module of `missing`, which this window is to build and none of its layouts holds, placed by its open rules,
+/// kept off the keys, then given to every workspace hidden. `can_build` says which modules this window has a host
+/// for; one it cannot build is left out, noted. `came` says where the module was, for the notes.
+fn place_missing(
+    layout: &mut Layout,
+    workspaces: &mut Workspaces,
+    missing: &[&ModuleId],
+    rules: &OpenRules,
+    decls: &[ModuleDecl],
+    can_build: &dyn Fn(&ModuleId) -> bool,
+    came: &str,
+) -> Vec<String> {
+    let mut notes = Vec::new();
     let mut placed_any = false;
-    for id in plan.build_here.iter().filter(|id| !present.contains(*id)) {
+    for &id in missing {
         if !can_build(id) {
             notes.push(format!(
-                "[window] '{id}' was in window 2 and this window cannot build it; left out"
+                "[window] '{id}' {came} and this window cannot build it; left out"
             ));
             continue;
         }
@@ -176,9 +302,7 @@ pub fn apply_main_restore(
         match open_by_rule(layout, id, &rule, Some(&keys), NOMINAL_GRID) {
             Ok(_) => {
                 placed_any = true;
-                notes.push(format!(
-                    "[window] '{id}' is back from window 2, placed by its open rule"
-                ));
+                notes.push(format!("[window] '{id}' {came}; placed by its open rule"));
             }
             Err(err) => notes.push(format!("[window] '{id}' could not be placed here: {err}")),
         }
@@ -189,9 +313,39 @@ pub fn apply_main_restore(
     notes
 }
 
+/// A restored window 2's modules the pair file gives it and none of its layouts holds: its layout file can predate
+/// what it held (the pair file's write landed and the layout's did not, as the processes ended), and a module given
+/// to it and built nowhere would be lost to both windows, window 1 keeping its placeholder away. Each is placed here
+/// by its open rules, as window 1 places what comes back to it.
+pub fn place_given(
+    layout: &mut Layout,
+    workspaces: &mut Workspaces,
+    given: &BTreeSet<ModuleId>,
+    rules: &OpenRules,
+    decls: &[ModuleDecl],
+    can_build: &dyn Fn(&ModuleId) -> bool,
+) -> Vec<String> {
+    let present: BTreeSet<ModuleId> = workspaces
+        .each(layout)
+        .into_iter()
+        .flat_map(|(_, l)| l.modules())
+        .collect();
+    let missing: Vec<&ModuleId> = given.iter().filter(|id| !present.contains(*id)).collect();
+    place_missing(
+        layout,
+        workspaces,
+        &missing,
+        rules,
+        decls,
+        can_build,
+        "is this window's by the pair file",
+    )
+}
+
 /// Window 2's start: every module of its layouts that is not one every window has of its own (the terminal and
 /// the chat; the editor is retired) and that the pair gives to window 2 (`given`) held away, since window 1 holds
-/// it, or no window does and window 1 will be asked for it.
+/// it, or no window does and window 1 will be asked for it. What the pair gives it is its own to build, a plugin
+/// page or Lua panel the start held away as window 1's included.
 pub fn second_start_away(layout: &mut Layout, workspaces: &mut Workspaces, given: &BTreeSet<ModuleId>) {
     let modules: BTreeSet<ModuleId> = workspaces
         .each(layout)
@@ -201,9 +355,147 @@ pub fn second_start_away(layout: &mut Layout, workspaces: &mut Workspaces, given
     for id in modules {
         let own = id == ModuleId::terminal() || id == ModuleId::agent() || id == ModuleId::editor();
         let held_elsewhere = id.kind() == ModuleKind::LuaWebview || id.number() >= 2;
-        if !own && held_elsewhere && !given.contains(&id) {
-            super::hold_away(layout, workspaces, &id, true);
+        if !own && held_elsewhere {
+            super::hold_away(layout, workspaces, &id, !given.contains(&id));
         }
+    }
+}
+
+/// What a window 2 started with `--restore` builds and where it goes, from the pair file read once, read-only: the
+/// modules it names window 2 the holder of, the monitor it names for window 2, and the file as read, which window 2
+/// keeps as its view of the pair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecondRestore {
+    pub given: BTreeSet<ModuleId>,
+    pub remembered: Option<String>,
+    pub file: PairFile,
+    pub notes: Vec<String>,
+}
+
+/// [`SecondRestore`] of `read`. A holder that is not a module id is left out, noted; a file that is missing or
+/// unusable gives nothing, so window 2 builds only what every window has.
+pub fn second_restore(read: &ReadPair) -> SecondRestore {
+    let mut restore = SecondRestore::default();
+    match read {
+        ReadPair::Read(file) => {
+            for (text, holder) in &file.holders {
+                if holder != WINDOW_2 {
+                    continue;
+                }
+                match ModuleId::parse(text) {
+                    Ok(id) => {
+                        restore.given.insert(id);
+                    }
+                    Err(_) => restore
+                        .notes
+                        .push(format!("[window] the pair file gives window 2 {text:?}; left out")),
+                }
+            }
+            restore.remembered = remembered_monitor(file, WINDOW_2);
+            restore.file = file.clone();
+        }
+        ReadPair::Missing => restore
+            .notes
+            .push("[window] window 2 is started again but there is no pair file; it builds its own modules".into()),
+        ReadPair::Unusable(why) => restore.notes.push(format!(
+            "[window] window 2 is started again but the pair file is unusable ({why}); it builds its own modules"
+        )),
+    }
+    restore.file.window2_open = true;
+    restore
+}
+
+/// The remembered output for a newly opened window 2, without restoring anything it previously held.
+pub fn second_placement(read: &ReadPair) -> Option<String> {
+    match read {
+        ReadPair::Read(file) => remembered_monitor(file, WINDOW_2),
+        ReadPair::Missing | ReadPair::Unusable(_) => None,
+    }
+}
+
+/// The connector of the output the pair file names for `window`, when it is one a window manager could name.
+pub fn remembered_monitor(file: &PairFile, window: &str) -> Option<String> {
+    file.monitors
+        .get(window)
+        .map(|monitor| monitor.connector.clone())
+        .filter(|connector| eitri_core::compositor::valid_output_name(connector))
+}
+
+/// The output window 1 is put on at its start: the one the pair file names for it, only when window 2 comes back
+/// with it. A window starting alone is placed by the window manager, wherever it was when it last closed.
+pub fn window1_start_monitor(file: &PairFile, window2_restored: bool) -> Option<String> {
+    window2_restored.then(|| remembered_monitor(file, WINDOW_1)).flatten()
+}
+
+/// The longest monitor description kept in the pair file: it is only ever shown, and the other window sends it.
+const DESCRIPTION_MAX: usize = 128;
+
+/// The other window's report of its monitor as the pair file keeps it: a connector a window manager could name,
+/// and its description cut to [`DESCRIPTION_MAX`] characters with control characters dropped. `None` for a
+/// connector that is not one.
+pub fn peer_monitor(connector: &str, description: &str) -> Option<Monitor> {
+    if !eitri_core::compositor::valid_output_name(connector) {
+        return None;
+    }
+    Some(Monitor {
+        connector: connector.to_string(),
+        description: description
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(DESCRIPTION_MAX)
+            .collect(),
+    })
+}
+
+/// This window's own monitor reports, as the pair file names them: the output list and the output the window is
+/// on, from the reports the window's monitor watch posts.
+#[derive(Default)]
+pub struct MonitorReports {
+    monitors: Vec<eitri_core::wm::Monitor>,
+}
+
+impl MonitorReports {
+    /// The monitor `event` puts this window on, when it says so; the output list is kept for the description.
+    pub fn report(&mut self, event: &eitri_core::wm::HostEvent) -> Option<Monitor> {
+        use eitri_core::wm::HostEvent;
+        match event {
+            HostEvent::MonitorsChanged { monitors } => {
+                self.monitors = monitors.clone();
+                None
+            }
+            HostEvent::WindowMonitor { monitor: Some(id), .. } => {
+                let description = self
+                    .monitors
+                    .iter()
+                    .find(|m| m.id == *id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                peer_monitor(&id.0, &description)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A window 1 whose window 2 was to come back and does not (its start refused, or it never finished its
+/// handshake): the placeholders this window kept for it come back as at the end of a link (the window controller's,
+/// on its own layout), the pair file says window 2 is not open while still naming what it held (until this window's
+/// layout holds that), and the tab files to offer from now on add window 2's. Those tab files.
+pub fn take_back_unrestored(writer: Option<&mut PairWriter>, alone_on_project: bool) -> TabFiles {
+    if let Some(writer) = writer {
+        writer.window2_left();
+    }
+    tab_files(Role::Main, true, alone_on_project, false)
+}
+
+/// What a window's close writes to the pair file whose writer it has. Window 2 closing orphaned (window 1 closed
+/// first) leaves the pair as it ended, window 2 open and holding what it holds, so the next launch starts both
+/// windows again, as it does after window 1 closed last with window 2 open; a window 2 that closes while window 1
+/// lives is ended by window 1's own write (`window2_closed`). Window 1's close forgets what a window 2 that is not
+/// open held, once its own layout file holds what it took back.
+pub fn on_close(writer: &mut PairWriter, second: bool, layout_written: bool) {
+    if !second && layout_written {
+        writer.forget_window2_holders();
     }
 }
 
@@ -298,6 +590,12 @@ impl PairWriter {
         &self.file
     }
 
+    /// Whether this window writes the pair file now.
+    #[cfg(test)]
+    pub fn writing(&self) -> bool {
+        self.writing
+    }
+
     /// From now on this window writes the pair file (window 2 once orphaned), starting with the file as it is
     /// and the monitors the file on disk names that this window never heard of.
     pub fn take_over(&mut self) {
@@ -310,13 +608,21 @@ impl PairWriter {
     /// itself, so this one writes it no more. If it died instead, the file still names what it held, and the next
     /// launch takes that back. A write still queued is dropped, since it holds this window's view from before the
     /// link ended and would land over the other window's; one already running is waited for, briefly (a small
-    /// file renamed into place), so it lands before the other window's first write rather than after.
-    pub fn hand_over(&mut self) {
+    /// file renamed into place). Returns true only when no write remains; a new writer must not be welcomed
+    /// while this returns false.
+    pub fn hand_over(&mut self) -> bool {
         self.writing = false;
         self.shared.lock().next = None;
-        if !self.flush(HAND_OVER_WAIT) {
-            eprintln!("[window] the pair file was still being written as the other window took it over");
+        let quiet = self.flush(HAND_OVER_WAIT);
+        if !quiet {
+            eprintln!("[window] the pair file is still being written");
         }
+        quiet
+    }
+
+    /// A refused handover leaves this window owning the file, with its current snapshot and pending inheritance.
+    pub fn keep_ownership(&mut self) {
+        self.writing = true;
     }
 
     /// A window 2 linked again after [`PairWriter::hand_over`] (one started anew once the old one was gone):
@@ -353,21 +659,10 @@ impl PairWriter {
         self.write();
     }
 
-    /// Window 2 closed on its own while it kept the pair file (orphaned): the pair ends and the next launch does
-    /// not start it again, while what it held stays named, for window 1 to take back.
+    /// Window 2 is not open and is not coming back (a restore of it that did not finish): the next launch does not
+    /// start it again, while what it held stays named, for window 1 to take back.
     pub fn window2_left(&mut self) {
         self.file.window2_open = false;
-        self.write();
-    }
-
-    /// A move finished: `id` is held by window `to` now. A module back in window 1 is not named.
-    #[cfg_attr(not(test), allow(dead_code))] // The move verbs report here once they move anything.
-    pub fn move_done(&mut self, id: &ModuleId, to: &str) {
-        if to == WINDOW_1 {
-            self.file.holders.remove(id.as_str());
-        } else {
-            self.file.holders.insert(id.as_str().to_string(), to.to_string());
-        }
         self.write();
     }
 
@@ -391,12 +686,17 @@ impl PairWriter {
 
     /// Window `window` is on `monitor` now: written at once when that is news.
     #[cfg_attr(not(test), allow(dead_code))] // Each window's monitor reports come here once they are made.
+    ///
+    /// Monitor memory is the pair's: while no window 2 is open, the report is kept for the pair's next write and
+    /// nothing is written, so a window that never had a window 2 leaves no file naming its monitor.
     pub fn monitor(&mut self, window: &str, monitor: Monitor) {
         if self.file.monitors.get(window) == Some(&monitor) {
             return;
         }
         self.file.monitors.insert(window.to_string(), monitor);
-        self.write();
+        if self.file.window2_open {
+            self.write();
+        }
     }
 
     /// Writes the file as it is now when this window holds the pair; for a restore that changed it.
@@ -508,6 +808,41 @@ mod tests {
     use eitri_core::layout::persist::{self, Loaded};
     use eitri_core::window_link::pair::{pair_file_name, read_pair};
 
+    #[test]
+    fn a_busy_pair_file_refuses_handover_and_keeps_its_snapshot_when_ownership_returns() {
+        let dir = Scratch::new("pair-busy-handover");
+        let file = PairFile {
+            window2_open: true,
+            ..PairFile::default()
+        };
+        let mut writer = PairWriter::new(&dir.0, &root(), file.clone(), true);
+        writer.shared.lock().busy = true;
+        writer.shared.lock().next = Some(PairFile::default());
+        let start = Instant::now();
+        assert!(!writer.hand_over());
+        assert!(
+            start.elapsed() >= HAND_OVER_WAIT,
+            "an active write is given the handover interval"
+        );
+        assert!(!writer.writing());
+        writer.keep_ownership();
+        assert!(writer.writing());
+        assert_eq!(writer.file(), &file);
+        let slot = writer.shared.lock();
+        assert!(slot.busy);
+        assert!(slot.next.is_none(), "keeping ownership queues no replacement snapshot");
+        assert!(writer.thread.is_none());
+    }
+
+    #[test]
+    fn an_idle_pair_file_hands_over_without_waiting_for_a_worker() {
+        let dir = Scratch::new("pair-idle-handover");
+        let mut writer = PairWriter::new(&dir.0, &root(), PairFile::default(), true);
+        assert!(writer.hand_over());
+        assert!(!writer.writing());
+        assert!(writer.thread.is_none());
+    }
+
     fn root() -> PathBuf {
         PathBuf::from("/home/someone/project")
     }
@@ -557,18 +892,57 @@ mod tests {
     }
 
     #[test]
+    fn a_window_without_a_window_2_neither_writes_nor_goes_back_to_its_monitor() {
+        let dir = Scratch::new("pair-monitor-alone");
+        let mut writer = PairWriter::new(&dir.0, &root(), PairFile::default(), true);
+        let dp2 = Monitor {
+            connector: "DP-2".into(),
+            description: "Dell".into(),
+        };
+        writer.monitor(WINDOW_1, dp2.clone());
+        assert!(writer.flush(BOUND));
+        assert_eq!(
+            read_pair(&dir.0, &root()),
+            ReadPair::Missing,
+            "a lone window's monitor is not written"
+        );
+        // Kept for the pair: window 2's open writes it with the rest.
+        writer.window2_opened();
+        assert!(writer.flush(BOUND));
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!()
+        };
+        assert_eq!(file.monitors.get(WINDOW_1), Some(&dp2));
+        assert_eq!(window1_start_monitor(&file, true).as_deref(), Some("DP-2"));
+        assert_eq!(
+            window1_start_monitor(&file, false),
+            None,
+            "window 1 starting without window 2 stays where the window manager puts it"
+        );
+    }
+
+    /// A move's commit in window 2 changes what it holds, which it says with `away{ids}`: that is what names the
+    /// moved module's holder in the file, and what forgets it once it went back.
+    #[test]
     fn a_move_and_window_2s_close_write_the_pair_file_and_a_window_not_holding_it_writes_nothing() {
         let dir = Scratch::new("pair-moves");
         let mut writer = PairWriter::new(&dir.0, &root(), PairFile::default(), true);
         writer.window2_opened();
-        writer.move_done(&id("terminal#2"), WINDOW_2);
+        writer.window2_holds(&["terminal#2".to_string()].into_iter().collect());
         assert!(writer.flush(BOUND));
         let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
             panic!()
         };
         assert_eq!(file.holders["terminal#2"], WINDOW_2);
-        writer.move_done(&id("terminal#2"), WINDOW_1);
-        writer.move_done(&id("lua:notes"), WINDOW_2);
+        writer.window2_holds(&["lua:notes".to_string()].into_iter().collect());
+        assert!(writer.flush(BOUND));
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!()
+        };
+        assert!(
+            !file.holders.contains_key("terminal#2") && file.holders["lua:notes"] == WINDOW_2,
+            "a module moved back is no one's: {file:?}"
+        );
         writer.window2_closed();
         assert!(writer.flush(BOUND));
         let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
@@ -579,7 +953,7 @@ mod tests {
         let other = Scratch::new("pair-not-holder");
         let mut second = PairWriter::new(&other.0, &root(), PairFile::default(), false);
         second.window2_opened();
-        second.move_done(&id("terminal#3"), WINDOW_2);
+        second.window2_holds(&["terminal#3".to_string()].into_iter().collect());
         assert!(second.flush(BOUND));
         assert_eq!(
             read_pair(&other.0, &root()),
@@ -792,7 +1166,7 @@ mod tests {
         let path = dir.0.join(pair_file_name(&root()));
         std::fs::create_dir_all(&dir.0).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
-        let plan = read_for_restore(&dir.0, &root(), false);
+        let plan = read_for_restore(&dir.0, &root(), true, &|| true);
         assert!(plan.write_now && !plan.in_the_way);
         assert_eq!(
             std::fs::read_to_string(path.with_extension("json.unusable")).unwrap(),
@@ -855,13 +1229,49 @@ mod tests {
             "window 1's monitor is kept by window 2's writes"
         );
         // Later writes of window 2 keep it too.
-        second.window2_left();
+        second.window2_holds(&BTreeSet::from(["lua:notes".to_string(), "terminal#2".to_string()]));
         assert!(second.flush(BOUND));
         let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
             panic!()
         };
-        assert!(!file.window2_open);
         assert_eq!(file.monitors.get(WINDOW_1), Some(&one_monitor));
+    }
+
+    #[test]
+    fn an_orphaned_window_2_closing_leaves_the_pair_to_come_back_at_the_next_launch() {
+        // Window 1 closed first and window 2 later: both were open when the pair ended, so both come back.
+        let dir = Scratch::new("pair-orphan-close");
+        let mut second = PairWriter::new(
+            &dir.0,
+            &root(),
+            PairFile {
+                window2_open: true,
+                ..PairFile::default()
+            },
+            false,
+        );
+        second.take_over();
+        second.window2_holds(&BTreeSet::from(["terminal#2".to_string()]));
+        on_close(&mut second, true, true);
+        assert!(second.flush(BOUND));
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!()
+        };
+        assert!(file.window2_open, "{file:?}");
+        assert_eq!(file.holders["terminal#2"], WINDOW_2);
+
+        // Window 2 closing while window 1 lives is window 1's to write: closed, and it holds nothing.
+        let dir = Scratch::new("pair-window-2-closed-first");
+        let mut first = PairWriter::new(&dir.0, &root(), PairFile::default(), true);
+        first.window2_opened();
+        first.window2_holds(&BTreeSet::from(["terminal#2".to_string()]));
+        first.window2_closed();
+        on_close(&mut first, false, true);
+        assert!(first.flush(BOUND));
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!()
+        };
+        assert!(!file.window2_open && file.holders.is_empty(), "{file:?}");
     }
 
     #[test]
@@ -945,6 +1355,98 @@ mod tests {
         assert!(!layout.is_away(&ModuleId::terminal()) && !layout.is_away(&ModuleId::agent()));
         let files = tab_files(Role::Second, false, true, false);
         assert!(files.also_offer.is_empty() && !files.offers_own);
+    }
+
+    #[test]
+    fn a_window_2_from_window_new_goes_to_window_2s_remembered_output() {
+        let dir = Scratch::new("pair-second-placement");
+        written_pair(&dir, false);
+        let path = dir.0.join(pair_file_name(&root()));
+        let before = bytes(&path);
+        assert_eq!(second_placement(&read_pair(&dir.0, &root())).as_deref(), Some("DP-2"));
+        assert_eq!(bytes(&path), before);
+    }
+
+    #[test]
+    fn a_first_window_new_leaves_window_2_to_the_window_manager() {
+        let mut file = PairFile::default();
+        file.monitors
+            .insert(WINDOW_1.into(), peer_monitor("DP-1", "Left").unwrap());
+        for read in [
+            ReadPair::Read(file),
+            ReadPair::Missing,
+            ReadPair::Unusable("bad file".into()),
+        ] {
+            assert_eq!(second_placement(&read), None);
+        }
+    }
+
+    #[test]
+    fn a_remembered_output_no_window_manager_could_name_is_not_used() {
+        let mut file = PairFile::default();
+        file.monitors.insert(
+            WINDOW_2.into(),
+            Monitor {
+                connector: "../x".into(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(second_placement(&ReadPair::Read(file)), None);
+    }
+
+    #[test]
+    fn a_restored_window_2_builds_the_pages_the_pair_gives_it() {
+        let mut layout = window(&["terminal#2", "lua:notes", "lua:other"]);
+        let mut workspaces = two_workspaces(layout.clone());
+        // Window 2's start in its order: every page held away as window 1's, then what the pair file gives it.
+        let frame = eitri_core::layout::Frame::new(NOMINAL_GRID, 1);
+        crate::linked_window::start_second(&mut layout, &mut workspaces, &frame).unwrap();
+        second_start_away(
+            &mut layout,
+            &mut workspaces,
+            &BTreeSet::from([id("lua:notes"), id("terminal#2")]),
+        );
+        assert_eq!(
+            crate::linked_window::away_everywhere(&layout, &workspaces),
+            BTreeSet::from([id("lua:other")]),
+            "a page the pair gives window 2 is built there, in every workspace"
+        );
+    }
+
+    #[test]
+    fn a_restored_window_2_builds_a_module_the_pair_gives_it_that_its_layout_lost() {
+        // The pair file names terminal#2 as window 2's, but window 2's layout was written before that move.
+        let mut layout = window(&["lua:notes"]);
+        let mut workspaces = two_workspaces(layout.clone());
+        let frame = eitri_core::layout::Frame::new(NOMINAL_GRID, 1);
+        crate::linked_window::start_second(&mut layout, &mut workspaces, &frame).unwrap();
+        let given = BTreeSet::from([id("terminal#2"), id("lua:notes")]);
+        second_start_away(&mut layout, &mut workspaces, &given);
+        let keys = layout.focus().clone();
+        let notes = place_given(
+            &mut layout,
+            &mut workspaces,
+            &given,
+            &OpenRules::default(),
+            &[],
+            &can_build_all,
+        );
+        assert!(notes.iter().any(|n| n.contains("terminal#2")), "{notes:?}");
+        for (name, l) in workspaces.each(&layout) {
+            assert!(l.contains(&id("terminal#2")), "{name}: built here");
+            assert!(!l.is_away(&id("terminal#2")), "{name}");
+        }
+        assert_eq!(layout.focus(), &keys, "and it does not take the keys");
+        // Nothing to place when the layout holds everything it is given.
+        assert!(place_given(
+            &mut layout,
+            &mut workspaces,
+            &given,
+            &OpenRules::default(),
+            &[],
+            &can_build_all
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1033,5 +1535,230 @@ mod tests {
             panic!()
         };
         assert!(again.current.hidden().contains(&ModuleId::terminal()));
+    }
+
+    fn output(connector: &str, name: &str) -> eitri_core::wm::Monitor {
+        eitri_core::wm::Monitor {
+            id: eitri_core::wm::MonitorId(connector.into()),
+            rect: eitri_core::layout::Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            scale: 1.0,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_monitor_report_writes_the_pair_file_at_once() {
+        use eitri_core::wm::{HostEvent, MonitorId, WinId};
+        let dir = Scratch::new("pair-own-monitor");
+        // A pair whose window 2 is open: a lone window's report is not written
+        // (`a_window_without_a_window_2_neither_writes_nor_goes_back_to_its_monitor`).
+        let open = PairFile {
+            window2_open: true,
+            ..PairFile::default()
+        };
+        let mut writer = PairWriter::new(&dir.0, &root(), open, true);
+        let mut reports = MonitorReports::default();
+        let on = |connector: Option<&str>| HostEvent::WindowMonitor {
+            win: WinId::MAIN,
+            monitor: connector.map(|c| MonitorId(c.into())),
+        };
+        assert_eq!(
+            reports.report(&HostEvent::MonitorsChanged {
+                monitors: vec![output("DP-1", "Left"), output("DP-2", "Right")],
+            }),
+            None,
+            "the output list alone says where no window is"
+        );
+        let report = reports.report(&on(Some("DP-2"))).expect("the window is on DP-2");
+        assert_eq!(
+            report,
+            Monitor {
+                connector: "DP-2".into(),
+                description: "Right".into()
+            }
+        );
+        // Nothing else changes: the report alone writes the file.
+        writer.monitor(WINDOW_1, report);
+        assert!(writer.flush(BOUND));
+        assert_eq!(writer.writes(), 1);
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!("written at once")
+        };
+        assert_eq!(remembered_monitor(&file, WINDOW_1).as_deref(), Some("DP-2"));
+        assert_eq!(file.monitors[WINDOW_1].description, "Right");
+        assert_eq!(reports.report(&on(None)), None, "leaving every output names none");
+
+        // The other window's report is its input: a connector no window manager could name is dropped, and a
+        // description is kept short and plain.
+        assert_eq!(peer_monitor("DP-1; rm -rf ~", "x"), None);
+        assert_eq!(peer_monitor("", "x"), None);
+        let long = peer_monitor("HDMI-A-1", &format!("Big\n{}", "screen ".repeat(100))).unwrap();
+        assert_eq!(long.connector, "HDMI-A-1");
+        assert_eq!(long.description.chars().count(), DESCRIPTION_MAX);
+        assert!(!long.description.contains('\n'));
+        let mut file = PairFile::default();
+        file.monitors.insert(
+            WINDOW_2.into(),
+            Monitor {
+                connector: "not an output".into(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(
+            remembered_monitor(&file, WINDOW_2),
+            None,
+            "a remembered name is checked the same way"
+        );
+    }
+
+    fn written_pair(dir: &Scratch, window2_open: bool) {
+        let mut file = PairFile {
+            window2_open,
+            ..PairFile::default()
+        };
+        for (id, holder) in [("terminal#2", WINDOW_2), ("lua:notes", WINDOW_2), ("bad id!", WINDOW_2)] {
+            file.holders.insert(id.into(), holder.into());
+        }
+        for (window, connector) in [(WINDOW_1, "DP-1"), (WINDOW_2, "DP-2")] {
+            file.monitors.insert(
+                window.into(),
+                Monitor {
+                    connector: connector.into(),
+                    description: String::new(),
+                },
+            );
+        }
+        eitri_core::window_link::pair::write_pair(&dir.0, &root(), &file).unwrap();
+    }
+
+    #[test]
+    fn a_restored_window_2_builds_what_the_pair_file_gives_it_and_offers_its_tabs() {
+        let dir = Scratch::new("pair-second-restore");
+        written_pair(&dir, true);
+
+        // Window 1 starts window 2 again only when every condition holds.
+        let plan = read_for_restore(&dir.0, &root(), true, &|| true);
+        assert!(plan.restore_second);
+        assert_eq!(plan.away, BTreeSet::from([id("terminal#2"), id("lua:notes")]));
+        assert_eq!(remembered_monitor(&plan.start, WINDOW_1).as_deref(), Some("DP-1"));
+        let off = read_for_restore(&dir.0, &root(), false, &|| {
+            panic!("not asked when window.restore is off")
+        });
+        assert!(
+            !off.restore_second && off.take_back,
+            "window.restore off: window 1 takes everything back"
+        );
+        let unusable = read_for_restore(&dir.0, &root(), true, &|| false);
+        assert!(!unusable.restore_second && unusable.take_back);
+        assert!(
+            unusable.notes.iter().any(|n| n.contains("layout file")),
+            "{:?}",
+            unusable.notes
+        );
+        assert!(!read_for_restore(&dir.0, &root(), true, &|| true).away.is_empty());
+        let closed = Scratch::new("pair-second-closed");
+        written_pair(&closed, false);
+        assert!(
+            !read_for_restore(&closed.0, &root(), true, &|| panic!("not asked for a closed window 2")).restore_second
+        );
+
+        // Window 2, started with `--restore`, reads the file once, read-only.
+        let path = dir.0.join(pair_file_name(&root()));
+        let before = bytes(&path);
+        let second = second_restore(&read_pair(&dir.0, &root()));
+        assert_eq!(bytes(&path), before, "read, never written");
+        assert_eq!(second.given, BTreeSet::from([id("terminal#2"), id("lua:notes")]));
+        assert_eq!(second.remembered.as_deref(), Some("DP-2"));
+        assert!(second.notes.iter().any(|n| n.contains("bad id!")), "{:?}", second.notes);
+        assert!(second.file.window2_open && second.file.monitors.contains_key(WINDOW_1));
+        let mut layout = window(&["terminal#2", "agent#3", "lua:notes"]);
+        let mut workspaces = Workspaces::single();
+        second_start_away(&mut layout, &mut workspaces, &second.given);
+        assert_eq!(
+            layout.away(),
+            BTreeSet::from([id("agent#3")]),
+            "it builds what it was given"
+        );
+        let files = tab_files(Role::Second, false, false, true);
+        assert!(
+            files.offers_own && files.also_offer.is_empty(),
+            "it offers its own saved tabs"
+        );
+
+        // A missing pair file gives it nothing to build.
+        let missing = second_restore(&ReadPair::Missing);
+        assert!(missing.given.is_empty() && missing.remembered.is_none() && !missing.notes.is_empty());
+    }
+
+    #[test]
+    fn a_restore_that_fails_takes_window_2s_modules_and_tabs_back() {
+        let dir = Scratch::new("pair-restore-fails");
+        written_pair(&dir, true);
+        let plan = read_for_restore(&dir.0, &root(), true, &|| true);
+        assert!(plan.restore_second);
+        let mut layout = window(&["terminal#2", "lua:notes"]);
+        let mut workspaces = two_workspaces(layout.clone());
+        apply_main_restore(
+            &plan,
+            &mut layout,
+            &mut workspaces,
+            &OpenRules::default(),
+            &[],
+            &can_build_all,
+        );
+        assert_eq!(layout.away(), BTreeSet::from([id("terminal#2"), id("lua:notes")]));
+        let mut writer = PairWriter::new(&dir.0, &root(), plan.start.clone(), true);
+        // Window 1 offered only its own saved tabs, window 2 being expected to offer its own.
+        assert_eq!(
+            tab_files(Role::Main, !plan.restore_second, false, false).also_offer,
+            Vec::<Role>::new()
+        );
+
+        // The layouts' half, as the window controller carries it out at the same moment.
+        let back = eitri_core::window_link::end::end_plan(
+            &crate::linked_window::away_everywhere(&layout, &workspaces),
+            eitri_core::window_link::end::EndKind::RestoreFailed,
+        );
+        eitri_core::window_link::end::apply_end(&back, &mut layout, &mut workspaces);
+        let files = take_back_unrestored(Some(&mut writer), false);
+        assert_eq!(
+            back.back,
+            [id("lua:notes")],
+            "the page is rebuilt here from its own store"
+        );
+        assert_eq!(
+            back.dropped,
+            [id("terminal#2")],
+            "the terminal's shell ended with the last run"
+        );
+        for (name, l) in workspaces.each(&layout) {
+            assert!(
+                l.away().is_empty(),
+                "{name}: no placeholder is left for a window that is not coming"
+            );
+            assert!(l.contains(&id("lua:notes")) && !l.contains(&id("terminal#2")), "{name}");
+        }
+        assert!(
+            files.offers_own && files.also_offer == [Role::Second],
+            "window 2's saved tabs are offered now"
+        );
+        assert!(writer.flush(BOUND));
+        let ReadPair::Read(file) = read_pair(&dir.0, &root()) else {
+            panic!("written at once")
+        };
+        assert!(!file.window2_open, "the next launch does not start window 2");
+        assert_eq!(
+            file.holders.get("lua:notes").map(String::as_str),
+            Some(WINDOW_2),
+            "what window 2 held stays named until this window's layout holds it"
+        );
+        // Without a writer (a window that does not hold the pair file) the tabs are offered all the same.
+        let files = take_back_unrestored(None, true);
+        assert_eq!(files.also_offer, [Role::Second, Role::Unpaired]);
     }
 }

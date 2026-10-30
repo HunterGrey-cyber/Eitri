@@ -4,7 +4,8 @@ use crate::window_link::ids;
 /// Choose the lowest instance number absent from every layout and every held or reserved id. The numbers this
 /// window cannot take (its layouts' modules and the reserved ids) and the ones the other window of a pair holds go
 /// through the pair's one allocator, so a number is never handed out twice across the two windows. Running out
-/// keeps the window's own words, which say the limit a person hits with one window open.
+/// uses the pair's words when the other window holds numbered instances of the kind; otherwise it keeps the
+/// window's own words, which say the limit a person hits with one window open.
 pub fn plan_new_instance(
     kind: ModuleKind,
     here: &[&Layout],
@@ -16,10 +17,16 @@ pub fn plan_new_instance(
         .flat_map(|layout| layout.modules())
         .chain(reserved.iter().cloned())
         .collect();
-    ids::new_instance(kind, &here_and_reserved, other_held).map_err(|_| match kind {
-        ModuleKind::Terminal => "at most 9 terminals".to_string(),
-        ModuleKind::Agent => "at most 9 chat views".to_string(),
-        _ => format!("no new instance of {kind:?} can be made"),
+    ids::new_instance(kind, &here_and_reserved, other_held).map_err(|err| {
+        if other_held.iter().any(|id| id.kind() == kind && id.number() >= 2) {
+            err.to_string()
+        } else {
+            match kind {
+                ModuleKind::Terminal => "at most 9 terminals".to_string(),
+                ModuleKind::Agent => "at most 9 chat views".to_string(),
+                _ => format!("no new instance of {kind:?} can be made"),
+            }
+        }
     })
 }
 
@@ -128,7 +135,7 @@ mod tests {
             (ModuleKind::Agent, "at most 9 chat views"),
         ] {
             let held: Vec<_> = (2..=9).map(|n| ModuleId::instance(kind, n).unwrap()).collect();
-            assert_eq!(plan_new_instance(kind, &[], &[], &held), Err(text.to_string()));
+            assert_eq!(plan_new_instance(kind, &[], &held, &[]), Err(text.to_string()));
         }
         assert_eq!(
             plan_new_instance(ModuleKind::Editor, &[], &[], &[]),

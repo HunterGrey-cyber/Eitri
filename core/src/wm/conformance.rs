@@ -50,6 +50,33 @@ pub struct Script {
     pub expect: Vec<Expect>,
 }
 
+/// The complete service teardown, for hosts whose cleanup and shutdown services are attached.
+pub fn teardown_script(win: WinId) -> Script {
+    let ops = vec![
+        HostOp::Cleanup(CleanupOp::PairOnClose { layout_written: true }),
+        HostOp::Editor(EditorCall::Shutdown { win }),
+        HostOp::Terminal(TermOp::ShutdownAll { win }),
+        HostOp::Cleanup(CleanupOp::ScratchDir),
+        HostOp::Cleanup(CleanupOp::PaneSwitchDir),
+        HostOp::Cleanup(CleanupOp::Feeds),
+        HostOp::Plugin(PluginOp::ShutdownAll { win }),
+        HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
+        HostOp::CloseWindow { win },
+    ];
+    let mut expect: Vec<_> = (0..ops.len())
+        .map(|op| Expect::Answer {
+            op,
+            applied: Applied::Done,
+        })
+        .collect();
+    expect.push(Expect::NoCloseRequest);
+    Script {
+        name: "the_teardown_ops_are_answered_done_in_order",
+        ops,
+        expect,
+    }
+}
+
 #[derive(Debug)]
 pub enum Expect {
     Answer {
@@ -68,6 +95,8 @@ pub enum Expect {
     Stacking(Vec<ModuleId>),
     /// The window's grid holds this many hosts of the module once the ops have applied.
     HostsOf(ModuleId, usize),
+    /// The script's window is no longer open once the ops have applied: its close went through.
+    WindowClosed,
 }
 
 /// What a host's grid did that no event reports, read around a script: the expectations on allocations and
@@ -77,6 +106,8 @@ pub trait GridObserve {
     fn allocations_asked(&self, win: WinId) -> usize;
     /// `win`'s module hosts as its grid stacks them, bottom first.
     fn stacking(&self, win: WinId) -> Vec<ModuleId>;
+    /// Whether `win` is still open: shown, not closed by an op or a close the host let through.
+    fn window_open(&self, win: WinId) -> bool;
 }
 
 #[derive(Debug)]
@@ -85,6 +116,7 @@ pub enum EventMatch {
     /// An unmap may clear focus or move it directly to another native destination.
     NativeFocusAwayFrom(ModuleId),
     Refused(OpTag),
+    RefusedWithText(OpTag, String),
     /// A refusal of an op on `module`'s surface, naming it, so the controller knows which module it was for.
     RefusedSurface(OpTag, ModuleId),
     PageShown(ViewId),
@@ -100,6 +132,9 @@ impl EventMatch {
             },
             (Self::NativeFocusAwayFrom(module), HostEvent::NativeFocus { owner, .. }) => {
                 owner.as_ref() != Some(&FocusOwner::Module(module.clone()))
+            }
+            (Self::RefusedWithText(expected, text), HostEvent::Refused { what, why, .. }) => {
+                expected == what && text == why
             }
             (Self::Refused(expected), HostEvent::Refused { what, .. }) => expected == what,
             (Self::RefusedSurface(expected, module), HostEvent::Refused { what, surface, .. }) => {
@@ -146,6 +181,7 @@ fn one_of_each_kind() -> Vec<(ModuleId, SurfaceKind)> {
                     args: vec![],
                     cwd: None,
                     clean: true,
+                    background: None,
                 },
             },
         ),
@@ -521,14 +557,87 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
             ops: vec![HostOp::CloseWindow { win: f.win }],
             expect: vec![Expect::NoCloseRequest],
         },
+        // A terminal offered by the other window gets its place made off screen and is answered as carried out, so
+        // the driver tells the controller it is prepared and the source may freeze it; nothing is refused.
+        Script {
+            name: "a_terminal_prepare_is_carried_out_and_answered_prepared",
+            ops: vec![HostOp::PrepareSurface {
+                win: f.win,
+                module: ModuleId::instance(ModuleKind::Terminal, 3).expect("a terminal's number"),
+                shape: crate::window_link::Shape::Tiled,
+                size: (640, 480),
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::PrepareSurface)),
+            ],
+        },
+        // A chat view offered by the other window gets its page made off screen and is answered as carried out, as a
+        // terminal's place is.
+        Script {
+            name: "a_chat_view_prepare_is_carried_out_and_answered_prepared",
+            ops: vec![HostOp::PrepareSurface {
+                win: f.win,
+                module: ModuleId::instance(ModuleKind::Agent, 3).expect("a chat view's number"),
+                shape: crate::window_link::Shape::Tiled,
+                size: (640, 480),
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::PrepareSurface)),
+            ],
+        },
+        // The teardown's last op is the close itself: the host's own close never asks the sink (whose answer to an
+        // asked close is always to stop it), and the close request it causes goes through, so the window is gone.
+        Script {
+            name: "close_window_closes_without_asking_and_proceeds",
+            ops: vec![HostOp::CloseWindow { win: f.win }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::NoCloseRequest,
+                Expect::WindowClosed,
+            ],
+        },
     ]
 }
 
-/// What a host that can start no second window, and builds no arriving terminal yet, answers the pair's ops: each
-/// refused while it applies, so the controller hears why. A host whose shell has no pair at all, and one whose kind
-/// code for an arrival has not landed, run these; a host that carries the ops out does not.
+/// A failed join reports the service's exact refusal while its op applies.
+pub fn join_back_refusal_script(win: WinId, text: &str) -> Script {
+    Script {
+        name: "a_join_back_that_fails_is_posted_refused_with_its_text",
+        ops: vec![HostOp::Chat(ChatOp::JoinBack {
+            win,
+            view: ViewId::of_module(&ModuleId::instance(ModuleKind::Agent, 2).unwrap()).unwrap(),
+        })],
+        expect: vec![
+            Expect::PostedDuring {
+                op: 0,
+                event: EventMatch::RefusedSurface(OpTag::Chat, ViewId::new(2).unwrap().module()),
+            },
+            Expect::Answer {
+                op: 0,
+                applied: Applied::Refused,
+            },
+            Expect::PostedDuring {
+                op: 0,
+                event: EventMatch::RefusedWithText(OpTag::Chat, text.into()),
+            },
+        ],
+    }
+}
+
+/// What a host that can start no second window answers the pair's ops: each refused while it applies, so the
+/// controller hears why. A host whose shell has no pair at all runs these; a host that carries the ops out does not.
 pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
-    let arriving = ModuleId::instance(ModuleKind::Terminal, 3).expect("a terminal's number");
     vec![
         // The toast says why no second window opened; nothing else of the window changes.
         Script {
@@ -545,28 +654,15 @@ pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
                 },
             ],
         },
-        // A terminal offered by the other window is refused before anything of it is built: the offer is turned
-        // down while the source still holds it whole.
-        Script {
-            name: "a_terminal_prepare_is_refused_until_its_kind_lands",
-            ops: vec![HostOp::PrepareSurface {
-                win: f.win,
-                module: arriving.clone(),
-                shape: crate::window_link::Shape::Tiled,
-                size: (640, 480),
-            }],
-            expect: vec![
-                Expect::Answer {
-                    op: 0,
-                    applied: Applied::Refused,
-                },
-                Expect::PostedDuring {
-                    op: 0,
-                    event: EventMatch::RefusedSurface(OpTag::PrepareSurface, arriving),
-                },
-            ],
-        },
     ]
+}
+
+/// The window an op closes.
+fn closed_win(op: &HostOp) -> Option<WinId> {
+    match op {
+        HostOp::CloseWindow { win } => Some(*win),
+        _ => None,
+    }
 }
 
 /// The window whose grid an op acts on.
@@ -628,6 +724,10 @@ pub fn run_observed(
                         script.name
                     ))
                 }
+            },
+            Expect::WindowClosed => match (grid, script.ops.iter().find_map(closed_win)) {
+                (Some(grid), Some(win)) => !grid.window_open(win),
+                _ => return Err(format!("{}: {expect:?} needs an observer and a window", script.name)),
             },
             Expect::HostsOf(module, count) => match (grid, win) {
                 (Some(grid), Some(win)) => grid.stacking(win).iter().filter(|host| *host == module).count() == *count,
@@ -718,7 +818,22 @@ mod tests {
         }
     }
 
-    /// The fake stands for a host with no pair and no arriving terminal by refusing those ops, as such a host does.
+    #[test]
+    fn a_join_back_that_fails_is_posted_refused_with_its_text() {
+        let host = FakeHost::new();
+        host.refuse_op(|op| matches!(op, HostOp::Chat(ChatOp::JoinBack { .. })));
+        let sink = Rc::new(RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        run(
+            host.as_ref(),
+            &sink,
+            &join_back_refusal_script(WinId::MAIN, "the native model cannot apply this operation"),
+        )
+        .unwrap();
+    }
+
+    /// The fake stands for a host with no pair by refusing its ops, as such a host does.
     #[test]
     fn the_fake_host_refusing_the_pairs_ops_passes_their_scripts() {
         let f = Fixture {
@@ -729,7 +844,7 @@ mod tests {
         };
         for script in pair_refusal_scripts(&f) {
             let host = FakeHost::new();
-            host.refuse_op(|op| matches!(op, HostOp::OpenLinkedWindow { .. } | HostOp::PrepareSurface { .. }));
+            host.refuse_op(|op| matches!(op, HostOp::OpenLinkedWindow { .. }));
             let sink = Rc::new(RecordingSink::default());
             let erased: Rc<dyn HostSink> = sink.clone();
             host.attach(Rc::downgrade(&erased));

@@ -1,27 +1,41 @@
-//! Trace a turn's latency from submission to its first paint frame and completion.
-//! Enabled by `EITRI_AGENT_TRACE=1`; emits one line per turn to stderr.
+//! Where a turn's latency actually goes, from the click to the pixels.
 //!
-//! Provider-boundary timing misses the panel pump, bridge and WebView rendering. These marks
-//! separate provider delay from the time spent delivering and drawing the reply:
+//! Off unless `EITRI_AGENT_TRACE=1`. One line per turn, to stderr.
+//!
+//! The point is to tell "the model is slow" apart from "our pipeline is slow", which the numbers in
+//! `agent/tests/claude_sidecar_partial_streaming.rs` cannot do: those are measured at the provider
+//! boundary, so everything after it -- the panel's tick, the bridge hop, the WebView's own render --
+//! is invisible to them. Measured partial streaming time-to-first-text is ~11s against ~29s
+//! without it; these marks show how much delay belongs to this side.
+//!
+//! The five marks:
 //!
 //! | mark | stamped where | means |
 //! | --- | --- | --- |
 //! | submitted | the `send_message` inbound message is handled | the user pressed Send |
-//! | first provider event | the pump drains any event of this turn | the provider emitted an event |
-//! | first presentation delta | the pump drains the first assistant text | the first text exists here |
-//! | first paint frame | reported back by the WebView | the frame containing the first text |
+//! | first provider event | the pump drains any event of this turn | the provider said anything at all |
+//! | first presentation delta | the pump drains the first assistant text | the first characters exist here |
+//! | first paint frame | reported back by the WebView | the first characters are on screen |
 //! | completed | the pump drains `TurnCompleted` | the turn is over |
 //!
-//! These timings describe request/response latency. They do not measure whether transport
-//! can keep up with a continuous unsolicited stream; that requires throughput measurements.
-//! Server-side grpc-js queues also let a consumer stall for 20 seconds without losing events,
-//! which demonstrates delivery correctness rather than transport speed.
+//! **What these numbers do NOT bound.** They measure a request/response route: a turn goes out, a
+//! reply streams back, and the span from "text exists in Rust" to "frame drawn" is ~20-26ms against
+//! a 3-6s wait. That is a statement about LATENCY on this shape of traffic, and nothing else. It is
+//! not evidence that transport is cheap in general, and specifically not for a continuous stream
+//! that pushes whether or not anyone asked for anything: whether the pipe keeps up is throughput,
+//! which nothing here measures. A latency measurement on the SDK route cannot establish that
+//! transport is not a bottleneck on another route.
 //!
-//! The WebView reports the duration from receiving a payload to the animation frame that
-//! draws it. Add that span to Rust's dispatch instant. JS `performance.now()` and Rust
-//! `Instant` have unrelated epochs, so their timestamps cannot be subtracted directly.
-//! The frame callback runs before compositor presentation, making the paint mark a lower
-//! bound on perceived latency rather than a measurement of when pixels become visible.
+//! Measured backpressure behaviour: a consumer that stalls for 20 seconds loses nothing, because
+//! grpc-js queues server-side rather than dropping. That establishes correctness, not speed.
+//!
+//! **On "first paint frame", and what it is not.** The WebView reports how long it took from
+//! *receiving* the payload to the animation frame that drew it, and that span is added to the
+//! moment Rust dispatched it. Measured as a span rather than a wall-clock instant on purpose: JS
+//! `performance.now()` and Rust `Instant` have unrelated epochs, so subtracting one from the other
+//! would produce a confident, meaningless number. It is also a frame, not a photon -- the callback
+//! runs before the compositor presents -- so read it as the frame the text was drawn into, and as a
+//! floor on what the user perceives, never as a measured perceptual latency.
 
 use agent::{AgentDomainEvent, ContentKind};
 use std::time::{Duration, Instant};
@@ -390,7 +404,7 @@ mod tests {
 
     /// A reload while the typing cadence holds the turn's first text: the envelope is thrown away
     /// because the `ready` snapshot carries the text, so the page reports no paint for it and the
-    /// line must not wait for one (it used to never print).
+    /// line must not wait for one.
     #[test]
     fn a_first_text_thrown_away_for_a_snapshot_finishes_the_trace_without_a_paint() {
         let mut trace = trace();

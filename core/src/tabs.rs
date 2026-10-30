@@ -239,12 +239,9 @@ pub enum PromptScope {
     Default,
 }
 
-/// The four bypass prompts, in English (since 2026-09-29). The band and every other prompt and flash it
-/// draws (`close 2 "docs"? (y/n)`, `close window? ...`) are English; these four, written in
-/// Chinese at first, were the only text in it that was not. Their structure is unchanged:
-/// what is asked and when, and `(y/n)` ends every one. `waiting`
-/// -- the number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`;
-/// the other two scopes never have cards to approve (a `NotStarted` tab has no session and the
+/// The four bypass prompts use English and end in `(y/n)`. `waiting` is the number of delivered
+/// cards a `LiveTab` entry would approve; it is read only for `LiveTab`.
+/// The other two scopes never have cards to approve (a `NotStarted` tab has no session and the
 /// window default is not a tab at all).
 pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     match scope {

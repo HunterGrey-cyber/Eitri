@@ -1603,8 +1603,9 @@ impl TaskRunner {
     }
 
     /// [`Self::runs`] for a page that is attaching: each run's stdout still held for the next batch is
-    /// already in the tail handed back, so it is taken out of the queue, in the same critical section that
-    /// copies the tail -- the page then sees every such line once, in the tail, and never again as output.
+    /// taken out of the queue, in the same critical section that copies the tail, so the page never sees a
+    /// line twice. A held line the tail still keeps is seen once, in the tail; one the tail has already
+    /// evicted (the queue holds up to `RATE_BYTES`, the tail `TAIL_BYTES`) is not seen at all.
     /// Stderr is not part of a tail and stays queued.
     pub fn attach(&mut self) -> Vec<RunInfo> {
         self.runs

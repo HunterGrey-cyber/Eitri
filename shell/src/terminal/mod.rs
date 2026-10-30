@@ -21,6 +21,8 @@ mod input_queue;
 // Whether a terminal's shell is running a job, asked when the window closes.
 pub(crate) mod jobs;
 pub(crate) mod keys;
+// A terminal's move to the other window, as far as it needs no display.
+pub(crate) mod moving;
 mod pane;
 pub(crate) mod pointer;
 // The window's terminals are kept in this registry.
@@ -30,6 +32,7 @@ pub(crate) use pane::TerminalPane;
 
 #[cfg(test)]
 use eitri_core::layout::{Layout, LayoutError, ModuleDecl};
+use eitri_core::lua::config::TerminalFontSetting;
 use eitri_core::theme::ThemeTokens;
 use eitri_terminal::{ExitInfo, TerminalColors};
 use terminal_render::RgbColor;
@@ -101,7 +104,7 @@ pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError
 
 /// Whether the shell's end closes the terminal module (decided 2026-09-26: `exit` in the bottom
 /// terminal closes the terminal window), as tmux closes a pane whose process exits. A real end does -- `exit`, `Ctrl+d`, a
-/// signal -- and `main.rs` then kills the module as `prefix x` does, without asking. What does not,
+/// signal -- and the controller then kills the module as `prefix x` does, without asking. What does not,
 /// and keeps its notice under the last screen with Enter restarting:
 /// - a child that left the terminal and still runs (`exec nohup cmd`): it is still this terminal's
 ///   child, and closing the module would hang it up;
@@ -114,29 +117,9 @@ pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError
 /// As the last module on screen, this is not the layout's kill to make (`eitri_core::layout::kill`
 /// refuses the last one, as a hide does): it closes the window instead, tmux's own last-pane rule,
 /// through the ordinary close path -- `close window? N running (y/n)` when a tab runs, and `n`
-/// leaves everything, this terminal and its notice included ([`OnExit`], task 6, 2026-09-26).
+/// leaves everything, this terminal and its notice included (`eitri_core::wm::close::OnExit`).
 pub(crate) fn closes_on_exit(exit: &ExitInfo) -> bool {
     !exit.detached && (exit.code.is_some() || exit.signal.is_some())
-}
-
-/// What a shell's own end does with the module ([`closes_on_exit`]'s `true` case), by
-/// `eitri_core::layout::can_kill`'s answer for it: another module is on screen, so the layout can
-/// take this one off it ([`KillScope::Module`]); or it is the last one, so ending it closes the
-/// window instead and the module itself is left alone until that really happens
-/// ([`KillScope::Window`]) -- `main.rs`'s `on_shell_exit` reads this rather than repeating the
-/// match, and its own test pins which scope means which.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum OnExit {
-    CloseModule,
-    CloseWindow,
-}
-
-pub(crate) fn on_exit(scope: eitri_core::layout::KillScope) -> OnExit {
-    use eitri_core::layout::KillScope;
-    match scope {
-        KillScope::Module => OnExit::CloseModule,
-        KillScope::Window => OnExit::CloseWindow,
-    }
 }
 
 /// Phase 1 takes two colours from the window's theme -- background and foreground -- so a light
@@ -154,6 +137,42 @@ pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
         foreground: rgb(tokens.fg),
         cursor: None,
     }
+}
+
+/// The face a terminal draws in, before the window's text zoom: the families to try in order and
+/// the un-zoomed size in logical pixels.
+///
+/// It is the editor's by default, so the terminal under the editor looks like it: `guifont`'s
+/// families (no family is `monospace` -- Neovide draws an empty `guifont` with a face built into its
+/// binary, which no font manager here can find) and `guifont`'s height as the editor converts it,
+/// the size the editor draws at before `g:neovide_scale_factor`. With the same family at the same
+/// scale the glyphs are the editor's size and the columns its width; the rows are the font's own
+/// height, without the editor's `linespace`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TerminalFace {
+    pub(crate) families: Vec<String>,
+    pub(crate) base_px: f32,
+}
+
+impl Default for TerminalFace {
+    /// The face for an empty `guifont`: what a pane draws in before nvim has reported one.
+    fn default() -> Self {
+        face_for("", None)
+    }
+}
+
+/// The face for nvim's `guifont`, under `init.lua`'s `terminal.font`: each part `terminal.font`
+/// names (its families, its height) replaces `guifont`'s, and each part it leaves out still follows
+/// the editor.
+pub(crate) fn face_for(guifont: &str, setting: Option<&TerminalFontSetting>) -> TerminalFace {
+    let families = setting
+        .map(|s| s.families.clone())
+        .filter(|families| !families.is_empty())
+        .unwrap_or_else(|| eitri_core::theme::guifont_families(guifont));
+    let base_px = setting
+        .and_then(|s| s.size_px)
+        .unwrap_or_else(|| eitri_core::theme::guifont_size_px(guifont));
+    TerminalFace { families, base_px }
 }
 
 #[cfg(test)]
@@ -376,13 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn on_exit_reads_can_kills_scope() {
-        use eitri_core::layout::KillScope;
-        assert_eq!(on_exit(KillScope::Module), OnExit::CloseModule);
-        assert_eq!(on_exit(KillScope::Window), OnExit::CloseWindow);
-    }
-
-    #[test]
     fn the_terminal_takes_the_themes_background_and_foreground() {
         let tokens = ThemeTokens::fallback();
         let colors = colors_from(&tokens);
@@ -466,5 +478,48 @@ mod start_dir_tests {
         let (dir, note) = start_dir(usable_dir(Ok(deleted)), root);
         assert_eq!(dir, root);
         assert!(note.expect("a note says why").contains("gone"));
+    }
+
+    /// The editor's face by default; `terminal.font` replaces only the parts it names.
+    #[test]
+    fn the_face_follows_guifont_and_terminal_font_replaces_what_it_names() {
+        let px = |points: f32| points * 96.0 / 72.0;
+        let face = face_for("Maple_Mono_NF_CN,monospace:h12", None);
+        assert_eq!(face.families, ["Maple Mono NF CN", "monospace"]);
+        assert!((face.base_px - px(12.0)).abs() < 1e-3);
+        assert_eq!(TerminalFace::default().families, Vec::<String>::new());
+        assert!(
+            (TerminalFace::default().base_px - px(14.0)).abs() < 1e-3,
+            "guifont's own default height"
+        );
+
+        let both = TerminalFontSetting {
+            families: vec!["Iosevka".into()],
+            size_px: Some(px(10.0)),
+        };
+        assert_eq!(
+            face_for("Maple Mono:h12", Some(&both)),
+            TerminalFace {
+                families: vec!["Iosevka".into()],
+                base_px: px(10.0)
+            }
+        );
+        let family_only = TerminalFontSetting {
+            families: vec!["Iosevka".into()],
+            size_px: None,
+        };
+        let face = face_for("Maple Mono:h12", Some(&family_only));
+        assert_eq!(face.families, ["Iosevka"]);
+        assert!(
+            (face.base_px - px(12.0)).abs() < 1e-3,
+            "the height still follows the editor"
+        );
+        let size_only = TerminalFontSetting {
+            families: vec![],
+            size_px: Some(px(16.0)),
+        };
+        let face = face_for("Maple Mono:h12", Some(&size_only));
+        assert_eq!(face.families, ["Maple Mono"], "the family still follows the editor");
+        assert!((face.base_px - px(16.0)).abs() < 1e-3);
     }
 }

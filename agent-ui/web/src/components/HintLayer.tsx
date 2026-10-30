@@ -52,22 +52,17 @@ function naturalHeight(label: HTMLElement): number {
   return Number.isFinite(height) ? height : 0;
 }
 
-/** One label's height as a whole-pixel box height, however the label was placed. An unsized
- *  label is its own box (`offsetHeight`, which rounds); one sized to a sign cell has that cell's box, so its
- *  height is what its style says -- ROUNDED the same way. This used to be the style unrounded (31.14px at
- *  `agent.font_size` 32) against the box's 31 for the same label, so a sign cell showing 31.05px was a sliver
- *  by one measure and not by the other, and the two placements alternated on every commit. */
+/** A whole-pixel height for every label: `offsetHeight` rounds, so round the styled height too.
+ *  At `agent.font_size` 32, 31.14px styled versus a 31px box can classify the same 31.05px sign
+ *  cell differently on alternating commits, preventing placement from settling. */
 function labelHeight(label: HTMLElement): number {
   return label.style.width === "" ? label.offsetHeight : Math.round(naturalHeight(label));
 }
 
-/** The largest label drawn in `layer` (a two-letter label is wider than a one-letter one), or `LABEL_PX` for
- *  a dimension nothing has been drawn to measure yet. The placement effect runs after every commit, so the
- *  first pass uses the fallback and the next one the measured size. A label sized to its sign cell has a width
- *  that says nothing about a label's own, so only its height is read (`labelHeight`); a row's FALLBACK label
- *  (no usable sign cell, `place`) has a box of its own and gives its width too -- they
- *  used to be left out, so at `agent.font_size` 32 a label of ~31px was clamped as if it were 16 and spilled
- *  past the list. */
+/** Largest drawn label, or `LABEL_PX` until measured. The first commit uses the fallback, the
+ *  next its measured size. A sign-sized label supplies only height; a fallback row label has its
+ *  own width too. Omitting that width clamps a ~31px label at `agent.font_size` 32 as if it were
+ *  16px, letting it spill past the list. */
 function labelSize(layer: HTMLElement | null): { width: number; height: number } {
   let width = 0;
   let height = 0;
@@ -78,9 +73,8 @@ function labelSize(layer: HTMLElement | null): { width: number; height: number }
   return { width: width > 0 ? width : LABEL_PX, height: height > 0 ? height : LABEL_PX };
 }
 
-/** A sign cell is a sliver -- too short to carry a label squashed into it -- only when it is clearly shorter
- *  than a label, not when the two merely disagree by the sub-pixel a rounded and a fractional measure of the
- *  same thing can (the boundary case that used to flip on every pass). */
+/** A sliver is clearly shorter than a label, beyond the rounding difference between fractional
+ *  and whole-pixel measurements, so the same cell cannot alternate between placements. */
 const SLIVER_SLACK_PX = 1;
 
 /** Two placements closer than this are the same one: a fractional rect differs by float noise between
@@ -150,10 +144,8 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
       if (cell !== null && !sliver) {
         return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
       }
-      // A row with no usable sign cell -- a prose row's has no width, another's has scrolled out
-      // of the list, a third has none at all -- used to be labelled on the row's OWN box (`?? vis`), an opaque
-      // label the size of the row's whole visible part laid over its text. It gets a normal small label at
-      // the row's visible top-left instead, clamped into the clip box like every other one.
+      // A row without a usable sign cell gets a small label at its visible top-left. Sizing it to
+      // the whole row would lay an opaque label over the text; clamp it like every other label.
       return { top: clampTop(vis.top), left: clampLeft(vis.left) };
     }
     // A link that wraps onto a second line has a bounding box starting at the row's

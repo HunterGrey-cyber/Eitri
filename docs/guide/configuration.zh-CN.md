@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=33183ad6f87fd4da004fcaa5daee2a4201af86a067c83abad744e5d6c7e833b0 -->
+<!-- translated-from: configuration.md sha256=eb1935047244df5e13fdd524a7cf5c79935eb5edcc5a482a12ba69be68ae3178 -->
 
 # 配置
 
@@ -26,6 +26,7 @@ eitri.config.set("review.hint", true)
 
 两种窗口读的是同一个文件：单窗口模式和 [companion 窗口](companion.zh-CN.md)。
 
+<a id="settings"></a>
 ## 设置
 
 | 键 | 值 | 默认值 | 作用 |
@@ -42,7 +43,9 @@ eitri.config.set("review.hint", true)
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
+| `terminal.font` | `guifont` 格式的字体，`"<字体>:h<磅数>"` | 你的 `guifont` | 终端的字体，窗口里每个终端都用它：`"Iosevka:h12"` 同时设字体和字号，`"Iosevka"` 只设字体（字号仍跟着你的 `guifont`），`":h12"` 只设字号。多个字体用逗号分开、按顺序尝试，`_` 或 `\ ` 表示空格，和 `guifont` 一样。不设置时，终端用编辑器的字体和字号，这样编辑器下面的终端看起来和编辑器一致；`guifont` 为空时用 `monospace`。字号和编辑器一起缩放，见[按键](keys.zh-CN.md)。 |
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
+| `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
 设置只在窗口启动时读取一次。改了 `init.lua` 之后，开一个新窗口才会生效。
@@ -156,7 +159,7 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- 终端
 - **选项**有 `at`（一个位置，见下）、`float`（布尔值）、`size`、`scratchpad`（布尔值：它浮动并以收起的状态打开，隐含 `float`）和 `focus`（布尔值，默认 `true`：新模块是否拿到按键；`false` 时按键留在原处，除非新模块取代了拿着按键的编辑器）。`at` 是下面之一：`side`（整个窗口右边的新列）、`bottom`（整个窗口下面的新行）、`main`（取代编辑器的位置，编辑器被隐藏）、`below-editor`（编辑器那一列下面的一行，终端的默认位置）、`right`、`below`、`left`、`above`（在拿着按键的模块旁边，占它一半的空间）和 `tab`（作为拿着按键的模块所在容器的一个标签页；那个容器是分割式时，会和它一起变成一个标签页式容器）。`size` 在模块平铺时是它在容器里所占的比例（大于 0 小于 1 的数），浮动时是 `{ w, h }` 或 `{ w = ..., h = ... }`，是窗口的比例，大于 0 且不超过 1；浮动窗口没有给大小时，居中打开，每个方向占窗口的 60%。
 - **会被拒绝的**，会让启动停下并点名那次调用：不在上面这些里的选项、类型不对或超出范围的值、写成表的平铺大小或写成数字的浮动大小、`float` 或 `scratchpad` 与 `at` 同时给出、浮动的编辑器（编辑器永远不浮动；编辑器的其他规则会被接受，但永远不会生效，因为没有什么会去打开编辑器）、既不是种类也不是模块 id 的目标，以及同一目标的第二条规则。规则的错误即使被你的 Lua 捕获也会让启动停下。
 - **哪条规则优先。** 先是模块自己 id 的规则，然后是它种类的规则，然后是 Lua 面板自己的 `position`，最后是它打开的那个场合的内置默认：新的终端或聊天视图和拆出来的标签页，开在拿着按键的模块右边（拆出来的标签页是基础视图的右边）；启动时放下的模块，或者关掉之后回来的模块，放在它一直在的地方（终端在编辑器下面，Lua 面板在它的 `position`）。没有任何模块拿着按键时（第一次启动，或者启动时读到的布局文件），`right`、`left` 和 `tab` 变成 `side`，`below` 和 `above` 变成 `bottom`，要求了它们的规则会在日志里留一条提示。
-- **规则永远不决定的事。** 自己说明了放在哪里的操作永远优先：分割键、移动、拖动、`eitri.layout.float`。已保存的布局永远不会被规则改动，来自 `eitri.layout.default` 或 `eitri.layout.workspace` 的布局会放下它点名的模块。已保存的布局或模板里没有、而规则想让它浮动的模块，会以平铺的方式回到它的后备位置，处于隐藏状态，并留下一条提示说明位置。新模块会隐藏着加进其他工作区，放在它的规则或种类给它的位置。
+- **规则永远不决定的事。** 自己说明了放在哪里的操作永远优先：分割键、移动、拖动、`eitri.layout.float`。已保存的布局永远不会被规则改动，来自 `eitri.layout.default` 或 `eitri.layout.workspace` 的布局会放下它点名的模块（在[插件自己的窗口](#plugins)里，插件自己的布局排在前面，它的页面每次启动都会被放回去）。已保存的布局或模板里没有、而规则想让它浮动的模块，会以平铺的方式回到它的后备位置，处于隐藏状态，并留下一条提示说明位置。新模块会隐藏着加进其他工作区，放在它的规则或种类给它的位置。
 
 <a id="plugins"></a>
 ## 插件
@@ -177,6 +180,7 @@ eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- 按路径
 - **按路径**，即其他任何写法：绝对路径，或以 `~` 开头的路径。相对路径会被拒绝，因为它在每个项目里会指向不同的目录。
 - 每次加载都会在你启动 Eitri 的终端里打印它用了哪个目录、为什么：`[plugin markdown] loaded /usr/share/eitri/plugins/markdown (system data directory)`。一个名字在哪里都找不到时，Eitri 会在启动时停下，并列出它找过的每个目录。
 - 选项是插件自己的设置，外加 `key`（前缀之后的模块按键）和 `position`（`"side"`、`"bottom"` 或 `"main"`）。插件按[打开规则](#where-a-new-module-opens)打开，模块名是 `lua:<id>`。
+- 插件可以在清单里（`[window]`）指定一个属于它自己的目录。在那个目录里启动 Eitri，这个窗口就是插件的：顶栏和窗口标题显示插件的标题，而不是项目名。没有保存过布局时，插件的布局排在你的 `eitri.layout.default` 前面，它没有放进去的编辑器或聊天先隐藏着（按它们的键就回来）。已保存的布局仍然优先，只有一个例外：布局里没有插件的页面，或者页面是隐藏的，每次启动都会把页面放回它的位置。想要回到插件的整套布局，删掉那个目录保存的布局文件（见[布局保存在哪里](#layout-from-lua)）。
 - 加载一个插件，就像运行任何程序一样信任它：它是你自己的本地目录。只加载你信任的插件。companion 窗口里没有插件。
 
 <a id="keys-in-a-plugin-page"></a>

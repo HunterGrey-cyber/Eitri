@@ -24,7 +24,7 @@ import {
 } from "./jkScroll";
 import type { Direction, Span, View } from "./jkScroll";
 
-/** How far the view moves per key-repeat interval while held: what one repeat used to scroll inside a tall
+/** How far the view moves per key-repeat interval while held: the scroll distance of one repeat inside a tall
  *  row. So the glide covers what the repeats covered, at the same rate, without the jumps; and the speed
  *  is set by the text's line height alone, never by how tall the rows passing by are. */
 export const HOLD_LINES_PER_REPEAT = STEP_LINES;
@@ -321,7 +321,7 @@ type Hold = {
 
 const holds = new WeakMap<HTMLElement, Hold>();
 
-/** A per-frame report for the GUI pass's frame-timing measurement: set on `window.__eitriHoldTrace` by the
+/** A per-frame report for frame-timing measurement: set on `window.__eitriHoldTrace` by the
  *  harness only; nothing in the panel sets it. */
 type HoldTrace = (frame: { t: number; scrollTop: number; cursor: number; y: number; speed: number }) => void;
 

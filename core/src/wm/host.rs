@@ -7,12 +7,13 @@ use crate::keymap::{
     key::{KeyName, KeySpec},
     prefix::Press,
 };
-use crate::layout::{kill::Reopen, Arrangement, Con, Direction, Frame, ModuleId, Size};
-use crate::tabs::ViewId;
+use crate::layout::{kill::Reopen, Arrangement, Direction, Frame, ModuleId, Size};
+use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
 use crate::window_link::{FocusTarget, Msg, Shape, Summary};
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::os::fd::{OwnedFd, RawFd};
@@ -26,8 +27,6 @@ use std::time::{Duration, Instant};
 pub trait Host {
     /// Performs an operation without blocking; refusals also post a refusal event.
     fn apply(&self, op: &HostOp) -> Applied;
-    /// Runs a remaining shell call with no batch applying or controller borrow held.
-    fn run_shell_verb(&self, win: WinId, call: &ShellCall, keycode: u32);
     /// Returns the host's current outputs.
     fn monitors(&self) -> Vec<Monitor>;
 }
@@ -76,8 +75,6 @@ pub trait Decide {
     fn close_requested(&mut self, win: WinId, by: CloseBy) -> (CloseVerdict, Batch);
     /// Runs an action through the shared action runner.
     fn run(&mut self, win: WinId, action: Action, origin: Origin) -> Batch;
-    /// Plans a focus transfer to a module.
-    fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch;
     /// The driver's queue has drained: what is judged against the state every batch before it left (a chat page
     /// that came on screen during one, against the coverage they left). Asked each time the queue empties, so a
     /// decider with nothing to judge answers an empty batch and allocates nothing.
@@ -223,29 +220,91 @@ pub enum Origin {
     Peer,
 }
 
-/// A call still carried out by the shell after the batch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShellVerb {
-    /// The target window.
-    pub win: WinId,
-    /// What the shell's arm is asked to do.
-    pub call: ShellCall,
-    /// The originating hardware code, or zero.
-    pub keycode: u32,
-}
-
-/// What a shell verb asks the shell's arm to do: an action of a family the controller does not decide yet. The
-/// prefix's own commands (the chooser's picks, the split keys' placements) are decided here and never reach it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ShellCall {
-    /// An action whose family the shell still carries out.
-    Action(Action),
+/// The editor pane's liveness and last quit request, copied without waiting for its worker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditorFacts {
+    pub running: bool,
+    pub exited: bool,
+    pub exit_pending: bool,
+    pub starting: bool,
+    pub watch: Option<super::close::NvimAnswer>,
 }
 
 /// Reads the controller makes of the shell directly, because each answers at once and none can call back into
 /// the controller: the grid's size and measures, the editor's cell and whether it runs, and whether a chat page
 /// claims a navigation key.
 pub trait HostReads {
+    /// Terminals with a running foreground job, counted without waiting for a child.
+    fn terminal_jobs(&self, win: WinId) -> usize {
+        let _ = win;
+        0
+    }
+    /// The running tabs and views a close can offer to the linked window.
+    fn running_chats(&self, win: WinId) -> Vec<(ModuleId, Option<TabId>)> {
+        let _ = win;
+        Vec::new()
+    }
+    /// The terminal panes with foreground jobs, read without waiting for a child.
+    fn terminal_job_modules(&self, win: WinId) -> Vec<ModuleId> {
+        let _ = win;
+        Vec::new()
+    }
+    /// The plugin pages whose guarded tasks still run.
+    fn pages_with_tasks(&self, win: WinId) -> Vec<ModuleId> {
+        let _ = win;
+        Vec::new()
+    }
+    /// Base-view tabs in their displayed order, including tabs that currently cannot move.
+    fn base_tabs(&self, win: WinId) -> Vec<TabId> {
+        let _ = win;
+        Vec::new()
+    }
+    /// The base view's active tab, which stays active in the other window when its workspace moves.
+    fn active_base_tab(&self, win: WinId) -> Option<TabId> {
+        let _ = win;
+        None
+    }
+    /// The local tab adopted for a module move, after its host operation has run.
+    fn arrived_tab(&self, win: WinId, mv: MoveId) -> Option<TabId> {
+        let _ = (win, mv);
+        None
+    }
+    /// A particular tab's move facts, so an unstarted tab can be named without a session id.
+    fn tab_move(&self, win: WinId, tab: TabId) -> Result<ChatMoveFacts, String> {
+        let _ = (win, tab);
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// The agent and provider session that name `tab` in the layout file's record of the tabs that came with a
+    /// workspace; `None` for a tab that holds no session.
+    fn moved_tab_key(&self, win: WinId, tab: TabId) -> Option<crate::window_link::base_tabs::MovedTabKey> {
+        let _ = (win, tab);
+        None
+    }
+    /// The pane's current liveness and quit watch, read without waiting for a worker.
+    fn editor_facts(&self, win: WinId) -> EditorFacts {
+        let _ = win;
+        EditorFacts::default()
+    }
+
+    /// Whether stepping `delta` tabs along window `win`'s tab set would switch to another tab now, read before the
+    /// step so a step with nowhere to go flashes instead. A host whose chats report none answers that it would not.
+    fn tab_can_step(&self, win: WinId, delta: i32) -> bool {
+        let _ = (win, delta);
+        false
+    }
+    /// Whether window `win`'s tab set has a last tab to go back to that still belongs to its base view. A host
+    /// whose chats report none answers that it has none.
+    fn tab_has_last(&self, win: WinId) -> bool {
+        let _ = win;
+        false
+    }
+    /// Where tab number `n` of window `win`'s tab set is now (the base view or the extra view showing it), or
+    /// `None` when there is no such tab. A host whose chats report none answers none.
+    fn tab_place(&self, win: WinId, n: u16) -> Option<crate::tab_set::TabPlace> {
+        let _ = (win, n);
+        None
+    }
+
     /// The grid's allocation, or the stand-in content size before its first one.
     fn grid_size(&self, win: WinId) -> Size;
     /// The divider thickness as the grid's dividers measure.
@@ -264,6 +323,22 @@ pub trait HostReads {
     /// size; `None` when the host cannot tell (no host, not laid out yet).
     fn module_size(&self, win: WinId, module: &ModuleId) -> Option<Size> {
         let _ = (win, module);
+        None
+    }
+    /// What a move of a tab of chat view `view` would take: the view's one tab, or for the base view the tab
+    /// holding `session` when one is named, else its active tab; with that tab's session, whether its agent keeps
+    /// a running turn across a move, and whether a turn runs. The refusal's words when the tab cannot move now (a
+    /// message steered into its turn unread, a session not bound to its review, an answer only this window can
+    /// use still awaited, a move already under way), read before anything is offered. A host whose chats cannot
+    /// move refuses.
+    fn chat_move(&self, win: WinId, view: ViewId, session: Option<&str>) -> Result<ChatMoveFacts, String> {
+        let _ = (win, view, session);
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// The chat view of window `win` whose tabs hold the session `session`, if one does. A host whose chats
+    /// report none answers none.
+    fn view_of_session(&self, win: WinId, session: &str) -> Option<ViewId> {
+        let _ = (win, session);
         None
     }
     /// What the chat view `view` holds for the user (cards waiting, a turn finished unseen), as its chip and its
@@ -291,7 +366,61 @@ pub trait HostReads {
         let _ = (view, breaks);
         Ok(())
     }
+    /// Whether this window has actually built the plugin page; a deferred holding has nothing to save.
+    fn page_built(&self, _win: WinId, _module: &ModuleId) -> bool {
+        false
+    }
+
+    /// The `?` sheet's section for the plugin page `module`, when `module` is one that declared its keys; read
+    /// before the chat takes the keys, so the sheet can show the keys of the page they came from. A host with no
+    /// plugin pages answers none.
+    fn plugin_keys_help(&self, win: WinId, module: &ModuleId) -> Option<crate::plugin::keys::PluginKeysHelp> {
+        let _ = (win, module);
+        None
+    }
+    /// The chat views that hold a tab now, the base view among them. A host whose chats report none answers none.
+    fn chat_views(&self) -> Vec<ViewId> {
+        Vec::new()
+    }
+    /// Whether the base view's active tab can go out into a view of its own now, asked before the view is made so
+    /// a break that cannot happen makes nothing; the refusal's words when it cannot. A host that cannot tell
+    /// refuses.
+    fn can_break_out(&self, win: WinId) -> Result<(), String> {
+        let _ = win;
+        Err(NOT_CARRIED_OUT.into())
+    }
+    fn chat_summary(&self, win: WinId) -> ChatSummary {
+        let _ = win;
+        ChatSummary::default()
+    }
 }
+
+/// What the controller needs of a chat tab to move it ([`HostReads::chat_move`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMoveFacts {
+    /// The tab that moves.
+    pub tab: TabId,
+    /// Its agent's own session id, which the other window's chooser and the editor's review name it by; `None`
+    /// for a tab that holds no session yet.
+    pub session: Option<String>,
+    /// Whether its agent keeps a running turn when the chat moves; when it does not, a running chat moves once
+    /// its turn ends.
+    pub live: bool,
+    /// Whether a turn of it runs now.
+    pub running: bool,
+}
+
+/// Window-wide chat counts, read without calling back into the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChatSummary {
+    pub waiting: u32,
+    pub unseen: u32,
+    pub running: u32,
+    pub queued: u32,
+}
+
+/// What a host answers for an operation or a read it does not carry out yet.
+pub const NOT_CARRIED_OUT: &str = "not carried out by this shell yet";
 
 /// What a chat view's kill ends: the turns running and the messages queued (for the base view, every tab's,
 /// since its kill closes them all; for an extra view, its one tab's), an extra view's tab label, which its y/n
@@ -367,10 +496,23 @@ pub enum HostOp {
         win: WinId,
         activation: Option<ActivationToken>,
     },
-    /// Sets window presentation flags.
+    /// Sets window presentation flags: the state the window's mode toggle (`window.immersive`) leads to. A host
+    /// whose window also changes mode without the controller hearing (a bare F11, the editor's own setting, the
+    /// compositor) carries it out as that toggle, since the state asked for may be out of date there.
     SetMode { win: WinId, mode: WindowMode },
-    /// Moves the window to an output.
-    MoveToMonitor { win: WinId, monitor: MonitorId },
+    /// Places the mapped window on its remembered output, if needed, and applies its role's focus.
+    PlaceWindow {
+        win: WinId,
+        monitor: Option<MonitorId>,
+        role: PlacementRole,
+    },
+    /// Starts the project's second window again at this window's start, as it was when the pair last ended: with no
+    /// activation token. Its placement role returns the keys here on sway and Hyprland after mapping. A refusal
+    /// means window 2 is not coming back; the host has then given back here what it held for window 2.
+    RestoreLinkedWindow { win: WinId },
+    /// Starts the project's editor window (`eitri <root>`) from a window 2 that has no window 1, detached from this
+    /// process: once up, it links to this window again. A refusal says why none was started.
+    StartEditorWindow { win: WinId },
     /// Closes without asking again.
     CloseWindow { win: WinId },
     /// Ends the application.
@@ -408,6 +550,15 @@ pub enum HostOp {
         record: serde_json::Value,
         fds: Descriptors,
     },
+    /// Orders a workspace's arriving base tabs after the tabs this window already held.
+    OrderBaseTabs {
+        win: WinId,
+        tabs: Vec<TabId>,
+        active: Option<TabId>,
+    },
+    /// Ends the other window's process, which this window started: what the user asked when that window stopped
+    /// answering in the middle of a move. The link's end then settles the move as any end does.
+    EndPeer { win: WinId, peer: PeerId },
     /// Makes a module available on screen.
     Map { win: WinId, module: ModuleId },
     /// Hides a module after its keys have moved.
@@ -436,6 +587,8 @@ pub enum HostOp {
     Plugin(PluginOp),
     /// Removes process-wide resources.
     Cleanup(CleanupOp),
+    /// Tells the pair file and the pages what a change of the pair left.
+    Pair(PairOp),
     /// Runs Lua after all other operations.
     Lua(LuaOp),
 }
@@ -469,6 +622,9 @@ pub struct EditorSpawn {
     pub cwd: Option<PathBuf>,
     /// Whether to start without user configuration.
     pub clean: bool,
+    /// The colour the editor paints before nvim's UI is ready, from the remembered theme; `None` keeps the editor's
+    /// own.
+    pub background: Option<(u8, u8, u8)>,
 }
 
 /// Why a module surface is released.
@@ -521,7 +677,9 @@ pub enum EditorCall {
     /// Sets editor focus.
     SetFocused { win: WinId, focused: bool },
     /// Asks the editor to quit through Lua.
-    Quit { win: WinId, lua: String },
+    Quit { win: WinId, lua: String, generation: u32 },
+    /// Releases an exited pane on the next turn of the loop, after its exit callback returns.
+    ReleaseExited { win: WinId },
     /// Ends the editor session.
     End { win: WinId },
     /// Shuts down the editor service.
@@ -539,6 +697,14 @@ pub enum EditorCall {
 /// Commands sent to the chat service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatOp {
+    /// Updates the chat font size in pixels.
+    SetFontSize { win: WinId, px: f32 },
+    /// One panel tab call, decided from the panel's read-only answers.
+    Tab {
+        win: WinId,
+        call: super::verbs::tabs::TabCall,
+    },
+
     /// Sets pane focus.
     PaneFocused { win: WinId, view: ViewId, focused: bool },
     /// Notifies a shown page.
@@ -563,10 +729,19 @@ pub enum ChatOp {
     LayoutViews { win: WinId, views: Vec<ViewId> },
     /// Breaks a tab out of its view.
     BreakOut { win: WinId, view: ViewId },
-    /// Joins a tab back.
+    /// Brings the tab of extra view `view` back into the base view, which then arrives where its reader left it.
+    /// The host carries it out whole; a refusal comes back as [`HostEvent::Refused`] naming `view`'s module, with the
+    /// panel's words, which the chrome says.
     JoinBack { win: WinId, view: ViewId },
-    /// Opens the keymap sheet.
-    OpenKeymap { win: WinId, view: ViewId },
+    /// Opens the `?` sheet in `view`'s page: `plugin` is the section of the plugin page that held the keys when the
+    /// key was pressed, read before the chat took them, and `opening` the number its close quotes back
+    /// ([`ChatEvent::KeymapClosed`]).
+    OpenKeymap {
+        win: WinId,
+        view: ViewId,
+        plugin: Option<crate::plugin::keys::PluginKeysHelp>,
+        opening: u64,
+    },
     /// Opens the command line.
     CommandLine { win: WinId, view: ViewId },
     /// Reloads a view.
@@ -583,15 +758,56 @@ pub enum ChatOp {
     LiteralKey { win: WinId, view: ViewId, key: KeySpec },
     /// Tells the panel whether the editor holds the keys of its typing window.
     EditorHasKeys { win: WinId, has_keys: bool },
+    /// Freezes tab `tab` of view `view` (the view's one tab when `None`) for move `mv`: it takes no input and
+    /// answers no card, its page is asked for its view state, and the host answers with [`ChatEvent::Frozen`]
+    /// carrying the same `mv`, the record and the handoff, or [`ChatEvent::FreezeRefused`]. The id goes both ways
+    /// because a tab may be frozen for a move that has ended and again for the next before the first answer comes.
+    Freeze {
+        win: WinId,
+        view: ViewId,
+        tab: Option<TabId>,
+        mv: MoveId,
+    },
+    /// The other window holds the frozen tab now: it leaves this window without its session being ended or
+    /// anything the handoff passed on being closed.
+    Forget {
+        win: WinId,
+        view: ViewId,
+        tab: Option<TabId>,
+    },
+    /// The move did not happen: the frozen tab takes input and answers cards again.
+    Resume {
+        win: WinId,
+        view: ViewId,
+        tab: Option<TabId>,
+    },
+    /// The editor's review events of session `session` are held (`hold`) while its chat moves, or, once the move
+    /// has ended, delivered to the window that holds the session now: this one when `here`, else the other.
+    ReviewHold {
+        win: WinId,
+        session: String,
+        hold: bool,
+        here: bool,
+    },
+    /// Before `move_done` of move `mv`: this window's presence counts the arriving session's running turn and
+    /// confirms its file, answered with [`ChatEvent::PresenceHeld`] or [`ChatEvent::PresenceRefused`].
+    HoldPresence { win: WinId, session: String, mv: MoveId },
+    /// Move `mv`'s arrival was given up: what [`ChatOp::HoldPresence`] counted for `session` is let go.
+    DropPresence { win: WinId, session: String, mv: MoveId },
 }
 
 /// Commands sent to terminal services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermOp {
+    /// Sets the text zoom of every terminal of the window, relative to its un-zoomed font; the
+    /// host keeps it for terminals made later and makes an unchanged level a no-op.
+    SetZoom { win: WinId, level: f32 },
     /// Starts a terminal.
     Start { win: WinId, module: ModuleId },
-    /// Sets the directory the next shell of a terminal whose pane a kill left idle starts in: a new instance on that
-    /// pane asks no create, which is what carries a new terminal's directory, so this does.
+    /// Sets the directory the next shell of a terminal starts in: a new instance on a pane a kill left idle asks no
+    /// create, which is what carries a new terminal's directory, so this does; a live pane with no shell running (the
+    /// base terminal never started, or killed, which keeps its pane live, or its shell ended) only takes the directory,
+    /// for its next start: a [`TermOp::Start`], a spawn that waited for the pane's size, or a restart on Enter.
     SetStartDir { win: WinId, module: ModuleId, dir: PathBuf },
     /// Sets terminal focus.
     SetFocused {
@@ -605,6 +821,21 @@ pub enum TermOp {
     /// new shell there; answered with [`TermEvent::Cwd`] carrying the same `read`, since reads of one module (a
     /// number reused meanwhile, two splits in a row) may come back in any order.
     ReadCwd { win: WinId, module: ModuleId, read: u64 },
+    /// Reads, off the toolkit's thread, the directory the terminal's shell is in and whether any process but the
+    /// shell runs in its session, after capturing which shell the pane runs ([`ShellStart`]); answered with
+    /// [`TermEvent::Job`] carrying the same `read`. No fallback directory: a directory that cannot be read is an
+    /// `Err`, since a guess would read as "elsewhere" and restart a shell whose directory is unknown.
+    ReadJob { win: WinId, module: ModuleId, read: u64 },
+    /// Ends the terminal's shell and starts a fresh one in `dir`, in the same pane, in one step: the pane, its place,
+    /// its size and whether it holds the keys stay as they were. Only when the pane still runs the shell `expect`
+    /// names and was given no key or mouse report for it since the capture ([`ShellStart::untouched`]); otherwise
+    /// refused as [`OpTag::Respawn`] with nothing touched. The new shell reports [`TermEvent::Started`].
+    Respawn {
+        win: WinId,
+        module: ModuleId,
+        dir: PathBuf,
+        expect: ShellStart,
+    },
     /// Enters copy mode, scrolled up a page when `up`.
     CopyMode { win: WinId, module: ModuleId, up: bool },
     /// Sends terminal keys.
@@ -625,9 +856,55 @@ pub enum TermOp {
     ShutdownAll { win: WinId },
 }
 
+/// Facts from a plugin page's move and its first restored frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PluginEvent {
+    /// The page was frozen for move `mv`: its tasks paused, `record` what moves with it (its saved state `null`
+    /// after the one-second bound or for a page without a handoff) and `handoff` its tasks' descriptors.
+    Frozen {
+        win: WinId,
+        module: ModuleId,
+        mv: crate::window_link::moves::MoveId,
+        record: serde_json::Value,
+        handoff: Handoff,
+    },
+    /// The page could not be frozen for move `mv`; `why` says why. Only that move is given up.
+    FreezeRefused {
+        win: WinId,
+        module: ModuleId,
+        mv: crate::window_link::moves::MoveId,
+        why: String,
+    },
+    /// The page that arrived here said `page.ready`: its restored document is drawn and it may be mapped.
+    Ready { win: WinId, module: ModuleId },
+}
+
 /// Commands sent to plugin services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginOp {
+    /// Pauses task readers and asks the page for state, bounded by one second; the move id matches its answer.
+    Freeze {
+        win: WinId,
+        module: ModuleId,
+        mv: crate::window_link::moves::MoveId,
+    },
+    /// Releases a page whose tasks are now held by the other window, without writing its store.
+    Forget { win: WinId, module: ModuleId },
+    /// Takes a paused page's tasks back after a move ends without sending it.
+    Resume { win: WinId, module: ModuleId },
+    /// Reopens a page's holding and its follow and command routing when it arrives or returns. A kept view
+    /// reloads here; a page with no view is built on its first show.
+    Hold { win: WinId, module: ModuleId },
+    /// Updates the whole-page zoom of an attached view. The controller keeps every page that ever
+    /// had a view in its zoom set (a page killed and rebuilt keeps its factor), so this can name a
+    /// module whose view is gone: the host then does nothing, quietly, rather than refusing.
+    SetZoom { win: WinId, module: ModuleId, level: f32 },
+    /// Ends every plugin task and page owned by this window.
+    ShutdownAll { win: WinId },
+    /// Tells pages following the editor that it has closed.
+    EditorClosed { win: WinId },
+    /// Reinstalls editor-following hooks into the new nvim session.
+    EditorBack { win: WinId },
     /// Reloads with optional guard reset.
     Reload {
         win: WinId,
@@ -646,17 +923,41 @@ pub enum PluginOp {
         module: ModuleId,
         has_keys: bool,
     },
+    /// The answer to plugin `plugin`'s `terminal.at` asked under `ticket`, for its host to give the page.
+    TerminalAtAnswer {
+        win: WinId,
+        plugin: String,
+        ticket: u64,
+        answer: crate::plugin::host::TerminalAtAnswer,
+    },
 }
 
 /// Process-wide resources to remove.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CleanupOp {
+    /// Flushes the pair's last state and sends the link's goodbye after the layout save.
+    PairOnClose { layout_written: bool },
     /// The editor feeds.
     Feeds,
     /// The pane-switch shim directory.
     PaneSwitchDir,
     /// The process scratch directory.
     ScratchDir,
+}
+
+/// What the pair's glue carries out once the controller has taken back what a window held away for the other
+/// window: the pair file's writes and the pages to load again, each after the layout ops that brought the modules
+/// back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairOp {
+    /// Window 2, orphaned by window 1's end: the pair file names `held`, what this window holds now, and this window
+    /// keeps the file from here on.
+    Orphaned { win: WinId, held: BTreeSet<String> },
+    /// Window 1, whose window 2 was to come back and does not: the pair file says window 2 is not open (still naming
+    /// what it held), the saved tabs offered from now on add window 2's, and the launch's restore of tabs goes on.
+    Unrestored { win: WinId },
+    /// A page that came back is loaded again, from its store as it is now.
+    ReloadPage { win: WinId, module: ModuleId },
 }
 
 /// Lua calls applied after native and service operations.
@@ -670,9 +971,33 @@ pub enum LuaOp {
     Invoke { command: String },
 }
 
+/// Text-size actions and page/base changes supplied by the shell.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextSizeEvent {
+    /// An application accelerator affecting every pane that exists.
+    Both {
+        win: WinId,
+        step: super::text_size::TextStep,
+    },
+    /// A wheel step addresses the pane under the pointer, regardless of where the keys are.
+    Pane {
+        win: WinId,
+        module: ModuleId,
+        step: super::text_size::TextStep,
+    },
+    /// A plugin page now has a view. The host posts this once per new view, not again for a view
+    /// it already attached: each one sets the zoom and logs a line, and the controller cannot tell
+    /// two posts for the same view apart.
+    PageAttached { win: WinId, module: ModuleId },
+    /// The unzoomed chat font size changed.
+    Base { win: WinId, px: f32 },
+}
+
 /// Facts posted by the native host and services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostEvent {
+    /// A text-size action or service fact.
+    TextSize(TextSizeEvent),
     /// A watched hardware key was released.
     KeyReleased { win: WinId, keycode: u32 },
     /// A pointer event on a controller target.
@@ -695,27 +1020,19 @@ pub enum HostEvent {
     Resized { win: WinId, metrics: FrameMetrics },
     /// A deferred module minimum changed.
     MinSize { win: WinId, module: ModuleId, min: Size },
-    /// Allocation settled its layout pins. `root` is the current tree as the settle left it, copied inside the
-    /// allocation: the event is heard later, from the driver's idle, and a change that comes in between (a
-    /// resize of that very pin) must not pass for part of the settle.
-    Settled { win: WinId, root: Con },
-    /// A remaining shell action changed the layout.
-    LayoutChangedByShell { win: WinId },
+    /// Allocation settled its layout pins. The controller queues the tree as the settle left it: this event
+    /// is heard later, from the driver's idle, and a change that comes in between (a resize of that very pin)
+    /// must not pass for part of the settle.
+    Settled { win: WinId },
     /// A `CreateSurface` op the host carried out: `module`'s surface exists now. Posted by the driver, which is
     /// the one other place besides a `Focus` op's tail where an op's answer is read.
     Created { win: WinId, module: ModuleId },
-    /// A `PrepareSurface` op the host carried out: the arriving module's place exists off screen. Posted by the
-    /// driver, as [`HostEvent::Created`] is.
+    /// A `PrepareSurface` op the host carried out: the arriving module's place exists without being revealed.
+    /// Posted by the driver, as [`HostEvent::Created`] is.
     Prepared { win: WinId, module: ModuleId },
     /// The answer gate refused a card answer from a chat view (`Controller::answer_gate`); `text` is why, for the
     /// toast.
     AnswerRefused { win: WinId, text: String },
-    /// The shell asked its own y/n (the window close) over the controller's on the window's one overlay: the
-    /// controller's question is withdrawn, as a `no` answers it, so no later key answers it unseen.
-    PromptWithdrawn { win: WinId },
-    /// An arm still in the shell refused: the window's name flashes and, when `text` is not empty, the toast says
-    /// it, drawn from the chrome model as every refusal is. It goes once the last such arm has moved here.
-    ShellRefused { win: WinId, text: String },
     /// A process termination signal arrived.
     EndSignal { name: &'static str },
     /// A module surface ended.
@@ -724,6 +1041,8 @@ pub enum HostEvent {
     Editor(EditorEvent),
     /// A chat service event.
     Chat(ChatEvent),
+    /// A plugin page's move or first restored frame.
+    Plugin(PluginEvent),
     /// A terminal service event.
     Terminal(TermEvent),
     /// A Lua kernel event.
@@ -736,8 +1055,12 @@ pub enum HostEvent {
     TopBarLeft { win: WinId },
     /// A linked process event.
     Peer(PeerEvent),
+    /// What the pair's glue saw of the link's end and of a window 2 that was to come back.
+    Pair(PairEvent),
     /// The output list changed.
-    MonitorsChanged,
+    MonitorsChanged { monitors: Vec<Monitor> },
+    /// The output the window is on, or none after leaving every output.
+    WindowMonitor { win: WinId, monitor: Option<MonitorId> },
     /// A scheduled timer or idle fired.
     Timer(TimerToken),
     /// A watched descriptor became ready.
@@ -789,11 +1112,12 @@ pub enum Ended {
 pub enum PointerTarget {
     /// A container strip entry.
     StripEntry(ModuleId),
-    /// A float title bar.
+    /// A float title bar: the float its chrome drew when the press began.
     FloatBar(ModuleId),
-    /// A float resize grip.
+    /// A float resize grip: the float its chrome drew when the press began.
     FloatGrip(ModuleId),
-    /// A layout divider.
+    /// A layout divider: the handle's index in the grid's pool of handles, which draws the arrangement's divider
+    /// of the same index.
     Divider(u32),
     /// A top-bar item.
     TopBarItem(u32),
@@ -803,15 +1127,21 @@ pub enum PointerTarget {
     Window,
 }
 
-/// Pointer coordinates and button transitions.
+/// Pointer coordinates and button transitions. A drag on a divider, a float's bar or its grip is posted by the
+/// grid's gesture as one `Press`, its `Motion`s and a `Release` or `Cancel`; the gesture claims its sequence and
+/// decides nothing, and nothing in the grid remembers the drag: the controller does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointerEv {
-    /// A button press.
+    /// A button press; for a drag, its begin: where it began in the widget, and the button pressed.
     Press { x: f64, y: f64, button: u32 },
-    /// Pointer movement.
+    /// Pointer movement; for a drag, the offset since its begin in the moving widget's own coordinates (what a
+    /// toolkit's drag update reports): the widget moves under the pointer as the drag re-allocates it, so it is
+    /// how far the pointer is from where that widget is drawn now.
     Motion { x: f64, y: f64 },
-    /// A button release.
+    /// A button release; for a drag, its end.
     Release { x: f64, y: f64 },
+    /// The gesture lost its sequence; a release may never arrive.
+    Cancel,
 }
 
 /// Rename entry input.
@@ -828,8 +1158,23 @@ pub enum EntryEv {
 /// Facts reported by the editor service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorEvent {
+    /// The pane's new nvim is running.
+    Ready { win: WinId },
+    /// The exited nvim's harness was released; the same pane can start again.
+    Released { win: WinId },
+    /// nvim's process still lives, so its harness cannot be released yet.
+    ReleaseRefused { win: WinId },
+    /// The pane could not restart from its current state.
+    RestartRefused { win: WinId, state: String },
     /// The child exited.
-    Exited { win: WinId },
+    Exited {
+        win: WinId,
+        settled: Option<super::close::NvimAnswer>,
+    },
+    /// The launcher exited while nvim itself is still alive and unreachable.
+    Unreachable { win: WinId },
+    /// This generation's quit request could not be sent.
+    QuitNotSent { win: WinId, generation: u32 },
     /// The editor reported its scale.
     ScaleReported { win: WinId, scale: f64 },
     /// A generation answered the quit request.
@@ -851,10 +1196,15 @@ pub enum ChatEvent {
     Busy { win: WinId, view: ViewId, busy: bool },
     /// A tab requested a shared action.
     TabVerb { win: WinId, view: ViewId, action: Action },
+    /// A chooser row belongs to the linked peer, which should be raised.
+    ChooserPartnerPick { win: WinId, view: ViewId, session: String },
     /// A view returned keys.
     KeysReturn { win: WinId, view: ViewId },
     /// A view reports coverage.
     Covered { win: WinId, view: ViewId },
+    /// A card arrived in a view that is off screen, and the policy brings the view back: shown where it was hidden
+    /// from and its tab drawn, the keys staying where they are.
+    Reveal { win: WinId, view: ViewId },
     /// A page became visible; the driver stamps the applying op.
     PageShown {
         win: WinId,
@@ -890,8 +1240,26 @@ pub enum ChatEvent {
         opening: u64,
         forced: bool,
     },
-    /// A view requested editor focus.
-    EditorRequest { win: WinId, view: ViewId },
+    /// A tab froze for a move ([`ChatOp::Freeze`]): `record` is what the other window rebuilds the tab from, and
+    /// `handoff` holds the descriptors, which nothing here reads.
+    Frozen {
+        win: WinId,
+        view: ViewId,
+        mv: MoveId,
+        record: serde_json::Value,
+        handoff: Handoff,
+    },
+    /// The tab could not freeze for move `mv`, in the words of `why`; the tab is as it was.
+    FreezeRefused {
+        win: WinId,
+        view: ViewId,
+        mv: MoveId,
+        why: String,
+    },
+    /// The presence [`ChatOp::HoldPresence`] asked for move `mv` is confirmed.
+    PresenceHeld { win: WinId, mv: MoveId },
+    /// The presence for move `mv` could not be confirmed.
+    PresenceRefused { win: WinId, mv: MoveId, why: String },
 }
 
 /// An opaque terminal transfer whose identity follows its shared allocation.
@@ -922,6 +1290,50 @@ impl PartialEq for Handoff {
     }
 }
 
+/// Which shell of a terminal pane something was asked against: the pane's start count, and the shell's pid when
+/// one was running. Captured by the host before a read off the toolkit's thread and handed back with its answer,
+/// so whoever acts on the answer can tell whether the pane still runs that shell. `typed` is how many keys and mouse
+/// reports the pane had been given for its shell at the capture: a read that found the shell idle says nothing of a
+/// command typed after it, which leaves the shell and its pid as they were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellStart {
+    pub generation: u64,
+    pub pid: Option<u32>,
+    pub typed: u64,
+}
+
+impl ShellStart {
+    pub fn of(generation: u64, pid: Option<u32>) -> Self {
+        Self {
+            generation,
+            pid,
+            typed: 0,
+        }
+    }
+
+    /// The same capture, with the pane's count of what it was given for its shell.
+    pub fn typed(self, typed: u64) -> Self {
+        Self { typed, ..self }
+    }
+
+    /// Whether `now` still runs the shell captured here ([`Self::still`]) and was given nothing for it since: what
+    /// a restart decided on an idle read needs, since a command typed meanwhile may be running in the same shell.
+    pub fn untouched(self, now: Option<ShellStart>) -> bool {
+        self.still(now) && now.is_some_and(|now| now.typed == self.typed)
+    }
+
+    /// Whether `now` (the pane as it is today, `None` once it is idle or gone) still runs the shell captured here. A
+    /// new start bumps the count, so a pane killed and reused under the same number fails; a shell that was running
+    /// must be the same process, so a pane closed in place (the base terminal keeps its pane when killed) fails too.
+    /// A shell not yet spawned at the capture may have spawned since, under the same start.
+    pub fn still(self, now: Option<ShellStart>) -> bool {
+        let Some(now) = now else {
+            return false;
+        };
+        now.generation == self.generation && (self.pid.is_none() || now.pid == self.pid)
+    }
+}
+
 /// Facts reported by terminal services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermEvent {
@@ -940,6 +1352,17 @@ pub enum TermEvent {
         read: u64,
         dir: Result<PathBuf, String>,
     },
+    /// What a [`TermOp::ReadJob`] read: `shell` is the pane's shell captured before the read, `cwd` that shell's
+    /// directory (`Err` when it could not be read, the shell having ended meanwhile among the reasons), and `busy`
+    /// whether any process but the shell runs in its session, in the foreground or not. `read` is the request's own.
+    Job {
+        win: WinId,
+        module: ModuleId,
+        read: u64,
+        shell: ShellStart,
+        cwd: Result<PathBuf, String>,
+        busy: bool,
+    },
     /// A terminal froze for a move ([`TermOp::Detach`]): `record` is what the destination rebuilds its screen and
     /// session from, and `handoff` holds the descriptors, which nothing here reads.
     Detached {
@@ -956,7 +1379,10 @@ pub enum TermEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LuaEvent {
     /// Layout requests are queued for the controller to drain.
-    LayoutRequests,
+    LayoutRequests {
+        win: WinId,
+        requests: Vec<crate::lua::layout::LayoutRequest>,
+    },
 }
 
 /// Facts reported by the hint coordinator.
@@ -1009,6 +1435,14 @@ pub enum PeerEvent {
     MoveDone { peer: PeerId, id: MoveId },
     /// The other window gave a move up, as its source before `move` or as its destination after it.
     MoveAbort { peer: PeerId, id: MoveId, why: String },
+    /// The other window asks this one to offer it a module this window holds: by its id here, or (a chat) by its
+    /// session.
+    MoveAsk {
+        peer: PeerId,
+        module: Option<ModuleId>,
+        session: Option<String>,
+        follow: bool,
+    },
     /// The link's wake was drained: a confirmed send may have been answered.
     Woke { peer: PeerId },
     /// The host's answer to [`HostOp::RaisePeer`]: the activation token it got, if any.
@@ -1021,6 +1455,27 @@ pub enum PeerEvent {
         target: FocusTarget,
         token: Option<String>,
     },
+    /// The other window asks for a workspace already held here.
+    Workspace {
+        peer: PeerId,
+        name: String,
+        token: Option<String>,
+    },
+    /// The saved workspace and the module moves that decide when it may be shown.
+    WorkspaceMove {
+        peer: PeerId,
+        group: u64,
+        name: String,
+        tree: serde_json::Value,
+        moves: Vec<u64>,
+        swap: Option<u64>,
+    },
+    /// Two workspace groups going in opposite directions.
+    Swap { peer: PeerId, move_a: u64, move_b: u64 },
+    /// The modules the other window currently holds.
+    Held { peer: PeerId, ids: Vec<ModuleId> },
+    /// The connector of the output the other window is on.
+    Monitor { peer: PeerId, connector: String },
     /// The other window said it is closing.
     Bye { peer: PeerId },
     /// The link ended.
@@ -1032,19 +1487,36 @@ impl PeerEvent {
     pub fn peer(&self) -> PeerId {
         match self {
             PeerEvent::MoveOffer { peer, .. }
+            | PeerEvent::WorkspaceMove { peer, .. }
+            | PeerEvent::Swap { peer, .. }
             | PeerEvent::MoveReady { peer, .. }
             | PeerEvent::MoveRefused { peer, .. }
             | PeerEvent::Move { peer, .. }
             | PeerEvent::MoveDone { peer, .. }
             | PeerEvent::MoveAbort { peer, .. }
+            | PeerEvent::MoveAsk { peer, .. }
             | PeerEvent::Woke { peer }
             | PeerEvent::Raised { peer, .. }
             | PeerEvent::Summary { peer, .. }
             | PeerEvent::FocusIntent { peer, .. }
+            | PeerEvent::Workspace { peer, .. }
+            | PeerEvent::Held { peer, .. }
+            | PeerEvent::Monitor { peer, .. }
             | PeerEvent::Bye { peer }
             | PeerEvent::LinkClosed { peer } => *peer,
         }
     }
+}
+
+/// What the pair's glue saw happen to the pair, for the window it names: the controller takes back what the window
+/// held away for the other window, as the other window's end leaves it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairEvent {
+    /// The other window ended, cleanly or not, after this window had linked to it; `who` names it as the log does.
+    LinkEnded { win: WinId, who: String },
+    /// Window 2, started again at this window's launch, does not come back: its start was refused, or it ended or
+    /// never finished its handshake.
+    RestoreFailed { win: WinId },
 }
 
 /// The controller's way to the other window: pushing a message onto the link thread's channel, which never calls
@@ -1108,8 +1580,12 @@ pub enum OpTag {
     Present,
     /// Identifies SetMode operations.
     SetMode,
-    /// Identifies MoveToMonitor operations.
-    MoveToMonitor,
+    /// Identifies PlaceWindow operations.
+    PlaceWindow,
+    /// Identifies RestoreLinkedWindow operations.
+    RestoreLinkedWindow,
+    /// Identifies StartEditorWindow operations.
+    StartEditorWindow,
     /// Identifies CloseWindow operations.
     CloseWindow,
     /// Identifies Quit operations.
@@ -1126,6 +1602,10 @@ pub enum OpTag {
     RaisePeer,
     /// Identifies AdoptMoved operations.
     AdoptMoved,
+    /// Identifies OrderBaseTabs operations.
+    OrderBaseTabs,
+    /// Identifies EndPeer operations.
+    EndPeer,
     /// Identifies Map operations.
     Map,
     /// Identifies Unmap operations.
@@ -1146,10 +1626,15 @@ pub enum OpTag {
     Chat,
     /// Identifies Terminal operations.
     Terminal,
+    /// Identifies a terminal's restart in place ([`TermOp::Respawn`]), told apart from the terminal's other ops so
+    /// its refusal reaches the restart that waits for it.
+    Respawn,
     /// Identifies Plugin operations.
     Plugin,
     /// Identifies Cleanup operations.
     Cleanup,
+    /// Identifies Pair operations.
+    Pair,
     /// Identifies Lua operations.
     Lua,
 }
@@ -1161,7 +1646,9 @@ impl OpTag {
             HostOp::OpenWindow { .. } => Self::OpenWindow,
             HostOp::Present { .. } => Self::Present,
             HostOp::SetMode { .. } => Self::SetMode,
-            HostOp::MoveToMonitor { .. } => Self::MoveToMonitor,
+            HostOp::PlaceWindow { .. } => Self::PlaceWindow,
+            HostOp::RestoreLinkedWindow { .. } => Self::RestoreLinkedWindow,
+            HostOp::StartEditorWindow { .. } => Self::StartEditorWindow,
             HostOp::CloseWindow { .. } => Self::CloseWindow,
             HostOp::Quit => Self::Quit,
             HostOp::CreateSurface { .. } => Self::CreateSurface,
@@ -1170,6 +1657,8 @@ impl OpTag {
             HostOp::OpenLinkedWindow { .. } => Self::OpenLinkedWindow,
             HostOp::RaisePeer { .. } => Self::RaisePeer,
             HostOp::AdoptMoved { .. } => Self::AdoptMoved,
+            HostOp::OrderBaseTabs { .. } => Self::OrderBaseTabs,
+            HostOp::EndPeer { .. } => Self::EndPeer,
             HostOp::Map { .. } => Self::Map,
             HostOp::Unmap { .. } => Self::Unmap,
             HostOp::Allocate { .. } => Self::Allocate,
@@ -1179,9 +1668,11 @@ impl OpTag {
             HostOp::Hint(..) => Self::Hint,
             HostOp::Editor(..) => Self::Editor,
             HostOp::Chat(..) => Self::Chat,
+            HostOp::Terminal(TermOp::Respawn { .. }) => Self::Respawn,
             HostOp::Terminal(..) => Self::Terminal,
             HostOp::Plugin(..) => Self::Plugin,
             HostOp::Cleanup(..) => Self::Cleanup,
+            HostOp::Pair(..) => Self::Pair,
             HostOp::Lua(..) => Self::Lua,
         }
     }
@@ -1189,7 +1680,8 @@ impl OpTag {
 
 impl HostOp {
     /// The window and module whose surface the op creates, drops, prepares, adopts, maps, unmaps, gives the keys
-    /// to or freezes for a move (`Terminal(Detach)`); `None` for every other op. A refused grab names its module, so
+    /// to, freezes for a move (`Terminal(Detach)`, `Chat(Freeze)`) or restarts in place (`Terminal(Respawn)`); `None`
+    /// for every other op. A refused grab names its module, so
     /// its refusal withdraws that one request and no other the same batch made, and a refused freeze names the
     /// terminal whose move is given up.
     pub fn surface(&self) -> Option<(WinId, ModuleId)> {
@@ -1198,7 +1690,7 @@ impl HostOp {
             | HostOp::DropSurface { win, module, .. }
             | HostOp::PrepareSurface { win, module, .. }
             | HostOp::AdoptMoved { win, module, .. }
-            | HostOp::Terminal(TermOp::Detach { win, module, .. })
+            | HostOp::Terminal(TermOp::Detach { win, module, .. } | TermOp::Respawn { win, module, .. })
             | HostOp::Map { win, module }
             | HostOp::Unmap { win, module }
             | HostOp::Focus {
@@ -1206,18 +1698,22 @@ impl HostOp {
                 to: FocusTo::Module(module),
                 ..
             } => Some((*win, module.clone())),
+            // A join the panel refused is told apart from any other chat call by the view it names, and so is a
+            // chat's freeze, whose refusal gives its move up.
+            HostOp::Chat(ChatOp::JoinBack { win, view } | ChatOp::Freeze { win, view, .. }) => {
+                Some((*win, view.module()))
+            }
             _ => None,
         }
     }
 }
 
-/// A complete decision ordered as layout, effects, Lua, then one remaining shell action.
+/// A complete decision ordered as layout, effects, then Lua.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Batch {
     layout: Vec<HostOp>,
     effects: Vec<HostOp>,
     lua: Vec<LuaOp>,
-    shell_verb: Option<ShellVerb>,
 }
 
 impl Batch {
@@ -1242,15 +1738,9 @@ impl Batch {
         self.lua.push(op);
     }
 
-    /// Sets the final shell action, replacing a previous one with a debug diagnostic.
-    pub fn set_shell_verb(&mut self, verb: ShellVerb) {
-        let previous = self.shell_verb.replace(verb);
-        debug_assert!(previous.is_none(), "a batch has at most one shell action");
-    }
-
     /// Reports whether every segment is empty.
     pub fn is_empty(&self) -> bool {
-        self.layout.is_empty() && self.effects.is_empty() && self.lua.is_empty() && self.shell_verb.is_none()
+        self.layout.is_empty() && self.effects.is_empty() && self.lua.is_empty()
     }
 
     /// Iterates layout work before service effects.
@@ -1263,19 +1753,11 @@ impl Batch {
         &self.lua
     }
 
-    /// Returns the optional final shell action.
-    pub fn shell_verb(&self) -> Option<&ShellVerb> {
-        self.shell_verb.as_ref()
-    }
-
     /// Appends each segment while preserving its internal order.
     pub fn append(&mut self, other: Batch) {
         self.layout.extend(other.layout);
         self.effects.extend(other.effects);
         self.lua.extend(other.lua);
-        if let Some(verb) = other.shell_verb {
-            self.set_shell_verb(verb);
-        }
     }
 }
 
@@ -1283,6 +1765,73 @@ impl Batch {
 mod tests {
     use super::*;
     use crate::layout::ModuleId;
+
+    /// A split from a terminal, or a restart in place, goes ahead after its read only if the same shell is still
+    /// there: not once the pane is idle, not after a new start under the same number, not after the running shell
+    /// was closed in place.
+    #[test]
+    fn a_captured_shell_is_still_there_only_for_the_same_start_and_process() {
+        let captured = ShellStart::of(3, Some(4100));
+        assert!(captured.still(Some(ShellStart::of(3, Some(4100)))));
+        assert!(!captured.still(None), "killed: the pane went idle");
+        assert!(
+            !captured.still(Some(ShellStart::of(4, Some(4200)))),
+            "the number reused by a new terminal"
+        );
+        assert!(
+            !captured.still(Some(ShellStart::of(4, Some(4100)))),
+            "a new start, whatever its pid"
+        );
+        assert!(
+            !captured.still(Some(ShellStart::of(3, None))),
+            "the shell closed in place"
+        );
+        let unspawned = ShellStart::of(1, None);
+        assert!(
+            unspawned.still(Some(ShellStart::of(1, Some(4300)))),
+            "spawned since, same start"
+        );
+        assert!(!unspawned.still(Some(ShellStart::of(2, Some(4300)))));
+    }
+
+    /// A restart decided on an idle read goes ahead only if nothing was typed into the shell after the read: a
+    /// command typed meanwhile keeps the same shell and pid, and may be running by the time the restart comes.
+    #[test]
+    fn a_shell_given_keys_since_the_capture_is_not_untouched() {
+        let captured = ShellStart::of(3, Some(4100)).typed(7);
+        assert!(captured.untouched(Some(ShellStart::of(3, Some(4100)).typed(7))));
+        assert!(captured.still(Some(ShellStart::of(3, Some(4100)).typed(8))));
+        assert!(
+            !captured.untouched(Some(ShellStart::of(3, Some(4100)).typed(8))),
+            "a key after the read"
+        );
+        assert!(
+            !captured.untouched(Some(ShellStart::of(4, Some(4100)).typed(7))),
+            "another start"
+        );
+        assert!(!captured.untouched(None), "the pane went idle");
+    }
+
+    /// A refused restart in place names its terminal and is told apart from the terminal's other ops, whose
+    /// refusal with a module is a move's freeze.
+    #[test]
+    fn a_respawn_is_tagged_apart_and_names_its_terminal() {
+        let op = HostOp::Terminal(TermOp::Respawn {
+            win: WinId::MAIN,
+            module: ModuleId::terminal(),
+            dir: "/w/work".into(),
+            expect: ShellStart::of(1, Some(10)),
+        });
+        assert_eq!(OpTag::of(&op), OpTag::Respawn);
+        assert_eq!(op.surface(), Some((WinId::MAIN, ModuleId::terminal())));
+        let read = HostOp::Terminal(TermOp::ReadJob {
+            win: WinId::MAIN,
+            module: ModuleId::terminal(),
+            read: 0,
+        });
+        assert_eq!(OpTag::of(&read), OpTag::Terminal);
+        assert_eq!(read.surface(), None);
+    }
 
     fn map(module: ModuleId) -> HostOp {
         HostOp::Map {
@@ -1338,19 +1887,12 @@ mod tests {
         second.push_layout(map(ModuleId::terminal()));
         second.push_effect(HostOp::Quit);
         second.push_effect(HostOp::Lua(emit("second")));
-        let verb = ShellVerb {
-            win: WinId::MAIN,
-            call: ShellCall::Action(crate::keymap::Action::FloatToggle),
-            keycode: 4,
-        };
-        second.set_shell_verb(verb.clone());
         first.append(second);
         assert_eq!(
             first.ops().cloned().collect::<Vec<_>>(),
             vec![map(ModuleId::agent()), map(ModuleId::terminal()), start(), HostOp::Quit]
         );
         assert_eq!(first.lua(), &[emit("first"), emit("second")]);
-        assert_eq!(first.shell_verb(), Some(&verb));
         assert!(!first.is_empty());
         assert!(Batch::default().is_empty());
     }
@@ -1384,12 +1926,15 @@ mod tests {
             SetMode
         );
         tag!(
-            HostOp::MoveToMonitor {
+            HostOp::PlaceWindow {
                 win,
-                monitor: MonitorId("one".into())
+                monitor: Some(MonitorId("one".into())),
+                role: PlacementRole::Main
             },
-            MoveToMonitor
+            PlaceWindow
         );
+        tag!(HostOp::RestoreLinkedWindow { win }, RestoreLinkedWindow);
+        tag!(HostOp::StartEditorWindow { win }, StartEditorWindow);
         tag!(HostOp::CloseWindow { win }, CloseWindow);
         tag!(HostOp::Quit, Quit);
         tag!(
@@ -1429,6 +1974,15 @@ mod tests {
             },
             AdoptMoved
         );
+        tag!(
+            HostOp::OrderBaseTabs {
+                win,
+                tabs: vec![TabId(1)],
+                active: Some(TabId(1))
+            },
+            OrderBaseTabs
+        );
+        tag!(HostOp::EndPeer { win, peer: PeerId(2) }, EndPeer);
         tag!(map(module.clone()), Map);
         tag!(
             HostOp::Unmap {
@@ -1460,6 +2014,7 @@ mod tests {
         tag!(start(), Terminal);
         tag!(HostOp::Plugin(PluginOp::Build { win, module }), Plugin);
         tag!(HostOp::Cleanup(CleanupOp::Feeds), Cleanup);
+        tag!(HostOp::Pair(PairOp::Unrestored { win }), Pair);
         tag!(HostOp::Lua(emit("changed")), Lua);
     }
 }

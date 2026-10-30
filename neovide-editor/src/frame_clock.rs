@@ -23,6 +23,9 @@ pub(crate) struct AnimationClock {
 }
 
 impl AnimationClock {
+    pub(crate) fn advance_subsurface(&mut self, now_us: i64, period: std::time::Duration, was_animating: bool) -> f32 {
+        self.advance(now_us, period.as_micros().min(i64::MAX as u128) as i64, was_animating)
+    }
     /// Call once per actual render, never from the polling tick. GDK's frame time stays fixed
     /// throughout a frame, unlike `Instant::now()` inside a variable-cost render callback.
     pub(crate) fn advance(&mut self, frame_time_us: i64, refresh_interval_us: i64, was_animating: bool) -> f32 {
@@ -150,5 +153,14 @@ mod tests {
         let mut clock = AnimationClock::default();
         seconds(clock.advance(1_000_000, 0, false), 1.0 / 60.0);
         seconds(clock.advance(2_000_000, -1, false), 1.0 / 60.0);
+    }
+
+    #[test]
+    fn subsurface_animation_uses_the_pacers_period_and_the_render_time() {
+        let mut clock = AnimationClock::default();
+        let period = std::time::Duration::from_nanos(6_060_606);
+        seconds(clock.advance_subsurface(1_000_000, period, false), 0.006060);
+        seconds(clock.advance_subsurface(1_012_121, period, true), 0.012121);
+        seconds(clock.advance_subsurface(9_000_000, period, false), 0.006060);
     }
 }

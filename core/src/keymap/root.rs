@@ -84,7 +84,7 @@ pub const ROOT_ACCELS: &[RootAccel] = &[
     },
     RootAccel {
         action: "text-reset",
-        // Keypad 0 with NumLock off reports as KP_Insert, not KP_0 (2026-09-23).
+        // Keypad 0 with NumLock off reports as KP_Insert, not KP_0.
         chords: &[
             RootChord {
                 ctrl: true,

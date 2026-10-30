@@ -63,9 +63,8 @@ pub fn load_mode(dir: &Path, project_root: &Path) -> LoadedMode {
 }
 
 /// Bypass is never written to disk, so no launch starts in it. Refused with an `InvalidInput`
-/// error, in every build: this was a `debug_assert!`, which a release build compiles out, so the
-/// rule held only because every caller happens to save on `ModeCycle::Changed(Auto)` alone. Both
-/// callers already log a failed save and carry on, so the refusal needs no new plumbing.
+/// error in every build; a debug-only assertion would leave release builds unprotected.
+/// Callers log a failed save and carry on.
 pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> std::io::Result<PathBuf> {
     if mode == SessionModeChoice::Bypass {
         return Err(std::io::Error::new(

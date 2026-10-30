@@ -1,5 +1,5 @@
 /** `Ctrl+[` is Esc, as in vim, nvim and the terminal. WebKitGTK 2.52.6 sends it
- *  as `key "["`, `code BracketLeft`, `ctrlKey` (observed 2026-09-29). One capture listener
+ *  as `key "["`, `code BracketLeft`, `ctrlKey`. One capture listener
  *  re-dispatches it as a plain Escape keydown on the same target, so every handler reads the key it
  *  already reads; an input method's own key is left to it, as Esc is.
  *

@@ -22,6 +22,7 @@ pub(crate) fn decl(module: &ModuleId) -> SurfaceDecl {
                 args: vec![],
                 cwd: None,
                 clean: true,
+                background: None,
             },
         },
         ModuleKind::Agent => SurfaceKind::Chat {
@@ -89,6 +90,11 @@ pub(crate) fn rig(layout: Layout) -> Rig {
 impl Rig {
     pub(crate) fn run(&mut self, action: Action) -> Batch {
         self.controller.run(WIN, action, Origin::Key { keycode: 7 })
+    }
+
+    /// A tab key with the keys in `keys`.
+    pub(crate) fn run_tab(&mut self, tab: crate::keymap::TabAction, keys: Option<ModuleId>) -> Batch {
+        self.controller.run_tab(WIN, tab, keys)
     }
 }
 

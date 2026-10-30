@@ -1,8 +1,7 @@
-//! The `Term`'s `EventListener`. The frozen driver used `VoidListener`, which silently dropped every
-//! answer the terminal owes a program: DSR cursor position, DA, colour queries (the spike reproduced
-//! `ESC[6n` going unanswered). This one keeps them, in order, for [`crate::screen::Screen`] to write
-//! back to the PTY once the parser returns -- the listener runs inside `Term`'s own parse and cannot
-//! reach the PTY, or read the `Term`, itself.
+//! The Term's EventListener keeps DSR, DA and colour-query replies in order for
+//! [`crate::screen::Screen`] to write back once parsing returns. The listener runs inside Term's
+//! parse and cannot reach the PTY or read Term itself; dropping replies would leave requests
+//! such as ESC[6n unanswered.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,8 +31,8 @@ pub struct HostEvents {
     /// this far: `Term` refuses it (`Osc52::OnlyCopy`, see `screen::term_config`).
     pub clipboard: Option<String>,
     /// Text a program copied to the primary selection with OSC 52 (`p`, and `s`, which `Term` reads
-    /// as the same thing): what a middle click pastes. Kept apart from `clipboard` (bottom-terminal
-    /// phase 2) so an nvim `"*y` inside the terminal does not overwrite what `Ctrl+V` pastes.
+    /// as the same thing): what a middle click pastes. Kept apart from `clipboard` so an nvim
+    /// `"*y` inside the terminal does not overwrite what `Ctrl+V` pastes.
     pub primary: Option<String>,
     /// Text a HOST selection gesture (a drag release) just finished. Not an OSC 52 event --
     /// selecting text never runs through `Term`'s own event stream -- so unlike the three fields

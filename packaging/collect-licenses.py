@@ -95,17 +95,14 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEXTS = os.path.join(REPO, "packaging", "license-texts")
 TARGET = "x86_64-unknown-linux-gnu"
 
-# The five binaries every release (public or private) installs from target/release, and the cargo
-# packages whose bin targets they are (publish.sh / release.sh build exactly
-# `-p shell -p agent -p supervisor --bins`). No `agent-hook`: it is the legacy backend's permission
-# hook, and no release build compiles the legacy backend at all, in either
-# profile.
+# The five binaries every release installs from target/release, built with
+# `-p shell -p agent -p supervisor --bins`. No `agent-hook`: it relays permissions for the legacy
+# backend, which no release build compiles in either profile.
 SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard"]
 SHIPPED_CARGO_PACKAGES = ["shell", "agent", "supervisor"]
 
-# Small counts, spelled as words in prose (never digits): a note once read
-# "all five binaries" as a literal, stale after `agent-hook` was dropped and four were left. Anything
-# past this table falls back to the digit rather than failing: nothing here needs a word past six.
+# Spell small binary counts as words from the actual list, so prose cannot retain a stale count.
+# Counts beyond this table fall back to digits rather than failing.
 _COUNT_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
 
 
@@ -183,9 +180,8 @@ ALLOWLIST = {
         "cover it."),
 }
 
-# List workspace members that retain their own licences instead of the root MIT licence.
-# Their licence texts travel with the binary like those of crates.io dependencies.
-# Other workspace members are covered by LICENSE and omitted here.
+# Workspace members with their own licences must carry their notices with the binary, just as
+# crates.io dependencies do. Other workspace members are Eitri's MIT code, covered by LICENSE.
 WORKSPACE_THIRD_PARTY = {
     "terminal-input": (
         "derived from Alacritty (commit 94e7c8874e526b1e67b349d9ba30ddf81669119e) and Apache-2.0, "
@@ -206,15 +202,11 @@ def own_code(name, license):
                "WORKSPACE_THIRD_PARTY")
 
 
-# Eitri's own artwork, packaging/icons: the logo installed as the application icon (under hicolor, as
-# cn.huntergrey.eitri.png/.svg). It is not code, so LICENSE's MIT does not cover it: Eitri licenses
-# it CC BY 4.0, and its colours come from the Neovim logo by Jason Long (CC BY 3.0). Both are
-# attribution-only licences, and the notice below -- which names the licence, its URL and the credit --
-# is what CC BY asks to travel with a copy, so it is printed into THIRD-PARTY-LICENSES in both profiles.
-#
-# This is deliberately NOT done by adding CC-BY-4.0 to PERMISSIVE: that set classifies every dependency,
-# and a crate or npm package under a Creative Commons licence (a data set, say) must still fail the run
-# until someone looks at it. ARTWORK_LICENSES is checked only against this one entry.
+# The application icon is CC BY 4.0 artwork; LICENSE's MIT grant covers code, not this logo.
+# Its colours come from the Neovim logo (CC BY 3.0). Both attribution licences
+# require the credit, licence and URL to travel with a copy, so both profiles print the notice.
+# Keep ARTWORK_LICENSES separate from PERMISSIVE: a crate or npm package under a Creative Commons
+# licence still needs examination rather than inheriting this artwork's classification.
 ARTWORK_DIR = os.path.join("packaging", "icons")
 ARTWORK_LICENSE = "CC-BY-4.0"
 ARTWORK_LICENSES = {"CC-BY-4.0", "CC-BY-3.0"}
@@ -235,10 +227,9 @@ ARTWORK_FILES = {
 # is reproduced, so a release of it without one must fail rather than print an empty entry.
 ALLOWLIST_TEXT_REQUIRED = {("npm", "@anthropic-ai/claude-agent-sdk")}
 
-# In the npm tree, and deliberately NOT in the shipped artifact. Verified on every run: the
-# artifact must not contain the package name at all (the SDK's resolver would name it if the
-# lookup code were bundled; measured 0 hits on 2026-09-19, with the artifact at ~106 MB against
-# this package's 205 MB).
+# In the npm tree but excluded from the shipped artifact. Its package name must be absent:
+# the SDK's resolver would name it if its lookup code were bundled. The measured artifact has
+# 0 hits at about 106 MB, compared with this package's 205 MB.
 NOT_SHIPPED = {
     ("npm", "@anthropic-ai/claude-agent-sdk-linux-x64"): (
         "the 205 MB native Claude Code CLI. The packaged sidecar serves host_cli only: the user "
@@ -443,10 +434,8 @@ def npm_packages(root, workspace=None):
         with open(os.path.join(d, "package.json")) as f:
             pj = json.load(f)
         if pj["name"].startswith("@types/"):
-            # DefinitelyTyped packages ship only .d.ts type declarations, never runtime code, so
-            # they can never reach a built bundle regardless of how `npm ls` found them --
-            # for example, @types/trusted-types is an
-            # optional dependency of dompurify that `--omit=dev` does not exclude.
+            # DefinitelyTyped packages ship only .d.ts declarations, so cannot reach a runtime bundle.
+            # `--omit=dev` still lists optional dependencies such as dompurify's @types/trusted-types.
             continue
         lic = pj.get("license")
         if isinstance(lic, dict):
@@ -788,10 +777,8 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
          {"Cr_z_adler32_simd_", "Cr_z_crc32_sse42_simd_", "Cr_z_inflate_fast_chunk_", "Cr_z_cpu_check_features"},
          None, "BSD-3-Clause", ["chromium.LICENSE"],
          "Copyright 2017 The Chromium Authors. Copyright (C) 2017 ARM, Inc."),
-        # Detected by code, NOT by the "wuffs-v0.3.c" string: that string is an STT_FILE entry the
-        # prebuilt archive leaves behind even when --gc-sections discards every byte of Wuffs, which
-        # is exactly what `shell` looked like on 2026-09-19 (no wuffs_ symbol, no Wuffs status
-        # string). The first version of this script matched the FILE entry and listed Wuffs wrongly.
+        # Detect Wuffs by code or its status string, not the "wuffs-v0.3.c" STT_FILE entry:
+        # --gc-sections can discard every byte of Wuffs while leaving that file name behind.
         ("Wuffs", set(), b"#base: ", "Apache-2.0", ["Apache-2.0.txt"], "Copyright 2017 The Wuffs Authors."),
     ]
     for comp, names, marker, lic, files, credit in embedded:
@@ -842,11 +829,9 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
 
 
 # ---------------------------------------------------------------------------------------------
-# The prebuilt Skia archive's own contents (a review found the gap): the public source asset redistributes the WHOLE archive, not just
-# whatever a shipped binary ends up linking after --gc-sections discards the rest. That is a
-# different question from native_components() above, which only ever sees what `shell` itself
-# actually links -- measured (2026-09-27) at 0 for every one of expat/libjpeg-turbo/Wuffs/HarfBuzz/
-# ICU despite all five being compiled into the archive's .a files.
+# The source asset redistributes the whole prebuilt Skia archive, including code --gc-sections
+# can discard from shipped binaries. native_components() covers only linked code: the measured
+# binary has 0 expat/libjpeg-turbo/Wuffs/HarfBuzz/ICU hits although all five are in the archive.
 # ---------------------------------------------------------------------------------------------
 
 # Every object member's name is "<rust-skia build_support target>.<source file>.o", except
@@ -904,10 +889,8 @@ def _skia_archive_member_component(stem):
     return None
 
 
-# A defined-symbol prefix expected somewhere among a component's own members: not how members are
-# classified (their own name already does that, above, unambiguously against this pinned archive --
-# see the module-level comment), but independent corroborating evidence, and the source of the
-# counts this script's own commit history records.
+# A defined-symbol prefix corroborates classification by member name independently.
+# Count the component's own global functions separately from other symbol types.
 _SKIA_ARCHIVE_SYMBOL_PREFIXES = {
     "expat": re.compile(r"^XML_"),
     "libjpeg-turbo": re.compile(r"^(jpeg_|jinit_)"),
@@ -1062,11 +1045,9 @@ def skia_archive_symbol_counts(archive_dir):
     for path in archives:
         for l in run(["nm", "--defined-only", path], REPO).splitlines():
             parts = l.split()
-            # A 3-field line is "<addr> <type> <name>"; "T" (global function/text) is what verdict
-            # #7's own table counted -- other global types (R/D/W/...) and local ones alike can share
-            # a component's prefix without being one of its own named functions (e.g. a `d
-            # XML_GetFeatureList.features` local data symbol in expat, or the several R/D/W-typed
-            # wuffs_base__*_TABLE data symbols wuffs generates).
+            # A 3-field line is "<addr> <type> <name>". Count T (global function/text) only:
+            # R/D/W and local symbols can share a component's prefix without naming its functions
+            # (e.g. expat's local data XML_GetFeatureList.features and Wuffs' R/D/W-typed tables).
             if len(parts) != 3 or parts[1] != "T":
                 continue
             sym = parts[-1]
@@ -1134,10 +1115,8 @@ def skia_archive_notice_entries(archive_path, extract_dir, expected_sha256=None)
         members = by_comp[comp]
         archives_here = sorted({m.split("(", 1)[0] for m in members})
         license_id, files = text(comp)
-        # Every component's text is vendored under packaging/license-texts/ EXCEPT Skia's own, which
-        # is its own LICENSE_SKIA read straight out of the archive (_license_skia_from_archive) --
-        # The note used to say "vendored" for every entry alike, which was wrong for
-        # the one component whose text this archive itself supplies.
+        # Every component's text is vendored under packaging/license-texts/ except Skia's own:
+        # _license_skia_from_archive reads LICENSE_SKIA directly from the archive.
         source = "its own LICENSE_SKIA inside the archive" if comp == "Skia" \
             else "text vendored in packaging/license-texts/"
         entries.append({
@@ -1412,11 +1391,9 @@ def artwork_entries(repo=REPO):
              "files": [("packaging/icons/LICENSE", notice)]}]
 
 
-# The exact LGPL-3.0 section 4(a) "prominent notice" sentence. Shared
-# between THIRD-PARTY-LICENSES (build_header) and SOURCE (write_source_notice) so the two files
-# never say it differently, and takes the real resolved version rather than a hardcoded one nothing
-# re-checks: a bump trips EXTRA_TEXTS's own version-mismatch guard elsewhere in this file, but that
-# guard has nothing to do with this sentence, and a stale version here could otherwise survive it.
+# Share the LGPL-3.0 section 4(a) prominent notice between THIRD-PARTY-LICENSES and SOURCE,
+# using the resolved version so both agree. EXTRA_TEXTS's version guard does not check this
+# sentence; a hardcoded version here could survive a dependency bump.
 def nvim_rs_lgpl_notice(version):
     return (f"This program statically links nvim-rs {version}, which is licensed under the GNU "
             "LGPL-3.0; its use is covered by that licence.")
@@ -1435,9 +1412,8 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
-    # LGPL-3.0 4(a): a "prominent notice ... that the Library is used" -- first, in BOTH profiles
-    # (the same sentence is at the top of THIRD-PARTY-LICENSES; the private/sidecar
-    # profile ships the identical statically-linked `shell`, so 4(a) is owed there too).
+    # LGPL-3.0 4(a) requires a prominent notice that the library is used. Put it first in both
+    # profiles: the private/sidecar profile ships the same statically linked shell.
     L = [RULE, "Eitri -- third-party licences", RULE, "", nvim_rs_lgpl_notice(nvim_rs["version"]), ""]
     L += [
         "Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
@@ -1545,8 +1521,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
                 continue
             sc_pkgs.append(resolve(p, by_nv, counts_sc))
     if no_sidecar:
-        # Computed here, before build_header(), so the header's own "Contents:" list
-        # can show this section's count the same way it shows every other part's.
+        # Compute before build_header() so its Contents list includes this section's count.
         archive_entries = skia_archive_notice_entries(skia_archive_path, skia_archive_extract_dir,
                                                         skia_archive_sha256)
 
@@ -1555,9 +1530,8 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
         raise Fail(f"COPYLEFT_ACK names {sorted(n for _, n in COPYLEFT_ACK)} but the tree ships "
                    f"{sorted(e['name'] for e in copyleft)}: drop the stale acknowledgement")
 
-    # Which shipped binaries actually carry nvim-rs code, checked by symbol. Patches
-    # the nvim-rs entry's already-resolved status text in place, naming the real hit list rather than
-    # a hand-kept "`shell`" that a future binary picking it up would leave silently stale.
+    # Name every shipped binary carrying nvim-rs code, checked by symbol. A hand-kept shell-only
+    # list would silently become stale if another binary began linking it.
     nvim_rs_binaries = nvim_rs_symbol_check(shipped)
     for e in rust:
         if e["name"] == "nvim-rs" and e["status"] and "{binaries}" in e["status"]:

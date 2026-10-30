@@ -14,7 +14,7 @@ import typescript from "highlight.js/lib/languages/typescript";
 import yaml from "highlight.js/lib/languages/yaml";
 import { escapeText, isHiddenChar } from "./revealHidden";
 
-/* The twelve languages the panel highlights, registered from `lib/core` rather than the default bundle
+/* The eleven languages the panel highlights, registered from `lib/core` rather than the default bundle
    so the single-file `dist` carries these and not all 190. `tsx` is typescript's own alias, and
    `toml` is highlight.js's `ini` grammar, which is what it ships for TOML. */
 for (const [name, language] of [
@@ -33,16 +33,9 @@ hljs.registerAliases(["sh", "shell", "zsh"], { languageName: "bash" });
    block above drifting out of sync with this one. */
 export { hljs };
 
-/* marked 13's RENDERER TYPE is `code({ text, lang, escaped })` (`marked.d.ts:172`), but by default
-   `marked.use()` still runs a `code` renderer through a legacy compatibility shim that calls it
-   with the OLD positional args (`func.call(this, token.text, token.lang, !!token.escaped)` --
-   `marked.esm.js`'s `#convertRendererFunction`), destructuring an object out of a plain string and
-   silently producing `text: undefined`. `useNewRenderer: true` is what actually turns the token on
-   ("Use the new renderer that accepts an object instead of individual parameters. This option will
-   be removed and default to true in the next major version." -- `marked.d.ts`'s own doc comment on
-   the flag). Confirmed by reproducing the failure first: without this flag every fenced block in
-   `markdown.test.ts` rendered as an empty `<pre><code></code></pre>`. Re-check both this flag and
-   the token shape if marked is upgraded. */
+/* marked 13 types `code` with an object token, but its default compatibility shim passes
+   positional strings, leaving destructured `text` undefined and fences empty. `useNewRenderer: true`
+   selects the token form. Re-check the flag and token shape when upgrading marked. */
 /* An image inside a link's text (the badge pattern
    `[![badge](img-url)](real-url)`, or mixed content like `[see ![b](img)](real-url)`) must not
    become the `image` renderer's own `<a>` (below) nested inside the `link` renderer's `<a>`. Left
@@ -137,11 +130,10 @@ marked.use({
     image({ href, text }: { href: string; title?: string | null; text: string }) {
       /* `text` (the alt) arrives ALREADY html-escaped -- marked's own tokenizer does it at token
          creation (`outputLink`'s image branch, `text: escape$1(text)`), unlike `href` and unlike
-         the `code` token's `text` above. Escaping it a second time here visibly broke rendering:
-         reproduced in jsdom, `![a & b <c>](url)` rendered the literal characters `a &amp; b &lt;c&gt;`
-         on screen (one layer of entity decoding by the HTML parser leaves the second layer as
-         literal text) instead of `a & b <c>`. `href` arrives raw, and `resolvedHref` above turns it
-         into the URL an ordinary link would go to; that is escaped exactly once, here. */
+         the `code` token's `text` above. Escaping it twice makes `![a & b <c>](url)` show the literal
+         `a &amp; b &lt;c&gt;` (one layer of HTML entity decoding leaves the second as literal text)
+         instead of `a & b <c>`. `href` arrives raw, and `resolvedHref` above turns it into the URL
+         an ordinary link would go to; that is escaped exactly once, here. */
       const url = resolvedHref(href);
       const shownUrl = url === null ? escapeHtml(href) : escapeHtml(url);
       /* Inside a link: part of that link's own text (see `linkDepth` above) -- the alt text, or,
@@ -153,14 +145,11 @@ marked.use({
       if (url === null) return label;
       return `<a href="${shownUrl}">${label}</a>`;
     },
-    /* GFM task-list items (`- [ ] x`, `- [x] y`): the default renderer emits a real
-       `<input disabled type="checkbox">`, which `FORBID_TAGS` below now drops (`input` is a
-       zero-click remote-load vector via `type="image"`) -- silently, since `checkbox()`'s return
-       value is spliced into an item's TEXT as a raw string (`listitem()`'s own `checkbox + ' '`),
-       never escaped or passed through a tag-aware renderer, so nothing else catches its removal.
-       Reproduced in jsdom: before this, `- [ ] todo\n- [x] done` rendered
-       `<li> todo</li><li> done</li>` -- indistinguishable, the one piece of information (done or
-       not) silently lost. Inert bracket text keeps that information without reintroducing the
+    /* GFM checkboxes must use inert bracket text: the default renderer inserts an `<input>` as raw
+       item text, which the sanitizer drops because `type="image"` can load remotely without a click.
+       The drop is silent -- the return value is spliced into the item's text unescaped and no
+       tag-aware renderer sees it, so nothing else catches its removal -- and it makes `- [ ] todo` and
+       `- [x] done` indistinguishable. Bracket text keeps that one piece of information without the
        forbidden tag. */
     checkbox({ checked }: Tokens.Checkbox) {
       return checked ? "[x]" : "[ ]";
@@ -232,42 +221,24 @@ function installSanitizeHooks(): void {
   });
 }
 
-/* What a reply must not carry -- a fake panel row, an overlay, a zero-click remote load -- in one
-   config for the one `sanitize` call below.
-   - `ALLOW_DATA_ATTR: false` / `ALLOW_ARIA_ATTR: false`: a reply cannot carry `data-nav-stop`,
-     `data-nav-action`, `data-path`, `aria-current`, … -- the attributes the panel's own navigation
-     and rendering key off.
-   - `id`/`name`/`role`/`form`/`formaction`: not `data-`/`aria-` prefixed, so the two flags above
-     don't reach them; `role` alone is enough to fake a `role="button"` node, and `formaction` can
-     redirect a real `<form>` submit.
-   - `style` tag and attribute: forbidden outright (a styled reply can paint an overlay over the
-     panel) -- a CSP cannot do this job, because
-     the panel's own CSS is inline, so `style-src` must already allow it.
-   - `picture`/`source`/`video`/`audio`/`input`/`iframe`/`object`/`embed`/`svg`/`image`/`img`/`math`:
-     every zero-click remote-load vector that was reproduced, plus MathML (DOMPurify's default
-     profile allows the whole `math` namespace, including `<mglyph src=…>`; not itself reproduced as
-     a WebKitGTK load, but the same shape as the `svg image href` vector this list already closes,
-     and nothing here ever legitimately emits `<math>`). Markdown's own `![alt](url)` never
-     reaches this list -- the `image` renderer above turns it into a link before marked's output
-     ever gets here.
-   - `background`: the one FORBID_ATTR gap found after the rest of this list -- DOMPurify's
-     default allowlist keeps `background` on `table`/`tr`/`td`/`th`/`thead`/`tbody`/`tfoot` (an
-     https value passes its URI check too), and WebKitGTK maps it to a `background-image`
-     presentational hint, so it loads with no click, the same class of vector as the remote loads above.
-     Reproduced in jsdom: `<table background="https://…"><tr><td>x</td></tr></table>` and a `<td
-     background=…>` inside a real markdown table both kept the attribute unchanged before this.
-   - `dialog`: an overlay with no `style` at all. WebKitGTK's own UA stylesheet gives
-     it `position: absolute; inset-inline: 0; margin: auto; background-color: Canvas` and
-     `dialog[open] { display: block }`; `.row` and `.message-list` are not positioned, so an
-     `<dialog open>` in a reply lays out against `.agent-ui-scroller` and paints, opaque, over the
-     rows after it -- the real permission card included, which is the `style` overlay above rebuilt from
-     an allowed tag. Reproduced in jsdom: it came through unchanged, `open` and all. Its content
-     is kept, in flow, as the rest of the reply.
-   - `popover`/`popovertarget`/`popovertargetaction`/`commandfor`/`command`/`tabindex`:
-     each needs a click, an id or a Tab to do anything, but none is anything markdown emits,
-     and the invoker attributes name their target by id -- which could be one of the PANEL's own
-     ids, since only the reply's own `id`s are forbidden above. `tabindex` would make part of a
-     reply a stop for `Tab`, which is how the panel's own controls are reached. */
+/* A reply must not fake panel controls, cover real rows or load remote resources without a click.
+   - Disable data/ARIA attributes so reply HTML cannot borrow navigation and rendering markers.
+     Also forbid id/name/role/form/formaction: these lack those prefixes, can fake controls or redirect submits.
+   - Forbid style tags and attributes: inline panel CSS requires CSP's style allowance, so CSP cannot
+     prevent a reply from painting an overlay.
+   - Forbid media, image, frame, object, embed, SVG, MathML and input tags as zero-click load vectors.
+     DOMPurify's default profile allows the whole `math` namespace, including `<mglyph src=...>`;
+     that is not verified as a WebKitGTK load, but has the shape of `svg image href` and nothing here
+     emits `<math>`. Markdown images become links before sanitization.
+   - Forbid background: DOMPurify allows it on table elements, including https URLs; WebKitGTK turns
+     it into a background-image presentational hint that loads without a click.
+   - Forbid dialog: its UA styling positions an open dialog absolutely and paints it opaque over later
+     rows, including permission cards. The unpositioned `.row` and `.message-list` let it position
+     against `.agent-ui-scroller`. Keep its content in flow instead.
+   - Forbid popover/invoker/command attributes: each needs a click, an id or a Tab to do anything and
+     markdown emits none of them, but the invokers name a target by id, which could be one of the
+     panel's own ids since only the reply's own `id`s are forbidden. Forbid tabindex so replies
+     cannot join the controls' Tab stops. */
 /* What the reader sees is what a copy takes. A reply's own HTML can hold text that is in the DOM
    but not seen in three ways this list closes: a `hidden` attribute (a `<span hidden>` tail on a
    command), a collapsed `<details>` body, and a colour of its own -- `<font color>` matching the

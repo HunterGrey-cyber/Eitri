@@ -63,7 +63,7 @@ describe("HistoryNotice", () => {
     expect(el.textContent).not.toContain("not loaded");
   });
 
-  /* Invariant 15, all three clauses. */
+  /* Reachable by j/k, outside the conversation cursor's row indices. */
   it("is reachable by j/k and is not a conversation row", () => {
     const { root, el } = renderInPanel();
     expect(stopsIn(root)).toContain(el);
@@ -71,10 +71,8 @@ describe("HistoryNotice", () => {
     expect(Array.from(root.querySelectorAll('[data-nav-stop="row"]'))).not.toContain(el);
   });
 
-  /* **The negative control**, and the reason the Copy path button is not decoration. `stopsIn`
-     keeps a stop only when it is a row OR holds an enabled control (`nav.ts`), so a notice built by
-     copying `.command-notice`'s attributes and leaving out its button would be filtered out and
-     `j`/`k` could never land on it. The first draft of this row did exactly that. */
+  /* `stopsIn` keeps rows or stops with an enabled control. Without Copy path, the notice
+     would be filtered out of j/k navigation. */
   it("would be unreachable without its button, which is why it has one", () => {
     const { root, el, button } = renderInPanel();
     expect(stopsIn(root)).toContain(el);

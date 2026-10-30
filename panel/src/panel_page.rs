@@ -13,13 +13,19 @@ use crate::panel_pacer::{Pacer, Sink};
 
 /// The panel's page: one web view showing the `agent-ui/web` bundle.
 ///
-/// **Contracts every implementation keeps.** Everything runs on one thread. `send` is asynchronous: it
-/// never delivers a page message, and never calls back into the panel, before it returns -- the panel
+/// **Contracts every implementation keeps.** Everything runs on one thread. `send` and `send_many` are asynchronous:
+/// neither delivers a page message or calls back into the panel before returning -- the panel
 /// may call it while holding its own state. Envelopes sent before the page said `ready` may be lost;
 /// the panel holds what matters until then.
 pub trait PageSurface {
     /// Run `window.__eitriDispatch(<json>)` in the page if it installed one; a page without it loses the envelope.
     fn send(&self, envelope_json: &str);
+    /// Deliver these envelopes in order. A host may keep the run in one script to prevent intermediate frames.
+    fn send_many(&self, envelopes: &[&str]) {
+        for envelope in envelopes {
+            self.send(envelope);
+        }
+    }
     /// Whether the page is on screen; the panel marks a tab seen only while it is.
     fn is_visible(&self) -> bool;
     /// Replace the document: the themed bundle, or the page shown after repeated crashes.
@@ -64,6 +70,15 @@ impl PanelPage {
         }
     }
 
+    /// Sends one run behind every stream envelope the pacer holds.
+    pub fn send_many(&self, payloads: &[&str]) {
+        match self.pacer.try_borrow_mut() {
+            Ok(mut pacer) => pacer.flush(&self.sink()),
+            Err(_) => eprintln!("[panel_pacer] BUG: the pacer was borrowed when a run was sent; sending it unordered"),
+        }
+        self.surface.send_many(payloads);
+    }
+
     /// Hands the page whatever the pacer holds, for a caller that sends its own (guarded) script.
     pub fn flush(&self) {
         if let Ok(mut pacer) = self.pacer.try_borrow_mut() {
@@ -101,5 +116,68 @@ pub struct SurfaceSink<'a>(&'a dyn PageSurface);
 impl Sink for SurfaceSink<'_> {
     fn send(&self, payload: &str) {
         self.0.send(payload);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eitri_core::panel_cadence::EnvelopeClass;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug, PartialEq)]
+    enum Delivery {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    #[derive(Default)]
+    struct RecordingSurface(RefCell<Vec<Delivery>>);
+
+    impl PageSurface for RecordingSurface {
+        fn send(&self, payload: &str) {
+            self.0.borrow_mut().push(Delivery::One(payload.to_owned()));
+        }
+        fn send_many(&self, payloads: &[&str]) {
+            self.0
+                .borrow_mut()
+                .push(Delivery::Many(payloads.iter().map(|s| (*s).to_owned()).collect()));
+        }
+        fn is_visible(&self) -> bool {
+            true
+        }
+        fn load_document(&self, _: &str, _: &str) {}
+        fn set_background(&self, _: [u8; 3]) {}
+    }
+
+    #[test]
+    fn a_stream_payload_held_by_the_pacer_reaches_the_page_before_a_run() {
+        let surface = Rc::new(RecordingSurface::default());
+        let page = PanelPage::new(surface.clone());
+        let now = Instant::now();
+        {
+            let mut pacer = page.pacer().borrow_mut();
+            pacer.set_cadence(Some(1));
+            pacer.set_editor_has_keys(true);
+            pacer.note_editor_key(now);
+            pacer.send_stream(
+                &page.sink(),
+                "held".into(),
+                None,
+                EnvelopeClass::Stream,
+                now + Duration::from_millis(5),
+            );
+            pacer.poll(&page.sink(), now + Duration::from_millis(20), true);
+        }
+        assert!(!surface.0.borrow().contains(&Delivery::One("held".into())));
+        surface.0.borrow_mut().clear();
+        page.send_many(&["snapshot", "draft"]);
+        assert_eq!(
+            *surface.0.borrow(),
+            [
+                Delivery::One("held".into()),
+                Delivery::Many(vec!["snapshot".into(), "draft".into()])
+            ]
+        );
     }
 }

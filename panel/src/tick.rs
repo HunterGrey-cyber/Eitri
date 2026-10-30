@@ -22,6 +22,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     let notes = state.start_notes.drain();
     out.send_all(ViewId::BASE, notes);
     collect_pending_starts(state, screen, out);
+    restore_once_released(state, screen, out);
     collect_pending_handoffs(state, out);
     inbound::collect_task_commands(state, out);
     report_sessions_that_never_opened(state, screen, out);
@@ -247,6 +248,7 @@ pub(super) fn report_attention(
     if state.shutting_down {
         return;
     }
+    report_busy(state, out);
     let after = state.tabs.attention();
     let now = state.tabs.tab_attentions();
     if after == before && now == state.reported_tabs {
@@ -255,6 +257,31 @@ pub(super) fn report_attention(
     let handed = eitri_core::tabs::views_handed_a_card(&state.reported_tabs, &now);
     state.reported_tabs = now;
     out.effect(Effect::Attention { before, after, handed });
+}
+
+/// Running-tab and queue counts invalidate the window's counts even when no attention mark moved.
+pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.shutting_down {
+        return;
+    }
+    let now = state.tabs.view_activity();
+    if now == state.reported_activity {
+        return;
+    }
+    let mut changed: Vec<_> = now
+        .iter()
+        .filter(|entry| !state.reported_activity.contains(entry))
+        .map(|(view, activity)| (*view, activity.running > 0))
+        .collect();
+    changed.extend(
+        state
+            .reported_activity
+            .iter()
+            .filter(|(view, _)| !now.iter().any(|(current, _)| current == view))
+            .map(|(view, _)| (*view, false)),
+    );
+    state.reported_activity = now;
+    out.effect(Effect::Busy { changed });
 }
 
 /// The window's wake, handed to every backend the tabs hold. A pair that cannot be made is logged, and the
@@ -278,9 +305,10 @@ pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate
 /// Whether something the tick acts on can become ready without raising the wake, so the tick has to run on
 /// its steady cadence: a worker reporting through a channel (a connect, a teardown, the supervisor's
 /// connect, the trust check, a review or scratch job, the history's writer), a backend that does not announce
-/// its folds, or the review flow waiting on the editor.
+/// its folds, the review flow waiting on the editor, or a move waiting on its page or its presence.
 pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
+        || state.chat_moves.is_waiting()
         || state.tabs.needs_polling()
         || !state.retiring.is_empty()
         || state.supervisor_pending.is_some()
@@ -764,6 +792,173 @@ mod tests {
             handle.run_tick(std::time::Instant::now()),
             crate::panel_wake::NextTick::Stop
         );
+    }
+
+    #[test]
+    fn the_busy_hook_hears_a_turn_start_and_end_with_no_card() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-turn");
+        let (handle, _page) = settled_panel();
+        let (tab, provider) = live_tab(&handle, &dir);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        let state = Rc::downgrade(&handle.state);
+        handle.on_busy(move |changed| {
+            assert!(
+                state.upgrade().unwrap().try_borrow_mut().is_ok(),
+                "the step has released its state"
+            );
+            calls.borrow_mut().push(changed.to_vec());
+        });
+        handle.tick();
+        heard.borrow_mut().clear();
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "running report", || !heard.borrow().is_empty());
+        assert_eq!(
+            heard.borrow_mut().drain(..).collect::<Vec<_>>(),
+            vec![vec![(ViewId::BASE, true)]]
+        );
+        assert_eq!(handle.state.borrow().tabs.attention().pending, 0);
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .queue_message(tab, "later", "later".into(), 1, false)
+            .unwrap();
+        handle.tick();
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, true)]));
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        tick_handle_until(&handle, "turn end report", || !heard.borrow().is_empty());
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
+        assert_eq!(handle.state.borrow().tabs.queued_count(), 0);
+        handle.tick();
+        assert!(heard.borrow().is_empty());
+        let _ = handle.shutdown();
+    }
+
+    #[test]
+    fn the_busy_hook_hears_each_running_tab_change_in_one_view() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-two-tabs");
+        let (handle, _page) = settled_panel();
+        let (first, backend) = live_backend(&dir);
+        {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.active();
+            state.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        }
+        let (_, second) = live_tab(&handle, &dir);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        handle.on_busy(move |changed| calls.borrow_mut().push(changed.to_vec()));
+        handle.tick();
+        heard.borrow_mut().clear();
+
+        for (provider, running) in [(&first, 1), (&second, 2)] {
+            provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+            tick_handle_until(&handle, "running tab count", || {
+                handle.chat_summary().running == running
+            });
+            handle.tick();
+            assert_eq!(
+                heard.borrow_mut().drain(..).collect::<Vec<_>>(),
+                vec![vec![(ViewId::BASE, true)]]
+            );
+        }
+        for (provider, running) in [(&second, 1), (&first, 0)] {
+            provider.queue(agent::AgentDomainEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                outcome: agent::TurnOutcome::Completed,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            });
+            tick_handle_until(&handle, "ended tab count", || handle.chat_summary().running == running);
+            handle.tick();
+            assert_eq!(
+                heard.borrow_mut().drain(..).collect::<Vec<_>>(),
+                vec![vec![(ViewId::BASE, running > 0)]]
+            );
+        }
+        assert_eq!(handle.chat_summary().queued, 0);
+        handle.tick();
+        assert!(heard.borrow().is_empty());
+        let _ = handle.shutdown();
+    }
+
+    #[test]
+    fn the_busy_hook_hears_a_change_whose_attention_did_not_move() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-queue");
+        let (handle, _page) = settled_panel();
+        let (tab, _provider) = live_tab(&handle, &dir);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        handle.on_busy(move |changed| calls.borrow_mut().push(changed.to_vec()));
+        handle.tick();
+        heard.borrow_mut().clear();
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .queue_message(tab, "later", "later".into(), 1, false)
+            .unwrap();
+        stepped(&handle.state, |state, out| {
+            let before = state.tabs.attention();
+            report_attention(state, before, out);
+        });
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
+        let before = handle.state.borrow().tabs.attention();
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({
+                "type": "queue_message",
+                "request_id": "q1",
+                "tab": tab.0,
+                "text": "next",
+            })
+            .to_string(),
+        );
+        handle.tick();
+        assert_eq!(handle.state.borrow().tabs.queued_count(), 0);
+        assert_eq!(handle.state.borrow().tabs.attention(), before);
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
+        let _ = handle.shutdown();
+    }
+
+    #[test]
+    fn the_busy_hook_reports_views_arriving_and_leaving_and_stops_at_shutdown() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        state.borrow_mut().busy_hook = Some(Rc::new(move |changed| calls.borrow_mut().push(changed.to_vec())));
+        stepped(&state, report_busy);
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
+        let two = ViewId::new(2).unwrap();
+        stepped(&state, |state, out| {
+            state.tabs.open(eitri_core::tab_set::AgentId::Claude);
+            state.tabs.break_out(two).unwrap();
+            report_busy(state, out);
+        });
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(two, false)]));
+        stepped(&state, |state, out| {
+            state.tabs.join_back(two).unwrap();
+            report_busy(state, out);
+        });
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(two, false)]));
+        stepped(&state, |state, out| {
+            state.shutting_down = true;
+            state.tabs.take_all();
+            let before = state.tabs.attention();
+            report_attention(state, before, out);
+            report_busy(state, out);
+        });
+        assert!(heard.borrow().is_empty());
     }
 
     /// Each chat view's chip shows its own tabs, so the hook hears a tab's own change even when the

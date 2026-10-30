@@ -76,9 +76,8 @@ export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: strin
  *  idle | ended | failed | new". `state` (failed/ended/not_started) always wins over `marker`, since
  *  a session that has stopped is no longer "running" no matter what its last marker was; `working`,
  *  `needs_input` and `unread` are the markers with their own word, and nothing pending reads as
- *  `idle`. `waiting`: a tab holding a card used to read `⚑ · idle`, when what it is
- *  doing is waiting on you -- the chooser draws it as `⚑N waiting`, the tray chip's `agent ⚑N` with
- *  the word the chip leaves out. `null` -- the
+ *  `idle`. A tab holding a card is waiting on you -- the chooser draws it as `⚑N waiting`,
+ *  the tray chip's `agent ⚑N` with the word the chip leaves out. `null` -- the
  *  defensive race `ChooserRow`'s own doc comment names -- reads as `new`, the same word a
  *  `not_started` tab gets, since neither can say anything more specific yet. */
 export function tabStateWord(info: TabInfo | null): string {

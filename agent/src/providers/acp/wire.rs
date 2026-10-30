@@ -7,7 +7,8 @@
 //! **Inbound** values are read leniently, by hand, from `serde_json::Value`: agents add update kinds,
 //! content types and fields between releases, and a field this build does not know must not end a turn.
 //! An update kind Eitri does not know is [`Update::Unknown`]; a payload that lacks what a known kind must
-//! carry is dropped by the caller with a log line, never guessed at.
+//! carry is dropped by the caller with a log line, never guessed at. An unreadable mode report is kept
+//! as [`Update::UnreadableMode`], so the caller can enforce the registered mode.
 //!
 //! Nothing under `_meta` and none of the `_auth/*` notifications is read: they carry the account's
 //! details, which are not Eitri's to keep or to log.
@@ -171,8 +172,8 @@ impl InitializeResponse {
 pub struct SessionSetup {
     /// Present in a `session/new` answer; a load keeps the id it asked for.
     pub session_id: Option<String>,
-    /// `modes.currentModeId`, when the agent reports modes.
-    pub current_mode: Option<String>,
+    /// `modes.currentModeId` or the mode option, including a report that cannot be read.
+    pub current_mode: Option<ModeReport>,
     /// `models.currentModelId`, for the panel's model line.
     pub current_model: Option<String>,
 }
@@ -181,23 +182,42 @@ impl SessionSetup {
     pub fn parse(value: &Value) -> SessionSetup {
         SessionSetup {
             session_id: text_of(value, "sessionId"),
-            current_mode: value
-                .get("modes")
-                .and_then(|m| text_of(m, "currentModeId"))
-                .or_else(|| mode_from_options(value.get("configOptions"))),
+            current_mode: setup_mode(
+                value
+                    .get("modes")
+                    .filter(|m| !m.is_null())
+                    .map(|m| text_of(m, "currentModeId").map_or(ModeReport::Unreadable, ModeReport::Known)),
+                mode_from_options(value.get("configOptions")),
+            ),
             current_model: value.get("models").and_then(|m| text_of(m, "currentModelId")),
         }
     }
 }
 
+/// The mode a session's setup reports, from its `modes` and its config options: a readable report from
+/// either wins over an unreadable one from the other, since an agent may fill only one of the two.
+fn setup_mode(modes: Option<ModeReport>, options: Option<ModeReport>) -> Option<ModeReport> {
+    match (modes, options) {
+        (Some(known @ ModeReport::Known(_)), _) | (_, Some(known @ ModeReport::Known(_))) => Some(known),
+        (modes, options) => modes.or(options),
+    }
+}
+
 /// The current value of the option that holds the mode, in a list of config options. An option is the
 /// mode's when its category or its id says `mode`.
-pub fn mode_from_options(options: Option<&Value>) -> Option<String> {
+pub fn mode_from_options(options: Option<&Value>) -> Option<ModeReport> {
     options?
         .as_array()?
         .iter()
         .find(|o| text_of(o, "category").as_deref() == Some("mode") || text_of(o, "id").as_deref() == Some("mode"))
-        .and_then(|o| text_of(o, "currentValue"))
+        .map(|o| text_of(o, "currentValue").map_or(ModeReport::Unreadable, ModeReport::Known))
+}
+
+/// A reported mode that can be compared with the registration, or one that cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeReport {
+    Known(String),
+    Unreadable,
 }
 
 /// A tool call as an update or a permission request describes it. Every field but the id is optional,
@@ -212,6 +232,8 @@ pub struct ToolCallFields {
     pub raw_output: Option<Value>,
     pub locations: Option<Value>,
     pub content: Vec<Value>,
+    #[serde(default)]
+    pub content_given: bool,
 }
 
 impl ToolCallFields {
@@ -232,11 +254,14 @@ impl ToolCallFields {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
+            // Only a list replaces the earlier content: a `null` (as serializers write an absent field) or any
+            // other value leaves it as it was, as an absent field does.
+            content_given: value.get("content").is_some_and(Value::is_array),
         })
     }
 
     /// Applies a later update about the same call: a field it carries replaces the earlier one, and one it
-    /// leaves out stays. A `content` list that is not empty replaces the earlier list as a whole.
+    /// leaves out stays. A carried `content` list replaces the earlier list as a whole, even when empty.
     pub fn merge(&mut self, update: &ToolCallFields) {
         fn replace<T: Clone>(slot: &mut Option<T>, with: &Option<T>) {
             if with.is_some() {
@@ -249,8 +274,9 @@ impl ToolCallFields {
         replace(&mut self.raw_input, &update.raw_input);
         replace(&mut self.raw_output, &update.raw_output);
         replace(&mut self.locations, &update.locations);
-        if !update.content.is_empty() {
+        if update.content_given {
             self.content.clone_from(&update.content);
+            self.content_given = true;
         }
     }
 
@@ -326,6 +352,8 @@ pub enum Update {
     },
     /// `current_mode_update`.
     Mode(String),
+    /// A mode update that carries no readable mode id.
+    UnreadableMode,
     /// `config_option_update`: the mode, when the options carry one.
     Options {
         mode: Option<String>,
@@ -370,11 +398,11 @@ pub fn parse_update(params: &Value) -> Option<(String, Update)> {
             (Some(used), Some(size)) => Update::Context { used, size },
             _ => Update::Unknown(kind.clone()),
         },
-        "current_mode_update" => {
-            text_of(update, "currentModeId").map_or_else(|| Update::Unknown(kind.clone()), Update::Mode)
-        }
-        "config_option_update" => Update::Options {
-            mode: mode_from_options(update.get("configOptions")),
+        "current_mode_update" => text_of(update, "currentModeId").map_or(Update::UnreadableMode, Update::Mode),
+        "config_option_update" => match mode_from_options(update.get("configOptions")) {
+            Some(ModeReport::Known(mode)) => Update::Options { mode: Some(mode) },
+            Some(ModeReport::Unreadable) => Update::UnreadableMode,
+            None => Update::Options { mode: None },
         },
         "plan" => Update::Ignored("plan"),
         "available_commands_update" => match update.get("availableCommands").and_then(Value::as_array) {
@@ -635,7 +663,71 @@ impl PromptResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_null_modes_falls_back_to_the_mode_option() {
+        let setup = SessionSetup::parse(&json!({
+            "sessionId": "s1",
+            "modes": null,
+            "configOptions": [{"id": "mode", "currentValue": "workspace-write"}]
+        }));
+        assert_eq!(
+            setup.current_mode,
+            Some(ModeReport::Known("workspace-write".to_string()))
+        );
+        // A readable report from either source wins over an unreadable one from the other.
+        let setup = SessionSetup::parse(&json!({
+            "sessionId": "s1",
+            "modes": {"availableModes": []},
+            "configOptions": [{"id": "mode", "currentValue": "workspace-write"}]
+        }));
+        assert_eq!(
+            setup.current_mode,
+            Some(ModeReport::Known("workspace-write".to_string()))
+        );
+        let setup = SessionSetup::parse(&json!({"sessionId": "s1", "modes": {"availableModes": []}}));
+        assert_eq!(setup.current_mode, Some(ModeReport::Unreadable));
+        let setup = SessionSetup::parse(&json!({"sessionId": "s1", "modes": null}));
+        assert_eq!(setup.current_mode, None);
+    }
+
+    #[test]
+    fn a_null_content_is_not_a_carried_list() {
+        let mut kept = ToolCallFields::parse(&json!({
+            "toolCallId": "c1",
+            "content": [{"type": "content", "content": {"type": "text", "text": "working"}}]
+        }))
+        .unwrap();
+        let update =
+            ToolCallFields::parse(&json!({"toolCallId": "c1", "status": "completed", "content": null})).unwrap();
+        kept.merge(&update);
+        assert_eq!(kept.content.len(), 1, "a null content keeps the earlier list");
+    }
+
     use super::*;
+
+    #[test]
+    fn mode_updates_distinguish_unreadable_reports_from_absent_options() {
+        for report in [
+            json!({"sessionUpdate": "current_mode_update"}),
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": 5}),
+            json!({"sessionUpdate": "config_option_update", "configOptions": [
+                {"id": "mode", "currentValue": 5}
+            ]}),
+            json!({"sessionUpdate": "config_option_update", "configOptions": [
+                {"id": "agent-mode", "category": "mode"}
+            ]}),
+        ] {
+            let (_, update) = parse_update(&json!({"sessionId": "s", "update": report})).unwrap();
+            assert_eq!(update, Update::UnreadableMode);
+        }
+        let (_, update) = parse_update(&json!({"sessionId": "s", "update": {
+            "sessionUpdate": "config_option_update", "configOptions": [
+                {"id": "model", "currentValue": 5}
+            ]
+        }}))
+        .unwrap();
+        assert_eq!(update, Update::Options { mode: None });
+    }
 
     #[test]
     fn commands_are_read_bounded_and_cleaned() {

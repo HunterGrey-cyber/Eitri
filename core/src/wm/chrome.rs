@@ -54,17 +54,19 @@ pub struct ChromeModel {
     pub modes: Modes,
     /// The rename entry while it is open, holding this text.
     pub rename: Option<String>,
-    /// The window's y/n while the controller asks one; `None` while none is asked. Where it sits needs the
+    /// The window close flow's or a module kill's y/n; `None` while none is asked. Its `closes_window` flag
+    /// routes the window stage's answer to the close flow. Where it sits needs the
     /// strip's place and the bar's and the label's heights, which only the shell's widgets know, so the shell
     /// places it.
     pub prompt: Option<Prompt>,
 }
 
 /// A y/n the window asks: its text, as plain text, and whether it is the window close's own question.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Prompt {
     pub text: String,
     pub closes_window: bool,
+    pub offers_move: bool,
 }
 
 /// The top bar's text, left to right, and the app name's flash.
@@ -80,7 +82,7 @@ pub struct TopBar {
     pub mark: Option<String>,
     /// Bumped by every refusal: each new value flashes the app name once, so a repeat is a new flash.
     pub flash: u64,
-    /// What the other window of a linked pair holds; nothing fills it yet.
+    /// What the other window of a linked pair holds, from its latest summary.
     pub other: Option<String>,
 }
 
@@ -150,6 +152,8 @@ impl Default for Modes {
 /// have changed; a field is derived again only when one of the revisions it reads has moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Dirty {
+    /// The attached peer and its latest summary.
+    pub peer: u64,
     /// The layout: every change the controller makes, and every change the shell reports.
     pub layout: u64,
     /// The attention of a chat that a chip or a strip entry shows.
@@ -184,9 +188,29 @@ pub struct Derivations {
 /// the tray has chips for (each chat and terminal with all its numbered instances after it).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChromeTitles {
+    /// The declared window title in a plugin's own window, otherwise the project's name.
     pub project: String,
     pub lua: Vec<(ModuleId, String)>,
     pub tray: Vec<ModuleId>,
+}
+
+impl ChromeTitles {
+    pub fn project_name(root: &std::path::Path, declared: Option<&str>) -> String {
+        declared
+            .map(str::to_owned)
+            .unwrap_or_else(|| super::titles::project_display_name(root))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_own_windows_title_is_the_declared_title() {
+    let root = std::path::Path::new("/projects/work");
+    assert_eq!(ChromeTitles::project_name(root, Some("Demo Window")), "Demo Window");
+    assert_eq!(
+        ChromeTitles::project_name(root, None),
+        super::titles::project_display_name(root)
+    );
 }
 
 /// The fields derived from inputs, in the order they are derived.
@@ -211,14 +235,14 @@ const FIELDS: [Field; 6] = [
 
 impl Field {
     /// The revisions the field reads.
-    fn inputs(self, d: &Dirty) -> [u64; 4] {
+    fn inputs(self, d: &Dirty) -> [u64; 5] {
         match self {
-            Field::TopBar => [d.layout, d.workspaces, d.titles, 0],
-            Field::Tray => [d.layout, d.attention, d.titles, d.size],
-            Field::Strips => [d.layout, d.attention, d.titles, 0],
-            Field::FloatBars => [d.layout, d.titles, 0, 0],
-            Field::PrefixStrip => [d.prefix, d.layout, d.workspaces, d.titles],
-            Field::Modes => [d.prefix, d.modes, 0, 0],
+            Field::TopBar => [d.layout, d.workspaces, d.titles, d.peer, 0],
+            Field::Tray => [d.layout, d.attention, d.titles, d.size, 0],
+            Field::Strips => [d.layout, d.attention, d.titles, 0, 0],
+            Field::FloatBars => [d.layout, d.titles, 0, 0, 0],
+            Field::PrefixStrip => [d.prefix, d.layout, d.workspaces, d.titles, d.peer],
+            Field::Modes => [d.prefix, d.modes, 0, 0, 0],
         }
     }
 }
@@ -230,7 +254,7 @@ pub struct ChromeState {
     /// The input revisions each field was last derived from. A window starts with every field as derived from
     /// the inputs' first revisions, so its first derivation waits for an input to move (the first layout batch,
     /// the titles, the prefix) rather than falling on whatever event comes first.
-    stamps: [[u64; 4]; 6],
+    stamps: [[u64; 5]; 6],
     pub(super) derivations: Derivations,
     titles: ChromeTitles,
     /// The tray's chips, in their fixed order.
@@ -247,8 +271,6 @@ pub struct ChromeState {
     coverage_judged: (u64, u64),
     /// The idle that derives what a resize changed, armed by the allocation that saw the new size.
     resize_idle: Option<TimerToken>,
-    /// The window's mode was asked of the host and its answer is not in yet.
-    pub(super) mode_asked: bool,
 }
 
 impl ChromeState {
@@ -441,7 +463,6 @@ pub(super) fn toggle_immersive(w: &mut Window, win: WinId, batch: &mut Batch) {
     let next = w.chrome.modes.mode.next(ModeEvent::ToggleImmersive);
     w.chrome.modes.mode = next;
     w.chrome_state.dirty.modes += 1;
-    w.chrome_state.mode_asked = true;
     touched(w);
     w.say(format!("[window_mode] immersive -> {next:?}"));
     batch.push_effect(HostOp::SetMode {
@@ -527,7 +548,11 @@ fn derive_top_bar(w: &mut Window, layout: &Layout, workspaces: Option<&Workspace
         selection: titles::selection_text(layout, &title),
         mark: titles::mark_text(layout.mark(), &title),
         flash: w.chrome.top_bar.flash,
-        other: w.chrome.top_bar.other.clone(),
+        other: w
+            .peer
+            .as_ref()
+            .and_then(|p| p.summary())
+            .map(|s| crate::window_link::summary::marks(super::moves::other_name(w), s)),
     };
     w.chrome_state.stamp(Field::TopBar);
     w.chrome_state.derivations.top_bar += 1;
@@ -626,8 +651,8 @@ fn derive_float_bars(w: &mut Window, arrangement: &Arrangement) -> bool {
 }
 
 /// The prefix strip as the prefix's wait reads: the digits and their modules, the workspace chooser's list, or
-/// the module keys (those that reach each module now while armed, the fixed ones after a split key) and the
-/// verbs. A window with no keymap yet has no prefix to wait with.
+/// the module keys (those that reach each module now while armed, the fixed ones after a split key or the hide
+/// key) and the verbs. A window with no keymap yet has no prefix to wait with.
 fn derive_prefix_strip(
     w: &mut Window,
     layout: &Layout,
@@ -644,15 +669,23 @@ fn derive_prefix_strip(
             let Some(workspaces) = workspaces else {
                 return false;
             };
-            Some(prefix_strip::workspace_pieces(
-                workspaces.order(),
-                workspaces.current(),
-                deleting,
-            ))
+            let mut order = workspaces.order().to_vec();
+            if !deleting {
+                if let Some(summary) = w.peer.as_ref().and_then(|p| p.summary()) {
+                    order.extend(
+                        summary
+                            .workspaces
+                            .iter()
+                            .map(|name| format!("{}:{name}", super::moves::other_name(w))),
+                    );
+                }
+            }
+            Some(prefix_strip::workspace_pieces(&order, workspaces.current(), deleting))
         }
-        Waiting::Command | Waiting::Module(_) => keys.map(|(keymap, module_keys)| {
+        Waiting::Command | Waiting::Module(_) | Waiting::Hide => keys.map(|(keymap, module_keys)| {
             let entries = match waiting {
                 Waiting::Command => crate::layout::strip_direct(module_keys, keymap, layout),
+                Waiting::Hide => crate::layout::strip_for_hide(module_keys, layout),
                 _ => crate::layout::strip(module_keys, layout),
             };
             prefix_strip::strip_pieces(waiting, &entries, &title(layout.focus()), &title, &keymap.strip_verbs())

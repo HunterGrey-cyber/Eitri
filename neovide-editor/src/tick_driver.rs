@@ -72,6 +72,7 @@ pub(crate) type Service = Rc<dyn Fn(&GLArea, ServiceSource) -> bool>;
 pub(crate) struct TickDriver {
     active: Cell<bool>,
     tick_id: RefCell<Option<TickCallbackId>>,
+    service_idle: RefCell<Option<glib::SourceId>>,
     area: RefCell<Option<glib::WeakRef<GLArea>>>,
     service: RefCell<Option<Service>>,
     /// Set when the watch cannot be had: the tick then stays on, as it did before this driver,
@@ -101,6 +102,38 @@ impl TickDriver {
 
     /// Registers the tick callback if it is not registered. Never runs the service synchronously.
     pub(crate) fn kick(self: &Rc<Self>) {
+        if self
+            .area()
+            .as_ref()
+            .and_then(crate::subsurface_on)
+            .is_some_and(|pane| pane.uses_pacing())
+            && !self.always_on.get()
+        {
+            if let Some(id) = self.tick_id.borrow_mut().take() {
+                id.remove();
+            }
+            if self.service_idle.borrow().is_some() {
+                return;
+            }
+            self.active.set(true);
+            let driver = Rc::downgrade(self);
+            *self.service_idle.borrow_mut() = Some(glib::idle_add_local_full(glib::Priority::from(120), move || {
+                if let Some(driver) = driver.upgrade() {
+                    driver.service_idle.borrow_mut().take();
+                    driver.active.set(false);
+                    let service = driver.service.borrow().clone();
+                    if let (Some(area), Some(service)) = (driver.area(), service) {
+                        service(&area, ServiceSource::Tick);
+                    }
+                }
+                glib::ControlFlow::Break
+            }));
+            return;
+        }
+        if let Some(id) = self.service_idle.borrow_mut().take() {
+            id.remove();
+            self.active.set(false);
+        }
         if self.active.get() {
             return;
         }
@@ -132,6 +165,9 @@ impl TickDriver {
             return;
         }
         if let Some(id) = self.tick_id.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.service_idle.borrow_mut().take() {
             id.remove();
         }
         self.active.set(false);

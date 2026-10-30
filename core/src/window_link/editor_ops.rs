@@ -27,11 +27,25 @@ pub trait OpContext {
     fn project_root(&self) -> &Path;
     /// Whether window 2 holds the chat of `session` (window 1's `session -> holder` map).
     fn session_in_window2(&self, session: &str) -> bool;
-    /// The canonical work tree of a plugin whose page window 2 holds, from window 1's own plugin table; `None`
+    /// The named canonical roots of a plugin whose page window 2 holds, from window 1's own table; `None`
     /// otherwise.
-    fn plugin_tree_in_window2(&self, plugin: &str) -> Option<PathBuf>;
+    fn plugin_roots_in_window2(&self, plugin: &str) -> Option<BTreeMap<String, PathBuf>>;
+    /// Follow installation data from this window's registration and its own feed socket.
+    fn plugin_follow(&self, _plugin: &str) -> Option<FollowConfig> {
+        None
+    }
     /// The paths window 1 recorded as drawn for window 2.
     fn drawn_for_window2(&self) -> Vec<PathBuf>;
+}
+
+/// Values read from window 1's plugin registration, never supplied by a linked page.
+#[derive(Clone)]
+pub struct FollowConfig {
+    pub socket: PathBuf,
+    pub scratch: Option<PathBuf>,
+    pub filetypes: Vec<String>,
+    pub commands: Vec<(String, &'static str)>,
+    pub auto: bool,
 }
 
 /// What an accepted op became.
@@ -129,12 +143,16 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
         }
         EditorOp::PluginOpen {
             plugin,
+            root,
             path,
             line,
             col,
         } => {
-            let tree = held_plugin(ctx, &plugin)?;
-            let file = plugin_file(&plugin, &tree, &path)?;
+            let roots = held_plugin_roots(ctx, &plugin)?;
+            let tree = roots
+                .get(&root)
+                .ok_or_else(|| OpRefused::Outside(format!("plugin {plugin} has no declared root named {root}")))?;
+            let file = plugin_file(&plugin, tree, &path)?;
             Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, col)))
         }
         // The op names only the plugin; the owner the editor records and the root it applies to are window 1's
@@ -153,6 +171,67 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                 inlay_hints,
             )))
         }
+        EditorOp::PluginInstall { plugin } => {
+            held_plugin(ctx, &plugin)?;
+            let config = ctx
+                .plugin_follow(&plugin)
+                .ok_or_else(|| OpRefused::PluginNotHeld(plugin.clone()))?;
+            Ok(Dispatch::Rpc(crate::plugin::editor::follow_install(
+                rpc,
+                &crate::plugin::editor::FollowInstall {
+                    owner: &plugin,
+                    socket: &config.socket,
+                    scratch_dir: config.scratch.as_deref(),
+                    filetypes: &config.filetypes,
+                    commands: &config.commands,
+                    auto: config.auto,
+                },
+            )))
+        }
+        EditorOp::PluginFollow { plugin, on } => {
+            held_plugin(ctx, &plugin)?;
+            Ok(Dispatch::Rpc(crate::plugin::editor::follow_on(rpc, &plugin, on)))
+        }
+        EditorOp::PluginText { plugin, buf } => {
+            held_plugin(ctx, &plugin)?;
+            // The bounds window 1 holds a following page of its own to: window 2's request names none.
+            Ok(Dispatch::Rpc(crate::plugin::editor::follow_text(
+                rpc,
+                &plugin,
+                buf,
+                crate::plugin::follow::MAX_TEXT_BYTES,
+                crate::plugin::follow::MAX_TEXT_LINES,
+            )))
+        }
+        EditorOp::PluginReveal {
+            plugin,
+            buf,
+            line,
+            token,
+        } => {
+            held_plugin(ctx, &plugin)?;
+            if line == 0 {
+                return Err(OpRefused::Outside("line starts at one".into()));
+            }
+            Ok(Dispatch::Rpc(crate::plugin::editor::follow_reveal(
+                rpc, &plugin, buf, line, token,
+            )))
+        }
+        EditorOp::PluginJump { plugin, buf, line, col } => {
+            held_plugin(ctx, &plugin)?;
+            if line == 0 {
+                return Err(OpRefused::Outside("line starts at one".into()));
+            }
+            Ok(Dispatch::Rpc(crate::plugin::editor::follow_jump(
+                rpc, &plugin, buf, line, col,
+            )))
+        }
+        EditorOp::PluginOpenLink { plugin, path, line } => {
+            held_plugin(ctx, &plugin)?;
+            let roots = Roots::new(BTreeMap::from([("project".into(), ctx.project_root().to_owned())]));
+            let file = file_inside(&roots, &path).map_err(|e| OpRefused::Outside(e.message(&path)))?;
+            Ok(Dispatch::Rpc(crate::plugin::editor::open(rpc, &file, line, None)))
+        }
         EditorOp::PluginAssistClear { plugin } => {
             held_plugin(ctx, &plugin)?;
             Ok(Dispatch::Rpc(crate::plugin::editor::assist_clear(rpc, &plugin)))
@@ -169,7 +248,14 @@ fn held_session(ctx: &dyn OpContext, session: &str) -> Result<(), OpRefused> {
 }
 
 fn held_plugin(ctx: &dyn OpContext, plugin: &str) -> Result<PathBuf, OpRefused> {
-    ctx.plugin_tree_in_window2(plugin)
+    held_plugin_roots(ctx, plugin)?
+        .into_values()
+        .next()
+        .ok_or_else(|| OpRefused::PluginNotHeld(plugin.to_owned()))
+}
+
+fn held_plugin_roots(ctx: &dyn OpContext, plugin: &str) -> Result<BTreeMap<String, PathBuf>, OpRefused> {
+    ctx.plugin_roots_in_window2(plugin)
         .ok_or_else(|| OpRefused::PluginNotHeld(plugin.to_owned()))
 }
 
@@ -245,7 +331,7 @@ mod tests {
     struct Ctx {
         root: PathBuf,
         sessions: Vec<String>,
-        plugins: BTreeMap<String, PathBuf>,
+        plugins: BTreeMap<String, BTreeMap<String, PathBuf>>,
         drawn: Vec<PathBuf>,
     }
 
@@ -256,8 +342,17 @@ mod tests {
         fn session_in_window2(&self, session: &str) -> bool {
             self.sessions.iter().any(|s| s == session)
         }
-        fn plugin_tree_in_window2(&self, plugin: &str) -> Option<PathBuf> {
+        fn plugin_roots_in_window2(&self, plugin: &str) -> Option<BTreeMap<String, PathBuf>> {
             self.plugins.get(plugin).cloned()
+        }
+        fn plugin_follow(&self, _plugin: &str) -> Option<FollowConfig> {
+            Some(FollowConfig {
+                socket: self.root.join("feed"),
+                scratch: None,
+                filetypes: vec!["markdown".into()],
+                commands: vec![("MarkdownPreview".into(), "toggle")],
+                auto: true,
+            })
         }
         fn drawn_for_window2(&self) -> Vec<PathBuf> {
             self.drawn.clone()
@@ -295,13 +390,115 @@ mod tests {
         symlink("real.rs", tree.join("alias.rs")).unwrap();
         symlink(base.join("outside/secret.rs"), tree.join("leak.rs")).unwrap();
         symlink("/etc", tree.join("dir")).unwrap();
+        let second_tree = root.join("work/second");
+        std::fs::create_dir_all(second_tree.join("src")).unwrap();
+        std::fs::write(second_tree.join("src/lib.rs"), "fn second() {}\n").unwrap();
+        symlink(tree.join("real.rs"), second_tree.join("leak.rs")).unwrap();
         let ctx = Ctx {
             root: root.clone(),
             sessions: vec!["s-held".into()],
-            plugins: BTreeMap::from([("snotra".to_string(), tree.clone())]),
+            plugins: BTreeMap::from([(
+                "snotra".to_string(),
+                BTreeMap::from([("a".into(), tree.clone()), ("b".into(), second_tree)]),
+            )]),
             drawn: vec![],
         };
         Fixture { _dir: dir, ctx, tree }
+    }
+
+    #[test]
+    fn window_2_has_no_op_that_takes_the_follow_snippet_down() {
+        // The snippet's autocmds and commands (`:MarkdownPreview`) are window 1's: a page ending in window 2 turns
+        // its following off and leaves them.
+        let teardown = serde_json::json!({ "op": "plugin_teardown", "plugin": "snotra" });
+        assert!(serde_json::from_value::<EditorOp>(teardown).is_err());
+    }
+
+    #[test]
+    fn the_markdown_previews_host_calls_from_window_2_go_through_typed_editor_ops() {
+        let f = fixture("markdown-typed");
+        let rpc = Recorder::default();
+        let ops = [
+            EditorOp::PluginText {
+                plugin: "snotra".into(),
+                buf: 3,
+            },
+            EditorOp::PluginReveal {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                token: 9,
+            },
+            EditorOp::PluginJump {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                col: 1,
+            },
+            EditorOp::PluginFollow {
+                plugin: "snotra".into(),
+                on: true,
+            },
+            EditorOp::PluginInstall {
+                plugin: "snotra".into(),
+            },
+            EditorOp::PluginOpenLink {
+                plugin: "snotra".into(),
+                path: f.ctx.root.join("src/a.rs").to_str().unwrap().into(),
+                line: Some(2),
+            },
+        ];
+        for op in ops {
+            let name = op.name();
+            let value = serde_json::to_value(&op).unwrap();
+            assert_eq!(value["op"], name);
+            let back = serde_json::from_value(value).unwrap();
+            assert!(matches!(dispatch(1, back, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        }
+        let calls = rpc.0.borrow();
+        assert_eq!(calls.len(), 6);
+        assert!(calls[..5]
+            .iter()
+            .all(|(code, _)| std::ptr::eq(*code, crate::plugin::editor::PLUGIN_FOLLOW_LUA)));
+        assert!(std::ptr::eq(calls[5].0, crate::plugin::editor::PLUGIN_OPEN_LUA));
+        assert_eq!(
+            calls[0].1[1]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("max_lines"))
+                .unwrap()
+                .1
+                .as_u64(),
+            Some(50_000)
+        );
+        drop(calls);
+        for op in [
+            EditorOp::PluginText {
+                plugin: "absent".into(),
+                buf: 3,
+            },
+            EditorOp::PluginReveal {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 0,
+                token: 1,
+            },
+            EditorOp::PluginOpenLink {
+                plugin: "snotra".into(),
+                path: "/etc/passwd".into(),
+                line: None,
+            },
+        ] {
+            assert!(dispatch(1, op, &f.ctx, &rpc).is_err());
+        }
+        assert_eq!(rpc.0.borrow().len(), 6, "a refused call never reaches nvim");
+        for op in [
+            r#"{"op":"plugin_text","plugin":"snotra","buf":3,"lua":"return 1"}"#,
+            r#"{"op":"plugin_install","plugin":"snotra","socket":"/foreign"}"#,
+        ] {
+            assert!(serde_json::from_str::<EditorOp>(op).is_err());
+        }
     }
 
     fn meta(session: &str) -> WireMeta {
@@ -351,6 +548,7 @@ mod tests {
     fn plugin_open(plugin: &str, path: &str) -> EditorOp {
         EditorOp::PluginOpen {
             plugin: plugin.into(),
+            root: "a".into(),
             path: path.into(),
             line: Some(2),
             col: None,
@@ -373,6 +571,61 @@ mod tests {
             .unwrap()
             .1
             .clone()
+    }
+
+    #[test]
+    fn plugin_open_uses_the_named_root_even_when_the_relative_path_exists_in_both() {
+        let f = fixture("named-root");
+        let rpc = Recorder::default();
+        let second = &f.ctx.plugins["snotra"]["b"];
+        for in_first in [false, true] {
+            if in_first {
+                std::fs::create_dir_all(f.tree.join("src")).unwrap();
+                std::fs::write(f.tree.join("src/lib.rs"), "fn first() {}\n").unwrap();
+            }
+            let op = EditorOp::PluginOpen {
+                plugin: "snotra".into(),
+                root: "b".into(),
+                path: "src/lib.rs".into(),
+                line: Some(2),
+                col: None,
+            };
+            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert_eq!(
+                opened_path(&rpc.calls().last().unwrap().1),
+                Value::Binary(
+                    std::fs::canonicalize(second.join("src/lib.rs"))
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_open_refuses_unknown_roots_and_escapes_from_the_named_root() {
+        let f = fixture("named-root-outside");
+        let rpc = Recorder::default();
+        for (root, path) in [("unknown", "src/lib.rs"), ("b", "../snotra/real.rs"), ("b", "leak.rs")] {
+            let op = EditorOp::PluginOpen {
+                plugin: "snotra".into(),
+                root: root.into(),
+                path: path.into(),
+                line: None,
+                col: None,
+            };
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+            if root == "unknown" {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no declared root named unknown"));
+            }
+        }
+        assert!(rpc.calls().is_empty());
     }
 
     #[test]

@@ -103,10 +103,8 @@ describe("the band degrades by priority", () => {
   });
 });
 
-/** A WebKit zoom of 1.5 measured the panel at
- *  520 logical px = 346 CSS px, which comes out to a 47-column budget here (47 * 7.2 = 338.4, the
- *  same char width every other test in this file already uses) -- the exact case that used to lose
- *  a y/n prompt's own `(y/n)`, and the typing-guard flash's own explanation, to `bandLayout`'s old `cut()`. */
+/** A WebKit zoom of 1.5 measures 520 logical px as 346 CSS px: a 47-column budget at 7.2 px per
+ *  character. A y/n prompt must keep its own `(y/n)`, and a typing-guard flash its explanation. */
 describe("a y/n prompt or a flash is never truncated", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
@@ -438,8 +436,8 @@ describe("turn ending", () => {
   });
   it("outlasts the model, usage and context, the cards and the queue, and is never in a y/n prompt's band", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), usage: { text: "1k tok $0.01", title: "" } };
-    // 255, not 240, since 2026-10-15: INSERT is a letter longer than INPUT was, and the mode block's
-    // separator arrow takes a cell of its own.
+    // 255, not 240: INSERT is a letter longer than INPUT, and the mode block's separator arrow takes
+    // a cell of its own.
     const narrow = ids(255, facts);
     expect(narrow).toContain("ending");
     expect(narrow).not.toContain("model");

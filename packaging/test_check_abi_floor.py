@@ -31,10 +31,8 @@ _FIXTURES = os.path.join(_HERE, "tests", "fixtures", "abi")
 
 _spec = importlib.util.spec_from_file_location("check_abi_floor", os.path.join(_HERE, "check-abi-floor.py"))
 abi = importlib.util.module_from_spec(_spec)
-# Registered before exec: check-abi-floor.py's dataclasses (with `from __future__ import
-# annotations`) resolve their field types against `sys.modules[cls.__module__]` at class-creation
-# time, which is empty/absent otherwise -- collect-licenses.py never hit this because it has no
-# dataclass.
+# Register before exec: dataclasses with postponed annotations resolve field types through
+# sys.modules[cls.__module__] during class creation; without registration that entry is absent.
 sys.modules[_spec.name] = abi
 _spec.loader.exec_module(abi)
 

@@ -1,11 +1,14 @@
 //! The runner's rules around every action, from a key, a Lua call or a panel tab verb: which family an action
-//! belongs to and whether that family's verbs are decided here yet, the container selection's gate and the
-//! float's, and the words of their refusals.
+//! belongs to, the container selection's gate and the float's, and the words of their refusals.
 
+pub mod chat;
 pub mod chrome;
+pub mod floats;
 pub mod focus;
 pub mod keys;
 pub mod modules;
+pub mod tabs;
+pub mod text_size;
 pub mod tiling;
 pub mod windows;
 pub mod workspaces;
@@ -14,7 +17,7 @@ use crate::keymap::action::{Action, FloatRule, SelectionRule};
 use crate::keymap::Keymap;
 use crate::layout::Selection;
 
-/// The families of verbs, each of which moves into the controller as a whole.
+/// The families of verbs, each decided by its own part of the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     /// What changes the tiled tree, the mark, the zoom or the selection.
@@ -74,6 +77,7 @@ pub fn family(action: &Action) -> Family {
         Action::WindowImmersive => Family::Chrome,
         Action::Module(_)
         | Action::ModuleHide
+        | Action::ModuleHideByKey
         | Action::ModuleKill
         | Action::InstanceNew { .. }
         | Action::Split { .. } => Family::Modules,
@@ -105,20 +109,6 @@ pub fn family_of(action: &Action, keys_on_a_float: bool, keys_on_the_editor: boo
         (Action::Move(_), Family::Tiling) if keys_on_a_float => Family::Floats,
         (Action::ModuleKill, Family::Modules) if keys_on_the_editor => Family::Close,
         (_, family) => family,
-    }
-}
-
-/// Whether the controller decides `family`'s verbs itself; the others go to the shell as its verb.
-pub fn moved(family: Family) -> bool {
-    match family {
-        Family::Tiling
-        | Family::Focus
-        | Family::Keys
-        | Family::Chrome
-        | Family::Modules
-        | Family::Workspaces
-        | Family::Windows => true,
-        Family::Floats | Family::Panel | Family::Close | Family::TextSize => false,
     }
 }
 

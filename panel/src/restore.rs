@@ -18,7 +18,8 @@ pub(super) fn restore_settled(state: &AgentPanelState) -> bool {
     let on_offer = restore_is_on_offer(state)
         || (state.restore_policy == RestorePolicy::Auto
             && state.restore_source.is_some()
-            && !state.ready(ViewId::BASE));
+            && !state.ready(ViewId::BASE))
+        || (state.restore_policy == RestorePolicy::Auto && (state.launch_restore_held || state.launch_restore_owed));
     !on_offer && !state.tabs.restore_question_open() && !restore_waits_for_trust(state) && state.restore_run.is_none()
 }
 
@@ -309,13 +310,27 @@ pub(super) fn restore_at_launch(state: &mut AgentPanelState, screen: &Screen, ou
     }
 }
 
-/// The state half of [`restore_at_launch`]: `None` when the launch restores nothing.
+/// The state half of [`restore_at_launch`]: `None` when the launch restores nothing, or is held
+/// ([`AgentPanelHandle::hold_launch_restore`]) and is owed until the hold is let go.
 pub(super) fn launch_restore(state: &mut AgentPanelState) -> Option<RestoreResult> {
+    if state.launch_restore_held {
+        state.launch_restore_owed = true;
+        return None;
+    }
+    state.launch_restore_owed = false;
     if state.restore_policy != RestorePolicy::Auto || state.restore_source.is_none() {
         return None;
     }
     let from = state.tabs.active();
     Some(ask_for_restore(state, from, RestoreAsk::Launch))
+}
+
+/// The launch restore the base page's `ready` owed while it was held, once the hold is let go: run on the
+/// tick after.
+pub(super) fn restore_once_released(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    if state.launch_restore_owed && !state.launch_restore_held && state.ready(ViewId::BASE) {
+        restore_at_launch(state, screen, out);
+    }
 }
 
 /// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed. A change is
@@ -700,6 +715,46 @@ mod tests {
         );
         stepped(&state, finish_restore);
         assert_eq!(toasts.borrow().len(), 1, "said once");
+    }
+
+    /// Window 1 starting window 2 again holds the automatic restore: the saved tabs of a window 2 that does not
+    /// come back are given while it is held, and both windows' tabs return in the one restore a window gets.
+    #[test]
+    fn an_automatic_restore_held_for_window_2_runs_on_the_tick_after_it_is_let_go() {
+        let (state, _dir) = restore_panel("restore-held", &[("s-1", None, Auto)], &["s-1"]);
+        {
+            let mut s = state.borrow_mut();
+            s.restore_policy = RestorePolicy::Auto;
+            s.page_mut(ViewId::BASE).document_ready = true;
+        }
+        let handle = AgentPanelHandle::over(state.clone(), None);
+        let tick = || {
+            handle.run_seen(|s, screen, out| {
+                tick_collect(s, screen, out);
+            })
+        };
+        handle.hold_launch_restore();
+        // The base page's `ready` while window 2 may still come back.
+        assert!(launch_restore(&mut state.borrow_mut()).is_none());
+        assert!(
+            state.borrow().restore_source.is_some(),
+            "nothing is restored while held"
+        );
+        assert!(!restore_settled(&state.borrow()), "a held restore is not settled");
+        tick();
+        assert!(
+            state.borrow().restore_source.is_some(),
+            "a tick while held restores nothing"
+        );
+
+        handle.release_launch_restore();
+        tick();
+        assert!(
+            state.borrow().restore_source.is_none(),
+            "the launch restore has its go on the tick after the hold is let go"
+        );
+        tick();
+        assert!(!state.borrow().launch_restore_owed, "and only that once");
     }
 
     #[test]

@@ -55,6 +55,7 @@ legacy-backend = ["eitri-core/legacy-backend", "eitri-panel/legacy-backend"]
 # The grid probe (`src/grid_probe/`): a mode of the product binary that runs scripted operations on the
 # real module grid inside the sandbox and logs what the hosts do. Never in a release or a default build.
 probe = []
+editor-fault-injection = ["neovide-editor/fault-injection"]
 
 [dev-dependencies]
 # `tests/web_bundle_freshness.rs` `include!`s `build_web.rs` (the way `build_info_lockfile_parsing.rs`
@@ -97,6 +98,10 @@ name = "web_bundle_freshness"
 [[test]]
 name = "end_signals"
 
+# The shell only carries out controller decisions; these source scans run without a display.
+[[test]]
+name = "core_wm_acceptance"
+
 # Guards the rule that every test opening a display starts its own
 # display (2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that
 # opens a display without `tests/support/own_x_server.rs`. A plain #[test] harness that opens nothing,
@@ -126,6 +131,11 @@ harness = false
 # the y/n prompt placed as if it had no height, half below the top bar.
 [[test]]
 name = "close_prompt_placement"
+harness = false
+
+# GTK owns the main thread; the pixel checks run only on their own Xvfb with `-- --ignored`.
+[[test]]
+name = "editor_hole_pixels"
 harness = false
 
 # A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own

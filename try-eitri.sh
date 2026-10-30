@@ -32,12 +32,9 @@ VERDANDI="${EITRI_VERDANDI_CHECKOUT:-$HOME/src/verdandi}"
 
 echo "project     $PROJECT"
 echo "backend     $BACKEND"
-# This used to export EITRI_VERDANDI_CHECKOUT unconditionally, defaulted or not.
-# `resolve_sidecar_program` checks an explicit checkout (step 2) before a packaged sibling or a
-# per-user built sidecar (steps 3-4), and returns its error outright when that checkout is set but
-# unusable -- so a stranger with no ~/src/verdandi (the public tree's default) got a checkout error
-# even where `eitri setup` had already built a usable sidecar. Export it only when the caller
-# actually asked (the variable was set) or the default checkout is really there.
+# An explicit checkout is tried before a packaged sibling or per-user sidecar, and an unusable
+# one stops resolution. Export it only when supplied or when the default checkout exists, so a
+# missing development checkout does not mask a usable sidecar from `eitri setup`.
 VERDANDI_RESOLVED=0
 if [[ "$BACKEND" == sidecar ]]; then
 	if [[ -n "${EITRI_VERDANDI_CHECKOUT-}" || -d "$VERDANDI" ]]; then

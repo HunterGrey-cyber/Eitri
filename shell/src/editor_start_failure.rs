@@ -1,10 +1,10 @@
 //! Explains an embedded nvim startup failure in the editor's own area, such as nvim missing
 //! from `PATH` or being older than the pinned fork supports.
-//! `NeovideEditorPane::on_start_failed` delivers the message once, asynchronously, after the
-//! pane's widget is already in the module grid. Install the hidden label when adding the
-//! editor module so the callback can show the cause, minimum version, and where to get nvim.
+//! `NeovideEditorPane::on_start_failed` delivers the message once per failed launch,
+//! asynchronously, after the pane's widget is already in the module grid. Install the hidden
+//! label when adding the editor module so the callback can show the cause, minimum version,
+//! and where to get nvim. A later successful launch hides the label again ([`hide`]).
 
-use eitri_core::layout::ModuleId;
 use gtk4::glib;
 use gtk4::prelude::*;
 
@@ -53,36 +53,8 @@ pub(crate) fn show(label: &gtk4::Label, message: &str) {
     label.set_visible(true);
 }
 
-/// Chooses where the keys go after nvim fails to start. Construction finishes asynchronously,
-/// after the window is shown and initial focus is chosen, so the failed editor may hold
-/// focus when the failure arrives and must give it up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeysAfterFailure {
-    /// The keys were elsewhere, or nowhere: they stay.
-    Stay,
-    /// The editor held them: they move to the chat, shown if it was hidden.
-    ToChat,
-}
-
-pub(crate) fn keys_after_failure(focused: Option<&ModuleId>) -> KeysAfterFailure {
-    if focused == Some(&ModuleId::editor()) {
-        KeysAfterFailure::ToChat
-    } else {
-        KeysAfterFailure::Stay
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The focus move (one of the mutations tried on this flow): the keys leave only an
-    /// editor that held them.
-    #[test]
-    fn the_keys_leave_a_failed_editor_only_if_it_held_them() {
-        assert_eq!(keys_after_failure(Some(&ModuleId::editor())), KeysAfterFailure::ToChat);
-        assert_eq!(keys_after_failure(Some(&ModuleId::agent())), KeysAfterFailure::Stay);
-        assert_eq!(keys_after_failure(Some(&ModuleId::terminal())), KeysAfterFailure::Stay);
-        assert_eq!(keys_after_failure(None), KeysAfterFailure::Stay);
-    }
+/// Hides `label` again once a later launch of the pane gave it a running nvim, which the failure
+/// message no longer describes.
+pub(crate) fn hide(label: &gtk4::Label) {
+    label.set_visible(false);
 }

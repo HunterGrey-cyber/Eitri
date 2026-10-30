@@ -6,7 +6,7 @@
 //! only in the grid's `dispose`.
 //!
 //! Each piece of chrome keeps drawing the same float for as long as that float stays on screen
-//! ([`chrome_owners`]): a press raises the float under the pointer, and if the chrome followed the
+//! ([`eitri_core::wm::grid::chrome_owners`]): a press raises the float under the pointer, and if the chrome followed the
 //! z-order instead, the bar being dragged would start drawing another float halfway through its own
 //! drag.
 //!
@@ -15,13 +15,15 @@
 //! those five characters, not as bold.
 
 use std::cell::RefCell;
-use std::ops::Range;
 use std::rc::Rc;
 
 use gtk4::glib;
 use gtk4::prelude::*;
 
 use eitri_core::layout::{FloatSpot, ModuleId, Rect};
+use eitri_core::wm::PointerTarget;
+
+use super::DragPhase;
 
 /// The bar's CSS node name. `theme::gtk_css` styles it, and its text as `floatbar > label`.
 pub(crate) const BAR_CSS_NAME: &str = "floatbar";
@@ -29,22 +31,16 @@ pub(crate) const BAR_CSS_NAME: &str = "floatbar";
 /// The grip's CSS node name.
 pub(crate) const GRIP_CSS_NAME: &str = "floatgrip";
 
-/// The grip's side in pixels.
-pub(super) const GRIP_PX: i32 = 12;
-
 /// The float a piece of chrome drew in the last allocation, and that float's whole rectangle.
 type Drawn = Rc<RefCell<Option<(ModuleId, Rect)>>>;
 
-/// What a drag step does with the float it began on and its next rectangle.
-type DragHook = Rc<dyn Fn(&ModuleId, Rect)>;
+/// Reports a native gesture's address, phase and unmodified coordinates to the grid's posting sink.
+type PointerPost = Rc<dyn Fn(PointerTarget, DragPhase, f64, f64, u32)>;
 
-/// What a press and a drag on a float's chrome do. Both are the grid's: it raises and restacks, and it
-/// stores the dragged rectangle in the layout.
+/// Float chrome reports pointer events; the controller decides focus, stacking and geometry.
+#[derive(Clone)]
 pub(super) struct ChromeHooks {
-    /// A primary press on the bar or the grip, with the float it draws.
-    pub(super) press: Rc<dyn Fn(&ModuleId)>,
-    /// A drag's next rectangle for the float it began on.
-    pub(super) drag: DragHook,
+    pub(super) post: PointerPost,
 }
 
 /// One float's bar and grip, pooled by the grid.
@@ -52,9 +48,11 @@ pub(super) struct FloatChrome {
     pub(super) bar: gtk4::Box,
     label: gtk4::Label,
     pub(super) grip: gtk4::Box,
-    /// The float this chrome drew in the last allocation, and that float's whole rectangle: what a
-    /// drag reads as "the rectangle as allocated now".
+    /// The float this chrome drew in the last allocation and its whole rectangle, for drawing and the probe.
     current: Drawn,
+    hooks: ChromeHooks,
+    /// Controllers bound to the module this chrome draws; a reused piece gets new event addresses.
+    gestures: RefCell<Option<(gtk4::GestureDrag, gtk4::GestureDrag)>>,
 }
 
 impl FloatChrome {
@@ -84,20 +82,34 @@ impl FloatChrome {
         grip.set_child_visible(false);
 
         let current: Drawn = Rc::new(RefCell::new(None));
-        bar.add_controller(drag_gesture(&current, hooks, false));
-        grip.add_controller(drag_gesture(&current, hooks, true));
         FloatChrome {
             bar,
             label,
             grip,
             current,
+            hooks: hooks.clone(),
+            gestures: RefCell::new(None),
         }
     }
 
-    /// Names `spot`'s module with `label`, records the rectangle a drag starts from, and shows the bar
-    /// and the grip. The caller allocates them.
+    /// Names `spot`'s module with `label`, records what is drawn, and shows its chrome. The caller allocates it.
     pub(super) fn show(&self, spot: &FloatSpot, label: &dyn Fn(&ModuleId) -> String) {
         set_bar_text(&self.label, &label(&spot.id));
+        let owner_changed = self.current.borrow().as_ref().is_none_or(|(id, _)| *id != spot.id);
+        if owner_changed {
+            // Event addresses stay with the drawn module. Reusing chrome cancels its old controllers instead
+            // of redirecting a sequence to the next module that happens to occupy the pool slot.
+            let old = self.gestures.borrow_mut().take();
+            if let Some((bar, grip)) = old {
+                self.bar.remove_controller(&bar);
+                self.grip.remove_controller(&grip);
+            }
+            let bar = drag_gesture(PointerTarget::FloatBar(spot.id.clone()), &self.hooks);
+            let grip = drag_gesture(PointerTarget::FloatGrip(spot.id.clone()), &self.hooks);
+            self.bar.add_controller(bar.clone());
+            self.grip.add_controller(grip.clone());
+            *self.gestures.borrow_mut() = Some((bar, grip));
+        }
         *self.current.borrow_mut() = Some((spot.id.clone(), spot.rect));
         self.bar.set_child_visible(true);
         self.grip.set_child_visible(true);
@@ -120,48 +132,37 @@ impl FloatChrome {
     }
 }
 
-/// The drag on a bar (`grip: false`) or a grip. The press that begins it raises the float and runs the
-/// bar-press hooks; each update stores the rectangle as allocated now plus the drag's offset
-/// (`super::dragged_float_rect`), for the float the drag began on only: if this chrome draws another
-/// float by then, the drag stops moving anything.
-fn drag_gesture(current: &Drawn, hooks: &ChromeHooks, grip: bool) -> gtk4::GestureDrag {
+/// A gesture's address is the module its chrome draws. All phases keep that address, even if the pool reuses
+/// the chrome; only the controller remembers a drag or computes geometry from its offsets.
+fn drag_gesture(on: PointerTarget, hooks: &ChromeHooks) -> gtk4::GestureDrag {
     let drag = gtk4::GestureDrag::new();
     drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
-    let dragging: Rc<RefCell<Option<ModuleId>>> = Rc::new(RefCell::new(None));
     {
-        let current = current.clone();
-        let dragging = dragging.clone();
-        let press = hooks.press.clone();
-        drag.connect_drag_begin(move |gesture, _, _| {
-            // Claimed: the press is the float's, and nothing under it acts on it as well.
+        let on = on.clone();
+        let post = hooks.post.clone();
+        drag.connect_drag_begin(move |gesture, x, y| {
+            // The chrome owns this press; no module underneath it should act on it too.
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            // Cloned out: the hooks raise and restack, and give the module the keys.
-            let id = current.borrow().as_ref().map(|(id, _)| id.clone());
-            *dragging.borrow_mut() = id.clone();
-            if let Some(id) = id {
-                press(&id);
-            }
+            post(on.clone(), DragPhase::Begin, x, y, gesture.current_button());
         });
     }
     {
-        let current = current.clone();
-        let dragging = dragging.clone();
-        let moved = hooks.drag.clone();
-        drag.connect_drag_update(move |_, dx, dy| {
-            let Some(grabbed) = dragging.borrow().clone() else {
-                return;
-            };
-            let Some((drawn, now)) = current.borrow().clone() else {
-                return;
-            };
-            if drawn != grabbed {
-                return;
-            }
-            moved(&grabbed, super::dragged_float_rect(now, dx, dy, grip));
+        let on = on.clone();
+        let post = hooks.post.clone();
+        drag.connect_drag_update(move |gesture, dx, dy| {
+            post(on.clone(), DragPhase::Update, dx, dy, gesture.current_button());
         });
     }
-    drag.connect_drag_end(move |_, _, _| {
-        dragging.borrow_mut().take();
+    {
+        let on = on.clone();
+        let post = hooks.post.clone();
+        drag.connect_cancel(move |gesture, _| {
+            post(on.clone(), DragPhase::Cancel, 0.0, 0.0, gesture.current_button());
+        });
+    }
+    let post = hooks.post.clone();
+    drag.connect_drag_end(move |gesture, x, y| {
+        post(on.clone(), DragPhase::End, x, y, gesture.current_button());
     });
     drag
 }
@@ -169,37 +170,4 @@ fn drag_gesture(current: &Drawn, hooks: &ChromeHooks, grip: bool) -> gtk4::Gestu
 /// The one way a bar's text is set: as text, never as markup (the module doc).
 fn set_bar_text(label: &gtk4::Label, text: &str) {
     label.set_text(text);
-}
-
-/// Where a float's grip goes: the square at the bottom-right corner of its whole rectangle.
-pub(super) fn grip_rect(rect: Rect) -> Rect {
-    let w = GRIP_PX.min(rect.w).max(0);
-    let h = GRIP_PX.min(rect.h).max(0);
-    Rect {
-        x: rect.x + rect.w - w,
-        y: rect.y + rect.h - h,
-        w,
-        h,
-    }
-}
-
-/// How a pool of `pool` pieces of chrome draws `spots` floats: how many new pieces to make first, and
-/// which slots to hide. The pool grows only when more floats are on screen than it has ever drawn at
-/// once; the slots past the last float are hidden, never dropped.
-pub(super) fn chrome_plan(pool: usize, spots: usize) -> (usize, Range<usize>) {
-    (spots.saturating_sub(pool), spots..pool.max(spots))
-}
-
-/// Which float each slot of the pool draws (slot `i` draws the `i`-th): the floats it drew before that
-/// are still in `floats`, in the slots' order, then the floats that are new, in z-order. So a raise,
-/// which changes only the order of `floats`, moves no float to another piece of chrome; a float that
-/// leaves frees its slot, and the ones above it close up.
-pub(super) fn chrome_owners(drew: &[ModuleId], floats: &[ModuleId]) -> Vec<ModuleId> {
-    let mut owners: Vec<ModuleId> = drew.iter().filter(|id| floats.contains(id)).cloned().collect();
-    for id in floats {
-        if !owners.contains(id) {
-            owners.push(id.clone());
-        }
-    }
-    owners
 }

@@ -31,7 +31,7 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
     });
   });
 
-  /* What the box says after `g` -- its two older pairs, then `gx`. Listed in this
+  /* What the box says after `g` -- `gg` and `gf`, then `gx`. Listed in this
      order: the box shows a prefix's pairs in table order. */
   it("names gx after gg and gf", () => {
     expect(FIXED_PENDING_ENTRIES.g.map((e) => [e.key, e.label])).toEqual([
@@ -41,8 +41,8 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
     ]);
   });
 
-  /* What the box says after a bracket -- the prompt pair it always had, then the
-     card pair `]p` / `[p` adds. Listed in this order: the box shows a prefix's pairs in table order. */
+  /* What the box says after a bracket -- the prompt pair, then the
+     card pair `]p` / `[p`. Listed in this order: the box shows a prefix's pairs in table order. */
   it("names the ]p and [p pairs after the prompt pairs", () => {
     expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label])).toEqual([
       ["]", "next prompt"],

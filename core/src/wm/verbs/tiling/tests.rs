@@ -70,7 +70,7 @@ fn a_refused_verb_emits_no_allocate_and_is_no_change_for_the_saver() {
     let said = r.said();
     let batch = r.run(Action::ToggleSplit);
     r.assert_refused(&batch, &said, "toggle-split: no split around the module on screen");
-    assert!(batch.lua().is_empty() && batch.shell_verb().is_none());
+    assert!(batch.lua().is_empty());
     assert_eq!(*r.layout.borrow(), before);
     let save_armed = r.controller.window_mut(WIN).map(|w| w.save_timer.is_some());
     assert_eq!(save_armed, Some(false), "no save is armed for a refusal");

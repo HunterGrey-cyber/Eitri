@@ -21,7 +21,7 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-/** `#root` went empty -- no chrome, every key dead, nothing logged -- until `prefix r`.
+/** A render failure must not leave `#root` empty -- no chrome, every key dead, nothing logged -- until `prefix r`.
  *  The entry point is the one place a boundary must exist for that to be impossible, so it is pinned here
  *  rather than in `App`'s own tests, which never render `main.tsx`. */
 it(

@@ -1,7 +1,6 @@
 #!/bin/sh
-# Test double for the claude CLI: the host's real claude must never run from an installer test
-# (a rule of this test suite). Records its argv in <scratch>/logs/claude.log and prints a
-# spec-shaped version.
+# Test double for the claude CLI: the host's real claude must never run from an installer test.
+# Records argv in <scratch>/logs/claude.log and prints a version for the installer's check.
 S=$(cd "$(dirname "$0")/.." && pwd)
 {
 	printf 'claude-stub'

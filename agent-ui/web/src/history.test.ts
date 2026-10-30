@@ -69,25 +69,19 @@ describe("historyNoticeText", () => {
     expect(historyNoticeText(notice({ omittedItems: 0 }))).not.toContain("not loaded");
   });
 
-  /* **The count is this restore's own, never a build-wide cap.** This sentence used to print
-     `HISTORY_MAX_ITEMS` -- the 400-item ceiling -- on every truncated restore, and a
-     real session that restored 32 items would have read "The last 400 records".
-     Two notices differing only in `restoredItems` have to produce two different sentences; a
-     constant, in either language, cannot do that. The second assertion is what stops the first
-     from being satisfied by a literal that happens to equal this fixture's 42: no multi-digit
-     number may appear in the function's own source at all (`> 0` is the only digit that may). */
+  /* The count is this restore's own, never a build-wide cap: a 400-item ceiling would mislabel a
+     measured 32-item restore. Two notices differing only in `restoredItems` must produce different
+     sentences. Reject multi-digit literals in the function source so a hard-coded fixture count
+     cannot pass; `> 0` is the only digit that may appear. */
   it("prints the restore's own count, not a ceiling shared by every restore", () => {
     expect(historyNoticeText(notice({ restoredItems: 32, omittedItems: 64 }))).toContain("The last 32 records");
     expect(historyNoticeText(notice({ restoredItems: 107, omittedItems: 193 }))).toContain("The last 107 records");
     expect(historyNoticeText.toString()).not.toMatch(/\d{2,}/);
   });
 
-  /* A count of exactly one, in both halves of the same sentence. Reachable only since the number
-     became this restore's own: with the 400-item ceiling the plural was right by construction, and
-     now the character budget can leave a single item (Rust's
-     `at_least_one_item_survives_even_when_it_alone_exceeds_the_budget` pins that it does). The
-     number stays in the singular wording rather than becoming "The last record of this session",
-     so a manual pass still has a count to check the sentence against. */
+  /* The character budget can leave exactly one item (Rust's
+     `at_least_one_item_survives_even_when_it_alone_exceeds_the_budget`). Keep its count even in the
+     singular so a manual pass can check it against the restored list. */
   it("says record, not records, when exactly one was kept or dropped", () => {
     expect(historyNoticeText(notice({ restoredItems: 1, omittedItems: 1 }))).toBe(
       "The last 1 record of this session. 1 earlier record was not loaded.",
@@ -100,11 +94,8 @@ describe("historyNoticeText", () => {
     );
   });
 
-  /* The cap is not on the wire and no longer anywhere on this side either: `HistoryNotice`
-     describes ONE restore, not the build's limits, and with the sentence printing the restore's own
-     number there is nothing left for a second copy of Rust's constant to be right or wrong about.
-     The cross-language tie that used to live here (reading `transcript_jsonl.rs` as text) went with
-     it -- a test pinning a constant nothing reads is drift-bait of its own. */
+  /* `HistoryNotice` describes one restore, not the build's limits. A second copy of Rust's cap
+     would be unused and could drift, so this module exports no ceiling. */
   it("exports no ceiling for anything to drift from", async () => {
     const module = await import("./history");
     expect(Object.keys(module)).toEqual(["historyNoticeText"]);

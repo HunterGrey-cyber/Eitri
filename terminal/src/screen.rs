@@ -1,14 +1,10 @@
 //! Bytes in, a `PaintList` out, and the answers the terminal owes the program.
 //!
-//! The frozen `terminal-pane/src/live.rs` with three changes,
-//! each measured against the frozen driver before it was taken:
-//! - **feed and render are split.** The frozen driver built a whole `PaintList` on every PTY read,
-//!   which ran 30-100x slower than the source under a noisy stream (15 MB of `yes`: 44 s against
-//!   1.5 s). [`Screen::feed`] only parses and marks dirty; the session renders at most once a frame.
-//! - **a real listener.** Replies go back to the program ([`Screen::take_replies`]).
-//! - **scrollback exists.** `Config::scrolling_history` is 10,000 lines (alacritty's default); the
-//!   frozen comment calling it "deliberately zero" was wrong, since `Term` never read history from
-//!   `total_lines`. Nothing shows it yet -- the view is always `FollowBottom` until phase 3.
+//! Feed only parses and marks dirty; rendering on every PTY read would tie full-frame work to
+//! output throughput. The session renders at most once a frame. Replies return to the program
+//! through [`Screen::take_replies`].
+//! Scrollback holds 10,000 lines (`Config::scrolling_history`, alacritty's default), and
+//! [`Screen::scroll`] moves the view through it.
 //!
 //! **A synchronized update that never ends is the session's to end.** `terminal-sync` publishes
 //! nothing between `ESC[?2026h` and `ESC[?2026l`, and ships no deadline on purpose: its
@@ -19,43 +15,24 @@
 //! counts it as one more dispatch -- so after a killed nvim, a `reset` is not what brings the
 //! screen back; the deadline is.
 //!
-//! **`render` never projects the live `Term` while an update is open.** An earlier design
-//! snapshotted `self.frame` inside every `publish` closure -- on every `FrameComplete`, every
-//! end-of-read `Wakeup`, and every `SyncAborted` -- which paid a full O(rows x cols)
-//! [`Projector::full`] on every PTY read that touched anything, whether or not a synchronized
-//! update was ever in play: measured 2.6-7.6x slower on a plain flood with no BSU/ESU anywhere, and
-//! paying the cost while hidden, which the session's render clock is meant to rule out.
+//! **`render` never projects the live `Term` while an update is open.** Outside an update,
+//! the live Term is the last complete publication: end_sync and abort_sync clear in_sync even
+//! when nothing was drawn, so [`Screen::render`] projects it at most once per call, paced by the
+//! session's render clock. Snapshotting on every publication would pay O(rows x cols) per PTY
+//! read, even for plain output and while hidden.
 //!
-//! The fix keeps the guarantee but ties the cost to what actually needs it. Two fixed points:
-//! - **Outside an open update, the live `Term` IS the last publication.** `SyncBarrier::end_sync`
-//!   and `abort_sync` both clear `in_sync` unconditionally, so `open_update()` reporting `None`
-//!   means `Term` is at a real, complete, presentable state -- there is nothing left to snapshot
-//!   for, and [`Screen::render`] projects the live `Term` directly, right there, at most once per
-//!   call (bounded by however often the caller calls it -- the render clock, not the PTY's).
-//! - **A synchronized update cannot mutate `Term` before its own `BSU` is dispatched.** So the one
-//!   moment a snapshot is structurally necessary is the instant `in_sync` flips false -> true:
-//!   [`Screen::feed`] steps `terminal-sync::SyncDriver::feed` one byte at a time (which is what it
-//!   already does internally -- see its own "WHY BYTE AT A TIME" doc -- so this adds no real
-//!   iteration cost, only moves the loop boundary) and takes `self.frame = self.projector.full(term)`
-//!   exactly at that transition, before any byte of the new update's content can hide behind it.
-//!   Everything published *after* that -- `FrameComplete`, `Wakeup`, `SyncAborted` -- needs no
-//!   snapshot of its own: either it closes the update, in which case the next `render()` call
-//!   reads the live `Term` per the point above, or it is itself a transition into a *further*
-//!   nested/new update, in which case it is captured by that transition instead.
-//!
-//! `render_never_shows_a_frame_torn_by_a_later_update_in_the_same_read` (the tear's own
-//! repro, `BSU CUP ED "frame\r\nplus1" ESU BSU CUP ED "HEL"` in one `feed()` call, never rendered
-//! in between) still passes under this design: the second `BSU`'s false->true transition captures
-//! `self.frame` at exactly the moment `Term` shows "frame"/"plus1" and nothing of "HEL" yet.
-//! `resize` no longer snapshots at all -- it used to, conditionally, but `render`'s own check now
-//! subsumes that, and subsumes a bug in the old conditional: resizing *inside*
-//! an update that goes on to publish nothing (an ESU or abort with no dispatch in between, so
-//! `SyncBarrier`'s own `dirty` flag never latches) used to leave `render` reporting the *old* grid
-//! size forever, because nothing about that resize ever triggered `feed`'s or `abort_sync`'s old
-//! per-publish snapshot. `Term::resize` unconditionally clears `in_sync` on the barrier by ending
-//! up at `open_update() == None` the moment the update actually ends (`end_sync`/`abort_sync` flip
-//! `in_sync` regardless of `dirty`), so the very next `render()` call reads the live, correctly
-//! resized `Term` -- no special-casing needed in `resize` at all.
+//! A synchronized update cannot mutate Term before its BSU is dispatched. [`Screen::feed`]
+//! therefore steps the driver one byte at a time and snapshots exactly at the false-to-true
+//! in_sync transition, before any content of the new update. Later publications need no snapshot:
+//! they either close the update, letting render read the live Term, or open another update whose
+//! transition captures the complete frame. In `BSU CUP ED "frame\r\nplus1" ESU BSU CUP ED "HEL"`
+//! fed without an intervening render, the second BSU must capture frame/plus1 and none of HEL.
+//! `resize` needs no snapshot: `render` reads the live grid once the update ends. That holds even
+//! for a resize inside an update that then ends without publishing anything (an ESU or abort with
+//! no dispatch between it and the BSU, so the barrier's `dirty` flag never latches): `end_sync` and
+//! `abort_sync` clear `in_sync` regardless of `dirty`, so `open_update()` is `None` the moment the
+//! update ends and the next `render()` reads the live, resized `Term`. A snapshot taken only on a
+//! publication would miss that resize and keep reporting the old grid size.
 //! This is still `Projector::full`'s own documented safety property doing the work: it "does
 //! **not** touch damage, so it is safe to call for a newly attached consumer at any moment" -- an
 //! extra full snapshot, wherever one is taken, is not the delta-stream-stealing hazard
@@ -94,9 +71,9 @@ pub struct TerminalColors {
     pub background: RgbColor,
     pub foreground: RgbColor,
     /// A fixed cursor colour, or `None` for none: the cursor then takes the colours of the cell it
-    /// covers, swapped, as foot and alacritty do when none is configured (GUI pass 2026-09-23,
-    /// defect 3 -- the theme's foreground as a fixed colour vanished on a cell a program painted
-    /// light). A program's own OSC 12 wins over either.
+    /// covers, swapped, as foot and alacritty do when none is configured (a fixed colour from the
+    /// theme's foreground vanishes on a cell a program painted light). A program's own OSC 12
+    /// wins over either.
     pub cursor: Option<RgbColor>,
 }
 
@@ -154,7 +131,7 @@ impl TerminalColors {
 /// Where the cursor is on the frame [`Screen::render`] last produced: window cells, the same space
 /// as every `PaintOp`. Reported whether or not the program hid the cursor (`ESC[?25l`), because it
 /// is still where the next character lands -- which is where the host draws an input method's
-/// preedit and places its candidate window (bottom-terminal phase 2). The `PaintList` itself carries
+/// preedit and places its candidate window. The `PaintList` itself carries
 /// the cursor only while it is visible, which is `terminal-render`'s contract and is not changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorCell {
@@ -200,9 +177,8 @@ impl Dimensions for GridSize {
     }
 }
 
-/// The one place a [`PtySize`] becomes a [`GridSize`]: `new` and
-/// `resize` used to repeat both the `.max(1)` (already redundant with [`PtySize::clamped`], which
-/// every caller here applies first) and the field-by-field construction.
+/// Convert a [`PtySize`] to a [`GridSize`]. Every caller applies [`PtySize::clamped`] first,
+/// so the dimensions need no additional lower bound here.
 fn grid_size(size: PtySize) -> GridSize {
     GridSize {
         cols: usize::from(size.cols),
@@ -526,8 +502,8 @@ impl Screen {
     }
 
     /// Whether what was published since the last publication could change a frame: anything but a
-    /// run of titles and bells, which the host shows elsewhere (or not at all) and which used to
-    /// rebuild and repaint the whole screen as often as a program sent them.
+    /// run of titles and bells, which the host shows elsewhere (or not at all). Rebuilding and
+    /// repainting for those events would tie rendering to their arrival rate.
     ///
     /// Exact, not a guess: `Term` reports a title (or its reset) only from `set_title` and
     /// `pop_title`, and a bell only from `bell`, at most one per dispatch, and none of those three
@@ -576,14 +552,13 @@ impl Screen {
     /// ends, and the next `render()` picks up the resize. That next render is owed even when one
     /// already ran inside the update and drew the old snapshot (`redraw_at_end`).
     ///
-    /// **Does re-align the scrollback anchor.** A resize reflows
-    /// the grid -- how many logical lines/rows exist -- which can shift or evict what a pinned
-    /// [`ScrollView`] anchor points at, exactly the way output does; [`ScrollView::observe`]'s own
-    /// doc already asks for a call "once per feed -- output and resize both shift what history
-    /// retains." `Self::feed` called it; this did not, so a pinned anchor left stale by a resize
-    /// only [`RawViewport::resolve`](terminal_frame::viewport::RawViewport::resolve)d against the
-    /// *new* grid on the next `render()` -- silently returning whatever line the stale index now
-    /// landed on if it happened to still be in bounds, rather than reporting the anchor expired.
+    /// **Re-aligns the scrollback anchor.** A resize reflows the grid -- how many logical
+    /// lines/rows exist -- which can shift or evict what a pinned [`ScrollView`] anchor points at,
+    /// exactly the way output does, so it calls [`ScrollView::observe`] as `Self::feed` does.
+    /// Without that, a pinned anchor left stale by a resize would
+    /// [`RawViewport::resolve`](terminal_frame::viewport::RawViewport::resolve) against the *new*
+    /// grid on the next `render()` and silently return whatever line the stale index lands on if
+    /// it is still in bounds, rather than reporting the anchor expired.
     pub fn resize(&mut self, size: PtySize) {
         let size = size.clamped();
         // `Term::resize` changes nothing for a size with the same cells (a new cell pixel size).
@@ -621,7 +596,7 @@ impl Screen {
 
     /// Ends an open synchronized update as if its `ESC[?2026l` had arrived, and marks the screen
     /// dirty if anything was drawn inside it. A no-op when none is open. Takes no snapshot of its
-    /// own, for the same reason `resize` no longer does: it clears `in_sync` unconditionally, so
+    /// own, for the same reason `resize` takes none: it clears `in_sync` unconditionally, so
     /// the next `Self::render` call reprojects the live `term` itself once this returns.
     pub fn abort_sync(&mut self) {
         let was_open = self.sync.barrier().in_sync();
@@ -1598,9 +1573,8 @@ mod tests {
 
     /// A line that wraps over more rows than a wheel notch moves: each step goes exactly as many
     /// rows as asked, up through the line and back down through it, never stopping at the line's
-    /// first row. The window's top used to be the anchored line's first row, so a step down that
-    /// stayed inside the line landed on that same row again, and the wheel could not move down
-    /// past a line longer than a notch.
+    /// first row. Anchoring only to that first row would trap a downward step within a line
+    /// longer than a wheel notch.
     #[test]
     fn scrolling_moves_row_by_row_through_a_line_that_wraps() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
@@ -1659,9 +1633,8 @@ mod tests {
     }
 
     /// A full history evicts rows, not lines: with the window's top inside the oldest retained line,
-    /// output that evicts that line's first rows keeps the same text at the top. The view used to
-    /// count its place from the line's original first row, so the text drifted down by the rows
-    /// evicted.
+    /// output that evicts that line's first rows keeps the same text at the top. Counting from
+    /// the line's original first row would make the text drift down by the number of rows evicted.
     #[test]
     fn eviction_inside_the_oldest_line_keeps_the_text_at_the_top() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());

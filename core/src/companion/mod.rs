@@ -2,8 +2,9 @@
 //! state machine that follows the attach.
 //!
 //! One `nvim_exec_lua` call ([`INSTALL_LUA`]) installs the six Eitri snippets and a liveness timer.
-//! The same call removes whatever an earlier panel left, so a second panel replaces the first and a
-//! second install from the same channel changes nothing. Nothing here touches the socket: the
+//! The same call removes whatever an earlier panel left, so a second panel replaces the first, and a
+//! second install from the same channel tears down and reinstalls without telling that channel it
+//! was replaced. Nothing here touches the socket: the
 //! caller sends [`install_args`] through an [`crate::nvim_rpc::NvimLink`] and reads the answer with
 //! [`parse_install_report`]. A slow answer is a pending one, never a failed one, because nvim
 //! queues requests while it waits for a character.

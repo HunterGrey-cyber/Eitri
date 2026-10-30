@@ -483,6 +483,15 @@ pub enum InboundMessage {
         opening: u64,
         return_keys: bool,
     },
+    /// The answer to `view_export`: the page's own view of the tab a move takes (its cursor, mode, expanded
+    /// blocks, scroll anchor), or `null` when it holds none. `request` is the number `view_export` carried;
+    /// the view is the page's, passed on to the other window's page unread.
+    ViewExported {
+        request_id: String,
+        request: u64,
+        #[serde(default)]
+        view: Option<serde_json::Value>,
+    },
     /// gx: open this web link in the system browser. The page sends the WHATWG-normalized address
     /// (`agent-ui/web/src/nav.ts#webUrl`); `shell` re-checks it (`panel/src/links.rs#web_url`) before it
     /// reaches `gtk4::UriLauncher`. No `serde(default)`: a message with no address is malformed, never "open
@@ -633,6 +642,7 @@ impl InboundMessage {
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
             | InboundMessage::KeymapClosed { .. }
+            | InboundMessage::ViewExported { .. }
             | InboundMessage::ReviewRecover { .. }
             | InboundMessage::TrustCommand { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
@@ -841,6 +851,7 @@ impl InboundMessage {
             | InboundMessage::NavFallthrough { request_id, .. }
             | InboundMessage::PaneNav { request_id, .. }
             | InboundMessage::KeymapClosed { request_id, .. }
+            | InboundMessage::ViewExported { request_id, .. }
             | InboundMessage::TrustAnswer { request_id, .. }
             | InboundMessage::TrustCancel { request_id, .. }
             | InboundMessage::TrustCommand { request_id, .. }
@@ -912,6 +923,19 @@ pub fn serialize_task_output_for_js(
         "taskId": task_id, "output": output.output, "totalBytes": output.total_bytes,
         "truncated": output.truncated })
     .to_string()
+}
+
+/// Whether `raw` is a message of the `painted` kind, regardless of its other fields. A host takes
+/// every message of this kind itself; the panel's parser does not know it.
+pub fn is_first_paint(raw: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    raw.contains("\"painted\"")
+        && raw.trim_start().starts_with('{')
+        && serde_json::from_str::<Kind>(raw).is_ok_and(|m| m.kind == "painted")
 }
 
 /// `{"kind":"command_result","requestId":...,"ok":true}` or
@@ -1183,6 +1207,18 @@ pub fn serialize_open_command_line_for_js() -> String {
 /// from the `panel_keys` mirror -- `Ctrl+j` claimed in BROWSE, or `Ctrl+k` claimed in INPUT. The page
 /// applies it against its own current state and, if that no longer matches, replies
 /// `nav_fallthrough` (`InboundMessage::NavFallthrough`).
+/// A move to the other window is about to take `tab`: the page answers with its view of it
+/// ([`InboundMessage::ViewExported`] carrying `request`).
+pub fn serialize_view_export_for_js(request: u64, tab: crate::tabs::TabId) -> String {
+    json!({ "kind": "view_export", "request": request, "tab": tab.0 }).to_string()
+}
+
+/// The view another window's page had of `tab`, which moved here: the page keeps it for the tab, as it keeps the
+/// view of a tab it switched away from, and shows it when the tab is shown. Passed on as it came.
+pub fn serialize_view_import_for_js(tab: crate::tabs::TabId, view: &serde_json::Value) -> String {
+    json!({ "kind": "view_import", "tab": tab.0, "view": view }).to_string()
+}
+
 pub fn serialize_nav_key_for_js(direction: NavKeyDirection) -> String {
     let direction = match direction {
         NavKeyDirection::Down => "down",
@@ -1565,12 +1601,15 @@ pub fn serialize_review_settings_for_js(enabled: bool, hint: bool) -> String {
     json!({ "kind": "review_settings", "enabled": enabled, "hint": hint }).to_string()
 }
 
-/// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[...]}`.
-/// Each event uses `AgentDomainEvent`'s tagged `Serialize` shape. `from_revision` is the projection's
-/// `last_revision` before folding the batch; `through_revision` is its value afterward.
-/// The frontend does not read these revisions. There is no gap detection or resync request;
-/// reloading the panel document consumes a fresh snapshot rather than requesting older events.
-/// `tab` identifies the session tab. The panel drops the envelope unless that tab is active.
+/// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[<AgentDomainEvent JSON>, ...]}`.
+/// `AgentDomainEvent`'s own `#[derive(Serialize)]` produces the tagged shape for each element.
+/// `from_revision` is the revision before the first delivered event, and `through_revision` is
+/// the last delivered event's post-fold revision. The notes-aware tagged envelope also carries
+/// `revisions`, parallel to `events`: each item's seq is its event's post-fold revision minus one.
+/// The page uses these tags to advance over requests the host answered and omitted. The range
+/// alone does not describe those gaps and is not used to request replay or resync. Reloading the
+/// document consumes a fresh snapshot, whose `throughRevision` seeds the page's counter.
+/// `tab` names the session tab; the panel drops events unless that tab is active.
 pub fn serialize_events_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
@@ -1672,6 +1711,26 @@ pub fn serialize_events_with_notes_for_js(
     events: &[AgentDomainEvent],
     notes: &CallNotes,
 ) -> String {
+    serialize_events_with_notes_and_revisions_for_js(tab, from_revision, through_revision, events, notes, None)
+}
+
+/// Like the notes envelope, with one post-fold revision per delivered event when tags are known.
+/// The tags preserve item sequence numbers when the host omits requests it answered itself.
+pub fn serialize_events_with_notes_and_revisions_for_js(
+    tab: crate::tabs::TabId,
+    from_revision: u64,
+    through_revision: u64,
+    events: &[AgentDomainEvent],
+    notes: &CallNotes,
+    revisions: Option<&[u64]>,
+) -> String {
+    if let Some(revisions) = revisions {
+        assert_eq!(
+            events.len(),
+            revisions.len(),
+            "each delivered event needs its fold revision"
+        );
+    }
     let mut payload = json!({
         "kind": "events",
         "tab": tab.0,
@@ -1679,6 +1738,9 @@ pub fn serialize_events_with_notes_for_js(
         "throughRevision": through_revision,
         "events": events
     });
+    if let Some(revisions) = revisions {
+        payload["revisions"] = json!(revisions);
+    }
     if !notes.allowed_by_rule.is_empty() {
         payload["ruleNotes"] = notes
             .allowed_by_rule
@@ -2516,7 +2578,8 @@ impl ChooserTab {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChooserRecord {
     pub provider_session_id: String,
     pub name: Option<String>,
@@ -2525,6 +2588,9 @@ pub struct ChooserRecord {
     pub updated_at: String,
     /// Its lease is held by another window: shown as `open in another window`, not choosable.
     pub held_elsewhere: bool,
+    /// The linked peer holds the lease, so the chooser can raise that window.
+    pub held_by_partner: bool,
+    pub partner_window: Option<u8>,
 }
 
 /// `prefix w`: open tabs first, then the records open in no tab, newest first. Opens the chooser.
@@ -2544,6 +2610,7 @@ pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) 
             json!({
                 "providerSessionId": r.provider_session_id, "name": r.name, "title": r.title,
                 "createdAt": r.created_at, "updatedAt": r.updated_at, "heldElsewhere": r.held_elsewhere,
+                "heldByPartner": r.held_by_partner, "partnerWindow": r.partner_window,
             })
         })
         .collect();
@@ -2772,6 +2839,23 @@ mod tests {
         assert_eq!(primary_copy(&escaped).map(|t| t.len()), Some(PRIMARY_COPY_MAX_BYTES));
         // The message is the shell's alone: the panel's parser never takes it.
         assert!(parse_inbound_message(&message("x")).is_none());
+    }
+
+    #[test]
+    fn first_paint_is_recognized_only_by_its_object_type() {
+        for painted in [r#"{"type":"painted"}"#, r#"{"type":"painted","x":1}"#] {
+            assert!(is_first_paint(painted), "{painted}");
+        }
+        for other in [
+            r#"{"type":"ready","request_id":"r"}"#,
+            r#"{"type":"copy_primary","text":"painted"}"#,
+            r#""painted""#,
+            r#"["painted"]"#,
+            "[]",
+            r#"{"type":"painted""#,
+        ] {
+            assert!(!is_first_paint(other), "{other}");
+        }
     }
 
     #[test]
@@ -4070,6 +4154,26 @@ mod tests {
         assert_eq!(parsed["throughRevision"], 4);
         assert_eq!(parsed["events"][0]["type"], "permission_resolved");
         assert_eq!(parsed["events"][0]["permission_id"], "p1");
+    }
+
+    #[test]
+    fn serialize_events_preserves_optional_fold_revisions_and_untagged_bytes() {
+        let events = vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }];
+        let notes = CallNotes::default();
+        let plain = serialize_events_for_js(TabId(1), 3, 5, &events);
+        assert_eq!(
+            plain,
+            serialize_events_with_notes_for_js(TabId(1), 3, 5, &events, &notes)
+        );
+        assert_eq!(
+            plain,
+            serialize_events_with_notes_and_revisions_for_js(TabId(1), 3, 5, &events, &notes, None)
+        );
+        let mut expected: Value = serde_json::from_str(&plain).unwrap();
+        assert!(expected.get("revisions").is_none());
+        expected["revisions"] = json!([5]);
+        let tagged = serialize_events_with_notes_and_revisions_for_js(TabId(1), 3, 5, &events, &notes, Some(&[5]));
+        assert_eq!(serde_json::from_str::<Value>(&tagged).unwrap(), expected);
     }
 
     #[test]
@@ -8040,6 +8144,8 @@ mod tests {
             created_at: "1".into(),
             updated_at: "2".into(),
             held_elsewhere: true,
+            held_by_partner: false,
+            partner_window: None,
         }];
         let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(&open, &records)).unwrap();
         assert_eq!(value["kind"], "chooser");

@@ -856,7 +856,8 @@ pre {
   min-width: 0;
   color: var(--nv-fg);
 }
-.composer-key {
+/* One keycap for the box's `i` and the start screen's row keys, so the two cannot drift apart. */
+.composer-key, .dash-key {
   color: var(--nv-muted);
   margin-left: auto;
   font-family: var(--nv-font-mono);
@@ -1046,18 +1047,58 @@ pre {
 .dashboard > .queue-lines, .dashboard > .dash-input {
   order: 3;
 }
-.dash-title {
+/* The head: Eitri's mark, the question and where it will run, one centred stack. The mark is the
+   quietest thing on the screen and the question the loudest; nothing between them moves. */
+.dash-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   text-align: center;
-  font-weight: 450;
+  min-width: 0;
+}
+.dash-mark {
+  width: 40px;
+  height: 40px;
+  margin-bottom: 22px;
+  flex: none;
+}
+/* The logo's outlines mix the muted ink (guarded against the page) rather than a rule colour, so they stay
+   visible on schemes whose rules sit close to their background. The editor block is the page itself, darker
+   than the frame on a dark scheme and lighter on a light one, as the window it draws. */
+.dash-mark-frame {
+  fill: color-mix(in srgb, var(--nv-fg) 6%, var(--nv-bg));
+}
+.dash-mark-column {
+  fill: color-mix(in srgb, var(--nv-fg) 14%, var(--nv-bg));
+}
+.dash-mark-editor {
+  fill: var(--nv-bg);
+}
+.dash-mark-frame, .dash-mark-editor, .dash-mark-column, .dash-mark-rule {
+  stroke: color-mix(in srgb, var(--nv-muted) 70%, var(--nv-bg));
+  stroke-width: 1;
+}
+.dash-mark-rule {
+  fill: none;
+  stroke-linecap: butt;
+}
+/* The one colour on this screen: the gutter and its E take the scheme's accent, the way the editor's own
+   cursor takes the scheme's colour. It is a shape, not text, and the accent is guarded against the page at 3:1. */
+.dash-mark-e {
+  fill: var(--nv-chrome-accent);
+}
+.dash-title {
+  font-weight: 500;
   font-size: var(--fs-title);
-  letter-spacing: -0.035em;
-  line-height: 1.3;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
 }
 .dash-where {
-  margin: 14px 0 0;
+  max-width: 100%;
+  margin: 8px 0 0;
   color: var(--nv-muted);
+  font-family: var(--nv-font-mono);
   font-size: var(--fs-sm);
-  text-align: center;
   overflow-wrap: anywhere;
 }
 .dash-input .composer {
@@ -1078,44 +1119,83 @@ pre {
 .agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within {
   border-color: var(--nv-focus-ring);
 }
+/* The actions: a short column under the head, set off from it by one hairline, each row a glyph, its words
+   and its key in a keycap like the box's own `i`. On a wide panel the column stays short so a key stays
+   beside its words. */
 .dash-items {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  margin-top: 24px;
-  /* A column under the question, not the panel's width: on a wide panel the keys stay beside their words. */
-  width: min(100%, 420px);
+  gap: 1px;
+  margin-top: 28px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule-soft);
+  width: min(100%, 340px);
   align-self: center;
 }
 .dash-item {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 7px 14px;
-  border-radius: 8px;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px 6px 10px;
+  border-radius: 6px;
   cursor: pointer;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-prose);
+  line-height: 1.5;
   min-width: 0;
 }
 .dash-item:hover, .dash-item[aria-current="true"] {
   background: var(--nv-cursorline);
 }
+/* 16px for a 16-unit viewBox: one unit is one pixel, so the 1px strokes on half-pixels stay sharp at 1x. */
+.dash-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--nv-muted);
+  stroke-width: 1;
+  stroke-linecap: butt;
+  stroke-linejoin: miter;
+}
+.dash-item[aria-current="true"] .dash-icon {
+  stroke: var(--nv-fg);
+}
 .dash-label {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.dash-resume-title {
-  display: none;
+/* What a row brings back (the newest session's title, the last window's tabs), after its words at one fixed
+   gap on every row, muted and cut to the row by the label's ellipsis. */
+.dash-detail {
+  margin-left: 0.4em;
+  color: var(--nv-muted);
 }
-.dash-icon, .dash-key {
+/* When Resume last's session was last opened (a clock time, or a date before today), right-aligned before the key. */
+.dash-when {
+  flex: none;
   color: var(--nv-muted);
   font-family: var(--nv-font-mono);
   font-size: var(--fs-xs);
+  white-space: nowrap;
 }
+/* The row key is a <kbd> drawn with the box's keycap (the shared rule above, whose class outranks the global
+   `kbd` rule and the user-agent's); weight and style are named too, so no engine's sheet can bold or slant it. */
 .dash-key {
-  margin-left: auto;
+  flex: none;
+  min-width: 1.9em;
+  text-align: center;
+  font-weight: normal;
+  font-style: normal;
+}
+/* Under the cursor the keycap lifts onto the page colour with a muted edge: a rule colour can match the
+   cursorline on light schemes and lose the keycap's outline. */
+.dash-item[aria-current="true"] .dash-key {
+  color: var(--nv-fg);
+  background: var(--nv-bg);
+  border-color: var(--nv-muted);
 }
 .dash-context {
   text-align: center;
@@ -1800,32 +1880,20 @@ input::placeholder {
    mono at the editor's text size (`--fs-base`).
 
    **Why the fills are plain tokens, not a computed mix.** The obvious design gives the whole band, and the mode
-   section would use `color-mix(in srgb, var(--nv-cursorline)/var(--nv-mode-*) N%, var(--nv-bg))`,
-   with a fallback if it fails 4.5:1. Nothing in this codebase can conditionally swap a fill per
-   theme at runtime -- there is no such mechanism, CSS or otherwise -- so "else fall back" has to be
-   a decision made once, here, backed by what `core/src/theme/tokens.rs` actually guarantees rather
-   than a fresh, unverified mix ratio. Two facts from that crate's own tests decide it:
-   `t.cursorline.contrast(t.fg) >= 4.5` (line ~581) and `fg` is separately guarded against `bg` at
-   the same 4.5 (`ensure_contrast(..., bg, fg, TEXT_CONTRAST)`) -- so plain `--nv-cursorline` under
-   `--nv-fg` text, and plain `--nv-bg` under it, are BOTH real, Rust-enforced guarantees for every
-   theme. An arbitrary percentage mix of either with `--nv-bg` carries no such guarantee (relative
-   luminance is not linear in the mix fraction), so this band uses the two tokens directly, at full
-   strength, rather than a blend of them -- a plain surface, the mode section marked by its own
-   cursorline fill and its label, which is what the old `.panel-footer .mode-block` already did, carried
-   forward rather than reinvented. */
-/* The band under the agent's input should be exactly as tall as the editor's statusline beside
-   it, so the two read as one row across the window -- `min-height` grows with whatever the band's children need (the
-   `⏵⏵` fallback symbol font in particular has its own metrics), so the band never actually matched the editor's own
-   statusline beside it. `--nv-editor-row` is the editor's real cell height (`core/src/theme/tokens.rs`,
-   `ThemeTokens.editor_row_px`, `None` until `neovide-editor` reports one -- the `24px` fallback is what a reload
-   before that first report, or `--clean`, still shows). `overflow: hidden` is what actually stops a child from
-   growing the row instead of clipping to it -- a bigger min-height alone would not have fixed this. No top rule: the
-   composer card above it is the foot's boundary, and a hairline under the card read as a second edge. With no border,
-   the line box is the whole row, so the text sits on the same centre line as the editor's statusline text. The band
-   continues the editor's statusline across the divider: the same fill and text pair (`--nv-chrome`, nvim's
-   `StatusLine`), and the same row -- lifted by the rows nvim keeps under its statusline for the command line
-   (`'cmdheight'`, `--nv-editor-cmd-rows`), which are blank here as the editor's are between messages. With no editor
-   beside the band the variable is absent and the band keeps the bottom row. */
+   section, a percentage `color-mix` fill with a fallback "if it fails 4.5:1". Nothing in this codebase can
+   swap a fill per theme at runtime, and a mix of two tokens carries no contrast guarantee (relative luminance
+   is not linear in the mix fraction), so the band uses tokens directly, at full strength: nvim's own
+   `StatusLine` pair, `--nv-chrome` under `--nv-chrome-fg` (`tokens.rs` guards that text against `chrome`,
+   not `bg`), and for the mode section the editor's own lualine pair (`--nv-status-*`, below), unguarded as
+   the statusline beside it is, or the guarded `cursorline`/`fg` pair when there is no lualine. */
+/* The band must match the editor's statusline height: min-height alone lets children's font
+   metrics grow it, especially the symbol fallback. Use the reported cell height (`--nv-editor-row`,
+   `ThemeTokens.editor_row_px`) with a 24px fallback before the editor reports or under --clean.
+   Fixed height and hidden overflow clip children instead of growing the row. No top border:
+   the composer already marks the foot's edge, and the full line box aligns the text's centres.
+   Continue nvim's StatusLine fill and text pair across the divider, lifted above the command-line
+   rows (`--nv-editor-cmd-rows`, from cmdheight). Without an editor the variable is absent and
+   the band stays at the bottom. */
 .status-band {
   display: flex;
   align-items: center;
@@ -1889,19 +1957,11 @@ input::placeholder {
   unicode-bidi: bidi-override;
   unicode-bidi: isolate-override;
 }
-/* A sandbox GUI pass on 2026-09-27 at WebKit zoom 1.5 measured a 47-column
-   band, where the bypass prompt (`Switch to bypass and approve the 1 waiting card? (y/n)`), the
-   empty-tab bypass prompt (`Switch to bypass? New sessions in this window start in bypass too (y/n)`)
-   and the flash (`y must be pressed on its own to enter bypass ...`) all lost their own
-   trailing `(y/n)`/explanation to the fixed-height, `overflow: hidden` row below. Neither
-   is truncated by `band.ts` any more (`Seg.wraps`); `StatusBand` adds this class only on a render
-   that actually needs it (a segment `bandLayout` marked `wraps`), so a short prompt/flash still
-   renders on the one fixed row exactly as before, and the moment `wraps` stops being set (the
-   prompt/flash itself ending, or the band widening enough to fit it), the class -- and this height
-   -- disappear with it, restoring the `--nv-editor-row` height the band otherwise keeps.
-   `align-items: flex-start` keeps the mode block pinned to the first line while the wrapped text
-   grows the row underneath it -- stated here rather than reinvented quietly if a later pass wants
-   the mode block centred against the wrapped block instead. */
+/* At WebKit zoom 1.5 a 47-column band clips the bypass prompts' trailing (y/n) and a flash's
+   explanation in a fixed-height row. `Seg.wraps` lets those segments grow instead of truncating.
+   `StatusBand` adds this class only when `bandLayout` marks a segment as wrapping, so short text
+   keeps the editor's fixed row height. Ending the prompt/flash or widening the band removes the
+   class and restores that height. Pin the mode block to the first line while text grows beneath it. */
 .status-band--wrap {
   height: auto;
   min-height: var(--nv-editor-row, 24px);
@@ -1923,17 +1983,13 @@ input::placeholder {
      its left edge, beside the mode block. */
   text-align: left;
 }
-/* The mode section, drawn the way the editor's statusline draws its own beside it (2026-10-15): lualine's
-   mode section -- its colours for the mode (`--nv-status-*`: `lualine_a_normal` for BROWSE and HINT,
-   `_insert` for INSERT, `_visual` for CARET, VISUAL and V-LINE), bold, one cell of air each side, from
-   the band's left edge, the full height of the row, and closed by lualine's default section separator,
-   a solid arrow in the section's colour one cell wide. The arrow is drawn, not typed: U+E0B0 is a Nerd
-   Font glyph the panel's font may not carry, and a triangle the row's height is what that glyph is.
-   The colours are copied as nvim has them, unguarded, for the reason the syntax colours are
-   (`tokens.rs`, `status_normal`): it is the editor's own pair; with no lualine they are the guarded
-   cursorline block the band drew before. Without the keys the block keeps its place but draws nothing --
-   no fill, no arrow, no word -- as an inactive statusline carries no mode; an empty filled block read as
-   a rendering fault. */
+/* Draw the mode like the editor's lualine section: its own mode pair (`--nv-status-*`), bold,
+   one cell of air on each side, full row height from the left edge, and a one-cell solid arrow.
+   Use normal for BROWSE/HINT, insert for INSERT, visual for CARET/VISUAL/V-LINE. Draw the arrow
+   rather than typing U+E0B0, which the panel font may lack. These pairs deliberately keep nvim's
+   unguarded colours, as syntax does; without lualine they use the guarded cursorline fallback.
+   Without the keys keep the space but draw no fill, arrow or word: an inactive statusline has
+   no mode, and an empty filled block looks like a rendering fault. */
 .status-band .band-open {
   align-self: stretch;
 }
@@ -1978,16 +2034,12 @@ input::placeholder {
 .band-mode[data-focused="false"]::after {
   display: none;
 }
-/* U+23F5 is not in FiraCode Nerd Font (`fc-list ':charset=23f5'`, 2026-09-26): this needs a
-   font that actually carries the glyph -- Noto Sans Symbols 2 first, Symbola and Segoe UI Symbol as
-   fallbacks a Linux/Windows host might carry instead, Adwaita Mono (GNOME's default, likely already
-   installed) before finally falling through to the panel's own mono stack, which would draw a
-   `.notdef` box. Colour is the mode: `--nv-muted` for manual (every edit asks: nothing to warn
-   about), `--nv-warn` for auto (a judgement call worth noticing),
-   `--nv-error` for bypass (no gate at all) -- a glyph colour, never text
-   (`indexCss.test.ts`'s `MODE_GLYPH_BRANCH` exemption, the same shape `.wk-key`'s already has).
-   `warn` and `error` are guarded at 3:1 against both `--nv-bg` and `--nv-chrome` in Rust, so they read on
-   the band's statusline fill as well as on the page. */
+/* U+23F5 is absent from FiraCode Nerd Font (`fc-list ':charset=23f5'`). Try Noto Sans Symbols 2,
+   then Symbola, Segoe UI Symbol and Adwaita Mono before the panel's mono stack, which would draw
+   a .notdef box. Colour marks the mode: muted for manual (every edit asks), warn for auto
+   (a judgement call), error for bypass (no gate). These are glyph colours, never text;
+   `MODE_GLYPH_BRANCH` in `indexCss.test.ts` narrows the exemption. Rust guards warn/error at 3:1
+   against both bg and chrome, so they remain visible on the page and statusline fill. */
 .mode-glyph {
   font-family: "Noto Sans Symbols 2", "Symbola", "Segoe UI Symbol", "Adwaita Mono", var(--nv-font-mono);
 }
@@ -2004,8 +2056,8 @@ input::placeholder {
 .mode-glyph[data-mode-name="bypass"] {
   color: var(--nv-error);
 }
-/* `↓N`/`↓ ⚑`: inverted, the same reversed body pair the panel's cursor and a
-   focused button already use (`indexCss.test.ts`'s `CURSOR_BRANCH`, widened to admit this). */
+/* `↓N`/`↓ ⚑` uses the same reversed body pair as the panel cursor and a focused button;
+   `indexCss.test.ts`'s `CURSOR_BRANCH` admits exactly that surface. */
 .band-unread {
   background: var(--nv-fg);
   color: var(--nv-bg);
@@ -2026,8 +2078,7 @@ input::placeholder {
   cursor: help; /* the full diagnostic line is in its title attribute */
 }
 
-/* The pill, the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into
-   the band, no longer its own block with a `margin-top`. */
+/* The mode glyph has its own span; the surrounding pill takes the band's text colour. */
 .status-band .mode-pill {
   color: var(--nv-chrome-fg);
 }
@@ -2045,18 +2096,12 @@ textarea,
 .fold-marker {
   user-select: none;
 }
-/* `copySelectionText` (`visual.ts`) sets `data-visual-copying` on every row the selection
-   touches -- and on every other block of `.message-list` it crosses, such as the
-   history notice and its button -- for the one synchronous `Selection.toString()` read a `y` performs, and removes it again
-   before the next frame paints -- so `user-select: none` above (whether or not WebKit's own
-   `toString`/native copy actually honours it) is never what keeps a row sign, a button label, a
-   form control's value or a fold marker's glyph out of the copied text; THIS rule is. Without it, what `y`
-   actually copied would depend on WebKit's own unverified handling of
-   `user-select: none` rather than on anything this file asserts. `.row-sign` is included here (it
-   is not above, since it is drawn WITH `user-select: none` regardless of VISUAL) for the same reason
-   every other member is: `display: none` removes it from `Selection.toString()` outright, which
-   `user-select: none` alone does not guarantee. `indexCss.test.ts` holds this list equal to
-   `VISUAL_CHROME` too. */
+/* `copySelectionText` in `visual.ts` marks every selected row and crossed list block, including
+   the history notice, for the synchronous `Selection.toString()` read, then clears the marks
+   before paint. Hide every VISUAL_CHROME member during that read: user-select alone does not
+   guarantee WebKit excludes signs, button labels, values or fold markers from copied text.
+   Include row-sign even though it already has user-select: none. The equality check in
+   `indexCss.test.ts` keeps this list aligned with `VISUAL_CHROME`. */
 [data-visual-copying] .row-sign,
 [data-visual-copying] [aria-hidden="true"],
 [data-visual-copying] button,

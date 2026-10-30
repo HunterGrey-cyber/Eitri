@@ -1,4 +1,4 @@
-# Root (ROOT-1), paths (SH-4), the launcher (MIN-2), the system checks and their distro hints.
+# Root, paths, the launcher, system checks and distro hints.
 # Sourced by harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
@@ -59,9 +59,9 @@ t_root_cache_of_another_user_refused() {
 
 TESTS="$TESTS t_home_root_refused"
 t_home_root_refused() {
-	# A HOME that is / however it is spelled -- `//` passed a check made before trimming slashes --
-	# or that holds a `.` or `..` component is refused before anything is read or locked: a purge
-	# there would name /.config/eitri. Dry runs, so a missing refusal still changes nothing.
+	# Refuse HOME=/ under every spelling (including //), and HOME with a `.` or `..` component,
+	# before reading or locking: a purge there would name /.config/eitri.
+	# Use dry runs so a missing refusal still changes nothing.
 	for h in / // /./ /.. "$TH/.." "$TH/./"; do
 		inst --home "$h" -- --uninstall --purge --dry-run
 		expect_fail "HOME=$h"
@@ -90,9 +90,8 @@ t_relative_xdg_data() {
 
 TESTS="$TESTS t_xdg_data_home_outside_home_refused_at_install"
 t_xdg_data_home_outside_home_refused_at_install() {
-	# An XDG_DATA_HOME outside $HOME used to write there anyway and leave
-	# --uninstall permanently refusing (it never removes anything outside $HOME, whole run). Refused
-	# up front now, before anything is written, on every mode that writes under it.
+	# Refuse XDG_DATA_HOME outside HOME before any mode writes there: uninstall will not remove
+	# anything outside HOME, so permitting such an install would leave it impossible to uninstall.
 	serve 1.0.0
 	inst_net --set "XDG_DATA_HOME=$T/outside-data" --
 	expect_fail "XDG_DATA_HOME outside \$HOME"
@@ -100,9 +99,8 @@ t_xdg_data_home_outside_home_refused_at_install() {
 	expect_out 'not inside'
 	expect_absent "$TH/.local/lib/eitri"
 	expect_absent "$T/outside-data"
-	# --uninstall itself is deliberately exempt from this new refusal (it needs to keep removing an
-	# install made before this check existed, or by hand): a bare --uninstall with nothing installed
-	# still reaches its ordinary "nothing to remove", not this row's own message.
+	# --uninstall is exempt so it can remove an install made before this check or by hand.
+	# With nothing installed, it must reach its ordinary "nothing to remove" result.
 	inst --set "XDG_DATA_HOME=$T/outside-data" -- --uninstall
 	expect_rc 0
 	expect_no_out 'XDG_DATA_HOME resolves to'
@@ -222,8 +220,8 @@ t_old_glibc() {
 
 TESTS="$TESTS t_bad_options_and_help"
 t_bad_options_and_help() {
-	# --nvim-only, --from-source and --with-nvim used to exit 2 here, "not in this installer yet"
-	# (they are implemented for real now; test_nvim.sh and test_from_source.sh exercise them).
+	# --nvim-only, --from-source and --with-nvim must reach their implemented paths, exercised in
+	# test_nvim.sh and test_from_source.sh, rather than be rejected as unimplemented.
 	inst -- --bogus
 	expect_rc 1
 	expect_out 'unknown option: --bogus'
@@ -238,8 +236,7 @@ t_bad_options_and_help() {
 
 TESTS="$TESTS t_help_has_no_internal_references"
 t_help_has_no_internal_references() {
-	# --help used to show a design-doc section number and a ruling id for the
-	# development loop -- internal references with no meaning to a user running this installer.
+	# Help must describe the development loop without internal document section numbers or decision ids.
 	inst -- --help
 	expect_rc 0
 	expect_no_out 'spec §'

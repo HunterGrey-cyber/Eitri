@@ -13,15 +13,12 @@ import { hljs } from "./markdown";
  * unstyled until this test found them.
  *
  * This uses the SAME `hljs` instance `markdown.ts` registers and exports for exactly this purpose
- * -- not a second copy of the registration list -- so a language added or removed there is
- * automatically in or out of this coverage check too.
+ * -- not a second copy of the registration list -- so each sample runs through the grammar the
+ * panel really uses. A language added there is covered only once it has a sample in `SAMPLES`.
  */
 
-/** One small, realistic sample per registered language, each written to exercise a spread of
- *  syntax groups (a comment, a string, a number, a keyword, a function/type declaration) rather
- *  than the bare one-liners `markdown.test.ts` uses for its narrower assertions. Not claimed to be
- *  exhaustive of every mode every grammar can reach -- see the report for that limit -- but broad
- *  enough that it is what found the two real gaps above. */
+/** One realistic sample per registered language, exercising comments, strings, numbers, keywords
+ *  and declarations. These samples do not exhaust every mode each grammar can reach. */
 const SAMPLES: Record<string, string> = {
   rust: `// A comment
 #[derive(Debug)]

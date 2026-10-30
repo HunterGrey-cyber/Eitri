@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems, modeConsequence } from "./Dashboard";
+import { DASH_ITEM_KEY, Dashboard, MODE_CONSEQUENCE, dashItems, lastOpenedStamp, modeConsequence } from "./Dashboard";
 import type { DashItem } from "./Dashboard";
 import type { EditorLink, Hello, PermissionModeChoice, ResumableSession } from "../types";
 
@@ -79,27 +79,27 @@ describe("Dashboard: the restore line", () => {
   it("names the tabs it would bring back, with the key on its own row", () => {
     const { container } = renderDash({ hello: withOffer(["api", "docs", "tests"]) });
     const row = restoreRow(container);
-    expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session (3 tabs: api, docs, tests)");
+    expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session 3 tabs · api, docs, tests");
     expect(row.querySelector(".dash-key")!.textContent).toBe("s");
   });
   it("says tab in the singular", () => {
     const { container } = renderDash({ hello: withOffer(["api"]) });
-    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session (1 tab: api)");
+    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session 1 tab · api");
   });
   it("names the first three and shows there are more", () => {
     const { container } = renderDash({ hello: withOffer(["a", "b", "c", "d", "e"]) });
-    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session (5 tabs: a, b, c, …)");
+    expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe("Restore last session 5 tabs · a, b, c, …");
   });
   it("cuts a long name to fit", () => {
     const { container } = renderDash({ hello: withOffer(["a-very-long-tab-name-indeed-yes"]) });
     const text = restoreRow(container).querySelector(".dash-label")!.textContent!;
-    expect(text).toContain("(1 tab: a-very-long-tab-nam…)");
+    expect(text).toContain("1 tab · a-very-long-tab-nam…");
     expect(text).not.toContain("indeed");
   });
   it("says in the label when some of them were in bypass, ahead of the names so the count is not read as one", () => {
     const { container } = renderDash({ hello: { ...HELLO, restore: { labels: ["api", "docs"], bypass: 1 } } });
     expect(restoreRow(container).querySelector(".dash-label")!.textContent).toBe(
-      "Restore last session (2 tabs, 1 in bypass: api, docs)",
+      "Restore last session 2 tabs, 1 in bypass · api, docs",
     );
   });
   it("clicking it runs it", () => {
@@ -110,8 +110,8 @@ describe("Dashboard: the restore line", () => {
 });
 
 describe("MODE_CONSEQUENCE", () => {
-  /** Auto's text describes the acceptEdits fast path used by this build's policy. The bypass text
-   *  is unchanged. `KeymapOverlay` shows these descriptions in the `?` sheet. */
+  /** Auto's consequence describes the policy's acceptEdits fast path. The `?` sheet
+   *  (`KeymapOverlay`) carries mode consequences, rather than the start screen. */
   it("says what manual, auto and bypass actually do", () => {
     expect(MODE_CONSEQUENCE.manual).toBe("Safe reads run; every edit and anything else asks.");
     expect(MODE_CONSEQUENCE.auto).toBe("Edits in this project and safe reads run; anything else asks.");
@@ -125,7 +125,7 @@ describe("Dashboard", () => {
    *  and carries nothing; the backend stays reachable in `prefix i` (the session-detail route). */
   it("draws the centred question and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
-    // 2026-10-16: no brand line above the question; the question and the where-line are the whole head.
+    // The question and where-line are the whole head; no brand line competes with them.
     getByText("What shall we work on?");
     expect(container.querySelector(".dash-brand")).toBeNull();
     getByText("~/Documents/eitri · work");
@@ -158,9 +158,74 @@ describe("Dashboard", () => {
     const { container } = renderDash({ hello: withRecord });
     const resume = container.querySelector('[data-nav-stop="dash"]:nth-child(2)')!;
     expect(resume.textContent).toContain("Resume last");
-    const muted = resume.querySelector(".dash-resume-title")!;
+    const muted = resume.querySelector(".dash-detail")!;
     expect(muted.textContent).toContain("zsh 补全 compinit slow");
     expect(muted.textContent).not.toContain("older");
+  });
+
+  it("says when the newest record was last opened, as a time that cannot go stale, before its key", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(2026, 9, 28, 15, 30));
+      const withRecord: Hello = {
+        ...HELLO,
+        resumableSessions: [
+          session({ updatedAt: String(new Date(2026, 9, 28, 9, 5).getTime()) }),
+          session({ providerSessionId: "id-2", updatedAt: "5" }),
+        ],
+      };
+      const { container } = renderDash({ hello: withRecord });
+      const resume = container.querySelector('[data-nav-stop="dash"]:nth-child(2)')!;
+      expect(resume.querySelector(".dash-when")!.textContent).toBe("09:05");
+      // Before the key, outside the label, so the label's ellipsis never cuts it.
+      expect(resume.querySelector(".dash-when")!.nextElementSibling!.className).toBe("dash-key");
+      expect(resume.querySelector(".dash-label .dash-when")).toBeNull();
+      // Only Resume last carries one.
+      expect(container.querySelectorAll(".dash-when")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stamps a clock time today, a month and day before it, and nothing for a stamp it cannot read", () => {
+    const now = new Date(2026, 9, 28, 0, 10).getTime();
+    expect(lastOpenedStamp(now, String(new Date(2026, 9, 28, 0, 3).getTime()))).toBe("00:03");
+    expect(lastOpenedStamp(now, String(new Date(2026, 9, 27, 23, 59).getTime()))).toBe("Oct 27");
+    expect(lastOpenedStamp(now, String(new Date(2025, 11, 31, 12, 0).getTime()))).toBe("Dec 31");
+    for (const bad of ["", "  ", "garbage", "0", "-5", "NaN", "Infinity", "8640000000000001"]) expect(lastOpenedStamp(now, bad), bad).toBeNull();
+  });
+
+  it("draws no time, and no empty span, when the newest record's stamp cannot be read", () => {
+    for (const updatedAt of ["", "not a time"]) {
+      const { container, unmount } = renderDash({ hello: { ...HELLO, resumableSessions: [session({ updatedAt })] } });
+      expect(container.querySelector(".dash-when"), updatedAt).toBeNull();
+      expect(container.textContent).not.toContain("not a time");
+      unmount();
+    }
+  });
+
+  it("leaves the time out on a narrow panel, so the title keeps the room", () => {
+    const withRecord: Hello = { ...HELLO, resumableSessions: [session({ updatedAt: String(Date.now() - 60 * 60_000) })] };
+    const { container } = renderDash({ hello: withRecord, narrow: true });
+    expect(container.querySelector(".dash-when")).toBeNull();
+    expect(container.querySelector(".dash-detail")!.textContent).toBe("zsh 补全 compinit slow");
+  });
+
+  it("draws a title or tab name that holds markup as literal text, and leaves the cutting to CSS", () => {
+    const longTitle = `<b>x</b> <img src=x onerror=alert(1)> ${"long words ".repeat(20)}end`;
+    const hello: Hello = {
+      ...HELLO,
+      resumableSessions: [session({ title: longTitle })],
+      restore: { labels: ["<i>tab</i>"], bypass: 0 },
+    };
+    const { container } = renderDash({ hello });
+    for (const detail of Array.from(container.querySelectorAll(".dash-detail"))) {
+      expect(detail.querySelector("b, i, img")).toBeNull();
+    }
+    const [restore, resume] = Array.from(container.querySelectorAll(".dash-detail"));
+    expect(restore.textContent).toBe("1 tab · <i>tab</i>");
+    // The whole title is in the row; nothing in the component shortened it.
+    expect(resume.textContent).toBe(longTitle);
   });
 
   /* The start screen carries no hints of its own. The status band under it names the mode, and
@@ -175,16 +240,20 @@ describe("Dashboard", () => {
       }
       expect(container.textContent).not.toContain(MODE_CONSEQUENCE[mode]);
       expect(Array.from(container.querySelector(".dashboard")!.children).map((el) => el.className)).toEqual([
+        "dash-head",
+        "dash-items",
+      ]);
+      // The head is the mark, the question and the where-line, and nothing more.
+      expect(Array.from(container.querySelector(".dash-head")!.children).map((el) => el.getAttribute("class"))).toEqual([
+        "dash-mark",
         "dash-title",
         "dash-where",
-        "dash-items",
       ]);
       unmount();
     }
   });
 
-  /* Manual's consequence (2026-10-14) is said where the other modes' are since 2026-10-15, the `?` sheet;
-     the start screen draws no mode row (the band names the mode). */
+  /* The `?` sheet carries mode consequences; the band names the mode, so the start screen needs no mode row. */
   it("says every edit asks in manual, and on another agent's tab only what reaches Eitri", () => {
     const { container } = renderDash({ mode: "manual" });
     expect(container.textContent).not.toMatch(/Mode:/);

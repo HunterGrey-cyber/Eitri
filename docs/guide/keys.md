@@ -49,12 +49,13 @@ The keys marked "repeats" can be pressed again within half a second without the 
 
 | keys | what they do |
 |---|---|
-| `<prefix> e` / `a` / `t` | show and focus the editor / the agent / the terminal, or hide it when it already has the keys |
+| `<prefix> e` / `a` / `t` | show and focus the editor / the agent / the terminal, or hide it when it already has the keys; once nvim has quit in the editor (`<prefix> x` on it, or a `:q` while the window stayed open), showing the editor starts a fresh nvim in its place |
 | `<prefix> Left`, `Right`, `Up`, `Down` | move the keys to the module on that side (repeats) |
 | `<prefix> ;` | move the keys back to the module that had them before |
 | `<prefix> o` | move the keys to the next module on screen |
 | `<prefix> z` | zoom this module, or restore it |
 | `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there; with the keys in a terminal, `t` opens a new terminal there (see [Containers and terminals](#containers-and-terminals)) |
+| `<prefix> d`, then `e`, `a` or `t` (or a panel's own key) | hide that module wherever the keys are; it keeps running. The keys stay where they are unless that module had them, and then go to its neighbour; `Esc` cancels |
 | `<prefix> !` | with the keys in the agent panel: break the active tab out into a chat view of its own, to the right of the panel; with the keys in such a view, join its tab back (see [Chat views](#chat-views)) |
 | `<prefix> {` / `<prefix> }` | swap this module with the previous / the next one on screen |
 | `<prefix> Alt+1` / `Alt+2` | every module in one row / in one column, at equal sizes |
@@ -68,10 +69,10 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> q` | draw a number on every module on screen; press that number (`1` to `9`, then `0`) to give that module the keys. `Esc` or any other key ends it, and so does one second without a key |
 | `<prefix> Ctrl+Up`, `Ctrl+Down`, `Ctrl+Left`, `Ctrl+Right` | move the nearest divider one cell that way (repeats) |
 | `<prefix> Alt+Up`, `Alt+Down`, `Alt+Left`, `Alt+Right` | the same, five cells (repeats) |
-| `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri, and then the question, like closing the window, also names the chat turns running or queued and the terminals running a command (`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`); a job left in the background at a shell prompt is not counted |
+| `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri, and then the question, like closing the window, also names the chat turns running or queued and the terminals running a command (`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`); a job left in the background at a shell prompt is not counted. On the editor it quits nvim as `:confirm qall` does (nvim asks about unsaved buffers itself), and the editor comes back with a fresh nvim on `<prefix> e` |
 | `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal and the toast says `prefix [ scrolls the terminal` |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
-| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only: the editor, the chat or a plugin's page (repeats: keep Ctrl down and press `=` or `-` again) |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only: the editor, the chat, a plugin's page or the terminal (repeats: keep Ctrl down and press `=` or `-` again) |
 
 Each of these arrangements ends a zoom when it changes something and leaves it on when there was nothing to do. The
 keys stay with the module that had them, and a hidden module stays hidden. With fewer than two modules on screen they
@@ -129,13 +130,20 @@ import and your tmux configuration bind that key.
 | keys | what they do |
 |---|---|
 | `F11` | fullscreen |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for the editor, the panel and every plugin page together (the keypad's `+`, `-` and `0` work too) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for the editor, the panel, every plugin page and the terminal together (the keypad's `+`, `-` and `0` work too) |
 | `Ctrl+wheel` | text size of the pane under the pointer only |
 
 A plugin's page (the learning plugin, the Markdown preview) is zoomed whole, its layout with its text, and follows the
 editor's size: `Ctrl+=` grows the editor and every page together, a page made larger or smaller on its own keeps that
 difference until `Ctrl+0` or `<prefix> Ctrl+0` on it, and the page keeps its size when it reloads. The page never
 sees these keys.
+
+The terminal draws in the editor's font, the families and the size of your `guifont` (`terminal.font` in
+`init.lua` changes that, see [Configuration](configuration.md#settings)), and follows the editor's size the same way:
+`Ctrl+=` grows it with the editor, and `Ctrl+wheel` over a terminal or `<prefix> Ctrl+=` in one sizes it alone, until
+`Ctrl+0` or `<prefix> Ctrl+0` there. Every terminal of the window is one size, as every chat view is. A size change is
+a new grid for the shell: a larger font is fewer rows and columns, and the program running in it is told, as when the
+pane itself is resized (`stty size` shows the new numbers). The program never sees these keys or `Ctrl+wheel`.
 
 A companion window (see [Companion mode](companion.md)) has no layout of its own, so there the prefix keeps
 the tab keys, `r`, `?`, `:`, `f`, the text size keys (`Ctrl+=`, `Ctrl+-`, `Ctrl+0`), sending the prefix itself

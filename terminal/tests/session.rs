@@ -10,7 +10,7 @@ use common::{ctrl, plain_sh, size, spec, Harness, WAIT};
 use eitri_terminal::mouse::{Button, MouseInput, MouseKind, MouseMods};
 use eitri_terminal::pty::HANGUP_GRACE;
 use eitri_terminal::session::SYNC_UPDATE_TIMEOUT;
-use eitri_terminal::{CursorCell, SessionCommand, SessionConfig, TerminalColors, REPLY_CAP};
+use eitri_terminal::{CursorCell, PtySize, SessionCommand, SessionConfig, TerminalColors, TerminalMetrics, REPLY_CAP};
 use terminal_input::NormalizedInput;
 use terminal_render::RgbColor;
 
@@ -68,8 +68,42 @@ fn stty_size_follows_resize_both_ways() {
     assert_eq!(h.frame.as_ref().map(|f| (f.cols, f.rows)), Some((50, 10)));
 }
 
-/// A program that asks the terminal where the cursor is must get an answer: the frozen driver's
-/// `VoidListener` dropped it and the program waited out its timeout.
+/// A text-size change is a metrics rebuild at the same pane size, and the grid it gives is what the
+/// shell is told: twice the font is fewer cells, and `stty size` reports exactly the rebuilt grid, both
+/// ways -- the same `PtySize::from_metrics` a pane resize sends, so the drawn grid and the PTY's agree.
+#[test]
+fn a_font_size_change_resizes_the_pty_to_the_rebuilt_grid() {
+    let (width, height) = (1280.0, 480.0);
+    let at = |px: f32| TerminalMetrics::with_families(&["monospace".to_string()], px, width, height, 1.0);
+    let small = PtySize::from_metrics(&at(14.0));
+    let large = PtySize::from_metrics(&at(28.0));
+    assert!(
+        large.cols < small.cols && large.rows < small.rows,
+        "twice the font must be fewer cells: {small:?} -> {large:?}"
+    );
+    let mut h = Harness::start(plain_sh(), small);
+    h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with('$')));
+    h.type_str("stty size\n");
+    let says = |size: PtySize| format!("{} {}", size.rows, size.cols);
+    h.wait_for(WAIT, |h| h.has_line(&says(small)));
+    h.session.send(SessionCommand::Resize(large));
+    h.type_str("clear; stty size\n");
+    h.wait_for(WAIT, |h| h.has_line(&says(large)));
+    assert_eq!(
+        h.frame.as_ref().map(|f| (f.cols, f.rows)),
+        Some((large.cols, large.rows))
+    );
+    h.session.send(SessionCommand::Resize(small));
+    h.type_str("clear; stty size\n");
+    h.wait_for(WAIT, |h| h.has_line(&says(small)));
+    assert_eq!(
+        h.frame.as_ref().map(|f| (f.cols, f.rows)),
+        Some((small.cols, small.rows))
+    );
+}
+
+/// A cursor-position query must get an answer: dropping it with a `VoidListener` makes the
+/// program wait out its timeout.
 #[test]
 fn a_cursor_position_query_is_answered() {
     let script = r#"stty -icanon -echo min 0 time 20; printf '\033[6n'; r=$(dd bs=1 count=6 2>/dev/null); printf 'reply=%s\n' "$(printf %s "$r" | od -An -c | tr -s ' ')""#;
@@ -178,9 +212,10 @@ fn the_title_reaches_the_host() {
     assert_eq!(h.events.title, Some(Some("eitri-title".to_string())));
 }
 
-/// After the initial frames, a child that prints nothing causes no render, host wake-up, or
-/// session-thread wake-up. The thread counter catches a timed `poll` that would keep waking
-/// without rendering.
+/// Idle output costs nothing: after the first frames, a child that prints nothing causes no render,
+/// no host wake-up, and no wake-up of the session thread itself (an unconditional redraw costs
+/// about 60x idle CPU). The third counter is what catches a `poll` timeout, which would
+/// wake the thread 60 times a second while rendering nothing.
 #[test]
 fn idle_renders_nothing() {
     let mut h = Harness::start(spec("/bin/sh", &["-c", "printf ready; exec sleep 5"]), size(80, 5));
@@ -224,17 +259,12 @@ fn a_flood_is_coalesced_to_about_one_render_per_frame() {
 }
 
 /// A bell on most reads must ride the render clock like a pixel
-/// change does, not ring the host once per loop turn. Before the fix, `publish_events` rang
-/// unconditionally on every read that saw an event, which for a bell-heavy stream is far more often
-/// than once per frame (measured: 1118 host wakes/s against 58 renders/s for the same volume).
+/// change does, not ring the host once per loop turn. Unconditionally ringing on every read
+/// with an event measures 1118 host wakes/s against 58 renders/s for the same volume.
 ///
-/// A byte-volume flood (`yes | head -c N`, as the render-coalescing test above uses) turned out not
-/// to pin this: how many separate read turns 4 MB of bells takes depends on how fast THIS build
-/// parses -- a slow debug build lets the pty buffer refill between reads and coalesces turns by
-/// accident, which is what made an earlier version of this test pass unmodified against the unfixed
-/// code (13 wake-ups over 2s, nowhere near a per-turn rate). Forty bells explicitly spaced 5ms
-/// apart are forty genuinely separate turns regardless of build speed, so this reproduces the bug's
-/// shape without depending on it.
+/// A byte-volume flood (`yes | head -c N`) depends on parsing speed: a slow debug build lets
+/// the PTY refill between reads and coalesces turns by accident (13 wakes over 2s in a
+/// measurement). Forty bells spaced 5ms apart force separate turns regardless of build speed.
 #[test]
 fn a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame() {
     let started = std::time::Instant::now();
@@ -255,7 +285,7 @@ fn a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame() {
 }
 
 /// A hidden bell must not wake the host: hidden terminals suppress frame and event wakes.
-/// An unconditional bell notification measured 719 hidden host wakes/s even though the pump
+/// An unconditional bell notification measures 719 hidden host wakes/s even though the pump
 /// has nothing to do with a bell.
 #[test]
 fn a_hidden_bell_flood_rings_the_host_not_at_all() {
@@ -326,7 +356,7 @@ fn the_tap_sees_the_raw_stream() {
 /// killed, by the pid captured at spawn. That pid is the shell's. A job the shell
 /// runs in a process group of its own gets the ordinary hangup -- from the shell, and from the
 /// kernel when the master closes -- and one that ignores it outlives the window, as it would
-/// outlive foot or alacritty; the GUI checklist records it.
+/// outlive foot or alacritty.
 #[test]
 fn a_shell_that_ignores_sighup_is_killed_after_the_grace_period() {
     let mut h = Harness::start(
@@ -423,9 +453,8 @@ fn a_reset_inside_an_open_update_is_published_after_the_deadline() {
 /// A child that exits while a synchronized update is still open must not freeze the pane on the
 /// stale pre-update frame: its own content and the exit notice must both reach the screen.
 /// `Screen::render` returns the snapshot taken at the moment the update opened for as long as
-/// `open_update()` is `Some`, and the exit path used to feed the notice and render without ever
-/// closing the update first -- so neither "inside" nor the notice ever appeared; the pane stayed on
-/// `["before", "", ...]` forever, even though `exited` was set.
+/// `open_update()` is `Some`. Feeding the exit notice and rendering without closing the update
+/// would leave the pane on `["before", "", ...]` despite `exited`, hiding both "inside" and the notice.
 #[test]
 fn an_exit_inside_an_open_synchronized_update_still_shows_its_content_and_the_notice() {
     let mut h = Harness::start(
@@ -574,7 +603,7 @@ fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
 /// A key the program does not echo changes nothing on screen, so it renders nothing. A render for
 /// an unchanged screen is not only wasted work: it takes the render clock's leading edge, and the
 /// echo of the next key that does change something then waits out the rest of the frame (16 ms
-/// after idle, measured, before keys at the live bottom stopped marking the screen dirty).
+/// after idle in a measurement).
 #[test]
 fn a_key_that_changes_nothing_on_screen_renders_nothing() {
     let mut h = Harness::start(
@@ -590,8 +619,8 @@ fn a_key_that_changes_nothing_on_screen_renders_nothing() {
 }
 
 /// A program that changes only its title, or rings the bell, changes nothing a frame shows: the
-/// events reach the host, riding the render clock as before, and no frame is built for them (34
-/// frames for 100 titles 5 ms apart before, measured).
+/// events reach the host, riding the render clock, and no frame is built for them (rendering
+/// unchanged frames measures 34 frames for 100 titles 5 ms apart).
 #[test]
 fn titles_and_bells_reach_the_host_without_a_frame() {
     let script = "printf ready; read _; i=0; while [ $i -lt 20 ]; do printf '\\033]2;t%d\\007\\a' $i; i=$((i+1)); sleep 0.005; done; exec sleep 5";

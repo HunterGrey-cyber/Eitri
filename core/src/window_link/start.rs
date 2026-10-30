@@ -1,4 +1,5 @@
-//! How window 2 comes to exist: window 1 starts it with `eitri linked-window [--legacy] <fd> 2 <root> [token]`, the link's other
+//! How window 2 comes to exist: window 1 starts it with `eitri linked-window [--legacy] [--clean] [--restore] <fd> 2
+//! <root> [token]`, the link's other
 //! end placed at that descriptor number, and window 2's first acts check that end before anything else runs.
 //!
 //! The command line carries what window 2 needs because `main()`'s flags take no values and an environment variable
@@ -40,19 +41,39 @@ pub struct LinkedArgs {
     pub root: PathBuf,
     /// An xdg-activation token from window 1, so window 2 opens focused.
     pub token: Option<String>,
+    /// Window 1 started this window again as the pair last ended it ([`RESTORE_FLAG`]).
+    pub restore: bool,
 }
 
 /// Window 1's `--legacy`, passed on to window 2 ahead of its other arguments: the flag picks a launch's chat
 /// backend, and window 2's chats are to run the backend window 1's run. `main()` reads it as on any launch.
 pub const LEGACY_FLAG: &str = "--legacy";
 
-/// Parses `[--legacy] <fd> <window> <root> [token]`, the arguments after `linked-window`.
+/// Window 1's `--clean`, passed on to window 2 after `--legacy`: a clean launch neither reads nor writes the user's
+/// remembered state, and a window 2 it starts is part of that launch. `main()` reads it as on any launch.
+pub const CLEAN_FLAG: &str = "--clean";
+
+/// Window 1 starting window 2 again at its own launch, because window 2 was open when the pair last ended: window 2
+/// then builds what the pair file says it held, offers its own saved tabs and goes back to its monitor. Written
+/// after `--clean`.
+pub const RESTORE_FLAG: &str = "--restore";
+
+/// Parses `[--legacy] [--clean] [--restore] <fd> <window> <root> [token]`, the arguments after `linked-window`; each
+/// flag at most once and in that order, as window 1 writes them.
 pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
-    let usage = format!("usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] <fd> {SECOND_WINDOW} <root> [token]");
-    let args = match args.split_first() {
-        Some((first, rest)) if first == LEGACY_FLAG => rest,
-        _ => args,
-    };
+    let usage = format!(
+        "usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] [{CLEAN_FLAG}] [{RESTORE_FLAG}] <fd> {SECOND_WINDOW} <root> [token]"
+    );
+    let mut args = args;
+    let mut restore = false;
+    for flag in [LEGACY_FLAG, CLEAN_FLAG, RESTORE_FLAG] {
+        if let Some((first, rest)) = args.split_first() {
+            if first == flag {
+                args = rest;
+                restore |= flag == RESTORE_FLAG;
+            }
+        }
+    }
     let (fd, window, root, token) = match args {
         [fd, window, root] => (fd, window, root, None),
         [fd, window, root, token] => (fd, window, root, Some(token)),
@@ -92,6 +113,7 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
         window: window.to_string_lossy().into_owned(),
         root,
         token,
+        restore,
     })
 }
 
@@ -144,8 +166,8 @@ pub fn open_log(state_home: &Path, root: &Path) -> io::Result<File> {
 }
 
 /// Starts window 2 from `exe` (window 1's `/proc/self/exe`, so both windows are one build even after an upgrade
-/// replaced the installed file) as `linked-window [--legacy] 3 2 <root> [token]` (`--legacy` when `legacy`), with
-/// `child_end` at descriptor 3 and not
+/// replaced the installed file) as `linked-window [--legacy] [--clean] [--restore] 3 2 <root> [token]` (`--legacy`
+/// when `legacy`, `--clean` when `clean`, `--restore` when `restore`), with `child_end` at descriptor 3 and not
 /// close-on-exec there, stdio on `/dev/null`, in its own process group. `child_end` itself stays close-on-exec in
 /// this process and is closed when the spawn returns, so window 1 keeps no copy of window 2's end.
 pub fn spawn_second(
@@ -154,8 +176,10 @@ pub fn spawn_second(
     root: &Path,
     token: Option<&str>,
     legacy: bool,
+    clean: bool,
+    restore: bool,
 ) -> io::Result<Child> {
-    let mut command = second_command(exe, root, token, legacy);
+    let mut command = second_command(exe, root, token, legacy, clean, restore);
     let raw = child_end.as_raw_fd();
     // SAFETY: the closure runs in the forked child before `exec` and calls only `fcntl` and `dup2`, both
     // async-signal-safe; `raw` stays open in this process until the spawn has returned.
@@ -169,11 +193,17 @@ pub fn spawn_second(
 
 /// Window 2's command without its link end: the arguments, the stdio, the process group. Nothing is added to the
 /// environment.
-fn second_command(exe: &Path, root: &Path, token: Option<&str>, legacy: bool) -> Command {
+fn second_command(exe: &Path, root: &Path, token: Option<&str>, legacy: bool, clean: bool, restore: bool) -> Command {
     let mut command = Command::new(exe);
     command.arg(SUBCOMMAND);
     if legacy {
         command.arg(LEGACY_FLAG);
+    }
+    if clean {
+        command.arg(CLEAN_FLAG);
+    }
+    if restore {
+        command.arg(RESTORE_FLAG);
     }
     command.arg(LINK_FD.to_string()).arg(SECOND_WINDOW).arg(root);
     if let Some(token) = token.filter(|t| !t.is_empty()) {
@@ -227,6 +257,7 @@ mod tests {
                 window: "2".into(),
                 root: "/home/someone/project".into(),
                 token: None,
+                restore: false,
             }
         );
         assert_eq!(
@@ -265,6 +296,7 @@ mod tests {
             window: "2".into(),
             root: "/p".into(),
             token: None,
+            restore: false,
         };
         let err = first_acts(&args).expect_err("this process's own pair has no parent at its other end");
         assert!(err.contains("parent"), "the refusal names the peer check: {err}");
@@ -286,6 +318,7 @@ mod tests {
             window: "2".into(),
             root: "/p".into(),
             token: None,
+            restore: false,
         };
         let err = first_acts(&args(r.as_raw_fd())).unwrap_err();
         assert!(err.contains("socket"), "a pipe is refused as not a socket: {err}");
@@ -312,7 +345,14 @@ mod tests {
     #[test]
     fn the_command_carries_the_token_as_its_last_argument_and_sets_no_environment() {
         let token = "activation-token-5f3a91";
-        let command = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), Some(token), false);
+        let command = second_command(
+            Path::new("/usr/bin/eitri"),
+            Path::new("/p"),
+            Some(token),
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             command.get_envs().count(),
             0,
@@ -323,13 +363,20 @@ mod tests {
             [SUBCOMMAND, "3", "2", "/p", token],
             "the token is the last argument"
         );
-        let without = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), None, false);
+        let without = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), None, false, false, false);
         assert_eq!(without.get_args().collect::<Vec<_>>(), [SUBCOMMAND, "3", "2", "/p"]);
     }
 
     #[test]
     fn a_legacy_window_1_starts_window_2_with_the_same_flag_and_it_parses() {
-        let command = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), Some("tok"), true);
+        let command = second_command(
+            Path::new("/usr/bin/eitri"),
+            Path::new("/p"),
+            Some("tok"),
+            true,
+            false,
+            false,
+        );
         let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
         assert_eq!(args, os(&[SUBCOMMAND, LEGACY_FLAG, "3", "2", "/p", "tok"]));
         let parsed = parse_args(&args[1..]).unwrap();
@@ -339,6 +386,103 @@ mod tests {
             "the flag is not read as an argument"
         );
         assert!(parse_args(&os(&[LEGACY_FLAG, "3", "2", "/p", "tok", "more"])).is_err());
+    }
+
+    #[test]
+    fn a_clean_window_1_starts_window_2_with_the_same_flag_and_it_parses() {
+        let exe = Path::new("/usr/bin/eitri");
+        let args_of = |command: Command| -> Vec<OsString> { command.get_args().map(OsString::from).collect() };
+        let clean = args_of(second_command(exe, Path::new("/p"), Some("tok"), false, true, false));
+        assert_eq!(clean, os(&[SUBCOMMAND, "--clean", "3", "2", "/p", "tok"]));
+        let both = args_of(second_command(exe, Path::new("/p"), Some("tok"), true, true, false));
+        assert_eq!(
+            both,
+            os(&[SUBCOMMAND, "--legacy", "--clean", "3", "2", "/p", "tok"]),
+            "--clean follows --legacy"
+        );
+        let expected = LinkedArgs {
+            fd: 3,
+            window: "2".into(),
+            root: "/p".into(),
+            token: Some("tok".into()),
+            restore: false,
+        };
+        assert_eq!(
+            parse_args(&clean[1..]).unwrap(),
+            expected,
+            "the flag is not read as an argument"
+        );
+        assert_eq!(
+            parse_args(&both[1..]).unwrap(),
+            expected,
+            "neither flag is read as an argument"
+        );
+        let refused = [
+            (
+                vec!["--clean", "--legacy", "3", "2", "/p"],
+                "the flags in the other order",
+            ),
+            (vec!["--clean", "--clean", "3", "2", "/p"], "--clean twice"),
+            (vec!["--legacy", "--legacy", "3", "2", "/p"], "--legacy twice"),
+            (
+                vec!["--legacy", "--clean", "--clean", "3", "2", "/p"],
+                "--clean twice after --legacy",
+            ),
+            (
+                vec!["--legacy", "--clean", "3", "2", "/p", "tok", "more"],
+                "an argument too many",
+            ),
+        ];
+        for (args, why) in refused {
+            assert!(parse_args(&os(&args)).is_err(), "{why} is refused: {args:?}");
+        }
+    }
+
+    #[test]
+    fn the_restore_flag_parses_beside_legacy_and_clean() {
+        let exe = Path::new("/usr/bin/eitri");
+        let args_of = |command: Command| -> Vec<OsString> { command.get_args().map(OsString::from).collect() };
+        let restore = args_of(second_command(exe, Path::new("/p"), None, false, false, true));
+        assert_eq!(restore, os(&[SUBCOMMAND, RESTORE_FLAG, "3", "2", "/p"]));
+        let all = args_of(second_command(exe, Path::new("/p"), Some("tok"), true, true, true));
+        assert_eq!(
+            all,
+            os(&[SUBCOMMAND, LEGACY_FLAG, CLEAN_FLAG, RESTORE_FLAG, "3", "2", "/p", "tok"]),
+            "--restore follows --legacy and --clean"
+        );
+        let parsed = parse_args(&restore[1..]).unwrap();
+        assert!(parsed.restore, "the flag is read");
+        assert_eq!((parsed.fd, parsed.token), (3, None), "and not as an argument");
+        let parsed = parse_args(&all[1..]).unwrap();
+        assert!(parsed.restore);
+        assert_eq!(parsed.token.as_deref(), Some("tok"));
+        assert!(
+            !parse_args(&os(&[LEGACY_FLAG, CLEAN_FLAG, "3", "2", "/p"]))
+                .unwrap()
+                .restore,
+            "no flag, no restore"
+        );
+        let refused = [
+            (vec!["--restore", "--clean", "3", "2", "/p"], "--restore before --clean"),
+            (
+                vec!["--restore", "--legacy", "3", "2", "/p"],
+                "--restore before --legacy",
+            ),
+            (vec!["--restore", "--restore", "3", "2", "/p"], "--restore twice"),
+            (
+                vec!["3", "2", "/p", "--restore"],
+                "--restore after the root, where the token goes",
+            ),
+        ];
+        for (args, why) in refused {
+            let parsed = parse_args(&os(&args));
+            assert!(
+                parsed
+                    .as_ref()
+                    .map_or(true, |a| a.token.as_deref() == Some("--restore") && !a.restore),
+                "{why} is refused or read as a token: {args:?} gave {parsed:?}"
+            );
+        }
     }
 
     #[test]

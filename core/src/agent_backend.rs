@@ -830,6 +830,33 @@ impl AgentBackend {
         }
     }
 
+    /// The provider's way to move with this backend's chat to the other window, when it has one; the legacy
+    /// backend has none.
+    #[cfg(target_os = "linux")]
+    pub fn mover(&self) -> Option<&dyn agent::chat_mover::ChatMover> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.mover(),
+        }
+    }
+
+    /// A second descriptor on the session lease, for the window the chat moves to; `None` when the session holds
+    /// no lease.
+    pub fn lease_descriptor(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.lease_descriptor(),
+        }
+    }
+
+    /// A moved chat's commit in the window that took it up: the lease names this process from here on.
+    pub fn commit_moved(&mut self) -> std::io::Result<()> {
+        match self {
+            AgentBackend::Legacy(_) => Ok(()),
+            AgentBackend::Conversation { conversation, .. } => conversation.commit_moved(),
+        }
+    }
+
     /// Effective capabilities: what the server advertises, intersected with what this client can
     /// actually drive end to end (`AgentConversation`/`ClaudeSidecarProvider` apply the
     /// intersection; this just reports it).

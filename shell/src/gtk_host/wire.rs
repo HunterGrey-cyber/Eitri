@@ -273,15 +273,20 @@ mod tests {
     #[test]
     fn a_chat_view_opened_at_runtime_swallows_super_chords() {
         assert!(plan_host(WireKind::Chat).super_filter);
-        // Every chat view made at run time is the controller's `CreateSurface`, whose maker wires its host.
+        // Every chat view made at run time is the controller's `CreateSurface` or an arrival's `PrepareSurface`, whose
+        // maker wires its host through one helper.
         let source = scan::read_required("shell/src/gtk_host/surfaces.rs");
-        let code: String = scan::code_only(&source.text).split_whitespace().collect();
-        let at = code
-            .find("CreateRoute::ChatView=>{")
-            .expect("the runtime chat view's route");
-        let body = scan::braced(&code, at + "CreateRoute::ChatView=>".len());
+        let text = scan::code_only(&source.text);
+        let code: String = text.split_whitespace().collect();
+        assert!(
+            code.contains("CreateRoute::ChatView=>self.chat_view_wired(module),"),
+            "the runtime chat view's route goes through the one chat view wiring"
+        );
+        let helper = scan::functions(&text, "chat_view_wired");
+        assert_eq!(helper.len(), 1, "one chat view wiring");
+        let helper: String = helper[0].split_whitespace().collect();
         assert_eq!(
-            body.matches("wire_host(WireKind::Chat,").count(),
+            helper.matches("wire_host(WireKind::Chat,").count(),
             1,
             "the runtime path wires its chat view's host as a chat, once"
         );

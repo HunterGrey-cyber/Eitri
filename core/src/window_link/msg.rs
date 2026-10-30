@@ -271,6 +271,21 @@ pub enum Msg {
         mv: u64,
         why: String,
     },
+    /// Asks the other window to offer a module it holds: the move a key in this window wants is the other window's
+    /// to start, since only the holder can freeze what it holds. Either names the module, or a chat's session.
+    MoveAsk {
+        module: Option<String>,
+        session: Option<String>,
+        follow: bool,
+    },
+    /// A workspace's saved arrangement and the module moves that decide its arrival.
+    WorkspaceMove {
+        group: u64,
+        name: String,
+        tree: Value,
+        moves: Vec<u64>,
+        swap: Option<u64>,
+    },
     Swap {
         move_a: u64,
         move_b: u64,
@@ -315,6 +330,8 @@ pub const KINDS: &[&str] = &[
     "move",
     "move_done",
     "move_abort",
+    "move_ask",
+    "workspace_move",
     "swap",
     "child_exited",
     "away",
@@ -351,6 +368,8 @@ impl Msg {
             Msg::Move { .. } => "move",
             Msg::MoveDone { .. } => "move_done",
             Msg::MoveAbort { .. } => "move_abort",
+            Msg::MoveAsk { .. } => "move_ask",
+            Msg::WorkspaceMove { .. } => "workspace_move",
             Msg::Swap { .. } => "swap",
             Msg::ChildExited { .. } => "child_exited",
             Msg::Away { .. } => "away",
@@ -669,6 +688,18 @@ mod tests {
             Msg::MoveAbort {
                 mv: 5,
                 why: "gone".into(),
+            },
+            Msg::MoveAsk {
+                module: Some("terminal#2".into()),
+                session: None,
+                follow: true,
+            },
+            Msg::WorkspaceMove {
+                group: 8,
+                name: "study".into(),
+                tree: serde_json::json!({"tiled": "agent"}),
+                moves: vec![5, 7],
+                swap: Some(9),
             },
             Msg::Swap { move_a: 5, move_b: 6 },
             Msg::ChildExited {

@@ -5,10 +5,9 @@
  * can make the editor's next frame land a refresh late. The page's own motion must not undo that:
  * the activity line's star repaints on its own, so while the user types it is slowed to no faster than
  * the cadence (never paused: the stream is meant to stay smooth, and a still star reads as a hang). The
- * variable keeps the name of the bar meter the star replaced.
+ * variable keeps the name of the bar meter the star replaced, so `--meter-step` drives the star's step.
  *
- * The only self-driven motion in the panel, checked 2026-09-29 by reading every `setInterval`,
- * `requestAnimationFrame`, `animation` and `transition` in `src/`:
+ * Self-driven motion in the panel:
  *
  * - the star (`index.css`, `.activity-glyph[data-moving]`): 4 visible states in 1200 ms, one repaint
  *   per {@link NATURAL_METER_STEP_MS}. Slowed here, through `--meter-step`.

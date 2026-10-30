@@ -287,7 +287,8 @@ describe("the trust question", () => {
       wait(TYPING_GUARD_MS + 50);
     }
     expect(prompt(container)).not.toBeNull();
-    expect(posted.filter((m) => !["ready", "panel_keys"].includes(String(m.type)))).toEqual([]);
+    // `painted` is the page's own first-frame word to its host, posted whatever the keys do.
+    expect(posted.filter((m) => !["ready", "panel_keys", "painted"].includes(String(m.type)))).toEqual([]);
   });
 
   it("a session prompt's flash also says y covers this start only", () => {

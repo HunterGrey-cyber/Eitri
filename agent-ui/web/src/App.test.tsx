@@ -15005,7 +15005,7 @@ describe("restoring the last session's tabs", () => {
     try {
       const { container, root } = emptyTabWithOffer();
       const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Restore"))!;
-      expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session (2 tabs, 1 in bypass: api, docs)");
+      expect(row.querySelector(".dash-label")!.textContent).toBe("Restore last session 2 tabs, 1 in bypass · api, docs");
       fireEvent.keyDown(root, { key: "s" });
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
       expect(lastOfType("restore_last")).toMatchObject({ tab: 1 });

@@ -1585,25 +1585,25 @@ fn describe_startup_failure(summary: &str, stderr_tail: &Arc<Mutex<StderrTail>>)
     format!("{summary}; its stderr said:\n{}", lines.join("\n"))
 }
 
-/// Polls `child` for up to `grace`, then escalates to SIGKILL if it hasn't exited on its own.
-/// Extracted out of `SpawnedSidecar::drop` so the grace/kill/give-up shape is independently
-/// testable against a real child process rather than only through a whole `SpawnedSidecar`.
-///
-/// Genuinely bounded either way: within `grace` if the child exits on its own, or near-instantly
-/// once `grace` elapses and this falls through to `kill()` + `wait()` -- never an unbounded wait
-/// that could hang the thread dropping it.
+/// Waits up to `grace` without reaping the child, then kills its group even if the leader exited on its
+/// own. Keeping the leader waitable reserves its pid until the group is ended; the final wait returns
+/// the leader's own exit status when it ended during the grace.
 pub(crate) fn stop_child(child: &mut Child, grace: Duration) -> std::io::Result<ExitStatus> {
+    use crate::jsonrpc_link::{child_state, ChildState};
+
     let deadline = std::time::Instant::now() + grace;
     loop {
-        match child.try_wait()? {
-            Some(status) => return Ok(status),
-            None if std::time::Instant::now() < deadline => {
+        match child_state(child.id()) {
+            ChildState::Running if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            None => break,
+            ChildState::Running | ChildState::Exited => break,
+            // A child reaped elsewhere no longer reserves its pid for the group signal.
+            ChildState::Gone => return child.wait(),
         }
     }
-    kill_group_or_child(child)?;
+    // A failed signal must not skip the wait: the leader may be a zombie that only this wait reaps.
+    let _ = kill_group_or_child(child);
     child.wait()
 }
 
@@ -1625,8 +1625,8 @@ impl Drop for SpawnedSidecar {
     /// parent-death signal, verified for real), wait up to
     /// `SIDECAR_EXIT_GRACE` (long enough for the sidecar to reap the `claude` CLI it owns before
     /// exiting -- a graceful exit lets the sidecar fail-close any pending permissions server-side
-    /// before this process moves on), then escalate to SIGKILL if it still hasn't exited --
-    /// the same graceful-then-forced escalation every child here gets. Deliberately simpler than
+    /// before this process moves on), then SIGKILL its group before reaping it, including when the
+    /// sidecar exited during the wait. Deliberately simpler than
     /// `panel/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
     /// pattern exists there because a *detached* supervisor process may run for an unbounded time
     /// after being spawned, so its eventual `wait()` has no natural bound to block on. Here, by the
@@ -1655,15 +1655,16 @@ impl Drop for SpawnedSidecar {
 }
 
 /// [`stop_child`] for a sidecar this process took over: its stdin is already closed by the caller;
-/// waits up to `grace` on the pidfd, then SIGKILL through it. Nothing is reaped here: the status is
-/// the kernel parent's to read (the window that started the sidecar, or init once it is gone).
+/// waits up to `grace` on the pidfd, then SIGKILLs the group through it even if the leader exited (a
+/// kernel without group signals through a pidfd reaches the group only while the leader lives). Nothing is
+/// reaped here: the status is the kernel parent's to read (the window that started the sidecar, or init
+/// once it is gone).
 #[cfg(target_os = "linux")]
 pub(crate) fn end_adopted(pidfd: &crate::child::PidFd, grace: Duration) {
-    if !pidfd.wait_exited(grace) {
-        // The group, as for a sidecar this process started, so its CLI goes with it.
-        let _ = pidfd.signal_group(libc::SIGKILL);
-        let _ = pidfd.wait_exited(Duration::from_secs(1));
-    }
+    let _ = pidfd.wait_exited(grace);
+    // The group, also when the leader exited already, so its CLI goes with it.
+    let _ = pidfd.signal_group(libc::SIGKILL);
+    let _ = pidfd.wait_exited(Duration::from_secs(1));
 }
 
 #[cfg(test)]
@@ -1812,10 +1813,59 @@ mod tests {
             .spawn()
             .unwrap();
         drop(child.stdin.take());
-        let started = std::time::Instant::now();
         let status = super::stop_child(&mut child, Duration::from_millis(200)).unwrap();
         assert_eq!(status.signal(), Some(9));
-        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A sidecar's own exit does not end the children it left running in its group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_that_exits_on_stdin_close_still_takes_its_group_with_it() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; read _; exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: libc::pid_t = line.trim().parse().unwrap();
+        let leader = child.id();
+        drop(child.stdin.take());
+        let status = super::stop_child(&mut child, Duration::from_secs(2)).unwrap();
+        assert_eq!(status.code(), Some(0), "the leader exited on its own: {status:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit(')').next().map(|rest| rest.trim_start().chars().next()))
+                .flatten();
+            if matches!(state, None | Some('Z') | Some('X')) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Only while the pid is still in the group the test started: a pid reused since names another
+                // process.
+                let group = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit(')')
+                            .next()
+                            .and_then(|rest| rest.split_whitespace().nth(2)?.parse::<u32>().ok())
+                    });
+                if group == Some(leader) {
+                    // SAFETY: `kill` reads no memory of ours; the pid is in the test's own group.
+                    unsafe { libc::kill(grandchild, libc::SIGKILL) };
+                }
+                panic!("the sidecar's own child {grandchild} still runs");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A sidecar that will not end is killed with its group, so what it started goes too.

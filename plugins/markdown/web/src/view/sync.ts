@@ -15,13 +15,17 @@ export const GUARD_MS = 150;
  *
  * The anchors are blocks, not the scroll ratio: a line inside a block is placed proportionally inside that block, a
  * line in the gap between two blocks (blank lines, a hidden element) proportionally across the gap, so a tall
- * diagram or a table never drags the lines around it out of place. A line after the last block maps to its bottom
- * (the end sentinel), and the result is clamped to the range the page can actually scroll to.
+ * diagram or a table never drags the lines around it out of place. Lines before the first block share the space
+ * above it. A line after the last block maps to its bottom (the end sentinel), and the result is clamped to the
+ * range the page can actually scroll to.
  */
 export function lineToY(index: Box[], L: number, scrollMax: number): number {
   const clamp = (y: number) => Math.min(Math.max(0, y), Math.max(0, scrollMax));
   const i = lastLineAtOrBefore(index, L);
-  if (i < 0) return 0;
+  if (i < 0) {
+    const first = index[0];
+    return first && first.line > 0 ? clamp((first.top * Math.max(0, L)) / first.line) : 0;
+  }
   const e = index[i];
   if (L < e.end) return clamp(e.top + (e.height * (L - e.line)) / (e.end - e.line));
   const bottom = e.top + e.height;
@@ -47,6 +51,21 @@ export function yToLine(index: Box[], y: number): number {
   const n = index[i + 1];
   if (!n || n.line <= e.end) return e.end;
   return e.end + ((n.line - e.end) * (y - bottom)) / (n.top - bottom);
+}
+
+/** How far from a whole pixel an offset may be and still be taken for it: far above floating-point rounding at any
+ *  document height, far below anything drawn. */
+export const SNAP_PX = 1e-6;
+
+/**
+ * The offset to scroll to so that document y `y` is at the top. The browser keeps a scroll offset in whole pixels
+ * and drops the fraction, and `lineToY` of the line `yToLine` read at a whole-pixel offset gives that offset back
+ * only up to floating-point rounding, as often a hair below it as above: dropped, a hair below loses a pixel. So a y
+ * that close to a whole pixel is that pixel, and a line read at an offset scrolls back to the same offset.
+ */
+export function scrollTarget(y: number): number {
+  const whole = Math.round(y);
+  return Math.abs(y - whole) < SNAP_PX ? whole : y;
 }
 
 export type Leader = "preview" | "editor" | "none";

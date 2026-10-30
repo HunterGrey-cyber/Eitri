@@ -442,13 +442,39 @@ pub fn startup_with(
     others: &[Role],
 ) -> (Option<SavedTabs>, Vec<String>, Vec<Takeover>) {
     let (own, mut notes) = startup_as(dir, project_root, role);
+    let (offer, takeovers) = offer_others(dir, project_root, role, others, own, &mut notes);
+    (offer, notes, takeovers)
+}
+
+/// [`startup_with`] without this window's own file: only the other windows' of `others`, for a window that offered
+/// its own earlier in the launch and has more to offer now.
+pub fn startup_others(
+    dir: Option<&Path>,
+    project_root: &Path,
+    role: Role,
+    others: &[Role],
+) -> (Option<SavedTabs>, Vec<String>, Vec<Takeover>) {
+    let mut notes = Vec::new();
+    let (offer, takeovers) = offer_others(dir, project_root, role, others, None, &mut notes);
+    (offer, notes, takeovers)
+}
+
+/// `own`, then the tabs of each window of `others` that has a usable file and is not `role`, each claimed.
+fn offer_others(
+    dir: Option<&Path>,
+    project_root: &Path,
+    role: Role,
+    others: &[Role],
+    own: Option<SavedTabs>,
+    notes: &mut Vec<String>,
+) -> (Option<SavedTabs>, Vec<Takeover>) {
     let Some(dir) = dir else {
-        return (own, notes, Vec::new());
+        return (own, Vec::new());
     };
     let mut offer = own;
     let mut takeovers = Vec::new();
     for other in others.iter().copied().filter(|other| *other != role) {
-        let Some(saved) = claim(dir, project_root, other, &mut notes) else {
+        let Some(saved) = claim(dir, project_root, other, notes) else {
             continue;
         };
         let name = file_name_as(project_root, other);
@@ -472,7 +498,7 @@ pub fn startup_with(
             Some(first) => first.followed_by(saved),
         });
     }
-    (offer, notes, takeovers)
+    (offer, takeovers)
 }
 
 /// Where the offering window keeps another window's tabs it claimed: beside that window's file, a name no other
@@ -643,6 +669,30 @@ impl TabFiles {
         }
     }
 
+    /// What these files offer beyond `given`, the files offered earlier in the launch: each other window's file not
+    /// offered yet, and this window's own if it was not. With nothing given, [`TabFiles::startup`].
+    pub fn startup_beyond(
+        &self,
+        given: Option<&TabFiles>,
+        dir: Option<&Path>,
+        project_root: &Path,
+    ) -> (Option<SavedTabs>, Vec<String>, Vec<Takeover>) {
+        let Some(given) = given else {
+            return self.startup(dir, project_root);
+        };
+        let others: Vec<Role> = self
+            .also_offer
+            .iter()
+            .copied()
+            .filter(|role| !given.also_offer.contains(role))
+            .collect();
+        if self.offers_own && !given.offers_own {
+            startup_with(dir, project_root, self.role, &others)
+        } else {
+            startup_others(dir, project_root, self.role, &others)
+        }
+    }
+
     /// The window's tab writer: its own role's file, taking over `takeovers` once written.
     pub fn writer(&self, dir: Option<PathBuf>, project_root: PathBuf, takeovers: Vec<Takeover>) -> TabWriter {
         let mut writer = TabWriter::new_as(dir, project_root, self.role);
@@ -653,7 +703,7 @@ impl TabFiles {
 
 impl SavedTabs {
     /// These tabs, then `later`'s that are not among them, each kind in order; the tab on screen stays this set's.
-    fn followed_by(self, later: SavedTabs) -> SavedTabs {
+    pub fn followed_by(self, later: SavedTabs) -> SavedTabs {
         let on_screen = |set: &SavedTabs, index: Option<usize>| {
             index
                 .and_then(|i| set.tabs.get(i))

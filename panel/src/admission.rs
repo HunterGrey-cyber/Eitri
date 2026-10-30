@@ -145,6 +145,7 @@ pub(super) fn admission(
         | InboundMessage::NavFallthrough { .. }
         | InboundMessage::PaneNav { .. }
         | InboundMessage::KeymapClosed { .. }
+        | InboundMessage::ViewExported { .. }
         | InboundMessage::OpenUrl { .. }
         | InboundMessage::RestoreLast { .. }
         | InboundMessage::TrustCommand { .. } => Admission::Ungated,

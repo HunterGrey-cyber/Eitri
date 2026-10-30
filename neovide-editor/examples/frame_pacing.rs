@@ -131,6 +131,7 @@ fn main() {
         "vim.fn.writefile({'ready'},vim.env.EITRI_PACING_READY)"
     );
     let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
+        starting_color: None,
         clean: !user_config,
         cwd: Some(scratch.clone()),
         child_env: vec![("EITRI_PACING_READY".into(), ready.to_string_lossy().into_owned())],

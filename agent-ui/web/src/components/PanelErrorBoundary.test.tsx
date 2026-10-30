@@ -22,8 +22,7 @@ function Boom({ message = "boom" }: { message?: string }): never {
   throw new Error(message);
 }
 
-/** One throw during render unmounted the whole React tree, so `#root` went
- *  empty and every key went dead. A boundary is the only thing React keeps a tree alive with. */
+/** A render throw needs a boundary to keep the root and its key handling alive. */
 describe("PanelErrorBoundary", () => {
   it("draws its children when nothing throws, and never calls onError", () => {
     const onError = vi.fn();

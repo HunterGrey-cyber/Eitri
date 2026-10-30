@@ -68,12 +68,29 @@ impl<P: Retire + Clone> InstancePool<P> {
 
     /// Run the kind's retirement hook once as the live entry moves to its idle slot.
     pub(crate) fn retire(&mut self, id: &ModuleId) -> bool {
-        let Some(entry) = self.live.remove(id) else {
+        let Some(entry) = self.set_idle(id) else {
             return false;
         };
         entry.on_retire();
-        self.idle.insert(id.clone(), entry);
         true
+    }
+
+    /// The live entry under `id` moved to its idle slot without its retirement hook, which the caller runs on the
+    /// entry answered once nothing holds the pool. `None` when no live entry has that id.
+    pub(crate) fn set_idle(&mut self, id: &ModuleId) -> Option<P> {
+        let entry = self.live.remove(id)?;
+        self.idle.insert(id.clone(), entry.clone());
+        Some(entry)
+    }
+
+    /// A new entry made for `id`, live from now on. Only for an id the pool holds no entry for, live or idle: an entry
+    /// never changes ids.
+    pub(crate) fn insert(&mut self, id: &ModuleId, entry: P) {
+        debug_assert!(
+            !self.live.contains_key(id) && !self.idle.contains_key(id),
+            "{id} already has an entry"
+        );
+        self.live.insert(id.clone(), entry);
     }
 }
 

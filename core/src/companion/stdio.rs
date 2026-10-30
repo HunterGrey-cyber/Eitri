@@ -122,7 +122,7 @@ mod tests {
         assert!(!is_pipe(-1));
     }
 
-    /// The case that crashed: the starter holds the read end, the panel writes. After the move the
+    /// The starter holds the read end, the panel writes. After the move the
     /// writes land in the log, and the starter's end sees the stream end at once, so a starter that
     /// buffers the stream until it ends (nvim's `stderr_buffered`) is not kept waiting or growing.
     #[test]

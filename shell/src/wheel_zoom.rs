@@ -21,7 +21,9 @@ use gtk4::gdk::{ModifierType, ScrollUnit};
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use crate::text_size::{self, TextSizeController, TextSizeTarget, TextStep};
+#[cfg(test)]
+use crate::text_size::{self, TextSizeTarget};
+use crate::text_size::{TextSizeController, TextStep};
 
 /// The part of a scroll gesture not yet spent on a step.
 #[derive(Debug, Default)]
@@ -82,7 +84,6 @@ pub(crate) fn steps(n: i32) -> Vec<TextStep> {
 
 /// Installs the controller on `host`, the module `id`'s host widget.
 pub(crate) fn install(id: ModuleId, host: &gtk4::Widget, text_size: Rc<TextSizeController>) {
-    let target = text_size::route_focused_module(Some(&id));
     let wheel = RefCell::new(WheelZoom::default());
     let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
     scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -93,12 +94,7 @@ pub(crate) fn install(id: ModuleId, host: &gtk4::Widget, text_size: Rc<TextSizeC
         }
         let n = wheel.borrow_mut().scroll_in(controller.unit(), dy);
         for step in steps(n) {
-            match &target {
-                TextSizeTarget::Editor => text_size.apply_editor(step),
-                TextSizeTarget::Panel => text_size.apply_panel(step),
-                TextSizeTarget::Page(page) => text_size.apply_page(page, step),
-                TextSizeTarget::Neither => {}
-            }
+            text_size.pane_step(id.clone(), step);
         }
         if n != 0 {
             println!("[text-size] Ctrl+wheel over {id}: {n:+} step(s)");
@@ -169,8 +165,8 @@ mod tests {
         assert!(steps(0).is_empty());
     }
 
-    /// The pane under the pointer, by its module: the editor, the chat and a Lua panel's page have a
-    /// text size; the terminal (until its phase 4) takes the scroll and does nothing.
+    /// The pane under the pointer, by its module: the editor, the chat, the terminals and a Lua
+    /// panel's page each route to their text size.
     #[test]
     fn each_module_routes_to_its_own_pane_or_to_nothing() {
         assert_eq!(
@@ -183,7 +179,7 @@ mod tests {
         );
         assert_eq!(
             text_size::route_focused_module(Some(&ModuleId::terminal())),
-            TextSizeTarget::Neither
+            TextSizeTarget::Terminal
         );
         assert_eq!(
             text_size::route_focused_module(Some(&ModuleId::lua("notes"))),

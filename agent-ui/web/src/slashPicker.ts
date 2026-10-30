@@ -1,4 +1,4 @@
-/** Parses the headless CLI's own reply (its shape captured from the CLI on 2026-09-28) to a bare `/model` or `/effort` into the
+/** Parses the headless CLI's own reply to a bare `/model` or `/effort` into the
  *  options `../components/SlashPicker` shows. Deliberately never a hard-coded model/effort list --
  *  every option comes out of the reply text itself, so a CLI whose choices change is reflected here
  *  with no code change, and a CLI whose reply shape changed entirely (a version this was never

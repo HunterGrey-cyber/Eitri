@@ -1,5 +1,4 @@
-//! An input method's unfinished composition, laid out on the terminal's own lattice (bottom-terminal
-//! phase 2).
+//! An input method's unfinished composition, laid out on the terminal's own lattice.
 //!
 //! While the user types pinyin, fcitx5/rime holds a *preedit* -- `ni hao` -- that is not yet text
 //! the shell should see. The host draws it over the finished frame, at the cell where typing lands
@@ -226,7 +225,7 @@ mod tests {
         assert!(layout.ops.windows(2).all(|w| w[0].layer() <= w[1].layer()));
     }
 
-    /// Rime puts its caret at the START of the composition, not the end: fcitx5-rime
+    /// Rime can put its caret at the START of the composition, not the end: fcitx5-rime
     /// 5.1.16's `PreeditCursorPositionAtBeginning` defaults to true on Linux (`rimeengine.h:88-94`,
     /// "this pins candidate window while typing"), and `rimestate.cpp:387` sets the cursor to 0. So
     /// the beam is on the composition's first cell and the candidate window goes there -- which, for
@@ -293,9 +292,9 @@ mod tests {
     /// The fill is the only thing that hides the terminal's own block cursor, so it must reach the
     /// cursor's cell wherever the caret is. The failing case has the
     /// cursor in the LAST column and the caret at the end, so the composition shifts one cell
-    /// further left than the cursor and its text ends one column short of it -- the fill used to
-    /// stop with the text, at 13..18, and the frame's block cursor stayed drawn in 19 with the beam
-    /// inside it. Swept over every anchor column (and past the grid, a frame and a resize crossing)
+    /// further left than the cursor and its text ends one column short of it. Stopping the fill
+    /// with the text at 13..18 would leave the block cursor in 19 with the beam inside it.
+    /// Swept over every anchor column (and past the grid, a frame and a resize crossing)
     /// and every kind of caret, the fill covers the cursor's cell, stays on the row, and holds every
     /// character it draws.
     #[test]

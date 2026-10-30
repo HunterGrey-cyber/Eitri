@@ -145,10 +145,10 @@ impl Pages {
         self.0.borrow().values().map(|slot| slot.page.clone()).collect()
     }
 
-    /// Sends `payload` to `view`'s page if it is live. The map is not borrowed while the page runs.
-    pub(super) fn send(&self, view: ViewId, payload: &str) {
+    /// Sends a run only to a live page, without holding the map while the page runs.
+    pub(super) fn send_many(&self, view: ViewId, payloads: &[&str]) {
         if let Some(page) = self.live(view) {
-            page.send(payload);
+            page.send_many(payloads);
         }
     }
 }
@@ -291,6 +291,15 @@ pub(super) fn forget_the_pages_nav_mode(state: &AgentPanelState, view: ViewId) {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn a_run_for_a_page_that_is_not_live_is_dropped() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.pages.0.borrow_mut().get_mut(&ViewId::BASE).unwrap().live = false;
+        handle.pages.send_many(ViewId::BASE, &["snapshot", "draft"]);
+        assert!(page.sent.borrow().is_empty());
+        assert!(page.batches.borrow().is_empty());
+    }
 
     /// The nav-mode mirror starts `Other` and returns to `Other` on every ready (a reload).
     /// A round trip through `handle_inbound_message`'s `Ready` arm needs a real `WebView`

@@ -1,9 +1,9 @@
 //! Stock tmux's prefix table, as probed -- the fixture the default table is checked against, and
 //! the keys a Lua panel may never take: every key stock tmux binds in its prefix table stays
-//! reserved, so a Lua panel never shadows a tmux reflex that a later phase might adopt.
+//! reserved, so a Lua panel never shadows a tmux reflex that a future binding might adopt.
 //!
-//! Probed 2026-09-25 on tmux next-3.7, a throwaway server with no config, which exits by itself
-//! since it has no sessions (remove its stale socket afterwards):
+//! Probed on tmux next-3.7 with a throwaway server and no config. It exits by itself since it has
+//! no sessions (remove its stale socket afterwards):
 //!
 //! ```sh
 //! tmux -L specprobe -f /dev/null start-server \; list-keys -T prefix

@@ -6,6 +6,7 @@ pub mod base_tabs;
 pub mod edge;
 pub mod editor_op;
 pub mod editor_ops;
+pub mod end;
 #[cfg(target_os = "linux")]
 pub mod fdpass;
 pub mod ids;

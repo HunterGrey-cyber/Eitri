@@ -1,19 +1,12 @@
 import type { EditorLink, Hello, PermissionModeChoice } from "../types";
 
-/** One row of the empty tab's dashboard: LazyVim's start screen
- *  (snacks.nvim's dashboard), a centred name and one key per action, in place of the eight resume
- *  rows this screen used to draw. `"resume"` is the newest remembered session -- `EmptyTab`'s own
- *  `r` used to walk all eight; the chooser (`w`/`prefix w`) is where every record still lives. */
+/** LazyVim-style dashboard rows: a centred name and one key per action. `"resume"` is the newest
+ *  remembered session; the chooser (`w`/`prefix w`) lists every record. */
 export type DashItem = "new" | "restore" | "resume" | "sessions" | "mode" | "keys";
 
-/** The key each item runs on directly -- also what `EmptyTab`'s `onKeyDown`
- *  dispatches on. Exported so that file and this one cannot silently disagree about which letter
- *  goes with which item.
- *
- *  `mode`'s column reads `⇧Tab`, not a letter -- the dashboard no longer claims
- *  a bare `m` (it collided with a fast typist's ordinary prose, e.g. "make", "mode"). The item is
- *  still reachable by `j`/`k` + Enter, Shift+Tab (`modeKey.ts`'s document-capture router, untouched
- *  here) and `<leader>m`; `EmptyTab` never dispatches on this string, it is display only. */
+/** The item's direct key, shared with `EmptyTab` so rendering and dispatch cannot disagree.
+ *  The mode key is display-only: a bare `m` collides with prose such as "make" and "mode".
+ *  Shift+Tab is claimed by `modeKey.ts`'s document-capture router; `<leader>m` also changes mode. */
 export const DASH_ITEM_KEY: Record<DashItem, string> = {
   new: "i",
   restore: "s",
@@ -65,14 +58,62 @@ export function modeConsequence(mode: PermissionModeChoice, agent: string | null
   return MODE_CONSEQUENCE[mode];
 }
 
-const ITEM_ICON: Record<DashItem, string> = {
-  new: "+",
-  restore: "↻",
-  resume: "↺",
-  sessions: "☰",
-  mode: "",
-  keys: "?",
-};
+/** One line-drawn glyph per item, in the row's own colour (`currentColor`), so every theme draws them in its own
+ *  ink and none depends on a font having the character. Drawn at 16px on a 16-unit grid with a 1px stroke and every
+ *  straight line centred on a half-pixel and ending on a whole one (butt caps), so at 1x each line covers whole
+ *  device pixels instead of blurring across two.
+ *  `"mode"` is never a row and has none. */
+function ItemIcon({ item }: { item: DashItem }) {
+  const paths: Record<DashItem, string> = {
+    new: "M7.5 3v9M3 7.5h9",
+    restore: "M2.5 5.5h8v7h-8zM4.5 6V3.5h9v7H11",
+    resume: "M3.5 8.5a5 5 0 1 0 1.46-3.54L3.5 6.5M3.5 3v3.5H7M8.5 5v3.5l2 1.5",
+    sessions: "M6 4.5h8M6 8.5h8M6 12.5h8M2 4.5h2M2 8.5h2M2 12.5h2",
+    mode: "",
+    keys: "M2.5 4.5h12v8h-12zM4 7.5h1M6 7.5h1M8 7.5h1M10 7.5h1M12 7.5h1M5 10.5h7",
+  };
+  return (
+    <svg className="dash-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d={paths[item]} />
+    </svg>
+  );
+}
+
+/** Eitri's logo, the Gutter E, as a line drawing in the theme's own ink: the window's frame, the editor block,
+ *  the narrow column to its right and the status line along the foot drawn as outlines, and the gutter bar
+ *  with its three strokes -- the E -- filled in the scheme's accent, the one colour on the screen. Drawn on a
+ *  40-unit grid at 40px, so one unit is one pixel: outlines are 1px strokes on half-pixels and the filled
+ *  parts sit on whole pixels, and at 1x nothing blurs across two. The full-colour logo is
+ *  `packaging/icons/eitri.svg`; this is the same layout in fewer inks. */
+export function EitriMark() {
+  return (
+    <svg className="dash-mark" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
+      <rect className="dash-mark-frame" x="3.5" y="4.5" width="33" height="31" rx="3" />
+      <rect className="dash-mark-editor" x="6.5" y="7.5" width="19" height="18" rx="1.5" />
+      <rect className="dash-mark-column" x="28.5" y="7.5" width="5" height="18" rx="1.5" />
+      <path className="dash-mark-rule" d="M4 28.5h32M11.5 29v6" />
+      <path className="dash-mark-e" d="M9 10h14v3H12v2h8v3h-8v2h11v3H9z" />
+    </svg>
+  );
+}
+
+/** When a record was last opened, as a clock time on its own day ("14:05") and a month and day before it
+ *  ("Oct 27"). The start screen is meant to sit still, and nothing re-renders it as time passes, so it says a
+ *  time that stays true rather than "12 min ago", which would still say so hours later. `null` for a stamp
+ *  that is not a positive millisecond count a date can hold, so the row draws nothing rather than an empty or raw stamp. */
+export function lastOpenedStamp(nowMs: number, stamp: string): string | null {
+  const millis = Number(stamp);
+  if (stamp.trim() === "" || !Number.isFinite(millis) || millis <= 0) return null;
+  const then = new Date(millis);
+  if (Number.isNaN(then.getTime())) return null;
+  const now = new Date(nowMs);
+  const sameDay =
+    then.getFullYear() === now.getFullYear() && then.getMonth() === now.getMonth() && then.getDate() === now.getDate();
+  if (sameDay) {
+    return `${String(then.getHours()).padStart(2, "0")}:${String(then.getMinutes()).padStart(2, "0")}`;
+  }
+  return then.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
 
 /** `~-abbreviates` a Linux/macOS home directory prefix. There is no way for this WebView to read
  *  the real `$HOME` (nothing on the wire carries it, and a browser has no `os.homedir()`) -- this
@@ -90,10 +131,8 @@ function narrowCwd(path: string): string {
   return short.startsWith("~") ? `~/…/${base}` : `…/${base}`;
 }
 
-/** `<cwd, ~-abbreviated> · <account>` (the line used to read
- *  `<cwd> · <backend> · <account>`, but the backend reads "sidecar" in every release build and
- *  carries nothing; it lives only in `prefix i` / `<leader>i`). narrow
- *  drops the account and cuts the cwd. */
+/** `<cwd, ~-abbreviated> · <account>`; backend details live in `prefix i` / `<leader>i`.
+ *  Narrow drops the account and cuts the cwd. */
 function whereLine(hello: Hello, narrow: boolean, agent: string | null): string {
   const cwd = narrow ? narrowCwd(hello.projectDir) : abbreviateHome(hello.projectDir);
   const parts = [cwd];
@@ -107,8 +146,8 @@ function whereLine(hello: Hello, narrow: boolean, agent: string | null): string 
 const RESTORE_NAME_CHARS = 20;
 const RESTORE_NAMES_SHOWN = 3;
 
-/** `3 tabs: api, docs, tests`, names cut to fit and a trailing `…` when there are more than are shown;
- *  `3 tabs, 1 in bypass: …` when some of them were, so the count never reads as a fourth name. The line
+/** `3 tabs · api, docs, tests`, names cut to fit and a trailing `…` when there are more than are shown;
+ *  `3 tabs, 1 in bypass · …` when some of them were, so the count never reads as a fourth name. The line
  *  is one row of a narrow panel, and CSS cuts what is still too long. */
 function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
   const cut = (name: string) => (name.length > RESTORE_NAME_CHARS ? `${name.slice(0, RESTORE_NAME_CHARS - 1)}…` : name);
@@ -116,7 +155,7 @@ function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
   if (offer.labels.length > RESTORE_NAMES_SHOWN) names.push("…");
   const count = offer.labels.length;
   const bypass = offer.bypass > 0 ? `, ${offer.bypass} in bypass` : "";
-  return `${count} ${count === 1 ? "tab" : "tabs"}${bypass}: ${names.join(", ")}`;
+  return `${count} ${count === 1 ? "tab" : "tabs"}${bypass} · ${names.join(", ")}`;
 }
 
 function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello; mode: PermissionModeChoice; agent: string | null }) {
@@ -127,7 +166,12 @@ function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello;
       return (
         <>
           Restore last session
-          {hello.restore && <span className="dash-resume-title"> ({restoreSummary(hello.restore)})</span>}
+          {hello.restore && (
+            <>
+              {" "}
+              <span className="dash-detail">{restoreSummary(hello.restore)}</span>
+            </>
+          )}
         </>
       );
     case "resume": {
@@ -136,7 +180,12 @@ function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello;
       return (
         <>
           Resume last
-          {title !== null && <span className="dash-resume-title"> {title}</span>}
+          {title !== null && (
+            <>
+              {" "}
+              <span className="dash-detail">{title}</span>
+            </>
+          )}
         </>
       );
     }
@@ -169,7 +218,7 @@ type Props = {
   agent?: string | null;
 };
 
-/** The empty tab's dashboard a centred question, the
+/** The empty tab's dashboard: Eitri's mark, a centred question, the
  *  where-line and one row per `dashItems(hello)`, each with its key -- and nothing else. What a mode
  *  does, what a message carries from the editor and the window's keys are all in the `?` sheet, which
  *  the last row opens; only a companion window with no editor attached says one more line, because
@@ -186,25 +235,37 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, editorLink = nu
   return (
     <div className="dashboard">
       <DashboardHead hello={hello} narrow={narrow} agent={agent} />
-      <DashboardItems hello={hello} mode={mode} cursor={cursor} onItem={onItem} editorLink={editorLink} agent={agent} />
+      <DashboardItems
+        hello={hello}
+        mode={mode}
+        cursor={cursor}
+        narrow={narrow}
+        onItem={onItem}
+        editorLink={editorLink}
+        agent={agent}
+      />
     </div>
   );
 }
 
-/** The dashboard's name and where-line. `EmptyTab` draws it above its box, which it keeps in one place in
+/** The dashboard's mark, question and where-line, one block. `EmptyTab` draws it above its box, which it keeps in one place in
  *  the tree whatever the screen shows (see `EmptyTab`'s own note on the start screen's box). */
 export function DashboardHead({ hello, narrow, agent = null }: { hello: Hello; narrow: boolean; agent?: string | null }) {
   return (
-    <>
+    <div className="dash-head">
+      <EitriMark />
       <div className="dash-title">What shall we work on?</div>
       <div className="dash-where">{whereLine(hello, narrow, agent)}</div>
-    </>
+    </div>
   );
 }
 
 /** The dashboard's rows and, in a companion window with no editor, its one line under them. With
  *  `boxIsNew`, the New session row is not drawn here: the box above the rows is that row (`EmptyTab`), and
- *  the cursor's index still counts it, so `j`/`k` and Enter mean what they did. */
+ *  the cursor's index still counts it, so `j`/`k` and Enter mean what they did.
+ *
+ *  Resume last says when that session was last opened (`lastOpenedStamp` over the record's `updatedAt`),
+ *  right-aligned before its key; a narrow panel leaves it out so the title keeps the room. */
 export function DashboardItems({
   hello,
   mode,
@@ -213,8 +274,11 @@ export function DashboardItems({
   editorLink = null,
   agent = null,
   boxIsNew = false,
-}: Omit<Props, "narrow"> & { boxIsNew?: boolean }) {
+  narrow = false,
+}: Omit<Props, "narrow"> & { boxIsNew?: boolean; narrow?: boolean }) {
   const items = dashItems(hello);
+  const newest = hello.resumableSessions[0] as Hello["resumableSessions"][number] | undefined;
+  const resumeWhen = narrow || newest === undefined ? null : lastOpenedStamp(Date.now(), newest.updatedAt);
   return (
     <>
       <div className="dash-items">
@@ -229,13 +293,12 @@ export function DashboardItems({
               aria-current={index === cursor ? "true" : undefined}
               onClick={() => onItem(item)}
             >
-              <span className="dash-icon" aria-hidden="true">
-                {ITEM_ICON[item]}
-              </span>
+              <ItemIcon item={item} />
               <span className="dash-label">
                 <ItemLabel item={item} hello={hello} mode={mode} agent={agent} />
               </span>
-              <span className="dash-key">{DASH_ITEM_KEY[item]}</span>
+              {item === "resume" && resumeWhen !== null && <span className="dash-when">{resumeWhen}</span>}
+              <kbd className="dash-key">{DASH_ITEM_KEY[item]}</kbd>
             </div>
           ),
         )}

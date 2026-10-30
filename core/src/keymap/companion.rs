@@ -78,6 +78,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::Even(_)
         | Action::Module(_)
         | Action::ModuleHide
+        | Action::ModuleHideByKey
         | Action::ModuleKill
         | Action::WindowImmersive
         | Action::Move(_)
@@ -104,12 +105,12 @@ pub fn classify(action: &Action) -> CompanionVerb {
 }
 
 /// What the armed prefix shows in a companion window: the keys that do something here, as the
-/// effective keymap binds them. After a split key (the only way the prefix waits for a module key)
-/// it says why nothing will happen.
+/// effective keymap binds them. After a split key or the hide key (the two waits for a module key) it
+/// says why nothing will happen.
 pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
     match waiting {
         Waiting::No | Waiting::Number | Waiting::Workspace { .. } => Vec::new(),
-        Waiting::Module(_) => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
+        Waiting::Module(_) | Waiting::Hide => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
         Waiting::Command => {
             let verbs = [
                 (Action::Tab(TabAction::New), "new tab"),
@@ -275,5 +276,11 @@ mod tests {
             strip_pieces(Waiting::Module(Axis::Row), &keymap),
             vec![StripPiece::Heading(REFUSED_TEXT.to_string())]
         );
+        assert_eq!(
+            strip_pieces(Waiting::Hide, &keymap),
+            vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
+            "a hide key waits as a split key does, with no layout to hide from"
+        );
+        assert_eq!(classify(&Action::ModuleHideByKey), CompanionVerb::Refuse);
     }
 }

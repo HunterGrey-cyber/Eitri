@@ -1,29 +1,18 @@
 //! Private per-instance directories under `TMPDIR`, and the sweep that reclaims ones whose process
 //! died without cleaning up.
 //!
-//! Extracted from `pane_switch.rs` unchanged in behaviour, because the theme feed needs the same
-//! thing: a directory holding a socket, unique per window, that a SIGKILL'd `shell` would otherwise
-//! leak. The reasoning below was learned in `pane_switch` and is kept with the code it justifies.
+//! Each window needs a unique directory holding a socket; SIGKILL can leave it behind.
+//! Liveness uses `agent::process_probe::pid_is_alive`, because macOS has no `/proc` and Linux
+//! must handle unprivileged checks and invalid pids too (see [`pid_is_running`]).
 //!
-//! The sweep's pid-liveness check was `/proc/<pid>` until this module moved into `eitri-core`
-//! (2026-09-17): that answers "not alive" unconditionally on macOS, which has no `/proc`, so
-//! every instance would have looked dead. It is now `agent::process_probe::pid_is_alive` -- see
-//! [`pid_is_running`]'s own doc for why that also answers Linux's own two hazards (an unprivileged
-//! caller, and a pid worth rejecting before any syscall) at least as well as `/proc` did.
-//!
-//! **The sweep must never block startup.** The owner check (below) closed
-//! the hang for another user's directory, but a directory of *ours* that an older build left
-//! group-writable (`0775` under umask 002) reopened it: a member of our own group could rename their
-//! own full-backlog listener over `socket_name` between the owner check and the connect, and the old
-//! `std::os::unix::net::UnixStream::connect` blocks until that listener's accept queue has room --
-//! sleeping this launch before its window exists. Two independent fixes, neither alone enough:
-//! (a) [`sweep_entries_owned_by`] now skips -- without connecting and without removing -- any
-//! candidate whose mode has a group- or other-write bit (`mode & 0o022 != 0`), which also covers a
-//! *stranger's* directory renamed to look like ours before the owner check runs; and (b) the probe
-//! itself ([`socket_has_a_listener`]) is now a raw, non-blocking `AF_UNIX` `connect()` rather than
-//! `UnixStream::connect`, so even a socket that passes (a) can never hang the sweep: `EAGAIN`,
-//! `EWOULDBLOCK` and `EINPROGRESS` all mean "a listener is there" (its queue is merely full or the
-//! connection is still completing), and everything else means it is not.
+//! The sweep must never block startup. A group-writable directory (0775 under umask 002) lets a
+//! group member swap in a full-backlog listener between the ownership check and the connect;
+//! a blocking connect would sleep until that queue has room. Two checks are needed:
+//! [`sweep_entries_owned_by`] skips directories with group- or other-write bits, without probing
+//! or removing them, including a stranger's directory renamed to look like ours. The probe
+//! ([`socket_has_a_listener`]) uses a non-blocking connect, so even a socket that passes those
+//! checks cannot hang startup. `EAGAIN`, `EWOULDBLOCK` and `EINPROGRESS` mean a listener is there
+//! (its queue is full or the connection is completing); other errors mean it is not.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -39,9 +28,9 @@ use std::time::{Duration, Instant};
 /// process onto one directory. The pid stays in the name so `ls "$TMPDIR"` says whose it is, and so
 /// [`sweep_stale_instance_dirs`] can tell a leaked directory from a live one.
 ///
-/// The uuid is written in its 32-hex `simple` form rather than the 36-byte hyphenated one
-/// (2026-09-17). Four bytes, and they matter: the socket inside one of these directories is capped
-/// at 103 bytes on macOS, where `TMPDIR` alone is 49. [`stale_instance_dir_pid`] parses either form,
+/// The uuid uses its 32-hex `simple` form rather than the 36-byte hyphenated one, saving four
+/// bytes: the socket path is capped at 103 bytes on macOS, where `TMPDIR` alone is 49.
+/// [`stale_instance_dir_pid`] parses either form,
 /// so directories an older build left behind are still recognised -- and each caller sweeps its
 /// own older *prefix* alongside its current one, which is the part a shorter uuid does not cover.
 pub(crate) fn instance_dir_path(tmp: &Path, prefix: &str) -> PathBuf {
@@ -208,8 +197,8 @@ fn sweep_entries_owned_by(tmp: &Path, prefix: &str, socket_name: &str, log_tag: 
 /// never a sweep candidate. The parser is the whole safety story for a recursive delete in `TMPDIR`.
 ///
 /// `Uuid::parse_str` accepts the hyphenated form as well as the 32-hex `simple` one
-/// [`instance_dir_path`] writes since 2026-09-17, which is what lets one sweep reclaim an older
-/// build's directories; `an_older_builds_hyphenated_uuid_is_still_recognised` pins that.
+/// [`instance_dir_path`] writes, so the sweep can reclaim older builds' directories;
+/// `an_older_builds_hyphenated_uuid_is_still_recognised` pins that.
 pub(crate) fn stale_instance_dir_pid(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     match rest.split_once('-') {
@@ -225,12 +214,9 @@ pub(crate) fn stale_instance_dir_pid(name: &str, prefix: &str) -> Option<u32> {
 /// `true` for a socket `uid` owns that a listener answers -- including one whose accept queue is
 /// merely full. Every other outcome answers `false`, because the caller pairs this with a pid check.
 ///
-/// This used to be `std::os::unix::net::UnixStream::connect`, a *blocking* connect. An
-/// `AF_UNIX` `connect()` never waits for a peer to `accept`, but it DOES block while the listener's
-/// accept queue is full -- sleeping this call, and the whole sweep, until the peer drains it (which,
-/// for a listener nobody is servicing, is forever). The probe is now a raw, non-blocking connect
-/// ([`nonblocking_connect_finds_a_listener`]) so a full queue can never hang the caller: it is one
-/// of the three outcomes this treats as "a listener is there", the same as before it retired.
+/// A blocking `AF_UNIX` connect waits while the listener's accept queue is full, potentially
+/// forever if nobody services it. The non-blocking probe ([`nonblocking_connect_finds_a_listener`])
+/// treats a full queue as a live listener without hanging the caller.
 fn socket_has_a_listener(socket: &Path, uid: u32) -> bool {
     let ours = matches!(socket.symlink_metadata(), Ok(meta) if meta.file_type().is_socket() && meta.uid() == uid);
     ours && nonblocking_connect_finds_a_listener(socket)
@@ -452,21 +438,15 @@ fn sockaddr_for(path: &Path) -> Option<libc::sockaddr_un> {
     Some(addr)
 }
 
-/// Used to be `/proc/<pid>` rather than `kill(pid, 0)`, on the reasoning that it needs no signal
-/// permission and cannot be mistaken for actually signalling something. Both objections are
-/// answered by `agent::process_probe::pid_is_alive` rather than sidestepped (2026-09-17): it treats
-/// `EPERM` as alive, so it needs no signal permission to answer
-/// correctly; signal `0` delivers nothing, so it performs only the existence and permission check,
-/// never an actual signal; it rejects pid `0` and anything above `i32::MAX` before the syscall,
-/// which a naive `kill()` would get wrong (`0` means "my own process group", and `u32::MAX` wraps
-/// to `-1`, "every process I may signal"); and on a DEFAULT `/proc` mount it answers identically
-/// to the old `/proc/<pid>` check for both zombies and other users' processes. Under `hidepid=2`
-/// (a real hardening option, not hypothetical) it is strictly BETTER, not merely equal: another
-/// user's live process is invisible in `/proc` there, so the old check would have read it as dead
-/// and reclaimed a live instance's directory, while `EPERM` from `kill` still reports it alive
-/// (corrected 2026-09-17: the earlier "identically" claim here was true only on a default mount).
-/// It is also
-/// the one check this module can share with macOS, which has no `/proc` at all.
+/// `agent::process_probe::pid_is_alive` treats `EPERM` as alive, so the check needs no signal
+/// permission. Signal 0 delivers nothing; it checks only existence and permission. Pid 0 and
+/// values above `i32::MAX` are rejected before the syscall: 0 means our process group, and
+/// `u32::MAX` would wrap to -1, every process we may signal.
+///
+/// On a default `/proc` mount this agrees with checking `/proc/<pid>` for zombies and other users'
+/// processes. Under `hidepid=2`, another user's live process is invisible in `/proc`, but `EPERM`
+/// still reports it alive, preventing reclamation of a live instance's directory. This check also
+/// works on macOS, which has no `/proc`.
 fn pid_is_running(pid: u32) -> bool {
     agent::process_probe::pid_is_alive(pid)
 }

@@ -554,3 +554,147 @@ pub fn empty_trust_plan() -> agent::TrustPlan {
         project_only: Vec::new(),
     }
 }
+
+/// A provider that moves with its chat as the real ones do, over a [`RecordingProvider`] both windows of a test
+/// drive: its freeze hands over three pipe descriptors and a record naming it, and [`adopt_moving`] takes the same
+/// double up again in the other window, so one recording sees what both windows did. Every step of a move it is
+/// asked for is kept in [`MovingProvider::steps`].
+#[cfg(target_os = "linux")]
+pub struct MovingProvider {
+    pub inner: std::sync::Arc<RecordingProvider>,
+    id: u64,
+    live: AtomicBool,
+    refuse_freeze: std::sync::Mutex<Option<String>>,
+    steps: std::sync::Mutex<Vec<&'static str>>,
+}
+
+#[cfg(target_os = "linux")]
+static MOVING: std::sync::Mutex<Vec<(u64, std::sync::Weak<MovingProvider>)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "linux")]
+static NEXT_MOVING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(target_os = "linux")]
+impl MovingProvider {
+    /// A double over `inner` that keeps a running turn across a move when `live`.
+    pub fn new(inner: RecordingProvider, live: bool) -> std::sync::Arc<MovingProvider> {
+        let id = NEXT_MOVING.fetch_add(1, Ordering::SeqCst);
+        let provider = std::sync::Arc::new(MovingProvider {
+            inner: std::sync::Arc::new(inner),
+            id,
+            live: AtomicBool::new(live),
+            refuse_freeze: std::sync::Mutex::new(None),
+            steps: std::sync::Mutex::new(Vec::new()),
+        });
+        MOVING.lock().unwrap().push((id, std::sync::Arc::downgrade(&provider)));
+        provider
+    }
+    /// The steps of a move asked of it so far, in order: `freeze`, `resume`, `adopt`, `commit`, `forget`.
+    pub fn steps(&self) -> Vec<&'static str> {
+        self.steps.lock().unwrap().clone()
+    }
+    /// The next freezes are refused with `why`, or go through again with `None`.
+    pub fn refuse_freezes(&self, why: Option<&str>) {
+        *self.refuse_freeze.lock().unwrap() = why.map(str::to_owned);
+    }
+    fn step(&self, step: &'static str) {
+        self.steps.lock().unwrap().push(step);
+    }
+}
+
+/// [`agent::chat_mover::adopt`] for a [`MovingProvider`]'s record: the double it names, taken up as the other
+/// window's provider, its three descriptors checked and closed.
+#[cfg(target_os = "linux")]
+pub fn adopt_moving(
+    kind: agent::chat_mover::MovedKind,
+    record: &serde_json::Value,
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> Result<agent::chat_mover::Adopted, String> {
+    if kind != agent::chat_mover::MovedKind::Claude || fds.len() != 3 {
+        return Err(format!(
+            "not a moving double's record: {kind:?} with {} descriptors",
+            fds.len()
+        ));
+    }
+    let id = record["double"].as_u64().ok_or("the record names no double")?;
+    let provider = MOVING
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(held, _)| *held == id)
+        .and_then(|(_, provider)| provider.upgrade())
+        .ok_or("the double the record names is gone")?;
+    provider.step("adopt");
+    Ok(agent::chat_mover::Adopted {
+        agent: provider,
+        external: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl agent::chat_mover::ChatMover for MovingProvider {
+    fn live_move(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+    fn freeze_for_chat_move(&self) -> Result<agent::chat_mover::FrozenProvider, String> {
+        if let Some(why) = self.refuse_freeze.lock().unwrap().clone() {
+            return Err(why);
+        }
+        self.step("freeze");
+        let fds = (0..3)
+            .map(|_| std::io::pipe().map(|(read, _)| read.into()))
+            .collect::<std::io::Result<Vec<std::os::fd::OwnedFd>>>()
+            .map_err(|e| e.to_string())?;
+        Ok(agent::chat_mover::FrozenProvider {
+            kind: agent::chat_mover::MovedKind::Claude,
+            record: serde_json::json!({ "double": self.id }),
+            fds,
+        })
+    }
+    fn resume_after_chat_move(&self, frozen: agent::chat_mover::FrozenProvider) -> Result<(), String> {
+        drop(frozen);
+        self.step("resume");
+        Ok(())
+    }
+    fn commit_chat_move(&self) -> std::io::Result<()> {
+        self.step("commit");
+        Ok(())
+    }
+    fn forget_chat_move(&self) {
+        self.step("forget");
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl agent::AgentProvider for MovingProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    fn info(&self) -> ProviderInfo {
+        self.inner.info()
+    }
+    fn create_session(&self, request: agent::CreateSessionRequest) -> Result<String, agent::ProviderError> {
+        self.inner.create_session(request)
+    }
+    fn resume_session(&self, request: agent::ResumeSessionRequest) -> Result<String, agent::ProviderError> {
+        self.inner.resume_session(request)
+    }
+    fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+        self.inner.send_turn(request)
+    }
+    fn interrupt_turn(&self, request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+        self.inner.interrupt_turn(request)
+    }
+    fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+        self.inner.resolve_permission(request)
+    }
+    fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
+        self.inner.close_session(request)
+    }
+    fn pump(&self) -> Vec<AgentDomainEvent> {
+        self.inner.pump()
+    }
+    fn mover(&self) -> Option<&dyn agent::chat_mover::ChatMover> {
+        Some(self)
+    }
+}

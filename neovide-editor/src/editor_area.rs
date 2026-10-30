@@ -34,6 +34,7 @@
 //! failure would cost the saving for the whole session. Every give-up is logged.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use gtk4::glib;
 use gtk4::graphene;
@@ -41,6 +42,9 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use crate::dmabuf_target::{self, Presenter};
+use crate::subsurface::{snapshot_plan, SnapshotPlan, SubsurfacePane};
+
+type CoverColor = Rc<dyn Fn() -> skia_safe::Color4f>;
 
 /// How many times a mid-run failure is retried, at a new size, per GL context.
 const RETRIES_PER_CONTEXT: u32 = 3;
@@ -139,6 +143,12 @@ pub struct PresentationCounts {
     /// Times the own-buffer path failed and fell back: a presenter that could not be set up, or a
     /// frame that failed mid-run. Turning it off (`EITRI_EDITOR_DMABUF`, GTK below 4.16) is not one.
     pub failures: u32,
+    pub child_commits: u64,
+    pub child_frames: u64,
+    pub transaction_misses: u64,
+    pub open_deferred: u64,
+    pub stale_callbacks: u64,
+    pub fallbacks: u64,
 }
 
 mod imp {
@@ -146,6 +156,9 @@ mod imp {
 
     #[derive(Default)]
     pub struct EditorGlArea {
+        pub(super) subsurface: RefCell<Option<Rc<SubsurfacePane>>>,
+        pub(super) cover: RefCell<Option<CoverColor>>,
+        pub(super) hole_changed: RefCell<Option<Rc<dyn Fn()>>>,
         pub(super) presenter: RefCell<Option<Presenter>>,
         pub(super) lifecycle: Cell<Lifecycle>,
         pub(super) last_resize: Cell<(i32, i32)>,
@@ -154,6 +167,7 @@ mod imp {
         pub(super) fallback_hint_done: Cell<bool>,
         /// Never reset: it spans every realize.
         pub(super) counts: Cell<PresentationCounts>,
+        pub(super) log: RefCell<Option<Rc<crate::subsurface::PaneLog>>>,
     }
 
     #[glib::object_subclass]
@@ -163,10 +177,51 @@ mod imp {
         type ParentType = gtk4::GLArea;
     }
 
-    impl ObjectImpl for EditorGlArea {}
+    impl ObjectImpl for EditorGlArea {
+        fn constructed(&self) {
+            self.parent_constructed();
+            if let Some(log) = crate::subsurface::PaneLog::new() {
+                log.counts(self.counts.get());
+                *self.log.borrow_mut() = Some(log);
+            }
+        }
+
+        fn dispose(&self) {
+            if let Some(log) = self.log.borrow_mut().take() {
+                log.missing();
+                log.counts(self.counts.get());
+            }
+        }
+    }
 
     impl WidgetImpl for EditorGlArea {
         fn snapshot(&self, snapshot: &gtk4::Snapshot) {
+            let pane = self.subsurface.borrow().clone();
+            match snapshot_plan(pane.as_deref()) {
+                SnapshotPlan::Nothing => {
+                    let size = (self.obj().width() as f32, self.obj().height() as f32);
+                    let bare = pane.as_deref().map(|pane| pane.outside_frame(size)).unwrap_or_default();
+                    if let (false, Some(cover)) = (bare.is_empty(), self.cover.borrow().as_ref()) {
+                        let color = cover();
+                        let rgba = gtk4::gdk::RGBA::new(color.r, color.g, color.b, color.a);
+                        for rect in &bare {
+                            snapshot.append_color(&rgba, rect);
+                        }
+                    }
+                    return;
+                }
+                SnapshotPlan::Cover => {
+                    if let Some(cover) = self.cover.borrow().as_ref() {
+                        let color = cover();
+                        snapshot.append_color(
+                            &gtk4::gdk::RGBA::new(color.r, color.g, color.b, color.a),
+                            &graphene::Rect::new(0.0, 0.0, self.obj().width() as f32, self.obj().height() as f32),
+                        );
+                    }
+                    return;
+                }
+                SnapshotPlan::Gtk => {}
+            }
             if self.present_own(snapshot) {
                 return;
             }
@@ -177,6 +232,13 @@ mod imp {
             self.count(|c| c.fallback_frames += 1);
             self.note_fallback();
             self.parent_snapshot(snapshot);
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            if let Some(pane) = self.subsurface.borrow().as_ref() {
+                pane.geometry_changed();
+            }
         }
 
         /// A class handler, so it runs after the pane's own `connect_unrealize` (which releases
@@ -202,10 +264,13 @@ mod imp {
     impl GLAreaImpl for EditorGlArea {}
 
     impl EditorGlArea {
-        fn count(&self, f: impl FnOnce(&mut PresentationCounts)) {
+        pub(super) fn count(&self, f: impl FnOnce(&mut PresentationCounts)) {
             let mut counts = self.counts.get();
             f(&mut counts);
             self.counts.set(counts);
+            if let Some(log) = self.log.borrow().as_ref() {
+                log.counts(counts);
+            }
         }
 
         fn update_lifecycle<R>(&self, f: impl FnOnce(&mut Lifecycle) -> R) -> R {
@@ -374,6 +439,37 @@ glib::wrapper! {
 }
 
 impl EditorGlArea {
+    pub(crate) fn present_log(&self) -> Option<Rc<crate::subsurface::PaneLog>> {
+        self.imp().log.borrow().clone()
+    }
+
+    pub(crate) fn count_presentation(&self, update: impl FnOnce(&mut PresentationCounts)) {
+        self.imp().count(update);
+    }
+
+    pub(crate) fn subsurface(&self) -> Option<Rc<SubsurfacePane>> {
+        self.imp().subsurface.borrow().clone()
+    }
+
+    pub(crate) fn set_subsurface(&self, pane: Option<Rc<SubsurfacePane>>) {
+        *self.imp().subsurface.borrow_mut() = pane;
+    }
+
+    pub(crate) fn set_cover(&self, cover: CoverColor) {
+        *self.imp().cover.borrow_mut() = Some(cover);
+    }
+
+    pub(crate) fn set_hole_changed(&self, callback: Rc<dyn Fn()>) {
+        *self.imp().hole_changed.borrow_mut() = Some(callback);
+    }
+
+    pub(crate) fn hole_changed(&self) {
+        let callback = self.imp().hole_changed.borrow().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
     /// Whether the `render` now being emitted draws into one of this area's own tiled buffers,
     /// which Skia can draw into directly. `false` means `GtkGLArea`'s own framebuffer is bound.
     pub(crate) fn draws_into_own_buffer(&self) -> bool {

@@ -1,28 +1,24 @@
 //! Eitri's own record of which project configuration the user trusted, one file per root and agent.
 //!
-//! Claude's record is `<state home>/eitri/trust/<16 hex of the root>.json`; every other agent's is
-//! that name followed by `.<profile key>` (`<16 hex>.json.codex`), and says which profile it is. Each
-//! holds the root it is about, when it was made, the fingerprint of the configuration that was shown
-//! and each file's own hash, so a later change can be named file by file. A root is only ever trusted
-//! by its own record for that agent -- a record for a parent or a child directory, or for another
-//! agent, is a different file -- and no other program's notion of trust is read.
+//! Claude's record is `<state home>/eitri/trust/<16 hex of the root>.json`; every other agent adds
+//! `.<profile key>` (`<16 hex>.json.codex`) and names its profile in the record. Each holds the root,
+//! trust time, configuration fingerprint and per-file hashes so changes can be named file by file.
+//! Trust is exact to the root and agent: parents, children and other agents have separate records.
+//! No other program's notion of trust is read.
 //!
 //! A record that cannot be used (missing, not JSON, another version, another root, owned by
 //! someone else, a link, a FIFO, or written after a prompt that showed less than this one does)
-//! reads as untrusted and is left where it is: another user may have
-//! planted it, and renaming it aside would only move their file around. Answering `y` replaces it
-//! atomically instead; the rename puts a new file in the name's place and never follows a planted
-//! link.
+//! reads as untrusted and stays in place: renaming a planted file aside only moves someone else's
+//! file around. Answering `y` replaces it atomically without following a planted link.
 //!
-//! Everything here that touches the disk (`state`, `record`, `forget`, `for_root`) is for the trust
-//! gate's worker thread only: a slow or hostile state directory must never stall the window.
-//! [`TrustStore::new`] and [`TrustStore::at`] touch nothing, so the window may build one anywhere.
+//! Disk operations (`state`, `record`, `forget`, `for_root`) belong on the trust worker: a slow or
+//! hostile state directory must never stall the window. [`TrustStore::new`] and [`TrustStore::at`]
+//! touch nothing, so the window may build one anywhere.
 //!
-//! The record is read without following any link from `/` down, but the state home may well be
-//! reached through one (`/home` a link to `/var/home`, a linked `~/.local/state`). So each of those
-//! calls first resolves the links of the store's directory, once, and writes and reads the record at
-//! that real path; a record is also read back right after it is written, and one that does not read
-//! back as written is an error rather than a "trusted" that the next start would not see.
+//! Reads follow no link from `/` down, but the state home can be linked (`/home` to `/var/home`, or
+//! `~/.local/state`). Each disk operation resolves the store directory once and uses that real path
+//! for reads and writes. A write must read back successfully; otherwise it would report trust that
+//! the next start cannot read.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -42,18 +38,13 @@ use crate::state_paths;
 /// fingerprint covers everything, so the window may keep the answer, but no record can.
 const MAX_RECORD_BYTES: u64 = 1 << 20;
 
-/// How much the prompt a record answered showed. A `y` is about what the person saw, not only about
-/// the bytes the fingerprint covers: an earlier prompt cut long values short, gave `env` names
-/// without their values and left out some fields of MCP servers and hooks, so a `y` given to it
-/// covered less than the same configuration shows now. A record of a lower disclosure (or none,
-/// which every record written before this field existed has) is not trust, and the project is
-/// asked about once more. Raise this whenever the prompt starts showing something it hid before.
-///
-/// 2: every value whole. 3: each file beyond the settings, memory and rule files (a command, an
-/// agent, a skill's file, a hook script) named with its size and the frontmatter keys that change
-/// what runs, where 2 gave only how many there were in each directory. 4: that note also names an
-/// agent file's own `permissionMode` and `mcpServers`, which 3 left unsaid. 5: Claude's prompt says
-/// that a subdirectory's `CLAUDE.md`, which the walk does not read, loads once Claude reads a file there.
+/// How much the prompt a record answered showed. A `y` approves what was shown, not just the bytes
+/// hashed: whole values, `env` values, every MCP and hook field, and each other configuration file
+/// by name, size and the frontmatter keys that change what runs (`hooks`, `allowed-tools`,
+/// `permissionMode`, `mcpServers`). Claude's prompt also says that a subdirectory's `CLAUDE.md`, which
+/// the walk does not read, loads once Claude reads a file there.
+/// A lower or missing disclosure is unusable even when the fingerprint matches, so the project is
+/// asked about again. Raise this whenever the prompt starts showing something it hid before.
 pub const DISCLOSURE: u32 = 5;
 
 /// What changed between the trusted configuration and the one found now, by path relative to the
@@ -104,17 +95,16 @@ struct Record {
     trusted_at: u64,
     fingerprint: String,
     files: BTreeMap<String, String>,
-    /// The profile's key for every agent but Claude, whose records predate profiles and carry none.
+    /// The profile's key, absent for Claude to keep its records compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
-    /// [`DISCLOSURE`] when the record was written; 0 for a record from before the field existed.
+    /// [`DISCLOSURE`] when the record was written; a missing field reads as 0 and is unusable.
     #[serde(default)]
     disclosure: u32,
 }
 
-/// The record's file name for `root` and `profile`. Claude's record keeps the name it had before
-/// profiles existed, so a record made then still answers; every other profile's adds its key to
-/// that name.
+/// The record's file name for `root` and `profile`. Keep Claude's name stable so existing records
+/// still answer; every other profile adds its key to that name.
 fn record_name(root: &Path, profile: &Profile) -> String {
     match profile {
         Profile::Claude => state_paths::file_name(root),

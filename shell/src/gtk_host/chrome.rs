@@ -12,7 +12,8 @@
 //! the name changes while it is open, hidden and emptied when it closes. The keys reach it through the host's `Focus`
 //! op, which comes before the `Chrome` op that fills it.
 //!
-//! The model's y/n (`prefix x`'s) is the prompt overlay's text: where it sits needs the prefix strip's left edge and
+//! The model's y/n (`prefix x`'s, and the window close's) is the prompt overlay's text: the overlay has no question of
+//! its own, so what it shows is always the model's. Where it sits needs the prefix strip's left edge and
 //! the top bar's and its own heights, which only the widgets know, so it is placed here from their measures, read
 //! once it shows its text (a hidden label measures nothing).
 
@@ -75,6 +76,7 @@ pub(crate) struct ChromeWidgets {
     pub(crate) selection: TextSetter,
     /// The marked module's text; nothing while no module is marked.
     pub(crate) mark: TextSetter,
+    pub(crate) other: TextSetter,
     /// One flash of the app name.
     pub(crate) flash: Box<dyn Fn()>,
     /// One tray chip as it is now: its text, whether it shows and whether its chat asks for the user.
@@ -96,6 +98,12 @@ pub(crate) struct ChromeWidgets {
     pub(crate) rename: RenameWidgets,
 }
 
+impl ChromeWidgets {
+    pub(crate) fn set_other(&self, text: Option<&str>) {
+        (self.other)(text);
+    }
+}
+
 /// Draws `now` on `widgets`, touching only what differs from `last` (everything when nothing was drawn yet), and
 /// keeps `now` as the model drawn.
 pub(crate) fn reconcile(widgets: &ChromeWidgets, last: &mut Option<ChromeModel>, now: &ChromeModel) {
@@ -104,6 +112,9 @@ pub(crate) fn reconcile(widgets: &ChromeWidgets, last: &mut Option<ChromeModel>,
     let old_bar = was.map(|model| &model.top_bar);
     if old_bar.is_none_or(|old| old.project != bar.project || old.workspace != bar.workspace) {
         (widgets.workspace)(&bar.project, bar.workspace.as_deref());
+    }
+    if old_bar.is_none_or(|old| old.other != bar.other) {
+        widgets.set_other(bar.other.as_deref());
     }
     if old_bar.is_none_or(|old| old.selection != bar.selection) {
         (widgets.selection)(bar.selection.as_deref());
@@ -187,6 +198,10 @@ mod tests {
             selection: Box::new({
                 let say = say(&heard);
                 move |text| say(format!("selection {text:?}"))
+            }),
+            other: Box::new({
+                let say = say(&heard);
+                move |text| say(format!("other {text:?}"))
             }),
             mark: Box::new({
                 let say = say(&heard);
@@ -297,6 +312,23 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_summary_changes_only_its_plain_text_label() {
+        let (widgets, heard) = recording();
+        let mut last = None;
+        let mut now = model();
+        reconcile(&widgets, &mut last, &now);
+        take(&heard);
+        now.top_bar.other = Some("2: ⚑1".into());
+        reconcile(&widgets, &mut last, &now);
+        assert_eq!(take(&heard), [r#"other Some("2: ⚑1")"#]);
+        reconcile(&widgets, &mut last, &now);
+        assert!(take(&heard).is_empty());
+        now.top_bar.other = None;
+        reconcile(&widgets, &mut last, &now);
+        assert_eq!(take(&heard), ["other None"]);
+    }
+
+    #[test]
     fn reconcile_touches_only_the_widgets_whose_field_changed() {
         let (widgets, heard) = recording();
         let mut last = None;
@@ -306,6 +338,7 @@ mod tests {
             take(&heard),
             [
                 "workspace eitri None",
+                "other None",
                 "selection None",
                 "mark None",
                 "chip editor editor shown=false",
@@ -355,6 +388,7 @@ mod tests {
         asking.prompt = Some(eitri_core::wm::chrome::Prompt {
             text: "kill-pane terminal? (y/n)".into(),
             closes_window: false,
+            offers_move: false,
         });
         reconcile(&widgets, &mut last, &asking);
         let (x, y) = prompt_origin(true, 100, 40, 20);

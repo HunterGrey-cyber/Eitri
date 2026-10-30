@@ -478,7 +478,7 @@ impl Probe {
         let n = self.script.count("p4_reorders", 200);
         let sample_every = self.script.count("p4_sample_every", 4).max(1);
         let (editor, term, agent) = (Self::editor_id(), ModuleId::terminal(), ModuleId::agent());
-        let _ = self.ctx.grid.show_module(&term);
+        (self.ctx.show_module)(&term);
         self.ctx.terminal.start();
         self.sleep(900).await;
         let we = self.in_window(self.tile_of(&editor));
@@ -782,7 +782,7 @@ impl Probe {
 
     /// The window's pooled page of `id`, if it has a live one.
     fn pooled(&self, id: &ModuleId) -> Option<WebView> {
-        self.ctx.chat_views.borrow().get(id).map(|(view, _)| view.clone())
+        self.ctx.chat_views.get(id).map(|(view, _)| view)
     }
 
     /// Exercises the window's own chat view lifecycle. Kill a startup view as `prefix x y`
@@ -902,8 +902,7 @@ impl Probe {
         let handle: AgentPanelHandle = self.ctx.panel.clone();
         // Attaching a page as a view the window already shows would take that view's routing from its
         // real page, so the probe's numbers must be free in the window it runs in.
-        let window_holds =
-            self.ctx.chat_views.borrow().get(&page_view.module()).is_some() || handle.views().contains(&page_view);
+        let window_holds = self.ctx.chat_views.holds(&page_view.module()) || handle.views().contains(&page_view);
         if window_holds {
             say(format!(
                 "skip {id} chat view {} is the window's own; keep agent#{} out of the probe's layout",
@@ -1066,7 +1065,7 @@ impl Probe {
     /// starts a text selection instead of the divider moving.
     pub(super) async fn p8_divider_pick(&self) {
         let term = ModuleId::terminal();
-        let shown = self.ctx.grid.show_module(&term).unwrap_or(false);
+        let shown = (self.ctx.show_module)(&term);
         self.ctx.terminal.start();
         self.sleep(900).await;
         let dividers = self.ctx.grid.probe_dividers();
@@ -1093,7 +1092,7 @@ impl Probe {
             }
         }
         if shown {
-            let _ = self.ctx.grid.hide_module(&term, &|id| self.give_keys(id));
+            (self.ctx.hide_module)(&term);
         }
     }
 

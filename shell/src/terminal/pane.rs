@@ -43,11 +43,19 @@
 //! Font metrics are lazy. [`ensure_session`] builds `TerminalMetrics` when starting the shell,
 //! so [`TerminalPane::new`] never touches a font manager. If no usable monospace font exists,
 //! the pane displays its failure frame instead of letting a font-manager panic close the process.
+//!
+//! `super::TerminalFace`, [`TerminalPane::set_face`] and [`TerminalPane::set_zoom`] use the
+//! editor's `guifont` unless `terminal.font` overrides it, at the window's terminal zoom.
+//! The controller changes that zoom with `g:neovide_scale_factor` or independently.
+//! A face or zoom change rebuilds metrics at the pane's size and sends the resulting grid
+//! to the PTY as a resize. A larger font therefore gives the shell a smaller grid.
+//! Before metrics exist, only the face is kept.
 
 use std::cell::RefCell;
 use std::panic;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gtk4::gdk::{Clipboard, ModifierType, Rectangle};
@@ -61,8 +69,8 @@ use gtk4::{
 use eitri_terminal::mouse::{Button as MouseButton, MouseKind, MouseModes, MouseMods, WheelDir};
 use eitri_terminal::pty::{fallback_shell, passwd_shell};
 use eitri_terminal::{
-    layout_preedit, CursorCell, PreeditLayout, PtySize, Screen, ScrollRequest, SelectCommand, SessionCommand,
-    SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
+    layout_preedit, CursorCell, DetachRefused, Detached, PreeditLayout, PtySize, Screen, ScrollRequest, SelectCommand,
+    SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
 };
 use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
@@ -73,16 +81,13 @@ use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
 use super::input_queue::{InputQueue, PaneInput, PasteTicket};
 use super::keys::{self, ClipboardChord, CopyModeKey, DeliveredKeys, RawKey, RepeatTracker};
 use super::pointer;
+use super::TerminalFace;
 use crate::wheel_zoom::WheelZoom;
 
 /// GDK's own numbering (X11/Wayland convention, not named constants in `gtk4-rs`): button 1 is the
 /// primary (left) button, button 2 the middle.
 const BUTTON_PRIMARY: u32 = 1;
 const BUTTON_MIDDLE: u32 = 2;
-
-/// Phase 1's face: the frozen pane's own default. Phase 4 takes nvim's `guifont`.
-const FONT_FAMILY: &str = "monospace";
-const FONT_SIZE_PT: f32 = 13.0;
 
 /// How long `Ctrl+Shift+V` waits for the clipboard before typing goes on without the paste
 /// (`input_queue`'s module doc). A read from this process takes microseconds and one through a
@@ -101,6 +106,10 @@ struct State {
     wanted: bool,
     session: Option<TerminalSession>,
     generation: u64,
+    /// Counts input accepted for the shell, including keys and mouse reports parked behind a paste and the start
+    /// of a paste; focus reports do not count. A restart decided on an idle read compares it, since a command typed
+    /// after the read keeps the same shell and pid. Releasing parked input may count it again; only equality matters.
+    typed: u64,
     /// The shell exited, OR the metrics/spawn failed before one ever started: the last frame (or
     /// the failure message) stays, and Enter restarts it.
     exited: bool,
@@ -149,6 +158,29 @@ struct State {
     /// Told each time a shell is spawned, with its pid; set by `main.rs` ([`TerminalPane::on_shell_start`]).
     /// Called with no borrow of this state held.
     on_shell_start: Option<Rc<dyn Fn(u32)>>,
+    /// The session is frozen for a move to the other window: what is typed or pointed here goes nowhere until the
+    /// move ends, since after a commit the other window answers for the program.
+    frozen: bool,
+    /// The size the other window had this terminal at, for a pane prepared to take it over before it has an
+    /// allocation of its own: what the adopted screen is sized to until GTK lays the pane out.
+    prepared: Option<Allocation>,
+    /// What the metrics are built in: the face before the zoom, and the window's terminal zoom over it.
+    /// Kept while there are no metrics, so the first build is already in the window's face and size.
+    face: TerminalFace,
+    zoom: f32,
+}
+
+/// How far apart two zoom levels may be and still be one size: far below the 0.1 of a step.
+const ZOOM_EPSILON: f32 = 1e-4;
+
+/// What a new face or zoom did to the pane ([`State::refont`]).
+#[derive(Debug, PartialEq)]
+enum Refont {
+    /// Neither the face nor the size moved: nothing to draw again.
+    Same,
+    /// Kept for the metrics' first build, or the metrics were rebuilt in it: drawn again, and the PTY told
+    /// `resize` when its size changed.
+    Changed { resize: Option<PtySize> },
 }
 
 /// What becomes of an input-method commit ([`State::route_commit`]).
@@ -173,6 +205,7 @@ impl State {
             wanted: false,
             session: None,
             generation: 0,
+            typed: 0,
             exited: false,
             frame: None,
             cursor: None,
@@ -191,7 +224,62 @@ impl State {
             cwd,
             on_shell_exit: None,
             on_shell_start: None,
+            frozen: false,
+            prepared: None,
+            face: TerminalFace::default(),
+            zoom: 1.0,
         }
+    }
+
+    /// A new face or zoom for the pane. With metrics, they are rebuilt at the pane's size in the new face,
+    /// and the PTY size that comes back is sent when it differs: a larger font is fewer cells, and the
+    /// shell must hear of it the way it hears of a smaller pane. Without metrics (no shell has been
+    /// wanted yet) nothing is built: the face is kept for the first build, and no font manager is touched
+    /// for a terminal never shown. A font that fails to build keeps the old metrics and the old face.
+    fn refont(&mut self, face: TerminalFace, zoom: f32) -> Refont {
+        // An editor-only step keeps the terminal in place by dividing its factor by the editor's new scale,
+        // which can leave the zoom a float's width off the old one: that is the same size, not a rebuild.
+        let same_zoom = (zoom - self.zoom).abs() < ZOOM_EPSILON;
+        if !zoom.is_finite() || zoom <= 0.0 || (face == self.face && same_zoom) {
+            return Refont::Same;
+        }
+        let Some(metrics) = self.metrics.as_ref() else {
+            self.face = face;
+            self.zoom = zoom;
+            return Refont::Changed { resize: None };
+        };
+        let before = PtySize::from_metrics(metrics);
+        let allocation = self.kept_allocation();
+        let rebuilt = match build_metrics(allocation, &face, zoom) {
+            Ok(rebuilt) => rebuilt,
+            Err(reason) => {
+                eprintln!(
+                    "[terminal] could not build font metrics for {:?}: {reason}",
+                    face.families
+                );
+                return Refont::Same;
+            }
+        };
+        let after = PtySize::from_metrics(&rebuilt);
+        println!(
+            "[terminal] font {:?} at {:.1}px: {}x{} cells",
+            rebuilt.families(),
+            rebuilt.size() * rebuilt.scale(),
+            after.cols,
+            after.rows
+        );
+        self.metrics = Some(rebuilt);
+        self.face = face;
+        self.zoom = zoom;
+        Refont::Changed {
+            resize: (after != before).then_some(after),
+        }
+    }
+
+    /// The pane's own allocation once it has one, else the one the other window had it at, else a nominal
+    /// one the pane's first allocation resizes.
+    fn kept_allocation(&self) -> Allocation {
+        self.allocation.or(self.prepared).unwrap_or(NOMINAL_ALLOCATION)
     }
 
     /// `connect_resize`'s bookkeeping, GTK-free so it is tested without a display: keep the
@@ -266,11 +354,38 @@ impl State {
         }
     }
 
+    /// Accepts input now, even when a paste holds it back from the session.
+    fn submit(&mut self, input: PaneInput) {
+        let counts_as_typing = !matches!(input, PaneInput::Focus(_));
+        match self.queue.submit(input) {
+            Some(input) => self.send_input(input),
+            None if counts_as_typing => self.typed += 1,
+            None => {}
+        }
+    }
+
+    /// Accepts a paste before its clipboard read answers, so a restart cannot discard it meanwhile.
+    fn begin_paste(&mut self) -> PasteTicket {
+        self.typed += 1;
+        self.queue.begin_paste()
+    }
+
+    /// The queue belongs to this pane and cannot follow a session to the other window.
+    fn freeze_refusal(&self) -> Option<String> {
+        (!self.queue.is_empty()).then(|| "input is still waiting behind a paste".into())
+    }
+
     /// Straight to the running shell; dropped when there is none (not started, or exited). The one
     /// place that turns a [`PaneInput`] into the matching [`SessionCommand`] (bottom-terminal phase
     /// 3c): a key is `Input`, a mouse gesture `Mouse`, a focus change `FocusReport` -- never the
     /// direct `SessionCommand::Focus` a report must not ride (`set_focused`'s own doc).
-    fn send_input(&self, input: PaneInput) {
+    fn send_input(&mut self, input: PaneInput) {
+        if !matches!(input, PaneInput::Focus(_)) {
+            self.typed += 1;
+        }
+        if self.frozen {
+            return;
+        }
         if let (Some(session), false) = (&self.session, self.exited) {
             let command = match input {
                 PaneInput::Key(input) => SessionCommand::Input(input),
@@ -317,6 +432,17 @@ impl State {
         // Leaving copy mode on exit/restart too -- a gone or about-to-be-replaced
         // shell holds nothing left to scroll back through.
         self.copy_mode = false;
+    }
+
+    /// A shell taken over from the other window replaces whatever this pane held: the pane starts afresh as for a new
+    /// shell, then takes the copy mode the arriving view is in, so its keys keep going to copy mode, not the shell.
+    fn took_over(&mut self, copy_mode: bool) {
+        self.forget_session();
+        self.generation += 1;
+        self.wanted = true;
+        self.frozen = false;
+        self.frame = None;
+        self.copy_mode = copy_mode;
     }
 
     /// `prefix [`/`prefix PageUp`, once the controller has already established this pane holds the
@@ -399,8 +525,27 @@ impl State {
     /// the shell's, and the next start spawns at them.
     fn close(&mut self) {
         self.wanted = false;
+        self.frozen = false;
         self.forget_session();
         self.frame = None;
+    }
+
+    /// The size an adopted session starts at: the pane's own allocation once it has one, else the one the other
+    /// window had it at, else a nominal one the pane's first allocation resizes (the other window could not tell, and
+    /// the shell is better taken over at a guess than left with no window). The metrics are built at it the first
+    /// time, as a spawn builds them.
+    fn adopt_size(
+        &mut self,
+        build: impl FnOnce(Allocation, &TerminalFace, f32) -> Result<TerminalMetrics, String>,
+    ) -> Result<PtySize, String> {
+        let allocation = self.kept_allocation();
+        let metrics = match self.metrics.take() {
+            Some(metrics) => metrics,
+            None => build(allocation, &self.face, self.zoom)?,
+        };
+        let size = PtySize::from_metrics(&metrics);
+        self.metrics = Some(metrics);
+        Ok(size)
     }
 
     /// [`ensure_session`]'s gate, and the size it spawns at. `None`: nothing to start (no shell
@@ -409,7 +554,7 @@ impl State {
     /// allocation the first time -- and the size is theirs.
     fn spawn_size(
         &mut self,
-        build: impl FnOnce(Allocation) -> Result<TerminalMetrics, String>,
+        build: impl FnOnce(Allocation, &TerminalFace, f32) -> Result<TerminalMetrics, String>,
     ) -> Option<Result<PtySize, String>> {
         if !self.wanted || self.session.is_some() || self.exited {
             return None;
@@ -417,7 +562,7 @@ impl State {
         let allocation = self.allocation?;
         let metrics = match self.metrics.take() {
             Some(metrics) => metrics,
-            None => match build(allocation) {
+            None => match build(allocation, &self.face, self.zoom) {
                 Ok(metrics) => metrics,
                 Err(reason) => return Some(Err(reason)),
             },
@@ -436,6 +581,15 @@ struct Allocation {
     height: f32,
     scale: f32,
 }
+
+/// What metrics are built at with no allocation of the pane's own and none from the other window: a guess
+/// the pane's first allocation resizes (an adopted shell is better taken over at one than left with no
+/// window).
+const NOMINAL_ALLOCATION: Allocation = Allocation {
+    width: 800.0,
+    height: 480.0,
+    scale: 1.0,
+};
 
 /// Cheap to clone: a handle on one widget and its state.
 #[derive(Clone)]
@@ -513,6 +667,11 @@ impl TerminalPane {
         self.state.borrow_mut().cwd = dir;
     }
 
+    /// How many keys and mouse reports the pane has been given for its shell; a focus report is not one.
+    pub(crate) fn typed(&self) -> u64 {
+        self.state.borrow().typed
+    }
+
     /// The identity of the current start, retained across a close until the next start.
     pub(crate) fn generation(&self) -> u64 {
         self.state.borrow().generation
@@ -570,6 +729,27 @@ impl TerminalPane {
         self.area.queue_render();
     }
 
+    /// The face the pane draws in before the zoom: the editor's `guifont`, or `terminal.font`.
+    pub(crate) fn set_face(&self, face: TerminalFace) {
+        let zoom = self.state.borrow().zoom;
+        self.refont(face, zoom);
+    }
+
+    /// The window's terminal text zoom, relative to the face's own size.
+    pub(crate) fn set_zoom(&self, zoom: f32) {
+        let face = self.state.borrow().face.clone();
+        self.refont(face, zoom);
+    }
+
+    fn refont(&self, face: TerminalFace, zoom: f32) {
+        let changed = self.state.borrow_mut().refont(face, zoom);
+        let Refont::Changed { resize } = changed else { return };
+        self.area.queue_render();
+        if let Some(size) = resize {
+            self.state.borrow().send_command(SessionCommand::Resize(size));
+        }
+    }
+
     /// Hands the running shell input that did not come from this widget's own keyboard -- the
     /// prefix's literal `Ctrl+a`/`Ctrl+l`. Dropped when no shell is running; behind a paste still
     /// being read, it waits for it ([`submit`]).
@@ -617,6 +797,122 @@ impl TerminalPane {
         self.area.queue_render();
     }
 
+    /// Freezes the running shell's session for a move to the other window: it reads, writes and draws nothing until
+    /// the move ends, and what is typed here meanwhile is dropped. The receiver gives the session's answer (what the
+    /// other window needs, or why the terminal stays); it is waited on off the GTK thread. Refused with no running
+    /// shell, one already frozen, or while input waits behind a paste.
+    pub(crate) fn detach(&self) -> Result<Receiver<Result<Detached, DetachRefused>>, String> {
+        discard_composition(&self.state, &self.im, &self.area);
+        let mut state = self.state.borrow_mut();
+        if state.frozen {
+            return Err("the terminal is already frozen for a move".into());
+        }
+        let session = match (&state.session, state.exited) {
+            (Some(session), false) => session,
+            _ => return Err("no shell runs in the terminal".into()),
+        };
+        if let Some(why) = state.freeze_refusal() {
+            return Err(why);
+        }
+        let (answer, answered) = std::sync::mpsc::channel();
+        session.send(SessionCommand::Detach(answer));
+        state.frozen = true;
+        Ok(answered)
+    }
+
+    /// The move did not happen: the frozen session rebuilds its screen, writes what it owed and reads again, and
+    /// this pane takes keys for it again. Nothing for a pane that is not frozen.
+    pub(crate) fn resume(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.frozen {
+            return;
+        }
+        state.frozen = false;
+        state.send_command(SessionCommand::Resume);
+        drop(state);
+        self.area.queue_render();
+    }
+
+    /// The other window holds the terminal now: the session lets its shell go without a hangup and ends, and the
+    /// pane forgets it as a kill's close does, so the number's next start is a fresh shell. The shell's exit is still
+    /// this process's to reap, which the window's spawner watch does (`linked_window::spawn::watch_moved_child`).
+    pub(crate) fn forget(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            // `Committed` is read before the `Shutdown` the dropped handle sends, and the session has ended by then.
+            state.send_command(SessionCommand::Committed);
+            state.close();
+        }
+        self.im.reset();
+        self.area.queue_render();
+    }
+
+    /// Made ready to take a terminal over from the other window, before anything there is frozen: the size it has
+    /// there, in logical pixels, so the screen it brings is laid out at it until this pane is allocated.
+    pub(crate) fn prepare(&self, width: u32, height: u32) {
+        let scale = self.area.scale_factor().max(1) as f32;
+        let mut state = self.state.borrow_mut();
+        state.prepared = (width > 0 && height > 0).then_some(Allocation {
+            width: width as f32 * scale,
+            height: height as f32 * scale,
+            scale,
+        });
+    }
+
+    /// Takes over the terminal a committed move carried: its shell, its PTY and its screen, which the session
+    /// rebuilds and draws, writing what the other window still owed the shell. Refused, with nothing taken, when the
+    /// record or its descriptors do not hold a terminal this process can adopt, or the pane already runs a shell.
+    pub(crate) fn adopt(&self, record: &serde_json::Value, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+        self.im.set_client_widget(Some(&self.area));
+        let (size, colors, focused, cwd) = {
+            let mut state = self.state.borrow_mut();
+            if state.session.is_some() && !state.exited {
+                return Err("the pane already runs a shell".into());
+            }
+            let size = state.adopt_size(build_metrics)?;
+            (size, state.colors, state.focused, state.cwd.clone())
+        };
+        let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
+        let config = SessionConfig {
+            // Not used by an adoption, which spawns nothing.
+            spawn: SpawnSpec::user_shell(cwd),
+            size,
+            colors,
+            focused,
+            tap: None,
+        };
+        let (session, copy_mode) = super::moving::adopt(record, fds, config, move || {
+            let _ = wake.unbounded_send(());
+        })?;
+        let pid = session.pid();
+        println!("[terminal] took over the shell {pid} from the other window");
+        let started = {
+            let mut state = self.state.borrow_mut();
+            state.took_over(copy_mode);
+            state.session = Some(session);
+            state.on_shell_start.clone()
+        };
+        if let Some(started) = started {
+            started(pid);
+        }
+        watch_session(&self.state, &self.area, &self.im, woken);
+        Ok(())
+    }
+
+    /// How a shell this pane took over from the other window ended, as the process that started it reports it: only
+    /// that process can wait for it. Whether this pane runs that shell, named by its pid and its start time, so an
+    /// end reported for an earlier process that had the same pid is not taken for this one's.
+    pub(crate) fn child_exited(&self, pid: u32, start: u64, status: std::process::ExitStatus) -> bool {
+        let state = self.state.borrow();
+        match &state.session {
+            Some(session) if session.pid() == pid && session.adopted_start() == Some(start) => {
+                session.send(SessionCommand::ChildExited(status));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Window close: hang the shell up. Does not wait -- `TerminalSession`'s own `Drop`.
     pub(crate) fn shutdown(&self) {
         let mut state = self.state.borrow_mut();
@@ -646,9 +942,13 @@ const NO_METRICS_SIZE: PtySize = PtySize {
 /// Use the actual allocation rather than a 1x1 placeholder. With lazy metrics, the first resize
 /// arrives before they exist, and GTK sends no second resize until the pane changes size.
 /// Building at a placeholder would therefore spawn the shell with the wrong PTY dimensions.
-fn build_metrics(allocation: Allocation) -> Result<TerminalMetrics, String> {
+///
+/// Uses `face` at `zoom`: the face's size times the window's terminal zoom, in logical pixels.
+/// The metrics scale that size to device pixels.
+fn build_metrics(allocation: Allocation, face: &TerminalFace, zoom: f32) -> Result<TerminalMetrics, String> {
     let Allocation { width, height, scale } = allocation;
-    panic::catch_unwind(|| TerminalMetrics::with_font(FONT_FAMILY, FONT_SIZE_PT, width, height, scale)).map_err(
+    let size = face.base_px * zoom;
+    panic::catch_unwind(|| TerminalMetrics::with_families(&face.families, size, width, height, scale)).map_err(
         |payload| {
             payload
                 .downcast_ref::<&str>()
@@ -683,7 +983,7 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
         };
         (s.cwd.clone(), size, s.colors, s.focused)
     };
-    let (wake, mut woken) = futures_channel::mpsc::unbounded::<()>();
+    let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
     let mut spec = SpawnSpec::user_shell(cwd.clone());
     let mut tried = Vec::new();
     let started = loop {
@@ -741,6 +1041,16 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
     if let Some(started) = started {
         started(pid);
     }
+    watch_session(state, area, im, woken);
+}
+
+/// Takes what the session publishes each time it wakes the pane, on the main loop.
+fn watch_session(
+    state: &Rc<RefCell<State>>,
+    area: &GLArea,
+    im: &IMMulticontext,
+    mut woken: futures_channel::mpsc::UnboundedReceiver<()>,
+) {
     let state = Rc::downgrade(state);
     let area = area.downgrade();
     let im = im.downgrade();
@@ -1630,10 +1940,7 @@ fn deliver(state: &RefCell<State>, raw: RawKey) {
 
 /// The one door to the shell: straight through, or behind a paste still being read.
 fn submit(state: &RefCell<State>, input: PaneInput) {
-    let mut s = state.borrow_mut();
-    if let Some(input) = s.queue.submit(input) {
-        s.send_input(input);
-    }
+    state.borrow_mut().submit(input);
 }
 
 /// `Ctrl+Shift+V`: reads the clipboard's text and pastes it. Its place in line is taken now, so
@@ -1664,7 +1971,7 @@ fn paste_from(
     label: &'static str,
 ) {
     discard_composition(state, im, area);
-    let ticket = state.borrow_mut().queue.begin_paste();
+    let ticket = state.borrow_mut().begin_paste();
     let read = clipboard.read_text_future();
     {
         let state = Rc::downgrade(state);
@@ -1755,6 +2062,71 @@ mod tests {
         );
     }
 
+    /// A restart in place decided on a read of an idle shell compares this count: a key or a mouse report after the
+    /// read counts, a focus report (sent when the keys move, typing nothing) does not, and a pane with no shell to
+    /// take the input counts it all the same.
+    #[test]
+    fn keys_and_mouse_reports_are_counted_and_focus_reports_are_not() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        assert_eq!(state.typed, 0);
+        state.send_input(PaneInput::Key(keys::paste("ls\r").expect("pasted text")));
+        assert_eq!(state.typed, 1);
+        state.send_input(PaneInput::Focus(true));
+        assert_eq!(state.typed, 1, "a focus report types nothing");
+        state.frozen = true;
+        state.send_input(PaneInput::Key(keys::paste("x").expect("pasted text")));
+        assert_eq!(state.typed, 2);
+    }
+
+    #[test]
+    fn input_parked_behind_a_paste_counts_as_typed() {
+        use eitri_core::wm::ShellStart;
+
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let before = state.typed;
+        state.begin_paste();
+        assert!(state.typed > before);
+        let after_paste = state.typed;
+        state.submit(PaneInput::Key(keys::paste("x").unwrap()));
+        assert!(state.typed > after_paste);
+        assert!(!ShellStart::of(0, Some(1))
+            .typed(before)
+            .untouched(Some(ShellStart::of(0, Some(1)).typed(state.typed))));
+    }
+
+    #[test]
+    fn a_focus_report_parked_behind_a_paste_is_not_counted_as_typing() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.begin_paste();
+        let before = state.typed;
+        state.submit(PaneInput::Focus(true));
+        assert_eq!(state.typed, before);
+    }
+
+    #[test]
+    fn a_paste_alone_makes_a_restart_refuse() {
+        use eitri_core::wm::ShellStart;
+
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let before = state.typed;
+        state.begin_paste();
+        assert!(state.typed > before);
+        assert!(!ShellStart::of(0, Some(1))
+            .typed(before)
+            .untouched(Some(ShellStart::of(0, Some(1)).typed(state.typed))));
+    }
+
+    #[test]
+    fn a_terminal_with_input_waiting_behind_a_paste_is_not_frozen_for_a_move() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        assert!(state.freeze_refusal().is_none());
+        let ticket = state.begin_paste();
+        state.submit(PaneInput::Key(keys::paste("x").unwrap()));
+        assert!(state.freeze_refusal().is_some());
+        assert!(state.finish_paste(ticket, None));
+        assert!(state.freeze_refusal().is_none());
+    }
+
     /// `prefix x` or the shell's own end (2026-09-26): after a close nothing spawns until a start
     /// wants a shell again, and then a fresh one does -- even after an exit, which on its own waits
     /// for Enter -- on a blank pane, at the allocation the pane already had.
@@ -1789,6 +2161,42 @@ mod tests {
         );
     }
 
+    /// A pane prepared for a terminal from the other window has no allocation of its own yet: the screen it takes
+    /// over is sized to the other window's size, its own allocation wins once it has one, and with neither it is a
+    /// nominal size the first allocation resizes, never a refusal that would lose the shell.
+    #[test]
+    fn an_adopted_terminal_takes_the_prepared_size_until_the_pane_is_allocated() {
+        let at = |allocation: Allocation| {
+            let metrics = default_metrics(allocation.width, allocation.height, allocation.scale);
+            (metrics.cols(), metrics.rows())
+        };
+        let prepared = Allocation {
+            width: 600.0,
+            height: 400.0,
+            scale: 1.0,
+        };
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.prepared = Some(prepared);
+        let size = state.adopt_size(build_metrics).unwrap();
+        assert_eq!((size.cols, size.rows), at(prepared), "the other window's size");
+
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.prepared = Some(prepared);
+        state.allocate(FIRST_SHOW);
+        let size = state.adopt_size(build_metrics).unwrap();
+        assert_eq!((size.cols, size.rows), at(FIRST_SHOW), "the pane's own allocation");
+
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let size = state.adopt_size(build_metrics).unwrap();
+        assert!(size.cols > 1 && size.rows > 1, "a nominal size: {size:?}");
+    }
+
+    /// The metrics a pane builds before it is given a face: the default one, at zoom 1.
+    fn default_metrics(width: f32, height: f32, scale: f32) -> TerminalMetrics {
+        let face = TerminalFace::default();
+        TerminalMetrics::with_families(&face.families, face.base_px, width, height, scale)
+    }
+
     /// The pane's own allocation in the GUI pass that found defect 1: 1280x234 device pixels at
     /// scale 1, which the old eagerly built metrics spawned at 13x160.
     const FIRST_SHOW: Allocation = Allocation {
@@ -1816,7 +2224,7 @@ mod tests {
             .spawn_size(build_metrics)
             .expect("wanted and allocated: a shell is due")
             .expect("this machine has a monospace font");
-        let expected = TerminalMetrics::with_font(FONT_FAMILY, FONT_SIZE_PT, 1280.0, 234.0, 1.0);
+        let expected = default_metrics(1280.0, 234.0, 1.0);
         assert_eq!(
             (size.cols, size.rows),
             (expected.cols(), expected.rows()),
@@ -1840,7 +2248,7 @@ mod tests {
         let size = state.spawn_size(build_metrics).unwrap().unwrap();
         let metrics = state.metrics.as_ref().expect("built by spawn_size");
         assert_eq!(metrics.scale(), 2.0);
-        let expected = TerminalMetrics::with_font(FONT_FAMILY, FONT_SIZE_PT, 2560.0, 468.0, 2.0);
+        let expected = default_metrics(2560.0, 468.0, 2.0);
         assert_eq!((size.cols, size.rows), (expected.cols(), expected.rows()));
     }
 
@@ -1893,6 +2301,105 @@ mod tests {
             None,
             "the same allocation again is not a change"
         );
+    }
+
+    /// A larger zoom is a larger font, so fewer cells fit: the rebuilt grid is what the PTY is told, and
+    /// it is the grid the metrics now draw. The same zoom again changes nothing.
+    #[test]
+    fn a_zoom_with_metrics_rebuilds_them_and_resizes_the_pty() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.wanted = true;
+        state.allocate(FIRST_SHOW);
+        let first = state.spawn_size(build_metrics).unwrap().unwrap();
+        let face = state.face.clone();
+        let Refont::Changed { resize: Some(size) } = state.refont(face.clone(), 2.0) else {
+            panic!("twice the size must change the grid of a {first:?} pane");
+        };
+        assert!(
+            size.cols < first.cols && size.rows < first.rows,
+            "{first:?} -> {size:?}"
+        );
+        let metrics = state.metrics.as_ref().unwrap();
+        assert_eq!((metrics.cols(), metrics.rows()), (size.cols, size.rows));
+        assert_eq!(size, PtySize::from_metrics(metrics), "the drawn grid is the PTY's grid");
+        let expected = default_metrics(FIRST_SHOW.width, FIRST_SHOW.height, FIRST_SHOW.scale);
+        assert!(
+            (metrics.cell_height() - expected.cell_height() * 2.0).abs() <= 2.0,
+            "{} vs {}",
+            metrics.cell_height(),
+            expected.cell_height()
+        );
+        assert_eq!(state.refont(face.clone(), 2.0), Refont::Same);
+        assert_eq!(
+            state.refont(face.clone(), 2.0 * (1.0 / 1.1) * 1.1),
+            Refont::Same,
+            "a zoom a float's width off is the same size"
+        );
+        let Refont::Changed { resize: Some(back) } = state.refont(face, 1.0) else {
+            panic!("back to zoom 1 must give the first grid back");
+        };
+        assert_eq!(back, first);
+    }
+
+    /// A new face is a rebuild too: a larger un-zoomed size from the editor's `guifont` is fewer cells.
+    #[test]
+    fn a_new_face_with_metrics_rebuilds_them_at_the_current_zoom() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.wanted = true;
+        state.allocate(FIRST_SHOW);
+        let first = state.spawn_size(build_metrics).unwrap().unwrap();
+        let expected = state_resize(&state, 1.5);
+        assert_eq!(
+            state.refont(state.face.clone(), 1.5),
+            Refont::Changed { resize: expected }
+        );
+        let larger = TerminalFace {
+            base_px: state.face.base_px * 2.0,
+            ..state.face.clone()
+        };
+        let Refont::Changed { resize: Some(size) } = state.refont(larger.clone(), 1.5) else {
+            panic!("a larger face must change the grid");
+        };
+        assert!(size.rows < first.rows, "{first:?} -> {size:?}");
+        assert_eq!(state.face, larger);
+        assert_eq!(state.zoom, 1.5, "the zoom stays over the new face");
+    }
+
+    /// The grid `zoom` would give the state's pane now, for comparing a refont against.
+    fn state_resize(state: &State, zoom: f32) -> Option<PtySize> {
+        let now = PtySize::from_metrics(state.metrics.as_ref()?);
+        let built = build_metrics(state.kept_allocation(), &state.face, zoom).ok()?;
+        let then = PtySize::from_metrics(&built);
+        (then != now).then_some(then)
+    }
+
+    /// No metrics yet (the terminal never shown): the face and zoom are kept, no font manager is touched,
+    /// and the first build is already in them.
+    #[test]
+    fn without_metrics_a_face_and_zoom_wait_for_the_first_build() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        let face = TerminalFace {
+            families: vec!["monospace".into()],
+            base_px: 20.0,
+        };
+        assert_eq!(state.refont(face.clone(), 1.5), Refont::Changed { resize: None });
+        assert!(state.metrics.is_none(), "nothing built for a terminal never shown");
+        assert_eq!(state.refont(face.clone(), 1.5), Refont::Same);
+        assert_eq!(
+            state.refont(face.clone(), f32::NAN),
+            Refont::Same,
+            "a bad zoom is ignored"
+        );
+        assert_eq!(state.refont(face.clone(), 0.0), Refont::Same);
+        state.wanted = true;
+        state.allocate(FIRST_SHOW);
+        state.spawn_size(build_metrics).unwrap().unwrap();
+        let metrics = state.metrics.as_ref().unwrap();
+        assert!(
+            (metrics.size() - 30.0).abs() < 1e-3,
+            "built at the face's 20px times 1.5"
+        );
+        assert_eq!(metrics.families(), ["monospace"]);
     }
 
     /// Bottom-terminal phase 2: Enter after an exit starts a new shell, and what was typed for the
@@ -2073,7 +2580,7 @@ mod tests {
         state.exited = true;
         assert_eq!(state.spawn_size(build_metrics), None, "an exited shell waits for Enter");
         state.exited = false;
-        let failed = state.spawn_size(|_| Err("no fonts".to_string()));
+        let failed = state.spawn_size(|_, _, _| Err("no fonts".to_string()));
         assert_eq!(failed, Some(Err("no fonts".to_string())));
         assert!(state.metrics.is_none(), "a failed build leaves nothing half-made");
     }
@@ -2128,6 +2635,30 @@ mod tests {
         assert!(
             matches!(state.route_commit("k", HAS_THE_KEYS), CommitRoute::Shell(_)),
             "and the next letter is typing again"
+        );
+    }
+
+    #[test]
+    fn a_terminal_moved_in_copy_mode_keeps_its_letters_out_of_the_shell() {
+        let mut state = State::new(PathBuf::from("/tmp"));
+        state.focused = true;
+        state.ime.set_focused(true);
+        state.took_over(true);
+        assert!(
+            matches!(
+                state.route_commit("j", HAS_THE_KEYS),
+                CommitRoute::CopyMode(CopyModeKey::Scroll(_))
+            ),
+            "j scrolls the arrived view"
+        );
+        assert_eq!(
+            state.route_commit("q", HAS_THE_KEYS),
+            CommitRoute::CopyMode(CopyModeKey::Leave)
+        );
+        state.took_over(false);
+        assert!(
+            matches!(state.route_commit("j", HAS_THE_KEYS), CommitRoute::Shell(_)),
+            "an arrival outside copy mode types"
         );
     }
 

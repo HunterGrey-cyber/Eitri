@@ -1,27 +1,12 @@
-//! Moved from the frozen `terminal-pane/src/backend.rs` (2026-09-23),
-//! unchanged below this paragraph but for rustfmt at this repository's `max_width = 120` and one
-//! split: the op loop of [`paint`] is [`paint_ops`] (bottom-terminal phase 2), so the host can paint
-//! an input method's preedit over a finished frame without clearing it. Where it says "Verdandi" or
-//! "the handoff", the contract now lives in this workspace's `terminal-render/`.
+//! Execute a `PaintList` on a Skia canvas without interpreting terminal semantics.
 //!
-//! Executes a `PaintList` onto a Skia canvas. This is the entire backend.
+//! Colours, glyph widths and cursor contrast arrive resolved by terminal-render. Palette, SGR,
+//! selection, wide-character and scrollback decisions belong there: interpreting them again here
+//! would create two implementations that can disagree.
 //!
-//! The rule from the handoff, and the reason this file is short:
-//!
-//! > A backend EXECUTES these ops. It never interprets terminal semantics.
-//!
-//! So there is no palette here, no SGR, no inverse, no selection flag, no wide-char spacer, no
-//! cursor inference, no scrollback arithmetic. Every colour arrives resolved, every glyph arrives
-//! with the column count it occupies, the cursor arrives with the character it covers already
-//! recoloured to contrast. If a change to this file ever needs one of those concepts, the contract
-//! has leaked and the fix belongs in Verdandi — send it back with a failing test rather than
-//! deciding it here, because a second interpretation that merely happens to agree today is the
-//! thing this architecture exists to prevent.
-//!
-//! Correctness first, deliberately: every visible cell is repainted every frame. No damage, no
-//! partial redraw, no glyph atlas. That keeps the fault domain to the four things that can actually
-//! be wrong at this stage — the op contract, cell metrics, Skia drawing, and pane clipping — and
-//! there is no measurement yet saying a full repaint is too slow.
+//! Every visible cell is repainted each frame, keeping faults local to the op contract, metrics,
+//! Skia drawing and clipping. Full repaint stays until a measurement says it is too slow.
+//! [`paint_ops`] also paints preedit over a finished frame without clearing it.
 
 use crate::metrics::TerminalMetrics;
 use skia_safe::{Canvas, Color, Paint, Rect};
@@ -182,10 +167,7 @@ pub fn paint_ops(canvas: &Canvas, ops: &[PaintOp], metrics: &TerminalMetrics) {
                 text_under,
                 ..
             } => {
-                // `blinking` is ignored on purpose: the handoff calls it advisory and a steady
-                // cursor conforming. A blink would also mean repainting on a timer, which is exactly
-                // the unconditional-redraw pattern that cost this project a measured 60x idle CPU
-                // regression in the editor pane.
+                // Blinking is advisory; a steady cursor avoids timer-driven redraws while idle.
                 let at = CellSpan {
                     row: *row,
                     col: *col,
@@ -392,8 +374,8 @@ fn draw_underline(canvas: &Canvas, cell: Rect, baseline_y: f32, thickness: f32, 
             }
         }
         UnderlineKind::Curl | UnderlineKind::Dotted | UnderlineKind::Dashed => {
-            // Dashes approximate all three patterned underline kinds and keep them distinct from Single.
-            // A sine curl would need a path stroke.
+            // Curl, dotted and dashed underlines are all approximated by dashes for now so they remain
+            // visibly distinct from Single; a true curl needs a path stroke, worth doing once the rest is correct.
             let period = (cell.width() / 3.0).max(2.0);
             let mut x = cell.left;
             while x < cell.right {

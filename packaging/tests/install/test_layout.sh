@@ -108,24 +108,17 @@ t_fresh_layout() {
 
 TESTS="$TESTS t_symlinked_bindir_launches"
 t_symlinked_bindir_launches() {
-	# A symlinked ~/.local/bin -- e.g. GNU stow folding it into a
-	# dotfiles repo -- is a directory symlink, not a symlink on the launcher file itself. The
-	# install still lands a real ~/.local/lib/eitri (untouched here), but the launcher's old
-	# `readlink -f "$0"` canonicalized straight through the symlinked bindir, landing LIBDIR next
-	# to the symlink's TARGET directory instead of this install's own sibling lib/eitri -- so
-	# install reported success and every launch, `eitri setup` included, died `cd:
-	# .../lib/eitri: No such file or directory`. Move the planted bindir (with its nvim/vim)
-	# aside and replace it with a symlink before installing, so it stays reachable at the same
-	# path after_each's byte-for-byte planted check reads.
+	# A symlinked ~/.local/bin (e.g. GNU stow's dotfiles directory) must keep LIBDIR beside this
+	# install's bin, not beside the link's target. Canonicalizing the whole launcher path with
+	# `readlink -f "$0"` would break every launch, including `eitri setup`.
+	# Move the planted bindir aside and link to it so after_each can still check nvim/vim byte for byte.
 	mv "$TH/.local/bin" "$T/realbin"
 	ln -s "$T/realbin" "$TH/.local/bin"
 	serve 1.0.0
 	inst_net
 	expect_rc 0
 	expect_out 'installed Eitri 1.0.0'
-	# The install must not have replaced the planted symlink with a real directory -- otherwise a
-	# later change to the installer could make this test stop exercising F5 at all without ever
-	# going red.
+	# Keep the symlink in place so this test continues to exercise a symlinked bindir.
 	if [ ! -L "$TH/.local/bin" ]; then fail "the installer replaced the symlinked bindir with a real directory"; fi
 	launch_out=$(env -i HOME="$TH" PATH="$TH/.local/bin:/usr/bin:/bin" bash -c 'eitri --version' 2>&1)
 	launch_rc=$?

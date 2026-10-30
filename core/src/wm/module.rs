@@ -3,6 +3,7 @@
 use super::host::*;
 use super::window::WinId;
 use crate::layout::{Layout, ModuleId, Reopen};
+use std::path::PathBuf;
 
 /// Where a declared module stands in its window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +38,25 @@ pub struct SurfaceDecl {
     pub deferred: bool,
 }
 
+#[derive(Debug, Clone)]
 struct Module {
     decl: SurfaceDecl,
     state: ModuleState,
     terminal: TermRun,
+    /// The directory a terminal's next shell starts in, kept until its next [`TermOp::Start`] and sent as
+    /// [`TermOp::SetStartDir`] just before it, or dropped when a shell starts first without one.
+    start_dir: Option<PathBuf>,
     built: bool,
+    reload_at_show: bool,
+}
+
+/// One module's entry as it was, or that it had none: what a declaration that never came to be is undone to.
+#[derive(Debug, Clone)]
+pub struct SavedEntry(Option<Module>);
+
+impl SavedEntry {
+    /// A module that had no entry.
+    pub const NONE: SavedEntry = SavedEntry(None);
 }
 
 /// Declarations retain their order so every plugin hears each change in a stable order.
@@ -61,7 +76,9 @@ impl Lifecycle {
                 ModuleState::Declared
             },
             terminal: TermRun::NotStarted,
+            start_dir: None,
             built: false,
+            reload_at_show: false,
         };
         if let Some(old) = self.modules.iter_mut().find(|m| m.decl.module == decl.module) {
             *old = module;
@@ -76,6 +93,41 @@ impl Lifecycle {
         self.declare(decl, true);
         if let Some(module) = self.modules.iter_mut().find(|m| m.decl.module == decl.module) {
             module.terminal = TermRun::Moved;
+            module.built = matches!(decl.kind, SurfaceKind::PluginPage { .. }) && !decl.deferred;
+        }
+    }
+
+    /// Keeps an arriving page out of layout maps until its restored document is ready.
+    pub(super) fn wait_page(&mut self, id: &ModuleId) {
+        if let Some(module) = self.modules.iter_mut().find(|m| m.decl.module == *id) {
+            module.state = ModuleState::Declared;
+        }
+    }
+
+    /// Allows the next layout change to map the restored document.
+    pub(super) fn ready_page(&mut self, id: &ModuleId) {
+        if let Some(module) = self
+            .modules
+            .iter_mut()
+            .find(|m| m.decl.module == *id && m.state == ModuleState::Declared)
+        {
+            module.state = ModuleState::Hosted;
+        }
+    }
+
+    /// `module`'s entry as it is now, for [`Lifecycle::restore`] to put back.
+    pub fn saved(&self, module: &ModuleId) -> SavedEntry {
+        SavedEntry(self.modules.iter().find(|m| m.decl.module == *module).cloned())
+    }
+
+    /// `module`'s entry set back to what `saved` held: the entry it was, in its place, or none at all.
+    pub fn restore(&mut self, module: &ModuleId, saved: SavedEntry) {
+        match saved.0 {
+            Some(entry) => match self.modules.iter_mut().find(|m| m.decl.module == *module) {
+                Some(old) => *old = entry,
+                None => self.modules.push(entry),
+            },
+            None => self.modules.retain(|m| m.decl.module != *module),
         }
     }
 
@@ -87,8 +139,44 @@ impl Lifecycle {
             .map(|m| &m.decl.kind)
     }
 
+    /// A start-hidden page already has a registered host even before its first show adds a layout leaf.
+    pub(super) fn deferred_holding(&self, id: &ModuleId) -> bool {
+        self.modules.iter().any(|module| {
+            module.decl.module == *id
+                && module.decl.deferred
+                && matches!(module.decl.kind, SurfaceKind::PluginPage { .. })
+                && module.hosted()
+        })
+    }
+
     pub fn state(&self, module: &ModuleId) -> Option<&ModuleState> {
         self.modules.iter().find(|m| &m.decl.module == module).map(|m| &m.state)
+    }
+
+    /// Whether `module`'s terminal runs a shell, as the host last said; `None` for a module that is not a declared
+    /// terminal.
+    pub fn terminal_run(&self, module: &ModuleId) -> Option<&TermRun> {
+        self.modules
+            .iter()
+            .find(|m| &m.decl.module == module && matches!(m.decl.kind, SurfaceKind::Terminal { .. }))
+            .map(|m| &m.terminal)
+    }
+
+    /// Keeps `dir` as the directory `module`'s next shell starts in: sent as [`TermOp::SetStartDir`] just before the
+    /// next [`TermOp::Start`] of that terminal, in the same effect segment. A later call replaces it; whether it was
+    /// kept (`module` is a declared terminal).
+    pub fn keep_start_dir(&mut self, module: &ModuleId, dir: PathBuf) -> bool {
+        match self
+            .modules
+            .iter_mut()
+            .find(|m| &m.decl.module == module && matches!(m.decl.kind, SurfaceKind::Terminal { .. }))
+        {
+            Some(m) => {
+                m.start_dir = Some(dir);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Effects have their own batch segment so later allocation decisions still run before them.
@@ -96,8 +184,15 @@ impl Lifecycle {
         self.follow_away(layout);
         let shown: Vec<_> = layout.modules().into_iter().filter(|id| layout.is_shown(id)).collect();
         for id in &shown {
-            if let Some(module) = self.modules.iter().find(|m| &m.decl.module == id && m.hosted()) {
+            if let Some(module) = self.modules.iter_mut().find(|m| &m.decl.module == id && m.hosted()) {
                 if matches!(module.decl.kind, SurfaceKind::Terminal { .. }) && module.terminal == TermRun::NotStarted {
+                    if let Some(dir) = module.start_dir.take() {
+                        batch.push_effect(HostOp::Terminal(TermOp::SetStartDir {
+                            win,
+                            module: id.clone(),
+                            dir,
+                        }));
+                    }
                     batch.push_effect(HostOp::Terminal(TermOp::Start {
                         win,
                         module: id.clone(),
@@ -146,6 +241,12 @@ impl Lifecycle {
                         _ => {}
                     }
                 }
+                if std::mem::take(&mut module.reload_at_show) && !matches!(module.state, ModuleState::Killed(_)) {
+                    batch.push_effect(HostOp::Pair(PairOp::ReloadPage {
+                        win,
+                        module: module.decl.module.clone(),
+                    }));
+                }
                 module.state = ModuleState::Shown;
             } else if !matches!(module.state, ModuleState::Killed(_)) {
                 module.state = ModuleState::Hidden;
@@ -161,7 +262,7 @@ impl Lifecycle {
         for module in &mut self.modules {
             let away = layout.is_away(&module.decl.module);
             match module.state {
-                ModuleState::Away if !away => module.state = ModuleState::Hosted,
+                ModuleState::Away if !away => module.back_here(),
                 ModuleState::Hosted | ModuleState::Shown | ModuleState::Hidden if away => {
                     module.state = ModuleState::Away
                 }
@@ -170,7 +271,30 @@ impl Lifecycle {
         }
     }
 
-    /// Host facts never mutate the layout; the shell has already placed or removed the surface.
+    /// `id`'s placeholder was taken back by a move that arrived here: it is hosted again before the change is laid
+    /// out, so the layout ops that change makes map it (the lifecycle's own pass runs after them). A Lua panel
+    /// comes back killed in place, so the same change reopens it from its producer here.
+    pub(super) fn returned(&mut self, id: &ModuleId) {
+        if let Some(module) = self
+            .modules
+            .iter_mut()
+            .find(|m| m.decl.module == *id && m.state == ModuleState::Away)
+        {
+            module.back_here();
+        }
+    }
+
+    /// A returned document reads its store afresh when next shown. Killed pages already reopen through their
+    /// lifecycle, so marking them would load the fresh document twice.
+    pub(super) fn reload_at_show(&mut self, id: &ModuleId) {
+        if let Some(module) = self.modules.iter_mut().find(|m| m.decl.module == *id) {
+            if !matches!(module.state, ModuleState::Killed(_)) {
+                module.reload_at_show = true;
+            }
+        }
+    }
+
+    /// Host facts never mutate the layout; placement is decided separately by the controller or shell.
     pub fn on_event(&mut self, win: WinId, event: &HostEvent, _layout: &Layout, batch: &mut Batch) {
         self.record_event(win, event);
         if let HostEvent::SurfaceEnded {
@@ -226,7 +350,12 @@ impl Lifecycle {
             return;
         };
         match event {
-            HostEvent::Terminal(TermEvent::Started { pid, .. }) => module.terminal = TermRun::Running { pid: *pid },
+            // A shell started, by its `Start` or in place with none (Enter after it ended): a directory kept for
+            // the next start is spent, and must not follow a later start into wherever the pane is by then.
+            HostEvent::Terminal(TermEvent::Started { pid, .. }) => {
+                module.terminal = TermRun::Running { pid: *pid };
+                module.start_dir = None;
+            }
             HostEvent::Terminal(TermEvent::Exited { .. }) => module.terminal = TermRun::Exited,
             HostEvent::SurfaceEnded {
                 why: Ended::Killed { reopen },
@@ -248,6 +377,16 @@ impl Lifecycle {
 }
 
 impl Module {
+    /// Away no longer: a Lua panel is reopened from its producer (nothing of its page came with it), anything else
+    /// is hosted and its change's own rules decide what it gets.
+    fn back_here(&mut self) {
+        self.state = if matches!(self.decl.kind, SurfaceKind::LuaPanel { .. }) {
+            ModuleState::Killed(Reopen::InPlace)
+        } else {
+            ModuleState::Hosted
+        };
+    }
+
     fn hosted(&self) -> bool {
         !matches!(
             self.state,
@@ -259,7 +398,6 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keymap::action::Action;
     use crate::layout::{hide, kill, Frame, ModuleDecl, Placement, Reopen, Size, Workspaces};
     use crate::tabs::ViewId;
     use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
@@ -311,6 +449,7 @@ mod tests {
                     args: vec![],
                     cwd: None,
                     clean: true,
+                    background: None,
                 },
             },
             deferred: false,
@@ -505,10 +644,10 @@ mod tests {
             self.effects().into_iter().skip(count).collect()
         }
 
-        fn shell(&self, arm: impl Fn(&mut Layout) + 'static) {
-            let layout = self.layout.clone();
-            self.host.on_shell_verb(move |_, _, _, _| arm(&mut layout.borrow_mut()));
-            self.driver.run(WIN, Action::PanelReload, Origin::Lua);
+        fn shell(&self, write: impl FnOnce(&mut Layout)) {
+            // The layout changed by the test, then heard as a change already drawn.
+            write(&mut self.layout.borrow_mut());
+            self.changed();
         }
 
         fn show(&self, module: &ModuleId) {
@@ -519,7 +658,7 @@ mod tests {
         }
 
         fn changed(&self) {
-            self.driver.post(HostEvent::LayoutChangedByShell { win: WIN });
+            self.driver.test_batch(|c| c.changed_in_test(WIN));
         }
 
         fn ended(&self, module: &ModuleId, reopen: Reopen) {
@@ -584,18 +723,22 @@ mod tests {
         let workspaces = d.workspaces.clone();
         let host = d.host.clone();
         d.shell(move |layout| {
-            kill(layout, &ModuleId::editor(), Reopen::Never, &frame()).unwrap();
-            workspaces.borrow_mut().retire_everywhere(&ModuleId::editor(), &frame());
+            kill(layout, &ModuleId::editor(), Reopen::InPlace, &frame()).unwrap();
+            workspaces.borrow_mut().end_everywhere(&ModuleId::editor(), &frame());
             host.post(HostEvent::SurfaceEnded {
                 win: WIN,
                 module: ModuleId::editor(),
-                why: Ended::Retired,
+                why: Ended::Killed {
+                    reopen: Reopen::InPlace,
+                },
             });
         });
         for (_, layout) in d.workspaces.borrow().each(&d.layout.borrow()) {
-            assert!(layout.is_gone(&ModuleId::editor()));
+            assert!(!layout.is_gone(&ModuleId::editor()));
+            assert!(!layout.is_shown(&ModuleId::editor()));
+            assert!(!layout.saved_hidden().contains(&ModuleId::editor()));
         }
-        assert_eq!(d.state(&ModuleId::editor()), Some(ModuleState::Retired));
+        assert_eq!(d.state(&ModuleId::editor()), Some(ModuleState::Killed(Reopen::InPlace)));
         assert!(d.ops().is_empty());
     }
 
@@ -653,7 +796,23 @@ mod tests {
         d.changed();
         d.exited(&t.module);
         d.changed();
-        assert_eq!(d.ops(), vec![start(&t.module)]);
+        assert_eq!(
+            d.ops(),
+            vec![
+                start(&t.module),
+                HostOp::Unmap {
+                    win: WIN,
+                    module: t.module.clone(),
+                },
+                HostOp::Allocate { win: WIN },
+                HostOp::Terminal(TermOp::HangUp {
+                    win: WIN,
+                    module: t.module.clone(),
+                }),
+            ]
+        );
+        d.show(&t.module);
+        assert_eq!(d.since(4), vec![start(&t.module)]);
     }
 
     #[test]
@@ -664,15 +823,31 @@ mod tests {
             d.started(&t.module);
             if exited {
                 d.exited(&t.module);
+                assert_eq!(
+                    d.ops(),
+                    vec![
+                        HostOp::Allocate { win: WIN },
+                        HostOp::Terminal(TermOp::HangUp {
+                            win: WIN,
+                            module: t.module.clone(),
+                        }),
+                    ]
+                );
+            } else {
+                let id = t.module.clone();
+                d.shell(move |layout| {
+                    kill(layout, &id, Reopen::At(Placement::BelowEditor), &frame()).unwrap();
+                });
+                d.ended(&t.module, Reopen::At(Placement::BelowEditor));
+                assert!(d.ops().is_empty());
             }
-            let id = t.module.clone();
-            d.shell(move |layout| {
-                kill(layout, &id, Reopen::At(Placement::BelowEditor), &frame()).unwrap();
-            });
-            d.ended(&t.module, Reopen::At(Placement::BelowEditor));
-            assert!(d.ops().is_empty());
+            assert_eq!(
+                d.state(&t.module),
+                Some(ModuleState::Killed(Reopen::At(Placement::BelowEditor)))
+            );
+            let count = d.ops().len();
             d.show(&t.module);
-            assert_eq!(d.ops(), vec![start(&t.module)]);
+            assert_eq!(d.since(count), vec![start(&t.module)]);
         }
     }
 
@@ -747,7 +922,6 @@ mod tests {
             ]
         );
         assert!(d.scheduler.armed().is_empty());
-        assert_eq!(d.driver.query(|c| c.shell_revision(WIN)), 0);
         d.started(&shown.module);
         d.show(&hidden.module);
         assert_eq!(
@@ -783,7 +957,7 @@ mod tests {
                 c.handle(ended).ops().all(is_cursor_signal),
                 "a killed chat has nothing to stop"
             );
-            let mut batch = c.handle(HostEvent::LayoutChangedByShell { win: WIN });
+            let mut batch = c.changed_in_test(WIN);
             // Layout ops joined after the change's effects were decided still apply before them.
             batch.push_layout(map);
             batch.push_layout(HostOp::Allocate { win: WIN });
@@ -840,7 +1014,7 @@ mod tests {
         let p = page("plugin", true, false);
         let d = Driven::hosted(&[t.clone(), p.clone()], &[]);
         let run = || {
-            d.driver.query(|c| {
+            d.driver.query_or(TermRun::NotStarted, |c| {
                 c.lifecycle(WIN)
                     .unwrap()
                     .modules

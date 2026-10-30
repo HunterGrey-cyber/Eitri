@@ -73,18 +73,13 @@ const TASK_COMMANDS: readonly SlashCommandEntry[] = [
 const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map([...SLASH_COMMANDS, ...TASK_COMMANDS].map((entry) => [entry.name, entry]));
 
 /** Held back regardless of the table's class above, because a real interactive terminal opens a
- *  picker/wizard for these that a headless turn cannot draw -- all four degraded to a plain-text
- *  summary instead when they were sent anyway.
+ *  picker/wizard for these that a headless turn cannot draw -- each degraded to a plain-text
+ *  summary instead when it was sent anyway.
  *
- *  `/model` used to be held back only WITHOUT an argument (a real interactive terminal opens a menu
- *  there). A 2026-09-28 probe showed a bare
- *  `/model`/`/effort` prints real, parseable text headless (`"Current model: ... Usage: /model
- *  <name>. Available: ..."` / `"Usage: /effort <low|medium|high|xhigh|max|auto>"`), so this panel
- *  now sends it too and opens a picker built from that reply (`../components/SlashPicker`,
- *  `./slashPicker`'s `parseModelReply`/`parseEffortReply`) rather than refusing it -- `/model` is
- *  therefore no longer in this set at all. `/effort` was never in it (it has no row in
- *  `SLASH_COMMANDS` -- an unknown slash word already falls through `heldBackSlashCommand` unheld,
- *  the same route `/model` now takes). */
+ *  Bare `/model` and `/effort` print parseable headless replies (`Current model: ... Usage:
+ *  /model <name>. Available: ...` and `Usage: /effort <low|medium|high|xhigh|max|auto>`), so the panel
+ *  sends them and builds a picker from the reply (`SlashPicker`, `parseModelReply`/`parseEffortReply`).
+ *  Neither belongs in this set. `/effort` has no `SLASH_COMMANDS` row; unknown words pass through. */
 const INTERACTIVE_ONLY_UNCONDITIONAL: ReadonlySet<string> = new Set(["login", "config", "resume"]);
 
 /** Classes that are always held back, regardless of name (no-op, error, hangs). No row
@@ -153,9 +148,9 @@ export function worksSlashCommands(): string[] {
   return SLASH_COMMANDS.filter((entry) => entry.class === "works").map((entry) => entry.name);
 }
 
-/** What the `?` overlay lists (a GUI pass, 2026-09-27): the **works** rows that Enter would
- *  actually send. The pass saw `/config` refused with that flash ("does not work in <the product> — ? lists
- *  the ones that do") while `?` listed `/config`, so the two contradicted each other on one screen. A command
+/** What the `?` overlay lists: the **works** rows that Enter would actually send. Listing `/config`
+ *  there while Enter refused it with the flash "does not work in <the product> — ? lists the ones
+ *  that do" would make the two contradict each other on one screen. A command
  *  held back unconditionally (`/config`, the only one left since a bare `/model` opens a picker instead of being
  *  held back) is left out; `worksSlashCommands` above stays the table's own class, unchanged. */
 export function listedSlashCommands(): string[] {

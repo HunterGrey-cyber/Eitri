@@ -108,12 +108,8 @@ describe("Composer sending", () => {
   });
 });
 
-// Send and Stop buttons are absent from the composer. Keyboard sending stays available:
-// Enter still sends and Shift+Enter still inserts a newline (both pinned
-// above), and Stop lives only in `ActivityLine` (formerly
-// `StatusLine`), for mouse users -- see `ActivityLine.test.tsx`'s own "shows the turn's motion and
-// Stop..." test for that half, gated the same way this one used to be, on the provider's
-// advertised `interrupt` capability rather than the backend's name.
+// Keyboard sending stays available: Enter sends and Shift+Enter inserts a newline. Stop lives in
+// `ActivityLine` for mouse users, gated on the provider's advertised `interrupt` capability.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {
@@ -168,8 +164,7 @@ describe("Composer and slash commands", () => {
     }
   });
 
-  /* /model is no longer interactive-only even bare -- its reply
-   *  parses into a picker (`App.tsx`'s own wiring; not this component's concern). */
+  /* A bare /model reply parses into a picker in `App.tsx`. */
   it("sends /model bare or with an argument alike", () => {
     for (const command of ["/model", "/model sonnet"]) {
       const { textarea, onSend } = renderComposer();
@@ -265,10 +260,8 @@ describe("Composer's BROWSE/INPUT split", () => {
   it("shows an empty-looking box instead of a textarea in BROWSE, with the hint after it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
-    // The BROWSE box has a dim reminder of the way into INPUT, because an arrival
-    // lands in BROWSE. The reminder tests below pin its appearance and behavior;
-    // `i`, a click and Tab still reach INPUT from the box.
-    // Since 2026-10-15 the reminder is the key alone at the box's right end (`.composer-key`).
+    // An arrival lands in BROWSE, so the box names its INPUT key at the right end (`.composer-key`).
+    // `i`, a click and Tab reach INPUT from the box.
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
@@ -310,11 +303,7 @@ describe("Composer's BROWSE/INPUT split", () => {
   });
 });
 
-/** The BROWSE reminder: the dim `i or Ctrl+j to type` that follows the placeholder or the draft in
- *  BROWSE, restoring what 2026-09-19 removed once that removal's own premise (`Ctrl+l` opening the
- *  composer directly) ended. */
-/* The box shows a reminder of the way in; since 2026-10-15 it is the key alone at the box's right end, as
-   the start screen's menu shows its keys, not the sentence "i or Ctrl+j to type" after the placeholder. */
+/* The box names its entry key at the right end, like the start menu, without repeating a sentence. */
 describe("Composer's BROWSE hint", () => {
   it("shows the key at the right end, with nothing typed, and no sentence", () => {
     const { container } = renderComposer({ mode: "browse" });
@@ -352,11 +341,8 @@ describe("Composer's BROWSE hint", () => {
   });
 });
 
-/** Where the caret goes on entering INPUT, now that `Composer`'s own
- *  `[focusRequest, mode]` effect runs `focusAtCaret` on every transition into "input" rather than
- *  only when `focusRequest` had separately been bumped past 0 (the focus bug was a
- *  fresh `autoFocus` mount of a non-empty box is not reliable on its own, in this project's own
- *  measured GUI pass). */
+/** Entering INPUT runs `focusAtCaret` even without a new `focusRequest`: `autoFocus` alone is not
+ *  reliable for a fresh non-empty box. */
 describe("Composer's caret on entering INPUT", () => {
   it("i restores the caret left at 3 in 'hello world'", () => {
     const { container, rerender } = renderComposerWithRerender({ mode: "input" });
@@ -407,9 +393,8 @@ describe("Composer in BROWSE", () => {
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
-  // `onShiftTab` is gone -- App.tsx's document-capture router (`modeKey.ts`) now
-  // claims Shift+Tab ahead of this component entirely, in every mode,
-  // as exercised in App.test.tsx's "Shift+Tab anywhere in the chat" describe block.
+  // `modeKey.ts` claims Shift+Tab in document capture, before this component, in every mode.
+  // `App.test.tsx` covers that route.
 });
 
 describe("Composer during a turn", () => {

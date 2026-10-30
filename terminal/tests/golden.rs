@@ -1,13 +1,9 @@
 //! Renders Verdandi's own golden op corpus and inspects the resulting pixels.
 //!
-//! Moved from the frozen `terminal-pane/tests/golden.rs` (2026-09-23).
-//! Since the move the corpus is read from `terminal-render/tests/golden/paintops.txt` itself, in this
-//! workspace, rather than from a copy of it: one file, so the two can no longer drift apart.
+//! The corpus is read from `terminal-render/tests/golden/paintops.txt` in this workspace:
+//! one file keeps the builder's corpus and these pixel checks from drifting apart.
 //!
-//! The corpus in `fixtures/paintops.txt` is the exact op stream Verdandi's builder produces for 17
-//! known scenarios, copied verbatim from `crates/terminal-render/tests/golden/paintops.txt`. It was
-//! copied from there and still matches that file byte for byte at the Verdandi revision this
-//! workspace pins. Using it
+//! The corpus is the exact op stream Verdandi's builder produces for 15 known scenarios. Using it
 //! here means the backend is tested against real op streams without this crate needing the builder,
 //! a `Term`, or any terminal vocabulary at test time.
 //!
@@ -73,8 +69,7 @@ impl Rendered {
     ///
     /// The right oracle for "what colour is this cell", and the reason a centre-pixel sample is the
     /// wrong one: a glyph's ink covers the centre, so sampling there answers "what colour is this
-    /// character" instead. Three assertions in the first draft of this file were wrong for exactly
-    /// that reason and passed only where the cell happened to be empty.
+    /// character" instead, giving the fill colour only where the cell happens to be empty.
     fn dominant_color(&self, row: u16, col: u16) -> Color {
         let rect = self.metrics.cell_rect(row, col, 1);
         // Keyed on the raw channel triple rather than on `Color`, which is not itself hashable.
@@ -171,7 +166,7 @@ fn the_corpus_loads_and_covers_what_it_claims_to() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// ASCII first: exact row and column placement, not "looks roughly right".
+// ASCII first: exact row/column placement, not "looks roughly right".
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -213,7 +208,9 @@ fn wrapped_rows_place_the_continuation_on_the_next_row() {
     assert_eq!(r.ink_in(2, 0, 6, bg), 0, "the third row is untouched");
 }
 
-// A wide glyph occupies two cells without drawing a spacer.
+// ---------------------------------------------------------------------------------------------
+// Wide characters. One glyph, two cells, no spacer.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn a_wide_glyph_occupies_both_of_its_cells() {
@@ -264,7 +261,9 @@ fn a_decorated_wide_glyph_is_decorated_across_both_cells() {
     );
 }
 
-// Combining marks must remain visible.
+// ---------------------------------------------------------------------------------------------
+// Combining marks must not be silently dropped.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn combining_marks_change_what_is_drawn() {
@@ -304,7 +303,9 @@ fn a_combining_mark_on_a_wide_base_keeps_the_wide_box() {
     assert!(r.ink_in(0, 3, 1, bg) > 0, "wide base, second column");
 }
 
-// Styles and colours arrive resolved; the backend uses the supplied values.
+// ---------------------------------------------------------------------------------------------
+// Styles and colours arrive resolved. The backend must use them, not re-derive them.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn fills_use_exactly_the_colour_they_were_given() {
@@ -351,7 +352,9 @@ fn selection_arrives_as_colours_with_nothing_to_interpret() {
     assert_ne!(selected, rgb(DEFAULT_BG), "a selected cell must be visibly filled");
 }
 
-// Draw cursors only from explicit paint operations.
+// ---------------------------------------------------------------------------------------------
+// Cursor. Drawn only from explicit ops, never inferred.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn a_block_cursor_fills_its_cell_and_keeps_the_character_readable() {
@@ -428,7 +431,9 @@ fn no_cursor_op_means_no_cursor_drawn() {
     }
 }
 
-// Render pinned history and show a notice when its anchor expires.
+// ---------------------------------------------------------------------------------------------
+// Pinned history and the expiry notice.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 fn a_pinned_window_renders_exactly_like_a_live_one() {
@@ -464,8 +469,8 @@ fn an_expired_anchor_draws_its_notice_over_the_content() {
     assert!(r.ink_in(0, 0, 8, notice_bg) > 0, "the notice text must be drawn");
 }
 
-/// A healthy view must draw no expiry notice. Testing expired anchors alone would also pass a
-/// backend that always drew a notice over everything.
+/// A failure-state test alone would pass against a backend
+/// that drew a notice over everything, always.
 #[test]
 fn a_healthy_view_draws_no_notice_at_all() {
     for name in ["ascii", "wrapped-rows", "pinned-history-negative-absolute-lines"] {

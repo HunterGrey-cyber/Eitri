@@ -225,6 +225,34 @@ pub enum Nav {
     Nothing,
 }
 
+/// The tiled cell touching an arrival edge, preferring recent use and then the top-left cell. Unzoomed cells
+/// include enclosing strips; floats cannot intercept a crossing from another window.
+pub fn navigate_from_edge(layout: &Layout, side: Direction, frame: &Frame) -> Nav {
+    let arrangement = arrange_with(layout, false, frame);
+    arrangement
+        .cells
+        .iter()
+        .filter(|(_, rect)| {
+            rect.w > 0
+                && rect.h > 0
+                && match side {
+                    Direction::Left => rect.x == 0,
+                    Direction::Right => rect.x + rect.w == frame.size.w,
+                    Direction::Up => rect.y == 0,
+                    Direction::Down => rect.y + rect.h == frame.size.h,
+                }
+        })
+        .min_by_key(|(id, rect)| {
+            (
+                layout.mru().iter().position(|m| m == id).unwrap_or(usize::MAX),
+                rect.y,
+                rect.x,
+            )
+        })
+        .map(|(id, _)| Nav::Module(id.clone()))
+        .unwrap_or(Nav::Nothing)
+}
+
 /// `neighbor()` on the unzoomed geometry. The caller unzooms only when this says `Module`, as
 /// tmux's `select-pane` does, and today's `'R'`/`Ctrl+h` arms did.
 pub fn navigate(layout: &Layout, from: &ModuleId, dir: Direction, frame: &Frame) -> Nav {
@@ -1198,5 +1226,41 @@ mod tests {
         assert_eq!(small.rect_of(&editor()).unwrap().h, 36, "5% of 720, not 0");
         assert_eq!(small.rect_of(&bottom()).unwrap().h, 684);
         assert_eq!(arrange(&layout, &tall).rect_of(&bottom()).unwrap().h, 988);
+    }
+    #[test]
+    fn navigate_from_edge_uses_each_edge_and_mru_without_floats_or_zoom() {
+        let mut layout = bottom_tree();
+        let float = ModuleId::lua("floating");
+        layout
+            .add_float(
+                &float,
+                super::super::FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 400,
+                    h: 300,
+                },
+                false,
+            )
+            .unwrap();
+        layout.set_focus(&float).unwrap();
+        for (side, expected) in [
+            (Direction::Left, editor()),
+            (Direction::Right, agent()),
+            (Direction::Up, editor()),
+            (Direction::Down, bottom()),
+        ] {
+            assert_eq!(navigate_from_edge(&layout, side, &frame()), Nav::Module(expected));
+        }
+        layout.set_focus(&agent()).unwrap();
+        layout.toggle_zoom(&editor());
+        assert_eq!(
+            navigate_from_edge(&layout, Direction::Up, &frame()),
+            Nav::Module(agent())
+        );
+        assert_eq!(
+            navigate_from_edge(&layout, Direction::Down, &Frame::new(Size::default(), HANDLE)),
+            Nav::Nothing
+        );
     }
 }

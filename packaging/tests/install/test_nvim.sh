@@ -87,8 +87,7 @@ t_nvim_offer_no_tty_reports_only() {
 
 TESTS="$TESTS t_nvim_offer_no_tty_explicit_setsid"
 t_nvim_offer_no_tty_explicit_setsid() {
-	# The same thing, spelled as the acceptance criterion words it: setsid, no controlling
-	# terminal, stdin from /dev/null, no flag.
+	# setsid, no controlling terminal, stdin from /dev/null, no flag: report nvim without fetching it.
 	serve 1.0.0
 	PRE_STUBS=$(old_nvim_stubs)
 	"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$PRE_STUBS" --stubs "$S/stubs" \
@@ -118,8 +117,8 @@ t_nvim_offer_no_nvim_flag_skips() {
 
 TESTS="$TESTS t_nvim_offer_adequate_path_nvim_wins_even_with_flag"
 t_nvim_offer_adequate_path_nvim_wins_even_with_flag() {
-	# $S/stubs' own nvim (NVIM v0.11.4) is already adequate -- no PRE_STUBS override here. Even
-	# --with-nvim must not replace it (spec: "an adequate PATH nvim always wins").
+	# $S/stubs' nvim (NVIM v0.11.4) is adequate, with no PRE_STUBS override. Even --with-nvim
+	# must not replace an adequate PATH nvim.
 	serve 1.0.0
 	nv_inst_net --with-nvim
 	expect_rc 0
@@ -153,11 +152,8 @@ t_nvim_offer_network_failure_warns_install_still_succeeds() {
 	expect_out "could not download nvim $NVIM_FIXTURE_VERSION"
 	expect_out "installed Eitri 1.0.0 into"
 	expect_absent "$(data_of)/eitri/nvim"
-	# This is install.sh:776's own recovery hint. Its exact command,
-	# `eitri setup --nvim-only`, used to die "--sidecar-only and --nvim-only cannot be combined"
-	# through the real launcher (packaging/eitri.launcher.sh always prepended --sidecar-only);
-	# packaging/test_launcher.sh's own "passes straight through" tests hold that half now. This
-	# assertion is the installer's own half: the hint must keep naming exactly that command.
+	# The recovery hint must name `eitri setup --nvim-only` exactly. The launcher must pass that mode
+	# through without prepending --sidecar-only; packaging/test_launcher.sh checks the launcher half.
 	expect_out 'run "eitri setup --nvim-only" once you have network access'
 }
 
@@ -224,21 +220,15 @@ t_nvim_only_reads_release_beside_the_running_script() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# --nvim-offer:
-# the SAME conditional offer a normal install runs, reachable standalone against an already
-# -installed Eitri -- what plain `eitri setup`'s second call runs since the fix, replacing the
-# old --nvim-only there. Contrast every test here with --nvim-only's own tests just above: the
-# report's own repro was plain `eitri setup` on a machine with an already-adequate PATH nvim
-# printing "installed nvim ... into ..." (repro 1) and, with the network unreachable, dying "could
-# not download nvim" (repro 2) -- both because do_nvim_only ignores NV_NVIM_OK entirely.
+# --nvim-offer runs the same conditional offer as a normal install, standalone on an existing
+# install. Plain `eitri setup` uses it for its second call: unlike --nvim-only, it honours NV_NVIM_OK
+# so an adequate PATH nvim is neither replaced nor made dependent on network access.
 
 TESTS="$TESTS t_nvim_offer_mode_skips_when_path_nvim_is_adequate"
 t_nvim_offer_mode_skips_when_path_nvim_is_adequate() {
-	# Reproduces the report's repro 1 and 2 together: an adequate PATH nvim (the default
-	# $S/stubs/nvim, NVIM v0.11.4) must suppress the offer before the network is ever touched, with
-	# no --yes/--with-nvim/--no-nvim and no tty at all -- exactly plain `eitri setup`'s own second
-	# call. srv_paths (the fixture server's real request log), not just NV_DATA/eitri/nvim being
-	# absent, is what tells a genuine skip apart from an attempt that merely failed to reach it.
+	# An adequate PATH nvim ($S/stubs/nvim, NVIM v0.11.4) must suppress the offer before any network
+	# access, with no affirmative flag or tty, as in plain `eitri setup`'s second call.
+	# srv_paths distinguishes a real skip from an attempted fetch that merely fails.
 	sc_setup_release 1.0.0 "$REV_A"
 	srv_mark
 	inst --set "EITRI_INSTALL_TEST_NVIM_BASE_URL=http://127.0.0.1:$PORT/nvim-releases" -- --nvim-offer
@@ -251,8 +241,8 @@ t_nvim_offer_mode_skips_when_path_nvim_is_adequate() {
 
 TESTS="$TESTS t_nvim_offer_mode_no_tty_no_flag_reports_only"
 t_nvim_offer_mode_no_tty_no_flag_reports_only() {
-	# With an inadequate PATH nvim, no opt-in flag and no controlling terminal, --nvim-offer
-	# must report the version without fetching nvim, just like the main install path.
+	# An inadequate PATH nvim with no flag or controlling terminal is only reported, never fetched:
+	# exercise t_nvim_offer_no_tty_reports_only through the standalone --nvim-offer entry point.
 	sc_setup_release 1.0.0 "$REV_A"
 	PRE_STUBS=$(old_nvim_stubs)
 	inst --set "EITRI_INSTALL_TEST_NVIM_BASE_URL=http://127.0.0.1:$PORT/nvim-releases" -- --nvim-offer
@@ -277,12 +267,8 @@ t_nvim_offer_mode_with_yes_installs() {
 
 TESTS="$TESTS t_nvim_offer_mode_aarch64_no_x86_64_nvim_offered"
 t_nvim_offer_mode_aarch64_no_x86_64_nvim_offered() {
-	# The aarch64 nvim-offer regression (the pinned nvim is x86_64 only, and this best-effort offer
-	# had no architecture guard) used to be exercised through --from-source, the only mode that
-	# reached maybe_offer_nvim with no check_platform gate anywhere above it. a later change made --from-source itself refuse up front on non-x86_64, which
-	# moved this coverage here: --nvim-offer reaches maybe_offer_nvim just as directly (do_nvim_offer
-	# calls no check_platform either), so the architecture guard inside maybe_offer_nvim itself stays
-	# under test.
+	# The pinned nvim is x86_64 only. --nvim-offer reaches maybe_offer_nvim without check_platform,
+	# so it exercises the offer's own architecture guard even though --from-source refuses aarch64.
 	sc_setup_release 1.0.0 "$REV_A"
 	d_stubs=$T/stubs-aarch64-nvim-offer
 	rm -rf "$d_stubs"
@@ -312,13 +298,9 @@ t_nvim_offer_mode_no_nvim_flag_skips() {
 
 TESTS="$TESTS t_nvim_offer_mode_skips_when_private_copy_present"
 t_nvim_offer_mode_skips_when_private_copy_present() {
-	# --nvim-offer never checked nvim_private_state, so on the flagship
-	# flagship case -- a PATH nvim older than the floor (Ubuntu 24.04's apt 0.9.5) with Eitri's own
-	# private copy of the pinned version already installed -- every later plain `eitri setup`
-	# warned "install a newer nvim" (Eitri does not use that one: core/src/nvim_bin.rs picks the
-	# private copy), asked again, and with --with-nvim downloaded and replaced the very same version.
-	# The reproduction: `--dry-run --with-nvim` printed "would install nvim 0.11.2", where
-	# --nvim-only on the same state printed "already installed".
+	# With an old PATH nvim and the pinned private copy already installed, --nvim-offer must report
+	# "already installed", including under --dry-run --with-nvim. Eitri uses that private copy
+	# (core/src/nvim_bin.rs), so another prompt or download would replace the same version needlessly.
 	sc_setup_release 1.0.0 "$REV_A"
 	PRE_STUBS=$(old_nvim_stubs)
 	bin=$(nvim_private_bin "$NVIM_FIXTURE_VERSION")
@@ -347,9 +329,8 @@ t_nvim_offer_mode_skips_when_private_copy_present() {
 
 TESTS="$TESTS t_nvim_offer_upgrade_skips_when_private_copy_present"
 t_nvim_offer_upgrade_skips_when_private_copy_present() {
-	# The same gap on the install path's own offer (maybe_offer_nvim, which predates --nvim-offer):
-	# an upgrade whose new RELEASE pins the nvim version already installed privately re-fetched and
-	# replaced it on --with-nvim/--yes, and asked again on a tty.
+	# The normal install's offer must also keep an existing private copy when the new RELEASE pins
+	# the same version, without another download on --with-nvim/--yes or another prompt on a tty.
 	serve 1.1.0 1.0.0
 	PRE_STUBS=$(old_nvim_stubs)
 	nv_inst_net --version 1.0.0 --with-nvim
@@ -372,14 +353,9 @@ t_nvim_offer_upgrade_skips_when_private_copy_present() {
 
 TESTS="$TESTS t_nvim_offer_up_to_date_still_offers"
 t_nvim_offer_up_to_date_still_offers() {
-	# The "up to date" branch used to return before
-	# maybe_offer_nvim ever ran at all, so re-running the same installer with --with-nvim/--yes
-	# after a --no-nvim install fetched nothing and said nothing. Reproduced (the
-	# verifier's t_vprobe_with_nvim_when_up_to_date): "nvim 0.9.5 is older...", then "Eitri 1.0.0
-	# is up to date", rc=0, no private nvim. The sidecar must genuinely be present after the first
-	# install (via NODE_BASE_URL, like sc_inst_net) so the second run actually reaches the fast
-	# "up to date" path (NV_SIDECAR_PRESENT=1 && NV_COMPLETE=1) rather than the ordinary reinstall
-	# one, which already calls maybe_offer_nvim on its own and would not exercise this fix.
+	# An up-to-date install must still honour --with-nvim/--yes after a --no-nvim install.
+	# Build a sidecar on the first run via NODE_BASE_URL so the second run reaches the fast path
+	# (NV_SIDECAR_PRESENT=1 && NV_COMPLETE=1), rather than reinstalling and calling the ordinary offer.
 	serve 1.0.0
 	PRE_STUBS=$(old_nvim_stubs)
 	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
@@ -405,10 +381,8 @@ t_nvim_offer_up_to_date_still_offers() {
 
 TESTS="$TESTS t_nvim_offer_mode_network_failure_warns_not_fatal"
 t_nvim_offer_mode_network_failure_warns_not_fatal() {
-	# The exact contrast with --nvim-only's own t_nvim_only_network_failure_is_fatal just above, and
-	# with the report's repro 2 (which used --nvim-only's own forced fetch and died): --nvim-offer is
-	# TOLERANT=1, the same as a normal install's own best-effort offer, so an unreachable nvim host
-	# warns and the run still exits 0 rather than dying.
+	# Unlike --nvim-only's forced fetch, --nvim-offer is best-effort (TOLERANT=1), like a normal
+	# install: an unreachable nvim host warns and the run still exits 0.
 	sc_setup_release 1.0.0 "$REV_A"
 	PRE_STUBS=$(old_nvim_stubs)
 	inst --set "EITRI_INSTALL_TEST_NVIM_BASE_URL=http://127.0.0.1:1" -- --nvim-offer --with-nvim
@@ -418,9 +392,8 @@ t_nvim_offer_mode_network_failure_warns_not_fatal() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Uninstall removes the private copy only -- already exercised by test_uninstall.sh's own
-# t_uninstall_exact et al. (populate plants $(data_of)/eitri/nvim/0.11.4/bin/nvim; the KEPT_TREE
-# after --uninstall has no eitri/ under .local/share at all). Nothing further to add here.
+# Uninstall's private-copy removal is exercised by test_uninstall.sh's t_uninstall_exact:
+# populate plants $(data_of)/eitri/nvim/0.11.4/bin/nvim, and KEPT_TREE has no eitri/ after uninstall.
 
 # ---------------------------------------------------------------------------------------------
 # A real controlling terminal exists while stdin still carries the script itself

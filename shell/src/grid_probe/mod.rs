@@ -29,11 +29,9 @@ use neovide_editor::NeovideEditorPane;
 
 use eitri_core::layout::{ModuleId, Rect};
 
-use eitri_panel::panel_page::PanelPage;
 use webkit6::WebView;
 
 use crate::agent_panel::AgentPanelHandle;
-use crate::gtk_host::instance_pool::InstancePool;
 use crate::module_grid::{ModuleGrid, ProbePlace};
 use crate::terminal::TerminalPane;
 
@@ -59,7 +57,12 @@ pub(crate) struct Context {
     /// key pressed.
     pub(crate) kill_chat_view: Rc<dyn Fn(&ModuleId)>,
     /// The window's pool of extra chat pages, read only.
-    pub(crate) chat_views: Rc<RefCell<InstancePool<(WebView, Rc<PanelPage>)>>>,
+    pub(crate) chat_views: crate::gtk_host_surfaces::ChatPool,
+    /// Shows a module where it was hidden from, the keys staying where they are, as `eitri.layout.show` asks the
+    /// window's controller: whether it was hidden and is shown now.
+    pub(crate) show_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    /// Hides a module as `eitri.layout.hide` asks the window's controller, which gives its keys away first.
+    pub(crate) hide_module: Rc<dyn Fn(&ModuleId)>,
 }
 
 /// Runs the script named by `EITRI_GRID_PROBE`, if the variable is set. Called once, after the window is
@@ -81,16 +84,16 @@ pub(crate) fn start_if_requested(ctx: Context) {
         }
     };
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let pooled: Vec<String> = ctx.chat_views.borrow().live().map(|(id, _)| id.to_string()).collect();
+    let pooled: Vec<String> = ctx.chat_views.live().iter().map(|(id, _)| id.to_string()).collect();
     say(format!("chat-views live={}", pooled.join(",")));
     // Startup views have no restored tab, and the panel releases empty views on its first
     // tick. Give each an empty tab before the loop runs so the lifecycle probe kills a view
     // that the window actually holds.
     let startup: Vec<(ModuleId, usize)> = ctx
         .chat_views
-        .borrow()
         .live()
-        .map(|(id, (view, _))| (id.clone(), page_pointer(view)))
+        .into_iter()
+        .map(|(id, (view, _))| (id, page_pointer(&view)))
         .collect();
     for (id, _) in &startup {
         if let Some(view) = crate::agent_panel::ViewId::of_module(id) {

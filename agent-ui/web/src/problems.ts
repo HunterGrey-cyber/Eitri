@@ -3,9 +3,10 @@
  *  -- the evidence is never hidden. An unrecognised failure returns `null`, and
  *  callers must render exactly what they show today in that case: no headline, just the raw text.
  *
- *  Every recognizer here matches on a substring or shape of a real, captured diagnostic (the two
+ *  Every recognizer here matches on a substring or shape of a real, captured diagnostic (the three
  *  fixtures under `fixtures/problems/`) or, for "not logged in", on Claude Code's own
- *  documented interactive string, since a logged-out diagnostic was never captured. The sidecar's own "inside the supported range but
+ *  documented interactive string, since the CLI's own logged-out diagnostic was never captured (the
+ *  sidecar's refusal of a logged-out account is a fixture). The sidecar's own "inside the supported range but
  *  untested" compatibility diagnostic is deliberately NOT matched by anything here: it stays the
  *  header's `⚠`, and this module has no rule that could catch it,
  *  which is the point -- adding one would be the regression. */
@@ -73,9 +74,9 @@ function classifyNotLoggedIn(text: string, account: string | null): Problem | nu
   return { headline: "Claude Code is not logged in.", remedy };
 }
 
-/** Captured verbatim in `fixtures/problems/not-logged-in.txt` by a GUI pass (2026-09-27): a
- *  sidecar started for an account whose config directory has no credentials (and no
- *  `ANTHROPIC_API_KEY`) refuses before it binds its socket -- Verdandi's own account check, ahead of
+/** `fixtures/problems/not-logged-in.txt` is a real capture of what a sidecar started for an account
+ *  whose config directory has no credentials (and no `ANTHROPIC_API_KEY`) prints when it refuses
+ *  before binding its socket -- Verdandi's own account check, ahead of
  *  the CLI version check, so no turn is ever sent and "Please run /login" never appears. Names the
  *  account and its directory from the text itself, which already carries both (a
  *  `VERDANDI_CLAUDE_CONFIG_DIR` override included, which `~/.claude-<name>` would get wrong). */
@@ -93,9 +94,9 @@ function classifySidecarNotLoggedIn(text: string): Problem | null {
 
 /** `stream_ended_early_reason`'s own opening (agent/src/providers/claude_sidecar/watch.rs): the
  *  sidecar's event stream ended before the session did -- the sidecar process stopped, or the
- *  connection to it could not be re-opened. A walkthrough
- *  saw a resumed session whose sidecar died before any new turn read "it most likely no longer
- *  exists" (`neverOpenedReason` below) and lose its transcript, while the record was fine. */
+ *  connection to it could not be re-opened. If it stops before a resumed session
+ *  sends its first turn, the wrapper's "it most likely no longer exists" guess is wrong and loses its
+ *  transcript while the record can still be fine (`neverOpenedReason` below). */
 const SIDECAR_STOPPED_MARKER = "the connection to the provider ended before this session did";
 
 /** Whether `text` says the sidecar stopped under a session (see `SIDECAR_STOPPED_MARKER`). */
@@ -134,8 +135,7 @@ export function failureEvidence(text: string): string {
 }
 
 /** Whether a problem's remedy already tells the reader to press `r`, so the row it heads leaves out
- *  its own "Press r to start a new session here." -- a failed tab said it twice
- *  (three times with the composer's line, which no longer repeats it). */
+ *  its own "Press r to start a new session here." to avoid repeating the remedy. */
 export function remedyNamesR(problem: Problem | null): boolean {
   return problem !== null && /\bpress r\b/i.test(problem.remedy);
 }

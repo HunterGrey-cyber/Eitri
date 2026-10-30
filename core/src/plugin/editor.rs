@@ -15,6 +15,8 @@ use crate::nvim_rpc::Pending;
 
 // Statics, not consts: a const is copied to each use, and the tests check that the very same text is what
 // reaches the editor, by address.
+pub static PLUGIN_BUFFERS_LUA: &str = include_str!("plugin_buffers.lua");
+pub static PLUGIN_CWD_LUA: &str = include_str!("plugin_cwd.lua");
 pub static PLUGIN_OPEN_LUA: &str = include_str!("plugin_open.lua");
 pub static PLUGIN_ASSIST_LUA: &str = include_str!("plugin_assist.lua");
 pub static PLUGIN_FOLLOW_LUA: &str = include_str!("plugin_follow.lua");
@@ -25,7 +27,14 @@ fn path_value(path: &Path) -> Value {
 }
 
 pub fn open(rpc: &dyn EditorRpc, path: &Path, line: Option<u32>, col: Option<u32>) -> Pending {
-    let mut opts = vec![(Value::from("path"), path_value(path))];
+    open_owned(rpc, "", path, line, col)
+}
+
+pub fn open_owned(rpc: &dyn EditorRpc, owner: &str, path: &Path, line: Option<u32>, col: Option<u32>) -> Pending {
+    let mut opts = vec![
+        (Value::from("path"), path_value(path)),
+        (Value::from("owner"), Value::from(owner)),
+    ];
     if let Some(line) = line {
         opts.push((Value::from("line"), Value::from(line)));
     }
@@ -75,6 +84,134 @@ pub fn assist_clear(rpc: &dyn EditorRpc, owner: &str) -> Pending {
     let mut opts = vec![(Value::from("owner"), Value::from(owner))];
     opts.extend(assist_order());
     rpc.exec_lua(PLUGIN_ASSIST_LUA, vec![Value::from("clear"), Value::Map(opts)])
+}
+
+/// Cwd calls carry the same process/order stamp as assists, so a delayed cd cannot overtake its clear.
+pub fn cwd(rpc: &dyn EditorRpc, owner: &str, dir: &Path) -> Pending {
+    let mut opts = vec![
+        (Value::from("owner"), Value::from(owner)),
+        (Value::from("dir"), path_value(dir)),
+    ];
+    opts.extend(assist_order());
+    rpc.exec_lua(PLUGIN_CWD_LUA, vec![Value::from("cd"), Value::Map(opts)])
+}
+
+pub fn cwd_clear(rpc: &dyn EditorRpc, owner: &str) -> Pending {
+    let mut opts = vec![(Value::from("owner"), Value::from(owner))];
+    opts.extend(assist_order());
+    rpc.exec_lua(PLUGIN_CWD_LUA, vec![Value::from("clear"), Value::Map(opts)])
+}
+
+pub fn preload(rpc: &dyn EditorRpc, owner: &str, path: &Path, diagnostics: bool, inlay_hints: bool) -> Pending {
+    buffers_call(
+        rpc,
+        owner,
+        "preload",
+        vec![
+            (Value::from("path"), path_value(path)),
+            (Value::from("diagnostics"), Value::from(diagnostics)),
+            (Value::from("inlay_hints"), Value::from(inlay_hints)),
+        ],
+    )
+}
+
+pub fn modified(rpc: &dyn EditorRpc, owner: &str, root: &Path) -> Pending {
+    buffers_call(rpc, owner, "modified", vec![(Value::from("root"), path_value(root))])
+}
+
+pub fn reload(rpc: &dyn EditorRpc, owner: &str, root: &Path) -> Pending {
+    buffers_call(rpc, owner, "reload", vec![(Value::from("root"), path_value(root))])
+}
+
+pub fn wipe_preload(rpc: &dyn EditorRpc, owner: &str) -> Pending {
+    buffers_call(rpc, owner, "wipe_preload", vec![])
+}
+
+pub fn diff(rpc: &dyn EditorRpc, owner: &str, args: &super::protocol::EditorDiff) -> Pending {
+    let side = |side: &super::protocol::DiffSide| match side {
+        super::protocol::DiffSide::Path { path } => Value::Map(vec![("path".into(), path_value(path))]),
+        super::protocol::DiffSide::Text { title, text, filetype } => {
+            let mut fields = vec![
+                ("title".into(), title.as_str().into()),
+                ("text".into(), text.as_str().into()),
+            ];
+            // An absent key reaches Lua as nil; a msgpack nil inside a map would arrive as vim.NIL instead.
+            if let Some(filetype) = filetype {
+                fields.push(("filetype".into(), filetype.as_str().into()));
+            }
+            Value::Map(fields)
+        }
+    };
+    buffers_call(
+        rpc,
+        owner,
+        "diff",
+        vec![("left".into(), side(&args.left)), ("right".into(), side(&args.right))],
+    )
+}
+
+pub fn close_diffs(rpc: &dyn EditorRpc, owner: &str) -> Pending {
+    buffers_call(rpc, owner, "close_diffs", vec![])
+}
+
+fn buffers_call(rpc: &dyn EditorRpc, owner: &str, op: &str, mut opts: Vec<(Value, Value)>) -> Pending {
+    opts.push((Value::from("owner"), Value::from(owner)));
+    opts.extend(assist_order());
+    rpc.exec_lua(PLUGIN_BUFFERS_LUA, vec![Value::from(op), Value::Map(opts)])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preloaded {
+    pub buf: u64,
+    pub replaced: bool,
+    pub stopped_clients: u64,
+}
+
+pub fn decode_preload(answer: &Value) -> Result<Preloaded, String> {
+    Ok(Preloaded {
+        buf: count(answer, "buf")?,
+        replaced: flag(answer, "replaced")?,
+        stopped_clients: count(answer, "stopped_clients")?,
+    })
+}
+
+pub fn decode_modified(answer: &Value) -> Result<Vec<String>, String> {
+    list(answer, "paths")?
+        .iter()
+        .map(|v| lossy_text(v).ok_or_else(|| "the editor's answer has a path that is not text".to_string()))
+        .collect()
+}
+
+pub fn decode_reload(answer: &Value) -> Result<(u64, u64), String> {
+    Ok((count(answer, "reloaded")?, count(answer, "kept_modified")?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedCwd {
+    pub dir: String,
+    pub tab: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearedCwd {
+    pub restored: u64,
+    pub moved: u64,
+}
+
+pub fn decode_cwd(answer: &Value) -> Result<ChangedCwd, String> {
+    Ok(ChangedCwd {
+        dir: field(answer, "dir")
+            .and_then(lossy_text)
+            .ok_or_else(|| "the editor's answer has no dir".to_string())?,
+        tab: count(answer, "tab")?,
+    })
+}
+
+pub fn decode_cwd_clear(answer: &Value) -> Result<ClearedCwd, String> {
+    Ok(ClearedCwd {
+        restored: count(answer, "restored")?,
+        moved: count(answer, "moved")?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +514,47 @@ mod tests {
         assert_eq!(calls[2].1[0], Value::from("clear"));
     }
 
+    #[test]
+    fn buffer_calls_use_constant_lua_arguments_and_decode_the_wire_shapes() {
+        let rpc = Recorder::default();
+        let path = Path::new("/w/work/demo/src/lib.rs");
+        let _ = preload(&rpc, "demo", path, true, false);
+        let _ = modified(&rpc, "demo", path.parent().unwrap());
+        let _ = reload(&rpc, "demo", path.parent().unwrap());
+        let _ = wipe_preload(&rpc, "demo");
+        let calls = rpc.0.borrow();
+        for (call, op) in calls.iter().zip(["preload", "modified", "reload", "wipe_preload"]) {
+            assert!(std::ptr::eq(call.0, PLUGIN_BUFFERS_LUA));
+            assert_eq!(call.1[0], Value::from(op));
+            assert_eq!(field(&call.1[1], "owner"), Some(&Value::from("demo")));
+        }
+        assert_eq!(field(&calls[0].1[1], "path"), Some(&path_value(path)));
+        assert_eq!(field(&calls[0].1[1], "diagnostics"), Some(&Value::from(true)));
+        assert_eq!(field(&calls[0].1[1], "inlay_hints"), Some(&Value::from(false)));
+        assert_eq!(field(&calls[0].1[1], "maker"), field(&calls[3].1[1], "maker"));
+        assert!(field(&calls[0].1[1], "order").unwrap().as_u64() < field(&calls[3].1[1], "order").unwrap().as_u64());
+        let answer = Value::Map(vec![
+            ("buf".into(), 7.into()),
+            ("replaced".into(), true.into()),
+            ("stopped_clients".into(), 1.into()),
+        ]);
+        assert_eq!(
+            decode_preload(&answer),
+            Ok(Preloaded {
+                buf: 7,
+                replaced: true,
+                stopped_clients: 1
+            })
+        );
+        assert_eq!(
+            decode_modified(&Value::Map(vec![("paths".into(), Value::Map(vec![]))])),
+            Ok(vec![])
+        );
+        assert!(decode_preload(&Value::Nil).is_err());
+        assert!(decode_modified(&Value::Map(vec![("paths".into(), Value::Array(vec![false.into()]))])).is_err());
+        assert!(decode_reload(&Value::Nil).is_err());
+    }
+
     /// The snippet keeps the call made last in force even when two reach nvim swapped, so each one has to say
     /// when it was made: by the same maker, counting up.
     #[test]
@@ -595,11 +773,44 @@ mod tests {
     }
 
     #[test]
+    fn cwd_calls_carry_arguments_and_order_and_answers_are_checked() {
+        let rpc = Recorder::default();
+        let _ = cwd(&rpc, "demo", Path::new("/work/back\\slash"));
+        let _ = cwd_clear(&rpc, "demo");
+        let calls = rpc.0.borrow();
+        for (at, op) in ["cd", "clear"].iter().enumerate() {
+            assert!(std::ptr::eq(calls[at].0, PLUGIN_CWD_LUA));
+            assert_eq!(calls[at].1[0], Value::from(*op));
+            assert_eq!(get(&calls[at].1[1], "owner"), &Value::from("demo"));
+        }
+        assert_eq!(
+            get(&calls[0].1[1], "dir"),
+            &Value::Binary(b"/work/back\\slash".to_vec())
+        );
+        assert_eq!(get(&calls[0].1[1], "maker"), get(&calls[1].1[1], "maker"));
+        assert!(get(&calls[0].1[1], "order").as_u64() < get(&calls[1].1[1], "order").as_u64());
+        let reply = Value::Map(vec![("dir".into(), "/work".into()), ("tab".into(), 1.into())]);
+        assert_eq!(
+            decode_cwd(&reply),
+            Ok(ChangedCwd {
+                dir: "/work".into(),
+                tab: 1
+            })
+        );
+        let clear = Value::Map(vec![("restored".into(), 2.into()), ("moved".into(), 1.into())]);
+        assert_eq!(decode_cwd_clear(&clear), Ok(ClearedCwd { restored: 2, moved: 1 }));
+        assert!(decode_cwd(&Value::Nil).unwrap_err().contains("dir"));
+        assert!(decode_cwd(&clear).is_err());
+        assert!(decode_cwd_clear(&reply).unwrap_err().contains("restored"));
+    }
+
+    #[test]
     fn the_snippets_keep_the_companion_contract() {
         for (name, lua) in [
             ("open", PLUGIN_OPEN_LUA),
             ("assist", PLUGIN_ASSIST_LUA),
             ("follow", PLUGIN_FOLLOW_LUA),
+            ("cwd", PLUGIN_CWD_LUA),
         ] {
             assert!(lua.is_ascii(), "{name}");
             for banned in ["goto ", "vim.env", "EITRI_", "vim.cmd("] {

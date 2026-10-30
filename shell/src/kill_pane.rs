@@ -1,7 +1,27 @@
-//! Convert the editor's request watch into the facts used by the close rules.
+//! Convert the editor's request watch, and the pane's other facts, into what the quit flow reads.
 
 use eitri_core::wm::close::{NvimAnswer, NvimReply};
+use eitri_core::wm::EditorFacts;
 use neovide_editor::CallWatch;
+
+/// The editor pane's facts as the quit flow reads them, copied from its getters, none of which waits: whether nvim
+/// runs, has exited, exits with its process still alive, is still to launch it, and how its last watched request
+/// stands.
+pub(crate) fn editor_facts(
+    running: bool,
+    exited: bool,
+    exit_pending: bool,
+    starting: bool,
+    watch: Option<&CallWatch>,
+) -> EditorFacts {
+    EditorFacts {
+        running,
+        exited,
+        exit_pending,
+        starting,
+        watch: watch.map(nvim_answer),
+    }
+}
 
 pub(crate) fn nvim_answer(watch: &CallWatch) -> NvimAnswer {
     NvimAnswer {
@@ -53,9 +73,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nvim_answer_reads_what_the_rules_read() {
-        let now = Instant::now();
+    pub(super) type Case = (&'static str, Option<CallWatch>, NvimState, QuitRequest);
+
+    /// A watch in each state a quit request can be in, with what the rules make of it.
+    pub(super) fn cases(now: Instant) -> Vec<Case> {
         let sent_at = now - NVIM_QUIT_PATIENCE - Duration::from_secs(1);
         let recent = now - Duration::from_millis(250);
         let old = now - NVIM_QUIT_PATIENCE;
@@ -74,14 +95,7 @@ mod tests {
                 blocking,
             })
         };
-        let asked = Asked {
-            generation: 1,
-            quit: EditorQuit::Window { confirmed: None },
-            revealed: false,
-            sent: true,
-            lent_by: None,
-        };
-        let cases = [
+        vec![
             ("no watch", None, NvimState::Returned, QuitRequest::Ask),
             (
                 "returned",
@@ -137,8 +151,24 @@ mod tests {
                 NvimState::Returned,
                 QuitRequest::Ask,
             ),
-        ];
-        for (name, watch, state, request) in cases {
+        ]
+    }
+
+    pub(super) fn asked() -> Asked {
+        Asked {
+            generation: 1,
+            quit: EditorQuit::Window { confirmed: None },
+            revealed: false,
+            sent: true,
+            lent_by: None,
+        }
+    }
+
+    #[test]
+    fn nvim_answer_reads_what_the_rules_read() {
+        let now = Instant::now();
+        let asked = asked();
+        for (name, watch, state, request) in cases(now) {
             let answer = watch.as_ref().map(nvim_answer);
             if let (Some(watch), Some(answer)) = (&watch, &answer) {
                 assert_eq!(answer.sent_at, watch.sent_at, "{name}");
@@ -159,6 +189,44 @@ mod tests {
             assert_eq!(quit_request(Some(&asked), answer.as_ref(), now), request, "{name}");
             assert_eq!(watch_request(None, watch.as_ref(), now), QuitRequest::Ask, "{name}");
             assert_eq!(quit_request(None, answer.as_ref(), now), QuitRequest::Ask, "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+    use eitri_core::wm::close::quit_request;
+    use std::time::Instant;
+
+    /// The pane's facts carry its watch one to one, in every state a quit request can be in, and the rules read the
+    /// same from the facts as from the watch; the pane's four flags pass as they are, starting among them.
+    #[test]
+    fn editor_facts_read_what_the_quit_rules_read() {
+        let now = Instant::now();
+        let asked = tests::asked();
+        for (name, watch, _, request) in tests::cases(now) {
+            let facts = editor_facts(true, false, false, false, watch.as_ref());
+            assert_eq!(facts.watch, watch.as_ref().map(nvim_answer), "{name}");
+            assert_eq!(quit_request(Some(&asked), facts.watch.as_ref(), now), request, "{name}");
+        }
+        for (running, exited, exit_pending, starting) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let facts = editor_facts(running, exited, exit_pending, starting, None);
+            assert_eq!(
+                (
+                    facts.running,
+                    facts.exited,
+                    facts.exit_pending,
+                    facts.starting,
+                    facts.watch
+                ),
+                (running, exited, exit_pending, starting, None)
+            );
         }
     }
 }

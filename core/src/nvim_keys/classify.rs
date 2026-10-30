@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn callbacks_match_by_desc() {
         use TabAction::*;
-        // nvim 0.12's own defaults (probed with nvim --clean, 2026-09-26)
+        // nvim 0.12 defaults, probed with `nvim --clean`.
         assert_eq!(classify(&map("[b", None, Some(":bprevious"))), Some(Prev));
         assert_eq!(classify(&map("]b", None, Some(":bnext"))), Some(Next));
         // LazyVim keymaps.lua:40-42 (Snacks.bufdelete, a callback)

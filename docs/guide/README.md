@@ -20,6 +20,7 @@ The window is made of modules you arrange yourself, i3/tmux style:
 - **[Containers](keys.md#containers-and-terminals).** Split modules side by side or one above another, or put them in tabbed or stacked containers.
 - **[Floats and the scratchpad](keys.md#floats-the-scratchpad-and-workspaces).** Float a module over the others, or stow it and call it back; it keeps running. The editor stays tiled.
 - **[Workspaces](keys.md#floats-the-scratchpad-and-workspaces).** Keep several arrangements of the same modules and switch between them.
+- **[Two windows](two-windows.md).** A second window for a second monitor, with its own workspaces and no editor; terminals, chats and pages move between the two while they keep running.
 
 Set [open rules](configuration.md#where-a-new-module-opens) in `$XDG_CONFIG_HOME/eitri/init.lua` (default
 `~/.config/eitri/init.lua`) to choose where new modules go. Use
@@ -38,6 +39,7 @@ you register, and you supervise each of them yourself, in a window you control.
 - [Getting started](getting-started.md): open a project, send your first prompt, and find your way around.
 - [Keys](keys.md): the prefix, the panel's keys and moving between panes.
 - [Configuration](configuration.md): `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the settings it reads and the keymap.
+- [How the editor reaches the screen](editor-presentation.md): the editor's own Wayland surface, `editor.presentation` and its fallback.
 - [Companion mode](companion.md): the agent panel as its own window beside the Neovim you already use.
 - [Turn review](turn-review.md): see what changed on disk during a turn, revert a hunk, send comments back.
 - [Markdown preview](markdown-preview.md): a Markdown file rendered beside the editor, scrolling with it, read with Vim keys.

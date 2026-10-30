@@ -12,9 +12,8 @@ fs_scaffold() {
 	_fs_dir=$1
 	rm -rf "$_fs_dir"
 	mkdir -p "$_fs_dir/shell" "$_fs_dir/agent" "$_fs_dir/packaging"
-	# The real tree's own shape: shell/Cargo.toml names `version.workspace = true`, not
-	# a plain quoted string, and the version itself lives once in the root's [workspace.package]
-	# so checkout_version must resolve the workspace version.
+	# The workspace version is inherited by shell/Cargo.toml via `version.workspace = true`;
+	# it lives once in the root's [workspace.package], not in a quoted crate-local version.
 	{
 		printf '[workspace]\n'
 		printf 'resolver = "2"\n'
@@ -120,10 +119,9 @@ mk_from_source_release() {
 # fs_cargo_stubs: PRE_STUBS-ready directory holding the recording cargo stub (fixtures/cargo-fromsource,
 # shared: harness.sh's own setup_stubs built it once, under $S itself, as $S/stubs-cargo -- its own
 # `S=$(cd "$(dirname "$0")/.." && pwd)` only resolves to the real $S from a directory one level under
-# it) under the name `cargo`, and nothing else -- $S/stubs (right after it) still supplies the
-# forbidden commands and claude, and /usr/bin:/bin (the default path-tail, right after that) supplies
-# the real rustc/cc/pkg-config/protoc/git check_build_tools also needs, none of which any test here
-# stubs.
+# it) under the name `cargo`, beside the rustc/cc/pkg-config/protoc stubs check_build_tools also
+# needs -- $S/stubs (right after it) still supplies the forbidden commands and claude, and
+# /usr/bin:/bin (the default path-tail, right after that) supplies the real git.
 fs_cargo_stubs() { printf '%s\n' "$S/stubs-cargo"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -164,9 +162,8 @@ t_from_source_clone_head_match_builds_and_installs() {
 	if [ "$(grep -c '^cargo build ' "$S/logs/cargo.log")" != 1 ]; then
 		fail "cargo build did not run exactly once: $(cat "$S/logs/cargo.log")"
 	fi
-	# --target-dir now pins staging's own
-	# <src>/target/release assumption -- $TH/.cache/eitri/src is clone_public_eitri's own
-	# NV_CACHE_NV/src, the from-source dir a network (non---checkout) build clones into.
+	# --target-dir pins staging's <src>/target/release assumption. $TH/.cache/eitri/src is
+	# clone_public_eitri's NV_CACHE_NV/src, the checkout for a network build.
 	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/eitri/src/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
@@ -250,10 +247,8 @@ t_from_source_tarball_option_conflict_refuses() {
 	expect_out 'Use one or the other'
 }
 
-# semver_cmp's downgrade refusal used to be called
-# only from do_install -- --from-source never refused a downgrade at all, so a mirror serving an
-# older, genuinely signed release rolled a from-source user silently backward, which is exactly the
-# rollback case a signature does not cover.
+# A signed older release can still roll a user backward: signatures do not prevent rollback.
+# The downgrade refusal must cover --from-source as well as prebuilt installs.
 TESTS="$TESTS t_from_source_older_version_refused"
 t_from_source_older_version_refused() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -309,8 +304,7 @@ t_from_source_checkout_public_rev_builds_and_installs() {
 		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
-	# --target-dir now pins staging's own
-	# <src>/target/release assumption; for --checkout that src is $FS_DIR itself.
+	# --target-dir pins staging's <src>/target/release assumption; --checkout uses $FS_DIR as src.
 	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
@@ -352,12 +346,9 @@ t_from_source_checkout_from_before_the_app_icon_refuses_with_a_pointer() {
 	expect_absent "$(data_of)/icons"
 }
 
-# from_source_stage always read <src>/target/release,
-# but the build honoured the caller's own CARGO_TARGET_DIR -- a --checkout tree with an older
-# target/release/shell already on disk (this project's own dev loop: ./install.sh run more than once
-# against different pins, or simply a workspace someone had already built by hand) silently staged
-# that STALE binary under a RELEASE naming the CURRENT HEAD, because a caller's CARGO_TARGET_DIR
-# redirected the fresh build somewhere staging never looked.
+# Staging reads <src>/target/release, so the build must use that same directory even when the
+# caller sets CARGO_TARGET_DIR. Otherwise stale binaries there could be installed under a RELEASE
+# naming the current HEAD. Plant a stale shell to make that failure visible.
 TESTS="$TESTS t_from_source_checkout_target_dir_pinned_against_stale_binary"
 t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -390,18 +381,10 @@ t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	expect_absent "$_elsewhere"
 }
 
-# Regression:
-# NV_FROM_SOURCE_DIR used to stay exactly what --checkout was given. run_in cds into it before
-# exec'ing cargo, but --target-dir's own value is expanded here, in the caller, before that cd ever
-# happens -- so a relative --checkout resolved "$NV_FROM_SOURCE_DIR/target" against the ORIGINAL
-# cwd (correct) everywhere except inside that one cargo argument, which then resolved a second time
-# against the POST-cd cwd (the checkout itself), landing the real build one directory too deep. The
-# pre-build rm loop (which runs outside run_in, so it still resolves correctly against the original
-# cwd) had already deleted the one place staging looks, so what used to be a working invocation
-# died with "did not produce target/release/shell" even though the build itself succeeded --
-# reproduced here exactly as reported: --checkout given as a relative path, run from that checkout's
-# own parent directory (which is where $T/cwd, this harness's fixed installer cwd, and $FS_DIR, a
-# sibling of it under $T, put every test by construction).
+# Resolve a relative --checkout before run_in changes cwd: --target-dir is expanded by the caller
+# but interpreted by cargo after that cd. Resolving it twice puts output one directory too deep,
+# while the pre-build rm loop clears the directory staging reads. Run from the checkout's parent
+# with a relative path to exercise both resolutions.
 TESTS="$TESTS t_from_source_checkout_relative_path_from_its_parent_directory"
 t_from_source_checkout_relative_path_from_its_parent_directory() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -422,12 +405,8 @@ t_from_source_checkout_relative_path_from_its_parent_directory() {
 	expect_eq "$(installed_version)" 1.0.0 "the version installed from a relative --checkout"
 }
 
-# Nothing exercised the
-# rm loop's own reason for existing -- a build that runs and exits 0 but writes nothing into
-# <src>/target/release (redirected elsewhere by a caller's own cargo config, or genuinely skipped)
-# used to leave staging free to pick up whatever binary was already on disk from an earlier run,
-# under a RELEASE naming the CURRENT build. Planting a stale binary and using the cargo stub's
-# "skip" mode (writes nothing at all) proves the rm loop is what turns that into an honest failure.
+# A successful build that writes nothing must not stage a stale binary under the current RELEASE.
+# Plant a stale shell and use cargo's "skip" stub: the pre-build rm loop must turn this into a failure.
 TESTS="$TESTS t_from_source_checkout_build_that_writes_nothing_refuses_stale_binary"
 t_from_source_checkout_build_that_writes_nothing_refuses_stale_binary() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -455,12 +434,9 @@ t_from_source_checkout_build_that_writes_nothing_refuses_stale_binary() {
 
 TESTS="$TESTS t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch"
 t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch() {
-	# A --checkout install's own RELEASE names a VERDANDI_SOURCE_SHA256 that is
-	# a `git archive` hash of the checkout tree, never the real release asset's bytes. A later,
-	# separate `eitri setup` run (this test's own second inst call, a fresh process with no
-	# override tarball of its own) used to download the real asset from the release server and
-	# refuse it as a checksum mismatch -- reading as tampering, when the real reason is that this
-	# kind of RELEASE cannot be resolved that way at all.
+	# A --checkout RELEASE names the `git archive` hash of the checkout, not the release asset's bytes.
+	# A separate `eitri setup` must not fetch the real asset and mistake that difference for tampering;
+	# this RELEASE cannot be resolved that way.
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
 	fs_verdandi_checkout "$T/verdandi-src"
 	fs_repo 1.0.0 https://github.com/HunterGrey-cyber/verdandi.git "$FS_VC_HEAD"
@@ -486,23 +462,13 @@ t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch() {
 	expect_no_out 'tampered'
 }
 
-# Both tests below used to build most of the way
-# through a --from-source run on aarch64 (the GTK-detection fix and
-# the nvim-offer fix, each real bugs in code only --from-source could reach without
-# check_platform's gate). F4 found that the whole attempt was pointless even when those two bugs were
-# fixed: fetch_skia_binaries always feeds the one pinned (x86_64) Skia archive, and skia-bindings
-# unpacks it with no target check, so a full aarch64 build always failed later anyway, at the link
-# step, with a confusing error. do_from_source now refuses up front on any non-x86_64 uname -m
-# instead, in both the --checkout and non---checkout shapes below -- moving this file's own aarch64
-# coverage to those two refusals. The nvim architecture guard still applies, and its coverage
-# moved to test_nvim.sh's t_nvim_offer_mode_aarch64_no_x86_64_nvim_offered, which reaches
-# maybe_offer_nvim through --nvim-offer, the one entry point still reachable with no check_platform
-# gate. The AArch64 ldconfig marker in lib_dirs_for has no such surviving
-# caller: check_platform gates every prebuilt path and do_from_source now gates itself, so there is
-# currently no way to reach check_gtk_webkit at all with uname -m reporting non-x86_64. That is the
-# Decisions section's own call ("pinning an aarch64 Skia archive is post-v1: nobody here can test an
-# ARM build"), not a coverage gap introduced here; lib_dirs_for's aarch64 branch stays in the code,
-# ready for whoever pins that archive, but has no reachable test until then.
+# The pinned Skia archive is x86_64 and skia-bindings unpacks it without a target check, so
+# --from-source refuses non-x86_64 up front in both network and --checkout modes, avoiding a late
+# link failure. ARM builds remain unsupported for now: pinning an aarch64 Skia archive needs an ARM
+# build that can be tested here.
+# The nvim architecture guard is exercised through --nvim-offer, which reaches maybe_offer_nvim
+# without check_platform. lib_dirs_for's aarch64 ldconfig branch has no reachable caller while both
+# prebuilt installs and --from-source gate the architecture, so it has no reachable test for now.
 
 TESTS="$TESTS t_from_source_non_x86_64_refuses_before_cloning"
 t_from_source_non_x86_64_refuses_before_cloning() {
@@ -537,9 +503,9 @@ t_from_source_checkout_refuses_on_non_x86_64() {
 	expect_no_out 'build tools: ok'
 }
 
-# fs_repo_public creates a fixture with the exported tree's submodule layout.
-# Cargo.lock has no git source for the fork; its revision comes from the checked-out gitlink.
-# Sets FS_DIR, FS_HEAD and FS_NEOVIDE_HEAD so --from-source --checkout can use this layout.
+# fs_repo_public VERSION VERDANDI_URL VERDANDI_REV: fs_repo in the public export's shape.
+# Cargo.lock has no neovide git source; neovide/ is a git submodule checked out from a fixture repo,
+# with its gitlink recorded in HEAD. Sets FS_DIR, FS_HEAD and FS_NEOVIDE_HEAD.
 fs_repo_public() {
 	FS_NEOVIDE_SRC=$T/neovide-src
 	rm -rf "$FS_NEOVIDE_SRC"

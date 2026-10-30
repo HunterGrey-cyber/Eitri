@@ -62,13 +62,9 @@ export type EmptyTabProps = {
    *  round trip, or an overlay closing, must never leave the keys on `document.body`. Landed on the composer (INPUT)
    *  or this screen's own root (BROWSE), whichever currently has the live control. */
   keysRequest: number;
-  /** The empty tab's dashboard follows the live conversation's rule for a waiting prefix: bumped by
-   *  `App.tsx`'s `dropPendingKeys()`, on every cancel route this screen never sees as a key of its
-   *  own -- Shift+Tab (`App.tsx`'s document-capture router claims it and stops it before this
-   *  screen's `onKeyDown`), an overlay (the chooser, a y/n prompt, a rename), a HINT, a tab switch,
-   *  `arrive`, `pane_focus`, `nav_key`. It drops this screen's own waiting prefix and leader
-   *  sequence, as those routes drop the live conversation's: `g`, Shift+Tab, `i` used to swallow the
-   *  `i`. Optional, so this component's own tests need no stand-in. */
+  /** Window cancel requests drop this screen's pending prefix and leader sequence too,
+   *  so `g`, Shift+Tab, `i` cannot swallow the INPUT request as a stale continuation.
+   *  Optional for callers with no window. */
   dropKeysRequest?: number;
   /** True while the `prefix w` chooser is drawn over this screen. Guards
    *  `focusRequest`/`arriveRequest`/`keysRequest` from stealing the keys out from under it -- the
@@ -84,14 +80,12 @@ export type EmptyTabProps = {
   /** See `navKeyRequest`. Optional, like `onChooseSessions`, so this component's own tests need no
    *  stand-in. */
   onNavFallthrough?: (direction: NavKeyDirection) => void;
-  /** Where this screen starts when it mounts, or when the window switches it to another empty tab
-   *  (from a GUI pass, 2026-09-26): `"browse"` after a tab switch or an arrival, `"input"` after a
-   *  new tab's `enter_input` and at launch. `focusRequest` and `arriveRequest` are the
-   *  window's counters and outlive any one tab, so a count already reached when this mounted is
-   *  not a request to it -- only a later change is. Defaults to `"input"`, today's launch state. */
+  /** Where this screen starts on mount or a switch to another empty tab: `"browse"` after a switch
+   *  or arrival, `"input"` after `enter_input` and at launch. The window's `focusRequest` and
+   *  `arriveRequest` counters outlive a tab: only a later change is a request to this screen.
+   *  Defaults to `"input"`, the launch state. */
   landing?: PanelMode;
-  /** This screen's own mode, for the band `App.tsx` draws under it (GUI pass 2026-09-26: the band
-   *  read `INPUT` whatever this screen was in). */
+  /** This screen's mode, so the outer band agrees with where the keys land. */
   onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
@@ -131,11 +125,8 @@ export type EmptyTabProps = {
   onQueue?: (text: string) => void;
   history?: string[];
   queueCount?: number;
-  /** The queue, shown above the composer the same way the live conversation shows it: a
-   *  `starting` tab can already have queued behind its own connect. The editor-context line
-   *  used to be shown here too, through its own `ContextLine`; it moved
-   *  into the outer band's `context` fact instead (`App.tsx` builds that directly from its own
-   *  `editorContext` state, so this component no longer needs a copy of it at all). */
+  /** Queue lines above the composer: a starting tab can already have messages queued behind its connect.
+   *  Editor context is built directly into the outer band by `App.tsx`. */
   queue?: QueueItem[];
   queueError?: string | null;
   /** Why its messages are held (the queue envelope's `note`). */
@@ -355,12 +346,9 @@ export function EmptyTab(props: EmptyTabProps) {
   }, []);
   const box: { title: string; entries: BoxEntry[] } | null =
     seq !== null ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, starting || failed) } : null;
-  /* A request for the keys (`enter_input`, a chooser closing) is a request for INPUT, not only for
-     focus: once anything took focus off the textarea (the chooser, a HINT, a click), `Composer`'s
-     blur left this tab in BROWSE with no textarea to focus, and the keys landed on an ancestor that
-     handles none (GUI pass, 2026-09-25). Refused where `i` is. Also refused while an
-     overlay (the launch chooser) is drawn over this screen -- its own `autoFocus` must not steal the
-     keys from a chooser opened over the empty tab. */
+  /* A request for the keys must enter INPUT as well as focus it: blur can leave BROWSE with no
+     textarea, and focusing an ancestor handles no typing. Refuse where `i` is refused, and while
+     an overlay is open, so autoFocus cannot steal the chooser's keys. */
   useEffect(() => {
     if (props.overlayOpen) return;
     if (props.focusRequest !== focusAtMount.current && !starting && !failed) {
@@ -430,7 +418,8 @@ export function EmptyTab(props: EmptyTabProps) {
    *  reached before this screen mounted -- another tab's own stale request, still sitting in
    *  `App.tsx`'s state -- is not a request to this one either. `starting`/`failed` (no box to enter)
    *  and a `mode` that no longer matches the direction (stale) both report back
-   *  through `onNavFallthrough` rather than transitioning. */
+   *  through `onNavFallthrough` rather than transitioning, except an upward request out of a starting
+   *  tab's open INPUT, which leaves it for BROWSE as `Esc` does (below). */
   const navKeySeenRef = useRef<number | null>(props.navKeyRequest?.seq ?? null);
   useEffect(() => {
     const req = props.navKeyRequest;
@@ -509,9 +498,7 @@ export function EmptyTab(props: EmptyTabProps) {
     switch (item) {
       case "new":
         setMode("input");
-        // C1a's own default: `i`/`o` (and a click, and `Enter` on this item) place the caret where
-        // it was left, never forced to the end -- only the `A` branch below overrides this after
-        // calling `runItem("new")` itself.
+        // `i`/`o`, a click and Enter keep the caret; only the `A` branch forces it to the end.
         setComposerCaret("kept");
         break;
       case "restore":
@@ -542,8 +529,7 @@ export function EmptyTab(props: EmptyTabProps) {
     // Every other keydown is "a key" to the typing guard, first, as `App.tsx`'s own `onKeyDown` does:
     // the leader below asks it whether it stood alone.
     const typedAt = typingGuard.timeOf(event);
-    // A key that cancelled a waiting `f`, `H`/`L`, `r` or `w` says so, with that key's own words --
-    // this used to be dropped, so the dashboard said nothing at all.
+    // Cancelling a waiting `f`, `H`/`L`, `r` or `w` must show that key's typing-guard reason.
     const cancelled = typingGuard.onKey(event.key, typedAt);
     if (cancelled !== null) props.onFlash?.(cancelled);
     // Every real key reads and drops a reserved prefix first; an input method's key and an
@@ -555,13 +541,9 @@ export function EmptyTab(props: EmptyTabProps) {
     // `isImeKey` test App.tsx's own leader engine and the composer use, so WebKit's `keyCode` 229
     // (a key the input method consumed, reported without `isComposing`) is caught here as well.
     if (isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) return;
-    // Shift+Tab used to be claimed here directly; it is now caught by App.tsx's
-    // document-capture router (`modeKey.ts`) before it ever reaches this handler.
-    // Once the composer is disabled (failed) there is nothing left to type into, so `mode` staying
-    // "input" must not swallow the keys the disabled screen still offers -- `r` on a failed tab, `f`
-    // for HINT, `y` to copy a handoff command -- the same reasoning `Composer`'s own doc comment
-    // gives for a dead session's INPUT being an empty mode. A `starting` tab's composer is live now
-    // (it queues behind the connect), so it is no longer exempted here.
+    // `modeKey.ts` claims Shift+Tab in document capture before this handler.
+    // A failed tab has no live input: its stale "input" mode must not swallow `r`, HINT or copying.
+    // A starting tab still has a live composer that queues behind its connect.
     if (mode === "input" && !failed) {
       // vim's Esc (and the live conversation's, `resolveKey`): back to the menu. The root takes the keys
       // BEFORE `setMode("browse")` unmounts the textarea, or they would fall to <body>.
@@ -599,14 +581,9 @@ export function EmptyTab(props: EmptyTabProps) {
       if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
       return;
     }
-    // A pending sequence's own continuation must run BEFORE the
-    // unconditional single-key handlers below, matching `App.tsx`'s own ordering (leader engine
-    // before other single-key handling: `f` there reaches HINT only through `resolveKey`, well
-    // after this same check). Without this, `f` alone unconditionally intercepted every `f`
-    // keydown -- including the second key of an armed `<leader>fn` -- so that binding could never
-    // complete here. `isActivatableControl`'s Enter/Space guard moves with it: both exist to keep
-    // the sequence engine from swallowing keys it must not (a focused button's own Enter/Space, or a
-    // continuation key `r`/`f`/`y` also happen to claim on their own below).
+    // A pending sequence owns continuations before the single-key handlers (`f`, `r`, `y`) can.
+    // Otherwise HINT steals the `f` of `<leader>fn`. Keep focused controls' Enter/Space ahead
+    // of the sequence engine too, so it cannot swallow their native activation.
     if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ")) return;
     if (seqRef.current !== null) {
       // Mirrors `App.tsx`'s own guard just below -- a bare
@@ -635,11 +612,8 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     if (event.key === "f") {
       event.preventDefault();
-      // `f` used to intercept every keydown unconditionally here, so "fix the dashboard
-      // layout⏎" typed on a fresh window's own first screen started a HINT on its own `f`, same as
-      // the live conversation's `case "hint"` (`App.tsx`) before it learned the same wait. Mirrors that fix
-      // exactly: defer `TYPING_GUARD_MS`, only firing if nothing else was typed meanwhile and this
-      // screen is still somewhere `f` may act (`modeRef`/`failedRef`, above).
+      // Defer HINT by `TYPING_GUARD_MS`, so "fix the dashboard layout⏎" does not act on its `f`.
+      // Fire only if nothing else was typed and this screen still allows HINT (`modeRef`/`failedRef`).
       const waiting = typingGuard.defer(
         typedAt,
         event.repeat,
@@ -652,10 +626,8 @@ export function EmptyTab(props: EmptyTabProps) {
       return;
     }
     if (event.key === "y" && !event.ctrlKey && !event.altKey && !event.metaKey) {
-      // Every BROWSE `y` opens the typing guard's burst, whether or not it copies
-      // anything -- vim's `y` is an operator whatever is under the cursor, and it is what a person types
-      // `yi` or `ys` after. It used to open only when a handoff command existed, so on an ordinary
-      // dashboard `y` then Enter ran the selected action and `y` then `j` moved the cursor.
+      // Every BROWSE `y` starts a typing burst even when there is no command to copy: `yi`/`ys`
+      // are operator continuations, so Enter and `j` immediately after `y` must not act on the dashboard.
       typingGuard.noteCopy(typedAt);
       if (handoff !== null) {
         event.preventDefault();
@@ -691,12 +663,9 @@ export function EmptyTab(props: EmptyTabProps) {
           props.onFlash?.(leaderTypingFlash(panelTable.leaderLabel));
           return;
         }
-        // Any OTHER single-key table binding that runs on its very first press -- `H`/`L`'s
-        // default tab.prev/tab.next, or an nvim-read binding on some other plain letter -- used to run
-        // at once, so "Looks good, now add tests⏎" typed on a fresh window's own first screen switched
-        // tabs on its own `L`. Mirrors `App.tsx`'s own rule for these keys exactly: `mayActAfterMotion` cannot
-        // help (there is never a motion run behind the very first key), so this defers the same way
-        // `a`/`d`/`f` above do.
+        // A single-key table binding (`H`/`L`, or a configured letter) also needs deferral: a first
+        // `L` in "Looks good, now add tests⏎" has no motion run for `mayActAfterMotion` to recognise.
+        // Wait as `a`/`d`/`f` do, rather than act on prose.
         if (start.kind === "run") {
           const { binding } = start;
           const flash = tableKeyTypingFlash(event.key, binding.desc);
@@ -739,20 +708,10 @@ export function EmptyTab(props: EmptyTabProps) {
       if (item !== undefined) runItem(item);
       return;
     }
-    // `m` used to run `runItem("mode")` here. It collided with ordinary typed
-    // prose starting with `m` (e.g. "make", "mode") landing on the dashboard before `i` was
-    // pressed, so the bare letter is gone -- the item stays reachable by `j`/`k` + Enter (above),
-    // Shift+Tab (`modeKey.ts`'s document-capture router, which runs ahead of this handler and is
-    // untouched here) and `<leader>m` (the leader engine above, `DASH_ITEM_KEY.mode` is display
-    // only). A stray `m` (or the `m` in "make") now falls through this whole chain and does
-    // nothing, exactly like any other unbound letter.
-    // `o` is an exact alias of `i`
-    // here too, and `A` opens the same composer with the caret forced to the end of the draft --
-    // this screen had never grown either of the live tab's two frozen aliases.
-    // This screen once lost "expla" to the `i` inside "explain": `i`/`o`/`A` open the composer only on a
-    // key that stands alone (`mayStartInput`: a pure pause, no motion exception -- "look at" walked with
-    // `l` and opened it with `o`);
-    // in the middle of typed prose they are swallowed and say how to type.
+    // Bare `m` collides with prose such as "make" and "mode"; mode changes use Shift+Tab or
+    // `<leader>m`. `o` aliases `i`; `A` forces the caret to the end. These INPUT entries require a
+    // pure pause (`mayStartInput`), never a motion exception: "look at" must not walk on `l` and
+    // open INPUT on `o`. In typed prose the keys are swallowed and say how to type.
     if ((event.key === "i" || event.key === "o" || event.key === "A") && !typingGuard.mayStartInput(typedAt, event.repeat)) {
       event.preventDefault();
       if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
@@ -770,13 +729,9 @@ export function EmptyTab(props: EmptyTabProps) {
       (event.key === "s" && items.includes("restore")) ||
       event.key === "w"
     ) {
-      // An arrival lands this
-      // dashboard in BROWSE, so typed prose reached these at once -- "run the tests" resumed the
-      // newest record into this tab on its own `r`, "what's next" opened the chooser on its `w`,
-      // which then took `j`/`k`/`x`/Enter from the rest of the sentence. Deferred exactly as `f` and
-      // `H`/`L` above are: each still does what it did, `TYPING_GUARD_MS` later, only if nothing
-      // else was typed meanwhile and the dashboard is still here in BROWSE. The bare `m` was dropped
-      // for the same collision; these keep their meaning.
+      // Arrivals land in BROWSE: "run the tests" must not resume on `r`, nor "what's next" open
+      // the chooser on `w` and feed it the rest. Defer by `TYPING_GUARD_MS` like `f` and `H`/`L`,
+      // acting only if nothing else was typed and the dashboard remains in BROWSE.
       event.preventDefault();
       const item: DashItem = event.key === "r" ? "resume" : event.key === "s" ? "restore" : "sessions";
       const flash = tableKeyTypingFlash(
@@ -798,8 +753,7 @@ export function EmptyTab(props: EmptyTabProps) {
     }
   }
 
-  // `hello !== null` beside `showDashboard`, which TS cannot narrow through, so the dashboard's parts take
-  // `hello` without a non-null assertion.
+  // Check `hello !== null` beside the dashboard flag: TypeScript cannot narrow through that flag.
   const inDashboard = hello !== null && showDashboard;
   return (
     <div className="empty-tab" tabIndex={0} onKeyDown={onKeyDown} ref={rootRef}>
@@ -825,15 +779,10 @@ export function EmptyTab(props: EmptyTabProps) {
           )}
         </>
       )}
-      {/* The empty tab's dashboard: replaces the eight resume rows that used to sit below
-          the composer. Never drawn while starting or failed (those screens keep their own).
-
-          On the dashboard the box you type in IS the New session row (2026-10-15): it sits between the
-          name and the other rows, as wide as they are, its key at the right where theirs are, and the
-          cursor's first stop. The box keeps one place in the tree on every screen -- the same parent
-          and the same position, whether the dashboard is drawn around it or not -- so going from the
-          dashboard to "Starting…" when a message is sent never remounts it (its focus, an input
-          method's composition and its history walk all live in it). */}
+      {/* No dashboard while starting or failed. Its box is the New session row, with the same width
+          and right-side key as the other actions. Keep the box at the same tree position and parent
+          on every screen: sending into Starting must not remount it and lose focus, IME composition
+          or its history walk. */}
       <div className={inDashboard ? "dashboard" : "empty-box-stack"}>
         {inDashboard && hello !== null && (
           <DashboardHead hello={hello} narrow={narrow} agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null} />
@@ -889,6 +838,7 @@ export function EmptyTab(props: EmptyTabProps) {
             editorLink={editorLink}
             agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null}
             boxIsNew
+            narrow={narrow}
           />
         )}
       </div>

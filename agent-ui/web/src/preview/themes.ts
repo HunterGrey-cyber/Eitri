@@ -7,7 +7,7 @@ type Palette = {
   browse: string; input: string; hintBg: string; hintFg: string; search: string; light: boolean;
   syn: Record<string, string>;
   /** lualine's mode sections (`lualine_a_normal`/`_insert`/`_visual`) for the scheme, `[bg, fg]`, which the
-   *  status band's mode block copies; the rose-pine dawn pair is read from LazyVim's lualine on 2026-10-15,
+   *  status band's mode block copies; the rose-pine dawn pair is read from LazyVim's lualine,
    *  the others are each scheme's own lualine theme. */
   status: { normal: [string, string]; insert: [string, string]; visual: [string, string] };
 };

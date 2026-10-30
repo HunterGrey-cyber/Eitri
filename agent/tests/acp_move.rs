@@ -483,3 +483,79 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
     });
     close(&provider);
 }
+
+#[test]
+fn an_acp_tab_moves_mid_turn() {
+    let dir = scratch("by-kind");
+    let source = running(
+        &dir,
+        vec![
+            chunk("before "),
+            write(
+                json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {
+                "sessionId": "s1",
+                "toolCall": {"toolCallId": "c1", "title": "Run command", "kind": "execute", "status": "pending",
+                             "rawInput": {"command": "touch x", "cwd": "/work"}},
+                "options": [{"optionId": "a-1", "name": "Yes", "kind": "allow_once"},
+                            {"optionId": "r-1", "name": "No", "kind": "reject_once"}]}}),
+            ),
+            expect_answer(7, json!({"outcome": {"outcome": "selected", "optionId": "a-1"}})),
+            chunk("after"),
+            reply(3, json!({"stopReason": "end_turn"})),
+        ],
+    );
+    let before = pump_until(&source, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. }))
+    });
+    let card = before
+        .iter()
+        .find_map(|e| match e {
+            AgentDomainEvent::PermissionRequested { permission_id, .. } => Some(permission_id.clone()),
+            _ => None,
+        })
+        .expect("a card");
+
+    // As two windows move it: through the face every provider moves by, the record as JSON, copies of the
+    // descriptors, taken up again by the kind the record names.
+    let mover = AgentProvider::mover(&source).expect("an ACP chat moves");
+    assert!(mover.live_move(), "its running turn moves with it");
+    let frozen = mover.freeze_for_chat_move().expect("the provider freezes");
+    let record: Value = serde_json::from_str(&frozen.record.to_string()).expect("the record reads back");
+    let kind = agent::chat_mover::MovedKind::from_wire(frozen.kind.wire()).expect("a kind this build moves");
+    let adopted = agent::chat_mover::adopt(kind, &record, frozen.copies().unwrap()).expect("taken up");
+    let destination = adopted.agent;
+    assert!(adopted.external.is_some(), "an ACP chat has its external side");
+    destination.mover().unwrap().commit_chat_move().expect("committed");
+    mover.forget_chat_move();
+    drop(frozen);
+
+    destination
+        .resolve_permission(ResolvePermissionRequest {
+            session_id: "s1".to_string(),
+            permission_id: card.clone(),
+            decision: PermissionDecision::Allow,
+        })
+        .expect("the card waits in the destination under the number it had");
+    let end = Instant::now() + Duration::from_secs(30);
+    let mut after = Vec::new();
+    while completed(&after).is_none() {
+        assert!(Instant::now() < end, "timed out; {} events so far", after.len());
+        after.extend(destination.pump());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(completed(&after), Some(TurnOutcome::Completed));
+    assert_eq!(texts(&before) + &texts(&after), "before after");
+    destination
+        .close_session(CloseSessionRequest {
+            session_id: "s1".to_string(),
+        })
+        .expect("closes");
+    let lines = stdin_lines(&dir);
+    assert_eq!(
+        count_containing(&lines, r#""id":7,"result""#),
+        1,
+        "the permission is answered once: {lines:#?}"
+    );
+}

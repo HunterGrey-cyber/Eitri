@@ -73,6 +73,9 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -84,6 +87,7 @@ use crate::gl_interop::resolve_gl_proc;
 /// `DRM_FORMAT_ABGR8888` ("AB24"): bytes R, G, B, A in memory, which is GL's `RGBA8` and the
 /// format `GtkGLArea` itself exports on a GLES context.
 pub(crate) const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+pub(crate) const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const MAX_PLANES: usize = 4;
@@ -214,6 +218,26 @@ fn egl_loaded() -> bool {
     true
 }
 
+/// Reads only from the EGL already loaded by the area's current context. A GLX context
+/// must never enter libepoxy's EGL resolver, which may terminate the process.
+pub(crate) fn egl_vendor() -> Option<String> {
+    if !egl_loaded() {
+        return None;
+    }
+    let fns = unsafe { Fns::load() }.ok()?;
+    let display = unsafe { (fns.egl_get_current_display)() };
+    if display.is_null() {
+        return None;
+    }
+    const EGL_VENDOR: i32 = 0x3053;
+    let vendor = unsafe { (fns.egl_query_string)(display, EGL_VENDOR) };
+    if vendor.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(vendor) }.to_string_lossy().into_owned())
+    }
+}
+
 type EglDisplay = *mut c_void;
 type EglImage = *mut c_void;
 
@@ -258,7 +282,7 @@ struct Fns {
 /// # Safety
 /// `p` must be a non-null function of exactly that signature.
 unsafe fn fn_ptr<F: Copy>(p: *const c_void) -> F {
-    assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*const c_void>());
+    debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*const c_void>());
     unsafe { std::mem::transmute_copy(&p) }
 }
 
@@ -423,8 +447,8 @@ impl Drop for Gbm {
     }
 }
 
-/// One presentation buffer. The dmabuf fds are shared with every `GdkTexture` built over it and
-/// close only when the last of those is released, so GTK never holds a closed fd.
+/// One GL-importable presentation buffer. GTK textures keep shared fds until their last release;
+/// Wayland consumers keep the slot reserved until the compositor has finished reading it.
 struct Buffer {
     width: i32,
     height: i32,
@@ -434,8 +458,8 @@ struct Buffer {
     modifier: u64,
     image: EglImage,
     texture: u32,
-    /// Set while a `GdkTexture` over this buffer is held by GTK ([`Reservation`]); cleared when
-    /// GTK releases it (on any thread). A buffer is drawn into only while clear.
+    /// Set while a consumer owns this buffer or its Wayland wrapper is being created. GTK's
+    /// reservation or the compositor's release clears it before another frame can draw into it.
     in_use: Arc<AtomicBool>,
 }
 
@@ -484,7 +508,7 @@ enum ExplicitFence {
 
 /// GL-context-bound state of the editor's own presentation path. Created with the `GtkGLArea`'s
 /// context current; `release` must also run with it current (the pane's unrealize).
-pub(crate) struct Presenter {
+pub(crate) struct DmabufPool {
     fns: Fns,
     display: EglDisplay,
     gbm: Gbm,
@@ -492,11 +516,107 @@ pub(crate) struct Presenter {
     framebuffer: u32,
     depth_stencil: u32,
     depth_stencil_size: (i32, i32),
-    buffers: Vec<Buffer>,
-    current: Option<usize>,
+    buffers: Vec<Option<Buffer>>,
+    retired: Vec<Buffer>,
+    egl_modifiers: Vec<(u64, bool)>,
+    render_device: Option<u64>,
     logged_modifier: bool,
     warned_buffer_count: bool,
     fence: ExplicitFence,
+}
+
+pub(crate) enum ModifierSource {
+    Gtk,
+    Compositor(Vec<u64>),
+}
+
+/// A stable pool index together with the framebuffer to render into and its allocation size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameSlot {
+    pub id: usize,
+    pub framebuffer: u32,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub(crate) struct PlaneInfo {
+    pub fds: Arc<Vec<OwnedFd>>,
+    pub strides: Vec<u32>,
+    pub offsets: Vec<u32>,
+    pub fd_sizes: Vec<u64>,
+    pub modifier: u64,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl PlaneInfo {
+    fn empty() -> Self {
+        Self {
+            fds: Arc::new(Vec::new()),
+            strides: Vec::new(),
+            offsets: Vec::new(),
+            fd_sizes: Vec::new(),
+            modifier: DRM_FORMAT_MOD_INVALID,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Chosen {
+    pub wrap_fourcc: u32,
+    pub opaque_region_needed: bool,
+    pub modifiers: Vec<u64>,
+}
+
+pub(crate) fn same_gpu(a: u64, b: u64, resolve: &dyn Fn(u64) -> Option<PathBuf>) -> bool {
+    match (resolve(a), resolve(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn device_path(dev: u64) -> PathBuf {
+    PathBuf::from(format!(
+        "/sys/dev/char/{}:{}/device",
+        libc::major(dev),
+        libc::minor(dev)
+    ))
+}
+
+pub(crate) fn resolve_device(dev: u64) -> Option<PathBuf> {
+    std::fs::canonicalize(device_path(dev)).ok()
+}
+
+pub(crate) fn check_params(planes: &PlaneInfo) -> Result<(), String> {
+    let n = planes.fds.len();
+    if planes.width < 1 || planes.height < 1 {
+        return Err("dmabuf dimensions must be positive".into());
+    }
+    if !(1..=MAX_PLANES).contains(&n)
+        || planes.strides.len() != n
+        || planes.offsets.len() != n
+        || planes.fd_sizes.len() != n
+    {
+        return Err("dmabuf must describe every plane exactly once".into());
+    }
+    for p in 0..n {
+        let (stride, offset, size) = (
+            u64::from(planes.strides[p]),
+            u64::from(planes.offsets[p]),
+            planes.fd_sizes[p],
+        );
+        // Plane 0 holds `height` rows of `stride`. A modifier's further planes have a layout of
+        // their own (AMD's DCC metadata plane sits in the same buffer object, far smaller than
+        // `height` rows of its pitch), so only their start and one row are checked, as compositors do.
+        let rows = if p == 0 { planes.height as u64 } else { 1 };
+        let end = stride.checked_mul(rows).and_then(|length| length.checked_add(offset));
+        if stride == 0 || offset >= size || end.is_none_or(|end| end > size) {
+            return Err(format!("dmabuf plane {p} extends past its fd"));
+        }
+    }
+    Ok(())
 }
 
 /// Which modifiers to ask GBM for: those EGL can render into (not external-only), that GTK can
@@ -511,9 +631,9 @@ pub(crate) fn usable_modifiers(egl: &[(u64, bool)], gtk_imports: impl Fn(u64) ->
         .collect()
 }
 
-impl Presenter {
+impl DmabufPool {
     /// Requires the GL context the frames will be drawn with to be current.
-    pub(crate) fn new(gdk_display: &gdk::Display) -> Result<Self, String> {
+    pub(crate) fn new(gdk_display: &gdk::Display, source: ModifierSource) -> Result<Self, String> {
         if !egl_loaded() {
             return Err("libEGL is not loaded, so the GL context is not an EGL one".into());
         }
@@ -596,14 +716,30 @@ impl Presenter {
             external.truncate(returned);
         }
         let egl: Vec<(u64, bool)> = mods.iter().zip(&external).map(|(m, e)| (*m, *e != 0)).collect();
-        let gtk_formats = gdk_display.dmabuf_formats();
-        let modifiers = usable_modifiers(&egl, |m| gtk_formats.contains(DRM_FORMAT_ABGR8888, m));
-        if modifiers.is_empty() {
-            return Err(format!(
-                "no tiled AB24 modifier both EGL renders to and GTK imports (EGL offered {})",
-                egl.len()
-            ));
-        }
+        let modifiers = match source {
+            ModifierSource::Gtk => {
+                let gtk_formats = gdk_display.dmabuf_formats();
+                let modifiers = usable_modifiers(&egl, |m| gtk_formats.contains(DRM_FORMAT_ABGR8888, m));
+                if modifiers.is_empty() {
+                    return Err(format!(
+                        "no tiled AB24 modifier both EGL renders to and GTK imports (EGL offered {})",
+                        egl.len()
+                    ));
+                }
+                modifiers
+            }
+            ModifierSource::Compositor(offered) => {
+                let usable = usable_modifiers(&egl, |_| true);
+                let modifiers: Vec<_> = offered.into_iter().filter(|m| usable.contains(m)).collect();
+                if modifiers.is_empty() {
+                    return Err("no tiled AB24 modifier both EGL renders to and the compositor imports".into());
+                }
+                modifiers
+            }
+        };
+        let render_device = std::fs::metadata(std::path::Path::new(OsStr::from_bytes(node.to_bytes())))
+            .ok()
+            .map(|m| m.rdev());
         let gbm = Gbm::open(&node)?;
 
         let mut framebuffer = 0;
@@ -619,49 +755,82 @@ impl Presenter {
             depth_stencil,
             depth_stencil_size: (0, 0),
             buffers: Vec::new(),
-            current: None,
+            retired: Vec::new(),
+            egl_modifiers: egl,
+            render_device,
             logged_modifier: false,
             warned_buffer_count: false,
             fence: ExplicitFence::Untried,
         })
     }
 
-    /// Picks a buffer GTK is not reading, of exactly `width x height` device pixels (allocating
-    /// one if none is free), and binds this presenter's framebuffer with it and a
-    /// depth/stencil renderbuffer attached -- the same attachments `GtkGLArea` gives its own
-    /// framebuffer with `has_stencil_buffer`. The GL context must be current.
-    pub(crate) fn begin_frame(&mut self, width: i32, height: i32) -> Result<(), String> {
-        self.current = None;
-        // Free buffers of another size go now; busy ones when GTK has let go of them.
-        let mut i = 0;
-        while i < self.buffers.len() {
-            let b = &self.buffers[i];
-            if (b.width, b.height) != (width, height) && !b.in_use.load(Ordering::Acquire) {
-                let b = self.buffers.swap_remove(i);
-                self.destroy_gl(&b);
-            } else {
-                i += 1;
-            }
+    /// Picks an idle buffer of exactly this size and binds it in the current GL context.
+    /// Consumers retire obsolete sizes only after their own release notification.
+    pub(crate) fn begin_frame(&mut self, width: i32, height: i32) -> Result<FrameSlot, String> {
+        self.collect_retired();
+        if width < 1 || height < 1 {
+            return Err(format!("invalid presentation buffer size {width}x{height}"));
         }
-        let index = match self
+        let Some(index) = self.buffers.iter().position(|b| {
+            b.as_ref()
+                .is_some_and(|b| (b.width, b.height) == (width, height) && !b.in_use.load(Ordering::Acquire))
+        }) else {
+            return self.allocate_slot(width, height);
+        };
+        let slot = FrameSlot {
+            id: index,
+            width,
+            height,
+            framebuffer: self.framebuffer,
+        };
+        self.bind(slot)?;
+        Ok(slot)
+    }
+
+    /// Allocates a new buffer of this size and binds it, never reusing an idle one. A consumer that keeps its
+    /// own record of each buffer (one wl_buffer per dmabuf) needs this, or two of its buffers would share one
+    /// dmabuf and drawing into one would change the other.
+    pub(crate) fn allocate_slot(&mut self, width: i32, height: i32) -> Result<FrameSlot, String> {
+        self.collect_retired();
+        if width < 1 || height < 1 {
+            return Err(format!("invalid presentation buffer size {width}x{height}"));
+        }
+        let buffer = self.allocate(width, height)?;
+        let index = self
             .buffers
             .iter()
-            .position(|b| (b.width, b.height) == (width, height) && !b.in_use.load(Ordering::Acquire))
-        {
-            Some(index) => index,
-            None => {
-                let buffer = self.allocate(width, height)?;
-                self.buffers.push(buffer);
-                if self.buffers.len() > 6 && !self.warned_buffer_count {
-                    self.warned_buffer_count = true;
-                    eprintln!(
-                        "[editor] {} presentation buffers alive: GTK is holding more frames than expected",
-                        self.buffers.len()
-                    );
-                }
-                self.buffers.len() - 1
-            }
+            .position(Option::is_none)
+            .unwrap_or(self.buffers.len());
+        if index == self.buffers.len() {
+            self.buffers.push(Some(buffer));
+        } else {
+            self.buffers[index] = Some(buffer);
+        }
+        let count = self.buffers.iter().flatten().count();
+        if count > 6 && !self.warned_buffer_count {
+            self.warned_buffer_count = true;
+            eprintln!(
+                "[editor] {} presentation buffers alive: GTK is holding more frames than expected",
+                count
+            );
+        }
+        let slot = FrameSlot {
+            id: index,
+            width,
+            height,
+            framebuffer: self.framebuffer,
         };
+        self.bind(slot)?;
+        Ok(slot)
+    }
+
+    pub(crate) fn bind(&mut self, slot: FrameSlot) -> Result<(), String> {
+        self.collect_retired();
+        let b = self.buffer(slot).ok_or("unknown presentation buffer")?;
+        if b.in_use.load(Ordering::Acquire) {
+            return Err("presentation buffer is still busy".into());
+        }
+        let (width, height, texture) = (b.width, b.height, b.texture);
         let f = &self.fns;
         unsafe {
             if self.depth_stencil_size != (width, height) {
@@ -670,13 +839,7 @@ impl Presenter {
                 self.depth_stencil_size = (width, height);
             }
             (f.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer);
-            (f.gl_framebuffer_texture_2d)(
-                GL_FRAMEBUFFER,
-                GL_COLOR_ATTACHMENT0,
-                GL_TEXTURE_2D,
-                self.buffers[index].texture,
-                0,
-            );
+            (f.gl_framebuffer_texture_2d)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
             (f.gl_framebuffer_renderbuffer)(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, self.depth_stencil);
             (f.gl_framebuffer_renderbuffer)(
                 GL_FRAMEBUFFER,
@@ -693,7 +856,7 @@ impl Presenter {
         }
         if !self.logged_modifier {
             self.logged_modifier = true;
-            let b = &self.buffers[index];
+            let b = self.buffer(slot).ok_or("unknown presentation buffer")?;
             println!(
                 "[editor] drawing into own {}x{} presentation buffers, AB24 modifier {:#018x} ({} plane(s)) \
                  instead of GtkGLArea's texture",
@@ -703,11 +866,13 @@ impl Presenter {
                 b.fds.len()
             );
         }
-        self.current = Some(index);
         Ok(())
     }
 
     fn allocate(&self, width: i32, height: i32) -> Result<Buffer, String> {
+        if self.modifiers.is_empty() {
+            return Err("no usable tiled presentation modifier".into());
+        }
         let g = &self.gbm;
         let gf = &g.fns;
         let (w, h) = (width as u32, height as u32);
@@ -818,35 +983,92 @@ impl Presenter {
         })
     }
 
-    /// Submits the frame drawn since `begin_frame`, fences it (module doc) and wraps its buffer as
-    /// a `GdkTexture` for this frame's snapshot. The buffer stays reserved until GTK releases that
-    /// texture.
-    pub(crate) fn finish_frame(&mut self, gdk_display: &gdk::Display) -> Result<gdk::Texture, String> {
-        let index = self.current.take().ok_or("finish_frame without begin_frame")?;
-        self.submit_and_fence(index);
-        let b = &self.buffers[index];
-        let mut builder = gdk::DmabufTextureBuilder::new()
-            .set_display(gdk_display)
-            .set_width(b.width as u32)
-            .set_height(b.height as u32)
-            .set_fourcc(DRM_FORMAT_ABGR8888)
-            .set_modifier(b.modifier)
-            .set_premultiplied(true)
-            .set_n_planes(b.fds.len() as u32);
-        for (p, fd) in b.fds.iter().enumerate() {
-            // SAFETY: the reservation below holds `fds` until GTK releases the texture, so every
-            // fd outlives the texture that names it.
-            builder = unsafe { builder.set_fd(p as u32, fd.as_raw_fd()) }
-                .set_stride(p as u32, b.strides[p])
-                .set_offset(p as u32, b.offsets[p]);
+    pub(crate) fn submit(&mut self, slot: FrameSlot) {
+        if self.buffer(slot).is_some() {
+            self.submit_and_fence(slot.id);
+            self.set_busy(slot, true);
         }
-        let reservation = Reservation::new(&b.fds, &b.in_use);
-        let for_gtk = reservation.clone();
-        let built = unsafe { builder.build_with_release_func(move || for_gtk.end()) };
-        built.map_err(|e| {
-            reservation.end();
-            format!("GTK refused the buffer: {e}")
-        })
+    }
+
+    fn buffer(&self, slot: FrameSlot) -> Option<&Buffer> {
+        self.buffers
+            .get(slot.id)?
+            .as_ref()
+            .filter(|b| (b.width, b.height) == (slot.width, slot.height))
+    }
+
+    pub(crate) fn planes(&self, slot: FrameSlot) -> PlaneInfo {
+        let Some(b) = self.buffer(slot) else {
+            return PlaneInfo::empty();
+        };
+        let fd_sizes = b
+            .fds
+            .iter()
+            .map(|fd| {
+                // DMA-BUF supports SEEK_END for discovering its allocation size, without I/O or a fence wait.
+                let size = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+                if size < 0 {
+                    0
+                } else {
+                    size as u64
+                }
+            })
+            .collect();
+        PlaneInfo {
+            fds: b.fds.clone(),
+            strides: b.strides[..b.fds.len()].to_vec(),
+            offsets: b.offsets[..b.fds.len()].to_vec(),
+            fd_sizes,
+            modifier: b.modifier,
+            width: b.width,
+            height: b.height,
+        }
+    }
+
+    pub(crate) fn set_busy(&self, slot: FrameSlot, busy: bool) {
+        if let Some(b) = self.buffer(slot) {
+            b.in_use.store(busy, Ordering::Release);
+        }
+    }
+
+    /// Retires a released slot without GL calls; release notifications need no current context.
+    /// The next bind or explicit teardown deletes the retired GL objects.
+    pub(crate) fn discard(&mut self, slot: FrameSlot) {
+        if self.buffer(slot).is_some_and(|b| !b.in_use.load(Ordering::Acquire)) {
+            if let Some(b) = self.buffers[slot.id].take() {
+                self.retired.push(b);
+            }
+        }
+    }
+
+    pub(crate) fn egl_modifiers(&self) -> &[(u64, bool)] {
+        &self.egl_modifiers
+    }
+
+    pub(crate) fn restrict_modifiers(&mut self, modifiers: &[u64]) {
+        self.modifiers = modifiers
+            .iter()
+            .copied()
+            .filter(|m| self.modifiers.contains(m))
+            .collect();
+    }
+
+    pub(crate) fn check_device(&self, main_device: u64) -> Result<(), String> {
+        let render = self.render_device.ok_or("cannot identify EGL's render device")?;
+        if !same_gpu(render, main_device, &resolve_device) {
+            let path = |dev| {
+                resolve_device(dev)
+                    .unwrap_or_else(|| device_path(dev))
+                    .display()
+                    .to_string()
+            };
+            return Err(format!(
+                "EGL device {} differs from compositor device {}",
+                path(render),
+                path(main_device)
+            ));
+        }
+        Ok(())
     }
 
     /// `glFlush`es the frame and, where the platform allows, inserts a native fence for it into
@@ -879,12 +1101,22 @@ impl Presenter {
                 Err("eglDupNativeFenceFDANDROID returned no fd".to_string())
             } else {
                 let fence = unsafe { OwnedFd::from_raw_fd(fd) };
-                import_write_fence(&self.buffers[index].fds, &fence)
+                self.buffers
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| "unknown presentation buffer".to_string())
+                    .and_then(|b| import_write_fence(&b.fds, &fence))
             }
         };
         if let Err(err) = result {
             eprintln!("[editor] explicit presentation fence unavailable ({err}); relying on the implicit fence");
             self.fence = ExplicitFence::Unavailable;
+        }
+    }
+
+    fn collect_retired(&mut self) {
+        for b in std::mem::take(&mut self.retired) {
+            self.destroy_gl(&b);
         }
     }
 
@@ -899,7 +1131,11 @@ impl Presenter {
     /// it), and every EGL image, which belongs to the display. Buffers GTK still holds keep their
     /// memory through the fds its textures own.
     pub(crate) fn release(mut self, context_is_current: bool) {
-        for b in std::mem::take(&mut self.buffers) {
+        for b in std::mem::take(&mut self.buffers)
+            .into_iter()
+            .flatten()
+            .chain(std::mem::take(&mut self.retired))
+        {
             if context_is_current {
                 unsafe { (self.fns.gl_delete_textures)(1, &b.texture) };
             }
@@ -911,6 +1147,83 @@ impl Presenter {
                 (self.fns.gl_delete_renderbuffers)(1, &self.depth_stencil);
             }
         }
+    }
+}
+
+/// GTK's texture consumer of the shared allocation and fence machinery.
+pub(crate) struct GdkTextures {
+    pool: DmabufPool,
+    current: Option<FrameSlot>,
+}
+
+// The area keeps its existing consumer name while both presentation paths share the pool.
+pub(crate) type Presenter = GdkTextures;
+
+impl GdkTextures {
+    pub(crate) fn new(display: &gdk::Display) -> Result<Self, String> {
+        Ok(Self {
+            pool: DmabufPool::new(display, ModifierSource::Gtk)?,
+            current: None,
+        })
+    }
+
+    pub(crate) fn begin_frame(&mut self, width: i32, height: i32) -> Result<(), String> {
+        self.current = None;
+        let obsolete: Vec<_> = self
+            .pool
+            .buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(id, b)| {
+                let b = b.as_ref()?;
+                ((b.width, b.height) != (width, height) && !b.in_use.load(Ordering::Acquire)).then_some(FrameSlot {
+                    id,
+                    width: b.width,
+                    height: b.height,
+                    framebuffer: self.pool.framebuffer,
+                })
+            })
+            .collect();
+        for slot in obsolete {
+            self.pool.discard(slot);
+        }
+        self.current = Some(self.pool.begin_frame(width, height)?);
+        Ok(())
+    }
+
+    /// Submits the frame drawn since `begin_frame`, fences it (module doc) and wraps its buffer as
+    /// a `GdkTexture` for this frame's snapshot. The buffer stays reserved until GTK releases that
+    /// texture.
+    pub(crate) fn finish_frame(&mut self, gdk_display: &gdk::Display) -> Result<gdk::Texture, String> {
+        let slot = self.current.take().ok_or("finish_frame without begin_frame")?;
+        self.pool.submit(slot);
+        let b = self.pool.buffer(slot).ok_or("unknown presentation buffer")?;
+        let mut builder = gdk::DmabufTextureBuilder::new()
+            .set_display(gdk_display)
+            .set_width(b.width as u32)
+            .set_height(b.height as u32)
+            .set_fourcc(DRM_FORMAT_ABGR8888)
+            .set_modifier(b.modifier)
+            .set_premultiplied(true)
+            .set_n_planes(b.fds.len() as u32);
+        for (p, fd) in b.fds.iter().enumerate() {
+            // SAFETY: the reservation below holds `fds` until GTK releases the texture, so every
+            // fd outlives the texture that names it.
+            builder = unsafe { builder.set_fd(p as u32, fd.as_raw_fd()) }
+                .set_stride(p as u32, b.strides[p])
+                .set_offset(p as u32, b.offsets[p]);
+        }
+        let reservation = Reservation::new(&b.fds, &b.in_use);
+        let for_gtk = reservation.clone();
+        let built = unsafe { builder.build_with_release_func(move || for_gtk.end()) };
+        built.map_err(|e| {
+            reservation.end();
+            format!("GTK refused the buffer: {e}")
+        })
+    }
+
+    pub(crate) fn release(self, context_is_current: bool) {
+        self.pool.release(context_is_current);
     }
 }
 
@@ -935,6 +1248,71 @@ fn import_write_fence(fds: &[OwnedFd], fence: &OwnedFd) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_gpu_matches_the_primary_and_render_nodes_of_one_device() {
+        let resolve = |dev| match dev {
+            1 | 2 => Some(PathBuf::from("/sys/devices/pci0000:00/0000:03:00.0")),
+            _ => None,
+        };
+        assert!(same_gpu(1, 2, &resolve));
+        assert!(same_gpu(3, 3, &resolve));
+        assert!(!same_gpu(1, 3, &resolve));
+    }
+
+    #[test]
+    fn same_gpu_refuses_two_devices() {
+        assert!(!same_gpu(1, 2, &|dev| Some(PathBuf::from(format!("/gpu/{dev}")))));
+    }
+
+    #[test]
+    fn check_params_refuses_a_plane_past_its_fd_and_a_zero_size() {
+        let mut planes = PlaneInfo {
+            fds: Arc::new(vec![std::fs::File::open("/dev/null").unwrap().into()]),
+            strides: vec![16],
+            offsets: vec![0],
+            fd_sizes: vec![64],
+            modifier: 8,
+            width: 4,
+            height: 4,
+        };
+        assert!(check_params(&planes).is_ok());
+        planes.offsets[0] = 1;
+        assert!(check_params(&planes).is_err());
+        planes.offsets[0] = 0;
+        planes.width = 0;
+        assert!(check_params(&planes).is_err());
+        planes.width = 4;
+        planes.strides.push(16);
+        assert!(check_params(&planes).is_err());
+    }
+
+    #[test]
+    fn check_params_sizes_only_plane_0_by_height() {
+        // A compressed modifier's metadata plane: same fd, past the image, smaller than height rows
+        // of its pitch.
+        let fd = || std::fs::File::open("/dev/null").unwrap().into();
+        let mut planes = PlaneInfo {
+            fds: Arc::new(vec![fd(), fd()]),
+            strides: vec![16, 16],
+            offsets: vec![0, 64],
+            fd_sizes: vec![96, 96],
+            modifier: 8,
+            width: 4,
+            height: 4,
+        };
+        assert!(check_params(&planes).is_ok());
+        planes.offsets[1] = 96;
+        assert!(check_params(&planes).is_err(), "a plane starting at the end of its fd");
+        planes.offsets[1] = 88;
+        assert!(
+            check_params(&planes).is_err(),
+            "a plane whose first row runs past its fd"
+        );
+        planes.offsets[1] = 64;
+        planes.fd_sizes[0] = 63;
+        assert!(check_params(&planes).is_err(), "plane 0 still needs height rows");
+    }
 
     #[test]
     fn the_fallback_hint_needs_gtk_4_16_the_fallback_and_a_vulkan_renderer() {

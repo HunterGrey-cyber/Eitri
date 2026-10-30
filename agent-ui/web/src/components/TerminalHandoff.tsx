@@ -26,10 +26,8 @@ export function handoffBlockedReason(providerSessionId: string | null, turnInPro
 }
 
 type Props = {
-  /** Controlled from `App.tsx`'s own `handoffOpen`, since
-   *  there is no permanently visible button left to hold `confirming` as this component's own state
-   *  any more -- the only entry points are `<leader>t` and the detail popover's trailing row, both
-   *  outside this component. `false` renders nothing at all. */
+  /** Controlled by `App.tsx`'s `handoffOpen`: the entry points (<leader>t and the details row)
+   *  live outside this component. False renders nothing. */
   open: boolean;
   /** `Esc`, or the confirmation's own Cancel button. Never called by this component on its own
    *  initiative otherwise -- in particular, NOT once `onHandoff` is pressed (see that button's own
@@ -51,12 +49,8 @@ type Props = {
   onHandoff: () => void;
 };
 
-/** The confirmation `<leader>t` and the detail popover's trailing row both open -- there is no
- *  separate "closed" idle state with its own button any more; `open` false
- *  is that state, and it draws nothing.
- *
- * It confirms rather than acting because the action closes the conversation — on a backend with no
- * resume, irreversibly. Stating that afterwards would be too late. */
+/** Confirmation opened by <leader>t or the details row; closed draws nothing. Confirm first:
+ *  the action closes the conversation, irreversibly on a backend with no resume. */
 export function ContinueInTerminal({ open, onClose, providerSessionId, turnInProgress, canResume, handingOff, onHandoff }: Props) {
   const blocked = handingOff
     ? "This conversation is being closed — the command will appear here once that has finished."
@@ -104,13 +98,8 @@ export function ContinueInTerminal({ open, onClose, providerSessionId, turnInPro
  * path that does hold a lease cannot promise more. So this says what is true and no more. */
 export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
   return (
-    // Same two-cell shape as the rest of the panel-as-document grid:
-    // a `→` sign beside the body, so this row's sign lines up with every other row's. `handoff-card`
-    // stays on the BODY cell rather than being replaced -- it carries its own box (border,
-    // background, spacing) that has nothing to do with the sign column, and every child selector
-    // below (`.handoff-card p`, `.warning`, `.detail`) still matches unchanged since the nesting
-    // relative to `.handoff-card` itself has not moved. `bodyClassName` is `Row`'s own way of
-    // saying that (`./Row`), rather than this file re-writing the two-cell grid by hand.
+    // Use Row's shared sign-column grid. Keep handoff-card on its body: its border, fill and
+    // spacing belong there, and its child selectors must still match.
     <Row kind="handoff" sign="→" role="status" bodyClassName="handoff-card">
       <strong>This conversation is closed in Eitri.</strong>
       <p>Run this in your own terminal to continue it:</p>

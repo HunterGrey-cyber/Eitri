@@ -1,5 +1,4 @@
-# Recovery and the lock (UPG-2), set -e inside functions (SH-2), truncation (SH-1) and piped
-# stdin (SH-3). Sourced by harness.sh.
+# Recovery, locking, set -e inside functions, truncation and piped stdin. Sourced by harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
@@ -91,12 +90,9 @@ t_lock_dead_taken_over() {
 
 TESTS="$TESTS t_lock_takeover_blocked_while_live"
 t_lock_takeover_blocked_while_live() {
-	# The stale-lock takeover dance is serialized
-	# by its own mkdir-based sub-lock ($NV_LOCK.takeover) -- a second run that finds the same stale
-	# lock while another run is already mid-takeover must wait, never race it. Before this, both
-	# runs could reach the takeover dance at once: see the comment above the sub-lock in
-	# acquire_lock for the five-step sequence that let two runs both end up believing they held the
-	# lock.
+	# Serialize stale-lock takeover with its own mkdir-based sub-lock ($NV_LOCK.takeover).
+	# A second run finding the same stale lock must wait: racing takeovers can both believe they hold
+	# it. acquire_lock's sub-lock comment describes the five-step race.
 	serve 1.0.0
 	sh -c 'exit 0' &
 	dead=$!
@@ -111,10 +107,8 @@ t_lock_takeover_blocked_while_live() {
 	kill "$holder" 2>/dev/null
 	wait "$holder" 2>/dev/null
 	expect_fail "a stale lock whose own takeover another run is already mid-way through"
-	# Reworded away from
-	# "already recovering the stale lock" -- this message fires on ordinary contention for
-	# lock.takeover too, whether or not the outer lock actually turns out to be stale, and used to
-	# claim staleness before this run had checked.
+	# Contention for lock.takeover does not prove the outer lock is stale; the message must not
+	# claim staleness before this run checks it.
 	expect_out "another Eitri installer (pid $holder) is already checking the lock $TH/.cache/eitri/lock"
 	expect_absent "$TH/.local/lib/eitri"
 	# Neither lock was disturbed: the stale one still has its own original (dead) pid, and the
@@ -150,11 +144,9 @@ t_lock_takeover_self_heals_abandoned_sub_lock() {
 
 TESTS="$TESTS t_lock_takeover_sub_lock_without_pid_refused"
 t_lock_takeover_sub_lock_without_pid_refused() {
-	# A run killed between
-	# mkdir "$NV_LOCK.takeover" and writing its own pid leaves a sub-lock no later run can ever
-	# recover (nothing will ever write a pid into it) -- this used to fall through to the same
-	# generic "already recovering the stale lock" message ordinary live contention gets, never
-	# telling a human that lock.takeover itself, not lock, is what has to be removed by hand.
+	# A run killed between mkdir "$NV_LOCK.takeover" and its pid write leaves a pid-less sub-lock
+	# that cannot be recovered automatically. The message must identify lock.takeover, not lock,
+	# for manual removal, rather than report ordinary live contention.
 	serve 1.0.0
 	mkdir -p "$TH/.cache/eitri/lock"
 	sh -c 'exit 0' &
@@ -190,9 +182,8 @@ t_lock_without_pid_refused() {
 
 TESTS="$TESTS t_lock_pid_write_failure_cleaned_up"
 t_lock_pid_write_failure_cleaned_up() {
-	# The pid write can fail after the lock directory (and something at
-	# NV_LOCK/pid) already exist -- rmdir must not be left with a non-empty directory to choke on,
-	# or every later run finds a stale lock with no pid and refuses forever.
+	# The pid write can fail after the lock directory and NV_LOCK/pid exist. Remove the pid file
+	# before rmdir, or later runs are permanently blocked by a non-empty lock with no pid.
 	serve 1.0.0
 	mkdir -p "$T/stubs-lockpidfail"
 	cp "$FIXTURES/mkdir-lock-pid-conflict" "$T/stubs-lockpidfail/mkdir"
@@ -281,11 +272,10 @@ t_truncated_script() {
 
 TESTS="$TESTS t_truncated_every_cut_point"
 t_truncated_every_cut_point() {
-	# Every cut of the script's last three lines, piped into sh with --help: a cut before the final
-	# `}` must run nothing at all; only the whole script (with or without its last newline) runs,
-	# and then with its arguments. A cut right after `}; main` once ran main with none of them -- a
-	# --dry-run or an --uninstall turned into a real install of the latest release. A stub uname
-	# catches a main that runs without its arguments before it could download or change anything.
+	# Every cut of the last three lines, piped to sh with --help: no prefix ending before the final
+	# `}` may run anything. The complete script must receive its arguments, with or without the final
+	# newline; otherwise --dry-run or --uninstall could become a real latest-release install.
+	# A stub uname catches a main with no arguments before any download or change.
 	size=$(wc -c <"$INSTALLER")
 	tail3=$(tail -n 3 "$INSTALLER" | wc -c)
 	before=$(snap "$TH")
@@ -376,10 +366,9 @@ t_upgrade_unwritable_bindir() {
 
 TESTS="$TESTS t_interrupted_after_swap_rerun_finishes"
 t_interrupted_after_swap_rerun_finishes() {
-	# An interrupt right after the swap's second rename: the new lib is in place and nothing after it
-	# was done. A sidecar for its rev is already present (a .deb install's `eitri setup` can have
-	# built it, and the install builds it before the swap), so the re-run once said "up to date"
-	# and left the install without a launcher, desktop entry or licences for good.
+	# An interrupt just after the swap's second rename leaves the new lib in place, before completion.
+	# A sidecar may already exist (from a .deb setup or the pre-swap build), so its presence alone must
+	# not make a re-run report up to date with no launcher, desktop entry or licences.
 	plant_sidecar aaaaaaa
 	serve 1.0.0
 	inst_net --stubs "$S/stubs-mvafterswap" --
@@ -401,12 +390,9 @@ t_interrupted_after_swap_rerun_finishes() {
 
 TESTS="$TESTS t_interrupted_upgrade_stale_old_files_not_up_to_date"
 t_interrupted_upgrade_stale_old_files_not_up_to_date() {
-	# Unlike a *first* install (the row above, where there is no old launcher/
-	# desktop/licences to begin with), an *upgrade* interrupted in the same spot -- right after the
-	# swap, before commit_files does anything -- leaves a complete OLDER install's launcher, desktop
-	# entry and licence files sitting there untouched. Every existence check install_complete made
-	# passed against them anyway, even though $NV_LIB now holds the NEW version, so the re-run said
-	# "up to date" and the stale SOURCE (naming the wrong release) was never replaced.
+	# An upgrade interrupted after the swap but before commit_files leaves the older install's
+	# launcher, desktop entry and licences in place. Existence checks alone cannot mark the new lib
+	# complete: a re-run must replace those files, including SOURCE naming the wrong release.
 	serve 1.0.0 1.1.0
 	inst_net
 	expect_rc 0

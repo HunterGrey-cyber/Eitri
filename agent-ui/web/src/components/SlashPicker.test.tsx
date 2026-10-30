@@ -147,9 +147,8 @@ describe("SlashPicker", () => {
     expect(mock).toHaveBeenCalled();
   });
 
-  /** A GTK focus round trip, `arrive` or a HINT landing used to
-   *  hand the keys to the container root instead of an open picker, since `App.tsx`'s `takeKeys`
-   *  had no branch for it -- mirrors `Chooser.test.tsx`'s identical `focusRequest` coverage. */
+  /** A GTK focus round trip, arrive or HINT landing must refocus the open picker rather than
+   *  its container root; mirrors Chooser.test.tsx's focusRequest coverage. */
   describe("focusRequest", () => {
     it("re-focuses the root after focus moved elsewhere", () => {
       const outside = document.createElement("button");

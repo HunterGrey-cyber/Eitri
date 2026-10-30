@@ -61,6 +61,10 @@ impl InputQueue {
         Self::default()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Input for the shell. `Some`: send it now, no paste is waiting. `None`: it waits behind one.
     pub(crate) fn submit(&mut self, input: PaneInput) -> Option<PaneInput> {
         if self.slots.is_empty() {
@@ -127,6 +131,22 @@ mod tests {
             text: text.to_string(),
             bracketed: true,
         }
+    }
+
+    #[test]
+    fn the_queue_is_empty_only_when_no_input_waits() {
+        let mut queue = InputQueue::new();
+        assert!(queue.is_empty());
+        let ticket = queue.begin_paste();
+        assert!(!queue.is_empty());
+        assert_eq!(queue.submit(typed("x").into()), None);
+        assert!(!queue.is_empty());
+        assert_eq!(queue.finish(ticket, None), Some(vec![typed("x").into()]));
+        assert!(queue.is_empty());
+        queue.begin_paste();
+        assert!(!queue.is_empty());
+        queue.clear();
+        assert!(queue.is_empty());
     }
 
     #[test]

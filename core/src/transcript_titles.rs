@@ -3,9 +3,9 @@
 //!
 //! The resume picker, the chooser and `hello` show each Claude record's newest `ai-title`. Reading it is a
 //! `stat`, an `open` and a 64 KiB tail read per row: about a millisecond for a picker cold, several on a
-//! network file system, and it ran on the loop that draws the editor. Now [`TitleCache::apply`] only
+//! network file system. [`TitleCache::apply`] only
 //! answers from memory -- the title read last time, or, for a transcript not read yet, the row's own
-//! title from Eitri's record (its first prompt, what a row without an `ai-title` always showed) -- and
+//! title from Eitri's record (its first prompt, also used when there is no `ai-title`) -- and
 //! asks the worker to look again. The worker reads a transcript again only when its size or time
 //! changed, and when a title it found differs from what memory held it raises the window's wake and
 //! says so ([`TitleCache::take_changed`]); the window then sends `hello` again with the new title. So a
@@ -262,7 +262,7 @@ mod tests {
     }
 
     /// What the window's thread spends titling sixteen rows whose transcripts are 1 MB each: reading them
-    /// itself, as the greeting did, or answering from the cache. For a measurement run by hand
+    /// itself or answering from the cache. For a measurement run by hand
     /// (`--release --ignored --nocapture`).
     #[test]
     #[ignore]

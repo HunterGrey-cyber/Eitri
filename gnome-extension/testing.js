@@ -43,7 +43,7 @@ export function install(service) {
         if (!window || width <= 0 || height <= 0)
             return false;
         try {
-            // Mutter 49 dropped the flags argument.
+            // Mutter 49 takes no flags argument.
             window.unmaximize();
         } catch (e) {
             try {

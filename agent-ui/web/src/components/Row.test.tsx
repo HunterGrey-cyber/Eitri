@@ -99,19 +99,15 @@ describe("Row", () => {
     expect(container.querySelector("pre")!.textContent).toBe("an unrecognised failure");
   });
 
-  /* The invariant, enforced over the SOURCE rather than over one render: no file may write a row's
-     glyph by hand again. `data-sign` and `.row-sign` are the two readings that must agree, and the
-     only way they can disagree is a second place that writes them -- so the guard is "there is no
-     second place", checked across every component. Without this, the five hand-written copies
-     could come back one at a time and every render test would still pass. */
+  /* Only Row may write the sign glyph. Deriving data and visible text from one argument keeps
+     them in agreement; a second writer could drift while render tests still pass. */
   it("is the only module that writes a row's sign", () => {
     const sources = import.meta.glob("../**/*.tsx", { query: "?raw", import: "default", eager: true }) as Record<
       string,
       string
     >;
     const product = Object.entries(sources).filter(([path]) => !path.includes(".test."));
-    // A glob that silently matched nothing would make the assertion below vacuous. Every component
-    // that renders a row must be in here: App and the four that used to write one by hand.
+    // A glob matching nothing would pass vacuously. Check that every row-rendering component is included.
     for (const name of ["App.tsx", "MessageList.tsx", "EmptyTab.tsx", "TerminalHandoff.tsx", "Row.tsx"]) {
       expect(product.some(([path]) => path.endsWith(`/${name}`)), `${name} not covered`).toBe(true);
     }

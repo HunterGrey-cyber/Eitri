@@ -1,11 +1,11 @@
 //! The pane-switch *protocol*: the private directory, the fake-`tmux` symlink, the socket the shim
-//! writes one direction letter to, and the parser that reads it -- plus, since 2026-09-26, a
-//! second message on the same socket: `Q <generation>`, sent by
+//! writes one direction letter to, and the parser that reads it. A second message on that socket,
+//! `Q <generation>`, is sent by
 //! [`crate::layout::kill::editor_quit_lua`] when a `:confirm qall` it asked nvim for is cancelled.
 //! Toolkit-free.
 //!
-//! Since v1 the same directory also holds
-//! `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l` a way out of the editor
+//! The same directory holds `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l`
+//! a way out of the editor
 //! when vim-tmux-navigator is absent, from Visual mode, and (`Ctrl+l` only) from Insert
 //! mode, writing the same letters to the same socket as the shim. It lives here because leaving can
 //! only work where the socket does.
@@ -85,13 +85,13 @@ const MAX_PENDING_CONNECTIONS: usize = 64;
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
 ///
-/// Terse on purpose (2026-09-17). It was `neovibe-pane-switch-`, which with a hyphenated
-/// uuid and a `switch.sock` inside came to 124 bytes under macOS's 49-byte `TMPDIR` -- 21 over the
-/// 103-byte limit [`agent::socket_path::MAX_SOCKET_PATH_BYTES`] enforces, so this socket could not
-/// be bound on macOS at all. See `SWEPT_NAMES` for what becomes of the old directories.
+/// Short names and a compact uuid keep the path within macOS's 103-byte limit
+/// ([`agent::socket_path::MAX_SOCKET_PATH_BYTES`]) under a 49-byte `TMPDIR`. The longer
+/// `neovibe-pane-switch-` prefix, hyphenated uuid and `switch.sock` total 124 bytes, 21 over.
+/// `SWEPT_NAMES` retains the names needed to reclaim those directories.
 pub(crate) const DIR_PREFIX: &str = "nv-ps-";
 
-/// The socket file inside that directory. `switch.sock` before 2026-09-17; see [`DIR_PREFIX`].
+/// The socket file inside that directory; kept short for the path budget described by [`DIR_PREFIX`].
 const SOCKET_NAME: &str = "s.sock";
 
 /// Every `(directory prefix, socket file)` pair this module has ever used, current first.
@@ -126,10 +126,9 @@ pub(crate) const NAV_LOADER_CMD: &str =
 ///
 /// Both `Drop` and the explicit [`PaneSwitchChannel::cleanup`] remove that whole directory, but
 /// **neither is guaranteed to run**, so this type does not promise that nothing is left behind. In
-/// `shell` the value lives inside the window's `close-request` closure, which GTK was observed not
-/// to free before the process exits (see [`PaneSwitchChannel::cleanup`]'s own doc for that finding,
-/// and why the close handler calls it explicitly), and no destructor runs at all on SIGKILL or a
-/// hard crash. What survives such an exit is a dead symlink and a dead socket under `TMPDIR`;
+/// `shell` the value lives inside the window's `close-request` closure, which GTK does not
+/// deterministically free before process exit, so the close handler calls cleanup explicitly.
+/// No destructor runs on SIGKILL or a hard crash; the dead symlink and socket survive under `TMPDIR`.
 /// [`sweep_stale_dirs`] is what reclaims them on a later launch.
 pub struct PaneSwitchChannel {
     dir: PathBuf,
@@ -143,8 +142,7 @@ pub struct PaneSwitchChannel {
     shim: bool,
 }
 
-/// Reclaims directories this module's earlier, now-dead processes left behind, under both the
-/// current and the older (before 2026-09-17) names.
+/// Reclaims directories dead processes left behind, under both current and legacy names.
 ///
 /// Separate from [`PaneSwitchChannel::bind`] so a host can run it even on a path that is about to
 /// give up (`shell` cannot bind without its shim binary, and still owes the sweep).
@@ -342,16 +340,12 @@ impl PaneSwitchChannel {
     /// that child down anyway, and a missing `tmux` only means the plugin's `system()` call finds
     /// nothing to run.
     ///
-    /// **This exists because `Drop` alone was observed not to be enough.** In the sandbox, closing
-    /// the real `shell` window left the shim directory behind every time: the channel is owned by
-    /// the window's `close-request` closure, and GTK does not deterministically free
-    /// signal-handler closures before the process exits, so its `Drop` never ran. That matters
-    /// more now than it did: a uuid-keyed directory is never reused, so a skipped cleanup leaks
-    /// rather than being overwritten by the next run at the same pid. [`sweep_stale_dirs`]
-    /// reclaims such a directory at the *next* launch, which is a backstop for the paths no
-    /// destructor can reach (SIGKILL, a hard crash) -- not a reason to skip this call, which is
-    /// what keeps a normal close from leaving anything behind at all. `Drop` is kept below for
-    /// every other path (an early failure, a future caller that owns this on the stack).
+    /// GTK does not deterministically free the window's `close-request` signal closure before
+    /// process exit, so `Drop` alone can leave the directory behind on a normal close. The
+    /// uuid-keyed directory is never reused: skipping cleanup leaks it. [`sweep_stale_dirs`]
+    /// reclaims survivors at the next launch, including those left by SIGKILL or a hard crash;
+    /// that backstop does not replace cleanup on a normal close. `Drop` also handles early
+    /// failures and callers that own the channel on the stack.
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -394,19 +388,12 @@ pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
 /// Reads [`PaneMessage`]s off a pane-switch socket without ever blocking the caller on a slow or
 /// trickling sender (the theme feed reads its socket the same way). Construct once per channel and
 /// retain across polls -- a fresh reader
-/// per call loses every partial connection's buffered bytes and reintroduces the bug below.
+/// per call loses partial connections' buffered bytes.
 ///
-/// **Before this:** each accepted connection was read with a blocking `read_line` under a
-/// per-connection `SO_RCVTIMEO`. That timeout is only ever consulted between two reads that each
-/// return *something*; a sender trickling its line in slowly (one byte at a time, well under the
-/// timeout) resets the clock on every successful partial read and holds the caller -- and the GTK
-/// main loop it runs on -- for the whole trickle rather than for the stated timeout. Measured at
-/// **3.2x the stated bound** for this module specifically -- 160.8ms against a 50ms `READ_TIMEOUT`
-/// (an "18x" figure is the *theme feed's* own measurement on its 100ms timeout, a different module)
-/// -- and reproduced again against this module's own old `accept_pending_messages` before the
-/// change landed -- see `a_trickled_message_never_holds_one_poll_past_its_budget`'s own doc.
-/// `poll` never blocks on a read: every read is non-blocking, and an incomplete connection is kept
-/// (not waited on) for the next call.
+/// A blocking `read_line` with `SO_RCVTIMEO` can hold the GTK loop for a whole trickled line:
+/// each successful partial read resets the timeout. Measured here at 3.2x the stated bound,
+/// 160.8 ms against a 50 ms timeout (the theme feed's separate measurement is 18x on 100 ms).
+/// `poll` instead keeps incomplete connections for the next call and never waits on a read.
 ///
 /// **Delivers every message in accept order, and never lets a newer connection's message overtake
 /// an older, still-incomplete one.** [`crate::line_feed::NewestLineReader`] is not reused here for
@@ -420,13 +407,11 @@ pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
 ///
 /// **Each accepted stream is made non-blocking explicitly.** `listener` is already non-blocking
 /// (the host polls it from a main loop that must not stall), and Linux does *not* carry that flag
-/// onto the fd `accept()` returns -- an accepted stream defaults to blocking there unless this is
-/// done, which would silently reintroduce the same hang this type exists to remove. (macOS copies
-/// the listener's flag instead, `rust-lang/rust#67027`, so it needed the opposite explicit call
-/// under the old blocking-read design.) A stream whose mode cannot be set is skipped, and one that grows past
-/// [`MAX_MESSAGE_BYTES`] is dropped with a log rather than retained without bound -- like the old
-/// code, this channel has nothing to fail closed *to*: a dropped message costs one focus switch or
-/// one stuck kill flag the user can retry, not a security boundary.
+/// onto the fd `accept()` returns; leaving it blocking can hang a read. macOS copies the listener's
+/// flag (`rust-lang/rust#67027`). A stream
+/// whose mode cannot be set is skipped; one that grows past [`MAX_MESSAGE_BYTES`] is dropped
+/// with a log. A dropped message costs one focus switch or one stuck kill flag the user can retry,
+/// not a security boundary.
 pub struct PaneSwitchReader {
     listener: UnixListener,
     pending: VecDeque<PendingConnection>,
@@ -545,28 +530,15 @@ impl PaneSwitchReader {
             }
         }
 
-        // Staleness eviction is merged into the read loop below rather than
-        // run as its own pass beforehand. The earlier two-pass shape evicted every stale connection
-        // at the *front* before ever attempting a read on any of them -- so a silent connection and
-        // a connection whose complete message was already sitting unread, accepted in the same poll
-        // (sharing one `accepted_at`), both aged out together: the sweep dropped the silent one,
-        // found the next front equally stale, and dropped that one too without ever calling
-        // `read_available` on it, discarding an already-complete message. Reading it here, in the
-        // same pass that decides staleness, means a front that is old enough to evict is still tried
-        // once first -- if that read turns out `Complete`, the message is delivered instead of lost;
-        // only a front that is *still* `Pending` after that read is the "never completed a message"
-        // case the eviction log line describes.
+        // Read the front before judging its age: a complete message must survive even when it
+        // shares accepted_at with a silent connection that just aged out. Only a front still
+        // Pending after the read can be evicted as never having completed a message.
         //
-        // The time budget starts *here*, on the real clock, and is checked
-        // after each read rather than before the first one. It used to be `now + MAX_POLL_DURATION`
-        // checked at the top of this loop, which (a) charged the accept loop above -- already bounded
-        // on its own by `MAX_ACCEPTS_PER_POLL` -- against the read budget, and (b) let a poll that had
-        // been preempted for 5ms before reaching this line return nothing at all, however complete its
-        // front message was. `now` is still the clock for *ageing* (tests move it forward to age a
-        // connection), but it is the wrong clock for a wall-clock budget: a `now` in the future
-        // disabled the budget and one in the past exhausted it before any work. Every poll now
-        // reads its front connection at least once, so each makes progress; the loop stays bounded,
-        // since every pass either removes the front connection or stops.
+        // Start the read budget on the real clock here, after the independently bounded accept
+        // loop, and check it after each read so even a preempted poll makes progress once.
+        // `now` ages connections in tests; using it for the work budget would disable that bound
+        // for a future time or exhaust it before work for a past time. Each pass removes the
+        // front or stops, keeping the loop bounded.
         let mut budget = MAX_READ_BYTES_PER_POLL;
         let deadline = Instant::now() + self.read_time_budget;
         let mut messages = Vec::new();
@@ -1067,8 +1039,8 @@ mod tests {
         assert!(empty.is_empty(), "nothing written yet");
         let elapsed = before.elapsed();
         // A blocking accepted stream would hold this poll until poll_within's 2 s cap, so the bound only has to
-        // tell "returned at once" from "blocked". 20 ms was tripped by scheduler delay alone on a loaded host
-        // (28.75 ms at a load average of ~20 on 18 cores, 2026-09-29); 500 ms keeps the whole margin to 2 s.
+        // distinguish an immediate return from a block. Scheduler delay alone can exceed 20 ms
+        // (measured 28.75 ms at load ~20 on 18 cores); 500 ms keeps the margin to the 2 s cap.
         assert!(
             elapsed < Duration::from_millis(500),
             "poll blocked for {elapsed:?} on an accepted, silent connection"
@@ -1284,8 +1256,7 @@ mod tests {
     /// Update the number deliberately; do not relax the assertion.
     #[test]
     fn the_switch_socket_path_is_exactly_100_bytes_at_the_macos_worst_case() {
-        // `/var/folders/<2>/<28>/T/` -- this project's Mac mini, measured 2026-09-17. Every macOS
-        // user's per-user temp dir has that shape, so this is the real worst case there.
+        // `/var/folders/<2>/<28>/T/`: the measured macOS per-user temp-directory shape, 49 bytes.
         let macos_tmp = Path::new("/var/folders/33/0tqfpnyn4z3c049gljzppdv00000gn/T/");
         assert_eq!(macos_tmp.as_os_str().len(), 49);
         // A synthetic 5-digit pid rather than this process's own: macOS's `PID_MAX` is 99999, so

@@ -1740,6 +1740,10 @@ impl AgentProvider for ClaudeSidecarProvider {
     fn event_signal(&self) -> Option<Arc<crate::provider::EventSignal>> {
         Some(Arc::clone(&self.events.signal))
     }
+    #[cfg(target_os = "linux")]
+    fn mover(&self) -> Option<&dyn crate::chat_mover::ChatMover> {
+        Some(self)
+    }
 }
 
 /// The events received off the wire and not yet taken by `pump`, with the signal that says so.

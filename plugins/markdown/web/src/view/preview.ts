@@ -8,7 +8,9 @@ import { ScrollGuard } from "./anchor";
 import { clickedRecently, lineAt, pickBlock } from "./current";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
-import { createThrottle, leader, lineToY, OwnTokens, REVEAL_THROTTLE_MS, yToLine, type Leader } from "./sync";
+import {
+  createThrottle, leader, lineToY, OwnTokens, REVEAL_THROTTLE_MS, scrollTarget, yToLine, type Leader,
+} from "./sync";
 import { applyUpdate } from "./update";
 
 /** Why the listeners of `afterUpdate` are called: what depends on the rendered text (the kit's find) waits for
@@ -256,6 +258,23 @@ export class Preview {
   }
 
   index(): Box[] { return (this.cached ??= buildIndex(measure(this.root, window.scrollY))); }
+  /**
+   * The source line at the top (zero-based, fractional), what a page that replaces this one is given to show: the
+   * line last placed there, while the page still shows it, else the line read at the scroll offset. Read back from
+   * the offset each time, the line would lose the part of a pixel the browser drops from the offset, and a line
+   * carried between two windows of different widths would lose it again at every move.
+   */
+  readingLine(): number {
+    if (this.anchor !== null && Math.abs(this.offsetFor(this.anchor) - window.scrollY) < 1) return this.anchor;
+    return yToLine(this.index(), window.scrollY);
+  }
+  /** Shows source line `L` at the top as the line placed there, as a page restoring its predecessor's line does:
+   *  while nvim leads it is also the target until nvim's next view. */
+  showLine(L: number): void {
+    if (this.lead() === "editor") this.target = L;
+    this.anchor = L;
+    this.scrollToLine(L);
+  }
   lines(): string[] { return this.rendered?.lines ?? []; }
   followedBuf(): number | null { return this.view?.buf ?? this.rendered?.buf ?? null; }
   /** The buffer and file the page's blocks were rendered from. A view of another buffer arrives before its text, so
@@ -462,8 +481,8 @@ export class Preview {
   private leadChanged(was: Leader): void {
     const now = this.lead();
     if (was === now || this.rendered === null) return;
-    if (now === "editor") this.target = this.anchor ?? yToLine(this.index(), window.scrollY);
-    else if (was === "editor") this.anchor = yToLine(this.index(), window.scrollY);
+    if (now === "editor") this.target = this.readingLine();
+    else if (was === "editor") this.anchor = this.readingLine();
   }
 
   /* The page's own scrolls are instant (a smooth one would be read as the reader moving for its whole length) and
@@ -474,7 +493,7 @@ export class Preview {
     const index = this.index();
     if (index.length === 0) return null;
     const max = this.scrollMax();
-    let y = lineToY(index, L, max);
+    let y = scrollTarget(lineToY(index, L, max));
     if (keepCursor) y = this.keepCursorIn(index, y, max);
     if (Math.abs(y - window.scrollY) >= 1) { this.guard.arm(y); window.scrollTo({ top: y, behavior: INSTANT }); }
     this.traceTop();
@@ -502,6 +521,12 @@ export class Preview {
     if (bottom <= y) out = top - reserve;
     else if (bottom > y + view - reserve) out = bottom - view + reserve;
     return clamp(out, 0, max);
+  }
+
+  /* The scroll offset that shows line `L` at the top, within the range the page can scroll. */
+  private offsetFor(L: number): number {
+    const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    return scrollTarget(lineToY(this.index(), L, max));
   }
 
   private traceTop(): void {

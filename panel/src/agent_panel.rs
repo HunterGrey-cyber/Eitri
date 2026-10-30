@@ -34,12 +34,15 @@
 //! state's fields stay private to the panel and every module reads them: the handle (`handle.rs`), the
 //! tick, the pages and what goes to which (`pages.rs`, `routing.rs`), a message's admission and its arms
 //! (`admission.rs`, `inbound.rs`, `verbs.rs`), starts and the trust question (`starts.rs`, `trust.rs`),
-//! the restore, a tab leaving with its session (`handoffs.rs`), teardown, turn review's side
+//! the restore, a tab leaving with its session (`handoffs.rs`) or moving to the other window (`chat_moves.rs`),
+//! teardown, turn review's side
 //! (`review_glue.rs`), the chooser and detail rows (`detail.rs`), and links. A scan of the panel's code
 //! reads every one of them.
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "chat_moves.rs"]
+mod chat_moves;
 #[path = "detail.rs"]
 mod detail;
 #[path = "handle.rs"]
@@ -104,6 +107,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 
 use admission::*;
+pub use chat_moves::ChatMoveEvent;
 use detail::*;
 pub use handle::{AgentPanelHandle, PanelInit, SupervisorLink};
 pub use handoffs::PanelTabHandoff;
@@ -181,8 +185,8 @@ struct AgentPanelState {
     /// Ticks that ran (past the close check), for a test counting how often an idle panel wakes.
     #[cfg(any(test, feature = "test-support"))]
     ticks_run: u64,
-    /// The panel's current theme. Starts on `ThemeTokens::fallback()` and is replaced by
-    /// `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
+    /// The panel's current theme. Starts on the theme its parts carry (the start set the host read)
+    /// and is replaced by `AgentPanelHandle::set_theme`. Held as tokens rather than an envelope because it feeds three
     /// things: the `ready` batch, the `<style>` inlined into every `load_html`, and the WebView's
     /// own background colour.
     theme: eitri_core::theme::ThemeTokens,
@@ -236,6 +240,9 @@ struct AgentPanelState {
     /// own changes, with the window's value before and after and the views handed a card: each chat
     /// chip's `⚑N`, the toast, `on_permission`.
     attention_hook: Option<AttentionHook>,
+    /// Running or queued work changed in these views; called after the step releases its state.
+    busy_hook: Option<Rc<dyn Fn(&[(ViewId, bool)])>>,
+    reported_activity: Vec<(ViewId, eitri_core::tab_set::ViewActivity)>,
     /// Every tab's attention as the hook was last told it (`report_attention`).
     reported_tabs: Vec<eitri_core::tabs::TabAttention>,
     /// The per-window scratch directory, `None` if it could not be made.
@@ -336,6 +343,14 @@ struct AgentPanelState {
     restore_source: Option<SavedTabs>,
     /// `agent.restore`, as `init.lua` left it (applied once, after it ran).
     restore_policy: RestorePolicy,
+    /// The saved tabs the window offers, as last given after `init.lua` ran; `None` until then.
+    tab_files: Option<eitri_core::saved_tabs::TabFiles>,
+    /// Window 1 starting window 2 again at its launch: `agent.restore = "auto"` waits until window 2 is back or
+    /// is not, so the saved tabs of a window 2 that does not come back return in the same restore as this
+    /// window's own (a restore fills only a window that has started nothing).
+    launch_restore_held: bool,
+    /// The base page was ready while the launch restore was held: it runs once the hold is let go.
+    launch_restore_owed: bool,
     /// Whether `init.lua` made bypass the default mode: the one user whose saved bypass tabs come
     /// back in bypass without being asked.
     bypass_by_config: bool,
@@ -360,6 +375,8 @@ struct AgentPanelState {
     trust: TrustGate,
     /// What starts a session's backend: the real connect workers, or a test's stand-in.
     spawner: Spawner,
+    /// Tabs moving to or from the other window of a linked pair (`chat_moves.rs`).
+    chat_moves: chat_moves::ChatMoves,
 }
 
 /// [`AgentPanelState::toast_hook`]: shows one line in the window's toast.
@@ -394,6 +411,7 @@ fn hold_window_presence(
 /// else starts the same in every panel and is set in one place, [`AgentPanelState::new`].
 struct StateParts {
     document: &'static PanelDocument,
+    theme: eitri_core::theme::ThemeTokens,
     host: Rc<dyn PanelHost>,
     trust: TrustGate,
     tabs: eitri_core::tab_set::TabSet,
@@ -422,6 +440,7 @@ impl AgentPanelState {
     fn new(parts: StateParts) -> Self {
         let StateParts {
             document,
+            theme,
             host,
             trust,
             mut tabs,
@@ -454,6 +473,7 @@ impl AgentPanelState {
             host,
             trust,
             spawner: Spawner::Real,
+            chat_moves: chat_moves::ChatMoves::default(),
             tabs,
             tab_memory,
             titles,
@@ -463,6 +483,9 @@ impl AgentPanelState {
             conversation_id,
             restore_source,
             restore_policy: RestorePolicy::Offer,
+            tab_files: None,
+            launch_restore_held: false,
+            launch_restore_owed: false,
             bypass_by_config: false,
             mode_remembered,
             default_agent: AgentId::Claude,
@@ -483,7 +506,7 @@ impl AgentPanelState {
             last_tick: None,
             #[cfg(any(test, feature = "test-support"))]
             ticks_run: 0,
-            theme: eitri_core::theme::ThemeTokens::fallback(),
+            theme,
             keymap_help: None,
             // The base view's record is there from the start: its page is the window's, attached or not.
             pages: BTreeMap::from([(ViewId::BASE, PageState::default())]),
@@ -501,6 +524,8 @@ impl AgentPanelState {
             answer_gate: None,
             coverage: None,
             attention_hook: None,
+            busy_hook: None,
+            reported_activity: Vec::new(),
             reported_tabs: Vec::new(),
             scratch,
             pending_edits: Vec::new(),
@@ -546,7 +571,8 @@ fn panel_state(
         scratch,
         backend_kind,
         document,
-        tab_files,
+        theme,
+        tab_role,
     } = init;
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
@@ -589,19 +615,16 @@ fn panel_state(
     };
     let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
     let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
-    let (restore_source, notes, takeovers) = tab_files.startup(tabs_dir.as_deref(), &project_dir);
-    for note in notes {
-        eprintln!("{note}");
-    }
     let trust = trust_gate_for(state_home.as_deref(), home.as_deref(), &canonical_root);
     AgentPanelState::new(StateParts {
         document,
+        theme,
         host,
         trust,
         tabs,
         editor_context,
         backend_kind,
-        tab_memory: tab_files.writer(tabs_dir, project_dir.clone(), takeovers),
+        tab_memory: eitri_core::saved_tabs::TabWriter::new_as(tabs_dir, project_dir.clone(), tab_role),
         conversation_id: agent::conversation_id_for_cwd(&canonical_root),
         project_dir,
         canonical_project_dir,
@@ -614,7 +637,8 @@ fn panel_state(
         history_writer,
         rules_dir,
         history,
-        restore_source,
+        // Given once `init.lua` has run: which saved tabs the window offers depends on it.
+        restore_source: None,
     })
 }
 
@@ -625,9 +649,11 @@ fn bare_state(
     document: &'static PanelDocument,
     host: Rc<dyn PanelHost>,
     tabs: eitri_core::tab_set::TabSet,
+    theme: eitri_core::theme::ThemeTokens,
 ) -> AgentPanelState {
     AgentPanelState::new(StateParts {
         document,
+        theme,
         host,
         // No worker and no disk: every start goes on untrusted, as for a root with nothing to
         // trust. A test about the question puts a real gate in its place.
@@ -694,6 +720,26 @@ mod tests {
                 scan::without(&code, &scan::modules(&code, "tests")) + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn the_panel_state_takes_its_theme_from_its_parts() {
+        use eitri_core::source_scan as scan;
+        let sources = panel_sources();
+        let code: String = production_code(&sources).split_whitespace().collect();
+        let at = code
+            .find("implAgentPanelState{")
+            .expect("the panel state implementation");
+        let body = scan::braced(&code, at + code[at..].find('{').unwrap());
+        assert_eq!(body.matches("fnnew(").count(), 1);
+        let at = body.find("fnnew(").unwrap();
+        let new = scan::braced(body, at + body[at..].find('{').unwrap());
+        assert!(!new.contains("ThemeTokens::fallback("));
+        let (_, state) = scan::function_in(&sources, "panel_state");
+        let state: String = state.split_whitespace().collect();
+        let at = state.find("letPanelInit{").expect("the panel inputs are destructured");
+        let inputs = scan::braced(&state, at + state[at..].find('{').unwrap());
+        assert!(!scan::word_ends(inputs, "theme").is_empty());
     }
 
     /// Source files for a scan's own test: `(path, text)` pairs.
@@ -775,6 +821,7 @@ mod tests {
     #[derive(Default)]
     pub(super) struct RecordingPage {
         pub(super) sent: RefCell<Vec<String>>,
+        pub(super) batches: RefCell<Vec<Vec<String>>>,
         pub(super) documents: RefCell<Vec<(String, String)>>,
         pub(super) backgrounds: RefCell<Vec<[u8; 3]>>,
         pub(super) visible: Cell<bool>,
@@ -783,6 +830,14 @@ mod tests {
     impl PageSurface for RecordingPage {
         fn send(&self, envelope_json: &str) {
             self.sent.borrow_mut().push(envelope_json.to_owned());
+        }
+        fn send_many(&self, envelopes: &[&str]) {
+            self.batches
+                .borrow_mut()
+                .push(envelopes.iter().map(|s| (*s).to_owned()).collect());
+            for envelope in envelopes {
+                self.send(envelope);
+            }
         }
         fn is_visible(&self) -> bool {
             self.visible.get()
@@ -822,12 +877,23 @@ mod tests {
     /// A handle over a recording page and a recording host. Not built through `AgentPanelHandle::new`,
     /// which would connect to (or start) the supervisor.
     pub(super) fn handle_with_recording_page() -> (AgentPanelHandle, Rc<RecordingPage>, Rc<RecordingHost>) {
-        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
-        let page = Rc::new(RecordingPage::default());
+        handle_with_recording_page_in_theme(eitri_core::theme::ThemeTokens::fallback())
+    }
+
+    pub(super) fn handle_with_recording_page_in_theme(
+        theme: eitri_core::theme::ThemeTokens,
+    ) -> (AgentPanelHandle, Rc<RecordingPage>, Rc<RecordingHost>) {
         let host = Rc::new(RecordingHost::default());
-        state.borrow_mut().host = host.clone() as Rc<dyn PanelHost>;
+        let mut state = bare_state(
+            &TEST_DOCUMENT,
+            host.clone(),
+            TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto),
+            theme,
+        );
+        state.spawner = spawn_nothing();
+        let page = Rc::new(RecordingPage::default());
         let handle = AgentPanelHandle::over(
-            state,
+            Rc::new(RefCell::new(state)),
             Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
         );
         (handle, page, host)
@@ -899,7 +965,12 @@ mod tests {
     /// and never touch the WebView, which lives on `AgentPanelHandle` and not on this struct --
     /// so no display is required to run them.
     pub(super) fn state_for_hooks(tabs: TabSet) -> Rc<RefCell<AgentPanelState>> {
-        let mut state = bare_state(&TEST_DOCUMENT, Rc::new(RecordingHost::default()), tabs);
+        let mut state = bare_state(
+            &TEST_DOCUMENT,
+            Rc::new(RecordingHost::default()),
+            tabs,
+            eitri_core::theme::ThemeTokens::fallback(),
+        );
         state.spawner = spawn_nothing();
         Rc::new(RefCell::new(state))
     }

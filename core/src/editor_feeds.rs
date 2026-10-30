@@ -1,8 +1,7 @@
 //! The editor's push sockets (theme, keys, editor context, pane switch, plugin follow) read from one place.
 //!
-//! Each feed used to be drained by a `glib` timer of its own in `shell`; the reading itself never
-//! needed a toolkit, only a clock. [`EditorFeeds::poll`] takes the time as an argument and decides
-//! which readers are due, so a host drives every feed from a single tick of whatever loop it has,
+//! Reading needs only a clock. [`EditorFeeds::poll`] takes the time as an argument and decides
+//! which readers are due, so a host drives every feed from a single tick of its loop,
 //! and a test drives it with times it makes up.
 //!
 //! A reader is added only when its consumer is ready: a socket nobody acts on yet is left unread,

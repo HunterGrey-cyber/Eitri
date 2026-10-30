@@ -10,7 +10,7 @@ import tokensRs from "../../../core/src/theme/tokens.rs?raw";
 // number lives in both languages, so this file holds them equal (see the typing-cadence test below).
 import panelCadenceRs from "../../../core/src/panel_cadence.rs?raw";
 import { NATURAL_METER_STEP_MS } from "./typingCadence";
-// The sideways guard below renders the panel's real `<pre>`s (the GUI pass, 2026-09-24).
+// The sideways guard renders the panel's real `<pre>`s.
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { renderToolCall } from "./toolRegistry";
@@ -25,15 +25,10 @@ import { Row } from "./components/Row";
 import { THINKING_PREVIEW_LINES } from "./components/MessageList";
 import type { ToolCallRecord } from "./types";
 
-/** Strip CSS comments, but never a `/*` that is inside a string.
- *
- *  A bypass can sit UPSTREAM of every scan in this
- *  file rather than inside any one guard: with a plain regex, a `content` string holding an
- *  opening comment marker and a later one holding a closing marker delete everything between
- *  them -- real rules included -- before a guard ever sees the text, and the braces stay balanced
- *  so `splitRules`' own throw does not fire. `splitRules` was already rewritten to treat a brace
- *  inside a string as literal text; this is that same awareness one step earlier, where the input
- *  to all of it is produced. */
+/** Strip CSS comments while preserving markers inside strings. A regex can treat two `content`
+ *  values as a comment pair and delete real rules between them while leaving balanced braces,
+ *  hiding those rules from every guard downstream. Quote awareness is needed here as well as
+ *  in `splitRules`, before any rule is scanned. */
 function stripComments(sheet: string): string {
   let out = "";
   let quote: string | null = null;
@@ -77,18 +72,12 @@ function everyBranchIsOnSurface(selector: string, branch: RegExp): boolean {
 }
 
 const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
-/** A selector branch that sits inside the winbar, the status line or the status band -- `.winbar`,
- *  `.status-line`, `.status-band`, or one of them as an ancestor (`.winbar .identities`,
- *  `.status-band .band-open`, ...). The band joined 2026-10-16, when it took the editor's statusline
- *  fill (`--nv-chrome`) so the two read as one line across the divider. */
+/** A branch inside the winbar, status line or status band, including their descendants.
+ *  The band uses the editor's statusline fill (`--nv-chrome`) to continue it across the divider. */
 const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line|status-band)\b/;
-/** The solid cursor block: the current row's sign cell, a focused button with its children (every
- *  control is keyboard-reachable and the selected one is drawn as the cursor), the band's own
- *  `↓N` button,
- *  the chooser's current row's sign cell, and CARET's own
- *  one-character block (the same reversed body pair, only on
- *  the selection it paints itself), and a permission card's primary button (2026-10-13: the chat page's
- *  card fills its first answer with the same reversed pair). Nothing else. */
+/** The solid cursor block: the current row's sign cell, a focused button and its children,
+ *  the band's `↓N` button, the chooser's current sign cell, CARET's one-character selection,
+ *  and a permission card's primary answer. Each uses the body's reversed pair. Nothing else. */
 const CURSOR_BRANCH =
   /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign|\.message-list\[data-visual="caret"\] ::selection|\.permission-card-buttons button:first-child)$/;
 /** A selection fill WebKit paints as given: one `--nv-*` token at 99% opacity. 99%, not 100%: WebKit
@@ -104,18 +93,15 @@ const WK_KEY_BRANCH = /(?:^|[\s.])wk-key$/;
  *  attribute selector, narrowed so it cannot widen to `.band-mode`/`.mode-pill`/anything else the
  *  glyph sits beside. */
 const MODE_GLYPH_BRANCH = /(?:^|[\s.])mode-glyph(?:\[data-mode-name="[a-z]+"\])?$/;
-/** The status band's mode block (2026-10-15), drawn in the editor's own statusline colours: a branch that is
- *  exactly `.band-mode`, optionally narrowed by `[data-mode="..."]`. Its text may be a `--nv-status-*-fg`
- *  only where the same rule paints that mode's `--nv-status-*-bg` -- the pair nvim's lualine draws, which is
- *  deliberately unguarded for the reason `--nv-syn-*` is: it is the editor's own colour. */
+/** The status band's mode block, drawn in the editor's own statusline colours: exactly
+ *  `.band-mode`, optionally narrowed by `[data-mode="..."]`. Its text may use a `--nv-status-*-fg`
+ *  only where the same rule paints that mode's `--nv-status-*-bg`. Like syntax colours, this pair
+ *  is deliberately unguarded because it is the editor's own colour. */
 const BAND_MODE_BRANCH = /^\.band-mode(?:\[data-mode="[a-z]+"\])?$/;
-/** Glyphs that carry a state in a signal colour (2026-10-13, the chat page): each selector exactly, with
- *  the one colour it may take. A glyph is not text, so the threshold that applies is the non-text one
- *  (3:1, WCAG 1.4.11): `--nv-ok`/`--nv-error` are guarded at 3:1 against `bg`, and `--nv-chrome-accent`
- *  -- the accent the activity line's bar meter was filled with before the star replaced it -- is guarded
- *  at 3:1 against both `chrome` and `bg` (`tokens.rs`; until 2026-10-13 against
- *  `chrome` alone, which on lunaperche left it black on a black `bg`). The numbers beside the edit signs
- *  stay in the head's ink, and a diff line's text stays in its own ink beside the colour of its `+`/`-`. */
+/** State glyphs, each with exactly one signal colour. Their non-text threshold is 3:1
+ *  (WCAG 1.4.11): `--nv-ok`/`--nv-error` are guarded against `bg`, and `--nv-chrome-accent`
+ *  against both `chrome` and `bg` so it stays visible on either. The numbers beside edit signs
+ *  keep the head's ink; a diff line keeps its own text ink beside its coloured `+`/`-`. */
 const GLYPH_COLOURS: Record<string, string> = {
   ".activity-glyph": "--nv-chrome-accent",
   '.row-tool[data-sign="◐"]::before': "--nv-chrome-accent",
@@ -127,18 +113,14 @@ const GLYPH_COLOURS: Record<string, string> = {
   ".permission-card .diff-added .diff-gutter": "--nv-ok",
   ".permission-card .diff-removed .diff-gutter": "--nv-error",
 };
-/** A selector branch inside one of the boxes painted `--nv-surface` (sw-theme-2): the which-key box,
- *  a permission card's edit head, the terminal handoff's command, a fenced code block, a tool's output box
- *  and a table's head (since 2026-10-14 a tool line, an output, a table's head and a permission card are not
- *  surface-painted, but their names stay matched). Where the
- *  text under such a selector actually lands is proven by rendering, in "text on a --nv-surface
- *  fill" at the bottom of this file; this only keeps the surface pair from being declared anywhere
- *  else. */
+/** Branches allowed to declare the surface pair: which-key, edit heads, handoff commands,
+ *  fenced code, tool output and table heads. Matching a name does not establish its actual fill;
+ *  the rendered-element checks below verify the nearest fill behind the text. */
 const SURFACE_BRANCH =
   /(?:^|[\s.])(?:which-key-box|tool-card(?:-[a-z]+)?|permission-card(?:-[a-z-]+)?|handoff-command|code-block|tool-result-(?:preview|body)|table-scroll th)\b/;
-/** The three tinted fills (2026-10-13), each with the one pair `tokens.rs` guards against
- *  it, and the selector branches that sit on it: your own tint (`--nv-tint`: your message, the composer
- *  and what is in it, an inline code span in a reply), a permission card's warn tint, and a failure's
+/** The three tinted fills, each with the one pair `tokens.rs` guards against
+ *  it, and the selector branches that sit on it: your own tint (`--nv-tint`: your message and an
+ *  inline code span in a reply), a permission card's warn tint, and a failure's
  *  error tint (a failed call's output, the lost-session card in the foot). As with `SURFACE_BRANCH`, where
  *  the text really lands is proven by rendering ("text on a tinted fill", at the bottom of this file);
  *  this keeps each pair from being declared anywhere else. */
@@ -168,9 +150,10 @@ const TINT_BRANCHES: { pair: RegExp; branch: RegExp }[] = [
  * non-guarantee applies more narrowly to `--nv-syn-keyword` on exactly
  * the which-key box's own `.wk-key` glyph.
  *
- * Returns every `color:` declaration in `source` that is NOT one of the three sanctioned pairings
- * above. Shared by the real guard test and the tests proving none of the three exemptions can
- * quietly widen -- on purpose. Before this was hoisted, each test carried its own copy of this
+ * Returns every `color:` declaration in `source` that none of the pairings this function admits
+ * allows: the three above, and the surface, tint, cursor, hint, keycap, mode-glyph, band-mode and
+ * glyph pairs its body names. Shared by the real guard test and the tests proving none of the
+ * exemptions can quietly widen -- on purpose. Before this was hoisted, each test carried its own copy of this
  * logic over its own string literal, so a change to the real guard (say, widening a regex to admit
  * more than intended) had no effect on the proof tests' copies at all. Calling the same function
  * from all of them closes that: a widened regex here is exercised by, and must still satisfy,
@@ -205,8 +188,8 @@ function unguardedTextColorDeclarations(source: string): string[] {
     for (const declaration of body.match(/(?<![a-z-])color:[^;]*;/g) ?? []) {
       if (onHljsSurface && /^color: var\(--nv-syn-[a-z]+\);$/.test(declaration)) continue;
       if (onChromeSurface && /^color: var\(--nv-chrome-(fg|muted)\);$/.test(declaration)) continue;
-      // Text on a card: `--nv-surface-fg`/`--nv-surface-muted`, guarded against `surface` in Rust
-      // (sw-theme-2), and only inside the boxes that paint it.
+      // Text on a card uses the surface pair, guarded against `surface` in Rust,
+      // and only inside the boxes that paint it.
       if (onCardSurface && /^color: var\(--nv-surface-(fg|muted)\);$/.test(declaration)) continue;
       // Text on a tint: that tint's own pair, guarded against it in Rust, and only on its own branches.
       if (tintPairs.some((pair) => pair.test(declaration))) continue;
@@ -236,22 +219,10 @@ function unguardedTextColorDeclarations(source: string): string[] {
   return declarations;
 }
 
-/** Every top-level `--custom-property: value;` declared inside a `:root { ... }` block, name (with
- *  its leading `--`) to raw declared-value TEXT. This is the one piece of `var()` this suite is
- *  allowed to resolve, and it is resolved from the stylesheet's own source rather than from
- *  anything jsdom computed: jsdom's `getComputedStyle` never substitutes `var()` at all (see the
- *  panel-width block below for the measurement that proves it), so `expandVars` below has to look
- *  the tokens up itself. A flat regex is enough because these declarations are not nested (the
- *  "contains no nested blocks today" test above is what keeps that assumption checked).
- *
- *  The `s` (dotAll) flag is needed on the per-declaration regex because a
- *  declaration's VALUE may span multiple lines:
- *  `--bypass: calc(\n  100cqw\n  );`, exactly the shape `index.css`'s own real `margin-left: clamp(
- *  ...)` already uses across five lines for an ordinary property -- has a `\n` between the `:` and
- *  the terminating `;`, and `.` never matches `\n` without this flag, so `.+?` failed to match
- *  anything and the WHOLE declaration was silently dropped, token and all. That is a hole in this
- *  guard's own parsing, not an exotic input: reproduced directly by feeding it a real multi-line
- *  custom property and confirming it vanished from the returned map entirely. */
+/** Top-level `:root` custom properties, mapped to raw declared-value text. jsdom never
+ *  substitutes `var()`, so `expandVars` resolves these from the stylesheet itself. A flat regex
+ *  suffices because the no-nesting assertion pins that premise. The dotAll flag is essential:
+ *  a value such as `calc(\n 100cqw\n)` spans lines and must not disappear from the map. */
 function rootCustomProperties(sheet: string): Map<string, string> {
   const tokens = new Map<string, string>();
   for (const block of sheet.match(/:root\s*\{[^}]*\}/g) ?? []) {
@@ -283,7 +254,7 @@ function expandVars(expr: string, depth = 0): string {
 }
 
 /** Evaluates one `--fs-*` token's declared VALUE to a pixel number by doing the arithmetic, not by
- *  matching the fraction as text. The text scale is one number and five ratios of
+ *  matching the fraction as text. The text scale is one number and seven ratios of
  *  it. A string match on `"* 12 / 14"` cannot tell a correct ratio from a wrong one written with
  *  the same digits transposed, or from an equally-plausible different fraction landing on the same
  *  wrong pixel number by coincidence -- it only proves the FILE SAYS a particular fraction, never
@@ -320,9 +291,7 @@ function rulesMatching(sheet: string, needle: string): { selector: string; body:
   return matches;
 }
 
-/** Custom properties declared on exactly `.row` -- none since 2026-10-13, when `--row-inline-size` (the
- *  row's width, derived from the list's measured one) went with the escapes that spent it. Read from the
- *  stylesheet's own source, like `ROOT_TOKENS`, so a test can say there are none. */
+/** Custom properties declared on exactly `.row`, read from source so a test can require none. */
 function rowCustomProperties(sheet: string): Map<string, string> {
   const tokens = new Map<string, string>();
   for (const rule of splitRules(stripComments(sheet))) {
@@ -339,18 +308,11 @@ function rowCustomProperties(sheet: string): Map<string, string> {
  *  not to this one), and the selector of the block it sits inside (`null` at the top level). */
 type CssRule = { selector: string; declarations: string; parent: string | null };
 
-/** Split a stylesheet into blocks, brace-depth and quote aware.
- *
- *  Two things this does that a regex cannot. A nested block is emitted as its OWN rule and its
- *  text is removed from its parent's declarations, so neither can hide the other -- the parent's
- *  own declarations end at the last `;` before the child's prelude, which is where CSS itself
- *  requires them to end. And a `{`, `}` or `;` inside a quoted string is literal text, not
- *  structure. **Throws on unbalanced braces**, so a malformed file fails every test that reads it
- *  rather than quietly yielding truncated blocks.
- *
- *  Hoisted to module scope (previously local to the `describe("index.css", ...)` callback) so the
- *  cascade describe block below and `allCustomPropertyDeclarations` can reuse the very same parser
- *  instead of each keeping a second copy that could drift out of sync with it. */
+/** Split blocks with brace-depth and quote awareness. Nested blocks are emitted separately;
+ *  the parent's declarations end at the last `;` before a child's prelude, so neither can hide
+ *  the other. Braces and semicolons in strings are literal. Unbalanced braces throw rather than
+ *  yielding truncated blocks. Cascade checks and custom-property scans share this parser so
+ *  they cannot drift apart. */
 function splitRules(sheet: string): CssRule[] {
   const rules: CssRule[] = [];
   const open: { selector: string; parent: string | null; own: string }[] = [];
@@ -414,42 +376,19 @@ function sizeContainerDeclarations(sheet: string): { selector: string; declarati
   return out;
 }
 
-/** Anything that MOVES: the `animation` and `transition` shorthands, every longhand of either,
- *  and a vendor-prefixed spelling of any of them. The leading lookbehind is what keeps
- *  `foo-animation:` (not a property) out while letting `-webkit-animation:` in through the
- *  prefix alternative. Matched against a rule's DECLARATIONS only: run over whole rule text it
- *  could be satisfied by a selector (a class literally named `.transition`, or a pseudo-class on
- *  one), which would make the guard pass for the wrong reason.
- *
- *  The `i` flag and the widened lookbehind handle uppercase declarations:
- *  CSS property names are ASCII case-insensitive (CSS Syntax L3), so `TRANSITION:`
- *  is live CSS that a case-sensitive matcher reads as nothing at all. Nobody writes it by
- *  hand -- it is closed because this guard's whole claim is a property of the FILE, and a
- *  property with a spelling that escapes it is not established. An ESCAPED ident is still
- *  NOT matched: decoding those needs a real tokenizer, and that limit is recorded in the
- *  control below so a passing scan does not overstate its coverage. */
+/** Motion declarations: animation and transition shorthands, longhands and vendor prefixes.
+ *  Search declarations only: selector names can contain the same words without causing motion.
+ *  The lookbehind rejects names such as `foo-animation`; matching is case-insensitive because
+ *  CSS property names are. Escaped identifiers need a real tokenizer and remain outside this
+ *  guard's coverage, as the control below records. */
 const MOTION_PROPERTY = /(?<![a-zA-Z-])(?:-webkit-|-moz-|-ms-|-o-)?(?:animation|transition)(?:-[a-z-]+)?\s*:/i;
 function movesSomething(rule: CssRule): boolean {
   return MOTION_PROPERTY.test(rule.declarations);
 }
 
-/** Every `--custom-property: value;` declaration ANYWHERE in the sheet, at any nesting depth --
- *  unlike `rootCustomProperties`/`ROOT_TOKENS` above, which is intentionally a regex over
- *  unqualified, TOP-LEVEL `:root { ... }` blocks only (that is genuinely what `expandVars` needs:
- *  the one scope a real browser resolves `var()` against for this file's own declarations).
- *
- *  A regex anchored on the literal text `:root\s*\{` cannot see a custom property declared inside
- *  `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --foo: ...; } }` --
- *  there is a `:not(...)` between `:root` and `{`, so the regex never matches the block at all,
- *  and a custom property declared there is invisible to every guard built on `ROOT_TOKENS`. This
- *  walks the real, brace/quote-aware parse instead, so it finds a declaration wherever CSS itself
- *  would let one be written -- nested under `@media`, scoped by `:not()`/`:is()`, or anywhere else
- *  -- which is what a guard that must hold "for every custom property in the file" actually needs.
- *
- *  Same `s` (dotAll) fix as `rootCustomProperties` above, for the same reason: a declaration whose
- *  value wraps across lines has a literal `\n` between the `:` and the `;`, which `.` does not match
- *  by default, so the whole declaration -- name, value, container-query unit and all -- was silently
- *  invisible to the WebKitGTK guard this function backs. */
+/** Custom-property declarations at any nesting depth. Unlike `ROOT_TOKENS`, this walks parsed
+ *  blocks, so a declaration under `@media` or on `:root:not(...)` cannot evade the scan through
+ *  selector spelling. DotAll keeps multiline values visible, including container-query units. */
 function allCustomPropertyDeclarations(sheet: string): { name: string; value: string; selector: string }[] {
   const out: { name: string; value: string; selector: string }[] = [];
   for (const rule of splitRules(stripComments(sheet))) {
@@ -461,22 +400,9 @@ function allCustomPropertyDeclarations(sheet: string): { name: string; value: st
   return out;
 }
 
-/** Every `CSSStyleRule` in the sheet **including the ones nested inside `@media`, `@supports` and
- *  `@layer`**, in document order.
- *
- *  Both CSSOM walkers below used to iterate `sheet.cssRules` flat and `continue` past anything that
- *  was not a `CSSStyleRule`, which made every rule inside a grouping rule invisible to them. A
- *  literal pill can escape both: `background` + `border-radius: 12px`
- *  + `width: fit-content` on the real `.row-prompt .row-body` -- wrapped in
- *  `@media (min-width: 1px) { ... }` passed the whole suite green, and so did an `@media` block
- *  cancelling the prompt rule's border, padding and colour at once. `index.css` already has one
- *  `@media` block of its own, so this was not a hypothetical shape.
- *
- *  Grouping rules are flattened UNCONDITIONALLY, without asking whether their condition matches.
- *  That is deliberate and it is the safe direction for a guard: a rule that draws a bubble only at
- *  some widths, or only under `prefers-reduced-motion`, still draws a bubble. A guard that asked
- *  jsdom to evaluate the condition would go quiet exactly where the stylesheet got more
- *  complicated. */
+/** Style rules in document order, including those inside `@media`, `@supports` and `@layer`.
+ *  Flatten grouping rules unconditionally: a forbidden shape at only some widths still counts.
+ *  Asking jsdom to evaluate conditions would hide those rules as the sheet grows more complex. */
 function allStyleRules(rules: CSSRuleList): CSSStyleRule[] {
   const out: CSSStyleRule[] = [];
   for (const rule of Array.from(rules)) {
@@ -511,22 +437,15 @@ function compareSpecificity(a: [number, number, number], b: [number, number, num
   return 0;
 }
 
-/** A shorthand's own longhands, for the shorthands `winningDeclaration` below is actually asked to
- *  check. A rule that sets only `border-left-style`/`border-left-width` never sets the literal
- *  string `"border-left"` at all, so asking the CSSOM for that one property name is blind to it --
- *  an equal-specificity, later `border-left-style: none; border-left-
- *  width: 0;` that cancels the real border while `winningDeclaration(..., "border-left")` kept
- *  reading the shorthand rule's own text and never noticed the longhands had moved past it. Not
- *  exhaustive -- extend it only when a new shorthand check needs one. */
+/** Longhands for the shorthands these checks inspect. Reading only a shorthand misses a later
+ *  longhand override, such as `border-left-style: none` cancelling a border. Extend this table
+ *  only when a new shorthand check needs it; it is not exhaustive. */
 const SHORTHAND_LONGHANDS: Record<string, string[]> = {
   "border-left": ["border-left-width", "border-left-style", "border-left-color"],
 };
 
-/** Whether `candidate` outranks `current` under the real cascade's own order: importance first
- *  (unconditionally -- an `!important` candidate always outranks a plain one, and a plain candidate
- *  never outranks an `!important` one, regardless of either one's specificity), THEN specificity,
- *  THEN source order at a tie. Split out of `winningDeclaration` so the three-way priority order is
- *  one small, directly readable function rather than a nested ternary. */
+/** Cascade priority: importance, then specificity, then source order at a tie. An `!important`
+ *  declaration beats a plain one regardless of either declaration's specificity or order. */
 function beatsCurrentWinner(
   candidate: { important: boolean; spec: [number, number, number]; order: number },
   current: { important: boolean; spec: [number, number, number]; order: number },
@@ -537,36 +456,17 @@ function beatsCurrentWinner(
   return candidate.order >= current.order;
 }
 
-/** Which declaration for `property` actually wins on the element matching `elementSelector`, read
- *  through the browser's own selector-matching (`Element.matches`) over the REAL parsed CSSOM
- *  rules -- not a regex over rule text -- so a competing rule that legitimately outranks the one
- *  under test by specificity, or by later source order at equal specificity, is honoured exactly
- *  as a real cascade would honour it. Importance (`!important`) is honoured too, ahead of
- *  specificity and order both -- CSS decides importance FIRST, so a lower-specificity, EARLIER
- *  `!important` declaration still beats a higher-specificity, later plain one, and a version of
- *  this function that ignored priority entirely called that combination a false negative (the
- *  bypass: `.row-body { border-left: none !important; }`, lower specificity than
- *  `.row-prompt .row-body`, appended at the end -- and it really does win in a browser).
+/** Read the winning raw declaration through `Element.matches` over parsed CSSOM rules.
+ *  Importance precedes specificity and source order, so even an earlier, less-specific
+ *  `!important` rule must win over a plain one.
  *
- *  If `property` is a known shorthand (`SHORTHAND_LONGHANDS`), a rule that sets one of ITS
- *  longhands competes in the very same race. When such a longhand declaration wins instead of the
- *  shorthand itself, the shorthand's own text is no longer what actually renders, and there is no
- *  general way from here to re-assemble "one shorthand plus a competing longhand" into a single
- *  value string -- so this returns `null` rather than a confident, wrong one. A caller checking a
- *  shorthand should therefore always assert what it means (`toBe(expected)`), never merely `not
- *  toBeNull()`, so a `null` this returns for the right reason cannot be mistaken for the win it is
- *  guarding against.
+ *  Known shorthand longhands compete in the same race. If a longhand wins, return `null`:
+ *  reconstructing the resulting shorthand is not generally possible. Callers must assert the
+ *  expected value, since merely accepting non-null can mistake an incomplete check for a win.
  *
- *  Needed at all because `getComputedStyle` cannot be used for `.row-prompt .row-body`'s
- *  `border-left`: it is a SHORTHAND carrying a `var()`, and jsdom's `cssstyle` drops any shorthand
- *  containing a `var()` entirely rather than resolving it (the same limitation the big comment atop
- *  the cascade describe block records for the mode block's BROWSE half) -- confirmed directly:
- *  mounting ONLY that rule and mounting NO rule at all produce byte-identical `getComputedStyle`
- *  output for every `border-left-*` longhand, so a regression that cancels the border cannot be
- *  seen through `getComputedStyle` at all, in either direction. A CSSOM RULE's own `.style`, unlike
- *  an element's resolved style, keeps the raw declared text (including any `var()`) -- confirmed
- *  directly too -- so this reads that instead, at the rule that priority+specificity+order actually
- *  pick. */
+ *  jsdom drops shorthands containing `var()` from computed styles: mounting a variable border
+ *  and mounting no border yield identical computed longhands. A CSSOM rule's own `.style`
+ *  retains the raw text, so read it from the rule the cascade selects. */
 function winningDeclaration(html: string, elementSelector: string, property: string, extraCss = ""): string | null {
   document.head.innerHTML = `<style>${css}${extraCss}</style>`;
   document.body.innerHTML = html;
@@ -575,9 +475,8 @@ function winningDeclaration(html: string, elementSelector: string, property: str
   return winningDeclarationOn(el, property);
 }
 
-/** `winningDeclaration`'s cascade for an element already in the document, against the stylesheet
- *  already mounted as `document.styleSheets[0]` -- for a check over every element of a kind rather
- *  than the first one a selector finds (the sideways guard, the GUI pass of 2026-09-24). */
+/** The same cascade for an element already mounted in the document, so checks can inspect
+ *  every element of a kind rather than only the first selector match. */
 function winningDeclarationOn(el: Element, property: string): string | null {
   const sheet = document.styleSheets[0];
   const candidateProperties = [property, ...(SHORTHAND_LONGHANDS[property] ?? [])];
@@ -648,27 +547,15 @@ describe("index.css", () => {
   });
 
   it("draws text only where Rust guards that colour for text against the surface it sits on", () => {
-    // --nv-warn/--nv-error/--nv-ok are guarded at 3:1 -- for borders, rules, tints and dots (WCAG
-    // 1.4.11), not for text -- and --nv-mode-browse/--nv-mode-input/--nv-chrome-accent are guarded
-    // at 3:1 or not at all. Used as 12px text on rose-pine dawn --nv-fg/--nv-muted's old ungated
-    // uses measured 2.05:1 (a resume row's heading on its hover band) to 3.84:1 (the session-lost
-    // banner), where the same text had been about 12:1 before the theme pipeline. A signal colour
-    // goes on a border or a rule beside the text, never on the text.
-    // (`(?<![a-z-])` so `background-color:`/`border-color:` are not read as text colours.)
-    //
-    // Two sanctioned pairings, each a colour guarded for TEXT against the specific surface it is
-    // drawn on: `--nv-fg`/`--nv-muted` on the plain body (guarded against `bg`), and
-    // `--nv-chrome-fg`/`--nv-chrome-muted` inside the
-    // winbar/status-line (guarded against `chrome` instead -- a reversed StatusLine makes `chrome`
-    // Normal's `fg`, so checking against `bg` would measure the wrong pair). Plus one exemption
-    // that is NOT a contrast guarantee at all: `--nv-syn-*` inside a
-    // `hljs-*` rule, deliberately unguarded because syntax tokens are meant to be the editor's own
-    // colours -- contrast-protecting them would make the panel's code disagree with the buffer
-    // beside it, which is precisely the feature, and a colorscheme whose `@comment` is unreadable
-    // renders unreadable comments in nvim too. Each exemption is narrowed to its own selector
-    // scope -- ENTIRELY `hljs-*`, or ENTIRELY inside `.winbar`/`.status-line` -- so none of the
-    // three can quietly widen to cover an unrelated rule or a grouped selector with only one
-    // branch on the right surface; the proof tests below pin all three directions.
+    // Signal colours have a 3:1 non-text guard or no guard, not the 4.5:1 text needs. On rose-pine
+    // dawn, ungated 12px text measures 2.05:1 on a resume row's hover band to 3.84:1 on the lost-session
+    // banner, versus about 12:1 before the theme pipeline. Keep signal colours beside text.
+    // The lookbehind excludes `background-color:` and `border-color:` from text declarations.
+    // Body and chrome text each need the pair guarded against their own fill; a reversed
+    // StatusLine can make chrome Normal's fg, so a bg guard says nothing about text on chrome.
+    // Syntax tokens deliberately keep the editor's colours, even when a scheme's comments are
+    // unreadable. Guarding them would make code disagree with the buffer. Every selector branch
+    // must earn its own exemption; one matching branch cannot exempt a whole group.
     const declarations = unguardedTextColorDeclarations(withoutComments);
     expect(declarations.length).toBeGreaterThan(0);
     for (const declaration of declarations) {
@@ -691,7 +578,7 @@ describe("index.css", () => {
 
   it("admits each tint's pair as text only on that tint's own branches, every branch of them", () => {
     expect(unguardedTextColorDeclarations(".row-prompt .row-body { color: var(--nv-tint-fg); }")).toEqual([]);
-    // The composer left the tint on 2026-10-15: the tint's pair is refused there now.
+    // The composer is off the tint, so the tint's pair is refused there.
     expect(unguardedTextColorDeclarations(".composer-browse-hint { color: var(--nv-tint-muted); }")).toEqual(["color: var(--nv-tint-muted);"]);
     expect(unguardedTextColorDeclarations(".permission-card-description { color: var(--nv-warn-tint-muted); }")).toEqual([]);
     expect(unguardedTextColorDeclarations(".tool-result-error .tool-result-truncated { color: var(--nv-error-tint-muted); }")).toEqual([]);
@@ -717,11 +604,8 @@ describe("index.css", () => {
   });
 
   it("still refuses a signal colour as text, even inside an hljs-* rule", () => {
-    // Proves the narrowed guard above did not quietly become "anything inside .hljs-* is exempt" --
-    // only --nv-syn-* survives it. A signal colour on text is exactly what the guard exists to
-    // catch, and this calls the SAME `unguardedTextColorDeclarations` the real guard test above
-    // does, so a future widening of that function's exemption regex fails HERE, not just silently
-    // passes both tests the way two independent copies of the same logic once did.
+    // Only syntax tokens are exempt inside highlight rules. Calling the real guard here means
+    // widening its exemption also fails this control; independent copies could drift together.
     const declarations = unguardedTextColorDeclarations(".hljs-keyword { color: var(--nv-warn); }");
     expect(declarations).toEqual(["color: var(--nv-warn);"]);
     expect(declarations[0]).not.toMatch(/^color: var\(--nv-(fg|muted)\);$/);
@@ -789,16 +673,9 @@ describe("index.css", () => {
   });
 
   it("still refuses --nv-chrome-accent as text inside the winbar", () => {
-    // `chrome_accent` is guarded at UI_CONTRAST (3.0), the WCAG 1.4.11 non-text threshold -- not
-    // the 4.5:1 a 12px label needs, and `tokens.rs`'s own test asserts only `>= 3.0`. Only
-    // chrome-fg/chrome-muted are guarded for TEXT against chrome, so only those two survive the
-    // chrome exemption; chrome-accent must still fail here even though it is scoped to `.winbar`,
-    // the same way a signal colour still fails inside `.hljs-*` above.
-    //
-    // This test's name used to end "despite its own doc comment", because that doc read "Accent
-    // TEXT drawn on chrome (the status bar's mode label)" -- a description that invited exactly the
-    // use this refuses. The doc now names its tier instead, so the two agree and there is no
-    // "despite" left; the guard stays, because the doc agreeing today is not a mechanism.
+    // `chrome_accent` has only the 3:1 non-text guard. Chrome text needs the 4.5:1 guard held by
+    // chrome-fg/chrome-muted, so an accent on winbar text must still fail. A matching tier in a
+    // doc comment is no substitute for this check.
     const declarations = unguardedTextColorDeclarations(".winbar .mode-label { color: var(--nv-chrome-accent); }");
     expect(declarations).toEqual(["color: var(--nv-chrome-accent);"]);
   });
@@ -874,13 +751,9 @@ describe("index.css", () => {
   });
 
   it("does not dim a conversation-picker row with opacity", () => {
-    // Every remembered-session row is unselected until clicked, since the picker opens on "New
-    // session". Opacity multiplies text contrast down with it: fg at 0.7 is 3.34:1 on rose-pine
-    // dawn and 2.93:1 on its hover band. The selected row is marked by its fill instead.
-    //
-    // `row-choice` as well as `session-choice`: the picker's rows moved onto the shared `.row`
-    // grid, and the rule that could dim one is now `.row-choice`'s, which the old pattern did not
-    // match at all.
+    // Session rows open unselected on "New session". Opacity lowers fg contrast at 0.7 to 3.34:1
+    // on rose-pine dawn and 2.93:1 on its hover band. The selected row uses a fill instead.
+    // Include both `row-choice` and `session-choice`, since shared grid rules can dim either.
     const rules = withoutComments.match(/[^{}]*(session-choice|row-choice)[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
@@ -889,11 +762,7 @@ describe("index.css", () => {
   });
 
   it("does not dim the activity line or the band with opacity either", () => {
-    // Same defect, same fix, same reason: opacity on top of an already-guarded muted text colour
-    // would multiply its contrast back down below what tokens.rs actually guaranteed. The winbar
-    // is gone; these two replace it and the old status line. `.status-row`
-    // and `.panel-footer` are themselves gone now,
-    // folded into `.status-band`.
+    // Opacity also lowers already-guarded muted text below its guaranteed contrast.
     const rules = withoutComments.match(/\.(?:status-band|activity-line)[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
@@ -902,11 +771,9 @@ describe("index.css", () => {
   });
 
   it("the status band is one editor row high, and never grows", () => {
-    // The panel band must align with the editor's status line (reported: the agent pane's bottom input / auto line was too wide and should
-    // be as wide as the neighbouring Neovim status line -- the band used to be `min-height: 24px`, which grows with whatever its
-    // children need (the `⏵⏵` fallback symbol font in particular). `--nv-editor-row` is the
-    // editor's own cell height (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`); a fixed
-    // `height` plus `overflow: hidden` is what actually stops the grow, not just a bigger min.
+    // The band must align with the editor's statusline. A min-height grows with children's font
+    // metrics, especially the symbol fallback; fixed `height` plus `overflow: hidden` stops that.
+    // `--nv-editor-row` carries `ThemeTokens.editor_row_px`, the editor's own cell height.
     const [band] = rulesMatching(withoutComments, ".status-band").filter((r) => r.selector.trim() === ".status-band");
     const decl = (name: string) =>
       band.body
@@ -919,67 +786,35 @@ describe("index.css", () => {
     expect(decl("min-height")).toBeUndefined();
     expect(decl("box-sizing")).toBe("border-box");
     expect(decl("overflow")).toBe("hidden");
-    // Since 2026-10-13 the band has no top rule -- the composer card above it is the foot's boundary --
-    // so nothing is taken out of the fixed height and the line box is the whole row, on the same centre
-    // line as the editor's statusline text.
+    // The composer is the foot's boundary. No top rule subtracts from the band's fixed height,
+    // so its line box shares the editor statusline's centre line.
     expect(decl("border-top")).toBeUndefined();
     expect(decl("line-height")).toBe("var(--nv-editor-row, 24px)");
   });
 
-  /* In-flight motion needs the structural property "the
-     element is absent" <=> "no animation is running" has to be a property of the FILE, not of this
-     document, so a second animated selector or a second @keyframes reusing the idea would be a
-     silent second motion nobody argued for (there is no second animation for a second
-     purpose).
-
-     **The guard needs negative controls for bypasses in splitting and declaration matching
-     against the real file (three) and three more
-     against the rewrite.** All six are kept below as negative controls, fed to the same splitter
-     the real assertions use -- as STRINGS rather than as real CSS, so a future author who reopens
-     one of them fails a test here instead of shipping an unargued motion:
-
-       (a) `animation-name` / `animation-duration` longhands on a second selector. The detector was
-           `/(?<![a-z-])animation:/`, the SHORTHAND only, so the longhand spelling of the same thing
-           was invisible.
-       (b) `transition: background-color 300ms` on any selector. The word `transition` appeared
-           nowhere in this file, and animating a COLOUR is exactly what the motion rule forbids (an
-           animated fill spends most of its period below the accent's 3:1 contrast) -- and the
-           single most ordinary thing to reach for on a hover state.
-       (c) a keyframe's LAST declaration written with no trailing `;` (`to { transform: scaleX(1);
-           opacity: 1 }`). The declaration regex was `[a-z-]+:[^;]*;`, which needs a later `;` to
-           terminate the match, so the one declaration that most often lacks one was never checked.
-       (d) a NESTED block hiding its parent's motion: `.tool-card { transition: ...; &:hover { ... } }`.
-           The rule splitter was `/[^{}]*\{[^{}]*\}/g`, whose `[^{}]*` cannot span a nested block, so
-           the only match it produced began inside the parent -- and the old `declarationsOf` then
-           sliced after that match's first `{`, which is the CHILD's, classifying the parent's
-           `transition:` as selector text. Closing (b)'s false positive on a class NAMED `.transition`
-           is what opened this, and it was a REGRESSION: the guard before (b), which searched whole
-           rule text, did catch this one.
-       (e) the same nesting one level down, inside `@media`.
-       (f) `content: "}"` followed by `animation:` in one rule -- a brace inside a string, which
-           splits the rule in the wrong place for any scanner that does not know about quotes.
-
-     The repair is the splitter itself: `splitRules` walks the sheet tracking brace depth AND quote
-     state, so (d), (e) and (f) are all parsed the way a browser parses them. Its companion is the
-     "contains no nested blocks today" assertion below, which is what keeps the several NARROWER
-     regex scans elsewhere in this file (`.winbar[^{}]*\{[^}]*\}` and friends) sound too: they all
-     assume a rule body has no `{` in it, and that assumption now fails loudly rather than silently
-     the day someone nests something. */
+  /* The in-flight indicator is the only motion; absence must mean no animation anywhere in the
+     stylesheet. Negative controls use the same splitter and declaration matcher as the real scan:
+     (a) animation longhands on another selector still cause motion;
+     (b) colour transitions spend part of their period below the full-strength contrast guard;
+     (c) a final declaration without `;` must still be checked;
+     (d) nested blocks must not hide their parent's declarations;
+     (e) the same holds inside `@media`;
+     (f) braces in strings are literal, not block boundaries.
+     `splitRules` tracks brace depth and quotes. The separate no-nesting assertion also protects
+     narrower regex scans whose rule-body patterns cannot span nested braces. */
 
   /** The selectors in a sheet that move something -- the whole guard in one call, so the negative
    *  controls exercise the real splitter rather than a hand-sliced approximation of it. */
   function movingSelectorsIn(sheet: string): string[] {
-    // Strips comments HERE rather than taking already-stripped text, so the controls below exercise
-    // the whole path a real scan takes -- including the stripper. The eighth bypass lived in that
-    // step, and a control that called the stripper itself would have passed with the broken one.
+    // Strip here so controls exercise the entire scan path. Pre-stripped controls would miss a
+      // stripper that hides real rules between comment markers inside strings.
     return splitRules(stripComments(sheet))
       .filter(movesSomething)
       .map((rule) => rule.selector);
   }
 
-  /** Every declaration inside a `@keyframes` body, INCLUDING one written last with no trailing
-   *  `;`. Split rather than matched, so a declaration is terminated by `;` or by the end of its
-   *  own block -- which is what closes bypass (c). */
+  /** Every keyframe declaration, including a final one without `;`: split at semicolons or
+   *  the end of its own block so the final property cannot escape the guard. */
   function keyframeDeclarations(body: string): string[] {
     const out: string[] = [];
     for (const block of body.match(/\{[^{}]*\}/g) ?? []) {
@@ -1049,8 +884,7 @@ describe("index.css", () => {
   });
 
   it("puts every animation OR transition declaration on .activity-glyph[data-moving], with exactly one @keyframes", () => {
-    // 2026-10-13: the activity line's star replaced the bar meter as the one moving thing (the chat
-    // page's look); the guard moved with it unchanged.
+    // The activity star is the one moving thing.
     const moving = movingSelectorsIn(css);
     expect(moving.length).toBeGreaterThan(0);
     for (const selector of moving) {
@@ -1060,7 +894,7 @@ describe("index.css", () => {
     expect(keyframeBlocks).toHaveLength(1);
     expect(keyframeBlocks[0]).toContain("turn-breath");
 
-    // Negative control 1 (as first written): a second animated selector and a second @keyframes.
+    // Negative control: a second animated selector and a second @keyframes.
     const twoAnimations =
       ".turn-activity .meter-fill { animation: turn-meter 1s; } .row-current { animation: pulse 1s; } " +
       "@keyframes turn-meter { from { transform: scaleX(0.25); } to { transform: scaleX(1); } } " +
@@ -1068,25 +902,21 @@ describe("index.css", () => {
     expect(movingSelectorsIn(twoAnimations)).toContain(".row-current");
     expect((twoAnimations.match(/@keyframes\s+[\w-]+\s*\{/g) ?? []).length).toBeGreaterThan(1);
 
-    // Negative control (a), a REPRODUCED bypass: the longhands. A second element reusing the one
-    // permitted @keyframes adds no second @keyframes and writes no `animation:` shorthand, so the
-    // original guard passed on it 36/36.
+    // Longhands can animate a second element using the permitted keyframes, without another
+    // keyframes block or an animation shorthand.
     const longhands = ".row-current .row-sign { animation-name: turn-meter; animation-duration: 2s; }";
     expect(movingSelectorsIn(longhands)).toEqual([".row-current .row-sign"]);
     expect(/(?<![a-z-])animation:/.test(longhands)).toBe(false);
 
-    // Negative control (b), a REPRODUCED bypass: a colour transition. `transition` was not
-    // mentioned by any guard in this file, and a 300ms colour fade spends most of its period below
-    // the contrast floor `tokens.rs` guarantees only at full strength (before any opacity is applied).
+    // A 300ms colour transition spends part of its period below the contrast floor Rust guards
+    // only at full strength.
     expect(movingSelectorsIn(".tool-card { transition: background-color 300ms linear; }")).toEqual([".tool-card"]);
     expect(movingSelectorsIn(".tool-card:hover { -webkit-transition: color 1s; }")).toEqual([".tool-card:hover"]);
     // ...and it is a DECLARATION guard, not a text search: a class whose NAME contains the word is
     // not a motion, and must not be reported as one.
     expect(movingSelectorsIn(".transition-demo:hover { color: var(--nv-fg); }")).toEqual([]);
 
-    // Negative control (d), a REPRODUCED bypass and a REGRESSION against the guard before (b): a
-    // nested block whose own `{` came before the parent's declarations were read. The parent is
-    // what moves; the child does not, and neither is lost.
+    // A nested block must not hide its parent's motion: the parent moves, the child does not.
     expect(movingSelectorsIn(".tool-card { transition: background-color 300ms linear; &:hover { color: var(--nv-fg); } }")).toEqual([
       ".tool-card",
     ]);
@@ -1094,14 +924,11 @@ describe("index.css", () => {
     expect(
       movingSelectorsIn("@media (min-width: 1px) { .tool-card { transition: opacity 300ms; &:hover { color: var(--nv-fg); } } }"),
     ).toEqual([".tool-card"]);
-    // Negative control (f), a REPRODUCED bypass: a brace inside a string. `content: "}"` ends no
-    // block, so the `animation:` after it is still this rule's declaration.
+    // A brace inside a string ends no block; the animation after it is still this rule's declaration.
     expect(movingSelectorsIn('.row-sign::before { content: "}"; animation: turn-meter 2s; }')).toEqual([
       ".row-sign::before",
     ]);
-    // Negative control (g): property names are
-    // ASCII case-insensitive per CSS Syntax L3, so this is live CSS that the case-sensitive
-    // matcher read as nothing at all. Injected into the real stylesheet it left the suite green.
+    // CSS property names are ASCII case-insensitive, so uppercase motion declarations must be seen.
     expect(movingSelectorsIn(".tool-card { TRANSITION: background-color 300ms linear; }")).toEqual([
       ".tool-card",
     ]);
@@ -1112,11 +939,8 @@ describe("index.css", () => {
     expect(movingSelectorsIn(".row-current { animati\\6fn: turn-meter 2s; }")).toEqual([]);
   });
 
-  /// The eighth bypass, and the only one that was upstream of every guard rather than inside one.
-  /// A comment stripper that does not know about strings lets two `content` values act as a comment
-  /// pair and delete every rule between them -- with the braces still balanced, so `splitRules`'
-  /// own throw stays silent. Injected into the real stylesheet, the animated rule in the middle
-  /// vanished before any guard ran and the suite stayed green.
+  /// A quote-unaware stripper can treat two content values as a comment pair and delete real rules
+    /// between them. Balanced braces cannot detect that loss; the scan must preserve those rules.
   it("does not let a string act as a comment marker", () => {
     const sheet =
       '.a::before { content: "/*"; }\n' +
@@ -1131,10 +955,9 @@ describe("index.css", () => {
   });
 
   it("rests the star at its full size under reduced motion, and breathes in exactly four steps otherwise", () => {
-    // The star replaced the bar meter on 2026-10-13. Its cycle is two halves, each `steps(2, jump-end)`:
-    // progress {0, 1/2} per half, so the scale runs full, halfway down, the bottom, halfway back up --
-    // four visible states, one per `--meter-step`, never eased (an eased fade or pulse repaints every
-    // frame, which the typing cadence exists to prevent).
+    // The star's cycle has two halves, each `steps(2, jump-end)`: full, halfway down, bottom,
+    // halfway back up. One visible state per `--meter-step`, never eased: an eased pulse repaints
+    // every frame, which typing cadence exists to prevent.
     const glyph = withoutComments.match(/\.activity-glyph\[data-moving\] \{[^}]*\}/);
     expect(glyph).not.toBeNull();
     expect(glyph![0]).toMatch(/animation: turn-breath calc\(var\(--meter-step, 300ms\) \* 4\) steps\(2, jump-end\) infinite;/);
@@ -1200,15 +1023,12 @@ describe("index.css", () => {
       expect(declaration).toMatch(/^transform\s*:/);
     }
 
-    // Negative control (as first written): an opacity fade, both declarations `;`-terminated.
+    // Negative control: an opacity fade with both declarations semicolon-terminated.
     const fade = "\n  from { transform: scaleX(0.25); opacity: 0.4; }\n  to { transform: scaleX(1); opacity: 1; }\n";
     expect(keyframeDeclarations(fade).some((d) => !d.startsWith("transform:"))).toBe(true);
 
-    // Negative control (c): a final
-    // declaration with no trailing `;`, which is how a last declaration is most often written.
-    // The second `expect` is the point of this control -- it runs the OLD pattern over the same
-    // string and shows it finds nothing wrong, so this is a hole that was really open rather than
-    // one this test merely asserts about.
+    // A final declaration needs no trailing semicolon. The second assertion demonstrates why
+    // a semicolon-only matcher misses this input.
     const unterminated = "\n  from { transform: scaleX(0.25); }\n  to { transform: scaleX(1); opacity: 1 }\n";
     expect(keyframeDeclarations(unterminated).filter((d) => !d.startsWith("transform:"))).toEqual(["opacity: 1"]);
     expect((unterminated.match(/[a-z-]+:[^;]*;/g) ?? []).filter((d) => !d.startsWith("transform:"))).toEqual([]);
@@ -1222,19 +1042,42 @@ describe("index.css", () => {
   });
 });
 
-/** Checks which declaration wins by attaching the real stylesheet to a DOM and reading
- * getComputedStyle. Matching rule text alone misses specificity conflicts: .row-assistant pre
- * can override .code-block, and mode-selector button rules can override choice-row layout and
- * selection fills. Negative controls restore the competing rules to verify that the assertions
- * detect them. jsdom does not resolve var(), so these assertions compare token names rather
- * than rendered colours. It also drops shorthands containing var(), including border and
- * border-left; longhands such as border-left-color remain observable. When a higher-specificity
- * var() competes with a lower-specificity literal, this engine uses source order. The
- * boxed-button background check would therefore pass even with the conflicting rule restored.
- * Its test uses border-radius instead, which contains no var() and changes when the conflict
- * returns. The code-block and selected-row background checks have var() on both sides. jsdom
- * applies specificity correctly in that case regardless of source order. Browser rendering
- * still needs to be checked separately. */
+/**
+ * Which declaration WINS, not merely which ones exist.
+ *
+ * A regex over rule TEXT cannot see specificity, and specificity silently defeats a planned rule:
+ * a `.row-assistant pre` rule (0,1,1) would outweigh `.code-block` (0,1,0) and win the code block's
+ * background back to `--nv-bg`; a boxed `.mode-selector button` rule (0,1,1) would outweigh
+ * `.row`/`.row-choice` (0,1,0) and put `display: block`/`padding: 10px` back over the sign-column
+ * grid; and `.mode-selector .session-choice button.selected` would outweigh `.row-choice.selected`.
+ * Prose is memory, not a guard.
+ *
+ * So: attach the real stylesheet to a real DOM and read `getComputedStyle`. jsdom resolves class
+ * and descendant selectors and applies specificity for ordinary (non-`var()`) declarations. Each
+ * case below has its own test and its own negative control that adds the competing rule and shows
+ * that it would win.
+ *
+ * THREE THINGS IT CANNOT DO, said plainly so nobody reads more into a green run than is there:
+ *   - jsdom does not resolve `var()`. A winning `background: var(--nv-surface)` computes to the
+ *     literal string "var(--nv-surface)". That is exactly what makes an assertion on such a
+ *     property useful when nothing else competes for it -- the string names the token, so a
+ *     different winner reads as a different string -- but it is a comparison of declarations, not
+ *     of rendered colour.
+ *   - jsdom's CSS engine fails to parse a SHORTHAND containing `var()`, so `border-left: 3px solid
+ *     var(--nv-mode-browse)` sets no longhand at all here, and neither does `border: 1px solid
+ *     var(--nv-border)`. Only a longhand such as `border-left-color` can be asserted.
+ *   - **A higher-specificity `var()` value losing to a lower-specificity plain-literal value is
+ *     decided by source order here, not by specificity.** When BOTH competing values are `var()`,
+ *     or BOTH are plain literals, this engine picks the correct higher-specificity winner regardless
+ *     of order (matches real cascade behaviour), and so it does when the literal is the
+ *     higher-specificity side. Only higher-specificity-`var()` vs. lower-specificity-literal is
+ *     broken: the literal wins whenever it is LAST in the stylesheet, the `var()` side whenever IT
+ *     is last. A test on such a pair asserts a property neither side writes with `var()` and nothing
+ *     else competes for, which is decided by ordinary specificity. The code-block and `.selected`
+ *     tests are `var()` on BOTH sides, so their `background` assertions are real specificity checks,
+ *     not order coincidences.
+ * Neither is a claim about a browser. Real rendering is checked by hand on a real display.
+ */
 describe("index.css cascade (which rule actually wins)", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -1249,23 +1092,16 @@ describe("index.css cascade (which rule actually wins)", () => {
   }
 
   const CODE_BLOCK = `<div class="message-list"><div class="row row-assistant"><div class="row-body"><pre class="code-block"><code>x</code></pre></div></div></div>`;
-  // Two buttons, not one: the plain row exercises index.css:470's `border`/`background` guard
-  // below, and `.selected` exercises `.row-choice.selected`'s own fill -- neither was reachable
-  // when this fixture held only the unselected row.
+  // Both plain and selected rows are needed: padding and the selected fill can fail independently.
   const CHOICE_ROW = `<div class="mode-selector"><div class="session-choice"><button type="button" class="row row-choice"><span class="row-sign">›</span><span class="row-body">y</span></button><button type="button" class="row row-choice selected"><span class="row-sign">›</span><span class="row-body">z</span></button></div></div>`;
-  // `.panel-footer .mode-block` is `.band-mode` now, a bare selector
-  // (no wrapper prefix -- `StatusBand.tsx` never nests it under a `.panel-footer`, which is gone).
+  // The band mode is a bare selector; `StatusBand.tsx` nests it under no footer wrapper.
   const MODE_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input">INPUT</span></div>`;
   const UNFOCUSED_INPUT_BLOCK = `<div class="status-band"><span class="band-mode" data-mode="input" data-focused="false">INPUT</span></div>`;
 
-  // The conversation used to be `grid-template-rows: auto 1fr auto auto`, which
-  // gives the `1fr` to the SECOND child -- the fatal-error banner when it is shown, not the list.
-  // The list then took its full content height and never scrolled, so `j`/`k` could not step
-  // through a long reply over a dead session. jsdom has no layout, so this pins the rule that
-  // decides it: the list grows by its own class, whatever sits between it and the rest of the
-  // panel: the activity line, the composer and the band.
-  // The band replaces the separate status row and footer,
-  // so it is also separate from the scrollable list.
+  // A grid's `1fr` goes to the second child, which can be the fatal banner rather than the
+    // list. Then the list takes its content height and cannot scroll through a long dead session.
+    // jsdom has no layout, so pin class-based growth: the list grows regardless of siblings,
+    // and the activity line, composer and band remain outside its scrollable area.
   const CONVERSATION = (banner: string) =>
     `<div class="agent-ui-root agent-ui-conversation">${banner}<div class="agent-ui-scroller"><div class="message-list">m</div></div>` +
     `<div class="activity-line">a</div><div class="composer">c</div><div class="status-band">s</div></div>`;
@@ -1289,15 +1125,14 @@ describe("index.css cascade (which rule actually wins)", () => {
         expect(computed(CONVERSATION(banner), other).flexGrow).toBe("0");
       }
     }
-    // Negative control: the old grid put back, which is what hands the space to the banner.
+    // Negative control: a grid hands the free space to the banner.
     const old = ".agent-ui-conversation { display: grid; grid-template-rows: auto 1fr auto auto; }";
     expect(computed(CONVERSATION(`<div class="fatal-error">e</div>`), ".agent-ui-conversation", old).display).toBe("grid");
   });
 
-  /// The `?` overlay covers the conversation and nothing else. Its box comes from its containing
-  /// block, so the pair that decides it -- the scroller being positioned, the overlay being
-  /// absolute -- is the invariant, not the overlay's own rule alone. The first version covered the
-  /// whole panel and put its own first heading under the winbar, unreadable and unreachable.
+  /// The `?` overlay covers only the conversation. Its positioned scroller and absolute overlay
+    /// jointly define the containing block; covering the whole panel hides its first heading
+    /// under the winbar, making it unreadable and unreachable.
   it("keeps the ? overlay inside the list's own region, not over the bars below it", () => {
     const markup =
       `<div class="agent-ui-root agent-ui-conversation">` +
@@ -1306,15 +1141,13 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="activity-line">a</div><div class="status-band">s</div></div>`;
     expect(computed(markup, ".agent-ui-scroller").position).toBe("relative");
     expect(computed(markup, ".keymap-overlay").position).toBe("absolute");
-    // And the bars are back to taking part in normal painting: nothing has to out-stack the overlay.
+    // The bars paint normally; nothing needs to out-stack the overlay.
     for (const bar of [".activity-line", ".status-band"]) {
       expect(computed(markup, bar).zIndex).toBe("auto");
     }
   });
 
-  /** The unread pill is the band's own `.band-unread`, drawn on the
-   *  band's right with `↓N` inverted, never over text. It is not floated absolutely over the
-   *  list -- the opposite invariant from the one this test used to pin. */
+  /** The unread pill sits on the band's right as inverted `↓N`, never floated over list text. */
   it("keeps the jump-to-bottom pill in normal flow inside the band, not floated over the list", () => {
     const markup = `<div class="status-band"><div class="band-right"><button class="band-seg band-unread">↓</button></div></div>`;
     expect(computed(markup, ".band-unread").position).toBe("static");
@@ -1323,8 +1156,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("does not dim the which-key strip with opacity", () => {
-    // The third instance of the same defect this file has now recorded twice (picker rows, winbar):
-    // opacity multiplies a guarded pair's contrast down with it. `? keys` recedes by token instead.
+    // Opacity lowers a guarded pair's contrast; `? keys` recedes by token instead.
     const rules = withoutComments.match(/\.which-key[^{}]*\{[^}]*\}/g) ?? [];
     expect(rules.length).toBeGreaterThan(0);
     for (const rule of rules) {
@@ -1334,22 +1166,15 @@ describe("index.css cascade (which rule actually wins)", () => {
 
   it("paints a code block on --nv-surface even inside an assistant row", () => {
     expect(computed(CODE_BLOCK, "pre").background).toBe("var(--nv-surface)");
-    // The negative control: the rule that was actually deleted, put back. Without it this
-    // assertion could be passing because nothing competes, which is not the same as winning.
+    // A competing rule proves this is a cascade win rather than an uncontested declaration.
     expect(computed(CODE_BLOCK, "pre", ".row-assistant pre { background: var(--nv-bg); }").background).toBe(
       "var(--nv-bg)",
     );
   });
 
-  /* --- no width limit ---------------------------------------------------------------------------
-     Until 2026-10-13 fenced code, tool output and a permission card's input and diff each "escaped" the
-     prose measure to the row's right edge, through a width the page measured (`--list-inline-size`,
-     before 2026-09-24 a `100cqw` against a query container on `.row`, which made WebKitGTK reset the
-     list's scroll position while a reply streamed). The chat page then sat in a centred column
-     (`--column-w`) that a wide panel could only be exceeded by code and tables. Since 2026-10-14 there is
-     no column: the conversation and the foot fill the panel between two side margins
-     (`--page-pad`, a viewport unit clamp), so nothing measured is needed, nothing reaches past anything,
-     and no container can come back for it. */
+  /* The conversation and foot fill the panel between viewport-based `--page-pad` margins.
+     Neither measured widths nor container-query escapes are needed; size containers make
+     WebKitGTK reset the reader's scroll position while a reply streams. */
   /* No width limit. The conversation and the foot fill the panel less `--page-pad`
      at each side, at every width, and nothing at the list's foot is drawn over the rows. */
   it("fills the panel at every width: no column cap, one margin for the list and the foot, no wide block, no fade", () => {
@@ -1370,7 +1195,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       expect(declarationsOf(foot), foot).toContain(SIDE);
     }
     expect(declarationsOf(".agent-ui-conversation > .row-error")).toContain(`margin: 8px ${SIDE}`);
-    // The composer is centred: the same margin each side (2026-10-15).
+    // The composer is centred with the same margin on each side.
     expect(declarationsOf(".composer")).toContain(`margin: 10px ${SIDE} 14px;`);
     // None of them is centred by a width and an auto margin instead: that would centre the list's box, not
     // its rows, and leave the foot and the conversation on different edges.
@@ -1417,15 +1242,12 @@ describe("index.css cascade (which rule actually wins)", () => {
     }
   });
 
-  /* The in-flight indicator must stay visible on a narrow line
-     Two defects, one bar. jsdom runs no flex layout, so both tests read the DECLARATIONS that
-     decide the outcome -- which is the same thing every other test in this block does, and is
-     exactly why the defects were invisible until someone did the flexbox arithmetic by hand. */
+  /* The in-flight indicator must stay visible on a narrow line. jsdom runs no flex layout,
+     so inspect the declarations that allocate the available width. */
 
   it("keeps the star from being squeezed off a narrow activity line", () => {
-    // The star is the line's one moving mark (2026-10-13; the bar meter before it). A flex item shrinks
-    // by default, and the narrow panel is where the reassurance matters most, so it is `flex: none` --
-    // the same idiom `.diff-gutter` uses.
+    // Flex items shrink by default. The star is the line's one moving mark and must stay
+    // visible even in a narrow panel, so it uses `flex: none`, as `.diff-gutter` does.
     const html =
       `<div class="activity-line"><span class="activity-glyph" data-moving="true">✻</span>` +
       `<span class="turn-activity" data-phase="thinking"><span class="turn-state">thinking</span></span></div>`;
@@ -1438,17 +1260,10 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(html, ".activity-glyph", ".activity-glyph { flex: 1 1 auto; }").flexShrink).toBe("1");
   });
 
-  /** The scale's arithmetic test reads `ROOT_TOKENS`, which is built by the
-   *  `:root`-only regex the container-unit guard was deliberately moved OFF. Redefining `--fs-sm`,
-   *  `--fs-xs` and `--fs-code` to literals inside
-   *  `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { ... } }` pinned three
-   *  sizes against `agent.font_size` and passed green -- and `data-theme` is set nowhere in
-   *  `agent-ui/web/src`, so that `:not()` always matches.
-   *
-   *  Rather than make `ROOT_TOKENS` see everywhere (it is right as it is: `expandVars` wants the
-   *  ONE scope a browser resolves this file's own `var()`s against), this pins the premise that
-   *  makes `ROOT_TOKENS` trustworthy -- there is nowhere else for these tokens to be declared. It
-   *  scans `allCustomPropertyDeclarations`, the brace-aware walker that DOES see everywhere. */
+  /** Font-size arithmetic reads only top-level `ROOT_TOKENS`. A literal override nested under
+   *  `@media` on `:root:not([data-theme="light"])` could pin sizes despite `agent.font_size`.
+   *  Keep that arithmetic trustworthy by requiring these tokens to be declared nowhere else,
+   *  using the brace-aware `allCustomPropertyDeclarations` walker to see every scope. */
   it("declares every panel token exactly once, on a plain :root, with nowhere else for one to hide", () => {
     const PANEL_TOKEN = /^--(row|prose|prompt|fs)-/;
     const declared = allCustomPropertyDeclarations(withoutComments).filter((d) => PANEL_TOKEN.test(d.name));
@@ -1457,8 +1272,7 @@ describe("index.css cascade (which rule actually wins)", () => {
 
     const sites = new Map<string, string[]>();
     for (const d of declared) sites.set(d.name, [...(sites.get(d.name) ?? []), d.selector.trim()]);
-    // No exception any more: `--row-inline-size`, declared on `.row` from 2026-09-24 to 2026-10-13 (the
-    // row's measured width), went with the escapes that spent it. Every panel token is a `:root` knob.
+    // Every panel token is a `:root` knob; no measured row-width exception is allowed.
     for (const [name, selectors] of sites) {
       expect(
         selectors,
@@ -1475,15 +1289,9 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect([...ROW_TOKENS.keys()]).toEqual([]);
   });
 
-  /* --- the text scale is one number and five ratios of it (2026-09-21) -------------------------
-     `--nv-font-size` replaced thirty-one hand-written `font-size` literals at six values with one
-     Rust-emitted base and five `--fs-*` tokens, each a ratio of it (index.css's own comment above
-     the `:root { --fs-xs: ...; }` block). These four guard that the change actually landed as a
-     SYSTEM, not just as a fresh set of numbers that happen to render the same as the old ones:
-     every `font-size` in the file spends a token rather than a literal, each token's ratio computes
-     to the exact pixel value the file used to hardcode, the one literal that remains (the `14px`
-     fallback) is not a second, driftable copy of Rust's own default, and the name carrying that
-     fallback is one `tokens.rs` actually emits. */
+  /* One Rust-emitted font-size base drives the scale. Require tokens at every font-size use,
+     evaluate their ratios as pixel values, hold the literal fallback equal to Rust's default,
+     and check that Rust actually emits the fallback's token name. */
 
   it("spends every font-size as a var(--fs-*) ratio, never a literal length", () => {
     // A whole scale is worth nothing if one call site still hardcodes a
@@ -1499,9 +1307,8 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("computes the six --fs-* tokens as exact ratios of one base, by arithmetic rather than by matching the fraction text", () => {
-    // The six values this file used to hardcode, and the ratio each token's own comment says it
-    // replaced -- evaluated, not string-matched (see `evaluateFsExpression`'s own doc for why a text
-    // match on `"* 12 / 14"` cannot tell a correct ratio from a wrong one).
+    // Evaluate the ratios rather than matching their spelling: transposed digits can retain
+    // the same text fragments while producing the wrong size.
     // The base is the editor's own text size by default and only the status band spends it, so the band
     // lines up with lualine; the chat reads at twelve fourteenths of it.
     const expected: [string, number][] = [
@@ -1522,39 +1329,24 @@ describe("index.css cascade (which rule actually wins)", () => {
     // string comparison that a differently-spelled but equally wrong fraction could still slip past.
     expect(evaluateFsExpression("calc(var(--nv-font-size, 14px) * 13 / 14)")).not.toBeCloseTo(12, 10);
 
-    // The heading step (2026-10-13) is one twentieth over the reply's prose, by the same arithmetic.
+    // The heading is one twentieth over the reply's prose, by the same arithmetic.
     expect(evaluateFsExpression(ROOT_TOKENS.get("--fs-heading")!)).toBeCloseTo(12 * 1.05, 10);
   });
 
   it("keeps the 14px fallback equal to Rust's own DEFAULT_PANEL_FONT_SIZE_PX, not a second hand-copied number", () => {
-    // index.css's own comment states this equality by hand ("The literal is a second copy of Rust's
-    // `DEFAULT_PANEL_FONT_SIZE_PX`, and `indexCss.test.ts` holds the two equal") -- this is that
-    // test. Two independently hand-copied numbers agreeing today is exactly the shape of defect this
-    // whole change removed elsewhere in the file (the old `30px`/`38px` pair `--row-gutter` replaced,
-    // named in this file's own "panel-width geometry" block above); reusing the same `tokensRs` raw
-    // text every other guard in this file already parses, rather than writing `14` down a second
-    // time in this test, is what keeps this guard from becoming the third hand-copied instance of
-    // its own number.
+    // Derive the fallback from Rust's source: copying `14` into the assertion would add a third
+    // independent copy of the number this equality is meant to keep in sync.
     const rustConstant = tokensRs.match(/pub const DEFAULT_PANEL_FONT_SIZE_PX:\s*f32\s*=\s*([\d.]+);/);
     expect(rustConstant, "DEFAULT_PANEL_FONT_SIZE_PX not found in tokens.rs -- the parse is broken, not the CSS").not.toBeNull();
     const cssFallback = ROOT_TOKENS.get("--fs-base")!.match(/^var\(--nv-font-size,\s*([\d.]+)px\)$/);
     expect(cssFallback, "--fs-base's fallback is not the plain var(--nv-font-size, <n>px) shape this test expects").not.toBeNull();
     expect(parseFloat(cssFallback![1])).toBe(parseFloat(rustConstant![1]));
-    // Red-check performed by hand for this round (not left as a live assertion, since it would mean
-    // editing the real file): changing either side alone -- `14px` in index.css's five `calc()`s and
-    // one `var()`, or `14.0` in tokens.rs -- while leaving the other, makes this line fail; that was
-    // confirmed and reverted rather than committed.
+
   });
 
   it("reads --nv-font-size's fallback spelling, not just its bare form, as a name Rust emits", () => {
-    // `var(--nv-font-size, 14px)` adds a fallback to the bare-variable form; every
-    // other `var(--nv-*)` use up to 2026-09-21 was the bare, no-fallback form the `--nv-* names`
-    // describe block's own regex (`/var\((--nv-[a-z-]+)/g`) was written against. Confirmed directly,
-    // not assumed: the capturing group `[a-z-]+` stops at the first character outside that class,
-    // which the comma before the fallback value already is, so the regex captures exactly
-    // `--nv-font-size` and no more -- this pins that down as a passing property of the real regex
-    // rather than leaving it to be re-discovered (or to silently start failing) the next time
-    // someone adds a `var(--nv-*, ...)` with a fallback.
+    // The shared name regex stops at the fallback's comma, so `var(--nv-font-size, 14px)`
+    // still yields only the name. Pin the real regex rather than assume fallback syntax works.
     const used = Array.from(withoutComments.matchAll(/var\((--nv-[a-z-]+)/g), (m) => m[1]);
     expect(used).toContain("--nv-font-size");
     // And the isolated case, so a future change to the SHARED regex that breaks this is caught here
@@ -1565,17 +1357,9 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("spends the phase word before the Stop button as the activity line narrows", () => {
-    // The priority order index.css states in prose: `.turn-activity` (the indicator's whole box) is
-    // the only child of `.activity-line` that gives, and inside that box the phase word is the only
-    // thing that can give. The star, the clock and Stop are never spent. The Stop button is the one
-    // that matters -- App.tsx's own comment says it is the ONLY Stop control for mouse users, so it
-    // going off the right edge is the interrupt affordance leaving the screen.
-    //
-    // The indicator is the only part of this row that can yield space. The
-    // mode block, the session status word and the position counter left `.status-line` entirely (the
-    // status word is no longer shown; the position moved into `StatusRow`'s own text) -- so
-    // there is no longer a second thing in the row that could compete with the indicator for space,
-    // and only the indicator's own shrink policy determines whether it stays visible.
+    // Only `.turn-activity` yields space; inside it only the phase word yields. The star, clock
+    // and Stop stay intact. Stop is the mouse user's only interrupt control, so losing it past
+    // the right edge removes that affordance.
     const html =
       `<div class="activity-line">` +
       `<span class="activity-glyph" data-moving="true">✻</span>` +
@@ -1614,23 +1398,16 @@ describe("index.css cascade (which rule actually wins)", () => {
     // And the bar never becomes two lines.
     expect(computed(html, ".activity-line").flexWrap).not.toBe("wrap");
     expect(computed(html, ".activity-line").whiteSpace).toBe("nowrap");
-    // Negative control: the state this replaced -- nothing shrinking, nothing clipping -- is what
-    // pushed Stop off the edge, and it is one later `flex` declaration away.
+    // Negative control: nothing shrinking or clipping pushes Stop off the edge.
     expect(computed(html, ".turn-state", ".activity-line .turn-activity .turn-state { flex: none; }").flexShrink).toBe("0");
   });
 
 
   it("keeps the sign column on the same track whether a grid row's body is prose or a wide code block", () => {
-    // On the sign-column grid -- the rows outside the conversation, such as the turn review's, since
-    // 2026-10-13 -- the entire reason the grid exists: the sign column must sit
-    // at the same x position down the whole page. Widening the BODY column must never be able to
-    // move it, so this compares `.row`'s own `grid-template-columns` -- the declaration that
-    // decides column 1's width -- across a plain-prose row and a row whose body is a wide code
-    // block. jsdom does not resolve `var()`, so both sides come back as the literal token text
-    // (`"var(--row-sign-w) minmax(0, var(--prose-measure))"`) regardless of which fixture produced
-    // them -- `expandVars` (top of file) resolves that against the real `:root` declarations so the
-    // pin is still on the real, current value (`--prose-measure: 1fr`) and not on the unresolved
-    // string, which would pass even if `.row`'s own selector stopped applying at all.
+    // Outside the conversation, the sign grid must keep column 1 at the same x position even
+    // when a body's code block is wide. jsdom returns unresolved `var()` text, so `expandVars`
+    // resolves the real root declarations; comparing unresolved text could pass if the row
+    // selector stopped applying.
     const proseRow =
       `<div class="review-overlay"><div class="row row-assistant">` +
       `<span class="row-sign">›</span><div class="row-body"><p>prose</p></div></div></div>`;
@@ -1640,11 +1417,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     const proseColumns = expandVars(computed(proseRow, ".row").gridTemplateColumns);
     expect(proseColumns).toBe("20px minmax(0, 1fr)");
     expect(expandVars(computed(codeRow, ".row").gridTemplateColumns)).toBe(proseColumns);
-    // Negative control: proves the assertion above can actually fail. A rule that changed column 1
-    // wins the SAME assertion path used above, at the same specificity as `.row`'s own base rule
-    // (`.row-assistant`, 0,1,0), placed after it -- reproducing the shape a careless edit to this
-    // grid, or to a class every row already carries, would take. The override is plain literals (no
-    // `var()`), so `expandVars` leaves it untouched -- it still has to differ from `proseColumns`.
+    // A later rule at the row's specificity can change column 1. Its literal override passes
+    // unchanged through `expandVars` and must differ from `proseColumns`.
     expect(
       expandVars(
         computed(codeRow, ".row", ".row-assistant { grid-template-columns: 24px minmax(0, 62ch); }").gridTemplateColumns,
@@ -1653,12 +1427,10 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("keeps the grid for rows outside the conversation and gives the conversation's rows a sign cell and a body of their own, with no size container", () => {
-    // Until 2026-10-13 this test pinned `--row-inline-size`, the row's width derived from the list's
-    // measured one, which every wide-content escape spent; before 2026-09-24 it pinned the opposite of
-    // what it pins now, `container-type: inline-size`, the container that made WebKitGTK drop the reader
-    // while a reply streamed. The chat page's rows spend nothing measured. Between 2026-10-13 and
-    // 2026-10-14 they were blocks in a centred column with no sign cell; they are now a grid of a
-    // generated sign cell (`--sign-w`) and a body, on one left edge.
+    // A row outside the conversation (the review overlay's) is a grid of a sign cell and a body. The
+    // conversation's rows are blocks, and a tool or thinking row draws its sign as generated content.
+    // No row is a size container: one makes WebKitGTK drop the reader while a reply streams. And no
+    // row spends a measured width.
     const grid = computed(
       `<div class="review-overlay"><div class="row row-review-file"><span class="row-sign">▾</span><div class="row-body">f</div></div></div>`,
       ".row",
@@ -1701,12 +1473,9 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(clobbered.paddingLeft).toBe("10px");
   });
 
-  /* --- the sign-column geometry, as tokens, is actually derived (2026-09-21) -------------------
-     `--row-gutter` replaced independent magic numbers (`.row`'s `22px`/`8px` and the `30px` other rules
-     subtracted) that used to have to agree by hand. Since 2026-10-13 its consumers are the review
-     overlay's indented lines, which line up with that grid; the conversation's rows left the grid. These
-     guard that the formula really is a formula, that its consumers spend it, and that no custom property
-     in the file carries a container-query unit (the WebKitGTK reason). */
+  /* Derive the sign gutter from the sign width and gap, and require the review overlay's
+     indented lines to spend it. Independent literal sums can drift out of alignment. Container
+     query units are also forbidden because of the WebKitGTK scroll-reset failure. */
 
   it("derives --row-gutter from the sign column instead of copying its sum, and every indent that lines up with the grid spends it", () => {
     // Half 1: the declared value is a formula over the two knobs that make up the sign column, not a
@@ -1715,9 +1484,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(gutter).toBe("calc(var(--row-sign-w) + var(--row-gap))");
     expect(gutter).toMatch(/var\(--row-sign-w\)/);
     expect(gutter).toMatch(/var\(--row-gap\)/);
-    // Half 2: a correct formula sitting unused proves nothing. Its consumers are the review overlay's lines
-    // that sit under a grid row's body; each spends the token, and nothing in the file spells the sign
-    // column's width (20px plus the 8px gap, or the older 30px / 32px sums) as a literal in a calc.
+    // A formula sitting unused proves nothing: review lines must spend it, and no calc may
+    // copy the sign width plus gap as a literal sum.
     expect(winningDeclaration('<div class="review-comment-text">note</div>', ".review-comment-text", "padding-left")).toBe("var(--row-gutter)");
     const consumers = splitRules(withoutComments).filter((r) => /var\(--row-gutter\)/.test(r.declarations));
     expect(consumers.length).toBeGreaterThanOrEqual(1);
@@ -1729,18 +1497,15 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(".review-comment-text { padding-left: calc(28px); }").toMatch(/\b(?:28|30|32)px\)/);
   });
   it("keeps a container-query unit out of every custom property declaration (WebKitGTK guard)", () => {
-    // Since 2026-09-24 there is no container-query unit anywhere in the file (the tripwire near the
-    // top of the `index.css` block: with no container, a `cq*` unit would silently resolve against
-    // the viewport). This guard is kept for what it pins about custom properties specifically, and
-    // because its bypasses are still real ones. What follows is its original rationale.
-    //
-    // Spelled out in index.css's own comment: a `var()` substitutes as raw tokens, so a `cqw` unit
-    // written INSIDE a custom property's value still substitutes as raw tokens, but
-    // container units inside custom properties are exactly the corner where an engine has shipped
-    // bugs, this panel runs in WebKitGTK, and the failure mode is not a wrong number in one place,
-    // it is the whole panel resolving against the wrong axis. So every escape rule spells its own
-    // `100cqw` and no `--custom-property`'s declared value may contain a `cq*` unit at all --
-    // wherever in the file it is declared, not merely inside an unqualified top-level `:root`.
+    // There is no container-query unit anywhere in the file (the tripwire near the top of the
+    // `index.css` block: with no container, a `cq*` unit would silently resolve against the
+    // viewport). This guard pins what that means for custom properties in particular: a `var()`
+    // substitutes as raw tokens, so a `cqw` unit written INSIDE a custom property's value still
+    // substitutes as raw tokens, container units inside custom properties are exactly the corner
+    // where an engine has shipped bugs, this panel runs in WebKitGTK, and the failure mode is not a
+    // wrong number in one place, it is the whole panel resolving against the wrong axis. So no
+    // `--custom-property`'s declared value may contain a `cq*` unit at all -- wherever in the file it
+    // is declared, not merely inside an unqualified top-level `:root`.
     //
     // Scans `allCustomPropertyDeclarations`, not `ROOT_TOKENS`: `ROOT_TOKENS` is built from a regex
     // anchored on the literal text `:root\s*\{`, which cannot see a declaration inside e.g.
@@ -1755,43 +1520,33 @@ describe("index.css cascade (which rule actually wins)", () => {
         /cq(w|h|i|b|min|max)/i,
       );
     }
-    // Negative control, an override outside the top-level root (adapted to a real token name --
-    // `--prompt-inset` itself no longer exists, but the escape mechanism is unchanged): nested
-    // inside `@media`, and reached through `:root:not(...)` rather than a bare `:root`.
+    // A nested override on `:root:not(...)` must be seen outside the top-level root.
     const bypass =
       '@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --row-sign-w: 10cqw; } }';
     expect(allCustomPropertyDeclarations(bypass)).toEqual([
       { name: "--row-sign-w", value: "10cqw", selector: ":root:not([data-theme=\"light\"])" },
     ]);
-    // ...and the OLD mechanism really did miss it -- so this is a reproduced bypass, not a test
-    // invented against a strawman.
+    // The root-only regex cannot see this override.
     expect(rootCustomProperties(bypass).size).toBe(0);
 
-    // A second bypass of the SAME guard is a multi-line VALUE rather than an unusual
-    // SELECTOR. `--bypass` here is a real container-query escape (a bare `100cqw`, exactly what this
-    // guard exists to forbid), split across three lines the way `index.css`'s own `margin-left:
-    // clamp(...)` already is -- the `s` flag fix above is what makes this line find it at all.
+    // Multiline values must also be visible: a bare `100cqw` inside a three-line calc is still
+    // a container-query escape. DotAll keeps it in the scan.
     const multiline = ":root {\n  --bypass: calc(\n    100cqw\n  );\n}";
     const multilineDecls = allCustomPropertyDeclarations(multiline);
     expect(multilineDecls).toEqual([{ name: "--bypass", value: "calc(\n    100cqw\n  )", selector: ":root" }]);
-    // The value this finds really would fail the guard's own assertion above -- the fix makes the
-    // scan SEE the declaration, not exempt it.
+    // Finding the declaration must expose its forbidden value, not exempt it.
     expect(multilineDecls[0].value).toMatch(/cq(w|h|i|b|min|max)/i);
-    // ...and the pre-fix regex (no `s` flag) really did drop it -- reproduced here rather than
-    // asserted from the comment alone, using the same expression as the working parser
-    // with only the flag removed.
+    // Removing only dotAll demonstrates why a multiline value can disappear.
     const preFixRegex = /^\s*(--[\w-]+)\s*:\s*(.+?)\s*$/;
     expect("\n  --bypass: calc(\n    100cqw\n  )\n".match(preFixRegex)).toBeNull();
   });
 
 
-  /* --- your own message (2026-10-13) ---------------------------------------------------------------
-     From 2026-09-21 to 2026-10-13 your message was an indent with a rule down its left edge, and these
-     tests kept it OFF the bubble vocabulary (no fill, no radius, no `fit-content`), to take Cursor's idea
-     without its look. The chat page's look (2026-10-13) makes it the shape every mainstream agent UI
-     uses: a tinted block on the right, on the same surface as the composer. These tests now pin that shape, the cascade that keeps it, and the
-     two properties the indent's tests carried that still matter -- the text colour is guarded against the
-     fill under it (since 2026-10-13 the tint's own `--nv-tint-fg`), and a long unbroken token breaks inside the block instead of scrolling the conversation. */
+  /* --- your own message ----------------------------------------------------------------------------------
+     Your message is the shape every mainstream agent UI uses: a tinted block on the right. These tests pin
+     that shape, the cascade that keeps it, and two properties any shape must keep -- the text colour is
+     guarded against the fill under it (the tint's own `--nv-tint-fg`), and a long unbroken token breaks
+     inside the block instead of scrolling the conversation. */
   it("draws your message as a tinted bubble at the body's edge, its sign outside it, and the cascade lets it win", () => {
     const html = '<div class="message-list"><div class="row row-prompt"><div class="row-sign">›</div><div class="row-body">hello</div></div></div>';
     expect(computed(html, ".row-prompt").display).toBe("flex");
@@ -1814,7 +1569,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(computed(html, ".row-prompt .row-body", ".row-prompt .row-body { overflow-wrap: normal; }").overflowWrap).toBe("normal");
     expect(computed(html, ".row-prompt .row-body", ".row-body { white-space: nowrap !important; }").whiteSpace).toBe("nowrap");
   });
-  /* 2026-10-15: the things a reader reviews or answers are framed and nothing else is -- an edit, a
+  /* The things a reader reviews or answers are framed and nothing else is -- an edit, a
      failure's output (pinned with the connector test), the permission card, a code block, and your own
      messages and the box you write them in. Prose, thoughts and a successful tool line stay unframed. */
   it("frames an edit in the transcript with its counts at the right edge and its diff under a hairline, and no connector", () => {
@@ -1937,26 +1692,17 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(specificity(".row-choice")).toEqual([0, 1, 0]);
     expect(specificity(".row-prompt .row-body")).toEqual([0, 2, 0]);
     expect(specificity(".message-list .row-prompt .row-body")).toEqual([0, 3, 0]);
-    // `.band-mode[data-mode="input"]`, not `.panel-footer .mode-block
-    // [data-mode="input"]` -- one class plus one attribute now that the wrapper prefix is gone.
+    // One class plus one attribute on the bare mode block: specificity (0,2,0).
     expect(specificity('.band-mode[data-mode="input"]')).toEqual([0, 2, 0]);
     expect(compareSpecificity([0, 3, 0], [0, 2, 0])).toBeGreaterThan(0);
   });
 
-  // "keeps a choice row off the boxed-button look" (the `.mode-selector button:not(.row-choice)`
-  // vs. `.row-choice` specificity regression) no longer applies to the current screen:
-  // the mode-selector start screen's boxed Auto/Bypass buttons are gone along with the screen
-  // itself (the empty tab never draws a boxed button), so `index.css` no longer carries that
-  // rule at all -- there is nothing left for `.row-choice` to lose a specificity fight WITH. The
-  // positive control this test opened with (`.mode-selector button:not(.row-choice)` must exist in
-  // the real file) would now fail correctly, on a feature that was deliberately deleted rather than
-  // regressed. `.row-choice`'s own rules (padding, background: none, the `:hover`/`:selected`
-  // fills) are unaffected and still covered by the tests around this one.
+  // The empty screen has no boxed mode-selector buttons, hence no such rule competes with
+    // `.row-choice`. Its padding, plain background, hover and selected fills are checked separately.
 
   it("paints the selected choice row's own fill, not the old per-list selected rule's", () => {
-    // The third historical loss the doc comment above names: `.mode-selector .session-choice
-    // button.selected` (0,3,1) used to outweigh `.row-choice.selected` (0,2,0). Before this
-    // fixture carried a `.selected` element, nothing in this file ever read this property.
+    // `.mode-selector .session-choice button.selected` (0,3,1) outweighs
+    // `.row-choice.selected` (0,2,0); the selected fixture must expose that competing fill.
     const row = computed(CHOICE_ROW, "button.selected");
     expect(row.background).toBe("var(--nv-cursorline)");
     const clobbered = computed(
@@ -1987,8 +1733,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(arrow.declarations).toMatch(/clip-path:\s*polygon\(0 0, 100% 50%, 0 100%\);/);
     expect(arrow.declarations).toMatch(/width:\s*1ch;/);
     expect(winningDeclaration(block("browse"), ".band-mode", "margin-right")).toBe("1ch");
-    // Without the keys (2026-10-16): no fill and no arrow, whatever the mode -- an inactive statusline has no
-    // mode section, and an empty filled block read as a rendering fault. Its place stays, so nothing shifts.
+    // Without the keys: no fill or arrow in any mode. An inactive statusline has no mode
+    // section; its place stays so nothing shifts or looks like an empty rendering artifact.
     for (const mode of ["browse", "input", "visual"]) {
       expect(winningDeclaration(block(mode, "false"), ".band-mode", "background"), mode).toBe("none");
       expect(winningDeclaration(block(mode, "false"), ".band-mode", "color"), mode).toBe("var(--nv-chrome-muted)");
@@ -2006,7 +1752,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(unguardedTextColorDeclarations('.band-mode[data-mode="input"] { background: var(--nv-status-insert-bg); color: var(--nv-status-insert-fg); }')).toEqual([]);
   });
 
-  /* 2026-10-16: the start screen's box sits where the conversation's box will be, so a first send moves nothing. */
+  /* The start screen's box sits where the conversation's box will be, so a first send moves nothing. */
   it("puts the start screen's box at the foot, under the rows, at the conversation box's distance from the band", () => {
     const rule = (selector: string) => splitRules(withoutComments).find((r) => r.parent === null && r.selector === selector)!;
     expect(rule(".dashboard > .queue-lines, .dashboard > .dash-input").declarations).toMatch(/order:\s*3;/);
@@ -2018,7 +1764,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(rule(".composer").declarations).toMatch(/margin:\s*10px var\(--page-pad\) 14px;/);
   });
 
-  /* 2026-10-16: the start screen's box keeps the bright frame only while the panel holds the keys. */
+  /* The start screen's box keeps its bright frame only while the panel holds the keys. */
   it("quiets the start screen's box without the keys, and gives it INPUT's colour with the caret in it", () => {
     const box = (focused: string) =>
       `<div class="agent-ui-root" data-pane-focused="${focused}"><div class="dash-input" aria-current="true"><div class="composer">c</div></div></div>`;
@@ -2031,8 +1777,27 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(typing.declarations).toMatch(/border-color:\s*var\(--nv-focus-ring\);/);
   });
 
-  /* 2026-10-16: with no config the editor's statusline sat one row above the panel's band (nvim's command line
-     takes the bottom row) and was grey where the band had no fill, so the line broke at the divider. */
+  /* A start-screen row's title or tabs are cut by the label's ellipsis, never by the component, and its keycap
+     wins over the global `kbd` rule and the user-agent's on every property that would change its look. */
+  it("cuts a start-screen row's detail with CSS, and draws its keycap the same in every engine", () => {
+    const row =
+      '<div class="dash-item" aria-current="true"><span class="dash-label">Resume last <span class="dash-detail">t</span></span><kbd class="dash-key">r</kbd></div>';
+    expect(winningDeclaration(row, ".dash-label", "text-overflow")).toBe("ellipsis");
+    expect(winningDeclaration(row, ".dash-label", "white-space")).toBe("nowrap");
+    expect(winningDeclaration(row, ".dash-label", "overflow")).toBe("hidden");
+    expect(winningDeclaration(row, ".dash-key", "font-family")).toBe("var(--nv-font-mono)");
+    // The box's keycap size, so the row keys and the box's `i` read as one kind of key.
+    expect(winningDeclaration(row, ".dash-key", "font-size")).toBe("var(--fs-sm)");
+    expect(winningDeclaration(row, ".dash-key", "padding")).toBe("0px 7px");
+    expect(winningDeclaration(row, ".dash-key", "line-height")).toBe("1.2");
+    expect(winningDeclaration(row, ".dash-key", "font-weight")).toBe("normal");
+    expect(winningDeclaration(row, ".dash-key", "font-style")).toBe("normal");
+    // Under the cursor the keycap keeps an edge in the muted ink, which a light scheme's cursorline cannot swallow.
+    expect(winningDeclaration(row, ".dash-key", "border-color")).toBe("var(--nv-muted)");
+  });
+
+  /* The band continues the editor's statusline across the divider: the same fill, lifted
+     above the command-line rows so the two lines stay aligned even with no configuration. */
   it("continues the editor's statusline: its fill and text pair, on its row above the command line", () => {
     const band = `<div class="status-band"><div class="band-open">x</div></div>`;
     expect(winningDeclaration(band, ".status-band", "background")).toBe("var(--nv-chrome)");
@@ -2050,7 +1815,7 @@ describe("index.css cascade (which rule actually wins)", () => {
         : `<div class="chooser"><span class="mode-glyph" data-mode-name="manual">x</span></div>`;
     expect(winningDeclaration(glyph(true), ".mode-glyph", "color")).toBe("var(--nv-chrome-muted)");
     expect(winningDeclaration(glyph(false), ".mode-glyph", "color")).toBe("var(--nv-muted)");
-    // Chrome-guarded text is admitted on the band now that it sits on chrome.
+    // Chrome-guarded text is admitted on the band because its fill is chrome.
     expect(unguardedTextColorDeclarations(".status-band .band-open { color: var(--nv-chrome-fg); }")).toEqual([]);
   });
 
@@ -2088,9 +1853,8 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("keeps the cursor band under a row whose control has focus: the focused control is the one solid mark", () => {
-    // Until 2026-10-13 the row's own sign cell was the solid cursor and stepped back to hollow while a
-    // control inside the row had focus. The conversation's cursor is the band now, a soft fill rather
-    // than a solid block, so the focused button is the only solid mark and the band stays.
+    // The conversation's cursor is a soft band, so a focused button is its only solid mark;
+    // the band stays beneath it.
     const html =
       `<div class="agent-ui-root"><div class="message-list" data-focused="true"><div class="row row-permission row-current"><span class="row-sign">!</span>` +
       `<div class="row-body"><button type="button">Approve</button></div></div><div class="cursor-band" aria-hidden="true"></div></div></div>`;
@@ -2104,11 +1868,9 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(getComputedStyle(band).background).toBe("var(--band-fill)");
   });
 
-  /* A HINT landing on a code block is "the item" until the next key (`y` copies it,
-     `v` starts inside it), and it is now drawn: the block outlined in the body's ink, thinner while the
-     panel does not have the keys. (Until 2026-10-13 the row's solid sign cell also went hollow meanwhile,
-     through a `data-code-landed` mark on the list; the chat page's cursor is a soft band under the row,
-     never a second solid mark, and the mark is gone.) */
+  /* A HINT landing on code holds that block until the next key (`y` copies, `v` starts inside).
+     Its outline uses the body's ink, thinner without the keys. The row's soft cursor band stays
+     beneath it without creating a second solid mark. */
   it("outlines a HINT-landed code block, thinner without the keys, over the cursor band", () => {
     const landed = (focused: string) =>
       `<div class="message-list" data-focused="${focused}"><div class="row row-assistant row-current">` +
@@ -2193,9 +1955,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(clobbered.color).toBe("var(--nv-fg)");
   });
 
-  /** The chooser's current row carries the panel's
-   *  solid cursor in its sign cell, and a record's long title stays on its own line beside the sign,
-   *  cut, rather than wrapping under it (it dropped to the row's left edge, under the sign column). */
+  /** The chooser's solid cursor stays in its sign cell. A long title must stay beside the sign
+   *  on its own line, clipped rather than wrapping below the sign column. */
   it("draws the chooser's cursor solid and keeps a long title beside its sign", () => {
     const html = `<div class="chooser"><div class="chooser-row current"><span class="chooser-sign">›</span><span class="chooser-line1"><span class="chooser-lead">t</span><span class="chooser-right">12 min ago</span></span></div></div>`;
     const sign = computed(html, ".chooser-sign");
@@ -2209,9 +1970,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(lead.textOverflow).toBe("ellipsis");
   });
 
-  /** `mock: bottom.html` B: `✻ Working… 1m 12s · ctrl+c interrupt` -- the Stop control is words in
-   *  the line, not a boxed button that WebKit would otherwise give its own
-   *  button face. Focused, it is still the solid cursor every focused control is. */
+  /** Stop is words in the activity line, without WebKit's boxed-button face; focused, it uses
+   *  the same solid cursor as every focused control. */
   it("draws the activity line's Stop as words, and as the solid cursor when focused", () => {
     const html = `<div class="agent-ui-root"><div class="activity-line"><button type="button" class="stop">ctrl+c interrupt</button></div></div>`;
     const stop = computed(html, ".stop");
@@ -2296,7 +2056,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   /* No tint on the composer: the page in a hairline frame,
-     rounded a little more than the conversation's blocks, the prompt `›` in a cell before the text. */
+     rounded a little more than the conversation's blocks, with no prompt cell before the text. */
   it("draws the composer as a framed box on the page with a prompt cell, and a visible ring over it while it has the keys", () => {
     const rules = splitRules(withoutComments);
     const box = rules.find((r) => r.selector === ".composer")!;
@@ -2308,9 +2068,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(focus.declarations).toMatch(/outline:\s*1px solid var\(--nv-focus-ring\);/);
     expect(focus.declarations).toMatch(/border-color:\s*var\(--nv-focus-ring\);/);
   });
-  /** The composer is one framed box on the page; nothing inside it draws a second box. Previously,
-   *  BROWSE's stand-in was boxed, and WebKit's own focus ring drew a box round
-   *  the textarea in INPUT. */
+  /** The composer has one frame: neither BROWSE's stand-in nor INPUT's textarea draws another,
+   *  including WebKit's focus ring. */
   it("draws no box or focus ring of its own inside the composer card, in either mode", () => {
     const hint = computed(`<div class="composer"><div class="composer-browse-hint">x</div></div>`, ".composer-browse-hint");
     for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
@@ -2349,12 +2108,9 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(getComputedStyle(document.body.querySelector(".composer-browse-hint")!).lineHeight).not.toBe("1.6");
   });
 
-  /* WebKitGTK drew "Ask the agent...— i or Ctrl+j to type" -- the
-     hint span is a flex item of `.composer-browse-hint`, and a flex item's leading white space is
-     removed, so the space `Composer.tsx` puts before the dash never showed. jsdom has no layout; this
-     pins the rule that keeps it. */
-  /* 2026-10-15: BROWSE's stand-in ends in the key alone, at the box's right end; with messages queued their
-     count comes first and the key right after it. */
+  /* A flex item's leading whitespace is removed, so the space before the hint's dash cannot
+     separate it from the preceding text. jsdom has no layout; pin the rule that supplies the gap. */
+  /* BROWSE's stand-in ends in the key alone at the right edge; a queued count precedes it. */
   it("puts BROWSE's key at the box's right end, after a queued count when there is one", () => {
     const html = (queued: boolean) =>
       `<div class="composer"><div class="composer-browse-hint">Ask the agent...${queued ? '<span class="composer-queued">+2 queued</span>' : ""}<span class="composer-key">i</span></div></div>`;
@@ -2364,8 +2120,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(winningDeclaration(html(true), ".composer-queued", "margin-left")).toBe("auto");
   });
 
-  /* The missing-sidecar remedy ("Looked for it at:\n  - <path>\n
-     Install ...") ran together into one line. */
+  /* Preserve line breaks in the missing-sidecar remedy so its paths and instructions stay separate. */
   it("keeps a problem remedy's own line breaks", () => {
     const remedy = computed(`<div class="row-problem"><div class="row-problem-remedy">a\nb</div></div>`, ".row-problem-remedy");
     expect(remedy.whiteSpace).toMatch(/^pre(-line|-wrap)?$/);
@@ -2386,8 +2141,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(reason.lineHeight).toBe("1.4");
   });
 
-  /** At ~348px beside a Lua panel the empty tab scrolled
-   *  sideways -- `width: 100%` plus 48px of padding in a content-box. */
+  /** At about 348px, content-box `width: 100%` plus 48px padding overflows the empty tab sideways. */
   it("keeps the empty tab inside its column", () => {
     const tab = computed(`<div class="agent-ui-root"><div class="empty-tab">x</div></div>`, ".empty-tab");
     expect(tab.boxSizing).toBe("border-box");
@@ -2397,32 +2151,15 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 });
 
-/**
- * Every `--nv-*` this stylesheet reads is a name Rust actually emits.
- *
- * A `var(--nv-typo)` is invisible twice over: CSS falls back to the property's initial value with
- * no error, and every other test in this file only checks the SHAPE of a declaration, never whether
- * the name inside it resolves. All 29 names in use were checked by hand on 2026-09-18; the next one
- * added would not have been.
- *
- * **The allowed set is DERIVED from `core/src/theme/tokens.rs`, never written down here.** A copy of
- * the list in this file would be a second thing to keep in sync with `ThemeTokens` -- the same
- * duplicated-definition defect this branch fixed for `isUsableLink` and for the row grid -- and it
- * would rot the first time a token was added, in the silent direction: the new name would look
- * unknown. So this reads that file's own text and reconstructs what `css_vars()` emits from the
- * three places it emits from. That makes this test sensitive to how `tokens.rs` is SPELLED, which
- * is the accepted cost and the reason the parse asserts its own sentinels before it is used: a
- * refactor that breaks the parse fails here loudly rather than quietly admitting everything.
- */
-/* A long `Bash` command scrolled the whole
-   conversation sideways -- 517px at a 420px panel, identical on `main` -- because `toolRegistry.tsx`
-   renders it as a `<pre>` and no rule ever took that `<pre>` off the UA's `white-space: pre`, and
-   `.message-list` scrolls on both axes. A WebKitGTK probe then found every other tool card (a path,
-   a URL, a pattern with no space in it), a URL in a reply's prose and a markdown table doing the same.
-   jsdom has no layout, so what these pin is the stylesheet's half of the contract: every line in the
-   list may break where it has to, and every `<pre>` the panel renders there either wraps or scrolls in
-   its own box. `shell/tests/panel_stream_scroll.rs` measures the result in the real engine. Both
-   tests fail on the earlier follow snap. */
+/** Every theme variable the stylesheet reads must be emitted by Rust. An unknown variable
+ *  silently falls back to the property's initial value, which shape-only checks cannot detect.
+ *  Derive the allowed set from the three emission sources in `core/src/theme/tokens.rs` rather
+ *  than copying a list that can drift. The spelling-sensitive parse checks its own sentinels,
+ *  so refactors fail loudly rather than silently admitting every name. */
+/* Long Bash commands, unbroken tool fields, prose URLs and tables must not push the whole
+   conversation sideways. A tool's `<pre>` otherwise keeps the UA's `white-space: pre`.
+   jsdom has no layout: require each line to break where needed and each rendered `<pre>` to wrap
+   or scroll within its own box. `shell/tests/panel_stream_scroll.rs` checks the real engine. */
 describe("index.css: nothing in the conversation scrolls it sideways", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -2465,8 +2202,7 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
       renderMarkdown("```rust\nfn main() {}\n```"),
       renderToStaticMarkup(card("Bash", { command: "cargo test" })),
       renderToStaticMarkup(card("Edit", { file_path: "/p/a.rs", old_string: "a\n", new_string: "b\n" })),
-      // A Bash card now renders `.permission-card-command`, not `.permission-card-input`
-      // -- this row is what keeps the raw-JSON class in the fixture, for a tool with no dedicated view.
+      // Bash uses `.permission-card-command`; an unknown tool keeps raw JSON input in the fixture.
       renderToStaticMarkup(card("mcp__demo__lookup", { k: "v" })),
     ];
     document.head.innerHTML = `<style>${css}${extraCss}</style>`;
@@ -2507,7 +2243,7 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     for (const pre of pres) {
       expect({ pre: pre.className || pre.parentElement?.className, how: containment(pre) }).not.toMatchObject({ how: null });
     }
-    // Negative control: the `Bash` command's own rule taken away is exactly the GUI pass's defect.
+    // Negative control: removing the command's wrapping rule exposes sideways overflow.
     const bash = panelPres(".tool-card-bash { white-space: pre; }").find((pre) => pre.classList.contains("tool-card-bash"))!;
     expect(containment(bash)).toBeNull();
   });
@@ -2612,8 +2348,8 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     const connector = splitRules(withoutComments).find((r) => r.selector === ".tool-result::before,\n.tool-result-preview::before" || r.selector.replace(/\s+/g, " ") === ".tool-result::before, .tool-result-preview::before");
     expect(connector?.declarations).toMatch(/content:\s*"⎿" \/ "";/);
     expect(connector?.declarations).toMatch(/color:\s*var\(--nv-muted\);/);
-    // Nothing in the conversation or the foot draws a coloured rail down a side any more: what is left of a
-    // `border-left` in a signal or hairline colour belongs to the start screen's cards and the trust prompt.
+    // Coloured side rails belong only to start-screen cards and the trust prompt, never the
+    // conversation or foot.
     const railed = splitRules(withoutComments)
       .filter((r) => /border-left:\s*\d+px solid var\(--(?:nv-warn|nv-error|rule-soft)\)/.test(r.declarations))
       .flatMap((r) => r.selector.split(",").map((b) => b.trim()));
@@ -2630,12 +2366,9 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
   });
 });
 
-/* The keymap GUI pass (2026-09-25): at the default 520px panel the `?` overlay scrolled sideways,
-   and at 348px (beside a Lua side panel) every row below the window keys showed its keys and no
-   description at all, pushed off the right edge. The keys column was `white-space: nowrap`, and one
-   key cell -- `Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)`, the same text on `main` -- is
-   wider than the panel. The keys may break at their own spaces; a key name itself never does,
-   because nothing here sets `overflow-wrap` on the overlay. */
+/* The `?` overlay must fit 520px and a 348px panel beside a Lua pane. A nowrap keys column,
+   especially `Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)`, can push descriptions off-screen.
+   Keys may break at spaces; individual key names stay whole because no overflow-wrap is set. */
 describe("index.css: the ? overlay never scrolls sideways", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -2664,7 +2397,7 @@ describe("index.css: the ? overlay never scrolls sideways", () => {
       expect(winningDeclarationOn(cell, "white-space") ?? "normal").toBe("normal");
       expect(winningDeclarationOn(cell.querySelector(".keycap")!, "white-space") ?? "normal").toBe("normal");
     }
-    // Negative control: the rule the pass found reads as the defect.
+    // Negative control: nowrap keys must be detected.
     expect(winningDeclarationOn(keyCells(".keymap-overlay td:first-child { white-space: nowrap; }")[0], "white-space")).toBe(
       "nowrap",
     );
@@ -2700,10 +2433,9 @@ describe("--nv-* names", () => {
   });
 });
 
-/** GUI pass, 2026-09-25: with the tab bar overflowing (three tabs in a 520px panel), WebKitGTK's
- *  horizontal scrollbar sat over the lower 21px of the 41px bar and ate every click there -- half
- *  of each tab did not select it. The bar still scrolls (the active tab is scrolled into view, and
- *  `h`/`l` move); it just draws no scrollbar, as tmux's status line has none. */
+/** WebKitGTK's horizontal scrollbar covers the lower 21px of a 41px tab bar when three tabs
+ *  overflow a 520px panel, intercepting clicks there. Hide only the scrollbar: the active tab
+ *  still scrolls into view and `h`/`l` still move, as on tmux's status line. */
 it("draws no scrollbar on the tab bar, so a click anywhere on a tab reaches it", () => {
   const sheet = stripComments(css);
   const bar = rulesMatching(sheet, ".tab-bar").find((r) => r.selector.trim() === ".tab-bar");
@@ -2713,15 +2445,10 @@ it("draws no scrollbar on the tab bar, so a click anywhere on a tab reaches it",
   expect(webkit.map((r) => r.body).join(";")).toMatch(/display:\s*none/);
 });
 
-/** `tokens.rs` derives `--nv-surface-fg` (and `--nv-surface-muted`)
- *  guarded against `--nv-surface`, but nothing read them, so every card still drew the body's own
- *  `--nv-fg`/`--nv-muted` -- guarded against `bg`, not against the fill under them. Under the
- *  shipped `zaibatsu` colorscheme (`NormalFloat` bg = Normal's fg) that is white text on a white
- *  card. This renders the panel's real surface-painted boxes, finds each text's nearest fill, and
- *  requires every text on a `--nv-surface` fill to be drawn in a surface-guarded colour (or a
- *  `--nv-syn-*` token, the deliberately unguarded syntax exemption). Declarations, not rendered
- *  colour: jsdom inherits `color` but never resolves `var()`, which is exactly what makes the token
- *  name comparable here. */
+/** Surface text needs its own guarded pair. With zaibatsu's NormalFloat bg equal to Normal's
+ *  fg, the body's pair can be white on white. Render the real boxes, find each text's nearest
+ *  fill, and require surface-guarded text or the deliberate syntax-colour exemption. Compare
+ *  declarations, not pixels: jsdom inherits `color` but does not resolve `var()`. */
 describe("text on a --nv-surface fill (sw-theme-2)", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -2850,12 +2577,10 @@ describe("text on a --nv-surface fill (sw-theme-2)", () => {
   });
 });
 
-/** 2026-10-13: the chat page's three tints (your own `--nv-tint`, a permission card's
- *  `--nv-warn-tint`, a failure's `--nv-error-tint`) are mixed in Rust, and `tokens.rs` guards one text pair
- *  against each. Before that, muted text measured 3.6-4.8:1 on them (the body's `--nv-muted` is guarded
- *  against `bg` only), the composer's dimmed hint 2.3-3.0:1 and its placeholder WebKit's `darkGray`, about
- *  1.9:1 on a light tint. This renders the panel's real tinted boxes, finds each text's nearest fill, and
- *  requires every text on a tint to be drawn in that tint's pair -- and the pairs nowhere else. */
+/** Rust mixes three tints and guards a text pair against each. Body-muted text measures
+ *  3.6-4.8:1 on them, a dimmed composer hint 2.3-3.0:1, and WebKit's darkGray placeholder about
+ *  1.9:1 on a light tint. Render the real boxes, find each text's nearest fill, and require its
+ *  matching tint pair -- and refuse that pair elsewhere. */
 describe("text on a tinted fill", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -2992,10 +2717,10 @@ describe("text on a tinted fill", () => {
       }
     }
     // The fixture really put text on each tint.
-    // Your messages and an inline code span; the composer left the tint on 2026-10-15.
+    // Your messages and inline code are on this tint; the composer is off it.
     expect(seen["var(--nv-tint)"] ?? 0, "your own tint").toBeGreaterThan(2);
     expect(seen["var(--nv-warn-tint)"] ?? 0, "the warn tint").toBeGreaterThan(8);
-    // A failed call's output has no fill since 2026-10-14; the lost-session card is what is left on this tint.
+    // A failed call's output and the lost-session card are on this tint.
     expect(seen["var(--nv-error-tint)"] ?? 0, "the error tint").toBeGreaterThan(2);
     expect(offenders).toEqual([]);
   });
@@ -3026,7 +2751,7 @@ describe("text on a tinted fill", () => {
   });
 
   it("draws the composer's placeholder in the body's muted ink at full strength, and its key undimmed", () => {
-    // The composer is on `--nv-bg` since 2026-10-15, so the body's pair, which Rust guards against it.
+    // The composer is on the body fill, so it takes the body's guarded pair.
     const rules = splitRules(withoutComments);
     const placeholder = rules.find((r) => r.parent === null && r.selector === ".composer textarea::placeholder");
     expect(placeholder, "WebKit's UA placeholder colour is darkGray, whatever the card's").toBeDefined();
@@ -3064,9 +2789,8 @@ describe("VISUAL mode", () => {
   });
 
   it("highlights a selection in nvim's Visual colour while VISUAL/V-LINE is on, and turns off the cursorline fill where the two coincide", () => {
-    // Comments stripped first: `rulesMatching` is a naive substring matcher, and this file's own
-    // doc comment on the rule below mentions ".row-current" in backticks -- without stripping,
-    // that comment text (attached to the WRONG rule's captured selector) is what "found" it.
+    // Strip comments first: a selector name mentioned in prose can fool `rulesMatching`'s
+    // substring search into finding the wrong captured rule.
     const stripped = stripComments(css);
     const selectionRule = rulesMatching(stripped, "::selection").find((r) => r.selector.includes("[data-visual]"));
     expect(selectionRule, "no .message-list[data-visual] ::selection rule").toBeDefined();
@@ -3103,11 +2827,11 @@ describe("VISUAL mode", () => {
   });
 });
 
-/* An atomic inline-block keeps an inline code token such as --json together and moves it to the
-   next line when needed. Unlike white-space: nowrap alone, max-width: 100% with overflow-wrap
-   lets a span longer than the row break within the row. The selector leaves fenced pre code
-   alone. jsdom has no layout, so these tests check the declarations and that they reach the
-   markdown renderer's inline spans. Rendering needs to be checked in a browser. */
+/* A browser can break `--json` between its hyphens; neither hyphens nor word-break prevents
+   it. No-wrap preserves short spans but overflows long ones. An atomic inline-block moves as
+   one piece when it fits the row; longer spans are capped at 100% and may break anywhere.
+   Fenced `pre code` stays outside the selector. jsdom has no layout: check the rule and that it
+   reaches the renderer's span; a real-display check is needed for rendering. */
 describe("inline code never breaks inside a token", () => {
   const rule = () => {
     const found = splitRules(stripComments(css)).filter(
@@ -3140,11 +2864,9 @@ describe("inline code never breaks inside a token", () => {
   });
 });
 
-/* At panel text 0.9 an expanded one-line
-   edit diff's horizontal scrollbar was drawn over its last (`+`) line. The scrollbar is WebKitGTK's overlay one, so
-   it takes no room of its own: the diff box (`.permission-card-diff`, the `pre` that scrolls sideways) keeps a strip
-   of padding under its last line for it to sit in. `scrollbar-gutter` does not help, it reserves the block-axis
-   scrollbar's room only. jsdom draws no scrollbar, so this pins the room, not the pixels. */
+/* At panel text 0.9, WebKitGTK's overlay scrollbar covers the last (+) line of a one-line
+   expanded diff. It takes no space, so reserve padding below that line. `scrollbar-gutter`
+   reserves block-axis scrollbar space only. jsdom draws none; check the room, not the pixels. */
 describe("an expanded diff keeps room under its last line for its scrollbar", () => {
   /** The effective bottom padding, in px, of `.permission-card-diff`: its `padding` shorthand and `padding-bottom`
    *  read in source order, as the cascade applies them within one rule. */
@@ -3172,13 +2894,10 @@ describe("an expanded diff keeps room under its last line for its scrollbar", ()
   });
 });
 
-/* The permission card's reason box
-   kept the browser's intrinsic width -- about twenty characters -- so its placeholder read "Reason (shown to the ag"
-   -- and Approve/Deny kept WebKit's own 13.33px form-control font whatever the panel's text size was, so at a larger
-   panel size the prose, the card's title and the reason box grew and the two buttons did not. The box now fills the
-   card (an ellipsis rather than a hard clip where even that is too narrow), and the buttons take the panel's face and
-   its `--fs-*` scale like every other control in it (the composer, the rename box). jsdom has no layout: this pins the
-   rules, and the pixels are owed a screen. */
+/* The reason box's intrinsic width is about twenty characters and clips its placeholder;
+   WebKit's default 13.33px button font also ignores panel scaling. Fill the card's width with
+   an ellipsis when needed, and give its buttons the panel face and token scale. jsdom has no
+   layout, so these check rules; a real display must check the pixels. */
 describe("the permission card's reason box and buttons follow the panel", () => {
   /** Every declaration block whose selector list names `selector` exactly, in source order. */
   const declarationsFor = (selector: string): string => {
@@ -3209,15 +2928,11 @@ describe("the permission card's reason box and buttons follow the panel", () => 
   });
 });
 
-/* The atomic layout above reaches every inline span under an
-   assistant row, which broke two things it was never meant to touch. (a) A table cell's words stay whole
-   (`.table-scroll td { overflow-wrap: normal }`, T1), but the span's own `overflow-wrap: anywhere` and
-   `max-width: 100%` beat the cell's inherited value, so an identifier in a cell broke again and was capped to
-   the cell's width. (b) An inline-block does not take its ancestors' text decoration into its own box (CSS
-   Text Decoration 3: "not propagated to ... atomic inline-level descendants"), so the code in a link lost its
-   underline and the code in `~~ ~~` its strike-through -- each takes it back on its own box, explicitly
-   rather than by `inherit`, since a `<strong>` between the link and the span would have a computed `none`.
-   `winningDeclarationOn` reads which rule wins; jsdom draws nothing. */
+/* Atomic inline code needs two exceptions. Table cells keep words whole, but a span's own
+   overflow-wrap and max-width override inherited cell values, so reset both there. Atomic
+   inline boxes also do not receive ancestor text decoration: set underline and strike-through
+   explicitly. Inheriting would fail with an intervening strong element whose computed value
+   is none. `winningDeclarationOn` checks the winners; jsdom draws nothing. */
 describe("inline code keeps its cell's words and its links' decoration", () => {
   afterEach(() => {
     document.head.innerHTML = "";
@@ -3276,7 +2991,7 @@ describe("the start screen's stage", () => {
     expect(winningDeclaration(html, ".empty-stage", "position")).toBe("relative");
     expect(winningDeclaration(html, ".empty-stage", "display")).toBe("flex");
     expect(winningDeclaration(html, ".empty-stage", "flex-direction")).toBe("column");
-    // Absolute against the stage (not the root), covering all of it.
+    // Absolute against the stage (not the root), inset 8px from each of its edges.
     expect(winningDeclaration(html, ".trust-prompt", "position")).toBe("absolute");
     expect(winningDeclaration(html, ".trust-prompt", "inset")).toBe("8px");
   });

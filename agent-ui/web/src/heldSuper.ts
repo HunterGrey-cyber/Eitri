@@ -1,10 +1,10 @@
 /** Whether a Super/Hyper key is physically held, tracked from that key's OWN keydown and keyup.
  *
- *  A 2026-09-28 sandbox pass answered the question `keymap.ts`'s `KeyLike` doc left open: WebKitGTK 2.52.6 never
- *  reports a held Super on ANOTHER key's event -- `metaKey` is false and `getModifierState("Super"/"Hyper")` reads
- *  false while Super is down, so `hasSuperOrHyper` alone let `Super+a` answer a permission card. What WebKitGTK does
- *  deliver is the Super key's own keydown (`key: "Super"`, `code: "OSLeft"`) and keyup. So this module remembers it,
- *  the way a terminal tracks a held modifier it cannot query.
+ *  WebKitGTK 2.52.6 never reports a held Super on ANOTHER key's event: `metaKey` is false and
+ *  `getModifierState("Super"/"Hyper")` reads false while Super is down, so those event flags alone
+ *  cannot protect a card from `Super+a`. What WebKitGTK does deliver is the Super key's own keydown
+ *  (`key: "Super"`, `code: "OSLeft"`) and keyup. So this module remembers it, the way a terminal
+ *  tracks a held modifier it cannot query.
  *
  *  A missed keyup (focus moved away with Super still down, as GNOME's own Super tap does when it opens
  *  the overview) would leave this true, which only ever makes an answer key refuse -- the safe side --

@@ -91,8 +91,8 @@ end
 -- DISPLAY-column range applied to every line, taken from its two corners. Moving the lower corner
 -- up to the cap line and keeping its byte column is not that range once the lines differ: a byte
 -- column 2 that was `b` on the true end line is the `X` of `\tXYZ` at display column 9 on a capped
--- line, and the block silently widened to columns the user never selected (this very function
--- once returned `abcdefghi` for a selection of `ab`).
+-- line, silently widening the block to columns the user never selected: a selection of `ab`
+-- becomes `abcdefghi`.
 --
 -- So the lower corner is placed on the lowest line within the cap, at the display column the real
 -- one had, and kept only if getregion's own rule then yields exactly the original block. A line
@@ -242,7 +242,7 @@ local timer = vim.uv.new_timer()
 
 local function fire()
   dirty = false
-  -- `vim.fn.*` and `nvim_api` are not allowed in a libuv callback (a "fast event"); hop to the
+  -- `vim.fn.*` and `vim.api` are not allowed in a libuv callback (a "fast event"); hop to the
   -- main loop first. Getting this wrong fails with E5560 at runtime, never at load.
   vim.schedule(send)
 end

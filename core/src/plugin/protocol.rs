@@ -31,6 +31,8 @@ pub enum ErrorCode {
     EditorTimeout,
     TooLarge,
     Io,
+    /// A verb that reshapes the window was asked by a page outside the plugin's own window.
+    NotOwnWindow,
 }
 
 /// `{}`, and nothing else.
@@ -77,6 +79,81 @@ pub struct EditorOpen {
     pub col: Option<u32>,
 }
 
+/// One side of a diff: a rooted file or bounded text displayed in a scratch buffer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum DiffSide {
+    Path {
+        path: std::path::PathBuf,
+    },
+    Text {
+        title: String,
+        text: String,
+        /// Without a filetype the scratch buffer gets no filetype and no syntax.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filetype: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorDiff {
+    pub left: DiffSide,
+    pub right: DiffSide,
+}
+
+impl EditorDiff {
+    pub fn check(&self) -> Result<(), (ErrorCode, String)> {
+        for side in [&self.left, &self.right] {
+            if let DiffSide::Text { title, text, filetype } = side {
+                if title.is_empty() || title.chars().count() > 80 || title.chars().any(super::keys::hidden) {
+                    return Err((
+                        ErrorCode::BadRequest,
+                        "title must be 1-80 characters without control or hidden characters".into(),
+                    ));
+                }
+                // A side's text bound is a request-shape rule, like the title and filetype rules beside it.
+                if text.len() > 96 * 1024 {
+                    return Err((ErrorCode::BadRequest, "diff text may be at most 96 KiB".into()));
+                }
+                if text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                    return Err((ErrorCode::BadRequest, "diff text holds a control character".into()));
+                }
+                if filetype.as_deref().is_some_and(|filetype| {
+                    filetype.is_empty()
+                        || filetype.len() > 32
+                        || !filetype
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                }) {
+                    return Err((ErrorCode::BadRequest, "filetype must match [a-z0-9_]{1,32}".into()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorPreload {
+    pub path: String,
+    pub diagnostics: OnOff,
+    pub inlay_hints: OnOff,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorRoot {
+    pub root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorCdArgs {
+    pub dir: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorAssist {
@@ -89,6 +166,13 @@ pub struct EditorAssist {
 #[serde(deny_unknown_fields)]
 pub struct LayoutFocus {
     pub target: FocusTarget,
+}
+
+/// `terminal.at {dir}`: the base terminal of the plugin's own window in `dir`, when nothing but its shell runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalAt {
+    pub dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,6 +325,16 @@ pub enum Verb {
     TaskCancel(TaskCancel),
     #[serde(rename = "editor.open")]
     EditorOpen(EditorOpen),
+    #[serde(rename = "editor.preload")]
+    EditorPreload(EditorPreload),
+    #[serde(rename = "editor.modified")]
+    EditorModified(EditorRoot),
+    #[serde(rename = "editor.reload")]
+    EditorReload(EditorRoot),
+    #[serde(rename = "editor.diff")]
+    EditorDiff(EditorDiff),
+    #[serde(rename = "editor.cd")]
+    EditorCd(EditorCdArgs),
     #[serde(rename = "editor.assist")]
     EditorAssist(EditorAssist),
     #[serde(rename = "editor.assist_clear")]
@@ -269,6 +363,8 @@ pub enum Verb {
     PageSaved(PageSaved),
     #[serde(rename = "page.ready")]
     PageReady(NoArgs),
+    #[serde(rename = "terminal.at")]
+    TerminalAt(TerminalAt),
 }
 
 impl Verb {
@@ -283,8 +379,13 @@ impl Verb {
             }
             Verb::TaskStart(_) | Verb::TaskCancel(_) => Some(Capability::Tasks),
             Verb::EditorOpen(_) => Some(Capability::EditorOpen),
+            Verb::EditorCd(_) => Some(Capability::EditorCwd),
+            Verb::EditorPreload(_) | Verb::EditorModified(_) | Verb::EditorReload(_) | Verb::EditorDiff(_) => {
+                Some(Capability::EditorBuffers)
+            }
             Verb::EditorAssist(_) | Verb::EditorAssistClear(_) => Some(Capability::EditorAssist),
             Verb::LayoutFocus(_) => Some(Capability::LayoutFocus),
+            Verb::TerminalAt(_) => Some(Capability::TerminalCwd),
             Verb::StateRead(_) | Verb::StateWrite(_) | Verb::LogAppend(_) | Verb::LogRead(_) => Some(Capability::State),
         }
     }
@@ -295,6 +396,11 @@ impl Verb {
             Verb::TaskStart(_) => "task.start",
             Verb::TaskCancel(_) => "task.cancel",
             Verb::EditorOpen(_) => "editor.open",
+            Verb::EditorCd(_) => "editor.cd",
+            Verb::EditorPreload(_) => "editor.preload",
+            Verb::EditorModified(_) => "editor.modified",
+            Verb::EditorReload(_) => "editor.reload",
+            Verb::EditorDiff(_) => "editor.diff",
             Verb::EditorAssist(_) => "editor.assist",
             Verb::EditorAssistClear(_) => "editor.assist_clear",
             Verb::LayoutFocus(_) => "layout.focus",
@@ -309,6 +415,7 @@ impl Verb {
             Verb::EditorOpenLink(_) => "editor.open_link",
             Verb::PageSaved(_) => "page.saved",
             Verb::PageReady(_) => "page.ready",
+            Verb::TerminalAt(_) => "terminal.at",
         }
     }
 }
@@ -895,6 +1002,39 @@ mod tests {
                 ),
                 "{raw}"
             );
+        }
+    }
+
+    #[test]
+    fn diff_fixtures_parse_and_sides_refuse_missing_mixed_or_extra_fields() {
+        let Inbound::Request(request) = parse_request(include_str!("fixtures/req-editor-diff.json")) else {
+            panic!("diff fixture must parse")
+        };
+        assert_eq!(request.verb.name(), "editor.diff");
+        assert_eq!(request.verb.capability(), Some(Capability::EditorBuffers));
+        let Verb::EditorDiff(args) = request.verb else {
+            panic!("not a diff")
+        };
+        assert_eq!(args.check(), Ok(()));
+        assert_eq!(fixture("rep-editor-diff.json")["result"], serde_json::json!({"tab": 2}));
+        let untyped: DiffSide = serde_json::from_value(serde_json::json!({"title": "Attempt", "text": "a"})).unwrap();
+        assert_eq!(
+            untyped,
+            DiffSide::Text {
+                title: "Attempt".into(),
+                text: "a".into(),
+                filetype: None
+            },
+            "a text side may leave its filetype out"
+        );
+        for bad in [
+            serde_json::json!({"title": "Attempt"}),
+            serde_json::json!({"text": "a", "filetype": "rust"}),
+            serde_json::json!({"path": "/work/a.rs", "title": "Attempt", "text": "a", "filetype": "rust"}),
+            serde_json::json!({"path": "/work/a.rs", "extra": true}),
+            serde_json::json!({"title": "Attempt", "text": "a", "filetype": "rust", "extra": true}),
+        ] {
+            assert!(serde_json::from_value::<DiffSide>(bad.clone()).is_err(), "{bad}");
         }
     }
 

@@ -1,9 +1,7 @@
 //! The transport half of wire 1: one Unix socket, nvim writing, the host polling.
 //!
-//! Deliberately the same shape as `crate::theme::feed` -- same instance directory scheme, same
-//! `--cmd` loader, same non-blocking listener drained from the host's main loop -- because that
-//! protocol is in production and its failure modes are already paid for. Read that module's
-//! comments before changing anything here; several of them are about bugs, not style.
+//! Like `crate::theme::feed`, it uses a private instance directory, a guarded `--cmd` loader and
+//! a non-blocking listener drained from the host's main loop, so reading context never waits on nvim.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -12,10 +10,10 @@ use std::time::Duration;
 use crate::editor_context::compose::{EditorContext, Selection};
 use crate::line_feed::NewestLineReader;
 
-/// Instance-directory prefix. Six bytes, like the other two, and that is a budget rather than a
+/// Instance-directory prefix. Six bytes, like every other feed's, and that is a budget rather than a
 /// convention: `crate::instance_dir` builds `<tmp>/<prefix><pid>-<uuid32>`, which reaches 93 bytes
-/// at the macOS worst case, against `agent::socket_path`'s 103-byte cap. Both existing sockets land
-/// at exactly 100.
+/// at the macOS worst case, against `agent::socket_path`'s 103-byte cap. Every feed socket in this
+/// crate lands at exactly 100.
 pub(crate) const DIR_PREFIX: &str = "nv-ec-";
 
 /// The socket file inside that directory. Six bytes, for the reason above.
@@ -53,7 +51,7 @@ pub struct EditorContextFeed {
 impl EditorContextFeed {
     /// Sweeps stale directories, builds this one, writes the snippet and binds the socket -- or
     /// returns `None` having logged why. `None` is supported and costs exactly one feature: nvim
-    /// gets no extra env or args, and turns are sent with no editor context, as they are today.
+    /// gets no extra env or args, and turns are sent with no editor context.
     pub fn new() -> Option<Self> {
         let tmp = std::env::temp_dir();
         for (prefix, socket_name) in SWEPT_NAMES {
@@ -184,8 +182,8 @@ impl EditorContextReader {
     }
 }
 
-/// A line that is not UTF-8 (nvim sends a file name's bytes as they are) is read with each bad byte as
-/// U+FFFD: the update still says which file is open, close enough for a person or an agent to know it,
+/// A line that is not UTF-8 (nvim sends a file name's bytes as they are) is read with each invalid
+/// sequence as one U+FFFD: the update still says which file is open, close enough for a person or an agent to know it,
 /// where dropping it would leave the file open before it named as the current one.
 fn parse_bytes(line: &[u8]) -> Result<EditorContext, String> {
     parse(&String::from_utf8_lossy(line))
@@ -349,13 +347,13 @@ mod tests {
     /// The socket path at macOS's own worst case, asserted **exactly** rather than against the cap.
     ///
     /// `assert_eq!(…, 100)` and not `<= MAX_SOCKET_PATH_BYTES`, for the reason `theme::feed`'s twin
-    /// gives: an inequality lets the whole margin be eaten in silence. This is the THIRD socket in
-    /// this crate and all three now sit at exactly 100 against a 103-byte cap, so the remaining
+    /// gives: an inequality lets the whole margin be eaten in silence. Every feed socket in this
+    /// crate sits at exactly 100 against a 103-byte cap, so the remaining
     /// budget is three bytes for every future protocol combined -- which is why this wire's
     /// directory prefix and file name are both six bytes rather than something legible.
     #[test]
     fn the_editor_context_socket_path_is_exactly_100_bytes_at_the_macos_worst_case() {
-        // `/var/folders/<2>/<28>/T/` -- this project's Mac mini, measured 2026-09-17.
+        // macOS's measured temporary-directory shape: `/var/folders/<2>/<28>/T/` (49 bytes).
         let macos_tmp = Path::new("/var/folders/33/0tqfpnyn4z3c049gljzppdv00000gn/T/");
         assert_eq!(macos_tmp.as_os_str().len(), 49);
         // A synthetic 5-digit pid: macOS's PID_MAX is 99999, and the length under test must not

@@ -181,8 +181,9 @@ const SHIFTED: &str = "~!@#$%^&*()_+{}|:\"<>?";
 /// control (C0, DEL, C1), a line or paragraph separator, or any character the agent panel draws as an
 /// escape (format characters such as bidi marks, isolates, zero-width characters and tag characters, and
 /// blank-rendering fillers), taken from that one table so the two never drift apart. The `?` sheet draws a
-/// page's rows as they are written, so a row holding one could disguise itself or the rows beside it.
-fn hidden(c: char) -> bool {
+/// page's rows as they are written, so a row holding one could disguise itself or the rows beside it; a
+/// manifest's window title is refused for the same characters.
+pub(crate) fn hidden(c: char) -> bool {
     c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || agent::providers::acp::wire::is_invisible_char(c)
 }
 

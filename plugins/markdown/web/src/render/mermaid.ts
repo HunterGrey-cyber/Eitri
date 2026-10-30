@@ -110,8 +110,8 @@ function idle(): Promise<void> {
 type Outcome = { svg: string } | { error: string; later: boolean };
 
 /** How many drawn outcomes the runner keeps, and how many characters of SVG and message they may hold together.
- *  Every edit inside a diagram is a new source, so without a bound a long editing session kept every revision's
- *  drawing for as long as the page lived. The bound counts only drawings of sources the document no longer holds:
+ *  Every edit inside a diagram is a new source, so without a bound a long editing session would keep every revision's
+ *  drawing for as long as the page lives. The bound counts only drawings of sources the document no longer holds:
  *  the newest outcome and every diagram of the document last filled are always kept, however many or large, since
  *  evicting one of those would draw it again on the next edit anywhere else. */
 export const CACHE_ENTRIES = 64;

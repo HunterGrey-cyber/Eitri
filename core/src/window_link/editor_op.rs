@@ -36,9 +36,10 @@ pub enum EditorOp {
         path: String,
         lines: Option<(u32, u32)>,
     },
-    /// A plugin page asks the editor to open a file of the plugin's work tree.
+    /// A plugin page asks the editor to open `path` relative to its declared `root`, named by the manifest.
     PluginOpen {
         plugin: String,
+        root: String,
         path: String,
         line: Option<u32>,
         col: Option<u32>,
@@ -47,6 +48,39 @@ pub enum EditorOp {
         plugin: String,
         diagnostics: bool,
         inlay_hints: bool,
+    },
+    /// The follow snippet installed for a page window 2 holds, from window 1's own registration of that plugin
+    /// (its socket, filetypes and commands); an install already in place is made again with the same values. There
+    /// is no teardown op: the snippet and its commands are window 1's, and a page ending in window 2 only turns its
+    /// following off ([`EditorOp::PluginFollow`]).
+    PluginInstall {
+        plugin: String,
+    },
+    PluginFollow {
+        plugin: String,
+        on: bool,
+    },
+    PluginText {
+        plugin: String,
+        buf: u64,
+    },
+    PluginReveal {
+        plugin: String,
+        buf: u64,
+        line: u32,
+        token: u64,
+    },
+    PluginJump {
+        plugin: String,
+        buf: u64,
+        line: u32,
+        col: u32,
+    },
+    /// An already resolved Markdown link, checked again against window 1's project before opening.
+    PluginOpenLink {
+        plugin: String,
+        path: String,
+        line: Option<u32>,
     },
     PluginAssistClear {
         plugin: String,
@@ -64,6 +98,12 @@ impl EditorOp {
             EditorOp::BufferState { .. } => "buffer_state",
             EditorOp::PluginOpen { .. } => "plugin_open",
             EditorOp::PluginAssistApply { .. } => "plugin_assist_apply",
+            EditorOp::PluginInstall { .. } => "plugin_install",
+            EditorOp::PluginFollow { .. } => "plugin_follow",
+            EditorOp::PluginText { .. } => "plugin_text",
+            EditorOp::PluginReveal { .. } => "plugin_reveal",
+            EditorOp::PluginJump { .. } => "plugin_jump",
+            EditorOp::PluginOpenLink { .. } => "plugin_open_link",
             EditorOp::PluginAssistClear { .. } => "plugin_assist_clear",
         }
     }
@@ -255,19 +295,18 @@ mod tests {
                 lines: Some((3, 2)),
             },
             EditorOp::PluginOpen {
-                plugin: "snotra".into(),
+                plugin: "demo".into(),
+                root: "work".into(),
                 path: "ch01/main.rs".into(),
                 line: Some(1),
                 col: None,
             },
             EditorOp::PluginAssistApply {
-                plugin: "snotra".into(),
+                plugin: "demo".into(),
                 diagnostics: true,
                 inlay_hints: false,
             },
-            EditorOp::PluginAssistClear {
-                plugin: "snotra".into(),
-            },
+            EditorOp::PluginAssistClear { plugin: "demo".into() },
         ];
         for op in ops {
             let json = serde_json::to_value(&op).unwrap();
@@ -284,8 +323,23 @@ mod tests {
             r#"{"op":"review_clear","path":"a","code":"x"}"#,
             r#"{"op":"review_clear_mine","lua":"x"}"#,
             r#"{"path":"a"}"#,
+            r#"{"op":"plugin_open","plugin":"demo","path":"a.rs","line":null,"col":null}"#,
         ] {
             assert!(serde_json::from_str::<EditorOp>(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn window_two_has_no_editor_buffers_or_cd_operation() {
+        for op in [
+            "plugin_preload",
+            "plugin_modified",
+            "plugin_reload",
+            "plugin_diff",
+            "plugin_cd",
+        ] {
+            let value = serde_json::json!({"op": op, "plugin": "demo"});
+            assert!(serde_json::from_value::<EditorOp>(value).is_err(), "{op}");
         }
     }
 

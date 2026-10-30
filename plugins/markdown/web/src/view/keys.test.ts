@@ -156,6 +156,17 @@ describe("headings and sideways", () => {
     expect((push.mock.calls.at(-1)![0] as { line: number }).line).toBeCloseTo(16 / 20 * 1, 5);
   });
 
+  it("scroll the current display formula sideways", async () => {
+    show("$$\n\\rule{20em}{1em}\n$$\n\npara");
+    await installKeys(preview, { run: () => false });
+    const display = document.querySelector(".katex-display")!;
+    const scrollBy = vi.fn();
+    display.scrollBy = scrollBy as typeof display.scrollBy;
+    press("scroll.right");
+    press("scroll.left");
+    expect(scrollBy.mock.calls.map((c) => (c[0] as ScrollToOptions).left)).toEqual([60, -60]);
+  });
+
   it("scroll the current wide block sideways", async () => {
     show(`${FENCE}sh\n${"x".repeat(400)}\n${FENCE}\n\npara`);
     await installKeys(preview, { run: () => false });

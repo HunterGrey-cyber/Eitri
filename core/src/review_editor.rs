@@ -1810,6 +1810,7 @@ mod tests {
     /// events a test gives it, and answers each call when it is made or, while `hold` is set, when
     /// the test releases it.
     struct Nvim {
+        serial: Cell<u64>,
         sent: RefCell<Vec<(&'static str, Vec<Value>)>>,
         held: RefCell<VecDeque<(Answer, Value)>>,
         hold: Cell<bool>,
@@ -1820,6 +1821,7 @@ mod tests {
     impl Nvim {
         fn new() -> Nvim {
             Nvim {
+                serial: Cell::new(1),
                 sent: RefCell::new(Vec::new()),
                 held: RefCell::new(VecDeque::new()),
                 hold: Cell::new(false),
@@ -1922,7 +1924,7 @@ mod tests {
         }
 
         fn target(&self) -> Option<u64> {
-            Some(1)
+            Some(self.serial.get())
         }
     }
 
@@ -1987,6 +1989,24 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_new_session_serial_reinstalls_the_review_module() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(&nvim, show("/p/a", "main:1"), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(nvim.count(REVIEW_LUA), 1);
+        let at_call = nvim.calls().len();
+        nvim.serial.set(2);
+        overlay.call(&nvim, show("/p/b", "main:2"), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        let calls = nvim.calls();
+        assert_eq!(calls[at_call], (REVIEW_LUA, None));
+        assert_eq!(calls[at_call + 1], (SHOW_LUA, Some("/p/b".into())));
+        assert_eq!(nvim.count(REVIEW_LUA), 2);
     }
 
     #[test]

@@ -15,38 +15,17 @@
 #                            --sidecar-only for one of those alone (eitri setup --help)
 set -euo pipefail
 
-# LIBDIR is derived from where THIS script actually lives, never hardcoded: the one launcher ships
-# in three shapes -- /usr/bin/eitri -> /usr/lib/eitri (.deb/.rpm), ~/.local/bin/eitri ->
-# ~/.local/lib/eitri (the tarball installer), and the tarball's own bin/eitri ->
-# lib/eitri before it is installed anywhere.
+# Derive LIBDIR from the launcher: /usr/bin/eitri uses /usr/lib/eitri, a user install's
+# ~/.local/bin/eitri uses ~/.local/lib/eitri, and an unpacked tarball's bin/eitri uses lib/eitri.
+# Resolve only the launcher's own symlink chain, never a symlinked directory: resolving a stow
+# bin/ directory physically would pick the dotfiles repository's sibling lib instead of this install's.
 #
-# F5: resolve ONLY the launcher FILE's own symlink chain here (a package manager's alternatives
-# system pointing `~/.local/bin/eitri -> /usr/bin/eitri`, or a plain
-# `~/bin/eitri -> ~/.local/bin/eitri`) -- never a symlinked DIRECTORY along the way. The old
-# `readlink -f "$0"` canonicalized every path component, including a symlinked `bin/` (e.g. GNU
-# stow folding `~/.local/bin` into a dotfiles repo): the fully-resolved path then sits in the
-# symlink's TARGET directory, whose sibling `../lib/eitri` is not this install's lib at all, and
-# every launch, `eitri setup` included, died `cd: .../lib/eitri: No such file or directory`.
-#
-# The `cd` below then gets `<the resolved file's directory>/../lib/eitri` and resolves the `..`
-# logically (its default): the `..` removes the directory before it as spelled, after checking that
-# it names a directory (symlinks followed), so a symlinked bindir leads to ITS OWN sibling
-# `lib/eitri`. POSIX cd(1) does the same, so this holds under `POSIXLY_CORRECT=1` too. Outside
-# POSIX mode, bash adds one thing: if the logical path does not exist, it retries physically. Only
-# the unsupported inverse shape needs that retry: a symlinked bindir whose TARGET, not the bindir
-# as named, has the sibling `lib/eitri`. That shape therefore works only with `POSIXLY_CORRECT`
-# unset, and F5 never asked for it.
-#
-# The parent is reached by appending `..`, never by a second `dirname`. An earlier version used
-# `dirname`, and `dirname .` is `.`, not `..`, so it broke `./eitri` run from inside an unpacked
-# release's bin/ and `bin/./eitri` run from its root. Appending `..` works for any spelling of the
-# directory (`.`, `bin/.`, `..`).
-#
-# `CDPATH=''` on that `cd` is a separate fix: without it, an exported `CDPATH` (e.g. `.`) with an
-# entry that matches the target makes bash's `cd` print the destination to stdout on top of `pwd`'s
-# own line, corrupting LIBDIR into two lines glued together wherever that path is relative -- `$0`
-# found through a relative `PATH` entry, or `bin/eitri` run from an unpacked release directory
-# (one of this launcher's three shapes, see above).
+# Logical `cd` removes `..` from the spelled directory, following symlinks only to check it exists.
+# This also works with POSIXLY_CORRECT=1. Bash outside POSIX mode can additionally retry physically
+# when the logical path is absent; only that retry supports a target directory with its own sibling lib.
+# Append `..` rather than taking dirname twice: `dirname .` is `.`, so the latter breaks ./eitri
+# from inside bin/ and bin/./eitri from the tarball root.
+# Clear CDPATH so `cd` cannot print a second path into LIBDIR when the launcher's path is relative.
 resolve_launcher_path() {
 	local path="$1" target depth=0
 	while [[ -L "$path" ]]; do
@@ -69,19 +48,14 @@ LIBDIR="$(CDPATH='' cd -- "$(dirname -- "$EITRI_LAUNCHER_PATH")/../lib/eitri" &&
 unset -f resolve_launcher_path
 unset EITRI_LAUNCHER_PATH
 
-# Handle `eitri setup [args]` before window flag parsing. Run the POSIX setup script with
-# sh so it also works without an execute bit.
-#
-# Forward --nvim-only, --nvim-offer, --uninstall, --sidecar-only, --from-source,
-# --build-sidecar-into and -h/--help unchanged in one invocation. Adding --sidecar-only
-# would conflict with an explicit mode because set_mode rejects a second mode.
-# packaging/test_launcher.sh reads the installer modes to catch missing forwarding cases.
-#
-# Without an explicit mode, build the sidecar first and then run --nvim-offer.
-# The offer skips an adequate PATH nvim, an already installed release nvim, or --no-nvim;
-# a download failure only warns. --nvim-only instead fetches even with an adequate PATH nvim
-# and fails on download errors. --sidecar-only ignores --yes and --with-nvim, and the offer
-# handles those options itself.
+# Handle setup before flag parsing: it opens no project or window. Invoke the POSIX installer
+# through sh so setup also works when the installed copy lacks its execute bit.
+# Explicit modes and help pass through once, unchanged: adding --sidecar-only would conflict with
+# --nvim-only or --uninstall. The mode list is checked against install.sh so new modes cannot be missed.
+# With no mode, build the sidecar and run the installer's normal nvim offer. Unlike --nvim-only,
+# that offer skips an adequate PATH/private nvim and only warns on download failure; an offline
+# machine or an already adequate nvim must not make setup fail. --no-nvim skips the offer;
+# --yes/--with-nvim are ignored by --sidecar-only and read by --nvim-offer itself.
 if [[ "${1:-}" == setup ]]; then
 	shift
 	for a in "$@"; do
@@ -127,11 +101,8 @@ CMD_NAME=eitri
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		# Forwarded, not decided here: which backend `--legacy` selects, and whether this build
-		# has one to select, is `shell`'s own call -- exactly the same
-		# reasoning that already governs the sidecar's own discovery below. Unlike the old
-		# `EITRI_AGENT_BACKEND=legacy` export this replaced, this is plain argv: `shell` decides
-		# per invocation, so two launches of the same installed binary can disagree.
+		# shell decides whether this invocation selects a compiled-in legacy backend. Keep it in argv
+		# so two launches of the same binary can choose differently.
 		--legacy)  [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --legacy" >&2; exit 64; }
 		           SHELL_ARGS+=(--legacy); shift ;;
 		# Forwarded too: shell starts its nvim with --clean, the same as running it directly.
@@ -152,29 +123,15 @@ while [[ $# -gt 0 ]]; do
 done
 PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "eitri: no such directory" >&2; exit 1; }
 
-# Since 2026-09-21 this variable decides BOTH halves, not just the sidecar's. It always moved which
-# account the CLI authenticates as and writes transcripts under; the binary now derives the
-# directory it READS transcripts from by the same convention (`agent::account`), so a resume finds
-# the history the account really holds. Before that the two disagreed silently on this host, where
-# the shell exports this for Verdandi and the window inherited a different `CLAUDE_CONFIG_DIR`.
+# Use the same account for CLI authentication, transcript writes and resume discovery (agent::account),
+# so a window inheriting a different CLAUDE_CONFIG_DIR still reads the selected account's history.
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
-# WHERE THE SIDECAR HINT LOOKS, and why it is not a decision.
-#
-# This only decides whether to print a hint before the window opens -- it never picks a backend and
-# never exports anything. The real discovery (which sidecar, if any, `shell` actually uses) is
-# `agent::providers::claude_sidecar::spawn::resolve_sidecar_program`; this mirrors
-# the two checks that matter for a "is there nothing at all" hint (an explicit override, and the
-# per-user rev-keyed path `user_sidecar_path` writes to) so a first run says so immediately
-# rather than after a failed session start. A packaged sibling
-# (`$LIBDIR/verdandi-claude-sidecar`, the private mirror's profile) is covered by the second check;
-# the checkout-based discovery (`EITRI_VERDANDI_CHECKOUT`, a dev override) is deliberately not
-# mirrored here -- it never applies to an installed release build, which is the only thing this
-# launcher ships for.
-#
-# <data> follows the XDG rule exactly (unset, empty or relative XDG_DATA_HOME means
-# $HOME/.local/share) -- a plain `${XDG_DATA_HOME:-default}` would pass a relative value straight
-# through and disagree with where the sidecar was actually built.
+# This hint never selects a backend or exports a discovery result: shell resolves the sidecar.
+# Mirror the executable override, packaged sibling and rev-keyed user path to warn before a failed
+# first session. The development checkout override does not apply to installed release builds.
+# Unset, empty or relative XDG_DATA_HOME means $HOME/.local/share; accepting a relative value here
+# would disagree with the installer's sidecar location.
 xdg_data_home() {
 	case "${XDG_DATA_HOME:-}" in
 		/*) printf '%s\n' "$XDG_DATA_HOME" ;;
@@ -185,9 +142,8 @@ xdg_data_home() {
 sidecar_found() {
 	[[ -n "${EITRI_SIDECAR_BINARY:-}" && -x "$EITRI_SIDECAR_BINARY" ]] && return 0
 	[[ -x "$LIBDIR/verdandi-claude-sidecar" ]] && return 0
-	# The rev-keyed per-user path is keyed by the FULL install's own pinned revision, which only a
-	# `RELEASE` beside this launcher's LIBDIR can name; a development build with no
-	# `RELEASE` at all just skips this third check rather than guessing a revision.
+	# Only this install's RELEASE can name its pinned revision. Without it, skip the user path
+	# rather than guessing which sidecar build belongs to this install.
 	if [[ -f "$LIBDIR/RELEASE" ]]; then
 		local rev7
 		rev7="$(sed -n 's/^VERDANDI_REV=\(.......\).*/\1/p' "$LIBDIR/RELEASE" | head -n1)"
@@ -197,7 +153,7 @@ sidecar_found() {
 }
 
 if [[ -z "$QUIET" ]] && ! sidecar_found; then
-	# Not an error: the window still opens with no agent backend to spawn, and the panel
+	# A missing backend still permits the window to open, and the panel
 	# says the same thing this line does.
 	echo 'eitri: no sidecar built yet -- run "eitri setup" to build one' >&2
 fi

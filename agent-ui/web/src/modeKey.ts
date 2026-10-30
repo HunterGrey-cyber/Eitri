@@ -21,9 +21,8 @@ export function isModeCycleKey(e: {
 
 /** Shift+Tab as WebKitGTK actually delivers it. A real keyboard's `us` layout (and any xkb layout)
  *  turns Shift+Tab into the keysym `ISO_Left_Tab`, which WebKitGTK 2.52.6 reports as
- *  `key: "Unidentified"`, `code: "Tab"`, `keyCode: 9` -- never `key: "Tab"` (seen in a GUI
- *  pass, 2026-09-26, with a virtual keyboard carrying the real `us` keymap). Checking `key === "Tab"`
- *  alone therefore never matched on a real keyboard, and the key fell through to GTK's `move-focus`.
+ *  `key: "Unidentified"`, `code: "Tab"`, `keyCode: 9` -- never `key: "Tab"`. Checking `key === "Tab"`
+ *  alone misses a real keyboard and lets the key fall through to GTK's `move-focus`.
  *  `code` names the physical key, so it is what identifies Tab here; `key === "Tab"` is kept for a
  *  keymap (or a test) that does deliver it. */
 export function isShiftTab(e: { key: string; code?: string; shiftKey: boolean }): boolean {
@@ -36,13 +35,13 @@ export type ModeKeyState = {
   chooserOpen: boolean;
   tabState: TabInfo["state"] | null;
   /** The tab's own mode (`TabInfo.mode`), read only to settle the `ended`/`failed` case: entering bypass there is refused, but a tab that is ALREADY in bypass can still leave it
-   *  in every state, so `ended`/`failed` is not simply "fixed" any more. `null` before any tab
+   *  in every state, so `ended`/`failed` is not simply "fixed". `null` before any tab
    *  exists yet, the same as `tabState`. */
   tabMode: PermissionModeChoice | null;
 };
 
 /** `not_started`, `starting`
- *  and `live` all always cycle now -- there is no provider capability left to gate on, since every
+ *  and `live` all cycle -- there is no provider capability left to gate on, since every
  *  session is gated and Rust is the one authority for whether a cycle actually lands in bypass (it
  *  may reprompt with `confirm_bypass` instead of just applying it). `ended`/`failed` can only LEAVE
  *  bypass, never enter it. */
@@ -62,9 +61,8 @@ export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "
 
 /** The key that restarts an ended or failed session in place (`EmptyTab`'s own `r` while failed;
  *  the live conversation's `restart` case while ended) -- fixed, not a rebindable `panelTable`
- *  action, so there is nothing on the wire to read it from; unlike `newTabChord` (which this
- *  parameter replaces at both call sites) it is never actually empty in practice, but the same
- *  optional shape is kept so a caller with none at all still gets a sensible message. */
+ *  action, so there is nothing on the wire to read it from; unlike `newTabChord` it is never empty
+ *  in practice, but the same optional shape is kept so a caller with none at all still gets a sensible message. */
 export function modeFixedMessage(resetKey: string): string {
   return resetKey === ""
     ? "the session has ended — start a new one to change the mode"

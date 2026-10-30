@@ -1092,6 +1092,30 @@ fn an_adopted_shell_whose_spawner_never_reports_ends_unknown() {
     assert_eq!(adopted_shell_ending(false), ExitInfo::UNKNOWN);
 }
 
+#[test]
+fn an_adopted_session_names_its_shell_by_the_start_time_its_record_gave() {
+    let (_tap, tap_fn) = tapped();
+    let source = Host::spawn(plain_sh(), tap_fn);
+    assert_eq!(
+        source.session.adopted_start(),
+        None,
+        "a shell the session spawned has no start time handed to it"
+    );
+    let detached = source.detach();
+    let start = detached.start;
+    let pidfd = pidfd_open(detached.pid);
+    let (_, tap_fn) = tapped();
+    let destination = Host::adopt(detached, pidfd, tap_fn);
+    assert_eq!(
+        destination.session.adopted_start(),
+        Some(start),
+        "with its pid, the start time names the shell taken over and no later process given that pid"
+    );
+    // Never committed: the shell is still the source's, which takes it back.
+    drop(destination);
+    source.session.send(SessionCommand::Resume);
+}
+
 // --- the adopted child, and keys after the move -------------------------------------------------------------------
 
 fn pidfd_sleeper() -> std::process::Child {

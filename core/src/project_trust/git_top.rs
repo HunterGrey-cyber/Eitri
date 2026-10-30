@@ -119,7 +119,7 @@ fn trim_line_ends(bytes: &[u8]) -> &[u8] {
 }
 
 /// Whether `dir/.git` is a repository git would accept. Everything it could not accept, or could not
-/// check without following a link, is a finding. On acceptance of a linked worktree, `linked_common`
+/// check without following a link, is a finding. On acceptance of a linked worktree, `linked_common_out`
 /// is set to the common directory its `commondir` names.
 fn accepts(dir: &Path, findings: &mut Vec<Finding>, linked_common_out: &mut Option<PathBuf>) -> bool {
     let dot_git_path = dir.join(".git");

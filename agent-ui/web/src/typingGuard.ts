@@ -1,74 +1,45 @@
-/**
- * A permission card is answered
- * only by a key that stands alone. **Eitri's own rule** -- no tool this panel copies has an exact
- * precedent. Claude Code answers a prompt only by an explicit choice (Enter on the highlighted option,
- * or a digit); vim tells a sequence from a lone key by time (`:h 'timeoutlen'`). This keeps
- * `a`/`d` and still makes "arrive, then type" harmless: arrivals land BROWSE with the cursor on
- * a waiting card, and a Claude Code user types at once, so the first letters of a
- * sentence arrive as BROWSE keys.
+/** A permission card is answered only by a key that stands alone. This is a rule of Eitri's own: no
+ *  tool the panel copies has an exact precedent. Claude Code answers a prompt only by an explicit
+ *  choice, and vim tells a sequence from a lone key by time (`:h 'timeoutlen'`). Arrivals land in
+ *  BROWSE on a waiting card, so immediately typed prose must not turn its first letters into answers.
+ *  `a`/`d`/`D` require a quiet `TYPING_GUARD_MS` before and after; another keydown cancels the wait.
+ *  Both sides matter: the first letter has no predecessor, but a letter inside or ending a word has.
+ *  Enter also permits an unbroken run of `h`/`l`/Tab/Shift+Tab beginning after a pause. Checking
+ *  only the preceding key would let `cancel` or `deal` walk onto Approve with their final `l`:
+ *  `l` from the card's row lands on its first control, Approve (`PermissionCard.tsx`'s
+ *  `data-nav-order`), so it is not the safe side.
+ *  What is left, stated rather than hidden: a word made only of walk keys, or prose paused for the
+ *  window before a final `l` whose Enter follows at once, still approves (`l` then Enter approves,
+ *  `ll` then Enter denies). Enter on a card button is claimed and deferred too: native activation
+ *  would let `:ls` then Enter approve after `l` moved focus and `s` arrived after a pause.
+ *  `App.tsx` requires focus to have landed on that button from the immediately preceding key or a
+ *  HINT with no key since. This guard counts keys and decides no landing; the landing is recorded
+ *  where focus moves, never guessed from a key's name, so `App.tsx` can tie it to the key that made it.
  *
- * - `a`/`d`/`D` answer only with no other key within `TYPING_GUARD_MS` before them **and** none
- *   within it after: they are deferred, and any keydown before the wait ends cancels them. Both
- *   directions, because the first letter of a sentence has no key before it ("also add a test") and
- *   a letter inside or at the end of one has ("please add", "fix the data").
- * - Enter on a focused card button answers only with no key within the window before it, unless
- *   every key of the unbroken run before it (each within the window of the next) was `h`, `l`, Tab
- *   or Shift+Tab -- a walk onto Approve/Deny/Always that began with a key standing alone. **This
- *   narrows an earlier rule**, which let Enter through whenever the ONE key before it was a walk, and
- *   assumed the residual ("…al⏎" right after an arrival onto a card) "lands on Deny, the safe side".
- *   That was false: `l` from the card's row walks to its first control, which is Approve
- *   (`PermissionCard.tsx`'s `data-nav-order`), so "cancel⏎" or "deal⏎" typed at once after an
- *   arrival approved the card. What is left, stated rather than hidden: a walk run that itself
- *   began with a key standing alone -- a message of nothing but walk keys ("l⏎" approves, "ll⏎"
- *   denies), or prose paused for `TYPING_GUARD_MS` or more right before a final `l` whose Enter
- *   follows at once ("cance", a pause, "l⏎" approves, as it did under the earlier rule).
- *   **A second narrowing (2026-09-29)**: `:ls⏎` approved a card through
- *   Enter's native activation, since `l` walked onto Approve and `s` was a pause away. Enter on a
- *   card's own button is now claimed and waits like `a`/`d` (`defer`, told the key is Enter so the
- *   walk exception above still applies), and `App.tsx` presses the button only when focus was put
- *   on that very button by the key right before Enter -- an `h`/`l` that moved it, a Tab -- or by a
- *   HINT landing with no key since. That landing is recorded where focus moves, never guessed from
- *   a key's name: this guard decides no landing, it only counts keys (`keyCount`), so `App.tsx` can
- *   tie the landing it saw to the key that made it.
- * - A held key's repeat (`event.repeat`) never answers. An answer that must not come from a held key
- *   at all -- INPUT's `Ctrl+y` -- also waits for its key's release (`deferUntilReleased`): the wait
- *   ends `TYPING_GUARD_MS` after the press only if the key is up by then, else at its release, and
- *   the key's first repeat, like any key, cancels it. A key's repeat begins only after the
- *   compositor's delay (500-600 ms by default), well after the window, so the repeat alone cannot
- *   tell a held key from a pressed one in time; with key repeat off it never comes at all. So a key
- *   down longer than `RELEASE_WAIT_MAX_MS` is refused at its release, with its own flash. How long it
- *   was down is read from the press's and the release's own event times, not from a timer: a timer
- *   counts a stall of the page's main thread as holding, and refused a quick press made during one.
- * - **A GUI pass (2026-09-27) found two more ways typed prose acts after an arrival**, and
- *   `mayActAfterMotion` closes both. The leader (Space by default) starts a sequence wherever the
- *   row cursor has the keys, so "set up my" ran `<leader>m` (the mode flipped to bypass, which on a
- *   switch-capable sidecar also approves every waiting card) and "the boy" ran
- *   `<leader>bo` and answered its own y/n with the `y`. And `j` from the last row lands on the
- *   activity line's Stop, so "just do it" interrupted the turn with its first Space (the card was
- *   denied with it). So the leader and Enter/Space on Stop act only on a key that stands alone, or
- *   at the end of an unbroken run of motion keys (`j`/`k`/`h`/`l`/`g`/`G`/Tab) that itself began
- *   with one: `jj<Space>bd` and `j`⏎ onto Stop stay one quick motion, a word does not.
- * - **Two more cases turned up,
- *   and neither can use `mayActAfterMotion`**: `f` (the global HINT trigger) and a single-key table
- *   binding that runs on its very first press (H/L's default tab.prev/tab.next, or an nvim-read
- *   binding on some other plain letter) are each always the FIRST key of whatever typed them, so
- *   they never have a motion run behind them to check -- "fix the dashboard layout⏎" started a HINT
- *   on its own `f` and "Looks good, now add tests⏎" switched tabs on its own `L`, sending the rest of
- *   the sentence into nvim, a shell or another session's composer. These use `defer` instead, the
- *   same forward-looking wait `a`/`d` already use (the "after" half of their rule): the key
- *   acts `TYPING_GUARD_MS` later, only if nothing else was typed meanwhile.
- * - **It extends to BROWSE's own entry into INPUT and to the keys after a copy (2026-09-29).** `i`/`o`/`A` enter
- *   INPUT only when `mayStartInput` allows it -- on a key that stands alone (a pure pause, NO motion exception: with
- *   the leader's `mayActAfterMotion` rule "look at" walked with `l` and opened INPUT with `o`) -- so "expla|in" no
- *   longer loses "expla" to the `i` inside the word, and "follow-up" no longer sends "llow-up" after its `o` opened
- *   the composer (a swallowed key says `TYPE_HINT_FLASH`). And `y` opens a burst (`noteCopy`/`afterCopy`): any key
- *   within `TYPING_GUARD_MS` of a BROWSE `y` is typing, so vim's `y i w` no longer copies the row, opens INPUT and
- *   types the `w`. The copy itself is frozen and still happens at once, the clipboard still overwritten; text typed
- *   without `i` is still dropped. A lone `i` after a pause is unchanged.
+ *  Repeats never answer. INPUT's `Ctrl+y` also waits for release: it acts `TYPING_GUARD_MS` after the
+ *  press if the key is up by then, else at its release, and any key, including its own repeat,
+ *  cancels it. Compositor repeat begins after 500-600 ms by default, too late for the 250 ms window;
+ *  with repeat off it never comes. A press longer than `RELEASE_WAIT_MAX_MS` is refused on release.
+ *  Measure duration using the events' times: a timer would count a main-thread stall as holding and
+ *  refuse a quick press during one.
  *
- * Pure: it never reads the DOM. Timestamps are the caller's (`event.timeStamp`); the timers are
- * injectable and default to the global ones, looked up at call time so a test's fake timers apply.
- */
+ *  The leader and Enter/Space on Stop accept a quiet key or an unbroken motion run beginning with
+ *  one (`j`/`k`/`h`/`l`/`g`/`G`/Tab). Otherwise prose like `set up my` runs `<leader>m` (the mode
+ *  flips to bypass, which on a switch-capable sidecar also approves every waiting card), `the boy`
+ *  runs `<leader>bo` (close the other tabs) and answers its confirmation with its own `y`, and
+ *  `just do it` reaches Stop and interrupts with Space, which also denies the card.
+ *  `jj<Space>bd` and `j` then Enter remain quick motions. HINT's `f` and single-key table bindings
+ *  such as H/L need the forward wait instead: as first letters they have no preceding motion run.
+ *  Without it `fix the dashboard layout` starts HINT and `Looks good, now add tests` switches tabs,
+ *  sending the remaining prose to the editor, terminal or another composer.
+ *
+ *  INPUT entry (`i`/`o`/`A`) requires a pure pause with no motion exception: `look at` would walk
+ *  with `l` then enter with `o`, and `explain` or `follow-up` would lose their prefixes. A swallowed
+ *  key says `TYPE_HINT_FLASH`. BROWSE's `y` copies immediately and opens a typing burst: following
+ *  keys within the window are swallowed, so `y i w` cannot copy, enter INPUT and type `w`.
+ *  The clipboard is still overwritten; text without `i` is still dropped. A lone `i` after a pause works.
+ *  Pure: no DOM reads. Callers supply event timestamps; injectable timers default to globals looked
+ *  up at call time so fake timers apply. */
 
 /** The guard window, both sides. Typed prose at 60 wpm is ~200 ms a key; a
  *  deliberate single `a` waits well over this for the next key. A tunable, not a key. */
@@ -76,7 +47,7 @@ export const TYPING_GUARD_MS = 250;
 
 /** How long a key that must be let go (`deferUntilReleased`) may stay down and still answer at its
  *  release. A held key is otherwise refused by its first repeat, but with key repeat off there is none,
- *  and a key held for seconds answered when let go. Below the compositor's repeat delay (500-600 ms by
+ *  so the release cap must also refuse a key held for seconds. Below the compositor's repeat delay (500-600 ms by
  *  default), so the cap, not the repeat, is what refuses a held key in either case; well above a
  *  deliberate press, which is up within about 150 ms. */
 export const RELEASE_WAIT_MAX_MS = 450;
@@ -117,11 +88,9 @@ const MODIFIER_KEYS = new Set([
  *  `y`) because it came in the middle of typing. */
 export const TYPE_HINT_FLASH = "i or Ctrl+j to type";
 
-/** What the band says when the leader did not start a sequence because it came in the middle of
- *  typing (`TypingGuard.mayActAfterMotion`; a GUI pass, 2026-09-27: "set up my" ran
- *  `<leader>m`, "the boy" `<leader>bo` and answered its y/n with its own `y`). `leaderLabel` is the
- *  leader as a person reads it (`Space`, or nvim's `mapleader`). The live conversation and the empty
- *  tab's dashboard both say it. */
+/** What the band says when the leader arrived during typing (`TypingGuard.mayActAfterMotion`).
+ *  `leaderLabel` is the human label (`Space` or nvim's `mapleader`); both the conversation and the
+ *  empty tab's dashboard use it. */
 export function leaderTypingFlash(leaderLabel: string): string {
   return `${leaderLabel} starts a sequence only on its own — i or Ctrl+j to type`;
 }
@@ -139,8 +108,8 @@ export function hintTypingFlash(): string {
  *  letter -- did not run, for the same reason `hintTypingFlash` does not. `key` is the key as a
  *  person reads it (already human: a table's single-key bindings are never the leader or a space);
  *  `desc` is the binding's own which-key description (`PanelBinding.desc`: "next tab", "close tab",
- *  ...), so the band names what did not happen rather than assuming every such key steps tabs (an
- *  nvim-read delete binding was once flashed as "switches tabs"). The empty tab's
+ *  ...), so the band names what did not happen rather than assuming every such key steps tabs: an
+ *  nvim-read binding could delete instead. The empty tab's
  *  own single letters (`r`, `w`) say theirs the same way. */
 export function tableKeyTypingFlash(key: string, desc: string): string {
   return `${key} (${desc}) runs only on its own — i or Ctrl+j to type`;
@@ -157,9 +126,10 @@ export function isModifierKey(key: string): boolean {
   return MODIFIER_KEYS.has(key);
 }
 
-/** Modifiers whose own keydown counts as another key for the guard. The shell withholds keys
- *  pressed with Super or Hyper (`shell/src/panel_super.rs`), so `a` then `Super+x` exposes only Super.
- *  That keydown must cancel the waiting `a` as the hidden `x` would. */
+/** Modifiers whose own keydown still counts as "another key" for the guard. The shell withholds
+ *  any key pressed with Super or Hyper from this page (`shell/src/panel_super.rs`), so for
+ *  `a` then `Super+x` the page sees only Super go down -- and a waiting `a` must be cancelled by
+ *  that, as the `x` would have cancelled it. */
 const CANCELLING_MODIFIERS = new Set(["Super", "Hyper", "OS"]);
 
 export type GuardTimers = {

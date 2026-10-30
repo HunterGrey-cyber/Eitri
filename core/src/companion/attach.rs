@@ -337,7 +337,6 @@ mod tests {
         let (mut a, effects) = Attacher::new(None);
         assert_eq!((a.state(), effects), (&LinkState::NoEditor, vec![]));
 
-        // any + Attach
         assert_eq!(
             a.handle(AttachEvent::Attach(addr("a"))),
             vec![Effect::Connect {
@@ -347,11 +346,9 @@ mod tests {
         );
         assert_eq!(*a.state(), LinkState::Connecting { addr: addr("a") });
 
-        // Connecting + Connected
         assert_eq!(a.handle(AttachEvent::Connected { gen: 1, channel: 5 }), vec![]);
         assert!(is_attaching(&a, false));
 
-        // Attaching + Blocking
         assert_eq!(a.handle(AttachEvent::Blocking { gen: 1, blocking: true }), vec![]);
         assert!(is_attaching(&a, true));
         assert_eq!(
@@ -363,7 +360,6 @@ mod tests {
         );
         assert!(is_attaching(&a, false));
 
-        // Attaching + Installed
         assert_eq!(
             a.handle(AttachEvent::Installed {
                 gen: 1,
@@ -381,7 +377,6 @@ mod tests {
             }
         );
 
-        // Attached + Closed
         assert_eq!(a.handle(AttachEvent::Closed { gen: 1 }), vec![Effect::CancelDraftEdits]);
         assert_eq!(
             *a.state(),
@@ -390,7 +385,6 @@ mod tests {
             }
         );
 
-        // Attached + Replaced
         let mut a = attached();
         assert_eq!(
             a.handle(AttachEvent::Replaced { gen: 1 }),
@@ -398,7 +392,6 @@ mod tests {
         );
         assert_eq!(*a.state(), LinkState::Detached { why: Detach::Replaced });
 
-        // Connecting/Attaching + a failure or Closed
         let failures = |gen| {
             [
                 (

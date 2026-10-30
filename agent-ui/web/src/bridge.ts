@@ -3,11 +3,14 @@ import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
 import type { ProposedChange } from "./proposal";
+import type { TabViewState } from "./tabs";
 
 export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
+  /** The mounted page has produced its first frame. The host reveals its view and answers nothing. */
+  | { type: "painted" }
   | { type: "send_message"; request_id: string; tab: TabId; text: string }
   | { type: "question_answer"; request_id: string; tab: TabId; interaction_id: string; answers: QuestionAnswerWire[] }
   | { type: "question_decline"; request_id: string; tab: TabId; interaction_id: string; kind: "cancel" | "chat"; so_far?: QuestionAnswerWire[] }
@@ -146,6 +149,10 @@ export type OutboundMessage =
    *  window gives the keys back to the module that held them, and always answers with a `command_result`.
    *  `InboundMessage::KeymapClosed`, `core/src/agent_bridge.rs`. */
   | { type: "keymap_closed"; request_id: string; opening: number; return_keys: boolean }
+  /** The answer to `view_export`: this page's view of the tab a move takes to the other window (`null` when it
+   *  holds none). `request` is the number `view_export` carried. Window-level; Rust passes the view on unread.
+   *  `InboundMessage::ViewExported`, `core/src/agent_bridge.rs`. */
+  | { type: "view_exported"; request_id: string; request: number; view: TabViewState | null }
   /** `gx` on a web link: open this address in the system browser. `url` is
    *  the WHATWG-normalized `href` (`nav.ts#webUrl`) -- what the pick showed -- never the spelling the reply
    *  wrote. Window-level, like `open_path`; Rust re-checks it (`panel/src/links.rs#web_url`, http(s) and a plain
@@ -252,6 +259,8 @@ type InboundHandler = (
         fromRevision: number;
         throughRevision: number;
         events: AgentDomainEvent[];
+        /** Post-fold revision per delivered event; gaps include requests answered by the host. */
+        revisions?: number[];
         /** Calls in this batch a saved prefix rule answered; absent when none did. */
         ruleNotes?: { toolUseId: string; rule: string }[];
         /** `Write` cards in this batch raised over no file; absent when none were. */
@@ -393,6 +402,12 @@ type InboundHandler = (
      *  last posted. Window-level, like `enter_input`/`arrive` -- there is no tab to name, since it
      *  is about which of BROWSE/INPUT has the keys, not about a tab's own state. */
     | { kind: "nav_key"; direction: NavKeyDirection }
+    /** A move to the other window is about to take `tab`: the page answers with its view of it (`view_exported`).
+     *  `serialize_view_export_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "view_export"; request: number; tab: TabId }
+    /** The other window's page's view of `tab`, which moved here: kept for the tab as a switch parks one. That
+     *  page's input, read by `parseView`. `serialize_view_import_for_js`, `core/src/agent_bridge.rs`. */
+    | { kind: "view_import"; tab: TabId; view: unknown }
     /** The reply to `review_request`: the turns, the files and the notes (`serialize_review_for_js`,
      *  `core/src/agent_bridge.rs`). Tab-scoped; matched to the overlay by `requestId`. */
     | ({ kind: "review" } & ReviewEnvelope)
@@ -508,6 +523,8 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "scratch" ||
         obj.kind === "notice" ||
         obj.kind === "nav_key" ||
+        obj.kind === "view_export" ||
+        obj.kind === "view_import" ||
         obj.kind === "review" ||
         obj.kind === "review_diff" ||
         obj.kind === "review_hint" ||
