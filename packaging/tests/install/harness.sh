@@ -74,7 +74,7 @@ setup_stubs() {
 		"$S/stubs-cargo" "$S/stubs-cpswap" "$S/stubs-fakeowner" "$S/stubs-iccache-fail" \
 		"$S/stubs-iccache-writes" "$S/helpers"
 	for c in sudo apt apt-get dnf pacman zypper; do cp "$FIXTURES/forbidden" "$S/stubs/$c"; done
-	cp "$FIXTURES/claude" "$FIXTURES/nvim" "$FIXTURES/gtk-update-icon-cache" "$S/stubs/"
+	cp "$FIXTURES/claude" "$FIXTURES/nvim" "$FIXTURES/gtk-update-icon-cache" "$FIXTURES/update-desktop-database" "$S/stubs/"
 	cp "$FIXTURES/gtk-update-icon-cache-fails" "$S/stubs-iccache-fail/gtk-update-icon-cache"
 	cp "$FIXTURES/gtk-update-icon-cache-writes" "$S/stubs-iccache-writes/gtk-update-icon-cache"
 	cp "$FIXTURES/id-root" "$S/stubs-root/id"

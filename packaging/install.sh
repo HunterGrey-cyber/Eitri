@@ -3277,6 +3277,18 @@ refresh_icon_cache() {
 		warn "gtk-update-icon-cache failed on $NV_DATA/icons/hicolor: the icon appears once the cache is rebuilt (log out and in, or run it yourself)"
 }
 
+# refresh_desktop_database: update-desktop-database on this user's applications directory, where the
+# tool exists, so the MIME types the entry lists reach Open With without a new login. Never fatal.
+refresh_desktop_database() {
+	if ! command -v update-desktop-database >/dev/null 2>&1; then return 0; fi
+	if [ "$OPT_DRY_RUN" = 1 ]; then
+		say "would run: update-desktop-database $NV_DATA/applications"
+		return 0
+	fi
+	update-desktop-database "$NV_DATA/applications" >/dev/null 2>&1 ||
+		warn "update-desktop-database failed on $NV_DATA/applications: Eitri appears in Open With once the cache is rebuilt (log out and in, or run it yourself)"
+}
+
 # tidy_icon_dirs: after --uninstall removed the icon files, the empty directories it emptied go (rmdir
 # only ever removes an empty one), and so does the cache gtk-update-icon-cache wrote -- when nothing
 # else is left in hicolor, which is then removed too. When another application's icons are there, the
@@ -3310,7 +3322,7 @@ tidy_icon_dirs() {
 desktop_exec_line() {
 	case $2 in
 	cn.huntergrey.eitri.Panel.desktop) printf 'Exec=%s panel --quiet %%f\n' "$1" ;;
-	*) printf 'Exec=%s --quiet %%f\n' "$1" ;;
+	*) printf 'Exec=%s --quiet %%F\n' "$1" ;;
 	esac
 }
 
@@ -3415,6 +3427,7 @@ commit_files() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		remove_old_desktop
 		refresh_icon_cache
+		refresh_desktop_database
 		return 0
 	fi
 	# The new lib is in place from here on: a failure leaves the install unfinished, and a re-run
@@ -3448,6 +3461,7 @@ commit_files() {
 	# After the new entry is in place, so an interruption never leaves neither.
 	remove_old_desktop
 	refresh_icon_cache
+	refresh_desktop_database
 	# Write the version stamp last. An interrupt or failed mv leaves it absent or naming an
 	# older version, so install_complete sees unfinished work even if every individual file
 	# exists from a complete install of a different version.
