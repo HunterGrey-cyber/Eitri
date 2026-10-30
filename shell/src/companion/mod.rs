@@ -50,6 +50,8 @@ pub(crate) struct Start {
     pub(crate) backend_kind: BackendKind,
     /// Why this build shows no web panel, where WebKit's sandbox cannot start.
     pub(crate) panel_notice: Option<String>,
+    /// Why the project folder is no boundary, when it is not one.
+    pub(crate) root_note: Option<String>,
 }
 
 fn fail(message: &str) -> glib::ExitCode {
@@ -310,6 +312,7 @@ fn run_window(
         }
         crate::webkit_sandbox::Decision::Available | crate::webkit_sandbox::Decision::DisabledByUser => None,
     };
+    let root_note = crate::agent_panel::root_note_for(&project_root);
     let start = Start {
         project_root,
         nvim,
@@ -318,6 +321,7 @@ fn run_window(
         close_with: Cell::new(close_with),
         backend_kind,
         panel_notice,
+        root_note,
     };
     // Before GTK and the panel's `WebView`, as in the editor window's `main`.
     if !crate::process_memory::ui_process_jsc_without_jit() {

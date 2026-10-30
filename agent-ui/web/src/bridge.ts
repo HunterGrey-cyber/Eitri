@@ -289,6 +289,9 @@ type InboundHandler = (
      *  `serialize_display_for_js`, `core/src/agent_bridge.rs`). Window-level, sent on every `ready`
      *  before the tabs. */
     | { kind: "display"; thinking: ThinkingDisplay }
+    /** Why the project folder is no boundary (`serialize_root_note_for_js`, `core/src/agent_bridge.rs`).
+     *  Window-level, sent right after `hello` on every `ready`; the page shows it until its own Dismiss. */
+    | { kind: "root_note"; text: string }
     /** The window's turn review switches (`serialize_review_settings_for_js`, `core/src/agent_bridge.rs`).
      *  Window-level, sent on every `ready` before the tabs and again when `init.lua`'s values arrive. */
     | { kind: "review_settings"; enabled: boolean; hint: boolean }
@@ -487,6 +490,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
         obj.kind === "display" ||
+        obj.kind === "root_note" ||
         obj.kind === "review_settings" ||
         obj.kind === "pane_focus" ||
         obj.kind === "editor_typing" ||

@@ -303,6 +303,8 @@ fn main() -> glib::ExitCode {
         },
     };
     println!("eitri: project root {}", project_root.display());
+    // Once, before GTK: the `lstat` and the group files it reads belong off the GTK thread.
+    let root_note = agent_panel::root_note_for(&project_root);
 
     // Which nvim the forked Neovide runtime spawns. Resolved and
     // acted on here -- before `build_application`/`app.run_with_args` bring up GTK's own threads,
@@ -436,6 +438,7 @@ fn main() -> glib::ExitCode {
             &project_root,
             backend_kind,
             panel_notice.as_deref(),
+            root_note.clone(),
             pair,
             start_note,
         )
@@ -473,6 +476,7 @@ fn build_ui(
     project_root: &Path,
     backend_kind: eitri_core::agent_backend::BackendKind,
     panel_notice: Option<&str>,
+    root_note: Option<String>,
     pair: Rc<linked_window::spawn::Pair>,
     start_note: Option<String>,
 ) {
@@ -707,6 +711,7 @@ fn build_ui(
         scratch_dir,
         backend_kind,
         panel_notice,
+        root_note,
         None,
         pair.pair_role(),
         {

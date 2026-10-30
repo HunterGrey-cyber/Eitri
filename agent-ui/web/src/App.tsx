@@ -546,18 +546,19 @@ export default function App() {
     setPage(next);
   }, []);
   const {
-    state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, turnClock, turnDurations, thinkingDisplay, paneFocused,
+    state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, turnClock, turnDurations, thinkingDisplay, paneFocused,
     queue, queueError, queueNote, queueSteers, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
     inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, heldTrust, confirm, renaming, queueTaken,
   } = page;
   const {
-    setFatalError, setHandoffRequests, setCommandNotice, setReview, setReviewHints, setChooser,
+    setFatalError, setHandoffRequests, setCommandNotice, setRootNote, setReview, setReviewHints, setChooser,
     setInputRequest, setArriveRequest, setPermissionRequest, setHeldTrust, setConfirm, setRenaming,
   } = useMemo(() => ({
     setFatalError: (value: SetStateAction<PageModel["fatalError"]>) => setPageField("fatalError", value),
     setHandoffRequests: (value: SetStateAction<PageModel["handoffRequests"]>) => setPageField("handoffRequests", value),
     setCommandNotice: (value: SetStateAction<PageModel["commandNotice"]>) => setPageField("commandNotice", value),
+    setRootNote: (value: SetStateAction<PageModel["rootNote"]>) => setPageField("rootNote", value),
     setReview: (value: SetStateAction<PageModel["review"]>) => setPageField("review", value),
     setReviewHints: (value: SetStateAction<PageModel["reviewHints"]>) => setPageField("reviewHints", value),
     setChooser: (value: SetStateAction<PageModel["chooser"]>) => setPageField("chooser", value),
@@ -4062,6 +4063,16 @@ export default function App() {
       </div>
     );
 
+  /* A fact about the window, not the last command: it has its own field and its own Dismiss, so neither a send
+     nor a refused command's notice takes it away. */
+  const rootNoteBanner =
+    rootNote === null ? null : (
+      <div className="command-notice root-note" role="status" data-nav-stop="root-note">
+        <span>{rootNote}</span>
+        <button onClick={() => setRootNote(null)}>Dismiss</button>
+      </div>
+    );
+
   const errorBanner =
     fatalError === null ? null : (
       <div className="fatal-error" role="alert" data-nav-stop="error">
@@ -4203,6 +4214,7 @@ export default function App() {
             onRenameCancel={cancelRename}
           />
         )}
+        {rootNoteBanner}
         {commandNoticeBanner}
         {/* The stage is the trust question's containing block: it spans everything above the band, so the
             band's own prompt and flashes stay readable while the question is up (an overlay over the whole
@@ -6437,6 +6449,7 @@ export default function App() {
         )}
       </div>
       {sessionEndedBanner}
+      {rootNoteBanner}
       {commandNoticeBanner}
       <QueueLines items={queue} error={queueError} note={queueNote} />
       <ActivityLine

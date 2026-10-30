@@ -125,6 +125,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
             ticks_run: _,
         theme: _,
         keymap_help: _,
+        root_note: _,
         pages: _,
         tabs_recorded: _,
         view_empty_hook: _,

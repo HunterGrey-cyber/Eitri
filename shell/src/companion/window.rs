@@ -293,6 +293,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         scratch_dir,
         start.backend_kind,
         start.panel_notice.as_deref(),
+        start.root_note.clone(),
         None,
         eitri_core::window_link::pair::Role::Main,
         fallback.clone(),

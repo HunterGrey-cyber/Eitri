@@ -11,7 +11,7 @@ use eitri_panel::panel_wake::{NextTick, TickSchedule};
 use gtk4::prelude::*;
 use gtk4::Application;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use webkit6::prelude::*;
@@ -192,6 +192,14 @@ impl PanelHost for GtkPanelHost {
     }
 }
 
+/// Why `root` is no project boundary (`agent::project_boundary`), as the line the panel shows; `None` when it is
+/// one. Reads the disk, so a window computes it once at start and hands it down.
+pub(crate) fn root_note_for(root: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    agent::project_boundary::refusal(root, home.as_deref(), &agent::project_boundary::Identity::current())
+        .map(agent::project_boundary::note)
+}
+
 /// `backend_kind` is `main()`'s own choice: `BackendKind::from_env`
 /// is called there, before any window exists, so `--legacy`/`EITRI_AGENT_BACKEND=legacy` on a
 /// release build can exit 1 naming the reason before touching GTK at all. This function no longer
@@ -208,6 +216,7 @@ pub(crate) fn build_agent_panel(
     scratch: Option<eitri_core::scratch::ScratchDir>,
     backend_kind: BackendKind,
     unavailable: Option<&str>,
+    root_note: Option<String>,
     related: Option<&WebView>,
     tab_role: eitri_core::window_link::pair::Role,
     theme: eitri_core::theme::ThemeTokens,
@@ -220,6 +229,7 @@ pub(crate) fn build_agent_panel(
         document: &PANEL_DOCUMENT,
         tab_role,
         theme,
+        root_note,
     };
     if let Some(notice) = unavailable {
         let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));

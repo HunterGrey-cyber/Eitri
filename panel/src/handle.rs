@@ -153,6 +153,9 @@ pub struct PanelInit {
     /// Whose saved-tabs file in the project's pair the panel keeps its tabs in. Which saved tabs it offers back
     /// is given once `init.lua` has run ([`AgentPanelHandle::set_tab_files`]).
     pub tab_role: eitri_core::window_link::pair::Role,
+    /// Why the project folder is no boundary (`agent::project_boundary::note`), when it is not one. Told to
+    /// every page right after its `hello`, so a reloaded page says it again.
+    pub root_note: Option<String>,
 }
 
 impl AgentPanelHandle {

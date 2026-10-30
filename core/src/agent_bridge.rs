@@ -1059,6 +1059,14 @@ pub fn serialize_pane_focus_for_js(focused: bool) -> String {
     json!({ "kind": "pane_focus", "focused": focused }).to_string()
 }
 
+/// `{"kind":"root_note","text":...}`: why this window's project folder is no boundary
+/// (`agent::project_boundary::note`). Window-level, no tab; the page shows it as a banner of its own
+/// that only its Dismiss clears, so a send or a command notice never takes it away. Sent right after
+/// `hello` on every `ready`, so a reloaded document says it again.
+pub fn serialize_root_note_for_js(text: &str) -> String {
+    json!({ "kind": "root_note", "text": text }).to_string()
+}
+
 /// `{"kind":"editor_typing","typing":bool,"periodMs":n}`: whether the user is typing in the editor
 /// (`panel_cadence`: the editor holds the keys and pressed one within the last 500 ms), and the
 /// gap between the panel's stream pushes while they do. The page slows its own self-driven motion
@@ -2912,6 +2920,18 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&serialize_pane_focus_for_js(focused)).unwrap();
             assert_eq!(value, serde_json::json!({ "kind": "pane_focus", "focused": focused }));
         }
+    }
+
+    #[test]
+    fn the_root_note_is_a_kind_tagged_text_that_keeps_its_characters() {
+        let text = "No project boundary here (it is open to others): a \"Claude\" tab asks.\nNext";
+        let value: serde_json::Value = serde_json::from_str(&serialize_root_note_for_js(text)).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "root_note", "text": text }));
+        assert_eq!(
+            serialize_root_note_for_js("a"),
+            r#"{"kind":"root_note","text":"a"}"#,
+            "the exact envelope"
+        );
     }
 
     #[test]

@@ -164,6 +164,10 @@ export type PageModel = {
   handoffRequests: ReadonlyMap<TabId, string>;
   /** A refused command, in words, on screen so Rust's human-readable reason reaches the user. */
   commandNotice: string | null;
+  /** Why the project folder is no boundary, as the `root_note` envelope said. Its own field: a send, a snapshot
+   *  and a refused command's notice never touch it, only its Dismiss (or a reloaded document, which is told
+   *  again) does. */
+  rootNote: string | null;
   /** See `CommandRecord`. Bookkeeping that nothing draws: the page records an outgoing request without a render
    *  and reads this only when the answer is reduced. */
   inFlight: ReadonlyMap<string, CommandRecord>;
@@ -222,7 +226,7 @@ export function initialPageModel(): PageModel {
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
     heldTrust: null, confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
     state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
-    handoff: null, handoffRequests: new Map(), commandNotice: null, inFlight: new Map(),
+    handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, inFlight: new Map(),
     turnClock: null, turnDurations: NO_TURN_DURATIONS, thinkingDisplay: "collapsed", paneFocused: false,
     queue: [], queueError: null, queueNote: null, queueSteers: null, history: [], ruleOffers: {},
     editorContext: null, editorLink: null, scratchEditing: false, review: null, reviewHints: {},
@@ -320,6 +324,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       // asked for.
       return (THINKING_DISPLAYS as readonly string[]).includes(envelope.thinking)
         ? { ...model, thinkingDisplay: envelope.thinking } : model;
+    case "root_note":
+      return typeof envelope.text === "string" && envelope.text !== "" ? { ...model, rootNote: envelope.text } : model;
     case "review_settings":
       // Only a real `true` turns a switch on: anything else from the wire leaves the line undrawn.
       return { ...model, reviewSettings: { enabled: envelope.enabled === true, hint: envelope.hint === true } };

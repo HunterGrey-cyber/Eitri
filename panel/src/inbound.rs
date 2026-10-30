@@ -429,6 +429,11 @@ pub(super) fn handle_inbound_message(
                     state.keymap_help.as_deref(),
                     offer.as_ref(),
                 );
+                // Why the folder is no boundary: a fact about the window, said again to every document,
+                // right after the greeting it belongs with.
+                if let Some(note) = &state.root_note {
+                    payloads.insert(1, eitri_core::agent_bridge::serialize_root_note_for_js(note));
+                }
                 // The status-band hints the replaced document was showing, of this view's tabs.
                 for hint in hints_for_new_document(state, view) {
                     payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));

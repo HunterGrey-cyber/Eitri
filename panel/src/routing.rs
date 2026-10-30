@@ -562,6 +562,54 @@ mod tests {
         assert!(kinds.iter().any(|k| k == "command_result"), "{kinds:?}");
     }
 
+    const ROOT_NOTE: &str =
+        "No project boundary here (it is open to others): a Claude tab asks before every file and command.";
+
+    fn root_note_texts(sent: &[String]) -> Vec<String> {
+        sent.iter()
+            .filter(|e| kind_of(e) == "root_note")
+            .map(|e| {
+                serde_json::from_str::<serde_json::Value>(e).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_page_gets_the_root_note_after_its_hello() {
+        let (handle, base, _host) = handle_with_recording_page();
+        let second = attach_recording_page(&handle, view(2));
+        handle.state.borrow_mut().root_note = Some(ROOT_NOTE.to_owned());
+        handle.page_message(ViewId::BASE, READY);
+        handle.page_message(view(2), READY);
+        for page in [&base, &second] {
+            let sent = page.sent.borrow();
+            let kinds: Vec<String> = sent.iter().map(|e| kind_of(e)).collect();
+            assert_eq!(&kinds[..2], ["hello", "root_note"], "{kinds:?}");
+            assert_eq!(root_note_texts(&sent), [ROOT_NOTE]);
+        }
+    }
+
+    #[test]
+    fn no_root_note_no_message() {
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        handle.page_message(ViewId::BASE, READY);
+        assert!(root_note_texts(&page.inner.sent.borrow()).is_empty());
+    }
+
+    #[test]
+    fn a_reloaded_page_gets_the_root_note_again() {
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        handle.state.borrow_mut().root_note = Some(ROOT_NOTE.to_owned());
+        handle.page_message(ViewId::BASE, READY);
+        handle.page_message(ViewId::BASE, READY);
+        assert_eq!(root_note_texts(&page.inner.sent.borrow()), [ROOT_NOTE, ROOT_NOTE]);
+    }
+
     /// `agent.thinking` reaches the page: at once to a page already listening, and again on every
     /// `ready`, so a reloaded document shows thinking the way the first one did.
     #[test]

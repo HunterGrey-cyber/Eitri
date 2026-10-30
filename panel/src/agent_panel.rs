@@ -193,6 +193,8 @@ struct AgentPanelState {
     /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
     /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
     keymap_help: Option<String>,
+    /// Why the project folder is no boundary, when it is not one: sent after the `hello` of every `ready`.
+    root_note: Option<String>,
     /// One record per chat page that is attached and live, by the view it shows, and always one for
     /// the base view. A page that goes idle loses its record, so nothing here is ever sent to it again
     /// until it is attached anew.
@@ -431,6 +433,7 @@ struct StateParts {
     tab_memory: TabWriter,
     conversation_id: String,
     restore_source: Option<SavedTabs>,
+    root_note: Option<String>,
 }
 
 impl AgentPanelState {
@@ -460,6 +463,7 @@ impl AgentPanelState {
             tab_memory,
             conversation_id,
             restore_source,
+            root_note,
         } = parts;
         let wake = panel_wake(&mut tabs);
         let titles =
@@ -508,6 +512,7 @@ impl AgentPanelState {
             ticks_run: 0,
             theme,
             keymap_help: None,
+            root_note,
             // The base view's record is there from the start: its page is the window's, attached or not.
             pages: BTreeMap::from([(ViewId::BASE, PageState::default())]),
             tabs_recorded: 0,
@@ -573,6 +578,7 @@ fn panel_state(
         document,
         theme,
         tab_role,
+        root_note,
     } = init;
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
@@ -639,6 +645,7 @@ fn panel_state(
         history,
         // Given once `init.lua` has run: which saved tabs the window offers depends on it.
         restore_source: None,
+        root_note,
     })
 }
 
@@ -679,6 +686,7 @@ fn bare_state(
         tab_memory: TabWriter::new(None, PathBuf::new()),
         conversation_id: String::new(),
         restore_source: None,
+        root_note: None,
     })
 }
 

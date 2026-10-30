@@ -361,6 +361,7 @@ pub fn assemble(
         document,
         tab_role: eitri_core::window_link::pair::Role::Main,
         theme: ThemeTokens::fallback(),
+        root_note: None,
     };
     let panel = AgentPanelHandle::new(init, page.is_some(), host);
     if let Some(page) = page {
