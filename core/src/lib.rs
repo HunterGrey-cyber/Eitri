@@ -33,6 +33,7 @@ pub mod lua;
 pub mod nvim_bin;
 pub mod nvim_keys;
 pub mod nvim_rpc;
+pub mod open_socket;
 pub mod pane_switch;
 pub mod panel_cadence;
 pub mod panel_control;

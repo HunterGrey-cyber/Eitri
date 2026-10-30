@@ -68,9 +68,9 @@ pub const PROTOCOL_V2: u64 = 2;
 const SENDER_CHAIN_MAX: usize = 32;
 
 /// The longest request line, without its newline.
-const MAX_LINE: usize = 4096;
+pub(crate) const MAX_LINE: usize = 4096;
 /// How long one connection may take to deliver its request line, in total.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(1);
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(1);
 /// How long a claimant waits for the running panel's reply, connect included.
 const FORWARD_DEADLINE: Duration = Duration::from_secs(2);
 /// How long [`ControlServer::cleanup`] waits for the server thread before it stops waiting.
@@ -348,7 +348,7 @@ compile_error!("panel_control needs a way to read a Unix socket peer's uid on th
 
 /// Why [`read_line`] gave no line.
 #[derive(Debug, PartialEq, Eq)]
-enum LineFail {
+pub(crate) enum LineFail {
     /// More than [`MAX_LINE`] bytes arrived before a newline.
     TooLong,
     /// The peer closed after sending something that never became a line.
@@ -362,7 +362,7 @@ enum LineFail {
 /// Reads one `\n`-terminated line of at most `max` bytes, all of it before `deadline`: a peer that
 /// trickles one byte at a time cannot hold the caller longer than the deadline. Each read is given
 /// only the time that is left, never a fresh allowance.
-fn read_line(stream: &UnixStream, deadline: Instant, max: usize) -> Result<Vec<u8>, LineFail> {
+pub(crate) fn read_line(stream: &UnixStream, deadline: Instant, max: usize) -> Result<Vec<u8>, LineFail> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     let mut reader = stream;
@@ -642,12 +642,12 @@ fn read_pid_record(pid_file: &Path) -> Option<PidRecord> {
 }
 
 /// `(device, inode)` of `path` itself, not of what a link there points at.
-fn identity(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn identity(path: &Path) -> Option<(u64, u64)> {
     path.symlink_metadata().ok().map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// Removes `sock` if it is a socket of this user.
-fn remove_own_socket(sock: &Path) {
+pub(crate) fn remove_own_socket(sock: &Path) {
     if matches!(sock.symlink_metadata(), Ok(meta) if meta.file_type().is_socket() && meta.uid() == euid()) {
         let _ = std::fs::remove_file(sock);
     }
@@ -661,11 +661,11 @@ fn remove_own_pid_file(pid_file: &Path) {
 }
 
 /// An exclusive `flock` on the reclaim lock file; closing the file releases it.
-struct ReclaimLock(#[allow(dead_code)] std::fs::File);
+pub(crate) struct ReclaimLock(#[allow(dead_code)] std::fs::File);
 
-/// Takes the reclaim lock, waiting up to [`RECLAIM_LOCK_WAIT`] for another claimant to finish. The
-/// file is created 0600 if missing and must be a regular file of this user; it is never removed.
-fn take_reclaim_lock(lock_file: &Path) -> Result<ReclaimLock, String> {
+/// Takes the reclaim lock, waiting up to `wait` for another claimant to finish. The file is created
+/// 0600 if missing and must be a regular file of this user; it is never removed.
+pub(crate) fn take_reclaim_lock(lock_file: &Path, wait: Duration) -> Result<ReclaimLock, String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -683,7 +683,7 @@ fn take_reclaim_lock(lock_file: &Path) -> Result<ReclaimLock, String> {
             lock_file.display()
         ));
     }
-    let give_up = Instant::now() + RECLAIM_LOCK_WAIT;
+    let give_up = Instant::now() + wait;
     loop {
         // SAFETY: `file` owns a valid descriptor for the whole call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -772,7 +772,7 @@ pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Resu
         }
         if lock.is_none() {
             // Whoever held it may have reclaimed the socket meanwhile: bind again before probing.
-            lock = Some(take_reclaim_lock(&lock_file)?);
+            lock = Some(take_reclaim_lock(&lock_file, RECLAIM_LOCK_WAIT)?);
             continue;
         }
         match probe(&sock, &pid_file, request)? {
@@ -891,7 +891,7 @@ fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Received>, a
     }
 }
 
-fn reply_line(stream: &UnixStream, line: &str) -> io::Result<()> {
+pub(crate) fn reply_line(stream: &UnixStream, line: &str) -> io::Result<()> {
     let mut writer = stream;
     writer.write_all(format!("{line}\n").as_bytes())
 }
