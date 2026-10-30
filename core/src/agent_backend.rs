@@ -1425,8 +1425,8 @@ impl AgentBackend {
     /// **On a session whose CLI runs its own auto mode under the gate, `Auto` defers** (2026-10-02,
     /// Verdandi protocol 3.14). Such a session asked for it (`ProviderCapabilities::cli_auto_mode`:
     /// the sidecar offered both `cli_auto_mode` and `permission_defer`) and the CLI's latest report
-    /// says `auto` (`AgentSessionProjection::cli_runs_auto`). There a gate request in `Auto` is
-    /// answered `allow` when a saved prefix rule allows it -- `agent::rule_that_allows`, the same
+    /// says `auto` (`AgentSessionProjection::cli_runs_auto`). There, at a project root that is a
+    /// boundary (`agent::project_boundary`), a gate request in `Auto` is answered `allow` when a saved prefix rule allows it -- `agent::rule_that_allows`, the same
     /// rule path `classify_with_rules` takes, with the same limits -- and otherwise
     /// `PermissionDecision::Defer`: Eitri's own classifier is not consulted and no card is drawn, and
     /// the CLI's classifier decides. A refusal comes back as `AgentDomainEvent::PermissionDenied`
@@ -1434,6 +1434,11 @@ impl AgentBackend {
     /// The projection is read again immediately before each request, not once per batch: ingestion
     /// keeps folding while the batch is answered, and a trip or a fallback to `default` it folds
     /// there must reach the next request, which then is not deferred (a trip: not answered).
+    ///
+    /// **At a root that is no boundary nothing is deferred.** The classifier the CLI runs was given
+    /// a project to protect, and such a root is not one: `$HOME`, a tree others can write to. Eitri's
+    /// own policy answers instead, as for a Manual tab on the same session, so every path-judged
+    /// call is a card and no saved rule replaces one.
     ///
     /// Everything above is unchanged on such a session: the tripwire, the CLI's own prompts and
     /// bypass. A session that did not ask for auto, or whose CLI fell back to `default`, is answered
@@ -1494,9 +1499,12 @@ impl AgentBackend {
             };
             tripped |= projection_tripped;
             // Only an Auto tab leaves anything to the CLI's classifier: Manual is Eitri's policy
-            // alone, whatever the CLI runs under it.
-            let defers_to_the_cli =
-                mode == PermissionMode::Auto && self.capabilities().cli_auto_mode && cli_reports_auto;
+            // alone, whatever the CLI runs under it. Nor does an Auto tab at a root that is no
+            // boundary: Eitri's policy answers there, and every path-judged call is a card.
+            let defers_to_the_cli = mode == PermissionMode::Auto
+                && self.capabilities().cli_auto_mode
+                && cli_reports_auto
+                && root_is_a_boundary(project_root);
             if tripped {
                 eprintln!("[permission] not answering {tool_name}: the agent reported a policy it was not asked for");
                 kept.push((revision, event));
@@ -1811,12 +1819,25 @@ struct GateRequest<'a> {
     provider_prompt: Option<&'a agent::ProviderPrompt>,
 }
 
+/// Whether the gate would take `project_root` for a boundary, with the home directory
+/// `agent::classify_permission_request` reads, so a deferral and a card never disagree about a root.
+fn root_is_a_boundary(project_root: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    agent::project_boundary::refusal(
+        project_root,
+        home.as_deref(),
+        &agent::project_boundary::Identity::current(),
+    )
+    .is_none()
+}
+
 /// What `decide` judges a request by besides the request itself.
 struct Judge<'a> {
     mode: PermissionMode,
     /// The session is an external agent's, whose requests no policy here judges.
     external: bool,
-    /// An Auto tab on a session whose CLI runs its own auto mode (`answer_what_needs_no_human`).
+    /// An Auto tab on a session whose CLI runs its own auto mode, at a root that is a boundary
+    /// (`answer_what_needs_no_human`).
     defers_to_the_cli: bool,
     rules: &'a agent::PrefixRules,
     project_root: &'a Path,
@@ -3260,6 +3281,8 @@ mod tests {
     fn a_workspace_holding_one_file() -> PathBuf {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("permission-policy");
+        // Whatever the umask: a root others can write to is no boundary.
+        chmod(&dir, 0o700);
         std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
         dir
     }
@@ -4958,6 +4981,142 @@ mod tests {
         backend.shutdown();
     }
 
+    fn chmod(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A workspace anyone on the machine can write to, which the gate takes for no boundary.
+    fn a_workspace_others_can_write() -> PathBuf {
+        let dir = a_workspace_holding_one_file();
+        chmod(&dir, 0o777);
+        dir
+    }
+
+    #[test]
+    fn an_auto_tab_on_a_cli_auto_session_cards_at_a_root_that_is_no_boundary() {
+        let dir = a_workspace_others_can_write();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let mut host_answered = BTreeSet::new();
+        let (delivered, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut host_answered,
+            &mut HumanApprovals::default(),
+        );
+        for id in ["perm-read", "perm-build", "perm-push"] {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(provider.decisions(), Vec::new(), "no deferral and no allow");
+        assert!(host_answered.is_empty());
+        assert_eq!(answered, AnsweredForYou::default());
+        assert_eq!(
+            agent::classify_permission_request("Read", &serde_json::json!({ "file_path": "main.rs" }), &dir).reason,
+            agent::project_boundary::NotABoundary::OthersCanWrite.reason(),
+            "the card stands for the root, not for the call"
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_saved_rule_answers_nothing_there() {
+        let dir = a_workspace_others_can_write();
+        let (provider, mut backend) = auto_backend(&dir);
+        let rules = agent::PrefixRules::default().with(agent::PrefixRule::parse("Bash(npm ci *)").unwrap());
+        provider.queue_all(vec![
+            cli_reports("auto"),
+            gate("perm-ci", "tu-ci", "Bash", serde_json::json!({ "command": "npm ci" })),
+        ]);
+        let (delivered, answered) = deliver_noting(
+            &mut backend,
+            &dir,
+            &rules,
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(carded(&delivered, "perm-ci"), "{delivered:?}");
+        assert_eq!(provider.decisions(), Vec::new());
+        assert!(answered.by_rule.is_empty(), "{answered:?}");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_usable_root_still_defers() {
+        let dir = a_workspace_holding_one_file();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Auto,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        for id in ["perm-read", "perm-build", "perm-push"] {
+            assert!(!carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(
+            provider.decisions(),
+            ["perm-read", "perm-build", "perm-push"].map(|id| (id.to_string(), PermissionDecision::Defer))
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn a_manual_tab_at_such_a_root_still_cards() {
+        let dir = a_workspace_others_can_write();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Manual,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        for id in ["perm-read", "perm-build", "perm-push"] {
+            assert!(carded(&delivered, id), "{id}: {delivered:?}");
+        }
+        assert_eq!(provider.decisions(), Vec::new());
+        backend.shutdown();
+    }
+
+    /// The user chose bypass, and it asks nothing of the root.
+    #[test]
+    fn a_bypass_tab_at_such_a_root_still_allows() {
+        let dir = a_workspace_others_can_write();
+        let (provider, mut backend) = auto_backend(&dir);
+        let mut batch = vec![cli_reports("auto")];
+        batch.extend(three_gates());
+        provider.queue_all(batch);
+        let (delivered, _) = deliver_noting(
+            &mut backend,
+            &dir,
+            &agent::PrefixRules::default(),
+            PermissionMode::Bypass,
+            &mut BTreeSet::new(),
+            &mut HumanApprovals::default(),
+        );
+        assert!(!carded(&delivered, "perm-push"), "{delivered:?}");
+        assert_eq!(
+            provider.decisions(),
+            ["perm-read", "perm-build", "perm-push"].map(|id| (id.to_string(), PermissionDecision::Allow))
+        );
+        backend.shutdown();
+    }
+
     /// Bypass is unchanged on an auto session: every gate request is allowed, which also skips the
     /// CLI's classifier (a hook allow does, measured on CLI 2.1.284).
     #[test]
@@ -5891,6 +6050,38 @@ mod external_tests {
             provider.inner.decisions().is_empty(),
             "{:?}",
             provider.inner.decisions()
+        );
+        backend.shutdown();
+    }
+
+    /// Every request of an external agent is the user's to answer already, so a root that is no
+    /// boundary changes nothing: Auto cards, Bypass allows, and no policy of Eitri's is consulted.
+    #[test]
+    fn an_external_agent_is_not_judged_at_such_a_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = workspace("external-no-boundary");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let (provider, mut backend) = codex_backend(&dir);
+        let rules = agent::PrefixRules::default();
+        provider.inner.queue(request(
+            "a1",
+            "commandExecution",
+            serde_json::json!({ "command": "ls" }),
+        ));
+        let mut answered = BTreeSet::new();
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Auto, &mut answered);
+        assert!(carded(&delivered, "a1"), "{delivered:?}");
+        assert!(provider.inner.decisions().is_empty());
+        provider.inner.queue(request(
+            "b1",
+            "commandExecution",
+            serde_json::json!({ "command": "ls" }),
+        ));
+        let delivered = deliver(&mut backend, &dir, &rules, PermissionMode::Bypass, &mut answered);
+        assert!(!carded(&delivered, "b1"), "{delivered:?}");
+        assert_eq!(
+            provider.inner.decisions(),
+            vec![("b1".to_string(), PermissionDecision::Allow)]
         );
         backend.shutdown();
     }

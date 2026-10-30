@@ -168,6 +168,7 @@
 //! the two can be grepped across repositories. This module classifies calls that DID reach a live
 //! gate. Different question, different answer, unchanged array.
 
+use crate::project_boundary::{checked_root, Identity};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -454,6 +455,8 @@ const GIT_LOCATION_VARIABLES: &[&str] = &[
 #[derive(Debug, Clone, Copy)]
 struct Surroundings<'a> {
     home: Option<&'a Path>,
+    /// Who the project root has to be a boundary against ([`crate::project_boundary`]).
+    who: &'a Identity,
     /// Any of [`GIT_LOCATION_VARIABLES`] is set.
     git_location_from_environment: bool,
     /// The work this classification may do on the filesystem ([`MAX_WORK_PER_CLASSIFICATION`]
@@ -471,6 +474,7 @@ pub fn classify_permission_request(tool_name: &str, input: &Value, project_root:
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let surroundings = Surroundings {
         home: home.as_deref(),
+        who: &Identity::current(),
         git_location_from_environment: GIT_LOCATION_VARIABLES.iter().any(|v| std::env::var_os(v).is_some()),
         work_budget: MAX_WORK_PER_CLASSIFICATION,
     };
@@ -576,7 +580,7 @@ fn classify_within_budget(
         return ask("this tool is not in the policy's table");
     }
     // Every remaining tool is judged against the project root, so the root has to be a boundary.
-    let root = match boundary(project_root, home) {
+    let root = match boundary(project_root, home, surroundings.who) {
         Ok(root) => root,
         Err(classification) => return classification,
     };
@@ -611,64 +615,11 @@ fn classify_within_budget(
     }
 }
 
-/// The canonical project root, or a card if it cannot serve as a boundary.
-///
-/// Two ways it cannot, and the second is the one that matters:
-/// - it does not resolve on disk -- if the boundary is unknown, nothing can be judged against it;
-/// - it IS the home directory, or an ancestor of it (`/` included). `project_root` falls back to
-///   the process cwd when no directory is given (`eitri_core::project_root`), and the packaged
-///   `.desktop` entry passes `%f`, which is empty when Eitri is started from the app menu -- so a
-///   menu launch can make `$HOME` the "project", and then every `Read` of `~/.ssh/id_ed25519` and
-///   every `cat .credentials/...` would count as "inside the project". Whether a menu launch really
-///   starts with cwd `$HOME` was NOT observed; the check does not depend on it.
-///
-/// `home` unset or unresolvable still leaves the `/` check, since `/` is an ancestor of every home.
-///
-/// A root in `/proc`, `/sys` or `/dev` is no boundary either -- every path
-/// under it passes through a tree whose links lead somewhere different in each process
-/// ([`KERNEL_TREES`]), which [`resolve`] would refuse one path at a time anyway; this says why once.
-///
-/// Nor is a root that no longer resolves to ITSELF.
-/// `project_root` is the canonical path the session was started in, and the CLI child's cwd; this
-/// used to canonicalize it again and take whatever came back. Once a process able to write the
-/// root's parent renamed the project and left a link to another directory in its place, that other
-/// directory became "the project" here, and an absolute `Write` or `Read` into it passed as inside
-/// -- while the CLI still sat in the renamed original, and a hook `allow` overrides the
-/// working-directory ask its own post-hook re-check would have raised. Every path-judged call cards
-/// now until the root is back. It compares paths, not the directory's identity: a real directory put
-/// in the root's place under the same name is not caught, and needs no catching here, since the CLI
-/// addresses its own cwd by that same string (`path.resolve` against it, and the `Bash` tool's
-/// `cwd`), so both sides then judge and act on the same replacement. The comparison is `Path`'s own,
-/// component by component, so a trailing `/` or a `.` in the middle is the same root.
-fn boundary(project_root: &Path, home: Option<&Path>) -> Result<PathBuf, Classification> {
-    let Ok(root) = project_root.canonicalize() else {
-        return Err(ask("the project root itself could not be resolved"));
-    };
-    if root.parent().is_none() {
-        return Err(ask("the project root is the filesystem root, which is no boundary"));
-    }
-    if is_in_a_kernel_tree(&root) {
-        return Err(ask(
-            "the project root is in /proc, /sys or /dev, whose links lead somewhere different in each process",
-        ));
-    }
-    if root != project_root {
-        return Err(ask(REASON_ROOT_NO_LONGER_ITSELF));
-    }
-    if let Some(home) = home.and_then(|h| h.canonicalize().ok()) {
-        if home.starts_with(&root) {
-            return Err(ask(
-                "the project root is the home directory or above it, which is no boundary",
-            ));
-        }
-    }
-    Ok(root)
+/// The canonical project root, or a card if it cannot serve as a boundary
+/// ([`crate::project_boundary`], which says what can).
+fn boundary(project_root: &Path, home: Option<&Path>, who: &Identity) -> Result<PathBuf, Classification> {
+    checked_root(project_root, home, who).map_err(|refused| ask(refused.reason()))
 }
-
-/// Why a project root that no longer resolves to itself cards ([`boundary`]). Not in
-/// [`REPLACEABLE_BY_A_RULE`].
-const REASON_ROOT_NO_LONGER_ITSELF: &str =
-    "the project root no longer resolves to itself: it was moved, or a link now stands in its place";
 
 enum PathField {
     Required,
@@ -2521,7 +2472,7 @@ const MAX_RESOLVED_DEPTH: usize = 128;
 /// sorted entry by entry, which would be the partial reading this module refuses.
 const KERNEL_TREES: [&str; 3] = ["/proc", "/sys", "/dev"];
 
-fn is_in_a_kernel_tree(path: &Path) -> bool {
+pub(crate) fn is_in_a_kernel_tree(path: &Path) -> bool {
     KERNEL_TREES.iter().any(|tree| path.starts_with(tree))
 }
 
@@ -3524,6 +3475,7 @@ impl ConfigCursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_boundary::NotABoundary;
     use serde_json::json;
 
     /// A real directory on disk, because every path branch here canonicalizes for real -- a
@@ -3551,6 +3503,8 @@ mod tests {
             // Canonical, as the session's own root always is: a root that does not
             // resolve to itself is no boundary, and macOS's `$TMPDIR` is under `/var -> private/var`.
             let root = root.canonicalize().unwrap();
+            // Whatever the umask: a root others can write to is no boundary.
+            chmod(&root, 0o700);
             std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
             Self { root }
         }
@@ -3585,6 +3539,17 @@ mod tests {
         std::fs::create_dir_all(git_dir.join("objects")).unwrap();
         std::fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// The test process as a [`Surroundings`] sees it, with its group taken for private so that a
+    /// workspace made under any umask stays a boundary: the cases about a root others can write to
+    /// say so themselves.
+    fn me() -> &'static Identity {
+        static ME: std::sync::OnceLock<Identity> = std::sync::OnceLock::new();
+        ME.get_or_init(|| Identity {
+            private_group: true,
+            ..Identity::current()
+        })
     }
 
     /// A directory outside every workspace, holding `secret` -- what a leak would print.
@@ -4005,7 +3970,7 @@ mod tests {
         );
         assert_eq!(
             classify_permission_request("Write", &calls[0].1, &root).reason,
-            REASON_ROOT_NO_LONGER_ITSELF
+            crate::project_boundary::NotABoundary::NoLongerItself.reason()
         );
     }
 
@@ -5299,6 +5264,7 @@ mod tests {
         let classify_with_home = |tool: &str, input: &Value, root: &Path, home: Option<&Path>| {
             let surroundings = Surroundings {
                 home,
+                who: me(),
                 git_location_from_environment: false,
                 work_budget: MAX_WORK_PER_CLASSIFICATION,
             };
@@ -5343,6 +5309,73 @@ mod tests {
             classify("TodoWrite", json!({ "todos": [] }), ws.path(), ws.path()),
             PermissionVerdict::AllowWithoutAsking
         );
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Anyone can add a file to such a root, or the `.git` a read-only command reads, so nothing
+    /// that is judged against it passes, whatever the same call would get elsewhere.
+    #[test]
+    fn a_root_others_can_write_is_no_boundary_for_any_path_judged_tool() {
+        let ws = Workspace::new();
+        let calls = [
+            ("Read", json!({ "file_path": "src/main.rs" })),
+            ("Grep", json!({ "pattern": "x" })),
+            ("Glob", json!({ "pattern": "**/*.rs" })),
+            ("Bash", json!({ "command": "ls" })),
+            ("Write", json!({ "file_path": "new.txt" })),
+        ];
+        for (tool, input) in &calls {
+            assert!(
+                !classify_permission_request(tool, input, ws.path()).needs_a_human(),
+                "{tool}"
+            );
+        }
+        chmod(ws.path(), 0o777);
+        for (tool, input) in &calls {
+            let classification = classify_permission_request(tool, input, ws.path());
+            assert_eq!(classification.verdict, PermissionVerdict::AskTheUser, "{tool}");
+            assert_eq!(classification.reason, NotABoundary::OthersCanWrite.reason(), "{tool}");
+        }
+        // What is decided by the tool's name alone does not depend on the root.
+        assert!(!classify_permission_request("TodoWrite", &json!({ "todos": [] }), ws.path()).needs_a_human());
+    }
+
+    #[test]
+    fn a_root_of_another_account_is_no_boundary() {
+        let ws = Workspace::new();
+        let someone_else = Identity {
+            uid: me().uid.wrapping_add(1),
+            ..*me()
+        };
+        let surroundings = Surroundings {
+            home: None,
+            who: &someone_else,
+            git_location_from_environment: false,
+            work_budget: MAX_WORK_PER_CLASSIFICATION,
+        };
+        let refused = classify_in("Read", &json!({ "file_path": "src/main.rs" }), ws.path(), &surroundings);
+        assert_eq!(refused.verdict, PermissionVerdict::AskTheUser);
+        assert_eq!(refused.reason, NotABoundary::NotYours.reason());
+    }
+
+    #[test]
+    fn a_saved_rule_does_not_replace_the_new_reasons() {
+        for refused in [NotABoundary::NotYours, NotABoundary::OthersCanWrite] {
+            assert!(!REPLACEABLE_BY_A_RULE.contains(&refused.reason()), "{refused:?}");
+        }
+        let ws = Workspace::new();
+        chmod(ws.path(), 0o777);
+        let rules = crate::permission_rules::PrefixRules::default()
+            .with(crate::permission_rules::PrefixRule::parse("Bash(cargo build *)").unwrap());
+        let input = json!({ "command": "cargo build" });
+        assert_eq!(rule_that_allows("Bash", &input, ws.path(), &rules), None);
+        let classification = classify_with_rules("Bash", &input, ws.path(), &rules);
+        assert_eq!(classification.verdict, PermissionVerdict::AskTheUser);
+        assert_eq!(classification.reason, NotABoundary::OthersCanWrite.reason());
     }
 
     /// A root in `/proc`, `/sys` or `/dev` is no boundary either. Every path
@@ -6098,6 +6131,7 @@ mod tests {
         let input = json!({ "command": "git log" });
         let with = |git_location_from_environment| Surroundings {
             home: None,
+            who: me(),
             git_location_from_environment,
             work_budget: MAX_WORK_PER_CLASSIFICATION,
         };
@@ -6117,6 +6151,7 @@ mod tests {
         home.write("harmless.inc", "[user]\n\tname = a\n");
         let surroundings = Surroundings {
             home: Some(home.path()),
+            who: me(),
             git_location_from_environment: false,
             work_budget: MAX_WORK_PER_CLASSIFICATION,
         };
@@ -7237,6 +7272,7 @@ mod tests {
         let input = json!({ "command": "git status" });
         let with_budget = |work_budget| Surroundings {
             home: None,
+            who: me(),
             git_location_from_environment: false,
             work_budget,
         };

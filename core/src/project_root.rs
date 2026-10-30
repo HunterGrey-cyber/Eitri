@@ -9,11 +9,20 @@
 //! to panic on an argument that is not valid UTF-8, and a filesystem path is exactly the argument
 //! class most likely to be one -- a module whose whole contract is "a bad input gets a sentence,
 //! not a panic" cannot be built on a type that cannot hold the bad input.
+//!
+//! Two resolvers live here. [`resolve_launch`] is the window's: its command line may name files, and
+//! then a file decides the root. [`resolve`], [`resolve_args`] and [`resolve_in`] take one directory
+//! and nothing else, for `eitri panel`, `eitri split` and the Mac host.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use agent::project_boundary::{open_to_others, refusal, Identity};
+
+use crate::project_trust::{git_top_level, GitWalk, Limits};
 
 /// The environment variable consulted when no directory was given on the command line. Exists so a
 /// launcher (`.desktop` entry, sandbox harness) can point `shell` at a project without having to
@@ -32,10 +41,12 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// `--legacy` is also intercepted in builds without the legacy backend (every release). Listing
 /// it in every build lets that path report `LEGACY_NOT_IN_BUILD`, rather than an unrecognized
 /// option or a silently opened cwd.
-const KNOWN_FLAGS: [&str; 3] = ["--clean", "--version", "--legacy"];
+///
+/// `--new-window` is read by [`resolve_launch_in`]; the directory-only resolvers step over it.
+const KNOWN_FLAGS: [&str; 4] = ["--clean", "--version", "--legacy", "--new-window"];
 
-/// The conventional end-of-flags separator. The first token after it is the project directory
-/// verbatim, so a directory whose name really does begin with `-` is reachable.
+/// The conventional end-of-flags separator. What follows it is read verbatim, so a path whose name
+/// really does begin with `-` is reachable.
 const END_OF_FLAGS: &str = "--";
 
 /// Whether `flag` appears in `args` *before* the first `--` -- the same end-of-flags rule
@@ -263,14 +274,8 @@ pub fn select_root_source<'a>(
         // Byte-wise, not `to_string_lossy().starts_with()`: a non-UTF-8 path must be classified
         // by what it actually starts with, not by what a replacement character makes of it.
         if arg.as_bytes().first() == Some(&b'-') {
-            if KNOWN_FLAGS.iter().any(|flag| arg == OsStr::new(flag)) {
-                continue;
-            }
-            return Err(format!(
-                "unrecognized option {arg:?} -- shell accepts {}; if that was meant to be a \
-                 project directory, pass it after `--` (shell -- {arg:?})",
-                KNOWN_FLAGS.join(" and ")
-            ));
+            check_flag(arg)?;
+            continue;
         }
         return Ok(RootSource::Argument(arg.to_os_string()));
     }
@@ -281,6 +286,18 @@ pub fn select_root_source<'a>(
         Some(value) if !value.is_empty() => RootSource::Env(value.to_os_string()),
         _ => RootSource::Cwd,
     })
+}
+
+/// A `-...` token before `--`: one of [`KNOWN_FLAGS`], or the sentence refusing it.
+fn check_flag(arg: &OsStr) -> Result<(), String> {
+    if KNOWN_FLAGS.iter().any(|flag| arg == OsStr::new(flag)) {
+        return Ok(());
+    }
+    Err(format!(
+        "unrecognized option {arg:?} -- shell accepts {}; if that was meant to be a \
+         project directory, pass it after `--` (shell -- {arg:?})",
+        KNOWN_FLAGS.join(" and ")
+    ))
 }
 
 /// Turns a chosen source into a real, absolute, symlink-free directory, or into the message
@@ -318,9 +335,422 @@ fn canonicalize_source(source: &RootSource, cwd: io::Result<PathBuf>) -> Result<
     Ok(resolved)
 }
 
+/// The line of `eitri + file`, nvim's bare `+`: the end of the buffer. `+4294967295` reads the same,
+/// which is where nvim would put a line past the end anyway.
+pub const LAST_LINE: u32 = u32::MAX;
+
+/// One file for the editor, and where the cursor goes in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTarget {
+    /// Absolute, valid UTF-8 and canonical; for a file that does not exist yet, its parent is.
+    pub path: PathBuf,
+    /// Only the first target has one: nvim runs a `+cmd` on the first file.
+    pub line: Option<u32>,
+    pub col: Option<u32>,
+}
+
+/// What the window's command line asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    /// The project root, canonical.
+    pub root: PathBuf,
+    /// What nvim opens, first shown. Empty when no file was named.
+    pub open: Vec<OpenTarget>,
+    /// `--new-window` before `--`.
+    pub new_window: bool,
+    /// Sentences for stderr: what was named and is not honoured in full.
+    pub notes: Vec<String>,
+}
+
+/// How many repositories the search for a usable top looks at. A file under more unusable
+/// repositories than this roots at its folder.
+const GIT_TOP_ROUNDS: usize = 4;
+
+/// [`resolve_launch_in`] from this process's arguments, environment, working directory and account.
+pub fn resolve_launch() -> Result<Launch, String> {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Canonical, because the walk for a git top compares it with a canonical path's ancestors.
+    let home = std::env::var_os("HOME").and_then(|home| PathBuf::from(home).canonicalize().ok());
+    resolve_launch_in(
+        &args,
+        std::env::var_os(PROJECT_DIR_ENV),
+        std::env::current_dir(),
+        home.as_deref(),
+        &Identity::current(),
+    )
+}
+
+/// The window's command line: `[flags] [+N|+] [DIR] [FILE...] [-- PATH...]`, flags anywhere before
+/// `--`. `home` must be canonical.
+///
+/// With no path this is [`resolve_in`]. The first path decides the rest: a directory is the root,
+/// usable or not, as `eitri DIR` always was, and every further path must be a file; a file starts
+/// file mode, the root comes from [`root_for_file`], and again every path must be a file. A name that
+/// does not exist yet is a file, when its parent does.
+pub fn resolve_launch_in(
+    args: &[OsString],
+    env: Option<OsString>,
+    cwd: io::Result<PathBuf>,
+    home: Option<&Path>,
+    who: &Identity,
+) -> Result<Launch, String> {
+    let parsed = parse_launch_args(args)?;
+    if parsed.paths.is_empty() {
+        if let Some(spec) = parsed.line_spec {
+            return Err(needs_a_file(&spec.token));
+        }
+        return Ok(Launch {
+            root: resolve_from(std::iter::empty(), env, cwd)?,
+            open: Vec::new(),
+            new_window: parsed.new_window,
+            notes: Vec::new(),
+        });
+    }
+
+    let cwd = cwd.map_err(|e| e.to_string());
+    let mut directory = None;
+    let mut open = Vec::new();
+    for (index, path) in parsed.paths.iter().enumerate() {
+        match classify(path, &cwd)? {
+            Named::File(target) => open.push(target),
+            Named::Directory(found) if index == 0 => directory = Some(found),
+            Named::Directory(_) => {
+                return Err(format!(
+                    "only the first path may be a directory, and {:?} is one",
+                    path.name
+                ));
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    for later in open.iter_mut().skip(1) {
+        if later.line.take().is_some() {
+            later.col = None;
+            notes.push(format!(
+                "eitri: a line applies to the first file only, dropped for {}",
+                later.path.display()
+            ));
+        }
+    }
+    match (open.first_mut(), parsed.line_spec) {
+        (Some(first), Some(spec)) => {
+            first.line = Some(spec.line);
+            first.col = None;
+        }
+        (None, Some(spec)) => return Err(needs_a_file(&spec.token)),
+        (_, None) => {}
+    }
+
+    let root = match directory {
+        Some(directory) => directory,
+        None => {
+            let cwd = cwd.ok().and_then(|cwd| cwd.canonicalize().ok());
+            // With a first path that is no directory, `open` holds it.
+            root_for_file(&open[0].path, cwd.as_deref(), home, who)
+        }
+    };
+    for target in &open {
+        if !target.path.starts_with(&root) {
+            notes.push(format!(
+                "eitri: {} is outside the project {}",
+                target.path.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(Launch {
+        root,
+        open,
+        new_window: parsed.new_window,
+        notes,
+    })
+}
+
+/// The arguments for nvim after `--embed`. Every path starts with `/`, so none can read as an option
+/// or a command, and the column goes through `cursor()` because a `+N` has no column.
+pub fn nvim_open_args(open: &[OpenTarget]) -> Vec<String> {
+    let position = open.first().and_then(|first| match (first.line?, first.col) {
+        (line, Some(col)) => Some(format!("+call cursor({line},{col})")),
+        (LAST_LINE, None) => Some(String::from("+")),
+        (line, None) => Some(format!("+{line}")),
+    });
+    position
+        .into_iter()
+        .chain(open.iter().map(|target| target.path.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// A `+` or `+N` on the command line, with its token for the message that may have to quote it.
+struct LineSpec {
+    token: OsString,
+    line: u32,
+}
+
+/// One path as typed.
+struct PathArg {
+    name: OsString,
+    /// Given after `--`: the name is the whole name, with no `:LINE` to find in it.
+    verbatim: bool,
+}
+
+struct ParsedLaunch {
+    new_window: bool,
+    line_spec: Option<LineSpec>,
+    paths: Vec<PathArg>,
+}
+
+/// The tokens, read with no filesystem call. Before `--` a `-...` token is a flag or an error wherever
+/// it stands, and a `+...` token is a line spec before the first path or an error; after `--` every
+/// token is a path.
+fn parse_launch_args(args: &[OsString]) -> Result<ParsedLaunch, String> {
+    let mut parsed = ParsedLaunch {
+        new_window: false,
+        line_spec: None,
+        paths: Vec::new(),
+    };
+    let mut args = args.iter();
+    for arg in args.by_ref() {
+        if arg == OsStr::new(END_OF_FLAGS) {
+            break;
+        }
+        match arg.as_bytes().first() {
+            Some(b'-') => {
+                check_flag(arg)?;
+                parsed.new_window |= arg == OsStr::new("--new-window");
+            }
+            Some(b'+') => match line_of_spec(arg.as_bytes()) {
+                Some(line) if parsed.paths.is_empty() => {
+                    parsed.line_spec = Some(LineSpec {
+                        token: arg.clone(),
+                        line,
+                    });
+                }
+                _ => return Err(looks_like_a_command(arg)),
+            },
+            _ => parsed.paths.push(PathArg {
+                name: arg.clone(),
+                verbatim: false,
+            }),
+        }
+    }
+    parsed.paths.extend(args.map(|name| PathArg {
+        name: name.clone(),
+        verbatim: true,
+    }));
+    Ok(parsed)
+}
+
+fn line_of_spec(token: &[u8]) -> Option<u32> {
+    match token {
+        b"+" => Some(LAST_LINE),
+        [b'+', digits @ ..] => number(digits),
+        _ => None,
+    }
+}
+
+/// Plain ASCII digits fitting `u32`; `str::parse` alone would also take a leading `+`.
+fn number(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+fn looks_like_a_command(token: &OsStr) -> String {
+    let token = token.to_string_lossy();
+    format!(
+        "eitri: {token} looks like an nvim command. To open a file with that name use ./{token} or eitri -- {token}"
+    )
+}
+
+fn needs_a_file(token: &OsStr) -> String {
+    format!("eitri: {} needs a file", token.to_string_lossy())
+}
+
+/// What a path on the command line turned out to name.
+enum Named {
+    Directory(PathBuf),
+    File(OpenTarget),
+}
+
+/// `name` made absolute. With no working directory only an absolute name means anything.
+fn anchored(name: &OsStr, cwd: &Result<PathBuf, String>) -> Result<PathBuf, String> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    match cwd {
+        Ok(cwd) => Ok(cwd.join(path)),
+        Err(why) => Err(format!(
+            "cannot open {name:?}: cannot determine the current working directory ({why})"
+        )),
+    }
+}
+
+/// Reads one path: stats it, follows it, and refuses what nvim cannot open. Nothing is opened, so a
+/// FIFO is refused without blocking on it.
+fn classify(arg: &PathArg, cwd: &Result<PathBuf, String>) -> Result<Named, String> {
+    // Joined to a cwd, an empty name would be the cwd.
+    if arg.name.is_empty() {
+        return Err(String::from("cannot open an empty path"));
+    }
+    let (name, line, col) = if arg.verbatim {
+        (arg.name.clone(), None, None)
+    } else {
+        split_position(&arg.name, cwd)?
+    };
+    let path = anchored(&name, cwd)?;
+    let resolved = match path.symlink_metadata() {
+        Ok(_) => {
+            let canonical = path.canonicalize().map_err(|e| format!("cannot open {name:?}: {e}"))?;
+            let metadata = canonical.metadata().map_err(|e| format!("cannot open {name:?}: {e}"))?;
+            if metadata.is_dir() {
+                return Ok(Named::Directory(canonical));
+            }
+            if !metadata.is_file() {
+                return Err(format!("{name:?} is not a regular file"));
+            }
+            canonical
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => new_file_path(&name, &path)?,
+        Err(e) => return Err(format!("cannot open {name:?}: {e}")),
+    };
+    if resolved.to_str().is_none() {
+        return Err(format!("cannot open {name:?}: path is not valid UTF-8"));
+    }
+    Ok(Named::File(OpenTarget {
+        path: resolved,
+        line,
+        col,
+    }))
+}
+
+/// Where a file that does not exist yet would be: its canonical parent and its name. `path` has been
+/// seen not to exist. A name that can only be a directory (`foo/`, `foo/.`) is not a new file.
+fn new_file_path(name: &OsStr, path: &Path) -> Result<PathBuf, String> {
+    let bytes = name.as_bytes();
+    let last = bytes.rsplit(|b| *b == b'/').next().unwrap_or(bytes);
+    let missing = || format!("cannot open {name:?}: no such directory");
+    if matches!(last, b"" | b"." | b"..") {
+        return Err(missing());
+    }
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Err(missing());
+    };
+    let parent = parent.canonicalize().map_err(|_| missing())?;
+    if !parent.is_dir() {
+        return Err(missing());
+    }
+    Ok(parent.join(file_name))
+}
+
+/// `name:LINE` and `name:LINE:COL`, each read only when the whole name does not exist and the shorter
+/// name does. Looked at in that order, so one suffix comes off first: `a:5:7` with a file `a:5` is
+/// line 7 of that file. A directory takes no line, and leaves the name whole.
+fn split_position(name: &OsStr, cwd: &Result<PathBuf, String>) -> Result<(OsString, Option<u32>, Option<u32>), String> {
+    let whole = (name.to_os_string(), None, None);
+    let exists = !matches!(
+        anchored(name, cwd)?.symlink_metadata(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound
+    );
+    if exists {
+        return Ok(whole);
+    }
+    let is_a_file = |short: &[u8]| -> Result<bool, String> {
+        let metadata = anchored(OsStr::from_bytes(short), cwd)?.metadata();
+        Ok(metadata.is_ok_and(|metadata| !metadata.is_dir()))
+    };
+    let Some((short, last)) = number_suffix(name.as_bytes()) else {
+        return Ok(whole);
+    };
+    if is_a_file(short)? {
+        return Ok((OsStr::from_bytes(short).to_os_string(), Some(last), None));
+    }
+    let Some((shorter, line)) = number_suffix(short) else {
+        return Ok(whole);
+    };
+    if is_a_file(shorter)? {
+        return Ok((OsStr::from_bytes(shorter).to_os_string(), Some(line), Some(last)));
+    }
+    Ok(whole)
+}
+
+/// `name:N` as `name` and `N`; `None` when the tail is no number or nothing stands before the colon.
+fn number_suffix(name: &[u8]) -> Option<(&[u8], u32)> {
+    let colon = name.iter().rposition(|b| *b == b':')?;
+    let (short, digits) = (&name[..colon], &name[colon + 1..]);
+    if short.is_empty() {
+        return None;
+    }
+    Some((short, number(digits)?))
+}
+
+/// The root for a file, which is canonical. Never refuses: a root that fails [`is_usable`] is what
+/// the permission gate and the panel's note are for, and a file you asked for still opens.
+///
+/// The nearest usable git top holds the project, and a usable cwd inside it narrows that to where the
+/// user is working. With no top, a usable cwd holding the file serves, else the file's own folder.
+fn root_for_file(file: &Path, cwd: Option<&Path>, home: Option<&Path>, who: &Identity) -> PathBuf {
+    let folder = file.parent().unwrap_or(file);
+    let cwd = cwd.filter(|cwd| file.starts_with(cwd) && is_usable(cwd, home, who));
+    match usable_git_top(folder, home, who) {
+        Some(top) => match cwd {
+            Some(cwd) if cwd.starts_with(&top) => cwd.to_path_buf(),
+            _ => top,
+        },
+        None => cwd.unwrap_or(folder).to_path_buf(),
+    }
+}
+
+/// The test the gate applies. `dir` must be canonical: a spelling through a link reads as a root that
+/// has moved.
+fn is_usable(dir: &Path, home: Option<&Path>, who: &Identity) -> bool {
+    refusal(dir, home, who).is_none()
+}
+
+/// The nearest git top above `start` that is usable and whose `.git` is too. An unusable top does not
+/// end the search, which goes on from its parent; nothing above a `$HOME` that `start` is under is
+/// looked at, as in trust discovery, and nothing there could be usable.
+fn usable_git_top(start: &Path, home: Option<&Path>, who: &Identity) -> Option<PathBuf> {
+    let stop_at = home.filter(|home| start.starts_with(home));
+    let mut from = start.to_path_buf();
+    for _ in 0..GIT_TOP_ROUNDS {
+        let walk = git_top_level(&from, stop_at, Limits::default().max_walk_up);
+        let top = walk.top.as_deref()?;
+        if is_usable(top, home, who) && git_dir_is_private(top, &walk, who) {
+            return walk.top;
+        }
+        if stop_at == Some(top) {
+            return None;
+        }
+        from = top.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// Whether nobody else can change `top`'s `.git`, and for a linked worktree its common directory:
+/// whoever can write hooks or config there runs code in every session at this root. Tested with
+/// `lstat`, as the root is.
+fn git_dir_is_private(top: &Path, walk: &GitWalk, who: &Identity) -> bool {
+    let private = |path: &Path| {
+        path.symlink_metadata()
+            .is_ok_and(|metadata| open_to_others(metadata.uid(), metadata.gid(), metadata.mode(), who).is_none())
+    };
+    let common = walk
+        .main_checkout
+        .as_ref()
+        .map(|checkout| checkout.join(".git"))
+        .or_else(|| walk.unplaced_common.clone());
+    private(&top.join(".git")) && common.is_none_or(|common| private(&common))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_trust::nofollow::tests::{canonical_scratch, mkfifo};
+    use agent::project_boundary::NotABoundary;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     /// `select_root_source` over `&str` literals, which is what almost every case below wants.
     fn select<'a>(args: impl IntoIterator<Item = &'a str>, env: Option<&str>) -> Result<RootSource, String> {
@@ -680,5 +1110,768 @@ mod tests {
         assert_eq!(resolve_args(&[through_dot.into_os_string()]), Ok(real));
         let err = resolve_args(&os(&["/definitely/not/a/real/eitri/project"])).expect_err("a missing directory");
         assert!(err.contains("/definitely/not/a/real/eitri/project"), "got {err}");
+    }
+
+    /// The account running the test, with a private group: a directory's mode alone then decides,
+    /// under whatever umask the machine has.
+    fn me() -> Identity {
+        // SAFETY: neither call has preconditions, and neither can fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Identity {
+            uid,
+            gid,
+            private_group: true,
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A directory only its owner can write to, with its parents.
+    fn dir(path: PathBuf) -> PathBuf {
+        std::fs::create_dir_all(&path).unwrap();
+        chmod(&path, 0o700);
+        path
+    }
+
+    fn file(path: PathBuf) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"text").unwrap();
+        path
+    }
+
+    /// A minimal git directory by hand, the layout `git_top_level` accepts.
+    fn fake_repo(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    }
+
+    /// `wt` as a linked worktree of the repository at `main`.
+    fn fake_worktree(main: &Path, wt: &Path) {
+        let git_dir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/wt\n").unwrap();
+        std::fs::write(git_dir.join("commondir"), b"../..\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+    }
+
+    fn text(path: &Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    fn at(home: &Path, args: &[&str], cwd: &Path) -> Result<Launch, String> {
+        resolve_launch_in(&os(args), None, Ok(cwd.to_path_buf()), Some(home), &me())
+    }
+
+    fn plain(path: PathBuf) -> OpenTarget {
+        OpenTarget {
+            path,
+            line: None,
+            col: None,
+        }
+    }
+
+    fn placed(path: PathBuf, line: Option<u32>, col: Option<u32>) -> OpenTarget {
+        OpenTarget { path, line, col }
+    }
+
+    /// A scratch tree and a home inside it, so no walk leaves the tree for a repository the machine
+    /// running the test happens to have above its temp dir.
+    fn scratch_home(label: &str) -> (impl Drop, PathBuf) {
+        let (guard, top) = canonical_scratch(label);
+        let home = dir(top.join("home"));
+        (guard, home)
+    }
+
+    #[test]
+    fn a_file_in_the_cwd_of_a_repo_takes_the_repo() {
+        let (_s, home) = scratch_home("rl-repo");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let lib = file(repo.join("src/lib.rs"));
+        let launch = at(&home, &["src/lib.rs"], &repo).unwrap();
+        assert_eq!(launch.root, repo);
+        assert_eq!(launch.open, [plain(lib)]);
+        assert!(launch.notes.is_empty(), "{:?}", launch.notes);
+        assert!(!launch.new_window);
+    }
+
+    #[test]
+    fn a_subdirectory_cwd_inside_the_repo_wins() {
+        let (_s, home) = scratch_home("rl-sub");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let member = dir(repo.join("member"));
+        let x = file(member.join("src/x.rs"));
+        let launch = at(&home, &["src/x.rs"], &member).unwrap();
+        assert_eq!((launch.root, launch.open), (member, vec![plain(x)]));
+    }
+
+    #[test]
+    fn a_cwd_outside_the_repo_gives_the_repo() {
+        let (_s, home) = scratch_home("rl-out");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let a = file(repo.join("a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, repo);
+        // A usable cwd that does not contain the file is no better than the home above.
+        let elsewhere = dir(home.join("elsewhere"));
+        assert_eq!(at(&home, &[text(&a)], &elsewhere).unwrap().root, repo);
+        // Nor is a usable cwd that contains the repo.
+        let code = dir(home.join("code"));
+        let inner = dir(code.join("inner"));
+        fake_repo(&inner);
+        let b = file(inner.join("b.rs"));
+        assert_eq!(at(&home, &[text(&b)], &code).unwrap().root, inner);
+    }
+
+    #[test]
+    fn no_repo_and_a_usable_cwd_gives_the_cwd() {
+        let (_s, home) = scratch_home("rl-cwd");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("sub/a.py"));
+        assert_eq!(at(&home, &["sub/a.py"], &scratch).unwrap().root, scratch);
+        assert_eq!(at(&home, &[text(&a)], &scratch).unwrap().root, scratch);
+    }
+
+    #[test]
+    fn no_repo_and_an_unusable_cwd_gives_the_parent() {
+        let (_s, home) = scratch_home("rl-parent");
+        let scratch = dir(home.join("code/scratch"));
+        let a = file(scratch.join("a.py"));
+        assert_eq!(at(&home, &["code/scratch/a.py"], &home).unwrap().root, scratch);
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, scratch);
+    }
+
+    #[test]
+    fn a_home_that_is_a_repo_is_no_git_top() {
+        let (_s, home) = scratch_home("rl-homerepo");
+        fake_repo(&home);
+        let scratch = dir(home.join("code/scratch"));
+        let a = file(scratch.join("a.py"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, scratch);
+    }
+
+    #[test]
+    fn a_file_in_home_takes_home_as_root() {
+        let (_s, home) = scratch_home("rl-home");
+        let notes = file(home.join("notes.md"));
+        let launch = at(&home, &["notes.md"], &home).unwrap();
+        assert_eq!((launch.root, launch.open), (home.clone(), vec![plain(notes.clone())]));
+        let elsewhere = dir(home.join("elsewhere"));
+        assert_eq!(at(&home, &[text(&notes)], &elsewhere).unwrap().root, home);
+    }
+
+    #[test]
+    fn an_unusable_parent_is_still_the_root() {
+        let (_s, home) = scratch_home("rl-shared");
+        let shared = dir(home.join("shared"));
+        chmod(&shared, 0o777);
+        let a = file(shared.join("a.py"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, shared);
+        // The cwd itself being that folder changes nothing: it is unusable, and the parent is it.
+        assert_eq!(at(&home, &["a.py"], &shared).unwrap().root, shared);
+    }
+
+    #[test]
+    fn a_foreign_owned_dot_git_is_skipped() {
+        let (_s, home) = scratch_home("rl-foreign");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let src = dir(repo.join("src"));
+        let a = file(src.join("a.rs"));
+        chmod(&repo.join(".git"), 0o775);
+        let launch = |who: &Identity| resolve_launch_in(&os(&[text(&a)]), None, Ok(home.clone()), Some(&home), who);
+        // A private group makes a 0775 `.git` the caller's alone.
+        assert_eq!(launch(&me()).unwrap().root, repo);
+        // A shared group does not. A test cannot chown, so this is the case where the directory
+        // passes and only its `.git` fails.
+        let shared = Identity {
+            private_group: false,
+            ..me()
+        };
+        assert_eq!(launch(&shared).unwrap().root, src);
+        let someone_else = Identity {
+            uid: me().uid.wrapping_add(1),
+            ..me()
+        };
+        assert_eq!(launch(&someone_else).unwrap().root, src);
+    }
+
+    #[test]
+    fn a_dot_git_file_of_a_linked_worktree_is_a_top() {
+        let (_s, home) = scratch_home("rl-wt");
+        let main = dir(home.join("main"));
+        fake_repo(&main);
+        let wt = dir(home.join("wt"));
+        fake_worktree(&main, &wt);
+        let a = file(wt.join("src/a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, wt);
+    }
+
+    #[test]
+    fn a_linked_worktree_of_a_repository_others_can_write_to_is_no_top() {
+        let (_s, home) = scratch_home("rl-wt-shared");
+        let main = dir(home.join("main"));
+        fake_repo(&main);
+        chmod(&main.join(".git"), 0o777);
+        let wt = dir(home.join("wt"));
+        fake_worktree(&main, &wt);
+        let src = dir(wt.join("src"));
+        let a = file(src.join("a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, src);
+    }
+
+    #[test]
+    fn a_symlinked_dot_git_counts_as_absent() {
+        let (_s, home) = scratch_home("rl-gitlink");
+        let real = dir(home.join("real"));
+        fake_repo(&real);
+        let linked = dir(home.join("linked"));
+        symlink(real.join(".git"), linked.join(".git")).unwrap();
+        let src = dir(linked.join("src"));
+        let a = file(src.join("a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, src);
+    }
+
+    #[test]
+    fn a_second_round_finds_the_usable_top_above_an_unusable_one() {
+        let (_s, home) = scratch_home("rl-round");
+        let outer = dir(home.join("outer"));
+        fake_repo(&outer);
+        let inner = dir(outer.join("inner"));
+        fake_repo(&inner);
+        chmod(&inner, 0o777);
+        let a = file(inner.join("a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, outer);
+    }
+
+    #[test]
+    fn the_search_for_a_usable_top_stops_after_four_rounds() {
+        let (_s, home) = scratch_home("rl-rounds");
+        let mut repo = dir(home.join("outer"));
+        fake_repo(&repo);
+        for _ in 0..GIT_TOP_ROUNDS {
+            repo = dir(repo.join("nested"));
+            fake_repo(&repo);
+            chmod(&repo, 0o777);
+        }
+        let a = file(repo.join("a.rs"));
+        assert_eq!(at(&home, &[text(&a)], &home).unwrap().root, repo);
+    }
+
+    #[test]
+    fn an_unreadable_cwd_counts_as_absent() {
+        let (_s, home) = scratch_home("rl-nocwd");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("a.py"));
+        let no_cwd = |name: &str| {
+            resolve_launch_in(
+                &os(&[name]),
+                None,
+                Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+                Some(&home),
+                &me(),
+            )
+        };
+        assert_eq!(no_cwd(text(&a)).unwrap().root, scratch);
+        // A relative name has nothing to be relative to.
+        let err = no_cwd("a.py").expect_err("a relative name with no cwd");
+        assert!(err.contains("working directory") && err.contains("gone"), "got {err}");
+    }
+
+    #[test]
+    fn a_symlink_roots_at_its_target() {
+        let (_s, home) = scratch_home("rl-link");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let real = file(repo.join("real.md"));
+        symlink(&real, home.join("link.md")).unwrap();
+        let launch = at(&home, &["link.md"], &home).unwrap();
+        assert_eq!((launch.root, launch.open), (repo, vec![plain(real)]));
+    }
+
+    #[test]
+    fn a_dangling_link_is_refused() {
+        let (_s, home) = scratch_home("rl-dangling");
+        let scratch = dir(home.join("scratch"));
+        symlink(home.join("nowhere"), scratch.join("link.md")).unwrap();
+        let err = at(&home, &["link.md"], &scratch).expect_err("a link to nothing has no canonical path");
+        assert!(err.contains("link.md"), "got {err}");
+    }
+
+    #[test]
+    fn a_new_file_uses_its_parent() {
+        let (_s, home) = scratch_home("rl-new");
+        let scratch = dir(home.join("scratch"));
+        let launch = at(&home, &["new.rs"], &scratch).unwrap();
+        assert_eq!(launch.open, [plain(scratch.join("new.rs"))]);
+        assert_eq!(launch.root, scratch);
+        assert!(!scratch.join("new.rs").exists(), "resolving creates nothing");
+        // The parent is spelt through a link: the new path is canonical all the same.
+        symlink(&scratch, home.join("via")).unwrap();
+        assert_eq!(
+            at(&home, &["via/new.rs"], &home).unwrap().open,
+            [plain(scratch.join("new.rs"))]
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_is_refused() {
+        let (_s, home) = scratch_home("rl-noparent");
+        let scratch = dir(home.join("scratch"));
+        let err = at(&home, &["missing/dir/new.rs"], &scratch).expect_err("nowhere to write it");
+        assert!(err.contains("no such directory"), "got {err}");
+        // A parent that is a file is no directory either.
+        file(scratch.join("a.rs"));
+        assert!(at(&home, &["a.rs/new.rs"], &scratch).is_err());
+    }
+
+    #[test]
+    fn a_trailing_slash_on_a_missing_name_is_refused() {
+        let (_s, home) = scratch_home("rl-slash");
+        let scratch = dir(home.join("scratch"));
+        for name in ["foo/", "foo/.", "foo/..", "foo//"] {
+            let err = at(&home, &[name], &scratch).expect_err(name);
+            assert!(err.contains("no such directory"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_empty_name_is_refused_rather_than_read_as_the_cwd() {
+        let (_s, home) = scratch_home("rl-empty");
+        let scratch = dir(home.join("scratch"));
+        assert!(at(&home, &[""], &scratch).is_err());
+    }
+
+    #[test]
+    fn a_fifo_is_refused() {
+        let (_s, home) = scratch_home("rl-fifo");
+        let scratch = dir(home.join("scratch"));
+        mkfifo(&scratch.join("pipe"));
+        let err = at(&home, &["pipe"], &scratch).expect_err("nvim would block reading it");
+        assert!(err.contains("is not a regular file"), "got {err}");
+        file(scratch.join("a.rs"));
+        let err = at(&home, &["a.rs", "pipe"], &scratch).expect_err("a later one too");
+        assert!(err.contains("is not a regular file"), "got {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_file_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let (_s, home) = scratch_home("rl-bytes");
+        let scratch = dir(home.join("scratch"));
+        let name = OsString::from_vec(b"a\xff.rs".to_vec());
+        std::fs::write(scratch.join(&name), b"text").unwrap();
+        let args = [name];
+        let launch = resolve_launch_in(&args, None, Ok(scratch.clone()), Some(&home), &me());
+        assert!(launch.unwrap_err().contains("path is not valid UTF-8"));
+        // A new file's name is an open path as well.
+        let args = [OsString::from_vec(b"new\xff.rs".to_vec())];
+        let launch = resolve_launch_in(&args, None, Ok(scratch), Some(&home), &me());
+        assert!(launch.unwrap_err().contains("path is not valid UTF-8"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_directory_still_opens() {
+        use std::os::unix::ffi::OsStringExt;
+        let (_s, home) = scratch_home("rl-bytesdir");
+        let project = dir(home.join(OsString::from_vec(b"proj\xff".to_vec())));
+        let args = [project.clone().into_os_string()];
+        let launch = resolve_launch_in(&args, None, Ok(home.clone()), Some(&home), &me()).unwrap();
+        assert_eq!((launch.root, launch.open), (project, vec![]));
+    }
+
+    #[test]
+    fn dir_then_files_keeps_dir_as_root_and_notes_one_outside() {
+        let (_s, home) = scratch_home("rl-dirfiles");
+        let project = dir(home.join("project"));
+        let a = file(project.join("a.rs"));
+        let b = file(home.join("other/b.rs"));
+        let launch = at(&home, &[text(&project), text(&a), text(&b)], &home).unwrap();
+        assert_eq!(launch.root, project);
+        assert_eq!(launch.open, [plain(a), plain(b.clone())]);
+        assert_eq!(launch.notes.len(), 1, "{:?}", launch.notes);
+        assert!(launch.notes[0].contains(text(&b)), "{:?}", launch.notes);
+        // A name after the directory is relative to the cwd, as for nvim, never to the directory.
+        let launch = at(&home, &["project", "other/b.rs"], &home).unwrap();
+        assert_eq!(launch.open, [plain(b)]);
+    }
+
+    #[test]
+    fn dir_keeps_its_root_with_no_usable_test() {
+        let (_s, home) = scratch_home("rl-dirhome");
+        let a = file(home.join("a.rs"));
+        let launch = at(&home, &[text(&home), text(&a)], &home).unwrap();
+        assert_eq!(launch.root, home);
+        assert_eq!(launch.open, [plain(a)]);
+    }
+
+    #[test]
+    fn several_files_root_at_the_first_and_note_one_outside() {
+        let (_s, home) = scratch_home("rl-several");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let a = file(repo.join("a.rs"));
+        let b = file(repo.join("b.rs"));
+        let c = file(home.join("c.rs"));
+        let launch = at(&home, &[text(&a), text(&b), text(&c)], &home).unwrap();
+        assert_eq!(launch.root, repo);
+        assert_eq!(launch.open, [plain(a), plain(b), plain(c.clone())]);
+        assert_eq!(launch.notes.len(), 1, "{:?}", launch.notes);
+        assert!(launch.notes[0].contains(text(&c)), "{:?}", launch.notes);
+    }
+
+    #[test]
+    fn dir_dir2_and_file_dir_are_refused() {
+        let (_s, home) = scratch_home("rl-twodirs");
+        let one = dir(home.join("one"));
+        let two = dir(home.join("two"));
+        let a = file(one.join("a.rs"));
+        for args in [[text(&one), text(&two)], [text(&a), text(&one)]] {
+            let err = at(&home, &args, &home).expect_err("one directory, and only first");
+            assert!(err.contains("directory"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn line_specs_only_before_the_first_path() {
+        let (_s, home) = scratch_home("rl-spec");
+        let a = file(home.join("a.rs"));
+        assert_eq!(
+            at(&home, &["+42", "a.rs"], &home).unwrap().open,
+            [placed(a.clone(), Some(42), None)]
+        );
+        assert_eq!(
+            at(&home, &["+42", "--", "a.rs"], &home).unwrap().open,
+            [placed(a.clone(), Some(42), None)]
+        );
+        assert_eq!(
+            at(&home, &["a.rs", "+42"], &home),
+            Err(
+                "eitri: +42 looks like an nvim command. To open a file with that name use ./+42 or eitri -- +42"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_bare_plus_is_the_last_line() {
+        let (_s, home) = scratch_home("rl-plus");
+        let a = file(home.join("a.rs"));
+        assert_eq!(
+            at(&home, &["+", "a.rs"], &home).unwrap().open,
+            [placed(a, Some(LAST_LINE), None)]
+        );
+    }
+
+    #[test]
+    fn plus_word_is_refused_with_the_way_out() {
+        let (_s, home) = scratch_home("rl-word");
+        file(home.join("+page.svelte"));
+        file(home.join("a.rs"));
+        assert_eq!(
+            at(&home, &["+page.svelte"], &home),
+            Err(
+                "eitri: +page.svelte looks like an nvim command. To open a file with that name use \
+                 ./+page.svelte or eitri -- +page.svelte"
+                    .to_string()
+            )
+        );
+        for word in ["+/pat", "+cmd", "+-1", "++1"] {
+            assert_eq!(
+                at(&home, &[word, "a.rs"], &home),
+                Err(format!(
+                    "eitri: {word} looks like an nvim command. To open a file with that name use ./{word} or \
+                     eitri -- {word}"
+                ))
+            );
+        }
+        // The two ways out the message names both open it.
+        let page = home.join("+page.svelte");
+        assert_eq!(
+            at(&home, &["./+page.svelte"], &home).unwrap().open,
+            [plain(page.clone())]
+        );
+        assert_eq!(at(&home, &["--", "+page.svelte"], &home).unwrap().open, [plain(page)]);
+    }
+
+    #[test]
+    fn plus_n_with_no_file_is_refused() {
+        let (_s, home) = scratch_home("rl-nofile");
+        let needs = Err("eitri: +42 needs a file".to_string());
+        assert_eq!(at(&home, &["+42"], &home), needs);
+        assert_eq!(at(&home, &["+42", text(&home)], &home), needs);
+        assert_eq!(at(&home, &["+"], &home), Err("eitri: + needs a file".to_string()));
+        // The variable is no file either, whatever it names.
+        let launch = resolve_launch_in(
+            &os(&["+42"]),
+            Some(home.clone().into_os_string()),
+            Ok(home.clone()),
+            Some(&home),
+            &me(),
+        );
+        assert_eq!(launch, needs);
+    }
+
+    #[test]
+    fn plus_n_too_big_is_refused() {
+        let (_s, home) = scratch_home("rl-big");
+        file(home.join("a.rs"));
+        let token = "+4294967296";
+        assert_eq!(
+            at(&home, &[token, "a.rs"], &home),
+            Err(format!(
+                "eitri: {token} looks like an nvim command. To open a file with that name use ./{token} or \
+                 eitri -- {token}"
+            ))
+        );
+    }
+
+    #[test]
+    fn after_double_dash_everything_is_a_path() {
+        let (_s, home) = scratch_home("rl-dashes");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("a.rs"));
+        for name in ["+42", "-weird.txt", "--new-window", "--", "+", "a.rs:7"] {
+            let launch = at(&home, &["--", name], &scratch).unwrap();
+            assert_eq!(launch.open, [plain(scratch.join(name))], "{name}");
+            assert!(!launch.new_window, "{name}");
+        }
+        // Several, in order, and none of them takes a line.
+        let launch = at(&home, &["--", "+42", "a.rs:7", "a.rs"], &scratch).unwrap();
+        assert_eq!(
+            launch.open,
+            [plain(scratch.join("+42")), plain(scratch.join("a.rs:7")), plain(a)]
+        );
+        assert!(launch.notes.is_empty(), "{:?}", launch.notes);
+    }
+
+    #[test]
+    fn a_name_that_reads_as_something_else_stays_one_absolute_argument() {
+        let (_s, home) = scratch_home("rl-odd");
+        let scratch = dir(home.join("scratch"));
+        for name in ["a b", "a\nb", "%", "#", "#1", "-x", "+x", "$HOME", "*", "a'b"] {
+            let path = file(scratch.join(name));
+            let launch = at(&home, &["--", name], &scratch).unwrap();
+            assert_eq!(nvim_open_args(&launch.open), [text(&path)], "{name:?}");
+        }
+        let launch = at(&home, &["./-x"], &scratch).unwrap();
+        assert_eq!(nvim_open_args(&launch.open), [text(&scratch.join("-x"))]);
+    }
+
+    #[test]
+    fn file_colon_line_splits_only_when_the_short_name_exists() {
+        let (_s, home) = scratch_home("rl-colon");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("a.rs"));
+        assert_eq!(
+            at(&home, &["a.rs:42"], &scratch).unwrap().open,
+            [placed(a.clone(), Some(42), None)]
+        );
+        // No short name: a new file with the whole name.
+        assert_eq!(
+            at(&home, &["new.rs:42"], &scratch).unwrap().open,
+            [plain(scratch.join("new.rs:42"))]
+        );
+        // The literal name wins over the short one.
+        let literal = file(scratch.join("b.rs:42"));
+        file(scratch.join("b.rs"));
+        assert_eq!(at(&home, &["b.rs:42"], &scratch).unwrap().open, [plain(literal)]);
+        // Not a number, or none that fits: part of the name.
+        for name in ["a.rs:", "a.rs:x", "a.rs:4294967296", "a.rs:+4"] {
+            assert_eq!(
+                at(&home, &[name], &scratch).unwrap().open,
+                [plain(scratch.join(name))],
+                "{name}"
+            );
+        }
+        // A directory takes no line: the name stays whole.
+        dir(scratch.join("src"));
+        assert_eq!(
+            at(&home, &["src:42"], &scratch).unwrap().open,
+            [plain(scratch.join("src:42"))]
+        );
+    }
+
+    #[test]
+    fn file_colon_line_colon_col() {
+        let (_s, home) = scratch_home("rl-col");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("a.rs"));
+        assert_eq!(
+            at(&home, &["a.rs:42:7"], &scratch).unwrap().open,
+            [placed(a, Some(42), Some(7))]
+        );
+        // The whole name first.
+        let literal = file(scratch.join("b.rs:42:7"));
+        file(scratch.join("b.rs"));
+        assert_eq!(at(&home, &["b.rs:42:7"], &scratch).unwrap().open, [plain(literal)]);
+        // Then the name with one suffix off, which reads as `file:LINE` on a file named `c.rs:42`.
+        let named = file(scratch.join("c.rs:42"));
+        file(scratch.join("c.rs"));
+        assert_eq!(
+            at(&home, &["c.rs:42:7"], &scratch).unwrap().open,
+            [placed(named, Some(7), None)]
+        );
+    }
+
+    #[test]
+    fn plus_n_beats_a_file_suffix() {
+        let (_s, home) = scratch_home("rl-beats");
+        let a = file(home.join("a.rs"));
+        assert_eq!(
+            at(&home, &["+5", "a.rs:42"], &home).unwrap().open,
+            [placed(a.clone(), Some(5), None)]
+        );
+        assert_eq!(
+            at(&home, &["+5", "a.rs:42:7"], &home).unwrap().open,
+            [placed(a, Some(5), None)]
+        );
+    }
+
+    #[test]
+    fn a_line_on_a_later_file_is_dropped_with_a_note() {
+        let (_s, home) = scratch_home("rl-later");
+        let a = file(home.join("a.rs"));
+        let b = file(home.join("b.rs"));
+        let launch = at(&home, &["a.rs", "b.rs:9:3"], &home).unwrap();
+        assert_eq!(launch.open, [plain(a.clone()), plain(b.clone())]);
+        assert_eq!(launch.notes.len(), 1, "{:?}", launch.notes);
+        assert!(launch.notes[0].contains(text(&b)), "{:?}", launch.notes);
+        // With a directory first, the first file is still the one with the line.
+        let launch = at(&home, &[text(&home), "a.rs:3", "b.rs"], &home).unwrap();
+        assert_eq!(launch.open, [placed(a, Some(3), None), plain(b)]);
+        assert!(launch.notes.is_empty(), "{:?}", launch.notes);
+    }
+
+    #[test]
+    fn options_after_files_are_checked() {
+        let (_s, home) = scratch_home("rl-options");
+        file(home.join("a.rs"));
+        let err = at(&home, &["a.rs", "--bogus"], &home).expect_err("an unknown option after a file");
+        assert!(err.contains("--bogus"), "got {err}");
+        assert!(at(&home, &["a.rs", "--clean"], &home).is_ok());
+    }
+
+    #[test]
+    fn new_window_anywhere_before_double_dash_is_a_flag() {
+        let (_s, home) = scratch_home("rl-newwin");
+        let a = file(home.join("a.rs"));
+        for args in [["--new-window", "a.rs"], ["a.rs", "--new-window"]] {
+            let launch = at(&home, &args, &home).unwrap();
+            assert!(launch.new_window, "{args:?}");
+            assert_eq!(launch.open, [plain(a.clone())], "{args:?}");
+        }
+        assert!(at(&home, &["--new-window"], &home).unwrap().new_window);
+        assert!(!at(&home, &["a.rs", "--", "--new-window"], &home).unwrap().new_window);
+        // The directory-only resolver steps over it the same way.
+        assert_eq!(select(["--new-window", "/x"], None), Ok(argument("/x")));
+    }
+
+    #[test]
+    fn env_naming_a_file_is_refused() {
+        let (_s, home) = scratch_home("rl-envfile");
+        let a = file(home.join("a.rs"));
+        let launch = resolve_launch_in(&[], Some(a.into_os_string()), Ok(home.clone()), Some(&home), &me());
+        let err = launch.expect_err("the variable stays directory-only");
+        assert!(
+            err.contains("not a directory") && err.contains(PROJECT_DIR_ENV),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_positional_file_beats_the_env() {
+        let (_s, home) = scratch_home("rl-envpos");
+        let scratch = dir(home.join("scratch"));
+        let a = file(scratch.join("a.py"));
+        let other = dir(home.join("other"));
+        let launch = resolve_launch_in(
+            &os(&[text(&a)]),
+            Some(other.into_os_string()),
+            Ok(scratch.clone()),
+            Some(&home),
+            &me(),
+        )
+        .unwrap();
+        assert_eq!((launch.root, launch.open), (scratch, vec![plain(a)]));
+    }
+
+    #[test]
+    fn the_empty_command_line_is_todays_root() {
+        let (_s, home) = scratch_home("rl-empty-line");
+        let scratch = dir(home.join("scratch"));
+        let other = dir(home.join("other"));
+        let bare = |args: &[&str], env: Option<&Path>| {
+            let env = env.map(|path| path.as_os_str().to_owned());
+            resolve_launch_in(&os(args), env, Ok(scratch.clone()), Some(&home), &me()).unwrap()
+        };
+        for args in [&[][..], &["--clean"][..], &["--"][..]] {
+            let launch = bare(args, None);
+            assert_eq!((&launch.root, launch.open.len()), (&scratch, 0), "{args:?}");
+            assert_eq!(bare(args, Some(&other)).root, other, "{args:?}");
+        }
+        // A directory given is what `resolve_in` makes of it, even one that is no boundary.
+        let launch = at(&home, &[text(&home)], &scratch).unwrap();
+        assert_eq!((launch.root, launch.open), (home.clone(), vec![]));
+        // No working directory is what `resolve_in` says about it, too.
+        let launch = resolve_launch_in(
+            &[],
+            None,
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+            Some(&home),
+            &me(),
+        );
+        assert!(launch.unwrap_err().contains("working directory"));
+    }
+
+    #[test]
+    fn every_refusal_the_gate_has_is_a_refusal_here() {
+        let (_s, home) = scratch_home("rl-refusals");
+        let own = dir(home.join("own"));
+        let linked = home.join("linked");
+        symlink(&own, &linked).unwrap();
+        let shared = dir(home.join("shared"));
+        chmod(&shared, 0o777);
+        let someone_else = Identity {
+            uid: me().uid.wrapping_add(1),
+            ..me()
+        };
+        assert!(is_usable(&own, Some(&home), &me()));
+        for reason in NotABoundary::ALL {
+            let (path, who) = match reason {
+                NotABoundary::Unresolvable => (home.join("missing"), me()),
+                NotABoundary::FilesystemRoot => (PathBuf::from("/"), me()),
+                NotABoundary::KernelTree => (PathBuf::from("/dev"), me()),
+                NotABoundary::NoLongerItself => (linked.clone(), me()),
+                NotABoundary::HomeOrAbove => (home.clone(), me()),
+                NotABoundary::NotYours => (own.clone(), someone_else),
+                NotABoundary::OthersCanWrite => (shared.clone(), me()),
+            };
+            assert_eq!(refusal(&path, Some(&home), &who), Some(reason), "{}", path.display());
+            assert!(!is_usable(&path, Some(&home), &who), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn nvim_args_line_col_and_last_line() {
+        let a = || PathBuf::from("/a");
+        assert_eq!(nvim_open_args(&[placed(a(), Some(42), None)]), ["+42", "/a"]);
+        assert_eq!(
+            nvim_open_args(&[placed(a(), Some(42), Some(7))]),
+            ["+call cursor(42,7)", "/a"]
+        );
+        assert_eq!(nvim_open_args(&[placed(a(), Some(LAST_LINE), None)]), ["+", "/a"]);
+        assert_eq!(
+            nvim_open_args(&[placed(a(), Some(3), None), plain(PathBuf::from("/b"))]),
+            ["+3", "/a", "/b"]
+        );
+        assert_eq!(nvim_open_args(&[plain(a()), plain(PathBuf::from("/b"))]), ["/a", "/b"]);
+        assert!(nvim_open_args(&[]).is_empty());
     }
 }

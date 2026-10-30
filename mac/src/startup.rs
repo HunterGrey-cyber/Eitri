@@ -82,9 +82,9 @@ pub enum ProjectStart {
 /// A launch from the Dock or Finder names no project and runs in `/`, which is never a project: that is
 /// `Choose`. `/` named on purpose, by an argument or the variable, is refused.
 ///
-/// This host has no options at all. The Linux window's own (`--clean`, `--version`, `--legacy`), which the
-/// shared resolver steps over, are refused here: skipped, `eitri-mac --legacy` would open the working
-/// directory on the sidecar with nothing said.
+/// This host has no options at all. The Linux window's own (`--clean`, `--version`, `--legacy`,
+/// `--new-window`), which the shared resolver steps over, are refused here: skipped, `eitri-mac --legacy`
+/// would open the working directory on the sidecar with nothing said.
 pub fn project_start(args: &[OsString], env_project_dir: Option<OsString>, cwd: &Path) -> Result<ProjectStart, String> {
     // LaunchServices may add a process serial number (`-psn_<n>_<n>`) to a GUI start's arguments; left in,
     // it would be an unrecognised option and the app would not start. Only before `--`: after it every
@@ -105,6 +105,11 @@ pub fn project_start(args: &[OsString], env_project_dir: Option<OsString>, cwd: 
              `--` (eitri-mac -- {option:?})"
         ));
     }
+    // Refused by name: after a directory the file would be dropped with nothing said, and alone it
+    // would read as a project directory that is not one.
+    if names_a_regular_file(&args, cwd) {
+        return Err(String::from(FILE_NOT_SUPPORTED));
+    }
     let source = select_root_source(args.iter().map(OsString::as_os_str), env_project_dir.as_deref())?;
     let root = resolve_in(&args, env_project_dir, Ok(cwd.to_path_buf()))?;
     if root == Path::new("/") {
@@ -116,6 +121,21 @@ pub fn project_start(args: &[OsString], env_project_dir: Option<OsString>, cwd: 
         };
     }
     Ok(ProjectStart::Root(root))
+}
+
+const FILE_NOT_SUPPORTED: &str = "opening a file is not supported on macOS yet";
+
+/// Whether any positional, before or after `--`, is a regular file, a relative one being relative to
+/// `cwd`. This `stat`s and opens nothing, so a FIFO cannot block it.
+fn names_a_regular_file(args: &[OsString], cwd: &Path) -> bool {
+    let mut options_ended = false;
+    args.iter().any(|arg| {
+        if !options_ended && arg.as_bytes() == b"--" {
+            options_ended = true;
+            return false;
+        }
+        std::fs::metadata(cwd.join(arg)).is_ok_and(|metadata| metadata.is_file())
+    })
 }
 
 /// Where Neovide keeps what it would keep for itself, and the editor's socket.
@@ -624,6 +644,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_is_refused_by_name_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, b"text").unwrap();
+        let refused = Err(String::from("opening a file is not supported on macOS yet"));
+        // By path, relative to the working directory, and after the separator.
+        assert_eq!(
+            project_start(&[file.as_os_str().to_owned()], None, Path::new("/")),
+            refused
+        );
+        assert_eq!(project_start(&[OsString::from("a.rs")], None, dir.path()), refused);
+        let args = [OsString::from("--"), OsString::from("a.rs")];
+        assert_eq!(project_start(&args, None, dir.path()), refused);
+    }
+
+    #[test]
+    fn dir_then_file_is_refused_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, b"text").unwrap();
+        let refused = Err(String::from("opening a file is not supported on macOS yet"));
+        let args = [dir.path().as_os_str().to_owned(), file.as_os_str().to_owned()];
+        assert_eq!(project_start(&args, None, Path::new("/")), refused);
+        let args = [
+            dir.path().as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("a.rs"),
+        ];
+        assert_eq!(project_start(&args, None, dir.path()), refused);
+    }
+
+    #[test]
     fn an_unknown_option_is_still_refused() {
         assert!(project_start(&[OsString::from("--bogus")], None, Path::new("/tmp")).is_err());
     }
@@ -631,7 +683,7 @@ mod tests {
     #[test]
     fn the_linux_windows_options_are_refused_not_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        for flag in ["--legacy", "--version", "--clean"] {
+        for flag in ["--legacy", "--version", "--clean", "--new-window"] {
             let refused = project_start(&[OsString::from(flag)], None, dir.path());
             assert!(
                 refused.as_ref().is_err_and(|why| why.contains(flag)),

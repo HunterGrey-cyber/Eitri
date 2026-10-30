@@ -65,6 +65,7 @@ pub mod persistence;
 pub mod private_fs;
 #[doc(hidden)]
 pub mod process_probe;
+pub mod project_boundary;
 pub mod provider_move;
 pub mod providers;
 pub mod setting_sources;
