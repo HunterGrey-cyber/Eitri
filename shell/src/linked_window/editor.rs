@@ -1261,6 +1261,11 @@ impl PluginEditorRpc {
                     buf: buf()?,
                     line: line()?.ok_or("missing line")?,
                     token: number("token")?,
+                    cursor: get("cursor")
+                        .and_then(rmpv::Value::as_u64)
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|e| e.to_string())?,
                 }),
                 Some("jump") => Ok(EditorOp::PluginJump {
                     plugin,
@@ -2119,7 +2124,7 @@ mod tests {
             ),
             editor::follow_on(&proxy, "ignored", true),
             editor::follow_text(&proxy, "ignored", 3, 1, 1),
-            editor::follow_reveal(&proxy, "ignored", 3, 2, 8),
+            editor::follow_reveal(&proxy, "ignored", 3, 2, 8, Some(5)),
             editor::follow_jump(&proxy, "ignored", 3, 2, 1),
             editor::follow_teardown(&proxy, "ignored"),
         ];

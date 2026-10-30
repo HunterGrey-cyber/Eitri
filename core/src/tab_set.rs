@@ -6830,7 +6830,8 @@ mod tests {
         set.get_mut(base).unwrap().backend = TabBackend::Live(backend);
         let (_queued_provider, backend) = live(&dir);
         set.get_mut(queued).unwrap().backend = TabBackend::Live(backend);
-        set.queue_message(queued, "later", "later".into(), 1, false).unwrap();
+        set.queue_message(queued, "later", "later".into(), 1, false, PromptOrigin::Typed)
+            .unwrap();
         provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         until("the turn starts", || set.running_count() == 1);
         assert_eq!(

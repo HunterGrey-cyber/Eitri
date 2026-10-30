@@ -822,7 +822,7 @@ mod tests {
             .state
             .borrow_mut()
             .tabs
-            .queue_message(tab, "later", "later".into(), 1, false)
+            .queue_message(tab, "later", "later".into(), 1, false, agent::PromptOrigin::Typed)
             .unwrap();
         handle.tick();
         assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, true)]));
@@ -906,7 +906,7 @@ mod tests {
             .state
             .borrow_mut()
             .tabs
-            .queue_message(tab, "later", "later".into(), 1, false)
+            .queue_message(tab, "later", "later".into(), 1, false, agent::PromptOrigin::Typed)
             .unwrap();
         stepped(&handle.state, |state, out| {
             let before = state.tabs.attention();

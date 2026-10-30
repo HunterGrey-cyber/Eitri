@@ -281,6 +281,8 @@ pub(crate) struct Teardown {
     pub(crate) context_feed: Option<eitri_core::editor_context::feed::EditorContextFeed>,
     pub(crate) nvim_keys_feed: Option<eitri_core::nvim_keys::feed::NvimKeysFeed>,
     pub(crate) follow_socket: Option<eitri_core::plugin::follow_feed::FollowSocket>,
+    /// The tutorial's lessons, written for this window's nvim; the next window's sweep is only a backstop.
+    pub(crate) tutor: Option<Rc<crate::tutor::Tutor>>,
     /// Nothing else holds the window's Lua engine once its build returns; this keeps it for the window's life, and
     /// is never read.
     #[allow(dead_code)]
@@ -310,8 +312,9 @@ impl Teardown {
         }
     }
 
-    /// The editor's feeds and the plugins' follow socket: each removes its socket and directory now, not at a
-    /// `Drop` that may never come (a directory a close leaves behind is swept by the next launch, as a backstop only).
+    /// The editor's feeds, the plugins' follow socket and the tutorial's lessons: each removes its socket or directory
+    /// now, not at a `Drop` that may never come (a directory a close leaves behind is swept by the next launch, as a
+    /// backstop only).
     fn feeds(&self) {
         if let Some(feed) = &self.theme_feed {
             feed.cleanup();
@@ -324,6 +327,9 @@ impl Teardown {
         }
         if let Some(socket) = &self.follow_socket {
             socket.cleanup();
+        }
+        if let Some(tutor) = &self.tutor {
+            tutor.cleanup();
         }
     }
 }

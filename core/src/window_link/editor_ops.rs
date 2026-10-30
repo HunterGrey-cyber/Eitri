@@ -208,13 +208,17 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             buf,
             line,
             token,
+            cursor,
         } => {
             held_plugin(ctx, &plugin)?;
             if line == 0 {
                 return Err(OpRefused::Outside("line starts at one".into()));
             }
+            if cursor == Some(0) {
+                return Err(OpRefused::Outside("cursor starts at one".into()));
+            }
             Ok(Dispatch::Rpc(crate::plugin::editor::follow_reveal(
-                rpc, &plugin, buf, line, token,
+                rpc, &plugin, buf, line, token, cursor,
             )))
         }
         EditorOp::PluginJump { plugin, buf, line, col } => {
@@ -428,6 +432,7 @@ mod tests {
                 buf: 3,
                 line: 2,
                 token: 9,
+                cursor: None,
             },
             EditorOp::PluginJump {
                 plugin: "snotra".into(),
@@ -483,6 +488,14 @@ mod tests {
                 buf: 3,
                 line: 0,
                 token: 1,
+                cursor: None,
+            },
+            EditorOp::PluginReveal {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                token: 1,
+                cursor: Some(0),
             },
             EditorOp::PluginOpenLink {
                 plugin: "snotra".into(),

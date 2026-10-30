@@ -368,21 +368,22 @@ fn counts_text(running: usize, queued: usize, jobs: usize, background: usize) ->
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// A linked window's close prompt: asked when this window has something running or queued, or a terminal
-/// running a foreground job, as [`window_close_prompt_with_jobs`]; it names the other window's work, and offers `m`
-/// (move this window's running work to the other window, then close) when there is something to move. The other
-/// window's part counts turns only: its summary carries no terminal jobs.
+/// A linked window's close prompt: asked when this window has something running or queued, a tab with background
+/// work, or a terminal running a foreground job, as [`window_close_prompt_with_jobs`]; it names the other window's
+/// work, and offers `m` (move this window's running work to the other window, then close) when there is something to
+/// move. The other window's part counts turns only: its summary carries no terminal jobs or background work.
 pub fn linked_window_close_prompt(
     running: usize,
     queued: usize,
     jobs: usize,
+    background: usize,
     other: Option<OtherWindow<'_>>,
     movable: usize,
 ) -> Option<String> {
     let Some(other) = other else {
-        return window_close_prompt_with_jobs(running, queued, jobs, 0);
+        return window_close_prompt_with_jobs(running, queued, jobs, background);
     };
-    let here = counts_text(running, queued, jobs, 0)?;
+    let here = counts_text(running, queued, jobs, background)?;
     let there = counts_text(other.running, other.queued, 0, 0).unwrap_or_else(|| "idle".to_string());
     let stays = if other.stays_without_editor {
         " (stays open without the editor)"
@@ -643,7 +644,7 @@ mod tests {
             stays_without_editor: true,
         };
         assert_eq!(
-            linked_window_close_prompt(1, 0, 0, Some(other), 1).as_deref(),
+            linked_window_close_prompt(1, 0, 0, 0, Some(other), 1).as_deref(),
             Some("close window? 1 running here; window 2: 2 running (stays open without the editor) (y/n, m: move 1 to window 2)")
         );
         let idle_one = OtherWindow {
@@ -653,16 +654,16 @@ mod tests {
             stays_without_editor: false,
         };
         assert_eq!(
-            linked_window_close_prompt(0, 2, 0, Some(idle_one), 0).as_deref(),
+            linked_window_close_prompt(0, 2, 0, 0, Some(idle_one), 0).as_deref(),
             Some("close window? 2 queued here; window 1: idle (y/n)")
         );
         assert_eq!(
-            linked_window_close_prompt(0, 0, 0, Some(other), 0),
+            linked_window_close_prompt(0, 0, 0, 0, Some(other), 0),
             None,
             "nothing here: no prompt, as today"
         );
         assert_eq!(
-            linked_window_close_prompt(1, 1, 0, None, 0),
+            linked_window_close_prompt(1, 1, 0, 0, None, 0),
             window_close_prompt(1, 1, 0)
         );
     }
@@ -676,18 +677,37 @@ mod tests {
             stays_without_editor: false,
         };
         assert_eq!(
-            linked_window_close_prompt(0, 0, 1, Some(other), 1).as_deref(),
+            linked_window_close_prompt(0, 0, 1, 0, Some(other), 1).as_deref(),
             Some("close window? 1 terminal job here; window 2: 1 queued (y/n, m: move 1 to window 2)"),
             "a terminal job alone is reason enough to ask"
         );
         assert_eq!(
-            linked_window_close_prompt(1, 0, 2, Some(other), 0).as_deref(),
+            linked_window_close_prompt(1, 0, 2, 0, Some(other), 0).as_deref(),
             Some("close window? 1 running, 2 terminal jobs here; window 2: 1 queued (y/n)")
         );
         assert_eq!(
-            linked_window_close_prompt(1, 1, 2, None, 0),
+            linked_window_close_prompt(1, 1, 2, 0, None, 0),
             window_close_prompt_with_jobs(1, 1, 2, 0),
             "unlinked, the prompt is the one a single window asks"
+        );
+    }
+
+    #[test]
+    fn a_linked_close_prompt_counts_this_windows_background_work() {
+        let other = OtherWindow {
+            name: "2",
+            running: 1,
+            queued: 0,
+            stays_without_editor: false,
+        };
+        assert_eq!(
+            linked_window_close_prompt(0, 0, 0, 2, Some(other), 0).as_deref(),
+            Some("close window? 2 with background tasks here; window 2: 1 running (y/n)"),
+            "background work alone is reason enough to ask"
+        );
+        assert_eq!(
+            linked_window_close_prompt(1, 0, 1, 1, None, 0),
+            window_close_prompt_with_jobs(1, 0, 1, 1)
         );
     }
 

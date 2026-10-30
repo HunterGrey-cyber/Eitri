@@ -69,6 +69,8 @@ pub enum EditorOp {
         buf: u64,
         line: u32,
         token: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<u32>,
     },
     PluginJump {
         plugin: String,

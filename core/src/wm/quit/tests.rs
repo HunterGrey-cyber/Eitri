@@ -660,7 +660,7 @@ fn a_kill_over_a_close_whose_cancel_is_late(fake: &Rc<Fake>, quitting: &Flow) ->
     let close = quitting.flow.borrow().in_flight.as_ref().unwrap().generation;
     fake.answer(false, false, "r?");
     // Were the kill to wait for the worker, it would still see the request outstanding: the
-    // answer comes after any bound (codex's timing).
+    // answer comes after any bound the kill could wait out.
     *fake.settled.borrow_mut() = fake.watch.borrow().clone();
     fake.running.set(false);
     fake.pending.set(true);

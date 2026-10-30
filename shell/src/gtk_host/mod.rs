@@ -194,8 +194,16 @@ pub(crate) const NO_OUTPUT_MOVE: &str = "this window manager cannot move a windo
 /// a command runs on the adapter's worker, GNOME's call is asynchronous.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MonitorMove {
-    /// sway and Hyprland name the window by this process's pid: the command runs as it is.
+    /// sway names the window by this process's pid: the command runs as it is.
     Command(Vec<String>),
+    /// Hyprland names the window by this process's pid too, but its command is written in the form its config
+    /// manager takes, which only the worker learns: it builds the command with
+    /// `eitri_core::compositor::placement_argv`.
+    Hyprland {
+        pid: u32,
+        connector: Option<String>,
+        role: eitri_core::wm::PlacementRole,
+    },
     /// No output move or compositor focus is needed.
     Unchanged,
     /// niri names a window by its id: the worker reads the window list for the first window of `pid`, then moves
@@ -212,7 +220,7 @@ pub(crate) fn monitor_move(
     connector: Option<&str>,
     role: eitri_core::wm::PlacementRole,
 ) -> Result<MonitorMove, String> {
-    use eitri_core::compositor::{placement_argv, valid_output_name, WindowRef, Wm};
+    use eitri_core::compositor::{placement_argv, valid_output_name, HyprForm, WindowRef, Wm};
     if connector.is_some_and(|connector| !valid_output_name(connector)) {
         return Err(format!("{:?} is not an output name", connector.unwrap_or_default()));
     }
@@ -227,8 +235,17 @@ pub(crate) fn monitor_move(
         return Ok(MonitorMove::Unchanged);
     }
     match wm {
-        Wm::Sway | Wm::Hyprland => placement_argv(wm, &own, connector, role)
+        // sway has one form. For Hyprland the legacy build only shows that there is a command; the worker writes
+        // the one it runs.
+        Wm::Sway => placement_argv(wm, HyprForm::Legacy, &own, connector, role)
             .map(MonitorMove::Command)
+            .ok_or_else(|| NO_OUTPUT_MOVE.to_string()),
+        Wm::Hyprland => placement_argv(wm, HyprForm::Legacy, &own, connector, role)
+            .map(|_| MonitorMove::Hyprland {
+                pid,
+                connector: connector.map(str::to_string),
+                role,
+            })
             .ok_or_else(|| NO_OUTPUT_MOVE.to_string()),
         Wm::Niri => Ok(MonitorMove::ById {
             pid,
@@ -1611,10 +1628,11 @@ mod monitor_move_tests {
             );
             assert_eq!(
                 monitor_move(Wm::Hyprland, 4242, Some("DP-2"), role),
-                Ok(MonitorMove::Command(vec![
-                    "hyprctl".into(), "--batch".into(),
-                    format!("dispatch focuswindow pid:4242 ; dispatch movewindow mon:DP-2 ; dispatch focuswindow pid:{focus_pid}")
-                ]))
+                Ok(MonitorMove::Hyprland {
+                    pid: 4242,
+                    connector: Some("DP-2".into()),
+                    role
+                })
             );
         }
         assert_eq!(
@@ -1623,12 +1641,11 @@ mod monitor_move_tests {
         );
         assert_eq!(
             monitor_move(Wm::Hyprland, 4242, None, restored),
-            Ok(MonitorMove::Command(vec![
-                "hyprctl".into(),
-                "dispatch".into(),
-                "focuswindow".into(),
-                "pid:101".into()
-            ]))
+            Ok(MonitorMove::Hyprland {
+                pid: 4242,
+                connector: None,
+                role: restored
+            })
         );
         for role in [PlacementRole::Main, PlacementRole::NewSecond, restored] {
             assert_eq!(
@@ -1665,11 +1682,12 @@ mod monitor_move_tests {
         );
         assert_eq!(
             monitor_move(Wm::Hyprland, 4242, Some("DP-2"), PlacementRole::Main),
-            Ok(MonitorMove::Command(vec![
-                "hyprctl".into(),
-                "--batch".into(),
-                "dispatch focuswindow pid:4242 ; dispatch movewindow mon:DP-2".into()
-            ]))
+            Ok(MonitorMove::Hyprland {
+                pid: 4242,
+                connector: Some("DP-2".into()),
+                role: PlacementRole::Main
+            }),
+            "Hyprland's command is written on the worker, in the form its config manager takes"
         );
         assert_eq!(
             monitor_move(Wm::Niri, 4242, Some("HDMI-A-1"), PlacementRole::Main),

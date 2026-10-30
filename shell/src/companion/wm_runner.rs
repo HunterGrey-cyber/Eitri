@@ -335,35 +335,9 @@ impl WmRunner {
                 ),
                 None => println!("[window] the Eitri GNOME Shell extension is not there; the window stays put"),
             },
-            MonitorMove::Command(argv) => {
-                let exec = self.exec.clone();
-                thread::spawn(move || {
-                    let _ = exec(argv);
-                });
-            }
-            MonitorMove::ById { pid, connector } => {
-                let (wm, exec) = (self.wm, self.exec.clone());
-                thread::spawn(move || {
-                    let Some(list) = compositor::list_windows_argv(wm) else {
-                        return;
-                    };
-                    let Ok(json) = exec(list) else { return };
-                    let windows = match compositor::parse_windows(wm, &json) {
-                        Ok(windows) => windows,
-                        Err(err) => {
-                            println!("[window] {} adapter: {err}", wm_name(wm));
-                            return;
-                        }
-                    };
-                    let argv = compositor::first_window_owner(&[pid], &windows)
-                        .and_then(|own| compositor::move_to_output_argv(wm, own, &connector));
-                    match argv {
-                        Some(argv) => {
-                            let _ = exec(argv);
-                        }
-                        None => println!("[window] no window of this process to move to {connector}"),
-                    }
-                });
+            how @ (MonitorMove::Command(_) | MonitorMove::Hyprland { .. } | MonitorMove::ById { .. }) => {
+                let commands = self.commands.clone();
+                thread::spawn(move || commands.place_blocking(how, &|line| println!("{line}")));
             }
         }
     }
@@ -625,6 +599,56 @@ impl Commands {
                 wm_name(wm),
                 target.pid
             ));
+        }
+    }
+
+    /// Runs the command of a window placement: sway's as it is, Hyprland's written in the form its config manager
+    /// takes, niri's after the window list gives this process's window id.
+    fn place_blocking(&self, how: crate::gtk_host::MonitorMove, log: &dyn Fn(&str)) {
+        use crate::gtk_host::MonitorMove;
+        let wm = self.wm;
+        match how {
+            MonitorMove::Unchanged | MonitorMove::Gnome { .. } => {}
+            MonitorMove::Command(argv) => {
+                let _ = (self.exec)(argv);
+            }
+            MonitorMove::Hyprland { pid, connector, role } => {
+                let own = WindowRef {
+                    pid,
+                    id: None,
+                    focused: false,
+                    visible: true,
+                    rect: None,
+                };
+                self.dispatch(
+                    "place the window",
+                    &|form| compositor::placement_argv(wm, form, &own, connector.as_deref(), role),
+                    log,
+                );
+            }
+            MonitorMove::ById { pid, connector } => {
+                let Some(list) = compositor::list_windows_argv(wm) else {
+                    return;
+                };
+                let Ok(json) = (self.exec)(list) else { return };
+                let windows = match compositor::parse_windows(wm, &json) {
+                    Ok(windows) => windows,
+                    Err(err) => {
+                        log(&format!("[window] {} adapter: {err}", wm_name(wm)));
+                        return;
+                    }
+                };
+                let moved = compositor::first_window_owner(&[pid], &windows).is_some_and(|own| {
+                    self.dispatch(
+                        "move to an output",
+                        &|form| compositor::move_to_output_argv(wm, form, own, &connector),
+                        log,
+                    )
+                });
+                if !moved {
+                    log(&format!("[window] no window of this process to move to {connector}"));
+                }
+            }
         }
     }
 }
@@ -1142,12 +1166,12 @@ mod tests {
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
             assert!(
-                ["clone", "move_focus_blocking", "raise_blocking"].contains(&method.as_str()),
+                ["clone", "move_focus_blocking", "raise_blocking", "place_blocking"].contains(&method.as_str()),
                 "the runner calls `commands.{method}` on its own thread"
             );
         }
         let mut workers = 0;
-        for name in [".move_focus_blocking(", ".raise_blocking("] {
+        for name in [".move_focus_blocking(", ".raise_blocking(", ".place_blocking("] {
             for (at, _) in runner.match_indices(name) {
                 workers += 1;
                 let before = &runner[at.saturating_sub(160)..at];
@@ -1157,7 +1181,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(workers, 2, "the scan saw the two worker calls");
+        assert_eq!(workers, 3, "the scan saw the three worker calls");
     }
 
     /// sway and niri have one form and no reply rule: nothing is probed, nothing judged.

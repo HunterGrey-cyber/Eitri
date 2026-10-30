@@ -261,7 +261,7 @@ fn the_last_terminals_exit_asks_what_a_window_close_asks() {
     );
     assert_eq!(
         r.driver.query(|c| c.chrome(WIN).prompt.unwrap().text),
-        crate::tabs::window_close_prompt_with_jobs(1, 0, 0).unwrap()
+        crate::tabs::window_close_prompt_with_jobs(1, 0, 0, 0).unwrap()
     );
 }
 
@@ -665,8 +665,46 @@ fn the_window_close_counts_each_chat_views_tab_once() {
     r.driver.close_requested(WIN, CloseBy::User);
     assert_eq!(
         r.driver.query(|c| c.chrome(WIN).prompt.unwrap().text),
-        crate::tabs::window_close_prompt_with_jobs(1, 0, 0).unwrap()
+        crate::tabs::window_close_prompt_with_jobs(1, 0, 0, 0).unwrap()
     );
+}
+
+/// Background work alone makes the window close ask, counted over the base view's tabs and each extra view's tab,
+/// and the last module's kill names it in its one question.
+#[test]
+fn the_window_close_asks_while_only_background_work_runs() {
+    let r = driven(two());
+    let view = ViewId::of_module(&ModuleId::instance(ModuleKind::Agent, 2).unwrap()).unwrap();
+    r.host.set_chat_views(vec![ViewId::BASE, view]);
+    for v in [ViewId::BASE, view] {
+        r.host.set_chat_kill_counts(
+            v,
+            ChatKillCounts {
+                background: 1,
+                ..Default::default()
+            },
+        );
+    }
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN).prompt.unwrap());
+    assert!(prompt.closes_window);
+    assert_eq!(
+        prompt.text,
+        crate::tabs::window_close_prompt_with_jobs(0, 0, 0, 2).unwrap()
+    );
+    assert_eq!(r.close_count(), 0);
+
+    let r = driven(Layout::new(Node::Leaf(ModuleId::terminal()), ModuleId::terminal()).unwrap());
+    r.host.set_chat_kill_counts(
+        ViewId::BASE,
+        ChatKillCounts {
+            background: 1,
+            ..Default::default()
+        },
+    );
+    r.driver.run(WIN, crate::keymap::Action::ModuleKill, Origin::Lua);
+    let text = r.driver.query(|c| c.chrome(WIN).prompt.unwrap().text);
+    assert!(text.contains("closes Eitri, 1 with background tasks"), "{text}");
 }
 
 fn agent_focused() -> Layout {
@@ -697,7 +735,7 @@ fn a_module_question_over_the_window_close_leaves_the_next_close_asking() {
     assert!(prompt.closes_window, "the next close asks again");
     assert_eq!(
         prompt.text,
-        crate::tabs::window_close_prompt_with_jobs(1, 0, 0).unwrap()
+        crate::tabs::window_close_prompt_with_jobs(1, 0, 0, 0).unwrap()
     );
 }
 
@@ -810,7 +848,7 @@ fn nvim_exiting_during_the_last_modules_question_asks_the_window_close_and_a_no_
     assert!(prompt.closes_window);
     assert_eq!(
         prompt.text,
-        crate::tabs::window_close_prompt_with_jobs(1, 0, 0).unwrap(),
+        crate::tabs::window_close_prompt_with_jobs(1, 0, 0, 0).unwrap(),
         "the window close's own question replaces the kill's"
     );
     r.answer("n");
