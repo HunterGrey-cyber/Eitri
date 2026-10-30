@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=5a52528ba73b50cb2bc27384fae0c60fcc49df749a96468576b58ab34ca4d843 -->
+<!-- translated-from: README.md sha256=da23a3c54b4b2bb1b92f27d8cac87511627b71ea73f34cb39af4fd9f1f63fe82 -->
 
 <div align="center">
 
@@ -53,6 +53,8 @@
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
 eitri ~/path/to/project
 ```
+
+`eitri FILE` 也可以只打开一个文件：项目从这个文件推出来，这个项目已经开着窗口时，文件交给那个窗口：见[打开文件](docs/guide/getting-started.zh-CN.md#open-a-file)。
 
 需要 x86_64 的 Linux（Wayland），以及已安装的 Neovim 0.10 或更新版本和 Claude Code。Arch 用户可以从 AUR 安装 [`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) 或 [`eitri-git`](https://aur.archlinux.org/packages/eitri-git)。`.deb`、`.rpm`、从源码构建，以及如何验证下载的文件，见 [INSTALL.zh-CN.md](INSTALL.zh-CN.md)。
 

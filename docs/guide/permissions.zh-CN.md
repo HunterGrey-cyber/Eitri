@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=feb77d0aed271bf2ee26723398ea03d67317136bb0ee1d181c176c56eb26d087 -->
+<!-- translated-from: permissions.md sha256=e783ee3aec8fd947f292a2366444458ec6138976182cf4f88105d5d4512ed79b -->
 
 # 权限与信任
 
@@ -29,6 +29,7 @@ Claude Code 的定时和任务工具在任何模式下都不出卡片，因为 C
 
 - 你的[保存的规则](#saved-rules)允许的调用会被立即批准，工具那一行会说是哪条规则做的。
 - 其他每一次调用都交给 Claude Code 的 auto 模式，由它用自己的分类器来决定。Eitri 不为它画卡片，也不应用自己的检查。
+  例外是[不算边界](#a-folder-that-is-no-boundary)的项目：在那里由 Eitri 自己的规则来回答，和 Manual 标签页一样。
 - Claude Code 拒绝一次调用时，工具那一行会写 `blocked by auto: <原因>`。多次被拒绝之后，Claude Code 会自己用一张卡片来问你。
 
 <a id="auto-when-claude-code-is-not-running-its-auto-mode"></a>
@@ -39,7 +40,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 - 在项目内部读取和搜索，不经询问直接运行；由只读取东西的程序加上普通参数组成的命令也是。带重定向、管道、`;` 或 `&&`、通配符、引号、`$(...)`、项目之外的路径，或者把 `git` 指向另一个仓库的选项的命令，会出卡片。
 - 在项目内部编辑或写入文件，不经询问直接运行，但 Claude Code 保护的文件和目录除外：`.git`、`.claude`、`.vscode`、`.idea`、`.husky`、`.cargo`、`.devcontainer`、`.yarn` 或 `.mvn` 下的任何东西，以及 `.gitconfig`、`.bashrc`、`.zshrc`、`.profile`、`.envrc`、`.npmrc` 和 `.mcp.json` 这样的文件。这些会出卡片。
 - `WebFetch`、`WebSearch` 和 `MultiEdit` 一律询问。Eitri 不认识的工具会询问。少数不改任何文件、不运行任何命令、也不访问任何网络的工具从不询问。
-- 项目目录如果就是你的主目录，或者在它之上，就不算边界：每一次必须对照项目来判断的调用都会询问。
+- 不算边界的项目目录（你的主目录或它之上，以及[不算边界的文件夹](#a-folder-that-is-no-boundary)里列出的其他情况），会让每一次必须对照项目来判断的调用都询问。
 - 一条[保存的规则](#saved-rules)可以允许一个只是没通过“已知是只读的”检验的命令。
 
 ### Bypass
@@ -54,6 +55,22 @@ Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题]
 ### Claude Code 自己运行在什么模式下
 
 在 Eitri 之下，Claude Code 从不运行在它自己的 bypass 模式里：它运行在它的默认模式或 auto 模式里，Eitri 站在它前面，而“bypass”只是 Eitri 替你回答。Eitri 还会检查 Claude Code 报告的是哪种模式。如果一个会话报告的模式是 Eitri 没有要求、也不预期的，比如 Claude Code 自己的 bypass 模式，Eitri 会带着一条消息结束那个会话，并且在其中不再回答任何东西。
+
+<a id="a-folder-that-is-no-boundary"></a>
+## 不算边界的文件夹
+
+Eitri 自己的规则拿路径去对照项目目录来判断。有些文件夹不能当这个边界，这时每一次必须对照项目来判断的调用都会询问。下面这些文件夹不算边界：
+
+- 文件系统根、内核目录树（`/proc`、`/sys`、`/dev`），或者解析之后又被移走的文件夹；
+- 你的主目录或它之上；
+- 不属于你的（属于别的用户，比如 `/etc`）；
+- 别的用户可写的（`/tmp` 和 `/var/tmp`，或共享的目录树）。只有你自己的组可写的文件夹仍然算，前提是那个组没有别的成员：umask 为 0002 时产生的 `drwxrwxr-x you you` 检出仍然是边界。
+
+最常见的情形是对没有自己项目的文件用 [`eitri FILE`](getting-started.zh-CN.md#open-a-file)，比如 `eitri ~/notes.md`。它对这种文件夹上的每个窗口都生效，不管窗口是怎么启动的，所以 `eitri /tmp` 和 `eitri ~` 的表现一样。面板会用一条提示说明，并给出原因。
+
+- **Manual 和 Auto 的 Claude 标签页会询问。** 每一次要对照项目来判断的调用都是一张卡片。原本会交给 Claude Code 自己的分类器的 Auto 标签页，在这里改由 Eitri 的规则回答，而它们会询问。
+- **Bypass 不询问**，和别处一样：那是你自己的选择。
+- **Codex 标签页不受这些影响。** 它保持 `workspace-write` 沙箱，所以可以不出卡片地写这个文件夹里的任何地方。
 
 <a id="saved-rules"></a>
 ## 保存的规则

@@ -386,12 +386,24 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
   it also lets saved bypass tabs come back in bypass without the question. What the three modes mean is in
   [Permissions](permissions.md).
 
+## Files and windows
+
+`eitri FILE` opens a file in the editor and takes its project from it (see
+[Open a file](getting-started.md#open-a-file)). Two things about it are decided on the command line, and there is no
+`init.lua` setting for them:
+
+- When a window of the file's project is already open, `eitri FILE` hands the file to that window, raises it and
+  returns. `eitri --new-window FILE` starts a new window instead. `--clean` and `--account NAME` also start a new
+  window, since reusing a window would drop what they ask for. `eitri DIR` and a bare `eitri` always start one.
+- A command typed in Eitri's own bottom terminal reaches its own window: the terminal's shell has `EITRI_OPEN_SOCKET`
+  set, and `eitri` reads it to find that window. You do not set this variable yourself.
+
 ## Accounts
 
 If you use more than one Claude account, name the one a window should use. Two ways:
 
 - `eitri --account NAME` on the command line (it also works with `eitri panel` and `eitri split`). The launcher
-  prints which account it chose and where the name came from.
+  prints which account it chose and where the name came from. With a file it always starts a new window.
 - `eitri.config.set("agent.account", "NAME")` in `init.lua`, as the default for launches that name none, such as
   one from the application menu.
 
@@ -419,7 +431,7 @@ not settings and are not listed.
 | `NEOVIM_BIN` | Read when `EITRI_NVIM` is not set: the same rule, an absolute path to an existing file. Without either, Eitri uses the `nvim` on `PATH`; if that is missing or older than 0.10 and you accepted a private copy from `eitri setup`, it uses the newest copy under `$XDG_DATA_HOME/eitri/nvim/`. |
 | `EITRI_CODEX` | The `codex` a Codex tab runs: an absolute path to an existing file, else Eitri stops at startup and names the variable. It wins over `agent.codex.command` and `PATH`. Empty counts as unset. Eitri sets no `CODEX_HOME` for a Codex tab; Codex reads yours, and a relative `CODEX_HOME` makes every Codex start refuse. |
 | `EITRI_NEOVIDE` | The Neovide that `eitri split` starts. It must name an existing file; unset, `neovide` on `PATH` is used. |
-| `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. |
+| `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. It names a directory only; a file is opened with `eitri FILE`. |
 | `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, overriding the Linux XDG directory or `~/.config/eitri`. Empty is unset; a relative value refuses to start. |
 | `EITRI_AGENT_TRACE` | Set to `1` to print one `[turn-trace]` line per turn on stderr, with the turn's timings. |
 | `EITRI_SUPERVISOR` | Set to `1`, `true` or `yes` to let a window start `eitri-supervisor`, a dashboard of the agent status of every open window, when none is running. Unset, a window only connects to one you started yourself. |

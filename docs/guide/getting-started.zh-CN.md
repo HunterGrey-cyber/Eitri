@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=7c59bd81441d84572895c1d699ef3d0e044359eb39ece5ce641e86eafb29a728 -->
+<!-- translated-from: getting-started.md sha256=8e38720ebf8f4d019a44947cf01ea06b726f51325b62211d6d5e522941575105 -->
 
 # 快速上手
 
@@ -14,7 +14,7 @@
 eitri [DIR]
 ```
 
-`DIR` 是项目目录。不写的话，Eitri 在设置了 `$EITRI_PROJECT_DIR` 时用它，否则用你运行命令时所在的目录。如果给的路径不是目录，或者给了 Eitri 不认识的选项，启动会直接带着一条消息停下，而不是去打开别的目录；要打开名字以 `-` 开头的目录，在它前面加 `--`（`eitri -- -notes`）。
+`DIR` 是项目目录。不写的话，Eitri 在设置了 `$EITRI_PROJECT_DIR` 时用它，否则用你运行命令时所在的目录。如果给的路径不存在，或者给了 Eitri 不认识的选项，启动会直接带着一条消息停下，而不是去打开别的目录；要打开名字以 `-` 开头的目录，在它前面加 `--`（`eitri -- -notes`）。要打开文件而不是目录，见[打开文件](#open-a-file)。
 
 每次启动都是一个独立的窗口，有自己的 Neovim、自己的会话和自己的项目根目录，所以你可以同时打开好几个项目。窗口标题写着项目名（`myproject — Eitri`；有两个工作区时再加上当前显示的那个：`myproject — Eitri · docs`），窗口切换器和合成器的窗口规则读的就是它。
 
@@ -32,6 +32,33 @@ eitri [DIR]
 `Ctrl+h` 和 `Ctrl+l` 在编辑器和面板之间移动按键焦点。
 
 有两个选项值得知道。`eitri --version` 打印版本后退出。`eitri --clean` 用 `nvim --clean` 启动编辑器里的 Neovim，也就是不带你的配置和插件，这是判断问题是否出在你自己的设置上最快的办法。
+
+<a id="open-a-file"></a>
+## 打开文件
+
+```sh
+eitri src/lib.rs
+eitri +42 src/lib.rs
+eitri src/lib.rs:42:7
+eitri a.rs b.rs
+eitri DIR FILE
+```
+
+`eitri FILE` 在编辑器里打开这个文件，并从文件推出项目：项目是文件所在的 git 仓库，没有仓库时是文件自己所在的文件夹；例外是当前目录包含这个文件、它本身是可用的文件夹、并且（有仓库时）位于仓库之内，这时用当前目录（`cd crate; eitri src/x.rs` 打开的项目是 `crate`，和在那里运行 `eitri .` 一样）。仓库也必须是可用的文件夹才算数（见[不算边界的文件夹](permissions.zh-CN.md#a-folder-that-is-no-boundary)）；不可用的仓库会被跳过，继续往上找。在主目录里、没有仓库时运行 `eitri code/scratch/a.py`，项目是 `~/code/scratch`，不是 `~`。这样得到的项目和用 `eitri DIR` 指定的一样，包括第一次启动会话时的[信任问题](permissions.zh-CN.md#trusting-a-project)。文件不必已经存在：它所在的文件夹必须存在，`:w` 会创建这个文件。
+
+- 给了好几个文件时，第一个显示出来，全部都已打开，和 `nvim a b c` 一样。项目之外的文件会打印一条提示，仍然打开。
+- 第一个文件之前的 `+N` 让它从第 N 行开始，单独一个 `+` 表示最后一行。`FILE:LINE` 和 `FILE:LINE:COL` 效果相同，但只在不存在字面同名文件时才这样解释。行号只作用于第一个文件。`+` 后面如果不是数字，比如 `+page.svelte` 或 `+/pattern`，会被拒绝，因为那会是一条 nvim 命令；要打开这样名字的文件，写 `./+page.svelte` 或 `eitri -- +page.svelte`。
+- `--` 之后的每个词都是路径。
+- `eitri DIR FILE...` 仍以 `DIR` 为项目，并先显示这些文件。
+- 不存在的文件夹、管道、套接字或设备文件，以及不是有效 UTF-8 的名字，会带着一条消息被拒绝。`eitri panel` 和 `eitri split` 仍然只接受目录，`EITRI_PROJECT_DIR` 也仍然只是目录。
+
+**这个项目已经开着一个窗口。** 这时 `eitri FILE` 不会再开一个窗口：正在运行的编辑器打开这个文件，窗口被带到前面、按键交给编辑器，命令立刻返回。如果那个窗口的编辑器是隐藏的或还没启动，会先显示出来，等它就绪后再打开文件。在某个 Eitri 窗口自己的底部终端里输入 `eitri FILE`，文件就在那个窗口里打开，即使你已经 `cd` 进了子文件夹，只要文件在该窗口的项目之内。`eitri DIR` 和不带参数的 `eitri` 总是开新窗口，`eitri --new-window FILE` 也是（`--clean` 和 `--account` 隐含它）。文件不在任何已开窗口的项目之内时开新窗口；窗口此刻无法接收文件时也开新窗口，比如它停在带未保存缓冲区的退出提示上。编辑器里当前缓冲区有未保存的修改时，文件在一个分割窗口里打开，那个缓冲区保持不动。
+
+在 GNOME 上，只有带激活令牌的启动才能把窗口提到前面，而在终端里输入的命令没有这个令牌：那里 GNOME 可能显示一条“窗口已就绪”的通知，而不是把窗口提到前面。预计 Sway、Hyprland 和 niri 会通过合成器把焦点交给窗口。只在 sway 上试过。
+
+**没有自己项目的文件。** `eitri ~/notes.md`、`eitri /etc/hosts` 和 `eitri /tmp/x.py` 也能打开，项目就是文件所在的文件夹。当这个文件夹不能作为 agent 的边界时（你的主目录、不属于你的文件夹、别的用户可写的文件夹、文件系统根），面板的每个页面都会显示一条提示：`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab can write anywhere in this folder.` 它会一直留着，直到你关掉它。各个模式下这意味着什么，见[权限](permissions.zh-CN.md#a-folder-that-is-no-boundary)。
+
+**从文件管理器打开。** Eitri 的桌面入口列出了纯文本、Markdown、C、C++、Python、Rust、JSON、TOML 和 shell 脚本，所以“打开方式”里会出现它（它不会成为默认程序）。这样的启动通常从你的主目录开始，所以项目按上面所说的从文件推出来。
 
 <a id="your-first-turn"></a>
 ## 你的第一个回合

@@ -15,6 +15,24 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   editor is one module of the window, and every other module sits beside it.
 - The window title names the project (`myproject — Eitri · docs`).
 
+**Opening a file**
+
+- `eitri FILE` opens a single file. The project comes from the file: its git repository, or its folder when there is
+  none, or your current directory when that directory holds the file and lies inside the repository. Several
+  files, `+N` and `+` before the first file, `FILE:LINE` and `FILE:LINE:COL`, `--` and `eitri DIR FILE` work as
+  `nvim` users expect; `+page.svelte` and similar are refused as nvim commands.
+- When a window of that project is already open, the file opens in it, the window comes to the front and the
+  command returns at once. Typed in Eitri's own bottom terminal, it opens in that window. `--new-window` always
+  starts a new window; so do `eitri DIR`, `--clean` and `--account`.
+- A file with no project of its own (`eitri ~/notes.md`, `eitri /etc/hosts`, `eitri /tmp/x.py`) opens in its folder
+  with no project boundary: a Claude tab asks before every file and command, a Codex tab can still write anywhere
+  in that folder, and the panel says so in a note.
+- On GNOME a command typed in a terminal cannot raise the window (GNOME wants an activation token it does not
+  have), so GNOME may only show a "ready" notice. Only sway was tried; the raise on GNOME has not been.
+- Eitri now appears under Open With for plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell scripts
+  (it does not become the default); that listing has not been tried in a file manager. `eitri split FILE` and
+  `eitri panel FILE` are not supported: both still take a directory.
+
 **Keyboard-driven tiling**
 
 - Splits, tabbed and stacked containers (`<prefix> Alt+w` / `Alt+s`), floats (`<prefix> Alt+Shift+Space`), a
@@ -144,6 +162,19 @@ The agents guide's first section describes all of this.
   asking, apart from a cron task Claude Code was told to keep across sessions.
 - **In a Manual tab, Claude Code's scheduling and task tools no longer ask** (`ScheduleWakeup`, the cron tools,
   `ListAgents`, `TaskStop`); `SendMessage` still does.
+- **A folder that is no boundary now makes a Claude tab ask, however it was opened.** That is your home directory
+  or above it, a folder you do not own, a folder other users can write to, the filesystem root and the kernel
+  trees. `eitri DIR` on a tree others can write to, on one you do not own (another user's checkout, a container
+  running as root over a mounted checkout, some network mounts), or on a 0775 checkout whose group Eitri can find
+  only through NSS (not in `/etc/group`), used to run as a project and now asks before every file and command.
+  A checkout that is `drwxrwxr-x you you` with a group that only you belong to is unchanged. The panel shows a note
+  that says why.
+- **An Auto tab at a home directory now asks.** Where Claude Code runs its own auto mode, an Auto tab used to leave
+  every call to Claude Code's classifier even at `eitri ~`; at a folder that is no boundary Eitri's own rules answer
+  instead, as in a Manual tab, and put each call that is judged against the project on a card. Bypass is unchanged,
+  and so are Codex tabs: they keep their `workspace-write` sandbox over that whole folder.
+- **`eitri FILE` when a window of the project is open hands the file to that window** instead of starting one;
+  `--new-window` is the way to get a new window.
 - **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
   window's layout and then saves only its own, so closing it no longer changes what the first window opens with.
 
@@ -182,6 +213,11 @@ with Claude Code's own identity line for the Agent SDK and Eitri's note once at 
 model service has run on this release's backend; what it adds was checked against a scripted stand-in, as the next
 paragraph says. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
 newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
+`eitri FILE` passed 34 checks in the same kind of headless sway session, with the real launcher and a scripted Claude Code
+stand-in: a file in a repository, `+42`, `~/notes.md` with its note and a card in a Manual and in an Auto tab, a file
+handed to a running window from outside and from its bottom terminal, a window that cannot take it, and a saved layout that
+hides the editor. A person has not looked at all its screens, and GNOME's raise, a Codex tab at such a folder, a scaled
+output and real hardware have not been tried.
 Companion mode on Hyprland (0.57.0 and 0.56.2) was run on a live desktop in a virtual machine, with keys sent through QEMU; on niri, KDE or a real GNOME login it has not been seen on a screen yet.
 
 The Claude Code tab's handling of Claude Code's own work was tested on this release's backend with the real Claude

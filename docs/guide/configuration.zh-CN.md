@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=eb1935047244df5e13fdd524a7cf5c79935eb5edcc5a482a12ba69be68ae3178 -->
+<!-- translated-from: configuration.md sha256=eaf7d9855735316b7035b133c90190a1bbc30745eee69b79edd00669051feb04 -->
 
 # 配置
 
@@ -217,12 +217,20 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 - **`agent.restore`** 决定上一个打开这个项目的窗口里开着的标签页怎么办。Eitri 会随时记下那些有可以继续的会话的标签页（它们的顺序、名字、模式、agent，以及当时在屏幕上的是哪一个），而且不会因为你关了窗口就记成“没有标签页”。设为 `"offer"` 时，只要窗口里还没有任何东西启动，空标签页的仪表盘就会显示一行 `Restore last session`，按 `s` 即可；`"auto"` 在启动时不用按任何键就把它们带回来（除非项目的 Claude 配置是新的或已改动，这时恢复要等你回答[信任问题](permissions.zh-CN.md#trusting-a-project)，在它上面按 `Esc` 会保留已保存的标签页：它们作为失败的标签页回来，可以用 `r` 再次启动；从空标签页的 `Restore last session` 那一行发起的，在那个标签页仍是空的时候，仍然留在那里供你再选）；`"off"` 或 `false` 既不提议也不记录；`true` 和 `"on"` 会被拒绝。每个标签页都会被继续（在你输入之前什么都不会发送），上次在屏幕上的那个仍然显示在屏幕上，并且会有一条消息告诉你恢复了几个。某个标签页如果保存的记录已经没了，或者它的会话被另一个窗口占着，就会被跳过并点名。曾经处于 bypass 的标签页，没有你的一句“是”，绝不会以 bypass 回来：`s` 会先问，回答 `n`（或使用 `"auto"`）就让它以 auto 回来。曾经处于 manual 的标签页会以 manual 回来，不用提问。
 - **`agent.default_mode`** 是新标签页开始时所处的模式，针对你还没有用 `Shift+Tab` 改过空标签页模式的项目（那个选择，manual 或 auto，按项目记住，并且始终优先，它优先时启动日志会说出来；bypass 从不被记住，一个没有 manual 模式的 agent 的标签页离开 bypass 时落到的 auto 也不会被记住）。设为 `"manual"` 会让每个标签页都以最严格的模式开始，在那里每一次文件编辑都是一张卡片；一个没有 manual 模式的 agent 的标签页会改以 auto 开始，Eitri 会说一次，并指明是哪个标签页。设为 `"bypass"` 是唯一一种窗口不经询问就以 bypass 开始的方式，因为你已经在自己的文件里这么说了；它同时也让保存下来的 bypass 标签页不必回答那个问题就以 bypass 回来。这三种模式的含义见[权限](permissions.zh-CN.md)。
 
+<a id="files-and-windows"></a>
+## 文件和窗口
+
+`eitri FILE` 在编辑器里打开一个文件，并从文件推出项目（见[打开文件](getting-started.zh-CN.md#open-a-file)）。其中有两点在命令行上决定，`init.lua` 里没有对应的设置：
+
+- 这个文件所属的项目已经开着一个窗口时，`eitri FILE` 把文件交给那个窗口，把它提到前面，然后返回。`eitri --new-window FILE` 则改为开一个新窗口。`--clean` 和 `--account NAME` 也开新窗口，因为复用窗口会丢掉它们要求的东西。`eitri DIR` 和不带参数的 `eitri` 总是开新窗口。
+- 在 Eitri 自己的底部终端里输入的命令会找到它自己的窗口：终端的 shell 里设置了 `EITRI_OPEN_SOCKET`，`eitri` 读它来找到那个窗口。这个变量不用你自己设置。
+
 <a id="accounts"></a>
 ## 账号
 
 如果你有不止一个 Claude 账号，就指明一个窗口该用哪个。有两种办法：
 
-- 命令行上的 `eitri --account NAME`（它对 `eitri panel` 和 `eitri split` 也有效）。启动器会打印它选了哪个账号，以及这个名字是从哪里来的。
+- 命令行上的 `eitri --account NAME`（它对 `eitri panel` 和 `eitri split` 也有效）。启动器会打印它选了哪个账号，以及这个名字是从哪里来的。带文件时它总是开新窗口。
 - `init.lua` 里的 `eitri.config.set("agent.account", "NAME")`，作为那些没有指明账号的启动（比如从应用菜单启动）的默认值。
 
 两者都有时，命令行优先。你的环境里已经设好的 `VERDANDI_CLAUDE_ACCOUNT` 也优先于 `init.lua`：`--account` 为这次启动设的就是同一个变量，所以一个标志也优先于继承来的值。
@@ -241,7 +249,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `NEOVIM_BIN` | 在没有设置 `EITRI_NVIM` 时读取：规则相同，要求指向现有文件的绝对路径。两者都没有时，Eitri 用 `PATH` 上的 `nvim`；如果它不存在或者比 0.10 旧，并且你在 `eitri setup` 里接受过一个私有副本，就用 `$XDG_DATA_HOME/eitri/nvim/` 下最新的那个副本。 |
 | `EITRI_CODEX` | Codex 标签页运行的 `codex`：一个现有文件的绝对路径，否则 Eitri 会在启动时停下并点出这个变量。它优先于 `agent.codex.command` 和 `PATH`。空值算作未设置。Eitri 不为 Codex 标签页设置 `CODEX_HOME`；Codex 读的是你的，而相对的 `CODEX_HOME` 会让每一次 Codex 启动都被拒绝。 |
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
-| `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。 |
+| `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。它只指目录；文件用 `eitri FILE` 打开。 |
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，覆盖 Linux 的 XDG 配置目录或 `~/.config/eitri`。空值视为未设置，相对路径会拒绝启动。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |

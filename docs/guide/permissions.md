@@ -55,6 +55,8 @@ This is the normal case. Eitri asks Claude Code to run its own auto mode and the
   rule did it.
 - Every other call is left to Claude Code's auto mode, which decides with its own classifier. Eitri draws no card
   for it and does not apply its own checks.
+  The exception is a project that is [no boundary](#a-folder-that-is-no-boundary): there Eitri's own rules answer,
+  as in a Manual tab.
 - When Claude Code refuses a call, the tool's row says `blocked by auto: <reason>`. After repeated refusals
   Claude Code asks you itself, on a card.
 
@@ -73,8 +75,9 @@ Eitri cannot be sure about is a card.
   `.mcp.json`. Those are cards.
 - `WebFetch`, `WebSearch` and `MultiEdit` always ask. A tool Eitri does not know asks. A few tools that change no
   file, run no command and reach no network never ask.
-- A project directory that is your home directory, or above it, is no boundary: every call that has to be
-  judged against the project asks.
+- A project directory that is no boundary (your home directory or above it, and the other cases under
+  [A folder that is no boundary](#a-folder-that-is-no-boundary)) makes every call that has to be judged against
+  the project ask.
 - A [saved rule](#saved-rules) can allow a command that only fails the "known to be read-only" test.
 
 ### Bypass
@@ -99,6 +102,29 @@ Claude Code never runs in its own bypass mode under Eitri: it runs in its defaul
 front of it, and "bypass" is only Eitri answering for you. Eitri also checks which mode Claude Code reports. If
 a session reports a mode Eitri did not ask for and does not expect, such as Claude Code's own bypass mode, Eitri
 ends that session with a message and answers nothing further in it.
+
+## A folder that is no boundary
+
+Eitri's own rules judge a path against the project directory. Some folders cannot be that boundary, and then every
+call that has to be judged against the project asks. A folder is no boundary when it is:
+
+- the filesystem root, a kernel tree (`/proc`, `/sys`, `/dev`) or a folder that has moved since it was resolved;
+- your home directory or above it;
+- not yours (another user owns it, which is the case for `/etc`);
+- writable by other users (`/tmp` and `/var/tmp`, or a shared tree). A folder only your own group can write to
+  still counts, when that group has no other member: the `drwxrwxr-x you you` checkout that a umask of 0002 makes
+  stays a boundary.
+
+You meet this most often with [`eitri FILE`](getting-started.md#open-a-file) on a file that has no project of its
+own, such as `eitri ~/notes.md`. It applies to every window on such a folder, however it was started, so
+`eitri /tmp` and `eitri ~` behave the same way. The panel says so in a note, with the reason.
+
+- **Manual and Auto Claude tabs ask.** Every call that would be judged against the project is a card. An Auto tab
+  that would otherwise leave the call to Claude Code's own classifier is answered by Eitri's rules instead, which
+  ask here.
+- **Bypass does not ask**, as everywhere: you chose it.
+- **A Codex tab is not covered by any of this.** It keeps its `workspace-write` sandbox, so it can write anywhere in
+  that folder without a card.
 
 ## Saved rules
 

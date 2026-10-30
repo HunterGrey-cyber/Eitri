@@ -19,9 +19,10 @@ eitri [DIR]
 ```
 
 `DIR` is the project directory. Without it Eitri uses `$EITRI_PROJECT_DIR` when that is set, and otherwise the
-directory you ran the command in. A path that is not a directory, or an option Eitri does not know, stops the
+directory you ran the command in. A path that does not exist, or an option Eitri does not know, stops the
 launch with a message instead of opening some other directory; to open a directory whose name starts with
-`-`, put `--` before it (`eitri -- -notes`).
+`-`, put `--` before it (`eitri -- -notes`). To open a file instead of a directory, see
+[Open a file](#open-a-file).
 
 Each launch is its own window with its own Neovim, its own sessions and its own project root, so you can have
 several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
@@ -45,6 +46,62 @@ account when one is configured, and a short menu:
 Two options are worth knowing. `eitri --version` prints the version and exits. `eitri --clean` starts the
 editor's Neovim with `nvim --clean`, that is without your configuration and plugins, which is the quickest way
 to tell whether a problem comes from your own setup.
+
+## Open a file
+
+```sh
+eitri src/lib.rs
+eitri +42 src/lib.rs
+eitri src/lib.rs:42:7
+eitri a.rs b.rs
+eitri DIR FILE
+```
+
+`eitri FILE` opens the file in the editor and finds the project from it: the project is the git repository the file
+sits in, or the file's own folder when there is none, except that your current directory is used instead when it
+holds the file, is itself a usable folder and, with a repository, lies inside it (`cd crate; eitri src/x.rs` opens
+the project `crate`, as `eitri .` there would). A repository counts only when it is a usable folder too (see
+[A folder that is no boundary](permissions.md#a-folder-that-is-no-boundary)); one that is not is skipped, and the
+search goes on above it. From your home directory, `eitri code/scratch/a.py` with no repository opens the project
+`~/code/scratch`, not `~`. A project found this way behaves like one named with `eitri DIR`, including the
+[trust question](permissions.md#trusting-a-project) at the first session. The file does not have to exist yet: its
+folder must, and `:w` creates the file.
+
+- With several files, the first one is shown and all of them are open, as in `nvim a b c`. A file outside the
+  project prints a note and still opens.
+- `+N` before the first file starts on line N, and a bare `+` on its last line. `FILE:LINE` and `FILE:LINE:COL` do
+  the same, but only when no file with that literal name exists. A line applies to the first file only. A word
+  after `+` that is not a number, such as `+page.svelte` or `+/pattern`, is refused because it would be an nvim
+  command; for a file with that name write `./+page.svelte` or `eitri -- +page.svelte`.
+- After `--` every word is a path.
+- `eitri DIR FILE...` keeps `DIR` as the project and shows the files first.
+- A folder that does not exist, a pipe, a socket or a device, and a name that is not valid UTF-8 are refused with a
+  message. `eitri panel` and `eitri split` still take a directory only, and `EITRI_PROJECT_DIR` stays a directory.
+
+**A window for that project is already open.** Then `eitri FILE` does not start another window: the running editor
+opens the file, the window comes to the front with the keys on the editor, and the command returns at once. If that
+window's editor was hidden or has not started yet, it is shown and the file opens when it is ready. Typed in an Eitri
+window's own bottom terminal, `eitri FILE` opens in that window, even after a `cd` into a subfolder, as long as the
+file is inside the window's project. `eitri DIR` and a bare `eitri` always start a new window, and so does
+`eitri --new-window FILE` (`--clean` and `--account` imply it). A file outside the project of
+every open window starts a new window, and so does a window that cannot take the file just now, for instance one
+sitting in a quit prompt with an unsaved buffer. When the buffer in the editor has unsaved
+changes, the file opens in a split and that buffer stays.
+
+On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
+terminal does not have: there GNOME may show a "window is ready" notice instead of raising the window. Sway, Hyprland
+and niri are expected to focus the window through the compositor. Only sway has been tried.
+
+**A file with no project of its own.** `eitri ~/notes.md`, `eitri /etc/hosts` and `eitri /tmp/x.py` open too, in the
+file's folder. When that folder cannot serve as a boundary for the agent (your home directory, a folder you do not
+own, a folder other users can write to, the filesystem root), the panel shows a note on every tab page:
+`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab can write
+anywhere in this folder.` It stays until you dismiss it. What that means for each mode is in
+[Permissions](permissions.md#a-folder-that-is-no-boundary).
+
+**From a file manager.** Eitri's desktop entry lists plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell
+scripts, so it appears under Open With for them (it does not become the default). Such a launch usually starts in your
+home directory, so the project comes from the file as described above.
 
 ## Your first turn
 

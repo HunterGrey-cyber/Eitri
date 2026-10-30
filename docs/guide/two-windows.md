@@ -45,6 +45,9 @@ A project has one pair of windows. A second full Eitri window opened on the same
   which raises itself and does it with its own Neovim: opening a file from a path click or `gf`, `Ctrl+g`, turn review,
   the context a prompt carries, the Markdown preview following the buffer, the colour scheme. They work in window 2 as
   they do in window 1.
+- **A file from the command line.** [`eitri FILE`](getting-started.md#open-a-file), typed in either window's bottom
+  terminal, opens the file in window 1's editor and raises window 1, since that is where the editor is. Reuse
+  was tried with one window; it has not been run with the pair.
 - **The editor key** in window 2 raises window 1 and gives its editor the keys. When window 1 is gone it asks
   `start the editor? (y/n)`; `y` starts a new Eitri window for the project, which links up to the waiting window 2.
 - **Everything else is its own.** Each window has its own workspaces, layout, open rules, HINT, tray and toasts. A
