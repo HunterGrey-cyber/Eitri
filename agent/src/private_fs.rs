@@ -38,10 +38,16 @@
 //! usual umask, and it may be a link into a dotfiles tree. So [`open_user_config_dir`] judges it and
 //! never tightens it, and [`create_new_file_at`] puts one new file there, whole or not at all, without
 //! ever opening a file that exists.
+//!
+//! **A directory another program keeps.** A home is shared with every program, and what sits in it may
+//! belong to another program that sets its modes as it likes. So nothing here that takes an open
+//! directory ever changes one it did not make: [`open_dir`] only opens, [`ensure_child_dir`] judges an
+//! existing child and leaves it as it is or refuses it, and [`publish_private_file`] and
+//! [`remove_if_same`] work on one name inside the handle they are given.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::Write;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
@@ -198,24 +204,10 @@ fn create_dirs_owner_usable(dir: &Path) -> std::io::Result<()> {
 fn make_dir_at(parent: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> std::io::Result<std::fs::File> {
     let cname = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a directory name holds a NUL"))?;
-    // SAFETY: `parent` is an open descriptor for the call and `cname` a NUL-terminated buffer that
-    // outlives it; `mkdirat` reads nothing else of ours.
-    let made = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), PRIVATE_DIR_MODE as libc::mode_t) } == 0;
-    if !made {
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-    }
+    let made = mkdir_at(parent, &cname)?;
     #[cfg(test)]
     run_after_mkdir_hook(path);
-    let opened = match openat_dir(parent, &cname) {
-        Err(e) if made && e.raw_os_error() == Some(libc::EACCES) => {
-            set_new_dir_mode_at(parent, &cname).and_then(|()| openat_dir(parent, &cname))
-        }
-        opened => opened,
-    };
-    let handle = opened.map_err(|e| {
+    let handle = open_after_mkdir(parent, &cname, made).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
@@ -229,6 +221,43 @@ fn make_dir_at(parent: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> s
         fchmod(&handle, PRIVATE_DIR_MODE)?;
     }
     Ok(handle)
+}
+
+/// `mkdirat` of `name` in `parent`: `true` when this call made it, `false` when something is already
+/// at the name, whatever it is.
+fn mkdir_at(parent: &std::fs::File, name: &CStr) -> std::io::Result<bool> {
+    // SAFETY: `parent` is an open descriptor for the call and `name` a NUL-terminated buffer that
+    // outlives it; `mkdirat` reads nothing else of ours.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), PRIVATE_DIR_MODE as libc::mode_t) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+/// Opens `name` in `parent` as [`openat_dir`] does, after [`mkdir_at`]. A umask that takes the owner's
+/// read bit leaves a directory no handle can be opened on, so only for one this call `made`, and only
+/// while the name can still hold it, the mode goes in by name first.
+fn open_after_mkdir(parent: &std::fs::File, name: &CStr, made: bool) -> std::io::Result<std::fs::File> {
+    match openat_dir(parent, name) {
+        Err(e) if made && e.raw_os_error() == Some(libc::EACCES) => match stat_at(parent, name)? {
+            Some(stat) if could_be_from_mkdir(stat.st_mode) => {
+                set_new_dir_mode_at(parent, name).and_then(|()| openat_dir(parent, name))
+            }
+            _ => Err(e),
+        },
+        opened => opened,
+    }
+}
+
+/// Whether a directory of this `mode` can be what [`mkdir_at`] left: the umask only takes bits from
+/// 0700, so a bit for group or others means something else was put at the name after the `mkdirat`.
+fn could_be_from_mkdir(mode: impl Into<u32>) -> bool {
+    mode.into() & 0o077 == 0
 }
 
 #[cfg(test)]
@@ -715,6 +744,18 @@ enum Entry {
 }
 
 fn entry_at(holder: &std::fs::File, name: &CStr) -> Result<Entry, DirRefusal> {
+    let Some(stat) = stat_at(holder, name).map_err(DirRefusal::Io)? else {
+        return Ok(Entry::Missing);
+    };
+    Ok(match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => Entry::Directory,
+        libc::S_IFLNK => Entry::Link,
+        _ => Entry::Other,
+    })
+}
+
+/// `fstatat` of the entry `name` in `holder` itself, a link included; `None` when nothing is there.
+fn stat_at(holder: &std::fs::File, name: &CStr) -> std::io::Result<Option<libc::stat>> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: the descriptor is `holder`'s own and open, `name` is NUL-terminated, and `stat` is a
     // buffer of the size `fstatat` writes; all three outlive the call.
@@ -729,16 +770,12 @@ fn entry_at(holder: &std::fs::File, name: &CStr) -> Result<Entry, DirRefusal> {
     if looked != 0 {
         let e = std::io::Error::last_os_error();
         return match e.raw_os_error() {
-            Some(libc::ENOENT) => Ok(Entry::Missing),
-            _ => Err(DirRefusal::Io(e)),
+            Some(libc::ENOENT) => Ok(None),
+            _ => Err(e),
         };
     }
     // SAFETY: `fstatat` returned 0, so it filled the buffer.
-    Ok(match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
-        libc::S_IFDIR => Entry::Directory,
-        libc::S_IFLNK => Entry::Link,
-        _ => Entry::Other,
-    })
+    Ok(Some(unsafe { stat.assume_init() }))
 }
 
 /// Opens the directory that holds the last component of `path`, which `base` resolves when `path` is
@@ -929,12 +966,14 @@ static CREATE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// ended with this one's id, and the next serial is another name.
 const TEMPORARY_TRIES: u32 = 8;
 
-fn create_temporary(dir: BorrowedFd<'_>, name: &str, mode: u32) -> Result<(CString, std::fs::File), CreateRefusal> {
-    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_WRONLY;
+/// A new file in `dir` under `<stem>.<pid>.<serial>.tmp`, never one that was there.
+fn create_temporary(dir: BorrowedFd<'_>, stem: &OsStr, mode: u32) -> std::io::Result<(CString, std::fs::File)> {
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_WRONLY;
     for _ in 0..TEMPORARY_TRIES {
         let serial = CREATE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = format!("{name}.{}.{serial}.tmp", std::process::id());
-        let tmp = CString::new(tmp).map_err(|e| CreateRefusal::Io(e.into()))?;
+        let mut tmp = stem.to_os_string();
+        tmp.push(format!(".{}.{serial}.tmp", std::process::id()));
+        let tmp = CString::new(tmp.as_bytes())?;
         // SAFETY: `dir` is open for the call and `tmp` is NUL-terminated and outlives it; the mode goes
         // through the variadic as the `c_uint` a `mode_t` is promoted to.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), tmp.as_ptr(), flags, mode as libc::c_uint) };
@@ -944,10 +983,10 @@ fn create_temporary(dir: BorrowedFd<'_>, name: &str, mode: u32) -> Result<(CStri
         }
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EEXIST) {
-            return Err(CreateRefusal::Io(e));
+            return Err(e);
         }
     }
-    Err(CreateRefusal::Io(std::io::ErrorKind::AlreadyExists.into()))
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
 /// Gives the finished temporary file its name, by the first of the two calls this file system has.
@@ -988,11 +1027,8 @@ pub(crate) fn create_new_file_with(
     bytes: &[u8],
     mode: u32,
 ) -> Result<(), CreateRefusal> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-        return Err(CreateRefusal::Io(std::io::ErrorKind::InvalidInput.into()));
-    }
-    let c_name = CString::new(name).map_err(|e| CreateRefusal::Io(e.into()))?;
-    let (tmp, mut file) = create_temporary(dir, name, mode)?;
+    let c_name = entry_name(OsStr::new(name)).map_err(CreateRefusal::Io)?;
+    let (tmp, mut file) = create_temporary(dir, OsStr::new(name), mode).map_err(CreateRefusal::Io)?;
     let placed = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
@@ -1012,10 +1048,169 @@ pub(crate) fn create_new_file_with(
     placed
 }
 
+/// `name` as one entry of a directory, or `InvalidInput`: `.`, `..` and a path lead out of the entry
+/// the caller meant, and a NUL cannot reach the system at all.
+fn entry_name(name: &OsStr) -> std::io::Result<CString> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    Ok(CString::new(bytes)?)
+}
+
+/// `name` in `parent` as an open directory handle. A missing one is made with `mkdirat` and set to exactly
+/// 0700 whatever the umask. An existing one must be a real directory (a link is not followed) of the euid
+/// that neither its group nor others can write, sticky or not, and its mode is left as it is, however
+/// narrow or wide within that. Anything else at the name is `PermissionDenied`, and a FIFO is never opened
+/// as one. Never changes a directory it did not make, so it fits a directory another program keeps, where
+/// [`create_private_dir_all`] does not. Another process of this user can swap the new directory for its own
+/// before the handle opens: one with a bit for group or others is told apart and kept as it is, while one
+/// narrower than 0700 reads as the umask's work and is set. A `name` that is not one entry of a directory
+/// is `InvalidInput`.
+pub fn ensure_child_dir(parent: &std::fs::File, name: &OsStr) -> std::io::Result<std::fs::File> {
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a real directory of this user that only this user can write to",
+                Path::new(name).display()
+            ),
+        )
+    };
+    let cname = entry_name(name)?;
+    let made = mkdir_at(parent, &cname)?;
+    #[cfg(test)]
+    run_after_mkdir_hook(Path::new(name));
+    // `open` with `O_DIRECTORY|O_NOFOLLOW` says `ENOTDIR` for a link on Linux and `ELOOP` elsewhere.
+    let handle = open_after_mkdir(parent, &cname, made).map_err(|e| match e.raw_os_error() {
+        Some(libc::ENOTDIR | libc::ELOOP) => refused(),
+        _ => e,
+    })?;
+    let meta = handle.metadata()?;
+    config_dir_checks(meta.mode(), meta.uid(), euid()).map_err(|_| refused())?;
+    if made && could_be_from_mkdir(meta.mode()) {
+        fchmod(&handle, PRIVATE_DIR_MODE)?;
+    }
+    Ok(handle)
+}
+
+/// `path` opened as a directory (`O_DIRECTORY | O_CLOEXEC`), with no test of its owner or mode: for a
+/// home, which is shared with every program and may be a link. What is opened is only a place to start
+/// from; [`ensure_child_dir`] judges what is inside it.
+pub fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Which file a name holds: the device and inode, which a rename over the name changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Publishes `bytes` as `name` in `dir`, replacing whatever file or link is there without opening it. The
+/// file is made in the same directory as `.<name>.<pid>.<serial>.tmp`, so a reader that looks for names
+/// ending as `name` does never meets it half-written, with `O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC` through `openat`. It is set to exactly 0600 on the handle whatever the umask, written whole
+/// and `fsync`ed, and only then renamed over `name` within the directory's handle. On any failure the
+/// temporary name is removed. Returns the identity of the file that took the name, for [`remove_if_same`].
+pub fn publish_private_file(dir: &std::fs::File, name: &OsStr, bytes: &[u8]) -> std::io::Result<FileIdentity> {
+    let target = entry_name(name)?;
+    let mut stem = OsString::from(".");
+    stem.push(name);
+    let (tmp, mut file) = create_temporary(dir.as_fd(), &stem, PRIVATE_FILE_MODE)?;
+    let published = fill_and_rename(&mut file, dir, &tmp, &target, bytes);
+    drop(file);
+    if published.is_err() {
+        // SAFETY: `dir` is open for the call and `tmp` is NUL-terminated and outlives it.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+    }
+    published
+}
+
+/// The identity comes from the handle before the rename, so nothing that can fail runs once the file has
+/// taken the name: an error always means `name` was left as it was.
+fn fill_and_rename(
+    file: &mut std::fs::File,
+    dir: &std::fs::File,
+    tmp: &CStr,
+    name: &CStr,
+    bytes: &[u8],
+) -> std::io::Result<FileIdentity> {
+    fchmod(file, PRIVATE_FILE_MODE)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let meta = file.metadata()?;
+    #[cfg(test)]
+    publish_test_hooks::before_rename();
+    let fd = dir.as_raw_fd();
+    // SAFETY: `dir` is open for the call and both names are NUL-terminated and outlive it.
+    if unsafe { libc::renameat(fd, tmp.as_ptr(), fd, name.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// Removes `name` from `dir` only when it is still the file `identity` names, looked at with `fstatat`
+/// and `AT_SYMLINK_NOFOLLOW`: `true` when this call removed it, `false` when something else is there or
+/// nothing is. The look and the `unlinkat` are two steps, so a rename between them is not seen; only a
+/// process of this user can do that in a directory [`ensure_child_dir`] accepted.
+pub fn remove_if_same(dir: &std::fs::File, name: &OsStr, identity: FileIdentity) -> std::io::Result<bool> {
+    let cname = entry_name(name)?;
+    let Some(stat) = stat_at(dir, &cname)? else {
+        return Ok(false);
+    };
+    // The widths of these two fields differ from one unix to another.
+    #[allow(clippy::unnecessary_cast)]
+    let named = FileIdentity {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    };
+    if named != identity {
+        return Ok(false);
+    }
+    // SAFETY: `dir` is open for the call and `cname` is NUL-terminated and outlives it.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOENT) => Ok(false),
+        _ => Err(e),
+    }
+}
+
+/// A hook a test sets on its own thread, called in [`publish_private_file`] once the temporary file is
+/// written and before it takes its name, so the directory can be looked at in that moment.
+#[cfg(test)]
+mod publish_test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_RENAME: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn set_before_rename(hook: impl FnOnce() + 'static) {
+        BEFORE_RENAME.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn before_rename() {
+        let hook = BEFORE_RENAME.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -2099,6 +2294,372 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         create_private_dir_all(&root.join("a"), &root).unwrap();
         create_private_dir_all(&root.join("a"), &root).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A scratch directory and a handle on it. The mode is set first: under a narrow umask the scratch
+    /// itself comes out without the owner's bits.
+    fn scratch_handle(label: &str) -> (std::path::PathBuf, std::fs::File) {
+        let dir = scratch(label);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let handle = open_dir(&dir).unwrap();
+        (dir, handle)
+    }
+
+    /// The directory is made 0700 and the handle is that directory: what is put through it lands there.
+    fn a_missing_child_comes_out_0700() {
+        let (base, handle) = scratch_handle("child-missing");
+        let child = ensure_child_dir(&handle, OsStr::new("ide")).unwrap();
+        assert_eq!(mode(&base.join("ide")), 0o700);
+        publish_private_file(&child, OsStr::new("1.lock"), b"{}").unwrap();
+        assert_eq!(names_in(&base.join("ide")), ["1.lock"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn ensure_child_dir_makes_a_missing_one_0700() {
+        a_missing_child_comes_out_0700();
+    }
+
+    /// 0277 would leave 0500, in which nothing can be created.
+    #[test]
+    fn ensure_child_dir_makes_a_missing_one_0700_under_a_narrow_umask() {
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::ensure_child_dir_makes_a_missing_one_0700_under_a_narrow_umask"
+            ),
+            0o277,
+            a_missing_child_comes_out_0700,
+        );
+    }
+
+    /// 0477 would leave 0300, on which no handle can be opened until the mode is set.
+    #[test]
+    fn ensure_child_dir_makes_a_missing_one_0700_under_a_umask_without_the_read_bit() {
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::ensure_child_dir_makes_a_missing_one_0700_under_a_umask_without_the_read_bit"
+            ),
+            0o477,
+            a_missing_child_comes_out_0700,
+        );
+    }
+
+    /// The directory is another program's, so an existing one keeps the mode it has, 0750 and 0500 alike.
+    #[test]
+    fn ensure_child_dir_keeps_an_existing_mode() {
+        for kept in [0o750, 0o755, 0o500] {
+            let (base, handle) = scratch_handle("child-kept");
+            let child = base.join("ide");
+            std::fs::create_dir(&child).unwrap();
+            set_mode(&child, kept);
+            ensure_child_dir(&handle, OsStr::new("ide")).unwrap();
+            assert_eq!(mode(&child), kept, "the mode of a directory this call did not make");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+    }
+
+    /// Runs `ensure_child_dir` with the directory it just made swapped for one of mode `swapped_in`, as
+    /// another process of this user could, and returns its answer and the mode left at the name.
+    fn with_a_swap_after_the_mkdir(label: &str, swapped_in: u32) -> (std::io::Result<std::fs::File>, u32) {
+        let (base, handle) = scratch_handle(label);
+        let child = base.join("ide");
+        let swap = {
+            let child = child.clone();
+            move |_: &Path| {
+                std::fs::remove_dir(&child).unwrap();
+                std::fs::create_dir(&child).unwrap();
+                set_mode(&child, swapped_in);
+            }
+        };
+        AFTER_MKDIR.with(|hook| *hook.borrow_mut() = Some(Box::new(swap)));
+        let answer = ensure_child_dir(&handle, OsStr::new("ide"));
+        AFTER_MKDIR.with(|hook| *hook.borrow_mut() = None);
+        let left = mode(&child);
+        set_mode(&child, 0o700);
+        std::fs::remove_dir_all(&base).unwrap();
+        (answer, left)
+    }
+
+    /// Group bits can only have come from something else: `mkdirat` with 0700 never leaves any.
+    #[test]
+    fn a_directory_swapped_in_after_the_mkdir_keeps_its_mode() {
+        let (answer, left) = with_a_swap_after_the_mkdir("child-swapped", 0o750);
+        assert!(answer.is_ok(), "{answer:?}");
+        assert_eq!(left, 0o750, "the mode of a directory this call did not make");
+    }
+
+    /// The owner cannot read this one, so no handle opens on it, and the by-name set is what would change it.
+    #[test]
+    fn a_swapped_in_directory_no_handle_opens_on_is_refused_and_left() {
+        if euid() == 0 {
+            return;
+        }
+        let (answer, left) = with_a_swap_after_the_mkdir("child-swapped-unreadable", 0o350);
+        let refused = answer.unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(left, 0o350, "the mode of a directory this call did not make");
+    }
+
+    /// A link to a directory that would pass is refused all the same, and a link to nothing makes nothing.
+    #[test]
+    fn ensure_child_dir_refuses_a_link() {
+        let (base, handle) = scratch_handle("child-link");
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        set_mode(&target, 0o700);
+        std::os::unix::fs::symlink(&target, base.join("ide")).unwrap();
+        std::os::unix::fs::symlink(base.join("nowhere"), base.join("dangling")).unwrap();
+        for name in ["ide", "dangling"] {
+            let refused = ensure_child_dir(&handle, OsStr::new(name)).unwrap_err();
+            assert_eq!(
+                refused.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{name}: {refused}"
+            );
+        }
+        assert!(names_in(&target).is_empty());
+        assert!(!base.join("nowhere").exists(), "a dangling link was made real");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `/usr/lib` is root's and readable, so only the owner test refuses it.
+    #[test]
+    fn ensure_child_dir_refuses_another_users_directory() {
+        if euid() == 0 {
+            return;
+        }
+        let usr = open_dir(Path::new("/usr")).unwrap();
+        let refused = ensure_child_dir(&usr, OsStr::new("lib")).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+    }
+
+    fn assert_refused_and_left_alone(label: &str, mode_of_child: u32) {
+        let (base, handle) = scratch_handle(label);
+        let child = base.join("ide");
+        std::fs::create_dir(&child).unwrap();
+        set_mode(&child, mode_of_child);
+        let refused = ensure_child_dir(&handle, OsStr::new("ide")).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        let left = child.symlink_metadata().unwrap().mode() & 0o7777;
+        assert_eq!(left, mode_of_child, "a refused directory is not fixed");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn ensure_child_dir_refuses_a_group_writable_one() {
+        assert_refused_and_left_alone("child-group", 0o770);
+    }
+
+    /// The sticky bit keeps others from renaming entries, not from adding them, so it changes nothing here.
+    #[test]
+    fn ensure_child_dir_refuses_a_world_writable_one() {
+        assert_refused_and_left_alone("child-world", 0o707);
+        assert_refused_and_left_alone("child-world-sticky", 0o1777);
+    }
+
+    /// A FIFO at the name is not opened for reading, which would wait for a writer.
+    #[test]
+    fn ensure_child_dir_refuses_a_file() {
+        let (base, handle) = scratch_handle("child-file");
+        std::fs::write(base.join("plain"), b"x").unwrap();
+        let fifo = std::ffi::CString::new(base.join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for name in ["plain", "fifo"] {
+                let _ = tx.send(ensure_child_dir(&handle, OsStr::new(name)).map(|_| ()));
+            }
+        });
+        for _ in 0..2 {
+            let refused = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("ensure_child_dir blocked on what is at the name")
+                .unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        }
+        assert_eq!(std::fs::read(base.join("plain")).unwrap(), b"x");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `..` would otherwise hand back the directory above, and `a/b` reach past the one entry asked for.
+    #[test]
+    fn a_name_that_is_not_one_entry_of_the_handle_is_refused() {
+        let (base, handle) = scratch_handle("one-entry");
+        let kept = OsStr::new("kept");
+        let identity = publish_private_file(&handle, kept, b"x").unwrap();
+        for name in ["", ".", "..", "../kept", "a/b", "nul\0"] {
+            let name = OsStr::new(name);
+            let invalid = std::io::ErrorKind::InvalidInput;
+            assert_eq!(ensure_child_dir(&handle, name).unwrap_err().kind(), invalid, "{name:?}");
+            assert_eq!(
+                publish_private_file(&handle, name, b"x").unwrap_err().kind(),
+                invalid,
+                "{name:?}"
+            );
+            assert_eq!(
+                remove_if_same(&handle, name, identity).unwrap_err().kind(),
+                invalid,
+                "{name:?}"
+            );
+        }
+        assert_eq!(names_in(&base), ["kept"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A home is judged by nobody here: a link to one opens, and a file is still no directory.
+    #[test]
+    fn open_dir_follows_a_link_and_refuses_a_file() {
+        let (base, _handle) = scratch_handle("open-dir");
+        let home = base.join("home");
+        std::fs::create_dir(&home).unwrap();
+        set_mode(&home, 0o777);
+        std::os::unix::fs::symlink(&home, base.join("link")).unwrap();
+        let held = open_dir(&base.join("link")).unwrap();
+        publish_private_file(&held, OsStr::new("through"), b"x").unwrap();
+        assert_eq!(names_in(&home), ["through"]);
+        assert_eq!(mode(&home), 0o777, "opening a home changes nothing");
+        let file = home.join("through");
+        assert_eq!(open_dir(&file).unwrap_err().kind(), std::io::ErrorKind::NotADirectory);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn a_published_file_is_0600_and_named_by_its_identity() {
+        let (base, handle) = scratch_handle("publish-umask");
+        let identity = publish_private_file(&handle, OsStr::new("1234.lock"), b"{\"pid\":1}").unwrap();
+        let path = base.join("1234.lock");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"pid\":1}");
+        let meta = path.symlink_metadata().unwrap();
+        let named = FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        assert_eq!(identity, named);
+        assert_eq!(names_in(&base), ["1234.lock"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 0277 would leave 0400, which only the handle the file was made by can still write.
+    #[test]
+    fn publish_writes_a_0600_file_under_any_umask() {
+        crate::test_umask::with_umask(
+            concat!(module_path!(), "::publish_writes_a_0600_file_under_any_umask"),
+            0o277,
+            a_published_file_is_0600_and_named_by_its_identity,
+        );
+    }
+
+    #[test]
+    fn publish_writes_a_0600_file_under_an_open_umask() {
+        crate::test_umask::with_umask(
+            concat!(module_path!(), "::publish_writes_a_0600_file_under_an_open_umask"),
+            0o000,
+            a_published_file_is_0600_and_named_by_its_identity,
+        );
+    }
+
+    /// A reader of `*.lock` never meets the file half-written: until the rename the directory holds the
+    /// finished file under a name no such reader takes.
+    #[test]
+    fn a_temporary_name_not_ending_in_lock_exists_until_the_rename() {
+        let (base, handle) = scratch_handle("publish-temporary");
+        let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (watched, saw) = (base.clone(), seen.clone());
+        publish_test_hooks::set_before_rename(move || {
+            let names = names_in(&watched);
+            assert_eq!(names.len(), 1, "{names:?}");
+            let name = &names[0];
+            let pid = format!(".1234.lock.{}.", std::process::id());
+            assert!(name.starts_with(&pid) && name.ends_with(".tmp"), "{name}");
+            assert!(!name.ends_with(".lock"), "{name}");
+            assert_eq!(std::fs::read(watched.join(name)).unwrap(), b"whole");
+            assert_eq!(mode(&watched.join(name)), 0o600);
+            saw.set(true);
+        });
+        publish_private_file(&handle, OsStr::new("1234.lock"), b"whole").unwrap();
+        assert!(seen.get(), "the hook did not run");
+        assert_eq!(names_in(&base), ["1234.lock"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A window that ended without cleaning up left its lock for this port; the new file takes the name
+    /// and the old mode goes with the old file.
+    #[test]
+    fn publish_replaces_a_dead_processs_file() {
+        let (base, handle) = scratch_handle("publish-replace");
+        let path = base.join("1234.lock");
+        std::fs::write(&path, b"a dead window's").unwrap();
+        set_mode(&path, 0o644);
+        let old = path.symlink_metadata().unwrap().ino();
+        let identity = publish_private_file(&handle, OsStr::new("1234.lock"), b"new").unwrap();
+        assert_ne!(identity.ino, old);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(names_in(&base), ["1234.lock"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The rename replaces the link itself: what it pointed at is not written.
+    #[test]
+    fn publish_replaces_a_link_without_writing_through_it() {
+        let (base, handle) = scratch_handle("publish-link");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, base.join("1234.lock")).unwrap();
+        publish_private_file(&handle, OsStr::new("1234.lock"), b"new").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        let meta = base.join("1234.lock").symlink_metadata().unwrap();
+        assert!(meta.file_type().is_file());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A directory at the name lets the temporary be written and fails the rename.
+    #[test]
+    fn a_failed_publish_leaves_no_temporary_name() {
+        let (base, handle) = scratch_handle("publish-fail");
+        std::fs::create_dir(base.join("1234.lock")).unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (watched, saw) = (base.clone(), seen.clone());
+        publish_test_hooks::set_before_rename(move || {
+            assert_eq!(names_in(&watched).len(), 2, "the temporary was not written");
+            saw.set(true);
+        });
+        publish_private_file(&handle, OsStr::new("1234.lock"), b"x").unwrap_err();
+        assert!(seen.get(), "the publish stopped before the rename");
+        assert_eq!(names_in(&base), ["1234.lock"]);
+        assert!(base.join("1234.lock").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Another file at the name is left there, a link to the file included, and a name already gone is
+    /// no error.
+    #[test]
+    fn remove_if_same_removes_only_that_file() {
+        let (base, handle) = scratch_handle("remove-same");
+        let name = OsStr::new("1234.lock");
+        let path = base.join("1234.lock");
+        let first = publish_private_file(&handle, name, b"first").unwrap();
+        let second = publish_private_file(&handle, name, b"second").unwrap();
+        assert!(!remove_if_same(&handle, name, first).unwrap(), "a file renamed over it");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        std::fs::rename(&path, base.join("moved")).unwrap();
+        std::os::unix::fs::symlink(base.join("moved"), &path).unwrap();
+        assert!(!remove_if_same(&handle, name, second).unwrap(), "a link to it");
+        assert_eq!(names_in(&base), ["1234.lock", "moved"]);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(base.join("moved"), &path).unwrap();
+        assert!(remove_if_same(&handle, name, second).unwrap());
+        assert!(names_in(&base).is_empty());
+        assert!(
+            !remove_if_same(&handle, name, second).unwrap(),
+            "nothing left at the name"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
