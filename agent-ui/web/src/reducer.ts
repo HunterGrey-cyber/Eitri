@@ -29,6 +29,7 @@ export function initialState(): AgentUiState {
     sessionId: null,
     providerSessionId: null,
     model: null,
+    effort: null,
     cwd: null,
     userPrompts: [],
     transcript: [],
@@ -208,7 +209,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
   // `turnThinking` defaults to false here too, for every event: it is cleared by the ABSENCE of a
   // special case rather than by a maintained list of event types that ought to clear it.
   // Only the `content_delta`/`"thinking"` arm below sets it back to true.
-  const preservesActivity = event.type === "turn_cause_updated" || event.type === "cli_cycle_started"
+  const preservesActivity = event.type === "turn_cause_updated" || event.type === "cli_cycle_started" || event.type === "effort_reported"
     || event.type === "background_tasks_changed" || event.type === "task_event" || event.type === "conversation_reset"
     || event.type === "subagent_frame" || (event.type === "session_notice" && !notices.recordsRow(event));
   let state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: preservesActivity ? incoming.turnThinking : false };
@@ -225,7 +226,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       state = questions.onCallStarted(state, event, seq);
       break;
     case "resume_outcome":
-      state = roster.onSessionEnd(state, event);
+      state = { ...roster.onSessionEnd(state, event), effort: null };
       break;
     case "session_closed":
     case "session_unavailable":
@@ -282,6 +283,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       return reset.fold(state, event);
     case "subagent_frame":
       return state;
+    case "effort_reported":
+      return { ...state, effort: event.effort };
     case "session_opened":
       // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
       // system/init at the start of each turn even inside one streaming session. Folding it is

@@ -96,6 +96,9 @@ pub(super) fn snapshot_json(state: &AgentSessionProjection, snapshot: &mut Value
     if let Some(model) = &state.fallback_model {
         snapshot["fallbackModel"] = json!(model);
     }
+    if let Some(effort) = &state.effort {
+        snapshot["effort"] = json!(effort);
+    }
 }
 
 pub(super) fn on_turn_end(state: &mut AgentSessionProjection, _event: &AgentDomainEvent) {

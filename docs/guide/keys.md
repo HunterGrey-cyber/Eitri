@@ -540,9 +540,18 @@ editor's own statusline shows its mode (lualine's mode section, when you use lua
   cards.
 
 `Esc` leaves INSERT for BROWSE. `i` or `o` (the caret where you left it), `A` (at the end of the draft) or
-`Ctrl+j` go from BROWSE to INSERT. `i`, `o`, `A` and `f` act only on a key that stands alone: if another key
-is pressed within about a quarter of a second of it, it does nothing, so the first letters of a sentence typed
-right after a reply arrives do not start HINT or open the box in the middle of a word.
+`Ctrl+j` go from BROWSE to INSERT, and so does `j` or `Down` on the last row: where it can move no further, it
+walks on into the box, with the caret where you left it. A long last row scrolls to its end first, and a held key
+stops at the last row, so it never types `jjjj` into your draft. On the empty tab the box is the last stop, so the
+same keys walk the rows and then enter it. A waiting card, a question, an open list and the search line keep `j`
+for themselves. `i`, `o`, `A`, `f` and this `j` act only on a key that stands alone: if another key is pressed
+within about a quarter of a second of it, it does nothing, so the first letters of a sentence typed right after a
+reply arrives do not start HINT or open the box in the middle of a word.
+
+The band's right side names the agent's model, and the effort beside it when the agent has said what it is. On a
+Claude tab a click on either opens the `/model` or `/effort` list; Claude Code says its effort only when asked, so
+it appears after `/model` or `/effort <level>` has run in that tab, and a click on the model is one way to ask. A
+Codex tab shows what Codex reports and offers no list.
 
 ### In INSERT
 
@@ -592,7 +601,7 @@ there are no Claude command holdbacks or pickers.
 
 | keys | what they do |
 |---|---|
-| `j` / `k`, or `Down` / `Up` | the next / the previous row; a long row scrolls first |
+| `j` / `k`, or `Down` / `Up` | the next / the previous row; a long row scrolls first; `j` on its own on the last row goes to the box |
 | `h` / `l` | the previous / the next button in the row |
 | `gg` / `G` | the first / the last row |
 | `[[` / `]]` | the previous / the next prompt of yours |

@@ -947,7 +947,7 @@ export function browseKeys(prefix: string): KeyHelp[] {
  *  it both ways by `keymap.test.ts`, so this list can neither promise a key that does nothing nor
  *  leave out one that does. */
 export const BROWSE_KEYS: KeyHelp[] = [
-  { keys: "j / k", what: "Next / previous row; a long row scrolls first" },
+  { keys: "j / k", what: "Next / previous row; a long row scrolls first; j alone on the last row goes to the box" },
   { keys: "↓ / ↑", what: "The same as j / k" },
   { keys: "h / l", what: "Previous / next button in the row" },
   { keys: "gg / G", what: "First / last row" },

@@ -306,6 +306,7 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::QuestionAsked { .. }
         | AgentDomainEvent::MoveSeeded(_) => true,
         AgentDomainEvent::SessionOpened { .. }
+        | AgentDomainEvent::EffortReported { .. }
         | AgentDomainEvent::UserMessageDropped { .. }
         | AgentDomainEvent::AssistantMessageBoundary { .. }
         | AgentDomainEvent::ToolCallCompleted { .. }

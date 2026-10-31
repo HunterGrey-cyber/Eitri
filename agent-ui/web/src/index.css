@@ -429,29 +429,11 @@ pre {
   color: var(--nv-muted);
   font-size: var(--fs-md);
 }
-.tool-result-error {
-  border: 1px solid color-mix(in srgb, var(--nv-error) 50%, var(--nv-bg));
-  background: var(--nv-error-tint);
-  color: var(--nv-error-tint-fg);
-  grid-template-columns: minmax(0, 1fr);
-  width: max-content;
-  min-width: min(100%, 36rem);
-  max-width: 100%;
-  padding: 12px 14px;
-  border-radius: 10px;
-}
-.tool-result-error::before {
-  display: none;
-}
-.tool-result-error .tool-result-body, .tool-result-error .tool-result-preview-line {
-  grid-column: 1;
-}
-.tool-result-preview.tool-result-error {
-  color: var(--nv-error-tint-fg);
-}
-.tool-result-error .tool-result-preview-more {
-  grid-column: 1;
-  color: var(--nv-error-tint-muted);
+/* The words that say a command failed (`Exit code 1`, a background command's `failed · exit code 1`). A non-zero
+   exit is routine in agent work, so a failed result sits in the flow like any other, in the same muted text on
+   the page, and the colour stays on these few words and the row's `✗`. */
+.tool-failure-words {
+  color: var(--nv-error);
 }
 .tool-result-preview-wrapped .tool-result-preview-line {
   white-space: pre-wrap;
@@ -1946,6 +1928,15 @@ input::placeholder {
 }
 .band-seg {
   white-space: nowrap;
+}
+/* The model and the effort where a click chooses them: they stay the text they were beside their neighbours. */
+.status-band .band-pick {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--nv-chrome-fg);
+  cursor: pointer;
 }
 /* The `Ctrl+y approves <tool>: <summary>` segment carries the agent's text. Its hidden characters are drawn
    as escapes (`band.ts`), but right-to-left letters are ordinary text and stay. Drawn by the bidi algorithm,

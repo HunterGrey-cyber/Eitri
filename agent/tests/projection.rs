@@ -1605,6 +1605,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::TaskEvent { .. } => "TaskEvent",
         AgentDomainEvent::ConversationReset { .. } => "ConversationReset",
         AgentDomainEvent::SubagentFrame { .. } => "SubagentFrame",
+        AgentDomainEvent::EffortReported { .. } => "EffortReported",
     }
 }
 

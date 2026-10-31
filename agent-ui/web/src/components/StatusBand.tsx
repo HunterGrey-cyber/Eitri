@@ -15,6 +15,10 @@ type Props = {
   /** The `↓N`/`↓ ⚑` button's own click. */
   onJump?: () => void;
   onOpenTasks?: () => void;
+  /** A click on the model or the effort: asks the agent for its choices, which open the `/model` or `/effort`
+   *  picker. Absent where there is nothing to choose (a Codex or ACP tab): the segment stays plain text. */
+  onPickModel?: () => void;
+  onPickEffort?: () => void;
 };
 
 /** `facts.pill`'s leading `"⏵⏵ "` names the mode word after it (`"manual"`/`"auto"`/`"bypass"`), which is all
@@ -83,7 +87,7 @@ function renderLeftSeg(
 /** One bottom statusline, rendered from `bandLayout`'s segments. Measure its content-box width
  *  and the mono character width to decide what fits. Re-measure the hidden `.band-measure` span
  *  when its box changes, including font or theme pushes, then turn each segment into markup. */
-export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks }: Props) {
+export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks, onPickModel, onPickEffort }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [widthPx, setWidthPx] = useState(0);
@@ -164,6 +168,14 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
               <span key="warn" className="band-seg band-warn" title={facts.warn ?? undefined}>
                 {seg.text}
               </span>
+            );
+          }
+          const pick = seg.id === "model" ? onPickModel : seg.id === "effort" ? onPickEffort : undefined;
+          if (pick !== undefined) {
+            return (
+              <button key={seg.id} type="button" className={`band-seg band-${seg.id} band-pick`} onClick={pick} title={seg.id === "model" ? "Choose the model" : "Choose the effort"}>
+                {seg.text}
+              </button>
             );
           }
           // The segment is the short figure; its tooltip is the breakdown it has no room for

@@ -106,6 +106,7 @@ const GLYPH_COLOURS: Record<string, string> = {
   ".activity-glyph": "--nv-chrome-accent",
   '.row-tool[data-sign="◐"]::before': "--nv-chrome-accent",
   '.row-tool[data-sign="✗"]::before': "--nv-error",
+  ".tool-failure-words": "--nv-error",
   ".edit-count-added .edit-sign": "--nv-ok",
   ".edit-count-removed .edit-sign": "--nv-error",
   ".diff-added .diff-gutter": "--nv-ok",
@@ -121,7 +122,7 @@ const SURFACE_BRANCH =
 /** The three tinted fills, each with the one pair `tokens.rs` guards against
  *  it, and the selector branches that sit on it: your own tint (`--nv-tint`: your message and an
  *  inline code span in a reply), a permission card's warn tint, and a failure's
- *  error tint (a failed call's output, the lost-session card in the foot). As with `SURFACE_BRANCH`, where
+ *  error tint (the lost-session card in the foot). As with `SURFACE_BRANCH`, where
  *  the text really lands is proven by rendering ("text on a tinted fill", at the bottom of this file);
  *  this keeps each pair from being declared anywhere else. */
 const TINT_BRANCHES: { pair: RegExp; branch: RegExp }[] = [
@@ -132,7 +133,7 @@ const TINT_BRANCHES: { pair: RegExp; branch: RegExp }[] = [
   { pair: /^color: var\(--nv-warn-tint-(fg|muted)\);$/, branch: /(?:^|[\s.])permission-card\b/ },
   {
     pair: /^color: var\(--nv-error-tint-(fg|muted)\);$/,
-    branch: /(?:^|[\s.])tool-result-error\b|^\.agent-ui-conversation > \.row-error\b/,
+    branch: /^\.agent-ui-conversation > \.row-error\b/,
   },
 ];
 
@@ -581,7 +582,10 @@ describe("index.css", () => {
     // The composer is off the tint, so the tint's pair is refused there.
     expect(unguardedTextColorDeclarations(".composer-browse-hint { color: var(--nv-tint-muted); }")).toEqual(["color: var(--nv-tint-muted);"]);
     expect(unguardedTextColorDeclarations(".permission-card-description { color: var(--nv-warn-tint-muted); }")).toEqual([]);
-    expect(unguardedTextColorDeclarations(".tool-result-error .tool-result-truncated { color: var(--nv-error-tint-muted); }")).toEqual([]);
+    // A failed result has no tint under it, so the tint's pair is refused there.
+    expect(unguardedTextColorDeclarations(".tool-result .tool-result-truncated { color: var(--nv-error-tint-muted); }")).toEqual([
+      "color: var(--nv-error-tint-muted);",
+    ]);
     expect(
       unguardedTextColorDeclarations(".agent-ui-conversation > .row-error .row-hint { color: var(--nv-error-tint-muted); }"),
     ).toEqual([]);
@@ -2309,9 +2313,8 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     expect(winningDeclarationOn(line, "white-space")).toBe("pre-wrap");
     expect(winningDeclarationOn(line, "overflow")).toBe("visible");
     expect(winningDeclarationOn(line, "text-overflow")).toBe("clip");
-    // In the failure's own full-strength ink -- the error tint's guarded text, the block it sits on --
-    // which the line inherits from the preview.
-    expect(winningDeclarationOn(line.parentElement!, "color")).toBe("var(--nv-error-tint-fg)");
+    // The ordinary result's ink, guarded against the page, which the line inherits from the preview.
+    expect(winningDeclarationOn(line.parentElement!, "color")).toBe("var(--nv-muted)");
     expect(winningDeclarationOn(line, "color")).toBeFalsy();
   });
 
@@ -2323,27 +2326,21 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     expect(winningDeclarationOn(preview.querySelector(".tool-result-preview-line")!, "grid-column")).toBe("2");
   });
 
-  it("draws a call's output under a muted connector with no fill, no frame and no rail, and a failure's in a framed block on the error tint", () => {
+  it("draws a call's output, a failure's too, under a muted connector with no fill, no frame and no rail", () => {
     const ok = foldedPreview();
     // On `--nv-bg`, so the body's muted ink, and the count is muted too.
     expect(winningDeclarationOn(ok, "color")).toBe("var(--nv-muted)");
     expect(winningDeclarationOn(ok.querySelector(".tool-result-preview-more")!, "color")).toBe("var(--nv-muted)");
     const failed = foldedPreview("", true);
-    expect(failed.classList.contains("tool-result-error")).toBe(true);
-    // A failure's output is the one framed output: on the error tint, outlined all round (never a rail down
-    // one side), its text the tint's guarded pair, the frame in place of the connector, and still one
-    // zero-minimum track so a long line cannot widen the row.
-    expect(winningDeclarationOn(failed, "border-left")).toBeFalsy();
-    expect(winningDeclarationOn(failed, "border")).toBe("1px solid color-mix(in srgb, var(--nv-error) 50%, var(--nv-bg))");
-    expect(winningDeclarationOn(failed, "background")).toBe("var(--nv-error-tint)");
-    expect(winningDeclarationOn(failed, "color")).toBe("var(--nv-error-tint-fg)");
-    expect(winningDeclarationOn(failed, "grid-template-columns")).toBe("minmax(0, 1fr)");
-    expect(winningDeclarationOn(failed, "width")).toBe("max-content");
-    expect(winningDeclarationOn(failed, "min-width")).toBe("min(100%, 36rem)");
-    expect(winningDeclarationOn(failed, "max-width")).toBe("100%");
-    expect(winningDeclarationOn(failed.querySelector(".tool-result-preview-line")!, "grid-column")).toBe("1");
-    // The count stays muted on a failure, in the tint's muted ink.
-    expect(winningDeclarationOn(failed.querySelector(".tool-result-preview-more")!, "color")).toBe("var(--nv-error-tint-muted)");
+    expect(failed.getAttribute("data-state")).toBe("error");
+    // A failure takes nothing of its own: the track, the ink and the count are the ordinary result's.
+    for (const property of ["border", "border-left", "background", "padding", "border-radius", "width", "min-width", "max-width"]) {
+      expect(winningDeclarationOn(failed, property), property).toBeFalsy();
+    }
+    expect(winningDeclarationOn(failed, "color")).toBe("var(--nv-muted)");
+    expect(winningDeclarationOn(failed, "grid-template-columns")).toBe("var(--sign-w) minmax(0, 1fr)");
+    expect(winningDeclarationOn(failed.querySelector(".tool-result-preview-line")!, "grid-column")).toBe("2");
+    expect(winningDeclarationOn(failed.querySelector(".tool-result-preview-more")!, "color")).toBe("var(--nv-muted)");
     // The connector is generated content in the first track, muted, and never read out.
     const connector = splitRules(withoutComments).find((r) => r.selector === ".tool-result::before,\n.tool-result-preview::before" || r.selector.replace(/\s+/g, " ") === ".tool-result::before, .tool-result-preview::before");
     expect(connector?.declarations).toMatch(/content:\s*"⎿" \/ "";/);

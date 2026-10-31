@@ -5,7 +5,7 @@ import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "recovery" | "ending" | "background";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (left of the
  *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -39,6 +39,9 @@ export type BandFacts = {
   context: { file: string; lines: [number, number] | null } | null;
   position: string | null;
   model: string | null;
+  /** The effort the agent said the session runs at, beside the model. `null`, or absent, is not known, and
+   *  says nothing: a level is never guessed. */
+  effort?: string | null;
   /** The active tab's last reported usage, already worded (`usageSegment`) -- `text` is the
    *  segment, `title` its tooltip. `null` until a turn has reported one, and always `null` on the
    *  empty tab. */
@@ -118,6 +121,12 @@ export function tasksLine(tasks: BackgroundTaskRecord[], now: number): string {
   const tokens = workflow.usage?.total_tokens;
   const usage = tokens == null ? "" : ` · ${tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : tokens} tokens`;
   return `⏵ ${revealedText(workflow.workflow_name ?? workflow.description)} · ${status} · ${elapsedWords(now - workflow.started_at)}${usage} · /tasks${tasks.length > 1 ? ` · +${tasks.length - 1} more` : ""}`;
+}
+
+/** The band's effort segment: the agent's own word, read after the model as Claude Code's footer reads
+ *  (`opus-5-5 · xhigh`). The word is drawn as text with its hidden characters escaped. */
+export function effortSegment(effort: string): string {
+  return `· ${revealedText(effort)}`;
 }
 
 /** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
@@ -297,6 +306,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(ctxFull && !link ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
     ...(f.review && f.review.files > 0 ? [{ id: "review", text: reviewSegment(f.review.files), side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
+    ...(f.model && f.effort ? [{ id: "effort", text: effortSegment(f.effort), side: "right" } as Seg] : []),
     ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
     ...(f.unread ? [{ id: "unread", text: f.unread, side: "right" } as Seg] : []),
@@ -309,6 +319,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
     (s) => s.filter((x) => x.id !== "review"),
+    // The effort qualifies the model, so it goes first, and never stands without it.
+    (s) => s.filter((x) => x.id !== "effort"),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),

@@ -3163,7 +3163,11 @@ export default function App() {
                 if (parsed !== null) setSlashReply({ kind: "model", options: parsed.options, current: parsed.current });
               } else if (pending === "effort") {
                 const parsed = parseEffortReply(event.result_text);
-                if (parsed !== null) setSlashReply({ kind: "effort", options: parsed.options, current: null });
+                // The reply names no level; the tab's known one marks the picker when it is one of the choices.
+                const known = stateRef.current.effort;
+                if (parsed !== null) {
+                  setSlashReply({ kind: "effort", options: parsed.options, current: known !== null && parsed.options.includes(known) ? known : null });
+                }
               }
             }
           }
@@ -3580,8 +3584,24 @@ export default function App() {
     // Another agent's tab gets a leading `/` as typed, and no picker: `/model` and `/effort` are Claude's.
     pendingSlashPickerRef.current = isExternalAgent(activeTabInfo(tabsRef.current)?.agent) ? null : barePickerCommand(text);
     postToRust({ type: "send_message", request_id: requestId, tab, text });
+    // Rust clears the tab's stored draft at any send. This one never touched the box, so what the box holds is
+    // mirrored again, or a tab switch would come back to an empty box.
+    if (options?.fromPicker && draftRef.current !== "") mirrorDraft(draftRef.current);
     // A send follows the reply, wherever the reader had scrolled (`./follow.ts`).
     resumeFollowing(containerRef.current?.querySelector(".message-list"));
+  }
+
+  /** A click on the band's model or effort: the bare command, whose reply opens its picker as typing it does, and
+   *  on a Claude tab names the effort too. Sent as the picker's own send, so a refusal leaves the box alone. A running
+   *  turn says so instead: a bare command waiting for the turn's end would open a picker long after the click. */
+  function askBandPicker(command: "/model" | "/effort") {
+    // The click left the keys on the band's button, which is no place for them: they go back where they were.
+    setKeysRequest((n) => n + 1);
+    if (stateRef.current.activeTurnId !== null) {
+      showFlash(`a turn is running: choose the ${command === "/model" ? "model" : "effort"} when it ends`);
+      return;
+    }
+    sendMessage(command, { fromPicker: true });
   }
 
   /** The picker's own Enter (`./components/SlashPicker`): sends the choice as an ordinary turn
@@ -4412,6 +4432,7 @@ export default function App() {
      refuse every command until that finishes. The composer must reflect that rather than accepting
      input it cannot deliver. */
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
+  const bandPicks = !isExternalAgent(activeTab?.agent) && !sessionEnded && !handingOff;
 
   /** `a`/`d`/`D` on a card, and Enter on a card's own button. `stillThere` says whether the card the key was aimed at
    *  can still take it, or is `null` when there is no card for the cursor (the "no card here" flash). The answer runs
@@ -5598,14 +5619,34 @@ export default function App() {
         // `j` that cannot move -- `nextStop` clamps rather than returning `null` at
         // a boundary (`clampStep`'s own doc comment), so "the last stop" is the stop the keys are
         // already on (the last row, or Stop while a turn runs), not `target === null` (that case is
-        // an EMPTY conversation, handled above and unrelated). Flashes once per press: a fresh `j`
-        // there, or -- a GUI pass (2026-09-27) found a held `j` reached the bottom in silence,
-        // since every step after the first is a repeat -- the first repeat that stops after moving.
-        // Never again on the repeats after that. `k` at the FIRST stop stays silent, as vim's own `k`
-        // on the first line does (`:h j`) -- only `j` names a route the reader might actually want next.
+        // an EMPTY conversation, handled above and unrelated). A plain `j` there walks on into the
+        // box, as `j` does on the empty tab, once `stepWithinRow` above has brought a long last row to
+        // its end (`TypingGuard.walkIntoBox`); a count is a distance, not this step. A card under the
+        // cursor or a waiting question keeps the keys where the reader's answer is. Anything else
+        // flashes once per press: a fresh `j` there, or the first repeat that stops after moving. Never
+        // again on the repeats after that. `k` at the FIRST stop stays silent, as vim's own `k` on the
+        // first line does (`:h j`) -- only `j` names a route the reader might actually want next.
         if (action.delta === 1) {
           if (target === landing.from) {
-            if (!event.repeat || heldMoveRef.current) showFlash(TYPE_HINT_FLASH);
+            const onCard = timeline[cursor]?.kind === "permission";
+            const cardsAtPress = state.pendingPermissions.length;
+            const walks =
+              count === null &&
+              !onCard &&
+              !waitingQuestion &&
+              !sessionEnded &&
+              typingGuard.walkIntoBox(event, typedAt, () => {
+                // A session can end, or a question or a card arrive, inside the wait. An ended session's box takes no
+                // keys, INPUT with a question waiting is its dock, and a new card is where the reader's answer is.
+                const { status, questions, pendingPermissions } = stateRef.current;
+                const ended = status.kind === "unavailable" || status.kind === "closed";
+                const asked = questions.some((q) => q.state.kind !== "settled") || pendingPermissions.length > cardsAtPress;
+                if (modeRef.current !== "browse" || ended || asked) return;
+                setMode("input");
+                setComposerCaret("kept");
+                setComposerFocusRequest((n) => n + 1);
+              });
+            if (!walks && (!event.repeat || heldMoveRef.current)) showFlash(TYPE_HINT_FLASH);
             heldMoveRef.current = false;
           } else {
             heldMoveRef.current = true;
@@ -6626,6 +6667,7 @@ export default function App() {
           link: editorLink,
           position: timeline.length === 0 ? null : `${cursor + 1}/${timeline.length}`,
           model: shortModel(state.fallbackModel === null ? state.model : revealedText(state.fallbackModel)),
+          effort: state.effort,
           // This tab's last reported usage, right of the model; nothing until one arrives.
           usage: usageSegment(state.usage),
           // How the latest turn ended when it did not complete, until the next turn starts.
@@ -6645,6 +6687,9 @@ export default function App() {
         onOpenDetail={() => post({ type: "open_detail" })}
         onOpenTasks={() => openTasksOverlay()}
         onJump={() => unreadJumpRef.current()}
+        // `/model` and `/effort` are Claude's. Another agent's tab shows what it reports and offers no choice.
+        onPickModel={bandPicks ? () => askBandPicker("/model") : undefined}
+        onPickEffort={bandPicks ? () => askBandPicker("/effort") : undefined}
       />
       <HintLayer root={containerRef.current} hints={hints} typed={hintTyped} />
     </div>

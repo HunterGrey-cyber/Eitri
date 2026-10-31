@@ -154,6 +154,8 @@ pub struct ThemeTokens {
     /// `zaibatsu` it is as unreadable on a card as `fg` is. Derived the way `chrome_muted` is: the
     /// Comment colour guarded against `surface`, toward `surface_fg`, with the pole fallback.
     pub surface_muted: Rgb,
+    /// `StatusLine`'s fill: what the status band continues from the editor's statusline, and nothing else. A
+    /// plugin can repaint that group while nvim runs, so the window's own chrome stands on `surface` instead.
     pub chrome: Rgb,
     pub chrome_fg: Rgb,
     /// Secondary text drawn on `chrome`. Guarded against `chrome`, not `bg`: a reversed StatusLine
@@ -188,7 +190,7 @@ pub struct ThemeTokens {
     /// The panel's three tinted fills, each a small step from `bg`, each with its own text pair. `tint`
     /// (7% toward `fg`) is the surface that is yours: your sent messages, the composer, an inline code
     /// span. `warn_tint` (6% toward `warn`) is a waiting permission card. `error_tint` (9% toward
-    /// `error`) is a failed call's output and a lost session. Mixed here, not in CSS, so the text is
+    /// `error`) is a lost session. Mixed here, not in CSS, so the text is
     /// guarded against the very colour painted.
     ///
     /// `fg`/`muted` are guarded against `bg` only, and a tint spends some of that margin (measured on

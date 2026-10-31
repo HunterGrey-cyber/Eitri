@@ -660,6 +660,9 @@ pub struct ThreadStartResponse {
     pub model_provider: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The reasoning effort the thread runs at, for the band; absent is an effort Codex did not state.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Instruction files the session loaded (`AGENTS.md` and the like).
     #[serde(default)]
     pub instruction_sources: Vec<String>,

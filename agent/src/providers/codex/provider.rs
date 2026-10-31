@@ -3594,6 +3594,7 @@ impl CodexProvider {
 
         let thread_id = started.thread.id.clone();
         let model = started.model.clone().unwrap_or_default();
+        let effort = started.reasoning_effort.clone();
         let mismatch = tripwire::check_echo(&expected_echo(reviewer, sandbox), &started.echo())
             .and_then(|()| {
                 tripwire::check_instruction_sources(
@@ -3623,6 +3624,10 @@ impl CodexProvider {
                     forked: false,
                     detail: None,
                 });
+            }
+            // After a resume's verdict, which ends what was known about the process before it.
+            if effort.is_some() {
+                st.events.push_back(AgentDomainEvent::EffortReported { effort });
             }
             if let Some(mismatch) = mismatch {
                 self.trip(&mut st, mismatch);

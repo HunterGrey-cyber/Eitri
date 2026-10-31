@@ -29,7 +29,7 @@ const EMPTIED = {
 const KEPT = [
   "backend", "conversationId", "sessionId", "model", "cwd", "status", "activeTurnId", "pendingPermissions",
   "capabilities", "provider", "accountLimits", "backgroundCalls", "backgroundTasks", "availableCommands", "apiRetry",
-  "compacting", "rateLimitWarning", "fallbackModel", "notification", "cliUnseenBusy", "nextSeq", "turnThinking",
+  "compacting", "rateLimitWarning", "fallbackModel", "effort", "notification", "cliUnseenBusy", "nextSeq", "turnThinking",
   "denialsBeforeTheirCall", "changedInputsBeforeTheirCall", "runningTurnCli",
 ] as const satisfies readonly (keyof AgentUiState)[];
 

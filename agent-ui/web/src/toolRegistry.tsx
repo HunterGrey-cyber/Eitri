@@ -520,8 +520,8 @@ const ToolResult = memo(function ToolResult({
     ? truncateResult(formatResultContent(result.content), DETAILED_HEAD_CHARS, DETAILED_TAIL_CHARS)
     : truncateResult(formatResultContent(result.content));
   return (
-    <div className={`tool-result${result.isError ? " tool-result-error" : ""}`} data-state={result.isError ? "error" : "done"}>
-      <pre className="tool-result-body">{shown === "" ? "(no output)" : shown}</pre>
+    <div className="tool-result" data-state={result.isError ? "error" : "done"}>
+      <pre className="tool-result-body">{shown === "" ? "(no output)" : result.isError ? withFailureWords(shown) : shown}</pre>
       {hiddenChars > 0 && (
         <div className="tool-result-truncated">
           {hiddenChars.toLocaleString("en-US")} characters not shown
@@ -530,6 +530,25 @@ const ToolResult = memo(function ToolResult({
     </div>
   );
 });
+
+/** The words a failed command's text opens with: `Exit code 1` or `Error: Exit code 1` from the agent, or
+ *  a background command's own `failed · exit code 1` after the card line's `⎿`. */
+const FAILURE_WORDS = /^(⎿ )?((?:Error: )?[Ee]xit code[ :]+-?\d+|failed(?: · exit code -?\d+)?)(?!\w)/;
+
+/** `text` with the words that say a command failed coloured and everything else left as it is; `draw` draws each
+ *  part. Text that does not open with those words comes back whole: the row's `✗` says it failed. */
+function withFailureWords(text: string, draw: (part: string) => ReactNode = (part) => part): ReactNode {
+  const found = FAILURE_WORDS.exec(text);
+  if (found === null) return draw(text);
+  const lead = found[1] ?? "";
+  return (
+    <>
+      {lead !== "" && draw(lead)}
+      <span className="tool-failure-words">{draw(found[2])}</span>
+      {draw(text.slice(found[0].length))}
+    </>
+  );
+}
 
 /** How many lines of a folded result its row shows (Claude Code's own fold shows three). */
 export const PREVIEW_LINES = 3;
@@ -570,10 +589,9 @@ function cutLine(raw: string, chars: number): string {
 }
 
 /** What a folded, finished call shows under its invocation: the first `PREVIEW_LINES` of its result, then
- *  a muted count of the lines not shown and how to see them. A failure shows its first line only, in the
- *  error treatment (`.tool-result-error`: the colour on the rule beside it, the text in the body colour --
- *  a signal colour is never a text colour here). Nothing when the result has no lines at all. It never
- *  scrolls and never holds focus: to `j`/`k` it is part of the row.
+ *  a muted count of the lines not shown and how to see them. A failure shows its first line only, in the same
+ *  text as any other result, with only the words that say it failed coloured (`withFailureWords`). Nothing when
+ *  the result has no lines at all. It never scrolls and never holds focus: to `j`/`k` it is part of the row.
  *
  *  `wrapped` is for a call the CLI itself refused: the one line is the CLI's own reason for the refusal,
  *  which is the whole point of the row, so it wraps (muted, as the note above it is) instead of being
@@ -593,12 +611,12 @@ const ToolResultPreview = memo(function ToolResultPreview({
   const hidden = total - shown.length;
   return (
     <div
-      className={`tool-result-preview${result.isError ? " tool-result-error" : ""}${wrapped ? " tool-result-preview-wrapped" : ""}`}
+      className={`tool-result-preview${wrapped ? " tool-result-preview-wrapped" : ""}`}
       data-state={result.isError ? "error" : "done"}
     >
       {shown.map((line, i) => (
         <div key={i} className="tool-result-preview-line">
-          {line === "" ? "\u00a0" : line}
+          {line === "" ? "\u00a0" : result.isError ? withFailureWords(line) : line}
         </div>
       ))}
       {hidden > 0 && (
@@ -691,7 +709,7 @@ export function renderToolCall(
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : specialInvocation ? (
-    <div className="tool-card tool-card-muted"><Shown text={cardLine!} /></div>
+    <div className="tool-card tool-card-muted">{withFailureWords(cardLine!, (part) => <Shown text={part} />)}</div>
   ) : config ? (
     config.renderInvocation(call.input, {
       expanded: (opts.expanded ?? showResult) || opts.detailed === true,
@@ -764,7 +782,7 @@ export function renderToolCall(
       {promptNote}
       {deniedNote}
       {changedNote}
-      {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note"><Shown text={cardLine} /></div>}
+      {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note">{withFailureWords(cardLine, (part) => <Shown text={part} />)}</div>}
       {showOrdinaryResult && shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
       {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
         <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} />

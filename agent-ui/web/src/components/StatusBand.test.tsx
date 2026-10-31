@@ -267,3 +267,42 @@ it("draws the Ctrl+y segment in its own `.band-approve` element, the one `index.
   expect(segs[0].classList.contains("band-approve")).toBe(true);
   expect(segs[0].textContent).toBe("Ctrl+y approves shell: cp א ב");
 });
+
+function renderPicks(facts: BandFacts, picks: { onPickModel?: () => void; onPickEffort?: () => void }, onOpenDetail = vi.fn()) {
+  const observers = stubResizeObserver();
+  const rendered = render(<StatusBand facts={facts} paneFocused={true} onOpenDetail={onOpenDetail} {...picks} />);
+  act(() => {
+    resize(observers[0], rendered.container.querySelector(".band-measure")!, 7.2);
+    resize(observers[0], rendered.container.querySelector(".status-band")!, 900);
+  });
+  return rendered;
+}
+
+it("the model and the effort open their pickers on a click, and nothing else opens with them", () => {
+  const onPickModel = vi.fn();
+  const onPickEffort = vi.fn();
+  const onOpenDetail = vi.fn();
+  const { container } = renderPicks({ ...RUNNING, effort: "xhigh" }, { onPickModel, onPickEffort }, onOpenDetail);
+  fireEvent.click(container.querySelector<HTMLElement>("button.band-model")!);
+  expect(onPickModel).toHaveBeenCalledTimes(1);
+  expect(onPickEffort).not.toHaveBeenCalled();
+  const effort = container.querySelector<HTMLElement>("button.band-effort")!;
+  expect(effort.textContent).toBe("· xhigh");
+  fireEvent.click(effort);
+  expect(onPickEffort).toHaveBeenCalledTimes(1);
+  expect(onOpenDetail).not.toHaveBeenCalled();
+});
+
+it("an agent with nothing to choose shows what it reports as plain text", () => {
+  const { container } = renderPicks({ ...RUNNING, effort: "high" }, {});
+  expect(container.querySelector("button.band-model")).toBeNull();
+  expect(container.querySelector("button.band-effort")).toBeNull();
+  expect(container.querySelector("span.band-effort")!.textContent).toBe("· high");
+  expect(container.querySelector("span.band-model")!.textContent).toBe("sonnet-5");
+});
+
+it("an effort nobody reported draws nothing, not even a place for it", () => {
+  const { container } = renderPicks(RUNNING, { onPickModel: vi.fn(), onPickEffort: vi.fn() });
+  expect(container.querySelector("button.band-model")).not.toBeNull();
+  expect(container.querySelector(".band-effort")).toBeNull();
+});

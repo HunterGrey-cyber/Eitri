@@ -75,6 +75,7 @@ pub struct MoveSeed {
     /// band after their turn ends until a later report replaces them, so they are settled for the move.
     #[serde(default)]
     pub(crate) fallback_model: Option<String>,
+    pub(crate) effort: Option<String>,
     #[serde(default)]
     pub(crate) rate_limit_warning: Option<NoticeRecord>,
     /// The exporting projection's `last_revision`: every record's `seq` is below it, and the adopting
@@ -263,6 +264,7 @@ impl AgentSessionProjection {
             // replaces them.
             rate_limit_warning,
             fallback_model,
+            effort,
             // Live, as the phases above.
             notification: _,
             questions,
@@ -333,6 +335,7 @@ impl AgentSessionProjection {
             steer_outcomes: steer_outcomes.clone(),
             cli_unseen_busy: *cli_unseen_busy,
             fallback_model: fallback_model.clone(),
+            effort: effort.clone(),
             rate_limit_warning: rate_limit_warning.clone(),
             through_revision: *last_revision,
         }
@@ -467,6 +470,7 @@ impl AgentSessionProjection {
             steer_outcomes,
             cli_unseen_busy,
             fallback_model,
+            effort,
             rate_limit_warning,
             through_revision,
         } = seed;
@@ -500,6 +504,7 @@ impl AgentSessionProjection {
         self.steer_outcomes = steer_outcomes.clone();
         self.cli_unseen_busy = *cli_unseen_busy;
         self.fallback_model = fallback_model.clone();
+        self.effort = effort.clone();
         self.rate_limit_warning = rate_limit_warning.clone();
         // `seed_fits` refused a zero revision, so this does not wrap.
         self.last_revision = through_revision - 1;
@@ -746,6 +751,9 @@ mod tests {
             let events: Vec<AgentDomainEvent> = serde_json::from_value(case["domain_events"].clone()).unwrap();
             notices.extend(events);
         }
+        notices.push(AgentDomainEvent::EffortReported {
+            effort: Some("high".into()),
+        });
         let mut source = source_with(&[opened()]);
         fold(&mut source, &notices);
         assert!(source.is_settled());
@@ -756,11 +764,13 @@ mod tests {
         let seed: MoveSeed = serde_json::from_str(&wire).unwrap();
         let adopted = AgentSessionProjection::adopt(&core(vec![opened()], seed, Vec::new())).unwrap();
         assert_eq!(adopted.fallback_model.as_deref(), Some("small"));
+        assert_eq!(adopted.effort.as_deref(), Some("high"));
         assert_eq!(adopted.rate_limit_warning, source.rate_limit_warning);
         let (mut shown, mut destination) = (serde_json::json!({}), serde_json::json!({}));
         source.snapshot_modules(&mut shown);
         adopted.snapshot_modules(&mut destination);
         assert_eq!(shown["fallbackModel"], destination["fallbackModel"]);
+        assert_eq!(shown["effort"], destination["effort"]);
         assert_eq!(shown["rateLimitWarning"], destination["rateLimitWarning"]);
         assert_eq!(adopted.export_settled(), source.export_settled());
 

@@ -246,6 +246,13 @@ pub enum AgentDomainEvent {
         model: String,
         cwd: String,
     },
+    /// The reasoning effort the agent says this session runs at, for the band. `None` says what was known no
+    /// longer holds. Codex reports it when a thread starts. Claude Code's wire carries none, so a Claude tab
+    /// learns it only from the CLI's own reply to `/model` or `/effort <level>`
+    /// (`providers::claude_sidecar::effort_reply`). An agent that never reports one never sends this.
+    EffortReported {
+        effort: Option<String>,
+    },
     TurnStarted {
         turn_id: String,
     },
@@ -1718,6 +1725,10 @@ pub struct AgentSessionProjection {
     pub rate_limit_warning: Option<NoticeRecord>,
     #[serde(skip)]
     pub fallback_model: Option<String>,
+    /// What the last [`AgentDomainEvent::EffortReported`] said; `None` until one says something, and after a
+    /// resume, which replaces the process that was running at it.
+    #[serde(skip)]
+    pub effort: Option<String>,
     #[serde(skip)]
     pub notification: Option<NoticeRecord>,
     /// Live process task membership and retained outcomes.
@@ -2273,6 +2284,7 @@ impl AgentSessionProjection {
             // A resume replaces the CLI process; `SessionOpened` repeats on every turn of one process and
             // ends nothing.
             AgentDomainEvent::ResumeOutcome { .. } => {
+                self.effort = None;
                 roster::on_session_end(self, event);
             }
             _ => {}
@@ -2329,6 +2341,7 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::ConversationReset { .. } => reset::fold(self, event),
             AgentDomainEvent::SubagentFrame { .. } => subagents::fold(self, event),
+            AgentDomainEvent::EffortReported { effort } => self.effort = effort.clone(),
             AgentDomainEvent::SessionOpened {
                 session_id,
                 provider_session_id,
@@ -2814,6 +2827,7 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         AgentDomainEvent::SessionOpened { .. }
         | AgentDomainEvent::ToolCallCompleted { .. }
         | AgentDomainEvent::PermissionResolved { .. }
+        | AgentDomainEvent::EffortReported { .. }
         | AgentDomainEvent::PermissionModeChanged { .. }
         | AgentDomainEvent::UngatedCliMode { .. }
         | AgentDomainEvent::CliPermissionMode { .. }
@@ -3878,6 +3892,37 @@ mod unseen_turns {
 
     fn kinds(p: &AgentSessionProjection) -> Vec<SessionNoticeKind> {
         p.notices.iter().map(|n| n.kind).collect()
+    }
+
+    /// What the band shows is the last statement, a statement of nothing clears it, and a resume ends it: the
+    /// process that ran at that level is gone, and a level set for it went with it.
+    #[test]
+    fn a_reported_effort_stands_until_it_is_replaced_or_the_process_is() {
+        let said = |effort: Option<&str>| AgentDomainEvent::EffortReported {
+            effort: effort.map(str::to_string),
+        };
+        let mut p = AgentSessionProjection::default();
+        assert_eq!(p.effort, None);
+        p.apply(&said(Some("high")));
+        assert_eq!(p.effort.as_deref(), Some("high"));
+        let snapshot = |p: &AgentSessionProjection| {
+            let mut shown = serde_json::json!({});
+            p.snapshot_modules(&mut shown);
+            shown
+        };
+        assert_eq!(snapshot(&p)["effort"], "high");
+        p.apply(&said(None));
+        assert_eq!(p.effort, None);
+        assert!(snapshot(&p).get("effort").is_none());
+        p.apply(&said(Some("low")));
+        p.apply(&AgentDomainEvent::ResumeOutcome {
+            requested_provider_session_id: "c".into(),
+            status: ResumeStatus::Attached,
+            attached_provider_session_id: Some("c".into()),
+            forked: false,
+            detail: None,
+        });
+        assert_eq!(p.effort, None);
     }
 
     #[test]

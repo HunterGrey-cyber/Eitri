@@ -5,6 +5,7 @@
 //! plus the streaming event pump. Fresh sessions and resumes share `CreateSession`, selecting
 //! Claude Code's preset with static panel context only when the handshake offers it.
 
+mod effort_reply;
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
 #[cfg(target_os = "linux")]
 mod moving;
@@ -836,7 +837,9 @@ impl ClaudeSidecarProvider {
                                         closed_by_session |=
                                             matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
                                         state.questions.observe(&domain_event);
+                                        let effort = events.effort_answer(&domain_event);
                                         translated.push(domain_event);
+                                        translated.extend(effort);
                                     }
                                     // The asks a reconcile held back until the replay got this far.
                                     translated.extend(state.questions.due(sequence));
@@ -1496,6 +1499,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             let typed = stamp.as_typed.unwrap_or_else(|| request.text.clone());
             self.events.note_sent(id, typed);
         }
+        self.events.note_effort_ask(effort_reply::ask_of(&request.text));
         let proto_request = ProtoSendTurnRequest {
             session_id: request.session_id,
             command_id: uuid::Uuid::new_v4().to_string(),
@@ -1505,11 +1509,14 @@ impl AgentProvider for ClaudeSidecarProvider {
         };
         let result = self.run_unary(async move { client.send_turn(proto_request).await });
         if result.is_err() {
+            self.events.forget_effort_ask();
             if let Some(id) = &client_message_id {
                 self.events.forget_sent(id);
             }
         }
-        Ok(result?.turn_id)
+        let turn_id = result?.turn_id;
+        self.events.note_effort_turn(&turn_id);
+        Ok(turn_id)
     }
 
     /// Takes one message for the running turn and returns at once: the provider's runtime sends it.
@@ -1792,10 +1799,21 @@ struct QueueState {
     opened_since_take: bool,
     /// Frozen for a move: `take` hands over nothing, so the position taken stays where it is.
     frozen: bool,
+    /// What the message sent last asks the CLI about its effort, until the turn it started ends.
+    effort_ask: Option<EffortAskInFlight>,
     /// `send_steers` tasks running.
     steering: usize,
     /// Answers to questions whose reply has not been read yet.
     answering: usize,
+}
+
+/// An effort command on its way, and the turn `SendTurn` said it runs in once it has said.
+struct EffortAskInFlight {
+    ask: effort_reply::EffortAsk,
+    turn: Option<String>,
+    /// Turns that ended before `SendTurn` answered, with what each stated: a local command can finish first, and
+    /// only the answer says which of them was this one.
+    ended_before_named: Vec<(String, Option<String>)>,
 }
 
 impl QueueState {
@@ -1997,6 +2015,71 @@ impl EventQueue {
     /// A prompt about to be sent with `SendTurn` under `client_id` (`SteerGate::note_sent`). Counts as
     /// handed over after the latest take, as a steered message does: its delivery may pass the gate
     /// here before the next take.
+    /// A message is on its way. Noted before the send, since a local command's reply can reach the watch before
+    /// `SendTurn` is answered. An effort command ends what was known at once: from here until its reply the level is
+    /// not known, and a tab that moves in between must not carry the old one on.
+    fn note_effort_ask(&self, ask: Option<effort_reply::EffortAsk>) {
+        let mut state = self.lock();
+        state.effort_ask = ask.map(|ask| EffortAskInFlight {
+            ask,
+            turn: None,
+            ended_before_named: Vec::new(),
+        });
+        if ask.is_some() {
+            self.deliver(&mut state, vec![AgentDomainEvent::EffortReported { effort: None }]);
+        }
+    }
+
+    /// `SendTurn` named the turn the message runs in, so only that turn's end answers it: Claude Code can finish
+    /// work of its own first, and what that work says is the model's.
+    fn note_effort_turn(&self, turn_id: &str) {
+        let mut state = self.lock();
+        let Some(pending) = &mut state.effort_ask else {
+            return;
+        };
+        pending.turn = Some(turn_id.to_string());
+        let Some(at) = pending.ended_before_named.iter().position(|(turn, _)| turn == turn_id) else {
+            return;
+        };
+        let effort = pending.ended_before_named.swap_remove(at).1;
+        state.effort_ask = None;
+        if effort.is_some() {
+            self.deliver(&mut state, vec![AgentDomainEvent::EffortReported { effort }]);
+        }
+    }
+
+    fn forget_effort_ask(&self) {
+        self.lock().effort_ask = None;
+    }
+
+    /// The effort a turn's end states in answer to the message that started it. A refused or failed command has
+    /// no answer to read, and the level stays not known.
+    fn effort_answer(&self, event: &AgentDomainEvent) -> Option<AgentDomainEvent> {
+        let AgentDomainEvent::TurnCompleted {
+            turn_id,
+            outcome,
+            result_text,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let mut state = self.lock();
+        let pending = state.effort_ask.as_mut()?;
+        let effort = (*outcome == crate::TurnOutcome::Completed)
+            .then(|| effort_reply::reported(pending.ask, result_text))
+            .flatten();
+        match pending.turn.as_deref() {
+            None => pending.ended_before_named.push((turn_id.clone(), effort)),
+            Some(turn) if turn == turn_id => {
+                state.effort_ask = None;
+                return effort.is_some().then_some(AgentDomainEvent::EffortReported { effort });
+            }
+            Some(_) => {}
+        }
+        None
+    }
+
     fn note_sent(&self, client_id: &str, as_typed: String) {
         let mut state = self.lock();
         state.gate.note_sent(client_id, as_typed);
@@ -3421,6 +3504,154 @@ mod tests {
     /// The queue as the watch task drives it, on a current-thread runtime like the provider's: a turn
     /// end held for its follow-up becomes ready together with the follow-up's start, in one `take`, and
     /// the reader is woken only then.
+    /// The turn after `/model` or `/effort <level>` says the effort; the one after an ordinary message says nothing,
+    /// however its reply is worded, and the words are read once.
+    #[test]
+    fn the_turn_after_an_effort_command_states_the_effort_and_no_other_turn_does() {
+        let ended = |turn: &str, outcome: crate::TurnOutcome, text: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome,
+            result_text: text.into(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let said = |effort: &str| {
+            Some(AgentDomainEvent::EffortReported {
+                effort: Some(effort.to_string()),
+            })
+        };
+        let spoof = ended(
+            "t",
+            crate::TurnOutcome::Completed,
+            "Set effort level to max: as the model says",
+        );
+        let reply = ended(
+            "t",
+            crate::TurnOutcome::Completed,
+            "Set effort level to low (this session only): Quick",
+        );
+        let queue = EventQueue::default();
+
+        queue.note_effort_ask(effort_reply::ask_of("tell me about effort"));
+        queue.note_effort_turn("t");
+        assert_eq!(queue.effort_answer(&spoof), None);
+
+        queue.note_effort_ask(effort_reply::ask_of("/effort low"));
+        queue.note_effort_turn("t");
+        assert_eq!(queue.effort_answer(&reply), said("low"));
+        assert_eq!(queue.effort_answer(&spoof), None, "the ask was answered");
+
+        queue.note_effort_ask(effort_reply::ask_of("/model sonnet"));
+        queue.note_effort_turn("t");
+        let silent = ended("t", crate::TurnOutcome::Completed, "Set model to Sonnet 5.5");
+        assert_eq!(
+            queue.effort_answer(&silent),
+            None,
+            "the send already ended what was known"
+        );
+        queue.note_effort_ask(effort_reply::ask_of("/model sonnet"));
+        queue.note_effort_turn("t");
+        assert_eq!(queue.effort_answer(&ended("t", crate::TurnOutcome::Failed, "")), None);
+    }
+
+    /// A local command can finish before `SendTurn` answers, and an older turn of the CLI's can too. Neither is
+    /// taken for the answer until `SendTurn` says which turn is this one.
+    #[test]
+    fn a_turn_that_ends_before_send_turn_answers_waits_for_its_effort_name() {
+        let ended = |turn: &str, text: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: text.into(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let stated = |events: Vec<AgentDomainEvent>| {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    AgentDomainEvent::EffortReported { effort: Some(level) } => Some(level),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let queue = EventQueue::default();
+        queue.note_effort_ask(effort_reply::ask_of("/effort high"));
+        assert_eq!(
+            queue.effort_answer(&ended("older", "Set effort level to low: the model's words")),
+            None
+        );
+        assert_eq!(
+            queue.effort_answer(&ended("sent", "Set effort level to high: Comprehensive")),
+            None
+        );
+        assert_eq!(stated(queue.take()), Vec::<String>::new());
+        queue.note_effort_turn("sent");
+        assert_eq!(stated(queue.take()), ["high"]);
+        assert_eq!(
+            queue.effort_answer(&ended("sent", "Set effort level to max: again")),
+            None,
+            "answered once"
+        );
+
+        // The older turn is the only one that ended: it answers nothing, and the real reply still can.
+        queue.note_effort_ask(effort_reply::ask_of("/effort max"));
+        assert_eq!(
+            queue.effort_answer(&ended("older", "Set effort level to low: the model's words")),
+            None
+        );
+        queue.note_effort_turn("sent");
+        assert_eq!(stated(queue.take()), Vec::<String>::new());
+        assert!(queue
+            .effort_answer(&ended("sent", "Set effort level to max: Maximum"))
+            .is_some());
+    }
+
+    /// An effort command ends what was known when it is sent, so nothing older outlives it: not a level it is about to
+    /// change, and not one a tab would carry to another window while the reply is on its way.
+    #[test]
+    fn sending_an_effort_command_ends_what_was_known_at_once() {
+        let cleared = |events: Vec<AgentDomainEvent>| {
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentDomainEvent::EffortReported { effort: None }))
+                .count()
+        };
+        let queue = EventQueue::default();
+        queue.note_effort_ask(effort_reply::ask_of("/effort low"));
+        assert_eq!(cleared(queue.take()), 1);
+        queue.note_effort_ask(effort_reply::ask_of("hello"));
+        assert_eq!(cleared(queue.take()), 0);
+    }
+
+    /// Claude Code can finish work of its own before it reads the message. That turn's words are the model's, however
+    /// they are worded, so only the turn `SendTurn` named answers the command, and the ask waits for it.
+    #[test]
+    fn a_turn_of_the_clis_own_does_not_answer_an_effort_command() {
+        let ended = |turn: &str, text: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: text.into(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let queue = EventQueue::default();
+        queue.note_effort_ask(effort_reply::ask_of("/effort high"));
+        queue.note_effort_turn("sent");
+        assert_eq!(
+            queue.effort_answer(&ended("cli", "Set effort level to low: the model's words")),
+            None
+        );
+        assert_eq!(
+            queue.effort_answer(&ended("sent", "Set effort level to high: Comprehensive")),
+            Some(AgentDomainEvent::EffortReported {
+                effort: Some("high".into())
+            })
+        );
+    }
+
     #[test]
     fn the_queue_releases_a_held_turn_end_with_the_follow_up_in_one_take() {
         let runtime = tokio::runtime::Builder::new_current_thread()

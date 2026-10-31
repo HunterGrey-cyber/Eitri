@@ -84,6 +84,33 @@ describe("the band degrades by priority", () => {
     }
     expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
   });
+  it("puts the effort right after the model, and shows none it was not told", () => {
+    const facts: BandFacts = { ...idle, effort: "xhigh" };
+    const wide = bandLayout(facts, 900, 7.2);
+    expect(wide.map((s) => s.id)).toEqual(["mode", "pill", "model", "effort", "position"]);
+    expect(wide.find((s) => s.id === "effort")).toMatchObject({ text: "· xhigh", side: "right" });
+    expect(ids(900, idle)).not.toContain("effort");
+    expect(ids(900, { ...idle, effort: null })).not.toContain("effort");
+    expect(ids(900, { ...idle, model: null, effort: "xhigh" })).not.toContain("effort");
+  });
+  it("drops the effort after the review pointer and before the model, and never leaves it alone", () => {
+    const facts: BandFacts = { ...idle, effort: "xhigh", review: { files: 3 } };
+    expect(ids(900, facts)).toContain("effort");
+    const widths = Array.from({ length: 80 }, (_, i) => 100 + i * 10);
+    const shown = widths.map((width) => bandLayout(facts, width, 7.2).map((s) => s.id));
+    for (const [i, row] of shown.entries()) {
+      if (row.includes("effort")) expect(row, `width ${widths[i]}`).toContain("model");
+      if (row.includes("review")) expect(row, `width ${widths[i]}`).toContain("effort");
+    }
+    expect(shown.some((row) => row.includes("model") && !row.includes("effort")), "a width keeps the model alone").toBe(true);
+    expect(shown.some((row) => row.includes("effort") && !row.includes("review")), "a width keeps the effort").toBe(true);
+    // Its width counts: wide enough for the band without it, too narrow with it.
+    expect(bandLayout({ ...idle, effort: "xhigh" }, 300, 7.2).map((s) => s.id)).not.toContain("effort");
+  });
+  it("draws a hidden character in the effort as its escape", () => {
+    const seg = bandLayout({ ...idle, effort: "hi\u202egh" }, 900, 7.2).find((s) => s.id === "effort")!;
+    expect(seg.text).not.toContain("\u202e");
+  });
   it("a y/n prompt takes everything right of the mode", () => {
     expect(ids(520, { ...running, prompt: "close 2 \"docs\"? (y/n)" })).toEqual(["mode", "prompt"]);
   });

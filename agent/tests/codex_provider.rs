@@ -674,6 +674,43 @@ fn a_read_only_session_says_so_at_its_start_and_every_turn() {
     );
 }
 
+/// The effort a thread's answer states reaches the band; an answer that states none says nothing.
+#[test]
+fn the_effort_the_thread_states_is_reported_after_it_opens() {
+    let answer = thread_response(3, "th-effort");
+    let stated =
+        answer["write"]
+            .as_str()
+            .unwrap()
+            .replacen(r#""result":{"#, r#""result":{"reasoningEffort":"high","#, 1);
+    let mut script = handshake(UA, signed_in());
+    script.push(expect_request(3, "thread/start"));
+    script.push(json!({ "write": stated }));
+    let provider = connect(script).expect("connects");
+    provider.start(start_request(Reviewer::User)).expect("starts");
+    let events = provider.pump();
+    assert!(
+        matches!(events[0], AgentDomainEvent::SessionOpened { .. }),
+        "{events:#?}"
+    );
+    assert_eq!(
+        events[1],
+        AgentDomainEvent::EffortReported {
+            effort: Some("high".into())
+        }
+    );
+
+    let mut script = handshake(UA, signed_in());
+    script.push(expect_request(3, "thread/start"));
+    script.push(thread_response(3, "th-silent"));
+    let provider = connect(script).expect("connects");
+    provider.start(start_request(Reviewer::User)).expect("starts");
+    assert!(!provider
+        .pump()
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::EffortReported { .. })));
+}
+
 #[test]
 fn the_plain_resume_capability_stays_off() {
     // Resuming goes through the external start (`resume` in `ExternalStart`); the Claude-shaped capability
@@ -789,6 +826,7 @@ fn stream_maps_a_recorded_command_and_message() {
         .iter()
         .map(|e| match e {
             AgentDomainEvent::SessionOpened { .. } => "opened",
+            AgentDomainEvent::EffortReported { .. } => "effort",
             AgentDomainEvent::TurnStarted { .. } => "turn",
             AgentDomainEvent::ToolCallStarted { .. } => "call",
             AgentDomainEvent::ToolCallCompleted { .. } => "result",
@@ -800,7 +838,7 @@ fn stream_maps_a_recorded_command_and_message() {
         .collect();
     assert_eq!(
         kinds,
-        ["opened", "turn", "call", "result", "boundary", "text", "done"],
+        ["opened", "effort", "turn", "call", "result", "boundary", "text", "done"],
         "{events:#?}"
     );
 
@@ -808,7 +846,12 @@ fn stream_maps_a_recorded_command_and_message() {
         AgentDomainEvent::SessionOpened { model, .. } => assert_eq!(model, "gpt-6-luna"),
         other => panic!("{other:?}"),
     }
-    match &events[2] {
+    assert!(
+        matches!(&events[1], AgentDomainEvent::EffortReported { effort: Some(_) }),
+        "what the thread's answer states: {:?}",
+        events[1]
+    );
+    match &events[3] {
         AgentDomainEvent::ToolCallStarted {
             turn_id,
             tool_use_id,
@@ -827,7 +870,7 @@ fn stream_maps_a_recorded_command_and_message() {
         }
         other => panic!("{other:?}"),
     }
-    match &events[3] {
+    match &events[4] {
         AgentDomainEvent::ToolCallCompleted {
             tool_use_id,
             content,
@@ -840,13 +883,13 @@ fn stream_maps_a_recorded_command_and_message() {
         }
         other => panic!("{other:?}"),
     }
-    match &events[5] {
+    match &events[6] {
         AgentDomainEvent::ContentDelta { kind, text, .. } => {
             assert_eq!((*kind, text.as_str()), (ContentKind::Text, "done"));
         }
         other => panic!("{other:?}"),
     }
-    match &events[6] {
+    match &events[7] {
         AgentDomainEvent::TurnCompleted {
             outcome,
             result_text,

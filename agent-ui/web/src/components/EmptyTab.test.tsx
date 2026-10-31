@@ -7,7 +7,7 @@ import type { EmptyTabProps } from "./EmptyTab";
 import type { Hello, ResumableSession, TabInfo } from "../types";
 import { TABLE } from "../testFixtures";
 import { WHICH_KEY_DELAY_MS } from "../leader";
-import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "../typingGuard";
+import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS, TypingGuard } from "../typingGuard";
 
 afterEach(cleanup);
 
@@ -283,9 +283,6 @@ describe("EmptyTab", () => {
       const current = () => root.querySelector<HTMLElement>('[aria-current="true"]');
       // DOM order is box then rows; visual order is rows then box, and j/k must follow the screen.
       const items = () => Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-      expect(items().indexOf(current()!)).toBe(0);
-      // Clamped, not wrapped: j on the box, the bottom, stays put.
-      fireEvent.keyDown(root, { key: "j" });
       expect(items().indexOf(current()!)).toBe(0);
       fireEvent.keyDown(root, { key: "k" });
       expect(items().indexOf(current()!)).toBe(3);
@@ -1410,6 +1407,58 @@ describe("EmptyTab: a failure while the composer has the keys", () => {
    stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a `y` that
    copied the handoff command is typing. This happened right here: "expla" typed on the empty tab lost
    its first letters to the `i` inside "explain". Time is vitest's fake clock. */
+describe("EmptyTab: j walks from the box's row into the box, by the conversation's rule", () => {
+  const at = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  function onTheBox() {
+    const typingGuard = new TypingGuard();
+    const rendered = renderEmpty({ onFlash: vi.fn(), typingGuard });
+    const root = toBrowse(rendered, { ...rendered.props, typingGuard });
+    at(1000);
+    return { ...rendered, root, typingGuard };
+  }
+  beforeEach(() => void vi.useFakeTimers());
+  afterEach(() => void vi.useRealTimers());
+
+  it.each(["j", "ArrowDown"])("%s alone on the box enters it, and only once it was let go", (key) => {
+    const { container, root, typingGuard } = onTheBox();
+    fireEvent.keyDown(root, { key });
+    typingGuard.onKeyUp(key.toLowerCase(), Date.now());
+    expect(container.querySelector("textarea")).toBeNull();
+    at(TYPING_GUARD_MS + 20);
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("j from a row above lands on the box and stays there until the next press", () => {
+    const { container, root, typingGuard } = onTheBox();
+    fireEvent.keyDown(root, { key: "k" });
+    at(1000);
+    fireEvent.keyDown(root, { key: "j" });
+    typingGuard.onKeyUp("j", Date.now());
+    at(1000);
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]')[0].getAttribute("aria-current")).toBe("true");
+  });
+
+  it("a held j never enters: its first repeat ends the wait", () => {
+    const { container, root } = onTheBox();
+    fireEvent.keyDown(root, { key: "j" });
+    at(550);
+    fireEvent.keyDown(root, { key: "j", repeat: true });
+    at(1000);
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("the first letters of typed prose do nothing", () => {
+    const { container, root } = onTheBox();
+    for (const key of ["j", "u"]) {
+      fireEvent.keyDown(root, { key });
+      at(60);
+    }
+    at(1000);
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+});
+
 describe("EmptyTab: typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   const at = (ms: number) => act(() => vi.advanceTimersByTime(ms));

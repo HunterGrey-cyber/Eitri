@@ -235,6 +235,34 @@ describe("j/k inside a row taller than the view", () => {
     expect(current(container)).toBe("c");
   });
 
+  it("a long last row scrolls to its end before j can walk into the box", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      prompts("a", "b");
+      const list = fakeLayout(container, [100, 990]);
+      const mode = () => container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+      const tap = () => {
+        const at = document.activeElement ?? document.body;
+        fireEvent.keyDown(at, { key: "j" });
+        fireEvent.keyUp(at, { key: "j" });
+        act(() => vi.advanceTimersByTime(300));
+      };
+      press("g");
+      press("g");
+      act(() => vi.advanceTimersByTime(300));
+      for (let i = 0; i < 40 && list.scrollTop < 690; i++) {
+        tap();
+        expect(mode()).toBe("browse");
+      }
+      expect(list.scrollTop).toBe(690);
+      tap();
+      expect(mode()).toBe("input");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("k is the mirror: the last step leaves the row's top on the top margin line", () => {
     const { container } = started();
     prompts("a", "b", "c");

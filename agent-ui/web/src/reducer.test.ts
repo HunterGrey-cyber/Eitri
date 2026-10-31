@@ -83,6 +83,19 @@ describe("applyEvent", () => {
     }
   });
 
+  it("keeps the effort the agent last stated, as AgentSessionProjection does", () => {
+    const said = (effort: string | null): AgentDomainEvent => ({ type: "effort_reported", effort });
+    let state = applyEvent(initialState(), said("high"));
+    expect(state.effort).toBe("high");
+    state = applyEvent(state, said(null));
+    expect(state.effort).toBeNull();
+    state = applyEvent(state, said("low"));
+    state = applyEvent(state, { type: "conversation_reset", new_conversation_id: "n", reason: "clear" } as never);
+    expect(state.effort, "/clear keeps the process, and what it runs at").toBe("low");
+    state = applyEvent(state, { type: "resume_outcome", requested_provider_session_id: "c", status: "attached", attached_provider_session_id: "c", forked: false, detail: null } as never);
+    expect(state.effort, "a resume replaces the process").toBeNull();
+  });
+
   it("turn_completed does not change status (v2 semantics: only session_unavailable/session_closed do)", () => {
     let state = applyEvent(initialState(), { type: "session_opened", session_id: "abc", provider_session_id: "claude-abc", model: "m", cwd: "/tmp" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t1" });

@@ -659,12 +659,29 @@ describe("a folded result's preview", () => {
     }
   });
 
-  it("draws a failed call in the error treatment, with its first line only", () => {
+  it("draws a failed call in ordinary result text, with its first line only", () => {
     const c = folded("bash: nope: command not found\nsecond\nthird\nfourth", {}, true);
-    expect(preview(c)!.classList.contains("tool-result-error")).toBe(true);
     expect(preview(c)!.getAttribute("data-state")).toBe("error");
+    expect(c.querySelector(".tool-failure-words")).toBeNull();
     expect(shownLines(c)).toEqual(["bash: nope: command not found"]);
     expect(more(c)).toBe("… +3 lines (Enter to expand, Ctrl+o for all)");
+  });
+
+  it("colours only the words that say a command failed, folded and expanded", () => {
+    const line = "Exit code 1";
+    for (const text of [line, `Error: ${line}`, "Exit code: 127"]) {
+      const c = folded(`${text}\nnpm ERR! nope`, {}, true);
+      expect(c.querySelector(".tool-failure-words")!.textContent).toBe(text);
+      expect(shownLines(c)).toEqual([text]);
+    }
+    const expanded = (isError: boolean) =>
+      render(<>{renderToolCall(call({ name: "Bash", input: { command: "x" }, result: { content: "Exit code 2\nnpm ERR! nope", isError } }), true, { cardLine: null })}</>).container;
+    const c = expanded(true);
+    expect(c.querySelector(".tool-failure-words")!.textContent).toBe("Exit code 2");
+    expect(c.querySelector(".tool-result-body")!.textContent).toBe("Exit code 2\nnpm ERR! nope");
+    // A successful result that talks about an exit code is left alone.
+    expect(expanded(false).querySelector(".tool-failure-words")).toBeNull();
+    expect(folded("Exit codes are listed below\n", {}, true).querySelector(".tool-failure-words")).toBeNull();
   });
 
   it("a one-line failure is the line and nothing else", () => {
@@ -719,7 +736,7 @@ describe("a folded result's preview", () => {
       true,
     );
     expect(shownLines(failed)).toEqual(["String to replace not found in file."]);
-    expect(preview(failed)!.classList.contains("tool-result-error")).toBe(true);
+    expect(preview(failed)!.getAttribute("data-state")).toBe("error");
   });
 
   it("keeps a runaway line, and a huge result, bounded in what it puts in the page", () => {
@@ -768,15 +785,23 @@ describe("background and scheduling cards", () => {
     ["stopped", 'Background command "C01t limit" was stopped after reaching its background time limit', 1800000, "stopped at its background time limit · 30m 00s"],
     ["stopped", "stopped because the system is running low on memory", 12000, "stopped: the system was low on memory"],
   ] as const)("settles %s with %s", (status, summary, ms, expected) => {
-    const out = show(background(), settled(status, summary, ms));
+    const out = show(background(), settled(status, summary, ms)).replace(/<[^>]*>/g, "");
     expect(out).toContain(expected);
     expect(out).not.toContain("Running in the background");
+  });
+
+  it("colours a failed background command's label and not the rest of its line", () => {
+    const c = background();
+    const cardLine = toolCardLine(c, settled("failed", "command failed (exit code 1)", 12000));
+    const { container } = render(<>{renderToolCall(c, false, { cardLine })}</>);
+    expect(container.querySelector(".tool-failure-words")?.textContent).toBe("failed · exit code 1");
+    expect(container.textContent).toContain("failed · exit code 1 · 0m 12s");
   });
 
   it("settles restored A cards from their notice, and missing outcomes with the session", () => {
     const s = initialState();
     s.notices = [{ seq: 4, kind: "task", level: "notice", content: "exit code 1", scalars: {}, taskId: limTask, toolUseId: "toolu_lim", taskStatus: "failed" }];
-    expect(show(background(), s)).toContain("failed · exit code 1");
+    expect(show(background(), s).replace(/<[^>]*>/g, "")).toContain("failed · exit code 1");
     expect(show(background())).toContain("stopped with the session");
   });
 

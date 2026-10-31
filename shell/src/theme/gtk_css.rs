@@ -10,12 +10,14 @@ use eitri_core::theme::tokens::{ThemeTokens, PROSE_FONT_STACK};
 pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     let bg = tokens.bg.hex();
     let fg = tokens.fg.hex();
-    let chrome = tokens.chrome.hex();
-    let chrome_fg = tokens.chrome_fg.hex();
-    // Every text colour drawn on `chrome` comes from a token guarded against `chrome`. The
-    // bg-guarded `muted` and the unguarded `mode_browse` are never used on chrome: a reversed
-    // StatusLine makes `chrome` the colour they were pushed toward.
-    let chrome_muted = tokens.chrome_muted.hex();
+    // The window's chrome: the top bar and what joins it (strips, float bars, the tray, the prefix strip and
+    // panel, the toast, the prompts, the first-start screen). It stands on `surface`, from the scheme's own
+    // `NormalFloat`/`Normal`, never on the `chrome` token: that is `StatusLine`, which a plugin may repaint while
+    // nvim runs, and the bar moves only when the colour scheme does. Every text colour drawn on it comes from a
+    // token guarded against `surface`; the bg-guarded `muted` and the unguarded `mode_browse` are never used here.
+    let bar = tokens.surface.hex();
+    let bar_fg = tokens.surface_fg.hex();
+    let bar_muted = tokens.surface_muted.hex();
     let border = tokens.border.hex();
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
@@ -50,15 +52,15 @@ window {{
 }}
 
 .topbar {{
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border-bottom: 1px solid {border};
     padding: 0 8px;
     min-height: 38px;
 }}
 
 .topbar-app-name {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
     font-size: 13px;
     margin-right: 8px;
@@ -67,14 +69,14 @@ window {{
 }}
 
 .topbar-project-name {{
-    color: {chrome_muted};
+    color: {bar_muted};
     font-size: 12px;
 }}
 
 /* `marked: <title>` while a module is marked for `swap.marked`: text only, quiet like the project
    name, never a frame on the module itself. */
 .topbar-mark {{
-    color: {chrome_muted};
+    color: {bar_muted};
     font-size: 12px;
     margin-right: 8px;
 }}
@@ -87,7 +89,7 @@ window {{
     background-image: none;
     border: none;
     box-shadow: none;
-    color: {chrome_muted};
+    color: {bar_muted};
     font-size: 12px;
     min-height: 22px;
     padding: 0 4px;
@@ -116,7 +118,7 @@ window {{
     background-image: none;
     border: none;
     box-shadow: none;
-    color: {chrome_muted};
+    color: {bar_muted};
     min-width: 28px;
     min-height: 28px;
     padding: 0;
@@ -167,12 +169,12 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
    23px plus its 1px rule, the 24px the geometry assumes before it can measure one, so the first
    strip on screen does not move what is below it. */
 {strip} {{
-    background-color: {chrome};
+    background-color: {bar};
     background-image: none;
 }}
 
 {strip} > label {{
-    color: {chrome_muted};
+    color: {bar_muted};
     font-size: 12px;
     min-height: 23px;
     padding: 0 8px;
@@ -180,7 +182,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 {strip} > label.{active} {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
 }}
 
@@ -189,13 +191,13 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
    geometry gives the bar. The grip is a 12px square in the rule's colour at the float's bottom-right
    corner. */
 {floatbar} {{
-    background-color: {chrome};
+    background-color: {bar};
     background-image: none;
     border-bottom: 1px solid {border};
 }}
 
 {floatbar} > label {{
-    color: {chrome_muted};
+    color: {bar_muted};
     font-size: 12px;
     min-height: 23px;
     padding: 0 8px;
@@ -209,8 +211,8 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .pane-placeholder {{
-    background-color: {chrome};
-    color: {chrome_muted};
+    background-color: {bar};
+    color: {bar_muted};
     font-size: 12px;
 }}
 
@@ -228,7 +230,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     background-image: none;
     border: 1px solid {border};
     box-shadow: none;
-    color: {chrome_muted};
+    color: {bar_muted};
     min-height: 22px;
     padding: 0 8px;
     border-radius: 4px;
@@ -236,7 +238,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .tray-chip.attention {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
 }}
 
@@ -248,25 +250,25 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
    adds those 10px to the armed bar's minimum width; while the prefix does not wait the strip is
    hidden, margin and all. */
 .prefix-strip {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-size: 12px;
     margin-right: 10px;
 }}
 
 .prefix-strip .dimmed {{
-    color: {chrome_muted};
+    color: {bar_muted};
 }}
 
 .prefix-strip .strip-dot {{
-    color: {chrome_muted};
+    color: {bar_muted};
 }}
 
 /* The hint panel (`shell::gtk_host::prefix_panel`): the keys and what they do while the prefix waits, over the
    window's bottom. Opaque, in the top bar's own guarded pair, so it reads the same over any module; a group's
    title and the footer are the muted token. It never takes a click or the keys. */
 .prefix-panel {{
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border: 1px solid {border};
     border-radius: 6px;
     padding: 8px 12px;
@@ -274,26 +276,26 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .prefix-panel .panel-heading {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
 }}
 
 .prefix-panel .panel-group-title {{
-    color: {chrome_muted};
+    color: {bar_muted};
     font-weight: 700;
 }}
 
 .prefix-panel .panel-key {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
 }}
 
 .prefix-panel .panel-label {{
-    color: {chrome_fg};
+    color: {bar_fg};
 }}
 
 .prefix-panel .panel-footer {{
-    color: {chrome_muted};
+    color: {bar_muted};
 }}
 
 /* The first-start screen: one panel over the window's middle, in the top bar's own guarded pair, opaque so it reads the
@@ -301,8 +303,8 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
    the machine was read for, the presets (the chosen one in the solid block of the window's focus language), then the
    footer's keys and the shortcut buttons. The panel itself takes the keys, so it shows no focus ring of its own. */
 .onboarding-screen {{
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border: 1px solid {border};
     border-radius: 8px;
     padding: 16px 20px;
@@ -311,7 +313,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .onboarding-screen .onboarding-title {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-weight: 700;
     font-size: 15px;
 }}
@@ -323,17 +325,17 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 .onboarding-screen .onboarding-item-tag,
 .onboarding-screen .onboarding-help,
 .onboarding-screen .onboarding-footer {{
-    color: {chrome_muted};
+    color: {bar_muted};
 }}
 
 .onboarding-screen .onboarding-row-text {{
-    color: {chrome_fg};
+    color: {bar_fg};
 }}
 
 .onboarding-screen .onboarding-question,
 .onboarding-screen .onboarding-status,
 .onboarding-screen .onboarding-item {{
-    color: {chrome_fg};
+    color: {bar_fg};
 }}
 
 .onboarding-screen .onboarding-question {{
@@ -341,20 +343,20 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .onboarding-screen .onboarding-item.selected {{
-    background-color: {chrome_fg};
-    color: {chrome};
+    background-color: {bar_fg};
+    color: {bar};
 }}
 
 .onboarding-screen .onboarding-body {{
-    color: {chrome_fg};
+    color: {bar_fg};
     font-family: monospace;
     font-size: 12px;
 }}
 
 .onboarding-screen .onboarding-button {{
     background: none;
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border: 1px solid {border};
     border-radius: 4px;
     padding: 2px 8px;
@@ -362,7 +364,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 .onboarding-screen .onboarding-button-label {{
-    color: {chrome_fg};
+    color: {bar_fg};
 }}
 
 /* A preset's row is a button for the mouse that looks like the row: no frame of its own, the chosen preset's solid
@@ -380,36 +382,36 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 /* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
    way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
    block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
-   language: solid means the keys go here. The pair is `chrome_fg` behind `chrome` text, the
-   reverse of the bar's guarded `chrome_fg`-on-`chrome` text pair, so it has the same 4.5:1.
+   language: solid means the keys go here. The pair is `surface_fg` behind `surface` text, the
+   reverse of the bar's guarded text pair, so it has the same 4.5:1.
    Placed after `.win-btn:hover` so a hovered AND focused button still shows the cursor. */
 .topbar-item:focus {{
-    background-color: {chrome_fg};
-    color: {chrome};
+    background-color: {bar_fg};
+    color: {bar};
 }}
 
 /* The `Ctrl+a` prefix is waiting for its next key (`eitri_core::wm::keys`). The same solid block as the top
-   bar's own cursor -- the pair is chrome_fg behind chrome text, guarded at 4.5:1 -- as a
+   bar's own cursor -- the pair is surface_fg behind surface text, guarded at 4.5:1 -- as a
    tmux theme highlights its session name while the prefix is down. */
 .topbar-app-name.prefix-armed {{
-    background-color: {chrome_fg};
-    color: {chrome};
+    background-color: {bar_fg};
+    color: {bar};
 }}
 
 /* A layout verb was refused -- `Ctrl+a x` on the last module on screen: the
    same block, for 200ms (`main.rs`'s `show_flash`, when the controller's chrome model asks for the
    flash). Its own class, so the prefix's own indicator is never switched off by the flash ending. */
 .topbar-app-name.refused {{
-    background-color: {chrome_fg};
-    color: {chrome};
+    background-color: {bar_fg};
+    color: {bar};
 }}
 
 /* The toast (`shell::toast`): a hidden chat's new permission card, over everything in
    the top right. The top bar's own guarded pair, so it reads the same in every mode, Immersive
    included, where it is the only thing that says so. */
 .module-toast {{
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border: 1px solid {border};
     border-radius: 6px;
     padding: 6px 10px;
@@ -419,8 +421,8 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 /* The window-close y/n and `prefix x`'s kill y/n: `.module-toast`'s own colours, `shell::close_prompt`'s own
    widget. Sized to sit inside the top bar's own strip, where the prefix strip just drew (`eitri_core::wm::close::prompt_origin`). */
 .close-prompt {{
-    background-color: {chrome};
-    color: {chrome_fg};
+    background-color: {bar};
+    color: {bar_fg};
     border: 1px solid {border};
     border-radius: 4px;
     padding: 2px 8px;
@@ -586,9 +588,9 @@ mod tests {
     }
 
     #[test]
-    fn text_on_chrome_is_paired_with_chrome_not_with_the_window_background() {
-        // lunaperche: reversed StatusLine, no Function. With bg-guarded tokens the (since deleted)
-        // status bar's "NORMAL" came out at 1.00:1 on chrome; the top bar's text is the same pair.
+    fn text_on_the_bar_is_paired_with_the_bar_not_with_the_window_background() {
+        // lunaperche: reversed StatusLine, no Function: the fill the bar left behind, and still no reason for
+        // its text to be anything but the pair guarded against what it stands on.
         let t = ThemeTokens::derive(&NvimThemePayload {
             v: PAYLOAD_VERSION,
             groups: [
@@ -627,55 +629,121 @@ mod tests {
         });
         let css = gtk_css(&t);
         for (selector, colour, min) in [
-            (".module-toast", t.chrome_fg, 4.5),
-            (".close-prompt", t.chrome_fg, 4.5),
-            (".tray-chip", t.chrome_muted, 4.5),
-            (".tray-chip.attention", t.chrome_fg, 4.5),
-            ("constrip > label", t.chrome_muted, 4.5),
-            ("constrip > label.active", t.chrome_fg, 4.5),
-            ("floatbar > label", t.chrome_muted, 4.5),
-            (".prefix-strip", t.chrome_fg, 4.5),
-            (".prefix-strip .dimmed", t.chrome_muted, 4.5),
-            (".prefix-strip .strip-dot", t.chrome_muted, 4.5),
-            (".prefix-panel", t.chrome_fg, 4.5),
-            (".prefix-panel .panel-heading", t.chrome_fg, 4.5),
-            (".prefix-panel .panel-group-title", t.chrome_muted, 4.5),
-            (".prefix-panel .panel-key", t.chrome_fg, 4.5),
-            (".prefix-panel .panel-label", t.chrome_fg, 4.5),
-            (".prefix-panel .panel-footer", t.chrome_muted, 4.5),
-            (".onboarding-screen", t.chrome_fg, 4.5),
-            (".onboarding-screen .onboarding-title", t.chrome_fg, 4.5),
-            (".onboarding-screen .onboarding-footer", t.chrome_muted, 4.5),
-            (".onboarding-screen .onboarding-row-text", t.chrome_fg, 4.5),
-            (".onboarding-screen .onboarding-body", t.chrome_fg, 4.5),
-            (".onboarding-screen .onboarding-button-label", t.chrome_fg, 4.5),
-            (".topbar-app-name", t.chrome_fg, 4.5),
-            (".topbar-project-name", t.chrome_muted, 4.5),
-            (".topbar-mark", t.chrome_muted, 4.5),
-            (".topbar-workspace", t.chrome_muted, 4.5),
-            (".win-btn", t.chrome_muted, 4.5),
+            (".module-toast", t.surface_fg, 4.5),
+            (".close-prompt", t.surface_fg, 4.5),
+            (".tray-chip", t.surface_muted, 4.5),
+            (".tray-chip.attention", t.surface_fg, 4.5),
+            ("constrip > label", t.surface_muted, 4.5),
+            ("constrip > label.active", t.surface_fg, 4.5),
+            ("floatbar > label", t.surface_muted, 4.5),
+            (".prefix-strip", t.surface_fg, 4.5),
+            (".prefix-strip .dimmed", t.surface_muted, 4.5),
+            (".prefix-strip .strip-dot", t.surface_muted, 4.5),
+            (".prefix-panel", t.surface_fg, 4.5),
+            (".prefix-panel .panel-heading", t.surface_fg, 4.5),
+            (".prefix-panel .panel-group-title", t.surface_muted, 4.5),
+            (".prefix-panel .panel-key", t.surface_fg, 4.5),
+            (".prefix-panel .panel-label", t.surface_fg, 4.5),
+            (".prefix-panel .panel-footer", t.surface_muted, 4.5),
+            (".onboarding-screen", t.surface_fg, 4.5),
+            (".onboarding-screen .onboarding-title", t.surface_fg, 4.5),
+            (".onboarding-screen .onboarding-footer", t.surface_muted, 4.5),
+            (".onboarding-screen .onboarding-row-text", t.surface_fg, 4.5),
+            (".onboarding-screen .onboarding-body", t.surface_fg, 4.5),
+            (".onboarding-screen .onboarding-button-label", t.surface_fg, 4.5),
+            (".topbar-app-name", t.surface_fg, 4.5),
+            (".topbar-project-name", t.surface_muted, 4.5),
+            (".topbar-mark", t.surface_muted, 4.5),
+            (".topbar-workspace", t.surface_muted, 4.5),
+            (".win-btn", t.surface_muted, 4.5),
         ] {
             let body = rule(&css, selector);
             assert!(
                 body.contains(&format!("\n    color: {};", colour.hex())),
                 "{selector}: {body}"
             );
-            assert!(colour.contrast(t.chrome) >= min, "{selector} is unreadable on chrome");
+            assert!(colour.contrast(t.surface) >= min, "{selector} is unreadable on the bar");
         }
+    }
+
+    /// A plugin that repaints `StatusLine` while nvim runs, or a scheme that gives it a loud colour, moves the status
+    /// band and nothing of the window's own chrome: every rule of the stylesheet is the same either way.
+    #[test]
+    fn the_stylesheet_does_not_read_statusline() {
+        let payload = |status: HlAttrs| NvimThemePayload {
+            v: PAYLOAD_VERSION,
+            groups: [
+                (
+                    "Normal".to_string(),
+                    HlAttrs {
+                        fg: Some(0xc6c6c6),
+                        bg: Some(0x101010),
+                        reverse: false,
+                    },
+                ),
+                ("StatusLine".to_string(), status),
+            ]
+            .into(),
+            options: NvimOptions {
+                background: "dark".into(),
+                guifont: String::new(),
+                colors_name: "any".into(),
+                cmdheight: None,
+            },
+        };
+        let quiet = ThemeTokens::derive(&payload(HlAttrs {
+            fg: Some(0xc6c6c6),
+            bg: Some(0x303030),
+            reverse: false,
+        }));
+        let cyan = ThemeTokens::derive(&payload(HlAttrs {
+            fg: Some(0x000000),
+            bg: Some(0x00ffff),
+            reverse: false,
+        }));
+        assert_ne!(quiet.chrome, cyan.chrome, "the band's fill does follow StatusLine");
+        // The one rule apart: the close button's hover is the `error` signal, which is guarded for the band too.
+        let without_the_signal = |t: &ThemeTokens| {
+            let css = gtk_css(t);
+            let start = css.find("\n.win-btn.close:hover {").unwrap();
+            let end = start + css[start..].find('}').unwrap();
+            format!("{}{}", &css[..start], &css[end..])
+        };
+        assert_eq!(without_the_signal(&quiet), without_the_signal(&cyan));
+    }
+
+    /// The fill comes from the scheme, so a light scheme gets a light bar, and its text is guarded on it either way.
+    #[test]
+    fn the_bar_follows_the_scheme_and_its_text_stays_guarded() {
+        for t in [dawn(), lunaperche(), ThemeTokens::fallback()] {
+            let bar = rule(&gtk_css(&t), ".topbar").to_string();
+            assert!(
+                bar.contains(&format!("background-color: {};", t.surface.hex())),
+                "{bar}"
+            );
+            assert!(bar.contains(&format!("\n    color: {};", t.surface_fg.hex())), "{bar}");
+            assert!(t.surface_fg.contrast(t.surface) >= 4.5);
+            assert!(t.surface_muted.contrast(t.surface) >= 4.5);
+        }
+        assert_ne!(
+            dawn().surface,
+            lunaperche().surface,
+            "the fill is the scheme's, not a constant"
+        );
     }
 
     /// The chosen preset is the solid block of the window's focus language: the guarded pair, reversed.
     #[test]
-    fn the_chosen_preset_is_the_reversed_chrome_pair() {
+    fn the_chosen_preset_is_the_reversed_bar_pair() {
         let t = ThemeTokens::fallback();
         let css = gtk_css(&t);
         let body = rule(&css, ".onboarding-screen .onboarding-item.selected");
         assert!(
-            body.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+            body.contains(&format!("background-color: {};", t.surface_fg.hex())),
             "{body}"
         );
-        assert!(body.contains(&format!("color: {};", t.chrome.hex())), "{body}");
-        assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
+        assert!(body.contains(&format!("color: {};", t.surface.hex())), "{body}");
+        assert!(t.surface_fg.contrast(t.surface) >= 4.5);
     }
 
     /// Focus is shown by cursors, never by chrome around the panes. The design considers a
@@ -693,11 +761,11 @@ mod tests {
             assert!(!css.contains("outline:"), "no outline");
             let item = rule(&css, ".topbar-item:focus");
             assert!(
-                item.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                item.contains(&format!("background-color: {};", t.surface_fg.hex())),
                 "{item}"
             );
-            assert!(item.contains(&format!("color: {};", t.chrome.hex())), "{item}");
-            assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
+            assert!(item.contains(&format!("color: {};", t.surface.hex())), "{item}");
+            assert!(t.surface_fg.contrast(t.surface) >= 4.5);
             assert!(
                 css.find(".win-btn:hover").unwrap() < css.find(".topbar-item:focus").unwrap(),
                 "hover must not win"
@@ -757,10 +825,10 @@ mod tests {
             let css = gtk_css(&t);
             let refused = rule(&css, ".topbar-app-name.refused");
             assert!(
-                refused.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                refused.contains(&format!("background-color: {};", t.surface_fg.hex())),
                 "{refused}"
             );
-            assert!(refused.contains(&format!("color: {};", t.chrome.hex())), "{refused}");
+            assert!(refused.contains(&format!("color: {};", t.surface.hex())), "{refused}");
             assert!(css.find("\n.topbar-app-name {").unwrap() < css.find("\n.topbar-app-name.refused").unwrap());
         }
     }
@@ -774,10 +842,10 @@ mod tests {
             let css = gtk_css(&t);
             let armed = rule(&css, ".topbar-app-name.prefix-armed");
             assert!(
-                armed.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+                armed.contains(&format!("background-color: {};", t.surface_fg.hex())),
                 "{armed}"
             );
-            assert!(armed.contains(&format!("color: {};", t.chrome.hex())), "{armed}");
+            assert!(armed.contains(&format!("color: {};", t.surface.hex())), "{armed}");
             assert!(
                 css.find("\n.topbar-app-name {").unwrap() < css.find("\n.topbar-app-name.prefix-armed {").unwrap(),
                 "the armed rule must come after the base rule"

@@ -38,6 +38,11 @@
  *  key says `TYPE_HINT_FLASH`. BROWSE's `y` copies immediately and opens a typing burst: following
  *  keys within the window are swallowed, so `y i w` cannot copy, enter INPUT and type `w`.
  *  The clipboard is still overwritten; text without `i` is still dropped. A lone `i` after a pause works.
+ *
+ *  `j`/Down with nowhere further to go walks on into the box (`walkIntoBox`), and asks the most of any key:
+ *  quiet before it, so a fast `jjj` to the bottom stops there; quiet after it, because `j` is a first letter and
+ *  "just do it" must not lose its `j` to the box; and let go, because a held key would otherwise repeat into the
+ *  draft as `jjjj` from the moment the box took the keys.
  *  Pure: no DOM reads. Callers supply event timestamps; injectable timers default to globals looked
  *  up at call time so fake timers apply. */
 
@@ -315,6 +320,12 @@ export class TypingGuard {
     heldFlash: string = cancelledFlash,
   ): boolean {
     return this.wait(t, repeat, run, cancelledFlash, "", heldKey, heldFlash);
+  }
+
+  /** `j`/Down that can move no further: `enter` runs as for `deferUntilReleased`, so only a press that stood alone
+   *  and was let go reaches the box. Returns whether it waits; otherwise the caller says how to type. */
+  walkIntoBox(event: { repeat: boolean; code?: string; key: string }, t: number, enter: () => void): boolean {
+    return this.deferUntilReleased(t, event.repeat, enter, TYPE_HINT_FLASH, heldKeyName(event));
   }
 
   /** A key let go at `t` (`timeOfRelease`), named as `deferUntilReleased` was given it. Ends a wait

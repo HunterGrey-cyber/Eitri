@@ -913,7 +913,7 @@ describe("the band's usage segment", () => {
     const { container } = started(snapshotState({ model: "claude-sonnet-5" }));
     events(1, { type: "turn_started", turn_id: "t1" }, turnDone(REPORT));
     expect(usageText(container)).toBe("4.3k tok $0.04");
-    const right = Array.from(container.querySelectorAll(".band-right .band-seg")).map((el) => el.className.replace("band-seg ", ""));
+    const right = Array.from(container.querySelectorAll(".band-right .band-seg")).map((el) => el.className.replace("band-seg ", "").replace(" band-pick", ""));
     expect(right.indexOf("band-usage")).toBe(right.indexOf("band-model") + 1);
     expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("since this tab started or resumed");
     expect(container.querySelector<HTMLElement>(".band-usage")!.title).toContain("input 1,000 · output 3,300 · cache write 0 · cache read 0 · $0.0420");
@@ -993,6 +993,87 @@ describe("slash command pickers", () => {
     fireEvent.change(container.querySelector("textarea")!, { target: { value: command } });
     fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
   }
+
+  /** The turn a bare command started, answered with `reply`; called more than once in a test. */
+  let revision = 0;
+  beforeEach(() => {
+    revision = 0;
+  });
+  function finishBareCommand(reply: string) {
+    const turn_id = `t${revision}`;
+    const list: AgentDomainEvent[] = [
+      { type: "turn_started", turn_id },
+      { type: "turn_completed", turn_id, outcome: "completed", result_text: reply, stop_reason: null, usage: null, detail: { reason: null, api_error_status: null, message: null } as never },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: revision, throughRevision: revision + list.length, events: list });
+    revision += list.length;
+  }
+
+  it("the band's model sends the bare command, its effort too, and the reply opens the same picker", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    dispatchLiveTab(snapshotState({ model: "claude-opus-5-5", effort: "high" }), 0);
+    act(() => widen(container));
+    fireEvent.click(container.querySelector<HTMLElement>("button.band-model")!);
+    expect(lastOfType("send_message")!.text).toBe("/model");
+    expect(container.querySelector("textarea")?.value ?? "").toBe("");
+    finishBareCommand(MODEL_REPLY);
+    expect(container.querySelector(".slash-picker")).not.toBeNull();
+    fireEvent.keyDown(container.querySelector(".slash-picker")!, { key: "Escape" });
+    fireEvent.click(container.querySelector<HTMLElement>("button.band-effort")!);
+    expect(lastOfType("send_message")!.text).toBe("/effort");
+    finishBareCommand(EFFORT_REPLY);
+    expect(container.querySelector(".slash-picker-current-marker")?.parentElement?.textContent).toContain("high");
+    vi.unstubAllGlobals();
+  });
+
+  it("a click on the band leaves the box's draft where a tab switch finds it", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = startedApp();
+      dispatchLiveTab(snapshotState({ model: "claude-opus-5-5" }), 0);
+      act(() => widen(container));
+      fireEvent.change(container.querySelector("textarea")!, { target: { value: "half a thought" } });
+      act(() => vi.advanceTimersByTime(1000));
+      expect(lastOfType("draft")!.text).toBe("half a thought");
+      const mirrored = lastOfType("draft");
+      fireEvent.click(container.querySelector<HTMLElement>("button.band-model")!);
+      expect(lastOfType("send_message")!.text).toBe("/model");
+      act(() => vi.advanceTimersByTime(1000));
+      // Rust clears its stored draft at the send, so the box's text goes back to it.
+      expect(lastOfType("draft")).not.toBe(mirrored);
+      expect(lastOfType("draft")!.text).toBe("half a thought");
+      expect(container.querySelector("textarea")!.value).toBe("half a thought");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a click on the band while a turn runs sends nothing and says why", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    dispatchLiveTab(snapshotState({ model: "claude-opus-5-5", activeTurnId: "t1" }), 0);
+    act(() => widen(container));
+    const sent = lastOfType("send_message");
+    fireEvent.click(container.querySelector<HTMLElement>("button.band-model")!);
+    expect(lastOfType("send_message")).toBe(sent);
+    expect(container.querySelector(".band-message")!.textContent).toBe("a turn is running: choose the model when it ends");
+    vi.unstubAllGlobals();
+  });
+
+  it("the band offers no picker on another agent's tab, and shows the effort it reports", () => {
+    const widen = stubBandWidth();
+    const { container } = startedApp();
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState({ model: "gpt-6", effort: "medium" }) });
+    dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent: "codex" }], defaultMode: "auto" });
+    act(() => widen(container));
+    expect(container.querySelector("button.band-model")).toBeNull();
+    expect(container.querySelector("button.band-effort")).toBeNull();
+    expect(container.querySelector(".band-effort")?.textContent).toBe("· medium");
+    vi.unstubAllGlobals();
+  });
 
   it("sends a bare /model as an ordinary turn -- it is no longer held back", () => {
     const { container } = startedApp();
@@ -11958,13 +12039,15 @@ describe("o/A and the caret, j at the end, Esc while running", () => {
     expect(container.querySelector("textarea")).toBeNull();
   });
 
-  it("j on the last stop flashes the typing hint once", () => {
+  it("j on the last stop right after another key flashes the typing hint once", () => {
     const widen = stubBandWidth();
     const { container } = startedApp();
     act(() => widen(container));
     // The one row this conversation has is already both the first and the last stop (a snapshot
     // lands the cursor on the last row).
-    fireEvent.keyDown(conversationRoot(container), { key: "j" });
+    const root = conversationRoot(container);
+    fireEvent.keyDown(root, { key: "k" });
+    fireEvent.keyDown(root, { key: "j" });
     expect(container.querySelector(".band-message")!.textContent).toBe("i or Ctrl+j to type");
     vi.unstubAllGlobals();
   });
@@ -13639,11 +13722,11 @@ describe("BROWSE visual mode", () => {
       const pickerRequest = lastOfType("send_message")!;
       expect(pickerRequest.text).toBe("/model haiku");
       dispatch({ kind: "command_result", requestId: pickerRequest.request_id, ok: false, error: "no active session" });
-      // Fixed: the picker's own refusal never mirrors anything back to Rust -- no new `draft` post
-      // at all, so the quoted text is left exactly as it was, never restored, still less
-      // concatenated with "/model haiku" ahead of it.
+      // The picker's own refusal puts nothing back: the only `draft` post after it is the send's own, saying what
+      // the box still holds, so the quoted text is left exactly as it was, never concatenated with "/model haiku".
       act(() => vi.advanceTimersByTime(300));
-      expect(posted.filter((m) => m.type === "draft")).toHaveLength(draftPostsBefore);
+      expect(posted.filter((m) => m.type === "draft").slice(draftPostsBefore).map((m) => m.text)).toEqual(["> hello world\n\n"]);
+      expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value ?? "> hello world\n\n").toBe("> hello world\n\n");
       // A footer flash, not the banner "It is back in the box" message an ordinary composer send's
       // refusal gets.
       expect(container.querySelector(".band-message")?.textContent).toBe("no active session");
@@ -14407,6 +14490,188 @@ describe("coming back restores where you were", () => {
     const { seen } = recording(() => dispatch({ kind: "arrive" }));
     expect(current(container)).toBe("row 5");
     expect(seen).toEqual(["resume"]);
+  });
+});
+
+/* `j`/Down off the last stop walks on into the box, the same way on the conversation as on the empty tab, but only
+   as a press that stood alone and was let go. Time is vitest's fake clock. */
+describe("j reaches the box from the last stop", () => {
+  const HINT = "i or Ctrl+j to type";
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const modeOf = (container: HTMLElement) => container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode;
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const conversationRoot = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+  function onLastRow(overrides: Partial<AgentUiState> = {}) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }], ...overrides }), 0);
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    wait(1000);
+    return { ...rendered, root: conversationRoot(rendered.container) };
+  }
+  /** A press and its release `held` ms later, then the rest of the wait. */
+  function tap(root: HTMLElement, init: Record<string, unknown> = { key: "j" }, held = 60) {
+    fireEvent.keyDown(root, init);
+    wait(held);
+    fireEvent.keyUp(root, init);
+    wait(TYPING_GUARD_MS + 20);
+  }
+
+  it.each([["j", { key: "j", code: "KeyJ" }], ["Down", { key: "ArrowDown", code: "ArrowDown" }]])("%s alone enters INSERT like i", (_name, init) => {
+    const { container, root } = onLastRow();
+    tap(root, init);
+    expect(modeOf(container)).toBe("input");
+    expect(band(container)).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector("textarea"));
+    expect(container.querySelector("textarea")!.value).toBe("");
+  });
+
+  it("waits for the quiet after the press, so nothing moves while the key could still be a first letter", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyUp(root, { key: "j" });
+    wait(TYPING_GUARD_MS - 20);
+    expect(modeOf(container)).toBe("browse");
+    wait(40);
+    expect(modeOf(container)).toBe("input");
+  });
+
+  it("a held j stops at the last row: its first repeat ends the wait and nothing reaches the draft", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "j" });
+    wait(550);
+    expect(modeOf(container)).toBe("browse");
+    fireEvent.keyDown(root, { key: "j", repeat: true });
+    wait(1000);
+    fireEvent.keyDown(root, { key: "j", repeat: true });
+    fireEvent.keyUp(root, { key: "j" });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("a key held down with repeat off is refused at its release", () => {
+    const { container, root } = onLastRow();
+    tap(root, { key: "j" }, 700);
+    expect(modeOf(container)).toBe("browse");
+    expect(band(container)).toBe(HINT);
+  });
+
+  it("a held j that walks down to the last row does not fall in when it is let go", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "k" });
+    wait(1000);
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyDown(root, { key: "j", repeat: true });
+    fireEvent.keyUp(root, { key: "j" });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("the first letters of a sentence typed as a reply lands do nothing", () => {
+    const { container, root } = onLastRow();
+    for (const key of ["j", "u", "s", "t"]) {
+      fireEvent.keyDown(root, { key });
+      wait(60);
+      fireEvent.keyUp(root, { key });
+      wait(20);
+    }
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("a fast run of j to the bottom stops there", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "k" });
+    wait(1000);
+    tap(root, { key: "j" }, 40); // onto the last row, and the release keeps nothing waiting
+    expect(modeOf(container)).toBe("browse");
+    fireEvent.keyDown(root, { key: "k" });
+    wait(1000);
+    fireEvent.keyDown(root, { key: "j" });
+    wait(120);
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyUp(root, { key: "j" });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a count is a distance: 3j on the last row stays there", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "3" });
+    wait(1000);
+    tap(root);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a card under the cursor, a question and an ended session keep j as it was", () => {
+    const card = onLastRow({
+      pendingPermissions: [{ permissionId: "p1", toolName: "Bash", input: { command: "ls" }, toolUseId: null, seq: 3 } as never],
+    });
+    tap(card.root);
+    expect(modeOf(card.container)).toBe("browse");
+    expect(band(card.container)).toBe(HINT);
+    card.unmount();
+    const ended = onLastRow({ status: { kind: "closed", reason: "completed" } as never });
+    tap(ended.root);
+    expect(ended.container.querySelector("textarea")).toBeNull();
+  });
+
+  it("a session that ends inside the wait keeps the keys out of its box", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyUp(root, { key: "j" });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ status: { kind: "closed", reason: "completed" } as never }) });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a question that arrives inside the wait keeps the panel in BROWSE", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyUp(root, { key: "j" });
+    const questions = [{ interactionId: "q1", toolUseId: "u1", turnId: null, seq: 3, questions: [], state: { kind: "waiting" } }];
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ questions: questions as never }) });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("a card that arrives inside the wait keeps the panel in BROWSE", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "j" });
+    fireEvent.keyUp(root, { key: "j" });
+    const card = { permissionId: "p1", toolName: "Bash", input: { command: "ls" }, toolUseId: null, seq: 3 };
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ pendingPermissions: [card as never] }) });
+    wait(1000);
+    expect(modeOf(container)).toBe("browse");
+  });
+
+  it("the ? sheet and the search line keep j for themselves", () => {
+    const { container, root } = onLastRow();
+    fireEvent.keyDown(root, { key: "?" });
+    wait(1000);
+    tap(document.activeElement as HTMLElement);
+    expect(modeOf(container)).toBe("browse");
+    fireEvent.keyDown(document.activeElement ?? root, { key: "Escape" });
+    wait(1000);
+    fireEvent.keyDown(conversationRoot(container), { key: "/" });
+    wait(1000);
+    const line = document.activeElement as HTMLElement;
+    expect(line.tagName).toBe("INPUT");
+    tap(line);
+    expect(modeOf(container)).toBe("browse");
   });
 });
 

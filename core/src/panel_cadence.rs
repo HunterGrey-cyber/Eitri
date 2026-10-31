@@ -127,6 +127,7 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::UserPromptSubmitted { .. }
         | AgentDomainEvent::TurnCompleted { .. }
         | AgentDomainEvent::SessionOpened { .. }
+        | AgentDomainEvent::EffortReported { .. }
         | AgentDomainEvent::SessionUnavailable { .. }
         | AgentDomainEvent::SessionClosed { .. }
         | AgentDomainEvent::ResumeOutcome { .. }

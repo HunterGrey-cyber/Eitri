@@ -73,6 +73,7 @@ fn send_and_wait(session: &mut AgentSession, prompt: &str) {
 
 fn print_event(event: &AgentDomainEvent) {
     match event {
+        AgentDomainEvent::EffortReported { effort } => println!("[effort] {effort:?}"),
         AgentDomainEvent::SessionOpened {
             session_id,
             provider_session_id,

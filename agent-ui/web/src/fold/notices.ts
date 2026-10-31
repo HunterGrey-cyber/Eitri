@@ -34,7 +34,7 @@ export function fold(state: AgentUiState, event: AgentDomainEvent): AgentUiState
 export function fromSnapshot(state: AgentUiState, snapshot: AgentUiSnapshot): AgentUiState {
   return { ...state, apiRetry: snapshot.apiRetry ?? null, compacting: snapshot.compacting ?? false,
     rateLimitWarning: snapshot.rateLimitWarning ?? null, fallbackModel: snapshot.fallbackModel ?? null,
-    notification: snapshot.notification ?? null };
+    effort: snapshot.effort ?? null, notification: snapshot.notification ?? null };
 }
 
 export function onTurnEnd(state: AgentUiState, _event: AgentDomainEvent): AgentUiState { return { ...state, apiRetry: null }; }

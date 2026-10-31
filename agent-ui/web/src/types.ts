@@ -441,6 +441,9 @@ export type AgentUiState = {
   sessionId: string | null;
   providerSessionId: string | null;
   model: string | null; cwd: string | null;
+  /** The effort the agent last said this session runs at (`effort_reported`). `null` is not known, which on a Claude
+   *  tab is the usual state: its wire carries none, and only the CLI's own `/model` and `/effort` replies say it. */
+  effort: string | null;
   userPrompts: UserPromptRecord[];
   transcript: TranscriptMessage[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
@@ -580,6 +583,7 @@ export type AgentUiSnapshot = Omit<
   | "compacting"
   | "rateLimitWarning"
   | "fallbackModel"
+  | "effort"
   | "notification"
   | "backgroundTasks"
   | "questions"
@@ -594,6 +598,7 @@ export type AgentUiSnapshot = Omit<
   compacting?: boolean;
   rateLimitWarning?: NoticeRecord | null;
   fallbackModel?: string | null;
+  effort?: string | null;
   notification?: NoticeRecord | null;
   backgroundTasks?: TaskRoster;
   questions?: AgentUiState["questions"];
@@ -766,6 +771,7 @@ export type AgentDomainEvent =
   | { type: "conversation_reset"; new_conversation_id: string; trigger: string | null }
   | { type: "subagent_frame"; parent_tool_use_id: string; frame: SubagentContent }
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
+  | { type: "effort_reported"; effort: string | null }
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
   /** A message put into the running turn was read by the agent: a user prompt at this point of the
