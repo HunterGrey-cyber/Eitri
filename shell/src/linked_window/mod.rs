@@ -9,6 +9,7 @@
 //! link to window 1 (`registry`). The pieces here that decide something are plain functions over the layout, so they
 //! are tested without a display; the GTK wiring is `build_ui`'s.
 
+pub mod closes;
 pub mod driver;
 pub mod editor;
 pub(crate) mod focus;

@@ -1200,6 +1200,11 @@ pub struct RestoreGo {
 }
 
 impl RestoreGo {
+    /// How many of the tabs to start had a turn running when they were saved, and it never ended.
+    pub fn cut_turns(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.planned.turn_running).count()
+    }
+
     /// The sessions to start, in order: what a caller that takes its leases ahead of time needs.
     pub fn session_ids(&self) -> Vec<String> {
         self.tabs
@@ -4742,6 +4747,7 @@ impl TabSet {
                         mode: tab.mode,
                         view: saved_view(tab.view),
                         window: None,
+                        turn_running: tab.turn_running(),
                     },
                 ))
             })
@@ -4766,6 +4772,7 @@ impl TabSet {
                 mode: granted.mode,
                 view: granted.planned.view.and_then(saved_view),
                 window: None,
+                turn_running: granted.planned.turn_running,
             });
         }
         if self.kind != BackendKind::Sidecar {
@@ -4788,6 +4795,7 @@ impl TabSet {
                         mode: tab.mode,
                         view: saved_view(tab.view),
                         window: None,
+                        turn_running: tab.turn_running(),
                     },
                 ))
             })
@@ -4819,6 +4827,7 @@ impl TabSet {
                     mode: granted.mode,
                     view: granted.planned.view.and_then(saved_view),
                     window: None,
+                    turn_running: granted.planned.turn_running,
                 },
             ));
         }
@@ -8767,6 +8776,34 @@ mod tests {
         shut_down_all(&mut set);
     }
 
+    /// A window can end with no chance to say anything, so a saved tab has to say a turn is running while it runs.
+    #[test]
+    fn a_saved_tab_says_a_turn_is_running_for_as_long_as_it_runs() {
+        let dir = workspace("tabs-saved-turn");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: "s-1".into(),
+            model: "m".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+        });
+        until("the session", || !set.saved_snapshot(PROJECT).unwrap().is_empty());
+        let running = |set: &TabSet| set.saved_snapshot(PROJECT).unwrap().tabs[0].turn_running;
+        assert!(!running(&set));
+
+        provider.queue(started("t1"));
+        pump_until_running(&mut set, &dir, tab, true);
+        assert!(running(&set));
+
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        pump_until_running(&mut set, &dir, tab, false);
+        assert!(!running(&set));
+        shut_down_all(&mut set);
+    }
+
     /// A turn that ends badly still ran for some time, and the turn-ending row says how long.
     #[test]
     fn an_interrupted_turn_records_its_duration_too() {
@@ -12233,6 +12270,7 @@ mod tests {
             saved_mode: mode,
             label: format!("title of {id}"),
             view: None,
+            turn_running: false,
         }
     }
 
@@ -14790,6 +14828,29 @@ mod tests {
         assert_eq!(set.oldest_card_place(), Some(TabPlace::Base(three)));
     }
 
+    /// A restore waiting for its trust answer is written as it stands, and a crash meanwhile leaves that file to the next
+    /// start, which still has the cut turn to tell of.
+    #[test]
+    fn a_restore_waiting_for_its_answer_goes_on_saying_a_turn_never_finished() {
+        let mut set = set();
+        let from = set.active();
+        let mut cut = planned("a", SessionModeChoice::Auto);
+        cut.turn_running = true;
+        let plan = plan_of(vec![cut, planned("b", SessionModeChoice::Auto)], Some("a"));
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+
+        let saved = set.saved_snapshot("conv").unwrap();
+        let running: Vec<(&str, bool)> = saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.turn_running))
+            .collect();
+        assert_eq!(running, [("a", true), ("b", false)]);
+    }
+
     #[test]
     fn a_saved_snapshot_writes_each_bound_tabs_view() {
         let mut set = set();
@@ -14850,6 +14911,7 @@ mod tests {
     fn planned_in(id: &str, view: u8) -> PlannedTab {
         PlannedTab {
             view: ViewId::new(view),
+            turn_running: false,
             ..planned(id, SessionModeChoice::Auto)
         }
     }
@@ -15670,6 +15732,7 @@ mod external_tab_tests {
             saved_mode: mode,
             label: format!("title of {id}"),
             view: None,
+            turn_running: false,
         }
     }
 
@@ -15823,6 +15886,7 @@ mod external_tab_tests {
                 mode: SessionModeChoice::Bypass,
                 view: None,
                 window: None,
+                turn_running: false,
             }]
         );
         assert_eq!(others_active(&saved), Some(0));
@@ -17611,6 +17675,7 @@ mod question_gate_tests {
                 saved_mode: SessionModeChoice::Bypass,
                 label: "saved".into(),
                 view: None,
+                turn_running: false,
             }],
             skipped: Vec::new(),
             active_session: Some("r1".into()),

@@ -24,6 +24,7 @@ fn saved(session: &str) -> SavedTab {
         mode: SessionModeChoice::Auto,
         view: None,
         window: None,
+        turn_running: false,
     }
 }
 

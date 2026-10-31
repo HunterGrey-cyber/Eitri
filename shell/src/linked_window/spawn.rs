@@ -45,6 +45,7 @@ use eitri_core::window_link::{FocusTarget, Msg, Summary, TurnEdge};
 use eitri_core::wm::feedback::TAB_ALREADY_MOVING_TEXT;
 use eitri_core::wm::PeerId;
 
+use super::closes::WindowCloses;
 use super::driver::{LinkDriver, Partner, HANDSHAKE_WITHIN};
 use super::group_tabs::{GroupTabs, TabReports, REPORT_AFTER};
 use super::hand_over::{self, TabHolder, TabHolderSlot};
@@ -243,6 +244,7 @@ pub struct Pair {
     restore_failed: Rc<RefCell<Option<OnRestoreFailed>>>,
     /// Window 1 only: what runs when a module window it started never linked.
     module_failed: Rc<RefCell<Option<OnModuleFailed>>>,
+    closes: Rc<WindowCloses>,
     /// Window 2 and a module window: the pair lock their `welcome` carried, kept for as long as the window lives, so
     /// an orphan can hand a copy to the window 1 that comes back for it.
     second_lock: Rc<RefCell<Option<PairLock>>>,
@@ -404,6 +406,7 @@ impl Pair {
         hooks: Hooks,
         second_lock: Rc<RefCell<Option<PairLock>>>,
     ) -> Rc<Pair> {
+        let modules: Rc<RefCell<ModuleWindows>> = Rc::default();
         let pair = Rc::new(Pair {
             role: RefCell::new(role),
             lock: lock.map(Rc::new),
@@ -415,7 +418,7 @@ impl Pair {
             clean: std::cell::Cell::new(false),
             running: Rc::default(),
             second: RefCell::new(None),
-            modules: Rc::default(),
+            modules: modules.clone(),
             child_exited: Rc::default(),
             peer_action: Rc::default(),
             tab_holder: Rc::default(),
@@ -427,6 +430,7 @@ impl Pair {
             restore_pending: Rc::default(),
             restore_failed: Rc::default(),
             module_failed: Rc::default(),
+            closes: WindowCloses::new(Rc::downgrade(&modules)),
             second_lock,
             orphan: RefCell::new(None),
             relinked: RefCell::new(None),
@@ -828,20 +832,22 @@ impl Pair {
     }
 
     /// A module window's link in window 1, as [`Pair::wire`] does a window 2's, keyed by its peer: its end forgets the
-    /// window, and the window's name is free to start again; a clean end after linking also drops its saved tabs. The
-    /// pair file has no place for a module window, so what it holds and which monitor it is on are the controller's
-    /// alone.
+    /// window, and the window's name is free to start again; a clean end after linking goes to [`WindowCloses`], which
+    /// decides whether what is kept for it goes too. The pair file has no place for a module window, so what it holds and
+    /// which monitor it is on are the controller's alone.
     fn wire_module(&self, name: &WindowName, peer: PeerId, link: &LinkDriver, was_linked: Rc<std::cell::Cell<bool>>) {
         let hooks = self.hooks.clone();
         let modules = Rc::downgrade(&self.modules);
         let window = name.clone();
         let failed = self.module_failed.clone();
+        let closes = self.closes.clone();
+        let after = self.starts.borrow().after.clone();
         link.on_end(move |link, end| {
             if forget_module(&modules, peer).is_some() && !was_linked.get() {
                 module_failed(&failed, &window, &format!("its link ended before it linked ({end:?})"));
             }
-            if let (true, true, Some(modules)) = (was_linked.get(), end.closed_for_good(), modules.upgrade()) {
-                modules.borrow_mut().tabs_window_closed(&window);
+            if was_linked.get() && end.closed_for_good() {
+                closes.window_closed(window.clone(), &after);
             }
             let hook = hooks.borrow().as_ref().map(|h| h.ended.clone());
             if let Some(ended) = hook {
@@ -1072,6 +1078,7 @@ impl Pair {
             }
             return Ok(OpenModule::Raised(peer));
         }
+        self.closes.reopening(&name);
         let peer = self.modules.borrow_mut().next_peer();
         // A window that misses its handshake, or is refused at its hello, never links: the controller is told, or it
         // would count the window as starting for good.
@@ -1192,10 +1199,28 @@ impl Pair {
         self.keep_window.set(true);
     }
 
+    /// Window 1 was asked to close: a module window that goes around now went with it, and stays for the next start.
+    pub fn group_asked(&self) {
+        let after = self.starts.borrow().after.clone();
+        self.closes.group_asked(&after);
+    }
+
+    /// What window 1 keeps for a closed window goes with it: `hook` hears each one, when that is settled.
+    pub fn on_window_forgotten(&self, hook: super::closes::OnForgotten) {
+        self.closes.on_forgotten(hook);
+    }
+
+    /// The closes heard so far as they stand at `now`, for a test that has no wish to wait out the burst.
+    #[cfg(test)]
+    pub(crate) fn settle_closes_at(&self, now: std::time::Instant) {
+        self.closes.settle(now);
+    }
+
     /// Window 1 closes its group. The chat windows are asked for their last tabs first, while their links can carry
     /// them; then every module window hears `bye`, with the application held until each has gone. Only the module
     /// windows are told: window 2 outlives window 1.
     pub fn end_group(self: &Rc<Self>) {
+        self.group_asked();
         if !self.modules.borrow_mut().ask_last_tabs() {
             self.end_group_now();
             return;

@@ -1179,6 +1179,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
             mode: eitri_core::agent_bridge::SessionModeChoice::Auto,
             view: None,
             window: None,
+            turn_running: false,
         };
         SavedTabs::from_parts(sessions.iter().map(saved).collect(), 0, Vec::new(), None)
     };

@@ -359,6 +359,8 @@ struct AgentPanelState {
     /// is not, so the saved tabs of a window 2 that does not come back return in the same restore as this
     /// window's own (a restore fills only a window that has started nothing).
     launch_restore_held: bool,
+    /// What the restore under way says of turns that never finished, in its one message.
+    restore_cut_note: Option<String>,
     /// The base page was ready while the launch restore was held: it runs once the hold is let go.
     launch_restore_owed: bool,
     /// Whether `init.lua` made bypass the default mode: the one user whose saved bypass tabs come
@@ -500,6 +502,7 @@ impl AgentPanelState {
             tab_files: None,
             group_tabs: restore::GroupTabs::default(),
             launch_restore_held: false,
+            restore_cut_note: None,
             launch_restore_owed: false,
             bypass_by_config: false,
             mode_remembered,
@@ -1106,6 +1109,7 @@ mod tests {
                         mode: *mode,
                         view: None,
                         window: None,
+                        turn_running: false,
                     })
                     .collect(),
                 0,

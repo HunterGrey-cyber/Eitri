@@ -976,6 +976,7 @@ impl ServiceSet for Services {
         let teardown = self.teardown()?;
         match op {
             CleanupOp::EndGroup => teardown.pair.end_group(),
+            CleanupOp::GroupAsked => teardown.pair.group_asked(),
             CleanupOp::KeepThisWindow => teardown.pair.keep_this_window(),
             CleanupOp::PairOnClose { layout_written } => {
                 if let Some(write) = teardown.pair.finish_group_tabs() {

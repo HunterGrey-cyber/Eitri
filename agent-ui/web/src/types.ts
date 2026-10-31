@@ -634,7 +634,12 @@ export type TurnClock = { turnId: string; since: number; exact: boolean };
  *  tab-bar order, and how many of those were in bypass. Rust sends it only while this window has
  *  started nothing and at least one saved tab can still be resumed, so its presence is the whole
  *  reason to draw the line. */
-export type RestoreOffer = { labels: string[]; bypass: number };
+export type RestoreOffer = {
+  labels: string[];
+  bypass: number;
+  /** What became of a turn running when the window ended, while it is offered; Rust words it. */
+  cutNote?: string | null;
+};
 
 export type Hello = {
   backend: BackendKind;

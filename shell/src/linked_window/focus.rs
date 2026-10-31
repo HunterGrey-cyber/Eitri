@@ -178,26 +178,32 @@ impl CmSession {
         self.writer.changed(self.file.clone());
     }
 
-    /// A window's link ended like `end`, `linked` saying the window had got as far as a link. A window the user closed
-    /// leaves the record; one that crashed or was ended by a signal keeps its line, and with it its output and its place
-    /// at the next start. One that never linked has no place of its own to keep: a start that keeps failing must not
-    /// come back every launch.
+    /// A window's link ended, `linked` saying the window had got as far as a link. Its line stays, and with it its output
+    /// and its place at the next start, until [`CmSession::window_closed`] says the user closed it. One that never linked
+    /// has no place of its own to keep: a start that keeps failing must not come back every launch.
     pub(crate) fn link_ended(
         &mut self,
         peer: eitri_core::wm::PeerId,
         name: &eitri_core::window_link::names::WindowName,
-        end: &super::LinkEnd,
         linked: bool,
     ) {
         if self.closing {
             return;
         }
         self.peers.remove(&peer);
-        if end.closed_for_good() || !linked {
-            self.file.windows.retain(|w| w.name != name.text());
-            self.reorder();
-            self.writer.changed(self.file.clone());
+        if !linked {
+            self.window_closed(name);
         }
+    }
+
+    /// A window is closed, and leaves the record.
+    pub(crate) fn window_closed(&mut self, name: &eitri_core::window_link::names::WindowName) {
+        if self.closing {
+            return;
+        }
+        self.file.windows.retain(|w| w.name != name.text());
+        self.reorder();
+        self.writer.changed(self.file.clone());
     }
 
     fn reorder(&mut self) {
@@ -433,7 +439,8 @@ mod tests {
             connector: "a;b".into(),
         });
         session.event(&PeerEvent::WindowFocused { peer: PeerId(17) });
-        session.link_ended(PeerId(16), &WindowName::Chat(1), &closed(), true);
+        session.link_ended(PeerId(16), &WindowName::Chat(1), true);
+        session.window_closed(&WindowName::Chat(1));
         let terminal = CmTerminal {
             shown: false,
             px: Some(220),
@@ -445,7 +452,8 @@ mod tests {
         assert_eq!(session.file.windows[0].output.as_deref(), Some("DP-2"));
         let final_file = session.file.clone();
         session.closing = true;
-        session.link_ended(PeerId(17), &WindowName::Page("markdown".into()), &closed(), true);
+        session.link_ended(PeerId(17), &WindowName::Page("markdown".into()), true);
+        session.window_closed(&WindowName::Page("markdown".into()));
         session.linked(PeerId(18), &WindowName::Chat(2));
         session.terminal(&layout);
         assert_eq!(session.file, final_file);
@@ -509,17 +517,10 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
-    fn closed() -> crate::linked_window::LinkEnd {
-        crate::linked_window::LinkEnd::Bye {
-            why: "window closed".into(),
-        }
-    }
-
     /// Only a window the user closed leaves the record: a crashed one keeps its line and its output, and the window that
     /// takes that name again is the same line.
     #[test]
     fn a_window_that_went_without_the_user_keeps_its_line() {
-        use crate::linked_window::LinkEnd;
         use eitri_core::window_link::cm_file::CmFile;
         use eitri_core::window_link::names::WindowName;
         use eitri_core::wm::{PeerEvent, PeerId};
@@ -538,11 +539,8 @@ mod tests {
         });
         let names = |session: &CmSession| session.file.ordered_windows();
 
-        session.link_ended(PeerId(17), &WindowName::Chat(2), &LinkEnd::Eof, true);
-        let signalled = LinkEnd::Bye {
-            why: format!("window p:markdown {}", crate::linked_window::KEPT_WORDS),
-        };
-        session.link_ended(PeerId(18), &page, &signalled, true);
+        session.link_ended(PeerId(17), &WindowName::Chat(2), true);
+        session.link_ended(PeerId(18), &page, true);
         assert_eq!(
             names(&session),
             [WindowName::Chat(1), WindowName::Chat(2), page.clone()]
@@ -558,10 +556,16 @@ mod tests {
         session.linked(PeerId(19), &WindowName::Chat(2));
         assert_eq!(names(&session).len(), 3);
 
-        session.link_ended(PeerId(19), &WindowName::Chat(2), &closed(), true);
+        session.link_ended(PeerId(19), &WindowName::Chat(2), true);
+        assert_eq!(
+            names(&session).len(),
+            3,
+            "a close leaves the line for the close's burst to judge"
+        );
+        session.window_closed(&WindowName::Chat(2));
         assert_eq!(names(&session), [WindowName::Chat(1), page]);
 
-        session.link_ended(PeerId(16), &WindowName::Chat(1), &LinkEnd::Eof, false);
+        session.link_ended(PeerId(16), &WindowName::Chat(1), false);
         assert_eq!(names(&session).len(), 1, "a window that never linked keeps no place");
 
         let final_file = session.file.clone();

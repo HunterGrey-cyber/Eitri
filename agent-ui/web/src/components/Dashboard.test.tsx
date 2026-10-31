@@ -102,6 +102,14 @@ describe("Dashboard: the restore line", () => {
       "Restore last session 2 tabs, 1 in bypass · api, docs",
     );
   });
+  it("says a turn was cut off for as long as the offer stands, and nothing when none was", () => {
+    const cut = { labels: ["api"], bypass: 0, cutNote: "a turn was cut off when this window last ended" };
+    const { container } = renderDash({ hello: { ...HELLO, restore: cut } });
+    expect(container.querySelector(".dash-cut-note")!.textContent).toBe(cut.cutNote);
+
+    const quiet = renderDash({ hello: withOffer(["api"]) });
+    expect(quiet.container.querySelector(".dash-cut-note")).toBeNull();
+  });
   it("clicking it runs it", () => {
     const { container, onItem } = renderDash({ hello: withOffer(["api"]) });
     fireEvent.click(restoreRow(container));

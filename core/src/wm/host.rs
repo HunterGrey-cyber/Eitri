@@ -1083,6 +1083,9 @@ pub enum CleanupOp {
     /// Window 1 in `compositor` mode closes its group: every module window hears the link's goodbye, and one that has
     /// not gone after a grace is ended.
     EndGroup,
+    /// Window 1 in `compositor` mode was asked to close, whatever it answers: the module windows that go around this
+    /// moment went with it, so what it keeps for them stays for the next start.
+    GroupAsked,
     /// An end signal, not the user, closes this module window: its goodbye says so, and window 1 keeps its tabs and
     /// its place for the next start. Comes ahead of [`CleanupOp::PairOnClose`].
     KeepThisWindow,

@@ -3,6 +3,7 @@
 //! and the pieces both windows share. Nothing here touches GTK or a display.
 
 pub mod base_tabs;
+pub mod close_burst;
 pub mod cm_file;
 pub mod edge;
 pub mod editor_op;

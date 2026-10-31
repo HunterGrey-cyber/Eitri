@@ -140,6 +140,10 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
         teardown(w, win, batch);
         return;
     }
+    // Whatever it answers; a `y` has been counted already, as the ask it answers.
+    if w.tiling == Tiling::Hub && matches!(cause, CloseCause::User | CloseCause::Compositor) && !w.close.confirmed {
+        batch.push_effect(HostOp::Cleanup(CleanupOp::GroupAsked));
+    }
     if w.close.teardown.is_some() {
         return;
     }
@@ -309,6 +313,48 @@ pub(super) fn superseded(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch)
     if declined {
         with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
     }
+}
+
+/// A peer has gone, and the window's close question may have been about it. What the close would ask now replaces it,
+/// and with nothing left to ask the close goes on: a question about windows that have gone would otherwise stay up for
+/// good, holding whatever is waiting for this window to close, as a logout does.
+pub(super) fn peer_left(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if w.close.state != CloseState::Asking || !matches!(w.close.pending, Some(PendingClose::Window { .. })) {
+        return;
+    }
+    let Some(text) = window_prompt(w, cx, win) else {
+        w.say("[window] what the close asked about has gone, so it goes on".into());
+        w.close.pending = None;
+        w.close.state = CloseState::Idle;
+        chrome::set_prompt(w, None);
+        request(w, cx, win, CloseCause::User, batch);
+        return;
+    };
+    // The window went while window 1's close stood open: a logout closes again only every few seconds, and a window
+    // that took longer to go than a burst lasts is no less part of it.
+    if w.tiling == Tiling::Hub {
+        batch.push_effect(HostOp::Cleanup(CleanupOp::GroupAsked));
+    }
+    if w.chrome.prompt.as_ref().is_none_or(|prompt| prompt.text != text) {
+        ask_window(w, cx, win, text);
+    }
+}
+
+/// Puts the window's close question up.
+fn ask_window(w: &mut Window, cx: &Cx, win: WinId, text: String) {
+    w.say(format!("[window] {text}"));
+    let confirmed = Some(text.clone());
+    w.modules.clear_question();
+    w.close.pending = Some(PendingClose::Window { confirmed });
+    w.close.state = CloseState::Asking;
+    chrome::set_prompt(
+        w,
+        Some(Prompt {
+            text,
+            closes_window: true,
+            offers_move: move_target(w) && !movable(cx, win).is_empty(),
+        }),
+    );
 }
 
 pub(super) fn answer(w: &mut Window, cx: &Cx, win: WinId, key: PromptKey, batch: &mut Batch) {
@@ -815,21 +861,7 @@ fn with_quit<T>(
     world.w.quit = quit;
     for intent in intents {
         match intent {
-            CloseIntent::Ask(text) => {
-                world.w.say(format!("[window] {text}"));
-                let confirmed = Some(text.clone());
-                world.w.modules.clear_question();
-                world.w.close.pending = Some(PendingClose::Window { confirmed });
-                world.w.close.state = CloseState::Asking;
-                chrome::set_prompt(
-                    world.w,
-                    Some(Prompt {
-                        text,
-                        closes_window: true,
-                        offers_move: move_target(world.w) && !movable(cx, win).is_empty(),
-                    }),
-                );
-            }
+            CloseIntent::Ask(text) => ask_window(world.w, cx, win, text),
             CloseIntent::Withdraw => world.w.close.confirmed = false,
             CloseIntent::Confirmed => {
                 world.w.close.confirmed = true;

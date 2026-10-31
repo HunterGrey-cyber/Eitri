@@ -6,8 +6,9 @@
 //! **In window 1**, [`GroupTabs`] reads the file once at its start, and offers window 2's and an unpaired window's left
 //! tabs into `c1` through the claims `eitri` mode uses. The window numbers that hold tabs open at the start, and every
 //! window that links is given its part: at a first link, a respawn after a crash and a relink alike. A window the user
-//! closed drops its part, since he closed those tabs. One that went any other way keeps it for its next start: a crash,
-//! an end signal, or a close that left tabs on offer unanswered.
+//! closed drops its part, since those tabs were closed, once [`super::closes::WindowCloses`] has settled that it was the
+//! user. One that went any other way keeps it for its next start: a crash, an end signal, a close that left tabs on offer
+//! unanswered, or a close of every window at once.
 //!
 //! **In a chat window**, [`TabReports`] carries each new set to window 1: a change on its own at once, and what follows
 //! close behind on a short timer, so a burst of tab changes costs two reports. While the link is down only the latest
@@ -250,6 +251,7 @@ mod tests {
             mode: SessionModeChoice::Auto,
             view: None,
             window: None,
+            turn_running: false,
         }
     }
 

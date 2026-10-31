@@ -303,6 +303,7 @@ export function DashboardItems({
           ),
         )}
       </div>
+      {hello.restore?.cutNote && <div className="dash-context dash-cut-note">{hello.restore.cutNote}</div>}
       {editorLink !== null && editorLink.state !== "attached" && (
         <div className="dash-context">No editor is attached: run :EitriPanel in nvim to send its file with each message.</div>
       )}

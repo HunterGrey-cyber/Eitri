@@ -214,6 +214,7 @@ pub(super) fn start_restore(
         })
         .collect();
     let (downgraded, asked) = (go.downgraded, go.asked);
+    state.restore_cut_note = eitri_core::tab_restore::cut_turns_note(go.cut_turns());
     let run = state.tabs.start_restore(from, go, |agent, id| {
         if agent.is_external() {
             return Ok(RestoreConnect::AwaitTrust);
@@ -262,7 +263,10 @@ pub(super) fn finish_restore(state: &mut AgentPanelState, out: &mut Outbox) {
         .and_then(eitri_core::tab_restore::RestoreRun::outcome);
     let Some(outcome) = outcome else { return };
     state.restore_run = None;
-    let message = outcome.message();
+    let mut message = outcome.message();
+    if let Some(note) = state.restore_cut_note.take() {
+        message = format!("{message}; {note}");
+    }
     eprintln!("[restore] {message}");
     out.effect(Effect::Toast(message));
 }
@@ -1162,6 +1166,7 @@ mod tests {
                 mode: Auto,
                 view: None,
                 window: None,
+                turn_running: false,
             })
             .collect();
         SavedTabs::from_parts(tabs, 0, Vec::new(), None)
@@ -1218,6 +1223,37 @@ mod tests {
             restore_waits_for_trust(&state.borrow()),
             "through the trust gate, as any restore"
         );
+    }
+
+    /// The dashboard's line goes with the offer, and with `auto` there never was one: what the tab came back without is
+    /// said in the restore's one message, which nothing replaces.
+    #[test]
+    fn a_restore_says_a_turn_was_cut_off_in_its_one_message() {
+        let (state, dir) = restore_panel("restore-cut-turn", &[("s-1", None, Auto)], &["s-1"]);
+        state.borrow_mut().restore_source.as_mut().unwrap().tabs[0].turn_running = true;
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        state.borrow_mut().toast_hook = Some({
+            let toasts = toasts.clone();
+            Rc::new(move |text: &str| toasts.borrow_mut().push(text.to_string()))
+        });
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        let collected = state.borrow_mut().tabs.collect_starts();
+        for result in &collected {
+            account_for_restore(&mut state.borrow_mut(), result);
+        }
+        stepped(&state, finish_restore);
+        assert_eq!(
+            *toasts.borrow(),
+            ["Restored 1 tab; a turn was cut off when this window last ended"]
+        );
+        for tab in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
     }
 
     #[test]
@@ -1985,6 +2021,7 @@ mod tests {
                     mode: Auto,
                     view: None,
                     window: None,
+                    turn_running: false,
                 }],
                 Some(0),
             ));

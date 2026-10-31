@@ -1298,6 +1298,119 @@ fn a_hub_ends_its_group_before_its_own_teardown() {
     assert_eq!(&r.ops()[at..], expected);
 }
 
+/// Window 1 cannot tell a logout from a user at its own close, but what it keeps for the windows going around that
+/// moment depends on it. Every close counts, a logout's next one too, and answering it does not.
+#[test]
+fn window_1_says_when_it_is_asked_to_close() {
+    let asked = |r: &Rig| {
+        r.ops()
+            .iter()
+            .filter(|op| **op == HostOp::Cleanup(CleanupOp::GroupAsked))
+            .count()
+    };
+    let r = hub_of(&[0]);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert_eq!(asked(&r), 1, "said with the question up");
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert_eq!(asked(&r), 2);
+    r.answer("y");
+    assert_eq!(asked(&r), 2);
+
+    let r = chat_window(WindowName::Chat(1));
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert_eq!(asked(&r), 0, "only window 1 holds a group");
+    let r = driven(two());
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert_eq!(asked(&r), 0);
+}
+
+/// A logout closes every window at once and waits for all of them to go: window 1's question goes with what it was about.
+#[test]
+fn window_1s_question_goes_when_the_windows_it_asked_about_have_gone() {
+    let r = hub_of(&[0, 0]);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    let prompt = |r: &Rig| r.driver.query(|c| c.chrome(WIN)).prompt.map(|p| p.text);
+    assert_eq!(prompt(&r).unwrap(), "close Eitri and its 2 windows? (y/n)");
+
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    assert_eq!(prompt(&r).unwrap(), "close Eitri and its 1 window? (y/n)");
+    assert_eq!(r.close_count(), 0);
+
+    r.driver.detach_peer(WIN, crate::wm::PeerId(17));
+    r.advance();
+    assert_eq!(prompt(&r), None);
+    assert_eq!(r.close_count(), 1);
+}
+
+/// What it still has to ask about keeps it: the logout waits, as it does for any window that asks.
+#[test]
+fn window_1s_question_stays_while_something_else_is_left_to_ask_about() {
+    let r = hub_of(&[0]);
+    r.host.set_terminal_jobs(2);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    r.advance();
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close window? 2 terminal jobs (y/n)");
+    assert_eq!(r.close_count(), 0);
+
+    r.answer("y");
+    r.advance();
+    assert_eq!(r.close_count(), 1, "the answer is to the question as it stands");
+}
+
+/// A logout's windows can go long after its closes, once a turn's question is answered: that is still window 1 being asked.
+#[test]
+fn a_window_going_while_window_1_asks_counts_as_window_1_being_asked() {
+    let r = hub_of(&[1, 1]);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    let asked = |r: &Rig| {
+        r.ops()
+            .iter()
+            .filter(|op| **op == HostOp::Cleanup(CleanupOp::GroupAsked))
+            .count()
+    };
+    assert_eq!(asked(&r), 1);
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    assert_eq!(asked(&r), 2);
+
+    let r = hub_of(&[0, 0]);
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    assert_eq!(asked(&r), 0, "no close is standing open");
+}
+
+/// In `eitri` mode window 2 outlives window 1, so it is only named beside what runs here: the question stays, and stops
+/// naming a window that has gone.
+#[test]
+fn window_1s_question_stops_naming_a_window_2_that_has_gone() {
+    let r = driven(two());
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(2),
+        WindowName::Second,
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    r.running();
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    let prompt = |r: &Rig| r.driver.query(|c| c.chrome(WIN)).prompt.map(|p| p.text).unwrap();
+    assert!(prompt(&r).contains("window 2"), "{}", prompt(&r));
+
+    r.driver.detach_peer(WIN, crate::wm::PeerId(2));
+    r.advance();
+    assert!(!prompt(&r).contains("window 2"), "{}", prompt(&r));
+    assert_eq!(r.close_count(), 0);
+}
+
+/// A window that was not asked to close stays up whatever its peers do.
+#[test]
+fn a_peer_going_closes_nothing_with_no_close_asked() {
+    let r = hub_of(&[1, 0]);
+    r.driver.detach_peer(WIN, crate::wm::PeerId(17));
+    r.advance();
+    assert_eq!(r.driver.query(|c| c.chrome(WIN)).prompt, None);
+    assert_eq!(r.close_count(), 0);
+}
+
 #[test]
 fn a_signal_ends_a_hubs_group_too() {
     let r = hub_of(&[1]);

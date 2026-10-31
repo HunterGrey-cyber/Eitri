@@ -366,6 +366,7 @@ mod tests {
             mode: Auto,
             view: None,
             window: None,
+            turn_running: false,
         }
     }
 

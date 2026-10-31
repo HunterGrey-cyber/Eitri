@@ -4139,9 +4139,7 @@ fn build_ui(
                 // turn review and the editor forget it as they forget window 2.
                 if !second && *name != WindowName::Second {
                     if let Some(session) = &cm_session {
-                        session
-                            .borrow_mut()
-                            .link_ended(peer, name, end, link.partner().is_some());
+                        session.borrow_mut().link_ended(peer, name, link.partner().is_some());
                     }
                     println!("[window] {} ended ({end:?})", name.text());
                     if let Some(review) = &pair_review {
@@ -4218,6 +4216,10 @@ fn build_ui(
             })
         };
         pair.set_hooks(linked_window::spawn::PairHooks { linked, post, ended });
+        if let Some(session) = &cm_session {
+            let session = session.clone();
+            pair.on_window_forgotten(Rc::new(move |name| session.borrow_mut().window_closed(name)));
+        }
         // A shell this window took over from the other window ends there, in its parent: how it ended comes back here.
         let terminals = Rc::downgrade(&terminals);
         pair.set_child_exited(Rc::new(move |pid, start, status| {

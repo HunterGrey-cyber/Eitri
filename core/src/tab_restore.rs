@@ -68,6 +68,8 @@ pub struct PlannedTab {
     /// Where it comes back is decided by `TabSet::start_restore`, which puts it there only when the
     /// window's layout holds that view and no other tab is bound to it yet.
     pub view: Option<ViewId>,
+    /// The tab was saved with a turn running that never ended.
+    pub turn_running: bool,
 }
 
 /// Which saved tabs to resume and which are skipped before any resume is tried.
@@ -110,6 +112,7 @@ pub fn plan(
     for tab in &saved.tabs {
         let (agent, id) = (tab.agent.clone(), tab.provider_session_id.as_str());
         let (saved_name, saved_mode, saved_view) = (tab.name.as_deref(), tab.mode, tab.view);
+        let turn_running = tab.turn_running;
         if open
             .iter()
             .any(|(open_agent, open_id)| *open_agent == agent && open_id == id)
@@ -146,6 +149,7 @@ pub fn plan(
             saved_mode,
             label,
             view: saved_view.and_then(ViewId::new).filter(|view| !view.is_base()),
+            turn_running,
         });
     }
     let active_session = saved.active_tab().map(|t| t.provider_session_id.clone());
@@ -156,6 +160,16 @@ pub fn plan(
     }
 }
 
+/// What the user is told of `cut` tabs coming back whose turn was still running when their window ended: it did not finish,
+/// and nothing else says so, since a window that loses its compositor is gone before it can ask.
+pub fn cut_turns_note(cut: usize) -> Option<String> {
+    match cut {
+        0 => None,
+        1 => Some("a turn was cut off when this window last ended".to_string()),
+        cut => Some(format!("{cut} turns were cut off when this window last ended")),
+    }
+}
+
 /// What the launch dashboard says about the tabs it can bring back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreOffer {
@@ -163,6 +177,8 @@ pub struct RestoreOffer {
     pub labels: Vec<String>,
     /// How many of them were in bypass.
     pub bypass: usize,
+    /// What the dashboard says of the turns of these tabs that never finished, for as long as it offers them.
+    pub cut_note: Option<String>,
 }
 
 impl RestorePlan {
@@ -192,6 +208,7 @@ impl RestorePlan {
                 .iter()
                 .filter(|i| i.saved_mode == SessionModeChoice::Bypass)
                 .count(),
+            cut_note: cut_turns_note(self.items.iter().filter(|i| i.turn_running).count()),
         })
     }
 }
@@ -358,6 +375,7 @@ mod tests {
                     mode: *mode,
                     view: None,
                     window: None,
+                    turn_running: false,
                 })
                 .collect(),
             active,
@@ -433,6 +451,7 @@ mod tests {
             mode: Auto,
             view: None,
             window: None,
+            turn_running: false,
         };
         saved.tabs.extend([acp("gem", "g-1"), acp("gone", "x-1")]);
         let acp_record = |name: &str, id: &str| ResumableSession {
@@ -513,6 +532,7 @@ mod tests {
             mode: Auto,
             view: Some(2),
             window: None,
+            turn_running: false,
         });
         let records = [
             record("a", None, None),
@@ -560,6 +580,7 @@ mod tests {
             mode: Auto,
             view: None,
             window: None,
+            turn_running: false,
         });
         let acp_record = |name: &str| ResumableSession {
             provider: format!("acp:{name}"),
@@ -599,6 +620,27 @@ mod tests {
         assert!(!is_open(&open, &record("shared", None, None)));
     }
 
+    /// Only a tab that can come back is told of: a turn whose session has gone has nothing to show for it here.
+    #[test]
+    fn the_offer_says_how_many_of_its_tabs_had_a_turn_cut_off() {
+        let mut saved = saved(&[("a", None, Auto), ("b", None, Auto), ("gone", None, Auto)], 0);
+        let records = [record("a", None, None), record("b", None, None)];
+        let note = |saved: &SavedTabs| plan(saved, &records, &[], |_, _| false).offer().unwrap().cut_note;
+        assert_eq!(note(&saved), None);
+
+        saved.tabs[2].turn_running = true;
+        assert_eq!(note(&saved), None, "its session has gone, so it is not on offer");
+
+        saved.tabs[1].turn_running = true;
+        assert_eq!(note(&saved).unwrap(), "a turn was cut off when this window last ended");
+
+        saved.tabs[0].turn_running = true;
+        assert_eq!(
+            note(&saved).unwrap(),
+            "2 turns were cut off when this window last ended"
+        );
+    }
+
     #[test]
     fn a_rename_saved_after_the_record_was_read_still_names_the_tab() {
         let saved = saved(&[("a", Some("newer"), Auto)], 0);
@@ -620,7 +662,8 @@ mod tests {
             offer,
             RestoreOffer {
                 labels: vec!["one".to_string(), "two".to_string()],
-                bypass: 1
+                bypass: 1,
+                cut_note: None,
             }
         );
 

@@ -1022,7 +1022,11 @@ pub fn serialize_hello_with_restore_for_js(
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
         // `agent::account`'s configured name, `null` when none is set.
         "account": greeting.account,
-        "restore": restore.map(|offer| json!({ "labels": offer.labels, "bypass": offer.bypass })),
+        "restore": restore.map(|offer| json!({
+            "labels": offer.labels,
+            "bypass": offer.bypass,
+            "cutNote": offer.cut_note,
+        })),
     })
     .to_string()
 }
@@ -8512,9 +8516,13 @@ mod tests {
         let offer = crate::tab_restore::RestoreOffer {
             labels: vec!["api".to_string(), "docs".to_string()],
             bypass: 1,
+            cut_note: Some("a turn was cut off".to_string()),
         };
         let value: Value = serde_json::from_str(&serialize_hello_with_restore_for_js(&greeting, Some(&offer))).unwrap();
-        assert_eq!(value["restore"], json!({ "labels": ["api", "docs"], "bypass": 1 }));
+        assert_eq!(
+            value["restore"],
+            json!({ "labels": ["api", "docs"], "bypass": 1, "cutNote": "a turn was cut off" })
+        );
         assert_eq!(value["kind"], "hello", "the rest of the hello is the same");
         let none: Value = serde_json::from_str(&serialize_hello_with_restore_for_js(&greeting, None)).unwrap();
         assert!(none["restore"].is_null());

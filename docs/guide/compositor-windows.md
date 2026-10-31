@@ -191,13 +191,18 @@ open and empty.
 | what happens | its tabs and its place |
 |---|---|
 | you close window 1 and answer `y` | **kept**: every chat window comes back at the next start |
-| you close a chat or page window with the compositor's key, or `<prefix> x` | **forgotten**: the tabs and the place are dropped |
+| you close a chat or page window with the compositor's key, or `<prefix> x` | **forgotten** after two seconds: the tabs and the place are dropped |
+| every window closes at once, as a logout does | **kept**: each window comes back at the next start |
 | a chat window with tabs still on offer closes before you answered the offer | **kept**: it reopens empty, offering them |
 | an end signal (`SIGTERM`) closes a window | **kept** |
 | a window crashes | **kept**, and its key starts it again |
 
 Closing window 1 closes the whole group, and always asks while any window is open:
 `close Eitri and its 2 windows? 3 turns are running, 1 queued (y/n)`.
+
+A compositor that exits or crashes takes every window with it at once, with no time to ask, so a turn running then stops
+where it was. At the next start the chat window's offer says so under its rows (`a turn was cut off when this window last
+ended`), and so does the message when the tab comes back, with `agent.restore = "auto"` too.
 
 When nvim exits in window 1 (`:qa`, say), window 1 closes, so it asks that same question. Answer `n` and the group stays:
 the bottom terminal takes the window and the keys, and `<prefix> e` starts nvim again.
@@ -230,8 +235,11 @@ below the chat, and back in `c3` when you return. The layout you had in `eitri` 
   compositor can.
 - On Hyprland, `Ctrl+h/j/k/l` stops at a floating window's edge when the next float sits diagonally, sharing no row or
   column with it, though Hyprland's own focus keys reach it. Floats that overlap are left to Hyprland.
-- A logout that closes every window one by one reads as you closing them, so their tabs and places are forgotten.
-  `hyprshutdown` does this. A plain exit of the compositor keeps them.
+- Nothing tells Eitri who closed a window, so it goes by what follows: a window closed within two seconds of window 1
+  being asked to close stays for the next start, whatever you answer, and so does one that goes while window 1's question
+  is up. Closes less than two seconds apart count as one, so that holds for all of them. Close a chat window and then
+  window 1 straight away, and that chat window comes back. A tool that closes windows more than two seconds apart reads as
+  you closing them.
 
 ## What is not supported
 

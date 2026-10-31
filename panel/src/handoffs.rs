@@ -177,6 +177,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         tab_files: _,
         group_tabs: _,
         launch_restore_held: _,
+        restore_cut_note: _,
         launch_restore_owed: _,
         bypass_by_config: _,
         mode_remembered: _,

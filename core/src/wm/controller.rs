@@ -243,6 +243,7 @@ impl Controller {
                 setup: &setup,
             };
             super::moves::detach(window, &cx, win, peer, &mut batch);
+            super::close::peer_left(window, &cx, win, &mut batch);
         }
         self.settle_chrome(&mut batch);
         batch

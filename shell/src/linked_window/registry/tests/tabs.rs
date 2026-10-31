@@ -3,6 +3,7 @@
 //! it and what the panel does with tabs given have their own tests.
 
 use std::cell::Cell;
+use std::time::Instant;
 
 use eitri_core::agent_backend::AgentId;
 use eitri_core::agent_bridge::SessionModeChoice;
@@ -30,6 +31,7 @@ fn tabs(sessions: &[&str]) -> SavedTabs {
             mode: SessionModeChoice::Auto,
             view: None,
             window: None,
+            turn_running: false,
         })
         .collect();
     SavedTabs::from_parts(tabs, 0, Vec::new(), None)
@@ -126,6 +128,12 @@ fn a_clean_close_of_a_linked_window_takes_its_tabs_out_of_the_file() {
 
     two.handle.close("window 2 closed");
     assert!(pump_until(&second, || second.ended().is_some()));
+    assert_eq!(
+        sessions_on_disk(&group),
+        ["s-1", "s-2"],
+        "too early to tell whose close it was"
+    );
+    group.pair.settle_closes_at(past_the_burst());
     assert!(pump_until(&first, || sessions_on_disk(&group) == ["s-1"]));
     let (_, again, _fds) = group.link(&c(2));
     assert_eq!(
@@ -133,6 +141,120 @@ fn a_clean_close_of_a_linked_window_takes_its_tabs_out_of_the_file() {
         None,
         "tabs the user closed are not reopened"
     );
+}
+
+/// When the burst's end has come for everything heard so far.
+fn past_the_burst() -> Instant {
+    Instant::now() + eitri_core::window_link::close_burst::CLOSE_BURST
+}
+
+/// Two linked chat windows with a tab each, on disk.
+fn two_windows(label: &str) -> (Group, [Their; 2], [LinkDriver; 2], Vec<OwnedFd>) {
+    let group = keeping(label);
+    let (_, one, mut fds) = group.link(&c(1));
+    let (_, two, more) = group.link(&c(2));
+    fds.extend(more);
+    let (first, second) = (
+        group.pair.module_link(&c(1)).unwrap(),
+        group.pair.module_link(&c(2)).unwrap(),
+    );
+    for (their, session) in [(&one, "s-1"), (&two, "s-2")] {
+        let report = Msg::TabsReport {
+            tabs: tabs(&[session]).to_wire(),
+        };
+        their.handle.send(report, Vec::new()).unwrap();
+    }
+    assert!(pump_until(&first, || {
+        second.pump();
+        sessions_on_disk(&group) == ["s-1", "s-2"]
+    }));
+    (group, [one, two], [first, second], fds)
+}
+
+/// A logout closes window 1 with the rest, and which of them hears it first depends on the compositor's list: however
+/// they fall, every window's tabs stay.
+#[test]
+fn windows_closed_as_window_1_is_asked_to_close_stay_in_the_file() {
+    for window_1_first in [true, false] {
+        let (group, [one, two], [first, second], _fds) = two_windows("tabs-logout");
+        if window_1_first {
+            group.pair.group_asked();
+        }
+        one.handle.close("window c1 closed");
+        two.handle.close("window c2 closed");
+        assert!(pump_until(&first, || first.ended().is_some()));
+        assert!(pump_until(&second, || second.ended().is_some()));
+        if !window_1_first {
+            group.pair.group_asked();
+        }
+        group.pair.settle_closes_at(past_the_burst());
+        assert_eq!(sessions_on_disk(&group), ["s-1", "s-2"]);
+        let (_, again, _fds) = group.link(&c(2));
+        assert!(
+            given_within(&again, Duration::from_secs(5)).is_some(),
+            "its tabs wait for it, and it may be opened again if the logout is called off"
+        );
+    }
+}
+
+/// Window 1 left alone, windows closed in quick succession are closed all the same.
+#[test]
+fn windows_closed_by_hand_in_quick_succession_are_all_closed() {
+    let (group, [one, two], [first, second], _fds) = two_windows("tabs-by-hand");
+    one.handle.close("window c1 closed");
+    two.handle.close("window c2 closed");
+    assert!(pump_until(&first, || first.ended().is_some()));
+    assert!(pump_until(&second, || second.ended().is_some()));
+    group.pair.settle_closes_at(past_the_burst());
+    assert!(pump_until(&first, || sessions_on_disk(&group).is_empty()));
+}
+
+/// A window opened again before its close has settled is a new window, as it is after.
+#[test]
+fn a_window_reopened_inside_its_burst_starts_empty() {
+    let (group, [_one, two], [first, second], _fds) = two_windows("tabs-reopened");
+    two.handle.close("window c2 closed");
+    assert!(pump_until(&second, || second.ended().is_some()));
+    let (_, again, _fds) = group.link(&c(2));
+    assert_eq!(given_within(&again, Duration::from_millis(100)), None);
+    assert!(pump_until(&first, || sessions_on_disk(&group) == ["s-1"]));
+}
+
+/// The hook hears a window once its close is settled, and never one that stays.
+#[test]
+fn what_else_is_kept_for_a_window_goes_only_when_its_close_is_settled() {
+    let heard: Rc<RefCell<Vec<WindowName>>> = Rc::default();
+    let (group, [one, two], [first, second], _fds) = two_windows("tabs-forgotten");
+    {
+        let heard = heard.clone();
+        group
+            .pair
+            .on_window_forgotten(Rc::new(move |name| heard.borrow_mut().push(name.clone())));
+    }
+    one.handle.close("window c1 closed");
+    assert!(pump_until(&first, || first.ended().is_some()));
+    assert!(heard.borrow().is_empty());
+    group.pair.settle_closes_at(past_the_burst());
+    assert_eq!(*heard.borrow(), [c(1)]);
+
+    group.pair.group_asked();
+    two.handle.close("window c2 closed");
+    assert!(pump_until(&second, || second.ended().is_some()));
+    group.pair.settle_closes_at(past_the_burst());
+    assert_eq!(
+        *heard.borrow(),
+        [c(1)],
+        "a window that went as window 1 was asked keeps its place"
+    );
+}
+
+/// The wait is a timer: nobody has to ask for a close to take effect.
+#[test]
+fn a_close_settles_by_a_timer_of_its_own() {
+    let (group, [_one, two], [_first, second], _fds) = two_windows("tabs-timer");
+    two.handle.close("window c2 closed");
+    assert!(pump_until(&second, || second.ended().is_some()));
+    assert!(group.timers.borrow().len() >= 1, "the close armed the wait");
 }
 
 /// A window a signal ended, or one with tabs on offer, was not closed by the user: its tabs stay for its next start.

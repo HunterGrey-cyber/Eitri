@@ -64,6 +64,9 @@ pub struct SavedTab {
     /// The chat window the tab was in, 2 to 9, when `view` does not say so: one tab of a window is its view, and the
     /// others are saved in the base view for `eitri` mode to find. Absent otherwise.
     pub window: Option<u8>,
+    /// A turn was running as this was written, and written again when it ended: what is read back says a window went with
+    /// no chance to finish it, or to ask about it. Absent from the file otherwise.
+    pub turn_running: bool,
 }
 
 impl SavedTab {
@@ -96,6 +99,7 @@ impl SavedTab {
             mode: self.mode,
             view: self.view,
             window: self.window,
+            turn_running: self.turn_running,
         };
         serde_json::to_value(entry).expect("a saved tab always serializes")
     }
@@ -115,6 +119,7 @@ impl SavedTab {
             mode: entry.mode,
             view: entry.view,
             window: entry.window,
+            turn_running: entry.turn_running,
         })
     }
 }
@@ -267,6 +272,10 @@ struct TabsFile {
     active_external: Option<usize>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One entry of `tabs`: a Claude tab, its agent implied by the array it is in.
 #[derive(Serialize, Deserialize)]
 struct ClaudeEntry {
@@ -281,6 +290,8 @@ struct ClaudeEntry {
     /// A value no chat window beside `c1` can have is read as absent, as `view`'s is.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
     window: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    turn_running: bool,
 }
 
 /// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
@@ -299,6 +310,8 @@ struct OtherEntry {
     /// A value no chat window beside `c1` can have is read as absent, as `view`'s is.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
     window: Option<u8>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    turn_running: bool,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -329,6 +342,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                 mode: t.mode,
                 view: t.view,
                 window: t.window,
+                turn_running: t.turn_running,
             })
             .collect(),
         active: saved.rank(saved.claude_active, false).unwrap_or(0),
@@ -343,6 +357,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                     mode: t.mode,
                     view: t.view,
                     window: t.window,
+                    turn_running: t.turn_running,
                 })
             })
             .collect(),
@@ -374,6 +389,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             mode: t.mode,
             view: t.view,
             window: t.window,
+            turn_running: t.turn_running,
         })
         .collect();
     // An agent this build does not know stays a hole, so the active index still finds its tab.
@@ -389,6 +405,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
                 mode: t.mode,
                 view: t.view,
                 window: t.window,
+                turn_running: t.turn_running,
             }),
             ExternalEntry::Unknown(_) => None,
         })
@@ -1311,6 +1328,42 @@ mod tests {
         PathBuf::from("/home/user/project")
     }
 
+    /// A running turn is said in the file and on the link and nowhere else: a tab with none reads as it always did, and a
+    /// file from before the key reads as no turn running.
+    #[test]
+    fn a_running_turn_survives_the_file_and_the_link_and_a_quiet_tab_says_nothing() {
+        let root = Path::new("/project");
+        let mut running = tab("s-1", None, SessionModeChoice::Auto);
+        running.turn_running = true;
+        let mut other = codex("s-2", SessionModeChoice::Auto);
+        other.turn_running = true;
+        let saved = SavedTabs::from_parts(vec![running.clone()], 0, vec![other.clone()], None);
+
+        let text = encode(&saved, root);
+        assert_eq!(text.matches("turn_running").count(), 2);
+        assert_eq!(decode(&text, root).unwrap(), saved);
+        assert_eq!(SavedTab::from_wire(&running.to_wire()).unwrap(), running);
+        assert_eq!(SavedTab::from_wire(&other.to_wire()).unwrap(), other);
+
+        let quiet = SavedTabs::from_parts(vec![tab("s-1", None, SessionModeChoice::Auto)], 0, Vec::new(), None);
+        let text = encode(&quiet, root);
+        assert!(!text.contains("turn_running"), "{text}");
+        assert!(!decode(&text, root).unwrap().tabs[0].turn_running);
+    }
+
+    /// It stays with its tab through the group's one file, whichever window the tab was in.
+    #[test]
+    fn a_running_turn_stays_with_its_tab_through_the_groups_file() {
+        let mut running = tab("s-2", None, SessionModeChoice::Auto);
+        running.turn_running = true;
+        let part = SavedTabs::from_parts(vec![running], 0, Vec::new(), None);
+        let two = WindowName::Chat(2);
+        let merged = merge_windows(&[(two.clone(), part)], Some(&two));
+
+        assert!(merged.tabs[0].turn_running);
+        assert!(tabs_for(&merged, &two).tabs[0].turn_running);
+    }
+
     fn tab(session: &str, name: Option<&str>, mode: SessionModeChoice) -> SavedTab {
         SavedTab {
             agent: AgentId::Claude,
@@ -1320,6 +1373,7 @@ mod tests {
             mode,
             view: None,
             window: None,
+            turn_running: false,
         }
     }
 
@@ -1466,6 +1520,7 @@ mod tests {
                 mode: SessionModeChoice::Manual,
                 view: None,
                 window: None,
+                turn_running: false,
             }],
             None,
         );
@@ -1914,6 +1969,7 @@ mod tests {
             mode,
             view: None,
             window: None,
+            turn_running: false,
         }
     }
 
@@ -2622,6 +2678,7 @@ mod measure {
             mode: SessionModeChoice::Auto,
             view: None,
             window: None,
+            turn_running: false,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();
