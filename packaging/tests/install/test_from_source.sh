@@ -66,6 +66,7 @@ fs_scaffold() {
 	printf 'dist/\n' >"$_fs_dir/plugins/markdown/web/.gitignore"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
+	if [ -z "${FS_NO_NOTICE:-}" ]; then printf 'test fixture NOTICE.\n' >"$_fs_dir/NOTICE"; fi
 }
 
 # fs_commit_and_tag DIR VERSION: sets FS_HEAD to the real commit sha.
@@ -174,9 +175,10 @@ t_from_source_clone_head_match_builds_and_installs() {
 	expect_exec "$TH/.local/bin/eitri"
 	expect_file "$TH/.local/lib/eitri/RELEASE"
 	expect_eq "$(installed_version)" 9.9.2 "the version installed from source"
-	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
+	for f in LICENSE NOTICE THIRD-PARTY-LICENSES SOURCE; do
 		expect_file "$TH/.local/share/licenses/eitri/$f"
 	done
+	expect_eq "$(cat "$TH/.local/share/licenses/eitri/NOTICE")" 'test fixture NOTICE.' "the tree's own NOTICE"
 	if ! grep -q 'built directly from source' "$TH/.local/share/licenses/eitri/THIRD-PARTY-LICENSES"; then
 		fail "THIRD-PARTY-LICENSES does not say it is a from-source placeholder"
 	fi
@@ -197,6 +199,36 @@ t_from_source_clone_head_match_builds_and_installs() {
 	if ! grep -Fq "$(cat "$PKG/icons/LICENSE")" "$TH/.local/share/licenses/eitri/THIRD-PARTY-LICENSES"; then
 		fail "THIRD-PARTY-LICENSES lacks the logo's licence notice"
 	fi
+}
+
+# fs_install_030: a --from-source install of a tree that calls itself 0.3.0, the version of the last release with
+# the acknowledgement inside LICENSE.
+fs_install_030() {
+	FS_FORK_REV=eeeeeee111111111111111111111111111111111
+	fs_repo 0.3.0 https://github.com/HunterGrey-cyber/verdandi.git ddddddd000000000000000000000000000000000
+	mk_from_source_release 0.3.0 ddddddd000000000000000000000000000000000 "$FS_HEAD"
+	serve 0.3.0
+	PRE_STUBS=$(fs_cargo_stubs)
+	inst --set "EITRI_INSTALL_TEST_REPO_URL=$FS_DIR" \
+		--set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--set "EITRI_INSTALL_TEST_SKIA_BASE_URL=http://127.0.0.1:$PORT/skia" \
+		-- --from-source --version 0.3.0 --base-url "http://127.0.0.1:$PORT" --release-signers "$SIGNERS"
+	expect_rc 0
+}
+
+TESTS="$TESTS t_from_source_at_030_installs_the_trees_notice"
+t_from_source_at_030_installs_the_trees_notice() {
+	fs_install_030
+	expect_eq "$(cat "$TH/.local/share/licenses/eitri/NOTICE")" 'test fixture NOTICE.' "the tree's own NOTICE"
+}
+
+TESTS="$TESTS t_from_source_at_030_without_notice_writes_no_placeholder"
+t_from_source_at_030_without_notice_writes_no_placeholder() {
+	FS_NO_NOTICE=1
+	fs_install_030
+	FS_NO_NOTICE=
+	expect_file "$TH/.local/share/licenses/eitri/LICENSE"
+	expect_absent "$TH/.local/share/licenses/eitri/NOTICE"
 }
 
 TESTS="$TESTS t_from_source_node_checksum_verified_before_build"

@@ -228,13 +228,14 @@ package() {
 		install -Dm0644 "plugins/markdown/web/dist/$_pf" "$pkgdir/usr/share/eitri/plugins/markdown/web/dist/$_pf"
 	done < <(cd plugins/markdown/web/dist && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
 
-	# This tree's own LICENSE, plus the built SDK's and Node's licences. No
+	# This tree's own LICENSE and NOTICE, plus the built SDK's and Node's licences. No
 	# THIRD-PARTY-LICENSES/SOURCE is written here at all -- unlike packaging/install.sh's own
 	# from_source_stage, which writes both as an explanatory placeholder file
 	# (packaging/install.sh:2097-2109), this locally-built, non-conveyed AUR package omits the
 	# generated third-party attribution outright rather than shipping a placeholder saying so.
 	install -d "$pkgdir/usr/share/licenses/$pkgname"
 	install -m0644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -m0644 "NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 	# The icon is the Eitri logo, which LICENSE's MIT does not cover: its CC BY 4.0 notice (and the credit
 	# for the colours) travels with it.
 	install -m0644 "packaging/icons/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-icon"

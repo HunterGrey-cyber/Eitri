@@ -1130,6 +1130,7 @@ ctr_phase_b() {
 	# The .deb's AppArmor profile (nfpm-public.yaml's `packager: deb` entry).
 	install -D -m 0644 packaging/apparmor/eitri "$st/packaging/apparmor/eitri"
 	install -m 0644 LICENSE "$st/LICENSE"
+	install -m 0644 NOTICE "$st/NOTICE"
 	install -m 0644 packaging/nfpm-public.yaml "$st/nfpm-public.yaml"
 	(cd "$st" && VERSION="$RS_VERSION" EITRI_SOURCE_URL="$(source_asset_url "$RS_VERSION")" \
 		nfpm pkg --config nfpm-public.yaml --packager deb --target "$out/eitri_${RS_VERSION}_amd64.deb")
@@ -1144,6 +1145,7 @@ ctr_phase_b() {
 	ctr_tarball_art "$st" "$tb/$tt"
 	ctr_tarball_plugins "$st" "$tb/$tt"
 	install -D -m 0644 "$st/LICENSE" "$tb/$tt/share/licenses/eitri/LICENSE"
+	install -D -m 0644 "$st/NOTICE" "$tb/$tt/share/licenses/eitri/NOTICE"
 	install -D -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$tb/$tt/share/licenses/eitri/THIRD-PARTY-LICENSES"
 	install -D -m 0644 "$st/dist/SOURCE" "$tb/$tt/share/licenses/eitri/SOURCE"
 	find "$tb/$tt" -exec touch -h -d "@$sde" {} +

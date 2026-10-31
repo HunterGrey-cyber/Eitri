@@ -148,13 +148,15 @@ contents:
     file_info:
       mode: 0644
 
-  # Eitri's own licence, the notices for everything else this package links or bundles
-  # (packaging/collect-licenses.py --no-sidecar), and the LGPL-3.0 sec 4(d)(0) /
+  # Eitri's own licence and acknowledgement, the notices for everything else this package links or
+  # bundles (packaging/collect-licenses.py --no-sidecar), and the LGPL-3.0 sec 4(d)(0) /
   # GPL-3.0 sec 6(d) Corresponding Source notice naming the source asset and the exact relink
-  # recipe. All three are the public release's own files (release.sh writes them before staging
+  # recipe. All four are the public release's own files (release.sh writes them before staging
   # this package), so this profile never regenerates them itself.
   - src: ./LICENSE
     dst: /usr/share/licenses/eitri/LICENSE
+  - src: ./NOTICE
+    dst: /usr/share/licenses/eitri/NOTICE
   - src: ./dist/THIRD-PARTY-LICENSES
     dst: /usr/share/licenses/eitri/THIRD-PARTY-LICENSES
   - src: ./dist/SOURCE

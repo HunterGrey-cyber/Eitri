@@ -381,7 +381,7 @@ t_interrupted_after_swap_rerun_finishes() {
 	expect_out 'installed Eitri 1.0.0'
 	expect_exec "$TH/.local/bin/eitri"
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
-	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do expect_file "$(data_of)/licenses/eitri/$f"; done
+	for f in LICENSE NOTICE THIRD-PARTY-LICENSES SOURCE; do expect_file "$(data_of)/licenses/eitri/$f"; done
 	# And now it is finished, a re-run is up to date.
 	inst_net
 	expect_rc 0

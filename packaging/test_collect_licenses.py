@@ -708,6 +708,36 @@ class CFileClassification(unittest.TestCase):
         self.assertEqual(text, cl.read_text(os.path.join(cl.TEXTS, "gcc-COPYING.RUNTIME")))
 
 
+class OwnNotice(unittest.TestCase):
+    """The root NOTICE travels in THIRD-PARTY-LICENSES as well as beside it, so a release cannot lose it."""
+
+    FAKE_COPYLEFT = [{"title": "nvim-rs 0.9.2", "license": "LGPL-3.0", "name": "nvim-rs", "version": "0.9.2"}]
+
+    def setUp(self):
+        self.dir = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_the_trees_notice_is_read_word_for_word(self):
+        with open(os.path.join(cl.REPO, "NOTICE"), encoding="utf-8") as f:
+            self.assertEqual(cl.own_notice(), f.read())
+
+    def test_a_tree_without_it_stops_the_run(self):
+        with self.assertRaisesRegex(cl.Fail, "NOTICE"):
+            cl.own_notice(self.dir)
+
+    def test_a_notice_that_no_longer_names_neovide_stops_the_run(self):
+        with open(os.path.join(self.dir, "NOTICE"), "w", encoding="utf-8") as f:
+            f.write("Something else.\n")
+        with self.assertRaisesRegex(cl.Fail, "Neovide"):
+            cl.own_notice(self.dir)
+
+    def test_the_header_prints_it_after_the_mit_line(self):
+        lines = cl.build_header(True, "https://example.invalid/x", self.FAKE_COPYLEFT, 1, 1, 1, None, 0, {}, {}, {},
+                                notice="Built on Neovide.\nSecond line.\n")
+        mit = lines.index("Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.")
+        self.assertEqual(lines[mit + 1:mit + 5], ["", "Built on Neovide.", "Second line.", ""])
+
+
 class BuildHeaderProfiles(unittest.TestCase):
     """build_header() is the prose block before PART 1, split out so its two profile shapes can be
     checked without a real build."""

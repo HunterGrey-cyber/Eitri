@@ -202,6 +202,7 @@ echo "--- verdandi-claude-sidecar --version ---"
 echo "--- licence directory ---"
 ls -la /usr/share/licenses/PKGNAME/
 test -f /usr/share/licenses/PKGNAME/LICENSE.md
+test -f /usr/share/licenses/PKGNAME/NOTICE
 '
 
 test_bin() {

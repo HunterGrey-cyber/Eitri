@@ -832,6 +832,7 @@ _TARBALL_ROLES = {
     **{role: f"share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "share/licenses/eitri/LICENSE",
+    "NOTICE": "share/licenses/eitri/NOTICE",
     "THIRD-PARTY-LICENSES": "share/licenses/eitri/THIRD-PARTY-LICENSES",
     "SOURCE": "share/licenses/eitri/SOURCE",
 }
@@ -846,6 +847,7 @@ _PACKAGE_ROLES = {
     **{role: f"usr/share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"usr/share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
     "LICENSE": "usr/share/licenses/eitri/LICENSE",
+    "NOTICE": "usr/share/licenses/eitri/NOTICE",
     "THIRD-PARTY-LICENSES": "usr/share/licenses/eitri/THIRD-PARTY-LICENSES",
     "SOURCE": "usr/share/licenses/eitri/SOURCE",
 }
@@ -1209,6 +1211,11 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
             f"{tarball}:{troles[role]}": os.path.join(x["tarball"], troles[role]),
             f"{source}:{tracked_path}": os.path.join(src_root, tracked_path),
         })
+    # The acknowledgement is the tracked file too, in the tarball and so in both packages.
+    problems += check_same_bytes({
+        f"{tarball}:NOTICE": os.path.join(x["tarball"], troles["NOTICE"]),
+        f"{source}:NOTICE": os.path.join(src_root, "NOTICE"),
+    })
     # The installer, four copies: the asset, the tarball's and both packages'
     # eitri-setup, and the source asset's packaging/install.sh.
     problems += check_same_bytes({

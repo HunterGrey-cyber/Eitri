@@ -148,6 +148,7 @@ package() {
 	# licence, which eitri-setup --build-sidecar-into saves beside the sidecar when present.
 	install -d "$pkgdir/usr/share/licenses/$pkgname"
 	install -m0644 "$top/share/licenses/eitri/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -m0644 "$top/share/licenses/eitri/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 	install -m0644 "$top/share/licenses/eitri/THIRD-PARTY-LICENSES" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES"
 	install -m0644 "$top/share/licenses/eitri/SOURCE" "$pkgdir/usr/share/licenses/$pkgname/SOURCE"
 	if [ -f "$srcdir/sidecar/LICENSE.md" ]; then

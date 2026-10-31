@@ -77,6 +77,7 @@ EXPECTED_TREE='./.local d
 ./.local/share/licenses/eitri d
 ./.local/share/licenses/eitri/.installed-version f
 ./.local/share/licenses/eitri/LICENSE f
+./.local/share/licenses/eitri/NOTICE f
 ./.local/share/licenses/eitri/SOURCE f
 ./.local/share/licenses/eitri/THIRD-PARTY-LICENSES f'
 
@@ -191,7 +192,8 @@ t_rerun_finishes_incomplete_install() {
 	expect_rc 0
 	plant_sidecar aaaaaaa
 	for f in "$TH/.local/bin/eitri" "$(data_of)/applications/cn.huntergrey.eitri.desktop" \
-		"$(data_of)/licenses/eitri/LICENSE" "$(data_of)/licenses/eitri/THIRD-PARTY-LICENSES" \
+		"$(data_of)/licenses/eitri/LICENSE" "$(data_of)/licenses/eitri/NOTICE" \
+		"$(data_of)/licenses/eitri/THIRD-PARTY-LICENSES" \
 		"$(data_of)/licenses/eitri/SOURCE"; do
 		rm "$f"
 		inst_net
@@ -284,6 +286,38 @@ t_upgrade_bad_layout() {
 	expect_eq "$(snap "$TH")" "$before" "the home after a refused upgrade"
 }
 
+TESTS="$TESTS t_release_before_notice_still_installs"
+t_release_before_notice_still_installs() {
+	# Through 0.3.0 the acknowledgement sits inside LICENSE and the tarball has no NOTICE; --version reaches them.
+	mk_release 0.3.0 "$REV_A"
+	serve 1.0.0 0.3.0
+	inst_net --version 0.3.0
+	expect_rc 0
+	expect_eq "$(installed_version)" 0.3.0 "the version installed"
+	expect_file "$(data_of)/licenses/eitri/LICENSE"
+	expect_absent "$(data_of)/licenses/eitri/NOTICE"
+	plant_sidecar aaaaaaa
+	inst_net --version 0.3.0
+	expect_rc 0
+	expect_out 'is up to date'
+}
+
+TESTS="$TESTS t_release_without_notice_refused"
+t_release_without_notice_refused() {
+	serve 1.0.0
+	d=$(served 1.0.0)
+	rm -rf "$T/bad"
+	mkdir -p "$T/bad"
+	tar -C "$T/bad" -xzf "$d/eitri-1.0.0-x86_64-linux.tar.gz"
+	rm "$T/bad/eitri-1.0.0-x86_64-linux/share/licenses/eitri/NOTICE"
+	tar -C "$T/bad" -czf "$d/eitri-1.0.0-x86_64-linux.tar.gz" eitri-1.0.0-x86_64-linux
+	resign "$d"
+	relatest 1.0.0
+	inst_net
+	expect_fail "a tarball without NOTICE"
+	expect_out 'has no share/licenses/eitri/NOTICE'
+}
+
 TESTS="$TESTS t_release_malformed"
 t_release_malformed() {
 	# A RELEASE naming no valid VERDANDI_REV refuses, and the message names the file -- in a real
@@ -330,6 +364,7 @@ t_dry_run_fresh() {
 	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop"
 	expect_out "would write $TH/.local/share/eitri/eitri.nvim/plugin/eitri.lua"
 	expect_out "would write $TH/.local/share/licenses/eitri/LICENSE"
+	expect_out "would write $TH/.local/share/licenses/eitri/NOTICE"
 	expect_out 'would download http'
 	expect_out '/SHA256SUMS.sig and check it with ssh-keygen -Y verify'
 	expect_out 'dry run: nothing was changed'

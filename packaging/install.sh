@@ -1824,7 +1824,8 @@ on_exit() {
 		fi
 		# The temporary names a write goes through before its `mv` (none is left on success).
 		for _oe_t in "$NV_BINDIR/.eitri.tmp.$$" \
-			"$NV_DATA/licenses/eitri/.LICENSE.tmp.$$" "$NV_DATA/licenses/eitri/.THIRD-PARTY-LICENSES.tmp.$$" \
+			"$NV_DATA/licenses/eitri/.LICENSE.tmp.$$" "$NV_DATA/licenses/eitri/.NOTICE.tmp.$$" \
+			"$NV_DATA/licenses/eitri/.THIRD-PARTY-LICENSES.tmp.$$" \
 			"$NV_DATA/licenses/eitri/.SOURCE.tmp.$$" "$NV_DATA/licenses/eitri/.installed-version.tmp.$$"; do
 			rm -f -- "$_oe_t" 2>/dev/null || :
 		done
@@ -2748,6 +2749,16 @@ from_source_stage() {
 		printf 'No LICENSE file was found in %s.\n' "$_fss_src" >"$_fss_top/share/licenses/eitri/LICENSE" ||
 			die "cannot write a placeholder LICENSE"
 	fi
+	if [ -f "$_fss_src/NOTICE" ]; then
+		cp -- "$_fss_src/NOTICE" "$_fss_top/share/licenses/eitri/NOTICE" || die "cannot stage NOTICE"
+	else
+		case $(licence_files) in
+		*NOTICE*)
+			printf 'No NOTICE file was found in %s.\n' "$_fss_src" >"$_fss_top/share/licenses/eitri/NOTICE" ||
+				die "cannot write a placeholder NOTICE"
+			;;
+		esac
+	fi
 	{
 		printf 'This copy of Eitri was built directly from source (sh install.sh --from-source),\n'
 		printf 'not from a signed release build, so this file is a placeholder rather than the\n'
@@ -3123,6 +3134,22 @@ dry_run_new_rev() {
 	say "the new release's RELEASE ($_dr_from) names verdandi $NV_NEW_REV7"
 }
 
+# licence_files: what this install writes under share/licenses/eitri. The acknowledgement in NOTICE sat
+# inside LICENSE through 0.3.0, so those releases, which --version still installs, have no NOTICE file; a
+# source tree from after the split can still call itself 0.3.0, and then the staged file decides.
+licence_files() {
+	case $NV_VERSION in
+	0.[0-2].* | 0.3.0 | 0.3.0-*)
+		if [ -n "${NV_STAGE_TOP:-}" ] && [ -f "$NV_STAGE_TOP/share/licenses/eitri/NOTICE" ]; then
+			printf '%s NOTICE\n' "$NV_LICENCE_FILES"
+		else
+			printf '%s\n' "$NV_LICENCE_FILES"
+		fi
+		;;
+	*) printf '%s NOTICE\n' "$NV_LICENCE_FILES" ;;
+	esac
+}
+
 # unpack_new: the verified tarball, unpacked in the cache and checked, becomes $NV_LIB.new.
 unpack_new() {
 	_un_top=$NV_STAGE/eitri-$NV_VERSION-x86_64-linux
@@ -3157,7 +3184,7 @@ unpack_new() {
 			die "$NV_TARBALL_NAME has no executable lib/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"
 		fi
 	done
-	for _un_f in $NV_LICENCE_FILES; do
+	for _un_f in $(licence_files); do
 		if [ ! -f "$_un_top/share/licenses/eitri/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	if [ ! -d "$_un_top/lib/eitri/plugins" ]; then
@@ -3357,7 +3384,7 @@ stage_files() {
 			say "would leave $NV_DATA/gnome-shell/extensions/$NV_EXT_ID alone: it is a symlink"
 		fi
 		for _sf_f in $NV_ICON_FILES; do say "would write $NV_DATA/icons/$_sf_f"; done
-		for _sf_f in $NV_LICENCE_FILES; do say "would write $_sf_lic/$_sf_f"; done
+		for _sf_f in $(licence_files); do say "would write $_sf_lic/$_sf_f"; done
 		return 0
 	fi
 	_sf_keep='nothing installed was changed: make it writable and re-run'
@@ -3394,7 +3421,8 @@ stage_files() {
 	else
 		warn "$NV_DATA/gnome-shell/extensions/$NV_EXT_ID is a symlink, so the GNOME Shell extension was not installed over it: it is yours, and it is left as it is"
 	fi
-	for _sf_f in $NV_LICENCE_FILES; do
+	NV_STAGED_LICENCES=$(licence_files)
+	for _sf_f in $NV_STAGED_LICENCES; do
 		cp -- "$NV_STAGE_TOP/share/licenses/eitri/$_sf_f" "$_sf_lic/.$_sf_f.tmp.$$" ||
 			die "cannot write $_sf_lic/.$_sf_f.tmp.$$; $_sf_keep"
 	done
@@ -3454,7 +3482,7 @@ commit_files() {
 		mv -- "$NV_DATA/icons/${_cf_f%/*}/.${_cf_f##*/}.tmp.$$" "$NV_DATA/icons/$_cf_f" ||
 			die "cannot write $NV_DATA/icons/$_cf_f; $_cf_fin"
 	done
-	for _cf_f in $NV_LICENCE_FILES; do
+	for _cf_f in $NV_STAGED_LICENCES; do
 		mv -- "$NV_DATA/licenses/eitri/.$_cf_f.tmp.$$" "$NV_DATA/licenses/eitri/$_cf_f" ||
 			die "cannot write $NV_DATA/licenses/eitri/$_cf_f; $_cf_fin"
 	done
@@ -3495,7 +3523,7 @@ install_complete() {
 	for _ic_f in $NV_ICON_FILES; do
 		if [ ! -f "$NV_DATA/icons/$_ic_f" ]; then return 0; fi
 	done
-	for _ic_f in $NV_LICENCE_FILES; do
+	for _ic_f in $(licence_files); do
 		if [ ! -f "$NV_DATA/licenses/eitri/$_ic_f" ]; then return 0; fi
 	done
 	_ic_stamp=$(cat -- "$NV_DATA/licenses/eitri/.installed-version" 2>/dev/null) || _ic_stamp=

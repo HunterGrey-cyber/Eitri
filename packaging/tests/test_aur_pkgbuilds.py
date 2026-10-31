@@ -200,8 +200,8 @@ class EitriBinPackage(_PackageCase):
         # must not install it (assert_desktop_and_icons checks eitri.desktop is absent).
         shutil.copy(os.path.join(_PACKAGING, "legacy", "eitri.desktop"), os.path.join(top, "share", "applications", "eitri.desktop"))
         shutil.copytree(os.path.join(_PACKAGING, "icons", "hicolor"), os.path.join(top, "share", "icons", "hicolor"))
-        for name in ("LICENSE", "THIRD-PARTY-LICENSES", "SOURCE"):
-            _touch(os.path.join(top, "share", "licenses", "eitri", name))
+        for name in ("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES", "SOURCE"):
+            _touch(os.path.join(top, "share", "licenses", "eitri", name), name.encode())
         for rel, data in MARKDOWN_SITE.items():
             _touch(os.path.join(top, "lib", "eitri", "plugins", "markdown", rel), data)
         # A fingerprint never reaches a tarball, but the package must leave one out if it ever did.
@@ -210,6 +210,7 @@ class EitriBinPackage(_PackageCase):
     def test_it_installs_the_desktop_entry_and_every_icon_from_the_tarball_layout(self):
         proc = self.package()
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(_read(os.path.join(self.pkgdir, "usr", "share", "licenses", "eitri-bin", "NOTICE")), b"NOTICE")
         self.assert_desktop_and_icons()
 
     def test_build_says_one_line_before_the_sidecar_build_and_nothing_else(self):
@@ -260,6 +261,7 @@ class EitriGitPackage(_PackageCase):
         shutil.copytree(EXTENSION_ROOT, os.path.join(tree, "gnome-extension"))
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(tree, "packaging", "icons"))
         _touch(os.path.join(tree, "LICENSE"), b"MIT\n")
+        _touch(os.path.join(tree, "NOTICE"), b"Neovide\n")
         _touch(os.path.join(self.srcdir, "release-for-sidecar.env"))
         for rel, data in MARKDOWN_SITE.items():
             _touch(os.path.join(tree, "plugins", "markdown", rel), data)
@@ -295,6 +297,7 @@ class EitriGitPackage(_PackageCase):
         self.assertEqual(_read(os.path.join(licences, "LICENSE-icon")), _read(os.path.join(_PACKAGING, "icons", "LICENSE")))
         self.assertIn(b"CC BY 4.0", _read(os.path.join(licences, "LICENSE-icon")))
         self.assertEqual(_read(os.path.join(licences, "LICENSE")), b"MIT\n")
+        self.assertEqual(_read(os.path.join(licences, "NOTICE")), b"Neovide\n")
 
     def test_it_installs_the_markdown_plugin_directory_from_the_built_tree(self):
         proc = self.package()

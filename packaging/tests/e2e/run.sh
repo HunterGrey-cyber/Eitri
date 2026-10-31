@@ -254,7 +254,7 @@ for p in hicolor/16x16/apps/cn.huntergrey.eitri.png hicolor/512x512/apps/cn.hunt
 	hicolor/scalable/apps/cn.huntergrey.eitri.svg; do
 	[ -f "$HOME/.local/share/icons/$p" ] || fail "missing the icon $p"
 done
-for p in LICENSE THIRD-PARTY-LICENSES SOURCE; do
+for p in LICENSE NOTICE THIRD-PARTY-LICENSES SOURCE; do
 	[ -f "$HOME/.local/share/licenses/eitri/$p" ] || fail "missing licences/$p"
 done
 [ -x "$SIDECAR_BIN" ] || fail "missing sidecar binary $SIDECAR_BIN"

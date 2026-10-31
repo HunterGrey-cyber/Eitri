@@ -367,6 +367,11 @@ mk_release() {
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
 		echo "$f for $v" >"$b/share/licenses/eitri/$f"
 	done
+	# Releases through 0.3.0 keep the acknowledgement inside LICENSE and have no NOTICE file.
+	case $v in
+	0.3.0) ;;
+	*) echo "NOTICE for $v" >"$b/share/licenses/eitri/NOTICE" ;;
+	esac
 	tar -C "$S/fix/build-$v" -czf "$S/fix/v$v/$top.tar.gz" "$top"
 	cp "$b/lib/eitri/RELEASE" "$S/fix/v$v/RELEASE"
 	cp "$INSTALLER" "$S/fix/v$v/install.sh"

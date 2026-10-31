@@ -1360,6 +1360,20 @@ def markdown_notice_entries(counts, repo=REPO):
              "files": [(MARKDOWN_NOTICE_TEXT, text)]}]
 
 
+def own_notice(repo=REPO):
+    """NOTICE at the repository root, word for word: the acknowledgement that sits beside the MIT licence.
+    It is printed in the header too, because a package that takes only LICENSE and this file (an older
+    installer unpacking a newer tarball) must still carry it, so a tree without it stops the run."""
+    path = os.path.join(repo, "NOTICE")
+    try:
+        text = read_text(path)
+    except OSError as e:
+        raise Fail(f"{path}: {e}: every release carries the root NOTICE beside LICENSE")
+    if "Neovide" not in text:
+        raise Fail(f"{path} no longer acknowledges Neovide; re-check it")
+    return text
+
+
 def artwork_entries(repo=REPO):
     """The one entry for Eitri's own artwork (ARTWORK_DIR under `repo`), or a Fail: the directory must
     hold exactly ARTWORK_FILES, its LICENSE must be the notice (ARTWORK_NOTICE) word for word,
@@ -1401,14 +1415,15 @@ def nvim_rs_lgpl_notice(version):
 
 def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web_count, sc, sc_pkgs_count,
                   counts_rust, counts_web, counts_sc, skia_archive_count=0, artwork_count=0, plugin_count=0,
-                  counts_plugin=None):
+                  counts_plugin=None, notice=None):
     """The prose block before PART 1, as its own function so a unit test can check the two profiles'
     shapes (LGPL-3.0 sec 4(a)) without a real build. `sc` is the sidecar_facts()
     dict, or None when no_sidecar. `skia_archive_count` (no_sidecar only) is the number of entries
     skia_archive_notice_entries() found, for the "Contents:" list below: that list
     used to stop at part 3/4 and never mentioned the archive-contents section at all. `artwork_count`
     is the number of entries artwork_entries() found (Eitri's own icon, under its own licence). `plugin_count` and
-    `counts_plugin` describe part 5, the Markdown preview plugin's page, which ships as a plugin directory."""
+    `counts_plugin` describe part 5, the Markdown preview plugin's page, which ships as a plugin directory.
+    `notice` is own_notice()'s text."""
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
@@ -1418,6 +1433,10 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     L += [
         "Eitri's own code is MIT-licensed: see LICENSE, installed beside this file.",
         "",
+    ]
+    if notice:
+        L += [*notice.strip().splitlines(), ""]
+    L += [
         "This package also contains other people's code, each part under its own licence,",
         "reproduced below. MIT covers Eitri's code only; it does not relicense any of this.",
     ]
@@ -1541,7 +1560,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     artwork = artwork_entries(repo)
     L = build_header(no_sidecar, source_url, copyleft, len(rust), len(native), len(web), sc,
                       len(sc_pkgs), counts_rust, counts_web, counts_sc, len(archive_entries), len(artwork),
-                      plugin_count=len(plugin), counts_plugin=counts_plugin)
+                      plugin_count=len(plugin), counts_plugin=counts_plugin, notice=own_notice(repo))
 
     printed = {}
     L += [RULE, "PART 1 -- Rust crates linked into the shipped binaries", RULE, ""]
@@ -1653,7 +1672,7 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
         "    ../../proto/verdandi/claude/runtime/v1/runtime.proto relative to its own vendored",
         "    crate directory, which is exactly vendor/claude-runtime-protocol/../../proto once this",
         "    asset is unpacked -- so an offline rebuild needs proto/ at the root to resolve that path;",
-        "  - LICENSE, THIRD-PARTY-LICENSES and this file, at the asset's root.",
+        "  - LICENSE, NOTICE, THIRD-PARTY-LICENSES and this file, at the asset's root.",
         "",
         "To rebuild the unmodified tree without a git checkout (no .git directory to read a commit",
         "from, in this project or in neovide/), set these before building, so `shell --version`",

@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-NOTICE
-
-This project depends on a fork of Neovide (https://github.com/neovide/neovide),
-also MIT-licensed (Copyright (c) 2023 Neovide Contributors), via a Cargo git
-dependency — it is not vendored or copied into this repository. Neovide's own
-architecture and code directly shaped a large fraction of this project's
-editor component (`neovide-editor/`), so it is acknowledged here even though
-no Neovide source is redistributed by this repository.

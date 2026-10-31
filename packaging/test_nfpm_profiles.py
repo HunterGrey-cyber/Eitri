@@ -285,6 +285,10 @@ class ReleaseAndSourceAreInBoth(unittest.TestCase):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             self.assertIn("/usr/share/licenses/eitri/SOURCE", _contents_by_dst(_load_yaml(path)))
 
+    def test_the_acknowledgement_is_in_both(self):
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            self.assertEqual(_contents_by_dst(_load_yaml(path))["/usr/share/licenses/eitri/NOTICE"]["src"], "./NOTICE")
+
 
 class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
     """The two files may differ only in: the sidecar

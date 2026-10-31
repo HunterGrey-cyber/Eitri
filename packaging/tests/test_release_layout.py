@@ -1542,6 +1542,7 @@ class ReleaseAssetsTests(unittest.TestCase):
                                      "plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST,
                                      "plugins/markdown/web/src/main.ts": b"m\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
+                                     "NOTICE": b"NOTICE",
                                      "packaging/apparmor/eitri": cls.APPARMOR,
                                      # The tracked desktop entry and icons the release ships unmodified
                                      # (rc.TRACKED_ART); each role's bytes are its own name, as below.
@@ -1686,6 +1687,13 @@ class ReleaseAssetsTests(unittest.TestCase):
             ("a desktop entry that is not the tracked one",
              lambda c: self.set_everywhere(c, "desktop", b"[Desktop Entry]\nName=Other\n"),
              ["not byte-identical", "{source}:packaging/cn.huntergrey.eitri.desktop"]),
+            ("a package without the acknowledgement", lambda c: c["rpm"].pop(rc.package_roles()["NOTICE"]),
+             ["{rpm}: missing", "usr/share/licenses/eitri/NOTICE"]),
+            ("a tarball without the acknowledgement",
+             lambda c: c["tarball"].pop(rc.tarball_roles(self.VERSION)["NOTICE"]),
+             ["{tarball}: missing", "share/licenses/eitri/NOTICE"]),
+            ("an acknowledgement that is not the tracked one", lambda c: self.set_everywhere(c, "NOTICE", b"other\n"),
+             ["not byte-identical", "{source}:NOTICE"]),
             ("a tarball without the legacy entry 0.2.0's installer needs",
              lambda c: c["tarball"].pop(rc.tarball_roles(self.VERSION)["legacy-desktop"]),
              ["{tarball}: missing", "share/applications/eitri.desktop"]),
