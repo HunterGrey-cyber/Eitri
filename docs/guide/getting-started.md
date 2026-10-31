@@ -16,11 +16,13 @@ too.
 
 If you have no `init.lua` yet, the first window opens a short setup screen before anything else. It lists what it
 found on your computer (a tmux configuration and its prefix, your desktop, the Neovim mappings that could collide
-with Eitri's keys, a running input method) and asks how the window's keys should work:
+with Eitri's keys, a running input method) and asks how the window's keys should work. On Hyprland, sway or niri it
+also offers, and selects, a preset where your window manager arranges chats and pages
+([Compositor windows](compositor-windows.md)):
 
 - `j` and `k`, or the number of a preset, choose; `Enter` goes on to a review that shows the lines it would write.
 - `Enter` on the review writes `~/.config/eitri/init.lua` (once, and never over a file that exists); `Backspace`
-  goes back. The new keys apply from the next start. After writing, `t` opens `:EitriTutor` and `Enter` closes.
+  goes back. The new keys, and any `window.tiling` line, apply from the next start. After writing, `t` opens `:EitriTutor` and `Enter` closes.
 - `Esc` is "not now": nothing is written, and the screen asks once more at the next start. `d` stops it for good.
   `:Eitri setup` brings it back later.
 

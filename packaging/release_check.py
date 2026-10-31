@@ -812,6 +812,8 @@ TRACKED_ART = {
     "desktop": f"packaging/{APP_ID}.desktop",
     # The companion panel's own entry, `eitri panel` (a second window class).
     "panel-desktop": f"packaging/{APP_ID}.Panel.desktop",
+    # The page window's entry (a web page as a window of its own, a third window class).
+    "page-desktop": f"packaging/{APP_ID}.Page.desktop",
     **{role: f"nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     **{role: f"gnome-extension/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     # 0.2.0's own desktop entry, byte for byte, in the tarball only (see _TARBALL_ONLY_ROLES).
@@ -828,6 +830,7 @@ _TARBALL_ROLES = {
     "RELEASE": "lib/eitri/RELEASE",
     "desktop": f"share/applications/{APP_ID}.desktop",
     "panel-desktop": f"share/applications/{APP_ID}.Panel.desktop",
+    "page-desktop": f"share/applications/{APP_ID}.Page.desktop",
     **{role: f"share/eitri/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     **{role: f"share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
@@ -843,6 +846,7 @@ _PACKAGE_ROLES = {
     "RELEASE": "usr/lib/eitri/RELEASE",
     "desktop": f"usr/share/applications/{APP_ID}.desktop",
     "panel-desktop": f"usr/share/applications/{APP_ID}.Panel.desktop",
+    "page-desktop": f"usr/share/applications/{APP_ID}.Page.desktop",
     **{role: f"usr/share/eitri/nvim/eitri.nvim/{rel}" for role, rel in _PLUGIN_FILES.items()},
     **{role: f"usr/share/gnome-shell/extensions/{GNOME_EXT_ID}/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     **{role: f"usr/share/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},

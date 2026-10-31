@@ -357,6 +357,35 @@ pub fn parse_buffer_state(v: &Value) -> Result<BufferState, String> {
     })
 }
 
+/// How long a module window's write waits for window 1's answer. Longer than a loaded window 1
+/// takes to read the presence directories, short enough that a window 1 that stopped is a refusal the
+/// user sees while still at the key.
+pub const GUARD_WAIT: Duration = Duration::from_secs(2);
+
+/// Why a module window that cannot hear from window 1 does not write.
+pub const NOT_LINKED: &str = "window 1 is not linked";
+
+/// What a write asks before it goes ahead, under the write slot and on its worker, never the GTK
+/// thread. A module window sees only itself and its link, so after its own checks it asks window 1,
+/// which sees the group; no link, no answer in time or the link ending meanwhile refuse. Any other
+/// window reads the presence directories itself.
+fn may_go_ahead(guard: &PresenceGuard) -> Result<(), Refusal> {
+    let Some(group) = guard.group() else {
+        return guard.check().map_err(Refusal::Blocked);
+    };
+    guard.check_own().map_err(Refusal::Blocked)?;
+    let not_linked = || Refusal::Blocked(Blocked::NotHeld(NOT_LINKED.to_string()));
+    let (job, answer) = group.ask().ok_or_else(not_linked)?;
+    match answer.recv_timeout(GUARD_WAIT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(why)) => Err(Refusal::Blocked(Blocked::Group(why))),
+        Err(_) => {
+            group.gave_up(job);
+            Err(not_linked())
+        }
+    }
+}
+
 /// Who answers the editor's questions about a file's buffers: this window's own editor, or, in
 /// window 2, which has none, window 1's, asked over the link.
 pub trait BufferAsk {
@@ -719,7 +748,7 @@ impl RevertJob {
         let rel = self.path.clone();
         let wanted = Some(self.wanted.as_ref());
         still_wanted(wanted)?;
-        self.guard.check().map_err(Refusal::Blocked)?;
+        may_go_ahead(&self.guard)?;
         let (root, target) = locate(&self.clear, &self.spec.root, &rel, &self.session)?;
         let (shadow, journal) = open_store(&self.spec)?;
 
@@ -808,7 +837,7 @@ impl UndoJob {
         let rel = self.path.clone();
         let wanted = Some(self.wanted.as_ref());
         still_wanted(wanted)?;
-        self.guard.check().map_err(Refusal::Blocked)?;
+        may_go_ahead(&self.guard)?;
         let (root, target) = locate(&self.clear, &self.spec.root, &rel, &self.session)?;
         let (shadow, journal) = open_store(&self.spec)?;
         let stored = |blob: &str| -> Result<Vec<u8>, Refusal> {
@@ -949,7 +978,7 @@ impl RecoverJob {
                 Ok(Recovered::Dismissed)
             }
             RecoverAnswer::Restore(ref clear) => {
-                self.guard.check().map_err(Refusal::Blocked)?;
+                may_go_ahead(&self.guard)?;
                 let (shadow, journal) = open_store(&self.spec)?;
                 // Held to the end, so another window cannot restore the same entry meanwhile.
                 let (entry, _claim) = claim(&journal, &self.entry)?;
@@ -1116,7 +1145,7 @@ fn final_checks(
     if let Some(hook) = hook {
         hook();
     }
-    guard.check().map_err(Refusal::Blocked)?;
+    may_go_ahead(guard)?;
     still_wanted(wanted)?;
     still_clear(clear, Instant::now())?;
     let create_missing = *expected == Current::Absent && writes_something;

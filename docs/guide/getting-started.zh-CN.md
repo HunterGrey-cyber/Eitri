@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=9a16b23f2e2a90dde93a53606bd2c0d7e46a09af0a981ba38b26deeb1c9d3b86 -->
+<!-- translated-from: getting-started.md sha256=1949f08e3daa658abfe53503d184a327df509d5dac4ff0ed65a86d25b9d417de -->
 
 # 快速上手
 
@@ -10,10 +10,10 @@
 <a id="the-first-launch"></a>
 ## 第一次启动
 
-如果你还没有 `init.lua`，第一个窗口会先打开一个简短的设置界面。它列出在你电脑上找到的东西（tmux 配置和它的前缀、你的桌面、可能和 Eitri 按键冲突的 Neovim 映射、正在运行的输入法），然后问窗口的按键要怎么用：
+如果你还没有 `init.lua`，第一个窗口会先打开一个简短的设置界面。它列出在你电脑上找到的东西（tmux 配置和它的前缀、你的桌面、可能和 Eitri 按键冲突的 Neovim 映射、正在运行的输入法），然后问窗口的按键要怎么用。在 Hyprland、sway 或 niri 上，它还提供并选中一个由窗口管理器排布聊天和页面的预设（[合成器窗口](compositor-windows.zh-CN.md)）：
 
 - `j` 和 `k`，或预设的数字，用来选择；`Enter` 进入复查，复查会展示它要写的行。
-- 复查时按 `Enter` 写入 `~/.config/eitri/init.lua`（只写一次，绝不覆盖已有的文件）；`Backspace` 返回。新按键从下次启动起生效。写完后，`t` 打开 `:EitriTutor`，`Enter` 关闭。
+- 复查时按 `Enter` 写入 `~/.config/eitri/init.lua`（只写一次，绝不覆盖已有的文件）；`Backspace` 返回。新按键和 `window.tiling` 这一行（如果有）都从下次启动起生效。写完后，`t` 打开 `:EitriTutor`，`Enter` 关闭。
 - `Esc` 是“以后再说”：什么都不写，下次启动时界面再问一次。`d` 让它永远不再出现。以后可以用 `:Eitri setup` 叫回来。
 
 你更想自己写文件的话，按两次 `Esc` 或按 `d`；界面提供的一切都在[按键](keys.zh-CN.md)和[配置](configuration.zh-CN.md#first-start)里。

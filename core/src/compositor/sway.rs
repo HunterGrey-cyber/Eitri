@@ -12,7 +12,7 @@ pub fn parse_windows(json: &str) -> Result<Vec<WindowRef>, String> {
         return Err("sway get_tree: expected an object".to_string());
     }
     let mut out = Vec::new();
-    collect(&root, &mut out);
+    collect(&root, None, None, &mut out);
     Ok(out)
 }
 
@@ -20,7 +20,11 @@ fn children<'a>(node: &'a Value, key: &str) -> &'a [Value] {
     node.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-fn collect(node: &Value, out: &mut Vec<WindowRef>) {
+fn collect(node: &Value, workspace: Option<&str>, output: Option<&str>, out: &mut Vec<WindowRef>) {
+    let kind = node.get("type").and_then(Value::as_str);
+    let name = node.get("name").and_then(Value::as_str);
+    let workspace = if kind == Some("workspace") { name } else { workspace };
+    let output = if kind == Some("output") { name } else { output };
     let nodes = children(node, "nodes");
     let floating = children(node, "floating_nodes");
     if nodes.is_empty() && floating.is_empty() {
@@ -33,6 +37,11 @@ fn collect(node: &Value, out: &mut Vec<WindowRef>) {
             {
                 out.push(WindowRef {
                     pid,
+                    app_id: node.get("app_id").and_then(Value::as_str).map(str::to_owned),
+                    title: name.map(str::to_owned),
+                    address: None,
+                    workspace: workspace.map(str::to_owned),
+                    output: output.map(str::to_owned),
                     id: node.get("id").and_then(Value::as_u64),
                     focused: node.get("focused").and_then(Value::as_bool).unwrap_or(false),
                     visible: node.get("visible").and_then(Value::as_bool) == Some(true),
@@ -43,7 +52,7 @@ fn collect(node: &Value, out: &mut Vec<WindowRef>) {
         return;
     }
     for child in nodes.iter().chain(floating) {
-        collect(child, out);
+        collect(child, workspace, output, out);
     }
 }
 

@@ -160,7 +160,9 @@ impl WindowModes {
 
     fn sync_widgets(&self) {
         let mode = self.mode.get();
-        let show_bar = mode.shows_top_bar() || self.revealed.get();
+        // A bar that hangs in no window (a chat or page window builds one for its hooks but never shows it) stays
+        // hidden whatever the mode or a reveal asks.
+        let show_bar = self.top_bar.parent().is_some() && (mode.shows_top_bar() || self.revealed.get());
         if !show_bar && self.focus_in_top_bar() {
             (self.return_to_pane)();
         }

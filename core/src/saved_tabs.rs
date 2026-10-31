@@ -21,6 +21,12 @@
 //! losing them; the claim is renamed `<name>.json.taken` once this window's own file holds every one of
 //! them ([`TabWriter::take_over_when_written`]), never before, so no saved tab is ever out of every file.
 //!
+//! **A group's file.** In compositor mode every chat is a window of its own and none of them writes: each tells window
+//! 1 its tabs, and window 1 writes today's `<16 hex>.json` for them all ([`merge_windows`]). Each extra window's tab on
+//! screen is saved as that view, so `eitri` mode reads the file as it always did: that tab in its view, every other tab
+//! in the base view, nothing hidden. A tab that view cannot say the window of carries its window in `window` as well,
+//! which `eitri` mode does not read and compositor mode does ([`tabs_for`]); an older build ignores the key.
+//!
 //! **When it is written** is [`TabMemory`]'s job, run on its own thread by [`TabWriter`]: whenever the set it is shown differs from the set
 //! it last saw, and never because the window is closing -- closing closes every tab, and recording
 //! "no tabs" then would erase exactly what the next launch wants.
@@ -33,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
 use crate::state_paths::{create_state_dir, state_subdir, temporary};
+use crate::window_link::names::WindowName;
 use crate::window_link::pair::{tabs_file_name, Role};
 
 /// The file format's version. A file of any other version is not read.
@@ -54,6 +61,62 @@ pub struct SavedTab {
     pub mode: SessionModeChoice,
     /// The chat view the tab was shown in, 2 to 9 (`agent#N`); absent for the base view.
     pub view: Option<u8>,
+    /// The chat window the tab was in, 2 to 9, when `view` does not say so: one tab of a window is its view, and the
+    /// others are saved in the base view for `eitri` mode to find. Absent otherwise.
+    pub window: Option<u8>,
+}
+
+impl SavedTab {
+    /// The chat window this tab belongs to: `c1` holds every tab with no number.
+    fn chat_window(&self) -> u8 {
+        self.window.or(self.view).unwrap_or(1)
+    }
+
+    /// This tab with no place of its own: the window it is in says where it shows.
+    fn in_base_view(self) -> SavedTab {
+        SavedTab {
+            view: None,
+            window: None,
+            ..self
+        }
+    }
+
+    /// The agent and session that name this tab.
+    fn key(&self) -> (AgentId, String) {
+        (self.agent.clone(), self.provider_session_id.clone())
+    }
+
+    /// This tab as it crosses the link to another window of the project.
+    pub fn to_wire(&self) -> serde_json::Value {
+        let entry = OtherEntry {
+            agent: self.agent.clone(),
+            conversation_id: self.conversation_id.clone(),
+            provider_session_id: self.provider_session_id.clone(),
+            name: self.name.clone(),
+            mode: self.mode,
+            view: self.view,
+            window: self.window,
+        };
+        serde_json::to_value(entry).expect("a saved tab always serializes")
+    }
+
+    /// A tab another window sent: its input, so a shape that is not a tab or a tab with no session is refused, as a
+    /// blank entry of the file is dropped.
+    pub fn from_wire(value: &serde_json::Value) -> Result<SavedTab, String> {
+        let entry = OtherEntry::deserialize(value).map_err(|e| format!("not a saved tab ({e})"))?;
+        if entry.provider_session_id.trim().is_empty() || entry.conversation_id.trim().is_empty() {
+            return Err("a saved tab with no session".to_string());
+        }
+        Ok(SavedTab {
+            agent: entry.agent,
+            conversation_id: entry.conversation_id,
+            provider_session_id: entry.provider_session_id,
+            name: entry.name,
+            mode: entry.mode,
+            view: entry.view,
+            window: entry.window,
+        })
+    }
 }
 
 /// The tabs of one window: the Claude tabs, then the other agents' tabs, each in tab-bar order.
@@ -101,9 +164,49 @@ impl SavedTabs {
         }
     }
 
+    /// These tabs with no place of their own: the window they are given to says where they show.
+    pub fn in_base_view(mut self) -> SavedTabs {
+        self.tabs = self.tabs.into_iter().map(SavedTab::in_base_view).collect();
+        self
+    }
+
     /// No tab of any agent.
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+
+    /// These tabs as they cross the link to another window of the project.
+    pub fn to_wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tabs": self.tabs.iter().map(SavedTab::to_wire).collect::<Vec<_>>(),
+            "active": self.active,
+            "claude_active": self.claude_active,
+        })
+    }
+
+    /// Tabs another window sent: its input, so a shape that is not a set of tabs, or one entry that is no tab, refuses
+    /// the set, and an index past its end reads as absent.
+    pub fn from_wire(value: &serde_json::Value) -> Result<SavedTabs, String> {
+        let tabs = value
+            .get("tabs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "not a set of saved tabs".to_string())?
+            .iter()
+            .map(SavedTab::from_wire)
+            .collect::<Result<Vec<SavedTab>, String>>()?;
+        let index = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < tabs.len())
+        };
+        let (active, claude_active) = (index("active"), index("claude_active"));
+        Ok(SavedTabs {
+            tabs,
+            active,
+            claude_active,
+        })
     }
 
     /// The tab that comes back on screen.
@@ -175,6 +278,9 @@ struct ClaudeEntry {
     /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
     view: Option<u8>,
+    /// A value no chat window beside `c1` can have is read as absent, as `view`'s is.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    window: Option<u8>,
 }
 
 /// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
@@ -190,6 +296,9 @@ struct OtherEntry {
     /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
     view: Option<u8>,
+    /// A value no chat window beside `c1` can have is read as absent, as `view`'s is.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    window: Option<u8>,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -219,6 +328,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                 name: t.name.clone(),
                 mode: t.mode,
                 view: t.view,
+                window: t.window,
             })
             .collect(),
         active: saved.rank(saved.claude_active, false).unwrap_or(0),
@@ -232,6 +342,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                     name: t.name.clone(),
                     mode: t.mode,
                     view: t.view,
+                    window: t.window,
                 })
             })
             .collect(),
@@ -262,6 +373,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             name: t.name,
             mode: t.mode,
             view: t.view,
+            window: t.window,
         })
         .collect();
     // An agent this build does not know stays a hole, so the active index still finds its tab.
@@ -276,6 +388,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
                 name: t.name,
                 mode: t.mode,
                 view: t.view,
+                window: t.window,
             }),
             ExternalEntry::Unknown(_) => None,
         })
@@ -317,6 +430,103 @@ fn usable(tabs: impl Iterator<Item = Option<SavedTab>>, external: bool) -> Vec<S
         }
     }
     kept
+}
+
+/// One file for a group's chat windows: each window's tabs in `parts`, windows in name order. `c1`'s are in the base
+/// view; each later window's tab on screen is that window's view and its others name the window, so `eitri` mode
+/// shows the first in its view and the rest in the base view, and no tab is hidden. The tab on screen is
+/// `active_from`'s. Anything but a chat window holds no tabs, and a session a window listed first stays there.
+pub fn merge_windows(parts: &[(WindowName, SavedTabs)], active_from: Option<&WindowName>) -> SavedTabs {
+    let mut windows: Vec<(u8, &SavedTabs)> = parts
+        .iter()
+        .filter_map(|(name, part)| Some((name.chat_number()?, part)))
+        .collect();
+    windows.sort_by_key(|(number, _)| *number);
+    let mut merged: Vec<SavedTab> = Vec::new();
+    for (number, part) in windows {
+        let on_screen = part.active.or(part.claude_active).unwrap_or(0);
+        for (index, tab) in part.tabs.iter().enumerate() {
+            if merged.iter().any(|kept| kept.key() == tab.key()) {
+                continue;
+            }
+            let (view, window) = match number {
+                1 => (None, None),
+                _ if index == on_screen => (Some(number), None),
+                _ => (None, Some(number)),
+            };
+            merged.push(SavedTab {
+                view,
+                window,
+                ..tab.clone()
+            });
+        }
+    }
+    let from = active_from.and_then(|name| parts.iter().find(|(part, _)| part == name).map(|(_, part)| part));
+    let key_of = |index: fn(&SavedTabs) -> Option<usize>| {
+        from.and_then(|part| index(part).and_then(|i| part.tabs.get(i)))
+            .map(SavedTab::key)
+    };
+    let (on_screen, claude_on_screen) = (key_of(|part| part.active), key_of(|part| part.claude_active));
+    from_tabs(merged, &on_screen, &claude_on_screen)
+}
+
+/// The window `name`'s part of `file`, each tab in the base view: the tabs whose window or view says it is theirs,
+/// `c1`'s being the tabs that name none. The window's own view is the tab it had on screen; `c1` has the file's.
+pub fn tabs_for(file: &SavedTabs, name: &WindowName) -> SavedTabs {
+    let Some(number) = name.chat_number() else {
+        return SavedTabs::default();
+    };
+    let at = |index: Option<usize>| {
+        index
+            .and_then(|i| file.tabs.get(i))
+            .filter(|tab| tab.chat_window() == number)
+            .map(SavedTab::key)
+    };
+    let shown = file
+        .tabs
+        .iter()
+        .find(|tab| tab.chat_window() == number && tab.view == Some(number))
+        .map(SavedTab::key);
+    let on_screen = shown.clone().or_else(|| at(file.active));
+    let claude_on_screen = shown.or_else(|| at(file.claude_active));
+    let tabs = file
+        .tabs
+        .iter()
+        .filter(|tab| tab.chat_window() == number)
+        .cloned()
+        .map(SavedTab::in_base_view)
+        .collect();
+    from_tabs(tabs, &on_screen, &claude_on_screen)
+}
+
+/// The chat windows `file` holds tabs for, by number.
+pub fn windows_holding(file: &SavedTabs) -> Vec<WindowName> {
+    let numbers: std::collections::BTreeSet<u8> = file.tabs.iter().map(SavedTab::chat_window).collect();
+    numbers.into_iter().map(WindowName::Chat).collect()
+}
+
+/// The extra chat views `file` has a tab saved in, by number.
+pub fn views_holding(file: &SavedTabs) -> Vec<u8> {
+    let numbers: std::collections::BTreeSet<u8> = file.tabs.iter().filter_map(|tab| tab.view).collect();
+    numbers.into_iter().collect()
+}
+
+/// `tabs`, in any order, with `on_screen` the tab that comes back on screen when it is listed and `claude_on_screen`
+/// the Claude tab a build that reads only those puts there.
+fn from_tabs(
+    tabs: Vec<SavedTab>,
+    on_screen: &Option<(AgentId, String)>,
+    claude_on_screen: &Option<(AgentId, String)>,
+) -> SavedTabs {
+    let (claude, others): (Vec<SavedTab>, Vec<SavedTab>) = tabs.into_iter().partition(|t| !t.agent.is_external());
+    let at = |tabs: &[SavedTab], key: &Option<(AgentId, String)>| {
+        key.as_ref().and_then(|key| tabs.iter().position(|t| t.key() == *key))
+    };
+    let claude_at = at(&claude, on_screen)
+        .or_else(|| at(&claude, claude_on_screen))
+        .unwrap_or(0);
+    let others_at = at(&others, on_screen);
+    SavedTabs::from_parts(claude, claude_at, others, others_at)
 }
 
 /// What [`load`] found.
@@ -890,6 +1100,12 @@ impl TabWriter {
         }
     }
 
+    /// `saved` is what the file holds already, read by the caller: the next set is a change from it, so one with no tabs
+    /// left empties the file.
+    pub fn starts_from(&mut self, saved: SavedTabs) {
+        self.last = saved;
+    }
+
     /// Stops all writing, for good, a set still queued included.
     pub fn disable(&mut self) {
         self.dir = None;
@@ -1103,6 +1319,7 @@ mod tests {
             name: name.map(str::to_string),
             mode,
             view: None,
+            window: None,
         }
     }
 
@@ -1125,6 +1342,21 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_crosses_the_link_whole_and_what_is_no_tab_is_refused() {
+        for agent in [AgentId::Claude, AgentId::Codex, AgentId::Acp("gemini".into())] {
+            let mut tab = tab("s-1", Some("work"), SessionModeChoice::Bypass);
+            tab.agent = agent;
+            tab.view = Some(3);
+            assert_eq!(SavedTab::from_wire(&tab.to_wire()), Ok(tab));
+        }
+        let mut blank = tab("  ", None, SessionModeChoice::Auto).to_wire();
+        assert!(SavedTab::from_wire(&blank).is_err(), "no session");
+        blank["agent"] = serde_json::json!("nobody");
+        assert!(SavedTab::from_wire(&blank).is_err(), "no such agent");
+        assert!(SavedTab::from_wire(&serde_json::json!("s-1")).is_err());
+    }
+
+    #[test]
     fn a_tab_in_a_chat_view_keeps_its_view_and_a_build_before_views_still_reads_the_file() {
         let mut base = two();
         base.tabs[1].view = Some(3);
@@ -1132,6 +1364,7 @@ mod tests {
             base,
             vec![SavedTab {
                 view: Some(2),
+                window: None,
                 ..codex("thread-a", SessionModeChoice::Auto)
             }],
             None,
@@ -1232,6 +1465,7 @@ mod tests {
                 name: None,
                 mode: SessionModeChoice::Manual,
                 view: None,
+                window: None,
             }],
             None,
         );
@@ -1679,6 +1913,7 @@ mod tests {
             name: Some("refactor".to_string()),
             mode,
             view: None,
+            window: None,
         }
     }
 
@@ -2087,6 +2322,284 @@ mod tests {
         assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");
         assert!(second.exists(), "another window's file is left where it is");
     }
+
+    /// Tabs of one chat window, Claude's in order, the one at `active` on screen.
+    fn window_tabs(sessions: &[&str], active: usize) -> SavedTabs {
+        let tabs = sessions
+            .iter()
+            .map(|session| tab(session, None, SessionModeChoice::Auto))
+            .collect();
+        SavedTabs::from_parts(tabs, active, Vec::new(), None)
+    }
+
+    fn sessions(saved: &SavedTabs) -> Vec<&str> {
+        saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect()
+    }
+
+    fn places(saved: &SavedTabs) -> Vec<(&str, Option<u8>, Option<u8>)> {
+        saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.view, t.window))
+            .collect()
+    }
+
+    /// What the file holds for `merged`, read back.
+    fn through_the_file(merged: &SavedTabs) -> SavedTabs {
+        decode(&encode(merged, &root()), &root()).unwrap()
+    }
+
+    /// What `eitri` mode has of `saved` after a launch and a write of its own: it knows views, not windows.
+    fn written_by_eitri_mode(saved: &SavedTabs) -> SavedTabs {
+        let mut written = saved.clone();
+        for tab in &mut written.tabs {
+            tab.window = None;
+        }
+        written
+    }
+
+    #[test]
+    fn a_tab_saved_in_c3_reopens_as_view_3_in_eitri_mode_and_back() {
+        let merged = merge_windows(&[(WindowName::Chat(3), window_tabs(&["s-3"], 0))], None);
+        let file = through_the_file(&merged);
+        assert_eq!(places(&file), [("s-3", Some(3), None)]);
+        let record = agent::ResumableSession {
+            provider: "claude".to_string(),
+            provider_session_id: "s-3".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            title: None,
+            name: None,
+        };
+        let plan = crate::tab_restore::plan(&file, &[record], &[], |_, _| false);
+        assert_eq!(
+            plan.items[0].view.map(|view| view.number()),
+            Some(3),
+            "`eitri` mode puts it in `agent#3`"
+        );
+
+        let back = tabs_for(&file, &WindowName::Chat(3));
+        assert_eq!(places(&back), [("s-3", None, None)]);
+        assert_eq!(back.active, Some(0));
+        assert!(tabs_for(&file, &WindowName::Chat(1)).is_empty());
+
+        // And a file `eitri` mode wrote opens the same way: its view is a window.
+        let viewed = SavedTabs::from_parts(
+            vec![
+                tab("base", None, SessionModeChoice::Auto),
+                SavedTab {
+                    view: Some(3),
+                    ..tab("s-3", None, SessionModeChoice::Auto)
+                },
+            ],
+            0,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(windows_holding(&viewed), [WindowName::Chat(1), WindowName::Chat(3)]);
+        assert_eq!(sessions(&tabs_for(&viewed, &WindowName::Chat(3))), ["s-3"]);
+        assert_eq!(sessions(&tabs_for(&viewed, &WindowName::Chat(1))), ["base"]);
+    }
+
+    #[test]
+    fn the_views_a_file_holds_are_listed_once_each() {
+        let tabs = [(None, "a"), (Some(3), "b"), (Some(2), "c"), (Some(3), "d")]
+            .map(|(view, session)| SavedTab {
+                view,
+                ..tab(session, None, SessionModeChoice::Auto)
+            })
+            .to_vec();
+        assert_eq!(views_holding(&SavedTabs::from_parts(tabs, 0, Vec::new(), None)), [2, 3]);
+    }
+
+    #[test]
+    fn a_c3_with_two_tabs_round_trips_through_eitri_mode_without_losing_one() {
+        let parts = [(WindowName::Chat(3), window_tabs(&["other", "shown"], 1))];
+        let file = through_the_file(&merge_windows(&parts, None));
+        assert_eq!(
+            places(&file),
+            [("other", None, Some(3)), ("shown", Some(3), None)],
+            "the tab on screen is the view, and the other stays in the base view with its window named"
+        );
+        // Read back in compositor mode as it was.
+        let again = tabs_for(&file, &WindowName::Chat(3));
+        assert_eq!(sessions(&again), ["other", "shown"]);
+        assert_eq!(again.active_tab().unwrap().provider_session_id, "shown");
+        assert_eq!(windows_holding(&file), [WindowName::Chat(3)]);
+
+        // Through `eitri` mode: one tab in the view, one in the base view, and both are still in the file.
+        let flipped = through_the_file(&written_by_eitri_mode(&file));
+        assert_eq!(sessions(&tabs_for(&flipped, &WindowName::Chat(3))), ["shown"]);
+        assert_eq!(
+            sessions(&tabs_for(&flipped, &WindowName::Chat(1))),
+            ["other"],
+            "the view holds one tab, so the other opens in c1"
+        );
+    }
+
+    #[test]
+    fn a_window_of_other_agents_tabs_alone_keeps_one_on_screen() {
+        let codex = |session: &str| SavedTab {
+            agent: AgentId::Codex,
+            ..tab(session, None, SessionModeChoice::Auto)
+        };
+        let part = SavedTabs::from_parts(Vec::new(), 0, vec![codex("x-1"), codex("x-2")], None);
+        let merged = merge_windows(&[(WindowName::Chat(2), part)], None);
+        assert_eq!(places(&merged), [("x-1", Some(2), None), ("x-2", None, Some(2))]);
+        let back = tabs_for(&through_the_file(&merged), &WindowName::Chat(2));
+        assert_eq!(sessions(&back), ["x-1", "x-2"]);
+    }
+
+    #[test]
+    fn window_1s_merge_keeps_each_windows_tabs_in_order_and_one_tab_on_screen() {
+        let codex = SavedTab {
+            agent: AgentId::Codex,
+            ..tab("x-2", None, SessionModeChoice::Auto)
+        };
+        let parts = [
+            (
+                WindowName::Chat(2),
+                SavedTabs::from_parts(Vec::new(), 0, vec![codex], Some(0)),
+            ),
+            (WindowName::Chat(1), window_tabs(&["a", "b"], 1)),
+            (WindowName::Page("markdown".into()), window_tabs(&["no"], 0)),
+            (WindowName::Second, window_tabs(&["no"], 0)),
+        ];
+        let merged = merge_windows(&parts, Some(&WindowName::Chat(1)));
+        assert_eq!(
+            places(&merged),
+            [("a", None, None), ("b", None, None), ("x-2", Some(2), None)],
+            "c1 first, whatever order the parts came in, and only chat windows hold tabs"
+        );
+        assert_eq!(merged.active_tab().unwrap().provider_session_id, "b");
+        let on_c2 = merge_windows(&parts, Some(&WindowName::Chat(2)));
+        assert_eq!(on_c2.active_tab().unwrap().provider_session_id, "x-2");
+        assert_eq!(
+            sessions(&tabs_for(&merged, &WindowName::Chat(1))),
+            ["a", "b"],
+            "each window takes its own"
+        );
+        assert_eq!(tabs_for(&merged, &WindowName::Chat(1)).active, Some(1));
+        assert!(tabs_for(&merged, &WindowName::Page("markdown".into())).is_empty());
+    }
+
+    #[test]
+    fn a_session_two_windows_list_for_a_moment_is_one_tab() {
+        let parts = [
+            (WindowName::Chat(1), window_tabs(&["moving"], 0)),
+            (WindowName::Chat(2), window_tabs(&["moving", "stays"], 0)),
+        ];
+        let merged = merge_windows(&parts, None);
+        assert_eq!(sessions(&merged), ["moving", "stays"]);
+        assert_eq!(through_the_file(&merged), merged);
+    }
+
+    #[test]
+    fn the_saved_tabs_format_is_unchanged() {
+        let codex = SavedTab {
+            agent: AgentId::Codex,
+            name: Some("reader".to_string()),
+            ..tab("x-1", None, SessionModeChoice::Bypass)
+        };
+        let part = SavedTabs::from_parts(
+            vec![
+                tab("s-one", Some("api"), SessionModeChoice::Auto),
+                tab("s-two", None, SessionModeChoice::Bypass),
+            ],
+            1,
+            vec![codex],
+            None,
+        );
+        let merged = merge_windows(&[(WindowName::Chat(1), part.clone())], Some(&WindowName::Chat(1)));
+        assert_eq!(merged, part, "one window with no extra views is that window's own set");
+        assert_eq!(
+            encode(&merged, &root()),
+            r#"{
+  "version": 1,
+  "project_root": "/home/user/project",
+  "tabs": [
+    {
+      "conversation_id": "0123456789abcdef0123456789abcdef",
+      "provider_session_id": "s-one",
+      "name": "api",
+      "mode": "auto"
+    },
+    {
+      "conversation_id": "0123456789abcdef0123456789abcdef",
+      "provider_session_id": "s-two",
+      "mode": "bypass"
+    }
+  ],
+  "active": 1,
+  "external_tabs": [
+    {
+      "agent": "codex",
+      "conversation_id": "0123456789abcdef0123456789abcdef",
+      "provider_session_id": "x-1",
+      "name": "reader",
+      "mode": "bypass"
+    }
+  ]
+}"#
+        );
+    }
+
+    /// An older build's reader takes the keys it knows and leaves the rest, so `window` costs it nothing; a value no
+    /// window can have reads as absent, as a view's does, rather than making the file unusable.
+    #[test]
+    fn a_key_this_build_does_not_know_and_a_window_no_tab_can_have_leave_the_file_usable() {
+        for window in ["1", "10", "\"3\"", "null"] {
+            let text = format!(
+                r#"{{"version":1,"project_root":"/home/user/project","tabs":[
+                {{"conversation_id":"c","provider_session_id":"s","mode":"auto","window":{window},"later":true}}],
+                "active":0,"later":{{}}}}"#
+            );
+            let saved = decode(&text, &root()).unwrap();
+            assert_eq!(saved.tabs[0].window, None, "{window}");
+        }
+    }
+
+    #[test]
+    fn saved_tabs_cross_the_link_whole_and_what_is_no_set_of_tabs_is_refused() {
+        let codex = SavedTab {
+            agent: AgentId::Codex,
+            window: Some(4),
+            ..tab("x-1", None, SessionModeChoice::Auto)
+        };
+        let set = SavedTabs::from_parts(
+            vec![tab("a", Some("api"), SessionModeChoice::Bypass)],
+            0,
+            vec![codex],
+            Some(0),
+        );
+        assert_eq!(SavedTabs::from_wire(&set.to_wire()).unwrap(), set);
+
+        assert!(SavedTabs::from_wire(&serde_json::json!([])).is_err());
+        assert!(SavedTabs::from_wire(&serde_json::json!({"tabs": [{"session": "s"}]})).is_err());
+        let blank = serde_json::json!({
+            "tabs": [{"agent": "claude", "conversation_id": " ", "provider_session_id": "s", "mode": "auto"}]
+        });
+        assert!(SavedTabs::from_wire(&blank).is_err(), "a tab with no session");
+        let mut late = set.to_wire();
+        late["active"] = serde_json::json!(9);
+        late["claude_active"] = serde_json::json!("0");
+        let read = SavedTabs::from_wire(&late).unwrap();
+        assert_eq!((read.active, read.claude_active), (None, None));
+    }
+
+    /// A launch that read the file compares its next set with what the file holds, not with nothing: the last tab of a
+    /// group going away empties the file.
+    #[test]
+    fn a_writer_told_what_the_file_holds_writes_its_emptying() {
+        let dir = ScratchDir::new("nv-saved-tabs", "writer-starts-from");
+        let saved = window_tabs(&["s-one"], 0);
+        save(&dir, &root(), &saved).unwrap();
+        let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
+        writer.starts_from(saved);
+        writer.observe(Some(SavedTabs::default()));
+        assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        assert_eq!(load(&dir, &root()), Loaded::Saved(SavedTabs::default()));
+    }
 }
 
 /// How long a change of the saved tabs holds the thread that observes it (the GTK thread, once per
@@ -2108,6 +2621,7 @@ mod measure {
             name: None,
             mode: SessionModeChoice::Auto,
             view: None,
+            window: None,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();

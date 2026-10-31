@@ -895,7 +895,14 @@ mod tests {
             PresetId::Compositor
         );
         assert_eq!(
-            preselect(&tmux(Some("p")), Some(&live), Build::THIS_BINARY),
+            preselect(
+                &tmux(Some("p")),
+                Some(&live),
+                Build {
+                    compositor_mode: false,
+                    ..WITH_COMPOSITOR
+                }
+            ),
             PresetId::NvimTmux
         );
         let down = desktop(Wm::Sway, false);

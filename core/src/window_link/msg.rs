@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::editor_op::EditorOp;
+use crate::agent_backend::AgentId;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The longest JSON sent in a packet of its own; anything longer goes as a body.
@@ -136,6 +137,28 @@ pub struct Summary {
 pub enum Shape {
     Tiled,
     Float { x: f64, y: f64, w: f64, h: f64 },
+}
+
+/// What a module window asks window 1 to do, because it needs another window: only window 1 starts and raises them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "a", rename_all = "snake_case")]
+pub enum HubAsk {
+    /// Show this module: the window that holds it comes forward, or one is started for it.
+    Module { id: String },
+    /// A new chat window.
+    InstanceNew,
+    /// Move the tab of `agent`'s session to the next free chat window, or with `back` into `c1`.
+    TabBreak {
+        agent: AgentId,
+        session: String,
+        back: bool,
+    },
+    /// Run this chat key, by its action's name and options, in the chat window that last held the keys: a page window
+    /// has no chat of its own for it.
+    ChatKey {
+        name: String,
+        opts: Vec<(String, serde_json::Value)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -298,6 +321,63 @@ pub enum Msg {
     Away {
         ids: Vec<String>,
     },
+    /// `token` is the asking window's activation token, for the window that comes forward.
+    HubAsk {
+        ask: HubAsk,
+        token: Option<String>,
+    },
+    /// The sending window's toplevel gained the keyboard.
+    WindowFocused {},
+    /// A module window's revert job asks whether window 1 lets it write.
+    RevertGuard {
+        job: u64,
+    },
+    /// The answer to `revert_guard`; `why` says what blocks it.
+    Guard {
+        job: u64,
+        ok: bool,
+        why: Option<String>,
+    },
+    /// The sending window's saved tabs, for window 1 to keep with the group's.
+    TabsReport {
+        tabs: Value,
+    },
+    /// Tabs for the receiving window to open: at a link, or with `adopt` one tab handed over from another window.
+    TabsGiven {
+        tabs: Value,
+        adopt: bool,
+    },
+    /// Window 1 is closing its group: the chat window says its tabs as they stand now, then [`Msg::TabsSaid`].
+    GroupClosing {},
+    /// The last [`Msg::TabsReport`] window 1 asked for is out, or there was none to send.
+    TabsSaid {},
+    /// Window 1 asks the holder of a tab to give it up for window `to`. Session ids are each agent's own.
+    TabRelease {
+        agent: AgentId,
+        session: String,
+        to: String,
+    },
+    /// The tab is retired here, and `tab` is what its next holder opens.
+    TabReleased {
+        session: String,
+        tab: Value,
+    },
+    /// The tab stays where it is, for the reason `why`: the holder's answer to `tab_release`, or what window 1 tells
+    /// the holder when the hand-over it asked for cannot start.
+    TabKept {
+        session: String,
+        why: String,
+    },
+    /// The tab `session` is open in the window it was handed to: that window tells window 1, and window 1 tells the
+    /// window that gave it up, which until then stays open in case the tab has to come back.
+    TabAdopted {
+        session: String,
+    },
+    /// A keymap action by its name and the options that rebuild it; no Lua and no free text crosses.
+    RunAction {
+        name: String,
+        opts: Vec<(String, Value)>,
+    },
 }
 
 /// Every kind this build knows; any other is refused by name.
@@ -335,6 +415,19 @@ pub const KINDS: &[&str] = &[
     "swap",
     "child_exited",
     "away",
+    "hub_ask",
+    "window_focused",
+    "revert_guard",
+    "guard",
+    "tabs_report",
+    "tabs_given",
+    "group_closing",
+    "tabs_said",
+    "tab_release",
+    "tab_released",
+    "tab_kept",
+    "tab_adopted",
+    "run_action",
 ];
 
 impl Msg {
@@ -373,6 +466,19 @@ impl Msg {
             Msg::Swap { .. } => "swap",
             Msg::ChildExited { .. } => "child_exited",
             Msg::Away { .. } => "away",
+            Msg::HubAsk { .. } => "hub_ask",
+            Msg::WindowFocused {} => "window_focused",
+            Msg::RevertGuard { .. } => "revert_guard",
+            Msg::Guard { .. } => "guard",
+            Msg::TabsReport { .. } => "tabs_report",
+            Msg::TabsGiven { .. } => "tabs_given",
+            Msg::GroupClosing {} => "group_closing",
+            Msg::TabsSaid {} => "tabs_said",
+            Msg::TabRelease { .. } => "tab_release",
+            Msg::TabReleased { .. } => "tab_released",
+            Msg::TabKept { .. } => "tab_kept",
+            Msg::TabAdopted { .. } => "tab_adopted",
+            Msg::RunAction { .. } => "run_action",
         }
     }
 }
@@ -416,6 +522,8 @@ pub fn body_cap(kind: &str) -> usize {
         // an editor operation.
         "editor" | "draft_back" => 16 * MIB,
         "welcome" => 3 * MIB,
+        // A whole window's saved tabs: a few hundred sessions pass the packet's size.
+        "tabs_report" | "tabs_given" => 8 * MIB,
         _ => 0,
     }
 }
@@ -560,13 +668,59 @@ mod tests {
     use super::*;
     use crate::window_link::editor_op::EditorOp;
 
+    fn the_hubs_kinds() -> Vec<Msg> {
+        vec![
+            Msg::HubAsk {
+                ask: HubAsk::Module { id: "agent#3".into() },
+                token: Some("t".into()),
+            },
+            Msg::WindowFocused {},
+            Msg::RevertGuard { job: 4 },
+            Msg::Guard {
+                job: 4,
+                ok: false,
+                why: Some("window 1 is not linked".into()),
+            },
+            Msg::TabsReport {
+                tabs: serde_json::json!({"tabs": [{"session": "s"}], "active": 0}),
+            },
+            Msg::TabsGiven {
+                tabs: serde_json::json!([{"session": "s"}]),
+                adopt: true,
+            },
+            Msg::GroupClosing {},
+            Msg::TabsSaid {},
+            Msg::TabRelease {
+                agent: AgentId::Acp("two".into()),
+                session: "s".into(),
+                to: "c3".into(),
+            },
+            Msg::TabReleased {
+                session: "s".into(),
+                tab: serde_json::json!({"session": "s"}),
+            },
+            Msg::TabKept {
+                session: "s".into(),
+                why: "a turn is running".into(),
+            },
+            Msg::TabAdopted { session: "s".into() },
+            Msg::RunAction {
+                name: "tab_goto".into(),
+                opts: vec![
+                    ("index".into(), serde_json::json!(3)),
+                    ("dir".into(), serde_json::json!("left")),
+                ],
+            },
+        ]
+    }
+
     fn one_of_each() -> Vec<Msg> {
         let edge = TurnEdge {
             session: "s".into(),
             edge: EdgeKind::Started,
             at_ns: 7,
         };
-        vec![
+        let mut all = vec![
             Msg::Hello {
                 build: "b".into(),
                 window: "2".into(),
@@ -710,7 +864,9 @@ mod tests {
             Msg::Away {
                 ids: vec!["lua:notes".into()],
             },
-        ]
+        ];
+        all.extend(the_hubs_kinds());
+        all
     }
 
     #[test]
@@ -785,6 +941,64 @@ mod tests {
             assert!(KINDS.contains(&msg.kind()));
             assert_eq!(from_json(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn every_new_kind_round_trips_and_carries_no_descriptor() {
+        let hub = the_hubs_kinds();
+        assert_eq!(hub.len(), 13);
+        for msg in hub {
+            let kind = msg.kind();
+            assert!(KINDS.contains(&kind), "{kind} is listed");
+            assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
+            assert!(check_fds(kind, false, 0).is_ok(), "{kind} needs no descriptor");
+            assert!(check_fds(kind, false, 1).is_err(), "{kind} carries no descriptor");
+            let may_be_long = matches!(kind, "tabs_report" | "tabs_given");
+            assert_eq!(
+                body_cap(kind) > 0,
+                may_be_long,
+                "{kind}: only a set of tabs passes one packet"
+            );
+        }
+        for ask in [
+            HubAsk::Module {
+                id: "lua:markdown".into(),
+            },
+            HubAsk::InstanceNew,
+            HubAsk::TabBreak {
+                agent: AgentId::Codex,
+                session: "s".into(),
+                back: true,
+            },
+            HubAsk::ChatKey {
+                name: "tab.select".into(),
+                opts: vec![("n".into(), serde_json::json!(3))],
+            },
+        ] {
+            let msg = Msg::HubAsk { ask, token: None };
+            assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
+        }
+        let msg = Msg::Guard {
+            job: 1,
+            ok: true,
+            why: None,
+        };
+        assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
+        assert_eq!(
+            from_json(
+                br#"{"v":1,"k":"hub_ask","ask":{"a":"tab_break","agent":"claude","session":"s","back":false},"token":null}"#
+            )
+            .unwrap(),
+            Msg::HubAsk {
+                ask: HubAsk::TabBreak {
+                    agent: AgentId::Claude,
+                    session: "s".into(),
+                    back: false
+                },
+                token: None
+            },
+            "an ask is tagged by `a` on the wire"
+        );
     }
 
     #[test]

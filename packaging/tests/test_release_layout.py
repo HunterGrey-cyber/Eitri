@@ -1131,7 +1131,7 @@ class BinaryAssetTreeTests(unittest.TestCase):
         rename of one without the other would otherwise fail only at release time)."""
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertEqual(sorted(rc.TRACKED_ART),
-                         sorted(["desktop", "panel-desktop", "legacy-desktop"]
+                         sorted(["desktop", "panel-desktop", "page-desktop", "legacy-desktop"]
                                 + [r for r in rc.package_roles() if r.startswith(("icon-", "plugin-", "gnome-ext-"))]))
         for role, path in rc.TRACKED_ART.items():
             self.assertTrue(os.path.isfile(os.path.join(repo, path)), (role, path))
@@ -1144,6 +1144,8 @@ class BinaryAssetTreeTests(unittest.TestCase):
         t, p = rc.tarball_roles("1.0.0"), rc.package_roles()
         self.assertEqual(t["panel-desktop"], top + "share/applications/cn.huntergrey.eitri.Panel.desktop")
         self.assertEqual(p["panel-desktop"], "usr/share/applications/cn.huntergrey.eitri.Panel.desktop")
+        self.assertEqual(t["page-desktop"], top + "share/applications/cn.huntergrey.eitri.Page.desktop")
+        self.assertEqual(p["page-desktop"], "usr/share/applications/cn.huntergrey.eitri.Page.desktop")
         self.assertEqual(t["plugin-eitri-lua"], top + "share/eitri/eitri.nvim/plugin/eitri.lua")
         self.assertEqual(p["plugin-eitri-lua"], "usr/share/eitri/nvim/eitri.nvim/plugin/eitri.lua")
         self.assertEqual(p["plugin-module"], "usr/share/eitri/nvim/eitri.nvim/lua/eitri/init.lua")

@@ -34,7 +34,8 @@
 //! state's fields stay private to the panel and every module reads them: the handle (`handle.rs`), the
 //! tick, the pages and what goes to which (`pages.rs`, `routing.rs`), a message's admission and its arms
 //! (`admission.rs`, `inbound.rs`, `verbs.rs`), starts and the trust question (`starts.rs`, `trust.rs`),
-//! the restore, a tab leaving with its session (`handoffs.rs`) or moving to the other window (`chat_moves.rs`),
+//! the restore, a tab leaving with its session (`handoffs.rs`), moving to the other window (`chat_moves.rs`) or handed
+//! to another window by resume (`hand_over.rs`),
 //! teardown, turn review's side
 //! (`review_glue.rs`), the chooser and detail rows (`detail.rs`), and links. A scan of the panel's code
 //! reads every one of them.
@@ -45,6 +46,8 @@ mod admission;
 mod chat_moves;
 #[path = "detail.rs"]
 mod detail;
+#[path = "hand_over.rs"]
+mod hand_over;
 #[path = "handle.rs"]
 mod handle;
 #[path = "handoffs.rs"]
@@ -101,7 +104,7 @@ pub use eitri_core::tab_set::{TabPlace, ViewId};
 use eitri_core::tabs::TabId;
 use outbox::{ask_gate, Dest, Effect, Outbox, Screen, Strip};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -109,6 +112,7 @@ use std::sync::mpsc;
 use admission::*;
 pub use chat_moves::ChatMoveEvent;
 use detail::*;
+pub use hand_over::TabAnswer;
 pub use handle::{AgentPanelHandle, PanelInit, SupervisorLink};
 pub use handoffs::PanelTabHandoff;
 use handoffs::*;
@@ -245,6 +249,8 @@ struct AgentPanelState {
     /// Running or queued work changed in these views; called after the step releases its state.
     busy_hook: Option<Rc<dyn Fn(&[(ViewId, bool)])>>,
     reported_activity: Vec<(ViewId, eitri_core::tab_set::ViewActivity)>,
+    /// Which tabs ran a turn when the hook was last told, each in its view (`report_busy`).
+    reported_turns: BTreeSet<(ViewId, TabId)>,
     /// Every tab's attention as the hook was last told it (`report_attention`).
     reported_tabs: Vec<eitri_core::tabs::TabAttention>,
     /// The per-window scratch directory, `None` if it could not be made.
@@ -347,6 +353,8 @@ struct AgentPanelState {
     restore_policy: RestorePolicy,
     /// The saved tabs the window offers, as last given after `init.lua` ran; `None` until then.
     tab_files: Option<eitri_core::saved_tabs::TabFiles>,
+    /// This window's part in a group's one tabs file.
+    group_tabs: restore::GroupTabs,
     /// Window 1 starting window 2 again at its launch: `agent.restore = "auto"` waits until window 2 is back or
     /// is not, so the saved tabs of a window 2 that does not come back return in the same restore as this
     /// window's own (a restore fills only a window that has started nothing).
@@ -379,6 +387,7 @@ struct AgentPanelState {
     spawner: Spawner,
     /// Tabs moving to or from the other window of a linked pair (`chat_moves.rs`).
     chat_moves: chat_moves::ChatMoves,
+    hand_overs: hand_over::HandOvers,
 }
 
 /// [`AgentPanelState::toast_hook`]: shows one line in the window's toast.
@@ -478,6 +487,7 @@ impl AgentPanelState {
             trust,
             spawner: Spawner::Real,
             chat_moves: chat_moves::ChatMoves::default(),
+            hand_overs: hand_over::HandOvers::default(),
             tabs,
             tab_memory,
             titles,
@@ -488,6 +498,7 @@ impl AgentPanelState {
             restore_source,
             restore_policy: RestorePolicy::Offer,
             tab_files: None,
+            group_tabs: restore::GroupTabs::default(),
             launch_restore_held: false,
             launch_restore_owed: false,
             bypass_by_config: false,
@@ -531,6 +542,7 @@ impl AgentPanelState {
             attention_hook: None,
             busy_hook: None,
             reported_activity: Vec::new(),
+            reported_turns: BTreeSet::new(),
             reported_tabs: Vec::new(),
             scratch,
             pending_edits: Vec::new(),
@@ -1093,6 +1105,7 @@ mod tests {
                         name: name.map(str::to_string),
                         mode: *mode,
                         view: None,
+                        window: None,
                     })
                     .collect(),
                 0,
@@ -1884,10 +1897,10 @@ mod tests {
         let builder = scan::code_only(&scan::file_with(&read, "fn build_agent_panel(").text);
         let build = scan::functions(&builder, "build_agent_panel");
         assert_eq!(build.len(), 1);
-        // The builder goes through `AgentPanelHandle::new` (once for the page, once for none), and
-        // that is the one place the state is built.
+        // The builder goes through `AgentPanelHandle::new` (once for the page, once for a window that shows
+        // no chat, once for none), and that is the one place the state is built.
         let flat_build: String = build[0].split_whitespace().collect();
-        assert_eq!(flat_build.matches("AgentPanelHandle::new(").count(), 2);
+        assert_eq!(flat_build.matches("AgentPanelHandle::new(").count(), 3);
         assert_eq!(scan::calls(build[0], "panel_state"), 0);
         let handle_impls = impl_blocks(&panel, "implAgentPanelHandle");
         let new: Vec<&str> = handle_impls

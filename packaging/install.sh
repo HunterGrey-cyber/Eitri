@@ -52,7 +52,7 @@ NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # NV_MAIN_DESKTOP is the one that is the application, named in messages. The other is the companion
 # panel's own entry (`eitri panel`, its own window class), hidden from menus.
 NV_MAIN_DESKTOP=cn.huntergrey.eitri.desktop
-NV_DESKTOP='cn.huntergrey.eitri.desktop cn.huntergrey.eitri.Panel.desktop'
+NV_DESKTOP='cn.huntergrey.eitri.desktop cn.huntergrey.eitri.Panel.desktop cn.huntergrey.eitri.Page.desktop'
 NV_OLD_DESKTOP=eitri.desktop
 # The nvim plugin that adds :EitriPanel: in the release tarball at share/eitri/eitri.nvim/<this path>, and
 # installed to $XDG_DATA_HOME/eitri/eitri.nvim/<this path>. Not under eitri/nvim/: that directory holds
@@ -3345,10 +3345,13 @@ tidy_icon_dirs() {
 }
 
 # desktop_exec_line EXEC FILE: the Exec= line an installed desktop entry gets, EXEC being the launcher's
-# quoted absolute path. The panel's entry runs the `panel` subcommand, which has to come first.
+# quoted absolute path. The panel's entry runs the `panel` subcommand, which has to come first; the
+# page window's entry (a bare `eitri %f` in the tarball) takes the launcher then --quiet and keeps its %f; the main
+# entry, which opens files from outside, also says --from-desktop and takes %F.
 desktop_exec_line() {
 	case $2 in
 	cn.huntergrey.eitri.Panel.desktop) printf 'Exec=%s panel --quiet %%f\n' "$1" ;;
+	cn.huntergrey.eitri.Page.desktop) printf 'Exec=%s --quiet %%f\n' "$1" ;;
 	*) printf 'Exec=%s --quiet --from-desktop %%F\n' "$1" ;;
 	esac
 }

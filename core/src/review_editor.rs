@@ -21,6 +21,7 @@ use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::{Pending, RpcError};
 use crate::turn_review::{Scope, MAX_OVERVIEW_DIFF_LINES};
 use crate::window_link::{Drawn, EditorOp, WireHunk, WireMeta};
+use crate::wm::PeerId;
 
 /// The module itself; args `(owner, version)`. The same owner and version again change nothing
 /// (`installed = false`); any other replaces the module there, tearing the old one down first.
@@ -419,33 +420,33 @@ pub enum OverlayOutcome {
 /// How often the module's events are asked for while any buffer shows a review.
 const DRAIN_EVERY: Duration = Duration::from_millis(500);
 
-/// Which window of a linked pair asked for a call, drew a file or holds a session. A window with no
-/// partner is window 1 throughout.
+/// Which window asked for a call, drew a file or holds a session: the window that runs the driver, or the
+/// window linked to it as that peer. A window with no partner is window 1 throughout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Window {
     One,
-    Two,
+    Linked(PeerId),
 }
 
-/// What window 1's driver owes window 2, in order.
+/// What window 1's driver owes a linked window, in order.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Window2Event {
-    /// The answer to one of window 2's opens, under the id of the operation that asked for it.
+pub enum LinkedEvent {
+    /// The answer to one of that window's opens, under the id of the operation that asked for it.
     Answered { op_id: u64, result: Result<String, String> },
-    /// What became of a file drawn for window 2. `op_id` is window 2's open this is the outcome of;
+    /// What became of a file drawn for that window. `op_id` is the window's open this is the outcome of;
     /// `None` for its other calls, and when another call or the editor took the file away.
     Drawn {
         op_id: Option<u64>,
         path: PathBuf,
         state: Drawn,
     },
-    /// Hunks reverted in the editor, and reverts undone there, for a session window 2 holds, in the
+    /// Hunks reverted in the editor, and reverts undone there, for a session that window holds, in the
     /// order they happened; each as [`editor_event_to_wire`] writes it.
     Events {
         session: String,
         events: Vec<serde_json::Value>,
     },
-    /// None of window 2's files is drawn any more: the module went away, or the editor reports
+    /// None of that window's files is drawn any more: the module went away, or the editor reports
     /// nothing drawn at all.
     Idle,
 }
@@ -455,21 +456,18 @@ pub enum Window2Event {
 pub struct Routed {
     /// This window's own outcomes.
     pub mine: Vec<OverlayOutcome>,
-    /// What goes to window 2 over the link.
-    pub window2: Vec<Window2Event>,
+    /// What goes to each linked window over its link.
+    pub linked: BTreeMap<PeerId, Vec<LinkedEvent>>,
 }
 
-/// Window 1 names window 2's opens `w2:<operation id>`: the answer goes back under the id window 2
-/// asked with, and can never be taken for one of window 1's own.
-pub const WINDOW_2_REQUEST_PREFIX: &str = "w2:";
-
-/// The request id window 1 gives the open that window 2's operation `op_id` asks for.
-pub fn window_2_request_id(op_id: u64) -> String {
-    format!("{WINDOW_2_REQUEST_PREFIX}{op_id}")
+/// Window 1 names a linked window's opens `w<peer>:<operation id>`: the answer goes back under the id
+/// that window asked with, and can never be taken for one of window 1's own or another window's.
+pub fn linked_request_id(peer: PeerId, op_id: u64) -> String {
+    format!("w{}:{op_id}", peer.0)
 }
 
-fn window_2_op_id(request_id: &str) -> Option<u64> {
-    request_id.strip_prefix(WINDOW_2_REQUEST_PREFIX)?.parse().ok()
+fn linked_op_id(peer: PeerId, request_id: &str) -> Option<u64> {
+    request_id.strip_prefix(&format!("w{}:", peer.0))?.parse().ok()
 }
 
 /// Whether an editor event says a hunk was reverted in a buffer, or that its text came back.
@@ -595,9 +593,9 @@ enum Install {
 /// embedded editor does), so two calls sent together can reach nvim in either order, and an older
 /// redraw executed last would leave the editor showing a turn the panel has left.
 ///
-/// **Two windows, one driver.** nvim has one review module and one event queue, which a drain
-/// empties, so window 2 never talks to it: its calls are queued here tagged [`Window::Two`]
-/// ([`EditorOverlay::call_for`]) behind the same install, the same one call in flight and the same
+/// **Several windows, one driver.** nvim has one review module and one event queue, which a drain
+/// empties, so a linked window never talks to it: its calls are queued here tagged
+/// [`Window::Linked`] ([`EditorOverlay::call_for`]) behind the same install, the same one call in flight and the same
 /// drain. Each outcome goes to exactly one window ([`Routed`]): an open's answer to the window that
 /// asked, a revert or its undo to the window holding the event's session, a buffer going off to the
 /// window that drew the file.
@@ -612,7 +610,7 @@ pub struct EditorOverlay {
     /// The unanswered `TAKE_EVENTS_LUA` and the install it was sent after.
     drain: Option<(Pending, u64)>,
     last_drain: Option<Instant>,
-    /// How many buffers show a review, by the editor's last answer: both windows' together.
+    /// How many buffers show a review, by the editor's last answer: every window's together.
     active: u64,
     /// The module's last `take_events` answer left events waiting.
     more_events: bool,
@@ -620,22 +618,26 @@ pub struct EditorOverlay {
     /// module (a revert made just before a clear): one more `take_events` is owed, sent after that
     /// answer so it reaches nvim after the call.
     drain_owed: bool,
-    /// The files this window drew. A file is in this set or in `window2_paths`, never both: the
-    /// module keeps one overlay per buffer, so the last window to draw a file is the one showing it.
+    /// The files this window drew. A file is in this set or in one set of `linked_paths`, never two:
+    /// the module keeps one overlay per buffer, so the last window to draw a file is the one showing it.
     active_paths: BTreeSet<PathBuf>,
-    /// The files window 2 drew.
-    window2_paths: BTreeSet<PathBuf>,
+    /// The files each linked window drew.
+    linked_paths: BTreeMap<PeerId, BTreeSet<PathBuf>>,
     /// The window holding each session that drew here; a session never named is this window's.
     holders: BTreeMap<String, Window>,
-    /// Sessions whose chat is moving between the windows: their events wait here, in order, until
+    /// Sessions whose chat is moving between two windows: their events wait here, in order, until
     /// the move is decided.
     held: BTreeMap<String, Vec<(EventKind, EditorRevertEvent)>>,
-    /// Window 2 went away: nothing more goes to it, and what is drawn for it is taken off.
-    window2_gone: bool,
+    /// Linked windows that went away: nothing more goes to them, and what is drawn for them is taken
+    /// off.
+    gone: BTreeSet<PeerId>,
     /// Outcomes decided between two ticks.
     done: Vec<OverlayOutcome>,
-    window2: Vec<Window2Event>,
+    linked: BTreeMap<PeerId, Vec<LinkedEvent>>,
 }
+
+/// What a window that drew nothing has drawn.
+static NOTHING_DRAWN: BTreeSet<PathBuf> = BTreeSet::new();
 
 fn lookup<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value
@@ -694,12 +696,12 @@ impl EditorOverlay {
             more_events: false,
             drain_owed: false,
             active_paths: BTreeSet::new(),
-            window2_paths: BTreeSet::new(),
+            linked_paths: BTreeMap::new(),
             holders: BTreeMap::new(),
             held: BTreeMap::new(),
-            window2_gone: false,
+            gone: BTreeSet::new(),
             done: Vec::new(),
-            window2: Vec::new(),
+            linked: BTreeMap::new(),
         }
     }
 
@@ -709,21 +711,21 @@ impl EditorOverlay {
         self.call_for(rpc, call, Window::One, now);
     }
 
-    /// Queues `call` for the window `from`, behind every call already queued by either window. An
-    /// open of window 2's carries the request id [`window_2_request_id`] gives it. Window 2's
-    /// [`OverlayCall::ClearAll`] clears only the files window 2 drew, one [`OverlayCall::Clear`]
-    /// each: window 1's overlays are not window 2's to take off. For the same reason a clear of
-    /// window 2's goes to the editor only if window 2 still holds the file when the clear's turn
-    /// comes: a draw of window 1's queued before it may have taken the file meanwhile.
+    /// Queues `call` for the window `from`, behind every call already queued by any window. An open
+    /// of a linked window's carries the request id [`linked_request_id`] gives it. A linked window's
+    /// [`OverlayCall::ClearAll`] clears only the files that window drew, one [`OverlayCall::Clear`]
+    /// each: no other window's overlays are its to take off. For the same reason a clear of a linked
+    /// window's goes to the editor only if that window still holds the file when the clear's turn
+    /// comes: a draw of another window's queued before it may have taken the file meanwhile.
     pub fn call_for(&mut self, rpc: &dyn EditorRpc, call: OverlayCall, from: Window, _now: Instant) {
-        if from == Window::Two {
-            self.window2_gone = false;
+        if let Window::Linked(peer) = from {
+            self.gone.remove(&peer);
             if matches!(call, OverlayCall::ClearAll) {
                 self.poll_in_flight();
                 self.poll_install();
                 self.sync_target(rpc);
-                for path in self.window2_paths.clone() {
-                    self.enqueue(OverlayCall::Clear { path }, Window::Two);
+                for path in self.linked_paths(peer).clone() {
+                    self.enqueue(OverlayCall::Clear { path }, from);
                 }
                 self.advance(rpc);
                 return;
@@ -785,13 +787,13 @@ impl EditorOverlay {
         self.drain_if_due(rpc, now);
         Routed {
             mine: std::mem::take(&mut self.done),
-            window2: std::mem::take(&mut self.window2),
+            linked: std::mem::take(&mut self.linked),
         }
     }
 
     /// The editor is gone, or its panel's drafts were dropped: nothing in flight will be heard
-    /// of, and nothing is known to be installed or drawn. Window 2's opens still waiting are told
-    /// so, since nothing else in window 1 answers them.
+    /// of, and nothing is known to be installed or drawn. Linked windows' opens still waiting are
+    /// told so, since nothing else in window 1 answers them.
     pub fn editor_lost(&mut self) {
         let waiting: Vec<Queued> = self
             .queue
@@ -799,9 +801,9 @@ impl EditorOverlay {
             .chain(self.in_flight.drain(..).map(|flight| flight.queued))
             .collect();
         for queued in waiting {
-            if queued.from == Window::Two {
+            if matches!(queued.from, Window::Linked(_)) {
                 self.fail(
-                    Window::Two,
+                    queued.from,
                     queued.call,
                     "the editor went away before it answered; nothing was opened",
                 );
@@ -814,7 +816,7 @@ impl EditorOverlay {
         self.more_events = false;
         self.drain_owed = false;
         self.active_paths.clear();
-        self.forget_window2_paths();
+        self.forget_linked_paths();
         self.done.clear();
     }
 
@@ -823,9 +825,26 @@ impl EditorOverlay {
         &self.active_paths
     }
 
-    /// The files window 2 last heard a review was drawn over for it.
-    pub fn window2_paths(&self) -> &BTreeSet<PathBuf> {
-        &self.window2_paths
+    /// The files the window at `peer` last heard a review was drawn over for it.
+    pub fn linked_paths(&self, peer: PeerId) -> &BTreeSet<PathBuf> {
+        self.linked_paths.get(&peer).unwrap_or(&NOTHING_DRAWN)
+    }
+
+    /// The linked window that drew `path`, if one did.
+    fn path_holder(&self, path: &Path) -> Option<PeerId> {
+        self.linked_paths
+            .iter()
+            .find(|(_, paths)| paths.contains(path))
+            .map(|(peer, _)| *peer)
+    }
+
+    /// Takes `path` from the linked window that drew it, if one did.
+    fn take_linked_path(&mut self, path: &Path) -> Option<PeerId> {
+        let peer = self.path_holder(path)?;
+        if let Some(paths) = self.linked_paths.get_mut(&peer) {
+            paths.remove(path);
+        }
+        Some(peer)
     }
 
     /// The window the editor's events for `session` go to.
@@ -853,19 +872,20 @@ impl EditorOverlay {
                     push_event(&mut self.done, kind, event);
                 }
             }
-            Window::Two => self.events_push_window2(session, waiting),
+            Window::Linked(peer) => self.events_push_linked(peer, session, waiting),
         }
     }
 
-    /// Window 2 unlinked: every file drawn for it is cleared, its calls not yet sent are dropped,
-    /// and nothing more goes to it. The clears are window 2's own, so a file window 1 draws over
-    /// before they go out keeps window 1's overlay.
-    pub fn window2_gone(&mut self) {
-        self.window2_gone = true;
-        self.window2.clear();
-        self.queue.retain(|queued| queued.from == Window::One);
-        for path in self.window2_paths.clone() {
-            self.enqueue(OverlayCall::Clear { path }, Window::Two);
+    /// The window at `peer` unlinked: every file drawn for it is cleared, its calls not yet sent are
+    /// dropped, and nothing more goes to it; the other windows keep what they drew. The clears are
+    /// that window's own, so a file another window draws over before they go out keeps its overlay.
+    pub fn linked_gone(&mut self, peer: PeerId) {
+        let window = Window::Linked(peer);
+        self.gone.insert(peer);
+        self.linked.remove(&peer);
+        self.queue.retain(|queued| queued.from != window);
+        for path in self.linked_paths(peer).clone() {
+            self.enqueue(OverlayCall::Clear { path }, window);
         }
     }
 
@@ -876,7 +896,7 @@ impl EditorOverlay {
             || !self.in_flight.is_empty()
             || self.drain.is_some()
             || !self.done.is_empty()
-            || !self.window2.is_empty()
+            || !self.linked.is_empty()
             || matches!(self.install, Install::Installing { .. })
             || self.active > 0
             || self.more_events
@@ -892,25 +912,27 @@ impl EditorOverlay {
         self.more_events = false;
         self.drain_owed = false;
         self.active_paths.clear();
-        self.forget_window2_paths();
+        self.forget_linked_paths();
     }
 
-    fn forget_window2_paths(&mut self) {
-        if !self.window2_paths.is_empty() {
-            self.window2_paths.clear();
-            self.push_window2(Window2Event::Idle);
+    fn forget_linked_paths(&mut self) {
+        for (peer, paths) in std::mem::take(&mut self.linked_paths) {
+            if !paths.is_empty() {
+                self.push_linked(peer, LinkedEvent::Idle);
+            }
         }
     }
 
-    fn push_window2(&mut self, event: Window2Event) {
-        if self.window2_gone {
+    fn push_linked(&mut self, peer: PeerId, event: LinkedEvent) {
+        if self.gone.contains(&peer) {
             return;
         }
-        if let Window2Event::Events { session, events } = &event {
-            if let Some(Window2Event::Events {
+        let waiting = self.linked.entry(peer).or_default();
+        if let LinkedEvent::Events { session, events } = &event {
+            if let Some(LinkedEvent::Events {
                 session: last,
                 events: into,
-            }) = self.window2.last_mut()
+            }) = waiting.last_mut()
             {
                 if last == session {
                     into.extend(events.iter().cloned());
@@ -918,11 +940,11 @@ impl EditorOverlay {
                 }
             }
         }
-        self.window2.push(event);
+        waiting.push(event);
     }
 
-    fn events_push_window2(&mut self, session: &str, events: Vec<(EventKind, EditorRevertEvent)>) {
-        if self.window2_gone {
+    fn events_push_linked(&mut self, peer: PeerId, session: &str, events: Vec<(EventKind, EditorRevertEvent)>) {
+        if self.gone.contains(&peer) {
             eprintln!(
                 "eitri: {} review events of session {session} were dropped: its window is gone",
                 events.len()
@@ -933,10 +955,13 @@ impl EditorOverlay {
             .iter()
             .map(|(kind, event)| editor_event_to_wire(*kind, event))
             .collect();
-        self.push_window2(Window2Event::Events {
-            session: session.to_owned(),
-            events,
-        });
+        self.push_linked(
+            peer,
+            LinkedEvent::Events {
+                session: session.to_owned(),
+                events,
+            },
+        );
     }
 
     fn fail(&mut self, from: Window, call: OverlayCall, why: &str) {
@@ -948,37 +973,49 @@ impl EditorOverlay {
     fn answer(&mut self, from: Window, request_id: String, result: Result<String, String>) {
         match from {
             Window::One => self.done.push(OverlayOutcome::Answered { request_id, result }),
-            Window::Two => match window_2_op_id(&request_id) {
-                Some(op_id) => self.push_window2(Window2Event::Answered { op_id, result }),
-                None => eprintln!("eitri: an answer for window 2 was dropped: {request_id:?} names no operation"),
+            Window::Linked(peer) => match linked_op_id(peer, &request_id) {
+                Some(op_id) => self.push_linked(peer, LinkedEvent::Answered { op_id, result }),
+                None => eprintln!("eitri: an answer for {peer:?} was dropped: {request_id:?} names no operation"),
             },
         }
     }
 
-    /// `path` is drawn now by the window `by`; what the other window drew there is gone.
+    /// The window at `peer` no longer shows `path`: another window's call took it, or the editor did.
+    fn push_off(&mut self, peer: PeerId, path: PathBuf) {
+        self.push_linked(
+            peer,
+            LinkedEvent::Drawn {
+                op_id: None,
+                path,
+                state: Drawn::Off,
+            },
+        );
+    }
+
+    /// `path` is drawn now by the window `by`; what another window drew there is gone.
     fn draw(&mut self, path: PathBuf, by: Window, op_id: Option<u64>, state: Drawn) {
+        let had_it = self.take_linked_path(&path);
         match by {
             Window::One => {
-                if self.window2_paths.remove(&path) {
-                    self.push_window2(Window2Event::Drawn {
-                        op_id: None,
-                        path: path.clone(),
-                        state: Drawn::Off,
-                    });
+                if let Some(holder) = had_it {
+                    self.push_off(holder, path.clone());
                 }
                 self.active_paths.insert(path);
             }
-            Window::Two => {
+            Window::Linked(peer) => {
                 if self.active_paths.remove(&path) {
                     push_off(&mut self.done, off_for(&path, "replaced"));
                 }
-                self.window2_paths.insert(path.clone());
-                if self.window2_gone {
+                if let Some(holder) = had_it.filter(|holder| *holder != peer) {
+                    self.push_off(holder, path.clone());
+                }
+                self.linked_paths.entry(peer).or_default().insert(path.clone());
+                if self.gone.contains(&peer) {
                     // Drawn for a window that is no longer there to see it or clear it.
-                    self.enqueue(OverlayCall::Clear { path }, Window::Two);
+                    self.enqueue(OverlayCall::Clear { path }, by);
                     return;
                 }
-                self.push_window2(Window2Event::Drawn { op_id, path, state });
+                self.push_linked(peer, LinkedEvent::Drawn { op_id, path, state });
             }
         }
     }
@@ -986,26 +1023,28 @@ impl EditorOverlay {
     /// Nothing is drawn over `path` after a call of the window `by`.
     fn undraw(&mut self, path: PathBuf, by: Window, op_id: Option<u64>) {
         let was_mine = self.active_paths.remove(&path);
-        let was_theirs = self.window2_paths.remove(&path);
+        let had_it = self.take_linked_path(&path);
         match by {
             Window::One => {
-                if was_theirs {
-                    self.push_window2(Window2Event::Drawn {
-                        op_id: None,
-                        path,
-                        state: Drawn::Off,
-                    });
+                if let Some(holder) = had_it {
+                    self.push_off(holder, path);
                 }
             }
-            Window::Two => {
+            Window::Linked(peer) => {
                 if was_mine {
                     push_off(&mut self.done, off_for(&path, "replaced"));
                 }
-                self.push_window2(Window2Event::Drawn {
-                    op_id,
-                    path,
-                    state: Drawn::Cleared,
-                });
+                if let Some(holder) = had_it.filter(|holder| *holder != peer) {
+                    self.push_off(holder, path.clone());
+                }
+                self.push_linked(
+                    peer,
+                    LinkedEvent::Drawn {
+                        op_id,
+                        path,
+                        state: Drawn::Cleared,
+                    },
+                );
             }
         }
     }
@@ -1024,7 +1063,7 @@ impl EditorOverlay {
             self.active = n;
             if n == 0 {
                 self.active_paths.clear();
-                self.forget_window2_paths();
+                self.forget_linked_paths();
             }
         }
     }
@@ -1082,7 +1121,7 @@ impl EditorOverlay {
                 let opened = lookup(answer, "opened").and_then(Value::as_bool);
                 let op_id = match from {
                     Window::One => None,
-                    Window::Two => window_2_op_id(&request_id),
+                    Window::Linked(peer) => linked_op_id(peer, &request_id),
                 };
                 let result = match opened {
                     Some(true) => {
@@ -1116,7 +1155,7 @@ impl EditorOverlay {
             OverlayCall::Clear { path } => self.undraw(path, from, None),
             OverlayCall::ClearAll => {
                 self.active_paths.clear();
-                self.forget_window2_paths();
+                self.forget_linked_paths();
             }
         }
     }
@@ -1206,9 +1245,9 @@ impl EditorOverlay {
         }
         match self.holder(&event.meta.session) {
             Window::One => push_event(&mut self.done, kind, event),
-            Window::Two => {
+            Window::Linked(peer) => {
                 let session = event.meta.session.clone();
-                self.events_push_window2(&session, vec![(kind, event)]);
+                self.events_push_linked(peer, &session, vec![(kind, event)]);
             }
         }
     }
@@ -1216,12 +1255,8 @@ impl EditorOverlay {
     /// A buffer that stopped showing a review is news for the window that drew it.
     fn route_off(&mut self, off: OffEvent) {
         let path = PathBuf::from(OsStr::from_bytes(off.path.as_bytes()));
-        if self.window2_paths.remove(&path) {
-            self.push_window2(Window2Event::Drawn {
-                op_id: None,
-                path,
-                state: Drawn::Off,
-            });
+        if let Some(holder) = self.take_linked_path(&path) {
+            self.push_off(holder, path);
         } else {
             self.active_paths.remove(&path);
             push_off(&mut self.done, off);
@@ -1264,16 +1299,19 @@ impl EditorOverlay {
                 }
                 while let Some(queued) = self.queue.pop_front() {
                     // Every call before this one is answered, so who holds the file is known: a
-                    // file window 2 no longer holds has nothing of window 2's to clear, and the
-                    // editor's clear would take window 1's overlay off.
-                    if let (Window::Two, OverlayCall::Clear { path }) = (queued.from, &queued.call) {
-                        if !self.window2_paths.contains(path) {
+                    // file the asking window no longer holds has nothing of that window's to clear,
+                    // and the editor's clear would take the holder's overlay off.
+                    if let (Window::Linked(peer), OverlayCall::Clear { path }) = (queued.from, &queued.call) {
+                        if !self.linked_paths(peer).contains(path) {
                             let path = path.clone();
-                            self.push_window2(Window2Event::Drawn {
-                                op_id: None,
-                                path,
-                                state: Drawn::Cleared,
-                            });
+                            self.push_linked(
+                                peer,
+                                LinkedEvent::Drawn {
+                                    op_id: None,
+                                    path,
+                                    state: Drawn::Cleared,
+                                },
+                            );
                             continue;
                         }
                     }
@@ -1470,8 +1508,8 @@ pub enum Overlay {
 }
 
 impl Overlay {
-    /// Whether a call can reach an editor now: a local driver needs this window's editor, and window
-    /// 2's goes to window 1, which answers for itself.
+    /// Whether a call can reach an editor now: a local driver needs this window's editor, and a
+    /// linked window's goes to window 1, which answers for itself.
     pub fn reachable(&self, rpc: Option<&dyn EditorRpc>) -> bool {
         match self {
             Overlay::Local(_) => rpc.is_some(),
@@ -1493,7 +1531,7 @@ impl Overlay {
             (Overlay::Local(_), None) => Routed::default(),
             (Overlay::Remote(overlay), _) => Routed {
                 mine: overlay.tick(now),
-                window2: Vec::new(),
+                linked: BTreeMap::new(),
             },
         }
     }
@@ -1928,6 +1966,16 @@ mod tests {
         }
     }
 
+    const PEER_2: PeerId = PeerId(2);
+    const TWO: Window = Window::Linked(PEER_2);
+    const C1: PeerId = PeerId(16);
+    const C2: PeerId = PeerId(17);
+
+    /// What a tick left for window 2.
+    fn for_two(routed: &Routed) -> &[LinkedEvent] {
+        routed.linked.get(&PEER_2).map_or(&[], Vec::as_slice)
+    }
+
     fn meta_of(session: &str) -> ShowMeta {
         ShowMeta {
             session: session.to_owned(),
@@ -1959,18 +2007,19 @@ mod tests {
             *at += Duration::from_secs(1);
             let routed = overlay.tick(nvim, *at);
             all.mine.extend(routed.mine);
-            all.window2.extend(routed.window2);
+            for (peer, events) in routed.linked {
+                all.linked.entry(peer).or_default().extend(events);
+            }
         }
         all
     }
 
     /// The events window 2 got for `session`, read back as window 2 reads them.
     fn window2_events(routed: &Routed, session: &str) -> Vec<(EventKind, EditorRevertEvent)> {
-        routed
-            .window2
+        for_two(routed)
             .iter()
             .filter_map(|event| match event {
-                Window2Event::Events { session: s, events } if s == session => Some(events),
+                LinkedEvent::Events { session: s, events } if s == session => Some(events),
                 _ => None,
             })
             .flatten()
@@ -2014,7 +2063,7 @@ mod tests {
         let nvim = Nvim::new();
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert_eq!(
             nvim.count(REVIEW_LUA),
@@ -2023,15 +2072,15 @@ mod tests {
         );
         assert_eq!(nvim.calls()[1], (SHOW_LUA, Some("/p/b".to_owned())));
         assert_eq!(
-            routed.window2,
-            vec![Window2Event::Drawn {
+            for_two(&routed),
+            vec![LinkedEvent::Drawn {
                 op_id: None,
                 path: PathBuf::from("/p/b"),
                 state: Drawn::Drawn,
             }]
         );
         assert!(overlay.active_paths().is_empty(), "window 1 drew nothing");
-        assert!(overlay.window2_paths().contains(Path::new("/p/b")));
+        assert!(overlay.linked_paths(PEER_2).contains(Path::new("/p/b")));
         assert!(overlay.wants_ticks(), "window 2's overlay alone keeps the drain going");
 
         nvim.events.borrow_mut().push(revert_of("/p/b", "s2"));
@@ -2054,7 +2103,7 @@ mod tests {
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
         overlay.call(&nvim, show("/p/a", "s1"), at);
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
         nvim.events.borrow_mut().extend([
             revert_of("/p/b", "s2"),
@@ -2089,18 +2138,18 @@ mod tests {
             },
             at,
         );
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
         overlay.call(&nvim, show("/p/c", "s1"), at);
         overlay.call_for(
             &nvim,
             OverlayCall::OpenAndShow {
-                request_id: window_2_request_id(7),
+                request_id: linked_request_id(PEER_2, 7),
                 path: PathBuf::from("/p/d"),
                 line: Some(3),
                 meta: meta_of("s2"),
                 hunks: Some(vec![hunk()]),
             },
-            Window::Two,
+            TWO,
             at,
         );
         let mut all = Routed::default();
@@ -2110,7 +2159,9 @@ mod tests {
             at += Duration::from_secs(1);
             let routed = overlay.tick(&nvim, at);
             all.mine.extend(routed.mine);
-            all.window2.extend(routed.window2);
+            for (peer, events) in routed.linked {
+                all.linked.entry(peer).or_default().extend(events);
+            }
         }
         assert_eq!(
             nvim.calls(),
@@ -2124,14 +2175,14 @@ mod tests {
             "both windows' calls, in the order they came"
         );
         assert!(
-            all.window2.contains(&Window2Event::Answered {
+            for_two(&all).contains(&LinkedEvent::Answered {
                 op_id: 7,
                 result: Ok("opened".to_owned()),
             }),
             "window 2's open is answered under its own id: {:?}",
-            all.window2
+            for_two(&all)
         );
-        assert!(all.window2.contains(&Window2Event::Drawn {
+        assert!(for_two(&all).contains(&LinkedEvent::Drawn {
             op_id: Some(7),
             path: PathBuf::from("/p/d"),
             state: Drawn::Drawn,
@@ -2153,10 +2204,10 @@ mod tests {
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
         overlay.call(&nvim, show("/p/a", "s1"), at);
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
-        overlay.call_for(&nvim, show("/p/c", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
+        overlay.call_for(&nvim, show("/p/c", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
-        overlay.call_for(&nvim, OverlayCall::ClearAll, Window::Two, at);
+        overlay.call_for(&nvim, OverlayCall::ClearAll, TWO, at);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert_eq!(
             nvim.count(CLEAR_ALL_LUA),
@@ -2176,13 +2227,13 @@ mod tests {
             ]
         );
         assert!(overlay.active_paths().contains(Path::new("/p/a")));
-        assert!(overlay.window2_paths().is_empty());
+        assert!(overlay.linked_paths(PEER_2).is_empty());
         assert!(
             nvim.drawn.borrow().contains(b"/p/a".as_slice()),
             "window 1's overlay stays"
         );
         for path in ["/p/b", "/p/c"] {
-            assert!(routed.window2.contains(&Window2Event::Drawn {
+            assert!(for_two(&routed).contains(&LinkedEvent::Drawn {
                 op_id: None,
                 path: PathBuf::from(path),
                 state: Drawn::Cleared,
@@ -2195,17 +2246,17 @@ mod tests {
         let nvim = Nvim::new();
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
-        overlay.call_for(&nvim, show("/p/a", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/a", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
-        assert!(overlay.window2_paths().contains(Path::new("/p/a")));
+        assert!(overlay.linked_paths(PEER_2).contains(Path::new("/p/a")));
 
         overlay.call(&nvim, show("/p/a", "s1"), at);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert!(overlay.active_paths().contains(Path::new("/p/a")));
-        assert!(overlay.window2_paths().is_empty());
+        assert!(overlay.linked_paths(PEER_2).is_empty());
         assert_eq!(
-            routed.window2,
-            vec![Window2Event::Drawn {
+            for_two(&routed),
+            vec![LinkedEvent::Drawn {
                 op_id: None,
                 path: PathBuf::from("/p/a"),
                 state: Drawn::Off,
@@ -2213,9 +2264,9 @@ mod tests {
             "window 2 is told its overlay there is gone"
         );
 
-        overlay.call_for(&nvim, show("/p/a", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/a", "s2"), TWO, at);
         let routed = ticks(&mut overlay, &nvim, &mut at);
-        assert!(overlay.window2_paths().contains(Path::new("/p/a")));
+        assert!(overlay.linked_paths(PEER_2).contains(Path::new("/p/a")));
         assert!(overlay.active_paths().is_empty());
         assert_eq!(
             routed.mine,
@@ -2246,21 +2297,21 @@ mod tests {
         ]);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert!(nvim.events.borrow().is_empty(), "the events were drained");
-        assert!(routed.mine.is_empty() && routed.window2.is_empty(), "{routed:?}");
+        assert!(routed.mine.is_empty() && for_two(&routed).is_empty(), "{routed:?}");
 
         // One move is done: the destination gets its events, in order.
-        overlay.release_session("moving", Window::Two);
+        overlay.release_session("moving", TWO);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         let kinds: Vec<EventKind> = window2_events(&routed, "moving").into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, vec![EventKind::Revert, EventKind::Unrevert]);
         assert!(routed.mine.is_empty());
-        assert_eq!(overlay.holder("moving"), Window::Two);
+        assert_eq!(overlay.holder("moving"), TWO);
 
         // The other aborts: the source gets its event back.
         overlay.release_session("staying", Window::One);
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert_eq!(sessions_of(&routed.mine), vec![("revert", "staying".to_owned())]);
-        assert!(routed.window2.is_empty());
+        assert!(for_two(&routed).is_empty());
 
         // After the move, the session's events follow it.
         nvim.events.borrow_mut().push(revert_of("/p/a", "moving"));
@@ -2275,10 +2326,10 @@ mod tests {
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
         overlay.call(&nvim, show("/p/a", "s1"), at);
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
-        overlay.call_for(&nvim, show("/p/c", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
+        overlay.call_for(&nvim, show("/p/c", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
-        overlay.window2_gone();
+        overlay.linked_gone(PEER_2);
         assert!(overlay.wants_ticks());
         let routed = ticks(&mut overlay, &nvim, &mut at);
         let cleared: Vec<_> = nvim
@@ -2295,7 +2346,10 @@ mod tests {
         );
         assert_eq!(nvim.drawn.borrow().iter().collect::<Vec<_>>(), vec![&b"/p/a".to_vec()]);
         assert!(overlay.active_paths().contains(Path::new("/p/a")));
-        assert!(routed.window2.is_empty(), "nothing more goes to a window that is gone");
+        assert!(
+            for_two(&routed).is_empty(),
+            "nothing more goes to a window that is gone"
+        );
     }
 
     #[test]
@@ -2303,9 +2357,9 @@ mod tests {
         let nvim = Nvim::new();
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
-        overlay.call_for(&nvim, show("/p/a", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/a", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
-        assert!(overlay.window2_paths().contains(Path::new("/p/a")));
+        assert!(overlay.linked_paths(PEER_2).contains(Path::new("/p/a")));
 
         // Window 1 draws the file; while its answer is out, window 2 clears the file, alone and as
         // part of clearing all of its own.
@@ -2316,10 +2370,10 @@ mod tests {
             OverlayCall::Clear {
                 path: PathBuf::from("/p/a"),
             },
-            Window::Two,
+            TWO,
             at,
         );
-        overlay.call_for(&nvim, OverlayCall::ClearAll, Window::Two, at);
+        overlay.call_for(&nvim, OverlayCall::ClearAll, TWO, at);
         nvim.hold.set(false);
         nvim.release();
         let routed = ticks(&mut overlay, &nvim, &mut at);
@@ -2330,12 +2384,12 @@ mod tests {
             "window 1's overlay stays"
         );
         assert!(overlay.active_paths().contains(Path::new("/p/a")));
-        assert!(overlay.window2_paths().is_empty());
+        assert!(overlay.linked_paths(PEER_2).is_empty());
         assert!(
             !routed.mine.iter().any(|o| matches!(o, OverlayOutcome::Off(_))),
             "window 1 is told nothing went: {routed:?}"
         );
-        assert!(routed.window2.contains(&Window2Event::Drawn {
+        assert!(for_two(&routed).contains(&LinkedEvent::Drawn {
             op_id: None,
             path: PathBuf::from("/p/a"),
             state: Drawn::Off,
@@ -2347,13 +2401,13 @@ mod tests {
         let nvim = Nvim::new();
         let mut overlay = EditorOverlay::new(Owner::Embedded);
         let mut at = Instant::now();
-        overlay.call_for(&nvim, show("/p/a", "s2"), Window::Two, at);
-        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Two, at);
+        overlay.call_for(&nvim, show("/p/a", "s2"), TWO, at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
         ticks(&mut overlay, &nvim, &mut at);
 
         nvim.hold.set(true);
         overlay.call(&nvim, show("/p/a", "s1"), at);
-        overlay.window2_gone();
+        overlay.linked_gone(PEER_2);
         nvim.hold.set(false);
         nvim.release();
         let routed = ticks(&mut overlay, &nvim, &mut at);
@@ -2366,12 +2420,100 @@ mod tests {
         assert_eq!(cleared, vec![(CLEAR_LUA, Some("/p/b".to_owned()))]);
         assert_eq!(nvim.drawn.borrow().iter().collect::<Vec<_>>(), vec![&b"/p/a".to_vec()]);
         assert!(overlay.active_paths().contains(Path::new("/p/a")));
-        assert!(overlay.window2_paths().is_empty());
+        assert!(overlay.linked_paths(PEER_2).is_empty());
         assert!(
             !routed.mine.iter().any(|o| matches!(o, OverlayOutcome::Off(_))),
             "{routed:?}"
         );
-        assert!(routed.window2.is_empty(), "nothing more goes to a window that is gone");
+        assert!(
+            for_two(&routed).is_empty(),
+            "nothing more goes to a window that is gone"
+        );
+    }
+
+    fn for_peer(routed: &Routed, peer: PeerId) -> &[LinkedEvent] {
+        routed.linked.get(&peer).map_or(&[], Vec::as_slice)
+    }
+
+    #[test]
+    fn one_linked_window_going_away_clears_only_what_it_drew() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call_for(&nvim, show("/p/a", "s1"), Window::Linked(C1), at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Linked(C2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        overlay.linked_gone(C1);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(nvim.drawn.borrow().iter().collect::<Vec<_>>(), vec![&b"/p/b".to_vec()]);
+        assert!(overlay.linked_paths(C1).is_empty());
+        assert!(overlay.linked_paths(C2).contains(Path::new("/p/b")));
+        assert!(routed.linked.is_empty(), "{routed:?}");
+    }
+
+    #[test]
+    fn a_window_drawing_over_another_linked_windows_file_tells_that_window() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call_for(&nvim, show("/p/a", "s1"), Window::Linked(C1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        overlay.call_for(&nvim, show("/p/a", "s2"), Window::Linked(C2), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            for_peer(&routed, C1),
+            [LinkedEvent::Drawn {
+                op_id: None,
+                path: PathBuf::from("/p/a"),
+                state: Drawn::Off,
+            }]
+        );
+        assert!(overlay.linked_paths(C1).is_empty());
+        assert!(overlay.linked_paths(C2).contains(Path::new("/p/a")));
+    }
+
+    #[test]
+    fn a_review_clear_of_one_window_leaves_another_windows_file_alone() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call_for(&nvim, show("/p/a", "s1"), Window::Linked(C1), at);
+        overlay.call_for(&nvim, show("/p/b", "s2"), Window::Linked(C2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        overlay.call_for(&nvim, OverlayCall::ClearAll, Window::Linked(C1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(nvim.drawn.borrow().iter().collect::<Vec<_>>(), vec![&b"/p/b".to_vec()]);
+    }
+
+    #[test]
+    fn an_answer_goes_to_the_window_whose_request_id_it_carries() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        for (peer, op_id) in [(C1, 7), (C2, 7)] {
+            overlay.call_for(
+                &nvim,
+                OverlayCall::OpenAndShow {
+                    request_id: linked_request_id(peer, op_id),
+                    path: PathBuf::from(format!("/p/{}", peer.0)),
+                    line: None,
+                    meta: meta_of("s"),
+                    hunks: None,
+                },
+                Window::Linked(peer),
+                at,
+            );
+        }
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        for peer in [C1, C2] {
+            assert!(
+                for_peer(&routed, peer)
+                    .iter()
+                    .any(|event| matches!(event, LinkedEvent::Answered { op_id: 7, .. })),
+                "{routed:?}"
+            );
+        }
+        assert_eq!(linked_request_id(PEER_2, 3), "w2:3", "window 2's opens keep their ids");
     }
 
     #[test]
@@ -2383,20 +2525,20 @@ mod tests {
         overlay.call_for(
             &nvim,
             OverlayCall::OpenAndShow {
-                request_id: window_2_request_id(4),
+                request_id: linked_request_id(PEER_2, 4),
                 path: PathBuf::from("/p/d"),
                 line: None,
                 meta: meta_of("s2"),
                 hunks: None,
             },
-            Window::Two,
+            TWO,
             at,
         );
         overlay.editor_lost();
         let routed = overlay.tick(&nvim, at);
         assert!(matches!(
-            routed.window2.as_slice(),
-            [Window2Event::Answered {
+            for_two(&routed),
+            [LinkedEvent::Answered {
                 op_id: 4,
                 result: Err(_)
             }]

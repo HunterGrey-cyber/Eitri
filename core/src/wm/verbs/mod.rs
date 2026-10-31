@@ -6,6 +6,7 @@ pub mod chrome;
 pub mod floats;
 pub mod focus;
 pub mod keys;
+pub mod module_windows;
 pub mod modules;
 pub mod tabs;
 pub mod text_size;

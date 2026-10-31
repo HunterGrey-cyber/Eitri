@@ -27,6 +27,7 @@ use crate::layout::{declared_placement, open_by_rule, FloatRect, ModuleId, Place
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::ids::arrival_id;
 use crate::window_link::moves::{MoveId, Moves, PeerAbort, Role, SourceVerdict, Window as Side, MOVE_DEADLINE};
+use crate::window_link::names::WindowName;
 use crate::window_link::{FocusTarget, Msg, Shape, Summary};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -139,9 +140,8 @@ pub fn plan(w: &Window, module: &ModuleId, target: &MoveTarget) -> MovePlan {
         };
     }
     drop(layout);
-    if w.peer
-        .as_ref()
-        .is_some_and(|p| p.moving(module) || p.pages_waiting.contains_key(module))
+    if w.peers()
+        .any(|(_, p)| p.moving(module) || p.pages_waiting.contains_key(module))
     {
         return MovePlan::Refused {
             why: feedback::MOVING_TEXT,
@@ -244,6 +244,7 @@ struct WaitingPage {
 /// A window's link to the other window of the pair and the moves on it; present while a peer is attached.
 pub struct PeerMoves {
     peer: PeerId,
+    name: WindowName,
     port: Rc<dyn PeerPort>,
     moves: Moves,
     side: Side,
@@ -275,9 +276,10 @@ pub struct PeerMoves {
 
 impl PeerMoves {
     /// The moves of a window whose role makes it `side` of the pair, talking through `port`.
-    pub fn new(peer: PeerId, port: Rc<dyn PeerPort>, side: Side) -> PeerMoves {
+    pub fn new(peer: PeerId, name: WindowName, port: Rc<dyn PeerPort>, side: Side) -> PeerMoves {
         PeerMoves {
             peer,
+            name,
             port,
             moves: Moves::new(side),
             side,
@@ -303,6 +305,11 @@ impl PeerMoves {
 
     pub fn peer(&self) -> PeerId {
         self.peer
+    }
+
+    /// The name the peer's window answers to.
+    pub fn name(&self) -> &WindowName {
+        &self.name
     }
 
     /// The other window's counts and workspace names, as it last sent them.
@@ -347,6 +354,8 @@ fn other_number(side: Side) -> u8 {
     }
 }
 
+/// The move a closing window hands `module` over with: one already in flight to any peer, else a new offer to
+/// window 2. The move is named by its peer and id.
 pub(super) fn offer_for_close(
     w: &mut Window,
     cx: &Cx,
@@ -355,34 +364,35 @@ pub(super) fn offer_for_close(
     selected_tab: Option<TabId>,
     selected: Option<Result<ChatMoveFacts, String>>,
     batch: &mut Batch,
-) -> Option<MoveId> {
+) -> Option<(PeerId, MoveId)> {
     let tab = selected_tab.or_else(|| selected.as_ref().and_then(|f| f.as_ref().ok()).map(|f| f.tab));
-    if let Some((id, _)) = w
-        .peer
-        .as_ref()?
-        .entries
-        .iter()
-        .find(|(_, e)| e.role == Role::Source && e.module == *module && (tab.is_none() || e.tab == tab))
-    {
-        return Some(*id);
+    let in_flight = w.peers().find_map(|(peer, p)| {
+        p.entries
+            .iter()
+            .find(|(_, e)| e.role == Role::Source && e.module == *module && (tab.is_none() || e.tab == tab))
+            .map(|(id, _)| (*peer, *id))
+    });
+    if in_flight.is_some() {
+        return in_flight;
     }
+    let peer = w.second_peer()?;
     // A refusal is toasted where it happens and leaves nothing for the close to wait for.
-    offer_selected(w, cx, win, module, None, false, selected, batch)
+    offer_selected(w, cx, win, peer, module, None, false, selected, batch)
         .ok()
         .flatten()
+        .map(|id| (peer, id))
 }
 
-pub(super) fn active_source_moves(w: &Window) -> Vec<MoveId> {
-    w.peer
-        .as_ref()
-        .map(|p| {
+/// Every move this window sends that has not ended, named by its peer and id.
+pub(super) fn active_source_moves(w: &Window) -> Vec<(PeerId, MoveId)> {
+    w.peers()
+        .flat_map(|(peer, p)| {
             p.entries
                 .iter()
                 .filter(|(_, e)| e.role == Role::Source)
-                .map(|(id, _)| *id)
-                .collect()
+                .map(move |(id, _)| (*peer, *id))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The window is torn down while moves it sent are undecided: each such module is let go here, never shut down. The
@@ -391,20 +401,19 @@ pub(super) fn active_source_moves(w: &Window) -> Vec<MoveId> {
 /// session ends with its last descriptor as it would have with the shutdown. Moves not yet sent are left to the
 /// teardown's shutdown: nothing of them has left this window.
 pub(super) fn forget_sent_at_teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
-    let Some(p) = w.peer.as_mut() else {
-        return;
-    };
-    let sent: Vec<MoveId> = p
-        .entries
-        .iter()
-        .filter(|(_, e)| e.role == Role::Source && e.stage == Stage::Sent)
-        .map(|(id, _)| *id)
-        .collect();
     let mut forgotten = Vec::new();
-    for id in sent {
-        if let Some(entry) = p.entries.remove(&id) {
-            batch.push_effect(forget_op(&entry, win));
-            forgotten.push(entry.module);
+    for p in w.peers.values_mut() {
+        let sent: Vec<MoveId> = p
+            .entries
+            .iter()
+            .filter(|(_, e)| e.role == Role::Source && e.stage == Stage::Sent)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in sent {
+            if let Some(entry) = p.entries.remove(&id) {
+                batch.push_effect(forget_op(&entry, win));
+                forgotten.push(entry.module);
+            }
         }
     }
     for module in forgotten {
@@ -421,24 +430,25 @@ pub(super) fn note_turn_wait(w: &mut Window, module: &ModuleId) {
     chrome::show_toast(w, text, ToastKind::Other);
 }
 
-pub(super) fn move_decided(w: &Window, id: MoveId) -> bool {
-    w.peer.as_ref().is_none_or(|p| p.groups.outcomes.contains_key(&id))
+/// Whether move `id` to `peer` has a verdict, or its peer is gone.
+pub(super) fn move_decided(w: &Window, peer: PeerId, id: MoveId) -> bool {
+    w.peer(peer).is_none_or(|p| p.groups.outcomes.contains_key(&id))
 }
 
 /// The other window, when `module` of `w` is frozen for a move it was sent and that window has not answered since
 /// its deadline, with that window's number: then the user may end that window, and the link's end settles the move.
 pub(crate) fn silent_peer(w: &Window, module: &ModuleId) -> Option<(PeerId, u8)> {
-    let p = w.peer.as_ref()?;
-    p.entries
-        .values()
-        .any(|e| e.role == Role::Source && e.module == *module && e.silent)
-        .then(|| (p.peer, other_number(p.side)))
+    w.peers().find_map(|(_, p)| {
+        p.entries
+            .values()
+            .any(|e| e.role == Role::Source && e.module == *module && e.silent)
+            .then(|| (p.peer, other_number(p.side)))
+    })
 }
 
-/// What the other window's last summary counted running and queued: what ends with it.
-pub(crate) fn peer_counts(w: &Window) -> (u32, u32) {
-    w.peer
-        .as_ref()
+/// What `peer`'s last summary counted running and queued: what ends with it.
+pub(crate) fn peer_counts(w: &Window, peer: PeerId) -> (u32, u32) {
+    w.peer(peer)
         .and_then(PeerMoves::summary)
         .map(|s| (s.running, s.queued))
         .unwrap_or_default()
@@ -452,24 +462,42 @@ pub fn side_of(role: &WindowRole) -> Side {
     }
 }
 
-/// Whether `module` of `w` has a move in flight from this window: until the move ends, nothing here may act on the
-/// session the other window may already be taking over.
+/// Whether `module` of `w` has a move in flight from this window to any peer: until the move ends, nothing here may
+/// act on the session the other window may already be taking over.
 pub(crate) fn moving(w: &Window, module: &ModuleId) -> bool {
-    w.peer.as_ref().is_some_and(|p| p.moving(module))
+    w.peers().any(|(_, p)| p.moving(module))
 }
 
-/// The ids modules arriving in `w` took and that are not placed yet; a new instance here must not take one, or the
-/// arrival would land on a module that already holds its name.
+/// The ids modules arriving in `w` from any peer took and that are not placed yet; a new instance here must not take
+/// one, or the arrival would land on a module that already holds its name.
 pub(crate) fn arriving(w: &Window) -> Vec<ModuleId> {
-    w.peer.as_ref().map(PeerMoves::arriving).unwrap_or_default()
+    w.peers().flat_map(|(_, p)| p.arriving()).collect()
 }
 
-/// Runs `f` on the window's peer, taken out for the call so both can be changed; `None` with no peer attached.
-fn with_peer<R>(w: &mut Window, f: impl FnOnce(&mut Window, &mut PeerMoves) -> R) -> Option<R> {
-    let mut p = w.peer.take()?;
+/// Runs `f` on `peer`, taken out for the call so both it and the window can be changed; `None` when it is not
+/// attached.
+fn with_peer<R>(w: &mut Window, peer: PeerId, f: impl FnOnce(&mut Window, &mut PeerMoves) -> R) -> Option<R> {
+    let mut p = w.peers.remove(&peer)?;
     let out = f(w, &mut p);
-    w.peer = Some(p);
+    w.peers.insert(peer, p);
     Some(out)
+}
+
+/// The peer a pair verb addresses: window 2. With none attached the verb is refused in the words of the role.
+pub(super) fn pair_peer(w: &mut Window, win: WinId, batch: &mut Batch) -> Option<PeerId> {
+    let peer = w.second_peer();
+    if peer.is_none() {
+        refuse(w, win, feedback::no_other_window_text(w.role()), batch);
+    }
+    peer
+}
+
+/// The peer that has an entry for move `mv` that `want` accepts: a host answer names its move by id alone, and move
+/// ids are numbered per link, so the entry decides which link it is for.
+fn peer_with(w: &Window, mv: MoveId, want: impl Fn(&Entry) -> bool) -> Option<PeerId> {
+    w.peers()
+        .find(|(_, p)| p.entries.get(&mv).is_some_and(&want))
+        .map(|(peer, _)| *peer)
 }
 
 /// A refusal of the move verb, said and toasted.
@@ -510,8 +538,8 @@ fn shape_of(w: &Window, cx: &Cx, win: WinId, module: &ModuleId) -> Shape {
 
 /// `move.to-window` for `module`: planned, and for the other window offered. Nothing is frozen yet; the deadline
 /// starts.
-pub fn offer(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, follow: bool, batch: &mut Batch) {
-    offer_tab(w, cx, win, module, None, follow, batch);
+pub fn offer(w: &mut Window, cx: &Cx, win: WinId, peer: PeerId, module: &ModuleId, follow: bool, batch: &mut Batch) {
+    offer_tab(w, cx, win, peer, module, None, follow, batch);
 }
 
 /// [`offer`], for a chat the tab holding `session` when one is named (the base view holds several), else the tab
@@ -521,12 +549,13 @@ pub(super) fn offer_tab(
     w: &mut Window,
     cx: &Cx,
     win: WinId,
+    peer: PeerId,
     module: &ModuleId,
     session: Option<&str>,
     follow: bool,
     batch: &mut Batch,
 ) {
-    let _ = offer_selected(w, cx, win, module, session, follow, None, batch);
+    let _ = offer_selected(w, cx, win, peer, module, session, follow, None, batch);
 }
 
 /// The move `module` was offered as; `Ok(None)` when it waits for a turn's end or the other window's own offer, and
@@ -535,13 +564,14 @@ fn offer_selected(
     w: &mut Window,
     cx: &Cx,
     win: WinId,
+    peer: PeerId,
     module: &ModuleId,
     session: Option<&str>,
     follow: bool,
     selected: Option<Result<ChatMoveFacts, String>>,
     batch: &mut Batch,
 ) -> Result<Option<MoveId>, String> {
-    let Some(peer) = w.peer.as_ref().map(PeerMoves::peer) else {
+    if w.peer(peer).is_none() {
         let text = feedback::no_other_window_text(w.role());
         refuse(w, win, text, batch);
         return Err(text.into());
@@ -562,7 +592,7 @@ fn offer_selected(
             return Err(why.to_owned());
         }
         MovePlan::Ask { module, .. } => {
-            ask(w, &module, follow);
+            ask(w, peer, &module, follow);
             return Ok(None);
         }
         MovePlan::Peer { kind, .. } => kind,
@@ -578,7 +608,7 @@ fn offer_selected(
         _ => None,
     };
     if chat.as_ref().is_some_and(|facts| {
-        w.peer.as_ref().is_some_and(|p| {
+        w.peers().any(|(_, p)| {
             p.entries
                 .values()
                 .any(|e| e.role == Role::Source && e.kind == MoveKind::Chat && e.tab == Some(facts.tab))
@@ -588,7 +618,7 @@ fn offer_selected(
         return Err(feedback::MOVING_TEXT.into());
     }
     if let Some(facts) = chat.as_ref().filter(|facts| facts.running && !facts.live) {
-        chat::queue(w, module, facts, follow);
+        chat::queue(w, peer, module, facts, follow);
         return Ok(None);
     }
     let shape = shape_of(w, cx, win, module);
@@ -605,7 +635,7 @@ fn offer_selected(
             (0, 0)
         };
     }
-    with_peer(w, |w, p| {
+    with_peer(w, peer, |w, p| {
         let now = w.now();
         let id = p.moves.offer(now);
         let msg = Msg::MoveOffer {
@@ -654,8 +684,8 @@ fn offer_selected(
 
 /// The other window holds `module`, which this window shows as away: that window is asked to offer it here. What
 /// it answers is its own move's: an offer, or a refusal it shows itself.
-fn ask(w: &mut Window, module: &ModuleId, follow: bool) {
-    with_peer(w, |w, p| {
+fn ask(w: &mut Window, peer: PeerId, module: &ModuleId, follow: bool) {
+    with_peer(w, peer, |w, p| {
         let msg = Msg::MoveAsk {
             module: Some(module.to_string()),
             session: None,
@@ -680,6 +710,7 @@ fn asked(
     w: &mut Window,
     cx: &Cx,
     win: WinId,
+    peer: PeerId,
     module: Option<ModuleId>,
     session: Option<String>,
     follow: bool,
@@ -688,8 +719,7 @@ fn asked(
     let (module, session) = match (module, session) {
         (Some(named), _) => {
             let module = w
-                .peer
-                .as_ref()
+                .peer(peer)
                 .and_then(|p| p.arrived.get(&named).cloned())
                 .unwrap_or(named);
             let away = w
@@ -719,7 +749,7 @@ fn asked(
         }
     };
     w.say(format!("[move] {module}: the other window asks for it"));
-    offer_tab(w, cx, win, &module, session.as_deref(), follow, batch);
+    offer_tab(w, cx, win, peer, &module, session.as_deref(), follow, batch);
 }
 
 /// The destination is ready: the module is frozen and its record asked of the host. An answer out of turn
@@ -836,12 +866,10 @@ pub fn frozen(
     handoff: Handoff,
     batch: &mut Batch,
 ) {
-    let stage = w
-        .peer
-        .as_ref()
-        .and_then(|p| p.entries.get(&mv))
-        .filter(|e| e.role == Role::Source && e.module == *module && e.kind == kind)
-        .map(|e| e.stage);
+    let peer = peer_with(w, mv, |e| {
+        e.role == Role::Source && e.module == *module && e.kind == kind
+    });
+    let stage = peer.and_then(|peer| w.peer(peer)?.entries.get(&mv)).map(|e| e.stage);
     match stage {
         Some(Stage::Freezing) => {}
         Some(Stage::Sent) => {
@@ -855,9 +883,8 @@ pub fn frozen(
         }
         _ => {
             let frozen_for = w
-                .peer
-                .as_ref()
-                .and_then(|p| p.entry_of(Role::Source, module, &[Stage::Freezing, Stage::Sent]));
+                .peers()
+                .find_map(|(_, p)| p.entry_of(Role::Source, module, &[Stage::Freezing, Stage::Sent]));
             if let Some(current) = frozen_for {
                 // Another move of the module has it frozen or sent: reading it again here would let both windows
                 // run one session. The stale answer's handoff is dropped unread.
@@ -878,7 +905,8 @@ pub fn frozen(
     }
     let id = mv;
     let mut record = record;
-    with_peer(w, |w, p| {
+    let Some(peer) = peer else { return };
+    with_peer(w, peer, |w, p| {
         if let Some(meta) = p.entries.get(&id).and_then(|e| e.record.get("workspace_tab")).cloned() {
             if let Some(object) = record.as_object_mut() {
                 object.insert("workspace_tab".into(), meta);
@@ -907,35 +935,38 @@ pub fn frozen(
 #[derive(Debug, Clone)]
 pub enum FreezeOf {
     Module(ModuleId),
-    Move(MoveId),
+    Move { module: ModuleId, mv: MoveId },
 }
 
 /// The host could not freeze a module: its move is given up before anything left. A refusal naming its move gives
 /// up that move alone, and only while it waits for that freeze: a late refusal of a move that has ended never gives
 /// up the move that followed it.
 pub fn freeze_refused(w: &mut Window, win: WinId, of: FreezeOf, why: String, batch: &mut Batch) {
-    with_peer(w, |w, p| {
-        let id = match of {
-            FreezeOf::Module(module) => p.entry_of(Role::Source, &module, &[Stage::Freezing]),
-            FreezeOf::Move(mv) => p
-                .entries
-                .get(&mv)
-                .is_some_and(|e| e.role == Role::Source && e.stage == Stage::Freezing)
-                .then_some(mv),
-        };
-        if let Some(id) = id {
+    let found = match &of {
+        FreezeOf::Module(module) => w.peers().find_map(|(peer, p)| {
+            p.entry_of(Role::Source, module, &[Stage::Freezing])
+                .map(|id| (*peer, id))
+        }),
+        FreezeOf::Move { module, mv } => peer_with(w, *mv, |e| {
+            e.role == Role::Source && e.module == *module && e.stage == Stage::Freezing
+        })
+        .map(|peer| (peer, *mv)),
+    };
+    if let Some((peer, id)) = found {
+        with_peer(w, peer, |w, p| {
             give_up(w, p, win, id, why, batch);
             rearm(w, p);
-        }
-    });
+        });
+    }
 }
 
 /// Whether `module` of `w` is a chat frozen for a move this window sends: a refused chat call naming it is that
 /// freeze's refusal.
 pub(crate) fn chat_freezing(w: &Window, module: &ModuleId) -> Option<MoveId> {
-    let p = w.peer.as_ref()?;
-    p.entry_of(Role::Source, module, &[Stage::Freezing])
-        .filter(|id| p.entries.get(id).is_some_and(|e| e.kind == MoveKind::Chat))
+    w.peers().find_map(|(_, p)| {
+        p.entry_of(Role::Source, module, &[Stage::Freezing])
+            .filter(|id| p.entries.get(id).is_some_and(|e| e.kind == MoveKind::Chat))
+    })
 }
 
 /// The source gives a move up by itself, only ever before `move` left: the destination is told so it drops what it
@@ -1134,14 +1165,18 @@ fn offered(
                     }
                 }
             }
+            // `p` is out of the window's map here: what the other peers hold or have arriving is read from the
+            // window and added to this peer's own, so no two arrivals of any links take one name.
+            let mut arriving = arriving(w);
+            arriving.extend(p.arriving());
             // A module of one name only (a page, a Lua panel) the other window can send only while this window holds
             // it away: one placed here and not away, or arriving here already, is this window's, and an offer of it
             // would take over the page this window shows.
-            let held_here =
-                !module.kind().has_instances() && (live.contains(&module) || p.arriving().contains(&module));
+            let held_here = !module.kind().has_instances() && (live.contains(&module) || arriving.contains(&module));
             live.extend(workspaces.reserved());
             live.extend(w.modules.pending_ids());
-            live.extend(p.arriving());
+            live.extend(arriving);
+            away.extend(w.held_union());
             away.extend(p.held.iter().cloned());
             (
                 live.into_iter().collect::<Vec<_>>(),
@@ -1231,9 +1266,17 @@ fn offered(
     });
 }
 
+/// The peer whose offer of `module` this window accepted and whose place the host has not yet made.
+fn accepting_peer(w: &Window, module: &ModuleId) -> Option<PeerId> {
+    w.peers()
+        .find(|(_, p)| p.entry_of(Role::Destination, module, &[Stage::Accepted]).is_some())
+        .map(|(peer, _)| *peer)
+}
+
 /// The host has the arriving module's place ready: the source may freeze it.
 pub fn prepared(w: &mut Window, module: &ModuleId) {
-    with_peer(w, |w, p| {
+    let Some(peer) = accepting_peer(w, module) else { return };
+    with_peer(w, peer, |w, p| {
         let Some(id) = p.entry_of(Role::Destination, module, &[Stage::Accepted]) else {
             return;
         };
@@ -1250,7 +1293,8 @@ pub fn prepared(w: &mut Window, module: &ModuleId) {
 /// The host could not prepare the arriving module's place: the offer is refused, and the source, which froze
 /// nothing yet, keeps it.
 pub fn prepare_refused(w: &mut Window, win: WinId, module: &ModuleId, why: String, batch: &mut Batch) {
-    with_peer(w, |w, p| {
+    let Some(peer) = accepting_peer(w, module) else { return };
+    with_peer(w, peer, |w, p| {
         let Some(id) = p.entry_of(Role::Destination, module, &[Stage::Accepted]) else {
             return;
         };
@@ -1558,7 +1602,12 @@ fn place_arrival(w: &mut Window, cx: &Cx, win: WinId, arrival: &ModuleId, shape:
 /// other window gave it no longer finds it. A base id, which never leaves the layout, is left as a killed module:
 /// its next show starts a fresh shell in the place prepared for it.
 pub fn adopt_refused(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, why: String, batch: &mut Batch) {
-    if let Some(waiting) = w.peer.as_mut().and_then(|p| p.pages_waiting.remove(module)) {
+    let waiting: Vec<_> = w
+        .peers
+        .values_mut()
+        .filter_map(|p| p.pages_waiting.remove(module))
+        .collect();
+    for waiting in waiting {
         w.cancel_timer(waiting.timer);
     }
     w.warn(format!("[move] {module}: could not be built here: {why}"));
@@ -1567,10 +1616,14 @@ pub fn adopt_refused(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, why
         w.refuse(win, format!("the moved chat could not be opened here: {why}"), batch);
         return;
     }
-    let replaced = w.peer.as_mut().and_then(|p| {
-        p.arrived.retain(|_, arrival| arrival != module);
-        p.replaced.remove(module)
-    });
+    let replaced = w
+        .peers
+        .values_mut()
+        .filter_map(|p| {
+            p.arrived.retain(|_, arrival| arrival != module);
+            p.replaced.remove(module)
+        })
+        .next();
     let reopen = super::close::reopen(module, &cx.setup.decls);
     let layout = w.layout.clone();
     let next = match layout.try_borrow_mut() {
@@ -1689,14 +1742,28 @@ fn focus_intent(
 
 // Both sides.
 
-/// `window.other`: the other window raised, and given the keys once it is up.
-pub fn raise_other(w: &mut Window, win: WinId, batch: &mut Batch) -> bool {
-    raise_for(w, win, FocusTarget::Window, batch)
+/// `window.other`: `peer` raised, and given the keys once it is up.
+pub fn raise_other(w: &mut Window, win: WinId, peer: PeerId, batch: &mut Batch) -> bool {
+    raise_for(w, win, peer, FocusTarget::Window, batch)
 }
 
-/// Raises the peer and remembers the intent until the compositor answers; false with no peer.
-pub fn raise_for(w: &mut Window, win: WinId, intent: impl Into<Raise>, batch: &mut Batch) -> bool {
-    with_peer(w, |_, p| queue_raise(p, win, intent, batch)).is_some()
+/// Raises `peer` and remembers the intent until the compositor answers; false when it is not attached.
+pub fn raise_for(w: &mut Window, win: WinId, peer: PeerId, intent: impl Into<Raise>, batch: &mut Batch) -> bool {
+    with_peer(w, peer, |_, p| queue_raise(p, win, intent, batch)).is_some()
+}
+
+/// Raises `peer` with the activation token of the module window that asked for it, and remembers the focus the raise
+/// is for until the compositor answers; false when the peer is not attached.
+pub fn forward_raise(w: &mut Window, win: WinId, peer: PeerId, token: Option<String>, batch: &mut Batch) -> bool {
+    with_peer(w, peer, |_, p| {
+        batch.push_effect(HostOp::ForwardRaise {
+            win,
+            peer: p.peer,
+            token,
+        });
+        p.raises.push_back(Raise::Focus(FocusTarget::Window));
+    })
+    .is_some()
 }
 
 /// The peer raised, and what the raise is for remembered until the compositor answers.
@@ -1705,8 +1772,16 @@ fn queue_raise(p: &mut PeerMoves, win: WinId, intent: impl Into<Raise>, batch: &
     p.raises.push_back(intent.into());
 }
 
-/// Tells the peer the window's current output when it is known.
+/// Tells every peer the window's current output when it is known.
 pub fn say_monitor(w: &mut Window) {
+    let peers: Vec<PeerId> = w.peers().map(|(peer, _)| *peer).collect();
+    for peer in peers {
+        say_monitor_to(w, peer);
+    }
+}
+
+/// Tells `peer` the window's current output when it is known.
+pub fn say_monitor_to(w: &mut Window, peer: PeerId) {
     let Some(id) = &w.monitor else { return };
     let description = w
         .monitors
@@ -1715,19 +1790,24 @@ pub fn say_monitor(w: &mut Window) {
         .map(|m| m.name.clone())
         .unwrap_or_default();
     let connector = id.0.clone();
-    with_peer(w, |w, p| send(w, p, Msg::Monitor { connector, description }));
+    with_peer(w, peer, |w, p| send(w, p, Msg::Monitor { connector, description }));
 }
 
-/// The host could not raise the other window: the focus it was for is not sent.
+/// The host could not raise a window: the focus it was for is not sent. The refusal names no peer, so the oldest
+/// raise of the first peer that waits for one is dropped.
 pub fn raise_refused(w: &mut Window) -> bool {
-    w.peer.as_mut().is_some_and(|p| p.raises.pop_front().is_some())
+    w.peers
+        .values_mut()
+        .find(|p| !p.raises.is_empty())
+        .is_some_and(|p| p.raises.pop_front().is_some())
 }
 
 /// One fact from the other window or the link, with the destination's moves settled before and after it.
 pub fn peer_event(w: &mut Window, cx: &Cx, win: WinId, event: PeerEvent, batch: &mut Batch) {
+    let peer = event.peer();
     // An ask starts this window's own offer, which needs the peer in its place: it is settled around, not inside.
     if let PeerEvent::Swap { move_a, move_b, .. } = event {
-        workspace::swap(w, cx, win, move_a, move_b, batch);
+        workspace::swap(w, cx, win, peer, move_a, move_b, batch);
         return;
     }
     if let PeerEvent::MoveAsk {
@@ -1737,15 +1817,15 @@ pub fn peer_event(w: &mut Window, cx: &Cx, win: WinId, event: PeerEvent, batch: 
         ..
     } = event
     {
-        with_peer(w, |w, p| settle(w, p, cx, win, batch));
-        asked(w, cx, win, module, session, follow, batch);
-        with_peer(w, |w, p| {
+        with_peer(w, peer, |w, p| settle(w, p, cx, win, batch));
+        asked(w, cx, win, peer, module, session, follow, batch);
+        with_peer(w, peer, |w, p| {
             settle(w, p, cx, win, batch);
             rearm(w, p);
         });
         return;
     }
-    with_peer(w, |w, p| {
+    with_peer(w, peer, |w, p| {
         // A confirmed `move_done` is committed before the fact is read: the other window may act on the module (a
         // focus intent for it) before this window was woken for the confirmation.
         settle(w, p, cx, win, batch);
@@ -1789,8 +1869,9 @@ pub fn peer_event(w: &mut Window, cx: &Cx, win: WinId, event: PeerEvent, batch: 
                     w.cancel_timer(token);
                 }
                 workspace::link_ended(w, p, win, batch);
-                super::verbs::modules::peer_gone(w);
-                super::close::moves_link_ended(w, cx, win, batch);
+                super::verbs::modules::peer_gone(w, peer);
+                let was_window_2 = *p.name() == WindowName::Second;
+                super::close::moves_link_ended(w, cx, win, peer, was_window_2, batch);
                 w.chrome_state.dirty.peer += 1;
             }
             PeerEvent::Raised { token, .. } => {
@@ -1827,28 +1908,33 @@ pub fn peer_event(w: &mut Window, cx: &Cx, win: WinId, event: PeerEvent, batch: 
             } => {
                 workspace::receive(w, p, cx, win, group, name, tree, moves, swap, batch);
             }
-            PeerEvent::Woke { .. } | PeerEvent::MoveAsk { .. } | PeerEvent::Swap { .. } => {}
+            // A module window's asks and focus reports are the controller's, decided before this runs.
+            PeerEvent::Woke { .. }
+            | PeerEvent::MoveAsk { .. }
+            | PeerEvent::Swap { .. }
+            | PeerEvent::HubAsk { .. }
+            | PeerEvent::WindowFocused { .. } => {}
         }
         settle(w, p, cx, win, batch);
         rearm(w, p);
     });
 }
 
-/// The peer goes away: every move ends as the link's end ends it, and nothing is left of the link here.
-pub fn detach(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
-    let Some(peer) = w.peer.as_ref().map(PeerMoves::peer) else {
+/// `peer` goes away: its moves end as the link's end ends them, and nothing is left of its link here; the window's
+/// other peers stay as they are.
+pub fn detach(w: &mut Window, cx: &Cx, win: WinId, peer: PeerId, batch: &mut Batch) {
+    if !w.peers.contains_key(&peer) {
         return;
-    };
+    }
     peer_event(w, cx, win, PeerEvent::LinkClosed { peer }, batch);
     let waiting: Vec<_> = w
-        .peer
-        .as_ref()
+        .peer(peer)
         .map(|p| p.pages_waiting.keys().cloned().collect())
         .unwrap_or_default();
     for module in waiting {
         show_waiting(w, win, &module, batch);
     }
-    if let Some(p) = w.peer.take() {
+    if let Some(p) = w.peers.remove(&peer) {
         if let Some((token, _)) = p.deadline {
             w.cancel_timer(token);
         }
@@ -1861,13 +1947,14 @@ pub fn detach(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
 
 /// The deadline's timer, if `token` is it: the moves' deadlines judged now.
 pub fn deadline_fired(w: &mut Window, win: WinId, token: TimerToken, batch: &mut Batch) -> bool {
-    if w.peer
-        .as_ref()
-        .is_none_or(|p| p.deadline.map(|(t, _)| t) != Some(token))
-    {
+    let Some(peer) = w
+        .peers()
+        .find(|(_, p)| p.deadline.map(|(t, _)| t) == Some(token))
+        .map(|(peer, _)| *peer)
+    else {
         return false;
-    }
-    with_peer(w, |w, p| {
+    };
+    with_peer(w, peer, |w, p| {
         p.deadline = None;
         let now = w.now();
         chat::holding_expired(w, p, win, now, batch);
@@ -1928,9 +2015,9 @@ fn current_summary(w: &Window, win: WinId, reads: &dyn HostReads) -> Summary {
 }
 
 /// A newly attached peer needs current counts before any later chat event arrives.
-pub fn summary_at_attach(w: &mut Window, win: WinId, reads: &dyn HostReads) {
+pub fn summary_at_attach(w: &mut Window, win: WinId, peer: PeerId, reads: &dyn HostReads) {
     let summary = current_summary(w, win, reads);
-    with_peer(w, |w, p| {
+    with_peer(w, peer, |w, p| {
         send(w, p, Msg::Summary(summary.clone()));
         p.debounce.sent_now(summary.clone());
         p.own_summary = summary;
@@ -1940,21 +2027,25 @@ pub fn summary_at_attach(w: &mut Window, win: WinId, reads: &dyn HostReads) {
 
 /// A tab operation changes host counts while its batch applies, so its read waits for the queue to drain.
 pub fn tab_verb(w: &mut Window) {
-    if let Some(p) = w.peer.as_mut() {
+    for p in w.peers.values_mut() {
         p.after_batch = true;
     }
 }
 
 pub fn after_batch(w: &mut Window, win: WinId, reads: &dyn HostReads) {
-    if let Some(p) = w.peer.as_mut().filter(|p| p.after_batch) {
+    let mut waited = false;
+    for p in w.peers.values_mut().filter(|p| p.after_batch) {
         p.after_batch = false;
         p.counts_dirty = true;
+        waited = true;
+    }
+    if waited {
         observe_summary(w, win, reads);
     }
 }
 
 pub fn counts_changed(w: &mut Window) {
-    if let Some(p) = w.peer.as_mut() {
+    for p in w.peers.values_mut() {
         p.counts_dirty = true;
     }
 }
@@ -1962,33 +2053,41 @@ pub fn counts_changed(w: &mut Window) {
 /// Changes are coalesced after the latest count or workspace change, with one timer per window.
 pub fn observe_summary(w: &mut Window, win: WinId, reads: &dyn HostReads) {
     let inputs = (w.chrome_state.dirty.attention, w.chrome_state.dirty.workspaces);
-    if w.peer
-        .as_ref()
-        .is_none_or(|p| p.after_batch || (p.summary_inputs == inputs && !p.counts_dirty))
-    {
+    let due: Vec<PeerId> = w
+        .peers()
+        .filter(|(_, p)| !(p.after_batch || (p.summary_inputs == inputs && !p.counts_dirty)))
+        .map(|(peer, _)| *peer)
+        .collect();
+    if due.is_empty() {
         return;
     }
     let summary = current_summary(w, win, reads);
-    with_peer(w, |w, p| {
-        p.summary_inputs = inputs;
-        p.counts_dirty = false;
-        if p.own_summary == summary {
-            return;
-        }
-        p.own_summary = summary.clone();
-        p.debounce.observe(w.now(), summary);
-        if let Some(token) = p.summary_timer.take() {
-            w.cancel_timer(token);
-        }
-        p.summary_timer = Some(w.arm_after(crate::window_link::summary::SummaryDebounce::DELAY));
-    });
+    for peer in due {
+        with_peer(w, peer, |w, p| {
+            p.summary_inputs = inputs;
+            p.counts_dirty = false;
+            if p.own_summary == summary {
+                return;
+            }
+            p.own_summary = summary.clone();
+            p.debounce.observe(w.now(), summary.clone());
+            if let Some(token) = p.summary_timer.take() {
+                w.cancel_timer(token);
+            }
+            p.summary_timer = Some(w.arm_after(crate::window_link::summary::SummaryDebounce::DELAY));
+        });
+    }
 }
 
 pub fn summary_fired(w: &mut Window, token: TimerToken) -> bool {
-    if w.peer.as_ref().is_none_or(|p| p.summary_timer != Some(token)) {
+    let Some(peer) = w
+        .peers()
+        .find(|(_, p)| p.summary_timer == Some(token))
+        .map(|(peer, _)| *peer)
+    else {
         return false;
-    }
-    with_peer(w, |w, p| {
+    };
+    with_peer(w, peer, |w, p| {
         p.summary_timer = None;
         let now = w.now();
         if let Some(summary) = p.debounce.poll(now) {

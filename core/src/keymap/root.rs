@@ -224,12 +224,36 @@ pub fn help_rows() -> Vec<HelpRow> {
             what: "Module below (the terminal when it is shown)".into(),
         },
     ];
-    for row in ROOT_ACCELS {
-        rows.push(HelpRow {
+    rows.extend(accel_rows());
+    rows
+}
+
+/// The overlay's section for a chat window of compositor mode: `Ctrl+h/j/k/l` leave the window, and the compositor
+/// says where to; what they do at a chat's edge is the composer's to decide, as in a companion window.
+pub fn compositor_help_rows() -> Vec<HelpRow> {
+    let mut rows = vec![
+        HelpRow {
+            keys: "Ctrl+h / Ctrl+l".into(),
+            what: "Leave this window (the compositor moves the focus)".into(),
+        },
+        HelpRow {
+            keys: "Ctrl+k / Ctrl+j".into(),
+            what: "Leave this window: Ctrl+k while browsing, Ctrl+j from the input".into(),
+        },
+    ];
+    rows.extend(accel_rows());
+    rows
+}
+
+/// The rows every window shares: the chords the shell registers, and the text size under the pointer.
+fn accel_rows() -> Vec<HelpRow> {
+    let mut rows: Vec<HelpRow> = ROOT_ACCELS
+        .iter()
+        .map(|row| HelpRow {
             keys: row.chords.iter().map(spell_chord).collect::<Vec<_>>().join(" / "),
             what: row.what.to_string(),
-        });
-    }
+        })
+        .collect();
     rows.push(HelpRow {
         keys: "Ctrl+wheel".into(),
         what: "Text size of the pane under the pointer only".into(),

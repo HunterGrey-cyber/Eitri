@@ -16,11 +16,17 @@ pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, batch: &mut Bat
             batch.push_effect(HostOp::OpenLinkedWindow { win });
         }
         Action::WindowOther => {
-            if !moves::raise_other(w, win, batch) {
+            if !w
+                .second_peer()
+                .is_some_and(|peer| moves::raise_other(w, win, peer, batch))
+            {
                 refuse(w, win, action, batch);
             }
         }
         Action::MoveToWindow { module, follow } => {
+            let Some(peer) = moves::pair_peer(w, win, batch) else {
+                return;
+            };
             let layout = w.layout.clone();
             let module = match module {
                 Some(module) => module.clone(),
@@ -32,11 +38,19 @@ pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, batch: &mut Bat
                     }
                 },
             };
-            moves::offer(w, cx, win, &module, *follow, batch);
+            moves::offer(w, cx, win, peer, &module, *follow, batch);
         }
         // The modules shown by a workspace move together, so their verdicts decide when its arrangement appears.
-        Action::WorkspaceToWindow { follow } => moves::workspace::offer(w, cx, win, *follow, false, batch),
-        Action::WorkspaceSwapWindow => moves::workspace::offer(w, cx, win, false, true, batch),
+        Action::WorkspaceToWindow { follow } => {
+            if let Some(peer) = moves::pair_peer(w, win, batch) {
+                moves::workspace::offer(w, cx, win, peer, *follow, false, batch);
+            }
+        }
+        Action::WorkspaceSwapWindow => {
+            if let Some(peer) = moves::pair_peer(w, win, batch) {
+                moves::workspace::offer(w, cx, win, peer, false, true, batch);
+            }
+        }
         _ => debug_assert!(false, "{action:?} is not a window verb"),
     }
 }

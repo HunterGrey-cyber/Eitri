@@ -25,6 +25,8 @@ no module, no Neovim command, nothing running.
 
 - `:EitriMarkdown` shows the preview to the right of the editor; `:EitriMarkdownToggle` shows or hides it;
   `:EitriMarkdownHide` hides it. Opened from Neovim, the preview leaves the keys in Neovim, so you keep typing.
+  With [compositor windows](compositor-windows.md) the preview is a window of its own: these commands open it where your
+  window manager puts it, and only your window manager closes it.
 - A key of your own: `eitri.plugin.load("markdown", { key = "b" })` makes the prefix then `b` (`Ctrl+b b` with the
   default prefix) show the preview and give it the keys, and hide it again while it has them. There is no default key.
 - The command names start with `Eitri` so they do not clash with the commands of other preview plugins. If your

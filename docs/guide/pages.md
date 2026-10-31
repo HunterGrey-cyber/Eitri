@@ -3,7 +3,8 @@ English | [简体中文](pages.zh-CN.md)
 # Pages you build
 
 Eitri can show web pages of your own as modules of the window, beside the editor, the chats and the terminals.
-There are two kinds:
+On Hyprland, sway and niri each page is a window of its own by default, which your window manager arranges
+([Compositor windows](compositor-windows.md)). There are two kinds:
 
 - **A Lua panel** is one line of `init.lua` that shows an HTML file or an address, such as your development
   server. It is an ordinary web view and knows nothing of Eitri.

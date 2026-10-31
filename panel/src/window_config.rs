@@ -45,6 +45,8 @@ pub struct WindowConfig {
     /// Which window manager the companion window asks to move focus (`companion.wm`). Read by every
     /// window so a bad value fails the same way everywhere; only the companion window uses it.
     pub companion_wm: eitri_core::compositor::WmChoice,
+    /// `window.tiling`: whether chats and pages open as windows of the compositor.
+    pub tiling: eitri_core::compositor::mode::TilingChoice,
     /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
     /// puts a hint in the status band.
     pub review: ReviewConfig,
@@ -88,6 +90,23 @@ pub fn parse_panel_font_size(raw: Option<&str>) -> Result<f32, String> {
 /// "eitri: ".
 pub fn parse_companion_wm(raw: Option<&str>) -> Result<eitri_core::compositor::WmChoice, String> {
     eitri_core::compositor::parse_config(raw)
+}
+
+/// `window.tiling`: `"auto"` (the default), `"eitri"` or `"compositor"`; anything else is a startup failure naming
+/// the key. `Err` is the text after "eitri: ".
+pub fn parse_tiling(raw: Option<&str>) -> Result<eitri_core::compositor::mode::TilingChoice, String> {
+    eitri_core::compositor::mode::parse_tiling(raw)
+}
+
+/// `compositor` mode needs a Wayland compositor: on macOS it is refused, naming the key.
+fn refuse_compositor_on_mac(choice: eitri_core::compositor::mode::TilingChoice, mac: bool) -> Result<(), String> {
+    if mac && choice == eitri_core::compositor::mode::TilingChoice::Compositor {
+        return Err(format!(
+            "{} = \"compositor\" is not available on macOS",
+            eitri_core::compositor::mode::TILING_KEY
+        ));
+    }
+    Ok(())
 }
 
 /// The account this window spends, from `VERDANDI_CLAUDE_ACCOUNT` or else `init.lua`'s
@@ -283,6 +302,11 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
 
     let companion_wm = parse_companion_wm(kernel.config.borrow().get(eitri_core::compositor::CONFIG_KEY))?;
 
+    // How chats and pages open (`window.tiling`: "auto", the default, "eitri" or "compositor"). Anything else is a
+    // startup failure naming the key, like `companion.wm`; macOS has no compositor mode to ask for.
+    let tiling = parse_tiling(kernel.config.borrow().get(eitri_core::compositor::mode::TILING_KEY))?;
+    refuse_compositor_on_mac(tiling, cfg!(target_os = "macos"))?;
+
     // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
     // hint in the status band (`review.hint`, default false). Anything but true/false is a startup
     // failure naming the key, like `agent.user_settings` above.
@@ -331,6 +355,7 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         tmux_skipped,
         which_key_delay,
         companion_wm,
+        tiling,
         review,
         thinking_display,
         nvim_prefix,
@@ -601,6 +626,34 @@ mod tests {
         let loaded = ran.and_then(|()| load(&kernel, panels));
         std::fs::remove_dir_all(&scratch).unwrap();
         loaded
+    }
+
+    /// `window.tiling` through the real Lua engine: unset is `auto`, each word is read, anything else is a startup
+    /// failure naming the key, and macOS refuses `compositor`.
+    #[test]
+    fn an_invalid_window_tiling_refuses_startup_naming_the_key() {
+        use eitri_core::compositor::mode::TilingChoice;
+        assert_eq!(load_from("", &[]).unwrap().tiling, TilingChoice::Auto);
+        for (word, choice) in [
+            ("auto", TilingChoice::Auto),
+            ("eitri", TilingChoice::Eitri),
+            ("compositor", TilingChoice::Compositor),
+        ] {
+            let config = load_from(&format!("eitri.config.set(\"window.tiling\", \"{word}\")"), &[]).unwrap();
+            assert_eq!(config.tiling, choice, "{word}");
+        }
+        let err = load_from("eitri.config.set(\"window.tiling\", \"tiles\")", &[])
+            .err()
+            .expect("a bad value refuses the start");
+        for needle in ["window.tiling", "\"tiles\"", "\"auto\"", "\"eitri\"", "\"compositor\""] {
+            assert!(err.contains(needle), "{err} lacks {needle}");
+        }
+        let err = refuse_compositor_on_mac(TilingChoice::Compositor, true).unwrap_err();
+        assert_eq!(err, "window.tiling = \"compositor\" is not available on macOS");
+        for choice in [TilingChoice::Auto, TilingChoice::Eitri] {
+            assert_eq!(refuse_compositor_on_mac(choice, true), Ok(()));
+        }
+        assert_eq!(refuse_compositor_on_mac(TilingChoice::Compositor, false), Ok(()));
     }
 
     /// `agent.thinking` through the real Lua engine: unset is collapsed, each word is read, anything else

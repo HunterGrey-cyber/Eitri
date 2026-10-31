@@ -1,4 +1,4 @@
-Eitri @VERSION@ -- Your Neovim, tiled with your agents, terminals and the web pages you build, in one window.
+Eitri @VERSION@ -- Your Neovim, tiled with your agents, terminals and the web pages you build.
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
@@ -6,6 +6,37 @@ and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 ACP join Claude Code, and you can put web pages of your own in the window. A Claude Code tab now also shows what
 Claude Code does on its own: background tasks, workflows, the turns it starts by itself and the questions it asks
 you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
+
+## What's new since 0.3.0
+
+**Windows your window manager tiles**
+
+- On Hyprland, sway and niri, each chat view and each page now opens as a window of its own and your compositor tiles
+  it. The editor stays in the first window, with one bottom terminal. `window.tiling` chooses: `"auto"`, the default,
+  does this when the compositor answers within 500 ms, `"compositor"` does it on any Wayland desktop, and `"eitri"`
+  keeps everything inside Eitri's window. GNOME, KDE and X11 see no change under `"auto"`.
+- The first start in this mode says so once, in a toast: `Hyprland detected: chats and pages open as their own windows;
+  window.tiling = "eitri" keeps them inside`. On those three compositors the first-start screen offers it as a preset.
+- Chat windows have the app id `cn.huntergrey.eitri.Panel`, page windows `cn.huntergrey.eitri.Page`, and titles that
+  never change, so a window rule can place them; a rule's placement wins over what Eitri remembers. The guide's new
+  "Compositor windows" page has a rule for each compositor.
+- `:EitriTutor` still teaches Eitri's own layout keys, which are off in this mode; the page says which keys still work.
+- A finished turn in another window no longer shows as running, in the top bar or in the close question.
+- Run on sway 1.12 in a headless session, and in a virtual machine on Hyprland 0.57.0 (Lua config), 0.56.2 (`hyprland.conf`
+  and Lua config) and niri 26.04; not on real hardware, and not on GNOME or KDE. Each chat window costs 51.4 MiB more than
+  the same chat as a tile with four projects open (release build, medians). The page's "Known gaps" lists what does not
+  work yet.
+
+**What this can break:**
+
+- **On Hyprland, sway and niri, chats and pages leave the Eitri window** and Eitri's layout keys go off: splits, zoom,
+  floats, workspaces and the second window's keys do nothing there but show one hint. Add
+  `eitri.config.set("window.tiling", "eitri")` to `init.lua` to keep the window as it was. Your layout file and tabs are
+  kept for it either way.
+- **In that mode, closing a chat window forgets its tabs,** with no question when it is idle. Closing the editor's
+  window keeps them.
+- **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
+  nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
 
 ## What's new in 0.3.0
 

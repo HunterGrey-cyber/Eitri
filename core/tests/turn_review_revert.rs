@@ -7,11 +7,12 @@
 //! `-- --ignored` over this target is harmless.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent::{AgentDomainEvent, TurnOutcome};
@@ -19,9 +20,9 @@ use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
 use eitri_core::turn_review::{
     replace, review_dir_for, AppliedRevert, Blocked, Busy, Content, EditorCheck, EditorClear, EmbeddedAsk, ExactHunks,
-    FsHooks, Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Recovered,
-    Refusal, RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, WriteError,
-    WriteSlot, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
+    FsHooks, GroupGuard, Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir,
+    RecoverAnswer, Recovered, Refusal, RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage,
+    TurnReview, WriteError, WriteSlot, BUFFER_STATE_LUA, MAX_CLEAR_AGE, NOT_LINKED,
 };
 use rmpv::Value;
 
@@ -793,6 +794,167 @@ fn a_running_turn_refuses_here_and_in_another_window() {
     drop(other);
     revert(w.guard()).unwrap();
     assert_eq!(w.read("a.txt"), b"base\n");
+}
+
+/// Window 1 as a module window's guard hears it: the answers it will give, in order, and how often it was asked.
+#[derive(Default)]
+struct FakeWindow1 {
+    answers: Mutex<VecDeque<Option<Result<(), String>>>>,
+    asked: AtomicUsize,
+}
+
+impl FakeWindow1 {
+    /// Each `Some` is an answer; `None` is no link to ask on.
+    fn answering(answers: impl IntoIterator<Item = Option<Result<(), String>>>) -> Arc<FakeWindow1> {
+        Arc::new(FakeWindow1 {
+            answers: Mutex::new(answers.into_iter().collect()),
+            asked: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl GroupGuard for FakeWindow1 {
+    fn ask(&self) -> Option<(u64, mpsc::Receiver<Result<(), String>>)> {
+        let job = self.asked.fetch_add(1, Ordering::SeqCst) as u64;
+        let answer = self
+            .answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("no more than expected")?;
+        let (tell, told) = mpsc::channel();
+        tell.send(answer).unwrap();
+        Some((job, told))
+    }
+
+    fn gave_up(&self, _job: u64) {}
+}
+
+fn module_window_guard(w: &World, window_1: &Arc<FakeWindow1>) -> PresenceGuard {
+    let guard = w.guard();
+    guard.set_group(window_1.clone());
+    guard
+}
+
+#[test]
+fn a_module_windows_revert_needs_window_1s_word_at_both_checks() {
+    let mut w = World::new("group-both");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let before = fingerprint(&w.file("a.txt"));
+    let revert = |guard: PresenceGuard| {
+        w.review
+            .revert_job(
+                guard,
+                wanted(),
+                SESSION,
+                n,
+                Scope::Turn,
+                "a.txt",
+                RevertTarget::File,
+                w.clear("a.txt"),
+            )
+            .run()
+    };
+
+    let at_the_end = FakeWindow1::answering([Some(Ok(())), Some(Err("an agent turn is running".to_string()))]);
+    let refused = revert(module_window_guard(&w, &at_the_end)).unwrap_err();
+    assert_eq!(
+        refused,
+        Refusal::Blocked(Blocked::Group("an agent turn is running".to_string()))
+    );
+    assert_eq!(refused.to_string(), "an agent turn is running");
+    assert_eq!(at_the_end.asked.load(Ordering::SeqCst), 2);
+    assert_eq!(fingerprint(&w.file("a.txt")), before);
+
+    let yes = FakeWindow1::answering([Some(Ok(())), Some(Ok(()))]);
+    revert(module_window_guard(&w, &yes)).unwrap();
+    assert_eq!(w.read("a.txt"), b"base\n");
+}
+
+#[test]
+fn a_module_window_with_no_link_to_window_1_does_not_write() {
+    let mut w = World::new("group-unlinked");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let before = fingerprint(&w.file("a.txt"));
+    let unlinked = FakeWindow1::answering([None]);
+    let refused = w
+        .review
+        .revert_job(
+            module_window_guard(&w, &unlinked),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            w.clear("a.txt"),
+        )
+        .run()
+        .unwrap_err();
+    assert_eq!(refused, Refusal::Blocked(Blocked::NotHeld(NOT_LINKED.to_string())));
+    assert_eq!(fingerprint(&w.file("a.txt")), before);
+}
+
+#[test]
+fn a_module_window_with_a_turn_of_its_own_refuses_before_asking() {
+    let mut w = World::new("group-own");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let window_1 = FakeWindow1::answering([]);
+    let busy = PresenceGuard::for_tests(&w.review_dir, std::process::id(), 1);
+    busy.set_group(window_1.clone());
+    let refused = w
+        .review
+        .revert_job(
+            busy,
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            w.clear("a.txt"),
+        )
+        .run()
+        .unwrap_err();
+    assert_eq!(refused, Refusal::Blocked(Blocked::TurnRunningHere));
+    assert_eq!(window_1.asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_module_windows_undo_and_recovery_ask_window_1_too() {
+    let mut w = World::new("group-undo");
+    w.write("a.txt", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"end\n", 0o644));
+    let applied = w.revert_file(n, "a.txt").unwrap();
+    let refusal = || Refusal::Blocked(Blocked::Group("no".to_string()));
+
+    let window_1 = FakeWindow1::answering([Some(Err("no".to_string()))]);
+    let undo = w.review.undo_job(
+        module_window_guard(&w, &window_1),
+        wanted(),
+        SESSION,
+        "a.txt",
+        applied.pre.clone(),
+        applied.post.clone(),
+        w.clear("a.txt"),
+    );
+    assert_refused(undo.run(), &refusal());
+    assert_eq!(w.read("a.txt"), b"base\n");
+
+    let w = World::new("group-recover");
+    w.write("a.txt", b"original\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    let window_1 = FakeWindow1::answering([Some(Err("no".to_string()))]);
+    let restore = w.review.recover_job(
+        module_window_guard(&w, &window_1),
+        &entry.id,
+        RecoverAnswer::Restore(w.clear("a.txt")),
+    );
+    assert_refused(restore.run(), &refusal());
+    assert_eq!(w.pending_of(1), vec![entry], "the entry is still pending");
 }
 
 #[test]

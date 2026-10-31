@@ -191,8 +191,18 @@ fn desktop(ctx: &DetectContext) -> Option<DesktopRow> {
                 lua_config,
             ))
         }
-        // niri's binds are not read; its socket in the environment is the whole of what is known.
-        Some("niri") => Some(detect::desktop_row(Wm::Niri, true, None, Vec::new(), false)),
+        // niri's binds are not read, and its socket in the environment can outlive it: the version command the start's
+        // own check runs says whether it is there, so a dead one is not offered as a choice to write down.
+        Some("niri") => {
+            let argv = eitri_core::compositor::mode::liveness_argv(Wm::Niri).unwrap_or_default();
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let live = match (ctx.run)(&argv) {
+                Ok(reply) => eitri_core::compositor::mode::liveness_ok(Wm::Niri, &reply),
+                Err(why) if never_answered(&why) => return None,
+                Err(_) => false,
+            };
+            Some(detect::desktop_row(Wm::Niri, live, None, Vec::new(), false))
+        }
         _ => Some(detect::desktop_row(wm, false, None, Vec::new(), false)),
     }
 }
@@ -234,6 +244,26 @@ mod tests {
         let found = RefCell::new(Vec::new());
         run(ctx, |row| found.borrow_mut().push(row));
         found.into_inner()
+    }
+
+    #[test]
+    fn a_niri_socket_with_no_niri_behind_it_is_not_live() {
+        let niri = &[("NIRI_SOCKET", "/run/niri.sock")];
+        let dead = fake(niri, Box::new(|_| Err("niri could not connect".to_string())));
+        assert!(!desktop(&dead).unwrap().live);
+        let cli_alone = fake(niri, Box::new(|_| Ok(r#"{"cli":"25.05"}"#.to_string())));
+        assert!(
+            !desktop(&cli_alone).unwrap().live,
+            "the command needs no compositor to print its own version"
+        );
+        let there = fake(
+            niri,
+            Box::new(|argv| {
+                assert_eq!(argv, ["niri", "msg", "--json", "version"]);
+                Ok(r#"{"cli":"25.05","compositor":"25.05"}"#.to_string())
+            }),
+        );
+        assert!(desktop(&there).unwrap().live);
     }
 
     #[test]

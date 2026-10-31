@@ -2,6 +2,7 @@
 
 use super::moves::MoveKind;
 use super::window::*;
+use crate::agent_backend::AgentId;
 use crate::keymap::{
     action::Action,
     key::{KeyName, KeySpec},
@@ -12,7 +13,8 @@ use crate::onboarding::screen::{CheckWhy, MarkerEvent};
 use crate::onboarding::{Found, Generated, Opening, WriteOutcome};
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
-use crate::window_link::{FocusTarget, Msg, Shape, Summary};
+use crate::window_link::names::WindowName;
+use crate::window_link::{FocusTarget, HubAsk, Msg, Shape, Summary};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -220,6 +222,8 @@ pub enum Origin {
     Follow,
     /// A linked process.
     Peer,
+    /// An action window 1 sent over the link to a module window: it runs there as it is, never sent back.
+    Hub,
 }
 
 /// The editor pane's liveness and last quit request, copied without waiting for its worker.
@@ -276,6 +280,12 @@ pub trait HostReads {
         let _ = (win, tab);
         Err(NOT_CARRIED_OUT.into())
     }
+    /// What a hand-over of `tab` to another window would take, which asks less of the tab than a move: its agent
+    /// resumes in the other window, so it need not be able to move live. `Err` says why it cannot go.
+    fn tab_hand_over(&self, win: WinId, tab: TabId) -> Result<TabHandOver, String> {
+        let _ = (win, tab);
+        Err(NOT_CARRIED_OUT.into())
+    }
     /// The agent and provider session that name `tab` in the layout file's record of the tabs that came with a
     /// workspace; `None` for a tab that holds no session.
     fn moved_tab_key(&self, win: WinId, tab: TabId) -> Option<crate::window_link::base_tabs::MovedTabKey> {
@@ -298,6 +308,16 @@ pub trait HostReads {
     /// whose chats report none answers that it has none.
     fn tab_has_last(&self, win: WinId) -> bool {
         let _ = win;
+        false
+    }
+    /// What the compositor is called in a notice (`Hyprland`, `sway`, `niri`), or `the compositor` when none is known.
+    fn compositor_name(&self) -> &'static str {
+        "the compositor"
+    }
+    /// Whether the module window `name` is open or starting, whoever started it: a hand-over starts its target without
+    /// the controller, so only the host knows of that one until it links. A host with no such windows has none open.
+    fn module_window_open(&self, name: &crate::window_link::names::WindowName) -> bool {
+        let _ = name;
         false
     }
     /// Where tab number `n` of window `win`'s tab set is now (the base view or the extra view showing it), or
@@ -408,6 +428,17 @@ pub struct ChatMoveFacts {
     /// Whether its agent keeps a running turn when the chat moves; when it does not, a running chat moves once
     /// its turn ends.
     pub live: bool,
+    /// Whether a turn of it runs now.
+    pub running: bool,
+}
+
+/// What the controller needs of a chat tab to hand it to another window ([`HostReads::tab_hand_over`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabHandOver {
+    /// Its agent: session ids are each agent's own, so this and `session` together name the tab.
+    pub agent: AgentId,
+    /// The session the other window resumes; `None` for a tab that holds none.
+    pub session: Option<String>,
     /// Whether a turn of it runs now.
     pub running: bool,
 }
@@ -545,6 +576,56 @@ pub enum HostOp {
     /// Brings the other window of the pair forward through the compositor; answered with [`PeerEvent::Raised`]
     /// carrying the activation token the host got for it, if any.
     RaisePeer { win: WinId, peer: PeerId },
+    /// Starts the module window `name`, which links back when it is up. `token` is the activation token of the window
+    /// that asked for it (`None`: the host makes one from this window's surface); with `keep_keys` the new window maps
+    /// without taking the keys.
+    OpenModuleWindow {
+        win: WinId,
+        name: WindowName,
+        token: Option<String>,
+        keep_keys: bool,
+    },
+    /// A raise of `peer` that a module window asked for: it is carried out with that window's `token`, and answered
+    /// with [`PeerEvent::Raised`] as [`HostOp::RaisePeer`] is.
+    ForwardRaise {
+        win: WinId,
+        peer: PeerId,
+        token: Option<String>,
+    },
+    /// Runs the key action `name` with `opts` in the module window `peer` (`Action::name` and
+    /// `Action::wire_options`).
+    PeerRun {
+        win: WinId,
+        peer: PeerId,
+        name: String,
+        opts: Vec<(String, serde_json::Value)>,
+    },
+    /// A focus move past this window's edge, which the compositor carries out.
+    CompositorFocus { win: WinId, direction: Direction },
+    /// A module window asks window 1 for another window of its own.
+    HubAsk { win: WinId, ask: HubAsk },
+    /// Builds the window's base chat page, once, at the start step the mode's facts allow. The only way one comes to
+    /// exist: a window that shows no chat of its own never gets this op.
+    BuildBasePage { win: WinId },
+    /// Hands the tab holding `agent`'s `session` (session ids are each agent's own, so the two together name the tab)
+    /// from the module window `from` to the chat window `to`, through this window: `to` is started or raised with the
+    /// asking window's `token`, and once it has linked `from` is asked to let the tab go. The host answers everything
+    /// that follows between the windows' links.
+    HandOverTab {
+        win: WinId,
+        from: PeerId,
+        agent: AgentId,
+        session: String,
+        to: WindowName,
+        token: Option<String>,
+    },
+    /// Tells the module window `peer` that the tab holding `session` stays there, for the reason `why`.
+    KeepTab {
+        win: WinId,
+        peer: PeerId,
+        session: String,
+        why: String,
+    },
     /// Builds the prepared surface `module` from the descriptors and the record a committed move carried. The
     /// descriptors are the op's alone: the host takes them out of `fds` and owns them from then on.
     AdoptMoved {
@@ -614,6 +695,8 @@ pub enum OnboardingOp {
     },
     /// Starts the detection rows; each answers [`OnboardingEvent::Found`].
     Detect { win: WinId, generation: u64 },
+    /// Shows a one-time notice, after whatever is up has hidden.
+    Notice { win: WinId, text: String },
     /// Reads Neovim's mappings again, probing `extra` as well for that one report; the answer is a
     /// [`OnboardingEvent::Found`].
     Rescan {
@@ -997,6 +1080,12 @@ pub enum PluginOp {
 /// Process-wide resources to remove.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CleanupOp {
+    /// Window 1 in `compositor` mode closes its group: every module window hears the link's goodbye, and one that has
+    /// not gone after a grace is ended.
+    EndGroup,
+    /// An end signal, not the user, closes this module window: its goodbye says so, and window 1 keeps its tabs and
+    /// its place for the next start. Comes ahead of [`CleanupOp::PairOnClose`].
+    KeepThisWindow,
     /// Flushes the pair's last state and sends the link's goodbye after the layout save.
     PairOnClose { layout_written: bool },
     /// The editor feeds.
@@ -1097,6 +1186,8 @@ pub enum HostEvent {
     AnswerRefused { win: WinId, text: String },
     /// A process termination signal arrived.
     EndSignal { name: &'static str },
+    /// Window 1 said `bye` to this module window: the group is closing, and the window goes with it.
+    GroupClosed { win: WinId },
     /// Another process asks this window to open a file. Always answered with one [`HostOp::OpenAnswer`] of this `id`.
     OpenFile {
         win: WinId,
@@ -1129,6 +1220,9 @@ pub enum HostEvent {
     Peer(PeerEvent),
     /// What the pair's glue saw of the link's end and of a window 2 that was to come back.
     Pair(PairEvent),
+    /// The module window `name`, started by `win`, did not come up: its handshake was missed, it was refused or its
+    /// link ended before it linked. Whatever waited for it is dropped, and the name is free to start again.
+    ModuleWindowFailed { win: WinId, name: WindowName, why: String },
     /// The output list changed.
     MonitorsChanged { monitors: Vec<Monitor> },
     /// The output the window is on, or none after leaving every output.
@@ -1168,6 +1262,8 @@ pub enum OnboardingEvent {
     },
     /// The check before the write said no.
     CheckFailed { win: WinId, generation: u64, why: CheckWhy },
+    /// The start's check said the screen stays closed.
+    NoScreen { win: WinId },
 }
 
 /// The native owner of the keys.
@@ -1294,6 +1390,10 @@ pub enum ChatEvent {
     TabVerb { win: WinId, view: ViewId, action: Action },
     /// A chooser row belongs to the linked peer, which should be raised.
     ChooserPartnerPick { win: WinId, view: ViewId, session: String },
+    /// A tab this module window offered stays here, for the reason `why`.
+    TabKept { win: WinId, why: String },
+    /// A tab left this module window: it is open in the window it was handed to, or its last tab was closed.
+    TabLeft { win: WinId },
     /// A view returned keys.
     KeysReturn { win: WinId, view: ViewId },
     /// A view reports coverage.
@@ -1576,6 +1676,15 @@ pub enum PeerEvent {
     Bye { peer: PeerId },
     /// The link ended.
     LinkClosed { peer: PeerId },
+    /// A module window asks this window (window 1) for another window; `token` is the asking window's activation
+    /// token, for the window that comes forward.
+    HubAsk {
+        peer: PeerId,
+        ask: HubAsk,
+        token: Option<String>,
+    },
+    /// The module window's toplevel gained the keyboard.
+    WindowFocused { peer: PeerId },
 }
 
 impl PeerEvent {
@@ -1599,6 +1708,8 @@ impl PeerEvent {
             | PeerEvent::Held { peer, .. }
             | PeerEvent::Monitor { peer, .. }
             | PeerEvent::Bye { peer }
+            | PeerEvent::HubAsk { peer, .. }
+            | PeerEvent::WindowFocused { peer }
             | PeerEvent::LinkClosed { peer } => *peer,
         }
     }
@@ -1698,6 +1809,22 @@ pub enum OpTag {
     OpenLinkedWindow,
     /// Identifies RaisePeer operations.
     RaisePeer,
+    /// Identifies OpenModuleWindow operations.
+    OpenModuleWindow,
+    /// Identifies ForwardRaise operations.
+    ForwardRaise,
+    /// Identifies PeerRun operations.
+    PeerRun,
+    /// Identifies CompositorFocus operations.
+    CompositorFocus,
+    /// Identifies HubAsk operations.
+    HubAsk,
+    /// Identifies BuildBasePage operations.
+    BuildBasePage,
+    /// Identifies HandOverTab operations.
+    HandOverTab,
+    /// Identifies KeepTab operations.
+    KeepTab,
     /// Identifies AdoptMoved operations.
     AdoptMoved,
     /// Identifies OrderBaseTabs operations.
@@ -1757,6 +1884,14 @@ impl OpTag {
             HostOp::PrepareSurface { .. } => Self::PrepareSurface,
             HostOp::OpenLinkedWindow { .. } => Self::OpenLinkedWindow,
             HostOp::RaisePeer { .. } => Self::RaisePeer,
+            HostOp::OpenModuleWindow { .. } => Self::OpenModuleWindow,
+            HostOp::ForwardRaise { .. } => Self::ForwardRaise,
+            HostOp::PeerRun { .. } => Self::PeerRun,
+            HostOp::CompositorFocus { .. } => Self::CompositorFocus,
+            HostOp::HubAsk { .. } => Self::HubAsk,
+            HostOp::BuildBasePage { .. } => Self::BuildBasePage,
+            HostOp::HandOverTab { .. } => Self::HandOverTab,
+            HostOp::KeepTab { .. } => Self::KeepTab,
             HostOp::AdoptMoved { .. } => Self::AdoptMoved,
             HostOp::OrderBaseTabs { .. } => Self::OrderBaseTabs,
             HostOp::EndPeer { .. } => Self::EndPeer,
@@ -2077,7 +2212,68 @@ mod tests {
             PrepareSurface
         );
         tag!(HostOp::OpenLinkedWindow { win }, OpenLinkedWindow);
+        tag!(HostOp::BuildBasePage { win }, BuildBasePage);
         tag!(HostOp::RaisePeer { win, peer: PeerId(2) }, RaisePeer);
+        tag!(
+            HostOp::OpenModuleWindow {
+                win,
+                name: WindowName::Chat(2),
+                token: None,
+                keep_keys: false
+            },
+            OpenModuleWindow
+        );
+        tag!(
+            HostOp::ForwardRaise {
+                win,
+                peer: PeerId(16),
+                token: Some("t".into())
+            },
+            ForwardRaise
+        );
+        tag!(
+            HostOp::PeerRun {
+                win,
+                peer: PeerId(16),
+                name: "tab.next".into(),
+                opts: vec![]
+            },
+            PeerRun
+        );
+        tag!(
+            HostOp::CompositorFocus {
+                win,
+                direction: Direction::Left
+            },
+            CompositorFocus
+        );
+        tag!(
+            HostOp::HandOverTab {
+                win,
+                from: PeerId(16),
+                agent: AgentId::Claude,
+                session: "s".into(),
+                to: WindowName::Chat(2),
+                token: None
+            },
+            HandOverTab
+        );
+        tag!(
+            HostOp::KeepTab {
+                win,
+                peer: PeerId(16),
+                session: "s".into(),
+                why: "no".into()
+            },
+            KeepTab
+        );
+        tag!(
+            HostOp::HubAsk {
+                win,
+                ask: HubAsk::InstanceNew
+            },
+            HubAsk
+        );
         tag!(
             HostOp::AdoptMoved {
                 win,

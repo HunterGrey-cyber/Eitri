@@ -16,7 +16,7 @@ pub const NVIM_LHS_CANDIDATES: [&str; 3] = ["<leader>W", "<leader>E", "<leader>z
 const PREFIX_TABLE: &str = "prefix";
 const SEND_PREFIX: &str = "send-prefix";
 const I3_ALT: &str = "i3-alt";
-const TILING_KEY: &str = "window.tiling";
+pub(crate) const TILING_KEY: &str = "window.tiling";
 const WHICH_KEY_DELAY_MS: u32 = 200;
 /// The name `{wm}` falls back to; preset 5 is offered only once a compositor has answered with its name.
 const UNNAMED_COMPOSITOR: &str = "compositor";
@@ -604,6 +604,10 @@ mod tests {
         compositor_mode: true,
         nvim_prefix: true,
     };
+    const WITHOUT_COMPOSITOR: Build = Build {
+        compositor_mode: false,
+        nvim_prefix: true,
+    };
 
     /// The file's lines after the two header comments and the blank line.
     fn body(generated: &Generated) -> Vec<&str> {
@@ -1111,7 +1115,7 @@ mod tests {
     fn preset_four_on_super_moves_nothing() {
         let mut c = choice(PresetId::I3Style);
         c.wm_mod = WmMod::Super;
-        let generated = generate(&c, Build::THIS_BINARY, Lang::En);
+        let generated = generate(&c, WITHOUT_COMPOSITOR, Lang::En);
         assert_eq!(
             body(&generated),
             ["-- $mod is Super: nothing after the prefix collides with it."]
@@ -1144,7 +1148,7 @@ mod tests {
                 let mut c = choice(preset);
                 c.tiling = tiling;
                 c.wm_name = Some("sway");
-                let text = generate(&c, Build::THIS_BINARY, Lang::En).text();
+                let text = generate(&c, WITHOUT_COMPOSITOR, Lang::En).text();
                 assert!(!text.contains("window.tiling\""), "{text}");
             }
         }
@@ -1247,8 +1251,8 @@ mod tests {
             PresetId::OtherPrefix,
             PresetId::I3Style,
         ];
-        assert_eq!(offered(Build::THIS_BINARY, false), four);
-        assert_eq!(offered(Build::THIS_BINARY, true), four);
+        assert_eq!(offered(WITHOUT_COMPOSITOR, false), four);
+        assert_eq!(offered(WITHOUT_COMPOSITOR, true), four);
         assert_eq!(offered(COMPOSITOR_BUILD, false), four);
         let mut five = four;
         five.push(PresetId::Compositor);

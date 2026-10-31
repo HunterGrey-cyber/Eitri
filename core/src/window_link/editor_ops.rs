@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 use crate::plugin::roots::{file_inside, Roots};
-use crate::review_editor::{OverlayCall, ShowHunk, ShowMeta};
+use crate::review_editor::{linked_request_id, OverlayCall, ShowHunk, ShowMeta};
 use crate::turn_review::revert::{buffer_state_args, BUFFER_STATE_LUA};
 use crate::turn_review::write::ProjectDir;
+use crate::wm::PeerId;
 
 use super::editor_op::EditorOp;
 
@@ -25,6 +26,8 @@ use super::editor_op::EditorOp;
 pub trait OpContext {
     /// The canonical project root, the same in both windows.
     fn project_root(&self) -> &Path;
+    /// The window the operation came from, which is who an open's answer goes back to.
+    fn peer(&self) -> PeerId;
     /// Whether window 2 holds the chat of `session` (window 1's `session -> holder` map).
     fn session_in_window2(&self, session: &str) -> bool;
     /// The named canonical roots of a plugin whose page window 2 holds, from window 1's own table; `None`
@@ -34,7 +37,7 @@ pub trait OpContext {
     fn plugin_follow(&self, _plugin: &str) -> Option<FollowConfig> {
         None
     }
-    /// The paths window 1 recorded as drawn for window 2.
+    /// The paths window 1 recorded as drawn for the asking window.
     fn drawn_for_window2(&self) -> Vec<PathBuf>;
 }
 
@@ -113,7 +116,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             held_session(ctx, &meta.session)?;
             let path = project_path(ctx, &path)?;
             Ok(Dispatch::Overlay(vec![OverlayCall::OpenAndShow {
-                request_id: format!("w2:{id}"),
+                request_id: linked_request_id(ctx.peer(), id),
                 path,
                 line,
                 meta: ShowMeta::from(meta),
@@ -127,8 +130,8 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             }
             Ok(Dispatch::Overlay(vec![OverlayCall::Clear { path }]))
         }
-        // One clear per path drawn for window 2, never a clear of everything: that would take window 1's
-        // overlays with it.
+        // One clear per path drawn for this window, never a clear of everything: that would take every other
+        // window's overlays with it.
         EditorOp::ReviewClearMine {} => Ok(Dispatch::Overlay(
             ctx.drawn_for_window2()
                 .into_iter()
@@ -342,6 +345,9 @@ mod tests {
     impl OpContext for Ctx {
         fn project_root(&self) -> &Path {
             &self.root
+        }
+        fn peer(&self) -> PeerId {
+            PeerId(2)
         }
         fn session_in_window2(&self, session: &str) -> bool {
             self.sessions.iter().any(|s| s == session)

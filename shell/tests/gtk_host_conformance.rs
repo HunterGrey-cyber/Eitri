@@ -882,6 +882,7 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
 /// `window.new` goes through the pair the shell gives the host, its answer the host's; `window.other`'s raise answers
 /// with the activation token this window's display gave, posted while it applies, for the controller to send on.
 fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), String> {
+    use eitri_core::window_link::names::WindowName;
     use eitri_core::wm::{HostEvent, PeerEvent, PeerId};
     struct Pair {
         opened: RefCell<Vec<WinId>>,
@@ -890,15 +891,15 @@ fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), Strin
         answer: RefCell<Result<(), String>>,
     }
     impl gtk_host::LinkedWindows for Pair {
-        fn open(&self, win: WinId, _token: Option<String>) -> Result<(), String> {
+        fn open(&self, win: WinId, _name: &WindowName, _token: Option<String>) -> Result<(), String> {
             self.opened.borrow_mut().push(win);
             self.answer.borrow().clone()
         }
-        fn end_peer(&self, win: WinId) -> Result<(), String> {
+        fn end_peer(&self, win: WinId, _peer: PeerId) -> Result<(), String> {
             self.opened.borrow_mut().push(win);
             self.answer.borrow().clone()
         }
-        fn restore(&self, win: WinId) -> Result<(), String> {
+        fn restore(&self, win: WinId, _name: &WindowName) -> Result<(), String> {
             self.restored.borrow_mut().push(win);
             self.answer.borrow().clone()
         }

@@ -9,6 +9,9 @@ was before the turn, and lets you send comments on the changes back to the agent
 It works from snapshots Eitri takes of the project's files, not from your git history, so it behaves the same
 in a directory that is not a git repository. Nothing is ever written into your project's `.git`.
 
+With [compositor windows](compositor-windows.md) the review lives in the chat window, and what it opens goes to the
+editor in window 1.
+
 Keys below are for the default setup. In the panel, "browsing" is the mode you reach with `Esc` from the
 message box; see [Getting started](getting-started.md).
 

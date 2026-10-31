@@ -2,11 +2,14 @@
 
 use super::host::*;
 use super::module::SurfaceDecl;
-use super::window::{ActivationToken, EditorPresence, WinId, WindowParts, WindowSpec};
+use super::window::{ActivationToken, EditorPresence, Tiling, WinId, WindowParts, WindowSpec};
 use super::Controller;
+use crate::compositor::mode::{resolve_mode, Mode, ModeFacts, TilingChoice, Why};
+use crate::compositor::Wm;
 use crate::keymap::Keymap;
-use crate::layout::{ModuleId, ModuleKeys};
+use crate::layout::{Frame, Layout, ModuleId, ModuleKeys, ModuleKind};
 use crate::tabs::ViewId;
+use crate::window_link::names::WindowName;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,136 @@ pub fn own_window(
         .map(|(id, _)| id.clone())
 }
 
+/// What a window's start knows of itself before its mode is resolved: everything but `choice` is known before
+/// `init.lua` runs, and `choice` as soon as it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyFacts {
+    /// Window 1 started this window: window 2 or a module window, whose mode is not in question.
+    pub started: bool,
+    /// The window shows a chat of its own; a page window does not.
+    pub shows_chat: bool,
+    pub mac: bool,
+    pub wayland: bool,
+    pub wm: Wm,
+    pub window2_orphan: bool,
+    pub module_orphans: bool,
+    pub unpaired: bool,
+    pub alone: bool,
+    /// What `window.tiling` says; `None` until `init.lua` has run.
+    pub choice: Option<TilingChoice>,
+}
+
+impl EarlyFacts {
+    /// These facts as the mode's rules read them, with what is known only after `init.lua` and the plugins.
+    pub fn mode_facts(&self, own_window: bool, live: Option<bool>) -> ModeFacts {
+        ModeFacts {
+            choice: self.choice.unwrap_or(TilingChoice::Auto),
+            mac: self.mac,
+            wayland: self.wayland,
+            wm: self.wm,
+            live,
+            own_window,
+            window2_orphan: self.window2_orphan,
+            module_orphans: self.module_orphans,
+            unpaired: self.unpaired,
+            alone: self.alone,
+        }
+    }
+
+    /// How a full window or window 2 tiles, and the mode's rule that decided it. Only a window nobody started has a
+    /// mode to resolve: a hub when it is `compositor`.
+    pub fn tiling(&self, own_window: bool, live: Option<bool>) -> (Tiling, Mode, Why) {
+        let (mode, why) = resolve_mode(&self.mode_facts(own_window, live));
+        let hub = !self.started && mode == Mode::Compositor;
+        (if hub { Tiling::Hub } else { Tiling::Eitri }, mode, why)
+    }
+}
+
+/// The start step a window's base chat page can be built at: the first one where the facts rule a hub out, since a
+/// hub builds none and everything else builds one before its first document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAt {
+    /// Before `init.lua`: nothing `init.lua` says can make this window a hub.
+    Kernel,
+    /// After `init.lua`: what it set rules a hub out.
+    Config,
+    /// Only the resolved mode can tell.
+    Layout,
+}
+
+/// Where `early` puts the window's base chat page. Rules that force `eitri` mode come first, and module orphans
+/// before the rest, since they force compositor mode whatever the session and the setting say; the mode's own order
+/// is [`resolve_mode`]'s.
+pub fn base_page_at(early: &EarlyFacts) -> PageAt {
+    if early.started || early.mac || early.window2_orphan || early.unpaired || early.alone {
+        return PageAt::Kernel;
+    }
+    if early.module_orphans {
+        return PageAt::Layout;
+    }
+    if !early.wayland {
+        return PageAt::Kernel;
+    }
+    match early.choice {
+        Some(TilingChoice::Eitri) => PageAt::Config,
+        Some(TilingChoice::Auto) if matches!(early.wm, Wm::Gnome | Wm::None) => PageAt::Config,
+        _ => PageAt::Layout,
+    }
+}
+
+/// What a hub's start opens beside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartWindows {
+    /// The module windows, in the start layout's leaf order.
+    pub open: Vec<WindowName>,
+    /// The panels of the start layout whose id cannot name a window.
+    pub unnamed: Vec<ModuleId>,
+}
+
+impl StartWindows {
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty() && self.unnamed.is_empty()
+    }
+}
+
+/// Whether `id` is a module that lives in a window of its own beside a hub.
+fn is_a_window(id: &ModuleId) -> bool {
+    matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview)
+}
+
+/// What `start`, the layout the window would open as a tile set, is as a hub: the editor over the bottom terminal,
+/// that terminal shown only if `start` shows it, and every chat and page `start` shows as a module window to open, in
+/// leaf order. A hidden one stays closed, as it stays off screen in `eitri` mode; its key opens it. A panel whose id
+/// names no window is left out here and reported by [`unnamed_pages`].
+pub fn hub_layout(start: &Layout) -> (Layout, Vec<WindowName>) {
+    let terminal = ModuleId::terminal();
+    let mut layout = crate::layout::hub_tree().layout;
+    if !start.is_shown(&terminal) {
+        crate::layout::hide(
+            &mut layout,
+            &terminal,
+            &Frame::new(super::persist::FIRST_LAUNCH_FRAME, 1),
+        )
+        .expect("the keys are on the editor, so the terminal can hide");
+    }
+    let windows = start
+        .modules()
+        .iter()
+        .filter(|id| is_a_window(id) && start.is_shown(id))
+        .filter_map(WindowName::for_module)
+        .collect();
+    (layout, windows)
+}
+
+/// The chats and pages `start` shows that [`hub_layout`] has no window for.
+pub fn unnamed_pages(start: &Layout) -> Vec<ModuleId> {
+    start
+        .modules()
+        .into_iter()
+        .filter(|id| is_a_window(id) && start.is_shown(id) && WindowName::for_module(id).is_none())
+        .collect()
+}
+
 pub enum StartStep {
     Feeds {
         spawn: EditorSpawn,
@@ -71,6 +204,8 @@ pub enum StartStep {
     Layout {
         parts: WindowParts,
         own_window: Option<String>,
+        /// How the window takes part in the compositor's tiling, known only now that `init.lua` has run.
+        tiling: Tiling,
     },
     Surfaces {
         decls: Vec<SurfaceDecl>,
@@ -105,10 +240,41 @@ impl StartStep {
 pub(super) struct StartState {
     next: usize,
     pub(super) own_window: Option<String>,
+    pub(super) tiling: Tiling,
     pub(super) spawn: Option<EditorSpawn>,
+    /// `None` for a window that was told none, which builds no base page.
+    early: Option<EarlyFacts>,
+    page_built: bool,
+    /// What a hub opens once `shell:ready` has gone out.
+    pub(super) windows: StartWindows,
+}
+
+impl StartState {
+    /// Builds the base page unless the window shows no chat or has one already.
+    fn build_page(&mut self, win: WinId, batch: &mut Batch) {
+        if self.early.is_some_and(|early| early.shows_chat) && !self.page_built {
+            self.page_built = true;
+            batch.push_layout(HostOp::BuildBasePage { win });
+        }
+    }
+
+    fn page_at(&self) -> Option<PageAt> {
+        self.early.as_ref().map(base_page_at)
+    }
 }
 
 impl Controller {
+    /// What `win`'s start knows so far: given before the kernel phase, and again before the config phase with
+    /// `window.tiling`.
+    pub fn set_early_facts(&mut self, win: WinId, early: EarlyFacts) {
+        self.starts.entry(win).or_default().early = Some(early);
+    }
+
+    /// What `win`'s start opens beside it as a hub, from the layout it would otherwise have opened.
+    pub fn set_start_windows(&mut self, win: WinId, windows: StartWindows) {
+        self.starts.entry(win).or_default().windows = windows;
+    }
+
     /// Walks one window's startup in order, retaining the feed settings until the editor is made.
     pub fn start(&mut self, win: WinId, step: StartStep) -> Batch {
         let state = self.starts.entry(win).or_default();
@@ -142,11 +308,29 @@ impl Controller {
                     });
                 }
             }
-            StartStep::Kernel => batch.push_lua(LuaOp::LoadInit),
-            StartStep::Config { keymap, module_keys } => self.set_keymap(win, keymap, module_keys),
+            StartStep::Kernel => {
+                if state.page_at() == Some(PageAt::Kernel) {
+                    state.build_page(win, &mut batch);
+                }
+                batch.push_lua(LuaOp::LoadInit);
+            }
+            StartStep::Config { keymap, module_keys } => {
+                if state.page_at() == Some(PageAt::Config) {
+                    state.build_page(win, &mut batch);
+                }
+                self.set_keymap(win, keymap, module_keys);
+            }
             StartStep::Chrome => {}
-            StartStep::Layout { parts, own_window } => {
+            StartStep::Layout {
+                parts,
+                own_window,
+                tiling,
+            } => {
                 state.own_window = own_window;
+                state.tiling = tiling;
+                if tiling == Tiling::Eitri {
+                    state.build_page(win, &mut batch);
+                }
                 self.attach_parts(win, parts);
                 self.show_editor_for_targets(win);
             }
@@ -179,6 +363,7 @@ impl Controller {
                 // Window 2 starts once this window's own start has finished, `shell:ready` included: on an idle,
                 // since a batch carries its Lua last.
                 self.arm_second_restore(win);
+                self.arm_start_windows(win);
             }
         }
         batch
@@ -199,6 +384,8 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::Prepared { win, .. }
         | HostEvent::Lua(LuaEvent::LayoutRequests { win, .. })
         | HostEvent::Pair(PairEvent::LinkEnded { win, .. } | PairEvent::RestoreFailed { win })
+        | HostEvent::ModuleWindowFailed { win, .. }
+        | HostEvent::GroupClosed { win }
         | HostEvent::AnswerRefused { win, .. }
         | HostEvent::OpenFile { win, .. }
         | HostEvent::SurfaceEnded { win, .. }
@@ -207,7 +394,8 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             OnboardingEvent::Open { win, .. }
             | OnboardingEvent::Found { win, .. }
             | OnboardingEvent::Written { win, .. }
-            | OnboardingEvent::CheckFailed { win, .. },
+            | OnboardingEvent::CheckFailed { win, .. }
+            | OnboardingEvent::NoScreen { win },
         )
         | HostEvent::TopBarLeft { win }
         | HostEvent::Refused {
@@ -243,6 +431,8 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | ChatEvent::Busy { win, .. }
             | ChatEvent::TabVerb { win, .. }
             | ChatEvent::ChooserPartnerPick { win, .. }
+            | ChatEvent::TabKept { win, .. }
+            | ChatEvent::TabLeft { win }
             | ChatEvent::KeysReturn { win, .. }
             | ChatEvent::Covered { win, .. }
             | ChatEvent::Reveal { win, .. }
@@ -288,11 +478,37 @@ mod tests {
     use crate::layout::{Layout, ModuleDecl, Placement};
     use crate::layout::{ModuleId, Workspaces};
     use crate::tabs::ViewId;
+    use crate::window_link::names::WindowName;
     use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
     use crate::wm::module::{ModuleState, SurfaceDecl};
     use crate::wm::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn a_hub_set_at_the_layout_step_reaches_the_window() {
+        for tiling in [Tiling::Eitri, Tiling::Hub, Tiling::ModuleWindow] {
+            let mut controller = Controller::new(FakeScheduler::new());
+            for step in [
+                StartStep::Feeds { spawn: spawn() },
+                StartStep::Window {
+                    spec: spec(EditorPresence::Owned),
+                },
+                StartStep::Editor,
+                StartStep::Kernel,
+                config(),
+                StartStep::Layout {
+                    parts: parts(),
+                    own_window: None,
+                    tiling,
+                },
+            ] {
+                controller.start(WinId::MAIN, step);
+            }
+            assert_eq!(controller.window_mut(WinId::MAIN).unwrap().tiling, tiling);
+        }
+        assert_eq!(Tiling::default(), Tiling::Eitri);
+    }
 
     #[test]
     fn event_window_covers_the_new_event() {
@@ -327,6 +543,7 @@ mod tests {
             StartStep::Layout {
                 parts: parts(),
                 own_window: Some("demo".into()),
+                tiling: Tiling::Eitri,
             },
         ] {
             controller.start(WinId::MAIN, step);
@@ -421,6 +638,7 @@ mod tests {
             StartStep::Layout {
                 parts: parts(),
                 own_window: None,
+                tiling: Tiling::Eitri,
             },
             StartStep::Surfaces {
                 decls: vec![SurfaceDecl {
@@ -551,6 +769,7 @@ mod tests {
             StartStep::Layout {
                 parts,
                 own_window: None,
+                tiling: Tiling::Eitri,
             },
         ] {
             driver.start(WinId::MAIN, step);
@@ -849,6 +1068,7 @@ mod tests {
             StartStep::Layout {
                 parts: parts(),
                 own_window: None,
+                tiling: Tiling::Eitri,
             },
         );
         driver.start(
@@ -1089,6 +1309,7 @@ mod tests {
                 StartStep::Layout {
                     parts: parts(),
                     own_window: None,
+                    tiling: Tiling::Eitri,
                 },
             );
             driver.start(
@@ -1111,6 +1332,124 @@ mod tests {
                 Some(ModuleState::Shown)
             );
         }
+    }
+
+    /// Walks the start of the chat or page window `name` as the shell does: the one leaf, no editor, no saver.
+    fn walk_module_window(
+        driver: &Driver<Controller>,
+        host: &FakeHost,
+        name: &WindowName,
+        kind: SurfaceKind,
+    ) -> (ModuleId, crate::wm::window::LayoutView) {
+        // A chat window shows its chat in its own base view, whatever its number.
+        let module = match name {
+            WindowName::Chat(_) => ModuleId::agent(),
+            _ => name.module().expect("a page window has a module"),
+        };
+        let layout = crate::layout::reconcile_module(crate::layout::Node::Leaf(module.clone()), &module)
+            .unwrap()
+            .layout;
+        let parts = WindowParts::new(layout, Workspaces::single(), None);
+        let (view, _) = parts.views();
+        let title = crate::wm::titles::module_window_title("project", name, None);
+        for step in [
+            StartStep::Feeds { spawn: spawn() },
+            StartStep::Window {
+                spec: WindowSpec {
+                    role: WindowRole::Linked { side: LinkSide::Second },
+                    presence: EditorPresence::None,
+                    title,
+                },
+            },
+            StartStep::Editor,
+            StartStep::Kernel,
+            config(),
+            StartStep::Layout {
+                parts,
+                own_window: None,
+                tiling: Tiling::ModuleWindow,
+            },
+            StartStep::Surfaces {
+                decls: vec![SurfaceDecl {
+                    module: module.clone(),
+                    kind: kind.clone(),
+                    deferred: false,
+                }],
+            },
+            StartStep::Chrome,
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        host.with_surface(WinId::MAIN, module.clone(), kind, true);
+        driver.start(
+            WinId::MAIN,
+            StartStep::Present {
+                activation: None,
+                first: module.clone(),
+                arrive: None,
+            },
+        );
+        driver.start(WinId::MAIN, StartStep::Requests);
+        (module, view)
+    }
+
+    fn assert_starts_alone(
+        driver: &Driver<Controller>,
+        host: &FakeHost,
+        (module, view): &(ModuleId, crate::wm::window::LayoutView),
+        title: &str,
+    ) {
+        assert_eq!(
+            driver.query(|c| c.window_spec(WinId::MAIN).map(|spec| spec.title.clone())),
+            Some(title.to_string())
+        );
+        assert_eq!(
+            view.read().modules(),
+            vec![module.clone()],
+            "one leaf and nothing beside it"
+        );
+        let ops = ops(host);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                HostOp::CreateSurface {
+                    kind: SurfaceKind::Editor { .. },
+                    ..
+                }
+            )),
+            "no editor is made"
+        );
+        for op in &ops {
+            if let HostOp::Focus { to, .. } = op {
+                assert_eq!(
+                    *to,
+                    FocusTo::Module(module.clone()),
+                    "the keys start on the module, not the top bar"
+                );
+            }
+        }
+        assert_eq!(host.focus_owner(WinId::MAIN), Some(module.clone()));
+    }
+
+    #[test]
+    fn a_chat_window_starts_with_its_chat_alone() {
+        let (driver, host) = setup();
+        let name = WindowName::Chat(3);
+        let started = walk_module_window(&driver, &host, &name, SurfaceKind::Chat { view: ViewId::BASE });
+        assert_eq!(started.0, ModuleId::agent(), "its chat is in its own base view");
+        assert_starts_alone(&driver, &host, &started, "project \u{2014} Eitri chat 3");
+    }
+
+    #[test]
+    fn a_page_window_starts_with_its_page_alone() {
+        let (driver, host) = setup();
+        let name = WindowName::Page("markdown".into());
+        let kind = SurfaceKind::PluginPage {
+            plugin: "markdown".into(),
+        };
+        let started = walk_module_window(&driver, &host, &name, kind);
+        assert_eq!(started.0, ModuleId::lua("markdown"));
+        assert_starts_alone(&driver, &host, &started, "project \u{2014} markdown \u{b7} Eitri");
     }
 
     #[test]
@@ -1155,6 +1494,487 @@ mod tests {
             .iter()
             .filter(|op| matches!(op, HostOp::RestoreLinkedWindow { win } if *win == WinId::MAIN))
             .count()
+    }
+
+    fn compositor_session() -> EarlyFacts {
+        EarlyFacts {
+            started: false,
+            shows_chat: true,
+            mac: false,
+            wayland: true,
+            wm: Wm::Sway,
+            window2_orphan: false,
+            module_orphans: false,
+            unpaired: false,
+            alone: false,
+            choice: None,
+        }
+    }
+
+    /// The start steps up to the layout's, with `early` told as the shell tells it; which phases carried
+    /// `BuildBasePage`, and how the window tiled.
+    fn page_built_at(early: EarlyFacts, choice: TilingChoice, live: Option<bool>) -> (Vec<StartPhase>, Tiling) {
+        let (driver, host) = setup();
+        let mut early = early;
+        driver.set_early_facts(WinId::MAIN, early);
+        for step in [
+            StartStep::Feeds { spawn: spawn() },
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+            StartStep::Editor,
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        let built = |host: &FakeHost| {
+            ops(host)
+                .iter()
+                .filter(|op| matches!(op, HostOp::BuildBasePage { win } if *win == WinId::MAIN))
+                .count()
+        };
+        let mut phases = Vec::new();
+        driver.start(WinId::MAIN, StartStep::Kernel);
+        if built(&host) > 0 {
+            phases.push(StartPhase::Kernel);
+        }
+        early.choice = Some(choice);
+        driver.set_early_facts(WinId::MAIN, early);
+        let so_far = built(&host);
+        driver.start(WinId::MAIN, config());
+        if built(&host) > so_far {
+            phases.push(StartPhase::Config);
+        }
+        let tiling = early.tiling(false, live).0;
+        let so_far = built(&host);
+        driver.start(
+            WinId::MAIN,
+            StartStep::Layout {
+                parts: parts(),
+                own_window: None,
+                tiling,
+            },
+        );
+        if built(&host) > so_far {
+            phases.push(StartPhase::Layout);
+        }
+        (phases, tiling)
+    }
+
+    #[test]
+    fn the_base_page_is_built_at_the_step_the_facts_allow() {
+        use StartPhase::{Config, Kernel, Layout as AtLayout};
+        let at = |early, choice, live| page_built_at(early, choice, live).0;
+        let base = compositor_session();
+
+        // What rules a hub out before `init.lua`: nothing it says can change the answer, even `compositor`.
+        let x11 = EarlyFacts { wayland: false, ..base };
+        assert_eq!(at(x11, TilingChoice::Compositor, Some(true)), [Kernel]);
+        for early in [
+            EarlyFacts { mac: true, ..base },
+            EarlyFacts {
+                window2_orphan: true,
+                ..base
+            },
+            EarlyFacts { unpaired: true, ..base },
+            EarlyFacts { alone: true, ..base },
+        ] {
+            assert_eq!(at(early, TilingChoice::Compositor, Some(true)), [Kernel]);
+        }
+
+        // What `init.lua` rules out: the setting itself, or `auto` on a desktop that does not tile.
+        let gnome = EarlyFacts { wm: Wm::Gnome, ..base };
+        assert_eq!(at(gnome, TilingChoice::Auto, None), [Config]);
+        assert_eq!(
+            at(EarlyFacts { wm: Wm::None, ..base }, TilingChoice::Auto, None),
+            [Config]
+        );
+        assert_eq!(at(base, TilingChoice::Eitri, None), [Config]);
+
+        // A tiling compositor under `auto`: only the resolved mode tells, and then only `eitri` builds it.
+        assert_eq!(at(base, TilingChoice::Auto, None), [AtLayout]);
+        assert_eq!(at(base, TilingChoice::Auto, Some(true)), []);
+        assert_eq!(at(gnome, TilingChoice::Compositor, Some(true)), []);
+
+        // Orphaned module windows force compositor mode whatever the session and the setting say.
+        let orphans = EarlyFacts {
+            module_orphans: true,
+            ..base
+        };
+        for early in [
+            orphans,
+            EarlyFacts {
+                wayland: false,
+                ..orphans
+            },
+        ] {
+            for choice in [TilingChoice::Auto, TilingChoice::Eitri, TilingChoice::Compositor] {
+                assert_eq!(at(early, choice, None), [], "{early:?} {choice:?}");
+                assert_eq!(
+                    base_page_at(&EarlyFacts {
+                        choice: Some(choice),
+                        ..early
+                    }),
+                    PageAt::Layout
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eitri_mode_builds_the_base_chat_page_once() {
+        let x11 = EarlyFacts {
+            wayland: false,
+            ..compositor_session()
+        };
+        for (early, choice) in [
+            (x11, TilingChoice::Auto),
+            (compositor_session(), TilingChoice::Eitri),
+            (compositor_session(), TilingChoice::Auto),
+        ] {
+            let (phases, tiling) = page_built_at(early, choice, None);
+            assert_eq!(tiling, Tiling::Eitri);
+            assert_eq!(phases.len(), 1, "{early:?}: {phases:?}");
+        }
+    }
+
+    #[test]
+    fn a_chat_window_gets_the_page_before_init_lua_and_a_page_window_never() {
+        let started = EarlyFacts {
+            started: true,
+            ..compositor_session()
+        };
+        // Window 2 and a chat window: `init.lua` cannot make either a hub, and a live compositor changes nothing.
+        let (phases, tiling) = page_built_at(started, TilingChoice::Auto, Some(true));
+        assert_eq!(phases, [StartPhase::Kernel]);
+        assert_eq!(tiling, Tiling::Eitri, "a started window has no mode of its own");
+        let page = EarlyFacts {
+            shows_chat: false,
+            ..started
+        };
+        assert_eq!(page_built_at(page, TilingChoice::Auto, Some(true)).0, []);
+    }
+
+    /// `editor | agent` over the terminal, as a first launch opens it, the terminal hidden.
+    fn default_start() -> Layout {
+        crate::wm::persist::first_launch_layout(&[]).unwrap()
+    }
+
+    fn lua(id: &str) -> ModuleId {
+        ModuleId::lua(id)
+    }
+
+    fn tree_of(ids: &[ModuleId]) -> Layout {
+        let mut leaves = ids.iter().cloned().map(crate::layout::Node::Leaf);
+        let first = leaves.next().unwrap();
+        let root = leaves.fold(first, |left, right| {
+            crate::layout::Node::split(crate::layout::Axis::Row, 0.5, left, right)
+        });
+        Layout::new(root, ModuleId::editor()).unwrap()
+    }
+
+    fn hub_start(driver: &Driver<Controller>, host: &FakeHost, parts: WindowParts, windows: StartWindows) {
+        let surfaces = [ModuleId::editor(), ModuleId::terminal()].map(|module| SurfaceDecl {
+            kind: if module == ModuleId::editor() {
+                SurfaceKind::Editor { spawn: spawn() }
+            } else {
+                SurfaceKind::Terminal { cwd: ".".into() }
+            },
+            module,
+            deferred: false,
+        });
+        let early = EarlyFacts {
+            choice: Some(TilingChoice::Compositor),
+            ..compositor_session()
+        };
+        driver.set_early_facts(WinId::MAIN, early);
+        driver.set_start_windows(WinId::MAIN, windows);
+        for step in [
+            StartStep::Feeds { spawn: spawn() },
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+            StartStep::Editor,
+            StartStep::Kernel,
+            config(),
+            StartStep::Layout {
+                parts,
+                own_window: None,
+                tiling: Tiling::Hub,
+            },
+            StartStep::Surfaces {
+                decls: surfaces.to_vec(),
+            },
+            StartStep::Chrome,
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        for decl in surfaces {
+            host.with_surface(WinId::MAIN, decl.module, decl.kind, true);
+        }
+        driver.start(
+            WinId::MAIN,
+            StartStep::Present {
+                activation: None,
+                first: ModuleId::editor(),
+                arrive: None,
+            },
+        );
+        driver.start(WinId::MAIN, StartStep::Requests);
+    }
+
+    fn hub_parts(start: &Layout) -> (WindowParts, StartWindows) {
+        let (layout, open) = hub_layout(start);
+        let windows = StartWindows {
+            open,
+            unnamed: unnamed_pages(start),
+        };
+        (WindowParts::new(layout, Workspaces::single(), None), windows)
+    }
+
+    fn opened(host: &FakeHost) -> Vec<WindowName> {
+        ops(host)
+            .into_iter()
+            .filter_map(|op| match op {
+                HostOp::OpenModuleWindow { name, keep_keys, .. } => {
+                    assert!(
+                        keep_keys,
+                        "{name:?}: a window the start opens leaves the keys where they are"
+                    );
+                    Some(name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_compositor_window_1_builds_no_chat_page_and_no_agent_module() {
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&default_start());
+        let (view, _) = parts.views();
+        hub_start(&driver, &host, parts, windows);
+        scheduler.advance(std::time::Duration::ZERO);
+        assert!(
+            !ops(&host).iter().any(|op| matches!(op, HostOp::BuildBasePage { .. })),
+            "a hub builds no chat page"
+        );
+        assert_eq!(view.read().leaves(), [ModuleId::editor(), ModuleId::terminal()]);
+        assert!(
+            !view.read().is_shown(&ModuleId::terminal()),
+            "it starts hidden, as a first launch has it"
+        );
+    }
+
+    #[test]
+    fn a_hub_start_leaves_the_keys_in_the_editor() {
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&default_start());
+        let (view, _) = parts.views();
+        hub_start(&driver, &host, parts, windows);
+        scheduler.advance(std::time::Duration::ZERO);
+        assert_eq!(view.read().focus(), &ModuleId::editor());
+        assert_eq!(opened(&host), [WindowName::Chat(1)]);
+        let focuses: Vec<HostOp> = ops(&host)
+            .into_iter()
+            .filter(|op| matches!(op, HostOp::Focus { .. }))
+            .collect();
+        assert_eq!(focuses.len(), 1, "{focuses:?}");
+        assert!(
+            matches!(&focuses[0], HostOp::Focus { to: FocusTo::Module(module), .. } if *module == ModuleId::editor())
+        );
+    }
+
+    #[test]
+    fn the_start_layouts_chats_and_pages_open_as_module_windows_in_order() {
+        assert_eq!(hub_layout(&default_start()).1, [WindowName::Chat(1)]);
+
+        let chat3 = ModuleId::instance(ModuleKind::Agent, 3).unwrap();
+        let start = tree_of(&[ModuleId::editor(), ModuleId::agent(), lua("markdown"), chat3]);
+        assert_eq!(
+            hub_layout(&start).1,
+            [
+                WindowName::Chat(1),
+                WindowName::Page("markdown".into()),
+                WindowName::Chat(3)
+            ]
+        );
+
+        // They go out once `shell:ready` has, in that order.
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&start);
+        hub_start(&driver, &host, parts, windows);
+        assert_eq!(opened(&host), [], "nothing is started inside the start's own batches");
+        scheduler.advance(std::time::Duration::ZERO);
+        assert_eq!(
+            opened(&host),
+            [
+                WindowName::Chat(1),
+                WindowName::Page("markdown".into()),
+                WindowName::Chat(3)
+            ]
+        );
+        let ready = host
+            .log()
+            .iter()
+            .position(
+                |entry| matches!(entry, Logged::Op(HostOp::Lua(LuaOp::Emit { event }), _) if event == "shell:ready"),
+            )
+            .unwrap();
+        let first = host
+            .log()
+            .iter()
+            .position(|entry| matches!(entry, Logged::Op(HostOp::OpenModuleWindow { .. }, _)))
+            .unwrap();
+        assert!(ready < first, "the windows start after shell:ready");
+        scheduler.advance(std::time::Duration::from_secs(1));
+        assert_eq!(opened(&host).len(), 3, "started once");
+    }
+
+    #[test]
+    fn the_terminal_a_start_layout_shows_stays_shown_and_a_hidden_chat_stays_closed() {
+        let start = tree_of(&[
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::terminal(),
+            lua("notes"),
+        ]);
+        let (layout, _) = hub_layout(&start);
+        assert!(layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(layout.leaves(), [ModuleId::editor(), ModuleId::terminal()]);
+
+        let mut hidden = start;
+        crate::layout::hide(
+            &mut hidden,
+            &ModuleId::agent(),
+            &crate::layout::Frame::new(crate::wm::persist::FIRST_LAUNCH_FRAME, 1),
+        )
+        .unwrap();
+        assert_eq!(hub_layout(&hidden).1, [WindowName::Page("notes".into())]);
+    }
+
+    #[test]
+    fn a_page_whose_id_names_no_window_is_skipped_with_a_line_and_a_toast() {
+        let plain = lua("Notes");
+        let odd = lua("My Panel");
+        let start = tree_of(&[ModuleId::editor(), odd.clone(), plain]);
+        assert_eq!(hub_layout(&start).1, [WindowName::Page("Notes".into())]);
+        assert_eq!(unnamed_pages(&start), [odd]);
+
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&start);
+        hub_start(&driver, &host, parts, windows);
+        scheduler.advance(std::time::Duration::ZERO);
+        assert_eq!(opened(&host), [WindowName::Page("Notes".into())]);
+        let toast = driver.query(|c| c.chrome(WinId::MAIN).toast.clone().map(|toast| toast.text));
+        assert_eq!(
+            toast.as_deref(),
+            Some(crate::wm::feedback::no_page_window_text("My Panel").as_str())
+        );
+    }
+
+    #[test]
+    fn a_window_already_linked_or_starting_is_not_opened_again() {
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&tree_of(&[
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::instance(ModuleKind::Agent, 2).unwrap(),
+        ]));
+        hub_start(&driver, &host, parts, windows);
+        // An orphan the start relinked is linked before the idle runs.
+        driver.attach_peer(
+            WinId::MAIN,
+            PeerId(16),
+            WindowName::Chat(1),
+            crate::wm::fake::FakePeerPort::new(),
+        );
+        scheduler.advance(std::time::Duration::ZERO);
+        assert_eq!(opened(&host), [WindowName::Chat(2)]);
+    }
+
+    #[test]
+    fn a_compositor_window_1_writes_no_eitri_layout_file() {
+        use crate::wm::persist::{layout_dir, Saver};
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nv-start", "hub-layout-files");
+        let dir = scratch.to_path_buf();
+        assert_eq!(layout_dir(Some(dir.clone()), Tiling::Hub), None);
+        assert_eq!(layout_dir(Some(dir.clone()), Tiling::ModuleWindow), None);
+        assert_eq!(layout_dir(Some(dir.clone()), Tiling::Eitri), Some(dir.clone()));
+
+        let start = |tiling: Tiling, layout_files: &std::path::Path| {
+            let (driver, host, scheduler) = setup_with_clock();
+            let layout = hub_layout(&default_start()).0;
+            let workspaces = Workspaces::single();
+            let saver = Saver::new(
+                Some(layout_files.to_path_buf()),
+                std::path::Path::new("/project"),
+                Vec::new(),
+                None,
+                &layout,
+                &workspaces,
+            );
+            for step in [
+                StartStep::Feeds { spawn: spawn() },
+                StartStep::Window {
+                    spec: spec(EditorPresence::Owned),
+                },
+                StartStep::Editor,
+                StartStep::Kernel,
+                config(),
+                StartStep::Layout {
+                    parts: WindowParts::new(layout, workspaces, Some(saver)),
+                    own_window: None,
+                    tiling,
+                },
+            ] {
+                driver.start(WinId::MAIN, step);
+            }
+            host.with_surface(
+                WinId::MAIN,
+                ModuleId::terminal(),
+                SurfaceKind::Terminal { cwd: ".".into() },
+                true,
+            );
+            driver.first_apply(WinId::MAIN, Vec::new());
+            driver.run(
+                WinId::MAIN,
+                crate::keymap::Action::Module(ModuleId::terminal()),
+                Origin::Key { keycode: 1 },
+            );
+            scheduler.advance(std::time::Duration::from_secs(2));
+            driver
+        };
+
+        // The same start and the same change as a tile window writes: the file the test looks for is real.
+        let tiled = dir.join("tiled");
+        std::fs::create_dir_all(&tiled).unwrap();
+        let driver = start(Tiling::Eitri, &tiled);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::fs::read_dir(&tiled).unwrap().next().is_none() {
+            assert!(std::time::Instant::now() < deadline, "a tile window writes its layout");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(driver);
+
+        let hub = dir.join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(hub.join("project.v2.json"), b"{\"left\":\"by eitri mode\"}").unwrap();
+        let listing = || {
+            let mut all: Vec<_> = std::fs::read_dir(&hub)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.clone(), std::fs::read(path).unwrap())
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        let before = listing();
+        let driver = start(Tiling::Hub, &hub);
+        assert!(driver.query(|c| c.window(WinId::MAIN).is_some_and(|w| w.saver.is_none())));
+        drop(driver);
+        assert_eq!(listing(), before);
     }
 
     #[test]
@@ -1299,6 +2119,34 @@ mod tests {
                 assert_eq!(placements(&host), expected, "later reports cannot take the keys again");
             }
         }
+    }
+
+    #[test]
+    fn a_new_module_window_asks_for_the_keys_once_it_is_mapped_and_is_never_moved() {
+        let (driver, host) = setup();
+        driver.set_placement(
+            WinId::MAIN,
+            WindowPlacement {
+                role: PlacementRole::NewModule,
+                remembered: None,
+                restore_second: false,
+            },
+        );
+        driver.post(HostEvent::MonitorsChanged {
+            monitors: vec![monitor("DP-1", 0), monitor("DP-2", 1920)],
+        });
+        walk(&driver, &host, ModuleId::editor(), None, true);
+        on(&driver, None);
+        assert!(placements(&host).is_empty(), "wait until mapped onto an output");
+        on(&driver, Some("DP-2"));
+        assert_eq!(placements(&host), vec![(None, PlacementRole::NewModule)]);
+        on(&driver, Some("DP-1"));
+        on(&driver, Some("DP-2"));
+        assert_eq!(
+            placements(&host),
+            vec![(None, PlacementRole::NewModule)],
+            "later reports cannot take the keys again"
+        );
     }
 
     #[test]

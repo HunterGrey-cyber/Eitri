@@ -23,7 +23,7 @@ use super::prefix_strip::{self, StripPiece};
 use super::titles;
 use super::toasts::{refusal_may_show, ToastKind};
 use super::tray::{chip_order, chip_states};
-use super::window::{WinId, Window, WindowMode as WindowState};
+use super::window::{Tiling, WinId, Window, WindowMode as WindowState};
 use crate::attention::Attention;
 use crate::keymap::prefix::Waiting;
 use crate::keymap::Keymap;
@@ -32,6 +32,9 @@ use crate::onboarding::OnboardingView;
 use crate::tabs::ViewId;
 use std::rc::Rc;
 use std::time::Duration;
+
+/// What a hub's top bar calls the windows whose marks it sums.
+pub const HUB_OTHERS: &str = "chats";
 
 /// How long a toast stays up; a new one starts its time again.
 pub const TOAST_FOR: Duration = Duration::from_secs(4);
@@ -576,11 +579,14 @@ fn derive_top_bar(w: &mut Window, layout: &Layout, workspaces: Option<&Workspace
         selection: titles::selection_text(layout, &title),
         mark: titles::mark_text(layout.mark(), &title),
         flash: w.chrome.top_bar.flash,
-        other: w
-            .peer
-            .as_ref()
-            .and_then(|p| p.summary())
-            .map(|s| crate::window_link::summary::marks(super::moves::other_name(w), s)),
+        other: w.group_summary().map(|s| {
+            // A hub's other windows are its chats, summed: no one window's number names them.
+            let name = match w.tiling {
+                Tiling::Hub => HUB_OTHERS,
+                Tiling::Eitri | Tiling::ModuleWindow => super::moves::other_name(w),
+            };
+            crate::window_link::summary::marks(name, &s)
+        }),
     };
     w.chrome_state.stamp(Field::TopBar);
     w.chrome_state.derivations.top_bar += 1;
@@ -699,7 +705,7 @@ fn derive_prefix_strip(
             };
             let mut order = workspaces.order().to_vec();
             if !deleting {
-                if let Some(summary) = w.peer.as_ref().and_then(|p| p.summary()) {
+                if let Some(summary) = w.group_summary() {
                     order.extend(
                         summary
                             .workspaces
@@ -716,7 +722,12 @@ fn derive_prefix_strip(
                 Waiting::Hide => crate::layout::strip_for_hide(module_keys, layout),
                 _ => crate::layout::strip(module_keys, layout),
             };
-            prefix_strip::strip_pieces(waiting, &entries, &title(layout.focus()), &title, &keymap.strip_verbs())
+            let verbs = match w.tiling {
+                Tiling::Eitri => keymap.strip_verbs(),
+                Tiling::Hub => keymap.compositor_strip_verbs(true),
+                Tiling::ModuleWindow => keymap.compositor_strip_verbs(false),
+            };
+            prefix_strip::strip_pieces(waiting, &entries, &title(layout.focus()), &title, &verbs)
         }),
     };
     w.chrome_state.stamp(Field::PrefixStrip);

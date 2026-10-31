@@ -96,8 +96,11 @@ impl AgentProvider for ScriptedProvider {
     fn close_session(&self, _r: CloseSessionRequest) -> Result<(), ProviderError> {
         Ok(())
     }
+    /// The count moves under the queue's lock, so `settle` never sees an empty queue with these events uncounted and
+    /// takes them for folded.
     fn pump(&self) -> Vec<AgentDomainEvent> {
-        let drained: Vec<AgentDomainEvent> = self.queued.lock().unwrap().drain(..).collect();
+        let mut queued = self.queued.lock().unwrap();
+        let drained: Vec<AgentDomainEvent> = queued.drain(..).collect();
         self.handed_out.fetch_add(drained.len() as u64, Ordering::Relaxed);
         drained
     }

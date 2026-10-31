@@ -977,7 +977,7 @@ pub struct TurnReview {
 
 /// The key of a pair's one partner: no process has this pid, and a pair never needs to tell its
 /// partner from another.
-const SOLE_PARTNER: u32 = 0;
+pub const SOLE_PARTNER: u32 = 0;
 
 /// A linked partner's turn, as its edges said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

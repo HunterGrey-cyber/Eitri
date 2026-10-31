@@ -164,6 +164,35 @@ pub struct LinkHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The sending side of a link for a thread of its own, which must not touch the GTK side's [`LinkHandle`]. Every
+/// clone queues on the same link, and sending never waits.
+#[derive(Clone)]
+pub struct LinkSender {
+    shared: Arc<Mutex<Shared>>,
+    commands: Arc<OwnedFd>,
+}
+
+impl LinkSender {
+    /// Queues `msg`; `false` when its kind's rules refuse it or the link has closed.
+    pub fn send(&self, msg: Msg) -> bool {
+        let Ok(out) = outbound(&msg, Vec::new(), None) else {
+            return false;
+        };
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.closed {
+            return false;
+        }
+        shared.queue.push_back(Command::Send(out));
+        signal(self.commands.as_fd());
+        true
+    }
+
+    /// Whether the link thread has stopped. This is ahead of the GTK side, which may have messages to read yet.
+    pub fn is_closed(&self) -> bool {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+}
+
 impl LinkHandle {
     /// Starts the link thread on `sock` (one end of the pair, close-on-exec). What arrives comes out of the receiver.
     pub fn start(sock: OwnedFd, presence: PresenceFlag) -> io::Result<(LinkHandle, Receiver<Inbound>)> {
@@ -207,6 +236,14 @@ impl LinkHandle {
             },
             rx,
         ))
+    }
+
+    /// A sender for a thread other than the GTK side's.
+    pub fn sender(&self) -> LinkSender {
+        LinkSender {
+            shared: Arc::clone(&self.shared),
+            commands: Arc::clone(&self.commands),
+        }
     }
 
     fn push(&self, command: Command) -> Result<(), Command> {
@@ -263,6 +300,22 @@ impl LinkHandle {
             let _ = self.push(Command::Send(bye));
         }
         self.stop();
+    }
+
+    /// [`LinkHandle::close`] for a caller that must not wait: `bye` is queued here, and the wait for what is still
+    /// queued, bounded the same way, runs on a thread of its own. With no thread to be had the wait happens here.
+    pub fn close_detached(self, why: &str) {
+        let bye = outbound(&Msg::Bye { why: why.to_owned() }, Vec::new(), None);
+        if let Ok(bye) = bye {
+            let _ = self.push(Command::Send(bye));
+        }
+        // Dropping the handle stops the link's thread and waits for it.
+        let spawned = std::thread::Builder::new()
+            .name("link-close".into())
+            .spawn(move || drop(self));
+        if let Err(err) = spawned {
+            eprintln!("[link] no thread for the link's close ({err}); closed from here");
+        }
     }
 
     /// Closes the link as [`LinkHandle::close`] does, then closes the descriptors of every move this window
@@ -1092,6 +1145,31 @@ mod tests {
         assert!(matches!(answer.try_recv(), Ok(Ok(()))));
         assert!(rx.try_recv().is_err(), "no message came: the wake was the answer's");
         assert!(!readable(link.wake_fd(), 0));
+    }
+
+    /// A peer that reads nothing leaves the `bye` queued behind a full socket. `close_detached` has returned before
+    /// the peer starts reading, so the flush is still running and the `bye` gets out; a close that waited would have
+    /// used up its bound with nobody reading, every time. A try counts only if the peer reads within that bound, so a
+    /// thread descheduled for the whole of it gets another.
+    #[test]
+    fn a_detached_close_returns_with_the_flush_still_to_run() {
+        let bye = Msg::Bye {
+            why: "window closed".into(),
+        };
+        let bye_got_out = || {
+            let (link, _rx, peer) = started();
+            let long = "x".repeat(32 * 1024);
+            for _ in 0..512 {
+                link.send(Msg::Bye { why: long.clone() }, Vec::new()).unwrap();
+            }
+            link.close_detached("window closed");
+            let mut last = None;
+            while let Some(got) = raw_recv(&peer, LONG) {
+                last = Some(from_json(&got.bytes).unwrap());
+            }
+            last.as_ref() == Some(&bye)
+        };
+        assert!((0..3).any(|_| bye_got_out()));
     }
 
     #[test]

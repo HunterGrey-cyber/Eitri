@@ -599,13 +599,46 @@ impl TabSet {
         if let Some(guard) = self.presence_guard() {
             guard.set_partner(partner.clone());
         }
+        self.partner_pids.clear();
         self.linked = partner.is_some();
+        self.untracked_starts.clear();
         if self.linked {
             self.untracked_turns = self.untracked_running(crate::turn_review::monotonic_ns());
             return Vec::new();
         }
         self.untracked_turns.clear();
         self.decide_every(|gate, _| gate.on_link_end())
+    }
+
+    /// Names one more linked window, for a window with several links. A prompt waits for its presence file from
+    /// now on, as under [`set_partner`](Self::set_partner). The same pid again replaces the partner: a relink.
+    pub fn add_partner(&mut self, partner: Partner) {
+        if self.partner_pids.is_empty() {
+            self.untracked_turns = self.untracked_running(crate::turn_review::monotonic_ns());
+            self.untracked_starts.clear();
+        }
+        self.partner_pids.insert(partner.pid);
+        self.linked = true;
+        if let Some(guard) = self.presence_guard() {
+            guard.add_partner(partner);
+        }
+    }
+
+    /// One link of a window with several ended, or, with `closing`, this window is about to close it. A prompt
+    /// waiting for its presence goes on waiting while another partner may skip this window's file; once the last
+    /// one is gone it goes as [`set_partner(None)`](Self::set_partner) lets it, or, with `closing`, stays as
+    /// [`close_link`](Self::close_link) keeps it. Returns what those prompts did.
+    pub fn remove_partner(&mut self, pid: u32, closing: bool) -> Vec<Sent> {
+        if let Some(guard) = self.presence_guard() {
+            guard.remove_partner(pid);
+        }
+        self.partner_pids.remove(&pid);
+        if !self.partner_pids.is_empty() {
+            return Vec::new();
+        }
+        self.linked = false;
+        self.untracked_turns.clear();
+        self.decide_every(|gate, _| if closing { gate.on_closing() } else { gate.on_link_end() })
     }
 
     /// The turns running in this window's tabs that have a session, each with its session and its start on the
@@ -644,10 +677,15 @@ impl TabSet {
     }
 
     /// For a linked window with no turn review: the turn starts and ends since the last call (an end at `now_ns`, a
-    /// start at the turn's own start), so the partner's overlap notes still count this window's turns. A window with turn review announces them from its
-    /// review, with the exact times; an unlinked one announces nothing.
+    /// start at the turn's own start), so the partner's overlap notes still count this window's turns. A window with
+    /// turn review announces them from its review, with the exact times; an unlinked one announces nothing.
+    ///
+    /// The running turns are read as they are now, and the ingestion thread folds between two calls, so a turn can
+    /// start and end without any call seeing it run. Its start in a delivered batch is then all that is left of it,
+    /// and it is announced as started and ended at `now_ns`: a window with turn review stamps a turn on delivery too.
     pub fn take_untracked_turn_edges(&mut self, now_ns: u64) -> Vec<crate::window_link::TurnEdge> {
         use crate::window_link::{EdgeKind, TurnEdge};
+        let delivered = std::mem::take(&mut self.untracked_starts);
         if !self.linked || self.turn_review.is_some() {
             self.untracked_turns.clear();
             return Vec::new();
@@ -673,6 +711,20 @@ impl TabSet {
                 });
             }
         }
+        for tab in delivered {
+            if told.contains_key(&tab) || running.contains_key(&tab) {
+                continue;
+            }
+            if let Some(session) = self.get(TabId(tab)).and_then(Tab::provider_session_id) {
+                for edge in [EdgeKind::Started, EdgeKind::Ended] {
+                    edges.push(TurnEdge {
+                        session: session.clone(),
+                        edge,
+                        at_ns: now_ns,
+                    });
+                }
+            }
+        }
         self.untracked_turns = running
             .into_iter()
             .map(|(tab, (session, started))| {
@@ -694,6 +746,7 @@ impl TabSet {
         if let Some(guard) = self.presence_guard() {
             guard.set_partner(None);
         }
+        self.partner_pids.clear();
         self.linked = false;
         self.untracked_turns.clear();
         self.decide_every(|gate, _| gate.on_closing())
@@ -1170,6 +1223,7 @@ impl TabSet {
             starting: &mut self.starting,
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
+            untracked_starts: &mut self.untracked_starts,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]

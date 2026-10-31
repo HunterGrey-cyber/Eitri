@@ -11,6 +11,7 @@ use eitri_core::layout::{Axis, Float, FloatRect, Layout, ModuleId, ModuleKind, N
 use eitri_core::tabs::ViewId;
 use eitri_core::window_link::fdpass;
 use eitri_core::window_link::link::{park, LinkHandle, PresenceFlag};
+use eitri_core::window_link::names::WindowName;
 use eitri_core::wm::fake::{FakeHost, FakeScheduler, Logged};
 use eitri_core::wm::module::SurfaceDecl;
 use eitri_core::wm::{
@@ -276,7 +277,7 @@ impl End {
         host.attach(Rc::downgrade(&sink));
         scheduler.attach(Rc::downgrade(&sink));
         driver.first_apply(WIN, hosted);
-        link.attach_controller(WIN, peer, &driver);
+        link.attach_controller(WIN, peer, WindowName::Second, &driver);
         End {
             driver,
             host,
@@ -662,14 +663,15 @@ fn the_moved_module_keeps_its_id_or_takes_the_lowest_free_number() {
 
     // Free in window 2: it keeps its id.
     one.move_to_other(&numbered(2));
-    assert!(until([&one, &two], LONG, || one.forgot(&numbered(2))));
-    assert!(two.layout.read().is_shown(&numbered(2)));
+    assert!(until([&one, &two], LONG, || one.forgot(&numbered(2))
+        && two.layout.read().is_shown(&numbered(2))));
 
-    // Window 2 has a `terminal` of its own and now `terminal#2`: the next arrival takes the lowest free number.
+    // Window 2 has a `terminal` of its own and now `terminal#2`: the next arrival takes the lowest free number. Window 1
+    // forgets the module when the move is committed, and window 2 places it on its own loop around then.
     one.move_to_other(&terminal());
-    assert!(until([&one, &two], LONG, || one.forgot(&terminal())));
     assert!(
-        two.layout.read().is_shown(&numbered(3)),
+        until([&one, &two], LONG, || one.forgot(&terminal())
+            && two.layout.read().is_shown(&numbered(3))),
         "{:?}",
         two.layout.read().modules()
     );

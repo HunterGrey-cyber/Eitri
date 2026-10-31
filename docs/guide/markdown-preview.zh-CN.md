@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=b0e9980afa5ebc40586e7d4bf312f14438aa84c1fec46b81c0b51fb69358e5dd -->
+<!-- translated-from: markdown-preview.md sha256=331e9149c23e0f6c35c0c1451c9e6af19c6c85c2806f2a869dbc74b8285dd7f2 -->
 
 # Markdown 预览
 
@@ -21,7 +21,7 @@ eitri.plugin.load("markdown")
 <a id="open-and-close-it"></a>
 ## 打开和关闭预览
 
-- `:EitriMarkdown` 在编辑器右边显示预览；`:EitriMarkdownToggle` 显示或隐藏它；`:EitriMarkdownHide` 隐藏它。从 Neovim 打开时，预览把按键留在 Neovim 里，你可以继续输入。
+- `:EitriMarkdown` 在编辑器右边显示预览；`:EitriMarkdownToggle` 显示或隐藏它；`:EitriMarkdownHide` 隐藏它。从 Neovim 打开时，预览把按键留在 Neovim 里，你可以继续输入。使用[合成器窗口](compositor-windows.zh-CN.md)时，预览是一个独立的窗口：这些命令在你的窗口管理器放置它的地方打开它，也只有窗口管理器能关闭它。
 - 你自己的按键：`eitri.plugin.load("markdown", { key = "b" })` 让前缀再按 `b`（默认前缀下是 `Ctrl+b b`）显示预览并把按键交给它，在它拿着按键时再按一次就隐藏它。没有默认按键。
 - 命令名都以 `Eitri` 开头，这样不会和其他预览插件的命令撞名。如果你的 Neovim 配置已经定义了同名的命令（比如 `:EitriMarkdown`），Eitri 不动那个命令，只定义其余的，并在你启动 Eitri 的终端里打印 `[plugin markdown] :EitriMarkdown is already defined; not replacing it`。要用 Eitri 的命令，就删掉或改名你自己的那个。
 

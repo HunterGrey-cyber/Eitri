@@ -51,7 +51,8 @@ pub trait QuitWorld {
     fn hide_editor(&mut self) -> Result<(), LayoutError>;
     fn end_editor(&mut self) -> Result<(), LayoutError>;
     fn kill_editor_in_place(&mut self) -> Result<(), LayoutError>;
-    fn show_chat(&mut self) -> Result<(), LayoutError>;
+    /// Shows the module that takes the screen from an exited editor that was the last one on it.
+    fn show_stand_in(&mut self) -> Result<(), LayoutError>;
     fn ask_to_close_window(&mut self, text: &str);
     fn withdraw_close_confirmation(&mut self);
     fn close_window_confirmed(&mut self);
@@ -382,7 +383,7 @@ impl QuitFlow {
     }
 
     /// An exited editor cannot retain the keys after the close is declined. If it is the last
-    /// visible module, show the chat before ending it so the grid can transfer those keys.
+    /// visible module, show another module before ending it so the grid can transfer those keys.
     pub fn window_close_declined(&mut self, world: &mut dyn QuitWorld) {
         if !kill_rules::retire_on_declined_close(world.facts().exited, world.editor_gone()) {
             return;
@@ -396,10 +397,10 @@ impl QuitFlow {
         Self::end_in_place(world, "[modules] editor: the restarted nvim exited before it was ready");
     }
 
-    /// An exited editor cannot keep the keys, so when it is the last module on screen the chat is shown first.
+    /// An exited editor cannot keep the keys, so when it is the last module on screen another is shown first.
     fn end_in_place(world: &mut dyn QuitWorld, why: &str) {
         let ended = match world.end_editor() {
-            Err(LayoutError::LastVisible(_)) => world.show_chat().and_then(|()| world.end_editor()),
+            Err(LayoutError::LastVisible(_)) => world.show_stand_in().and_then(|()| world.end_editor()),
             other => other,
         };
         match ended {

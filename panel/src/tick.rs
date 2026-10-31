@@ -29,6 +29,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
     }
+    super::hand_over::poll(state, out);
     collect_history(state, out);
     // A supervisor this window had to start itself finishes connecting here rather than
     // during `build_ui`, where waiting for it would have delayed the window appearing.
@@ -265,7 +266,8 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
         return;
     }
     let now = state.tabs.view_activity();
-    if now == state.reported_activity {
+    let turns = state.tabs.turns_running();
+    if now == state.reported_activity && turns == state.reported_turns {
         return;
     }
     let mut changed: Vec<_> = now
@@ -280,7 +282,18 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
             .filter(|(view, _)| !now.iter().any(|(current, _)| current == view))
             .map(|(view, _)| (*view, false)),
     );
+    // One turn ending as another starts leaves a view's counts as they were, and what waits for that one turn still
+    // has to hear of it.
+    for (view, _) in turns.symmetric_difference(&state.reported_turns) {
+        if !changed.iter().any(|(seen, _)| seen == view) {
+            let busy = now
+                .iter()
+                .any(|(current, activity)| current == view && activity.running > 0);
+            changed.push((*view, busy));
+        }
+    }
     state.reported_activity = now;
+    state.reported_turns = turns;
     out.effect(Effect::Busy { changed });
 }
 
@@ -309,6 +322,7 @@ pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate
 pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
         || state.chat_moves.is_waiting()
+        || state.hand_overs.is_waiting()
         || state.tabs.needs_polling()
         || !state.retiring.is_empty()
         || state.supervisor_pending.is_some()
@@ -836,7 +850,12 @@ mod tests {
         });
         tick_handle_until(&handle, "turn end report", || !heard.borrow().is_empty());
         assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
-        assert_eq!(handle.state.borrow().tabs.queued_count(), 0);
+        // The report reads what the ingest thread folded, which can show the end a tick before the pump hears of it,
+        // and the queue goes out on the pump's word. Its leaving is a change of its own to report.
+        tick_handle_until(&handle, "the queue going out", || {
+            handle.state.borrow().tabs.queued_count() == 0
+        });
+        heard.borrow_mut().clear();
         handle.tick();
         assert!(heard.borrow().is_empty());
         let _ = handle.shutdown();
@@ -959,6 +978,62 @@ mod tests {
             report_busy(state, out);
         });
         assert!(heard.borrow().is_empty());
+    }
+
+    /// A wait for one tab's turn listens for this: the counts come out the same when the turn ends as another starts.
+    #[test]
+    fn the_busy_hook_hears_one_turn_end_as_another_starts() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-swap");
+        let (handle, _page) = settled_panel();
+        let (first, first_provider) = live_tab(&handle, &dir);
+        let second = handle
+            .state
+            .borrow_mut()
+            .tabs
+            .open(eitri_core::tab_set::AgentId::Claude);
+        let (second_provider, backend) = live_backend(&dir);
+        let running = |tab| handle.state.borrow().tabs.get(tab).is_some_and(|t| t.turn_running());
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(second)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        handle.on_busy(move |changed| calls.borrow_mut().push(changed.to_vec()));
+        first_provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the first turn", || running(first));
+        handle.tick();
+        heard.borrow_mut().clear();
+
+        first_provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        second_provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        // Each conversation folds on its own thread: no tick runs until both have, so one report sees both.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while running(first) || !running(second) {
+            assert!(std::time::Instant::now() < deadline, "the turns never swapped");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let activity = handle.state.borrow().tabs.view_activity();
+        assert_eq!(
+            activity,
+            handle.state.borrow().reported_activity,
+            "the counts did not move"
+        );
+        tick_handle_until(&handle, "the swap's report", || !heard.borrow().is_empty());
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, true)]));
+        handle.tick();
+        assert!(heard.borrow().is_empty(), "and once");
+        let _ = handle.shutdown();
     }
 
     /// Each chat view's chip shows its own tabs, so the hook hears a tab's own change even when the

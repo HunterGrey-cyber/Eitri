@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=75f8cc6affb4e11d42b213107f6dd68d3a0720b50c9dde4f71534251107880b6 -->
+<!-- translated-from: configuration.md sha256=ccff5ef8f8194af385a8ac623e8ca0490a354dd6e17beb6b409d2476235d866d -->
 
 # 配置
 
@@ -47,7 +47,8 @@ eitri.config.set("review.hint", true)
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
 | `keymap.which_key_delay` | 0 到 5000 之间的整数，或 `false` / `"off"` | `"off"` | 前缀等第二个键等多少毫秒后，用一个面板列出接下来可以按的键；`0` 立刻显示。见[提示面板](keys.zh-CN.md#the-hint-panel)。companion 窗口和 Mac 上不画。 |
 | `keymap.nvim_prefix` | 一个最长 16 个字符的 Neovim 左端（`"<leader>W"`），或 `false` / `"off"` | `"off"` | 在 Neovim 的 Normal 模式里，把你前缀表里的布局键映射到这个左端之下，每个键运行对应的 `:Eitri` 动作。见[从 Neovim 用：`:Eitri`](keys.zh-CN.md#from-neovim-eitri)。 |
-| `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)。 |
+| `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2，以及合成器窗口组的窗口 1 是否恢复它的窗口、它们的输出和底部终端。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)和[合成器窗口](compositor-windows.zh-CN.md#coming-back)。 |
+| `window.tiling` | `"auto"`、`"eitri"` 或 `"compositor"` | `"auto"` | 聊天和页面由谁排布。`"auto"` 在 Hyprland、sway 或 niri 回答时让它们成为窗口管理器的窗口，在别的地方留在 Eitri 的窗口里；`"eitri"` 留在里面；`"compositor"` 在任何 Wayland 桌面上都让它们成为窗口。其他值会让启动停下。见[合成器窗口](compositor-windows.zh-CN.md)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
 设置只在窗口启动时读取一次。改了 `init.lua` 之后，开一个新窗口才会生效。
@@ -89,7 +90,7 @@ eitri.keymap.use("i3-alt")
 
 命令行指定了文件的启动（`eitri FILE`）不会打开这个界面，因为你是为那个文件来的，也不算一次回答：下一次普通的 `eitri` 会打开它，`:Eitri setup` 随时都能打开它。
 
-**它看什么。** 只读，从不改：Eitri 为 [`keymap.from_tmux`](#settings) 已经读过的 tmux 配置；你用的桌面，以及在 i3 或 sway 下 `$mod` 是 Alt 还是 Super（先问窗口管理器自己，再读它的配置文件）；Hyprland 下它的绑定；你的 Neovim 里哪个插件占用（或很可能占用）`Ctrl+b` 和 `Ctrl+h/j/k/l`；以及有没有输入法在运行（看进程；Eitri 从不读输入法自己的设置）。各行随答案到来逐个出现，界面不会等慢的那一行。这些文字都不会被抄进文件。
+**它看什么。** 只读，从不改：Eitri 为 [`keymap.from_tmux`](#settings) 已经读过的 tmux 配置；你用的桌面，以及在 i3 或 sway 下 `$mod` 是 Alt 还是 Super（先问窗口管理器自己，再读它的配置文件）；Hyprland 下它的绑定；Hyprland、sway 或 niri 是否回答了版本命令，回答了就有一行 `windows` 说明 [`window.tiling`](compositor-windows.zh-CN.md) `"auto"` 在这里会怎么做；你的 Neovim 里哪个插件占用（或很可能占用）`Ctrl+b` 和 `Ctrl+h/j/k/l`；以及有没有输入法在运行（看进程；Eitri 从不读输入法自己的设置）。各行随答案到来逐个出现，界面不会等慢的那一行。这些文字都不会被抄进文件。
 
 **你选什么。** `j`/`k` 或数字在预设之间移动，`Enter` 继续：
 
@@ -98,9 +99,10 @@ eitri.keymap.use("i3-alt")
 | Neovim + tmux | `keymap.from_tmux` 开，按键仍由你的 tmux 配置决定；提示面板写成一行注释（有 tmux 配置时的默认选项） |
 | Neovim，不用 tmux | `keymap.from_tmux` 关，前缀是默认的 `Ctrl+b`，[提示面板](keys.zh-CN.md#the-hint-panel)开；Neovim 报告过 leader 时，窗口键也放在它下面（`keymap.nvim_prefix`） |
 | 换个前缀 | `Ctrl+a`、`Ctrl+Space` 或你按下的键：`k.prefix`、去掉旧的 `Ctrl+b` 的 `k.del`，以及 `k.set("prefix", key, "send-prefix")`，写法同[按键](keys.zh-CN.md#choosing-ctrlspace-as-the-prefix)里所示 |
-| i3 / sway 风格 | 默认按键；`$mod` 是 Alt 时再加 `eitri.keymap.use("i3-alt")`；是 Super 时不多写什么 |
+| i3 / sway 风格 | 默认按键；`$mod` 是 Alt 时再加 `eitri.keymap.use("i3-alt")`；是 Super 时不多写什么；`window.tiling` 写 `"eitri"`，由 Eitri 排布自己的模块 |
+| 平铺合成器 | `window.tiling` 写 `"compositor"`：[窗口管理器把聊天和页面当作自己的窗口排布](compositor-windows.zh-CN.md)，Eitri 的布局键关闭。只有 Hyprland、sway 或 niri 回答了才列出，这时它是默认选项 |
 
-写入之前，复查这一步会把这些行展示出来；`p` 修改前缀，`Backspace` 返回。选了和窗口当前所用不同的前缀，会先做一次**按键测试**：界面请你按一下那个键，并说明它到没到。被输入法或桌面占走的键到不了 Eitri，界面会直说，然后让你换一个前缀，或者仍然写入；等待期间按 `Esc` 返回。键位表不接受的键（`Ctrl+h`、单个字母）会立刻被拒绝，并给出原因。
+写入之前，复查这一步会把这些行展示出来；`p` 修改前缀，`Backspace` 返回。在 Hyprland、sway 或 niri 上，前三个预设还多一个 `w`，它把 `window.tiling` 写成 `"compositor"` 或 `"eitri"`；旁边那一行说明是哪个（`Windows: sway arranges`）。选了和窗口当前所用不同的前缀，会先做一次**按键测试**：界面请你按一下那个键，并说明它到没到。被输入法或桌面占走的键到不了 Eitri，界面会直说，然后让你换一个前缀，或者仍然写入；等待期间按 `Esc` 返回。键位表不接受的键（`Ctrl+h`、单个字母）会立刻被拒绝，并给出原因。
 
 窗口太矮、放不下界面时，用 `PageUp` 和 `PageDown` 滚动，在复查这一步 `j`/`k` 和方向键也可以。在第一页按 `r` 重新读取 Neovim 的映射，用于缓冲区自己的映射或晚加载的插件。按 `?` 显示一行帮助。
 

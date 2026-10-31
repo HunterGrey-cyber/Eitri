@@ -300,6 +300,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         scratch_dir,
         start.backend_kind,
         start.panel_notice.as_deref(),
+        true,
         start.root_note.clone(),
         None,
         eitri_core::window_link::pair::Role::Main,
@@ -390,15 +391,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         Rc::new(move |text: &str| toast.show(text))
     };
     let strip = PrefixStrip::new();
-    let strip_frame = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    strip_frame.add_css_class("module-toast");
-    strip_frame.set_halign(gtk4::Align::End);
-    strip_frame.set_valign(gtk4::Align::Start);
-    strip_frame.set_margin_top(6);
-    strip_frame.set_margin_end(6);
-    strip_frame.set_can_target(false);
-    strip_frame.set_visible(false);
-    strip_frame.append(strip.widget());
+    let strip_frame = crate::prefix_strip::floating_frame(&strip);
     overlay.add_overlay(&strip_frame);
     let strip = Rc::new(strip);
 

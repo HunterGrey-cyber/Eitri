@@ -6,6 +6,7 @@
 pub mod action;
 pub mod bundles;
 pub mod companion;
+pub mod compositor;
 pub mod hints;
 pub mod key;
 pub mod keys_return;

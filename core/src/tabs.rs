@@ -401,6 +401,32 @@ pub fn linked_window_close_prompt(
     ))
 }
 
+/// Window 1's close prompt in `compositor` mode: it closes the module windows with it, so it asks whatever they are
+/// doing, and it moves nothing. `running` and `queued` are the whole group's.
+pub fn group_close_prompt(windows: usize, running: usize, queued: usize) -> String {
+    group_close_prompt_with_jobs(windows, running, queued, 0)
+}
+
+/// [`group_close_prompt`] for a window that also holds terminals: `jobs` is how many run a job in the foreground, which
+/// the close ends as a window's close does.
+pub fn group_close_prompt_with_jobs(windows: usize, running: usize, queued: usize, jobs: usize) -> String {
+    let windows = match windows {
+        1 => "1 window".to_string(),
+        n => format!("{n} windows"),
+    };
+    let mut parts = Vec::new();
+    match running {
+        0 => {}
+        1 => parts.push("1 turn is running".to_string()),
+        n => parts.push(format!("{n} turns are running")),
+    }
+    parts.extend(counts_text(0, queued, jobs, 0));
+    if parts.is_empty() {
+        return format!("close Eitri and its {windows}? (y/n)");
+    }
+    format!("close Eitri and its {windows}? {} (y/n)", parts.join(", "))
+}
+
 /// `<leader>bo`: every tab but `active`, and the one
 /// y/n naming how many close and how many of them are running, e.g. `close 3 other tabs? 1 running
 /// (y/n)`. `entries` is every open tab's id paired with whether it is running (a turn in progress,
@@ -634,6 +660,27 @@ mod tests {
     use super::*;
     use crate::attention::{AgentPlace, Attention};
     use crate::layout::ModuleKind;
+
+    #[test]
+    fn a_groups_close_prompt_counts_its_windows_and_what_they_run() {
+        assert_eq!(
+            group_close_prompt(2, 3, 0),
+            "close Eitri and its 2 windows? 3 turns are running (y/n)"
+        );
+        assert_eq!(group_close_prompt(2, 0, 0), "close Eitri and its 2 windows? (y/n)");
+        assert_eq!(
+            group_close_prompt(1, 1, 2),
+            "close Eitri and its 1 window? 1 turn is running, 2 queued (y/n)"
+        );
+        assert_eq!(
+            group_close_prompt(3, 0, 1),
+            "close Eitri and its 3 windows? 1 queued (y/n)"
+        );
+        assert_eq!(
+            group_close_prompt_with_jobs(1, 0, 0, 1),
+            "close Eitri and its 1 window? 1 terminal job (y/n)"
+        );
+    }
 
     #[test]
     fn a_linked_close_prompt_names_the_other_window_and_offers_the_move() {

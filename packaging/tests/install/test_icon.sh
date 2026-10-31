@@ -28,8 +28,9 @@ run_old_installer() {
 }
 
 # The entries a release of this installer writes into the applications directory, in C order (what
-# `LC_ALL=C ls` prints): the application's own and the companion panel's.
-NEW_DESKTOPS='cn.huntergrey.eitri.Panel.desktop
+# `LC_ALL=C ls` prints): the application's own, the companion panel's and the page window's.
+NEW_DESKTOPS='cn.huntergrey.eitri.Page.desktop
+cn.huntergrey.eitri.Panel.desktop
 cn.huntergrey.eitri.desktop'
 
 # icon_tmps: any leftover temporary name under the data directory's icons.
@@ -131,7 +132,7 @@ t_upgrade_from_before_the_icon_replaces_the_desktop_entry() {
 	plant_sidecar bbbbbbb
 	# The home an earlier release left: the entry under its old name, and no icons at all.
 	rm -rf "$(data_of)/icons"
-	rm "$(data_of)/applications/cn.huntergrey.eitri.desktop" "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
+	rm "$(data_of)/applications/cn.huntergrey.eitri.desktop" "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop" "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop"
 	plant_old_desktop
 	serve 1.1.0 1.0.0
 	inst_net
@@ -224,8 +225,8 @@ t_old_desktop_entry_that_is_not_ours_is_left_alone() {
 		if [ -d "$old" ]; then
 			expect_dir "$old"
 		else
-			expect_eq "$(snap "$TH/.local/share/applications" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop')" \
-				"$(printf '%s\n' "$before" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop')" "the old entry ($variant)"
+			expect_eq "$(snap "$TH/.local/share/applications" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop' -e 'cn.huntergrey.eitri.Page.desktop')" \
+				"$(printf '%s\n' "$before" | grep -v -e 'cn.huntergrey.eitri.desktop' -e 'cn.huntergrey.eitri.Panel.desktop' -e 'cn.huntergrey.eitri.Page.desktop')" "the old entry ($variant)"
 		fi
 		expect_file "$TH/.local/share/applications/cn.huntergrey.eitri.desktop"
 		inst -- --uninstall
@@ -234,6 +235,7 @@ t_old_desktop_entry_that_is_not_ours_is_left_alone() {
 		if [ ! -e "$old" ] && [ ! -L "$old" ]; then fail "--uninstall removed a foreign $variant eitri.desktop"; fi
 		expect_absent "$TH/.local/share/applications/cn.huntergrey.eitri.desktop"
 		expect_absent "$TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop"
+		expect_absent "$TH/.local/share/applications/cn.huntergrey.eitri.Page.desktop"
 	done
 }
 

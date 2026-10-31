@@ -274,14 +274,12 @@ pub fn pick(
     if let WorkspacePick::Switch(index) = choice {
         let local = w.workspaces.borrow().order().len();
         if index >= local {
-            let name = w
-                .peer
-                .as_ref()
-                .and_then(|p| p.summary())
-                .and_then(|s| s.workspaces.get(index - local))
-                .cloned();
+            let name = w.group_summary().and_then(|s| s.workspaces.get(index - local).cloned());
             if let Some(name) = name {
-                crate::wm::moves::raise_for(w, win, crate::wm::moves::Raise::Workspace(name), batch);
+                // The names past the local ones are window 2's.
+                if let Some(peer) = w.second_peer() {
+                    crate::wm::moves::raise_for(w, win, peer, crate::wm::moves::Raise::Workspace(name), batch);
+                }
                 return;
             }
         }

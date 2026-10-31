@@ -73,6 +73,8 @@ pub(crate) struct Deps {
     pub(crate) panels: Rc<dyn Fn() -> (Vec<String>, LuaClaims)>,
     /// Shows a text in a scratch buffer of the editor: the panel's, which owns the window's scratch directory.
     pub(crate) view_in_editor: Rc<dyn Fn(&str, &str) -> Result<(), String>>,
+    /// Shows a one-time notice once what is up has hidden.
+    pub(crate) notice: Rc<dyn Fn(String)>,
     pub(crate) log: Option<ViewLog>,
 }
 
@@ -97,6 +99,8 @@ enum Msg {
         generation: u64,
         why: CheckWhy,
     },
+    /// The start's check found the screen stays closed.
+    NoScreen,
     /// The job `0` ended: nothing more comes from it.
     Ended(u64),
 }
@@ -147,6 +151,10 @@ impl OnboardingHost {
                 generation, requested, ..
             } => self.check(*generation, *requested),
             OnboardingOp::Detect { generation, .. } => self.detect(*generation),
+            OnboardingOp::Notice { text, .. } => {
+                (self.deps.notice)(text.clone());
+                Applied::Done
+            }
             OnboardingOp::Rescan { generation, extra, .. } => {
                 let extra: Vec<String> = extra.iter().map(KeySpec::to_vim).collect();
                 self.rescan(*generation, &extra);
@@ -179,20 +187,25 @@ impl OnboardingHost {
     }
 
     fn decide(self: &Rc<Self>, generation: u64, inputs: trigger::Inputs) {
-        self.spawn("onboarding-trigger", None, move |tx| {
+        let asked = self.spawn("onboarding-trigger", None, move |tx| {
             let (decision, log) = trigger::decide(&inputs);
             for line in log {
                 eprintln!("{}", line.escape_debug());
             }
-            if decision == trigger::Decision::Open {
-                let _ = tx.send(Msg::Open {
+            let _ = tx.send(match decision {
+                trigger::Decision::Open => Msg::Open {
                     generation,
                     mode: OpenMode::First,
                     show_why: None,
                     today: eitri_core::onboarding::today(),
-                });
-            }
+                },
+                trigger::Decision::Closed => Msg::NoScreen,
+            });
         });
+        // Nothing will answer, and with nobody asked no screen opens.
+        if !asked {
+            self.post(OnboardingEvent::NoScreen { win: self.deps.win });
+        }
     }
 
     fn check(self: &Rc<Self>, generation: u64, requested: bool) -> Applied {
@@ -571,6 +584,7 @@ impl OnboardingHost {
                 let opening = self.opening(generation, mode, show_why, today);
                 self.post(OnboardingEvent::Open { win, opening });
             }
+            Msg::NoScreen => self.post(OnboardingEvent::NoScreen { win }),
             Msg::Found { generation, found } => self.post(OnboardingEvent::Found { win, generation, found }),
             Msg::Written { generation, outcome } => self.post(OnboardingEvent::Written {
                 win,

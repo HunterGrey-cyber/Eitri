@@ -30,6 +30,14 @@ t_panel_entry_and_plugin_installed() {
 		fail "the panel entry differs from the tarball's in more than Exec"
 	fi
 	if ! grep -Fqx 'NoDisplay=true' "$p"; then fail "the panel entry is not hidden"; fi
+	# The page window's entry is rewritten like the main one: the launcher, then --quiet.
+	p=$(data_of)/applications/cn.huntergrey.eitri.Page.desktop
+	expect_file "$p"
+	expect_eq "$(grep '^Exec=' "$p")" "Exec=\"$TH/.local/bin/eitri\" --quiet %f" "the page entry's Exec line"
+	if [ "$(grep -v '^Exec=' "$p")" != "$(grep -v '^Exec=' "$PKG/cn.huntergrey.eitri.Page.desktop")" ]; then
+		fail "the page entry differs from the tarball's in more than Exec"
+	fi
+	if ! grep -Fqx 'NoDisplay=true' "$p"; then fail "the page entry is not hidden"; fi
 	# The main entry is unchanged.
 	expect_eq "$(grep '^Exec=' "$(data_of)/applications/cn.huntergrey.eitri.desktop")" \
 		"Exec=\"$TH/.local/bin/eitri\" --quiet --from-desktop %F" "the main entry's Exec line"
@@ -58,7 +66,7 @@ t_plugin_follows_xdg_data_home() {
 
 TESTS="$TESTS t_tarball_missing_the_panel_pieces_is_refused"
 t_tarball_missing_the_panel_pieces_is_refused() {
-	for what in share/applications/cn.huntergrey.eitri.Panel.desktop share/eitri/eitri.nvim/lua/eitri/init.lua; do
+	for what in share/applications/cn.huntergrey.eitri.Panel.desktop share/applications/cn.huntergrey.eitri.Page.desktop share/eitri/eitri.nvim/lua/eitri/init.lua; do
 		serve 1.0.0
 		d=$(served 1.0.0)
 		top=eitri-1.0.0-x86_64-linux
@@ -83,7 +91,7 @@ t_rerun_finishes_an_install_that_lost_a_panel_piece() {
 	inst_net
 	expect_rc 0
 	plant_sidecar aaaaaaa
-	for f in "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop" "$(data_of)/eitri/eitri.nvim/lua/eitri/init.lua"; do
+	for f in "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop" "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop" "$(data_of)/eitri/eitri.nvim/lua/eitri/init.lua"; do
 		rm "$f"
 		inst_net
 		expect_rc 0
@@ -172,6 +180,7 @@ t_dry_run_install_names_the_panel_pieces() {
 	inst_net --dry-run
 	expect_rc 0
 	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop with Exec=\"$TH/.local/bin/eitri\" panel --quiet %f"
+	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Page.desktop with Exec=\"$TH/.local/bin/eitri\" --quiet %f"
 	for f in $(plugin_files); do expect_out "would write $TH/.local/share/eitri/eitri.nvim/$f"; done
 	expect_eq "$(snap "$TH")" "$before" "the home after a dry run"
 }

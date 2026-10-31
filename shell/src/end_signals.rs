@@ -85,6 +85,19 @@ pub(crate) fn mark_closing() {
     CLOSING.store(true, Ordering::SeqCst);
 }
 
+/// How long ago the first signal arrived; zero before one has, and while the watchdog, on its own thread, has yet to
+/// write it down: its signal is then a moment old.
+pub(crate) fn since_first_signal() -> Duration {
+    since(FIRST_AT_MS.load(Ordering::SeqCst), epoch().elapsed())
+}
+
+fn since(first_at_ms: u64, now: Duration) -> Duration {
+    match first_at_ms {
+        0 => Duration::ZERO,
+        at => now.saturating_sub(Duration::from_millis(at)),
+    }
+}
+
 /// Points each of `fds` that is a terminal which has hung up (its writes fail with `EIO`; `isatty` says so by
 /// failing with `EIO` itself) at `/dev/null`, so later writes to it succeed and go nowhere, as they would have
 /// gone nowhere anyway. A live terminal and anything that is not a terminal are left as they are.
@@ -328,6 +341,18 @@ pub(crate) fn install(on_signal: impl Fn(&'static str) + 'static) -> Result<(), 
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn a_signal_not_yet_written_down_is_a_moment_old() {
+        let uptime = Duration::from_secs(3600);
+        assert_eq!(since(0, uptime), Duration::ZERO, "not the time since the process began");
+        assert_eq!(since(3_597_000, uptime), Duration::from_secs(3));
+        assert_eq!(
+            since(3_700_000, uptime),
+            Duration::ZERO,
+            "a clock read before the signal"
+        );
+    }
 
     #[test]
     fn a_full_pipe_is_not_written_and_does_not_block() {

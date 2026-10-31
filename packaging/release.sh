@@ -1017,6 +1017,7 @@ ctr_stage_art() {
 	local st="$1" f
 	install -m 0644 packaging/cn.huntergrey.eitri.desktop "$st/packaging/cn.huntergrey.eitri.desktop"
 	install -m 0644 packaging/cn.huntergrey.eitri.Panel.desktop "$st/packaging/cn.huntergrey.eitri.Panel.desktop"
+	install -m 0644 packaging/cn.huntergrey.eitri.Page.desktop "$st/packaging/cn.huntergrey.eitri.Page.desktop"
 	# The nvim plugin, at the path nfpm-public.yaml names as its source (relative to the staging dir).
 	while IFS= read -r f; do
 		install -D -m 0644 "nvim/eitri.nvim/$f" "$st/nvim/eitri.nvim/$f"
@@ -1040,6 +1041,7 @@ ctr_tarball_art() {
 	local st="$1" tree="$2" f
 	install -D -m 0644 "$st/packaging/cn.huntergrey.eitri.desktop" "$tree/share/applications/cn.huntergrey.eitri.desktop"
 	install -D -m 0644 "$st/packaging/cn.huntergrey.eitri.Panel.desktop" "$tree/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	install -D -m 0644 "$st/packaging/cn.huntergrey.eitri.Page.desktop" "$tree/share/applications/cn.huntergrey.eitri.Page.desktop"
 	while IFS= read -r f; do
 		install -D -m 0644 "$st/nvim/eitri.nvim/$f" "$tree/share/eitri/eitri.nvim/$f"
 	done < <(cd "$st/nvim/eitri.nvim" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)

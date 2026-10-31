@@ -21,6 +21,7 @@ pub use hyprland_dispatch::{
 
 mod hyprland;
 mod hyprland_dispatch;
+pub mod mode;
 mod niri;
 mod sway;
 
@@ -58,7 +59,7 @@ pub struct Rect {
     pub h: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowRef {
     pub pid: u32,
     pub id: Option<u64>,
@@ -67,6 +68,18 @@ pub struct WindowRef {
     /// directional move, but can still be raised.
     pub visible: bool,
     pub rect: Option<Rect>,
+    pub app_id: Option<String>,
+    pub title: Option<String>,
+    pub workspace: Option<String>,
+    pub output: Option<String>,
+    pub address: Option<String>,
+}
+
+/// A different known workspace or output means the compositor placed this window deliberately. Missing facts
+/// prove nothing, so an adapter that cannot report an output still compares workspaces.
+pub fn placed_by_rule(before: &WindowRef, mine: &WindowRef) -> bool {
+    let differs = |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(a), Some(b)) if a != b);
+    differs(&before.workspace, &mine.workspace) || differs(&before.output, &mine.output)
 }
 
 pub fn parse_config(value: Option<&str>) -> Result<WmChoice, String> {
@@ -171,6 +184,14 @@ pub fn list_windows_argv(wm: Wm) -> Option<Vec<String>> {
     }
 }
 
+/// Hyprland's client reply carries numeric monitor ids; this reply supplies their connector names.
+pub fn list_outputs_argv(wm: Wm) -> Option<Vec<String>> {
+    match wm {
+        Wm::Hyprland => argv(&["hyprctl", "monitors", "-j"]),
+        _ => None,
+    }
+}
+
 /// The command that focuses `target`. niri needs the window id; without one there is no command. `form` is read
 /// for Hyprland only.
 pub fn focus_window_argv(wm: Wm, form: HyprForm, target: &WindowRef) -> Option<Vec<String>> {
@@ -240,12 +261,12 @@ pub fn placement_argv(
 ) -> Option<Vec<String>> {
     use crate::wm::PlacementRole;
     let focus_pid = match role {
-        PlacementRole::NewSecond => Some(target.pid),
+        PlacementRole::NewSecond | PlacementRole::NewModule => Some(target.pid),
         PlacementRole::RestoredSecond { first_pid } => Some(first_pid),
         PlacementRole::Main => None,
     }
     .filter(|_| matches!(wm, Wm::Sway | Wm::Hyprland));
-    let focus = focus_pid.and_then(|pid| focus_window_argv(wm, form, &WindowRef { pid, ..*target }));
+    let focus = focus_pid.and_then(|pid| focus_window_argv(wm, form, &WindowRef { pid, ..target.clone() }));
     let Some(output) = output else { return focus };
     if wm == Wm::Hyprland {
         let output = OutputName::new(output)?;
@@ -296,6 +317,24 @@ pub fn has_neighbour(windows: &[WindowRef], dir: Direction) -> Option<bool> {
     )
 }
 
+/// Whether a window on screen overlaps the focused one, as floats do. Rectangles then show no edge: such a window
+/// can lie in a direction [`has_neighbour`] cannot see.
+pub fn focused_overlaps(windows: &[WindowRef]) -> bool {
+    let Some((fi, f)) = windows
+        .iter()
+        .enumerate()
+        .find_map(|(i, w)| w.focused.then_some(w.rect.map(|r| (i, r)))?)
+    else {
+        return false;
+    };
+    windows
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| *i != fi && w.visible)
+        .filter_map(|(_, w)| w.rect)
+        .any(|r| r.x < f.x + f.w && f.x < r.x + r.w && r.y < f.y + f.h && f.y < r.y + r.h)
+}
+
 /// The window owned by the nearest process in `chain`. When that process has several windows, the
 /// focused one, else the first.
 pub fn first_window_owner<'a>(chain: &[u32], windows: &'a [WindowRef]) -> Option<&'a WindowRef> {
@@ -312,6 +351,92 @@ pub fn first_window_owner<'a>(chain: &[u32], windows: &'a [WindowRef]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_known_change_of_workspace_or_output_counts_as_a_placement_rule() {
+        let before = WindowRef {
+            workspace: Some("1".into()),
+            output: Some("DP-1".into()),
+            ..Default::default()
+        };
+        assert!(!placed_by_rule(&before, &before));
+        assert!(!placed_by_rule(&before, &WindowRef::default()));
+        assert!(placed_by_rule(
+            &before,
+            &WindowRef {
+                workspace: Some("2".into()),
+                ..before.clone()
+            }
+        ));
+        assert!(placed_by_rule(
+            &before,
+            &WindowRef {
+                output: Some("DP-2".into()),
+                ..before.clone()
+            }
+        ));
+        assert!(!placed_by_rule(&WindowRef::default(), &before));
+    }
+
+    #[test]
+    fn parse_windows_keeps_class_title_address_and_workspace() {
+        for version in ["0.56.2", "0.57.0"] {
+            let clients: serde_json::Value =
+                serde_json::from_str(&fixture(&format!("hyprland_clients_{version}.json"))).unwrap();
+            let reply = serde_json::json!({"clients": clients, "monitors": [{"id": 0, "name": "DP-1"}]});
+            let windows = parse_windows(Wm::Hyprland, &reply.to_string()).unwrap();
+            let panel = windows
+                .iter()
+                .find(|w| w.app_id.as_deref() == Some("cn.huntergrey.eitri.Panel"))
+                .unwrap();
+            assert_eq!(panel.workspace.as_deref(), Some("1"));
+            assert_eq!(panel.output.as_deref(), Some("DP-1"));
+            assert!(panel.address.as_deref().unwrap().starts_with("0x"));
+            assert!(panel.title.as_deref().unwrap().starts_with("Eitri"));
+        }
+        let sway = parse_windows(Wm::Sway, &fixture("sway_tree_real_two_windows.json")).unwrap();
+        assert!(sway
+            .iter()
+            .all(|w| w.workspace.as_deref() == Some("1") && w.output.as_deref() == Some("HEADLESS-1")));
+        assert!(sway
+            .iter()
+            .all(|w| w.app_id.is_some() && w.title.is_some() && w.address.is_none()));
+        let niri = parse_windows(Wm::Niri, &fixture("niri_windows.json")).unwrap();
+        assert!(niri
+            .iter()
+            .all(|w| w.workspace.as_deref() == Some("1") && w.output.is_none()));
+        assert_eq!(niri[1].app_id.as_deref(), Some("cn.huntergrey.eitri.Panel"));
+        assert_eq!(niri[1].title.as_deref(), Some("Eitri · demo"));
+    }
+
+    #[test]
+    fn a_title_never_reaches_a_compositor_command() {
+        for title in ["x'}) os.execute('y') --", "a;b"] {
+            let reply = fixture("hostile_window_titles.json").replace("TITLE", title);
+            for wm in [Wm::Hyprland, Wm::Sway, Wm::Niri] {
+                let json: serde_json::Value = serde_json::from_str(&reply).unwrap();
+                let key = match wm {
+                    Wm::Hyprland => "hyprland",
+                    Wm::Sway => "sway",
+                    _ => "niri",
+                };
+                let window = parse_windows(wm, &json[key].to_string()).unwrap().remove(0);
+                assert_eq!(window.title.as_deref(), Some(title));
+                for form in [HyprForm::Legacy, HyprForm::Lua] {
+                    for argv in [
+                        focus_window_argv(wm, form, &window),
+                        move_to_output_argv(wm, form, &window, "DP-1"),
+                        placement_argv(wm, form, &window, Some("DP-1"), crate::wm::PlacementRole::NewModule),
+                    ] {
+                        let argv = argv.unwrap().join(" ");
+                        assert!(!argv.contains(title) && !argv.contains("hostile-class"));
+                        assert!(argv.contains("4242") || argv.contains("42"));
+                    }
+                    assert!(move_to_output_argv(wm, form, &window, title).is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_compositor_adapters_keep_their_config_key_and_notices() {
@@ -380,6 +505,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
             assert_eq!(move_focus_argv(Wm::Gnome, HyprForm::Legacy, dir), None);
@@ -492,6 +618,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         assert_eq!(
             focus_window_argv(Wm::Hyprland, HyprForm::Legacy, &w),
@@ -520,6 +647,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         assert_eq!(
             move_to_output_argv(Wm::Sway, HyprForm::Legacy, &w, "HEADLESS-2"),
@@ -538,7 +666,12 @@ mod tests {
             v(&["niri", "msg", "action", "move-window-to-monitor", "--id", "7", "eDP-1"])
         );
         assert_eq!(
-            move_to_output_argv(Wm::Niri, HyprForm::Legacy, &WindowRef { id: None, ..w }, "eDP-1"),
+            move_to_output_argv(
+                Wm::Niri,
+                HyprForm::Legacy,
+                &WindowRef { id: None, ..w.clone() },
+                "eDP-1"
+            ),
             None
         );
         assert_eq!(move_to_output_argv(Wm::Gnome, HyprForm::Legacy, &w, "DP-1"), None);
@@ -554,6 +687,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         assert_eq!(
             move_focus_argv(Wm::Hyprland, HyprForm::Lua, Direction::Left),
@@ -599,6 +733,39 @@ mod tests {
     }
 
     #[test]
+    fn a_new_module_window_is_focused_by_its_own_pid_and_moved_nowhere() {
+        use crate::wm::PlacementRole;
+        let w = WindowRef {
+            pid: 4242,
+            id: None,
+            focused: false,
+            visible: true,
+            rect: None,
+            ..Default::default()
+        };
+        for (wm, form) in [
+            (Wm::Sway, HyprForm::Legacy),
+            (Wm::Hyprland, HyprForm::Legacy),
+            (Wm::Hyprland, HyprForm::Lua),
+        ] {
+            let focus = focus_window_argv(wm, form, &w);
+            assert!(focus.is_some(), "{wm:?}");
+            assert_eq!(
+                placement_argv(wm, form, &w, None, PlacementRole::NewModule),
+                focus,
+                "{wm:?} {form:?}"
+            );
+        }
+        // niri and GNOME focus by the token alone.
+        for wm in [Wm::Niri, Wm::Gnome, Wm::None] {
+            assert_eq!(
+                placement_argv(wm, HyprForm::Legacy, &w, None, PlacementRole::NewModule),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn a_hyprland_placement_ends_with_the_focus_its_role_names_in_either_form() {
         use crate::wm::PlacementRole;
         let v = |parts: &[&str]| Some(parts.iter().map(ToString::to_string).collect::<Vec<_>>());
@@ -608,6 +775,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         let restored = PlacementRole::RestoredSecond { first_pid: 101 };
         for (role, focus_pid) in [(PlacementRole::NewSecond, 4242), (restored, 101)] {
@@ -669,6 +837,7 @@ mod tests {
                 focused: false,
                 visible: true,
                 rect: None,
+                ..Default::default()
             };
             assert_eq!(move_to_output_argv(Wm::Sway, HyprForm::Legacy, &w, bad), None);
         }
@@ -730,6 +899,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_window_on_screen_over_the_focused_one_counts_as_overlapping() {
+        let r = |x, y, w, h| Some(Rect { x, y, w, h });
+        let window = |focused, visible, rect| WindowRef {
+            focused,
+            visible,
+            rect,
+            ..Default::default()
+        };
+        let float = window(true, true, r(100, 100, 800, 600));
+        assert!(focused_overlaps(&[
+            float.clone(),
+            window(false, true, r(700, 100, 800, 600))
+        ]));
+        assert!(!focused_overlaps(&[
+            float.clone(),
+            window(false, false, r(700, 100, 800, 600))
+        ]));
+        assert!(!focused_overlaps(&[
+            float.clone(),
+            window(false, true, r(900, 100, 800, 600))
+        ]));
+        assert!(!focused_overlaps(&[
+            window(false, true, r(0, 0, 9, 9)),
+            window(false, true, r(0, 0, 9, 9))
+        ]));
+    }
+
+    #[test]
     fn a_hidden_window_is_no_neighbour_but_can_be_raised() {
         let r = |x, y, w, h| Some(Rect { x, y, w, h });
         let panel = WindowRef {
@@ -738,6 +935,7 @@ mod tests {
             focused: true,
             visible: true,
             rect: r(960, 0, 960, 1080),
+            ..Default::default()
         };
         // The editor sits to the panel's left, but on a workspace that is not shown (sway keeps its
         // last rectangle there), or behind another tab.
@@ -747,6 +945,7 @@ mod tests {
             focused: false,
             visible: false,
             rect: r(0, 0, 960, 1080),
+            ..Default::default()
         };
         let ws = [editor, panel];
         assert_eq!(has_neighbour(&ws, Direction::Left), Some(false));
@@ -776,6 +975,7 @@ mod tests {
             focused,
             visible: true,
             rect,
+            ..Default::default()
         };
         // Beside the focused window's edge but entirely below its span: not a left neighbour.
         let ws = [w(true, r(500, 0, 500, 400)), w(false, r(0, 400, 500, 400))];
@@ -818,6 +1018,49 @@ mod tests {
         // Focused window is on the right output: the left output's window is a left neighbour.
         assert_eq!(has_neighbour(&ws, Direction::Left), Some(true));
         assert_eq!(has_neighbour(&ws, Direction::Right), Some(false));
+    }
+
+    /// `hyprctl clients -j` on Hyprland 0.57 with a compositor-mode group in one workspace: window 1 on the left, the
+    /// chat and page windows stacked beside it, each with its own app id and the fixed title it mapped with. Every
+    /// Eitri window has the one app id its kind has, so a list of them tells the windows apart.
+    #[test]
+    fn a_compositor_mode_group_on_hyprland_parses() {
+        let w = parse_windows(Wm::Hyprland, &fixture("hyprland_clients_cm_0.57.0.json")).unwrap();
+        let of = |app: &str| w.iter().find(|w| w.app_id.as_deref() == Some(app)).unwrap();
+        let (editor, chat, page) = (
+            of("cn.huntergrey.eitri"),
+            of("cn.huntergrey.eitri.Panel"),
+            of("cn.huntergrey.eitri.Page"),
+        );
+        assert_eq!(w.len(), 3);
+        assert_eq!(editor.title.as_deref(), Some("project — Eitri"));
+        assert_eq!(chat.title.as_deref(), Some("project — Eitri chat"));
+        assert_eq!(page.title.as_deref(), Some("project — Notes · Eitri"));
+        assert_eq!(
+            w.iter().filter(|w| w.focused).map(|w| w.pid).collect::<Vec<_>>(),
+            [page.pid]
+        );
+        assert!(w.iter().all(|w| w.workspace.as_deref() == Some("1") && w.visible));
+        let (e, c) = (editor.rect.unwrap(), chat.rect.unwrap());
+        assert!(e.x + e.w <= c.x, "the chat window sits beside the editor");
+    }
+
+    /// The page window of that group has the chat above it and window 1 to its left, and nothing below or to its right.
+    /// A client list holds every workspace's windows, so only the monitors' reply takes the others out.
+    #[test]
+    fn hyprland_neighbours_are_the_windows_its_monitors_show() {
+        let clients: serde_json::Value = serde_json::from_str(&fixture("hyprland_clients_cm_0.57.0.json")).unwrap();
+        let parsed = |active: i64| {
+            let monitors = serde_json::json!([{"id": 0, "name": "DP-1", "activeWorkspace": {"id": active}}]);
+            let reply = serde_json::json!({"clients": clients, "monitors": monitors});
+            parse_windows(Wm::Hyprland, &reply.to_string()).unwrap()
+        };
+        let on_screen = parsed(1);
+        assert_eq!(has_neighbour(&on_screen, Direction::Up), Some(true));
+        assert_eq!(has_neighbour(&on_screen, Direction::Left), Some(true));
+        assert_eq!(has_neighbour(&on_screen, Direction::Down), Some(false));
+        assert_eq!(has_neighbour(&on_screen, Direction::Right), Some(false));
+        assert_eq!(has_neighbour(&parsed(2), Direction::Up), Some(false));
     }
 
     /// `hyprctl clients -j` as Hyprland 0.56.2 and 0.57.0 print it, with nvim's foot on the left and the panel on the
@@ -910,6 +1153,7 @@ mod tests {
             focused,
             visible: true,
             rect: None,
+            ..Default::default()
         }
     }
 

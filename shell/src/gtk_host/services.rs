@@ -310,11 +310,7 @@ impl Teardown {
             }
         });
         if let Some(link) = pair.link() {
-            link.close(if pair.is_second() {
-                "window 2 closed"
-            } else {
-                "window 1 closed"
-            });
+            link.close(&pair.closed_words());
         }
     }
 
@@ -371,7 +367,7 @@ pub(crate) struct Services {
     pub(crate) teardown: Rc<RefCell<Option<Rc<Teardown>>>>,
     /// The freeze each terminal was last asked for by a move: only that one's refusal gives a move up.
     pub(crate) freezes: Rc<crate::terminal::moving::Freezes>,
-    /// Holds or releases the editor's review events of a moving chat's session (`PairReview::hold_session`):
+    /// Holds or releases the editor's review events of a moving chat's session (`GroupReview::hold_session`):
     /// `None` in a window that is no pair's, where no chat moves.
     pub(crate) review_hold: Option<ReviewHold>,
 }
@@ -979,7 +975,14 @@ impl ServiceSet for Services {
     fn cleanup(&self, op: &CleanupOp) -> Result<(), String> {
         let teardown = self.teardown()?;
         match op {
-            CleanupOp::PairOnClose { layout_written } => teardown.pair_on_close(*layout_written),
+            CleanupOp::EndGroup => teardown.pair.end_group(),
+            CleanupOp::KeepThisWindow => teardown.pair.keep_this_window(),
+            CleanupOp::PairOnClose { layout_written } => {
+                if let Some(write) = teardown.pair.finish_group_tabs() {
+                    self.agent.hold_close_for_tabs(write);
+                }
+                teardown.pair_on_close(*layout_written);
+            }
             CleanupOp::ScratchDir => {
                 if let Some(path) = &teardown.scratch_path {
                     let _ = std::fs::remove_dir_all(path);

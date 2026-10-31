@@ -19,8 +19,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use eitri_core::window_link::link::{Inbound, LinkHandle, PresenceFlag};
+use eitri_core::window_link::link::{Inbound, LinkHandle, LinkSender, PresenceFlag};
 use eitri_core::window_link::msg::KINDS;
+use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{LinkError, Msg, TurnEdge};
 use eitri_core::wm::{Controller, Driver, PeerId, WinId};
 use gtk4::glib;
@@ -296,11 +297,17 @@ impl LinkDriver {
         }
     }
 
-    /// Makes the window controller's `win` the link's end toward `peer`: the move protocol's messages reach it as
-    /// peer events, each drain as one wake event, and the link's end detaches the peer. The controller sends on the
-    /// link through a [`LinkPort`]. An offer this window cannot read is refused on the link at once, never posted.
-    /// The controller is held weakly: the link must not keep the window's controller alive.
-    pub fn attach_controller(&self, win: WinId, peer: PeerId, controller: &Rc<Driver<Controller>>) {
+    /// A sender for a thread other than this one, while the link has a handle.
+    pub fn sender(&self) -> Option<LinkSender> {
+        self.inner.handle.borrow().as_ref().map(LinkHandle::sender)
+    }
+
+    /// Makes the window controller's `win` the link's end toward `peer`, the window called `name`: the move
+    /// protocol's messages reach it as peer events, each drain as one wake event, and the link's end detaches the
+    /// peer. The controller sends on the link through a [`LinkPort`]. An offer this window cannot read is refused on
+    /// the link at once, never posted. The controller is held weakly: the link must not keep the window's controller
+    /// alive.
+    pub fn attach_controller(&self, win: WinId, peer: PeerId, name: WindowName, controller: &Rc<Driver<Controller>>) {
         let weak = Rc::downgrade(controller);
         for kind in peer::MOVE_KINDS {
             let weak = weak.clone();
@@ -327,15 +334,30 @@ impl LinkDriver {
         }
         self.on_end(move |_, _| {
             if let Some(controller) = weak.upgrade() {
-                controller.detach_peer(win);
+                controller.detach_peer(win, peer);
             }
         });
-        controller.attach_peer(win, peer, Rc::new(LinkPort::new(self.clone())));
+        controller.attach_peer(win, peer, name, Rc::new(LinkPort::new(self.clone())));
     }
 
     /// Says `bye{why}` and closes the link; the other window sees a clean close. This window's own handlers for
     /// the end do not run: it asked for it.
     pub fn close(&self, why: &str) {
+        if let Some(handle) = self.closing() {
+            handle.close(why);
+        }
+    }
+
+    /// [`LinkDriver::close`] with the wait for a full socket on a thread of its own: for one close of many, each of which
+    /// could otherwise hold the GTK thread for its whole bound.
+    pub fn close_detached(&self, why: &str) {
+        if let Some(handle) = self.closing() {
+            handle.close_detached(why);
+        }
+    }
+
+    /// Says this window is closing the link, and gives up its handle to do it with.
+    fn closing(&self) -> Option<LinkHandle> {
         if !self.inner.closed_here.get() && self.is_up() {
             let handlers: Vec<ClosingHandler> = self.inner.on_closing.borrow().clone();
             for handler in handlers {
@@ -348,10 +370,7 @@ impl LinkDriver {
         if let Some(id) = self.inner.watch.borrow_mut().take() {
             id.remove();
         }
-        let handle = self.inner.handle.borrow_mut().take();
-        if let Some(handle) = handle {
-            handle.close(why);
-        }
+        self.inner.handle.borrow_mut().take()
     }
 
     /// Whether `other` is this same link.
@@ -614,7 +633,7 @@ pub(crate) mod tests {
         driver.on("hello", |link, _, _| link.set_linked());
         theirs
             .send(
-                crate::linked_window::spawn::hello("0.4.0+abc".into(), 4242, 99),
+                crate::linked_window::spawn::hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99),
                 Vec::new(),
             )
             .unwrap();
@@ -636,7 +655,9 @@ pub(crate) mod tests {
             let drains = drains.clone();
             driver.on_drained(move |_| drains.set(drains.get() + 1));
         }
-        let answer = driver.send_confirmed(Msg::Presence { held: true }, Vec::new()).unwrap();
+        // A message the other end's link does not answer: `presence` draws an acknowledgement, which arrives here
+        // as a message whenever it beats the pump.
+        let answer = driver.send_confirmed(Msg::MoveDone { mv: 1 }, Vec::new()).unwrap();
         assert!(
             answer.recv_timeout(Duration::from_secs(5)).unwrap().is_ok(),
             "the packet was written"
@@ -661,6 +682,13 @@ pub(crate) mod tests {
 
     /// A window controller holding one window, on the fake host, for the link to attach to.
     pub(crate) fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
+        controller_in(eitri_core::wm::window::Tiling::Eitri)
+    }
+
+    /// [`controller`], its window tiled as `tiling`.
+    pub(crate) fn controller_in(
+        tiling: eitri_core::wm::window::Tiling,
+    ) -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
         use eitri_core::layout::{Layout, ModuleDecl, ModuleId, ModuleKeys, Placement, Workspaces};
         use eitri_core::wm::fake::{FakeHost, FakeScheduler};
         use eitri_core::wm::start::StartStep;
@@ -696,6 +724,7 @@ pub(crate) mod tests {
             StartStep::Config { keymap, module_keys },
             StartStep::Layout {
                 own_window: None,
+                tiling,
                 parts: WindowParts::new(
                     Layout::initial(&[ModuleDecl {
                         id: ModuleId::terminal(),
@@ -730,7 +759,7 @@ pub(crate) mod tests {
         use eitri_core::wm::Origin;
         let (wm, host) = controller();
         let (driver, theirs, _their_inbound) = pair();
-        driver.attach_controller(WinId::MAIN, PeerId(2), &wm);
+        driver.attach_controller(WinId::MAIN, PeerId(2), WindowName::Second, &wm);
         wm.run(WinId::MAIN, Action::WindowOther, Origin::Key { keycode: 0 });
         assert_eq!(
             raises(&host),
@@ -752,7 +781,7 @@ pub(crate) mod tests {
     fn an_offer_this_window_cannot_read_is_refused_on_the_link() {
         let (wm, _host) = controller();
         let (driver, theirs, their_inbound) = pair();
-        driver.attach_controller(WinId::MAIN, PeerId(2), &wm);
+        driver.attach_controller(WinId::MAIN, PeerId(2), WindowName::Second, &wm);
         theirs
             .send(
                 Msg::MoveOffer {

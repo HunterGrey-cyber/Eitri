@@ -103,9 +103,9 @@ fn build_ui_starts_every_module_from_the_start_theme() {
     assert!(read < install && install < spawn && install < window);
     let spawn = scan::braced(&code, spawn + code[spawn..].find('{').unwrap());
     assert!(spawn.contains("background:start_theme.editor_background()"));
-    let panels = call_texts(&code, "build_agent_panel(");
+    let panels = call_texts(&code, "make_panel_handle(");
     assert_eq!(panels.len(), 1);
-    assert!(read < code.find("build_agent_panel(").unwrap());
+    assert!(read < code.find("make_panel_handle(").unwrap());
     assert!(panels[0].contains("start_theme"));
 }
 
@@ -992,7 +992,7 @@ fn no_window_verb_is_left_in_build_ui() {
         assert!(!code.contains(verb), "build_ui still names `{verb}`");
     }
     assert!(code.contains("wm_host.set_linked_windows(pair.clone());"));
-    assert!(code.contains("link.attach_controller(WinId::MAIN,peer,&wm);"));
+    assert!(code.contains("link.attach_controller(WinId::MAIN,peer,name.clone(),&wm);"));
 }
 
 /// The answer gate the panel asks at each card answer is the controller's query, and its refusal is posted for the
@@ -1141,6 +1141,25 @@ fn build_ui_walks_the_start_plan() {
         at.windows(2).all(|w| w[0] < w[1]),
         "the phases run in the plan's order: {at:?}"
     );
+    // The base page's place: the panel is made without a page before `init.lua`, the controller is told what it needs
+    // to say when the page is built, and what it built is taken once the layout phase is over, before any surface.
+    let handle = code
+        .find("agent_panel::make_panel_handle(")
+        .expect("the panel's handle");
+    let maker = code
+        .find("wm_host.set_base_page_maker(")
+        .expect("the host can build the page");
+    let told = code.find("driver.set_early_facts(").expect("the start's facts");
+    let kernel = code.find("StartStep::Kernel").unwrap();
+    assert!(handle < maker && maker < told && told < kernel);
+    let told_again = code.rfind("driver.set_early_facts(").unwrap();
+    assert!(
+        kernel < told_again && told_again < code.find("StartStep::Config").unwrap(),
+        "the config phase knows what `window.tiling` says"
+    );
+    let taken = code.find("base_page.take()").expect("the page's place");
+    assert!(code.find("StartStep::Layout").unwrap() < taken);
+    assert!(taken < code.find("StartStep::Surfaces").unwrap());
     let own = code
         .find("plugin_panels.set_own_window(")
         .expect("the hosts learn window ownership");
@@ -1188,12 +1207,71 @@ fn build_ui_walks_the_start_plan() {
     }
 }
 
+/// The base chat page has one way to exist: the controller's `BuildBasePage`, which a hub never emits. Its one caller
+/// is the maker the host's arm for that op runs, and that arm is the maker's one way in.
+#[test]
+fn the_base_page_has_one_call_site() {
+    let mut calls = Vec::new();
+    for (path, code) in shell_code() {
+        for (at, _) in code.match_indices("build_base_page(") {
+            if !code[..at].ends_with("fn ") {
+                calls.push(path.clone());
+            }
+        }
+    }
+    assert_eq!(calls, ["shell/src/gtk_host/surfaces.rs"], "{calls:?}");
+    let surfaces = file_code("shell/src/gtk_host/surfaces.rs");
+    let maker = "implBasePageMakerforBasePage{";
+    let maker = surfaces.find(maker).expect("the maker") + maker.len() - 1;
+    assert!(
+        scan::braced(&surfaces, maker).contains("build_base_page("),
+        "only the maker's `build` builds it"
+    );
+    let host = file_code("shell/src/gtk_host/mod.rs");
+    assert_eq!(
+        host.matches("maker.build()").count(),
+        1,
+        "the host runs the maker in one place"
+    );
+    let arm = host.find("HostOp::BuildBasePage{..}=>{").expect("the op's arm");
+    let built = host.find("maker.build()").unwrap();
+    assert!(arm < built && built < arm + 300, "that place is the op's arm");
+    assert_eq!(
+        file_code("core/src/wm/start.rs")
+            .matches("HostOp::BuildBasePage")
+            .count(),
+        1,
+        "the controller emits it in one place"
+    );
+}
+
+/// Giving a panel its tab files reads them and claims other windows' tabs at once, so a hub never does; it turns the
+/// tab writer off before the config can turn anything on, and its handle gets no page to run a writer from.
+#[test]
+fn a_hub_reads_and_claims_no_tabs_file() {
+    let code = build_ui_code();
+    let given = code
+        .find("agent_panel_handle.set_tab_files(")
+        .expect("the window's tabs");
+    assert_eq!(code.matches("set_tab_files(").count(), 1);
+    assert!(
+        code[..given].ends_with("if!hub{"),
+        "the tab files are given only outside a hub"
+    );
+    let off = code
+        .find("agent_panel_handle.keep_no_tabs()")
+        .expect("a hub's writer is off");
+    assert!(code[..off].ends_with("ifhub{"));
+    assert!(off < code.find("config.apply_to_panel(").unwrap());
+}
+
 /// Every key action, Lua run and panel tab verb reaches the controller's runner, and only through it: no
 /// shell runner of its own is left, no arm of the shell's is reached at all, and each call of the runner names
 /// where it came from as one of the routes the shell has. A new route is a deliberate edit of this list.
 #[test]
 fn the_runner_is_the_only_door() {
-    const ROUTES: &[&str] = &["Key", "PanelTab", "Lua", "Follow", "Chip"];
+    // `Hub`: what window 1 sent a module window over the link, run there as it is.
+    const ROUTES: &[&str] = &["Key", "PanelTab", "Lua", "Follow", "Chip", "Hub"];
     let mut runs = 0;
     for (path, code) in shell_code() {
         let flat: String = code.split_whitespace().collect();
@@ -1563,7 +1641,7 @@ fn window_restore_is_read_before_the_pair_files_decision() {
         code.find("set_tab_files(").unwrap() < layout,
         "the panel has its tabs before the layout phase"
     );
-    let panels = call_texts(&code, "build_agent_panel(");
+    let panels = call_texts(&code, "make_panel_handle(");
     assert!(
         !panels[0].contains("tab_files"),
         "the panel is built with no saved tabs chosen yet"
@@ -1630,9 +1708,10 @@ fn the_links_end_and_the_restore_of_window_2_are_carried_out_by_the_window() {
     assert!(
         code.contains(concat!(
             "pair_raise.used_for_window(pair.holds_pair()||pair.is_second(),",
-            "pair.restored(),incoming_opens.is_some(),)"
+            "pair.restored()||module_window.is_some(),incoming_opens.is_some(),)"
         )),
-        "a restored window 2's first show keeps window 1's keys, and a window holding the open socket can be raised"
+        "a restored window 2's first show keeps window 1's keys, so does a module window's, and a window holding the \
+         open socket can be raised"
     );
 }
 
@@ -1665,7 +1744,7 @@ fn the_shell_names_no_mutable_layout() {
     }
     let code = build_ui_code();
     assert!(
-        code.contains("letparts=eitri_core::wm::WindowParts::new(start_layout,start_workspaces,Some(layout_saver));"),
+        code.contains("letparts=eitri_core::wm::WindowParts::new(start_layout,start_workspaces,layout_saver);"),
         "the window's start values go to the controller by value"
     );
     assert!(code.contains("let(module_layout,workspaces)=parts.views();"));

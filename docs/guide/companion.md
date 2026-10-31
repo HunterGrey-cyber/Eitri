@@ -14,6 +14,9 @@ buffers reload after the agent edits them, a file opens at a line from the panel
 Neovim. It removes all of it again when the panel goes away. Nothing is written to your Neovim configuration.
 Your editor keeps its own speed and keys, and your window manager arranges the two windows.
 
+Plain `eitri` on Hyprland, sway or niri also puts its chats and pages in windows of their own, around Eitri's editor
+rather than yours: see [Compositor windows](compositor-windows.md).
+
 ## The eitri.nvim plugin
 
 `eitri.nvim` is a thin launcher: everything the panel needs inside Neovim, the panel installs itself, so the
@@ -162,7 +165,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 
 | desktop | detected by | what Eitri does |
 |---|---|---|
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch`. Eitri first asks Hyprland once whether it runs a Lua config (`hyprland.lua`) or a `hyprland.conf`, and writes its commands the way that config takes them. What happens at the edge is Hyprland's own |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch`, after checking that a visible window really lies in that direction, because Hyprland's own move picks a window even when nothing lies that way: a key at a real edge stops there. Windows that overlap, such as floats, are left to Hyprland. Eitri first asks Hyprland once whether it runs a Lua config (`hyprland.lua`) or a `hyprland.conf`, and writes its commands the way that config takes them |
 | sway | `SWAYSOCK` | moves focus with `swaymsg`, after checking that a visible window really lies in that direction (on any output), so sway's default focus wrapping does not carry you to the far side. At the edge the key is consumed |
 | niri | `NIRI_SOCKET` | moves focus with `niri msg action`; what happens at the edge is niri's own |
 | GNOME | `XDG_CURRENT_DESKTOP` contains `GNOME`, in a Wayland session | moves focus through the [Eitri GNOME Shell extension](#gnome-the-extension), once you have enabled it. Without it no focus moves (a Wayland client cannot take focus on GNOME by itself), and the band says once that your desktop does not let Eitri move focus and names the extension |

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=da23a3c54b4b2bb1b92f27d8cac87511627b71ea73f34cb39af4fd9f1f63fe82 -->
+<!-- translated-from: README.md sha256=505c0f922d6ce98663ba530ba8a106f0e85dff1a2a6c0bad9bf18ce68952f9a6 -->
 
 <div align="center">
 
@@ -7,7 +7,7 @@
 
 <h1>Eitri</h1>
 
-<p><b>你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。</b></p>
+<p><b>你的 Neovim，和 agent、终端、你自己做的网页平铺在一起。</b></p>
 
 <p>
 <a href="https://eitri.cc/zh/">官网</a> ·
@@ -25,7 +25,7 @@
 
 一个 Linux 上的 Neovim 图形前端。Eitri 是一个桌面窗口（MIT 许可），包在你自己的 Neovim 配置外面，你监督的 agent（Claude Code、Codex，或任何讲 ACP 的 agent）、终端和你自己的网页平铺在它旁边。回复是排好版的 markdown 和 diff，带一张张权限卡片，全程不用碰鼠标。
 
-键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键：先按 `Ctrl+b`，再按一个键；`Ctrl+b ?` 列出全部按键。i3 的那些移动也有，是前缀之后的 Alt 组合键；在编辑器里运行 `:EitriTutor`，会带你一步步把这些键走一遍。
+键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键：先按 `Ctrl+b`，再按一个键；`Ctrl+b ?` 列出全部按键。i3 的那些移动也有，是前缀之后的 Alt 组合键；在编辑器里运行 `:EitriTutor`，会带你一步步把这些键走一遍。在 Hyprland、sway 或 niri 上，聊天和页面默认是窗口，由你自己的窗口管理器平铺，这些布局键也随之关闭（`window.tiling`）。
 
 **[eitri.cc](https://eitri.cc/zh/)** 上有截图、按键、和其他方案的对比，以及环境要求和限制。
 

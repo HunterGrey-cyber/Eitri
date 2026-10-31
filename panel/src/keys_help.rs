@@ -13,6 +13,7 @@ use eitri_core::layout::{Direction, ModuleKeys};
 use eitri_core::nvim_keys::NvimReport;
 
 use eitri_core::keymap::companion::CompanionVerb;
+use eitri_core::keymap::compositor::{classify_module, ModuleVerb};
 
 use crate::agent_panel::AgentPanelHandle;
 
@@ -29,6 +30,9 @@ pub enum HelpScope {
     /// without HINT (this window has none), plus the zoom and the moves between the editor and the panel,
     /// and a root row that says where the keys go (the window, not a window manager, decides).
     PanelBesideEditor,
+    /// A chat window of compositor mode: only the keys that do something in it are listed
+    /// (`eitri_core::keymap::compositor::classify_module`), and the root rows say the compositor moves the focus.
+    ModuleWindow,
 }
 
 /// The two window-level tables of the overlay, "Anywhere in the window" then "After <prefix>", for
@@ -59,6 +63,20 @@ fn help_tables(scope: HelpScope, keymap: &Keymap, module_keys: &ModuleKeys) -> (
             }];
             root.extend(user_rows(keymap, eitri_core::keymap::companion::beside_keep));
             (root, panel_beside_editor_rows(keymap, module_keys))
+        }
+        HelpScope::ModuleWindow => {
+            let works_here = |action: &Action| {
+                matches!(
+                    classify_module(action),
+                    ModuleVerb::AsToday | ModuleVerb::AskHub | ModuleVerb::TabBreak
+                )
+            };
+            let root_works_here = |action: &Action| {
+                works_here(action) || matches!(classify_module(action), ModuleVerb::EdgeToCompositor(_))
+            };
+            let mut root = eitri_core::keymap::root::compositor_help_rows();
+            root.extend(companion_root_rows(keymap, user_rows(keymap, root_works_here)));
+            (root, keymap.help_where(module_keys, works_here))
         }
     }
 }
@@ -259,6 +277,32 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_window_of_compositor_mode_lists_no_key_that_is_off_there() {
+        let keymap = Keymap::defaults();
+        let keys = ModuleKeys::built_in();
+        let (root, prefix) = help_tables(HelpScope::ModuleWindow, &keymap, &keys);
+        assert_eq!(root, eitri_core::keymap::root::compositor_help_rows());
+        assert!(
+            root.iter().all(|row| !row.what.contains("top bar")),
+            "at the edge a key goes to the compositor: {root:?}"
+        );
+        let split = Action::Split {
+            axis: eitri_core::layout::Axis::Row,
+            cwd: Default::default(),
+        };
+        let swap = Action::Swap(eitri_core::keymap::SwapTarget::Next);
+        for action in [split, Action::Zoom, swap, Action::Even(eitri_core::layout::Axis::Row)] {
+            let what = action.describe(&keymap.prefix().human(), "");
+            assert!(
+                prefix.iter().all(|row| !row.what.starts_with(&what)),
+                "{what} is listed: {prefix:?}"
+            );
+        }
+        let tab = Action::Tab(TabAction::New).describe(&keymap.prefix().human(), "");
+        assert!(prefix.iter().any(|row| row.what.starts_with(&tab)), "{prefix:?}");
+    }
+
+    #[test]
     fn window_scope_is_the_whole_table() {
         let keymap = Keymap::defaults();
         let keys = ModuleKeys::built_in();
@@ -301,6 +345,25 @@ mod tests {
         let (root, _) = help_tables(HelpScope::PanelBesideEditor, &keymap, &keys);
         assert_eq!(root.len(), 3, "this window also has the zoom: {root:?}");
         assert_eq!(root[2].keys, "Ctrl+Alt+t");
+    }
+
+    /// A module window runs a focus move as the compositor's, so it words it that way; layout keys are off there.
+    #[test]
+    fn a_module_window_lists_the_root_keys_it_runs() {
+        let root = |key: &str, action: &str| eitri_core::keymap::KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        let keymap = Keymap::apply_user(&[root("M-y", "select.left"), root("M-z", "zoom")], &[]).unwrap();
+        let keys = ModuleKeys::built_in();
+        let (rows, _) = help_tables(HelpScope::ModuleWindow, &keymap, &keys);
+        let built_in = eitri_core::keymap::root::compositor_help_rows();
+        assert_eq!(rows.len(), built_in.len() + 1, "{rows:?}");
+        let row = rows.last().unwrap();
+        assert_eq!(row.keys, "Alt+y");
+        assert!(row.what.contains("your window manager moves focus"), "{row:?}");
     }
 
     /// Each window lists the root keys it runs and no other: a companion window runs a move toward the next window

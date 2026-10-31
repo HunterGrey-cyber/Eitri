@@ -3,6 +3,7 @@ use crate::keymap::prefix::{Press, Waiting};
 use crate::keymap::KeySpec;
 use crate::layout::{Float, FloatRect, Frame, ModuleKeys, Nav, Node, Selection, Size, Workspaces};
 use crate::lua::layout::LayoutRequest;
+use crate::window_link::names::WindowName;
 use crate::wm::chrome::ChromeModel;
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
 use crate::wm::verbs::rig::{decl, Said};
@@ -1514,7 +1515,8 @@ fn killing_an_agent_view_with_background_shells_asks_and_names_them() {
 fn new_instances_skip_the_other_windows_numbers_and_refuse_when_none_is_free() {
     use crate::wm::fake::FakePeerPort;
     let r = driven(three(editor()));
-    r.driver.attach_peer(WIN, PeerId(2), FakePeerPort::new());
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
     let held = |last| {
         (2..=last)
             .map(|n| ModuleId::instance(ModuleKind::Terminal, n).unwrap())
@@ -1550,7 +1552,7 @@ fn new_instances_skip_the_other_windows_numbers_and_refuse_when_none_is_free() {
         r.refusals_since(mark),
         vec!["no free terminal number: the two windows share terminal#2 to terminal#9"]
     );
-    r.driver.detach_peer(WIN);
+    r.driver.detach_peer(WIN, PeerId(2));
     let r = driven(three(editor()));
     for _ in 2..=9 {
         r.run(
@@ -1574,7 +1576,7 @@ fn new_instances_skip_the_other_windows_numbers_and_refuse_when_none_is_free() {
 fn a_named_scratchpad_instance_cannot_take_a_number_held_by_the_peer() {
     let r = driven(three(editor()));
     r.driver
-        .attach_peer(WIN, PeerId(2), crate::wm::fake::FakePeerPort::new());
+        .attach_peer(WIN, PeerId(2), WindowName::Second, crate::wm::fake::FakePeerPort::new());
     r.host.post(HostEvent::Peer(PeerEvent::Held {
         peer: PeerId(2),
         ids: vec![terminal2()],
@@ -1633,7 +1635,7 @@ fn the_editor_key_in_an_unlinked_window_2_asks_to_start_the_editor() {
     assert_eq!(r.refusals_since(mark), vec!["eitri could not be started".to_string()]);
 
     r.driver
-        .attach_peer(WIN, PeerId(1), crate::wm::fake::FakePeerPort::new());
+        .attach_peer(WIN, PeerId(1), WindowName::Second, crate::wm::fake::FakePeerPort::new());
     let mark = r.mark();
     r.run(Action::Module(editor()), Origin::Key { keycode: K1 });
     assert_eq!(r.chrome().prompt, None, "nothing is asked with the editor window there");
@@ -1707,6 +1709,112 @@ fn a_plugin_module_opens_by_its_own_rule_with_the_keys_as_asked() {
     );
     let rule = with(rules(), Some(own), Some(false));
     assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Down)), false));
+}
+
+fn terminal_n(n: u8) -> ModuleId {
+    ModuleId::instance(ModuleKind::Terminal, n).unwrap()
+}
+
+#[test]
+fn attaching_a_second_peer_keeps_the_first() {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(three(editor()));
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
+    r.driver
+        .attach_peer(WIN, PeerId(16), WindowName::Chat(1), FakePeerPort::new());
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(2),
+        ids: vec![terminal_n(2)],
+    }));
+    let ids = |r: &Rig| {
+        r.driver.query(|c| {
+            c.window(WIN)
+                .map(|w| w.peers().map(|(id, _)| *id).collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+    };
+    assert_eq!(ids(&r), vec![PeerId(2), PeerId(16)]);
+    assert_eq!(
+        r.driver.query(|c| c.window(WIN).and_then(|w| w.second_peer())),
+        Some(PeerId(2))
+    );
+    r.driver.detach_peer(WIN, PeerId(16));
+    assert_eq!(ids(&r), vec![PeerId(2)]);
+    assert_eq!(
+        r.driver
+            .query(|c| c.window(WIN).and_then(|w| w.held_by(&terminal_n(2)))),
+        Some(PeerId(2)),
+        "the first peer's held set is untouched"
+    );
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
+    assert_eq!(
+        ids(&r),
+        vec![PeerId(2)],
+        "attaching an attached id replaces that peer alone"
+    );
+}
+
+#[test]
+fn a_module_held_by_any_peer_is_away() {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(three(editor()));
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
+    r.driver
+        .attach_peer(WIN, PeerId(16), WindowName::Chat(1), FakePeerPort::new());
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(2),
+        ids: vec![terminal_n(2)],
+    }));
+    r.host.post(HostEvent::Peer(PeerEvent::Held {
+        peer: PeerId(16),
+        ids: vec![terminal_n(3)],
+    }));
+    let held_by = |n| {
+        r.driver
+            .query(|c| c.window(WIN).and_then(|w| w.held_by(&terminal_n(n))))
+    };
+    assert_eq!(held_by(2), Some(PeerId(2)));
+    assert_eq!(held_by(3), Some(PeerId(16)));
+    assert_eq!(held_by(4), None);
+    let mark = r.mark();
+    r.run(
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        Origin::Key { keycode: K1 },
+    );
+    assert!(
+        r.ops_since(mark)
+            .iter()
+            .any(|op| matches!(op, HostOp::CreateSurface { module, .. } if module.to_string() == "terminal#4")),
+        "a new instance counts the held sets of every peer"
+    );
+}
+
+#[test]
+fn a_peer_going_clears_only_the_question_about_that_peer() {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(three(editor()));
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
+    r.driver
+        .attach_peer(WIN, PeerId(16), WindowName::Chat(1), FakePeerPort::new());
+    r.driver.test_batch(|c| {
+        c.window_mut(WIN).unwrap().modules.end_peer = Some(PeerId(2));
+        Batch::default()
+    });
+    let asked = |r: &Rig| r.driver.query(|c| c.window(WIN).and_then(|w| w.modules.end_peer));
+    r.host.post(HostEvent::Peer(PeerEvent::LinkClosed { peer: PeerId(16) }));
+    assert_eq!(
+        asked(&r),
+        Some(PeerId(2)),
+        "another window's end leaves the question alone"
+    );
+    r.host.post(HostEvent::Peer(PeerEvent::LinkClosed { peer: PeerId(2) }));
+    assert_eq!(asked(&r), None);
 }
 
 fn open_request(id: u64) -> HostEvent {

@@ -351,6 +351,7 @@ mk_release() {
 	} >"$b/lib/eitri/RELEASE"
 	cp "$PKG/cn.huntergrey.eitri.desktop" "$b/share/applications/cn.huntergrey.eitri.desktop"
 	cp "$PKG/cn.huntergrey.eitri.Panel.desktop" "$b/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	cp "$PKG/cn.huntergrey.eitri.Page.desktop" "$b/share/applications/cn.huntergrey.eitri.Page.desktop"
 	# The nvim plugin, as the tarball lays it out: share/eitri/eitri.nvim (release.sh).
 	mkdir -p "$b/share/eitri"
 	cp -R "$PKG/../nvim/eitri.nvim" "$b/share/eitri/eitri.nvim"

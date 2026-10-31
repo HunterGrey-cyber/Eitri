@@ -17,7 +17,9 @@ use super::focus::{arrive_tail, give_keys};
 use super::host::*;
 use super::window::{WinId, Window};
 use crate::layout::ModuleId;
+use crate::onboarding::presets::TILING_KEY;
 use crate::onboarding::screen::{Effect, Screen};
+use crate::onboarding::WriteOutcome;
 
 /// The screen a window shows, and what the controller keeps beside it.
 pub struct OnboardingState {
@@ -31,6 +33,8 @@ pub struct OnboardingState {
     pub generation: u64,
     /// The date the marker file carries, from the opening.
     pub today: String,
+    /// Whether the file being written sets `window.tiling`.
+    pub writes_tiling: bool,
 }
 
 /// `window.setup`: asks the host to check and open the screen as the user asked for it. A screen already up is
@@ -75,7 +79,13 @@ pub(super) fn event(w: &mut Window, win: WinId, event: OnboardingEvent, batch: &
             let Some(state) = live(w, generation, false) else {
                 return;
             };
+            let tiling_written = state.writes_tiling && matches!(outcome, WriteOutcome::Written(_));
             let effects = state.screen.written(outcome);
+            // What the toast announces is what the user just chose against: `auto` would override the preset the
+            // screen described, on the same start.
+            if tiling_written {
+                w.first_toast = None;
+            }
             carry(w, win, effects, batch);
         }
         OnboardingEvent::CheckFailed { generation, why, .. } => {
@@ -85,6 +95,17 @@ pub(super) fn event(w: &mut Window, win: WinId, event: OnboardingEvent, batch: &
             let effects = state.screen.check_failed(why);
             carry(w, win, effects, batch);
         }
+        OnboardingEvent::NoScreen { .. } => release_first_toast(w, win, batch),
+    }
+}
+
+/// Compositor mode's first-start toast, once no screen stands in its way.
+fn release_first_toast(w: &mut Window, win: WinId, batch: &mut Batch) {
+    if w.onboarding.is_some() {
+        return;
+    }
+    if let Some(text) = w.first_toast.take() {
+        batch.push_effect(HostOp::Onboarding(OnboardingOp::Notice { win, text }));
     }
 }
 
@@ -107,6 +128,7 @@ fn open(w: &mut Window, win: WinId, opening: crate::onboarding::Opening, batch: 
         screen,
         held_module: None,
         press_timer: None,
+        writes_tiling: false,
         generation,
         today,
     });
@@ -130,11 +152,16 @@ pub(super) fn carry(w: &mut Window, win: WinId, effects: Vec<Effect>, batch: &mu
                 batch.push_effect(HostOp::Onboarding(OnboardingOp::Rescan { win, generation, extra }))
             }
             Effect::Scroll(by) => batch.push_effect(HostOp::Onboarding(OnboardingOp::Scroll { win, by })),
-            Effect::Write(generated) => batch.push_effect(HostOp::Onboarding(OnboardingOp::Write {
-                win,
-                generation,
-                generated,
-            })),
+            Effect::Write(generated) => {
+                if let Some(state) = w.onboarding.as_mut() {
+                    state.writes_tiling = generated.settings.iter().any(|(key, _)| key == TILING_KEY);
+                }
+                batch.push_effect(HostOp::Onboarding(OnboardingOp::Write {
+                    win,
+                    generation,
+                    generated,
+                }))
+            }
             Effect::Marker(event) => batch.push_effect(HostOp::Onboarding(OnboardingOp::Marker {
                 win,
                 event,
@@ -234,6 +261,7 @@ fn close(w: &mut Window, win: WinId, batch: &mut Batch) {
     }
     w.onboarding = None;
     w.say("[onboarding] screen closed".into());
+    release_first_toast(w, win, batch);
 }
 
 /// A timer fired: the press test's, when it is this screen's. `false` for any other token, including a stale one.
@@ -254,7 +282,7 @@ mod tests {
     use crate::keymap::{Action, KeyName, KeySpec, Keymap};
     use crate::layout::{Axis, Layout, ModuleKeys, ModuleKind, Node};
     use crate::onboarding::screen::{CheckWhy, Step, PRESS_TEST_TIMEOUT};
-    use crate::onboarding::{Build, DesktopRow, Found, Lang, OpenMode, Opening, TmuxRow, WmMod, WriteOutcome};
+    use crate::onboarding::{Build, DesktopRow, Found, Lang, OpenMode, Opening, TmuxRow, WmMod};
     use crate::wm::chrome::ChromeModel;
     use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
     use crate::wm::verbs::rig::{decl, rig_with, WIN};
@@ -843,6 +871,111 @@ mod tests {
             "{:?}",
             again.step()
         );
+    }
+
+    /// The notices the host was told to show.
+    fn notices(r: &Rig) -> Vec<String> {
+        r.ops_since(0)
+            .into_iter()
+            .filter_map(|op| match op {
+                HostOp::Onboarding(OnboardingOp::Notice { text, .. }) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The screen on a live sway, in a build with compositor mode, sent to write the file its fifth preset describes.
+    fn asked_to_write_the_tiling(r: &Rig) {
+        r.ask();
+        let mut with_compositor = opening(1, false);
+        with_compositor.build = Build {
+            compositor_mode: true,
+            nvim_prefix: true,
+        };
+        r.post(OnboardingEvent::Open {
+            win: WIN,
+            opening: with_compositor,
+        });
+        r.found(
+            1,
+            Found::Desktop(DesktopRow {
+                wm: Some("sway"),
+                live: true,
+                wm_mod: None,
+                note: None,
+                binds: Vec::new(),
+            }),
+        );
+        r.found(1, Found::Windows(Some(crate::onboarding::Tiling::Compositor)));
+        let mark = r.mark();
+        r.key(enter());
+        r.key(enter());
+        let sets_it = r.ops_since(mark).into_iter().any(|op| {
+            matches!(op, HostOp::Onboarding(OnboardingOp::Write { generated, .. })
+                if generated.settings.iter().any(|(key, _)| key == TILING_KEY))
+        });
+        assert!(sets_it, "the file sets the tiling");
+    }
+
+    fn write_answer(r: &Rig, outcome: WriteOutcome) {
+        r.post(OnboardingEvent::Written {
+            win: WIN,
+            generation: 1,
+            outcome,
+        });
+    }
+
+    #[test]
+    fn with_no_screen_to_come_the_first_start_toast_shows() {
+        let r = driven(two());
+        r.driver.hold_first_toast(WIN, "sway detected".into());
+        assert_eq!(notices(&r), Vec::<String>::new(), "the check has not answered yet");
+        r.post(OnboardingEvent::NoScreen { win: WIN });
+        assert_eq!(notices(&r), ["sway detected"]);
+        r.post(OnboardingEvent::NoScreen { win: WIN });
+        assert_eq!(notices(&r), ["sway detected"], "said once");
+    }
+
+    #[test]
+    fn the_first_start_toast_waits_for_the_screen_to_close() {
+        let r = driven(two());
+        r.driver.hold_first_toast(WIN, "sway detected".into());
+        r.open();
+        r.post(OnboardingEvent::NoScreen { win: WIN });
+        assert_eq!(notices(&r), Vec::<String>::new(), "never over the screen");
+        r.key(enter());
+        r.key(enter());
+        write_answer(&r, WriteOutcome::Written(PathBuf::from("/scratch/config/init.lua")));
+        assert_eq!(notices(&r), Vec::<String>::new());
+        r.key(enter());
+        assert_eq!(r.step(), None, "the screen has closed");
+        assert_eq!(
+            notices(&r),
+            ["sway detected"],
+            "a file that leaves the tiling alone keeps the toast"
+        );
+    }
+
+    #[test]
+    fn a_window_tiling_line_the_screen_wrote_drops_the_first_start_toast() {
+        let r = driven(two());
+        r.driver.hold_first_toast(WIN, "sway detected".into());
+        asked_to_write_the_tiling(&r);
+        write_answer(&r, WriteOutcome::Written(PathBuf::from("/scratch/config/init.lua")));
+        r.key(enter());
+        assert_eq!(r.step(), None, "the screen has closed");
+        assert_eq!(notices(&r), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_window_tiling_line_that_was_not_written_keeps_the_first_start_toast() {
+        let r = driven(two());
+        r.driver.hold_first_toast(WIN, "sway detected".into());
+        asked_to_write_the_tiling(&r);
+        write_answer(&r, WriteOutcome::Failed("the disk is full".into()));
+        r.key(escape());
+        assert_eq!(r.step(), None, "the screen has closed");
+        assert_eq!(notices(&r), ["sway detected"]);
     }
 
     #[test]

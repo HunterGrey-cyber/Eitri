@@ -339,6 +339,10 @@ class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
         )
         self.assertEqual(public["homepage"], "https://github.com/HunterGrey-cyber/eitri")
 
+    def test_both_descriptions_open_with_the_tagline(self):
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            self.assertEqual(_load_yaml(path)["description"].splitlines()[0], TAGLINE, path)
+
     def test_both_descriptions_end_with_the_source_url_placeholder(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             description = _load_yaml(path)["description"]
@@ -397,8 +401,11 @@ DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.desktop"
 # application of its own to match.
 PANEL_DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.Panel.desktop"
 PANEL_DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
-DESKTOP_SRCS = [DESKTOP_SRC, PANEL_DESKTOP_SRC]
-DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST]
+# The page window's entry (`eitri %f`, window class cn.huntergrey.eitri.Page): hidden likewise.
+PAGE_DESKTOP_SRC = "./packaging/cn.huntergrey.eitri.Page.desktop"
+PAGE_DESKTOP_DST = "/usr/share/applications/cn.huntergrey.eitri.Page.desktop"
+DESKTOP_SRCS = [DESKTOP_SRC, PANEL_DESKTOP_SRC, PAGE_DESKTOP_SRC]
+DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST, PAGE_DESKTOP_DST]
 # The nvim plugin: every file under nvim/eitri.nvim, at the same relative path under this directory.
 NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
 NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/init.lua", "plugin/eitri.lua"]
@@ -414,8 +421,8 @@ GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
 # The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build, in one window."
-TAGLINE_ZH = "你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。"
+TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build."
+TAGLINE_ZH = "你的 Neovim，和 agent、终端、你自己做的网页平铺在一起。"
 # Every file under packaging/icons/hicolor, as the package path it must land at.
 ICON_FILES = {
     "16x16/apps/cn.huntergrey.eitri.png",
@@ -469,6 +476,23 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
             "Terminal=false",
         ):
             self.assertIn(line, lines)
+
+    def test_the_page_desktop_entry_is_hidden_and_opens_a_page_window(self):
+        with open(os.path.join(_HERE, "cn.huntergrey.eitri.Page.desktop"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(
+            lines,
+            [
+                "[Desktop Entry]",
+                "Type=Application",
+                "Name=Eitri page",
+                "Exec=eitri %f",
+                f"Icon={ICON_NAME}",
+                "NoDisplay=true",
+                "StartupWMClass=cn.huntergrey.eitri.Page",
+                "Terminal=false",
+            ],
+        )
 
     def test_the_gnome_extension_ships_its_four_files_and_no_test_code(self):
         root = os.path.join(_HERE, "..", "gnome-extension")

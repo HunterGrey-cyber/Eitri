@@ -5,13 +5,17 @@
 //! (`spawn`), and the two talk over the link (`driver`). Window 2 is the same executable, started as `eitri
 //! linked-window`: a full window with no editor, whose plugin pages and Lua panels stay with window 1. A window
 //! that finds the pair lock held by another runs unpaired: it never starts a second window and never writes the
-//! pair's files. The pieces here that decide something are plain functions over the layout, so they are tested
-//! without a display; the GTK wiring is `build_ui`'s.
+//! pair's files. Window 1 may also start module windows, each showing one chat or one plugin page, each with its own
+//! link to window 1 (`registry`). The pieces here that decide something are plain functions over the layout, so they
+//! are tested without a display; the GTK wiring is `build_ui`'s.
 
 pub mod driver;
 pub mod editor;
 pub(crate) mod focus;
+pub mod group_tabs;
+pub mod hand_over;
 pub mod pair_files;
+pub mod registry;
 pub mod relink;
 pub mod review;
 pub mod spawn;
@@ -25,6 +29,7 @@ use std::rc::Rc;
 
 use eitri_core::layout::workspace::Workspaces;
 use eitri_core::layout::{Frame, Layout, LayoutError, ModuleId, ModuleKind};
+use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::pair::PairLock;
 use eitri_core::window_link::start;
 use neovide_editor::NeovideEditorPane;
@@ -51,6 +56,8 @@ pub enum WindowRole {
     Main { link: Option<LinkDriver> },
     /// The window started by window 1, with no editor.
     Second { link: LinkDriver },
+    /// A chat or page window started by window 1, its hub, with no editor.
+    Module { name: WindowName, link: LinkDriver },
     /// A full window on a project whose pair another window holds.
     Unpaired,
 }
@@ -81,9 +88,9 @@ impl WindowRole {
         }
     }
 
-    /// Whether this window builds and owns the editor: every window but window 2.
+    /// Whether this window builds and owns the editor: every window but those window 1 started.
     pub fn owns_editor(&self) -> bool {
-        !matches!(self, WindowRole::Second { .. })
+        !matches!(self, WindowRole::Second { .. } | WindowRole::Module { .. })
     }
 
     /// Whether this window reads and writes the project's plain layout and tabs files. Window 2 and an unpaired
@@ -96,7 +103,7 @@ impl WindowRole {
     pub fn link(&self) -> Option<&LinkDriver> {
         match self {
             WindowRole::Main { link } => link.as_ref(),
-            WindowRole::Second { link } => Some(link),
+            WindowRole::Second { link } | WindowRole::Module { link, .. } => Some(link),
             WindowRole::Alone | WindowRole::Unpaired => None,
         }
     }
@@ -107,8 +114,8 @@ impl WindowRole {
             WindowRole::Unpaired => WindowNew::Refuse(UNPAIRED_REFUSAL),
             WindowRole::Main { link: Some(link) } if link.is_up() => WindowNew::Raise,
             WindowRole::Main { .. } => WindowNew::Spawn,
-            // Window 2's other window is window 1, which is already there.
-            WindowRole::Second { .. } => WindowNew::Raise,
+            // Window 2's other window is window 1, which is already there; so is a module window's.
+            WindowRole::Second { .. } | WindowRole::Module { .. } => WindowNew::Raise,
         }
     }
 
@@ -117,7 +124,7 @@ impl WindowRole {
         use eitri_core::window_link::pair::Role;
         match self {
             WindowRole::Alone | WindowRole::Main { .. } => Role::Main,
-            WindowRole::Second { .. } => Role::Second,
+            WindowRole::Second { .. } | WindowRole::Module { .. } => Role::Second,
             WindowRole::Unpaired => Role::Unpaired,
         }
     }
@@ -126,7 +133,9 @@ impl WindowRole {
     pub fn wm_spec_role(&self) -> (eitri_core::wm::WindowRole, eitri_core::wm::EditorPresence) {
         use eitri_core::wm::{EditorPresence, LinkSide, WindowRole as WmRole};
         match self {
-            WindowRole::Second { .. } => (WmRole::Linked { side: LinkSide::Second }, EditorPresence::None),
+            WindowRole::Second { .. } | WindowRole::Module { .. } => {
+                (WmRole::Linked { side: LinkSide::Second }, EditorPresence::None)
+            }
             _ => (WmRole::Main, EditorPresence::Owned),
         }
     }
@@ -172,11 +181,20 @@ pub enum WindowStart {
         /// Started again by window 1's launch (`--restore`), as the pair last ended.
         restore: bool,
     },
+    /// `eitri linked-window --module ...`: the chat or page window `name`, its link end checked and owned.
+    Module {
+        name: WindowName,
+        root: PathBuf,
+        sock: OwnedFd,
+        token: Option<String>,
+        /// Started again by window 1, as it was (`--restore`).
+        restore: bool,
+    },
 }
 
-/// Window 2's first acts, before anything else in the process can open, inherit or print: `args` (what follows
+/// A started window's first acts, before anything else in the process can open, inherit or print: `args` (what follows
 /// `linked-window`) parsed, the link end made close-on-exec, checked and owned, then the window's own log put on
-/// stdout and stderr. An error is the reason window 2 cannot start; a log that cannot be opened is not one, since
+/// stdout and stderr. An error is the reason the window cannot start; a log that cannot be opened is not one, since
 /// stdout and stderr are `/dev/null` from the spawn and a write there cannot fail.
 pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
     let parsed = start::parse_args(args)?;
@@ -185,7 +203,7 @@ pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     );
-    if let Some(log) = home.and_then(|home| start::open_log(&home, &parsed.root).ok()) {
+    if let Some(log) = home.and_then(|home| start::open_log(&home, &parsed.root, &parsed.name()).ok()) {
         // SAFETY: `dup2` onto the standard descriptors, from a descriptor open for the call. Nothing else in the
         // process runs yet, so nothing is writing to either.
         unsafe {
@@ -193,12 +211,36 @@ pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
             libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
         }
     }
-    Ok(WindowStart::Second {
-        root: parsed.root,
-        sock,
-        token: parsed.token,
-        restore: parsed.restore,
-    })
+    Ok(linked_start(parsed, sock))
+}
+
+/// The start a checked command line asks for, with its link end: `--module` names a module window, and without it
+/// the window is window 2.
+fn linked_start(parsed: start::LinkedArgs, sock: OwnedFd) -> WindowStart {
+    let name = parsed.name();
+    let start::LinkedArgs {
+        root,
+        token,
+        restore,
+        module,
+        ..
+    } = parsed;
+    if module.is_some() {
+        WindowStart::Module {
+            name,
+            root,
+            sock,
+            token,
+            restore,
+        }
+    } else {
+        WindowStart::Second {
+            root,
+            sock,
+            token,
+            restore,
+        }
+    }
 }
 
 /// `<state home>`: `$XDG_STATE_HOME` when it is absolute, else `$HOME/.local/state`, the rule every state
@@ -267,6 +309,17 @@ pub enum LinkEnd {
     Bye { why: String },
     /// The link reached its end with no `bye`: the other window died, or the link broke.
     Eof,
+}
+
+/// How a module window's `bye` ends when it goes without the user having closed what it holds.
+pub(crate) const KEPT_WORDS: &str = "closed, kept for the next start";
+
+impl LinkEnd {
+    /// The window at the other end was closed, and what it held with it. An end with no `bye` is not that, nor is a `bye`
+    /// that says the window is kept: only window 1 can hold a window's tabs and place for its next start.
+    pub fn closed_for_good(&self) -> bool {
+        matches!(self, LinkEnd::Bye { why } if !why.ends_with(KEPT_WORDS))
+    }
 }
 
 /// Loads `module`'s page again, from its store as it is now: a plugin's page with no view here (never built, or
@@ -672,6 +725,57 @@ pub(crate) mod tests {
         );
         assert_eq!(WindowRole::Alone.pair_role(), Role::Main);
         assert_eq!(WindowRole::Main { link: None }.pair_role(), Role::Main);
+    }
+
+    #[test]
+    fn a_module_command_line_starts_a_module_window() {
+        let start_of = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            let (end, _other) = eitri_core::window_link::fdpass::seqpacket_pair().unwrap();
+            linked_start(start::parse_args(&args).unwrap(), end)
+        };
+        match start_of(&["--restore", "--module", "chat:3", "3", "c3", "/p", "token"]) {
+            WindowStart::Module {
+                name,
+                root,
+                token,
+                restore,
+                ..
+            } => {
+                assert_eq!(name, WindowName::Chat(3));
+                assert_eq!(root, Path::new("/p"));
+                assert_eq!(token.as_deref(), Some("token"));
+                assert!(restore);
+            }
+            _ => panic!("--module starts a module window"),
+        }
+        assert!(matches!(
+            start_of(&["--module", "page:markdown", "3", "p:markdown", "/p"]),
+            WindowStart::Module { name: WindowName::Page(id), token: None, restore: false, .. } if id == "markdown"
+        ));
+        assert!(matches!(start_of(&["3", "2", "/p"]), WindowStart::Second { .. }));
+    }
+
+    #[test]
+    fn a_module_window_has_no_editor_and_none_of_the_main_files() {
+        let (driver, _theirs, _inbound) = driver::tests::pair();
+        let role = WindowRole::Module {
+            name: WindowName::Chat(2),
+            link: driver,
+        };
+        assert!(!role.owns_editor());
+        assert!(!role.writes_main_files());
+        assert!(role.link().is_some());
+        assert_eq!(role.window_new(), WindowNew::Raise, "window 1 is already there");
+        assert_eq!(
+            role.wm_spec_role(),
+            (
+                eitri_core::wm::WindowRole::Linked {
+                    side: eitri_core::wm::LinkSide::Second
+                },
+                eitri_core::wm::EditorPresence::None
+            )
+        );
     }
 
     #[test]

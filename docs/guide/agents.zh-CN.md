@@ -1,9 +1,9 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=6f3d38177133c5d5d7ee4256aaffedd4c5a3d6292895c81f37ab6ae63451fff8 -->
+<!-- translated-from: agents.md sha256=0a9e69ba5e90e06eb7ed5b9283a89492249ffad4e549cbbeba3c95d562b65a5b -->
 
 # Codex 与其他 agent
 
-agent 面板里的每个标签页都运行一个 agent，创建标签页时选定。默认是 Claude Code。一个标签页也可以运行 Codex，或者任何你注册的、通过标准输入输出说 Agent Client Protocol（ACP）的 agent。这一页讲这两种需要准备什么、怎样打开这样的标签页、Eitri 在启动之前会问你什么、谁来回答 agent 的请求，以及和 Claude 标签页相比，哪些地方更弱或者没有。
+agent 面板里的每个标签页都运行一个 agent，创建标签页时选定。在 Hyprland、sway 和 niri 上，面板默认是一个独立的窗口（[合成器窗口](compositor-windows.zh-CN.md)）。默认的 agent 是 Claude Code。一个标签页也可以运行 Codex，或者任何你注册的、通过标准输入输出说 Agent Client Protocol（ACP）的 agent。这一页讲这两种需要准备什么、怎样打开这样的标签页、Eitri 在启动之前会问你什么、谁来回答 agent 的请求，以及和 Claude 标签页相比，哪些地方更弱或者没有。
 
 Eitri 运行的是你自己安装并登录好的 agent；它不附带其中任何一个。面板、按键、队列、[回合审阅](turn-review.zh-CN.md)以及[快速上手](getting-started.zh-CN.md)的其余内容，在每个标签页里都一样。关于[权限](permissions.zh-CN.md)和 [Claude 账号](configuration.zh-CN.md#accounts)的页面只描述 Claude 标签页，除非这一页另有说明。
 

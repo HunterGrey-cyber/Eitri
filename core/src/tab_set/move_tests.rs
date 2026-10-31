@@ -328,6 +328,22 @@ fn partner() -> Partner {
     }
 }
 
+fn partner_of(pid: u32) -> Partner {
+    Partner { pid, ..partner() }
+}
+
+#[test]
+fn a_window_stays_linked_until_its_last_partner_goes() {
+    let mut set = set();
+    set.add_partner(partner_of(100));
+    set.add_partner(partner_of(200));
+    assert!(set.is_linked());
+    assert!(set.remove_partner(100, false).is_empty());
+    assert!(set.is_linked(), "the other link is still up");
+    assert!(set.remove_partner(200, false).is_empty());
+    assert!(!set.is_linked());
+}
+
 #[test]
 fn adopt_moved_keeps_every_handed_over_field_through_the_first_tick_and_delivery() {
     let dir = workspace("move-keeps-fields");
@@ -1201,6 +1217,56 @@ fn a_linked_window_without_turn_review_still_announces_its_turns() {
     assert!(
         set.take_untracked_turn_edges(50).is_empty(),
         "nothing after the link ends"
+    );
+    shut_down(&mut set);
+}
+
+#[test]
+fn a_turn_that_ran_between_two_looks_is_still_announced() {
+    use crate::window_link::EdgeKind;
+    let dir = workspace("move-untracked-brief");
+    let mut set = set();
+    let (provider, tab) = live_tab(&mut set, &dir);
+    provider.queue(opened(&dir));
+    pump_until(&mut set, &dir, "the session", |s| {
+        s.get(tab).unwrap().provider_session_id().is_some()
+    });
+    let _ = set.set_partner(Some(partner()));
+    assert!(set.take_untracked_turn_edges(10).is_empty());
+
+    // The ingestion thread folds the whole turn with no tick in between, so no look sees it running.
+    provider.queue(started("t0"));
+    until("the turn", || set.get(tab).unwrap().turn_running());
+    provider.queue(completed("t0"));
+    until("its end", || !set.get(tab).unwrap().turn_running());
+    set.pump(&dir, true);
+    let edges = set.take_untracked_turn_edges(20);
+    assert_eq!(
+        edges
+            .iter()
+            .map(|edge| (edge.session.as_str(), edge.edge, edge.at_ns))
+            .collect::<Vec<_>>(),
+        [("sess-move", EdgeKind::Started, 20), ("sess-move", EdgeKind::Ended, 20)],
+        "it started and ended here, in that order"
+    );
+    assert!(set.take_untracked_turn_edges(30).is_empty(), "each edge once");
+
+    // A turn a look saw running is announced by the look, and only by it, wherever its start was delivered.
+    provider.queue(started("t1"));
+    until("the next turn", || set.get(tab).unwrap().turn_running());
+    let seen = set.take_untracked_turn_edges(crate::turn_review::monotonic_ns());
+    assert!(
+        matches!(&seen[..], [edge] if edge.edge == EdgeKind::Started),
+        "{seen:?}"
+    );
+    set.pump(&dir, true);
+    assert!(set.take_untracked_turn_edges(40).is_empty(), "the look told it already");
+    provider.queue(completed("t1"));
+    pump_until(&mut set, &dir, "its end", |s| !s.get(tab).unwrap().turn_running());
+    let ended = set.take_untracked_turn_edges(50);
+    assert!(
+        matches!(&ended[..], [edge] if edge.edge == EdgeKind::Ended),
+        "{ended:?}"
     );
     shut_down(&mut set);
 }

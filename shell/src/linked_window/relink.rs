@@ -1,4 +1,4 @@
-//! An orphaned window 2 and the window 1 that comes back for it.
+//! An orphaned window of a group and the window 1 that comes back for it.
 //!
 //! When the link ends without window 2 asking -- window 1 closed cleanly and said `bye`, or it died -- window 2 stays
 //! up with no editor and keeps holding the pair lock, so no other window can take the pair over. It then listens on
@@ -19,6 +19,17 @@
 //! turns running in the orphan, so none of them is unseen by the new window's turn review. Neither side has
 //! confirmed its presence in the handshake: each counts the other as another window until the other says so.
 //!
+//! A module window orphaned by its window 1 dying waits the same way, on a socket of its own,
+//! `w-<16 hex>-<file form>.sock`, since each orphan serves one connection at a time and a group has several. A window 1
+//! that finds no window 2 waiting lists those sockets ([`relink_all`]) and connects to each on a worker of its own, all
+//! inside one [`RELINK_WITHIN`]: an orphan that misses the bound is left waiting and the others link. A `bye` to a
+//! module window means its group closed, and it closes rather than waits. A late orphan has no timeout of its own: it
+//! waits out the window that left it, whose claim keeps other starts off, and the first start after that links it.
+//!
+//! Each orphan answers whoever comes first, so two starts could each win a part of a group, and the lock copies they
+//! adopt do not exclude each other. The [`GroupClaim`] orders them: a start takes it before it connects to any module
+//! window and keeps it for as long as it runs, so a start that finds it held links nothing and runs unpaired.
+//!
 //! The orphan's editor key offers to start the editor window: `eitri <root>` from this executable, in a session of its
 //! own with its standard streams on `/dev/null`, its exit reaped by a thread of this window and never waited for.
 
@@ -30,14 +41,15 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eitri_core::layout::{ModuleId, ModuleKind};
 use eitri_core::window_link::fdpass;
 use eitri_core::window_link::link::{Inbound, LinkHandle, PresenceFlag};
-use eitri_core::window_link::pair::{pair_lock_name, PairLock};
+use eitri_core::window_link::names::WindowName;
+use eitri_core::window_link::pair::{pair_lock_name, GroupClaim, PairLock};
 use eitri_core::window_link::start::SECOND_WINDOW;
 use eitri_core::window_link::{Msg, Summary, TurnEdge};
 
@@ -67,17 +79,37 @@ pub fn orphan_dir() -> PathBuf {
     eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir())
 }
 
-/// `dir/w-<16 hex>.sock`, checked against the socket path limit.
+/// Window 2's socket, `dir/w-<16 hex>.sock`, checked against the socket path limit.
 pub fn socket_path(dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
-    agent::socket_path::in_dir(
-        dir,
-        &format!("w-{}.sock", eitri_core::state_paths::project_key(project_root)),
-    )
+    socket_path_for(dir, project_root, &WindowName::Second)
 }
 
-/// `dir/w-<16 hex>.lock`, held while a socket in the way is judged and reclaimed.
-fn lock_path(dir: &Path, project_root: &Path) -> PathBuf {
-    dir.join(format!("w-{}.lock", eitri_core::state_paths::project_key(project_root)))
+/// The socket the window `name` waits on, checked against the socket path limit: window 2's `w-<16 hex>.sock`, a module
+/// window's `w-<16 hex>-<file form>.sock`. A page's file form is a hash of fixed length, so the length does not depend
+/// on the page's id.
+pub fn socket_path_for(dir: &Path, project_root: &Path, name: &WindowName) -> io::Result<PathBuf> {
+    agent::socket_path::in_dir(dir, &format!("{}.sock", file_stem(project_root, name)))
+}
+
+/// `dir/<the same name>.lock`, held while a socket in the way is judged and reclaimed.
+fn lock_path_for(dir: &Path, project_root: &Path, name: &WindowName) -> PathBuf {
+    dir.join(format!("{}.lock", file_stem(project_root, name)))
+}
+
+fn file_stem(project_root: &Path, name: &WindowName) -> String {
+    let key = eitri_core::state_paths::project_key(project_root);
+    match name {
+        WindowName::Second => format!("w-{key}"),
+        module => format!("w-{key}-{}", module.file_form()),
+    }
+}
+
+/// What the user calls the window `name` in a refusal.
+fn called(name: &WindowName) -> String {
+    match name {
+        WindowName::Second => "window 2".to_string(),
+        module => format!("the window {}", module.text()),
+    }
 }
 
 fn euid() -> u32 {
@@ -184,9 +216,9 @@ fn probe(path: &Path) -> InTheWay {
     }
 }
 
-/// An exclusive `flock` on the reclaim lock file, released when it is dropped. Taken without waiting: the window
-/// holding the pair lock is the only one that binds this socket, so a lock held by another means something else is
-/// at work here, and nothing is reclaimed.
+/// An exclusive `flock` on the reclaim lock file, released when it is dropped. Taken without waiting: one window of the
+/// group is the only one that binds a given name, so a lock held by another means something else is at work here, and
+/// nothing is reclaimed.
 struct ReclaimLock(#[allow(dead_code)] std::fs::File);
 
 impl ReclaimLock {
@@ -229,11 +261,17 @@ pub struct OrphanSocket {
 }
 
 impl OrphanSocket {
-    /// Binds `w-<16 hex>.sock` for `project_root` in `dir`, which is made if missing and must be a private directory
-    /// of this user. A socket in the way is taken over only when nothing listens on it.
+    /// Binds window 2's socket.
+    #[cfg(test)]
     pub fn bind(dir: &Path, project_root: &Path) -> Result<OrphanSocket, String> {
+        OrphanSocket::bind_as(dir, project_root, &WindowName::Second)
+    }
+
+    /// Binds the socket of the window `name` ([`socket_path_for`]) for `project_root` in `dir`, which is made if missing
+    /// and must be a private directory of this user. A socket in the way is taken over only when nothing listens on it.
+    pub fn bind_as(dir: &Path, project_root: &Path, name: &WindowName) -> Result<OrphanSocket, String> {
         eitri_core::panel_control::ensure_dir(dir)?;
-        let path = socket_path(dir, project_root).map_err(|e| e.to_string())?;
+        let path = socket_path_for(dir, project_root, name).map_err(|e| e.to_string())?;
         let busy = |e: &io::Error| e.kind() == io::ErrorKind::AddrInUse;
         match listen_at(&path) {
             Ok(fd) => return OrphanSocket::bound(fd, path),
@@ -241,7 +279,7 @@ impl OrphanSocket {
             Err(e) => return Err(format!("could not bind {}: {e}", path.display())),
         }
         // Held until the new socket is bound, so a reclaim and its bind are never split by another claim.
-        let _lock = ReclaimLock::take(&lock_path(dir, project_root))?;
+        let _lock = ReclaimLock::take(&lock_path_for(dir, project_root, name))?;
         match listen_at(&path) {
             Ok(fd) => return OrphanSocket::bound(fd, path),
             Err(e) if busy(&e) => {}
@@ -337,17 +375,23 @@ pub fn peer_of(conn: &OwnedFd) -> Option<Partner> {
     (pid != 0).then_some(Partner { pid, start })
 }
 
-/// What `bye` tells a window 1 of another build, with the way to get the pair back.
-pub fn another_build_text(theirs: &str, ours: &str) -> String {
+/// What the orphan `who` tells a window 1 of another build with `bye`, with the way to get the pair back.
+pub fn another_build_text(who: &str, theirs: &str, ours: &str) -> String {
     format!(
-        "window 2 runs another build of Eitri ({ours}, the new window is {}): close window 2, then run eitri again",
+        "{who} runs another build of Eitri ({ours}, the new window is {}): close {who}, then run eitri again",
         shown(theirs)
     )
 }
 
-/// Checks the `hello` of a window 1 that connected to the orphan: of this `build`, calling itself window 1, said by
-/// the process that connected (`peer`). The partner it names, or why it is refused.
+/// [`check_relink_hello_to`] for window 2.
+#[cfg(test)]
 pub fn check_relink_hello(msg: &Msg, build: &str, peer: Option<Partner>) -> Result<Partner, String> {
+    check_relink_hello_to("window 2", msg, build, peer)
+}
+
+/// Checks the `hello` of a window 1 that connected to the orphan `who`: of this `build`, calling itself window 1, said
+/// by the process that connected (`peer`). The partner it names, or why it is refused.
+fn check_relink_hello_to(who: &str, msg: &Msg, build: &str, peer: Option<Partner>) -> Result<Partner, String> {
     let Msg::Hello {
         build: theirs,
         window,
@@ -362,7 +406,7 @@ pub fn check_relink_hello(msg: &Msg, build: &str, peer: Option<Partner>) -> Resu
         ));
     };
     if theirs != build {
-        return Err(another_build_text(theirs, build));
+        return Err(another_build_text(who, theirs, build));
     }
     if window != FIRST_WINDOW {
         return Err(format!("the new window calls itself window {}", shown(window)));
@@ -405,12 +449,29 @@ pub fn welcome_holders(held: &BTreeSet<String>) -> BTreeMap<String, String> {
 /// The orphan's `welcome` to a window 1 that came back: what it holds now and the turns running in it, its
 /// presence not confirmed yet. The feeds are window 1's to send.
 pub fn relink_welcome(held: &BTreeSet<String>, running: Vec<TurnEdge>) -> Msg {
+    welcome_from(SECOND_WINDOW.to_string(), welcome_holders(held), running)
+}
+
+/// As [`relink_welcome`], from the orphan `name`. A module window says its own name and holds its one module, which
+/// its name gives whatever its layout calls it (a chat window's base chat is its `agent#N`).
+pub fn relink_welcome_as(name: &WindowName, held: &BTreeSet<String>, running: Vec<TurnEdge>) -> Msg {
+    match name.module() {
+        Some(module) => welcome_from(
+            name.text(),
+            BTreeMap::from([(module.as_str().to_string(), name.text())]),
+            running,
+        ),
+        None => relink_welcome(held, running),
+    }
+}
+
+fn welcome_from(window: String, holders: BTreeMap<String, String>, running: Vec<TurnEdge>) -> Msg {
     Msg::Welcome {
-        window: SECOND_WINDOW.to_string(),
+        window,
         presence_ready: false,
         running,
         summary: Summary::default(),
-        holders: welcome_holders(held),
+        holders,
         context: None,
         theme: None,
         keys: None,
@@ -435,7 +496,11 @@ pub fn answer_relink_hello(
     if link.linked() {
         return Err("a second hello on a linked link".into());
     }
-    let partner = match check_relink_hello(msg, build, peer) {
+    let who = match &welcome {
+        Msg::Welcome { window, .. } => WindowName::parse(window).map_or_else(|_| "this window".into(), |n| called(&n)),
+        _ => "this window".to_string(),
+    };
+    let partner = match check_relink_hello_to(&who, msg, build, peer) {
         Ok(partner) => partner,
         Err(why) => return refuse(why),
     };
@@ -454,8 +519,10 @@ pub fn answer_relink_hello(
     Ok(partner)
 }
 
-/// A window 1 linked to an orphaned window 2, handed from the worker that made the link to the window it starts.
+/// A window 1 linked to an orphan, handed from the worker that made the link to the window it starts.
 pub struct Relinked {
+    /// The orphan's name, as its `welcome` said it and its socket's name confirmed it.
+    pub name: WindowName,
     pub handle: LinkHandle,
     pub inbound: Receiver<Inbound>,
     /// Set while the orphan counts as another window for turn review: from the handshake until it confirms.
@@ -479,6 +546,39 @@ pub fn refusal_note(why: &str) -> Option<String> {
     (why != NO_ORPHAN_TEXT).then(|| format!("not linked to window 2: {why}; this window runs unpaired"))
 }
 
+/// As [`refusal_note`], for the module windows waiting when no window 2 was.
+pub fn group_refusal_note(why: &str) -> String {
+    format!("not linked to the windows waiting for this project: {why}; this window runs unpaired")
+}
+
+/// Who a re-link expects at the end of a socket.
+enum Waiting {
+    Second,
+    /// A module window, by the file form its socket's name carries.
+    Module {
+        form: String,
+    },
+}
+
+impl Waiting {
+    fn who(&self) -> String {
+        match self {
+            Waiting::Second => "window 2".to_string(),
+            Waiting::Module { form } => format!("the window {form}"),
+        }
+    }
+
+    /// The window a `welcome` on this socket names, when that is the one that waits here. A name is the other
+    /// window's input: only its match with the socket's own name makes it a name this window keeps.
+    fn named(&self, said: &str) -> Result<WindowName, String> {
+        let name = WindowName::parse(said).ok().filter(|name| match self {
+            Waiting::Second => *name == WindowName::Second,
+            Waiting::Module { form } => *name != WindowName::Second && name.file_form() == *form,
+        });
+        name.ok_or_else(|| format!("welcome came from window {}", shown(said)))
+    }
+}
+
 /// A window 1 starting for a project whose pair lock is held: connects once to the orphan's socket in `dir`, on a
 /// worker thread this call joins, bounded by `within`. `layout_dir` is where this project's pair lock file is, which
 /// the lock in the `welcome` must be. `Err` says why there is no re-link; the window then runs unpaired.
@@ -494,11 +594,136 @@ pub fn relink(
     let deadline = Instant::now() + within;
     let worker = std::thread::Builder::new()
         .name("eitri-relink".into())
-        .spawn(move || relink_on(&path, &lock_file, build, deadline, within))
+        .spawn(move || relink_on(&path, &lock_file, build, deadline, within, &Waiting::Second))
         .map_err(|e| format!("the re-link could not be started ({e})"))?;
     worker
         .join()
         .unwrap_or_else(|_| Err("the re-link stopped unexpectedly".into()))
+}
+
+/// The module windows' sockets waiting in `dir` for this project, each with the file form its name carries. Window 2's
+/// socket has no part after the key and is not among them.
+fn module_sockets(dir: &Path, project_root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("{} could not be listed ({err})", dir.display())),
+    };
+    let prefix = format!("w-{}-", eitri_core::state_paths::project_key(project_root));
+    let mut sockets = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(text) = file_name.to_str() else { continue };
+        let form = text.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(".sock"));
+        if let (Some(form), Ok(path)) = (form, agent::socket_path::in_dir(dir, text)) {
+            sockets.push((path, form.to_string()));
+        }
+    }
+    Ok(sockets)
+}
+
+/// A window 1 that found no window 2 waiting: connects to every module window waiting in `dir`, each on a worker of its
+/// own, all inside one `within` from now, and gives back every one that welcomed it in time, each with its own copy of
+/// the pair lock, checked as [`relink`] checks it. One that misses the bound or refuses is left to go on waiting. A
+/// socket nothing listens on is a leftover, which is no refusal. `Err` says why none linked when one refused and none
+/// came.
+pub fn relink_all(
+    dir: &Path,
+    layout_dir: &Path,
+    project_root: &Path,
+    build: String,
+    within: Duration,
+) -> Result<Vec<Relinked>, String> {
+    let sockets = module_sockets(dir, project_root)?;
+    let lock_file = layout_dir.join(pair_lock_name(project_root));
+    let deadline = Instant::now() + within;
+    let (done, results) = mpsc::channel();
+    let mut refusals = Vec::new();
+    let mut asked = 0;
+    for (path, form) in sockets {
+        let (done, lock_file, build) = (done.clone(), lock_file.clone(), build.clone());
+        let started = std::thread::Builder::new().name("eitri-relink".into()).spawn(move || {
+            let waiting = Waiting::Module { form };
+            // Nobody reads this after the bound: the link it made goes with it, and the orphan waits again.
+            let _ = done.send(relink_on(&path, &lock_file, build, deadline, within, &waiting));
+        });
+        match started {
+            Ok(_) => asked += 1,
+            Err(err) => refusals.push(format!("the re-link could not be started ({err})")),
+        }
+    }
+    drop(done);
+    let mut relinked = Vec::new();
+    for _ in 0..asked {
+        // Waits on the results rather than joining the workers: a worker past the bound holds nobody up.
+        match results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(one)) => relinked.push(one),
+            Ok(Err(why)) if why == NO_ORPHAN_TEXT => {}
+            Ok(Err(why)) => refusals.push(why),
+            Err(_) => {
+                refusals.push(format!("a window did not answer within {} ms", within.as_millis()));
+                break;
+            }
+        }
+    }
+    for why in &refusals {
+        println!("[window] a waiting window is not linked: {why}");
+    }
+    relinked.sort_by(|a, b| a.name.cmp(&b.name));
+    match refusals.into_iter().next() {
+        Some(why) if relinked.is_empty() => Err(why),
+        _ => Ok(relinked),
+    }
+}
+
+/// What a window 1 starting for a project whose pair lock is held found waiting.
+pub enum StartRelink {
+    /// Nobody it could link to: it runs unpaired.
+    Nothing,
+    Window2(Relinked),
+    /// Every orphan that linked, and the claim on their group, which the window keeps for as long as it runs.
+    Modules(Vec<Relinked>, GroupClaim),
+}
+
+/// A window 1's start on a project whose pair lock is held: window 2's orphan first, and only when none waits, every
+/// module window. What it found, and the note to show when something waiting refused it.
+pub fn relink_at_start(
+    dir: &Path,
+    layout_dir: &Path,
+    project_root: &Path,
+    build: String,
+    within: Duration,
+) -> (StartRelink, Option<String>) {
+    let why = match relink(dir, layout_dir, project_root, build.clone(), within) {
+        Ok(one) => return (StartRelink::Window2(one), None),
+        Err(why) if why != NO_ORPHAN_TEXT => {
+            println!("[window] no re-link: {why}; this window runs unpaired");
+            return (StartRelink::Nothing, refusal_note(&why));
+        }
+        Err(why) => why,
+    };
+    let claim = match GroupClaim::try_take(layout_dir, project_root) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            println!("[window] no re-link: another window leads this project's group; this window runs unpaired");
+            return (StartRelink::Nothing, None);
+        }
+        Err(err) => {
+            println!("[window] no re-link: the group cannot be claimed ({err}); this window runs unpaired");
+            return (StartRelink::Nothing, None);
+        }
+    };
+    match relink_all(dir, layout_dir, project_root, build, within) {
+        Ok(group) if !group.is_empty() => (StartRelink::Modules(group, claim), None),
+        Ok(_) => {
+            println!("[window] no re-link: {why}; this window runs unpaired");
+            (StartRelink::Nothing, None)
+        }
+        Err(why) => {
+            println!("[window] no re-link: {why}; this window runs unpaired");
+            (StartRelink::Nothing, Some(group_refusal_note(&why)))
+        }
+    }
 }
 
 fn relink_on(
@@ -507,7 +732,9 @@ fn relink_on(
     build: String,
     deadline: Instant,
     within: Duration,
+    waiting: &Waiting,
 ) -> Result<Relinked, String> {
+    let who = waiting.who();
     let conn = connect_to(path).map_err(|e| match e.raw_os_error() {
         Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => NO_ORPHAN_TEXT.to_string(),
         _ => format!("{} could not be reached ({e})", path.display()),
@@ -516,7 +743,7 @@ fn relink_on(
     if uid != euid() {
         return Err(format!("{} belongs to uid {uid}; not linking to it", path.display()));
     }
-    let start = agent::child::start_time(pid).map_err(|e| format!("window 2 (process {pid}) cannot be named ({e})"))?;
+    let start = agent::child::start_time(pid).map_err(|e| format!("{who} (process {pid}) cannot be named ({e})"))?;
     // SAFETY: neither call has preconditions or can fail.
     let me = unsafe { libc::getpid() } as u32;
     let my_start = agent::child::start_time(me).map_err(|e| format!("this process cannot be named ({e})"))?;
@@ -541,24 +768,19 @@ fn relink_on(
         Ok(Inbound::Msg {
             msg: Msg::Bye { why }, ..
         }) => {
-            return Err(format!(
-                "window 2 refused the re-link: {}",
-                shown_within(&why, BYE_CHARS)
-            ));
+            return Err(format!("{who} refused the re-link: {}", shown_within(&why, BYE_CHARS)));
         }
         Ok(Inbound::Msg { msg, .. }) => {
-            return Err(format!("window 2's first message was `{}`, not welcome", msg.kind()));
+            return Err(format!("{who}'s first message was `{}`, not welcome", msg.kind()));
         }
-        Ok(Inbound::Refused(err)) => return Err(format!("window 2's answer was refused ({err})")),
-        Ok(Inbound::Closed) => return Err("window 2 closed the connection".into()),
+        Ok(Inbound::Refused(err)) => return Err(format!("{who}'s answer was refused ({err})")),
+        Ok(Inbound::Closed) => return Err(format!("{who} closed the connection")),
         Err(RecvTimeoutError::Timeout) => {
-            return Err(format!("window 2 did not answer within {} ms", within.as_millis()));
+            return Err(format!("{who} did not answer within {} ms", within.as_millis()));
         }
-        Err(RecvTimeoutError::Disconnected) => return Err("the link ended before window 2 answered".into()),
+        Err(RecvTimeoutError::Disconnected) => return Err(format!("the link ended before {who} answered")),
     };
-    if window != SECOND_WINDOW {
-        return Err(format!("welcome came from window {}", shown(&window)));
-    }
+    let name = waiting.named(&window)?;
     // The link checked that `welcome` carries exactly one descriptor.
     let fd = fds.into_iter().next().ok_or("welcome carried no pair lock")?;
     let theirs = std::fs::File::from(fd.try_clone().map_err(|e| e.to_string())?)
@@ -579,6 +801,7 @@ fn relink_on(
         ));
     }
     Ok(Relinked {
+        name,
         handle,
         inbound,
         presence,

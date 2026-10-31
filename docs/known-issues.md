@@ -14,6 +14,9 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   among them, have not been tested; reports from them are welcome. Hyprland: companion mode (focus moves and
   raises) was run on a live 0.57.0 and 0.56.2 (with `hyprland.conf` and with `hyprland.lua`); the second window's
   raises were not.
+- **[Compositor windows](guide/compositor-windows.md)**, the default on Hyprland, sway and niri, have run only in a
+  headless session and a virtual machine, and some things do not work as they should yet: the guide's
+  [known gaps](guide/compositor-windows.md#known-gaps) list them.
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
   meet this; Ubuntu 22.04 and Debian 12 do not.

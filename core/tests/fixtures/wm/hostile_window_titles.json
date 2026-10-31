@@ -1,0 +1,5 @@
+{
+  "hyprland": [{"pid":4242,"class":"hostile-class","title":"TITLE","address":"0x42","workspace":{"name":"1"},"monitor":"DP-1"}],
+  "sway": {"type":"output","name":"DP-1","nodes":[{"type":"workspace","name":"1","nodes":[{"type":"con","pid":4242,"id":42,"app_id":"hostile-class","name":"TITLE"}]}]},
+  "niri": [{"pid":4242,"id":42,"app_id":"hostile-class","title":"TITLE","workspace_id":1,"output":"DP-1"}]
+}

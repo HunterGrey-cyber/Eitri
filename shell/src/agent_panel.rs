@@ -18,7 +18,7 @@ use webkit6::prelude::*;
 use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 // What the rest of `shell` reaches through `crate::agent_panel::`.
-pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
+pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, TabAnswer, ViewId};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs`
 /// guarantees this file exists and is current by the time `shell` itself compiles.
@@ -210,12 +210,17 @@ pub(crate) fn root_note_for(root: &Path) -> Option<String> {
 /// is built: the panel's place is `webkit_sandbox::notice_widget(notice)`, and the handle carries the
 /// same state with no page (`AgentPanelHandle::with_pages`'s own doc), no pump, no supervisor client.
 /// Otherwise the handle is built first and the base view's page built for it by [`build_chat_page`].
+///
+/// The companion window's panel, whose page is built at once: it has no mode to wait for. A main window takes
+/// [`make_panel_handle`] and [`build_base_page`] instead. `base_page` false: the handle without a page, as when
+/// WebKit cannot start, and an empty place in its stead.
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
     editor_context: eitri_core::editor_context::ContextSource,
     scratch: Option<eitri_core::scratch::ScratchDir>,
     backend_kind: BackendKind,
     unavailable: Option<&str>,
+    base_page: bool,
     root_note: Option<String>,
     related: Option<&WebView>,
     tab_role: eitri_core::window_link::pair::Role,
@@ -231,8 +236,13 @@ pub(crate) fn build_agent_panel(
         theme,
         root_note,
     };
+    if !base_page {
+        let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));
+        return (gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast(), handle);
+    }
     if let Some(notice) = unavailable {
         let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));
+        handle.say_no_panel();
         return (crate::webkit_sandbox::notice_widget(notice), handle);
     }
     let handle = AgentPanelHandle::new(init, true, Rc::new(GtkPanelHost));
@@ -245,6 +255,47 @@ pub(crate) fn build_agent_panel(
     start_pump_timer(handle.clone());
 
     (webview.upcast(), handle)
+}
+
+/// The window's panel with no page yet: whether it gets one is decided at a later start step, and a hub and a page
+/// window never do (`build_base_page`). `AgentPanelHandle::open_pages` makes up for what this leaves out.
+pub(crate) fn make_panel_handle(
+    project_dir: PathBuf,
+    editor_context: eitri_core::editor_context::ContextSource,
+    scratch: Option<eitri_core::scratch::ScratchDir>,
+    backend_kind: BackendKind,
+    root_note: Option<String>,
+    tab_role: eitri_core::window_link::pair::Role,
+    theme: eitri_core::theme::ThemeTokens,
+) -> AgentPanelHandle {
+    let init = PanelInit {
+        project_dir,
+        editor_context,
+        scratch,
+        backend_kind,
+        document: &PANEL_DOCUMENT,
+        tab_role,
+        theme,
+        root_note,
+    };
+    AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost))
+}
+
+/// The base view's page and the pump that drives every page after it. The page exists only because the window
+/// controller said so (`HostOp::BuildBasePage`), so this has one caller.
+pub(crate) fn build_base_page(handle: &AgentPanelHandle) -> (WebView, Rc<PanelPage>) {
+    handle.open_pages();
+    let built = build_chat_page(handle, ViewId::BASE, None);
+    // One timer serves every page; `build_agent_panel`'s start of it says why it starts here.
+    start_pump_timer(handle.clone());
+    built
+}
+
+/// A hub's panel has no page and no pump of its own, but every chat window's turn review draws in its editor: this
+/// pump is what answers their opens and sends back what the overlay finds.
+pub(crate) fn start_review_pump(handle: &AgentPanelHandle) {
+    handle.drive_review_without_pages();
+    start_pump_timer(handle.clone());
 }
 
 /// The one way a chat page is built: its own `UserContentManager`, the CSP floor, the ephemeral
@@ -1488,9 +1539,7 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
     /// how many ticks run in one second.
     #[test]
     fn an_idle_panel_is_not_ticked() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = gtk4::glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
         let page = std::rc::Rc::new(CountingPage::default());
@@ -1524,14 +1573,102 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         assert_eq!(handle.ticks_run(), before, "nothing runs after the close");
     }
 
+    /// An editor that refuses every call at once: an open comes back answered, with no nvim to run.
+    struct RefusingEditor;
+
+    impl eitri_core::editor_rpc::EditorRpc for RefusingEditor {
+        fn exec_lua(&self, _: &'static str, _: Vec<rmpv::Value>) -> eitri_core::nvim_rpc::Pending {
+            eitri_core::nvim_rpc::Pending::failed(eitri_core::nvim_rpc::RpcError::Unavailable("test".into()))
+        }
+
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    /// A hub has no page, so nothing else ticks its panel: a chat window's open reaches window 1's overlay and only
+    /// this pump answers it, on the link, once the overlay has an outcome.
+    #[test]
+    fn a_page_free_window_pumps_the_reviews_its_editor_serves() {
+        use eitri_core::review_editor::{LinkedEvent, OverlayCall, Owner, ShowMeta, Window};
+        use eitri_core::wm::PeerId;
+        use eitri_panel::agent_panel::ReviewSettled;
+        const CHAT_WINDOW: PeerId = PeerId(16);
+
+        let _turn = crate::layout_state::default_context_turn();
+        let context = gtk4::glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let handle = AgentPanelHandle::for_host_test_without_pages();
+        handle.set_editor_rpc(Rc::new(RefusingEditor));
+        handle.set_review_owner(|| Some(Owner::Embedded));
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let hearing = heard.clone();
+        handle.on_pair_outbound(move |out| hearing.borrow_mut().push(out));
+        assert_eq!(handle.wake_fd(), None, "a window with no page has nothing to wake for");
+        assert!(!handle.tick(), "and nothing to tick for");
+
+        start_review_pump(&handle);
+        assert!(handle.wake_fd().is_some());
+        handle.with_turn_review(&mut |flow, _, rpc| {
+            let call = OverlayCall::OpenAndShow {
+                request_id: format!("w{}:7", CHAT_WINDOW.0),
+                path: "/p/a.rs".into(),
+                line: None,
+                meta: ShowMeta {
+                    tab: 1,
+                    session: "s1".into(),
+                    turn: 1,
+                    scope: eitri_core::turn_review::Scope::Turn,
+                },
+                hunks: None,
+            };
+            let overlay = flow.local_overlay().expect("window 1 owns the overlay");
+            overlay.call_for(
+                rpc.expect("an editor"),
+                call,
+                Window::Linked(CHAT_WINDOW),
+                Instant::now(),
+            );
+            ReviewSettled::default()
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while heard.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "the open was never answered");
+            iterate_for(5);
+        }
+        let linked: Vec<LinkedEvent> = heard
+            .borrow()
+            .iter()
+            .flat_map(|out: &eitri_panel::agent_panel::PairOutbound| {
+                out.linked.get(&CHAT_WINDOW).cloned().unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            matches!(
+                &linked[..],
+                [LinkedEvent::Answered {
+                    op_id: 7,
+                    result: Err(_)
+                }]
+            ),
+            "{linked:?}"
+        );
+
+        // The close stops it for good.
+        let _watch = handle.shutdown();
+        iterate_for(100);
+        let before = handle.ticks_run();
+        handle.wake();
+        iterate_for(200);
+        assert_eq!(handle.ticks_run(), before, "nothing runs after the close");
+    }
+
     /// The supervisor raise waits on its socket: a connected window is not woken while nothing arrives
     /// (it looked five times a second), a request still raises it at once, and a supervisor that goes away
     /// lets go of the watch. A window with no supervisor arms nothing.
     #[test]
     fn the_supervisor_raise_waits_on_its_socket() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = gtk4::glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
         let handle = AgentPanelHandle::for_host_test(std::rc::Rc::new(CountingPage::default()));

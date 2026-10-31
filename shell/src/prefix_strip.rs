@@ -18,6 +18,21 @@ pub(crate) struct PrefixStrip {
     widget: gtk4::Box,
 }
 
+/// A window with no top bar shows the strip in this frame, over its top right corner, so the page under it does not
+/// move while the prefix waits. Nothing in it takes a click; its owner shows it only while the strip has something.
+pub(crate) fn floating_frame(strip: &PrefixStrip) -> gtk4::Box {
+    let frame = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    frame.add_css_class("module-toast");
+    frame.set_halign(gtk4::Align::End);
+    frame.set_valign(gtk4::Align::Start);
+    frame.set_margin_top(6);
+    frame.set_margin_end(6);
+    frame.set_can_target(false);
+    frame.set_visible(false);
+    frame.append(strip.widget());
+    frame
+}
+
 impl PrefixStrip {
     pub(crate) fn new() -> PrefixStrip {
         let widget = gtk4::Box::new(gtk4::Orientation::Horizontal, PIECE_SPACING);

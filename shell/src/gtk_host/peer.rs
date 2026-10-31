@@ -248,6 +248,12 @@ pub(crate) fn pair_event(peer: PeerId, msg: &Msg) -> Option<PeerEvent> {
             peer,
             connector: connector.clone(),
         }),
+        Msg::HubAsk { ask, token } => Some(PeerEvent::HubAsk {
+            peer,
+            ask: ask.clone(),
+            token: token.clone(),
+        }),
+        Msg::WindowFocused {} => Some(PeerEvent::WindowFocused { peer }),
         _ => None,
     }
 }
@@ -286,13 +292,19 @@ mod tests {
     /// Whether the other end of `fd`'s socket pair has closed: read by the end still held, so no descriptor number
     /// that another test may reuse is looked at once closed.
     fn other_end_closed(fd: &OwnedFd) -> bool {
+        other_end_closes_within(fd, 0)
+    }
+
+    /// [`other_end_closed`], waiting up to `ms` for it: a child another test thread is starting holds a copy of every
+    /// descriptor until it execs, so the other end can outlive this process's close by a moment.
+    fn other_end_closes_within(fd: &OwnedFd, ms: i32) -> bool {
         let mut pfd = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         // SAFETY: one `pollfd` that lives for the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
         ready == 1 && pfd.revents & libc::POLLHUP != 0
     }
 
@@ -469,7 +481,7 @@ mod tests {
         });
         assert_eq!(event, None);
         assert!(
-            other_end_closed(&c_peer) && other_end_closed(&d_peer),
+            other_end_closes_within(&c_peer, 20_000) && other_end_closes_within(&d_peer, 20_000),
             "descriptors that came with another message are closed"
         );
         drop(taken);

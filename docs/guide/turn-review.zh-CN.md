@@ -1,11 +1,13 @@
 [English](turn-review.md) | 简体中文
-<!-- translated-from: turn-review.md sha256=68a2d2bb53236096e60677cfddd5619134d8cce5530cf0508d7e0a789963abf0 -->
+<!-- translated-from: turn-review.md sha256=3d5bfe4e894f902384b0ffa076603de6a79942d065db4681576b60b74eec3542 -->
 
 # 审阅一个回合
 
 agent 在你的项目上工作之后，回合审阅回答一个问题：在那个回合期间，磁盘上改了什么？它列出文件，显示每个文件的各个 hunk，让你把一个 hunk 或整个文件放回回合之前的样子，也让你把对这些改动的评论，作为你的下一条消息发回给 agent。
 
 它依据的是 Eitri 对项目文件拍下的快照，而不是你的 git 历史，所以在不是 git 仓库的目录里，表现也完全一样。它从不往你项目的 `.git` 里写任何东西。
+
+使用[合成器窗口](compositor-windows.zh-CN.md)时，审阅在聊天窗口里进行，它打开的内容会到窗口 1 的编辑器里。
 
 下面的按键针对默认设置。在面板里，“浏览模式”就是你从消息输入框按 `Esc` 进入的那种模式；见[快速上手](getting-started.zh-CN.md)。
 

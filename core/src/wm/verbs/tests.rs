@@ -19,7 +19,7 @@ fn terminal() -> ModuleId {
 }
 
 /// `editor | (agent / terminal)`, the keys on `keys`.
-fn three(keys: ModuleId) -> Layout {
+pub(super) fn three(keys: ModuleId) -> Layout {
     let root = Node::split(
         Axis::Row,
         0.5,
@@ -229,7 +229,7 @@ fn decided_here(action: &Action) -> bool {
     }
 }
 
-fn one_of_each() -> Vec<Action> {
+pub(super) fn one_of_each() -> Vec<Action> {
     vec![
         Action::Move(Direction::Left),
         Action::ContainerTabbed,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::keymap::Action;
 use crate::layout::{Axis, Child, Con, ConLayout, Float, FloatRect, Frame, Layout, Node, Size, Zoom};
+use crate::window_link::names::WindowName;
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
 use crate::wm::verbs::rig::{self, decl, moves};
 use crate::wm::*;
@@ -1081,7 +1082,7 @@ fn the_edge_goes_to_the_other_window_only_when_its_monitor_lies_that_way() {
         let r = driven(two());
         let port = FakePeerPort::new();
         if peer {
-            r.driver.attach_peer(WIN, PeerId(2), port.clone());
+            r.driver.attach_peer(WIN, PeerId(2), WindowName::Second, port.clone());
         }
         let monitor = |name: &str, x, y| Monitor {
             id: MonitorId(name.into()),
@@ -1124,4 +1125,97 @@ fn the_edge_goes_to_the_other_window_only_when_its_monitor_lies_that_way() {
             );
         }
     }
+}
+
+#[test]
+fn the_edge_never_crosses_to_a_module_window_peer() {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(two());
+    r.driver
+        .attach_peer(WIN, PeerId(16), WindowName::Chat(1), FakePeerPort::new());
+    let monitor = |name: &str, x| Monitor {
+        id: MonitorId(name.into()),
+        rect: crate::layout::Rect {
+            x,
+            y: 0,
+            w: 1200,
+            h: 800,
+        },
+        scale: 1.0,
+        name: name.into(),
+    };
+    r.post(HostEvent::MonitorsChanged {
+        monitors: vec![monitor("mine", 0), monitor("right", 1200)],
+    });
+    r.post(HostEvent::WindowMonitor {
+        win: WIN,
+        monitor: Some(MonitorId("mine".into())),
+    });
+    r.post(HostEvent::Peer(PeerEvent::Monitor {
+        peer: PeerId(16),
+        connector: "right".into(),
+    }));
+    let mark = r.mark();
+    let (consumed, _) = r.batch(|w, reads, batch| move_focus(w, reads, WIN, &agent(), Direction::Right, batch));
+    assert!(!consumed);
+    assert!(
+        r.notes().iter().any(|n| n.contains("no module that way")),
+        "{:?}",
+        r.notes()
+    );
+    assert!(!r
+        .ops_since(mark)
+        .iter()
+        .any(|op| matches!(op, HostOp::RaisePeer { .. })));
+}
+
+/// Window 1 on the left monitor with a `Second` peer whose monitor lies to the right, and `extra` peers attached
+/// beside it; the focus moves right at the edge.
+fn edge_crossing_with(extra: &[(PeerId, WindowName)]) -> (bool, Vec<HostOp>) {
+    use crate::wm::fake::FakePeerPort;
+    let r = driven(two());
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, FakePeerPort::new());
+    for (peer, name) in extra {
+        r.driver.attach_peer(WIN, *peer, name.clone(), FakePeerPort::new());
+    }
+    let monitor = |name: &str, x| Monitor {
+        id: MonitorId(name.into()),
+        rect: crate::layout::Rect {
+            x,
+            y: 0,
+            w: 1200,
+            h: 800,
+        },
+        scale: 1.0,
+        name: name.into(),
+    };
+    r.post(HostEvent::MonitorsChanged {
+        monitors: vec![monitor("mine", 0), monitor("right", 1200)],
+    });
+    r.post(HostEvent::WindowMonitor {
+        win: WIN,
+        monitor: Some(MonitorId("mine".into())),
+    });
+    r.post(HostEvent::Peer(PeerEvent::Monitor {
+        peer: PeerId(2),
+        connector: "right".into(),
+    }));
+    let mark = r.mark();
+    let (consumed, _) = r.batch(|w, reads, batch| move_focus(w, reads, WIN, &agent(), Direction::Right, batch));
+    (consumed, r.ops_since(mark))
+}
+
+#[test]
+fn the_edge_crosses_to_window_2_when_it_is_the_only_peer() {
+    let (consumed, ops) = edge_crossing_with(&[]);
+    assert!(consumed);
+    assert!(ops.iter().any(|op| matches!(op, HostOp::RaisePeer { .. })), "{ops:?}");
+}
+
+#[test]
+fn the_edge_does_not_cross_to_window_2_with_a_module_window_beside_it() {
+    let (consumed, ops) = edge_crossing_with(&[(PeerId(16), WindowName::Chat(1))]);
+    assert!(!consumed);
+    assert!(!ops.iter().any(|op| matches!(op, HostOp::RaisePeer { .. })), "{ops:?}");
 }

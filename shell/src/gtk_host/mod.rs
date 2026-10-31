@@ -74,6 +74,11 @@
 //! `EndPeer` ends the other window through the same set, when this window started it.
 //! `RestoreLinkedWindow` starts window 2 again at a launch through the same [`LinkedWindows`], with no token, and
 //! `StartEditorWindow` starts the editor window from a window 2 left without one.
+//! A module window of compositor mode adds five: `OpenModuleWindow` starts or raises a chat or page window through
+//! [`LinkedWindows::open_module`] (a window the start opens takes no token and leaves the keys where they are),
+//! `ForwardRaise` answers with the token a module window forwarded, `PeerRun` and `HubAsk` send `run_action` and
+//! `hub_ask` over the link ([`LinkedWindows::send`], [`LinkedWindows::send_to_hub`]), and `CompositorFocus` is the
+//! compositor's focus move past the window's edge, through [`PairRaise::move_focus`].
 //! `PlaceWindow` applies this process's placement role, optionally moving to an output before focusing
 //! ([`monitor_move`]), through the [`MonitorPlacer`] the shell sets, never on the GTK thread.
 //!
@@ -108,6 +113,8 @@ use std::rc::{Rc, Weak};
 use eitri_core::attention::Attention;
 use eitri_core::layout::{Direction, ModuleId, Rect, Size};
 use eitri_core::tabs::ViewId;
+use eitri_core::window_link::names::WindowName;
+use eitri_core::window_link::Msg;
 use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
     ActivationToken, Applied, ChatKillCounts, ChatOp, CleanupOp, CloseBy, CloseVerdict, DropWhy, EditorCall,
@@ -177,22 +184,60 @@ pub(crate) const NOT_CARRIED_OUT: &str = "not carried out by this shell yet";
 /// so the host can also run alone.
 pub(crate) trait PairRaise {
     fn raise(&self, window: &gtk4::Window, token: Option<&str>);
+    /// Has the compositor move the keys one window `direction`; `false` with no adapter to do it, which `on_none` has
+    /// then said once. Never waits: the adapter's command runs on its worker.
+    fn move_focus(&self, direction: Direction, on_none: &dyn Fn(&str)) -> bool;
 }
 
 /// What starts the project's second window for `OpenLinkedWindow`: the pair's own code, which belongs to the shell's
 /// binary. A host without it cannot start one.
 pub(crate) trait LinkedWindows {
-    /// Starts the second window, or raises it when it runs; `token` is the activation token this window's display
+    /// Starts the window `name`, or raises it when it runs; `token` is the activation token this window's display
     /// gave, so the window that comes forward gets the keys. `Err` says why nothing was started.
-    fn open(&self, win: WinId, token: Option<String>) -> Result<(), String>;
-    /// Ends the other window's process, when this window started it. `Err` says why nothing was ended.
-    fn end_peer(&self, win: WinId) -> Result<(), String> {
-        let _ = win;
+    fn open(&self, win: WinId, name: &WindowName, token: Option<String>) -> Result<(), String>;
+    /// Ends the process of the window `peer`, when this window started it. `Err` says why nothing was ended.
+    fn end_peer(&self, win: WinId, peer: PeerId) -> Result<(), String> {
+        let _ = (win, peer);
         Err(NOT_CARRIED_OUT.into())
     }
-    /// Starts the second window again at this window's launch, as the pair last ended, with no activation token.
-    /// `Err` says why it was not; what this window held for it has then been given back here.
-    fn restore(&self, win: WinId) -> Result<(), String>;
+    /// Starts the window `name` again at this window's launch, as the pair last ended, with no activation token.
+    /// `Err` says why it was not; what this window held for window 2 has then been given back here.
+    fn restore(&self, win: WinId, name: &WindowName) -> Result<(), String>;
+    /// Whether the module window `name` is open or starting, whoever started it.
+    fn module_window_open(&self, name: &WindowName) -> bool {
+        let _ = name;
+        false
+    }
+    /// Window 1 opens the chat or page window `name`: starts it, or raises it with `token`. With `keep_keys` the window
+    /// maps without taking the keys, and one that is open already is left as it is.
+    fn open_module(&self, win: WinId, name: &WindowName, token: Option<String>, keep_keys: bool) -> Result<(), String> {
+        let _ = (win, name, token, keep_keys);
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// Sends `msg` to the window `peer` over its link. `Err` says why it was not sent.
+    fn send(&self, win: WinId, peer: PeerId, msg: Msg) -> Result<(), String> {
+        let _ = (win, peer, msg);
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// Sends `msg` to window 1, from a window it started. `Err` says why it was not sent.
+    fn send_to_hub(&self, win: WinId, msg: Msg) -> Result<(), String> {
+        let _ = (win, msg);
+        Err(NOT_CARRIED_OUT.into())
+    }
+    /// Hands the tab holding `agent`'s `session` from the module window `from` to the chat window `to`, which is started
+    /// or raised with `token`. The window that asked is told itself when it cannot go; `Err` says why no window could be.
+    fn hand_over(
+        &self,
+        win: WinId,
+        from: PeerId,
+        agent: &eitri_core::agent_backend::AgentId,
+        session: &str,
+        to: &WindowName,
+        token: Option<String>,
+    ) -> Result<(), String> {
+        let _ = (win, from, agent, session, to, token);
+        Err(NOT_CARRIED_OUT.into())
+    }
     /// In a window 2 with no window 1, starts the editor window detached from this process; it links to this
     /// window once it is up. `Err` says why none was started.
     fn start_editor(&self, win: WinId) -> Result<(), String>;
@@ -241,6 +286,7 @@ pub(crate) fn monitor_move(
         focused: false,
         visible: true,
         rect: None,
+        ..Default::default()
     };
     if connector.is_none() && !matches!(wm, Wm::Sway | Wm::Hyprland) {
         return Ok(MonitorMove::Unchanged);
@@ -279,6 +325,12 @@ pub(crate) trait MonitorPlacer {
 }
 
 /// What builds a module's surface for `CreateSurface` and releases it for `DropSurface`.
+/// Builds the window's base chat page when the controller says so (`HostOp::BuildBasePage`), which it does once and
+/// never in a hub or a page window.
+pub(crate) trait BasePageMaker {
+    fn build(&self);
+}
+
 pub(crate) trait SurfaceMaker {
     /// Reveals a prepared page in the same allocation that applies its committed arrangement.
     fn mapped(&self, _module: &ModuleId, _mapped: bool) {}
@@ -382,6 +434,9 @@ pub(crate) trait ServiceSet {
         None
     }
     fn tab_move(&self, _tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
+        Err(NOT_CARRIED_OUT.into())
+    }
+    fn tab_hand_over(&self, _tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::TabHandOver, String> {
         Err(NOT_CARRIED_OUT.into())
     }
     fn moved_tab_key(&self, _tab: eitri_core::tabs::TabId) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
@@ -540,6 +595,7 @@ pub(crate) struct GtkHost {
     asking: RefCell<BTreeMap<WinId, bool>>,
     mode_toggle: RefCell<Option<Rc<ModeToggleFn>>>,
     surface_maker: RefCell<Option<Rc<dyn SurfaceMaker>>>,
+    base_page_maker: RefCell<Option<Rc<dyn BasePageMaker>>>,
     services: RefCell<Option<Rc<dyn ServiceSet>>>,
     lua: RefCell<Option<Rc<dyn LuaRunner>>>,
     /// The application `OpenWindow` builds windows for; held weakly, as GTK holds its windows.
@@ -580,6 +636,7 @@ impl GtkHost {
             asking: RefCell::new(BTreeMap::new()),
             mode_toggle: RefCell::new(None),
             surface_maker: RefCell::new(None),
+            base_page_maker: RefCell::new(None),
             services: RefCell::new(None),
             lua: RefCell::new(None),
             application: RefCell::new(None),
@@ -710,6 +767,10 @@ impl GtkHost {
     }
 
     /// What the `Lua` ops run on. Set before the first batch that carries one.
+    pub(crate) fn set_base_page_maker(&self, maker: Rc<dyn BasePageMaker>) {
+        *self.base_page_maker.borrow_mut() = Some(maker);
+    }
+
     pub(crate) fn set_lua(&self, lua: Rc<dyn LuaRunner>) {
         *self.lua.borrow_mut() = Some(lua);
     }
@@ -1166,12 +1227,12 @@ impl GtkHost {
         }
     }
 
-    fn end_peer(&self, op: &HostOp, win: WinId) -> Applied {
+    fn end_peer(&self, op: &HostOp, win: WinId, peer: PeerId) -> Applied {
         let linked = self.linked_windows.borrow().clone();
         let Some(linked) = linked else {
             return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
         };
-        match linked.end_peer(win) {
+        match linked.end_peer(win, peer) {
             Ok(()) => Applied::Done,
             Err(why) => self.refuse(op, &why),
         }
@@ -1236,7 +1297,7 @@ impl GtkHost {
         let Some(linked) = linked else {
             return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
         };
-        match linked.open(win, self.activation_token(win)) {
+        match linked.open(win, &WindowName::Second, self.activation_token(win)) {
             Ok(()) => Applied::Done,
             Err(why) => self.refuse(op, &why),
         }
@@ -1251,9 +1312,143 @@ impl GtkHost {
         let Some(linked) = linked else {
             return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
         };
-        match linked.restore(win) {
+        match linked.restore(win, &WindowName::Second) {
             Ok(()) => Applied::Done,
             Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// Starts the module window `name`, or raises it when it runs. The window that comes forward takes the activation
+    /// token of the key that asked, or of this window's surface when none came; a window the start opens takes none, and
+    /// leaves the keys where they are.
+    fn open_module_window(
+        &self,
+        op: &HostOp,
+        win: WinId,
+        name: &WindowName,
+        token: Option<&str>,
+        keep_keys: bool,
+    ) -> Applied {
+        // Cloned out first: the start wires the new link and may call back into GTK.
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        let token = if keep_keys {
+            None
+        } else {
+            match token {
+                Some(token) => Some(token.to_string()),
+                None if self.window(win).is_some() => self.activation_token(win),
+                None => None,
+            }
+        };
+        match linked.open_module(win, name, token, keep_keys) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// A raise a module window asked for: the token that came with it is the one the window that comes forward gets,
+    /// so it is answered as it would be had this window made one.
+    fn forward_raise(&self, peer: PeerId, token: Option<&str>) -> Applied {
+        self.post(HostEvent::Peer(PeerEvent::Raised {
+            peer,
+            token: token.map(str::to_string),
+        }));
+        Applied::Done
+    }
+
+    /// The key action `name` goes to the module window `peer`, which parses and runs it itself.
+    fn peer_run(
+        &self,
+        op: &HostOp,
+        win: WinId,
+        peer: PeerId,
+        name: &str,
+        opts: &[(String, serde_json::Value)],
+    ) -> Applied {
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        let msg = Msg::RunAction {
+            name: name.to_string(),
+            opts: opts.to_vec(),
+        };
+        match linked.send(win, peer, msg) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// A module window asks window 1 for another window, with an activation token from its own surface for the window
+    /// that comes forward.
+    fn hub_ask(&self, op: &HostOp, win: WinId, ask: &eitri_core::window_link::HubAsk) -> Applied {
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        let msg = Msg::HubAsk {
+            ask: ask.clone(),
+            token: self.activation_token(win),
+        };
+        match linked.send_to_hub(win, msg) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// Window 1 hands a tab between module windows; the links carry the rest.
+    fn hand_over_tab(
+        &self,
+        op: &HostOp,
+        win: WinId,
+        from: PeerId,
+        (agent, session): (&eitri_core::agent_backend::AgentId, &str),
+        to: &WindowName,
+        token: Option<&str>,
+    ) -> Applied {
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        match linked.hand_over(win, from, agent, session, to, token.map(str::to_string)) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// Window 1 tells a module window that the tab it offered stays there.
+    fn keep_tab(&self, op: &HostOp, win: WinId, peer: PeerId, session: &str, why: &str) -> Applied {
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        let msg = Msg::TabKept {
+            session: session.to_string(),
+            why: why.to_string(),
+        };
+        match linked.send(win, peer, msg) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// A focus move past this window's edge: the compositor's own tool moves it, on its worker. With none, the notice
+    /// that says so is the refusal, shown once.
+    fn compositor_focus(&self, op: &HostOp, direction: Direction) -> Applied {
+        let raise = self.pair_raise.borrow().clone();
+        let Some(raise) = raise else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        let notice = RefCell::new(None::<String>);
+        if raise.move_focus(direction, &|text| *notice.borrow_mut() = Some(text.to_string())) {
+            return Applied::Done;
+        }
+        match notice.into_inner() {
+            Some(text) => self.refuse(op, &text),
+            None => Applied::Refused,
         }
     }
 
@@ -1451,10 +1646,45 @@ impl Host for GtkHost {
                 fds,
             } => self.adopt_moved(op, *win, module, *kind, record, fds),
             HostOp::OrderBaseTabs { tabs, active, .. } => self.service(op, |s| s.order_base_tabs(tabs, *active)),
-            HostOp::EndPeer { win, .. } => self.end_peer(op, *win),
+            HostOp::EndPeer { win, peer } => self.end_peer(op, *win, *peer),
             HostOp::Cleanup(call) => self.service(op, |s| s.cleanup(call)),
             HostOp::Pair(call) => self.service(op, |s| s.pair(call)),
             HostOp::SetMode { win, .. } => self.set_mode(op, *win),
+            HostOp::OpenModuleWindow {
+                win,
+                name,
+                token,
+                keep_keys,
+            } => self.open_module_window(op, *win, name, token.as_deref(), *keep_keys),
+            HostOp::ForwardRaise { peer, token, .. } => self.forward_raise(*peer, token.as_deref()),
+            HostOp::PeerRun { win, peer, name, opts } => self.peer_run(op, *win, *peer, name, opts),
+            HostOp::CompositorFocus { direction, .. } => self.compositor_focus(op, *direction),
+            HostOp::HubAsk { win, ask } => self.hub_ask(op, *win, ask),
+            HostOp::BuildBasePage { .. } => {
+                // Cloned out first: the page's build reaches the panel, and through it the host again.
+                let maker = self.base_page_maker.borrow().clone();
+                match maker {
+                    Some(maker) => {
+                        maker.build();
+                        Applied::Done
+                    }
+                    None => self.refuse(op, NOT_CARRIED_OUT),
+                }
+            }
+            HostOp::HandOverTab {
+                win,
+                from,
+                agent,
+                session,
+                to,
+                token,
+            } => self.hand_over_tab(op, *win, *from, (agent, session), to, token.as_deref()),
+            HostOp::KeepTab {
+                win,
+                peer,
+                session,
+                why,
+            } => self.keep_tab(op, *win, *peer, session, why),
             HostOp::Quit => self.refuse(op, NOT_CARRIED_OUT),
         }
     }
@@ -1494,6 +1724,15 @@ impl Host for GtkHost {
 /// Every read answers at once from the window's grid and editor, and calls nothing that could reach the
 /// controller; a window that has given neither answers as [`NoReads`] does.
 impl HostReads for GtkHost {
+    /// The name of the window manager this window's moves go through, which `companion.wm` picks.
+    fn compositor_name(&self) -> &'static str {
+        let wm = self.placer.borrow().as_ref().map(|placer| placer.wm());
+        eitri_core::compositor::mode::compositor_name(wm.unwrap_or(eitri_core::compositor::Wm::None))
+    }
+    fn module_window_open(&self, name: &WindowName) -> bool {
+        let linked = self.linked_windows.borrow().clone();
+        linked.is_some_and(|linked| linked.module_window_open(name))
+    }
     fn page_built(&self, _win: WinId, module: &ModuleId) -> bool {
         self.services
             .borrow()
@@ -1552,6 +1791,10 @@ impl HostReads for GtkHost {
     fn tab_move(&self, _win: WinId, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
         let services = self.services.borrow().clone();
         services.map_or_else(|| Err(NOT_CARRIED_OUT.into()), |s| s.tab_move(tab))
+    }
+    fn tab_hand_over(&self, _win: WinId, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::TabHandOver, String> {
+        let services = self.services.borrow().clone();
+        services.map_or_else(|| Err(NOT_CARRIED_OUT.into()), |s| s.tab_hand_over(tab))
     }
     fn moved_tab_key(
         &self,
@@ -1727,6 +1970,26 @@ mod monitor_move_tests {
             for wm in [Wm::Sway, Wm::Hyprland, Wm::Niri, Wm::Gnome] {
                 assert!(monitor_move(wm, 4242, Some("DP-2; focus"), role).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn a_new_module_window_is_focused_by_its_pid_once_mapped_and_moved_nowhere() {
+        let role = PlacementRole::NewModule;
+        assert_eq!(
+            monitor_move(Wm::Sway, 4242, None, role),
+            Ok(MonitorMove::Command(vec!["swaymsg".into(), "[pid=4242] focus".into()]))
+        );
+        assert_eq!(
+            monitor_move(Wm::Hyprland, 4242, None, role),
+            Ok(MonitorMove::Hyprland {
+                pid: 4242,
+                connector: None,
+                role
+            })
+        );
+        for wm in [Wm::Niri, Wm::Gnome, Wm::None] {
+            assert_eq!(monitor_move(wm, 4242, None, role), Ok(MonitorMove::Unchanged), "{wm:?}");
         }
     }
 
@@ -2158,5 +2421,340 @@ mod terminal_at_tests {
         }))));
         assert_eq!(host.apply(&op), Applied::Done);
         assert_eq!(*calls.borrow(), ["close", "dir /new", "start"]);
+    }
+}
+
+#[cfg(test)]
+mod module_window_ops_tests {
+    use super::*;
+    use eitri_core::window_link::HubAsk;
+    use eitri_core::wm::conformance::RecordingSink;
+
+    #[derive(Default)]
+    struct Linked {
+        opened: RefCell<Vec<(WindowName, Option<String>, bool)>>,
+        sent: RefCell<Vec<(PeerId, Msg)>>,
+        to_hub: RefCell<Vec<Msg>>,
+        handed: RefCell<Vec<(PeerId, String, WindowName, Option<String>)>>,
+        open_windows: RefCell<Vec<WindowName>>,
+    }
+
+    impl LinkedWindows for Linked {
+        fn open(&self, _: WinId, _: &WindowName, _: Option<String>) -> Result<(), String> {
+            unreachable!()
+        }
+        fn restore(&self, _: WinId, _: &WindowName) -> Result<(), String> {
+            unreachable!()
+        }
+        fn start_editor(&self, _: WinId) -> Result<(), String> {
+            unreachable!()
+        }
+        fn module_window_open(&self, name: &WindowName) -> bool {
+            self.open_windows.borrow().contains(name)
+        }
+        fn open_module(&self, _: WinId, name: &WindowName, token: Option<String>, keep: bool) -> Result<(), String> {
+            self.opened.borrow_mut().push((name.clone(), token, keep));
+            Ok(())
+        }
+        fn send(&self, _: WinId, peer: PeerId, msg: Msg) -> Result<(), String> {
+            self.sent.borrow_mut().push((peer, msg));
+            Ok(())
+        }
+        fn send_to_hub(&self, _: WinId, msg: Msg) -> Result<(), String> {
+            self.to_hub.borrow_mut().push(msg);
+            Ok(())
+        }
+        fn hand_over(
+            &self,
+            _: WinId,
+            from: PeerId,
+            _: &eitri_core::agent_backend::AgentId,
+            session: &str,
+            to: &WindowName,
+            token: Option<String>,
+        ) -> Result<(), String> {
+            let handed = (from, session.to_string(), to.clone(), token);
+            self.handed.borrow_mut().push(handed);
+            Ok(())
+        }
+    }
+
+    struct Compositor(Option<&'static str>);
+    impl PairRaise for Compositor {
+        fn raise(&self, _: &gtk4::Window, _: Option<&str>) {
+            unreachable!()
+        }
+        fn move_focus(&self, _: Direction, on_none: &dyn Fn(&str)) -> bool {
+            match self.0 {
+                Some(notice) => {
+                    on_none(notice);
+                    false
+                }
+                None => true,
+            }
+        }
+    }
+
+    fn host() -> (Rc<GtkHost>, Rc<RecordingSink>, Rc<Linked>) {
+        let host = GtkHost::new();
+        let sink = Rc::new(RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        let linked = Rc::new(Linked::default());
+        host.set_linked_windows(linked.clone());
+        (host, sink, linked)
+    }
+
+    fn chat(n: u8) -> WindowName {
+        WindowName::Chat(n)
+    }
+
+    #[test]
+    fn opening_a_module_window_passes_the_key_s_token_and_a_start_s_window_takes_none() {
+        let (host, _sink, linked) = host();
+        for (token, keep_keys) in [(Some("key"), false), (Some("dropped"), true), (None, false)] {
+            let op = HostOp::OpenModuleWindow {
+                win: WinId::MAIN,
+                name: chat(2),
+                token: token.map(str::to_string),
+                keep_keys,
+            };
+            assert_eq!(host.apply(&op), Applied::Done);
+        }
+        assert_eq!(
+            *linked.opened.borrow(),
+            vec![
+                (chat(2), Some("key".to_string()), false),
+                (chat(2), None, true),
+                // No window of this host to make a token from: it goes without one.
+                (chat(2), None, false),
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct Pages(Cell<u32>);
+
+    impl BasePageMaker for Pages {
+        fn build(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn the_base_page_is_built_by_the_maker_and_refused_without_one() {
+        let (host, sink, _) = host();
+        let op = HostOp::BuildBasePage { win: WinId::MAIN };
+        assert_eq!(host.apply(&op), Applied::Refused);
+        assert!(sink.events().iter().any(|(_, event)| matches!(
+            event,
+            HostEvent::Refused {
+                what: OpTag::BuildBasePage,
+                ..
+            }
+        )));
+        let pages = Rc::new(Pages::default());
+        host.set_base_page_maker(pages.clone());
+        assert_eq!(host.apply(&op), Applied::Done);
+        assert_eq!(pages.0.get(), 1);
+    }
+
+    #[test]
+    fn a_host_with_no_pair_refuses_the_ops_that_reach_another_window() {
+        let host = GtkHost::new();
+        let sink = Rc::new(RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        let ops = [
+            HostOp::OpenModuleWindow {
+                win: WinId::MAIN,
+                name: chat(1),
+                token: None,
+                keep_keys: false,
+            },
+            HostOp::PeerRun {
+                win: WinId::MAIN,
+                peer: PeerId(16),
+                name: "zoom".into(),
+                opts: vec![],
+            },
+            HostOp::HubAsk {
+                win: WinId::MAIN,
+                ask: HubAsk::InstanceNew,
+            },
+            HostOp::CompositorFocus {
+                win: WinId::MAIN,
+                direction: Direction::Left,
+            },
+            HostOp::HandOverTab {
+                win: WinId::MAIN,
+                from: PeerId(16),
+                agent: eitri_core::agent_backend::AgentId::Claude,
+                session: "s".into(),
+                to: chat(2),
+                token: None,
+            },
+            HostOp::KeepTab {
+                win: WinId::MAIN,
+                peer: PeerId(16),
+                session: "s".into(),
+                why: "no".into(),
+            },
+        ];
+        for op in &ops {
+            assert_eq!(host.apply(op), Applied::Refused, "{op:?}");
+        }
+        let refused: Vec<OpTag> = sink
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                HostEvent::Refused { what, .. } => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                OpTag::OpenModuleWindow,
+                OpTag::PeerRun,
+                OpTag::HubAsk,
+                OpTag::CompositorFocus,
+                OpTag::HandOverTab,
+                OpTag::KeepTab
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hand_over_goes_to_the_pair_and_a_kept_tab_over_the_askers_link() {
+        let (host, _sink, linked) = host();
+        let hand_over = HostOp::HandOverTab {
+            win: WinId::MAIN,
+            from: PeerId(16),
+            agent: eitri_core::agent_backend::AgentId::Claude,
+            session: "s".into(),
+            to: chat(3),
+            token: Some("theirs".into()),
+        };
+        assert_eq!(host.apply(&hand_over), Applied::Done);
+        assert_eq!(
+            *linked.handed.borrow(),
+            vec![(PeerId(16), "s".to_string(), chat(3), Some("theirs".to_string()))]
+        );
+        let keep = HostOp::KeepTab {
+            win: WinId::MAIN,
+            peer: PeerId(16),
+            session: "s".into(),
+            why: "all nine chat windows are open".into(),
+        };
+        assert_eq!(host.apply(&keep), Applied::Done);
+        assert_eq!(
+            *linked.sent.borrow(),
+            vec![(
+                PeerId(16),
+                Msg::TabKept {
+                    session: "s".into(),
+                    why: "all nine chat windows are open".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_forwarded_raise_is_answered_with_the_token_it_carries() {
+        let (host, sink, _linked) = host();
+        let op = HostOp::ForwardRaise {
+            win: WinId::MAIN,
+            peer: PeerId(17),
+            token: Some("theirs".into()),
+        };
+        assert_eq!(host.apply(&op), Applied::Done);
+        assert_eq!(
+            sink.events().into_iter().map(|(_, event)| event).collect::<Vec<_>>(),
+            vec![HostEvent::Peer(PeerEvent::Raised {
+                peer: PeerId(17),
+                token: Some("theirs".into())
+            })]
+        );
+    }
+
+    #[test]
+    fn a_run_and_an_ask_go_over_the_link_as_the_messages_the_other_window_reads() {
+        let (host, _sink, linked) = host();
+        let run = HostOp::PeerRun {
+            win: WinId::MAIN,
+            peer: PeerId(17),
+            name: "tab.select".into(),
+            opts: vec![("n".into(), 3.into())],
+        };
+        assert_eq!(host.apply(&run), Applied::Done);
+        let ask = HostOp::HubAsk {
+            win: WinId::MAIN,
+            ask: HubAsk::InstanceNew,
+        };
+        assert_eq!(host.apply(&ask), Applied::Done);
+        assert_eq!(
+            *linked.sent.borrow(),
+            vec![(
+                PeerId(17),
+                Msg::RunAction {
+                    name: "tab.select".into(),
+                    opts: vec![("n".into(), 3.into())]
+                }
+            )]
+        );
+        assert_eq!(
+            *linked.to_hub.borrow(),
+            vec![Msg::HubAsk {
+                ask: HubAsk::InstanceNew,
+                token: None
+            }]
+        );
+    }
+
+    #[test]
+    fn the_off_key_hint_names_the_window_manager_this_window_moves_through() {
+        struct Placer(eitri_core::compositor::Wm);
+        impl MonitorPlacer for Placer {
+            fn wm(&self) -> eitri_core::compositor::Wm {
+                self.0
+            }
+            fn place(&self, _: MonitorMove) {
+                unreachable!()
+            }
+        }
+        let (host, _sink, _linked) = host();
+        assert_eq!(host.compositor_name(), "the compositor");
+        use eitri_core::compositor::Wm;
+        for (wm, name) in [(Wm::Hyprland, "Hyprland"), (Wm::Sway, "sway"), (Wm::Niri, "niri")] {
+            host.set_monitor_placer(Rc::new(Placer(wm)));
+            assert_eq!(host.compositor_name(), name);
+        }
+    }
+
+    #[test]
+    fn a_window_a_hand_over_starts_reads_as_open_to_the_controller() {
+        let (host, _sink, linked) = host();
+        assert!(!host.module_window_open(&chat(2)));
+        linked.open_windows.borrow_mut().push(chat(2));
+        assert!(host.module_window_open(&chat(2)));
+        assert!(!host.module_window_open(&chat(3)));
+    }
+
+    #[test]
+    fn a_focus_move_past_the_edge_is_the_compositors_and_says_once_when_it_has_none() {
+        let (host, sink, _linked) = host();
+        let op = HostOp::CompositorFocus {
+            win: WinId::MAIN,
+            direction: Direction::Right,
+        };
+        host.set_pair_raise(Rc::new(Compositor(None)));
+        assert_eq!(host.apply(&op), Applied::Done);
+        host.set_pair_raise(Rc::new(Compositor(Some("no compositor tool"))));
+        assert_eq!(host.apply(&op), Applied::Refused);
+        assert!(sink.events().into_iter().any(|(_, event)| matches!(
+            event,
+            HostEvent::Refused { what: OpTag::CompositorFocus, why, .. } if why == "no compositor tool"
+        )));
     }
 }

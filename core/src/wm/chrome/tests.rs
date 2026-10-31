@@ -2,6 +2,7 @@ use super::*;
 use crate::keymap::prefix::Press;
 use crate::keymap::{Action, KeySpec};
 use crate::layout::{hide, Axis, FloatRect, Frame, Node, Size};
+use crate::window_link::names::WindowName;
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
 use crate::wm::verbs::rig::{decl, rig, WIN};
 use crate::wm::*;
@@ -889,7 +890,8 @@ fn a_resize_with_no_float_up_derives_nothing() {
 fn the_top_bar_text_shows_the_other_windows_marks() {
     let r = driven(three(editor()));
     let peer = PeerId(2);
-    r.driver.attach_peer(WIN, peer, crate::wm::fake::FakePeerPort::new());
+    r.driver
+        .attach_peer(WIN, peer, WindowName::Second, crate::wm::fake::FakePeerPort::new());
     assert_eq!(r.driver.query(|c| c.chrome(WIN)).top_bar.other, None);
     r.driver.post(HostEvent::Peer(PeerEvent::Summary {
         peer,
@@ -905,8 +907,46 @@ fn the_top_bar_text_shows_the_other_windows_marks() {
         r.driver.query(|c| c.chrome(WIN)).top_bar.other.as_deref(),
         Some("2: ⚑1 •2 ●3 +4")
     );
-    r.driver.detach_peer(WIN);
+    r.driver.detach_peer(WIN, peer);
     assert_eq!(r.driver.query(|c| c.chrome(WIN)).top_bar.other, None);
+}
+
+#[test]
+fn the_top_bar_sums_every_peers_summary() {
+    let r = driven(three(editor()));
+    r.driver
+        .attach_peer(WIN, PeerId(2), WindowName::Second, crate::wm::fake::FakePeerPort::new());
+    r.driver.attach_peer(
+        WIN,
+        PeerId(16),
+        WindowName::Chat(1),
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    let summary = |running, queued, workspaces: &[&str]| crate::window_link::Summary {
+        running,
+        queued,
+        workspaces: workspaces.iter().map(|n| n.to_string()).collect(),
+        ..Default::default()
+    };
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: PeerId(2),
+        summary: summary(1, 2, &["main"]),
+    }));
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: PeerId(16),
+        summary: summary(2, 0, &["not-a-workspace"]),
+    }));
+    assert_eq!(
+        r.driver.query(|c| c.chrome(WIN)).top_bar.other.as_deref(),
+        Some("2: ●3 +2")
+    );
+    let workspaces = r.driver.query(|c| {
+        c.window(WIN)
+            .and_then(|w| w.group_summary())
+            .map(|s| s.workspaces)
+            .unwrap_or_default()
+    });
+    assert_eq!(workspaces, vec!["main".to_string()], "only window 2 has workspaces");
 }
 
 #[test]

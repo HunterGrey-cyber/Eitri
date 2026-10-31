@@ -750,6 +750,40 @@ pub const NO_SECOND_WINDOW_TEXT: &str = "this window has no second window yet";
 /// way to start it again (running `eitri` on the project links a new one too).
 pub const ORPHAN_TEXT: &str = "the editor window is closed: the editor key starts it again";
 
+// Compositor mode's words.
+
+/// What the next-chat-window key says when chat windows 2 to 9 are all started or starting.
+pub const ALL_CHAT_WINDOWS_TEXT: &str = "all nine chat windows are open";
+
+/// What the toast says when the module window `name` did not come up, for `why`.
+pub fn module_window_failed_text(name: &crate::window_link::names::WindowName, why: &str) -> String {
+    format!("window {} did not start: {why}", name.text())
+}
+
+/// What a module window says when its tab cannot be handed to another window: it holds no session yet.
+
+/// What the toast says when `tab.break` finds the tab's turn running: the tab leaves once it ends.
+pub const TAB_BREAK_WAITS_TEXT: &str = "the tab moves to its own window when this turn ends";
+
+/// What the toast says when a second `tab.break` calls off the one waiting for its turn's end.
+pub const TAB_BREAK_CANCELLED_TEXT: &str = "the tab stays here";
+
+/// Why a hand-over is refused while another from the same window is under way.
+pub const TAB_ALREADY_MOVING_TEXT: &str = "a tab is already moving";
+
+/// Why a tab stays when a turn started between the ask and its release.
+pub const A_TURN_STARTED_TEXT: &str = "a turn started";
+
+/// What a window 1 in compositor mode says for a panel whose id no window can be named by: the id and the rule.
+pub fn no_page_window_text(id: &str) -> String {
+    format!("{id}: no page window for this id (letters, digits, . _ and -, at most 40, a letter or digit at both ends)")
+}
+
+/// The log line for a key the compositor owns, by the action's name.
+pub fn off_in_compositor_mode_log(action: &str) -> String {
+    format!("[keys] {action}: off in compositor mode")
+}
+
 /// What a window verb that needs the other window says while none is attached: in window 2, that its window 1 is
 /// gone; anywhere else, that there is no second window yet.
 pub fn no_other_window_text(role: &super::window::WindowRole) -> &'static str {

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::attention::Attention;
 use crate::layout::{chip_label, export::head_name, Layout, ModuleId, ModuleKind, Selection};
+use crate::window_link::names::WindowName;
 
 /// The top bar's project label shows the directory's own last path component, never the whole
 /// resolved path -- which would run long and, for a project under the user's home directory,
@@ -34,6 +35,31 @@ pub fn window_title(project: &str, workspace: Option<&str>) -> String {
         Some(name) => format!("{project} \u{2014} Eitri \u{b7} {name}"),
         None => format!("{project} \u{2014} Eitri"),
     }
+}
+
+/// A chat or page window's title: fixed when the window is built, since the compositor's window rules and switchers
+/// read it. A chat is `<project> — Eitri chat` (its number follows from the second on), a page is
+/// `<project> — <plugin name> · Eitri`, by the plugin's id while its name is not known. Window 2 has the
+/// plain window title.
+pub fn module_window_title(project: &str, name: &WindowName, plugin_name: Option<&str>) -> String {
+    match name {
+        WindowName::Second => window_title(project, None),
+        WindowName::Chat(1) => format!("{project} \u{2014} Eitri chat"),
+        WindowName::Chat(n) => format!("{project} \u{2014} Eitri chat {n}"),
+        WindowName::Page(id) => format!("{project} \u{2014} {} \u{b7} Eitri", plugin_name.unwrap_or(id)),
+    }
+}
+
+/// What a page window is named by in its title: its plugin's name, else the title its Lua panel registered with, else
+/// nothing, and [`module_window_title`] falls back on the id.
+pub fn page_name<'a>(id: &str, plugin: Option<&'a str>, panels: &'a [(ModuleId, String)]) -> Option<&'a str> {
+    let module = ModuleId::lua(id);
+    plugin.or_else(|| {
+        panels
+            .iter()
+            .find(|(panel, _)| *panel == module)
+            .map(|(_, title)| title.as_str())
+    })
 }
 
 /// What the top bar says about the mark `swap.marked` swaps with: nothing without one. The mark
@@ -104,6 +130,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_page_window_is_named_by_its_plugin_then_its_panels_title_then_its_id() {
+        let panels = [(ModuleId::lua("notes"), "My Notes".to_string())];
+        assert_eq!(page_name("notes", Some("Notes plugin"), &panels), Some("Notes plugin"));
+        assert_eq!(page_name("notes", None, &panels), Some("My Notes"));
+        assert_eq!(page_name("other", None, &panels), None);
+        let name = WindowName::Page("notes".into());
+        assert_eq!(
+            module_window_title("project", &name, page_name("notes", None, &panels)),
+            "project \u{2014} My Notes \u{b7} Eitri"
+        );
+    }
+
+    #[test]
     fn the_mark_reads_as_text_naming_its_module_and_is_absent_without_one() {
         use super::mark_text;
         let title = |id: &ModuleId| id.as_str().to_string();
@@ -117,6 +156,34 @@ mod tests {
     #[test]
     fn the_title_is_the_project_then_eitri() {
         assert_eq!(super::window_title("neovibe", None), "neovibe \u{2014} Eitri");
+    }
+
+    #[test]
+    fn module_window_titles_are_fixed() {
+        use super::module_window_title;
+        let chat = WindowName::Chat;
+        assert_eq!(
+            module_window_title("neovibe", &chat(1), None),
+            "neovibe \u{2014} Eitri chat"
+        );
+        assert_eq!(
+            module_window_title("neovibe", &chat(3), None),
+            "neovibe \u{2014} Eitri chat 3"
+        );
+        let page = WindowName::Page("markdown".into());
+        assert_eq!(
+            module_window_title("neovibe", &page, Some("Markdown preview")),
+            "neovibe \u{2014} Markdown preview \u{b7} Eitri"
+        );
+        assert_eq!(
+            module_window_title("neovibe", &page, None),
+            "neovibe \u{2014} markdown \u{b7} Eitri",
+            "the plugin id stands in for a name that is not known"
+        );
+        assert_eq!(
+            module_window_title("neovibe", &WindowName::Second, None),
+            "neovibe \u{2014} Eitri"
+        );
     }
 
     #[test]

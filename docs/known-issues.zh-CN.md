@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=f6eae3537a31675720671757644f29b1665b0f4440c6999490236513f19df08b -->
+<!-- translated-from: known-issues.md sha256=b78e3a5e9da4c1c451aaa91294311234430cd6424257063b89800121aab57f4a -->
 
 # 已知问题与限制
 
@@ -9,6 +9,7 @@
 
 - **x86_64 的 Linux，Wayland。** X11 没有测试过（不过欢迎来自 X11 的反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
 - **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
+- **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，目前只在无界面会话和虚拟机里跑过，还有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.10 或更新**：用你自己 `PATH` 里的，或者让安装脚本为 Eitri 单独下载的一份私有副本。
 - **Claude Code**，已安装并已登录，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。

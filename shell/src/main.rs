@@ -9,6 +9,7 @@ mod chat_views;
 mod chrome;
 mod close_prompt;
 mod companion;
+mod compositor_mode;
 mod editor_feeds;
 mod editor_hole;
 mod editor_presentation;
@@ -88,6 +89,7 @@ use eitri_core::keymap::{Action, TabAction};
 use eitri_core::layout::rules::without_keys;
 use eitri_core::layout::{Direction, Layout, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, OpenRule};
 use eitri_core::plugin::theme::PageTheme;
+use eitri_core::window_link::names::WindowName;
 use eitri_core::wm::chrome::ChromeTitles;
 use eitri_core::wm::module::SurfaceDecl;
 use eitri_core::wm::start::StartStep;
@@ -102,6 +104,51 @@ use neovide_editor::NeovideEditorPane;
 use wire::{wire_host, WireDeps, WireKind};
 
 const APP_ID: &str = "cn.huntergrey.eitri";
+/// A page window's application id, the one its desktop file is named by.
+const PAGE_APP_ID: &str = "cn.huntergrey.eitri.Page";
+
+/// Which kind of process this is, and so which application id it registers: a full window or window 2 is the main
+/// application, a chat window is the panel's, a page window has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppKind {
+    Main,
+    Chat,
+    Page,
+}
+
+impl AppKind {
+    fn of(start: &linked_window::WindowStart) -> AppKind {
+        match start {
+            linked_window::WindowStart::Module {
+                name: WindowName::Chat(_),
+                ..
+            } => AppKind::Chat,
+            linked_window::WindowStart::Module {
+                name: WindowName::Page(_),
+                ..
+            } => AppKind::Page,
+            _ => AppKind::Main,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            AppKind::Main => APP_ID,
+            AppKind::Chat => companion::PANEL_APP_ID,
+            AppKind::Page => PAGE_APP_ID,
+        }
+    }
+}
+
+/// The module a chat or page window shows alone: a chat window shows its chat in its own base view, whatever its
+/// number, and a page window its plugin's page.
+fn module_of_window(name: &WindowName) -> Option<ModuleId> {
+    match name {
+        WindowName::Second => None,
+        WindowName::Chat(_) => Some(ModuleId::agent()),
+        WindowName::Page(_) => name.module(),
+    }
+}
 
 /// How long the top bar's app name shows the prefix indicator's block when a layout verb is refused
 /// (the refusal flashes the top bar, the same way the prefix indicator shows).
@@ -197,10 +244,10 @@ fn main() -> glib::ExitCode {
     // directory step. `args_os`, not `args`, and skipping argv[0] (never a
     // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
     let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // `eitri linked-window` is window 2 of a pair, started by window 1 with the link's end inherited: that end is
-    // checked and made this process's own before anything else here can open, inherit or hand on a descriptor,
-    // and the window's own log replaces the stdout and stderr it was started with. Its project root is on its
-    // command line, so the project resolver below never reads these arguments.
+    // `eitri linked-window` is window 2 of a pair or, with `--module`, a chat or page window, started by window 1 with
+    // the link's end inherited: that end is checked and made this process's own before anything else here can open,
+    // inherit or hand on a descriptor, and the window's own log replaces the stdout and stderr it was started with.
+    // Its project root is on its command line, so the project resolver below never reads these arguments.
     let start = if early_args
         .first()
         .is_some_and(|a| a == eitri_core::window_link::start::SUBCOMMAND)
@@ -302,10 +349,12 @@ fn main() -> glib::ExitCode {
     // `eitri_core::project_root`'s own module doc for why three separate `current_dir()` reads
     // were one process-global too many.
     //
-    // What the command line names to open comes out of the same resolution as nvim's own arguments; window 2 has no
-    // editor and carries none.
+    // What the command line names to open comes out of the same resolution as nvim's own arguments; window 2 and a
+    // module window have no editor and carry none.
     let (project_root, open) = match &start {
-        linked_window::WindowStart::Second { root, .. } => (root.clone(), Vec::new()),
+        linked_window::WindowStart::Second { root, .. } | linked_window::WindowStart::Module { root, .. } => {
+            (root.clone(), Vec::new())
+        }
         linked_window::WindowStart::Full => match eitri_core::project_root::resolve_launch() {
             Ok(launch) => {
                 for note in &launch.notes {
@@ -347,7 +396,7 @@ fn main() -> glib::ExitCode {
     // Neovide reads it, and the bottom terminal's shell removes it itself).
     // Window 2 never starts nvim: which one window 1 runs is window 1's, and a missing nvim is no reason for the
     // window without an editor not to open.
-    let second = matches!(start, linked_window::WindowStart::Second { .. });
+    let second = !matches!(start, linked_window::WindowStart::Full);
     match if second {
         Ok(None)
     } else {
@@ -395,8 +444,15 @@ fn main() -> glib::ExitCode {
     // A full window takes the project's pair lock here, before it reads any file of the pair (its saved tabs are
     // read as the window is built). Finding it held, it asks once whether an orphaned window 2 holds it and waits
     // for a window 1, and links to it as window 1; otherwise it runs unpaired.
+    // The compositor is asked whether it answers while GTK comes up, off this thread and from the environment alone;
+    // the mode's resolution reads whatever has come in by then. After the environment has last been written above.
+    if matches!(start, linked_window::WindowStart::Full) {
+        let wm = eitri_core::compositor::detect(&|name: &str| std::env::var_os(name));
+        compositor_mode::start_probe(wm);
+    }
+    let kind = AppKind::of(&start);
     let start = RefCell::new(Some(start));
-    let app = build_application();
+    let app = build_application(kind);
     app.connect_activate(move |app| {
         // `activate` comes once for a window that opts out of single-instance behaviour.
         let Some(start) = start.borrow_mut().take() else { return };
@@ -413,52 +469,76 @@ fn main() -> glib::ExitCode {
                     .ok_or_else(|| std::io::Error::other("no state directory"))
                     .and_then(|dir| eitri_core::window_link::pair::PairLock::try_take(dir, &project_root));
                 let legacy = backend_kind == eitri_core::agent_backend::BackendKind::Legacy;
+                use linked_window::relink::StartRelink;
                 let relinked = match (&taken, layout_dir.as_deref()) {
-                    // Before anything is drawn: the worker this joins is bounded, and no window exists yet to stall.
-                    (Ok(None), Some(dir)) => match linked_window::relink::relink(
-                        &linked_window::relink::orphan_dir(),
-                        dir,
-                        &project_root,
-                        version::fingerprint(),
-                        linked_window::relink::RELINK_WITHIN,
-                    ) {
-                        Ok(relinked) => Some(relinked),
-                        Err(why) => {
-                            println!("[window] no re-link: {why}; this window runs unpaired");
-                            start_note = linked_window::relink::refusal_note(&why);
-                            None
-                        }
-                    },
-                    _ => None,
+                    // Before anything is drawn: the workers this waits for are bounded, and no window exists yet to
+                    // stall.
+                    (Ok(None), Some(dir)) => {
+                        let (found, note) = linked_window::relink::relink_at_start(
+                            &linked_window::relink::orphan_dir(),
+                            dir,
+                            &project_root,
+                            version::fingerprint(),
+                            linked_window::relink::RELINK_WITHIN,
+                        );
+                        start_note = note;
+                        found
+                    }
+                    _ => StartRelink::Nothing,
                 };
                 match relinked {
-                    Some(relinked) => {
+                    StartRelink::Window2(relinked) => {
                         let pair = linked_window::spawn::Pair::relinked(relinked, &project_root, legacy, want_clean);
                         if let Some(link) = pair.link() {
                             link.watch();
                         }
                         pair
                     }
-                    None => linked_window::spawn::Pair::full(taken, &project_root, legacy, want_clean),
+                    StartRelink::Modules(group, claim) => {
+                        let pair = linked_window::spawn::Pair::relinked_group(group, &project_root, legacy, want_clean);
+                        pair.hold_group_claim(Some(claim));
+                        pair.watch_module_links();
+                        pair
+                    }
+                    StartRelink::Nothing => {
+                        // A first start leads its group too: an orphan a failed link left behind is not another
+                        // start's to take while this window runs.
+                        let claim = match (&taken, layout_dir.as_deref()) {
+                            (Ok(Some(_)), Some(dir)) => {
+                                eitri_core::window_link::pair::GroupClaim::try_take(dir, &project_root)
+                                    .inspect_err(|err| println!("[window] the group cannot be claimed: {err}"))
+                                    .unwrap_or_default()
+                            }
+                            _ => None,
+                        };
+                        let pair = linked_window::spawn::Pair::full(taken, &project_root, legacy, want_clean);
+                        pair.hold_group_claim(claim);
+                        pair
+                    }
                 }
             }
             linked_window::WindowStart::Second {
                 sock, token, restore, ..
-            } => match linked_window::spawn::Pair::second(sock, &project_root) {
-                Ok(pair) => {
-                    pair.set_activation(token);
-                    pair.set_restored(restore);
-                    pair.set_launch_flags(
-                        backend_kind == eitri_core::agent_backend::BackendKind::Legacy,
-                        want_clean,
-                    );
-                    pair
-                }
-                Err(err) => {
-                    eprintln!("eitri: the link to window 1 could not be started: {err}");
-                    std::process::exit(2);
-                }
-            },
+            } => linked_pair(
+                linked_window::spawn::Pair::second(sock, &project_root),
+                token,
+                restore,
+                backend_kind,
+                want_clean,
+            ),
+            linked_window::WindowStart::Module {
+                name,
+                sock,
+                token,
+                restore,
+                ..
+            } => linked_pair(
+                linked_window::spawn::Pair::module(sock, name, &project_root),
+                token,
+                restore,
+                backend_kind,
+                want_clean,
+            ),
         };
         build_ui(
             app,
@@ -473,6 +553,15 @@ fn main() -> glib::ExitCode {
         )
     });
     app.run_with_args::<&str>(&[])
+}
+
+/// The hub's compositor record is kept up to date only on a normal start: `--clean` neither reads it nor writes
+/// the default set over it, so the next normal start still finds the saved windows.
+fn cm_record_kept(
+    start: Option<eitri_core::window_link::cm_file::CmFile>,
+    want_clean: bool,
+) -> Option<eitri_core::window_link::cm_file::CmFile> {
+    start.filter(|_| !want_clean)
 }
 
 /// `NON_UNIQUE`, deliberately, and this is the one decision in this file that changes what a
@@ -495,11 +584,54 @@ fn main() -> glib::ExitCode {
 ///
 /// `eitri FILE` going to a running window changes none of this: the launch that hands its file over exits before it
 /// gets here (`open_requests::hand_over`), so every window is still a process of its own.
-fn build_application() -> Application {
+fn build_application(kind: AppKind) -> Application {
     Application::builder()
-        .application_id(APP_ID)
+        .application_id(kind.id())
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build()
+}
+
+/// A window started by window 1 takes its start's token and flags. With no link to window 1 it has nothing to be.
+fn linked_pair(
+    pair: std::io::Result<Rc<linked_window::spawn::Pair>>,
+    token: Option<String>,
+    restore: bool,
+    backend_kind: eitri_core::agent_backend::BackendKind,
+    want_clean: bool,
+) -> Rc<linked_window::spawn::Pair> {
+    match pair {
+        Ok(pair) => {
+            pair.set_activation(token);
+            pair.set_restored(restore);
+            pair.set_launch_flags(
+                backend_kind == eitri_core::agent_backend::BackendKind::Legacy,
+                want_clean,
+            );
+            pair
+        }
+        Err(err) => {
+            eprintln!("eitri: the link to window 1 could not be started: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// What this window's start knows of itself before `init.lua` runs.
+fn early_facts(pair: &linked_window::spawn::Pair, shows_chat: bool) -> eitri_core::wm::start::EarlyFacts {
+    let env = |name: &str| std::env::var_os(name);
+    let module_orphans = pair.relinked_module_windows();
+    eitri_core::wm::start::EarlyFacts {
+        started: pair.is_second(),
+        shows_chat,
+        mac: cfg!(target_os = "macos"),
+        wayland: eitri_core::compositor::mode::wayland_session(&env),
+        wm: eitri_core::compositor::detect(&env),
+        window2_orphan: pair.relink_holders().is_some() && !module_orphans,
+        module_orphans,
+        unpaired: pair.is_unpaired(),
+        alone: pair.is_alone(),
+        choice: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -520,6 +652,14 @@ fn build_ui(
     // Window 2 of a pair has no editor: no nvim is started, so none of the editor's feeds, the pane-switch channel
     // or the scratch directory exists in it, and every use of the editor below is behind its `Option`.
     let owns_editor = pair.owns_editor();
+    // A chat or page window shows its one module alone: no editor, no layout file, no top bar, and the only page it
+    // builds is its own.
+    let module_window: Option<(WindowName, ModuleId)> = pair
+        .module_window()
+        .and_then(|name| module_of_window(&name).map(|module| (name, module)));
+    let shows_a_chat = module_window
+        .as_ref()
+        .is_none_or(|(name, _)| matches!(name, WindowName::Chat(_)));
     // Before anything else, so
     // `gtk-xft-dpi` is never unset by the time the agent panel's (or a Lua panel's) `WebView` reads
     // it. See `xft_dpi`'s module doc.
@@ -668,10 +808,13 @@ fn build_ui(
             spec: eitri_core::wm::WindowSpec {
                 role: wm_role,
                 presence: editor_presence,
-                title: eitri_core::wm::titles::window_title(
-                    &eitri_core::wm::titles::project_display_name(project_root),
-                    None,
-                ),
+                title: {
+                    let project = eitri_core::wm::titles::project_display_name(project_root);
+                    match &module_window {
+                        Some((name, _)) => eitri_core::wm::titles::module_window_title(&project, name, None),
+                        None => eitri_core::wm::titles::window_title(&project, None),
+                    }
+                },
             },
         },
     );
@@ -706,10 +849,20 @@ fn build_ui(
     }
 
     let config_dir = config_dir();
-    let lua_engine = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
+    let lua_engine = Rc::new(
+        LuaEngine::showing(
+            config_dir.clone(),
+            module_window.as_ref().map(|(_, module)| module.clone()),
+        )
+        .expect("LuaEngine construction must not fail"),
+    );
     // `eitri.window` names this window before `init.lua` runs, so a config both windows run can keep a side
     // effect to one of them.
-    if let Err(err) = lua_engine.set_window(pair.pair_role()) {
+    let named = match &module_window {
+        Some((name, _)) => lua_engine.set_window_name(&name.text()),
+        None => lua_engine.set_window(pair.pair_role()),
+    };
+    if let Err(err) = named {
         eprintln!("[lua] eitri.window could not be set: {err}");
     }
     // What the kernel phase's `init.lua` and the requests phase's `shell:ready` run on.
@@ -749,14 +902,13 @@ fn build_ui(
         gtk4::Settings::default().map_or(xft_dpi::GTK_DEFAULT_XFT_DPI, |s| s.gtk_xft_dpi()),
         eitri_core::theme::guifont_size_px(start_theme.guifont()),
     )));
-    let (agent_widget, agent_panel_handle) = agent_panel::build_agent_panel(
+    // The panel without a page: the controller says when the page is built, and in a hub it never is.
+    let agent_panel_handle = agent_panel::make_panel_handle(
         project_root.to_path_buf(),
         editor_context_source,
         scratch_dir,
         backend_kind,
-        panel_notice,
         root_note,
-        None,
         pair.pair_role(),
         {
             let mut tokens = start_theme.tokens.clone();
@@ -766,6 +918,8 @@ fn build_ui(
             tokens
         },
     );
+    let base_page = gtk_host_surfaces::BasePage::new(agent_panel_handle.clone(), panel_notice);
+    wm_host.set_base_page_maker(base_page.clone());
     // The panel reads the context when its tick runs, and its tick runs only when woken. Window 1 also tells
     // window 2 each new context, which wakes window 2's panel there.
     if let Some(one) = &window1_editor {
@@ -782,16 +936,18 @@ fn build_ui(
         let panel = agent_panel_handle.clone();
         two.on_context(Rc::new(move || panel.wake()));
     }
-    // Turn review across the pair, in a window that can be one of a pair: one presence with the other window, the
-    // overlap notes across both, and window 2's review in window 1's editor. Wired to each link as it comes up.
+    // Turn review across linked windows, in a window that can be one of a group: one presence with the other windows,
+    // the overlap notes across them, every linked window's review in window 1's editor, and window 1 deciding every
+    // revert of a group. Wired to each link as it comes up.
     let pair_review = match (&window1_editor, &window2_editor) {
         (Some(one), _) if pair.holds_pair() => Some(linked_window::review::Role::One(one.clone())),
+        (None, Some(two)) if pair.is_module() => Some(linked_window::review::Role::Module(two.ops())),
         (None, Some(two)) => Some(linked_window::review::Role::Two(two.ops())),
         _ => None,
     }
     .map(|role| {
         let side: Rc<dyn linked_window::review::ReviewSide> = Rc::new(agent_panel_handle.clone());
-        linked_window::review::PairReview::new(project_root, side, role, editor_repeat.clone())
+        linked_window::review::GroupReview::new(project_root, side, role, editor_repeat.clone())
     });
     if let Some(review) = &pair_review {
         let outbound = Rc::downgrade(review);
@@ -809,7 +965,14 @@ fn build_ui(
         }));
     }
 
-    // `init.lua`: its Lua panels and the plugins it loads are registered before the config is read.
+    // `init.lua`: its Lua panels and the plugins it loads are registered before the config is read. A window that may
+    // yet turn out a hub, by what `init.lua` says, builds no panel's view until its mode is known; the base page's
+    // start step comes from the same facts.
+    let mut early = early_facts(&pair, shows_a_chat);
+    driver.set_early_facts(WinId::MAIN, early);
+    if eitri_core::wm::start::base_page_at(&early) != eitri_core::wm::start::PageAt::Kernel {
+        lua_engine.panels.borrow_mut().hold_views();
+    }
     driver.start(WinId::MAIN, StartStep::Kernel);
 
     // The window config, the keymap, the plugins' panels, the module keys and the keys help; the config phase is
@@ -821,6 +984,66 @@ fn build_ui(
             std::process::exit(1);
         }
     };
+    // The window's mode, known as soon as `init.lua` has run: what `window.tiling` says, the pair's facts and whether
+    // this project is a plugin's own window. A hub keeps no tabs of its own and hosts no panel.
+    let tiling_choice = config.tiling;
+    early.choice = Some(tiling_choice);
+    driver.set_early_facts(WinId::MAIN, early);
+    let plugins = lua_engine
+        .plugins
+        .borrow()
+        .plugins()
+        .iter()
+        .filter_map(|registration| {
+            registration
+                .plugin
+                .window_root
+                .as_ref()
+                .map(|root| (registration.plugin.manifest.id.clone(), root.clone()))
+        })
+        .collect::<Vec<_>>();
+    let own_window = eitri_core::wm::start::own_window(project_root, &plugins, pair.pair_role());
+    // Whether the compositor answered is read as it stands, never waited for: no answer yet counts as not live.
+    let (tiling, resolved) = if module_window.is_some() {
+        (eitri_core::wm::window::Tiling::ModuleWindow, None)
+    } else {
+        let (tiling, mode, why) = early.tiling(own_window.is_some(), compositor_mode::probe_now());
+        (tiling, (!early.started).then_some((mode, why)))
+    };
+    // What the window says of the mode it opened in, shown with the first toast; a window another started has no
+    // mode of its own to say anything of.
+    let mut back_from_compositor = false;
+    let (mode_notes, first_toast) = resolved
+        .map(|(mode, why)| {
+            let state_dir = eitri_core::layout::persist::state_dir(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            );
+            let prev = state_dir
+                .as_deref()
+                .map(|dir| eitri_core::compositor::mode::read_mode_state(dir, project_root))
+                .unwrap_or_default();
+            back_from_compositor = mode == eitri_core::compositor::mode::Mode::Eitri
+                && prev.last == Some(eitri_core::compositor::mode::Mode::Compositor);
+            let settled = compositor_mode::settle(mode, why, early.wm, tiling_choice, prev);
+            println!("{}", settled.log);
+            if let Some(dir) = state_dir.as_deref().filter(|_| settled.state != prev) {
+                if let Err(err) = eitri_core::compositor::mode::write_mode_state(dir, project_root, &settled.state) {
+                    println!("[mode] could not record the mode in {}: {err}", dir.display());
+                }
+            }
+            (settled.notes, settled.first_toast)
+        })
+        .unzip();
+    let hub = tiling == eitri_core::wm::window::Tiling::Hub;
+    lua_engine.panels.borrow_mut().settle_views(!hub);
+    if hub {
+        agent_panel_handle.keep_no_tabs();
+        agent_panel::start_review_pump(&agent_panel_handle);
+    } else if module_window.is_some() {
+        // Window 1 saves the group's tabs: this window tells it its own.
+        agent_panel_handle.keep_no_tabs();
+    }
     config.apply_to_panel(&agent_panel_handle);
     let keymap = config.keymap.clone();
     if let Some(tutor) = &tutor {
@@ -853,20 +1076,49 @@ fn build_ui(
         }));
     }
     if let Some(one) = &window1_editor {
-        let one = one.clone();
         let panels = Rc::downgrade(&plugin_panels);
         let project = project_root.to_owned();
+        let roots_of: linked_window::editor::PageRoots = Rc::new(move |owner| {
+            let panels = panels.upgrade()?;
+            panels.modules().contains(&ModuleId::lua(owner)).then(|| {
+                panels
+                    .plugin_roots(owner)
+                    .unwrap_or_else(|| BTreeMap::from([("project".into(), project.clone())]))
+            })
+        });
+        one.set_page_roots(roots_of.clone());
+        let one = one.clone();
+        let pair = Rc::downgrade(&pair);
         plugin_panels.set_holder_hook(Rc::new(move |owner, held| {
-            let roots = if held {
-                None
-            } else {
-                panels.upgrade().map(|p| {
-                    p.plugin_roots(owner)
-                        .unwrap_or_else(|| BTreeMap::from([("project".into(), project.clone())]))
-                })
-            };
-            one.set_plugin_in_window2(owner, roots);
+            let peer = pair
+                .upgrade()
+                .map_or(linked_window::spawn::SECOND_PEER, |pair| pair.page_peer(owner));
+            let roots = if held { None } else { roots_of(owner) };
+            one.set_plugin_in_window(owner, (!held).then_some(peer), roots);
         }));
+    }
+    // A page window is titled by its plugin's name, known only now that the plugins are loaded. Set once, before
+    // the window is shown, and never again: window rules and switchers read the title as it is.
+    if let Some((name @ WindowName::Page(id), _)) = &module_window {
+        let plugin_title = lua_engine
+            .plugins
+            .borrow()
+            .plugins()
+            .iter()
+            .find(|registration| registration.plugin.manifest.id == *id)
+            .map(|registration| registration.plugin.manifest.title.clone());
+        let panel_titles: Vec<(ModuleId, String)> = lua_engine
+            .panels
+            .borrow()
+            .entries()
+            .iter()
+            .map(|entry| (entry.module.clone(), entry.title.clone()))
+            .collect();
+        window.set_title(Some(&eitri_core::wm::titles::module_window_title(
+            &eitri_core::wm::titles::project_display_name(project_root),
+            name,
+            eitri_core::wm::titles::page_name(id, plugin_title.as_deref(), &panel_titles),
+        )));
     }
     // The socket nvim reports followed buffers and plugin commands to, bound only when a loaded plugin follows the
     // editor or defines nvim commands: a window without one has no such socket at all. Bound now, before any page
@@ -1059,7 +1311,11 @@ fn build_ui(
         module_keys.clone(),
         agent_panel_handle.clone(),
         config.tmux_skipped.clone(),
-        eitri_panel::keys_help::HelpScope::Window,
+        if module_window.is_some() {
+            eitri_panel::keys_help::HelpScope::ModuleWindow
+        } else {
+            eitri_panel::keys_help::HelpScope::Window
+        },
     );
     keys_help.send();
     // The first-start screen's host, filled in where the window's overlay and driver exist: each report of the editor's
@@ -1189,11 +1445,15 @@ fn build_ui(
             std::process::exit(1);
         }
     };
-    let pair_layout_dir = eitri_core::layout::persist::state_dir(
-        std::env::var_os("XDG_STATE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+    // A chat or page window and a hub read and write none of the pair's files.
+    let pair_layout_dir = eitri_core::wm::persist::layout_dir(
+        eitri_core::layout::persist::state_dir(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        ),
+        tiling,
     );
-    let pair_restore = match pair_layout_dir.as_deref().filter(|_| pair.holds_pair()) {
+    let pair_restore = match pair_layout_dir.as_deref().filter(|_| pair.keeps_pair_file()) {
         Some(dir) => {
             // Window 2's own layout file, read here only to know it can be opened: one it would have to set aside
             // gives it nothing to come back to.
@@ -1250,14 +1510,67 @@ fn build_ui(
         }
         None => None,
     };
+    // The compositor group's record is separate from every tiled-window and pair file.
+    let cm_layout_dir = (hub || module_window.is_some())
+        .then(|| {
+            eitri_core::state_paths::state_dir(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
+        })
+        .flatten();
+    let cm_restore = if window_restore && !want_clean && (hub || pair.restored()) {
+        cm_layout_dir.as_deref().and_then(
+            |dir| match eitri_core::window_link::cm_file::read_cm(dir, project_root) {
+                eitri_core::window_link::cm_file::ReadCm::Read(file, notes) => {
+                    for note in notes {
+                        println!("[layout] {note}");
+                    }
+                    Some(file)
+                }
+                eitri_core::window_link::cm_file::ReadCm::Unusable(why) => {
+                    eprintln!("[layout] {why}");
+                    None
+                }
+                eitri_core::window_link::cm_file::ReadCm::Missing => None,
+            },
+        )
+    } else {
+        None
+    };
     let window2_restored = pair_restore.restore_second;
     // Window 1 offers window 2's saved tabs after its own when window 2 does not come back; a window 2 started again
-    // offers its own.
-    agent_panel_handle.set_tab_files(linked_window::pair_files::tab_files(
-        pair.pair_role(),
-        pair.holds_pair() && !window2_restored && pair.relink_holders().is_none(),
-        pair.holds_pair()
-            && linked_window::pair_files::alone_on_project(
+    // offers its own. A hub is told none: giving them reads the files and claims other windows' tabs at once, and a
+    // group's tabs belong to its chat windows.
+    if !hub {
+        agent_panel_handle.set_tab_files(linked_window::pair_files::tab_files(
+            pair.pair_role(),
+            pair.holds_pair() && !window2_restored && pair.relink_holders().is_none(),
+            pair.holds_pair()
+                && linked_window::pair_files::alone_on_project(
+                    eitri_core::turn_review::review_dir_for(
+                        std::env::var_os("XDG_STATE_HOME").as_deref(),
+                        std::env::var_os("HOME").as_deref(),
+                        project_root,
+                    )
+                    .as_deref(),
+                ),
+            // A chat or page window started with `--restore` only keeps the keys in window 1: it is no window 2 come
+            // back, and offers no saved tabs of window 2's.
+            pair.restored() && module_window.is_none(),
+        ));
+    }
+    // A hub's tabs are the group's, one file for every chat window: read here once, and the windows that hold tabs open
+    // at the start beside the layout's.
+    let tab_windows = if hub && agent_panel_handle.remembers_tabs() {
+        let group_tabs = linked_window::group_tabs::GroupTabs::read(
+            eitri_core::saved_tabs::state_dir(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
+            .as_deref(),
+            project_root,
+            linked_window::pair_files::alone_on_project(
                 eitri_core::turn_review::review_dir_for(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),
                     std::env::var_os("HOME").as_deref(),
@@ -1265,13 +1578,18 @@ fn build_ui(
                 )
                 .as_deref(),
             ),
-        pair.restored(),
-    ));
+        );
+        let windows = group_tabs.windows();
+        pair.keep_group_tabs(group_tabs);
+        windows
+    } else {
+        Vec::new()
+    };
     if window2_restored {
         agent_panel_handle.hold_launch_restore();
     }
     if let Some(dir) = pair_layout_dir.as_deref() {
-        let writing = pair.holds_pair() && !pair_restore.in_the_way;
+        let writing = pair.keeps_pair_file() && !pair_restore.in_the_way;
         let start = if writing {
             pair_restore.start.clone()
         } else if pair.restored() {
@@ -1302,12 +1620,19 @@ fn build_ui(
                     // Window 1 spawns restored window 2 directly; the link uses the same parent identity.
                     first_pid: unsafe { libc::getppid() as u32 },
                 }
+            } else if module_window.is_some() {
+                eitri_core::wm::PlacementRole::NewModule
             } else if pair.is_second() {
                 eitri_core::wm::PlacementRole::NewSecond
             } else {
                 eitri_core::wm::PlacementRole::Main
             },
-            remembered: if pair.holds_pair() {
+            remembered: if let Some((name, _)) = &module_window {
+                cm_restore
+                    .as_ref()
+                    .and_then(|file| file.output(name))
+                    .map(str::to_owned)
+            } else if pair.holds_pair() {
                 linked_window::pair_files::window1_start_monitor(&pair_restore.start, window2_restored)
             } else if pair.restored() {
                 second_restore.remembered.clone()
@@ -1317,9 +1642,13 @@ fn build_ui(
             restore_second: window2_restored,
         },
     );
-    let state_dir = eitri_core::layout::persist::state_dir(
-        std::env::var_os("XDG_STATE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+    // With no state directory the window reads no layout file and its saver writes none.
+    let state_dir = eitri_core::wm::persist::layout_dir(
+        eitri_core::layout::persist::state_dir(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        ),
+        tiling,
     );
     // The key that shows the editor, as the keymap binds it: named by the note a layout that hides
     // the editor prints, the way the toast names its own way back.
@@ -1327,20 +1656,6 @@ fn build_ui(
         .keys_for(&Action::Module(ModuleId::editor()))
         .first()
         .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
-    let plugins = lua_engine
-        .plugins
-        .borrow()
-        .plugins()
-        .iter()
-        .filter_map(|registration| {
-            registration
-                .plugin
-                .window_root
-                .as_ref()
-                .map(|root| (registration.plugin.manifest.id.clone(), root.clone()))
-        })
-        .collect::<Vec<_>>();
-    let own_window = eitri_core::wm::start::own_window(project_root, &plugins, pair.pair_role());
     let has_own_window = own_window.is_some();
     let own_window_decl = own_window.as_ref().and_then(|id| {
         lua_engine
@@ -1376,19 +1691,27 @@ fn build_ui(
     let loaded = state_dir.as_deref().map(|dir| {
         eitri_core::layout::persist::load_for_role(dir, project_root, pair.pair_role(), &layout_decls, &layout_deferred)
     });
+    // A chat or page window starts from its one leaf in one workspace, whatever the files and `init.lua` say.
+    let module_start = module_window.as_ref().map(|(_, module)| {
+        eitri_core::layout::reconcile_module(eitri_core::layout::Node::Leaf(module.clone()), module)
+            .map(|one| (eitri_core::layout::Workspaces::single(), one.layout, one.notes, None))
+            .map_err(|err| format!("the layout of the window for {module} could not start: {err}"))
+    });
     // `start_layout` is the current workspace's layout, `start_workspaces` the window's other workspaces beside it
     // and what a later build keeps in the file: this window's own values until the controller takes them, so what
     // the window's start owes its role (below) is written to them before anything reads them.
-    let (mut start_workspaces, mut start_layout, keep_copy) = match eitri_core::wm::persist::choose_startup_layout(
-        lua_default.as_ref(),
-        plugin_window,
-        loaded,
-        &layout_decls,
-        &rules,
-        show_editor.as_deref(),
-        &layout_deferred,
-        &own_rules,
-    ) {
+    let (mut start_workspaces, mut start_layout, keep_copy) = match module_start.unwrap_or_else(|| {
+        eitri_core::wm::persist::choose_startup_layout(
+            lua_default.as_ref(),
+            plugin_window,
+            loaded,
+            &layout_decls,
+            &rules,
+            show_editor.as_deref(),
+            &layout_deferred,
+            &own_rules,
+        )
+    }) {
         Ok((workspaces, layout, notes, keep_copy)) => {
             for note in notes {
                 println!("[layout] {note}");
@@ -1405,6 +1728,7 @@ fn build_ui(
         .borrow()
         .defined_workspaces()
         .iter()
+        .filter(|_| tiling == eitri_core::wm::window::Tiling::Eitri)
         .map(|(name, tree)| tree.clone().map(|tree| (name.clone(), tree)))
         .collect::<Result<Vec<_>, _>>();
     let defined = match defined {
@@ -1435,8 +1759,50 @@ fn build_ui(
     // pages, panels and instances the pair does not give it marked away; an unpaired window's copy of window 1's
     // layout with every away mark dropped, since it builds its own instance of everything; window 1's layouts as
     // the pair file has them, which wins over its own file's away marks.
+    // A hub's shape is fixed: the layout chosen above decides which chats and pages open as windows, and nothing more.
     let mut restore_base: Option<(eitri_core::layout::Layout, eitri_core::layout::Workspaces)> = None;
-    if pair.is_second() {
+    let mut hub_cm_start = None;
+    if hub {
+        let (mut layout, mut open) = eitri_core::wm::start::hub_layout(&start_layout);
+        if let Some(file) = &cm_restore {
+            layout = file.terminal.layout();
+            open = file
+                .ordered_windows()
+                .into_iter()
+                .filter(|name| {
+                    let Some(module) = name.module() else { return false };
+                    let available = module.kind() == ModuleKind::Agent
+                        || decls.iter().any(|d| d.id == module)
+                        || deferred.contains(&module);
+                    if !available {
+                        println!("[layout] {} is not registered; its window stays closed", name.text());
+                    }
+                    available
+                })
+                .collect();
+        }
+        let mut file = eitri_core::window_link::cm_file::CmFile::new(&layout, &open);
+        for window in &mut file.windows {
+            window.output = cm_restore
+                .as_ref()
+                .and_then(|file| file.windows.iter().find(|w| w.name == window.name))
+                .and_then(|w| w.output.clone());
+        }
+        hub_cm_start = Some(file);
+        driver.set_start_windows(
+            WinId::MAIN,
+            eitri_core::wm::start::StartWindows {
+                open: linked_window::group_tabs::beside_the_layout(open, tab_windows),
+                unnamed: if cm_restore.is_some() {
+                    Vec::new()
+                } else {
+                    eitri_core::wm::start::unnamed_pages(&start_layout)
+                },
+            },
+        );
+        start_layout = layout;
+        start_workspaces = eitri_core::layout::Workspaces::single();
+    } else if pair.is_second() && module_window.is_none() {
         let frame = eitri_core::layout::Frame::new(eitri_core::layout::rules::NOMINAL_GRID, 1);
         if let Err(err) = linked_window::start_second(&mut start_layout, &mut start_workspaces, &frame) {
             eprintln!("eitri: window 2's layout could not start without its editor: {err}");
@@ -1484,13 +1850,36 @@ fn build_ui(
         // Alone (the pair lock could not be had): no other window can hold anything, so nothing is away here.
         linked_window::ignore_away(&mut start_layout, &mut start_workspaces);
     }
+    // The layout files stayed as they were through the compositor run, and the chats it left are in the tabs file, in
+    // views: the window opens with those views, or every chat would come back in the base view's strip.
+    let saved_views = (back_from_compositor
+        && !want_clean
+        && own_window.is_none()
+        && pair.pair_role() == eitri_core::window_link::pair::Role::Main
+        && agent_panel_handle.remembers_tabs())
+    .then(|| {
+        eitri_core::saved_tabs::state_dir(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
+    })
+    .flatten()
+    .map(|dir| match eitri_core::saved_tabs::load(&dir, project_root) {
+        eitri_core::saved_tabs::Loaded::Saved(saved) => eitri_core::saved_tabs::views_holding(&saved),
+        _ => Vec::new(),
+    })
+    .unwrap_or_default();
+    for note in eitri_core::wm::persist::tile_saved_views(&mut start_layout, &mut start_workspaces, &saved_views) {
+        println!("[layout] {note}");
+    }
     for module in plugin_panels.modules() {
         if start_layout.is_away(&module) {
             plugin_panels.mark_away(&module);
             if let Some(one) = &window1_editor {
                 let owner = module.as_str().trim_start_matches("lua:");
-                one.set_plugin_in_window2(
+                one.set_plugin_in_window(
                     owner,
+                    Some(pair.page_peer(owner)),
                     Some(
                         plugin_panels
                             .plugin_roots(owner)
@@ -1500,27 +1889,52 @@ fn build_ui(
             }
         }
     }
-    let mut layout_saver = layout_state::saver(
-        state_dir,
-        pair.pair_role(),
-        project_root,
-        &start_layout,
-        &start_workspaces,
-        layout_decls.clone(),
-        keep_copy,
-    );
-    layout_saver.set_deferred(layout_deferred.clone());
-    if let Some((layout, spaces)) = restore_base.take() {
-        layout_saver = layout_saver.with_base(&layout, &spaces);
-        if layout_saver.submit_now(&start_layout, &start_workspaces) {
-            println!("[layout] the layout as the pair file left it is written");
+    let layout_saver = (!hub).then(|| {
+        let mut layout_saver = layout_state::saver(
+            state_dir,
+            pair.pair_role(),
+            project_root,
+            &start_layout,
+            &start_workspaces,
+            layout_decls.clone(),
+            keep_copy,
+        );
+        layout_saver.set_deferred(layout_deferred.clone());
+        if let Some((layout, spaces)) = restore_base.take() {
+            layout_saver = layout_saver.with_base(&layout, &spaces);
+            if layout_saver.submit_now(&start_layout, &start_workspaces) {
+                println!("[layout] the layout as the pair file left it is written");
+            }
         }
-    }
+        layout_saver
+    });
     // The window's layouts and its saver, given to the controller before any hook that posts to it. From here on
     // the controller is the one writer of both; `module_layout` and `workspaces` are every reader's views on them.
-    let parts = eitri_core::wm::WindowParts::new(start_layout, start_workspaces, Some(layout_saver));
+    let parts = eitri_core::wm::WindowParts::new(start_layout, start_workspaces, layout_saver);
     let (module_layout, workspaces) = parts.views();
-    driver.start(WinId::MAIN, StartStep::Layout { parts, own_window });
+    let cm_start = cm_record_kept(hub_cm_start, want_clean);
+    let cm_session = cm_start.zip(cm_layout_dir.as_deref()).and_then(|(file, dir)| {
+        linked_window::focus::CmSession::new(dir, project_root, file)
+            .inspect_err(|err| eprintln!("[layout] compositor layout writer: {err}"))
+            .ok()
+            .map(|session| Rc::new(RefCell::new(session)))
+    });
+    driver.start(
+        WinId::MAIN,
+        StartStep::Layout {
+            parts,
+            own_window,
+            tiling,
+        },
+    );
+    // The base page's place, whichever start step built it; a window that builds none has an empty place no host takes.
+    let agent_widget: gtk4::Widget = base_page
+        .take()
+        .unwrap_or_else(|| gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast());
+    // What the verbs that differ between `c1` and the other chat windows read.
+    if let Some((name, _)) = &module_window {
+        driver.set_module_name(WinId::MAIN, name.clone());
+    }
     // Every module's host, added once and never reparented (`module_grid`'s module doc). It arranges through
     // the controller, which holds the window's layout from the phase above, and the host drives and reads it.
     let grid = ModuleGrid::new(module_layout.clone());
@@ -1666,6 +2080,18 @@ fn build_ui(
                 }
             }
         }));
+        // A hub makes the editor's host and the bottom terminal's: chats and pages are windows of their own.
+        if hub {
+            made.retain(|decl| matches!(decl.module.kind(), ModuleKind::Editor | ModuleKind::Terminal));
+        }
+        // A chat or page window makes the host of its one module and no other.
+        if let Some((_, module)) = &module_window {
+            made.retain(|decl| decl.module == *module);
+            if made.is_empty() {
+                eprintln!("eitri: this window shows {module}, which has no page in this project");
+                std::process::exit(1);
+            }
+        }
         made
     };
     // A window with no editor declares the editor's surface like any other and the controller makes none for it,
@@ -1693,6 +2119,8 @@ fn build_ui(
             .modules()
             .into_iter()
             .filter(|id| !plugin_panels.starts_hidden(id) || layout.is_shown(id))
+            .filter(|_| !hub)
+            .filter(|id| module_window.as_ref().is_none_or(|(_, module)| id == module))
             .collect()
     };
     for id in &shown_at_start {
@@ -1730,6 +2158,7 @@ fn build_ui(
         None => Rc::new(linked_window::NoEditor),
     };
     wm_host.set_services(Rc::new(PanelServices {
+        cm_session: cm_session.clone().map(|session| (session, app.clone())),
         inner: gtk_host_services::Services {
             editor: pane.clone(),
             editor_rpc: editor_rpc.clone(),
@@ -1763,6 +2192,14 @@ fn build_ui(
     // modules the surfaces phase declared -- each shown terminal's shell, each shown start-hidden page, each
     // plugin told whether it is drawn. The launch is not a change, so nothing is saved for it. Every host the
     // window opens with was made by the walk, so no module is left to declare here.
+    if let Some(session) = &cm_session {
+        let (session, layout) = (session.clone(), module_layout.clone());
+        grid.connect_changed_by_controller(move || {
+            if let Some(layout) = layout.try_read() {
+                session.borrow_mut().terminal(&layout);
+            }
+        });
+    }
     grid.take_every_host_off_screen();
     driver.first_apply(WinId::MAIN, Vec::new());
     // Every change of the arrangement is written to this project's state file, 500ms after the last
@@ -2070,7 +2507,13 @@ fn build_ui(
     }
 
     let top_bar = chrome::build_top_bar(&window, &chrome_project);
-    root.append(&top_bar.widget);
+    // A chat or page window shows no top bar: its widgets still exist, so every hook that reads one finds it, but
+    // the bar has no parent and is hidden, so the toast and the y/n prompt place themselves as if it were away.
+    if module_window.is_none() {
+        root.append(&top_bar.widget);
+    } else {
+        top_bar.widget.set_visible(false);
+    }
     root.append(&grid);
 
     // Names for tray chips and the prefix strip: built-ins use their kind, and Lua panels use
@@ -2098,7 +2541,14 @@ fn build_ui(
     );
     top_bar.tray.append(tray.widget());
     let prefix_strip = Rc::new(prefix_strip::PrefixStrip::new());
-    top_bar.strip.append(prefix_strip.widget());
+    // A chat or page window's top bar is never shown: the strip floats over its page instead, or `Ctrl+b` would change
+    // nothing on screen there.
+    let floating_strip = module_window
+        .is_some()
+        .then(|| prefix_strip::floating_frame(&prefix_strip));
+    if floating_strip.is_none() {
+        top_bar.strip.append(prefix_strip.widget());
+    }
     let top_items: Vec<gtk4::Widget> = std::iter::once(top_bar.workspace.clone().upcast())
         .chain(tray.items())
         .chain(top_bar.items.iter().cloned())
@@ -2109,6 +2559,9 @@ fn build_ui(
     hint_overlay.set_child(Some(&backdrop));
     hint_overlay.add_overlay(&root);
     hint_overlay.set_measure_overlay(&root, true);
+    if let Some(frame) = &floating_strip {
+        hint_overlay.add_overlay(frame);
+    }
     window.set_child(Some(&hint_overlay));
     if let Some(pane) = &pane {
         let refresh = {
@@ -2145,8 +2598,14 @@ fn build_ui(
     hint_overlay.add_overlay(onboarding_screen.widget());
     // A window 1 an orphaned window 2 refused runs unpaired: the user sees why, and the refusal says what brings the
     // pair back.
-    if let Some(note) = &start_note {
-        toast.show_for(note, toast::NOTICE_FOR);
+    // The mode's own notes follow it: they are said once, and a toast that replaced the relink's would hide it.
+    let notices: Vec<&str> = start_note
+        .iter()
+        .chain(mode_notes.iter().flatten())
+        .map(String::as_str)
+        .collect();
+    if !notices.is_empty() {
+        toast.show_for(&notices.join("; "), toast::NOTICE_FOR);
     }
     // The window's y/n, for a window close that would interrupt a running tab and for `prefix x`. Built here,
     // before everything that asks it; its key layer is added with the window's others, in their declared order
@@ -2311,6 +2770,14 @@ fn build_ui(
                 };
                 (ids, claims)
             }),
+            notice: {
+                let toast = toast.clone();
+                let project_root = project_root.to_path_buf();
+                Rc::new(move |text| {
+                    toast.show_notice_when_free(text);
+                    compositor_mode::toast_went_up(&project_root);
+                })
+            },
             view_in_editor: {
                 let panel = agent_panel_handle.clone();
                 Rc::new(move |title: &str, text: &str| panel.view_in_editor(title, text))
@@ -2398,6 +2865,9 @@ fn build_ui(
                     } else {
                         armed_name.remove_css_class("prefix-armed");
                     }
+                    if let Some(frame) = &floating_strip {
+                        frame.set_visible(pieces.is_some_and(|pieces| !pieces.is_empty()));
+                    }
                     strip.show(pieces.unwrap_or(&[]));
                 }),
                 prefix_panel: Box::new(move |model| match model {
@@ -2480,6 +2950,9 @@ fn build_ui(
     );
     if let Err(why) = wm_host.draw_chrome(WinId::MAIN) {
         eprintln!("[wm] BUG: the window's chrome was not drawn: {why}");
+    }
+    if let Some(text) = first_toast.flatten() {
+        driver.hold_first_toast(WinId::MAIN, text);
     }
     // With no `init.lua`, the first launch of a full window offers to write one. Decided on a worker once the config
     // phase is over; the screen opens only if the answer comes, and every other start is left as it was.
@@ -2767,12 +3240,17 @@ fn build_ui(
     }
     // How either window of the pair comes forward from the other, the compositor's way.
     let pair_raise = PairRaise::new(config.companion_wm);
+    if module_window.is_some() {
+        pair_raise.prepare_module();
+    }
     // A restored window's first show asks for no focus of its own. Placement returns the keys to window 1 on
     // sway and Hyprland after mapping, including when the compositor chooses the remembered output itself. Neither
-    // does the first show of a window outside a pair.
+    // does the first show of a window outside a pair. A chat or page window's first show only presents it with its
+    // start's token: the compositor's own focus follows once it is mapped (the new module window's placement), so it
+    // comes forward once.
     let raises = pair_raise.used_for_window(
         pair.holds_pair() || pair.is_second(),
-        pair.restored(),
+        pair.restored() || module_window.is_some(),
         incoming_opens.is_some(),
     );
     // A window put back on its monitor moves through the same adapter, whatever its part in a pair.
@@ -2795,10 +3273,14 @@ fn build_ui(
         };
         let reports = RefCell::new(linked_window::pair_files::MonitorReports::default());
         let pair_for_monitor = Rc::downgrade(&pair);
+        let cm_session = cm_session.clone();
         linked_window::focus::watch(
             &window,
             WinId::MAIN,
             Rc::new(move |event| {
+                if let (Some(session), HostEvent::MonitorsChanged { monitors }) = (&cm_session, &event) {
+                    session.borrow_mut().outputs_changed(monitors);
+                }
                 if let Some(monitor) = reports.borrow_mut().report(&event) {
                     if let Some(pair) = pair_for_monitor.upgrade() {
                         pair.with_pair_writer(|writer| writer.monitor(own_window, monitor));
@@ -3112,11 +3594,22 @@ fn build_ui(
         }
     }));
     // A chat's move answers later: the panel's freeze, with the move's own id, and the presence an arriving chat
-    // waits for before move_done.
+    // waits for before move_done. A hand-over's answers go to window 1 over the link: no move of this controller's
+    // carries one.
     panel_hooks.on_chat_move = Some(Box::new({
         let driver = driver.clone();
-        move |event: agent_panel::ChatMoveEvent| {
-            driver.post(HostEvent::Chat(chat_move_event(WinId::MAIN, event)));
+        let pair = Rc::downgrade(&pair);
+        move |event: agent_panel::ChatMoveEvent| match event {
+            agent_panel::ChatMoveEvent::HandOver(answer) => {
+                if let Some(pair) = pair.upgrade() {
+                    pair.answer_hand_over(answer);
+                }
+            }
+            event => {
+                if let Some(event) = chat_move_event(WinId::MAIN, event) {
+                    driver.post(HostEvent::Chat(event));
+                }
+            }
         }
     }));
     // Every hook is built: the panel gets them all at once. Nothing since the first was built can
@@ -3493,26 +3986,40 @@ fn build_ui(
     // window ends, by a clean close or not, this window takes back what it held for it.
     {
         let said: Rc<linked_window::HeldSaid> = Rc::default();
-        let say_held: linked_window::spawn::OnLinked = {
+        // What this window holds now, unless the layout is being written.
+        let held_now: Rc<dyn Fn() -> Option<std::collections::BTreeSet<String>>> = {
             let module_layout = module_layout.clone();
             let workspaces = workspaces.clone();
+            Rc::new(move || {
+                let (Some(layout), Some(workspaces)) = (module_layout.try_read(), workspaces.try_read()) else {
+                    return None;
+                };
+                Some(linked_window::held(&layout, &workspaces))
+            })
+        };
+        let say_held: linked_window::spawn::LinkMade = {
+            let held_now = held_now.clone();
             let said = said.clone();
             Rc::new(move |link| {
                 if !link.linked() {
                     return;
                 }
-                let (Some(layout), Some(workspaces)) = (module_layout.try_read(), workspaces.try_read()) else {
-                    return;
-                };
-                said.say(link, linked_window::held(&layout, &workspaces));
+                if let Some(held) = held_now() {
+                    said.say(link, held);
+                }
             })
         };
         {
             let pair = Rc::downgrade(&pair);
             let say_held = say_held.clone();
+            let held_now = held_now.clone();
             let tell: Rc<dyn Fn()> = Rc::new(move || {
-                if let Some(link) = pair.upgrade().and_then(|pair| pair.link()) {
+                let Some(pair) = pair.upgrade() else { return };
+                if let Some(link) = pair.link() {
                     say_held(&link);
+                }
+                if let Some(held) = held_now() {
+                    pair.say_held_to_modules(&held);
                 }
             });
             // Every change of what this window holds is the controller's, and ends with the allocation it asks for.
@@ -3520,18 +4027,44 @@ fn build_ui(
         }
         let ever_linked = Rc::new(std::cell::Cell::new(false));
         let linked: linked_window::spawn::OnLinked = {
+            let cm_session = cm_session.clone();
             let panel = agent_panel_handle.clone();
             let partner_window = if pair.is_second() { 1 } else { 2 };
             let ever_linked = ever_linked.clone();
             let wm = Rc::downgrade(&driver);
-            // Window 1's other window is window 2, and window 2's is window 1.
-            let peer = eitri_core::wm::PeerId(if pair.is_second() { 1 } else { 2 });
+            let second = pair.is_second();
             let window1_editor = window1_editor.clone();
             let window2_editor = window2_editor.clone();
             let pair_review = pair_review.clone();
             let toast = toast.clone();
             let pair_weak = Rc::downgrade(&pair);
-            Rc::new(move |link| {
+            let window_weak = window.downgrade();
+            Rc::new(move |name, peer, link| {
+                // The move protocol is the controller's: its messages, the link's wakes and its end reach it from here.
+                let attach = || {
+                    if let Some(wm) = wm.upgrade() {
+                        link.attach_controller(WinId::MAIN, peer, name.clone(), &wm);
+                    }
+                };
+                // A module window of this window 1: the editor and the turn review serve it as they serve window 2,
+                // and a page window holds its plugin's page from here on, while the panel's partner and the pair file
+                // serve window 2's one link.
+                if !second && *name != WindowName::Second {
+                    if let Some(session) = &cm_session {
+                        session.borrow_mut().linked(peer, name);
+                    }
+                    if let (Some(pair), Some(held)) = (pair_weak.upgrade(), held_now()) {
+                        pair.say_held_to_modules(&held);
+                    }
+                    if let Some(one) = &window1_editor {
+                        one.linked(peer, name.clone(), link);
+                    }
+                    if let Some(review) = &pair_review {
+                        review.linked(peer, link);
+                    }
+                    attach();
+                    return;
+                }
                 panel.set_partner(link.partner().map(|p| (p.pid, p.start, partner_window).into()));
                 ever_linked.set(true);
                 toast.set_standing(None);
@@ -3550,29 +4083,42 @@ fn build_ui(
                 said.new_link();
                 say_held(link);
                 if let Some(one) = &window1_editor {
-                    one.linked(link);
+                    one.linked(peer, name.clone(), link);
                 }
                 if let Some(two) = &window2_editor {
                     two.linked(link);
                 }
                 if let Some(review) = &pair_review {
-                    review.linked(link);
+                    review.linked(peer, link);
                 }
-                // The move protocol is the controller's: its messages, the link's wakes and its end reach it from here.
-                if let Some(wm) = wm.upgrade() {
-                    link.attach_controller(WinId::MAIN, peer, &wm);
+                attach();
+                // A chat or page window that took the keyboard before its link was up could not say so then: it
+                // says so now, or window 1 would send a chat key to the window that held the keys before it.
+                if window_weak.upgrade().is_some_and(|window| window.is_active()) {
+                    if let Some(pair) = pair_weak.upgrade() {
+                        pair.say_window_focused();
+                    }
+                }
+                // Tabs that changed with no link up go now, and a window 1 new to this window hears what it holds.
+                if let Some(pair) = pair_weak.upgrade() {
+                    pair.say_tabs();
                 }
             })
         };
         let post: Rc<dyn Fn(eitri_core::wm::PeerEvent)> = {
+            let cm_session = cm_session.clone();
             let wm = Rc::downgrade(&driver);
             Rc::new(move |event| {
+                if let Some(session) = &cm_session {
+                    session.borrow_mut().event(&event);
+                }
                 if let Some(wm) = wm.upgrade() {
                     wm.post(HostEvent::Peer(event));
                 }
             })
         };
         let ended: linked_window::spawn::OnEnded = {
+            let cm_session = cm_session.clone();
             let panel = agent_panel_handle.clone();
             let module_layout = module_layout.clone();
             let workspaces = workspaces.clone();
@@ -3584,15 +4130,32 @@ fn build_ui(
             let window1_editor = window1_editor.clone();
             let window2_editor = window2_editor.clone();
             let pair_review = pair_review.clone();
-            Rc::new(move |link, end| {
+            Rc::new(move |name, peer, link, end| {
+                // A module window held nothing of this window's, and its link's end detaches its peer by itself; the
+                // turn review and the editor forget it as they forget window 2.
+                if !second && *name != WindowName::Second {
+                    if let Some(session) = &cm_session {
+                        session
+                            .borrow_mut()
+                            .link_ended(peer, name, end, link.partner().is_some());
+                    }
+                    println!("[window] {} ended ({end:?})", name.text());
+                    if let Some(review) = &pair_review {
+                        review.unlinked(peer);
+                    }
+                    if let Some(one) = &window1_editor {
+                        one.unlinked(peer);
+                    }
+                    return;
+                }
                 panel.set_partner(None);
                 // The partner counts as another window from here on: it may have died, and this window cannot see
                 // its state.
                 if let Some(review) = &pair_review {
-                    review.unlinked();
+                    review.unlinked(peer);
                 }
                 if let Some(one) = &window1_editor {
-                    one.unlinked();
+                    one.unlinked(peer);
                 }
                 if let Some(two) = &window2_editor {
                     two.unlinked();
@@ -3621,7 +4184,13 @@ fn build_ui(
                     }));
                 }
                 if let Some(pair) = pair_weak.upgrade() {
-                    if second {
+                    if second && !pair.waits_for_relink_after(end) {
+                        println!("[window] window 1 closed the group; this window closes with it");
+                        if let Some(wm) = wm.upgrade() {
+                            wm.post(HostEvent::GroupClosed { win: WinId::MAIN });
+                        }
+                        return;
+                    } else if second {
                         // A window 1 started for the project now finds this window waiting, and links to it.
                         let held_now: linked_window::relink::HeldNow = {
                             let module_layout = module_layout.clone();
@@ -3655,6 +4224,23 @@ fn build_ui(
                 println!("[terminal] the shell {pid} ended; no terminal here runs it");
             }
         }));
+        {
+            // A chat or page window this window started that never links: the controller drops what waited for it,
+            // so its key starts it again. On an idle: the hook runs from the link's own pump.
+            let wm = Rc::downgrade(&driver);
+            pair.on_module_failed(Rc::new(move |name: &WindowName, why: &str| {
+                let (wm, name, why) = (wm.clone(), name.clone(), why.to_string());
+                glib::idle_add_local_once(move || {
+                    if let Some(wm) = wm.upgrade() {
+                        wm.post(HostEvent::ModuleWindowFailed {
+                            win: WinId::MAIN,
+                            name,
+                            why,
+                        });
+                    }
+                });
+            }));
+        }
         // A window 2 started again at this launch that does not come back -- its start refused, or it ended or never
         // finished its handshake -- leaves this window holding placeholders nobody builds: they come back here as at
         // a link's end, the pair file says window 2 is not open, and window 2's saved tabs are offered. On an idle:
@@ -3675,6 +4261,43 @@ fn build_ui(
                 });
             }));
         }
+    }
+    if module_window.is_some() {
+        // What window 1 asks of this window's tabs in a hand-over.
+        pair.set_tab_holder(Rc::new(linked_window::hand_over::PanelTabs::new(
+            agent_panel_handle.clone(),
+            Rc::downgrade(&driver),
+        )));
+        // Each change of this window's tabs, for window 1 to save.
+        {
+            let pair = Rc::downgrade(&pair);
+            agent_panel_handle.report_tabs(move |tabs| {
+                if let Some(pair) = pair.upgrade() {
+                    pair.tabs_changed(tabs.clone());
+                }
+            });
+        }
+        // What window 1 sends to run here: an action by its name and options, parsed as a key's binding is and run as
+        // it is, never sent back. A name that does not parse here is logged and nothing runs.
+        let driver = Rc::downgrade(&driver);
+        let panels = lua_engine.panels.clone();
+        pair.set_peer_action(Rc::new(move |name, opts| {
+            let ids: Vec<String> = panels.borrow().entries().iter().map(|e| e.id.clone()).collect();
+            if let Some(action) = linked_window::registry::peer_action(&name, &opts, &ids) {
+                if let Some(driver) = driver.upgrade() {
+                    driver.run(WinId::MAIN, action, eitri_core::wm::Origin::Hub);
+                }
+            }
+        }));
+        // Window 1 is told each time this window takes the keyboard, for the window the keys are in.
+        let pair = Rc::downgrade(&pair);
+        window.connect_is_active_notify(move |window| {
+            if window.is_active() {
+                if let Some(pair) = pair.upgrade() {
+                    pair.say_window_focused();
+                }
+            }
+        });
     }
     driver.start(
         WinId::MAIN,
@@ -3856,10 +4479,10 @@ impl plugin_panels::FollowWindow for GridFollowWindow {
 /// Adds the panel's effects and read-only facts to the window's module services.
 /// A move's answer from the panel, as the controller hears it: a frozen tab's descriptors become the handoff the
 /// link sends unread.
-fn chat_move_event(win: WinId, event: agent_panel::ChatMoveEvent) -> ChatEvent {
+fn chat_move_event(win: WinId, event: agent_panel::ChatMoveEvent) -> Option<ChatEvent> {
     use agent_panel::ChatMoveEvent as Panel;
     use eitri_core::window_link::moves::MoveId;
-    match event {
+    Some(match event {
         Panel::Frozen { view, mv, record, fds } => ChatEvent::Frozen {
             win,
             view,
@@ -3879,10 +4502,13 @@ fn chat_move_event(win: WinId, event: agent_panel::ChatMoveEvent) -> ChatEvent {
             mv: MoveId(mv),
             why,
         },
-    }
+        Panel::LastTabClosed => ChatEvent::TabLeft { win },
+        Panel::HandOver(_) => return None,
+    })
 }
 
 struct PanelServices {
+    cm_session: Option<(Rc<RefCell<linked_window::focus::CmSession>>, gtk4::Application)>,
     inner: gtk_host_services::Services,
 }
 
@@ -3936,6 +4562,9 @@ impl gtk_host::ServiceSet for PanelServices {
     fn tab_move(&self, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::ChatMoveFacts, String> {
         self.inner.agent.tab_move_facts(tab)
     }
+    fn tab_hand_over(&self, tab: eitri_core::tabs::TabId) -> Result<eitri_core::wm::TabHandOver, String> {
+        self.inner.agent.tab_hand_over_facts(tab)
+    }
     fn moved_tab_key(&self, tab: eitri_core::tabs::TabId) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
         self.inner.agent.moved_tab_key(tab)
     }
@@ -3953,6 +4582,11 @@ impl gtk_host::ServiceSet for PanelServices {
         self.inner.terminal_jobs()
     }
     fn cleanup(&self, op: &eitri_core::wm::CleanupOp) -> Result<(), String> {
+        if matches!(op, eitri_core::wm::CleanupOp::PairOnClose { .. }) {
+            if let Some((session, app)) = &self.cm_session {
+                session.borrow_mut().finish(app);
+            }
+        }
         self.inner.cleanup(op)
     }
     fn pair(&self, op: &eitri_core::wm::PairOp) -> Result<(), String> {
@@ -4118,6 +4752,42 @@ fn extra_chat_views(layouts: &[&eitri_core::layout::Layout]) -> Vec<ModuleId> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_clean_start_does_not_keep_the_compositor_record_to_rewrite() {
+        use eitri_core::window_link::cm_file::CmFile;
+        let file = CmFile::new(&eitri_core::layout::hub_tree().layout, &[]);
+        assert_eq!(cm_record_kept(Some(file.clone()), false), Some(file.clone()));
+        assert_eq!(cm_record_kept(Some(file), true), None);
+    }
+
+    /// The last tab closed by hand reaches the controller as a tab having left the window; a hand-over's answers go
+    /// over the link instead.
+    #[test]
+    fn a_closed_last_tab_reaches_the_controller_as_a_tab_that_left() {
+        let event = chat_move_event(WinId::MAIN, agent_panel::ChatMoveEvent::LastTabClosed);
+        assert!(matches!(event, Some(ChatEvent::TabLeft { win: WinId::MAIN })));
+    }
+
+    /// Only a run that follows compositor mode gives saved views tiles: a layout file `eitri` mode wrote says what it
+    /// wants, and a window with `window.restore` off asked for its default layout.
+    #[test]
+    fn only_a_way_back_from_compositor_mode_tiles_the_saved_views() {
+        use eitri_core::source_scan as scan;
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        let code = flat(&code);
+        let guarded = code
+            .find(concat!("letsaved_views=(back_from_", "compositor"))
+            .expect("the views are read only then");
+        let tiled = code
+            .find(concat!("tile_saved_", "views(&mutstart_layout"))
+            .expect("the start layout gets them");
+        let views = code
+            .find(concat!("letstartup_chat_", "views"))
+            .expect("the window builds its chat views from that layout");
+        assert!(guarded < tiled && tiled < views);
+    }
+
     /// Enumerating extra views merges workspaces without duplicating or including the base view.
     #[test]
     fn extra_chat_views_are_sorted_and_unique_across_workspaces() {
@@ -4153,8 +4823,124 @@ mod tests {
     /// that behavior requires launching two real `shell` processes.
     #[test]
     fn build_application_still_opts_out_of_gios_single_instance_behaviour() {
-        let app = build_application();
-        assert!(app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE));
+        for kind in [AppKind::Main, AppKind::Chat, AppKind::Page] {
+            let app = build_application(kind);
+            assert!(
+                app.flags().contains(gtk4::gio::ApplicationFlags::NON_UNIQUE),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_kind_of_window_has_its_app_id() {
+        assert_eq!(AppKind::Main.id(), "cn.huntergrey.eitri");
+        assert_eq!(AppKind::Chat.id(), "cn.huntergrey.eitri.Panel");
+        assert_eq!(AppKind::Page.id(), "cn.huntergrey.eitri.Page");
+        let module = |name: WindowName| linked_window::WindowStart::Module {
+            name,
+            root: PathBuf::from("/p"),
+            sock: std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+            token: None,
+            restore: false,
+        };
+        assert_eq!(AppKind::of(&module(WindowName::Chat(1))), AppKind::Chat);
+        assert_eq!(AppKind::of(&module(WindowName::Chat(4))), AppKind::Chat);
+        assert_eq!(AppKind::of(&module(WindowName::Page("markdown".into()))), AppKind::Page);
+        assert_eq!(AppKind::of(&module(WindowName::Second)), AppKind::Main);
+        assert_eq!(AppKind::of(&linked_window::WindowStart::Full), AppKind::Main);
+    }
+
+    /// A chat or page window shows one module: `build_ui` makes no editor for it, reads and writes no layout file,
+    /// hangs no top bar in the window and builds no other module's host, and a chat window shows its chat in its
+    /// own base view.
+    #[test]
+    fn the_module_window_branch_builds_only_its_module() {
+        use eitri_core::source_scan as scan;
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        for needle in [
+            concat!("module_window.is_none() {\n        root.append(&top_bar", ".widget)"),
+            concat!("made.retain(|decl| decl.module == ", "*module)"),
+            concat!("reconcile_", "module("),
+            concat!("Tiling::", "ModuleWindow"),
+            concat!("set_page_", "roots("),
+        ] {
+            assert!(flat(&code).contains(&flat(needle)), "build_ui lacks {needle}");
+        }
+        assert!(
+            !code.contains(concat!("set_transient", "_for")),
+            "a module window is not a dialog of window 1"
+        );
+        let (_, modes) = scan::function_in(&[scan::read_required("shell/src/window_mode.rs")], "sync_widgets");
+        assert!(
+            flat(&modes).contains(&flat(concat!("self.top_bar.parent()", ".is_some() &&"))),
+            "a top bar with no parent is never shown again by a window mode or a reveal"
+        );
+    }
+
+    /// A `bye` to a module window is the group closing: the window closes instead of waiting for a window 1.
+    #[test]
+    fn a_module_window_that_hears_its_group_close_closes_rather_than_waits() {
+        use eitri_core::source_scan as scan;
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        let code = flat(&code);
+        let asked = code
+            .find(concat!("waits_for_relink_", "after(end)"))
+            .expect("the hook asks how the link ended");
+        let closes = code[asked..]
+            .find(concat!("HostEvent::", "GroupClosed"))
+            .expect("a group's end closes the window");
+        let waits = code[asked..]
+            .find(concat!("pair.wait_for_", "relink("))
+            .expect("any other end waits");
+        assert!(closes < waits, "the close is the branch that does not wait");
+    }
+
+    /// A chat window saves nothing itself: its panel's writer is off from the moment the mode is known, each change of
+    /// its tabs goes to window 1, and a link that comes up hears the latest.
+    #[test]
+    fn a_module_window_tells_window_1_its_tabs_and_keeps_no_file() {
+        use eitri_core::source_scan as scan;
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        let code = flat(&code);
+        assert_eq!(
+            code.matches(&flat(concat!("agent_panel_handle.keep_no", "_tabs();")))
+                .count(),
+            2
+        );
+        for wired in [
+            concat!("agent_panel_handle.report_", "tabs(move |tabs|"),
+            concat!("pair.tabs_", "changed(tabs.clone());"),
+            concat!("pair.say_", "tabs();"),
+            concat!("linked_window::group_tabs::beside_the_", "layout(open, tab_windows)"),
+        ] {
+            assert_eq!(code.matches(&flat(wired)).count(), 1, "{wired}");
+        }
+    }
+
+    /// What a chat or page window needs of `build_ui` besides its module: its name for the controller, the keys left
+    /// in window 1 when it was started restored, no saved tabs of window 2's, the focus it gained before it linked,
+    /// and window 1's way to hear that a window it started never linked.
+    #[test]
+    fn the_module_window_branch_names_itself_and_wires_its_start_and_focus() {
+        use eitri_core::source_scan as scan;
+        let flat = |text: &str| text.split_whitespace().collect::<String>();
+        let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        for needle in [
+            concat!("driver.set_module_", "name(WinId::MAIN, name.clone())"),
+            concat!("pair.restored() && module_window.", "is_none(),"),
+            concat!("PlacementRole::", "NewModule"),
+            concat!("pair.restored() || module_window.", "is_some()"),
+            concat!("window_weak.upgrade().is_some_and(|window| window.", "is_active())"),
+            concat!("pair.say_window_", "focused()"),
+            concat!("pair.on_module_", "failed("),
+            concat!("HostEvent::ModuleWindow", "Failed {"),
+        ] {
+            assert!(flat(&code).contains(&flat(needle)), "build_ui lacks {needle}");
+        }
     }
 
     /// Keysyms named literally (not a single character and not an `Fnn` function key) that
@@ -4322,7 +5108,7 @@ mod tests {
             at(call),
             at(concat!("BackendKind::", "from_env")),
             at(concat!("nvim_bin::", "resolve()")),
-            at(concat!("build_", "application()")),
+            at(concat!("build_", "application(kind)")),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     }
@@ -4347,7 +5133,7 @@ mod tests {
             at(concat!("resolve_", "launch()")),
             at(concat!("open_requests::hand_", "over(")),
             at(concat!("nvim_bin::", "resolve()")),
-            at(concat!("build_", "application()")),
+            at(concat!("build_", "application(kind)")),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     }
@@ -4433,7 +5219,7 @@ mod tests {
         let body = &src[start..end];
         let jit = concat!("process_memory::ui_process_jsc", "_without_jit()");
         assert_eq!(body.matches(jit).count(), 1, "called exactly once in main");
-        assert!(body.find(jit) < body.find(concat!("build_", "application()")));
+        assert!(body.find(jit) < body.find(concat!("build_", "application(kind)")));
         let (_, ui) =
             eitri_core::source_scan::function_in(&eitri_core::source_scan::rust_sources(&["shell/src"]), "build_ui");
         assert_eq!(

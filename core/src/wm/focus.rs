@@ -239,6 +239,8 @@ pub fn move_focus(
             ));
             true
         }
+        // A window of compositor mode has no top bar to give the keys to: past its edge is the compositor's.
+        Nav::TopBar if w.tiling != super::window::Tiling::Eitri => to_compositor(w, win, from, direction, batch),
         Nav::TopBar => {
             batch.push_layout(HostOp::Focus {
                 win,
@@ -248,6 +250,7 @@ pub fn move_focus(
             w.say(format!("[pane_switch] {from} {direction:?} -> the top bar"));
             true
         }
+        Nav::Nothing if w.tiling != super::window::Tiling::Eitri => to_compositor(w, win, from, direction, batch),
         Nav::Nothing => {
             use crate::window_link::edge::{edge_route, EdgeRoute, MonitorRect};
             let rect = |connector: Option<&str>| {
@@ -261,14 +264,20 @@ pub fn move_focus(
                 })
             };
             let mine = rect(w.monitor.as_ref().map(|id| id.0.as_str()));
-            let other = rect(w.peer.as_ref().and_then(|p| p.monitor.as_deref()));
+            // Only window 2 is a neighbour on the same desktop, and only when it is the window's only peer: a module
+            // window is placed by the compositor.
+            let second = w.lone_second_peer();
+            let other = rect(second.and_then(|peer| w.peer(peer)).and_then(|p| p.monitor.as_deref()));
             if edge_route(mine, other, direction.into()) == EdgeRoute::OtherWindow
-                && super::moves::raise_for(
-                    w,
-                    win,
-                    crate::window_link::FocusTarget::Edge { side: direction.into() },
-                    batch,
-                )
+                && second.is_some_and(|peer| {
+                    super::moves::raise_for(
+                        w,
+                        win,
+                        peer,
+                        crate::window_link::FocusTarget::Edge { side: direction.into() },
+                        batch,
+                    )
+                })
             {
                 w.say(format!("[pane_switch] {from} {direction:?} -> the other window"));
                 return true;
@@ -279,6 +288,13 @@ pub fn move_focus(
             false
         }
     }
+}
+
+/// The focus move reached the edge of a window of compositor mode: the compositor moves it from here.
+fn to_compositor(w: &mut Window, win: WinId, from: &ModuleId, direction: Direction, batch: &mut Batch) -> bool {
+    batch.push_effect(HostOp::CompositorFocus { win, direction });
+    w.say(format!("[pane_switch] {from} {direction:?} -> the compositor"));
+    true
 }
 
 /// The top bar gave the keys up by its own key: they go back to the module that last had them, as a bare grab.

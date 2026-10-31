@@ -5,16 +5,15 @@ use super::*;
 /// answers too late, or one with no move behind it), so a run's log tells the two apart.
 pub fn page_ready(w: &mut Window, win: WinId, module: &ModuleId, batch: &mut Batch) {
     let since = w
-        .peer
-        .as_ref()
-        .and_then(|p| p.pages_waiting.get(module))
+        .peers()
+        .find_map(|(_, p)| p.pages_waiting.get(module))
         .map(|waiting| waiting.since);
     match since {
         Some(since) => {
             let ms = w.now().saturating_duration_since(since).as_millis();
             w.say(format!("[move] {module}: page ready after {ms} ms"));
         }
-        None if w.peer.is_some() => w.say(format!("[move] {module}: page.ready with no arrival waiting")),
+        None if w.has_peer() => w.say(format!("[move] {module}: page.ready with no arrival waiting")),
         None => {}
     }
     show_waiting(w, win, module, batch);
@@ -22,7 +21,7 @@ pub fn page_ready(w: &mut Window, win: WinId, module: &ModuleId, batch: &mut Bat
 
 /// Maps a page whose arrival waits, now: its document is ready, its wait ran out, or the link ended.
 pub fn show_waiting(w: &mut Window, win: WinId, module: &ModuleId, batch: &mut Batch) {
-    let waiting = w.peer.as_mut().and_then(|p| p.pages_waiting.remove(module));
+    let waiting = w.peers.values_mut().find_map(|p| p.pages_waiting.remove(module));
     if let Some(waiting) = waiting {
         w.cancel_timer(waiting.timer);
         if waiting.show {
@@ -46,7 +45,7 @@ pub fn show_waiting(w: &mut Window, win: WinId, module: &ModuleId, batch: &mut B
 }
 
 pub fn page_timer(w: &mut Window, win: WinId, token: TimerToken, batch: &mut Batch) -> bool {
-    let module = w.peer.as_ref().and_then(|p| {
+    let module = w.peers().find_map(|(_, p)| {
         p.pages_waiting
             .iter()
             .find(|(_, waiting)| waiting.timer == token)
@@ -62,13 +61,18 @@ pub fn page_timer(w: &mut Window, win: WinId, token: TimerToken, batch: &mut Bat
 
 /// A page's refusal can end only the freeze of that page and move, never a different kind's transfer.
 pub fn page_freeze_refused(w: &mut Window, win: WinId, module: &ModuleId, mv: MoveId, why: String, batch: &mut Batch) {
-    let waiting = w.peer.as_ref().and_then(|p| p.entries.get(&mv)).is_some_and(|entry| {
+    let waiting = peer_with(w, mv, |entry| {
         entry.kind == MoveKind::PluginPage
             && entry.module == *module
             && entry.role == Role::Source
             && entry.stage == Stage::Freezing
-    });
+    })
+    .is_some();
     if waiting {
-        freeze_refused(w, win, FreezeOf::Move(mv), why, batch);
+        let of = FreezeOf::Move {
+            module: module.clone(),
+            mv,
+        };
+        freeze_refused(w, win, of, why, batch);
     }
 }

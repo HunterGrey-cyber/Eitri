@@ -105,18 +105,18 @@ pub(super) fn refused_offer(p: &mut PeerMoves, id: MoveId, module: &ModuleId, wh
 }
 
 /// The close flow waits on `id`: its verdict is kept until [`unwatch`].
-pub(in crate::wm) fn watch(w: &mut Window, id: MoveId) {
-    if let Some(p) = w.peer.as_mut() {
+pub(in crate::wm) fn watch(w: &mut Window, peer: PeerId, id: MoveId) {
+    if let Some(p) = w.peer_mut(peer) {
         p.groups.watched.insert(id);
     }
 }
 
-pub(in crate::wm) fn unwatch(w: &mut Window, ids: &[MoveId]) {
-    if let Some(p) = w.peer.as_mut() {
-        for id in ids {
+pub(in crate::wm) fn unwatch(w: &mut Window, moves: &[(PeerId, MoveId)]) {
+    for (peer, id) in moves {
+        if let Some(p) = w.peer_mut(*peer) {
             p.groups.watched.remove(id);
+            p.groups.forget(&[*id]);
         }
-        p.groups.forget(ids);
     }
 }
 
@@ -128,7 +128,7 @@ pub(super) fn arrives_with_group(p: &PeerMoves, id: MoveId) -> bool {
 /// A workspace deleted here takes its record of the tabs that came with it along, so a later one of the same name
 /// does not inherit it. An outgoing group no longer owns a workspace here, even if its name is taken again.
 pub(in crate::wm) fn workspace_deleted(w: &mut Window, name: &str) {
-    if let Some(p) = w.peer.as_mut() {
+    for p in w.peers.values_mut() {
         p.groups.arrived_tabs.take_back(name, &[]);
         for g in p.groups.groups.values_mut() {
             if g.source && g.state.name() == name {
@@ -141,7 +141,7 @@ pub(in crate::wm) fn workspace_deleted(w: &mut Window, name: &str) {
 /// A renamed workspace keeps its record of the tabs that came with it, renamed to its own name included.
 /// Pages still waiting and outgoing groups follow the name too, so ready and completion find the same workspace.
 pub(in crate::wm) fn workspace_renamed(w: &mut Window, old: &str, new: &str) {
-    if let Some(p) = w.peer.as_mut() {
+    for p in w.peers.values_mut() {
         p.groups.arrived_tabs.workspace_renamed(old, new);
         for g in p.groups.groups.values_mut() {
             if g.source && g.state.name() == old {
@@ -183,22 +183,19 @@ fn snapshot(w: &Window, cx: &Cx) -> Option<(String, serde_json::Value, Vec<Modul
     Some((name, tree, modules))
 }
 
-/// Offer the current workspace; a swap uses the group id from the other window as its rendezvous.
-pub fn offer(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: bool, batch: &mut Batch) {
-    if w.peer.is_none() {
+/// Offer the current workspace to `peer`; a swap uses the group id from the other window as its rendezvous.
+pub fn offer(w: &mut Window, cx: &Cx, win: WinId, peer: PeerId, follow: bool, swap: bool, batch: &mut Batch) {
+    if w.peer(peer).is_none() {
         refuse(w, win, feedback::no_other_window_text(w.role()), batch);
         return;
     }
-    if w.peer
-        .as_ref()
-        .is_some_and(|p| p.groups.groups.values().any(|g| g.source))
-    {
+    if w.peer(peer).is_some_and(|p| p.groups.groups.values().any(|g| g.source)) {
         refuse(w, win, "a workspace is already moving", batch);
         return;
     }
-    if let Some(group) = start(w, cx, win, follow, swap.then_some(0), batch) {
+    if let Some(group) = start(w, cx, win, peer, follow, swap.then_some(0), batch) {
         if swap {
-            with_peer(w, |w, p| {
+            with_peer(w, peer, |w, p| {
                 p.groups.groups.get_mut(&group).unwrap().swap = Some(0);
                 send(
                     w,
@@ -213,7 +210,15 @@ pub fn offer(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: bool, batc
     }
 }
 
-fn start(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: Option<u64>, batch: &mut Batch) -> Option<u64> {
+fn start(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    peer: PeerId,
+    follow: bool,
+    swap: Option<u64>,
+    batch: &mut Batch,
+) -> Option<u64> {
     let (name, mut tree, modules) = snapshot(w, cx)?;
     if tree.to_string().len() > TREE_LIMIT {
         refuse(w, win, "a workspace tree is too large", batch);
@@ -221,10 +226,9 @@ fn start(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: Option<u64>, b
     }
     let existing = cx.reads.base_tabs(win);
     let recorded = w.workspaces.borrow().moved_tabs_of(&name).to_vec();
-    let has_record = !w.peer.as_ref()?.groups.arrived_tabs.recorded(&name).is_empty();
+    let has_record = !w.peer(peer)?.groups.arrived_tabs.recorded(&name).is_empty();
     let recorded_tabs = w
-        .peer
-        .as_ref()?
+        .peer(peer)?
         .groups
         .arrived_tabs
         .recorded(&name)
@@ -263,7 +267,7 @@ fn start(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: Option<u64>, b
     if let Some(object) = tree.as_object_mut() {
         object.remove("moved_tabs");
     }
-    let p = w.peer.as_mut()?;
+    let p = w.peer_mut(peer)?;
     p.groups.next += 1;
     let group = (p.groups.next << 1) | u64::from(p.side == Side::Two);
     let g = Group {
@@ -280,7 +284,7 @@ fn start(w: &mut Window, cx: &Cx, win: WinId, follow: bool, swap: Option<u64>, b
         move_order: BTreeMap::new(),
         immediate: Vec::new(),
     };
-    offer_group(w, cx, win, group, g, requests, batch);
+    offer_group(w, cx, win, peer, group, g, requests, batch);
     Some(group)
 }
 
@@ -290,6 +294,7 @@ fn offer_group(
     w: &mut Window,
     cx: &Cx,
     win: WinId,
+    peer: PeerId,
     group: u64,
     mut g: Group,
     requests: Vec<(ModuleId, Option<TabId>)>,
@@ -308,12 +313,12 @@ fn offer_group(
             w.say(format!("[move] {module}: {}", feedback::TURN_RUNS_STAYS_TEXT));
             Err(feedback::TURN_RUNS_STAYS_TEXT.to_owned())
         } else {
-            offer_selected(w, cx, win, &module, None, false, facts, batch)
+            offer_selected(w, cx, win, peer, &module, None, false, facts, batch)
         };
         match offered {
             Ok(Some(id)) => {
                 g.move_order.insert(id, order);
-                if let Some(entry) = w.peer.as_mut().and_then(|p| p.entries.get_mut(&id)) {
+                if let Some(entry) = w.peer_mut(peer).and_then(|p| p.entries.get_mut(&id)) {
                     if tab.is_some() {
                         entry.record = serde_json::json!({"workspace_tab": {"group": group, "order": order,
                             "active": entry.tab == g.active}});
@@ -342,7 +347,7 @@ fn offer_group(
             state.record(module, Verdict::Refused(why.clone()));
         }
         g.state = state;
-        with_peer(w, |w, p| {
+        with_peer(w, peer, |w, p| {
             send(
                 w,
                 p,
@@ -357,7 +362,7 @@ fn offer_group(
         });
         g.published = true;
     }
-    if let Some(p) = w.peer.as_mut() {
+    if let Some(p) = w.peer_mut(peer) {
         p.groups.groups.insert(group, g);
     }
 }
@@ -468,29 +473,27 @@ fn validate_tree(name: &str, tree: &serde_json::Value, cx: &Cx) -> Result<Layout
 
 /// `swap{a, 0}` asks for this window's half of the swap whose other half is group `a`; sent back to the window whose
 /// group `a` is, it says no half will come, and that group goes on as a plain move. `swap{a, b}` pairs the two.
-pub(super) fn swap(w: &mut Window, cx: &Cx, win: WinId, move_a: u64, move_b: u64, batch: &mut Batch) {
+pub(super) fn swap(w: &mut Window, cx: &Cx, win: WinId, peer: PeerId, move_a: u64, move_b: u64, batch: &mut Batch) {
     if move_b == 0
-        && w.peer
-            .as_ref()
+        && w.peer(peer)
             .and_then(|p| p.groups.groups.get(&move_a))
             .is_some_and(|g| g.source)
     {
         let text = "the other window's workspace could not move; this one moves alone";
         w.say(format!("[move] {text}"));
         chrome::show_toast(w, text.to_owned(), ToastKind::Other);
-        if let Some(g) = w.peer.as_mut().and_then(|p| p.groups.groups.get_mut(&move_a)) {
+        if let Some(g) = w.peer_mut(peer).and_then(|p| p.groups.groups.get_mut(&move_a)) {
             g.swap = None;
         }
         return;
     }
     if move_b == 0 {
         let outgoing = w
-            .peer
-            .as_ref()
+            .peer(peer)
             .and_then(|p| p.groups.groups.iter().find(|(_, g)| g.source).map(|(id, _)| *id));
-        let Some(group) = outgoing.or_else(|| start(w, cx, win, false, Some(move_a), batch)) else {
+        let Some(group) = outgoing.or_else(|| start(w, cx, win, peer, false, Some(move_a), batch)) else {
             // The other window's workspace still arrives here, as a plain move.
-            with_peer(w, |w, p| {
+            with_peer(w, peer, |w, p| {
                 if let Some(incoming) = p.groups.groups.get_mut(&move_a) {
                     incoming.swap = None;
                 }
@@ -498,7 +501,7 @@ pub(super) fn swap(w: &mut Window, cx: &Cx, win: WinId, move_a: u64, move_b: u64
             });
             return;
         };
-        with_peer(w, |w, p| {
+        with_peer(w, peer, |w, p| {
             if let Some(outgoing) = p.groups.groups.get_mut(&group) {
                 outgoing.swap = Some(move_a);
             }
@@ -507,7 +510,7 @@ pub(super) fn swap(w: &mut Window, cx: &Cx, win: WinId, move_a: u64, move_b: u64
             }
             send(w, p, Msg::Swap { move_a, move_b: group });
         });
-    } else if let Some(p) = w.peer.as_mut() {
+    } else if let Some(p) = w.peer_mut(peer) {
         if let Some(g) = p.groups.groups.get_mut(&move_a) {
             g.swap = Some(move_b);
         }
@@ -519,7 +522,14 @@ pub(super) fn swap(w: &mut Window, cx: &Cx, win: WinId, move_a: u64, move_b: u64
 
 /// Settle groups after the batch, including host answers that froze or refused a module without a peer event.
 pub fn progress(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
-    with_peer(w, |w, p| {
+    let peers: Vec<PeerId> = w.peers().map(|(peer, _)| *peer).collect();
+    for peer in peers {
+        progress_peer(w, cx, win, peer, batch);
+    }
+}
+
+fn progress_peer(w: &mut Window, cx: &Cx, win: WinId, peer: PeerId, batch: &mut Batch) {
+    with_peer(w, peer, |w, p| {
         for g in p.groups.groups.values_mut() {
             for id in &g.ids {
                 if let Some(outcome) = p.groups.outcomes.get(id) {

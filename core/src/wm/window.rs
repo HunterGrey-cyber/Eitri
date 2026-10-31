@@ -11,8 +11,10 @@ use super::keys::KeyState;
 use super::module::{Lifecycle, ModuleState};
 use super::persist::{Fired, Saver};
 use crate::layout::{Arrangement, Layout, ModuleId, Rect as LayoutRect, Size, Workspaces};
+use crate::window_link::names::WindowName;
+use crate::window_link::Summary;
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +39,22 @@ pub enum LinkSide {
     /// The second end.
     Second,
 }
+
+/// How a window takes part in the compositor's tiling. Set once, at the start plan's layout step, since the mode
+/// is known only after `init.lua` and the plugins have run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tiling {
+    /// Everything lives inside the window; the compositor sees one window.
+    #[default]
+    Eitri,
+    /// The window holds the editor and the chrome, and chats and pages are windows of the compositor beside it.
+    Hub,
+    /// A chat or page that is a window of the compositor.
+    ModuleWindow,
+}
+
+/// A key action waiting for a module window that is starting: its name and the options that rebuild it.
+pub type PendingRun = (String, Vec<(String, serde_json::Value)>);
 
 /// The purpose of a native window.
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +202,8 @@ pub enum EditorRun {
 pub struct Window {
     /// The plugin whose declared root is this window's project, absent in window 2.
     pub own_window: Option<String>,
+    /// How the window takes part in the compositor's tiling.
+    pub tiling: Tiling,
     pub(super) close: super::close::CloseFlow,
     pub(super) quit: super::quit::QuitFlow,
     pub(super) quit_timer: Option<(TimerToken, u32)>,
@@ -236,8 +256,19 @@ pub struct Window {
     /// What the module verbs wait for: the y/n's module, the new instances whose surface was asked for, the
     /// splits waiting for a terminal's directory.
     pub(super) modules: super::verbs::modules::ModuleVerbs,
-    /// The link to the other window of the pair and the moves on it, while a peer is attached.
-    pub(super) peer: Option<super::moves::PeerMoves>,
+    /// The links to the windows this one is grouped with and the moves on each, by peer.
+    pub(super) peers: BTreeMap<PeerId, super::moves::PeerMoves>,
+    /// Whether this window already showed the hint that the compositor arranges windows.
+    pub(super) hint_shown: bool,
+    /// The chat window that last held the keyboard, while it is attached (a window 1 in compositor mode).
+    pub(super) last_chat: Option<PeerId>,
+    /// The module windows started and not yet linked, each with the actions waiting for it: they are sent when its
+    /// peer attaches and dropped, with a log line, when the window ends or is refused first.
+    pub(super) pending_runs: BTreeMap<WindowName, Vec<PendingRun>>,
+    /// What this window is, when it is a module window.
+    pub(super) module_name: Option<WindowName>,
+    /// The tab whose `tab.break` waits for its turn's end.
+    pub(super) tab_break_wait: Option<crate::tabs::TabId>,
     /// Output facts shared by navigation and the linked window.
     pub(super) monitors: Vec<Monitor>,
     pub(super) monitor: Option<MonitorId>,
@@ -248,8 +279,12 @@ pub struct Window {
     /// Window 2 is started again after this window's start: the idle armed for it, until it fires.
     pub(super) restore_second: bool,
     pub(super) restore_idle: Option<TimerToken>,
+    /// The idle that opens the module windows a hub's start owes, once `shell:ready` has gone out.
+    pub(super) start_windows_idle: Option<TimerToken>,
     /// The first-start screen while one is up.
     pub(super) onboarding: Option<super::onboarding::OnboardingState>,
+    /// Compositor mode's first-start toast, until the screen is ruled out or has closed.
+    pub(super) first_toast: Option<String>,
     /// How many times the window asked for the screen's check: the generation the next screen opens under. An
     /// answer carrying another number is for a screen that is gone.
     pub(super) onboarding_generation: u64,
@@ -277,6 +312,7 @@ impl Window {
     pub fn new(spec: WindowSpec, parts: WindowParts, timers: Timers) -> Window {
         Window {
             own_window: None,
+            tiling: Tiling::default(),
             close: Default::default(),
             quit: Default::default(),
             quit_timer: None,
@@ -307,7 +343,12 @@ impl Window {
             focus: FocusState::default(),
             keys: KeyState::default(),
             modules: Default::default(),
-            peer: None,
+            peers: BTreeMap::new(),
+            hint_shown: false,
+            last_chat: None,
+            pending_runs: BTreeMap::new(),
+            module_name: None,
+            tab_break_wait: None,
             monitors: Vec::new(),
             monitor: None,
             monitor_memory: crate::window_link::edge::MonitorMemory::new(None),
@@ -315,7 +356,9 @@ impl Window {
             placement_focus_pending: false,
             restore_second: false,
             restore_idle: None,
+            start_windows_idle: None,
             onboarding: None,
+            first_toast: None,
             onboarding_generation: 0,
             chrome: ChromeModel::default(),
             chrome_rev: 0,
@@ -335,6 +378,85 @@ impl Window {
         println!("{line}");
         #[cfg(test)]
         self.notes.push(line);
+    }
+
+    /// The link to `id` and its moves, while that peer is attached.
+    pub fn peer(&self, id: PeerId) -> Option<&super::moves::PeerMoves> {
+        self.peers.get(&id)
+    }
+
+    pub fn peer_mut(&mut self, id: PeerId) -> Option<&mut super::moves::PeerMoves> {
+        self.peers.get_mut(&id)
+    }
+
+    /// The attached peer that is the window called `name`.
+    pub fn peer_named(&self, name: &WindowName) -> Option<PeerId> {
+        self.peers.iter().find(|(_, p)| p.name() == name).map(|(id, _)| *id)
+    }
+
+    /// Every attached peer, by id.
+    pub fn peers(&self) -> impl Iterator<Item = (&PeerId, &super::moves::PeerMoves)> {
+        self.peers.iter()
+    }
+
+    /// Whether any peer is attached.
+    pub fn has_peer(&self) -> bool {
+        !self.peers.is_empty()
+    }
+
+    /// The peer named `Second`, if it is attached: window 2 seen from window 1, and window 1 seen from window 2,
+    /// which attaches its only peer under the same name. The name is the pair's role, not a window number.
+    pub fn second_peer(&self) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|(_, p)| *p.name() == WindowName::Second)
+            .map(|(id, _)| *id)
+    }
+
+    /// The `Second` peer when it is the window's only peer: the one case where window 2 is a neighbour on the same
+    /// desktop and the window may offer to move work into it.
+    pub fn lone_second_peer(&self) -> Option<PeerId> {
+        if self.peers.len() == 1 {
+            self.second_peer()
+        } else {
+            None
+        }
+    }
+
+    /// The peer that holds `id`, a module of this window's group that lives in its window.
+    pub fn held_by(&self, id: &ModuleId) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|(_, p)| p.held.contains(id))
+            .map(|(peer, _)| *peer)
+    }
+
+    /// Every module any peer holds, once each.
+    pub(super) fn held_union(&self) -> Vec<ModuleId> {
+        let mut all: Vec<ModuleId> = self.peers.values().flat_map(|p| p.held.iter().cloned()).collect();
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// The counts of every peer's last summary added up, with the workspace names of window 2 alone, since a module
+    /// window has none; `None` while no peer has sent a summary.
+    pub fn group_summary(&self) -> Option<Summary> {
+        let mut total: Option<Summary> = None;
+        for p in self.peers.values() {
+            let Some(s) = p.summary() else {
+                continue;
+            };
+            let sum = total.get_or_insert_with(Summary::default);
+            sum.waiting += s.waiting;
+            sum.unseen += s.unseen;
+            sum.running += s.running;
+            sum.queued += s.queued;
+            if *p.name() == WindowName::Second {
+                sum.workspaces = s.workspaces.clone();
+            }
+        }
+        total
     }
 
     /// Prints a refusal or a mistake on stderr.
@@ -462,7 +584,10 @@ impl Window {
         self.monitor_memory = crate::window_link::edge::MonitorMemory::new(placement.remembered);
         self.restore_second = placement.restore_second;
         self.placement_role = placement.role;
-        self.placement_focus_pending = matches!(placement.role, PlacementRole::RestoredSecond { .. });
+        self.placement_focus_pending = matches!(
+            placement.role,
+            PlacementRole::RestoredSecond { .. } | PlacementRole::NewModule
+        );
     }
 
     /// Asks the window's remembered output whether it is to move there now: only once it is on an output (so it is
@@ -685,6 +810,9 @@ pub enum PlacementRole {
     Main,
     /// A window opened explicitly receives the keys after moving.
     NewSecond,
+    /// A chat or page window opened by a key or a hub ask receives the keys once it is mapped, wherever the
+    /// compositor put it: it is never moved to an output.
+    NewModule,
     /// A window reopened at launch returns the keys to window 1 after mapping or moving.
     RestoredSecond { first_pid: u32 },
 }

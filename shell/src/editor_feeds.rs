@@ -342,9 +342,7 @@ mod tests {
     /// them.
     #[test]
     fn an_idle_pump_is_not_woken_and_a_message_still_arrives() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -444,9 +442,7 @@ mod tests {
     /// goes quiet again.
     #[test]
     fn a_reader_added_by_a_handler_is_read_and_the_pump_goes_quiet() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -495,9 +491,7 @@ mod tests {
     /// dropped the call would leave its panel showing an old context until something else woke it.
     #[test]
     fn a_new_context_wakes_the_panel_in_both_windows() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
         let pump = FeedPump::start();

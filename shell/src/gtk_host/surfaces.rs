@@ -36,7 +36,7 @@ use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
 use crate::agent_panel::{self, AgentPanelHandle};
 use crate::gtk_host::instance_pool::Reused;
-use crate::gtk_host::{GtkHost, SurfaceMaker};
+use crate::gtk_host::{BasePageMaker, GtkHost, SurfaceMaker};
 use crate::gtk_host_services::{LuaPages, Registry};
 use crate::module_grid::{HostKind, ModuleGrid};
 use crate::plugin_panels::PluginPanels;
@@ -50,6 +50,42 @@ pub(crate) type ChatPool = Rc<Registry<(webkit6::WebView, Rc<PanelPage>)>>;
 
 /// Why a new chat view is refused where WebKit cannot start.
 pub(crate) const CHAT_VIEWS_NEED_WEBKIT: &str = "chat views need WebKit, which cannot start here";
+
+/// Builds the base chat page's place when the controller asks, and holds it for the window's surfaces phase. Where
+/// WebKit cannot start the place is `notice`, and the panel stays without pages.
+pub(crate) struct BasePage {
+    agent: AgentPanelHandle,
+    notice: Option<String>,
+    made: RefCell<Option<gtk4::Widget>>,
+}
+
+impl BasePage {
+    pub(crate) fn new(agent: AgentPanelHandle, notice: Option<&str>) -> Rc<BasePage> {
+        Rc::new(BasePage {
+            agent,
+            notice: notice.map(str::to_owned),
+            made: RefCell::new(None),
+        })
+    }
+
+    /// The place the controller asked for, handed over once; `None` when it asked for none.
+    pub(crate) fn take(&self) -> Option<gtk4::Widget> {
+        self.made.borrow_mut().take()
+    }
+}
+
+impl BasePageMaker for BasePage {
+    fn build(&self) {
+        let widget = match &self.notice {
+            Some(notice) => {
+                self.agent.say_no_panel();
+                crate::webkit_sandbox::notice_widget(notice)
+            }
+            None => crate::agent_panel::build_base_page(&self.agent).0.upcast(),
+        };
+        *self.made.borrow_mut() = Some(widget);
+    }
+}
 
 /// What `build_ui` gives every terminal pane once, when it is made.
 pub(crate) type WireTerminal = Rc<dyn Fn(&ModuleId, &TerminalPane)>;

@@ -120,6 +120,7 @@ t_symlinked_extension_directory_is_left_alone() {
 	expect_out "$EXT_ID is a symlink"
 	expect_eq "$(snap "$TH/my-extension")" "$mine" "the user's own extension checkout after an install"
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
+	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop"
 	plant_sidecar aaaaaaa
 	inst_net
 	expect_rc 0
@@ -130,6 +131,7 @@ t_symlinked_extension_directory_is_left_alone() {
 	expect_eq "$(snap "$TH/my-extension")" "$mine" "the user's own extension checkout after an uninstall"
 	expect_out "$EXT_ID is a symlink, so it was left alone"
 	expect_absent "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
+	expect_absent "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop"
 }
 
 TESTS="$TESTS t_uninstall_removes_the_extension_and_tidies_empty_parents"

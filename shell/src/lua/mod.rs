@@ -11,6 +11,7 @@ mod panel;
 pub(crate) use eitri_core::lua::panel::PanelSlot;
 pub(crate) use panel::{install_crash_recovery_into, PanelEntry, PanelRegistry};
 
+use eitri_core::layout::ModuleId;
 use eitri_core::lua::kernel::Kernel;
 use std::cell::RefCell;
 use std::ops::Deref;
@@ -35,10 +36,15 @@ impl Deref for LuaEngine {
 
 impl LuaEngine {
     pub(crate) fn new(config_dir: PathBuf) -> mlua::Result<Self> {
+        Self::showing(config_dir, None)
+    }
+
+    /// The engine of a window; `shows` is the one module of a chat or page window, which builds no other panel's view.
+    pub(crate) fn showing(config_dir: PathBuf, shows: Option<ModuleId>) -> mlua::Result<Self> {
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let for_panels = panels.clone();
         let kernel = Kernel::new(config_dir.clone(), move |lua, eitri| {
-            panel::install(lua, eitri, for_panels, config_dir)
+            panel::install(lua, eitri, for_panels, config_dir, shows)
         })?;
         Ok(Self { kernel, panels })
     }
@@ -50,7 +56,7 @@ impl LuaEngine {
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let for_panels = panels.clone();
         let kernel = Kernel::new(config_dir.clone(), move |lua, eitri| {
-            panel::install(lua, eitri, for_panels, config_dir)?;
+            panel::install(lua, eitri, for_panels, config_dir, None)?;
             eitri_core::lua::plugin::refuse_plugins(lua, eitri)
         })?;
         Ok(Self { kernel, panels })

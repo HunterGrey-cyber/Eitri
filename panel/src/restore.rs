@@ -15,12 +15,17 @@ pub(super) fn restore_is_on_offer(state: &AgentPanelState) -> bool {
 /// Whether the last window's tabs are settled ([`AgentPanelHandle::restore_settled`]). `agent.restore
 /// = "auto"` keeps its source until the base page's first `ready` uses it up.
 pub(super) fn restore_settled(state: &AgentPanelState) -> bool {
-    let on_offer = restore_is_on_offer(state)
-        || (state.restore_policy == RestorePolicy::Auto
-            && state.restore_source.is_some()
-            && !state.ready(ViewId::BASE))
-        || (state.restore_policy == RestorePolicy::Auto && (state.launch_restore_held || state.launch_restore_owed));
+    let on_offer = restore_is_on_offer(state) || launch_restore_waits(state);
     !on_offer && !state.tabs.restore_question_open() && !restore_waits_for_trust(state) && state.restore_run.is_none()
+}
+
+/// Whether `agent.restore = "auto"` has its go still to come: the source waits for the base page's first `ready`, or
+/// the launch is held.
+pub(super) fn launch_restore_waits(state: &AgentPanelState) -> bool {
+    state.restore_policy == RestorePolicy::Auto
+        && ((state.restore_source.is_some() && !state.ready(ViewId::BASE))
+            || state.launch_restore_held
+            || state.launch_restore_owed)
 }
 
 /// What the dashboard says it can bring back: the saved tabs that still can be, `None` when that is
@@ -34,8 +39,12 @@ pub(super) fn restore_offer(state: &AgentPanelState) -> Option<RestoreOffer> {
 
 /// Which of the saved tabs can come back, judged against the records and leases as they are now.
 pub(super) fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::RestorePlan {
+    plan_of(state, &state.restore_source.clone().unwrap_or_default())
+}
+
+/// Which of `saved` can come back, judged against the records and leases as they are now.
+pub(super) fn plan_of(state: &AgentPanelState, saved: &SavedTabs) -> eitri_core::tab_restore::RestorePlan {
     let canonical = state.canonical_project_dir.as_str();
-    let saved = state.restore_source.clone().unwrap_or_default();
     // Read here rather than taken from a greeting: the greeting lists the active tab's agent's
     // records, and the saved Claude tabs are matched with Claude's whichever agent that tab runs. The
     // other agents' records are read beside them, each saved tab being matched only with a record its
@@ -48,7 +57,7 @@ pub(super) fn restore_plan(state: &AgentPanelState) -> eitri_core::tab_restore::
     if saved.has_other_agents() {
         records.extend(eitri_core::agent_backend::external_sessions(&state.project_dir));
     }
-    let mut plan = eitri_core::tab_restore::plan(&saved, &records, &state.tabs.open_sessions(), |agent, id| {
+    let mut plan = eitri_core::tab_restore::plan(saved, &records, &state.tabs.open_sessions(), |agent, id| {
         agent::lease::SessionLease::is_held(&agent.record_name(), canonical, id).unwrap_or(false)
     });
     // A saved tab of an ACP agent `init.lua` no longer registers has no command to run: it is skipped
@@ -333,15 +342,112 @@ pub(super) fn restore_once_released(state: &mut AgentPanelState, screen: &Screen
     }
 }
 
+/// Tabs window 1 kept for this chat window, given at each link: they wait for the base page's first `ready` as a
+/// launch's saved tabs do, or take their go at once when it has been. A window that has started something has its
+/// tabs, as a launch restore finds them, and leaves these. So does a window that has told window 1 a set of its own and
+/// closed it since: empty again it looks new, but what it is given dates from before that close.
+pub(super) fn take_given_tabs(state: &mut AgentPanelState, screen: &Screen, tabs: SavedTabs, out: &mut Outbox) {
+    if state.restore_policy == RestorePolicy::Off || tabs.is_empty() {
+        return;
+    }
+    if !state.tabs.is_pristine() || state.restore_run.is_some() || state.group_tabs.told_its_own() {
+        println!(
+            "[restore] {} saved tab(s) given; this window has started, so they stay out",
+            tabs.tabs.len()
+        );
+        return;
+    }
+    state.restore_source = Some(tabs);
+    if state.ready(ViewId::BASE) {
+        restore_at_launch(state, screen, out);
+    }
+}
+
+/// The tabs a restore still holds that the user has said nothing about. A source a user session passed by is out:
+/// the window's next write leaves those tabs out, as `eitri` mode's does.
+pub(super) fn unopened_tabs(state: &AgentPanelState) -> Option<SavedTabs> {
+    let waiting = restore_is_on_offer(state) || launch_restore_waits(state) || state.group_tabs.holds_unopened;
+    state.restore_source.clone().filter(|_| waiting)
+}
+
+/// See [`AgentPanelHandle::tabs_to_keep`].
+pub(super) fn tabs_to_keep(state: &AgentPanelState) -> Option<SavedTabs> {
+    let now = state.tabs.saved_snapshot(&state.conversation_id);
+    let tabs = match (now, unopened_tabs(state)) {
+        (Some(now), Some(unopened)) => now.followed_by(unopened),
+        (now, unopened) => now.or(unopened)?,
+    };
+    (state.group_tabs.told || !tabs.is_empty()).then_some(tabs)
+}
+
 /// Keeps the saved-tabs file in step with the tabs: once per tick, cheap when nothing changed. A change is
-/// handed to the writer thread (`TabWriter`); nothing here touches the disk.
+/// handed to the writer thread (`TabWriter`), or told to window 1 by a window of a group; nothing here touches the
+/// disk.
 pub(super) fn remember_tabs(state_ref: &mut AgentPanelState) {
     // A dashboard restore still waiting is listed from the first write that would otherwise leave it out.
     if state_ref.tabs.settle_waiting_restore() {
         state_ref.restore_source = None;
     }
     let snapshot = state_ref.tabs.saved_snapshot(&state_ref.conversation_id);
+    if state_ref.restore_policy != RestorePolicy::Off {
+        let AgentPanelState {
+            group_tabs,
+            restore_source,
+            ..
+        } = &mut *state_ref;
+        group_tabs.observe(snapshot.as_ref(), restore_source.as_ref());
+    }
     state_ref.tab_memory.observe(snapshot);
+}
+
+/// Where a chat window of a group tells its tabs.
+type TabReportHook = Rc<dyn Fn(&SavedTabs)>;
+
+/// This window's part in a group's one tabs file, whichever side of it this window is on.
+#[derive(Default)]
+pub(super) struct GroupTabs {
+    /// A chat window: where its tabs are told, and the set last told. It starts from "no tabs", as the writer does, so
+    /// a window that has done nothing says nothing and what window 1 keeps for it stands.
+    report: Option<(TabReportHook, SavedTabs)>,
+    /// A chat window has told window 1 a set, so what is its to save is known there from this window, not from the file.
+    told: bool,
+    /// A chat window: a tab handed over took a restore's place on the empty tab, so the tabs of that restore are neither
+    /// open here nor on offer, and only what it reports keeps them.
+    holds_unopened: bool,
+    /// Window 1: the file's last write, which its close waits for as it waits for a window's own.
+    pub(super) last_write: Option<mpsc::Receiver<()>>,
+}
+
+impl GroupTabs {
+    pub(super) fn report_to(&mut self, hook: TabReportHook) {
+        self.report = Some((hook, SavedTabs::default()));
+    }
+
+    pub(super) fn told_its_own(&self) -> bool {
+        self.told
+    }
+
+    /// A tab handed over is about to take the empty tab the window's restore would have used.
+    pub(super) fn hold_unopened(&mut self) {
+        self.holds_unopened = true;
+    }
+
+    /// `unopened`: the tabs a restore still holds, which this window reports beside its own once a hand-over has taken
+    /// their place.
+    fn observe(&mut self, now: Option<&SavedTabs>, unopened: Option<&SavedTabs>) {
+        let (Some(now), Some((hook, last))) = (now, self.report.as_mut()) else {
+            return;
+        };
+        let now = match unopened.filter(|_| self.holds_unopened) {
+            Some(unopened) => now.clone().followed_by(unopened.clone()),
+            None => now.clone(),
+        };
+        if now != *last {
+            hook(&now);
+            *last = now;
+            self.told = true;
+        }
+    }
 }
 
 /// How one collected connect relates to the restore in progress, if there is one.
@@ -1037,6 +1143,202 @@ mod tests {
         }
     }
 
+    /// What a report and a given set need of a real launch: the saved tabs of an empty panel, on its first page.
+    fn chat_window(label: &str, policy: RestorePolicy, sessions: &[&str]) -> Rc<RefCell<AgentPanelState>> {
+        let (state, _dir) = restore_panel(label, &[], sessions);
+        state.borrow_mut().restore_policy = policy;
+        state.borrow_mut().restore_source = None;
+        state
+    }
+
+    fn given(sessions: &[&str]) -> SavedTabs {
+        let tabs = sessions
+            .iter()
+            .map(|session| eitri_core::saved_tabs::SavedTab {
+                agent: AgentId::Claude,
+                conversation_id: "0123456789abcdef".to_string(),
+                provider_session_id: session.to_string(),
+                name: None,
+                mode: Auto,
+                view: None,
+                window: None,
+            })
+            .collect();
+        SavedTabs::from_parts(tabs, 0, Vec::new(), None)
+    }
+
+    fn take_given(state: &Rc<RefCell<AgentPanelState>>, tabs: SavedTabs) {
+        handle_for(state).give_tabs(tabs);
+    }
+
+    /// Closing a window answers nothing about tabs on offer, and at a close that keeps it a window that told nothing and
+    /// holds nothing must not say "no tabs": window 1 would take that for the window having closed them.
+    #[test]
+    fn tabs_on_offer_stay_unopened_and_an_empty_window_says_nothing() {
+        let state = chat_window("unopened-offer", RestorePolicy::Offer, &["s-1"]);
+        let handle = handle_for(&state);
+        let sessions = |tabs: Option<SavedTabs>| {
+            tabs.map(|tabs| {
+                tabs.tabs
+                    .iter()
+                    .map(|tab| tab.provider_session_id.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(handle.unopened_tabs(), None);
+        assert_eq!(handle.tabs_to_keep(), None);
+        take_given(&state, given(&["s-1"]));
+        assert_eq!(sessions(handle.unopened_tabs()), Some(vec!["s-1".to_string()]));
+        assert_eq!(sessions(handle.tabs_to_keep()), Some(vec!["s-1".to_string()]));
+    }
+
+    #[test]
+    fn tabs_given_before_the_first_ready_are_restored_by_it() {
+        let state = chat_window("given-before-ready", RestorePolicy::Auto, &["s-1"]);
+        take_given(&state, given(&["s-1"]));
+        assert_eq!(
+            state.borrow().restore_source.as_ref().map(|s| s.tabs.len()),
+            Some(1),
+            "they wait for the page, as a launch's saved tabs do"
+        );
+        assert!(!restore_settled(&state.borrow()));
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        let result = launch_restore(&mut state.borrow_mut()).expect("the launch restore has them");
+        assert!(matches!(result, RestoreResult::Deferred));
+        assert!(state.borrow().restore_source.is_none(), "one go");
+    }
+
+    #[test]
+    fn tabs_given_after_the_first_ready_are_restored_at_once() {
+        let state = chat_window("given-after-ready", RestorePolicy::Auto, &["s-1"]);
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        take_given(&state, given(&["s-1"]));
+        assert!(state.borrow().restore_source.is_none(), "a launch restore had them");
+        assert!(
+            restore_waits_for_trust(&state.borrow()),
+            "through the trust gate, as any restore"
+        );
+    }
+
+    #[test]
+    fn tabs_given_under_offer_are_offered_and_under_off_are_dropped() {
+        let offered = chat_window("given-offer", RestorePolicy::Offer, &["s-1"]);
+        offered.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        take_given(&offered, given(&["s-1"]));
+        assert_eq!(
+            restore_offer(&offered.borrow()).map(|offer| offer.labels),
+            Some(vec!["title of s-1".to_string()])
+        );
+
+        let off = chat_window("given-off", RestorePolicy::Off, &["s-1"]);
+        take_given(&off, given(&["s-1"]));
+        assert!(off.borrow().restore_source.is_none());
+    }
+
+    /// A window that lived through window 1's restart has its tabs, and the file may be behind it: what it closed
+    /// meanwhile must not come back.
+    #[test]
+    fn a_window_that_has_started_keeps_what_it_has_when_tabs_are_given() {
+        let (state, dir) = restore_panel("given-started", &[], &["s-1", "s-2"]);
+        state.borrow_mut().restore_policy = RestorePolicy::Auto;
+        state.borrow_mut().restore_source = None;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        let tab = state.borrow().tabs.active();
+        let (_provider, backend) = live_backend(&dir);
+        state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        take_given(&state, given(&["s-1", "s-2"]));
+        assert!(state.borrow().restore_source.is_none());
+        assert_eq!(state.borrow().tabs.tabs().len(), 1);
+        for tab in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    /// A chat window's writer is off and its tabs go over the link: only the sets that differ, nothing before its
+    /// first session, and nothing on the disk.
+    #[test]
+    fn module_windows_never_write_a_tabs_file() {
+        let (state, dir) = restore_panel("module-window-tabs", &[], &[]);
+        let files = agent::state_dirs::test_workspace_dir("module-window-tabs-files");
+        state.borrow_mut().tab_memory = TabWriter::new_as(
+            Some(files.clone()),
+            dir.clone(),
+            eitri_core::window_link::pair::Role::Second,
+        );
+        let handle = handle_for(&state);
+        handle.keep_no_tabs();
+        let told = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        handle.report_tabs({
+            let told = told.clone();
+            move |tabs: &SavedTabs| {
+                let sessions = tabs.tabs.iter().map(|t| t.provider_session_id.clone());
+                told.borrow_mut().push(sessions.collect());
+            }
+        });
+        remember_tabs(&mut state.borrow_mut());
+        assert!(told.borrow().is_empty(), "a window that has done nothing says nothing");
+
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        provider.open_session("s-live", &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().provider_session_id().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the session id never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        remember_tabs(&mut state.borrow_mut());
+        remember_tabs(&mut state.borrow_mut());
+        assert_eq!(*told.borrow(), [vec!["s-live".to_string()]], "once for one change");
+        assert_eq!(
+            handle.tabs_now().map(|tabs| tabs.tabs.len()),
+            Some(1),
+            "and it can say them at any moment"
+        );
+        assert!(state
+            .borrow()
+            .tab_memory
+            .wait_written(std::time::Duration::from_secs(5)));
+        assert_eq!(std::fs::read_dir(&files).unwrap().count(), 0, "nothing was written");
+
+        let taken = state.borrow_mut().tabs.take_all();
+        remember_tabs(&mut state.borrow_mut());
+        assert_eq!(told.borrow().len(), 1, "a closing window's empty set is not a change");
+        for tab in taken {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    /// A hub is told no tab files and keeps no tabs: what the last run saved is not offered, not claimed, and not
+    /// written over at its close.
+    #[test]
+    fn a_window_that_keeps_no_tabs_offers_claims_and_writes_none() {
+        let (state, dir) = restore_panel("keeps-no-tabs", &[("s-1", None, Auto)], &["s-1"]);
+        let files = agent::state_dirs::test_workspace_dir("keeps-no-tabs-files");
+        state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
+        let handle = handle_for(&state);
+        handle.keep_no_tabs();
+        assert!(state.borrow().restore_source.is_none());
+        assert!(!state.borrow().tab_memory.is_enabled());
+        assert!(!restore_is_on_offer(&state.borrow()));
+        drop(handle.shutdown());
+        assert_eq!(std::fs::read_dir(&files).unwrap().count(), 0, "nothing was written");
+    }
+
     /// `agent.restore = "off"` is the whole feature off: nothing is offered, nothing is remembered.
     #[test]
     fn restore_off_offers_nothing_and_remembers_nothing() {
@@ -1682,6 +1984,7 @@ mod tests {
                     name: None,
                     mode: Auto,
                     view: None,
+                    window: None,
                 }],
                 Some(0),
             ));

@@ -65,8 +65,8 @@ pub(super) fn release_review(win: WinId, entry: &Entry, here: bool, batch: &mut 
 
 /// A chat asked to move while its turn runs, whose agent cannot keep the turn across a move: it is offered once the
 /// turn ends, and the user is told so.
-pub(super) fn queue(w: &mut Window, module: &ModuleId, facts: &ChatMoveFacts, follow: bool) {
-    let Some(p) = w.peer.as_mut() else {
+pub(super) fn queue(w: &mut Window, peer: PeerId, module: &ModuleId, facts: &ChatMoveFacts, follow: bool) {
+    let Some(p) = w.peer_mut(peer) else {
         return;
     };
     let view = view_of(module);
@@ -84,18 +84,21 @@ pub(super) fn queue(w: &mut Window, module: &ModuleId, facts: &ChatMoveFacts, fo
 
 /// The turn of chat view `view` has ended: a move that waited for it is offered now.
 pub fn turn_ended(w: &mut Window, cx: &Cx, win: WinId, view: ViewId, batch: &mut Batch) {
-    let Some(p) = w.peer.as_mut() else {
+    let Some((peer, at)) = w
+        .peers()
+        .find_map(|(peer, p)| p.queued.iter().position(|q| q.view == view).map(|at| (*peer, at)))
+    else {
         return;
     };
-    let Some(at) = p.queued.iter().position(|q| q.view == view) else {
+    let Some(queued) = w.peer_mut(peer).map(|p| p.queued.remove(at)) else {
         return;
     };
-    let queued = p.queued.remove(at);
     w.say(format!("[move] {}: its turn ended; offered now", queued.module));
     offer_tab(
         w,
         cx,
         win,
+        peer,
         &queued.module,
         queued.session.as_deref(),
         queued.follow,
@@ -157,7 +160,17 @@ pub(super) fn base_tab_offered(
 /// This window's presence answered for the session arriving with move `mv`: held, `move_done` goes; not held, the
 /// arrival is given up and the other window keeps the chat.
 pub fn presence_answered(w: &mut Window, win: WinId, mv: MoveId, held: Result<(), String>, batch: &mut Batch) {
-    with_peer(w, |w, p| {
+    // The answer names its move alone; the link that holds the arrival for it is the one that awaits a presence.
+    let peer =
+        peer_with(w, mv, |e| e.role == Role::Destination && e.stage == Stage::Holding).or_else(|| w.second_peer());
+    let Some(peer) = peer else {
+        w.warn(format!(
+            "[move] a presence answer for move {}, which no link waits for; ignored",
+            mv.0
+        ));
+        return;
+    };
+    with_peer(w, peer, |w, p| {
         let holding = p
             .entries
             .get(&mv)
@@ -236,7 +249,8 @@ pub(super) fn presence_after_adopt(win: WinId, id: MoveId, entry: &Entry, batch:
 /// The chooser picked a session the other window holds: that window is asked to move it here, the keys following
 /// it. False with no other window.
 pub fn ask_session(w: &mut Window, session: String) -> bool {
-    with_peer(w, |w, p| {
+    let Some(peer) = w.second_peer() else { return false };
+    with_peer(w, peer, |w, p| {
         let msg = Msg::MoveAsk {
             module: None,
             session: Some(session.clone()),

@@ -496,14 +496,19 @@ pub(in crate::wm) fn peer_key(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId
         Ok(layout) => (layout.is_away(id), layout.contains(id)),
         Err(_) => return false,
     };
-    let held = !local && w.peer.as_ref().is_some_and(|p| p.held.contains(id));
+    let held = !local && w.held_by(id).is_some();
     if editor_elsewhere || away || held {
-        if moves::raise_for(
-            w,
-            win,
-            crate::window_link::FocusTarget::Module { id: id.to_string() },
-            batch,
-        ) {
+        // The window that holds the module is raised; one that said nothing yet is window 2.
+        let to = w.held_by(id).or_else(|| w.second_peer());
+        if to.is_some_and(|peer| {
+            moves::raise_for(
+                w,
+                win,
+                peer,
+                crate::window_link::FocusTarget::Module { id: id.to_string() },
+                batch,
+            )
+        }) {
             return true;
         }
         if editor_elsewhere {
@@ -1105,12 +1110,7 @@ pub fn instance_new(
                 .chain(moves::arriving(w))
                 .collect();
             Some(match kind {
-                ModuleKind::Terminal | ModuleKind::Agent => plan_new_instance(
-                    kind,
-                    &here,
-                    &reserved,
-                    w.peer.as_ref().map(|p| p.held.as_slice()).unwrap_or_default(),
-                ),
+                ModuleKind::Terminal | ModuleKind::Agent => plan_new_instance(kind, &here, &reserved, &w.held_union()),
                 other => Err(feedback::no_new_instance_text(other)),
             })
         }
@@ -1201,7 +1201,7 @@ pub fn scratch_new(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &m
             Some(format!("{id}: it is being made"))
         } else if moves::arriving(w).contains(id) {
             Some(format!("{id}: it is arriving from the other window"))
-        } else if w.peer.as_ref().is_some_and(|p| p.held.contains(id)) {
+        } else if w.held_by(id).is_some() {
             Some(format!("{id}: the other window holds it"))
         } else {
             let here: Vec<&Layout> = workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
@@ -1210,13 +1210,7 @@ pub fn scratch_new(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &m
                 .filter(|n| *n != id.number())
                 .map(|n| ModuleId::instance(id.kind(), n).expect("a numbered terminal or chat view"))
                 .collect();
-            plan_new_instance(
-                id.kind(),
-                &here,
-                &reserved,
-                w.peer.as_ref().map(|p| p.held.as_slice()).unwrap_or_default(),
-            )
-            .err()
+            plan_new_instance(id.kind(), &here, &reserved, &w.held_union()).err()
         }),
         _ => None,
     };
@@ -1486,7 +1480,7 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
             w.refuse(win, text, batch);
             return Ran::Done;
         }
-        let (running, queued) = moves::peer_counts(w);
+        let (running, queued) = moves::peer_counts(w, peer);
         let text = feedback::close_peer_text(other, running, queued);
         w.say(format!(
             "[modules] {id}: frozen for window {other}, which is not answering: {text}"
@@ -1578,12 +1572,16 @@ fn ask_start_editor(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
     close::superseded(w, cx, win, batch);
 }
 
-/// The other window went: a shown question about ending it names a window that is not there any more (and a new
-/// window 2 could take its number), so it goes, and a `y` meant for it does nothing.
-pub(in crate::wm) fn peer_gone(w: &mut Window) {
-    if w.modules.end_peer.take().is_some() && w.chrome.prompt.as_ref().is_some_and(|p| !p.closes_window) {
-        w.say("[modules] the other window went; its question is gone".into());
-        chrome::set_prompt(w, None);
+/// The window behind `peer` went: a shown question about ending it names a window that is not there any more (and
+/// a new window 2 could take its number), so it goes, and a `y` meant for it does nothing. A question about another
+/// peer stays.
+pub(in crate::wm) fn peer_gone(w: &mut Window, peer: PeerId) {
+    if w.modules.end_peer == Some(peer) {
+        w.modules.end_peer = None;
+        if w.chrome.prompt.as_ref().is_some_and(|p| !p.closes_window) {
+            w.say("[modules] the other window went; its question is gone".into());
+            chrome::set_prompt(w, None);
+        }
     }
 }
 
@@ -1612,7 +1610,10 @@ pub fn prompt_answer(w: &mut Window, cx: &Cx, win: WinId, answer: PromptKey, bat
         let editor = crate::window_link::FocusTarget::Module {
             id: ModuleId::editor().to_string(),
         };
-        if !moves::raise_for(w, win, editor, batch) {
+        if !w
+            .second_peer()
+            .is_some_and(|peer| moves::raise_for(w, win, peer, editor, batch))
+        {
             w.say("[modules] editor: the editor window is started".into());
             batch.push_effect(HostOp::StartEditorWindow { win });
         }

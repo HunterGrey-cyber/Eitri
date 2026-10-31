@@ -26,6 +26,7 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/shell f
 ./.local/share d
 ./.local/share/applications d
+./.local/share/applications/cn.huntergrey.eitri.Page.desktop f
 ./.local/share/applications/cn.huntergrey.eitri.Panel.desktop f
 ./.local/share/applications/cn.huntergrey.eitri.desktop f
 ./.local/share/eitri d
@@ -362,6 +363,7 @@ t_dry_run_fresh() {
 	expect_out "would write the launcher $TH/.local/bin/eitri"
 	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.desktop"
 	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Panel.desktop"
+	expect_out "would write $TH/.local/share/applications/cn.huntergrey.eitri.Page.desktop"
 	expect_out "would write $TH/.local/share/eitri/eitri.nvim/plugin/eitri.lua"
 	expect_out "would write $TH/.local/share/licenses/eitri/LICENSE"
 	expect_out "would write $TH/.local/share/licenses/eitri/NOTICE"

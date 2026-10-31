@@ -1,9 +1,9 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=9c2a1d5061919265784f8bb991817db04315e7a57a82dbf288f3d2f1f4b911d5 -->
+<!-- translated-from: pages.md sha256=29ecbceeb8cfe23e9e21b01e175c28c0057453e56f71a6575b8fcb4d206954f6 -->
 
 # 你自己做的页面
 
-Eitri 可以把你自己的网页作为窗口里的模块显示出来，和编辑器、聊天、终端放在一起。有两种：
+Eitri 可以把你自己的网页作为窗口里的模块显示出来，和编辑器、聊天、终端放在一起。在 Hyprland、sway 和 niri 上，每个页面默认是一个独立的窗口，由你的窗口管理器排布（[合成器窗口](compositor-windows.zh-CN.md)）。有两种：
 
 - **Lua 面板**是 `init.lua` 里的一条调用，显示一个 HTML 文件或一个地址，比如你的开发服务器。它是一个普通的网页视图，对 Eitri 一无所知。
 - **插件**是一个带 `eitri-plugin.toml` 的目录，加上一个小网站。它的页面拿到 Eitri 的配色、Eitri 的页面按键，以及一座通往一组封闭的宿主能力的桥，具体哪些由清单点名：保存它自己的数据、把按键交给编辑器、运行插件自己的程序、跟随你正在编辑的缓冲区。Eitri 随附的 [Markdown 预览](markdown-preview.zh-CN.md)就是一个插件。

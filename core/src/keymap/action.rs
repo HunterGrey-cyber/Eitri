@@ -219,6 +219,27 @@ pub enum OptValue {
 }
 
 impl OptValue {
+    /// The value a JSON option read off a link stands for.
+    pub fn from_wire(value: &serde_json::Value) -> OptValue {
+        use serde_json::Value;
+        match value {
+            Value::Bool(b) => OptValue::Bool(*b),
+            Value::String(text) => OptValue::Str(text.clone()),
+            Value::Number(n) => n.as_i64().map_or(OptValue::Other("number"), OptValue::Int),
+            Value::Null => OptValue::Other("nil"),
+            Value::Array(_) | Value::Object(_) => OptValue::Other("table"),
+        }
+    }
+
+    fn to_wire(&self) -> serde_json::Value {
+        match self {
+            OptValue::Int(n) => (*n).into(),
+            OptValue::Bool(b) => (*b).into(),
+            OptValue::Str(text) => text.clone().into(),
+            OptValue::Other(_) => serde_json::Value::Null,
+        }
+    }
+
     fn kind(&self) -> &'static str {
         match self {
             OptValue::Int(_) => "a number",
@@ -1017,6 +1038,15 @@ impl Action {
             Action::CopyMode { up: true } => vec![("up".into(), OptValue::Bool(true))],
             _ => vec![],
         }
+    }
+
+    /// [`Action::options`] as JSON values, which cross a link beside [`Action::name`]; [`OptValue::from_wire`] reads them
+    /// back for [`parse`].
+    pub fn wire_options(&self) -> Vec<(String, serde_json::Value)> {
+        self.options()
+            .into_iter()
+            .map(|(key, value)| (key, value.to_wire()))
+            .collect()
     }
 
     /// The `?` overlay's description. `prefix` is the prefix as a person reads it (`Ctrl+b`);

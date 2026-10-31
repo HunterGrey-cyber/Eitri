@@ -1466,6 +1466,7 @@ mod tests {
                 name: None,
                 mode: eitri_core::agent_bridge::SessionModeChoice::Auto,
                 view: None,
+                window: None,
             }],
             0,
             Vec::new(),

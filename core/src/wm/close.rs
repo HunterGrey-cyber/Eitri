@@ -42,6 +42,11 @@
 //!   arrangement stays the user's. A second request while nvim is asking is refused, as a second `x`
 //!   is, with what nvim is doing ([`NvimState`]); only when nvim's own loop has not answered for
 //!   [`NVIM_QUIT_PATIENCE`] does it kill nvim instead ([`quit_request`]).
+//! - **a group**, in `compositor` mode: window 1's close closes every chat and page window with it, so it asks whatever
+//!   they are doing and counts what they run ([`crate::tabs::group_close_prompt`]), and its teardown ends them first
+//!   ([`CleanupOp::EndGroup`]). A module window is its one module, so its kill and its close are one thing: the close,
+//!   which asks only while a turn runs. One that hears its group closing ([`CloseCause::GroupClosed`]) tears down
+//!   without asking: the user answered in window 1.
 //! - **a declined window close after nvim exited on its own**: nvim is gone and the window stays, so
 //!   the editor is retired as `prefix x`'s kill of it retires it ([`Reopen::Never`]) -- never left on
 //!   screen holding the keys with nothing behind it ([`retire_on_declined_close`]). It is not
@@ -71,7 +76,7 @@ use super::host::*;
 use super::quit::{QuitFlow, QuitWorld, WindowClose};
 use super::toasts::ToastKind;
 use super::verbs::modules::{self, Cx};
-use super::window::{WinId, Window};
+use super::window::{Tiling, WinId, Window};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CloseState {
@@ -91,7 +96,7 @@ pub struct CloseFlow {
     pending: Option<PendingClose>,
     confirmed: bool,
     repeated: bool,
-    moving: Vec<crate::window_link::moves::MoveId>,
+    moving: Vec<(super::window::PeerId, crate::window_link::moves::MoveId)>,
     move_pending: Vec<(ModuleId, Option<crate::tabs::TabId>)>,
     move_wait_noted: std::collections::BTreeSet<ModuleId>,
 }
@@ -113,6 +118,8 @@ pub enum CloseCause {
     NvimExited,
     LastTerminalExit(ModuleId),
     Signal(&'static str),
+    /// Window 1 said it is closing the group this module window belongs to.
+    GroupClosed,
 }
 
 /// A signal never waits for an answer. Ordinary closes let nvim guard unsaved buffers before an idle tears down.
@@ -125,8 +132,11 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
     if ended(w) {
         return;
     }
-    // The signal's own handler has said so, through a write that never blocks.
-    if let CloseCause::Signal(_) = cause {
+    // The signal's own handler has said so, through a write that never blocks; a group's close was asked in window 1.
+    if matches!(cause, CloseCause::Signal(_) | CloseCause::GroupClosed) {
+        if matches!(cause, CloseCause::Signal(_)) && w.tiling == Tiling::ModuleWindow {
+            batch.push_effect(HostOp::Cleanup(CleanupOp::KeepThisWindow));
+        }
         teardown(w, win, batch);
         return;
     }
@@ -167,24 +177,27 @@ fn ended(w: &mut Window) -> bool {
 }
 
 /// The last module's one question also confirms the window consequences at this moment.
-pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: ModuleId, _batch: &mut Batch) {
+pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: ModuleId, batch: &mut Batch) {
     if ended(w) {
         return;
     }
+    // A module window is its one module, so killing it is closing it, with the one question that close has.
+    if w.tiling == Tiling::ModuleWindow {
+        request(w, cx, win, CloseCause::User, batch);
+        return;
+    }
     let (running, queued, background) = window_counts(cx);
-    let text = window_prompt(w, cx, win)
-        .filter(|_| w.peer.is_some())
-        .unwrap_or_else(|| {
-            prompt(
-                &module,
-                &chrome::title(w, &module),
-                KillScope::Window,
-                running,
-                queued,
-                cx.reads.terminal_jobs(win),
-                background,
-            )
-        });
+    let text = window_prompt(w, cx, win).filter(|_| w.has_peer()).unwrap_or_else(|| {
+        prompt(
+            &module,
+            &chrome::title(w, &module),
+            KillScope::Window,
+            running,
+            queued,
+            cx.reads.terminal_jobs(win),
+            background,
+        )
+    });
     let confirmed = window_prompt(w, cx, win);
     w.say(format!("[modules] {module}: {text}"));
     w.modules.clear_question();
@@ -195,7 +208,7 @@ pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: Modul
         Some(Prompt {
             text,
             closes_window: true,
-            offers_move: w.peer.is_some() && !movable(cx, win).is_empty(),
+            offers_move: move_target(w) && !movable(cx, win).is_empty(),
         }),
     );
 }
@@ -318,8 +331,8 @@ fn begin_moves(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
     w.close.confirmed = true;
     w.close.move_pending = movable(cx, win);
     w.close.moving = super::moves::active_source_moves(w);
-    for id in w.close.moving.clone() {
-        super::moves::workspace::watch(w, id);
+    for (peer, id) in w.close.moving.clone() {
+        super::moves::workspace::watch(w, peer, id);
     }
     moves_progress(w, cx, win, batch);
 }
@@ -358,21 +371,37 @@ pub(super) fn moves_progress(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Ba
             w.close.move_pending.push((module, tab));
             continue;
         }
-        if let Some(id) = super::moves::offer_for_close(w, cx, win, &module, tab, selected, batch) {
-            super::moves::workspace::watch(w, id);
-            w.close.moving.push(id);
+        if let Some((peer, id)) = super::moves::offer_for_close(w, cx, win, &module, tab, selected, batch) {
+            super::moves::workspace::watch(w, peer, id);
+            w.close.moving.push((peer, id));
         }
     }
-    if !w.close.move_pending.is_empty() || w.close.moving.iter().any(|id| !super::moves::move_decided(w, *id)) {
+    if !w.close.move_pending.is_empty()
+        || w.close
+            .moving
+            .iter()
+            .any(|(peer, id)| !super::moves::move_decided(w, *peer, *id))
+    {
         return;
     }
     stop_moving(w);
     request(w, cx, win, CloseCause::User, batch);
 }
 
-/// A dead link decides the remaining handovers, including chats waiting for a turn's end.
-pub(super) fn moves_link_ended(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+/// A dead link decides the remaining handovers, including chats waiting for a turn's end. Only the end of a link the
+/// close waits on counts: one with a move in flight, or window 2's, which the waiting hand-overs are for.
+pub(super) fn moves_link_ended(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    peer: super::window::PeerId,
+    was_window_2: bool,
+    batch: &mut Batch,
+) {
     if w.close.state != CloseState::Moving {
+        return;
+    }
+    if !was_window_2 && !w.close.moving.iter().any(|(moving_to, _)| *moving_to == peer) {
         return;
     }
     stop_moving(w);
@@ -424,6 +453,10 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
     chrome::set_prompt(w, None);
     let layout_written = save_for_close(w);
     super::moves::forget_sent_at_teardown(w, win, batch);
+    // Window 2 outlives window 1; a row of orphaned chat windows after the editor was quit would be clutter.
+    if w.tiling == Tiling::Hub {
+        batch.push_effect(HostOp::Cleanup(CleanupOp::EndGroup));
+    }
     for op in [
         HostOp::Cleanup(CleanupOp::PairOnClose { layout_written }),
         HostOp::Editor(EditorCall::Shutdown { win }),
@@ -654,19 +687,34 @@ fn window_counts(cx: &Cx) -> (usize, usize, usize) {
     (counts.running, counts.queued, background)
 }
 
+/// Whether the window offers to move its modules away: window 2 is the only window it is linked to.
+fn move_target(w: &Window) -> bool {
+    w.lone_second_peer().is_some()
+}
+
 pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
     let (running, queued, background) = window_counts(cx);
-    // Only a linked window offers `m`, so only its question counts the pages it would move as running work.
+    match w.tiling {
+        Tiling::Hub if w.has_peer() => return Some(group_prompt(w, cx, win)),
+        // Its close touches nothing of the rest of the group, so what runs here is all it names.
+        Tiling::ModuleWindow => {
+            return crate::tabs::window_close_prompt_with_jobs(running, queued, cx.reads.terminal_jobs(win), background)
+        }
+        Tiling::Hub | Tiling::Eitri => {}
+    }
+    // Only a window that offers `m` counts the pages it would move as running work.
+    let offers_move = move_target(w);
     let running = running
-        + if w.peer.is_some() {
+        + if offers_move {
             cx.reads.pages_with_tasks(win).len()
         } else {
             0
         };
-    let other = w.peer.as_ref().map(|p| crate::tabs::OtherWindow {
+    let summary = w.group_summary();
+    let other = w.has_peer().then(|| crate::tabs::OtherWindow {
         name: super::moves::other_name(w),
-        running: p.summary().map_or(0, |s| s.running as usize),
-        queued: p.summary().map_or(0, |s| s.queued as usize),
+        running: summary.as_ref().map_or(0, |s| s.running as usize),
+        queued: summary.as_ref().map_or(0, |s| s.queued as usize),
         stays_without_editor: matches!(w.presence(), super::window::EditorPresence::Owned),
     });
     crate::tabs::linked_window_close_prompt(
@@ -675,7 +723,19 @@ pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
         cx.reads.terminal_jobs(win),
         background,
         other,
-        if w.peer.is_some() { movable(cx, win).len() } else { 0 },
+        if offers_move { movable(cx, win).len() } else { 0 },
+    )
+}
+
+/// Window 1's question in a hub: every linked module window and what their last summaries say runs in them.
+fn group_prompt(w: &Window, cx: &Cx, win: WinId) -> String {
+    let (running, queued, _) = window_counts(cx);
+    let summary = w.group_summary();
+    crate::tabs::group_close_prompt_with_jobs(
+        w.peers().count(),
+        running + summary.as_ref().map_or(0, |s| s.running as usize),
+        queued + summary.as_ref().map_or(0, |s| s.queued as usize),
+        cx.reads.terminal_jobs(win),
     )
 }
 
@@ -766,7 +826,7 @@ fn with_quit<T>(
                     Some(Prompt {
                         text,
                         closes_window: true,
-                        offers_move: world.w.peer.is_some() && !movable(cx, win).is_empty(),
+                        offers_move: move_target(world.w) && !movable(cx, win).is_empty(),
                     }),
                 );
             }
@@ -885,8 +945,14 @@ impl QuitWorld for WindowQuit<'_, '_> {
         self.w.restart_wanted = false;
         self.kill_editor_layout(Reopen::InPlace)
     }
-    fn show_chat(&mut self) -> Result<(), crate::layout::LayoutError> {
-        modules::show_on_screen(self.w, self.cx, self.win, &ModuleId::agent(), self.batch)
+    /// The chat, or in window 1 of a group, whose chats are other windows, the bottom terminal: it is the only other
+    /// module that window holds, so the window keeps a place for the keys and the key that starts nvim again.
+    fn show_stand_in(&mut self) -> Result<(), crate::layout::LayoutError> {
+        let stand_in = match self.w.tiling {
+            super::window::Tiling::Hub => ModuleId::terminal(),
+            super::window::Tiling::Eitri | super::window::Tiling::ModuleWindow => ModuleId::agent(),
+        };
+        modules::show_on_screen(self.w, self.cx, self.win, &stand_in, self.batch)
     }
     fn ask_to_close_window(&mut self, text: &str) {
         self.intents.push(CloseIntent::Ask(text.into()));

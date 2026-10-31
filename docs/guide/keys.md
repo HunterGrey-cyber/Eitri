@@ -27,6 +27,9 @@ including anything you changed in [your configuration](configuration.md) or took
 >   (whichever your locale asks for, as Neovim's `:Tutor` picks). It says your own prefix wherever a lesson means
 >   it, and teaches the stock keys after the prefix, so a tmux configuration that rebinds some of them is not
 >   reflected; your prefix and `?` list yours.
+> - **On Hyprland, sway and niri this page's layout keys are off by default,** because your window manager arranges
+>   the windows: `Ctrl+b %` shows one hint and does nothing else. [Compositor windows](compositor-windows.md#keys) says
+>   which keys still work there, and `window.tiling = "eitri"` brings the rest back. The tutor teaches them either way.
 
 ## The prefix
 
@@ -432,6 +435,9 @@ not in a second window, which has no Neovim.
 | `:Eitri workspace <name>` | switch to the workspace, making it when there is none |
 | `:Eitri keys` | the keys sheet |
 | `:Eitri setup` | the [first-start screen](configuration.md#first-start), to choose a key setup again |
+
+With [compositor windows](compositor-windows.md#keys), `workspace`, `open terminal` and `split` of the editor or the
+terminal are off, as their keys are.
 
 Completion goes by position: the first word offers these words and the actions, `split` offers `right` and `below`,
 `open` offers `terminal` and `agent`, and a module's place offers the module ids, every numbered instance among them

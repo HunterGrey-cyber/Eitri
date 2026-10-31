@@ -2,10 +2,12 @@ use super::*;
 use crate::keymap::{prefix::Press, KeySpec};
 use crate::layout::{Axis, Layout, Node, Workspaces};
 use crate::tabs::ViewId;
+use crate::window_link::names::WindowName;
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
 use crate::wm::host::*;
 use crate::wm::persist::Saver;
 use crate::wm::verbs::rig::{decl, rig_with, WIN};
+use crate::wm::window::Tiling;
 use crate::wm::Driver;
 use std::cell::RefCell;
 use std::path::Path;
@@ -23,7 +25,17 @@ fn driven(layout: Layout) -> Rig {
 }
 
 fn driven_with(layout: Layout, saver: impl FnOnce(&Layout, &Workspaces) -> Option<Saver>) -> Rig {
-    let r = rig_with(layout, saver);
+    driven_rig(rig_with(layout, saver))
+}
+
+/// As [`driven`], for a window that takes part in the compositor's tiling as `tiling` says.
+fn driven_tiled(layout: Layout, tiling: Tiling) -> Rig {
+    let mut r = rig_with(layout, |_, _| None);
+    r.controller.window_mut(WIN).unwrap().tiling = tiling;
+    driven_rig(r)
+}
+
+fn driven_rig(r: crate::wm::verbs::rig::Rig) -> Rig {
     let hosted: Vec<_> = r.layout.borrow().modules().iter().map(decl).collect();
     for d in hosted {
         r.host.with_surface(WIN, d.module, d.kind, false);
@@ -874,7 +886,8 @@ fn the_close_prompt_names_the_other_windows_work() {
         });
         r.running();
         let peer = crate::wm::PeerId(2);
-        r.driver.attach_peer(WIN, peer, crate::wm::fake::FakePeerPort::new());
+        r.driver
+            .attach_peer(WIN, peer, WindowName::Second, crate::wm::fake::FakePeerPort::new());
         r.driver.post(HostEvent::Peer(PeerEvent::Summary {
             peer,
             summary: crate::window_link::Summary {
@@ -912,7 +925,8 @@ fn moving_close() -> (Rig, Rc<crate::wm::fake::FakePeerPort>) {
         }),
     );
     let port = crate::wm::fake::FakePeerPort::new();
-    r.driver.attach_peer(WIN, super::super::PeerId(2), port.clone());
+    r.driver
+        .attach_peer(WIN, super::super::PeerId(2), WindowName::Second, port.clone());
     r.driver.close_requested(WIN, CloseBy::User);
     (r, port)
 }
@@ -1162,4 +1176,303 @@ fn a_clean_close_of_window_1_says_bye_through_its_teardown() {
     }));
     asked.advance();
     in_order(&asked.ops()[at..]);
+}
+
+#[test]
+fn the_close_prompt_counts_every_peers_running_turns() {
+    let r = driven(two());
+    r.running();
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(2),
+        WindowName::Second,
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(16),
+        WindowName::Chat(1),
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    for peer in [2, 16] {
+        r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+            peer: crate::wm::PeerId(peer),
+            summary: crate::window_link::Summary {
+                running: 1,
+                ..Default::default()
+            },
+        }));
+    }
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert!(prompt.text.contains("window 2: 2 running"), "{}", prompt.text);
+    assert!(!prompt.offers_move, "a window with a module window peer offers no move");
+    assert!(!prompt.text.contains("m: move"), "{}", prompt.text);
+}
+
+/// A window 1 in `compositor` mode with chat windows `c1`, `c2`..., each reporting the turns `running` gives it.
+fn hub_of(running: &[u32]) -> Rig {
+    let r = driven_tiled(two(), Tiling::Hub);
+    for (at, running) in running.iter().enumerate() {
+        let peer = crate::wm::PeerId(16 + at as u32);
+        let name = WindowName::Chat(at as u8 + 1);
+        r.driver
+            .attach_peer(WIN, peer, name, crate::wm::fake::FakePeerPort::new());
+        r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+            peer,
+            summary: crate::window_link::Summary {
+                running: *running,
+                ..Default::default()
+            },
+        }));
+    }
+    r
+}
+
+/// The chat window `name`, linked to its window 1.
+fn chat_window(name: WindowName) -> Rig {
+    let only = Layout::new(Node::Leaf(ModuleId::agent()), ModuleId::agent()).unwrap();
+    let r = driven_tiled(only, Tiling::ModuleWindow);
+    r.driver.set_module_name(WIN, name.clone());
+    r.driver
+        .attach_peer(WIN, crate::wm::PeerId(1), name, crate::wm::fake::FakePeerPort::new());
+    r
+}
+
+#[test]
+fn closing_window_1_counts_every_module_windows_running_turns() {
+    let r = hub_of(&[2, 1]);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 2 windows? 3 turns are running (y/n)");
+    assert!(prompt.closes_window);
+    assert!(!prompt.offers_move, "a hub moves nothing: its windows close with it");
+}
+
+#[test]
+fn closing_window_1_asks_while_it_has_windows_however_idle_they_are() {
+    let r = hub_of(&[0, 0]);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 2 windows? (y/n)");
+}
+
+#[test]
+fn closing_window_1_names_a_terminal_job_beside_its_windows() {
+    let r = hub_of(&[1]);
+    r.host.set_terminal_jobs(2);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(
+        prompt.text,
+        "close Eitri and its 1 window? 1 turn is running, 2 terminal jobs (y/n)"
+    );
+}
+
+#[test]
+fn the_last_modules_kill_in_window_1_asks_the_groups_question() {
+    let only = Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap();
+    let r = driven_tiled(only, Tiling::Hub);
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(16),
+        WindowName::Chat(1),
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    r.driver
+        .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 1 window? (y/n)");
+    assert!(!prompt.offers_move);
+}
+
+#[test]
+fn a_hub_ends_its_group_before_its_own_teardown() {
+    let r = hub_of(&[1]);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let at = r.ops().len();
+    r.answer("y");
+    r.advance();
+    let mut expected = vec![HostOp::Cleanup(CleanupOp::EndGroup)];
+    expected.extend(teardown_ops(false));
+    assert_eq!(&r.ops()[at..], expected);
+}
+
+#[test]
+fn a_signal_ends_a_hubs_group_too() {
+    let r = hub_of(&[1]);
+    let at = r.ops().len();
+    r.signal();
+    assert_eq!(r.ops()[at], HostOp::Cleanup(CleanupOp::EndGroup));
+    assert_eq!(r.close_count(), 1);
+}
+
+/// A signal is not the user closing the window, and only window 1 can keep what it held: a module window's goodbye has
+/// to say which one it was.
+#[test]
+fn a_signal_to_a_module_window_says_its_place_stays() {
+    let kept = |r: &Rig| r.ops().contains(&HostOp::Cleanup(CleanupOp::KeepThisWindow));
+
+    let r = chat_window(WindowName::Chat(2));
+    r.signal();
+    let at = |wanted: &dyn Fn(&HostOp) -> bool| r.ops().iter().position(wanted).unwrap();
+    assert!(
+        at(&|op| *op == HostOp::Cleanup(CleanupOp::KeepThisWindow))
+            < at(&|op| matches!(op, HostOp::Cleanup(CleanupOp::PairOnClose { .. }))),
+        "said ahead of the goodbye"
+    );
+
+    let r = chat_window(WindowName::Chat(2));
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    r.advance();
+    assert_eq!(r.close_count(), 1);
+    assert!(!kept(&r), "the compositor's close is the user's");
+
+    let r = hub_of(&[1]);
+    r.signal();
+    assert!(!kept(&r), "window 1 has nobody to tell");
+}
+
+#[test]
+fn window_2s_close_rules_are_unchanged() {
+    let r = driven(two());
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(2),
+        WindowName::Second,
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    r.running();
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(
+        prompt.text,
+        "close window? 1 running here; window 2: idle (stays open without the editor) (y/n)"
+    );
+    let at = r.ops().len();
+    r.answer("y");
+    r.advance();
+    assert_eq!(
+        &r.ops()[at..],
+        teardown_ops(false),
+        "window 1 sends window 2 its goodbye and leaves it running"
+    );
+}
+
+#[test]
+fn a_compositor_close_of_a_chat_window_with_a_running_turn_asks_once() {
+    let r = chat_window(WindowName::Chat(2));
+    r.running();
+    assert_eq!(r.driver.close_requested(WIN, CloseBy::Compositor), CloseVerdict::Stop);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close window? 1 running (y/n)");
+    assert!(!prompt.offers_move);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert_eq!(r.driver.query(|c| c.chrome(WIN).prompt.unwrap()), prompt);
+    let at = r.ops().len();
+    r.answer("y");
+    assert_eq!(r.ops().len(), at, "the close runs from an idle");
+    r.advance();
+    assert_eq!(&r.ops()[at..], teardown_ops(false));
+}
+
+#[test]
+fn a_compositor_close_of_an_idle_chat_window_asks_nothing() {
+    let r = chat_window(WindowName::Chat(2));
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_none()));
+    r.advance();
+    assert_eq!(r.close_count(), 1);
+}
+
+#[test]
+fn a_module_windows_kill_is_its_close() {
+    let idle = chat_window(WindowName::Chat(2));
+    idle.driver
+        .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
+    assert!(idle.driver.query(|c| c.chrome(WIN).prompt.is_none()));
+    idle.advance();
+    assert_eq!(idle.close_count(), 1);
+
+    let busy = chat_window(WindowName::Chat(2));
+    busy.running();
+    busy.driver
+        .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
+    let prompt = busy.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close window? 1 running (y/n)");
+    busy.answer("y");
+    busy.advance();
+    assert_eq!(busy.close_count(), 1);
+}
+
+#[test]
+fn a_module_window_that_hears_window_1_close_closes_itself() {
+    let r = chat_window(WindowName::Chat(2));
+    r.running();
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_some()));
+    let at = r.ops().len();
+    r.driver.post(HostEvent::GroupClosed { win: WIN });
+    assert_eq!(
+        &r.ops()[at..],
+        teardown_ops(false),
+        "the close was asked in window 1, so nothing here asks again"
+    );
+    assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_none()));
+}
+
+/// A hub's chats are other windows, so with its bottom terminal hidden the editor is all it shows. When nvim exits and
+/// the group's question is answered `n`, the terminal takes the screen and the keys, the editor ends in place and says
+/// so, and the editor's key starts nvim again.
+#[test]
+fn a_declined_close_after_a_hubs_nvim_exited_leaves_the_terminal_and_the_way_back() {
+    let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
+    let mut hub = rig_with(crate::wm::start::hub_layout(&first_launch).0, |_, _| None);
+    let window = hub.controller.window_mut(WIN).unwrap();
+    window.tiling = Tiling::Hub;
+    window.editor_spawn = Some(EditorSpawn {
+        env: vec![],
+        args: vec![],
+        cwd: None,
+        clean: false,
+        background: None,
+        open: vec![],
+    });
+    let r = driven_rig(hub);
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(16),
+        WindowName::Chat(1),
+        crate::wm::fake::FakePeerPort::new(),
+    );
+    assert!(!r.layout.borrow().is_shown(&ModuleId::terminal()));
+    r.exited(None);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.expect("a hub asks");
+    assert!(prompt.text.contains("close Eitri and its 1 window"), "{}", prompt.text);
+    r.answer("n");
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+    assert_eq!(
+        r.driver.query(|c| c.chrome(WIN).toast.unwrap().text),
+        crate::wm::feedback::editor_ended_text(&crate::keymap::Keymap::defaults())
+    );
+    assert!(r.layout.borrow().is_shown(&ModuleId::terminal()));
+    assert!(!r.layout.borrow().is_shown(&ModuleId::editor()));
+    assert_eq!(r.layout.borrow().focus(), &ModuleId::terminal());
+
+    r.driver.post(HostEvent::Editor(EditorEvent::Released { win: WIN }));
+    r.driver.run(
+        WIN,
+        crate::keymap::Action::Module(ModuleId::editor()),
+        Origin::Key { keycode: 1 },
+    );
+    r.advance();
+    assert!(
+        r.ops()
+            .iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::Restart { .. }))),
+        "{:?}",
+        r.ops()
+    );
+    assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
 }

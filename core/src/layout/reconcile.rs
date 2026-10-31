@@ -41,6 +41,18 @@ use super::tree::{place_new, Layout, LayoutError};
 /// Every window has these three (the terminal since the module layout began hosting it).
 const BUILT_INS: [fn() -> ModuleId; 3] = [ModuleId::editor, ModuleId::agent, ModuleId::terminal];
 
+/// Which modules a window's tree must hold, by the kind of window it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltIns {
+    /// A full window: the editor and the chat.
+    Full,
+    /// A window that holds the editor and the chrome while chats and pages are windows of the compositor: the
+    /// editor, and no chat.
+    Hub,
+    /// A chat or page window: exactly the one leaf, this module.
+    Module(ModuleId),
+}
+
 /// A reconciled layout, and what was changed to get it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reconciled {
@@ -54,6 +66,8 @@ pub enum ReconcileError {
     MissingBuiltIn(ModuleId),
     /// Nothing would be on screen.
     NothingVisible,
+    /// A chat or page window's tree holds a module that is not the window's own.
+    NotThisWindows(ModuleId),
     /// The tree breaks an invariant `Layout::from_parts` holds (a duplicate, a ratio out of range, a
     /// pinned length below zero).
     Layout(LayoutError),
@@ -64,6 +78,7 @@ impl fmt::Display for ReconcileError {
         match self {
             ReconcileError::MissingBuiltIn(id) => write!(f, "the layout has no '{id}', which every window has"),
             ReconcileError::NothingVisible => write!(f, "the layout hides every module"),
+            ReconcileError::NotThisWindows(id) => write!(f, "the layout holds '{id}', which this window does not show"),
             ReconcileError::Layout(err) => err.fmt(f),
         }
     }
@@ -109,6 +124,7 @@ pub fn reconcile_floating(
         lua,
         instances,
         false,
+        &BuiltIns::Full,
     )
 }
 
@@ -127,7 +143,55 @@ pub fn reconcile_away(
     lua: &[ModuleDecl],
     instances: &[ModuleId],
 ) -> Result<Reconciled, ReconcileError> {
-    reconcile_with(root, floats, memory, hidden, away, focus, lua, instances, false)
+    reconcile_with(
+        root,
+        floats,
+        memory,
+        hidden,
+        away,
+        focus,
+        lua,
+        instances,
+        false,
+        &BuiltIns::Full,
+    )
+}
+
+/// The layout of a chat or page window: the one leaf `module`, shown and holding the keys ([`BuiltIns::Module`]).
+/// A tree of anything else is refused, and nothing else is placed: no terminal, no panel, no instance.
+pub fn reconcile_module(root: Node, module: &ModuleId) -> Result<Reconciled, ReconcileError> {
+    reconcile_with(
+        root,
+        Vec::new(),
+        BTreeMap::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        Some(module),
+        &[],
+        &[],
+        false,
+        &BuiltIns::Module(module.clone()),
+    )
+}
+
+/// The layout of window 1 in a compositor group ([`BuiltIns::Hub`]): the editor over the bottom terminal, pinned as a
+/// first launch pins it, the keys on the editor. Its shape never comes from a file.
+pub fn hub_tree() -> Reconciled {
+    let editor = ModuleId::editor();
+    let (root, _) = place_new(Node::Leaf(editor.clone()), &ModuleId::terminal(), Placement::BelowRoot);
+    reconcile_with(
+        root,
+        Vec::new(),
+        BTreeMap::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        Some(&editor),
+        &[],
+        &[],
+        false,
+        &BuiltIns::Hub,
+    )
+    .expect("the editor over the terminal is a whole window")
 }
 
 /// Reconciles a Lua default or a template, keeping the instances -- terminals and chat views -- named
@@ -168,6 +232,7 @@ pub fn reconcile_default_floating_with(
         lua,
         &instances,
         true,
+        &BuiltIns::Full,
     )
 }
 
@@ -182,7 +247,11 @@ fn reconcile_with(
     lua: &[ModuleDecl],
     instances: &[ModuleId],
     pin: bool,
+    built_ins: &BuiltIns,
 ) -> Result<Reconciled, ReconcileError> {
+    if let BuiltIns::Module(module) = built_ins {
+        return reconcile_one_module(root, module, hidden, focus);
+    }
     let known = |id: &ModuleId| {
         BUILT_INS.iter().any(|b| b() == *id)
             || lua.iter().any(|d| d.id == *id && d.id.kind() == ModuleKind::LuaWebview)
@@ -219,7 +288,11 @@ fn reconcile_with(
         notes.push(format!("left out '{id}': this window has no such module"));
     }
     let mut root = root.ok_or(ReconcileError::MissingBuiltIn(ModuleId::editor()))?;
-    for built_in in [ModuleId::editor(), ModuleId::agent()] {
+    let required: &[fn() -> ModuleId] = match built_ins {
+        BuiltIns::Hub => &[ModuleId::editor],
+        BuiltIns::Full | BuiltIns::Module(_) => &[ModuleId::editor, ModuleId::agent],
+    };
+    for built_in in required.iter().map(|id| id()) {
         if !root.leaves().contains(&built_in) && (built_in == ModuleId::editor() || !floating.contains(&built_in)) {
             return Err(ReconcileError::MissingBuiltIn(built_in));
         }
@@ -325,6 +398,36 @@ fn reconcile_with(
         layout.set_away(id, true).map_err(ReconcileError::Layout)?;
     }
     Ok(Reconciled { layout, notes })
+}
+
+/// A chat or page window's tree: `module` as the only leaf, shown, with the keys. Nothing else is a module here, so
+/// any other leaf, a float or a missing `module` is refused.
+fn reconcile_one_module(
+    root: Node,
+    module: &ModuleId,
+    hidden: &BTreeSet<ModuleId>,
+    focus: Option<&ModuleId>,
+) -> Result<Reconciled, ReconcileError> {
+    let leaves = root.leaves();
+    if let Some(other) = leaves.iter().find(|id| *id != module) {
+        return Err(ReconcileError::NotThisWindows(other.clone()));
+    }
+    if !leaves.contains(module) {
+        return Err(ReconcileError::MissingBuiltIn(module.clone()));
+    }
+    if hidden.contains(module) {
+        return Err(ReconcileError::NothingVisible);
+    }
+    if focus.is_some_and(|f| f != module) {
+        return Err(ReconcileError::NotThisWindows(
+            focus.cloned().unwrap_or_else(|| module.clone()),
+        ));
+    }
+    let layout = Layout::new(root, module.clone()).map_err(ReconcileError::Layout)?;
+    Ok(Reconciled {
+        layout,
+        notes: Vec::new(),
+    })
 }
 
 /// The shown modules of `node` that its tab containers draw, in tree order: a tabbed or stacked
@@ -972,6 +1075,66 @@ mod tests {
             reconcile(leaf(ModuleId::lua("gone")), &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::MissingBuiltIn(editor())),
             "nothing left at all"
+        );
+    }
+
+    fn with_built_ins(root: Node, built_ins: &BuiltIns) -> Result<Reconciled, ReconcileError> {
+        reconcile_with(
+            root,
+            Vec::new(),
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &[],
+            &[],
+            false,
+            built_ins,
+        )
+    }
+
+    #[test]
+    fn a_module_windows_tree_holds_exactly_its_module() {
+        let only = BuiltIns::Module(agent());
+        let r = with_built_ins(leaf(agent()), &only).unwrap();
+        assert_eq!(
+            r.layout.modules(),
+            vec![agent()],
+            "no terminal, no panel is placed beside it"
+        );
+        assert_eq!(r.layout.focus(), &agent());
+        assert!(r.notes.is_empty());
+        assert_eq!(
+            with_built_ins(row(leaf(editor()), leaf(agent())), &only),
+            Err(ReconcileError::NotThisWindows(editor())),
+            "the editor beside it"
+        );
+        assert_eq!(
+            with_built_ins(leaf(editor()), &only),
+            Err(ReconcileError::NotThisWindows(editor())),
+            "without the module"
+        );
+        let page = ModuleId::lua("markdown");
+        assert!(with_built_ins(leaf(page.clone()), &BuiltIns::Module(page)).is_ok());
+        assert_eq!(
+            reconcile_module(leaf(agent()), &agent()).unwrap().layout.modules(),
+            vec![agent()]
+        );
+    }
+
+    #[test]
+    fn the_hub_tree_needs_the_editor_alone() {
+        let r = with_built_ins(leaf(editor()), &BuiltIns::Hub).unwrap();
+        assert!(r.layout.modules().contains(&editor()));
+        assert!(!r.layout.modules().contains(&agent()), "a hub asks for no chat");
+        assert_eq!(
+            with_built_ins(leaf(editor()), &BuiltIns::Full),
+            Err(ReconcileError::MissingBuiltIn(agent())),
+            "a full window still needs both"
+        );
+        assert_eq!(
+            with_built_ins(leaf(agent()), &BuiltIns::Hub),
+            Err(ReconcileError::MissingBuiltIn(editor()))
         );
     }
 

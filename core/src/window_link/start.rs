@@ -1,6 +1,8 @@
-//! How window 2 comes to exist: window 1 starts it with `eitri linked-window [--legacy] [--clean] [--restore] <fd> 2
-//! <root> [token]`, the link's other
-//! end placed at that descriptor number, and window 2's first acts check that end before anything else runs.
+//! How a linked window comes to exist: window 1 starts window 2 with `eitri linked-window [--legacy] [--clean]
+//! [--restore] <fd> 2 <root> [token]`, and a module window with the same line plus `--module chat:<n>|page:<id>` and
+//! the window's own name in place of `2`, the link's other end placed at that descriptor number, and the window's
+//! first acts check that end before anything else runs. What follows says window 2; a module window is started and
+//! checked the same way.
 //!
 //! The command line carries what window 2 needs because `main()`'s flags take no values and an environment variable
 //! would be inherited by every terminal window 2 starts; the activation token travels as an argument for the same
@@ -19,16 +21,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use super::fdpass;
-use super::pair::log_file_name;
+pub use super::names::SECOND_WINDOW;
+use super::names::{ModuleArg, WindowName};
+use super::pair::log_file_name_for;
 
 /// The subcommand `main()` dispatches before the project resolver.
 pub const SUBCOMMAND: &str = "linked-window";
 
 /// The descriptor number window 2 finds its link end at (0-2 are its stdio).
 pub const LINK_FD: RawFd = 3;
-
-/// The only window a linked window can be.
-pub const SECOND_WINDOW: &str = "2";
 
 /// How many earlier logs are kept beside the current one: the previous run's, as `<name>.1`.
 pub const LOG_KEEP: usize = 1;
@@ -43,6 +44,15 @@ pub struct LinkedArgs {
     pub token: Option<String>,
     /// Window 1 started this window again as the pair last ended it ([`RESTORE_FLAG`]).
     pub restore: bool,
+    /// The module this window is started to show ([`MODULE_FLAG`]); `None` for window 2.
+    pub module: Option<ModuleArg>,
+}
+
+impl LinkedArgs {
+    /// The window this command line starts: `parse_args` has held `window` to it.
+    pub fn name(&self) -> WindowName {
+        self.module.as_ref().map_or(WindowName::Second, ModuleArg::name)
+    }
 }
 
 /// Window 1's `--legacy`, passed on to window 2 ahead of its other arguments: the flag picks a launch's chat
@@ -58,11 +68,25 @@ pub const CLEAN_FLAG: &str = "--clean";
 /// after `--clean`.
 pub const RESTORE_FLAG: &str = "--restore";
 
-/// Parses `[--legacy] [--clean] [--restore] <fd> <window> <root> [token]`, the arguments after `linked-window`; each
-/// flag at most once and in that order, as window 1 writes them.
+/// The module a module window is started to show, written last among the flags. Its value has to agree with the window
+/// name that follows, so neither can be read without the other.
+pub const MODULE_FLAG: &str = "--module";
+
+/// What window 1 passes on to a window it starts, each flag as above.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkedFlags {
+    pub legacy: bool,
+    pub clean: bool,
+    pub restore: bool,
+}
+
+/// Parses `[--legacy] [--clean] [--restore] [--module chat:<n>|page:<id>] <fd> <window> <root> [token]`, the arguments
+/// after `linked-window`; each flag at most once and in that order, as window 1 writes them. Without `--module` the
+/// window is `2`; with it, the window is the one the module names.
 pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
     let usage = format!(
-        "usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] [{CLEAN_FLAG}] [{RESTORE_FLAG}] <fd> {SECOND_WINDOW} <root> [token]"
+        "usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] [{CLEAN_FLAG}] [{RESTORE_FLAG}] \
+         [{MODULE_FLAG} chat:<n>|page:<id>] <fd> <window> <root> [token]"
     );
     let mut args = args;
     let mut restore = false;
@@ -72,6 +96,19 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
                 args = rest;
                 restore |= flag == RESTORE_FLAG;
             }
+        }
+    }
+    let mut module = None;
+    if let Some((first, rest)) = args.split_first() {
+        if first == MODULE_FLAG {
+            let (value, rest) = rest
+                .split_first()
+                .ok_or_else(|| format!("{SUBCOMMAND}: {MODULE_FLAG} without a value; {usage}"))?;
+            let value = value
+                .to_str()
+                .ok_or_else(|| format!("{SUBCOMMAND}: the {MODULE_FLAG} value is not UTF-8"))?;
+            module = Some(ModuleArg::parse(value).map_err(|why| format!("{SUBCOMMAND}: {MODULE_FLAG}: {why}"))?);
+            args = rest;
         }
     }
     let (fd, window, root, token) = match args {
@@ -88,9 +125,10 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
             "{SUBCOMMAND}: the descriptor {fd} is below {LINK_FD} (0-2 are stdio)"
         ));
     }
-    if window != SECOND_WINDOW {
+    let expected = module.as_ref().map_or(SECOND_WINDOW.to_owned(), |m| m.name().text());
+    if window != expected.as_str() {
         return Err(format!(
-            "{SUBCOMMAND}: the window {window:?} is not {SECOND_WINDOW:?}, the only one started this way"
+            "{SUBCOMMAND}: the window {window:?} is not {expected:?}, the one this command line starts"
         ));
     }
     let root = PathBuf::from(root);
@@ -114,6 +152,7 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
         root,
         token,
         restore,
+        module,
     })
 }
 
@@ -150,13 +189,14 @@ pub fn first_acts(args: &LinkedArgs) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Opens window 2's log, `<state_home>/eitri/log/window-2-<16 hex>.log`, where `state_home` is `$XDG_STATE_HOME` (or
-/// `$HOME/.local/state`). The directory is made private; the previous run's log is renamed `<name>.1` (replacing an
-/// older one) and a new one is opened 0600, refusing a link in its place. The caller `dup2`s it onto 1 and 2.
-pub fn open_log(state_home: &Path, root: &Path) -> io::Result<File> {
+/// Opens the log of window `window`, `<state_home>/eitri/log/window-<file form>-<16 hex>.log`, where `state_home` is
+/// `$XDG_STATE_HOME` (or `$HOME/.local/state`). The directory is made private; the previous run's log is renamed
+/// `<name>.1` (replacing an older one) and a new one is opened 0600, refusing a link in its place. The caller `dup2`s
+/// it onto 1 and 2.
+pub fn open_log(state_home: &Path, root: &Path, window: &WindowName) -> io::Result<File> {
     let dir = state_home.join("eitri").join("log");
     crate::state_paths::create_state_dir(&dir)?;
-    let name = log_file_name(root);
+    let name = log_file_name_for(root, window);
     let path = dir.join(&name);
     match std::fs::rename(&path, dir.join(format!("{name}.{LOG_KEEP}"))) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -165,11 +205,7 @@ pub fn open_log(state_home: &Path, root: &Path) -> io::Result<File> {
     agent::private_fs::open_private(&path)
 }
 
-/// Starts window 2 from `exe` (window 1's `/proc/self/exe`, so both windows are one build even after an upgrade
-/// replaced the installed file) as `linked-window [--legacy] [--clean] [--restore] 3 2 <root> [token]` (`--legacy`
-/// when `legacy`, `--clean` when `clean`, `--restore` when `restore`), with `child_end` at descriptor 3 and not
-/// close-on-exec there, stdio on `/dev/null`, in its own process group. `child_end` itself stays close-on-exec in
-/// this process and is closed when the spawn returns, so window 1 keeps no copy of window 2's end.
+/// Starts window 2 ([`spawn_linked`]).
 pub fn spawn_second(
     exe: &Path,
     child_end: OwnedFd,
@@ -179,7 +215,24 @@ pub fn spawn_second(
     clean: bool,
     restore: bool,
 ) -> io::Result<Child> {
-    let mut command = second_command(exe, root, token, legacy, clean, restore);
+    let flags = LinkedFlags { legacy, clean, restore };
+    spawn_linked(exe, child_end, root, &WindowName::Second, token, flags)
+}
+
+/// Starts window `name` from `exe` (window 1's `/proc/self/exe`, so both windows are one build even after an upgrade
+/// replaced the installed file) as `linked-window [--legacy] [--clean] [--restore] [--module <arg>] 3 <name> <root>
+/// [token]`, with `child_end` at descriptor 3 and not close-on-exec there, stdio on `/dev/null`, in its own process
+/// group. `child_end` itself stays close-on-exec in this process and is closed when the spawn returns, so window 1
+/// keeps no copy of the other window's end.
+pub fn spawn_linked(
+    exe: &Path,
+    child_end: OwnedFd,
+    root: &Path,
+    name: &WindowName,
+    token: Option<&str>,
+    flags: LinkedFlags,
+) -> io::Result<Child> {
+    let mut command = linked_command(exe, root, name, token, flags);
     let raw = child_end.as_raw_fd();
     // SAFETY: the closure runs in the forked child before `exec` and calls only `fcntl` and `dup2`, both
     // async-signal-safe; `raw` stays open in this process until the spawn has returned.
@@ -191,21 +244,24 @@ pub fn spawn_second(
     child
 }
 
-/// Window 2's command without its link end: the arguments, the stdio, the process group. Nothing is added to the
-/// environment.
-fn second_command(exe: &Path, root: &Path, token: Option<&str>, legacy: bool, clean: bool, restore: bool) -> Command {
+/// A linked window's command without its link end: the arguments, the stdio, the process group. Nothing is added to
+/// the environment.
+fn linked_command(exe: &Path, root: &Path, name: &WindowName, token: Option<&str>, flags: LinkedFlags) -> Command {
     let mut command = Command::new(exe);
     command.arg(SUBCOMMAND);
-    if legacy {
+    if flags.legacy {
         command.arg(LEGACY_FLAG);
     }
-    if clean {
+    if flags.clean {
         command.arg(CLEAN_FLAG);
     }
-    if restore {
+    if flags.restore {
         command.arg(RESTORE_FLAG);
     }
-    command.arg(LINK_FD.to_string()).arg(SECOND_WINDOW).arg(root);
+    if let Some(module) = name.module_arg() {
+        command.arg(MODULE_FLAG).arg(module.text());
+    }
+    command.arg(LINK_FD.to_string()).arg(name.text()).arg(root);
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         command.arg(token);
     }
@@ -240,12 +296,31 @@ fn place_link_end(raw: RawFd) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::test_scratch_dir::ScratchDir;
+    use crate::window_link::pair::log_file_name;
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    /// Window 2's command as `spawn_second` builds it.
+    fn second_command(
+        exe: &Path,
+        root: &Path,
+        token: Option<&str>,
+        legacy: bool,
+        clean: bool,
+        restore: bool,
+    ) -> Command {
+        linked_command(
+            exe,
+            root,
+            &WindowName::Second,
+            token,
+            LinkedFlags { legacy, clean, restore },
+        )
     }
 
     #[test]
@@ -258,6 +333,7 @@ mod tests {
                 root: "/home/someone/project".into(),
                 token: None,
                 restore: false,
+                module: None,
             }
         );
         assert_eq!(
@@ -297,6 +373,7 @@ mod tests {
             root: "/p".into(),
             token: None,
             restore: false,
+            module: None,
         };
         let err = first_acts(&args).expect_err("this process's own pair has no parent at its other end");
         assert!(err.contains("parent"), "the refusal names the peer check: {err}");
@@ -319,6 +396,7 @@ mod tests {
             root: "/p".into(),
             token: None,
             restore: false,
+            module: None,
         };
         let err = first_acts(&args(r.as_raw_fd())).unwrap_err();
         assert!(err.contains("socket"), "a pipe is refused as not a socket: {err}");
@@ -406,6 +484,7 @@ mod tests {
             root: "/p".into(),
             token: Some("tok".into()),
             restore: false,
+            module: None,
         };
         assert_eq!(
             parse_args(&clean[1..]).unwrap(),
@@ -486,19 +565,173 @@ mod tests {
     }
 
     #[test]
+    fn the_module_flag_parses_and_must_match_the_window_name() {
+        let parsed = parse_args(&os(&["--module", "chat:3", "3", "c3", "/abs"])).unwrap();
+        assert_eq!(parsed.module, Some(ModuleArg::Chat(3)));
+        assert_eq!(parsed.window, "c3");
+        assert_eq!(parsed.name(), WindowName::Chat(3));
+        assert_eq!(parse_args(&os(&["3", "2", "/abs"])).unwrap().name(), WindowName::Second);
+
+        let parsed = parse_args(&os(&[
+            "--legacy",
+            "--clean",
+            "--restore",
+            "--module",
+            "page:markdown",
+            "3",
+            "p:markdown",
+            "/abs",
+            "tok",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.module, Some(ModuleArg::Page("markdown".into())));
+        assert_eq!(parsed.name(), WindowName::Page("markdown".into()));
+        assert!(parsed.restore);
+        assert_eq!(parsed.token.as_deref(), Some("tok"));
+
+        let refused = [
+            (vec!["--module", "chat:3", "3", "c4", "/abs"], "another chat's name"),
+            (vec!["--module", "chat:3", "3", "2", "/abs"], "window 2's name"),
+            (vec!["--module", "chat:10", "3", "c10", "/abs"], "a chat past 9"),
+            (vec!["--module", "chat:0", "3", "c0", "/abs"], "chat 0"),
+            (vec!["--module", "page:a/b", "3", "p:a/b", "/abs"], "a bad page id"),
+            (vec!["--module", "page:a", "3", "p:b", "/abs"], "another page's name"),
+            (
+                vec!["--module", "other", "3", "c3", "/abs"],
+                "an unknown module argument",
+            ),
+            (vec!["3", "c3", "/abs"], "a chat window's name without the flag"),
+            (vec!["3", "p:markdown", "/abs"], "a page window's name without the flag"),
+            (
+                vec!["--module", "chat:3", "--restore", "3", "c3", "/abs"],
+                "--restore after --module",
+            ),
+            (
+                vec!["--module", "chat:3", "--module", "chat:3", "3", "c3", "/abs"],
+                "--module twice",
+            ),
+            (vec!["3", "c3", "/abs", "--module", "chat:3"], "--module after the root"),
+            (vec!["--module"], "--module with nothing after it"),
+        ];
+        for (args, why) in refused {
+            assert!(parse_args(&os(&args)).is_err(), "{why} is refused: {args:?}");
+        }
+    }
+
+    #[test]
+    fn window_2s_command_line_is_unchanged() {
+        let exe = Path::new("/usr/bin/eitri");
+        for legacy in [false, true] {
+            for clean in [false, true] {
+                for restore in [false, true] {
+                    for token in [None, Some("tok")] {
+                        let mut expected = vec!["linked-window"];
+                        if legacy {
+                            expected.push("--legacy");
+                        }
+                        if clean {
+                            expected.push("--clean");
+                        }
+                        if restore {
+                            expected.push("--restore");
+                        }
+                        expected.extend(["3", "2", "/p"]);
+                        expected.extend(token);
+                        let command = second_command(exe, Path::new("/p"), token, legacy, clean, restore);
+                        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+                        assert_eq!(command.get_envs().count(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_module_windows_command_line_parses_back_to_its_name() {
+        let exe = Path::new("/usr/bin/eitri");
+        let all = LinkedFlags {
+            legacy: true,
+            clean: true,
+            restore: true,
+        };
+        let chat = linked_command(exe, Path::new("/p"), &WindowName::Chat(3), Some("tok"), all);
+        let args: Vec<OsString> = chat.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            os(&[
+                SUBCOMMAND,
+                LEGACY_FLAG,
+                CLEAN_FLAG,
+                RESTORE_FLAG,
+                MODULE_FLAG,
+                "chat:3",
+                "3",
+                "c3",
+                "/p",
+                "tok"
+            ])
+        );
+        assert_eq!(parse_args(&args[1..]).unwrap().name(), WindowName::Chat(3));
+
+        let page = WindowName::Page("markdown".into());
+        let command = linked_command(exe, Path::new("/p"), &page, None, LinkedFlags::default());
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            os(&[SUBCOMMAND, MODULE_FLAG, "page:markdown", "3", "p:markdown", "/p"])
+        );
+        assert_eq!(parse_args(&args[1..]).unwrap().name(), page);
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "the command sets no environment variable"
+        );
+    }
+
+    #[test]
+    fn a_module_windows_log_has_its_own_name() {
+        let root = Path::new("/projects/state-paths");
+        assert_eq!(
+            log_file_name_for(root, &WindowName::Chat(2)),
+            "window-c2-410d926fb96fb107.log"
+        );
+        assert_eq!(
+            log_file_name_for(root, &WindowName::Page("markdown".into())),
+            "window-p-bc18f706-410d926fb96fb107.log"
+        );
+        assert_eq!(log_file_name(root), "window-2-410d926fb96fb107.log");
+        assert_eq!(log_file_name(root), log_file_name_for(root, &WindowName::Second));
+
+        let state = ScratchDir::new("mw-start", "module-log");
+        let dir = state.join("eitri").join("log");
+        let mut second = open_log(&state, root, &WindowName::Second).unwrap();
+        second.write_all(b"window 2\n").unwrap();
+        drop(second);
+        let mut chat = open_log(&state, root, &WindowName::Chat(2)).unwrap();
+        chat.write_all(b"chat 2\n").unwrap();
+        drop(chat);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(log_file_name(root))).unwrap(),
+            "window 2\n",
+            "starting a module window leaves window 2's log where it is"
+        );
+        assert!(!dir.join(format!("{}.1", log_file_name(root))).exists());
+    }
+
+    #[test]
     fn the_log_is_private_and_the_last_one_is_kept_as_dot_one() {
         let state = ScratchDir::new("mw-start", "log");
         let root = Path::new("/home/someone/project");
         let dir = state.join("eitri").join("log");
         let name = log_file_name(root);
 
-        let mut first = open_log(&state, root).unwrap();
+        let mut first = open_log(&state, root, &WindowName::Second).unwrap();
         first.write_all(b"first run\n").unwrap();
         drop(first);
-        let mut second = open_log(&state, root).unwrap();
+        let mut second = open_log(&state, root, &WindowName::Second).unwrap();
         second.write_all(b"second run\n").unwrap();
         drop(second);
-        let mut third = open_log(&state, root).unwrap();
+        let mut third = open_log(&state, root, &WindowName::Second).unwrap();
         third.write_all(b"third run\n").unwrap();
         assert!(fdpass::is_cloexec(third.as_fd()).unwrap());
         drop(third);
@@ -533,7 +766,7 @@ mod tests {
         let name = log_file_name(root);
         std::os::unix::fs::symlink(&target, dir.join(&name)).unwrap();
 
-        let mut log = open_log(&state, root).unwrap();
+        let mut log = open_log(&state, root, &WindowName::Second).unwrap();
         log.write_all(b"run\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
         assert!(!std::fs::symlink_metadata(dir.join(&name))

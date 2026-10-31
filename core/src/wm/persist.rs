@@ -68,6 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::host::Waker;
+use super::window::Tiling;
 use crate::layout::persist::{self, Loaded, V2State};
 use crate::layout::rules::{At, OpenPoint, NOMINAL_GRID};
 use crate::layout::tree::{DEFAULT_EDITOR_SHARE, RIGHT_OF_ROOT_SHARE};
@@ -118,6 +119,13 @@ impl Log {
 /// first allocation. Hiding reads no geometry unless the hidden module holds the keys, which at startup the
 /// terminal never does, so it is a formality, kept equal to the grid's own so the two can never disagree.
 pub const FIRST_LAUNCH_FRAME: Size = Size { w: 1280, h: 721 };
+
+/// Where a window's layout files are, `dir` being `persist::state_dir`'s answer: only a window that keeps its own
+/// layout has any. A hub's shape is fixed and a chat or page window holds its one module, so neither reads or writes
+/// `eitri` mode's files, which wait there for the next start in that mode.
+pub fn layout_dir(dir: Option<PathBuf>, tiling: Tiling) -> Option<PathBuf> {
+    dir.filter(|_| tiling == Tiling::Eitri)
+}
 
 /// A first launch's layout with no Lua default: the built-in modules and the Lua panels where their
 /// declarations put them, and the bottom terminal placed below the editor but hidden.
@@ -511,6 +519,43 @@ fn restore_window_page(layout: &mut Layout, plugin: &PluginWindow<'_>) -> Result
     Ok(())
 }
 
+/// A window back in `eitri` mode after a run of compositor mode: its chat windows saved their tabs under views, and the
+/// layout files were left as they were, so nothing holds those views. Each saved view no workspace holds becomes a tile
+/// below the chat, or below the module with the keys when the chat is not shown, so its tab reopens on screen and the next
+/// save keeps it there. The keys stay where the layout put them. A view that cannot be placed is said, and its tab comes
+/// back in the base view.
+pub fn tile_saved_views(layout: &mut Layout, workspaces: &mut Workspaces, views: &[u8]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let keys = layout.focus().clone();
+    for view in views {
+        let Ok(module) = ModuleId::instance(ModuleKind::Agent, *view) else {
+            continue;
+        };
+        if workspaces.each(layout).iter().any(|(_, each)| each.contains(&module)) {
+            continue;
+        }
+        let chat = ModuleId::agent();
+        let beside = if layout.is_shown(&chat) {
+            Some(chat)
+        } else {
+            layout.tiled_anchor()
+        };
+        let placed = match beside {
+            Some(beside) => crate::layout::place(layout, &module, &beside, crate::layout::Axis::Column)
+                .map_err(|err| err.to_string()),
+            None => Err("nothing is tiled to place it beside".to_string()),
+        };
+        match placed {
+            Ok(()) => workspaces.add_everywhere(&module),
+            Err(why) => notes.push(format!("{module}: its saved tabs stay in the base view: {why}")),
+        }
+    }
+    if let Err(err) = layout.set_focus(&keys) {
+        notes.push(format!("the keys could not stay on {keys}: {err}"));
+    }
+    notes
+}
+
 /// Appends missing init.lua templates after saved workspaces, then shares every module across them. A template
 /// keeps a `deferred` module it names (as `choose_startup_layout`'s default tree does), and the fit then puts it,
 /// hidden, into every workspace that lacks it.
@@ -641,7 +686,7 @@ fn take_settled_lengths(base: &mut Con, now: &Con) {
 /// How long the close waits for the state file's writes to finish: far longer than a small file's write takes
 /// on a working disk. A filesystem slower than that loses the last arrangement, never the file (`persist::save`
 /// writes through a `.tmp` and a rename).
-const CLOSE_FLUSH_BOUND: Duration = Duration::from_secs(5);
+pub const CLOSE_FLUSH_BOUND: Duration = Duration::from_secs(5);
 
 /// Everything one save needs, copied on the caller's thread: no `Rc`, nothing borrowed, so the writer thread can
 /// read, decode and write while the window goes on.
@@ -1905,6 +1950,39 @@ mod tests {
             tiled: Node::split(Axis::Row, 0.5, Node::Leaf(first), Node::Leaf(second)),
             floats: Vec::new(),
         }
+    }
+
+    /// The way back from compositor mode: `agent#3` has a tile again, in the one workspace on screen and hidden in the
+    /// others, and a view something already holds stays where it is.
+    #[test]
+    fn a_saved_view_no_layout_holds_comes_back_as_a_tile() {
+        let agent_3 = ModuleId::instance(ModuleKind::Agent, 3).unwrap();
+        let agent_2 = ModuleId::instance(ModuleKind::Agent, 2).unwrap();
+        let mut layout = Layout::initial(&[]).unwrap();
+        let mut workspaces = Workspaces::single();
+        workspaces.create("other", Layout::initial(&[]).unwrap()).unwrap();
+        let keys = layout.focus().clone();
+
+        assert!(tile_saved_views(&mut layout, &mut workspaces, &[3]).is_empty());
+        assert!(layout.is_shown(&agent_3));
+        assert_eq!(*layout.focus(), keys, "the keys stay");
+        let (name, other) = workspaces
+            .each(&layout)
+            .into_iter()
+            .find(|(name, _)| *name == "other")
+            .unwrap();
+        assert!(other.contains(&agent_3) && !other.is_shown(&agent_3), "{name}");
+
+        let before = layout.clone();
+        assert!(tile_saved_views(&mut layout, &mut workspaces, &[3]).is_empty());
+        assert_eq!(layout, before, "once there it is left alone");
+
+        crate::layout::hide(&mut layout, &ModuleId::agent(), &Frame::new(FIRST_LAUNCH_FRAME, 1)).unwrap();
+        assert!(tile_saved_views(&mut layout, &mut workspaces, &[2]).is_empty());
+        assert!(
+            layout.is_shown(&agent_2),
+            "with the chat hidden it goes beside what is shown"
+        );
     }
 
     #[test]

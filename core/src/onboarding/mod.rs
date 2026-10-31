@@ -75,8 +75,7 @@ pub enum PresetId {
     Compositor,
 }
 
-/// What this binary can do, so the screen offers only that. The compositor's tiling does not exist in this
-/// binary; the field is here so its rows can be built and tested before it does.
+/// What this binary can do, so the screen offers only that. Compositor mode does not exist on macOS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Build {
     pub compositor_mode: bool,
@@ -85,7 +84,7 @@ pub struct Build {
 
 impl Build {
     pub const THIS_BINARY: Build = Build {
-        compositor_mode: false,
+        compositor_mode: cfg!(not(target_os = "macos")),
         nvim_prefix: true,
     };
 }
@@ -393,12 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn this_binary_has_no_compositor_mode() {
+    fn this_binary_has_compositor_mode_except_on_macos() {
         let build = Build::THIS_BINARY;
         assert_eq!(
             build,
             Build {
-                compositor_mode: false,
+                compositor_mode: cfg!(not(target_os = "macos")),
                 nvim_prefix: true
             }
         );

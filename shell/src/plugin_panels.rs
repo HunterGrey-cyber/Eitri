@@ -2735,9 +2735,7 @@ mod tests {
     fn views_reach_their_host_and_wake_it() {
         // The follow feed adds its reader to glib's default main context, which other tests in this crate own
         // while they run, so this one takes its turn and holds the context for its whole run.
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -2793,9 +2791,7 @@ mod tests {
     fn on_screen_reaches_the_host_only_when_it_changes() {
         // The follow feed adds its reader to glib's default main context, which other tests in this crate own
         // while they run, so this one takes its turn and holds the context for its whole run.
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -2829,9 +2825,7 @@ mod tests {
     fn the_editors_end_is_told_once_until_a_new_session() {
         // The follow feed adds its reader to glib's default main context, which other tests in this crate own
         // while they run, so this one takes its turn and holds the context for its whole run.
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -2912,9 +2906,7 @@ mod tests {
     fn a_restarted_editor_gets_the_follow_snippet_again() {
         // The follow feed adds its reader to glib's default main context, which other tests in this crate own
         // while they run, so this one takes its turn and holds the context for its whole run.
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()

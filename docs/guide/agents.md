@@ -2,7 +2,8 @@ English | [简体中文](agents.zh-CN.md)
 
 # Codex and other agents
 
-Every tab in the agent panel runs one agent, chosen when the tab is made. Claude Code is the default. A tab can
+Every tab in the agent panel runs one agent, chosen when the tab is made. On Hyprland, sway and niri the panel is a
+window of its own by default ([Compositor windows](compositor-windows.md)). Claude Code is the default. A tab can
 also run Codex, or any agent you register that speaks the Agent Client Protocol (ACP) over standard input and
 output. This page covers what you need for those two, how to open such a tab, what Eitri asks you before it
 starts one, who answers an agent's requests, and what is weaker or missing compared with a Claude tab.

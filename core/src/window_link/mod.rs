@@ -3,6 +3,7 @@
 //! and the pieces both windows share. Nothing here touches GTK or a display.
 
 pub mod base_tabs;
+pub mod cm_file;
 pub mod edge;
 pub mod editor_op;
 pub mod editor_ops;
@@ -14,6 +15,7 @@ pub mod ids;
 pub mod link;
 pub mod moves;
 pub mod msg;
+pub mod names;
 pub mod pair;
 #[cfg(target_os = "linux")]
 pub mod start;
@@ -22,6 +24,6 @@ pub mod workspace_move;
 
 pub use editor_op::{EditorOp, WireEol, WireHunk, WireLine, WireMeta, WireScope};
 pub use msg::{
-    DraftEnd, Drawn, EdgeKind, EditorRequest, FocusTarget, Frame, Header, LinkError, Msg, ReplyResult, Shape, Side,
-    Summary, TurnEdge, INLINE_MAX, MAX_MOVE_FDS, PROTOCOL_VERSION,
+    DraftEnd, Drawn, EdgeKind, EditorRequest, FocusTarget, Frame, Header, HubAsk, LinkError, Msg, ReplyResult, Shape,
+    Side, Summary, TurnEdge, INLINE_MAX, MAX_MOVE_FDS, PROTOCOL_VERSION,
 };

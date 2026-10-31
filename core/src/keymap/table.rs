@@ -998,6 +998,20 @@ impl Keymap {
     /// kill, hide (`module.hide` and the hide key), split right, split below, even, swap and the keys sheet, in that
     /// order, in tmux spelling. A verb nothing is bound to is left out.
     pub fn strip_verbs(&self) -> Vec<String> {
+        self.strip_verbs_but(&[])
+    }
+
+    /// [`Keymap::strip_verbs`] for a window of compositor mode: the compositor arranges the windows, so the verbs that
+    /// lay modules out are not listed, nor `hide` where the window has no module of its own to hide.
+    pub fn compositor_strip_verbs(&self, hides: bool) -> Vec<String> {
+        let off = ["right", "below", "even", "swap"];
+        match hides {
+            true => self.strip_verbs_but(&off),
+            false => self.strip_verbs_but(&[&off[..], &["hide"]].concat()),
+        }
+    }
+
+    fn strip_verbs_but(&self, off: &[&str]) -> Vec<String> {
         type Is = fn(&Action) -> bool;
         let groups: [(&str, Is); 7] = [
             ("kill", |a| matches!(a, Action::ModuleKill)),
@@ -1010,6 +1024,7 @@ impl Keymap {
         ];
         groups
             .iter()
+            .filter(|(label, _)| !off.contains(label))
             .filter_map(|(label, is)| {
                 let keys: Vec<String> = self
                     .bindings
@@ -1597,6 +1612,13 @@ mod tests {
             let map = Keymap::apply_user(&[del(key), set(key, "zoom")], &[]).unwrap();
             assert_eq!(map.lookup(&k(key)).unwrap().action, Action::Zoom);
         }
+    }
+
+    #[test]
+    fn compositor_mode_strips_the_verbs_that_lay_modules_out() {
+        let map = Keymap::defaults();
+        assert_eq!(map.compositor_strip_verbs(true), ["x kill", "d hide", "? keys"]);
+        assert_eq!(map.compositor_strip_verbs(false), ["x kill", "? keys"]);
     }
 
     #[test]

@@ -20,8 +20,8 @@ use super::chrome;
 use super::close::{prompt_key, PromptKey};
 use super::focus::{arrive_tail, give_keys, land_by_key, move_focus};
 use super::host::*;
-use super::window::{WinId, Window};
-use crate::keymap::prefix::{Outcome, Prefix, PrefixCommand, Press, Waiting, DISPLAY_PANES_TIME};
+use super::window::{Tiling, WinId, Window};
+use crate::keymap::prefix::{ModuleWaits, Outcome, Prefix, PrefixCommand, Press, Waiting, DISPLAY_PANES_TIME};
 use crate::keymap::KeyName;
 use crate::layout::{Direction, ModuleId, ModuleKind};
 use crate::tabs::ViewId;
@@ -178,9 +178,15 @@ pub(super) fn window_press(
     batch: &mut Batch,
 ) -> (Verdict, Option<PrefixCommand>) {
     let now = w.now();
+    let waits = match w.tiling {
+        Tiling::Eitri => ModuleWaits::SplitAndHide,
+        Tiling::Hub => ModuleWaits::Hide,
+        Tiling::ModuleWindow => ModuleWaits::Neither,
+    };
     let Some(prefix) = w.keys.prefix.as_mut() else {
         return (Verdict::PassThrough, None);
     };
+    prefix.set_module_waits(waits);
     let was = prefix.waiting();
     let outcome = prefix.press(press.press, press.keycode, now);
     let after = prefix.waiting();

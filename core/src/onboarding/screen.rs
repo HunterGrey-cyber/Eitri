@@ -1216,6 +1216,20 @@ impl Screen {
             let key = self.shown_key(&self.effective_prefix());
             view.body.push(self.say(TextId::DoneTutorStock, &[("key", &key)]));
         }
+        let sets_tiling = self
+            .generated(false)
+            .settings
+            .iter()
+            .any(|(key, _)| key == presets::TILING_KEY);
+        if sets_tiling {
+            view.body.push(self.say(TextId::DoneWindowsNext, &[]));
+        }
+        // The tutor can be opened in this run or the next, so either of them being in that mode counts.
+        let opens_as_windows = self.windows == Some(Some(Tiling::Compositor)) || self.tiling() == Tiling::Compositor;
+        if self.build().compositor_mode && opens_as_windows {
+            view.body
+                .push(self.say(TextId::DoneTutorWindows, &[("wm", self.wm_name())]));
+        }
         view.footer = self.footer(TextId::FootDone);
     }
 }
@@ -2705,5 +2719,62 @@ mod tests {
         s.press(&enter());
         s.press(&k('s'));
         assert!(status(&s).contains("sway would otherwise arrange them"));
+    }
+
+    /// A screen with compositor mode on sway, with preset `preset` chosen.
+    fn on_sway(preset: char) -> Screen {
+        let mut o = opening(OpenMode::First);
+        o.build = Build {
+            compositor_mode: true,
+            nvim_prefix: true,
+        };
+        let mut s = shown(o);
+        s.found(desktop("sway", Vec::new()));
+        s.found(Found::Windows(Some(Tiling::Compositor)));
+        s.press(&k(preset));
+        s.press(&enter());
+        s
+    }
+
+    fn done_body(s: &mut Screen) -> String {
+        s.press(&enter());
+        s.written(WriteOutcome::Written(PathBuf::from("/x/init.lua")));
+        view(s).body.join("\n")
+    }
+
+    #[test]
+    fn done_says_a_window_tiling_line_waits_for_the_next_start() {
+        let mut s = on_sway('1');
+        s.press(&k('w'));
+        let body = done_body(&mut s);
+        assert!(body.contains(en(TextId::DoneWindowsNext)), "{body}");
+
+        let mut s = screen();
+        s.press(&enter());
+        s.press(&enter());
+        s.written(WriteOutcome::Written(PathBuf::from("/x/init.lua")));
+        assert!(
+            !view(&s).body.join("\n").contains(en(TextId::DoneWindowsNext)),
+            "a file with no such line says nothing of it"
+        );
+    }
+
+    #[test]
+    fn done_says_what_the_tutor_teaches_where_the_compositor_arranges_the_windows() {
+        let wants = "The tutor teaches the keys of Eitri's own layout: where sway arranges the windows";
+        let mut kept = on_sway('1');
+        assert!(done_body(&mut kept).contains(wants));
+        // Eitri arranges from the next start, but this run's tutor still meets the keys that are off.
+        let mut chose_eitri = on_sway('1');
+        chose_eitri.press(&k('w'));
+        assert!(done_body(&mut chose_eitri).contains(wants));
+        assert!(!{
+            let mut s = screen();
+            s.press(&enter());
+            s.press(&enter());
+            s.written(WriteOutcome::Written(PathBuf::from("/x/init.lua")));
+            view(&s).body.join("\n")
+        }
+        .contains(wants));
     }
 }

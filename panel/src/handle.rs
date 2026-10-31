@@ -35,6 +35,19 @@ impl AgentPanelHandle {
         AgentPanelHandle::over(Rc::new(RefCell::new(state)), Some(Rc::new(PanelPage::new(page))))
     }
 
+    /// [`for_host_test`](Self::for_host_test) with no page at all, as a hub's or a page window's panel.
+    pub fn for_host_test_without_pages() -> Self {
+        let tabs =
+            eitri_core::tab_set::TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
+        let state = bare_state(
+            &HOST_TEST_DOCUMENT,
+            Rc::new(NoHost),
+            tabs,
+            eitri_core::theme::ThemeTokens::fallback(),
+        );
+        AgentPanelHandle::over(Rc::new(RefCell::new(state)), None)
+    }
+
     /// [`for_host_test`](Self::for_host_test) with its tabs kept in `files` for `project`: one tab that keeps
     /// the session `session` (a resume that failed, so the close has nothing to tear down and owes only the
     /// write), and `before_write` run on the writer thread before each write. A host's test of its close holds
@@ -97,8 +110,11 @@ pub struct AgentPanelHandle {
     /// page's own messages, and there is no page. Every method below still runs against the inert
     /// state `main.rs`'s focus, HINT, prefix and tab-verb paths call into; what would reach a page
     /// does nothing, and the tab verbs refuse (`closing`), so `main.rs` flashes rather than opening
-    /// tabs nobody can see.
-    pub(super) with_pages: bool,
+    /// tabs nobody can see. Off in a window whose page is not built yet, or never will be: on from
+    /// [`open_pages`](Self::open_pages), for every copy of the handle.
+    pub(super) with_pages: Rc<std::cell::Cell<bool>>,
+    /// A window with no page whose editor serves other windows' turn reviews: its tick does that and nothing else.
+    drives_review: Rc<std::cell::Cell<bool>>,
     /// The wake's raise, held outside the state so raising it never needs the state's cell.
     pub(super) raise: Option<agent::UiWake>,
     partner: Rc<RefCell<PartnerChooser>>,
@@ -158,6 +174,30 @@ pub struct PanelInit {
     pub root_note: Option<String>,
 }
 
+/// Connects to (or starts) the supervisor for a window on `project_dir`; a supervisor being started comes back as the
+/// receiver the pump drains.
+#[allow(clippy::type_complexity)]
+fn connect_supervisor(
+    project_dir: &std::path::Path,
+    backend_kind: BackendKind,
+) -> (
+    Option<crate::supervisor_client::SupervisorClient>,
+    Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
+) {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let project_name = project_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
+    let connected =
+        match crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, project_dir) {
+            crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
+            crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
+        };
+    println!("[agent_panel] backend: {}", backend_kind.as_str());
+    connected
+}
+
 impl AgentPanelHandle {
     /// A handle over `state`, holding the state's wake, with `page` attached as the base view's when
     /// there is one; with none, the handle has no pages at all.
@@ -167,7 +207,8 @@ impl AgentPanelHandle {
         let handle = AgentPanelHandle {
             state,
             pages: Pages::default(),
-            with_pages: page.is_some(),
+            with_pages: Rc::new(std::cell::Cell::new(page.is_some())),
+            drives_review: Rc::default(),
             raise,
             partner: Rc::default(),
             arrived_moves: Rc::default(),
@@ -195,32 +236,13 @@ impl AgentPanelHandle {
     }
 
     /// With pages (`with_pages`): connects to (or starts) the supervisor and builds the state; the pages
-    /// are attached afterwards ([`attach_page`](Self::attach_page)). Without (WebKit's sandbox cannot
-    /// start): the state alone, no pump and no supervisor client, and every page verb does nothing.
+    /// are attached afterwards ([`attach_page`](Self::attach_page)). Without: the state alone, no pump and no
+    /// supervisor client, and every page verb does nothing until [`open_pages`](Self::open_pages), which a window
+    /// with no page ever (WebKit's sandbox cannot start; a hub; a page window) never calls.
     pub fn new(init: PanelInit, with_pages: bool, host: Rc<dyn PanelHost>) -> Self {
-        let backend_kind = init.backend_kind;
         let (supervisor, supervisor_pending) = if with_pages {
-            let project_dir = &init.project_dir;
-            let instance_id = uuid::Uuid::new_v4().to_string();
-            let project_name = project_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
-            let connected = match crate::supervisor_client::SupervisorClient::connect_or_spawn(
-                instance_id,
-                project_name,
-                project_dir,
-            ) {
-                crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
-                crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
-            };
-            println!("[agent_panel] backend: {}", backend_kind.as_str());
-            connected
+            connect_supervisor(&init.project_dir, init.backend_kind)
         } else {
-            println!(
-                "[agent_panel] backend: {} (no panel: WebKit's sandbox cannot start here)",
-                backend_kind.as_str()
-            );
             (None, None)
         };
         let state = Rc::new(RefCell::new(panel_state(init, supervisor, supervisor_pending, host)));
@@ -228,11 +250,95 @@ impl AgentPanelHandle {
         AgentPanelHandle {
             state,
             pages: Pages::default(),
-            with_pages,
+            with_pages: Rc::new(std::cell::Cell::new(with_pages)),
+            drives_review: Rc::default(),
             raise,
             partner: Rc::default(),
             arrived_moves: Rc::default(),
         }
+    }
+
+    /// This window will have pages after all: what [`new`](Self::new) does with pages, done now that the window knows.
+    /// Called before its first page is attached.
+    pub fn open_pages(&self) {
+        self.wake();
+        if self.with_pages.replace(true) {
+            return;
+        }
+        let (project_dir, backend_kind) = {
+            let state = self.state.borrow();
+            (state.project_dir.clone(), state.backend_kind)
+        };
+        let (supervisor, supervisor_pending) = connect_supervisor(&project_dir, backend_kind);
+        let mut state = self.state.borrow_mut();
+        state.supervisor = supervisor;
+        state.supervisor_pending = supervisor_pending;
+    }
+
+    /// Says on the log that this window has a backend and no panel: WebKit's sandbox cannot start here.
+    pub fn say_no_panel(&self) {
+        self.wake();
+        println!(
+            "[agent_panel] backend: {} (no panel: WebKit's sandbox cannot start here)",
+            self.state.borrow().backend_kind.as_str()
+        );
+    }
+
+    /// This window keeps no saved tabs: it offers none, claims none and writes none, at its close too. Its project's
+    /// tabs are the other windows' to keep.
+    pub fn keep_no_tabs(&self) {
+        self.wake();
+        let mut state = self.state.borrow_mut();
+        state.tab_memory.disable();
+        state.restore_source = None;
+    }
+
+    /// This window's tabs are window 1's to save: `hook` hears each new set, compared on every tick as the writer's
+    /// are, and must not reach back into the panel.
+    pub fn report_tabs(&self, hook: impl Fn(&eitri_core::saved_tabs::SavedTabs) + 'static) {
+        self.wake();
+        self.state.borrow_mut().group_tabs.report_to(Rc::new(hook));
+    }
+
+    /// The tabs as they stand, whatever the last tick saw; `None` while the panel is busy or closing.
+    pub fn tabs_now(&self) -> Option<eitri_core::saved_tabs::SavedTabs> {
+        self.wake();
+        let state = self.state.try_borrow().ok()?;
+        state.tabs.saved_snapshot(&state.conversation_id)
+    }
+
+    /// Tabs this window was given and the user has said nothing about: on offer, or waiting for their restore. Closing
+    /// the window is no answer to them. `None` when there are none, or while the panel is busy.
+    pub fn unopened_tabs(&self) -> Option<eitri_core::saved_tabs::SavedTabs> {
+        self.wake();
+        unopened_tabs(&*self.state.try_borrow().ok()?)
+    }
+
+    /// What this window's part of the file should hold when it goes without the user closing it: its tabs and any it has
+    /// not opened. `None` when that says nothing to window 1: the panel is busy, or the window has told nothing and has
+    /// nothing, so what is kept for it stands.
+    pub fn tabs_to_keep(&self) -> Option<eitri_core::saved_tabs::SavedTabs> {
+        self.wake();
+        let state = self.state.try_borrow().ok()?;
+        tabs_to_keep(&state)
+    }
+
+    /// Tabs window 1 kept for this window: restored or offered as a launch's own saved tabs are, under `agent.restore`.
+    pub fn give_tabs(&self, tabs: eitri_core::saved_tabs::SavedTabs) {
+        self.wake();
+        self.run_seen(|state, screen, out| take_given_tabs(state, screen, tabs, out));
+    }
+
+    /// Whether this window's tabs are remembered at all: `agent.restore` is not `"off"`.
+    pub fn remembers_tabs(&self) -> bool {
+        self.wake();
+        self.state.borrow().restore_policy != RestorePolicy::Off
+    }
+
+    /// The group's tabs file's last write: this window's close holds for it as it holds for a window's own file.
+    pub fn hold_close_for_tabs(&self, write: std::sync::mpsc::Receiver<()>) {
+        self.wake();
+        self.state.borrow_mut().group_tabs.last_write = Some(write);
     }
 
     /// `page` becomes `view`'s live page, starting with a fresh record (no document ready yet): a new
@@ -241,7 +347,7 @@ impl AgentPanelHandle {
     /// editor's keys as they stand; its document is loaded by [`load_document`](Self::load_document).
     pub fn attach_page(&self, view: ViewId, page: Rc<PanelPage>) {
         self.wake();
-        if !self.with_pages {
+        if !self.with_pages.get() {
             return;
         }
         let (cadence, editor_has_keys) = {
@@ -518,6 +624,26 @@ impl AgentPanelHandle {
         super::chat_moves::facts_for_tab(&self.state.borrow(), tab)
     }
 
+    /// What a hand-over of `tab` to another window would take, or why it cannot go.
+    pub fn tab_hand_over_facts(&self, tab: TabId) -> Result<eitri_core::wm::TabHandOver, String> {
+        self.wake();
+        super::hand_over::facts(&self.state.borrow(), tab)
+    }
+
+    /// Lets the tab holding `agent`'s `session` go for a hand-over, answered later through [`Self::on_chat_move`]: once
+    /// its backend has let the session go, or at once when the tab stays.
+    pub fn release_tab(&self, agent: &AgentId, session: &str) {
+        self.wake();
+        self.run(|state, out| super::hand_over::release(state, agent, session, out));
+    }
+
+    /// Takes up a tab another window let go, as a launch brings a saved tab back; answered later through
+    /// [`Self::on_chat_move`], once the tab has settled here.
+    pub fn adopt_tab(&self, tab: eitri_core::saved_tabs::SavedTab) {
+        self.wake();
+        self.run(|state, out| super::hand_over::adopt(state, tab, out));
+    }
+
     pub fn moved_tab_key(&self, tab: TabId) -> Option<eitri_core::window_link::base_tabs::MovedTabKey> {
         self.wake();
         let state = self.state.borrow();
@@ -616,7 +742,7 @@ impl AgentPanelHandle {
     /// [`take_wake`](Self::take_wake). `None`: there is no wake, and the host runs the tick every
     /// [`TICK`](Self::TICK) as [`run_tick`](Self::run_tick) says.
     pub fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
-        if !self.with_pages {
+        if !self.with_pages.get() && !self.drives_review.get() {
             return None;
         }
         self.state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::fd)
@@ -686,9 +812,10 @@ impl AgentPanelHandle {
         self.poll_partner_chooser();
         let state = &self.state;
         let pages = &self.pages;
-        // No page, no session ever starts and nothing could be shown: nothing to drive.
-        if !self.with_pages {
-            return false;
+        // No page, no session ever starts and nothing could be shown: nothing to drive, unless the window's editor
+        // serves the reviews of the windows that show the chats.
+        if !self.with_pages.get() {
+            return self.drives_review.get() && self.tick_review();
         }
         // The window has been closed and its tabs taken; everything below would be a no-op
         // against a destroyed window for as long as the close watch holds the application. Stop
@@ -758,6 +885,28 @@ impl AgentPanelHandle {
         true
     }
 
+    /// The one job of a tick with no page: the overlay in this window's editor moves on, and what it found goes out
+    /// to the windows it was drawn for.
+    fn tick_review(&self) -> bool {
+        if self.state.borrow().shutting_down {
+            return false;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.state.borrow_mut().ticks_run += 1;
+        }
+        self.run_seen(poll_review_flow);
+        self.run(pair_outbound);
+        true
+    }
+
+    /// This window will show no page, but other windows' reviews draw in its editor: from now on its tick runs for
+    /// them, and the host drives it as it drives a window with pages.
+    pub fn drive_review_without_pages(&self) {
+        self.wake();
+        self.drives_review.set(true);
+    }
+
     /// Shuts down every tab's backend, INCLUDING one still being constructed on a worker thread,
     /// all of them in parallel under one backstop.
     ///
@@ -809,7 +958,10 @@ impl AgentPanelHandle {
         // The tabs as they are now, whatever the last tick saw: the writer's last set, written before the
         // close lets the process go.
         remember_tabs(&mut self.state.borrow_mut());
-        let last_write = self.state.borrow_mut().tab_memory.finish();
+        let last_write = {
+            let mut state = self.state.borrow_mut();
+            state.tab_memory.finish().or(state.group_tabs.last_write.take())
+        };
         let tabs = {
             let mut state = self.state.borrow_mut();
             // Read by the tick, by `poll_activate` and by every path into the tab set, all of
@@ -1651,7 +1803,7 @@ impl AgentPanelHandle {
     /// (`with_pages`'s own doc): every verb below then does nothing, and says so to its caller the way
     /// it does for a closing window.
     pub(super) fn closing(&self) -> bool {
-        !self.with_pages || self.state.borrow().shutting_down
+        !self.with_pages.get() || self.state.borrow().shutting_down
     }
 
     /// `prefix c`: opens a tab running the window's default agent (`agent.default`) in the base view,
@@ -1694,7 +1846,7 @@ impl AgentPanelHandle {
 
     /// Whether stepping the base tabs can select a tab, without sending anything to a page.
     pub fn can_step(&self, delta: i32) -> bool {
-        if !self.with_pages {
+        if !self.with_pages.get() {
             return false;
         }
         let Ok(state) = self.state.try_borrow() else {
@@ -1715,7 +1867,7 @@ impl AgentPanelHandle {
 
     /// Whether the previous base tab can be selected, without sending anything to a page.
     pub fn has_last(&self) -> bool {
-        if !self.with_pages {
+        if !self.with_pages.get() {
             return false;
         }
         let Ok(state) = self.state.try_borrow() else {
@@ -1726,7 +1878,7 @@ impl AgentPanelHandle {
 
     /// Where a numbered tab would be selected, without sending anything to a page.
     pub fn tab_place(&self, n: u16) -> Option<TabPlace> {
-        if !self.with_pages {
+        if !self.with_pages.get() {
             return None;
         }
         let state = self.state.try_borrow().ok()?;
@@ -3006,6 +3158,7 @@ mod tests {
                     name: None,
                     mode: Auto,
                     view: None,
+                    window: None,
                 }],
                 0,
                 Vec::new(),

@@ -43,6 +43,11 @@ pub(crate) struct WmRunner {
     /// The commands, shared with the worker threads that run them.
     commands: Commands,
     read_stat: ReadStat,
+    /// Present only for a module window: the focused window just before its first map, when known. The first
+    /// placement takes it; a later one, long after the map, has no pre-map window to compare with.
+    module_before: RefCell<Option<Option<WindowRef>>>,
+    /// The worker of the last placement: the next one waits for it, so it reads what that one decided.
+    last_placement: RefCell<Option<thread::JoinHandle<()>>>,
     /// The Eitri extension's service, on GNOME only.
     gnome: Option<Rc<dyn GnomeCalls>>,
     /// What the extension was last told about its partner.
@@ -122,12 +127,23 @@ impl WmRunner {
         Self::with_adapters(wm, exec, read_stat, None)
     }
 
+    /// A runner whose commands are `exec`, for a test of what runs them and where.
+    #[cfg(test)]
+    pub(crate) fn with_exec(
+        wm: Wm,
+        exec: impl Fn(Vec<String>) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Rc<Self> {
+        Rc::new(Self::with_commands(wm, Arc::new(exec), Arc::new(|_| None)))
+    }
+
     fn with_adapters(wm: Wm, exec: Exec, read_stat: ReadStat, gnome: Option<Rc<dyn GnomeCalls>>) -> Self {
         WmRunner {
             wm,
             notice_shown: Cell::new(false),
             commands: Commands::new(wm, exec),
             read_stat,
+            module_before: RefCell::default(),
+            last_placement: RefCell::default(),
             gnome,
             partner: Rc::default(),
         }
@@ -318,6 +334,21 @@ impl WmRunner {
         }
     }
 
+    /// The focused window before mapping, read on a worker. The first present waits by polling its answer.
+    pub(crate) fn before_map(&self) -> std::sync::mpsc::Receiver<Option<WindowRef>> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let commands = self.commands.clone();
+        thread::spawn(move || {
+            let focused = window_snapshot(&commands).and_then(|windows| windows.into_iter().find(|w| w.focused));
+            let _ = send.send(focused);
+        });
+        receive
+    }
+
+    pub(crate) fn module_mapped_from(&self, before: Option<WindowRef>) {
+        *self.module_before.borrow_mut() = Some(before);
+    }
+
     /// Moves this process's own window to an output, as `how` says: a command on a worker thread, the window list
     /// read there first for niri's window id, or GNOME's extension asked, its answer logged. Nothing waits here.
     pub(crate) fn move_own(&self, how: crate::gtk_host::MonitorMove) {
@@ -336,8 +367,16 @@ impl WmRunner {
                 None => println!("[window] the Eitri GNOME Shell extension is not there; the window stays put"),
             },
             how @ (MonitorMove::Command(_) | MonitorMove::Hyprland { .. } | MonitorMove::ById { .. }) => {
-                let commands = self.commands.clone();
-                thread::spawn(move || commands.place_blocking(how, &|line| println!("{line}")));
+                let commands = Commands {
+                    before_map: self.module_before.borrow_mut().take(),
+                    ..self.commands.clone()
+                };
+                let last = self.last_placement.borrow_mut().take();
+                let worker = thread::spawn(move || {
+                    after(last);
+                    commands.place_blocking(how, &|line| println!("{line}"));
+                });
+                *self.last_placement.borrow_mut() = Some(worker);
             }
         }
     }
@@ -351,6 +390,13 @@ impl WmRunner {
             let chain = chain(&*read_stat);
             commands.raise_blocking(&chain, &|line| println!("{line}"));
         });
+    }
+}
+
+/// Waits for the worker before this one, if there was one.
+fn after(last: Option<thread::JoinHandle<()>>) {
+    if let Some(last) = last {
+        let _ = last.join();
     }
 }
 
@@ -433,6 +479,29 @@ struct Commands {
     wm: Wm,
     exec: Exec,
     hypr: Arc<HyprState>,
+    before_map: Option<Option<WindowRef>>,
+    /// The first placement found a compositor rule placed this window. That holds for its life: an output that comes
+    /// back later asks for this window again, and the rule still wins.
+    placed_by_rule: Arc<AtomicBool>,
+}
+
+/// Both replies are read on the same worker; client monitor ids are joined to connector names.
+fn window_snapshot(commands: &Commands) -> Option<Vec<WindowRef>> {
+    let list = compositor::list_windows_argv(commands.wm)?;
+    let json = (commands.exec)(list).ok()?;
+    if let Some(outputs) = compositor::list_outputs_argv(commands.wm) {
+        let monitors = (commands.exec)(outputs)
+            .ok()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+        if let (Ok(clients), Some(monitors)) = (serde_json::from_str::<serde_json::Value>(&json), monitors) {
+            return compositor::parse_windows(
+                commands.wm,
+                &serde_json::json!({"clients": clients, "monitors": monitors}).to_string(),
+            )
+            .ok();
+        }
+    }
+    compositor::parse_windows(commands.wm, &json).ok()
 }
 
 impl Commands {
@@ -441,6 +510,8 @@ impl Commands {
             wm,
             exec,
             hypr: Arc::default(),
+            before_map: None,
+            placed_by_rule: Arc::default(),
         }
     }
 
@@ -539,27 +610,36 @@ impl Commands {
         locked(&self.hypr.failures).clone()
     }
 
+    /// A focus move past the window's edge. sway and Hyprland both go somewhere when nothing lies that way, a window
+    /// of another column or output, so the list of windows decides first and the key stops at a real edge.
     fn move_focus_blocking(&self, dir: Direction, log: &dyn Fn(&str)) {
         let wm = self.wm;
-        if wm == Wm::Sway {
-            let windows = compositor::list_windows_argv(wm)
-                .and_then(|argv| (self.exec)(argv).ok())
-                .and_then(|json| compositor::parse_windows(wm, &json).ok());
-            match windows
-                .as_deref()
-                .and_then(|windows| compositor::has_neighbour(windows, dir))
-            {
+        if matches!(wm, Wm::Sway | Wm::Hyprland) {
+            let name = wm_name(wm);
+            let windows = window_snapshot(self);
+            match windows.as_deref().and_then(|windows| match wm {
+                // Hyprland moves between windows that overlap, and their rectangles show no edge to stop at.
+                Wm::Hyprland if compositor::focused_overlaps(windows) => Some(true),
+                _ => compositor::has_neighbour(windows, dir),
+            }) {
                 Some(false) => {
                     log(&format!(
-                        "[companion] sway: no window {dir:?} of the panel; the key stops here"
+                        "[companion] {name}: no window {dir:?} of the panel; the key stops here"
                     ));
                     return;
                 }
-                // Not knowing is not a reason to eat the key: sway's own answer is the better guess.
-                None => log("[companion] sway: could not read the window tree; moving focus anyway"),
+                // Not knowing is not a reason to eat the key: the compositor's own answer is the better guess.
+                None => log(&format!(
+                    "[companion] {name}: could not read the window list; moving focus anyway"
+                )),
                 Some(true) => {}
             }
         }
+        self.focus_by_direction(dir, log);
+    }
+
+    fn focus_by_direction(&self, dir: Direction, log: &dyn Fn(&str)) {
+        let wm = self.wm;
         self.dispatch(
             "focus by direction",
             &|form| compositor::move_focus_argv(wm, form, dir),
@@ -583,7 +663,7 @@ impl Commands {
                 return;
             }
         };
-        let Some(target) = compositor::first_window_owner(chain, &windows).copied() else {
+        let Some(target) = compositor::first_window_owner(chain, &windows).cloned() else {
             log(&format!(
                 "[companion] raise: no window owned by any process in {chain:?}; nothing raised"
             ));
@@ -607,6 +687,18 @@ impl Commands {
     fn place_blocking(&self, how: crate::gtk_host::MonitorMove, log: &dyn Fn(&str)) {
         use crate::gtk_host::MonitorMove;
         let wm = self.wm;
+        if let Some(Some(before)) = &self.before_map {
+            let mine =
+                window_snapshot(self).and_then(|windows| windows.into_iter().find(|w| w.pid == std::process::id()));
+            // No facts about this window prove no rule: it is placed as any other is.
+            if mine.is_some_and(|mine| compositor::placed_by_rule(before, &mine)) {
+                self.placed_by_rule.store(true, Ordering::Relaxed);
+            }
+        }
+        if self.placed_by_rule.load(Ordering::Relaxed) {
+            log("[window] keeping the compositor's placement and focus");
+            return;
+        }
         match how {
             MonitorMove::Unchanged | MonitorMove::Gnome { .. } => {}
             MonitorMove::Command(argv) => {
@@ -619,6 +711,7 @@ impl Commands {
                     focused: false,
                     visible: true,
                     rect: None,
+                    ..Default::default()
                 };
                 self.dispatch(
                     "place the window",
@@ -659,6 +752,156 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_window_that_mapped_off_the_focused_workspace_is_neither_moved_nor_focused() {
+        let pid = std::process::id();
+        for (wm, json) in [
+            (
+                Wm::Sway,
+                format!(
+                    r#"{{"type":"output","name":"DP-2","nodes":[{{"type":"workspace","name":"2","nodes":[{{"type":"con","pid":{pid},"id":42}}]}}]}}"#
+                ),
+            ),
+            (
+                Wm::Hyprland,
+                format!(r#"[{{"pid":{pid},"workspace":{{"name":"2"}},"monitor":"DP-2"}}]"#),
+            ),
+            (
+                Wm::Niri,
+                format!(r#"[{{"pid":{pid},"id":42,"workspace_id":2,"output":"DP-2"}}]"#),
+            ),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let exec: Exec = Arc::new(move |argv| {
+                seen.lock().unwrap().push(argv.clone());
+                Ok(if argv.get(1).is_some_and(|v| v == "monitors") {
+                    "[]".into()
+                } else {
+                    json.clone()
+                })
+            });
+            let mut commands = Commands::new(wm, exec);
+            commands.before_map = Some(Some(WindowRef {
+                workspace: Some("1".into()),
+                output: Some("DP-1".into()),
+                ..Default::default()
+            }));
+            commands.place_blocking(
+                crate::gtk_host::monitor_move(wm, pid, Some("DP-1"), eitri_core::wm::PlacementRole::NewModule).unwrap(),
+                &|_| {},
+            );
+            let mut expected = vec![compositor::list_windows_argv(wm).unwrap()];
+            if let Some(monitors) = compositor::list_outputs_argv(wm) {
+                expected.push(monitors);
+            }
+            assert_eq!(
+                *calls.lock().unwrap(),
+                expected,
+                "{wm:?}: only the window facts are requested"
+            );
+        }
+    }
+
+    /// A restored window waits for its output while a rule has put it elsewhere. When the output comes back the
+    /// controller asks again, with no snapshot left to compare, and the rule's answer has to stand.
+    #[test]
+    fn a_rule_that_placed_a_window_still_holds_when_its_output_comes_back() {
+        let pid = std::process::id();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        let exec: Exec = Arc::new(move |argv| {
+            calls.lock().unwrap().push(argv.clone());
+            Ok(format!(
+                r#"{{"type":"output","name":"DP-1","nodes":[{{"type":"workspace","name":"2","nodes":[{{"type":"con","pid":{pid},"id":42}}]}}]}}"#
+            ))
+        });
+        let mut first = Commands::new(Wm::Sway, exec);
+        let mut later = first.clone();
+        first.before_map = Some(Some(WindowRef {
+            workspace: Some("1".into()),
+            output: Some("DP-1".into()),
+            ..Default::default()
+        }));
+        let role = eitri_core::wm::PlacementRole::RestoredSecond { first_pid: 123 };
+        let to_output = |output| crate::gtk_host::monitor_move(Wm::Sway, pid, output, role).unwrap();
+        first.place_blocking(to_output(Some("DP-1")), &|_| {});
+        let listed = seen.lock().unwrap().len();
+
+        later.before_map = None;
+        later.place_blocking(to_output(Some("DP-2")), &|_| {});
+        assert_eq!(seen.lock().unwrap().len(), listed, "no move, and nothing asked");
+    }
+
+    /// With the window list gone the window may be anywhere, and that proves no rule: left alone, a restored window
+    /// would keep the keys it should have handed back to window 1.
+    #[test]
+    fn a_window_missing_from_the_list_after_its_map_is_still_placed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        let exec: Exec = Arc::new(move |argv| {
+            calls.lock().unwrap().push(argv.clone());
+            Ok(r#"{"type":"output","name":"DP-1","nodes":[]}"#.to_string())
+        });
+        let mut commands = Commands::new(Wm::Sway, exec);
+        commands.before_map = Some(Some(WindowRef {
+            workspace: Some("1".into()),
+            output: Some("DP-1".into()),
+            ..Default::default()
+        }));
+        let role = eitri_core::wm::PlacementRole::RestoredSecond { first_pid: 123 };
+        let how = crate::gtk_host::monitor_move(Wm::Sway, 7, Some("DP-2"), role).unwrap();
+        commands.place_blocking(how, &|_| {});
+        let last = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            last,
+            vec![
+                "swaymsg".to_string(),
+                "[pid=7] move container to output \"DP-2\"; [pid=123] focus".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restored_window_goes_back_to_its_output() {
+        let pid = std::process::id();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        let exec: Exec = Arc::new(move |argv| {
+            calls.lock().unwrap().push(argv.clone());
+            Ok(if argv.get(1).is_some_and(|v| v == "-t") {
+                format!(
+                    r#"{{"type":"output","name":"DP-1","nodes":[{{"type":"workspace","name":"1","nodes":[{{"type":"con","pid":{pid},"id":42}}]}}]}}"#
+                )
+            } else {
+                String::new()
+            })
+        });
+        let mut commands = Commands::new(Wm::Sway, exec);
+        commands.before_map = Some(Some(WindowRef {
+            workspace: Some("1".into()),
+            output: Some("DP-1".into()),
+            ..Default::default()
+        }));
+        let file: eitri_core::window_link::cm_file::CmFile = serde_json::from_str(
+            r#"{"version":1,"terminal":{"shown":false,"px":200},"windows":[{"name":"c2","output":"DP-2","order":0}]}"#,
+        )
+        .unwrap();
+        let output = file.output(&eitri_core::window_link::names::WindowName::Chat(2));
+        let role = eitri_core::wm::PlacementRole::RestoredSecond { first_pid: 123 };
+        commands.place_blocking(
+            crate::gtk_host::monitor_move(Wm::Sway, pid, output, role).unwrap(),
+            &|_| {},
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1],
+            vec![
+                "swaymsg".to_string(),
+                format!("[pid={pid}] move container to output \"DP-2\"; [pid=123] focus")
+            ]
+        );
+    }
 
     fn fake(answers: &'static str) -> (Exec, Arc<Mutex<Vec<Vec<String>>>>) {
         let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
@@ -733,13 +976,80 @@ mod tests {
         assert_eq!(seen[1], vec!["swaymsg", "focus", "right"]);
     }
 
+    /// Hyprland's directional move goes to some window even at a real edge, so the key stops there as it does on sway.
+    /// The window above window 1 here is on a workspace no monitor shows, which makes it no neighbour.
     #[test]
-    fn hyprland_moves_without_asking() {
-        let (exec, seen) = hyprland(|_| LEGACY_PROBE, |_| "ok");
+    fn hyprland_stops_at_an_edge_and_moves_when_a_window_lies_that_way() {
+        const CLIENTS: &str = r#"[
+            {"pid": 1, "at": [0, 400], "size": [500, 400], "workspace": {"id": 1}, "focusHistoryID": 0},
+            {"pid": 2, "at": [510, 400], "size": [500, 400], "workspace": {"id": 1}, "focusHistoryID": 1},
+            {"pid": 3, "at": [0, 0], "size": [500, 300], "workspace": {"id": 2}, "focusHistoryID": 2}
+        ]"#;
+        const MONITORS: &str = r#"[{"id": 0, "name": "DP-1", "activeWorkspace": {"id": 1}}]"#;
+        let lists = |argv: &[String]| match argv[1].as_str() {
+            "clients" => CLIENTS,
+            "monitors" => MONITORS,
+            _ => "ok",
+        };
+        let reads = || {
+            vec![
+                strings(&["hyprctl", "clients", "-j"]),
+                strings(&["hyprctl", "monitors", "-j"]),
+            ]
+        };
+
+        let (exec, seen) = hyprland(|_| LEGACY_PROBE, lists);
         Commands::new(Wm::Hyprland, exec).move_focus_blocking(Direction::Up, &|_| {});
+        assert_eq!(*seen.lock().unwrap(), reads(), "an edge runs only the two lists");
+
+        let (exec, seen) = hyprland(|_| LEGACY_PROBE, lists);
+        Commands::new(Wm::Hyprland, exec).move_focus_blocking(Direction::Right, &|_| {});
+        let mut moved = reads();
+        moved.extend([probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])]);
+        assert_eq!(*seen.lock().unwrap(), moved);
+    }
+
+    /// Two floats that overlap: the other one starts before this one ends, so no rectangle lies past its edge, and
+    /// Hyprland's own move still reaches it.
+    #[test]
+    fn hyprland_moves_between_windows_that_overlap() {
+        const CLIENTS: &str = r#"[
+            {"pid": 1, "at": [100, 100], "size": [800, 600], "workspace": {"id": 1}, "focusHistoryID": 0},
+            {"pid": 2, "at": [700, 100], "size": [800, 600], "workspace": {"id": 1}, "focusHistoryID": 1}
+        ]"#;
+        const MONITORS: &str = r#"[{"id": 0, "name": "DP-1", "activeWorkspace": {"id": 1}}]"#;
+        let (exec, seen) = hyprland(
+            |_| LEGACY_PROBE,
+            |argv: &[String]| match argv[1].as_str() {
+                "clients" => CLIENTS,
+                "monitors" => MONITORS,
+                _ => "ok",
+            },
+        );
+        Commands::new(Wm::Hyprland, exec).move_focus_blocking(Direction::Right, &|_| {});
         assert_eq!(
-            *seen.lock().unwrap(),
-            vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "u"])]
+            seen.lock().unwrap().last(),
+            Some(&strings(&["hyprctl", "dispatch", "movefocus", "r"]))
+        );
+    }
+
+    /// Lists that cannot be read are no reason to eat the key.
+    #[test]
+    fn hyprland_moves_when_its_window_list_cannot_be_read() {
+        let (exec, seen) = hyprland(|_| LEGACY_PROBE, |_| "ok");
+        let (lines, log) = logged();
+        Commands::new(Wm::Hyprland, exec).move_focus_blocking(Direction::Up, &log);
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&strings(&["hyprctl", "dispatch", "movefocus", "u"]))
+        );
+        assert!(
+            lines
+                .borrow()
+                .iter()
+                .any(|line| line.contains("could not read the window list")),
+            "{:?}",
+            lines.borrow()
         );
     }
 
@@ -787,8 +1097,8 @@ mod tests {
         let (exec, seen) = hyprland(|_| "ok\n", |_| "ok\n");
         let commands = Commands::new(Wm::Hyprland, exec);
         let (lines, log) = logged();
-        commands.move_focus_blocking(Direction::Left, &log);
-        commands.move_focus_blocking(Direction::Down, &log);
+        commands.focus_by_direction(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Down, &log);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
@@ -808,7 +1118,7 @@ mod tests {
             let (exec, seen) = hyprland(move |_| reply, |_| "ok");
             let commands = Commands::new(Wm::Hyprland, exec);
             let (lines, log) = logged();
-            commands.move_focus_blocking(Direction::Right, &log);
+            commands.focus_by_direction(Direction::Right, &log);
             assert_eq!(
                 *seen.lock().unwrap(),
                 vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])],
@@ -844,6 +1154,7 @@ mod tests {
                 focused: false,
                 visible: true,
                 rect: None,
+                ..Default::default()
             };
             commands.dispatch(
                 "focus by pid",
@@ -885,7 +1196,7 @@ mod tests {
                 let (commands, start) = (commands.clone(), start.clone());
                 thread::spawn(move || {
                     start.wait();
-                    commands.move_focus_blocking(dir, &|_| {});
+                    commands.focus_by_direction(dir, &|_| {});
                 })
             })
             .collect();
@@ -944,8 +1255,8 @@ mod tests {
         });
         let commands = Commands::new(Wm::Hyprland, exec);
         let (lines, log) = logged();
-        commands.move_focus_blocking(Direction::Left, &log);
-        commands.move_focus_blocking(Direction::Up, &log);
+        commands.focus_by_direction(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Up, &log);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
@@ -976,7 +1287,7 @@ mod tests {
             let commands = Commands::new(Wm::Hyprland, exec);
             let (lines, log) = logged();
             for _ in 0..3 {
-                commands.move_focus_blocking(Direction::Left, &log);
+                commands.focus_by_direction(Direction::Left, &log);
             }
             let seen = seen.lock().unwrap();
             assert_eq!(
@@ -1016,8 +1327,8 @@ mod tests {
         );
         let commands = Commands::new(Wm::Hyprland, exec);
         let (lines, log) = logged();
-        commands.move_focus_blocking(Direction::Left, &log);
-        commands.move_focus_blocking(Direction::Right, &log);
+        commands.focus_by_direction(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Right, &log);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
@@ -1037,8 +1348,8 @@ mod tests {
         let (exec, seen) = hyprland(|_| "ok", |_| "No such window found");
         let commands = Commands::new(Wm::Hyprland, exec);
         let (lines, log) = logged();
-        commands.move_focus_blocking(Direction::Left, &log);
-        commands.move_focus_blocking(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Left, &log);
         assert_eq!(seen.lock().unwrap().iter().filter(|argv| **argv == probe()).count(), 1);
         assert_eq!(
             lines.borrow().len(),
@@ -1059,7 +1370,7 @@ mod tests {
         );
         let commands = Commands::new(Wm::Hyprland, exec);
         let (lines, log) = logged();
-        commands.move_focus_blocking(Direction::Left, &log);
+        commands.focus_by_direction(Direction::Left, &log);
         commands.raise_blocking(&[9], &log);
         commands.raise_blocking(&[9], &log);
         assert_eq!(commands.failure_counts().len(), 2);
@@ -1074,6 +1385,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         for (reply, fails) in [
             ("ok\n\n\nok", false),
@@ -1478,12 +1790,12 @@ mod tests {
         let runner = WmRunner::with_commands(Wm::Hyprland, exec, Arc::new(|_| None));
         assert!(runner.editor_edge(Direction::Right, &no_notice));
         let waited = Instant::now();
-        while seen.lock().unwrap().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
+        while seen.lock().unwrap().len() < 4 && waited.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            *seen.lock().unwrap(),
-            vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])]
+            seen.lock().unwrap()[2..],
+            [probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])]
         );
         let runner = WmRunner::with_commands(Wm::None, fake("").0, Arc::new(|_| None));
         let notices = RefCell::new(Vec::new());

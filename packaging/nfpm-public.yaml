@@ -5,7 +5,7 @@ release: 1
 version_schema: semver
 maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 description: |
-  Your Neovim, tiled with your agents, terminals and the web pages you build, in one window.
+  Your Neovim, tiled with your agents, terminals and the web pages you build.
   It runs the Claude Code you installed; run `eitri setup` after installing to build the agent
   backend (it downloads and builds Anthropic's Agent SDK on your own machine -- the SDK is not
   ours to redistribute, so this package never contains it).
@@ -75,6 +75,9 @@ contents:
   # The panel's own entry: `eitri panel` is a second window class, so it gets its own (hidden) entry.
   - src: ./packaging/cn.huntergrey.eitri.Panel.desktop
     dst: /usr/share/applications/cn.huntergrey.eitri.Panel.desktop
+  # The page window's entry: a web page opened as a window of its own is a third window class (hidden likewise).
+  - src: ./packaging/cn.huntergrey.eitri.Page.desktop
+    dst: /usr/share/applications/cn.huntergrey.eitri.Page.desktop
   # The nvim plugin that adds :EitriPanel (nvim/eitri.nvim/doc/eitri.txt says how to load it).
   - src: ./nvim/eitri.nvim/plugin/eitri.lua
     dst: /usr/share/eitri/nvim/eitri.nvim/plugin/eitri.lua

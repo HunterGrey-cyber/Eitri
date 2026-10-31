@@ -357,6 +357,7 @@ mod tests {
                     name: name.map(str::to_string),
                     mode: *mode,
                     view: None,
+                    window: None,
                 })
                 .collect(),
             active,
@@ -431,6 +432,7 @@ mod tests {
             name: None,
             mode: Auto,
             view: None,
+            window: None,
         };
         saved.tabs.extend([acp("gem", "g-1"), acp("gone", "x-1")]);
         let acp_record = |name: &str, id: &str| ResumableSession {
@@ -510,6 +512,7 @@ mod tests {
             name: None,
             mode: Auto,
             view: Some(2),
+            window: None,
         });
         let records = [
             record("a", None, None),
@@ -556,6 +559,7 @@ mod tests {
             name: None,
             mode: Auto,
             view: None,
+            window: None,
         });
         let acp_record = |name: &str| ResumableSession {
             provider: format!("acp:{name}"),

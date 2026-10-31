@@ -924,7 +924,7 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::CloseTab { .. } => {
             let tab = tab_of(target);
-            match close_tab(state, tab, &mut out) {
+            match close_tab_asked(state, tab, &mut out) {
                 Ok(()) => ok(&mut out),
                 Err(why) => refuse(&mut out, why),
             }
@@ -1291,7 +1291,7 @@ pub(super) fn handle_inbound_message(
             .is_some_and(|tab| !state.tabs.close_needs_confirm(tab)) =>
         {
             let shown = state.tab_of_page(view).expect("checked in the guard");
-            match close_tab(state, shown, &mut out) {
+            match close_tab_asked(state, shown, &mut out) {
                 Ok(()) => ok(&mut out),
                 Err(why) => refuse(&mut out, why),
             }

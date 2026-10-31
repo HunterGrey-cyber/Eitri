@@ -1,4 +1,7 @@
-//! The editor is window 1's: window 2 has no nvim, so everything it needs of the editor goes over the link.
+//! The editor is window 1's: no other window has an nvim, so everything window 2 or a module window needs of the
+//! editor goes over its link. Each such window is served alike through its own link: what that link was told, the
+//! pages its window holds, its operations still out and its drafts are its own, and an answer goes back on the link
+//! the question came on. Below, "window 2" stands for any of them.
 //!
 //! Window 1 forwards what its editor feeds already parsed (the context, the theme with the editor's cell height,
 //! nvim's keys), once at each link and then on change only. Window 2 asks for editor operations as typed
@@ -6,7 +9,7 @@
 //! the Lua and builds every argument itself after its own checks. Editor requests (a path to open, a draft to edit,
 //! the keys for the editor) are intents: window 1 checks the path as it checks its own, raises itself and carries
 //! the request out, and a draft written back in nvim goes to whichever window holds its tab at that moment. Follow
-//! lines for a plugin page window 2 holds go to window 2; nvim's side of them stays in window 1.
+//! lines for a plugin page go to the window that holds it; nvim's side of them stays in window 1.
 //!
 //! Nothing here waits: answers are polled by a repeating step the window drives (a GLib timer; a test steps it
 //! by hand), and every message is queued on the link.
@@ -28,7 +31,9 @@ use eitri_core::scratch::{EditDone, PendingEdit, ScratchDir, ScratchRequest};
 use eitri_core::tabs::TabId;
 use eitri_core::theme::payload::NvimThemePayload;
 use eitri_core::window_link::editor_ops::{dispatch, Dispatch, OpContext};
+use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{DraftEnd, EditorOp, EditorRequest, LinkError, Msg, ReplyResult};
+use eitri_core::wm::PeerId;
 use serde_json::{json, Value};
 
 use super::driver::LinkDriver;
@@ -107,18 +112,15 @@ pub fn keys_of(value: &Value) -> Result<NvimReport, String> {
     serde_json::from_value(value.clone()).map_err(|e| e.to_string())
 }
 
-/// What window 1's feeds last parsed, and what the window at the link's other end was last told, so a feed that
-/// repeats itself sends nothing.
+/// What window 1's feeds last parsed: one value of each kind, however many windows hear it.
 #[derive(Default)]
 pub struct FeedForward {
     context: Option<Value>,
     theme: ThemeRecord,
     keys: Option<Value>,
-    /// What this link was told, kind by kind; `None` for a kind not told yet. The whole is `None` while there is
-    /// no link to tell.
-    told: Option<Told>,
 }
 
+/// What one link was told, kind by kind, so a feed that repeats itself sends nothing; `None` for a kind not told yet.
 #[derive(Default)]
 struct Told {
     context: Option<Option<Value>>,
@@ -127,43 +129,32 @@ struct Told {
 }
 
 impl FeedForward {
-    /// A new link: everything known is told at once.
-    pub fn new_link(&mut self) -> Vec<Msg> {
-        self.told = Some(Told::default());
-        [self.context_msg(), self.theme_msg(), self.keys_msg()]
+    /// What a new link hears at once: everything known.
+    fn new_link(&self, told: &mut Told) -> Vec<Msg> {
+        [self.context_msg(told), self.theme_msg(told), self.keys_msg(told)]
             .into_iter()
             .flatten()
             .collect()
     }
 
-    /// The link ended: nothing is told until the next one.
-    pub fn unlinked(&mut self) {
-        self.told = None;
-    }
-
-    pub fn context(&mut self, context: Option<&EditorContext>) -> Option<Msg> {
+    pub fn context(&mut self, context: Option<&EditorContext>) {
         self.context = context_value(context);
-        self.context_msg()
     }
 
-    pub fn theme(&mut self, payload: &NvimThemePayload) -> Option<Msg> {
+    pub fn theme(&mut self, payload: &NvimThemePayload) {
         self.theme.payload = Some(payload.clone());
-        self.theme_msg()
     }
 
-    pub fn cell_height(&mut self, height: f32) -> Option<Msg> {
+    pub fn cell_height(&mut self, height: f32) {
         self.theme.cell_height = Some(height);
-        self.theme_msg()
     }
 
-    pub fn keys(&mut self, report: &NvimReport) -> Option<Msg> {
+    pub fn keys(&mut self, report: &NvimReport) {
         self.keys = Some(keys_value(report));
-        self.keys_msg()
     }
 
-    fn context_msg(&mut self) -> Option<Msg> {
-        let told = self.told.as_mut()?;
-        // A window 2 starts with no context, so a link that has heard nothing is told only a context there is.
+    fn context_msg(&self, told: &mut Told) -> Option<Msg> {
+        // A linked window starts with no context, so a link that has heard nothing is told only a context there is.
         let unchanged = match &told.context {
             Some(said) => *said == self.context,
             None => self.context.is_none(),
@@ -177,8 +168,7 @@ impl FeedForward {
         })
     }
 
-    fn theme_msg(&mut self) -> Option<Msg> {
-        let told = self.told.as_mut()?;
+    fn theme_msg(&self, told: &mut Told) -> Option<Msg> {
         if self.theme == ThemeRecord::default() {
             return None;
         }
@@ -190,8 +180,7 @@ impl FeedForward {
         Some(Msg::Theme { payload: value })
     }
 
-    fn keys_msg(&mut self) -> Option<Msg> {
-        let told = self.told.as_mut()?;
+    fn keys_msg(&self, told: &mut Told) -> Option<Msg> {
         let value = self.keys.clone()?;
         if told.keys.as_ref() == Some(&value) {
             return None;
@@ -546,12 +535,12 @@ pub enum EditorAct<'a> {
 /// Carries an act out in window 1's own editor, after the window raised itself with the token window 2 sent.
 pub type Drive = Rc<dyn Fn(EditorAct<'_>, Option<String>) -> Result<(), String>>;
 
-/// Where window 2's review calls go: window 1's own review driver. Its answer is the op's reply, or `None` when the
-/// driver answers the op itself once it has the call's outcome (an open).
-pub type OverlayHook = Rc<dyn Fn(u64, Vec<OverlayCall>) -> Option<ReplyResult>>;
+/// Where a linked window's review calls go: window 1's own review driver, as that window's. Its answer is the op's
+/// reply, or `None` when the driver answers the op itself once it has the call's outcome (an open).
+pub type OverlayHook = Rc<dyn Fn(PeerId, u64, Vec<OverlayCall>) -> Option<ReplyResult>>;
 
-/// The files window 1's review driver last heard were drawn for window 2: the only ones window 2 may clear.
-pub type DrawnForWindow2 = Rc<dyn Fn() -> Vec<PathBuf>>;
+/// The files window 1's review driver last heard were drawn for the window at this peer: the only ones it may clear.
+pub type DrawnFor = Rc<dyn Fn(PeerId) -> Vec<PathBuf>>;
 
 /// A draft edit for a tab that is in this window now ended in nvim: its session, and how it ended. Called for every
 /// end, a discarded or failed one too, since the tab is still marked as editing until it hears.
@@ -570,29 +559,53 @@ pub type TokenSource = Rc<dyn Fn() -> Option<String>>;
 /// Brings this window forward with the other window's activation token, if it sent one.
 pub type Raise = Rc<dyn Fn(Option<String>)>;
 
+/// A draft edit out in nvim for the tab `tab` of the window at `peer`: a tab's number means something only in its own
+/// window.
 struct OutDraft {
     edit: PendingEdit,
+    peer: PeerId,
     tab: u64,
     session: Option<String>,
 }
 
-/// Window 1's side: the feeds told to window 2, its operations answered and its requests carried out.
+/// One linked window, as window 1's editor serves it.
+struct LinkState {
+    link: LinkDriver,
+    name: WindowName,
+    /// What this link was last told.
+    told: Told,
+}
+
+/// The roots of the plugin an id names, from this window's table; `None` when no plugin of that id is loaded here, as
+/// for a Lua panel.
+pub type PageRoots = Rc<dyn Fn(&str) -> Option<BTreeMap<String, PathBuf>>>;
+
+/// The window a plugin's page is in, when that is not this one, and the plugin's roots from this window's table.
+struct HeldPage {
+    peer: PeerId,
+    roots: BTreeMap<String, PathBuf>,
+}
+
+/// Window 1's side: the feeds told to each linked window, its operations answered and its requests carried out.
 pub struct Window1Editor {
     me: Weak<Window1Editor>,
     root: PathBuf,
     repeat: Repeat,
-    link: RefCell<Option<LinkDriver>>,
+    links: RefCell<BTreeMap<PeerId, LinkState>>,
     feeds: RefCell<FeedForward>,
     rpc: RefCell<Option<Rc<dyn EditorRpc>>>,
     own_session: RefCell<OwnSession>,
-    window2_plugins: RefCell<BTreeMap<String, BTreeMap<String, PathBuf>>>,
+    /// By plugin, not by link: a page is in one window, and a page a restored layout left away is that window's
+    /// before the window has linked.
+    plugins: RefCell<BTreeMap<String, HeldPage>>,
+    page_roots: RefCell<Option<PageRoots>>,
     plugin_follows: RefCell<BTreeMap<String, eitri_core::window_link::editor_ops::FollowConfig>>,
-    drawn_for_window2: RefCell<Option<DrawnForWindow2>>,
+    drawn_for: RefCell<Option<DrawnFor>>,
     overlay: RefCell<Option<OverlayHook>>,
     drive: RefCell<Option<Drive>>,
     draft_here: RefCell<Option<DraftHere>>,
     token: RefCell<Option<TokenSource>>,
-    inflight: RefCell<Vec<(u64, Pending)>>,
+    inflight: RefCell<Vec<(PeerId, u64, Pending)>>,
     /// Window 1's own scratch directory, under which window 2's drafts get one of their own: the editor-context
     /// feed already leaves out every buffer under it.
     scratch_parent: Option<PathBuf>,
@@ -608,13 +621,14 @@ impl Window1Editor {
             me: me.clone(),
             root,
             repeat,
-            link: RefCell::default(),
+            links: RefCell::default(),
             feeds: RefCell::default(),
             rpc: RefCell::default(),
             own_session: RefCell::new(Rc::new(|_: &str| false)),
-            window2_plugins: RefCell::default(),
+            plugins: RefCell::default(),
+            page_roots: RefCell::default(),
             plugin_follows: RefCell::default(),
-            drawn_for_window2: RefCell::default(),
+            drawn_for: RefCell::default(),
             overlay: RefCell::default(),
             drive: RefCell::default(),
             draft_here: RefCell::default(),
@@ -654,8 +668,8 @@ impl Window1Editor {
         *self.overlay.borrow_mut() = Some(hook);
     }
 
-    pub fn set_drawn_for_window2(&self, drawn: DrawnForWindow2) {
-        *self.drawn_for_window2.borrow_mut() = Some(drawn);
+    pub fn set_drawn_for(&self, drawn: DrawnFor) {
+        *self.drawn_for.borrow_mut() = Some(drawn);
     }
 
     /// What the plugin `owner` follows in this window's editor (its socket, its filetypes and commands), kept for
@@ -664,126 +678,169 @@ impl Window1Editor {
         self.plugin_follows.borrow_mut().insert(owner.to_owned(), config);
     }
 
-    /// The plugin `owner`'s page is in window 2 (`roots` from this window's plugin table), or no
-    /// longer is.
-    pub fn set_plugin_in_window2(&self, owner: &str, roots: Option<BTreeMap<String, PathBuf>>) {
-        let mut plugins = self.window2_plugins.borrow_mut();
-        match roots {
-            Some(roots) => plugins.insert(owner.to_owned(), roots),
-            None => plugins.remove(owner),
+    /// The plugin `owner`'s page is in the window at `peer` (`roots` from this window's plugin table), or, with
+    /// either absent, in no linked window. A page is in one window, so this replaces where it was.
+    pub fn set_plugin_in_window(&self, owner: &str, peer: Option<PeerId>, roots: Option<BTreeMap<String, PathBuf>>) {
+        let mut plugins = self.plugins.borrow_mut();
+        match (peer, roots) {
+            (Some(peer), Some(roots)) => plugins.insert(owner.to_owned(), HeldPage { peer, roots }),
+            _ => plugins.remove(owner),
         };
     }
 
-    /// Sends what the window holds for the link, if it is up; a send refused for its size is logged.
-    fn send(&self, msg: Msg) {
+    /// Where the roots of a page window's plugin come from, when that window links.
+    pub fn set_page_roots(&self, roots: PageRoots) {
+        *self.page_roots.borrow_mut() = Some(roots);
+    }
+
+    /// The window at `peer`, as a log line names it.
+    fn window_text(&self, peer: PeerId) -> String {
+        match self.links.borrow().get(&peer) {
+            Some(state) => format!("window {}", state.name.text()),
+            None => format!("the window of {peer:?}"),
+        }
+    }
+
+    /// Sends what the window holds for the link to `peer`, if it is up; a send refused for its size is logged.
+    fn send(&self, peer: PeerId, msg: Msg) {
         let kind = msg.kind();
-        if let Err(err) = self.try_send(msg) {
-            eprintln!("[link] {kind} could not be sent to window 2: {err}");
+        if let Err(err) = self.try_send(peer, msg) {
+            eprintln!("[link] {kind} could not be sent to {}: {err}", self.window_text(peer));
         }
     }
 
     /// [`send`](Self::send), with the refusal returned. Nothing is sent, and `Ok` comes back, while unlinked.
-    fn try_send(&self, msg: Msg) -> Result<(), LinkError> {
-        let link = self.link.borrow().clone();
+    fn try_send(&self, peer: PeerId, msg: Msg) -> Result<(), LinkError> {
+        let link = self.links.borrow().get(&peer).map(|state| state.link.clone());
         match link.filter(LinkDriver::linked) {
             Some(link) => link.send(msg, Vec::new()),
             None => Ok(()),
         }
     }
 
-    /// A draft edit of window 2's tab ended: the tab hears how. A draft too large to hand back still ends the
-    /// tab's edit, with the reason, so its next `Ctrl+g` works.
-    fn draft_back(&self, tab: u64, session: Option<String>, text: String, end: DraftEnd) {
+    /// A draft edit of a tab of the window at `peer` ended: the tab hears how. A draft too large to hand back still
+    /// ends the tab's edit, with the reason, so its next `Ctrl+g` works.
+    fn draft_back(&self, peer: PeerId, tab: u64, session: Option<String>, text: String, end: DraftEnd) {
         let source = self.token.borrow().clone();
         let token = source.and_then(|token| token());
-        let refused = match self.try_send(Msg::DraftBack {
-            tab,
-            session: session.clone(),
-            text,
-            end,
-            token: token.clone(),
-        }) {
+        let refused = match self.try_send(
+            peer,
+            Msg::DraftBack {
+                tab,
+                session: session.clone(),
+                text,
+                end,
+                token: token.clone(),
+            },
+        ) {
             Ok(()) => return,
             Err(err) => err,
         };
-        eprintln!("[scratch] the draft of window 2's tab {tab} could not be handed back: {refused}");
-        self.send(Msg::DraftBack {
-            tab,
-            session,
-            text: String::new(),
-            end: DraftEnd::Failed {
-                why: format!("the edited draft could not be handed back ({refused}); the tab keeps its draft"),
+        let window = self.window_text(peer);
+        eprintln!("[scratch] the draft of {window}'s tab {tab} could not be handed back: {refused}");
+        self.send(
+            peer,
+            Msg::DraftBack {
+                tab,
+                session,
+                text: String::new(),
+                end: DraftEnd::Failed {
+                    why: format!("the edited draft could not be handed back ({refused}); the tab keeps its draft"),
+                },
+                token,
             },
-            token,
-        });
+        );
+    }
+
+    /// Tells each link what `told` finds it has not heard of one kind, which goes to none that has.
+    fn tell(&self, told: fn(&FeedForward, &mut Told) -> Option<Msg>) {
+        let out: Vec<(PeerId, Msg)> = {
+            let feeds = self.feeds.borrow();
+            let mut links = self.links.borrow_mut();
+            links
+                .iter_mut()
+                .filter_map(|(peer, state)| Some((*peer, told(&feeds, &mut state.told)?)))
+                .collect()
+        };
+        for (peer, msg) in out {
+            self.send(peer, msg);
+        }
     }
 
     pub fn context_changed(&self, context: Option<&EditorContext>) {
-        let msg = self.feeds.borrow_mut().context(context);
-        if let Some(msg) = msg {
-            self.send(msg);
-        }
+        self.feeds.borrow_mut().context(context);
+        self.tell(FeedForward::context_msg);
     }
 
     pub fn theme_changed(&self, payload: &NvimThemePayload) {
-        let msg = self.feeds.borrow_mut().theme(payload);
-        if let Some(msg) = msg {
-            self.send(msg);
-        }
+        self.feeds.borrow_mut().theme(payload);
+        self.tell(FeedForward::theme_msg);
     }
 
     pub fn cell_height_changed(&self, height: f32) {
-        let msg = self.feeds.borrow_mut().cell_height(height);
-        if let Some(msg) = msg {
-            self.send(msg);
-        }
+        self.feeds.borrow_mut().cell_height(height);
+        self.tell(FeedForward::theme_msg);
     }
 
     pub fn keys_changed(&self, report: &NvimReport) {
-        let msg = self.feeds.borrow_mut().keys(report);
-        if let Some(msg) = msg {
-            self.send(msg);
-        }
+        self.feeds.borrow_mut().keys(report);
+        self.tell(FeedForward::keys_msg);
     }
 
-    /// A link to window 2 is up: its operations and requests are taken from it, and it is told the feeds.
-    pub fn linked(&self, link: &LinkDriver) {
-        *self.link.borrow_mut() = Some(link.clone());
+    /// A link to the window `name` is up: its operations and requests are taken from it, and it is told the feeds.
+    /// Links already up hear nothing of it.
+    pub fn linked(&self, peer: PeerId, name: WindowName, link: &LinkDriver) {
+        // A page window holds its plugin's page from its first message on. A Lua panel's window has no plugin here.
+        if let WindowName::Page(id) = &name {
+            let roots = self.page_roots.borrow().as_ref().and_then(|roots| roots(id));
+            if roots.is_some() {
+                self.set_plugin_in_window(id, Some(peer), roots);
+            }
+        }
         let me = self.me.clone();
         link.on("editor_op", move |_, msg, _| {
             if let (Some(me), Msg::EditorOp { id, op }) = (me.upgrade(), msg) {
-                me.op(id, op);
+                me.op(peer, id, op);
             }
         });
         let me = self.me.clone();
         link.on("editor", move |_, msg, _| {
             if let (Some(me), Msg::Editor { request, token }) = (me.upgrade(), msg) {
-                if let Err(why) = me.request(request, token) {
-                    eprintln!("[link] window 2's editor request was refused: {why}");
+                if let Err(why) = me.request(peer, request, token) {
+                    eprintln!("[link] {}'s editor request was refused: {why}", me.window_text(peer));
                 }
             }
         });
-        let told = self.feeds.borrow_mut().new_link();
-        for msg in told {
-            self.send(msg);
+        let mut told = Told::default();
+        let heard = self.feeds.borrow().new_link(&mut told);
+        self.links.borrow_mut().insert(
+            peer,
+            LinkState {
+                link: link.clone(),
+                name,
+                told,
+            },
+        );
+        for msg in heard {
+            self.send(peer, msg);
         }
     }
 
-    /// The link ended: what window 2 held is forgotten, and its operations still out have nowhere to be answered.
-    /// A draft still out in nvim stays: once written it goes to its tab if that tab is here by then.
-    pub fn unlinked(&self) {
-        self.link.borrow_mut().take();
-        self.feeds.borrow_mut().unlinked();
-        self.window2_plugins.borrow_mut().clear();
-        self.inflight.borrow_mut().clear();
+    /// The link to `peer` ended: what its window held is forgotten, and its operations still out have nowhere to be
+    /// answered. The other links carry on as they were. A draft still out in nvim stays: once written it goes to its
+    /// tab if that tab is here by then.
+    pub fn unlinked(&self, peer: PeerId) {
+        self.links.borrow_mut().remove(&peer);
+        self.plugins.borrow_mut().retain(|_, page| page.peer != peer);
+        self.inflight.borrow_mut().retain(|(asking, ..)| *asking != peer);
     }
 
-    /// The owners whose follow lines go to window 2.
+    /// The owners whose follow lines go to another window.
     pub fn follow_owners(&self) -> BTreeSet<String> {
-        self.window2_plugins.borrow().keys().cloned().collect()
+        self.plugins.borrow().keys().cloned().collect()
     }
 
-    /// `batch` with the lines for window 2's pages sent to it; the rest is this window's.
+    /// `batch` with the lines for the pages other windows hold sent to them; the rest is this window's.
     pub fn route_follow(&self, batch: FollowBatch) -> FollowBatch {
         let owners = self.follow_owners();
         if owners.is_empty() {
@@ -791,23 +848,27 @@ impl Window1Editor {
         }
         let (here, there) = split_follow(batch, &owners);
         for (owner, line) in there {
-            self.send(Msg::Follow { owner, line });
+            let holder = self.plugins.borrow().get(&owner).map(|page| page.peer);
+            if let Some(peer) = holder {
+                self.send(peer, Msg::Follow { owner, line });
+            }
         }
         here
     }
 
-    fn reply(&self, id: u64, result: ReplyResult) {
-        self.send(Msg::EditorReply { id, result });
+    fn reply(&self, peer: PeerId, id: u64, result: ReplyResult) {
+        self.send(peer, Msg::EditorReply { id, result });
     }
 
-    fn op(&self, id: u64, op: EditorOp) {
+    fn op(&self, peer: PeerId, id: u64, op: EditorOp) {
         let rpc: Rc<dyn EditorRpc> = self.rpc.borrow().clone().unwrap_or_else(|| Rc::new(super::NoEditor));
         let name = op.name();
-        let dispatched = dispatch(id, op, &Ctx(self), &*rpc);
+        let dispatched = dispatch(id, op, &Ctx { one: self, peer }, &*rpc);
         match dispatched {
             Err(refused) => {
-                println!("[link] window 2's {name} was refused: {refused}");
+                println!("[link] {}'s {name} was refused: {refused}", self.window_text(peer));
                 self.reply(
+                    peer,
                     id,
                     ReplyResult::Err {
                         why: refused.to_string(),
@@ -815,25 +876,25 @@ impl Window1Editor {
                 );
             }
             Ok(Dispatch::Rpc(pending)) => {
-                self.inflight.borrow_mut().push((id, pending));
+                self.inflight.borrow_mut().push((peer, id, pending));
                 self.poll_soon();
             }
             Ok(Dispatch::Overlay(calls)) => {
                 let hook = self.overlay.borrow().clone();
                 let result = match hook {
-                    Some(hook) => hook(id, calls),
+                    Some(hook) => hook(peer, id, calls),
                     None => Some(ReplyResult::Err {
                         why: "this window's review driver takes no calls from the other window".into(),
                     }),
                 };
                 if let Some(result) = result {
-                    self.reply(id, result);
+                    self.reply(peer, id, result);
                 }
             }
         }
     }
 
-    fn request(&self, request: EditorRequest, token: Option<String>) -> Result<(), String> {
+    fn request(&self, peer: PeerId, request: EditorRequest, token: Option<String>) -> Result<(), String> {
         let drive = self
             .drive
             .borrow()
@@ -876,14 +937,20 @@ impl Window1Editor {
                 });
                 match started {
                     Ok(edit) => {
-                        self.drafts.borrow_mut().push(OutDraft { edit, tab, session });
+                        self.drafts.borrow_mut().push(OutDraft {
+                            edit,
+                            peer,
+                            tab,
+                            session,
+                        });
                         self.poll_soon();
                         Ok(())
                     }
                     Err(why) => {
                         // Window 2's tab is waiting for its edit to end: it hears why, keeps its draft, and its
                         // next `Ctrl+g` works.
-                        self.draft_back(tab, session, String::new(), DraftEnd::Failed { why: why.clone() });
+                        let end = DraftEnd::Failed { why: why.clone() };
+                        self.draft_back(peer, tab, session, String::new(), end);
                         Err(why)
                     }
                 }
@@ -931,10 +998,10 @@ impl Window1Editor {
     /// Answers every operation whose editor call came back and routes every draft written back. Whether anything
     /// is still out.
     pub fn poll(&self) -> bool {
-        let answered: Vec<(u64, ReplyResult)> = {
+        let answered: Vec<(PeerId, u64, ReplyResult)> = {
             let mut inflight = self.inflight.borrow_mut();
             let mut answered = Vec::new();
-            inflight.retain(|(id, pending)| match pending.try_take() {
+            inflight.retain(|(peer, id, pending)| match pending.try_take() {
                 None => true,
                 Some(reply) => {
                     let result = match reply {
@@ -944,14 +1011,14 @@ impl Window1Editor {
                         },
                         Err(err) => ReplyResult::Err { why: err.to_string() },
                     };
-                    answered.push((*id, result));
+                    answered.push((*peer, *id, result));
                     false
                 }
             });
             answered
         };
-        for (id, result) in answered {
-            self.reply(id, result);
+        for (peer, id, result) in answered {
+            self.reply(peer, id, result);
         }
         let done: Vec<(OutDraft, EditDone)> = {
             let mut drafts = self.drafts.borrow_mut();
@@ -973,7 +1040,7 @@ impl Window1Editor {
     }
 
     /// A draft edit ended: the tab's holder now hears how, found by its session. A tab that came to this window
-    /// meanwhile takes it here; otherwise window 2 does (a tab with no session yet has not moved).
+    /// meanwhile takes it here; otherwise the window that asked does (a tab with no session yet has not moved).
     fn draft_written(&self, draft: OutDraft, result: EditDone) {
         let here = draft
             .session
@@ -987,9 +1054,15 @@ impl Window1Editor {
             }
             return;
         }
-        if self.link.borrow().as_ref().is_none_or(|link| !link.linked()) {
+        let gone = self
+            .links
+            .borrow()
+            .get(&draft.peer)
+            .is_none_or(|state| !state.link.linked());
+        if gone {
+            let window = self.window_text(draft.peer);
             eprintln!(
-                "[scratch] a draft written for window 2's tab {} is lost: window 2 is gone",
+                "[scratch] a draft written for {window}'s tab {} is lost: that window is gone",
                 draft.tab
             );
             return;
@@ -999,36 +1072,54 @@ impl Window1Editor {
             EditDone::Discarded => (String::new(), DraftEnd::Discarded),
             EditDone::Failed(why) => (String::new(), DraftEnd::Failed { why }),
         };
-        self.draft_back(draft.tab, draft.session, text, end);
+        self.draft_back(draft.peer, draft.tab, draft.session, text, end);
     }
 }
 
-/// What `dispatch` asks window 1, answered from window 1's own records.
-struct Ctx<'a>(&'a Window1Editor);
+/// What `dispatch` asks window 1 about one operation, answered from window 1's own records for the window at `peer`,
+/// whose operation it is.
+struct Ctx<'a> {
+    one: &'a Window1Editor,
+    peer: PeerId,
+}
+
+impl Ctx<'_> {
+    /// The window that holds `session`. A session one of this window's tabs holds is no other window's; any other
+    /// that a window names is taken as one of its own (a chat started there): this window keeps no record of which
+    /// sessions the others hold, so the one refusal it can make is for a session it holds itself.
+    fn session_window(&self, session: &str) -> Option<PeerId> {
+        (!(self.one.own_session.borrow())(session)).then_some(self.peer)
+    }
+}
 
 impl OpContext for Ctx<'_> {
     fn project_root(&self) -> &Path {
-        &self.0.root
+        &self.one.root
     }
 
-    /// A session one of this window's tabs holds is never window 2's; any other that window 2 names is taken as
-    /// one of its own (a chat started there): this window keeps no record of which sessions window 2 holds, so
-    /// the one refusal it can make is for a session it holds itself.
+    fn peer(&self) -> PeerId {
+        self.peer
+    }
+
     fn session_in_window2(&self, session: &str) -> bool {
-        !(self.0.own_session.borrow())(session)
+        self.session_window(session) == Some(self.peer)
     }
 
     fn plugin_follow(&self, plugin: &str) -> Option<eitri_core::window_link::editor_ops::FollowConfig> {
-        self.0.plugin_follows.borrow().get(plugin).cloned()
+        self.one.plugin_follows.borrow().get(plugin).cloned()
     }
 
+    /// The roots only for the window that holds the page: a page's calls come from the page.
     fn plugin_roots_in_window2(&self, plugin: &str) -> Option<BTreeMap<String, PathBuf>> {
-        self.0.window2_plugins.borrow().get(plugin).cloned()
+        let plugins = self.one.plugins.borrow();
+        let page = plugins.get(plugin)?;
+        (page.peer == self.peer).then(|| page.roots.clone())
     }
 
+    /// What the review driver drew for the asking window, and for no other.
     fn drawn_for_window2(&self) -> Vec<PathBuf> {
-        let drawn = self.0.drawn_for_window2.borrow().clone();
-        drawn.map(|drawn| drawn()).unwrap_or_default()
+        let drawn = self.one.drawn_for.borrow().clone();
+        drawn.map(|drawn| drawn(self.peer)).unwrap_or_default()
     }
 }
 
@@ -1649,6 +1740,7 @@ fn write_marker(done: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linked_window::spawn::SECOND_PEER;
     use crate::linked_window::tests::Scratch;
     use eitri_core::editor_context::Selection;
     use eitri_core::window_link::fdpass;
@@ -1766,7 +1858,7 @@ mod tests {
         let one = Window1Editor::new(&root, Some(base.join("scratch-1")), steps.repeat());
         let two = Window2Editor::new(&root, Some(base.join("scratch-2")), steps.repeat());
         let (one_link, two_link) = linked_pair();
-        one.linked(&one_link);
+        one.linked(SECOND_PEER, WindowName::Second, &one_link);
         two.linked(&two_link);
         Windows {
             _dir: dir,
@@ -1877,9 +1969,9 @@ mod tests {
                 later_themes.borrow_mut().push(p.options.background)
             }));
         }
-        w.one.unlinked();
+        w.one.unlinked(SECOND_PEER);
         later.linked(&two_link);
-        w.one.linked(&one_link);
+        w.one.linked(SECOND_PEER, WindowName::Second, &one_link);
         assert!(settle(&one_link, &two_link, &w.steps, || !later_themes
             .borrow()
             .is_empty()));
@@ -1993,8 +2085,11 @@ mod tests {
         });
         w.one.set_rpc(rpc.clone());
         // Give window 1 a valid holding: a refusal must come from the missing operation itself.
-        w.one
-            .set_plugin_in_window2("demo", Some(BTreeMap::from([("work".into(), w.root.join("plugin"))])));
+        w.one.set_plugin_in_window(
+            "demo",
+            Some(SECOND_PEER),
+            Some(BTreeMap::from([("work".into(), w.root.join("plugin"))])),
+        );
         let (host, page) = window_two_plugin(&w);
         let root = w.root.join("plugin");
         let path = root.join("a.rs");
@@ -2085,8 +2180,11 @@ mod tests {
     fn a_plugins_fixed_calls_in_window_2_are_typed_and_answered_by_window_1() {
         use eitri_core::plugin::{editor, roots::Roots};
         let w = windows("plugin-ops");
-        w.one
-            .set_plugin_in_window2("markdown", Some(BTreeMap::from([("work".into(), w.root.clone())])));
+        w.one.set_plugin_in_window(
+            "markdown",
+            Some(SECOND_PEER),
+            Some(BTreeMap::from([("work".into(), w.root.clone())])),
+        );
         w.one.set_plugin_follow(
             "markdown",
             eitri_core::window_link::editor_ops::FollowConfig {
@@ -2218,7 +2316,7 @@ mod tests {
         assert_eq!(got.into_inner(), Some(Ok(rmpv::Value::Nil)));
 
         // A review call goes to window 1's review driver, which answers it.
-        w.one.set_overlay(Rc::new(|_: u64, calls: Vec<OverlayCall>| {
+        w.one.set_overlay(Rc::new(|_: PeerId, _: u64, calls: Vec<OverlayCall>| {
             Some(ReplyResult::Ok {
                 value: Value::from(calls.len()),
             })
@@ -2278,17 +2376,20 @@ mod tests {
     type Driven = Rc<RefCell<Vec<(Option<ScratchAsk>, Option<String>)>>>;
 
     fn recording_drive(w: &Windows) -> Driven {
+        drive_recorded(&w.one)
+    }
+
+    fn drive_recorded(one: &Window1Editor) -> Driven {
         let driven: Driven = Rc::default();
         let record = driven.clone();
-        w.one
-            .set_drive(Rc::new(move |act: EditorAct<'_>, token: Option<String>| {
-                let ask = match act {
-                    EditorAct::Request(request) => Some(read_request(request).unwrap()),
-                    EditorAct::Focus => None,
-                };
-                record.borrow_mut().push((ask, token));
-                Ok(())
-            }));
+        one.set_drive(Rc::new(move |act: EditorAct<'_>, token: Option<String>| {
+            let ask = match act {
+                EditorAct::Request(request) => Some(read_request(request).unwrap()),
+                EditorAct::Focus => None,
+            };
+            record.borrow_mut().push((ask, token));
+            Ok(())
+        }));
         driven
     }
 
@@ -2802,8 +2903,9 @@ mod tests {
         // No page in window 2: every line is window 1's.
         assert_eq!(w.one.route_follow(both.clone()), both);
 
-        w.one.set_plugin_in_window2(
+        w.one.set_plugin_in_window(
             "markdown",
+            Some(SECOND_PEER),
             Some(BTreeMap::from([("work".into(), w.root.join("work/markdown"))])),
         );
         let here = w.one.route_follow(both);
@@ -2825,7 +2927,7 @@ mod tests {
             "and its commands, in their order"
         );
         drop(lines);
-        w.one.set_plugin_in_window2("markdown", None);
+        w.one.set_plugin_in_window("markdown", None, None);
         let back = batch("markdown");
         assert_eq!(
             w.one.route_follow(back.clone()),
@@ -2836,6 +2938,468 @@ mod tests {
             follow_batch("snotra", &view_line(&view("markdown", 1, ViewCause::User, None))).is_none(),
             "a line naming another owner than its message is dropped"
         );
+    }
+
+    const A: PeerId = PeerId(16);
+    const B: PeerId = PeerId(17);
+
+    /// One window at the far end of a link of window 1's, keeping everything window 1 tells it.
+    struct Linked {
+        ours: LinkDriver,
+        far: LinkDriver,
+        heard: Rc<RefCell<Vec<Msg>>>,
+    }
+
+    impl Linked {
+        fn heard(&self) -> Vec<Msg> {
+            self.heard.borrow().clone()
+        }
+
+        fn kinds(&self) -> Vec<&'static str> {
+            self.heard.borrow().iter().map(Msg::kind).collect()
+        }
+
+        fn count(&self) -> usize {
+            self.heard.borrow().len()
+        }
+
+        fn send(&self, msg: Msg) {
+            self.far.send(msg, Vec::new()).unwrap();
+        }
+    }
+
+    /// Window 1 in a project with `src/a.rs`, with no window linked yet.
+    struct Group {
+        _dir: Scratch,
+        root: PathBuf,
+        steps: Steps,
+        one: Rc<Window1Editor>,
+    }
+
+    fn group(label: &str) -> Group {
+        let dir = Scratch::new(label);
+        let base = std::fs::canonicalize(&dir.1).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::create_dir_all(base.join("scratch-1")).unwrap();
+        let steps = Steps::default();
+        let one = Window1Editor::new(&root, Some(base.join("scratch-1")), steps.repeat());
+        Group {
+            _dir: dir,
+            root,
+            steps,
+            one,
+        }
+    }
+
+    impl Group {
+        fn link(&self, peer: PeerId, name: WindowName) -> Linked {
+            let (ours, far) = linked_pair();
+            let heard: Rc<RefCell<Vec<Msg>>> = Rc::default();
+            for kind in ["context", "theme", "keys", "follow", "draft_back", "editor_reply"] {
+                let heard = heard.clone();
+                far.on(kind, move |_, msg, _| heard.borrow_mut().push(msg));
+            }
+            self.one.linked(peer, name, &ours);
+            Linked { ours, far, heard }
+        }
+
+        fn step(&self, windows: &[&Linked]) {
+            for window in windows {
+                window.ours.pump();
+                window.far.pump();
+            }
+            self.steps.run();
+        }
+
+        fn settle(&self, windows: &[&Linked], done: impl Fn() -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                self.step(windows);
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        /// Runs everything a while, for checking that nothing more arrives.
+        fn pump_a_while(&self, windows: &[&Linked]) {
+            for _ in 0..20 {
+                self.step(windows);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn roots(&self) -> BTreeMap<String, PathBuf> {
+            BTreeMap::from([("work".into(), self.root.clone())])
+        }
+    }
+
+    /// Holds every editor call's answer for the test to give.
+    #[derive(Default)]
+    struct Holding(RefCell<Vec<Answer>>);
+
+    impl EditorRpc for Holding {
+        fn exec_lua(&self, _code: &'static str, _args: Vec<rmpv::Value>) -> Pending {
+            let (answer, pending) = Pending::pair();
+            self.0.borrow_mut().push(answer);
+            pending
+        }
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    fn buffer_state(id: u64, path: &str) -> Msg {
+        Msg::EditorOp {
+            id,
+            op: EditorOp::BufferState {
+                path: path.into(),
+                lines: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_context_change_reaches_every_linked_window_once() {
+        let g = group("every-window");
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        g.one.context_changed(Some(&context("/p/a.rs")));
+        assert!(g.settle(&[&a, &b], || a.count() == 1 && b.count() == 1));
+
+        g.one.context_changed(Some(&context("/p/a.rs")));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(a.kinds(), ["context"], "an unchanged context is not told again");
+        assert_eq!(b.kinds(), ["context"], "an unchanged context is not told again");
+    }
+
+    #[test]
+    fn a_new_link_is_told_everything_and_an_old_one_only_changes() {
+        let g = group("late-link");
+        let a = g.link(A, WindowName::Chat(1));
+        g.one.context_changed(Some(&context("/p/a.rs")));
+        g.one.theme_changed(&theme("dark"));
+        g.one.keys_changed(&keys(500));
+        assert!(g.settle(&[&a], || a.count() == 3));
+
+        let b = g.link(B, WindowName::Page("markdown".into()));
+        assert!(g.settle(&[&a, &b], || b.count() == 3));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(b.kinds(), ["context", "theme", "keys"]);
+        assert_eq!(a.count(), 3, "a window that heard it all hears nothing of the new link");
+
+        g.one.theme_changed(&theme("light"));
+        assert!(g.settle(&[&a, &b], || a.count() == 4 && b.count() == 4));
+        assert_eq!(a.heard()[3], b.heard()[3], "a change reaches both alike");
+    }
+
+    #[test]
+    fn an_editor_reply_goes_back_on_the_link_the_op_came_from() {
+        let g = group("replies");
+        let rpc = Rc::new(Holding::default());
+        g.one.set_rpc(rpc.clone());
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        // Each window numbers its own operations, so the same id comes from both, and both are out at once.
+        a.send(buffer_state(7, "src/a.rs"));
+        assert!(g.settle(&[&a, &b], || rpc.0.borrow().len() == 1));
+        b.send(buffer_state(7, "src/a.rs"));
+        assert!(g.settle(&[&a, &b], || rpc.0.borrow().len() == 2));
+
+        let answer = |value: &str| rpc.0.borrow_mut().pop().unwrap().send(Ok(rmpv::Value::from(value)));
+        answer("for b");
+        assert!(g.settle(&[&a, &b], || b.count() == 1));
+        answer("for a");
+        assert!(g.settle(&[&a, &b], || a.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        let reply = |value: &str| Msg::EditorReply {
+            id: 7,
+            result: ReplyResult::Ok { value: json!(value) },
+        };
+        assert_eq!(a.heard(), [reply("for a")]);
+        assert_eq!(b.heard(), [reply("for b")]);
+
+        // A refusal, which no editor call stands behind, goes the same way.
+        b.send(buffer_state(8, "../outside"));
+        assert!(g.settle(&[&a, &b], || b.count() == 2));
+        g.pump_a_while(&[&a, &b]);
+        assert!(matches!(
+            &b.heard()[1],
+            Msg::EditorReply {
+                id: 8,
+                result: ReplyResult::Err { .. }
+            }
+        ));
+        assert_eq!(a.count(), 1, "the other window hears nothing of it");
+    }
+
+    #[test]
+    fn an_operation_out_when_its_link_ends_leaves_the_other_windows_to_be_answered() {
+        let g = group("reply-after-end");
+        let rpc = Rc::new(Holding::default());
+        g.one.set_rpc(rpc.clone());
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        a.send(buffer_state(1, "src/a.rs"));
+        b.send(buffer_state(1, "src/a.rs"));
+        assert!(g.settle(&[&a, &b], || rpc.0.borrow().len() == 2));
+
+        g.one.unlinked(A);
+        for answer in rpc.0.borrow_mut().drain(..) {
+            answer.send(Ok(rmpv::Value::Nil));
+        }
+        assert!(g.settle(&[&a, &b], || b.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(a.count(), 0, "the ended link has nowhere to be answered");
+    }
+
+    #[test]
+    fn a_draft_ends_in_the_window_that_holds_its_tab() {
+        let g = group("draft-window");
+        let driven = drive_recorded(&g.one);
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        // A tab's number is its own window's, so both windows can have a tab 4 with a draft out.
+        for (at, window) in [&a, &b].into_iter().enumerate() {
+            window.send(Msg::Editor {
+                request: EditorRequest::Scratch {
+                    tab: 4,
+                    session: None,
+                    text: "a draft".into(),
+                },
+                token: None,
+            });
+            assert!(g.settle(&[&a, &b], || driven.borrow().len() == at + 1));
+        }
+        let ask = |at: usize| driven.borrow()[at].0.clone().unwrap();
+        let back = |text: &str| Msg::DraftBack {
+            tab: 4,
+            session: None,
+            text: text.into(),
+            end: DraftEnd::Written,
+            token: None,
+        };
+
+        nvim_writes(&ask(1), "edited for b");
+        assert!(g.settle(&[&a, &b], || b.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(b.heard(), [back("edited for b")]);
+        assert_eq!(a.count(), 0, "the window that asked hears, and no other");
+
+        nvim_writes(&ask(0), "edited for a");
+        assert!(g.settle(&[&a, &b], || a.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(a.heard(), [back("edited for a")]);
+        assert_eq!(b.count(), 1);
+    }
+
+    #[test]
+    fn a_follow_line_goes_to_the_window_holding_the_page() {
+        let g = group("follow-window");
+        let (a, b) = (
+            g.link(A, WindowName::Chat(1)),
+            g.link(B, WindowName::Page("markdown".into())),
+        );
+        let batch = |seq: u64| FollowBatch {
+            views: vec![view("markdown", seq, ViewCause::User, None)],
+            views_received: 1,
+            ..FollowBatch::default()
+        };
+        let line = |seq: u64| Msg::Follow {
+            owner: "markdown".into(),
+            line: view_line(&view("markdown", seq, ViewCause::User, None)),
+        };
+
+        g.one.set_plugin_in_window("markdown", Some(B), Some(g.roots()));
+        assert!(g.one.route_follow(batch(1)).views.is_empty());
+        assert!(g.settle(&[&a, &b], || b.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(b.heard(), [line(1)]);
+        assert_eq!(a.count(), 0, "only the page's window hears its lines");
+
+        // The page moves: the next line follows it.
+        g.one.set_plugin_in_window("markdown", Some(A), Some(g.roots()));
+        assert!(g.one.route_follow(batch(2)).views.is_empty());
+        assert!(g.settle(&[&a, &b], || a.count() == 1));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(a.heard(), [line(2)]);
+        assert_eq!(b.count(), 1);
+
+        g.one.set_plugin_in_window("markdown", None, None);
+        assert_eq!(
+            g.one.route_follow(batch(3)),
+            batch(3),
+            "back in this window, its lines stay here"
+        );
+    }
+
+    #[test]
+    fn a_page_window_holds_its_plugin_once_it_links_and_a_lua_panels_holds_none() {
+        let g = group("page-window-links");
+        let rpc = Rc::new(Answering {
+            calls: RefCell::default(),
+            answer: rmpv::Value::Nil,
+        });
+        g.one.set_rpc(rpc.clone());
+        let roots = g.roots();
+        g.one
+            .set_page_roots(Rc::new(move |id| (id == "markdown").then(|| roots.clone())));
+        let line = || FollowBatch {
+            views: vec![view("markdown", 1, ViewCause::User, None)],
+            views_received: 1,
+            ..FollowBatch::default()
+        };
+        assert_eq!(g.one.route_follow(line()), line(), "no window holds it yet");
+
+        let (page, panel) = (
+            g.link(A, WindowName::Page("markdown".into())),
+            g.link(B, WindowName::Page("preview_panel".into())),
+        );
+        assert_eq!(g.one.follow_owners(), BTreeSet::from(["markdown".to_string()]));
+        assert!(g.one.route_follow(line()).views.is_empty());
+        assert!(g.settle(&[&page, &panel], || page.count() == 1));
+        assert!(matches!(&page.heard()[0], Msg::Follow { owner, .. } if owner == "markdown"));
+
+        page.send(Msg::EditorOp {
+            id: 1,
+            op: EditorOp::PluginAssistClear {
+                plugin: "markdown".into(),
+            },
+        });
+        assert!(g.settle(&[&page, &panel], || page.count() == 2));
+        assert!(
+            matches!(
+                &page.heard()[1],
+                Msg::EditorReply {
+                    result: ReplyResult::Ok { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            page.heard()
+        );
+
+        g.one.unlinked(A);
+        assert_eq!(g.one.route_follow(line()), line(), "the page ended with its window");
+        assert_eq!(panel.count(), 0);
+    }
+
+    #[test]
+    fn a_page_a_window_will_hold_is_its_before_the_link_and_ends_with_it() {
+        let g = group("held-before-link");
+        let line = || FollowBatch {
+            views: vec![view("markdown", 1, ViewCause::User, None)],
+            views_received: 1,
+            ..FollowBatch::default()
+        };
+        g.one.set_plugin_in_window("markdown", Some(A), Some(g.roots()));
+        g.one.set_plugin_in_window("snotra", Some(B), Some(g.roots()));
+        assert!(
+            g.one.route_follow(line()).views.is_empty(),
+            "a page restored away is not this window's, though its window has not linked yet"
+        );
+
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        assert!(g.one.route_follow(line()).views.is_empty());
+        assert!(g.settle(&[&a, &b], || a.count() == 1));
+
+        g.one.unlinked(A);
+        assert_eq!(
+            g.one.route_follow(line()),
+            line(),
+            "a window that ended holds no page any more"
+        );
+        assert_eq!(
+            g.one.follow_owners(),
+            BTreeSet::from(["snotra".to_string()]),
+            "and the other window keeps the page it holds"
+        );
+    }
+
+    #[test]
+    fn a_window_reaches_the_editor_only_for_the_page_it_holds() {
+        let g = group("page-window");
+        let rpc = Rc::new(Answering {
+            calls: RefCell::default(),
+            answer: rmpv::Value::Nil,
+        });
+        g.one.set_rpc(rpc.clone());
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        g.one.set_plugin_in_window("markdown", Some(B), Some(g.roots()));
+        let clear = |id: u64| Msg::EditorOp {
+            id,
+            op: EditorOp::PluginAssistClear {
+                plugin: "markdown".into(),
+            },
+        };
+
+        a.send(clear(1));
+        assert!(g.settle(&[&a, &b], || a.count() == 1));
+        assert!(
+            matches!(
+                &a.heard()[0],
+                Msg::EditorReply {
+                    result: ReplyResult::Err { .. },
+                    ..
+                }
+            ),
+            "a window is refused a page another window holds: {:?}",
+            a.heard()
+        );
+        assert!(rpc.calls.borrow().is_empty());
+
+        b.send(clear(1));
+        assert!(g.settle(&[&a, &b], || b.count() == 1));
+        assert_eq!(rpc.calls.borrow().len(), 1, "the holder's own call reaches the editor");
+    }
+
+    #[test]
+    fn a_review_clear_from_a_window_the_driver_draws_nothing_for_clears_nothing() {
+        let g = group("drawn-window");
+        let path = g.root.join("src/a.rs");
+        g.one.set_drawn_for(Rc::new({
+            let path = path.clone();
+            move |peer: PeerId| {
+                if peer == SECOND_PEER {
+                    vec![path.clone()]
+                } else {
+                    Vec::new()
+                }
+            }
+        }));
+        let cleared: Rc<RefCell<Vec<usize>>> = Rc::default();
+        {
+            let cleared = cleared.clone();
+            g.one
+                .set_overlay(Rc::new(move |_: PeerId, _: u64, calls: Vec<OverlayCall>| {
+                    cleared.borrow_mut().push(calls.len());
+                    Some(ReplyResult::Ok { value: Value::Null })
+                }));
+        }
+        let (two, a) = (g.link(SECOND_PEER, WindowName::Second), g.link(A, WindowName::Chat(1)));
+        let clear = || Msg::EditorOp {
+            id: 1,
+            op: EditorOp::ReviewClearMine {},
+        };
+        two.send(clear());
+        assert!(g.settle(&[&two, &a], || two.count() == 1));
+        a.send(clear());
+        assert!(g.settle(&[&two, &a], || a.count() == 1));
+        assert_eq!(*cleared.borrow(), [1, 0], "window 2 clears what was drawn for it");
+    }
+
+    #[test]
+    fn unlinking_one_window_keeps_the_others_feeds() {
+        let g = group("one-link-ends");
+        let (a, b) = (g.link(A, WindowName::Chat(1)), g.link(B, WindowName::Chat(2)));
+        g.one.theme_changed(&theme("dark"));
+        assert!(g.settle(&[&a, &b], || a.count() == 1 && b.count() == 1));
+
+        g.one.unlinked(A);
+        g.one.theme_changed(&theme("light"));
+        assert!(g.settle(&[&a, &b], || b.count() == 2));
+        g.pump_a_while(&[&a, &b]);
+        assert_eq!(a.count(), 1, "the ended link hears nothing more");
     }
 
     #[test]

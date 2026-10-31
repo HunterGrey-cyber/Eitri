@@ -117,8 +117,8 @@ impl QuitWorld for Rc<Fake> {
     fn editor_ended_text(&self) -> String {
         crate::wm::feedback::editor_ended_text(&crate::keymap::Keymap::defaults())
     }
-    fn show_chat(&mut self) -> Result<(), LayoutError> {
-        self.did("show_chat");
+    fn show_stand_in(&mut self) -> Result<(), LayoutError> {
+        self.did("show_stand_in");
         self.editor_last_visible.set(false);
         Ok(())
     }
@@ -493,7 +493,7 @@ fn a_declined_close_after_nvim_exited_retires_the_editor() {
         fake.log(),
         [
             "end_editor refused".to_string(),
-            "show_chat".to_string(),
+            "show_stand_in".to_string(),
             "end_editor".to_string(),
             format!(
                 "toast: {}",

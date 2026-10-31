@@ -1304,12 +1304,17 @@ pub struct TabSet {
     /// Prompts held until the presence says they may go out (a linked window), by tab: at most one
     /// per tab ([`TabSet::poll_turn_sends`]).
     pending_sends: BTreeMap<u64, moving::PendingSend>,
-    /// Whether this window is linked to another one (`TabSet::set_partner`): then a prompt waits for
-    /// its presence file before it goes out.
+    /// Whether this window is linked to another one (`TabSet::set_partner`, `TabSet::add_partner`): then a
+    /// prompt waits for its presence file before it goes out.
     linked: bool,
+    /// The partners named one by one (`TabSet::add_partner`), by pid: the window stays linked until the last goes.
+    partner_pids: BTreeSet<u32>,
     /// While linked with no turn review installed: the turns running here as the partner was last told of them,
     /// by tab, with each one's session and `CLOCK_MONOTONIC` start ([`TabSet::take_untracked_turn_edges`]).
     untracked_turns: BTreeMap<u64, (String, u64)>,
+    /// While no turn review is installed: the tabs whose delivered events held a turn's start since the partner was
+    /// last told ([`TabSet::take_untracked_turn_edges`]). A turn that started and ended in between leaves only this.
+    untracked_starts: BTreeSet<u64>,
     /// A prompt's file could not be confirmed: the partner is to be told `presence{held: false}`
     /// ([`TabSet::take_presence_false_owed`]).
     presence_false_owed: bool,
@@ -1404,7 +1409,9 @@ impl TabSet {
             starting_since: BTreeMap::new(),
             pending_sends: BTreeMap::new(),
             linked: false,
+            partner_pids: BTreeSet::new(),
             untracked_turns: BTreeMap::new(),
+            untracked_starts: BTreeSet::new(),
             presence_false_owed: false,
             moving: BTreeSet::new(),
             arrivals: BTreeMap::new(),
@@ -2049,6 +2056,12 @@ impl TabSet {
                 .saturating_add(tab.session.queue.len().try_into().unwrap_or(u32::MAX));
         }
         activity.into_iter().collect()
+    }
+
+    /// The tabs a turn runs in, each in its view.
+    pub fn turns_running(&self) -> BTreeSet<(ViewId, TabId)> {
+        let running = self.tabs.iter().filter(|tab| tab.turn_running());
+        running.map(|tab| (tab.view, tab.id)).collect()
     }
 
     /// The base view's tabs, in tab order.
@@ -2973,6 +2986,7 @@ impl TabSet {
             starting: &mut self.starting,
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
+            untracked_starts: &mut self.untracked_starts,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -3154,6 +3168,9 @@ impl TabSet {
                 Self::pump_resync_show(&mut live, &pending, turn_ended, tick, place)
             }
         };
+        if arm.untracked_start {
+            tick.untracked_starts.insert(live.id.0);
+        }
         let still = Self::pump_after_match(live.backend, live.id, review, resynced);
         Self::pump_settle(tab, arm, place, &still, tick.project_root, out);
     }
@@ -3271,6 +3288,10 @@ impl TabSet {
                 _ => {}
             }
         }
+        arm.untracked_start = review.is_none()
+            && events
+                .iter()
+                .any(|event| matches!(event, AgentDomainEvent::TurnStarted { .. }));
         // The whole batch, what the snapshot already carried included: the review has seen neither
         // part. Only enqueues.
         if let Some(review) = review {
@@ -4720,6 +4741,7 @@ impl TabSet {
                         name: tab.name.clone(),
                         mode: tab.mode,
                         view: saved_view(tab.view),
+                        window: None,
                     },
                 ))
             })
@@ -4743,6 +4765,7 @@ impl TabSet {
                 name: granted.planned.name.clone(),
                 mode: granted.mode,
                 view: granted.planned.view.and_then(saved_view),
+                window: None,
             });
         }
         if self.kind != BackendKind::Sidecar {
@@ -4764,6 +4787,7 @@ impl TabSet {
                         name: tab.name.clone(),
                         mode: tab.mode,
                         view: saved_view(tab.view),
+                        window: None,
                     },
                 ))
             })
@@ -4794,6 +4818,7 @@ impl TabSet {
                     name: granted.planned.name.clone(),
                     mode: granted.mode,
                     view: granted.planned.view.and_then(saved_view),
+                    window: None,
                 },
             ));
         }
@@ -5659,6 +5684,8 @@ struct PumpTick<'a> {
     starting_since: &'a mut BTreeMap<u64, u64>,
     /// The prompts held for the presence: their tabs stay in `starting` whatever is folded.
     held_sends: &'a BTreeMap<u64, moving::PendingSend>,
+    /// `TabSet::untracked_starts`.
+    untracked_starts: &'a mut BTreeSet<u64>,
     #[cfg(test)]
     after_drain: &'a mut Option<BackendSeam>,
     #[cfg(test)]
@@ -5697,6 +5724,8 @@ struct ArmOutcome {
     delivered: Option<(String, crate::panel_cadence::EnvelopeClass)>,
     /// The tab's turn trace saw its first text in this batch, in a tab a page shows.
     saw_first_text: bool,
+    /// The batch held a turn's start, and no turn review saw it.
+    untracked_start: bool,
 }
 
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
@@ -15793,6 +15822,7 @@ mod external_tab_tests {
                 name: None,
                 mode: SessionModeChoice::Bypass,
                 view: None,
+                window: None,
             }]
         );
         assert_eq!(others_active(&saved), Some(0));

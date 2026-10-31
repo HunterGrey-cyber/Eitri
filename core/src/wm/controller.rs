@@ -35,6 +35,7 @@ use crate::keymap::Keymap;
 use crate::layout::{Arrangement, Con, ModuleId, ModuleKeys, Size};
 use crate::lua::layout::LayoutRequest;
 use crate::tabs::ViewId;
+use crate::window_link::names::WindowName;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -138,6 +139,14 @@ impl Controller {
         }
     }
 
+    /// Holds compositor mode's first-start toast until the first-start screen is ruled out or has closed, so it never
+    /// shows over the screen; a `window.tiling` line the screen wrote drops it.
+    pub fn hold_first_toast(&mut self, win: WinId, text: String) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.first_toast = Some(text);
+        }
+    }
+
     /// What `win`'s module verbs place and kill by, from its config on; before it, no rules, no declarations and
     /// the current directory as the project root.
     pub fn set_module_setup(&mut self, win: WinId, setup: ModuleSetup) {
@@ -168,6 +177,14 @@ impl Controller {
         }
     }
 
+    /// Arms the idle that opens the module windows `win`'s start owes, when it owes any.
+    pub(super) fn arm_start_windows(&mut self, win: WinId) {
+        let owes = self.starts.get(&win).is_some_and(|start| !start.windows.is_empty());
+        if let Some(window) = self.windows.get_mut(&win).filter(|_| owes) {
+            window.start_windows_idle = Some(window.arm_idle());
+        }
+    }
+
     /// A chooser pick, by the key `keycode` that made it, uses the same workspace decisions as the action runner.
     pub fn workspace_pick(&mut self, win: WinId, choice: crate::keymap::prefix::WorkspacePick, keycode: u32) -> Batch {
         let mut batch = Batch::default();
@@ -185,28 +202,33 @@ impl Controller {
         batch
     }
 
-    /// `win` is linked to the other window of the pair, `peer`, reached through `port`; its moves start from here.
-    /// A window already linked keeps its old link's moves only as far as the link's end leaves them.
-    pub fn attach_peer(&mut self, win: WinId, peer: PeerId, port: Rc<dyn PeerPort>) -> Batch {
+    /// `win` is linked to the window `peer`, called `name`, reached through `port`; its moves start from here.
+    /// Attaching an id that is attached replaces that peer alone, ending its moves as the link's end does; the
+    /// window's other peers stay.
+    pub fn attach_peer(&mut self, win: WinId, peer: PeerId, name: WindowName, port: Rc<dyn PeerPort>) -> Batch {
         let mut batch = Batch::default();
-        if self.windows.get(&win).is_some_and(|w| w.peer.is_some()) {
-            batch = self.detach_peer(win);
+        if self.windows.get(&win).is_some_and(|w| w.peer(peer).is_some()) {
+            batch = self.detach_peer(win, peer);
         }
         let Some(window) = self.windows.get_mut(&win) else {
             eprintln!("[wm] BUG: a peer attached to {win:?}, which is not held");
             return batch;
         };
         let side = super::moves::side_of(window.role());
-        window.peer = Some(super::moves::PeerMoves::new(peer, port, side));
-        super::moves::say_monitor(window);
-        super::moves::summary_at_attach(window, win, &*self.reads);
+        window
+            .peers
+            .insert(peer, super::moves::PeerMoves::new(peer, name.clone(), port, side));
+        super::moves::say_monitor_to(window, peer);
+        super::moves::summary_at_attach(window, win, peer, &*self.reads);
         window.say(format!("[window] linked to the other window ({peer:?})"));
+        verbs::module_windows::linked(window, win, &name, peer, &mut batch);
         batch
     }
 
-    /// `win`'s link has gone: every move on it ends as the link's end ends it (a module not yet sent stays here,
-    /// an arrival not yet committed is dropped), and the window verbs refuse until a peer is attached again.
-    pub fn detach_peer(&mut self, win: WinId) -> Batch {
+    /// `win`'s link to `peer` has gone: every move on it ends as the link's end ends it (a module not yet sent stays
+    /// here, an arrival not yet committed is dropped), and the window verbs refuse until a peer is attached again.
+    /// The window's other peers are untouched.
+    pub fn detach_peer(&mut self, win: WinId, peer: PeerId) -> Batch {
         let mut batch = Batch::default();
         let (reads, keymap, setup) = self.module_parts(win);
         if let Some(window) = self.windows.get_mut(&win) {
@@ -215,17 +237,25 @@ impl Controller {
                 keymap: &keymap,
                 setup: &setup,
             };
-            super::moves::detach(window, &cx, win, &mut batch);
+            super::moves::detach(window, &cx, win, peer, &mut batch);
         }
         self.settle_chrome(&mut batch);
         batch
+    }
+
+    /// The peers attached to `win`, by id, each with the name its window answers to.
+    pub fn peer_names(&self, win: WinId) -> Vec<(PeerId, WindowName)> {
+        self.windows
+            .get(&win)
+            .map(|window| window.peers().map(|(id, peer)| (*id, peer.name().clone())).collect())
+            .unwrap_or_default()
     }
 
     /// The window a peer is attached to.
     fn window_of_peer(&self, peer: PeerId) -> Option<WinId> {
         self.windows
             .iter()
-            .find(|(_, window)| window.peer.as_ref().is_some_and(|p| p.peer() == peer))
+            .find(|(_, window)| window.peer(peer).is_some())
             .map(|(win, _)| *win)
     }
 
@@ -235,6 +265,10 @@ impl Controller {
             eprintln!("[wm] {event:?}: no window is linked to that peer");
             return;
         };
+        if let PeerEvent::HubAsk { .. } | PeerEvent::WindowFocused { .. } = event {
+            self.hub_event(win, event, batch);
+            return;
+        }
         let (reads, keymap, setup) = self.module_parts(win);
         if let Some(window) = self.windows.get_mut(&win) {
             let cx = module_verbs::Cx {
@@ -246,17 +280,55 @@ impl Controller {
         }
     }
 
+    /// What a module window says to window 1 in compositor mode: a window of another tiling has no such peers.
+    fn hub_event(&mut self, win: WinId, event: PeerEvent, batch: &mut Batch) {
+        let Some(window) = self.windows.get_mut(&win) else {
+            return;
+        };
+        if window.tiling != super::window::Tiling::Hub {
+            window.warn(format!(
+                "[window] {event:?}: this window is not window 1 of a compositor group"
+            ));
+            return;
+        }
+        match event {
+            PeerEvent::WindowFocused { peer } => verbs::module_windows::window_focused(window, peer),
+            PeerEvent::HubAsk { peer, ask, token } => {
+                let reads = self.reads.clone();
+                let asked = verbs::module_windows::hub_ask(window, &*reads, win, peer, ask, token.clone(), batch);
+                let Some(action) = asked else {
+                    return;
+                };
+                // A module of window 1's own: it runs here as its key does, and the window comes forward after.
+                let ran = self.run_gated(win, action, Origin::Hub, None);
+                batch.append(ran);
+                batch.push_effect(HostOp::Present {
+                    win,
+                    activation: token.map(super::window::ActivationToken),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// What this module window is, for the verbs that differ between `c1` and the others.
+    pub fn set_module_name(&mut self, win: WinId, name: WindowName) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.module_name = Some(name);
+        }
+    }
+
     /// The host could not start or raise the other window. The refusal names no window: a raise's goes to the
     /// window that asked for one, a start's to every window that can have a second one (one per process).
     fn window_op_refused(&mut self, what: OpTag, why: &str, batch: &mut Batch) {
         for (win, window) in &mut self.windows {
             let asked = match what {
-                OpTag::RaisePeer => super::moves::raise_refused(window),
+                OpTag::RaisePeer | OpTag::ForwardRaise => super::moves::raise_refused(window),
                 _ => !matches!(window.role(), super::window::WindowRole::Companion),
             };
             if asked {
                 verbs::windows::refused(window, *win, &what, why, batch);
-                if what == OpTag::RaisePeer {
+                if matches!(what, OpTag::RaisePeer | OpTag::ForwardRaise) {
                     return;
                 }
             }
@@ -546,11 +618,17 @@ impl Controller {
             self.start_note("[wm] BUG: attach_parts for a window without a declaration".into());
             return;
         };
+        let tiling = self.starts.get(&win).map(|start| start.tiling).unwrap_or_default();
+        // A hub's shape is fixed and `eitri` mode's files are not its to touch, whatever saver it was handed.
+        if tiling == super::window::Tiling::Hub {
+            parts.saver = None;
+        }
         if let Some(saver) = parts.saver.as_mut() {
             saver.set_waker(self.scheduler.waker());
         }
         let mut window = Window::new(spec, parts, self.timers.clone());
         window.own_window = self.starts.get(&win).and_then(|start| start.own_window.clone());
+        window.tiling = tiling;
         window.monitors = self.monitors.clone();
         if let Some(placement) = self.placements.remove(&win) {
             window.set_placement(placement);
@@ -769,6 +847,12 @@ impl Controller {
         if let LayoutRequest::Run(action) = request {
             return self.run(win, action, Origin::Lua);
         }
+        if window.tiling == super::window::Tiling::Hub
+            && super::lua::hub_request(window, &*reads, win, &request, &mut batch)
+        {
+            self.settle_chrome(&mut batch);
+            return batch;
+        }
         let Ok(selection) = window.layout.try_borrow().map(|layout| layout.selection()) else {
             window.warn(format!("[wm] BUG: the layout was borrowed when {request:?} arrived"));
             return batch;
@@ -809,7 +893,7 @@ impl Controller {
                 module_verbs::hide(window, &cx, win, id, &mut batch).map_err(|err| err.to_string())
             }
             LayoutRequest::Focus(id)
-                if window.peer.is_some() && module_verbs::peer_key(window, &cx, win, id, &mut batch) =>
+                if window.has_peer() && module_verbs::peer_key(window, &cx, win, id, &mut batch) =>
             {
                 Ok(())
             }
@@ -1044,6 +1128,9 @@ impl Controller {
             PrefixCommand::Hide { module } => {
                 let (reads, keymap, setup) = self.module_parts(win);
                 if let Some(window) = self.windows.get_mut(&win) {
+                    if verbs::module_windows::hide_key_of_a_window(window, &module) {
+                        return batch;
+                    }
                     let cx = module_verbs::Cx {
                         reads: &*reads,
                         keymap: &keymap,
@@ -1224,6 +1311,17 @@ impl Controller {
             batch.push_effect(HostOp::RestoreLinkedWindow { win: *win });
             return;
         }
+        if let Some((win, window)) = self
+            .windows
+            .iter_mut()
+            .find(|(_, window)| window.start_windows_idle == Some(token))
+        {
+            window.start_windows_idle = None;
+            if let Some(start) = self.starts.get_mut(win) {
+                verbs::module_windows::open_at_start(window, *win, std::mem::take(&mut start.windows), batch);
+            }
+            return;
+        }
         if let Some(at) = self.view_empty.iter().position(|(armed, ..)| *armed == token) {
             let (_, win, view) = self.view_empty.remove(at);
             self.modules_event(win, batch, |window, cx, batch| {
@@ -1373,6 +1471,12 @@ impl Controller {
         self.windows.get_mut(&win)
     }
 
+    /// The window's record, read only, for tests.
+    #[cfg(test)]
+    pub(crate) fn window(&self, win: WinId) -> Option<&Window> {
+        self.windows.get(&win)
+    }
+
     /// What the window's chrome was last told the prefix waits for, and the digits it drew, for tests.
     #[cfg(test)]
     pub(crate) fn prefix_shown(&self, win: WinId) -> Option<(crate::keymap::prefix::Waiting, Vec<(char, ModuleId)>)> {
@@ -1441,6 +1545,13 @@ impl Decide for Controller {
         if super::start::event_window(&event).is_some_and(|win| self.awaiting_layout(win, &event)) {
             return batch;
         }
+        // A view stays busy while another of its tabs runs, and a `tab.break` waits only for its own tab: the panel
+        // reports a change of which tabs run even when the view's counts come out the same.
+        if let HostEvent::Chat(ChatEvent::Busy { win, busy: true, .. }) = event {
+            self.modules_event(win, &mut batch, |window, cx, batch| {
+                verbs::module_windows::turn_may_have_ended(window, cx.reads, win, batch);
+            });
+        }
         // While the base terminal is restarted in place, the end of the shell being replaced is not a kill.
         if let HostEvent::Terminal(ended @ TermEvent::Exited { win, module }) = &event {
             if let Some(window) = self.windows.get_mut(win) {
@@ -1507,6 +1618,11 @@ impl Decide for Controller {
                         super::close::request(w, cx, win, super::close::CloseCause::Signal(name), batch)
                     });
                 }
+            }
+            HostEvent::GroupClosed { win } => {
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    super::close::request(w, cx, win, super::close::CloseCause::GroupClosed, batch)
+                });
             }
             HostEvent::Editor(
                 event @ (EditorEvent::Ready { win }
@@ -1634,7 +1750,10 @@ impl Decide for Controller {
                 if let Some(window) = self.windows.get_mut(&win) {
                     match super::moves::chat_freezing(window, &module) {
                         Some(mv) => {
-                            let of = super::moves::FreezeOf::Move(mv);
+                            let of = super::moves::FreezeOf::Move {
+                                module: module.clone(),
+                                mv,
+                            };
                             super::moves::freeze_refused(window, win, of, why, &mut batch);
                         }
                         None => verbs::chat::join_refused(window, win, &why, &mut batch),
@@ -1657,7 +1776,8 @@ impl Decide for Controller {
                     OnboardingEvent::Open { win, .. }
                     | OnboardingEvent::Found { win, .. }
                     | OnboardingEvent::Written { win, .. }
-                    | OnboardingEvent::CheckFailed { win, .. } => *win,
+                    | OnboardingEvent::CheckFailed { win, .. }
+                    | OnboardingEvent::NoScreen { win } => *win,
                 };
                 if let Some(window) = self.windows.get_mut(&win) {
                     super::onboarding::event(window, win, event, &mut batch);
@@ -1803,9 +1923,13 @@ impl Decide for Controller {
                     super::moves::frozen(window, win, kind, &view.module(), mv, record, handoff, &mut batch);
                 }
             }
-            HostEvent::Chat(ChatEvent::FreezeRefused { win, mv, why, .. }) => {
+            HostEvent::Chat(ChatEvent::FreezeRefused { win, view, mv, why }) => {
                 if let Some(window) = self.windows.get_mut(&win) {
-                    super::moves::freeze_refused(window, win, super::moves::FreezeOf::Move(mv), why, &mut batch);
+                    let of = super::moves::FreezeOf::Move {
+                        module: view.module(),
+                        mv,
+                    };
+                    super::moves::freeze_refused(window, win, of, why, &mut batch);
                 }
             }
             HostEvent::Chat(ChatEvent::PresenceHeld { win, mv }) => {
@@ -1818,12 +1942,22 @@ impl Decide for Controller {
                     super::moves::presence_answered(window, win, mv, Err(why), &mut batch);
                 }
             }
-            // A chat's move that waited for its turn's end goes now.
+            // A chat's move that waited for its turn's end goes now, and the counts another window shows change.
             HostEvent::Chat(ChatEvent::Busy { win, view, busy: false }) => {
                 self.modules_event(win, &mut batch, |window, cx, batch| {
                     super::moves::turn_ended(window, cx, win, view, batch);
-                })
+                    verbs::module_windows::turn_may_have_ended(window, cx.reads, win, batch);
+                });
+                self.chat_chrome(&HostEvent::Chat(ChatEvent::Busy { win, view, busy: false }));
             }
+            HostEvent::Chat(ChatEvent::TabKept { win, why }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::module_windows::tab_kept(window, why);
+                }
+            }
+            HostEvent::Chat(ChatEvent::TabLeft { win }) => self.modules_event(win, &mut batch, |window, cx, batch| {
+                verbs::module_windows::tab_left(window, cx, win, batch);
+            }),
             HostEvent::Prepared { win, module } => {
                 if let Some(window) = self.windows.get_mut(&win) {
                     super::moves::prepared(window, &module);
@@ -1862,17 +1996,53 @@ impl Decide for Controller {
                 surface: None,
             } => {
                 for (win, window) in &mut self.windows {
-                    if window.peer.is_some() {
+                    if window.has_peer() {
                         window.say(format!("[move] the other window could not be ended: {why}"));
                         window.refuse(*win, why.clone(), &mut batch);
                     }
                 }
             }
             HostEvent::Refused {
-                what: what @ (OpTag::OpenLinkedWindow | OpTag::RaisePeer),
+                what: what @ (OpTag::OpenLinkedWindow | OpTag::RaisePeer | OpTag::ForwardRaise),
                 why,
                 ..
             } => self.window_op_refused(what, &why, &mut batch),
+            // One module window did not come up: what waited for it is dropped and the key that asked can start it
+            // again.
+            HostEvent::ModuleWindowFailed { win, name, why } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    if verbs::module_windows::start_failed(window, Some(&name), &why) {
+                        window.refuse(win, super::feedback::module_window_failed_text(&name, &why), &mut batch);
+                    }
+                }
+            }
+            // The compositor's own verbs refused: the refusal's text is what the user is shown, or the flash alone.
+            HostEvent::Refused {
+                what:
+                    what @ (OpTag::CompositorFocus | OpTag::PeerRun | OpTag::HubAsk | OpTag::HandOverTab | OpTag::KeepTab),
+                why,
+                ..
+            } => {
+                for (win, window) in &mut self.windows {
+                    if matches!(window.role(), super::window::WindowRole::Companion) {
+                        continue;
+                    }
+                    window.say(format!("[window] {what:?} refused: {why}"));
+                    window.refuse(*win, why.clone(), &mut batch);
+                }
+            }
+            // The refusal names no window: every module window still starting is given up.
+            HostEvent::Refused {
+                what: OpTag::OpenModuleWindow,
+                why,
+                ..
+            } => {
+                for (win, window) in &mut self.windows {
+                    if verbs::module_windows::start_failed(window, None, &why) {
+                        window.refuse(*win, why.clone(), &mut batch);
+                    }
+                }
+            }
             event => {
                 if let HostEvent::Refused {
                     what: OpTag::CreateSurface,
@@ -2065,6 +2235,24 @@ impl Controller {
         let keymap = || keymap.unwrap_or_else(|| Rc::new(Keymap::defaults()));
         let reads = self.reads.clone();
         let window = self.windows.get_mut(&win).expect("checked above");
+        // In compositor mode the compositor owns the layout: window 1 and a module window sort every action first.
+        // What another window sent runs as it is, but for what only this window's verbs carry out, and a follow
+        // command has its own operation.
+        let module_gate = if origin == Origin::Hub {
+            verbs::module_windows::gate_sent
+        } else {
+            verbs::module_windows::gate
+        };
+        let decided = match subject {
+            Some(module) => {
+                let show = matches!(action, Action::Module(_));
+                verbs::module_windows::follow(window, win, module, show, &mut batch)
+            }
+            None => module_gate(window, &*reads, win, &action, &mut batch),
+        };
+        if decided {
+            return batch;
+        }
         let facts = window.layout.try_borrow().map(|layout| {
             (
                 layout.selection(),

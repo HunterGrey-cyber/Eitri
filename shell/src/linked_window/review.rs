@@ -1,59 +1,78 @@
-//! Turn review across a linked pair: the two windows are one presence, and window 2 reviews in window 1's editor.
+//! Turn review across linked windows: the windows of a group are one presence, every linked window reviews in window
+//! 1's editor, and window 1 decides every revert of the group.
 //!
-//! **One presence.** Once linked, each window names the other as its partner (pid and start time) with the flag
-//! the link thread keeps for it ([`LinkDriver::presence_flag`]): the partner's `windows/` file is skipped by this
-//! window's revert checks only while that flag is clear, and the link thread sets it from the handshake (neither
-//! window has confirmed its presence when it says hello or welcome) and from every `presence{held}` before it
-//! acknowledges, whatever the GTK side is doing. Each window says `presence{held: true}` once its presence thread
-//! has confirmed its files, and `presence{held: false}` when a prompt's turn could not be confirmed, then
-//! `true` again once it is. The partner is cleared when the link ends and before this window closes it, so a
-//! partner it cannot see counts as another window again. Prompts held for the presence then go out when the link
-//! ended, but stay unsent with a note when this window closes it: the partner skips this window's file until it
-//! reads the close. The link thread counts the partner as another window from its `bye` or the link's end on.
+//! **One presence.** Once linked, a window names the window at the link's other end as its partner (pid and start
+//! time) with the flag the link thread keeps for it ([`LinkDriver::presence_flag`]): the partner's `windows/` file is
+//! skipped by this window's revert checks only while that flag is clear, and the link thread sets it from the
+//! handshake (neither window has confirmed its presence when it says hello or welcome) and from every
+//! `presence{held}` before it acknowledges, whatever the GTK side is doing. Each window says `presence{held: true}`
+//! on every link once its presence thread has confirmed its files, and `presence{held: false}` when a prompt's turn
+//! could not be confirmed, then `true` again once it is. A partner is cleared when its link ends and before this
+//! window closes it, so a partner it cannot see counts as another window again. Prompts held for the presence then go
+//! out when the last link ended, but stay unsent with a note when this window closes it: the partner skips this
+//! window's file until it reads the close. The link thread counts the partner as another window from its `bye` or
+//! the link's end on. A prompt that told its partners it could not be confirmed waits for every one of them to
+//! acknowledge, or for its link to end.
 //!
-//! **Overlap notes.** Every turn start and end of this window goes to the partner as `turn_edge` with its
-//! monotonic time (a window with turn review off still says when its turns run), and the partner's edges (with
-//! those its `hello` or `welcome` named) go into this window's turn review as a partner's turns, the edges of one
-//! drain of the link together.
+//! **Overlap notes.** Every turn start and end of this window goes to every partner as `turn_edge` with its monotonic
+//! time (a window with turn review off still says when its turns run), and each partner's edges (with those its
+//! `hello` or `welcome` named) go into this window's turn review as that partner's turns, the edges of one drain of
+//! the link together. Module windows are linked to window 1 alone, so window 1 passes each one's edges on to the
+//! others as they came ([`GroupReview::pass_on_edges`]), says which turns run to a window that links later, and ends
+//! the running turns of a window whose link ended: chats in two module windows get their overlap notes as tabs do.
 //!
-//! **One editor.** Window 1's review driver is the only one that talks to nvim's review module. Window 2's overlay
-//! calls arrive as editor operations and are queued on that driver as window 2's; what the driver finds for window
-//! 2 (an open's answer, what became of a file it drew, the reverts made in nvim for a session it holds, nothing
-//! drawn any more) goes back as `editor_reply`, `review_drawn`, `review_events` and `review_idle`. Window 2's
-//! flow drives an overlay proxy that keeps what is drawn from those, and asks window 1's nvim about a buffer
-//! through the same editor operations.
+//! **One editor.** Window 1's review driver is the only one that talks to nvim's review module. A linked window's
+//! overlay calls arrive as editor operations and are queued on that driver as that window's; what the driver finds
+//! for it (an open's answer, what became of a file it drew, the reverts made in nvim for a session it holds, nothing
+//! drawn any more) goes back on its link as `editor_reply`, `review_drawn`, `review_events` and `review_idle`. Its
+//! flow drives an overlay proxy that keeps what is drawn from those, and asks window 1's nvim about a buffer through
+//! the same editor operations.
+//!
+//! **Window 1 decides.** A module window is linked to window 1 alone, so it cannot tell another module window's
+//! presence from a stranger's. Its revert's worker, after its own checks, asks window 1 with `revert_guard` and waits
+//! for `guard` (`HubGuard`); window 1 answers from its own check, which skips every linked partner, on a thread of
+//! its own, since that check reads the presence directories. Window 2 and window 1 check for themselves.
 //!
 //! **Moved chats.** What a job finishes here for a session whose chat moved to the other window goes there as
-//! `review_result`, and one that arrives is recorded by the tab that holds the session here.
+//! `review_result`, and one that arrives is recorded by the tab that holds the session here. Only a pair moves a live
+//! chat, so these go between window 1 and window 2.
 //!
-//! Nothing here waits: answers are polled by a repeating step the window drives (a GLib timer; a test steps it
-//! by hand), and every message is queued on the link.
+//! Nothing here waits: answers are polled by a repeating step the window drives (a GLib timer; a test steps it by
+//! hand), and every message is queued on a link.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eitri_core::nvim_rpc::Pending;
-use eitri_core::review_editor::{OverlayCall, RemoteOverlay, Window, Window2Event};
-use eitri_core::turn_review::{Held, Partner, RemoteAsk};
-use eitri_core::window_link::{EditorOp, Msg, ReplyResult};
+use eitri_core::review_editor::{LinkedEvent, OverlayCall, RemoteOverlay, Window};
+use eitri_core::turn_review::{GroupGuard, Held, Partner, RemoteAsk, SOLE_PARTNER};
+use eitri_core::window_link::link::LinkSender;
+use eitri_core::window_link::{EdgeKind, EditorOp, Msg, ReplyResult, TurnEdge};
+use eitri_core::wm::PeerId;
 use eitri_panel::agent_panel::{AgentPanelHandle, PairOutbound, ReviewSettled, ReviewStep};
 use serde_json::Value;
 
 use super::driver::LinkDriver;
 use super::editor::{EditorOps, Repeat, Window1Editor};
+use super::spawn::{HUB_PEER, SECOND_PEER};
 
 /// How often the answers this window waits for are looked at: an open's from window 1, its own presence
-/// thread's confirmation.
+/// thread's confirmation, a guard check's for a module window.
 const POLL_EVERY: Duration = Duration::from_millis(20);
 
 /// How long after its presence thread said it could not hold a file the window asks it again.
 const ASK_AGAIN_AFTER: Duration = Duration::from_secs(1);
 
-/// What a window 1 with no review driver to queue window 2's calls on answers them.
+/// What a window 1 with no review driver to queue a linked window's calls on answers them.
 pub const NO_DRIVER: &str = "the editor window has no review overlay to draw in";
+
+/// What a window 1 that holds no presence answers a module window's guard.
+const NO_PRESENCE: &str = "the editor window holds no presence on this project";
 
 /// The window's turn review as this file reaches it: the panel in a window, a bare tab set and flow in a test.
 pub trait ReviewSide {
@@ -69,69 +88,199 @@ impl ReviewSide for AgentPanelHandle {
 
 /// Which window this is.
 pub enum Role {
-    /// Window 1: the editor is here; window 2's overlay calls are queued on this window's driver.
+    /// Window 1: the editor is here; every linked window's overlay calls are queued on this window's driver, and
+    /// this window answers the module windows' guards.
     One(Rc<Window1Editor>),
-    /// Window 2: its review reaches window 1's editor through these operations.
+    /// Window 2: its review reaches window 1's editor through these operations, and it checks its reverts itself.
     Two(Rc<EditorOps>),
+    /// A module window: its review reaches window 1's editor as window 2's does, and its reverts ask window 1.
+    Module(Rc<EditorOps>),
 }
 
-/// The presence thread's confirmation, asked for so the partner can be told this window holds its presence.
+/// The presence thread's confirmation, asked for so the partners can be told this window holds its presence.
 struct Confirming {
     answer: Option<mpsc::Receiver<Held>>,
     /// When to ask again after the thread could not hold the files.
     again_at: Option<Instant>,
 }
 
-/// One window's turn review on the link.
-pub struct PairReview {
-    me: Weak<PairReview>,
+/// What a module window's revert workers share with its GTK side: the way to window 1, and the workers waiting for
+/// an answer, by job. A worker never reaches the GTK side: it sends on the link's own queue, and the answer is put
+/// here when the link's messages are read.
+#[derive(Default)]
+struct HubGuard {
+    /// The link to window 1, while it is up.
+    link: Mutex<Option<LinkSender>>,
+    waiting: Mutex<BTreeMap<u64, mpsc::Sender<Result<(), String>>>>,
+    jobs: AtomicU64,
+}
+
+impl HubGuard {
+    fn linked(&self, link: Option<LinkSender>) {
+        *self.link.lock().unwrap_or_else(|e| e.into_inner()) = link;
+    }
+
+    /// The link ended: every worker waiting hears at once that no answer will come, as its sender goes.
+    fn ended(&self) {
+        let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
+        *link = None;
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Window 1's answer to `job`, for a worker that still waits. The link's messages are read behind its thread, so
+    /// an answer read here may come from a link that has already ended: its worker hears the end instead, as the
+    /// sender goes.
+    fn answered(&self, job: u64, answer: Result<(), String>) {
+        let waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&job);
+        let up = self
+            .link
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|link| !link.is_closed());
+        if let (Some(waiting), true) = (waiting, up) {
+            let _ = waiting.send(answer);
+        }
+    }
+}
+
+impl GroupGuard for HubGuard {
+    fn ask(&self) -> Option<(u64, mpsc::Receiver<Result<(), String>>)> {
+        // Held while the worker is filed, so a link ending now finds it and lets it go.
+        let link = self.link.lock().unwrap_or_else(|e| e.into_inner());
+        let link = link.as_ref()?;
+        let job = self.jobs.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        let (answer, answered) = mpsc::channel();
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job, answer);
+        if link.send(Msg::RevertGuard { job }) {
+            Some((job, answered))
+        } else {
+            self.gave_up(job);
+            None
+        }
+    }
+
+    fn gave_up(&self, job: u64) {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(&job);
+    }
+}
+
+/// A guard check running for a module window: its peer, its job and the answer to come.
+struct GuardCheck {
+    peer: PeerId,
+    job: u64,
+    answer: mpsc::Receiver<Result<(), String>>,
+}
+
+/// One link's part in the window's turn review.
+struct LinkReview {
+    peer: PeerId,
+    link: LinkDriver,
+    /// The partner at the other end, while the handshake named one.
+    partner: Option<u32>,
+    /// Whom this link's turn edges are filed under in the overlap scan: its pid for a module window, the sole partner
+    /// for window 2 and for window 1 as a linked window sees it, since a chat that moved goes on as that partner's turn.
+    /// In a module window the turns window 1 passes on go under that one partner too: a session is one chat's, so they
+    /// stay apart.
+    turns_of: u32,
+    /// The partner's turn edges taken from the link in one drain, applied together once it is drained: a start
+    /// and its end that arrived together are one interval, not a turn still running.
+    edges_in: RefCell<Vec<TurnEdge>>,
+    /// Window 1 only: the turns running at this link's other end, with their start times.
+    turns_running: RefCell<BTreeMap<String, u64>>,
+    /// This link has yet to hear `presence{held: true}`.
+    owes_held: Cell<bool>,
+}
+
+impl LinkReview {
+    fn send_edge(&self, edge: &TurnEdge) {
+        self.send(Msg::TurnEdge {
+            session: edge.session.clone(),
+            edge: edge.edge,
+            at_ns: edge.at_ns,
+        });
+    }
+
+    fn send(&self, msg: Msg) {
+        if !self.link.linked() {
+            return;
+        }
+        let kind = msg.kind();
+        if let Err(err) = self.link.send(msg, Vec::new()) {
+            eprintln!("[review] {kind} could not be sent to the other window: {err}");
+        }
+    }
+}
+
+/// One window's turn review on its links: window 1's on every link it has, any other window's on its link to window 1.
+pub struct GroupReview {
+    me: Weak<GroupReview>,
     root: PathBuf,
     side: Rc<dyn ReviewSide>,
     role: Role,
     repeat: Repeat,
-    link: RefCell<Option<LinkDriver>>,
-    /// Window 2's opens sent to window 1, each answered by the driver there once it has the call's outcome.
+    links: RefCell<BTreeMap<PeerId, Rc<LinkReview>>>,
+    /// A linked window's opens sent to window 1, each answered by the driver there once it has the call's outcome.
     opens: Rc<RefCell<Vec<(u64, Pending)>>>,
     /// The confirmation this window waits for before it says `presence{held: true}`; `None` once said.
     confirming: RefCell<Option<Confirming>>,
+    /// The links told `presence{held: false}` that have not acknowledged: a prompt waits for them all, since until
+    /// then any of them may skip this window's file.
+    acks_owed: RefCell<BTreeSet<PeerId>>,
     polling: Cell<bool>,
     /// The `review_result`s sent, which number them.
     results_sent: Cell<u64>,
-    /// The partner's turn edges taken from the link in one drain, applied together once it is drained: a start
-    /// and its end that arrived together are one interval, not a turn still running.
-    edges_in: RefCell<Vec<eitri_core::window_link::TurnEdge>>,
+    /// In a module window: how its reverts reach window 1.
+    hub: Option<Arc<HubGuard>>,
+    /// In window 1: the module windows' guard checks not yet answered.
+    guard_checks: RefCell<Vec<GuardCheck>>,
 }
 
-impl PairReview {
-    /// Window 1's (`Role::One`): window 2's overlay calls go to this window's driver from now on. Window 2's
-    /// (`Role::Two`): its review flow reaches window 1's editor from now on, and while unlinked has none.
-    pub fn new(root: &Path, side: Rc<dyn ReviewSide>, role: Role, repeat: Repeat) -> Rc<PairReview> {
+impl GroupReview {
+    /// Window 1's (`Role::One`): every linked window's overlay calls go to this window's driver from now on. Any
+    /// other's: its review flow reaches window 1's editor from now on, and while unlinked has none.
+    pub fn new(root: &Path, side: Rc<dyn ReviewSide>, role: Role, repeat: Repeat) -> Rc<GroupReview> {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let review = Rc::new_cyclic(|me| PairReview {
+        let hub = matches!(role, Role::Module(_)).then(Arc::default);
+        let review = Rc::new_cyclic(|me| GroupReview {
             me: me.clone(),
             root,
             side,
             role,
             repeat,
-            link: RefCell::default(),
+            links: RefCell::default(),
             opens: Rc::default(),
             confirming: RefCell::default(),
+            acks_owed: RefCell::default(),
             polling: Cell::new(false),
             results_sent: Cell::new(0),
-            edges_in: RefCell::default(),
+            hub,
+            guard_checks: RefCell::default(),
         });
         match &review.role {
-            Role::One(editor) => review.serve_window_2(editor),
-            Role::Two(ops) => review.reach_window_1(ops),
+            Role::One(editor) => review.serve_linked_windows(editor),
+            Role::Two(ops) | Role::Module(ops) => review.reach_window_1(ops),
+        }
+        if let Some(hub) = &review.hub {
+            let hub: Arc<dyn GroupGuard> = hub.clone();
+            review.side.with(&mut |_, tabs, _| {
+                if let Some(guard) = tabs.presence_guard() {
+                    guard.set_group(hub.clone());
+                }
+                ReviewSettled::default()
+            });
         }
         review
     }
 
-    /// Window 1: window 2's overlay calls are queued on this window's driver, tagged as window 2's, behind every
-    /// call of its own. An open is answered by the driver once it has the outcome; the others at once.
-    fn serve_window_2(&self, editor: &Window1Editor) {
+    /// Window 1: a linked window's overlay calls are queued on this window's driver, tagged as that window's, behind
+    /// every call of its own. An open is answered by the driver once it has the outcome; the others at once.
+    fn serve_linked_windows(&self, editor: &Window1Editor) {
         let side = Rc::downgrade(&self.side);
-        editor.set_overlay(Rc::new(move |_id: u64, calls: Vec<OverlayCall>| {
+        editor.set_overlay(Rc::new(move |peer: PeerId, _id: u64, calls: Vec<OverlayCall>| {
             let side = side.upgrade()?;
             let opens = calls.iter().any(|call| matches!(call, OverlayCall::OpenAndShow { .. }));
             let mut calls = Some(calls);
@@ -140,7 +289,7 @@ impl PairReview {
                 if let (Some(overlay), Some(rpc), Some(calls)) = (flow.local_overlay(), rpc, calls.take()) {
                     let now = Instant::now();
                     for call in calls {
-                        overlay.call_for(rpc, call, Window::Two, now);
+                        overlay.call_for(rpc, call, Window::Linked(peer), now);
                     }
                     queued = true;
                 }
@@ -155,12 +304,12 @@ impl PairReview {
             }
         }));
         let side = Rc::downgrade(&self.side);
-        editor.set_drawn_for_window2(Rc::new(move || {
+        editor.set_drawn_for(Rc::new(move |peer: PeerId| {
             let mut drawn = Vec::new();
             if let Some(side) = side.upgrade() {
                 side.with(&mut |flow, _, _| {
                     if let Some(overlay) = flow.local_overlay() {
-                        drawn = overlay.window2_paths().iter().cloned().collect();
+                        drawn = overlay.linked_paths(peer).iter().cloned().collect();
                     }
                     ReviewSettled::default()
                 });
@@ -169,7 +318,7 @@ impl PairReview {
         }));
     }
 
-    /// Window 2: the flow's overlay calls and buffer questions go to window 1 as editor operations.
+    /// A linked window: the flow's overlay calls and buffer questions go to window 1 as editor operations.
     fn reach_window_1(&self, ops: &Rc<EditorOps>) {
         let sending = ops.clone();
         let opens = self.opens.clone();
@@ -202,21 +351,44 @@ impl PairReview {
         });
     }
 
-    fn send(&self, msg: Msg) {
-        let link = self.link.borrow().clone();
-        if let Some(link) = link.filter(LinkDriver::linked) {
-            let kind = msg.kind();
-            if let Err(err) = link.send(msg, Vec::new()) {
-                eprintln!("[review] {kind} could not be sent to the other window: {err}");
-            }
+    fn is_window_1(&self) -> bool {
+        matches!(self.role, Role::One(_))
+    }
+
+    /// The live links, in peer order.
+    fn up_links(&self) -> Vec<Rc<LinkReview>> {
+        self.links
+            .borrow()
+            .values()
+            .filter(|state| state.link.linked())
+            .cloned()
+            .collect()
+    }
+
+    /// Sends `msg` on the link to `peer`, if it is up.
+    fn send(&self, peer: PeerId, msg: Msg) {
+        let state = self.links.borrow().get(&peer).cloned();
+        if let Some(state) = state {
+            state.send(msg);
         }
+    }
+
+    /// The state of `link`, when it is still the link to `peer`: a late message of an ended link is not its
+    /// successor's.
+    fn state_of(&self, peer: PeerId, link: &LinkDriver) -> Option<Rc<LinkReview>> {
+        self.links
+            .borrow()
+            .get(&peer)
+            .filter(|state| state.link.same(link))
+            .cloned()
     }
 
     /// A chat of `session` is moving between the windows: in window 1, which runs nvim, the editor's review events
     /// of that session wait (`hold`) until the move has ended, then go to the window holding the session, this
-    /// one when `here`. Window 2 holds nothing: nvim's events reach it only through window 1.
+    /// one when `here`. Only a pair moves a live chat, so the other window is window 2. No other window holds
+    /// anything: nvim's events reach it only through window 1.
     pub fn hold_session(&self, session: &str, hold: bool, here: bool) -> Result<(), String> {
-        if !matches!(self.role, Role::One(_)) {
+        if !self.is_window_1() {
             return Err("only the window that runs the editor holds its review events".into());
         }
         let mut done = false;
@@ -225,7 +397,8 @@ impl PairReview {
                 if hold {
                     overlay.hold_session(session);
                 } else {
-                    overlay.release_session(session, if here { Window::One } else { Window::Two });
+                    let to = if here { Window::One } else { Window::Linked(SECOND_PEER) };
+                    overlay.release_session(session, to);
                 }
                 done = true;
             }
@@ -239,7 +412,7 @@ impl PairReview {
     }
 
     /// The turns running here now, as started edges: what this window's `welcome` carries.
-    pub fn running_turns(&self) -> Vec<eitri_core::window_link::TurnEdge> {
+    pub fn running_turns(&self) -> Vec<TurnEdge> {
         let mut edges = Vec::new();
         self.side.with(&mut |_, tabs, _| {
             edges = match tabs.turn_review() {
@@ -251,52 +424,128 @@ impl PairReview {
         edges
     }
 
-    /// The link is up: the partner is named to this window's presence, its turns are taken into the overlap scan,
-    /// this window's turn edges are kept for it, and the link's review messages are taken from here on.
-    pub fn linked(&self, link: &LinkDriver) {
-        *self.link.borrow_mut() = Some(link.clone());
-        self.take_messages(link);
+    /// The link to `peer` is up: the partner is named to this window's presence, its turns are taken into the overlap
+    /// scan, this window's turn edges are kept for its partners, and the link's review messages are taken from here
+    /// on.
+    pub fn linked(&self, peer: PeerId, link: &LinkDriver) {
+        let window_1 = self.is_window_1();
+        let partner = link.partner();
+        let turns_of = match partner {
+            Some(partner) if window_1 && peer != SECOND_PEER => partner.pid,
+            _ => SOLE_PARTNER,
+        };
+        let state = Rc::new(LinkReview {
+            peer,
+            link: link.clone(),
+            partner: partner.map(|partner| partner.pid),
+            turns_of,
+            edges_in: RefCell::default(),
+            turns_running: RefCell::default(),
+            owes_held: Cell::new(true),
+        });
+        let first = !self.links.borrow().values().any(|state| state.partner.is_some());
+        self.links.borrow_mut().insert(peer, state.clone());
+        self.take_messages(peer, link);
+        if let Some(hub) = &self.hub {
+            hub.linked(link.sender());
+        }
         let me = self.me.clone();
-        link.on_closing(move |_| {
-            if let Some(me) = me.upgrade() {
-                me.end(true);
+        link.on_closing(move |link| {
+            if let Some(me) = me.upgrade().filter(|me| me.state_of(peer, link).is_some()) {
+                me.end(peer, true);
             }
         });
-        if let Some(partner) = link.partner() {
+        if let Some(partner) = partner {
             let mut partner = Some(Partner {
                 pid: partner.pid,
                 start: partner.start,
                 counts_as_other: link.presence_flag(),
             });
-            let mut running = Some(link.take_partner_running());
+            let named_running = link.take_partner_running();
+            let mut running = Some(named_running.clone());
             self.side.with(&mut |_, tabs, _| {
-                let sent = tabs.set_partner(partner.take());
+                let sent = match partner.take() {
+                    Some(partner) if window_1 => {
+                        tabs.add_partner(partner);
+                        Vec::new()
+                    }
+                    partner => tabs.set_partner(partner),
+                };
                 if let Some(review) = tabs.turn_review_mut() {
-                    review.announce_turn_edges(true);
-                    review.partner_turns(running.take().unwrap_or_default());
+                    // Edges kept for the links already up stay theirs.
+                    if first {
+                        review.announce_turn_edges(true);
+                    }
+                    review.partner_turns_of(turns_of, running.take().unwrap_or_default());
                 }
                 ReviewSettled::sent(sent)
             });
+            self.pass_on_edges(&state, &named_running);
         } else {
             eprintln!("[review] the link names no partner; the other window counts as another window");
         }
+        self.tell_running_turns(&state);
         self.confirm_presence();
     }
 
-    fn take_messages(&self, link: &LinkDriver) {
+    /// Window 1 passes `from`'s turn edges on to its other links as they came, and keeps which of `from`'s turns run.
+    /// A module window hears no other module window directly, and its overlap notes need their turns.
+    fn pass_on_edges(&self, from: &LinkReview, edges: &[TurnEdge]) {
+        if !self.is_window_1() || edges.is_empty() {
+            return;
+        }
+        {
+            let mut running = from.turns_running.borrow_mut();
+            for edge in edges {
+                match edge.edge {
+                    EdgeKind::Started => {
+                        running.insert(edge.session.clone(), edge.at_ns);
+                    }
+                    EdgeKind::Ended => {
+                        running.remove(&edge.session);
+                    }
+                }
+            }
+        }
+        for state in self.up_links().iter().filter(|state| state.peer != from.peer) {
+            for edge in edges {
+                state.send_edge(edge);
+            }
+        }
+    }
+
+    /// Window 1 tells a window that has just linked which turns run in the windows linked before it.
+    fn tell_running_turns(&self, to: &LinkReview) {
+        if !self.is_window_1() {
+            return;
+        }
+        for state in self.up_links().iter().filter(|state| state.peer != to.peer) {
+            for (session, at_ns) in state.turns_running.borrow().iter() {
+                to.send_edge(&TurnEdge {
+                    session: session.clone(),
+                    edge: EdgeKind::Started,
+                    at_ns: *at_ns,
+                });
+            }
+        }
+    }
+
+    fn take_messages(&self, peer: PeerId, link: &LinkDriver) {
         let me = self.me.clone();
-        link.on("turn_edge", move |_, msg, _| {
+        link.on("turn_edge", move |link, msg, _| {
             let (Some(me), Msg::TurnEdge { session, edge, at_ns }) = (me.upgrade(), msg) else {
                 return;
             };
-            me.edges_in
-                .borrow_mut()
-                .push(eitri_core::window_link::TurnEdge { session, edge, at_ns });
+            if let Some(state) = me.state_of(peer, link) {
+                state.edges_in.borrow_mut().push(TurnEdge { session, edge, at_ns });
+            }
         });
         let me = self.me.clone();
-        link.on_drained(move |_| {
+        link.on_drained(move |link| {
             if let Some(me) = me.upgrade() {
-                me.apply_partner_edges();
+                if let Some(state) = me.state_of(peer, link) {
+                    me.apply_partner_edges(&state);
+                }
             }
         });
         // The link thread has already set the partner's flag and acknowledged.
@@ -310,8 +559,15 @@ impl PairReview {
             let (Some(me), Msg::PresenceAck { held: false }) = (me.upgrade(), msg) else {
                 return;
             };
-            me.side
-                .with(&mut |_, tabs, _| ReviewSettled::sent(tabs.on_presence_ack(Instant::now())));
+            let all_heard = {
+                let mut owed = me.acks_owed.borrow_mut();
+                owed.remove(&peer);
+                owed.is_empty()
+            };
+            if all_heard {
+                me.side
+                    .with(&mut |_, tabs, _| ReviewSettled::sent(tabs.on_presence_ack(Instant::now())));
+            }
         });
         let me = self.me.clone();
         link.on("review_result", move |_, msg, _| {
@@ -332,12 +588,17 @@ impl PairReview {
                 }
             });
         });
-        if let Role::Two(_) = self.role {
-            self.take_window_1_reports(link);
+        match self.role {
+            Role::One(_) => self.answer_guards(peer, link),
+            Role::Two(_) => self.take_window_1_reports(link),
+            Role::Module(_) => {
+                self.take_window_1_reports(link);
+                self.take_guard_answers(link);
+            }
         }
     }
 
-    /// Window 2: what window 1's driver reports about this window's overlays.
+    /// A linked window: what window 1's driver reports about this window's overlays.
     fn take_window_1_reports(&self, link: &LinkDriver) {
         let me = self.me.clone();
         link.on("review_drawn", move |_, msg, _| {
@@ -360,16 +621,84 @@ impl PairReview {
         });
     }
 
+    /// A module window: window 1's answers go to the workers waiting for them.
+    fn take_guard_answers(&self, link: &LinkDriver) {
+        let me = self.me.clone();
+        link.on("guard", move |_, msg, _| {
+            let (Some(me), Msg::Guard { job, ok, why }) = (me.upgrade(), msg) else {
+                return;
+            };
+            if let Some(hub) = &me.hub {
+                let answer = if ok {
+                    Ok(())
+                } else {
+                    Err(why.unwrap_or_else(|| "the editor window gave no reason".to_string()))
+                };
+                hub.answered(job, answer);
+            }
+        });
+    }
+
+    /// Window 1: a module window's `revert_guard` is answered from this window's check, which sees the whole group.
+    fn answer_guards(&self, peer: PeerId, link: &LinkDriver) {
+        let me = self.me.clone();
+        link.on("revert_guard", move |_, msg, _| {
+            if let (Some(me), Msg::RevertGuard { job }) = (me.upgrade(), msg) {
+                me.check_for(peer, job);
+            }
+        });
+    }
+
+    /// Runs the guard check for the window at `peer` on a thread of its own, since it reads the presence directories;
+    /// its answer goes on the link from the repeating step.
+    fn check_for(&self, peer: PeerId, job: u64) {
+        let mut guard = None;
+        self.side.with(&mut |_, tabs, _| {
+            guard = tabs.presence_guard();
+            ReviewSettled::default()
+        });
+        let Some(guard) = guard else {
+            self.send_guard(peer, job, Err(NO_PRESENCE.to_string()));
+            return;
+        };
+        let (answer, answered) = mpsc::channel();
+        let started = std::thread::Builder::new()
+            .name("eitri-review-guard".into())
+            .spawn(move || {
+                let _ = answer.send(guard.check().map_err(|blocked| blocked.to_string()));
+            });
+        match started {
+            Ok(_) => {
+                self.guard_checks.borrow_mut().push(GuardCheck {
+                    peer,
+                    job,
+                    answer: answered,
+                });
+                self.poll_soon();
+            }
+            Err(err) => self.send_guard(peer, job, Err(format!("the check could not start: {err}"))),
+        }
+    }
+
+    fn send_guard(&self, peer: PeerId, job: u64, answer: Result<(), String>) {
+        let (ok, why) = match answer {
+            Ok(()) => (true, None),
+            Err(why) => (false, Some(why)),
+        };
+        self.send(peer, Msg::Guard { job, ok, why });
+    }
+
     /// The partner's turn edges taken since the last drain, into the overlap scan in one go.
-    fn apply_partner_edges(&self) {
-        let edges = std::mem::take(&mut *self.edges_in.borrow_mut());
+    fn apply_partner_edges(&self, state: &LinkReview) {
+        let edges = std::mem::take(&mut *state.edges_in.borrow_mut());
         if edges.is_empty() {
             return;
         }
+        self.pass_on_edges(state, &edges);
         let mut edges = Some(edges);
         self.side.with(&mut |_, tabs, _| {
             if let (Some(review), Some(edges)) = (tabs.turn_review_mut(), edges.take()) {
-                review.partner_turns(edges);
+                review.partner_turns_of(state.turns_of, edges);
             }
             ReviewSettled::default()
         });
@@ -384,39 +713,65 @@ impl PairReview {
         });
     }
 
-    /// The link ended: the partner counts as another window again (the prompts held for the presence go out), its
-    /// running turns end in the overlap scan, and nothing more is kept for it. Window 1 clears every file drawn for
-    /// window 2; window 2's overlays are known drawn no more, and what waited on window 1's editor is told it will
-    /// not be answered.
-    pub fn unlinked(&self) {
-        self.end(false);
+    /// The link to `peer` ended: that partner counts as another window again (once the last is gone, the prompts held
+    /// for the presence go out), its running turns end in the overlap scan, and nothing more is kept for it. Window 1
+    /// clears every file drawn for that window; a linked window's overlays are known drawn no more, and what waited on
+    /// window 1's editor is told it will not be answered.
+    pub fn unlinked(&self, peer: PeerId) {
+        self.end(peer, false);
     }
 
     /// [`unlinked`](Self::unlinked), or, with `closing`, this window is about to close the link itself: then the
     /// prompts held for the presence are not sent but wait in their queues with a note, since the partner skips
     /// this window's file until it reads the close, and that file was not confirmed to mark their turns.
-    fn end(&self, closing: bool) {
-        if self.link.borrow_mut().take().is_none() {
+    fn end(&self, peer: PeerId, closing: bool) {
+        let Some(state) = self.links.borrow_mut().remove(&peer) else {
             return;
-        }
+        };
         // Edges already read are still the partner's turns: they go into the scan before it is told the partner
         // is gone.
-        self.apply_partner_edges();
-        self.confirming.borrow_mut().take();
-        let window_1 = matches!(self.role, Role::One(_));
+        self.apply_partner_edges(&state);
+        // Whatever it still ran ends now for the windows that heard it started: nobody else will say so.
+        let at_ns = eitri_core::turn_review::monotonic_ns();
+        let ended: Vec<TurnEdge> = std::mem::take(&mut *state.turns_running.borrow_mut())
+            .into_keys()
+            .map(|session| TurnEdge {
+                session,
+                edge: EdgeKind::Ended,
+                at_ns,
+            })
+            .collect();
+        self.pass_on_edges(&state, &ended);
+        let last = self.links.borrow().is_empty();
+        if last {
+            self.confirming.borrow_mut().take();
+        }
+        // A prompt that waited only for this link's acknowledgement waits for nothing now, unless this window is the
+        // one closing it: the partner goes on skipping this window's file until it reads the close.
+        let all_heard = {
+            let mut owed = self.acks_owed.borrow_mut();
+            owed.remove(&peer) && owed.is_empty() && !closing
+        };
+        let window_1 = self.is_window_1();
         self.side.with(&mut |flow, tabs, _| {
-            let sent = if closing {
-                tabs.close_link()
-            } else {
-                tabs.set_partner(None)
+            let mut sent = match (window_1, state.partner) {
+                (true, Some(pid)) => tabs.remove_partner(pid, closing),
+                (true, None) => Vec::new(),
+                (false, _) if closing => tabs.close_link(),
+                (false, _) => tabs.set_partner(None),
             };
+            if all_heard && !last {
+                sent.extend(tabs.on_presence_ack(Instant::now()));
+            }
             if let Some(review) = tabs.turn_review_mut() {
-                review.announce_turn_edges(false);
-                review.partner_gone();
+                if last {
+                    review.announce_turn_edges(false);
+                }
+                review.partner_gone_of(state.turns_of);
             }
             let outs = if window_1 {
                 if let Some(overlay) = flow.local_overlay() {
-                    overlay.window2_gone();
+                    overlay.linked_gone(peer);
                 }
                 Vec::new()
             } else {
@@ -424,49 +779,60 @@ impl PairReview {
             };
             ReviewSettled { outs, sent }
         });
-        self.opens.borrow_mut().clear();
+        if let Some(hub) = &self.hub {
+            hub.ended();
+        }
+        if !window_1 {
+            self.opens.borrow_mut().clear();
+        }
     }
 
-    /// What the window's panel left for the other window after a tick.
+    /// What the window's panel left for the other windows after a tick.
     pub fn outbound(&self, out: PairOutbound) {
         let PairOutbound {
-            window2,
+            linked,
             edges,
             presence_false,
             results,
         } = out;
-        if self.link.borrow().as_ref().is_none_or(|link| !link.linked()) {
+        let links = self.up_links();
+        if links.is_empty() {
             return;
         }
-        for event in window2 {
-            if let Some(msg) = self.window_2_msg(event) {
-                self.send(msg);
+        for (peer, events) in linked {
+            for event in events {
+                if let Some(msg) = self.linked_msg(event) {
+                    self.send(peer, msg);
+                }
             }
         }
         for edge in edges {
-            self.send(Msg::TurnEdge {
-                session: edge.session,
-                edge: edge.edge,
-                at_ns: edge.at_ns,
-            });
+            for state in &links {
+                state.send_edge(&edge);
+            }
         }
+        let holder = if self.is_window_1() { SECOND_PEER } else { HUB_PEER };
         for (session, result) in results {
             let job = self.results_sent.get() + 1;
             self.results_sent.set(job);
-            self.send(Msg::ReviewResult { session, job, result });
+            self.send(holder, Msg::ReviewResult { session, job, result });
         }
         if presence_false {
-            self.send(Msg::Presence { held: false });
+            for state in &links {
+                state.owes_held.set(true);
+                state.send(Msg::Presence { held: false });
+            }
+            *self.acks_owed.borrow_mut() = links.iter().map(|state| state.peer).collect();
             // Asked afresh: an answer already on its way was for a set before this turn's.
             self.confirming.borrow_mut().take();
             self.confirm_presence();
         }
     }
 
-    /// One of window 1's driver's reports for window 2, as its message; paths go relative to the project root.
-    fn window_2_msg(&self, event: Window2Event) -> Option<Msg> {
+    /// One of window 1's driver's reports for a linked window, as its message; paths go relative to the project root.
+    fn linked_msg(&self, event: LinkedEvent) -> Option<Msg> {
         Some(match event {
-            Window2Event::Answered { op_id, result } => Msg::EditorReply {
+            LinkedEvent::Answered { op_id, result } => Msg::EditorReply {
                 id: op_id,
                 result: match result {
                     Ok(message) => ReplyResult::Ok {
@@ -475,10 +841,10 @@ impl PairReview {
                     Err(why) => ReplyResult::Err { why },
                 },
             },
-            Window2Event::Drawn { op_id, path, state } => {
+            LinkedEvent::Drawn { op_id, path, state } => {
                 let Some(rel) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) else {
                     eprintln!(
-                        "[review] window 2 drew {}, outside the project; not reported",
+                        "[review] a linked window drew {}, outside the project; not reported",
                         path.display()
                     );
                     return None;
@@ -489,13 +855,13 @@ impl PairReview {
                     state,
                 }
             }
-            Window2Event::Events { session, events } => Msg::ReviewEvents { session, events },
-            Window2Event::Idle => Msg::ReviewIdle,
+            LinkedEvent::Events { session, events } => Msg::ReviewEvents { session, events },
+            LinkedEvent::Idle => Msg::ReviewIdle,
         })
     }
 
     /// Asks the presence thread to confirm this window's files, and says `presence{held: true}` once it has. A
-    /// window that holds no presence never says it: the partner goes on counting it as another window.
+    /// window that holds no presence never says it: its partners go on counting it as another window.
     fn confirm_presence(&self) {
         let Some(answer) = self.ask_confirmation() else {
             eprintln!("[review] this window holds no presence; the other window counts it as another window");
@@ -539,7 +905,44 @@ impl PairReview {
     pub fn poll(&self, now: Instant) -> bool {
         self.poll_opens();
         self.poll_confirmation(now);
-        !self.opens.borrow().is_empty() || self.confirming.borrow().is_some()
+        self.poll_guard_checks();
+        !self.opens.borrow().is_empty() || self.confirming.borrow().is_some() || !self.guard_checks.borrow().is_empty()
+    }
+
+    fn poll_guard_checks(&self) {
+        let mut finished = Vec::new();
+        self.guard_checks
+            .borrow_mut()
+            .retain(|check| match check.answer.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => true,
+                Ok(answer) => {
+                    finished.push((check.peer, check.job, answer));
+                    false
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished.push((check.peer, check.job, Err("the check stopped".to_string())));
+                    false
+                }
+            });
+        for (peer, job, answer) in finished {
+            self.send_guard(peer, job, answer);
+        }
+    }
+
+    /// The revert workers waiting for window 1.
+    #[cfg(test)]
+    fn guards_waiting(&self) -> usize {
+        self.hub
+            .as_ref()
+            .map_or(0, |hub| hub.waiting.lock().unwrap_or_else(|e| e.into_inner()).len())
+    }
+
+    /// The newest job waiting for window 1.
+    #[cfg(test)]
+    fn guard_job(&self) -> Option<u64> {
+        let hub = self.hub.as_ref()?;
+        let waiting = hub.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.keys().next_back().copied()
     }
 
     fn poll_opens(&self) {
@@ -589,7 +992,11 @@ impl PairReview {
         match held {
             Some(Held::Yes) => {
                 self.confirming.borrow_mut().take();
-                self.send(Msg::Presence { held: true });
+                for state in self.up_links() {
+                    if state.owes_held.replace(false) {
+                        state.send(Msg::Presence { held: true });
+                    }
+                }
             }
             Some(Held::No(why)) => {
                 eprintln!("[review] this window's presence is not confirmed yet ({why}); asked again shortly");
@@ -641,19 +1048,26 @@ mod tests {
     };
     use eitri_core::window_link::fdpass;
     use eitri_core::window_link::link::{LinkHandle, PresenceFlag};
+    use eitri_core::window_link::names::WindowName;
     use eitri_core::window_link::EdgeKind;
     use eitri_panel::agent_panel::take_pair_outbound;
     use rmpv::Value as M;
     use serde_json::{json, Value as Json};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     const BASE: &[u8] = b"one\ntwo\nthree\n";
     const CHANGED: &[u8] = b"one\nTWO\nthree\n";
     const AGAIN: &[u8] = b"one\nTWO\nTHREE\n";
     const BUSY_TURN: &str = "an agent turn is running";
     const OTHER_WINDOW: &str = "another Eitri window has this project open";
+
+    /// Which side of a [`Pair`] a step of a test acts on.
+    #[derive(Debug, Clone, Copy)]
+    enum Window {
+        One,
+        Two,
+    }
 
     // ---- the processes the windows' presence files name -------------------------------------------------------
 
@@ -921,7 +1335,7 @@ mod tests {
 
         /// One tick of the panel: the pump, the review flow, the prompts the presence lets go, and what the link
         /// owes the other window, handed to `review`.
-        fn tick(&self, review: Option<&PairReview>) {
+        fn tick(&self, review: Option<&GroupReview>) {
             let outbound = {
                 let mut tabs = self.side.tabs.borrow_mut();
                 let mut flow = self.side.flow.borrow_mut();
@@ -1134,8 +1548,8 @@ mod tests {
         two: Win,
         one_link: LinkDriver,
         two_link: LinkDriver,
-        one_review: Rc<PairReview>,
-        two_review: Rc<PairReview>,
+        one_review: Rc<GroupReview>,
+        two_review: Rc<GroupReview>,
         _one_editor: Rc<Window1Editor>,
         _two_editor: Rc<Window2Editor>,
         stand: Stand,
@@ -1198,17 +1612,21 @@ mod tests {
                 }));
             }
             let two_editor = Window2Editor::new(&project, None, steps.repeat());
-            one_editor.linked(&one_link);
+            one_editor.linked(
+                crate::linked_window::spawn::SECOND_PEER,
+                eitri_core::window_link::names::WindowName::Second,
+                &one_link,
+            );
             two_editor.linked(&two_link);
-            let one_review = PairReview::new(
+            let one_review = GroupReview::new(
                 &project,
                 one.side.clone(),
                 Role::One(one_editor.clone()),
                 steps.repeat(),
             );
-            let two_review = PairReview::new(&project, two.side.clone(), Role::Two(two_editor.ops()), steps.repeat());
-            one_review.linked(&one_link);
-            two_review.linked(&two_link);
+            let two_review = GroupReview::new(&project, two.side.clone(), Role::Two(two_editor.ops()), steps.repeat());
+            one_review.linked(SECOND_PEER, &one_link);
+            two_review.linked(HUB_PEER, &two_link);
             Pair {
                 _scratch: scratch,
                 project,
@@ -1672,6 +2090,31 @@ mod tests {
         p.shut_down();
     }
 
+    #[test]
+    fn a_turn_between_two_ticks_of_a_window_with_turn_review_off_still_counts_in_the_others_overlap_note() {
+        let mut p = Pair::new("review-off-brief", false);
+        p.one_presence();
+        p.two.side.tabs.borrow_mut().turn_review_off();
+        let (one_turn, _) = p.start_turn(Window::One);
+        let tab = p.two.tab;
+        // Window 2's ingestion thread folds the whole turn while its tick does not run: no tick sees it running.
+        p.two.queue_turn_start();
+        until("window 2's turn", || {
+            p.two.side.tabs.borrow().get(tab).unwrap().turn_running()
+        });
+        p.two.queue_turn_end();
+        until("its end", || !p.two.side.tabs.borrow().get(tab).unwrap().turn_running());
+        p.step();
+        p.end_turn(Window::One);
+        p.settle("window 1's record to carry the note", |p| {
+            p.one
+                .records()
+                .iter()
+                .any(|r| r.turn_id == one_turn && r.overlapped_tab)
+        });
+        p.shut_down();
+    }
+
     // ---- the editor across the pair ----------------------------------------------------------------------------------
 
     #[test]
@@ -1856,5 +2299,690 @@ mod tests {
             "a window without the editor holds nothing"
         );
         p.shut_down();
+    }
+
+    // ---- a group of windows -------------------------------------------------------------------------------------
+
+    const C1: PeerId = PeerId(16);
+    const C2: PeerId = PeerId(17);
+
+    /// Both ends of a link between the windows of the processes `a` and `b`, each end counting the other as another
+    /// window until it says its presence is held.
+    fn ends(a: LinkPartner, b: LinkPartner) -> (LinkDriver, LinkDriver) {
+        let (x, y) = fdpass::seqpacket_pair().unwrap();
+        let flag = || PresenceFlag(Arc::new(AtomicBool::new(true)));
+        let (a_flag, b_flag) = (flag(), flag());
+        let (a_handle, a_in) = LinkHandle::start(x, a_flag.clone()).unwrap();
+        let (b_handle, b_in) = LinkHandle::start(y, b_flag.clone()).unwrap();
+        let (a_link, b_link) = (LinkDriver::new(a_handle, a_in), LinkDriver::new(b_handle, b_in));
+        a_link.set_presence(a_flag);
+        b_link.set_presence(b_flag);
+        a_link.set_partner(b);
+        b_link.set_partner(a);
+        a_link.set_linked();
+        b_link.set_linked();
+        (a_link, b_link)
+    }
+
+    /// A module window of a [`Group`]: its presence files are named by a process standing for it.
+    struct Member {
+        win: Win,
+        /// Window 1's end of its link.
+        hub_link: LinkDriver,
+        link: LinkDriver,
+        review: Rc<GroupReview>,
+        _editor: Rc<Window2Editor>,
+        stand: Stand,
+    }
+
+    /// Which window of a [`Group`] a step of a test acts on.
+    #[derive(Debug, Clone, Copy)]
+    enum Seat {
+        One,
+        First,
+        Second,
+    }
+
+    /// Window 1, with the editor, and two module windows, linked to it and to nothing else, over real socketpairs.
+    /// Nobody has said its presence is held yet.
+    struct Group {
+        _scratch: Scratch,
+        project: PathBuf,
+        review_dir: PathBuf,
+        steps: Steps,
+        nvim: Rc<FakeNvim>,
+        one: Win,
+        review: Rc<GroupReview>,
+        _editor: Rc<Window1Editor>,
+        c1: Member,
+        c2: Member,
+    }
+
+    impl Group {
+        /// With `park_one`, window 1's presence thread waits for its release, and with `park_c2`, the second module
+        /// window's.
+        fn new(label: &str, park_one: bool, park_c2: bool) -> Group {
+            agent::state_dirs::redirect_state_to_a_test_root();
+            let scratch = Scratch::new(label);
+            let base = std::fs::canonicalize(&scratch.1).unwrap();
+            let project = base.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let review_dir = review_dir_for(Some(base.join("state").as_os_str()), None, &project).unwrap();
+            for rel in ["a.txt", "b.txt", "c.txt"] {
+                std::fs::write(project.join(rel), BASE).unwrap();
+            }
+            let steps = Steps::default();
+            let nvim = Rc::new(FakeNvim::new());
+            let one = Win::new(
+                &project,
+                &review_dir,
+                std::process::id(),
+                "s-one",
+                Some(nvim.clone() as Rc<dyn EditorRpc>),
+                Some(Owner::Embedded),
+                park_one,
+            );
+            let editor = Window1Editor::new(&project, None, steps.repeat());
+            editor.set_rpc(nvim.clone());
+            {
+                let side = one.side.clone();
+                editor.set_own_session(Rc::new(move |session: &str| {
+                    side.tabs
+                        .borrow()
+                        .tabs()
+                        .iter()
+                        .any(|t| t.provider_session_id().as_deref() == Some(session))
+                }));
+            }
+            let review = GroupReview::new(&project, one.side.clone(), Role::One(editor.clone()), steps.repeat());
+            let this_process = LinkPartner {
+                pid: std::process::id(),
+                start: agent::child::start_time(std::process::id()).unwrap(),
+            };
+            let member = |peer: PeerId, name: WindowName, session: &str, parked: bool| {
+                let stand = Stand::start();
+                let win = Win::new(&project, &review_dir, stand.pid(), session, None, None, parked);
+                let (hub_link, link) = ends(
+                    this_process,
+                    LinkPartner {
+                        pid: stand.pid(),
+                        start: stand.start_time(),
+                    },
+                );
+                let own_editor = Window2Editor::new(&project, None, steps.repeat());
+                editor.linked(peer, name, &hub_link);
+                own_editor.linked(&link);
+                let own = GroupReview::new(
+                    &project,
+                    win.side.clone(),
+                    Role::Module(own_editor.ops()),
+                    steps.repeat(),
+                );
+                review.linked(peer, &hub_link);
+                own.linked(HUB_PEER, &link);
+                let ended = Rc::downgrade(&own);
+                link.on_end(move |_, _| {
+                    if let Some(review) = ended.upgrade() {
+                        review.unlinked(HUB_PEER);
+                    }
+                });
+                Member {
+                    win,
+                    hub_link,
+                    link,
+                    review: own,
+                    _editor: own_editor,
+                    stand,
+                }
+            };
+            let c1 = member(C1, WindowName::Chat(1), "s-c1", false);
+            let c2 = member(C2, WindowName::Chat(2), "s-c2", park_c2);
+            Group {
+                _scratch: scratch,
+                project,
+                review_dir,
+                steps,
+                nvim,
+                one,
+                review,
+                _editor: editor,
+                c1,
+                c2,
+            }
+        }
+
+        fn members(&self) -> [&Member; 2] {
+            [&self.c1, &self.c2]
+        }
+
+        /// One round of every window: the links' messages, each panel's tick, the timers.
+        fn step(&self) {
+            for member in self.members() {
+                member.hub_link.pump();
+                member.link.pump();
+            }
+            self.one.tick(Some(&self.review));
+            for member in self.members() {
+                member.win.tick(Some(&member.review));
+            }
+            self.steps.run();
+        }
+
+        fn settle(&self, what: &str, done: impl Fn(&Group) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                self.step();
+                if done(self) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Window 1 has heard every module window say its presence is held, and each of them window 1's.
+        fn all_present(&self) {
+            self.settle("every window to confirm its presence", |g| {
+                g.members().iter().all(|member| {
+                    !member.hub_link.presence_flag().load(Ordering::SeqCst)
+                        && !member.link.presence_flag().load(Ordering::SeqCst)
+                })
+            });
+        }
+
+        fn win(&self, seat: Seat) -> &Win {
+            match seat {
+                Seat::One => &self.one,
+                Seat::First => &self.c1.win,
+                Seat::Second => &self.c2.win,
+            }
+        }
+
+        fn win_mut(&mut self, seat: Seat) -> &mut Win {
+            match seat {
+                Seat::One => &mut self.one,
+                Seat::First => &mut self.c1.win,
+                Seat::Second => &mut self.c2.win,
+            }
+        }
+
+        fn start_turn(&mut self, seat: Seat) -> (String, u32) {
+            let id = self.win_mut(seat).queue_turn_start();
+            let mut n = None;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while n.is_none() {
+                assert!(Instant::now() < deadline, "the base of {id}");
+                self.step();
+                n = self.win(seat).base_taken(&id);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (id, n.unwrap())
+        }
+
+        fn end_turn(&mut self, seat: Seat) {
+            let id = self.win(seat).queue_turn_end();
+            self.settle("the turn's end", |g| g.win(seat).end_taken(&id));
+        }
+
+        /// One whole turn in `seat` that writes `bytes` to `rel`; returns its number. Its `running/` file is gone by
+        /// the time this returns.
+        fn turn(&mut self, seat: Seat, rel: &str, bytes: &[u8]) -> u32 {
+            let (_, n) = self.start_turn(seat);
+            std::fs::write(self.project.join(rel), bytes).unwrap();
+            self.end_turn(seat);
+            assert!(self.win(seat).confirmed());
+            n
+        }
+
+        fn request(&self, seat: Seat, id: &str, message: InboundMessage) -> Result<Option<String>, String> {
+            self.win(seat).handle(message);
+            self.settle(id, |g| result_of(&g.win(seat).side.outs.borrow(), id).is_some());
+            result_of(&self.win(seat).side.outs.borrow(), id).unwrap()
+        }
+
+        fn read(&self, rel: &str) -> Vec<u8> {
+            std::fs::read(self.project.join(rel)).unwrap()
+        }
+
+        fn drawn(&self, rel: &str) -> bool {
+            let path = self.project.join(rel).into_os_string().into_encoded_bytes();
+            self.nvim.drawn.borrow().contains(&path)
+        }
+
+        fn shut_down(self) {
+            let Group { one, c1, c2, .. } = self;
+            let (first, second) = (c1.stand, c2.stand);
+            for win in [one, c1.win, c2.win] {
+                if let Some(release) = &win.release {
+                    let _ = release.send(());
+                }
+                win.shut_down();
+            }
+            drop((first, second));
+        }
+    }
+
+    fn overlapped(win: &Win, id: &str) -> bool {
+        win.records().iter().any(|r| r.turn_id == id && r.overlapped_tab)
+    }
+
+    #[test]
+    fn overlapping_turns_in_two_module_windows_each_carry_the_overlap_note() {
+        let mut g = Group::new("group-overlap", false, false);
+        g.all_present();
+        let (first, _) = g.start_turn(Seat::First);
+        let (second, _) = g.start_turn(Seat::Second);
+        g.end_turn(Seat::Second);
+        g.end_turn(Seat::First);
+        g.settle("both records to carry the note", |g| {
+            overlapped(&g.c1.win, &first) && overlapped(&g.c2.win, &second)
+        });
+        g.shut_down();
+    }
+
+    /// Lets every edge on its way arrive, and takes a turn that starts afterwards past what its start's scan looks at.
+    fn let_edges_settle(g: &Group) {
+        let settled_at = Instant::now();
+        while settled_at.elapsed() < Duration::from_millis(300) {
+            g.step();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_turn_passed_on_ends_when_its_window_goes() {
+        let mut g = Group::new("group-overlap-gone", false, false);
+        g.all_present();
+        let (running, _) = g.start_turn(Seat::Second);
+        let_edges_settle(&g);
+        g.c2.hub_link.close("the window went away");
+        let_edges_settle(&g);
+
+        let (alone, _) = g.start_turn(Seat::First);
+        g.end_turn(Seat::First);
+        for _ in 0..20 {
+            g.step();
+        }
+        assert!(!overlapped(&g.c1.win, &alone), "{:?}", g.c1.win.records());
+        assert!(!running.is_empty());
+        g.shut_down();
+    }
+
+    #[test]
+    fn a_window_that_links_later_hears_the_turns_already_running() {
+        let mut g = Group::new("group-overlap-late", false, false);
+        g.all_present();
+        let (_, n) = g.start_turn(Seat::First);
+        assert!(n > 0);
+        let_edges_settle(&g);
+
+        let stand = Stand::start();
+        let this_process = LinkPartner {
+            pid: std::process::id(),
+            start: agent::child::start_time(std::process::id()).unwrap(),
+        };
+        let (hub_link, far) = ends(
+            this_process,
+            LinkPartner {
+                pid: stand.pid(),
+                start: stand.start_time(),
+            },
+        );
+        let heard: Rc<RefCell<Vec<Msg>>> = Rc::default();
+        {
+            let heard = heard.clone();
+            far.on("turn_edge", move |_, msg, _| heard.borrow_mut().push(msg));
+        }
+        g.review.linked(PeerId(18), &hub_link);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while heard.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "the running turn was not told");
+            hub_link.pump();
+            far.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(
+                &heard.borrow()[0],
+                Msg::TurnEdge {
+                    session,
+                    edge: EdgeKind::Started,
+                    ..
+                } if session == "s-c1"
+            ),
+            "{:?}",
+            heard.borrow()
+        );
+        g.review.unlinked(PeerId(18));
+        g.end_turn(Seat::First);
+        g.shut_down();
+    }
+
+    /// One finished turn in each window of the group, each writing its own file; what reverting each one takes.
+    fn one_turn_each(g: &mut Group) -> [(Seat, &'static str, &'static str, TabId, u32); 3] {
+        let n1 = g.turn(Seat::One, "a.txt", CHANGED);
+        let n2 = g.turn(Seat::First, "b.txt", CHANGED);
+        let n3 = g.turn(Seat::Second, "c.txt", CHANGED);
+        [
+            (Seat::One, "r1", "a.txt", g.one.tab, n1),
+            (Seat::First, "r2", "b.txt", g.c1.win.tab, n2),
+            (Seat::Second, "r3", "c.txt", g.c2.win.tab, n3),
+        ]
+    }
+
+    #[test]
+    fn a_turn_running_in_c2_blocks_a_revert_in_c1() {
+        let mut g = Group::new("c2-turn", false, false);
+        g.all_present();
+        let n = g.turn(Seat::First, "a.txt", CHANGED);
+
+        g.start_turn(Seat::Second);
+        assert!(g.c2.win.confirmed(), "c2's turn holds its running file");
+        let refused = g.request(Seat::First, "r1", revert_file("r1", g.c1.win.tab, n, "a.txt"));
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains(BUSY_TURN)),
+            "window 1 names the turn it sees: {refused:?}"
+        );
+        assert_eq!(g.read("a.txt"), CHANGED);
+
+        g.end_turn(Seat::Second);
+        assert!(g.c2.win.confirmed());
+        let result = g.request(Seat::First, "r2", revert_file("r2", g.c1.win.tab, n, "a.txt"));
+        assert_eq!(result, Ok(None), "with no turn running anywhere it goes through");
+        assert_eq!(g.read("a.txt"), BASE);
+        g.shut_down();
+    }
+
+    #[test]
+    fn an_unlinked_third_window_blocks_a_revert_anywhere_in_the_group() {
+        let mut g = Group::new("third", false, false);
+        g.all_present();
+        let reverts = one_turn_each(&mut g);
+        let third = Stand::start();
+        let holder = PresenceHolder::start(g.review_dir.clone(), third.pid());
+        assert_eq!(
+            holder
+                .sync_confirmed(&BTreeSet::new())
+                .recv_timeout(Duration::from_secs(10)),
+            Ok(Held::Yes)
+        );
+
+        for (seat, id, rel, tab, n) in reverts {
+            let refused = g.request(seat, id, revert_file(id, tab, n, rel));
+            assert!(
+                refused.as_ref().is_err_and(|why| why.contains(OTHER_WINDOW)),
+                "{seat:?}: {refused:?}"
+            );
+            assert_eq!(g.read(rel), CHANGED);
+        }
+        drop(holder);
+        drop(third);
+        g.shut_down();
+    }
+
+    #[test]
+    fn c2_counting_as_other_blocks_until_its_presence_held_arrives() {
+        let mut g = Group::new("c2-counted", false, true);
+        g.settle("c1 to confirm its presence", |g| {
+            !g.c1.hub_link.presence_flag().load(Ordering::SeqCst)
+        });
+        let n = g.turn(Seat::First, "a.txt", CHANGED);
+
+        let refused = g.request(Seat::First, "r1", revert_file("r1", g.c1.win.tab, n, "a.txt"));
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains(OTHER_WINDOW)),
+            "c2 has not said its presence is held: {refused:?}"
+        );
+        assert_eq!(g.read("a.txt"), CHANGED);
+
+        g.c2.win.release.as_ref().unwrap().send(()).unwrap();
+        g.settle("c2 to confirm its presence", |g| {
+            !g.c2.hub_link.presence_flag().load(Ordering::SeqCst)
+        });
+        let result = g.request(Seat::First, "r2", revert_file("r2", g.c1.win.tab, n, "a.txt"));
+        assert_eq!(result, Ok(None));
+        assert_eq!(g.read("a.txt"), BASE);
+        g.shut_down();
+    }
+
+    /// c1's revert of a turn of its own is on its worker, waiting for a window 1 that takes `revert_guard` and never
+    /// answers; returns the request's id.
+    fn waiting_for_the_guard(g: &mut Group) -> (&'static str, Instant) {
+        g.all_present();
+        let n = g.turn(Seat::First, "a.txt", CHANGED);
+        g.c1.hub_link.on("revert_guard", |_, _, _| {});
+        let asked = Instant::now();
+        g.c1.win.handle(revert_file("r1", g.c1.win.tab, n, "a.txt"));
+        g.settle("the revert to ask window 1", |g| g.c1.review.guards_waiting() == 1);
+        ("r1", asked)
+    }
+
+    #[test]
+    fn the_link_dropping_while_c1_waits_for_the_guard_refuses_the_revert() {
+        let mut g = Group::new("link-drops", false, false);
+        let (id, _) = waiting_for_the_guard(&mut g);
+        // Every window goes on being stepped while the worker waits: nothing on this thread waits with it.
+        for _ in 0..10 {
+            g.step();
+        }
+        assert_eq!(result_of(&g.c1.win.side.outs.borrow(), id), None, "still waiting");
+
+        g.c1.hub_link.close("window 1 went away");
+        g.settle("the revert's answer", |g| {
+            result_of(&g.c1.win.side.outs.borrow(), id).is_some()
+        });
+        let refused = result_of(&g.c1.win.side.outs.borrow(), id).unwrap();
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains(eitri_core::turn_review::NOT_LINKED)),
+            "{refused:?}"
+        );
+        assert_eq!(g.read("a.txt"), CHANGED);
+        assert_eq!(g.c1.review.guards_waiting(), 0);
+        g.shut_down();
+    }
+
+    #[test]
+    fn a_window_1_that_does_not_answer_refuses_the_revert_at_the_end_of_the_wait() {
+        let mut g = Group::new("no-answer", false, false);
+        let (id, asked) = waiting_for_the_guard(&mut g);
+        g.settle("the revert's answer", |g| {
+            result_of(&g.c1.win.side.outs.borrow(), id).is_some()
+        });
+        assert!(asked.elapsed() >= eitri_core::turn_review::GUARD_WAIT);
+        let refused = result_of(&g.c1.win.side.outs.borrow(), id).unwrap();
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains(eitri_core::turn_review::NOT_LINKED)),
+            "{refused:?}"
+        );
+        assert_eq!(g.read("a.txt"), CHANGED);
+        assert_eq!(
+            g.c1.review.guards_waiting(),
+            0,
+            "a worker that gave up leaves nothing behind"
+        );
+        g.shut_down();
+    }
+
+    #[test]
+    fn an_approval_read_after_the_link_ended_lets_no_write_through() {
+        let mut g = Group::new("late-approval", false, false);
+        let (id, _) = waiting_for_the_guard(&mut g);
+        // A write asks twice; the first approval takes the job on to its last look before it writes.
+        let first = g.c1.review.guard_job().unwrap();
+        let approval = |job| Msg::Guard {
+            job,
+            ok: true,
+            why: None,
+        };
+        g.c1.hub_link.send(approval(first), Vec::new()).unwrap();
+        g.settle("the last look to ask window 1", |g| {
+            g.c1.review.guard_job().is_some_and(|job| job != first)
+        });
+        let last = g.c1.review.guard_job().unwrap();
+
+        // The approval and the end both reach c1's link thread before its GTK side reads either.
+        let link = g.c1.link.sender().unwrap();
+        g.c1.hub_link.send(approval(last), Vec::new()).unwrap();
+        g.c1.hub_link.close("window 1 went away");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !link.is_closed() {
+            assert!(Instant::now() < deadline, "timed out waiting for the link thread");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        g.settle("the revert's answer", |g| {
+            result_of(&g.c1.win.side.outs.borrow(), id).is_some()
+        });
+        let refused = result_of(&g.c1.win.side.outs.borrow(), id).unwrap();
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains(eitri_core::turn_review::NOT_LINKED)),
+            "{refused:?}"
+        );
+        assert_eq!(g.read("a.txt"), CHANGED);
+        g.shut_down();
+    }
+
+    #[test]
+    fn window_1_reverts_with_c1_and_c2_linked_and_idle() {
+        let mut g = Group::new("idle", false, false);
+        g.all_present();
+        for (seat, id, rel, tab, n) in one_turn_each(&mut g) {
+            assert_eq!(g.request(seat, id, revert_file(id, tab, n, rel)), Ok(None), "{seat:?}");
+            assert_eq!(g.read(rel), BASE);
+        }
+        g.shut_down();
+    }
+
+    #[test]
+    fn review_calls_from_two_module_windows_route_back_to_their_own_link() {
+        let mut g = Group::new("routing", false, false);
+        g.all_present();
+        let n1 = g.turn(Seat::First, "a.txt", CHANGED);
+        let n2 = g.turn(Seat::Second, "b.txt", CHANGED);
+        for (seat, id, tab, n, rel) in [
+            (Seat::First, "o1", g.c1.win.tab, n1, "a.txt"),
+            (Seat::Second, "o2", g.c2.win.tab, n2, "b.txt"),
+        ] {
+            assert_eq!(
+                g.request(seat, id, open_in_editor(id, tab, n, rel)),
+                Ok(Some("opened".to_string())),
+                "answered on its own link"
+            );
+        }
+        let shows = |win: &Win, rel: &str| {
+            let path = win.file(rel);
+            win.side
+                .flow
+                .borrow_mut()
+                .remote_overlay()
+                .is_some_and(|overlay| overlay.active_paths().contains(&path))
+        };
+        g.settle("each window to hear its file is drawn", |g| {
+            shows(&g.c1.win, "a.txt") && shows(&g.c2.win, "b.txt")
+        });
+        assert!(!shows(&g.c1.win, "b.txt") && !shows(&g.c2.win, "a.txt"));
+
+        g.nvim
+            .events
+            .borrow_mut()
+            .push(revert_event(&g.c2.win, n2, "b.txt", 2, "two", "TWO"));
+        g.settle("c2's draft", |g| g.c2.win.draft_reverts() == 1);
+        for _ in 0..40 {
+            g.step();
+        }
+        assert_eq!(
+            g.c1.win.draft_reverts(),
+            0,
+            "the event goes to the window holding its session"
+        );
+        assert_eq!(g.one.draft_reverts(), 0);
+
+        g.review.unlinked(C1);
+        g.settle("c1's file to be cleared", |g| !g.drawn("a.txt"));
+        for _ in 0..20 {
+            g.step();
+        }
+        assert!(g.drawn("b.txt"), "c2 keeps what it drew");
+        g.shut_down();
+    }
+
+    #[test]
+    fn a_turn_in_a_module_window_marks_window_1s_overlapping_turn() {
+        let mut g = Group::new("overlap", false, false);
+        g.all_present();
+        let (one_turn, _) = g.start_turn(Seat::One);
+        g.start_turn(Seat::First);
+        g.end_turn(Seat::One);
+        g.settle("window 1's record to carry the note", |g| {
+            g.one
+                .records()
+                .iter()
+                .any(|r| r.turn_id == one_turn && r.overlapped_tab)
+        });
+        g.shut_down();
+    }
+
+    /// A prompt of window 1's, whose presence thread stalled, past its wait: both links are told, and window 1 has
+    /// read neither acknowledgement yet.
+    fn prompt_waiting_for_acks() -> Group {
+        let g = Group::new("acks", true, false);
+        let held = g.one.side.tabs.borrow_mut().send_prompt(
+            g.one.tab,
+            "p1",
+            ViewId::BASE,
+            FirstTurn {
+                typed_by_person: true,
+                wire: "hello".into(),
+                typed: "hello".into(),
+            },
+        );
+        assert!(held.is_none(), "held for the presence");
+        until("both links to be told", || {
+            g.one.tick(Some(&g.review));
+            g.steps.run();
+            g.review.acks_owed.borrow().len() == 2
+        });
+        g
+    }
+
+    #[test]
+    fn a_prompt_waiting_for_acknowledgements_waits_for_every_link() {
+        let g = prompt_waiting_for_acks();
+        until("c1's acknowledgement", || {
+            g.c1.hub_link.pump();
+            g.review.acks_owed.borrow().len() == 1
+        });
+        for _ in 0..5 {
+            g.one.tick(Some(&g.review));
+        }
+        assert!(g.one.provider.turns().is_empty(), "c2 may still skip window 1's file");
+        until("c2's acknowledgement", || {
+            g.c2.hub_link.pump();
+            g.one.tick(Some(&g.review));
+            !g.one.provider.turns().is_empty()
+        });
+        assert_eq!(g.one.provider.turns(), vec!["hello".to_string()]);
+        g.shut_down();
+    }
+
+    #[test]
+    fn a_link_ending_stands_for_its_acknowledgement() {
+        let g = prompt_waiting_for_acks();
+        until("c1's acknowledgement", || {
+            g.c1.hub_link.pump();
+            g.review.acks_owed.borrow().len() == 1
+        });
+        g.review.unlinked(C2);
+        until("the prompt", || {
+            g.one.tick(Some(&g.review));
+            !g.one.provider.turns().is_empty()
+        });
+        g.shut_down();
     }
 }

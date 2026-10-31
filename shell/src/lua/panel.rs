@@ -1,6 +1,7 @@
 //! Lua panel views and their crash recovery. Registration order and replacement live in core;
 //! the shell retains widgets and their shared crash guards by module id.
 
+use eitri_core::layout::ModuleId;
 use eitri_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use gtk4::prelude::*;
 use mlua::{Lua, Table};
@@ -73,6 +74,9 @@ pub(crate) struct PanelEntry {
 pub(crate) struct PanelRegistry {
     registry: eitri_core::lua::panel::PanelRegistry,
     pub(crate) views: PanelViews,
+    /// Panels register with an empty place, no view and no web process: the window may yet turn out to be a hub,
+    /// whose panels are windows of their own.
+    holding: bool,
 }
 
 impl PanelRegistry {
@@ -93,6 +97,42 @@ impl PanelRegistry {
     pub(crate) fn entries(&self) -> &[eitri_core::lua::panel::PanelEntry] {
         self.registry.entries()
     }
+
+    /// Panels registered from now on wait for [`settle_views`](Self::settle_views). Nothing waits where WebKit cannot
+    /// start: there a panel's notice is its view.
+    pub(crate) fn hold_views(&mut self) {
+        self.holding = crate::webkit_sandbox::decision().allows_webviews();
+    }
+
+    /// The window's mode is known. A window that hosts its panels (`hosts`) builds the views that waited; a hub
+    /// keeps its empty places, for these panels and any registered later.
+    pub(crate) fn settle_views(&mut self, hosts: bool) {
+        if !self.holding || !hosts {
+            return;
+        }
+        self.holding = false;
+        let waiting: Vec<(ModuleId, String, String)> = self
+            .entries()
+            .iter()
+            .map(|entry| (entry.module.clone(), entry.id.clone(), entry.url.clone()))
+            .collect();
+        for (module, id, url) in waiting {
+            let guard = self.views.guard(&module).expect("registered panel guard");
+            let webview = webkit6::WebView::new();
+            webview.load_uri(&url);
+            webview.set_hexpand(true);
+            webview.set_vexpand(true);
+            install_crash_recovery_into(&webview, id, url, None, guard);
+            self.views.set_widget(&module, webview.upcast());
+        }
+    }
+}
+
+/// Whether a window builds the view of the panel `id` as it registers. `shows` is the one module of a chat or page
+/// window, which builds no other module's page; `holding` is [`PanelRegistry`]'s. `init.lua` registers every panel in
+/// every window, so the panel is still recorded, with an empty widget that no host takes.
+fn builds_view(shows: Option<&ModuleId>, holding: bool, id: &str) -> bool {
+    !holding && shows.is_none_or(|module| *module == ModuleId::lua(id))
 }
 
 pub(crate) fn install(
@@ -100,6 +140,7 @@ pub(crate) fn install(
     eitri: &Table,
     registry: Rc<RefCell<PanelRegistry>>,
     config_dir: PathBuf,
+    shows: Option<ModuleId>,
 ) -> mlua::Result<()> {
     let panel_table = lua.create_table()?;
     let register_fn = lua.create_function(move |_, spec: Table| {
@@ -110,7 +151,15 @@ pub(crate) fn install(
         // panel is registered as usual with a notice in its place, so its key, position and title
         // still hold and `init.lua` needs no change. `main.rs`'s kill and revive paths downcast the
         // widget to a `WebView` and skip anything else.
-        let (widget, crash_guard) = if crate::webkit_sandbox::decision().allows_webviews() {
+        let holding = registry.borrow().holding;
+        let (widget, crash_guard) = if !builds_view(shows.as_ref(), holding, &parsed.id) {
+            (
+                gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast(),
+                Rc::new(RefCell::new(
+                    crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+                )),
+            )
+        } else if crate::webkit_sandbox::decision().allows_webviews() {
             let webview = webkit6::WebView::new();
             webview.load_uri(&resolved_url);
             webview.set_hexpand(true);
@@ -200,6 +249,41 @@ pub(crate) fn install_crash_recovery_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_or_page_window_builds_no_other_panels_view() {
+        assert!(
+            builds_view(None, false, "notes"),
+            "a window with no one module builds every panel"
+        );
+        let page = ModuleId::lua("notes");
+        assert!(builds_view(Some(&page), false, "notes"));
+        assert!(!builds_view(Some(&page), false, "other"));
+        assert!(!builds_view(Some(&ModuleId::agent()), false, "notes"));
+
+        let (_, code) = eitri_core::source_scan::function_in(
+            &[eitri_core::source_scan::read_required("shell/src/lua/panel.rs")],
+            "install",
+        );
+        let decided = code.find("builds_view(").expect("the panel's view is decided");
+        let built = code.find("WebView::new(").expect("the panel's view is built");
+        assert!(decided < built, "no view is built before it is decided");
+    }
+
+    #[test]
+    fn a_window_that_may_be_a_hub_builds_no_panel_view_as_it_registers() {
+        assert!(!builds_view(None, true, "notes"));
+        // Nothing in this test builds a view: a hub leaves what waited alone, and stays holding.
+        let mut registry = PanelRegistry {
+            holding: true,
+            ..PanelRegistry::default()
+        };
+        registry.settle_views(false);
+        assert!(
+            registry.holding,
+            "a panel registered later builds no view in a hub either"
+        );
+    }
 
     #[test]
     fn a_view_built_after_its_panel_registered_finds_its_crash_guard() {

@@ -1,8 +1,10 @@
 //! Reusable operation scripts for native hosts and their display-free doubles.
 
 use super::{host::*, window::*};
-use crate::layout::{ModuleId, ModuleKind};
+use crate::layout::{Direction, ModuleId, ModuleKind};
 use crate::tabs::ViewId;
+use crate::window_link::names::WindowName;
+use crate::window_link::HubAsk;
 use std::cell::{Cell, RefCell};
 
 #[derive(Default)]
@@ -664,7 +666,8 @@ pub fn join_back_refusal_script(win: WinId, text: &str) -> Script {
     }
 }
 
-/// What a host that can start no second window answers the pair's ops: each refused while it applies, so the
+/// What a host that can start no second window answers the pair's ops, and the ones a module window's start and keys
+/// add: each refused while it applies, so the
 /// controller hears why. A host whose shell has no pair at all runs these; a host that carries the ops out does not.
 pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
     vec![
@@ -680,6 +683,78 @@ pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
                 Expect::PostedDuring {
                     op: 0,
                     event: EventMatch::Refused(OpTag::OpenLinkedWindow),
+                },
+            ],
+        },
+        Script {
+            name: "a_refused_open_module_window_is_posted_refused",
+            ops: vec![HostOp::OpenModuleWindow {
+                win: f.win,
+                name: WindowName::Chat(2),
+                token: None,
+                keep_keys: false,
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::OpenModuleWindow),
+                },
+            ],
+        },
+        Script {
+            name: "a_refused_peer_run_is_posted_refused",
+            ops: vec![HostOp::PeerRun {
+                win: f.win,
+                peer: PeerId(16),
+                name: "zoom".into(),
+                opts: vec![],
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::PeerRun),
+                },
+            ],
+        },
+        Script {
+            name: "a_refused_hub_ask_is_posted_refused",
+            ops: vec![HostOp::HubAsk {
+                win: f.win,
+                ask: HubAsk::InstanceNew,
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::HubAsk),
+                },
+            ],
+        },
+        Script {
+            name: "a_refused_compositor_focus_is_posted_refused",
+            ops: vec![HostOp::CompositorFocus {
+                win: f.win,
+                direction: Direction::Left,
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::CompositorFocus),
                 },
             ],
         },
@@ -873,7 +948,16 @@ mod tests {
         };
         for script in pair_refusal_scripts(&f) {
             let host = FakeHost::new();
-            host.refuse_op(|op| matches!(op, HostOp::OpenLinkedWindow { .. }));
+            host.refuse_op(|op| {
+                matches!(
+                    op,
+                    HostOp::OpenLinkedWindow { .. }
+                        | HostOp::OpenModuleWindow { .. }
+                        | HostOp::PeerRun { .. }
+                        | HostOp::HubAsk { .. }
+                        | HostOp::CompositorFocus { .. }
+                )
+            });
             let sink = Rc::new(RecordingSink::default());
             let erased: Rc<dyn HostSink> = sink.clone();
             host.attach(Rc::downgrade(&erased));

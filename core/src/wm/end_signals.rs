@@ -20,6 +20,21 @@ pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 /// of those bounds means raising this one.
 pub const CLOSE_WITHIN: Duration = Duration::from_secs(40);
 
+/// How far ahead of the watchdog's `_exit` the SIGKILL of a window told to close lands: the `_exit` takes the thread
+/// that would send it.
+pub const KILL_AHEAD_OF_EXIT: Duration = Duration::from_secs(1);
+
+/// How long a window told to close has between its SIGTERM and its SIGKILL, when `grace` passes before that SIGTERM
+/// and the signal that started this process's own close came `since_signal` ago (zero if none has). The watchdog ends
+/// this process [`CLOSE_WITHIN`] after a signal, and a window that does not answer its own SIGTERM (one that is
+/// stopped) outlives whoever was to kill it; a signal that comes later only moves that end further off.
+///
+/// A window that hears the close late is still given more than its close can take, because a signal has to be answered
+/// within [`ANSWER_WITHIN`]: what is left then is above every bound that close may wait out, added up.
+pub fn told_within(grace: Duration, since_signal: Duration) -> Duration {
+    CLOSE_WITHIN.saturating_sub(since_signal + grace + KILL_AHEAD_OF_EXIT)
+}
+
 /// What the watchdog knows when it decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watch {
@@ -129,15 +144,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_close_bound_covers_every_bound_the_close_waits_out() {
+    /// Every bound a window's close may wait out, added as if they ran one after another.
+    fn every_close_bound() -> Duration {
         let session = Duration::from_secs(18);
         let saved_tabs = Duration::from_secs(5);
         let nvim = Duration::from_secs(5);
         let tasks = crate::plugin::tasks::GRACE;
         let pages = crate::plugin::tasks::GRACE + Duration::from_secs(1);
+        session + saved_tabs + nvim + tasks + pages
+    }
+
+    #[test]
+    fn the_close_bound_covers_every_bound_the_close_waits_out() {
         let margin = Duration::from_secs(5);
-        assert!(CLOSE_WITHIN >= session + saved_tabs + nvim + tasks + pages + margin);
+        assert!(CLOSE_WITHIN >= every_close_bound() + margin);
+    }
+
+    const GRACE: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn a_told_window_is_killed_before_the_watchdog_ends_this_process() {
+        for since_signal in [Duration::ZERO, Duration::from_secs(1), ANSWER_WITHIN] {
+            let kill_at = since_signal + GRACE + told_within(GRACE, since_signal);
+            assert!(
+                kill_at + KILL_AHEAD_OF_EXIT <= CLOSE_WITHIN,
+                "a close {since_signal:?} after its signal kills at {kill_at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_told_window_has_longer_than_its_close_can_take() {
+        for since_signal in [Duration::ZERO, Duration::from_secs(1), ANSWER_WITHIN] {
+            assert!(
+                GRACE + told_within(GRACE, since_signal) >= every_close_bound(),
+                "told {since_signal:?} after the signal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_with_no_time_left_kills_at_once() {
+        assert_eq!(told_within(GRACE, CLOSE_WITHIN + GRACE), Duration::ZERO);
     }
 
     #[test]

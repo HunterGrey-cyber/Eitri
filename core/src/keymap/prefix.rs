@@ -81,6 +81,19 @@ pub enum Outcome {
     Run(PrefixCommand),
 }
 
+/// Which keys wait for a module key after them, by what the window can place and hide. A key that does not wait runs
+/// as its action at once, so the window's own rule for that action answers the press.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModuleWaits {
+    /// A split key and the hide key both wait: the window lays modules out.
+    #[default]
+    SplitAndHide,
+    /// Only the hide key waits: the window places nothing, but has a module to hide.
+    Hide,
+    /// Neither waits: the window holds one module.
+    Neither,
+}
+
 /// The key `send-prefix` / `send-keys` hands the pane with the keys: `send-prefix` sends the configured prefix chord
 /// itself, so a user who rebound the prefix still reaches a program inside the pane that wants it.
 pub fn literal_for(action: &Action, keymap: &Keymap) -> Option<KeySpec> {
@@ -138,6 +151,7 @@ pub struct Prefix {
     held: Option<u32>,
     keymap: Rc<Keymap>,
     module_keys: Rc<ModuleKeys>,
+    waits: ModuleWaits,
 }
 
 impl Prefix {
@@ -148,7 +162,13 @@ impl Prefix {
             held: None,
             keymap,
             module_keys,
+            waits: ModuleWaits::default(),
         }
+    }
+
+    /// Which keys wait for a module key from the next press on.
+    pub fn set_module_waits(&mut self, waits: ModuleWaits) {
+        self.waits = waits;
     }
 
     /// Limits root keys to the actions `keep` accepts (a companion window has no layout to run most of them on).
@@ -335,11 +355,11 @@ impl Prefix {
                 };
                 match self.keymap.lookup(&key) {
                     Some(binding) => match binding.action {
-                        Action::Split { axis, cwd } => {
+                        Action::Split { axis, cwd } if self.waits == ModuleWaits::SplitAndHide => {
                             self.state = State::AwaitModule { axis, cwd };
                             Outcome::Swallow
                         }
-                        Action::ModuleHideByKey => {
+                        Action::ModuleHideByKey if self.waits != ModuleWaits::Neither => {
                             self.state = State::AwaitHide;
                             Outcome::Swallow
                         }

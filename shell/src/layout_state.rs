@@ -30,16 +30,79 @@ pub(crate) fn saver(
     saver
 }
 
-/// Taken by every test in this crate that runs glib's default main context, so they take turns:
-/// a source added there panics while another thread owns it.
 #[cfg(test)]
-pub(crate) static DEFAULT_CONTEXT_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static DEFAULT_CONTEXT_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One test's turn on glib's default main context, from [`default_context_turn`]. It ends by destroying every source
+/// added during it: a closure on that context belongs to the thread that added it, and a test's thread ends with the
+/// test. A source left behind, such as the timer a pump armed for its next deadline, would come due under the next
+/// test's iteration on another thread, where the closure's guard panics inside a callback that cannot unwind, and
+/// that aborts the whole binary.
+#[cfg(test)]
+pub(crate) struct DefaultContextTurn {
+    first_id: u32,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Taken by every test in this crate that runs glib's default main context, so they take turns: a source added there
+/// panics while another thread owns it.
+#[cfg(test)]
+pub(crate) fn default_context_turn() -> DefaultContextTurn {
+    let turn = DEFAULT_CONTEXT_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    DefaultContextTurn {
+        first_id: source_id_now(),
+        _turn: turn,
+    }
+}
+
+/// The id glib gives the source attached now: it hands them out in rising order. Read by attaching one that is
+/// destroyed before it can run.
+#[cfg(test)]
+fn source_id_now() -> u32 {
+    use gtk4::glib;
+    let marker = glib::source::idle_source_new(None, glib::Priority::LOW, || glib::ControlFlow::Break);
+    let id = marker.attach(Some(&glib::MainContext::default())).as_raw();
+    marker.destroy();
+    id
+}
+
+#[cfg(test)]
+impl Drop for DefaultContextTurn {
+    fn drop(&mut self) {
+        use gtk4::glib::{self, translate::from_glib};
+        let context = glib::MainContext::default();
+        for id in self.first_id..source_id_now() {
+            // SAFETY: the range starts at an id glib gave out and rises, so no id in it is zero.
+            let id: glib::SourceId = unsafe { from_glib(id) };
+            if let Some(source) = context.find_source_by_id(&id) {
+                source.destroy();
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::linked_window::tests::{id, window, Scratch};
     use eitri_core::layout::persist::{self, file_name_v2_as};
+
+    /// What a test leaves on the default context goes with its turn, armed or ready: the next test's iteration would
+    /// run it on a thread that is not its own.
+    #[test]
+    fn a_turn_takes_the_sources_added_during_it_with_it() {
+        use gtk4::glib;
+        let (timer, idle) = {
+            let _turn = default_context_turn();
+            (
+                glib::timeout_add_local_once(std::time::Duration::from_secs(60), || {}),
+                glib::idle_add_local_once(|| {}),
+            )
+        };
+        let context = glib::MainContext::default();
+        assert!(context.find_source_by_id(&timer).is_none(), "the armed timer");
+        assert!(context.find_source_by_id(&idle).is_none(), "the ready idle");
+    }
 
     fn root() -> PathBuf {
         PathBuf::from("/home/someone/project")

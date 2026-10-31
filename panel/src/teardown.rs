@@ -562,10 +562,54 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
     Ok(())
 }
 
+/// [`close_tab`] for a close someone asked for on one tab. The window hears when that was the base view's last: it may
+/// be a chat window with nothing left to show. A tab closed for a hand-over goes through [`close_tab`], since its window
+/// has to stay until the tab is safe in its new one.
+pub(super) fn close_tab_asked(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) -> Result<(), &'static str> {
+    let last = state.tabs.base_tabs() == [tab];
+    close_tab(state, tab, out)?;
+    if last {
+        out.effect(Effect::ChatMove(ChatMoveEvent::LastTabClosed));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn closing_the_base_views_last_tab_by_asking_tells_the_window() {
+        let (handle, _page) = settled_panel();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let into = heard.clone();
+        handle.state.borrow_mut().chat_moves.hook = Some(Rc::new(move |event| into.borrow_mut().push(event)));
+        let lasts = || {
+            let lasts = heard.borrow();
+            lasts
+                .iter()
+                .filter(|event| matches!(event, ChatMoveEvent::LastTabClosed))
+                .count()
+        };
+        let (first, second) = {
+            let mut state = handle.state.borrow_mut();
+            let first = state.tabs.active();
+            (first, state.tabs.open(AgentId::Claude))
+        };
+        handle.run(|state, out| close_tab_asked(state, second, out)).unwrap();
+        assert_eq!(lasts(), 0, "a tab is left");
+        handle.run(|state, out| close_tab(state, first, out)).unwrap();
+        assert_eq!(lasts(), 0, "a close nobody asked for on this tab says nothing");
+        let fresh = handle.state.borrow().tabs.active();
+        handle.run(|state, out| close_tab_asked(state, fresh, out)).unwrap();
+        assert_eq!(lasts(), 1);
+        assert_eq!(
+            handle.state.borrow().tabs.base_tabs().len(),
+            1,
+            "a fresh tab stands in its place"
+        );
+    }
 
     /// `SESSION_CLOSE_BACKSTOP` must cover both the `close_session` unary RPC and the
     /// sidecar's own reap of the `claude` CLI it owns, with margin -- so the drop normally finishes

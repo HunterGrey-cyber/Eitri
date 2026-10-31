@@ -10,6 +10,10 @@ window remembers the monitor it was on.
 Nothing about this is on by default and no key is bound to it. Without a call in your `init.lua` or a command from the
 panel, Eitri is one window, as before.
 
+There is no second window on Hyprland, sway or niri unless you set `window.tiling` to `"eitri"`: there, chats and pages
+are windows of your window manager by default, and its workspaces and outputs do this page's job. See
+[Compositor windows](compositor-windows.md).
+
 ## Open the second window
 
 Five verbs make up the feature. None has a default key, so bind the ones you want in
@@ -143,5 +147,5 @@ unseen by the other window's revert check until Eitri has read its first event.
 Two windows have been run in an isolated, headless sway session with two outputs, scripted keys and a stand-in model: the
 moves, the keys across the edge, a window ending and coming back, a restart on remembered monitors and the memory
 figure above. The Markdown preview and a moved chat were seen arriving. GNOME's token raise was tried in a probe, not
-with the pair. Hyprland, niri, KDE and a real desktop with two physical monitors have not been tried; reports are
-welcome. The [known issues](../known-issues.md) list the rest.
+with the pair. On Hyprland 0.57 and 0.56.2 in a virtual machine only the keys at the edge were tried, on one output and
+on two. niri, KDE and a real desktop with two physical monitors have not been tried; reports are welcome. The [known issues](../known-issues.md) list the rest.

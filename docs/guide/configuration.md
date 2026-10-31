@@ -60,7 +60,8 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `keymap.from_tmux` | `true` / `"on"` or `false` / `"off"` | `"on"` | Whether Eitri reads your tmux prefix and prefix-table keys from your tmux configuration. See [Keys](#keys). |
 | `keymap.which_key_delay` | a whole number from 0 to 5000, or `false` / `"off"` | `"off"` | Milliseconds the prefix waits for a second key before a panel lists the keys that may follow; `0` shows it at once. See [The hint panel](keys.md#the-hint-panel). Not drawn in a companion window or on the Mac. |
 | `keymap.nvim_prefix` | a Neovim left-hand side of at most 16 characters (`"<leader>W"`), or `false` / `"off"` | `"off"` | Maps the layout keys of your prefix table in Neovim's Normal mode under this left-hand side, each running its `:Eitri` action. See [From Neovim: `:Eitri`](keys.md#from-neovim-eitri). |
-| `window.restore` | `true` / `"on"` or `false` / `"off"` | `true` | Whether the window that holds a pair brings window 2 back at the next start when it was open when the pair last ended. With `false`, window 1 takes back what window 2 held and offers its saved tabs. See [Two windows](two-windows.md). |
+| `window.restore` | `true` / `"on"` or `false` / `"off"` | `true` | Whether the window that holds a pair brings window 2 back at the next start when it was open when the pair last ended, and whether window 1 of a compositor group brings back its windows, their outputs and its bottom terminal. With `false`, window 1 takes back what window 2 held and offers its saved tabs. See [Two windows](two-windows.md) and [Compositor windows](compositor-windows.md#coming-back). |
+| `window.tiling` | `"auto"`, `"eitri"` or `"compositor"` | `"auto"` | Who arranges chats and pages. `"auto"` makes them windows of your window manager on Hyprland, sway or niri when the compositor answers, and keeps them inside Eitri's window anywhere else; `"eitri"` keeps them inside; `"compositor"` makes them windows on any Wayland desktop. Any other value stops startup. See [Compositor windows](compositor-windows.md). |
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
 The settings are read once, when the window starts. Change `init.lua` and open a new window to apply a change.
@@ -120,8 +121,8 @@ nothing: the next plain `eitri` opens it, and `:Eitri setup` opens it at any tim
 
 **What it looks at.** It reads, and never changes: the tmux configuration Eitri already read for
 [`keymap.from_tmux`](#settings); the desktop you are on and, under i3 or sway, whether `$mod` is Alt or Super (from
-the window manager's own answer, else its config file); under Hyprland, its binds; which plugin in your Neovim
-owns, or probably owns, `Ctrl+b` and `Ctrl+h/j/k/l`; and whether an input method is running (by its process; Eitri
+the window manager's own answer, else its config file); under Hyprland, its binds; whether Hyprland, sway or niri answers its version command, and then a `windows` row says
+what [`window.tiling`](compositor-windows.md) `"auto"` would do here; which plugin in your Neovim owns, or probably owns, `Ctrl+b` and `Ctrl+h/j/k/l`; and whether an input method is running (by its process; Eitri
 never reads an input method's own settings). Rows appear as the answers come in, and the screen does not wait for
 a slow one. None of that text is copied into the file.
 
@@ -132,10 +133,12 @@ a slow one. None of that text is copied into the file.
 | Neovim + tmux | `keymap.from_tmux` on, so the keys stay your tmux configuration's; the hint panel as a commented line (the default when a tmux configuration exists) |
 | Neovim, no tmux | `keymap.from_tmux` off, the stock `Ctrl+b` prefix, and the [hint panel](keys.md#the-hint-panel) on; when Neovim reported a leader, the window keys under it (`keymap.nvim_prefix`) |
 | Another prefix | `Ctrl+a`, `Ctrl+Space`, or a key you press: `k.prefix`, `k.del` for the old `Ctrl+b` and `k.set("prefix", key, "send-prefix")`, as [Keys](keys.md#choosing-ctrlspace-as-the-prefix) shows |
-| i3 / sway style | the stock keys, and `eitri.keymap.use("i3-alt")` when your `$mod` is Alt; nothing extra when it is Super |
+| i3 / sway style | the stock keys, and `eitri.keymap.use("i3-alt")` when your `$mod` is Alt; nothing extra when it is Super; `window.tiling` `"eitri"`, so Eitri arranges its own modules |
+| Tiling compositor | `window.tiling` `"compositor"`: [your window manager arranges chats and pages](compositor-windows.md) as its own windows, and Eitri's layout keys are off. Listed only when Hyprland, sway or niri answered, and then it is the default |
 
-The review step shows the lines before they are written; `p` changes the prefix and `Backspace` goes back. A
-prefix other than the one the window runs with is checked with a **press test** first: the screen asks you to press
+The review step shows the lines before they are written; `p` changes the prefix and `Backspace` goes back. On
+Hyprland, sway or niri the first three presets also get `w`, which writes `window.tiling` as `"compositor"` or
+`"eitri"`; the line beside it says which (`Windows: sway arranges`). A prefix other than the one the window runs with is checked with a **press test** first: the screen asks you to press
 it once and says whether it arrived. A key an input method or the desktop takes never reaches Eitri, and the screen
 says so, then lets you choose another prefix or write it anyway; `Esc` goes back while it waits. A key the keymap
 refuses (`Ctrl+h`, a bare letter) is refused at once, with the reason.

@@ -502,6 +502,7 @@ mod tests {
             focused: false,
             visible: true,
             rect: None,
+            ..Default::default()
         };
         for bad in hostile {
             assert_eq!(OutputName::new(bad), None, "{bad:?}");

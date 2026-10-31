@@ -128,6 +128,10 @@ pub enum ChatMoveEvent {
     PresenceHeld { mv: u64 },
     /// The presence could not hold it.
     PresenceRefused { mv: u64, why: String },
+    /// A tab handed to or from another window by resume, which no move of the controller's carries.
+    HandOver(super::TabAnswer),
+    /// The base view's last tab was closed by asking, and a fresh one stands in its place.
+    LastTabClosed,
 }
 
 /// What takes a moved chat's provider up by its kind: the providers' own adopt, or a test's stand-in.
@@ -863,6 +867,9 @@ mod tests {
                         && b.provider_session_id().is_some()
                 })
         });
+        // The conversation folds on its own thread, so all of that can show before the first tick, and a window
+        // that has never pumped its tabs refuses a freeze.
+        w.handle.tick();
         (tab, provider)
     }
 

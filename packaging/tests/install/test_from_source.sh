@@ -55,6 +55,7 @@ fs_scaffold() {
 	cp "$PKG/eitri.launcher.sh" "$_fs_dir/packaging/eitri.launcher.sh"
 	cp "$PKG/cn.huntergrey.eitri.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.desktop"
 	cp "$PKG/cn.huntergrey.eitri.Panel.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.Panel.desktop"
+	cp "$PKG/cn.huntergrey.eitri.Page.desktop" "$_fs_dir/packaging/cn.huntergrey.eitri.Page.desktop"
 	mkdir -p "$_fs_dir/nvim"
 	cp -R "$PKG/../nvim/eitri.nvim" "$_fs_dir/nvim/eitri.nvim"
 	cp -R "$PKG/../gnome-extension" "$_fs_dir/gnome-extension"
@@ -186,6 +187,7 @@ t_from_source_clone_head_match_builds_and_installs() {
 	# placeholder licence file carries the logo's CC BY notice, which needs no generating.
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.desktop"
 	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Panel.desktop"
+	expect_file "$(data_of)/applications/cn.huntergrey.eitri.Page.desktop"
 	for f in plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt; do
 		if ! cmp -s "$PKG/../nvim/eitri.nvim/$f" "$(data_of)/eitri/eitri.nvim/$f"; then fail "the plugin file $f was not installed from the checkout"; fi
 	done

@@ -1,11 +1,13 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=07b62f120f9201c44c239b529891e669bb445d8aa15042eb0474032746704a4e -->
+<!-- translated-from: companion.md sha256=3322e2cdac68ce72c638a549d6fc0bfae34bdd42616ec5e3e9d9562f3be0bc95 -->
 
 # 配合你自己的 Neovim 使用
 
 Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时用的 Neovim 旁边，可以是在终端里（在 tmux 里或不在都行），也可以是上游 Neovide 或其他任何 Neovim 图形前端。这一页讲怎样启动它、焦点怎样在两个窗口之间移动，以及每种桌面需要什么。直接运行 `eitri` 得到的窗口在[快速上手](getting-started.zh-CN.md)里讲；面板自己的按键在两种方式下是一样的，[按键](keys.zh-CN.md)里列出了它们。
 
 面板通过 RPC socket 附着到你的 Neovim 上，并在里面装一小段胶水代码：你打开的文件和 Visual 选区会送给 agent；面板取用你的配色方案并显示你的 which-key 按键；agent 改完文件后缓冲区会重新加载；可以从面板里按行号打开文件；`Ctrl+g` 在 Neovim 里编辑草稿。面板一消失就把这些全部撤掉。你的 Neovim 配置里不会被写入任何东西。编辑器保持它自己的速度和按键，两个窗口怎么摆由你的窗口管理器决定。
+
+在 Hyprland、sway 或 niri 上，普通的 `eitri` 也会把它的聊天和页面放进各自的窗口，不过围绕的是 Eitri 的编辑器，而不是你的：见[合成器窗口](compositor-windows.zh-CN.md)。
 
 <a id="the-eitrinvim-plugin"></a>
 ## eitri.nvim 插件
@@ -105,7 +107,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 
 | 桌面 | 通过什么检测 | Eitri 做什么 |
 |---|---|---|
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch` 移动焦点。Eitri 先问一次 Hyprland 用的是 Lua 配置（`hyprland.lua`）还是 `hyprland.conf`，再按那种配置的写法发命令。到了边缘会怎样，由 Hyprland 自己决定 |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch` 移动焦点，之前先确认那个方向确实有可见的窗口，因为 Hyprland 自己的移动在那个方向什么都没有时也会挑一个窗口：到了真正的边缘，按键就停在那里。互相重叠的窗口（比如浮动窗口）交给 Hyprland 决定。Eitri 先问一次 Hyprland 用的是 Lua 配置（`hyprland.lua`）还是 `hyprland.conf`，再按那种配置的写法发命令 |
 | sway | `SWAYSOCK` | 用 `swaymsg` 移动焦点，会先确认那个方向上确实有一个可见的窗口（在任何输出上），所以 sway 默认的焦点环绕不会把你带到远端。到了边缘，这个键被吞掉 |
 | niri | `NIRI_SOCKET` | 用 `niri msg action` 移动焦点；到了边缘会怎样，由 niri 自己决定 |
 | GNOME | `XDG_CURRENT_DESKTOP` 含有 `GNOME`，且是 Wayland 会话 | 通过 [Eitri GNOME Shell 扩展](#gnome-the-extension)移动焦点，前提是你已经启用了它。没有它就不移动焦点（在 GNOME 上 Wayland 客户端没法自己抢到焦点），状态条会提示一次：你的桌面不允许 Eitri 移动焦点，并指出这个扩展 |

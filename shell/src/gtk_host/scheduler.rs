@@ -305,9 +305,7 @@ mod tests {
 
     #[test]
     fn glib_scheduler_maps_idle_to_default_idle_and_timers_to_default() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -336,9 +334,7 @@ mod tests {
 
     #[test]
     fn a_wake_from_another_thread_posts_wake_on_the_ui_thread() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
             .acquire()
@@ -355,9 +351,7 @@ mod tests {
 
     #[test]
     fn a_waker_and_a_watch_taken_before_the_loop_owns_the_context_still_post() {
-        let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         assert!(
             !context.is_owner(),

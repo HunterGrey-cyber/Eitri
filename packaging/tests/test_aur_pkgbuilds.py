@@ -28,6 +28,7 @@ _REPO = os.path.dirname(_PACKAGING)
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-aur-pkgbuild-tests")
 DESKTOP = "cn.huntergrey.eitri.desktop"
 PANEL_DESKTOP = "cn.huntergrey.eitri.Panel.desktop"
+PAGE_DESKTOP = "cn.huntergrey.eitri.Page.desktop"
 PLUGIN_ROOT = os.path.join(_REPO, "nvim", "eitri.nvim")
 EXTENSION_ROOT = os.path.join(_REPO, "gnome-extension")
 EXTENSION_ID = "eitri@huntergrey.cn"
@@ -137,6 +138,11 @@ class _PackageCase(unittest.TestCase):
             _read(os.path.join(self.pkgdir, "usr/share/applications", PANEL_DESKTOP)),
             _read(os.path.join(_PACKAGING, PANEL_DESKTOP)),
         )
+        self.assertIn(f"usr/share/applications/{PAGE_DESKTOP}", got)
+        self.assertEqual(
+            _read(os.path.join(self.pkgdir, "usr/share/applications", PAGE_DESKTOP)),
+            _read(os.path.join(_PACKAGING, PAGE_DESKTOP)),
+        )
         self.assertEqual(len(_plugin_files()), 3)
         self.assertEqual(
             [p for p in got if p.startswith("usr/share/eitri/nvim/")],
@@ -189,6 +195,7 @@ class EitriBinPackage(_PackageCase):
         os.makedirs(os.path.join(top, "share", "applications"))
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(top, "share", "applications", DESKTOP))
         shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(top, "share", "applications", PANEL_DESKTOP))
+        shutil.copy(os.path.join(_PACKAGING, PAGE_DESKTOP), os.path.join(top, "share", "applications", PAGE_DESKTOP))
         shutil.copytree(PLUGIN_ROOT, os.path.join(top, "share", "eitri", "eitri.nvim"))
         # A stray testing.js beside the four shipped files must not be installed (the git route's checkout,
         # below, holds the whole directory and the package must leave the rest out the same way).
@@ -257,6 +264,7 @@ class EitriGitPackage(_PackageCase):
         # The committed entry and icons, exactly as the repository holds them (and the notice).
         shutil.copy(os.path.join(_PACKAGING, DESKTOP), os.path.join(tree, "packaging", DESKTOP))
         shutil.copy(os.path.join(_PACKAGING, PANEL_DESKTOP), os.path.join(tree, "packaging", PANEL_DESKTOP))
+        shutil.copy(os.path.join(_PACKAGING, PAGE_DESKTOP), os.path.join(tree, "packaging", PAGE_DESKTOP))
         shutil.copytree(PLUGIN_ROOT, os.path.join(tree, "nvim", "eitri.nvim"))
         shutil.copytree(EXTENSION_ROOT, os.path.join(tree, "gnome-extension"))
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(tree, "packaging", "icons"))

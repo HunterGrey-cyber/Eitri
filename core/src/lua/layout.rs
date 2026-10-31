@@ -106,12 +106,12 @@ pub struct LayoutStore {
     accepting: bool,
     lua_panels: Vec<String>,
     layout: Option<Query<Layout>>,
-    window: Option<&'static str>,
+    window: Option<String>,
 }
 
 /// How `eitri.window` and `get().window` name a window: `"1"` for the one that holds the pair (a
 /// window alone included), `"2"` for the second, and nothing for a window on a project whose pair
-/// another window holds.
+/// another window holds. A chat or page window is named by its own name (`"c3"`, `"p:markdown"`).
 pub fn window_name(role: crate::window_link::pair::Role) -> Option<&'static str> {
     match role {
         crate::window_link::pair::Role::Main => Some("1"),
@@ -150,8 +150,8 @@ impl LayoutStore {
 
     /// Which window of a pair this is, for `get().window` ([`window_name`]); `Kernel::set_window`
     /// sets it with `eitri.window`.
-    pub fn set_window(&mut self, window: Option<&'static str>) {
-        self.window = window;
+    pub fn set_window(&mut self, window: Option<&str>) {
+        self.window = window.map(str::to_owned);
     }
 
     /// The registered panel ids that `module.<id>` may name.
@@ -522,7 +522,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 "away",
                 lua.create_sequence_from(layout.away().iter().map(ModuleId::as_str))?,
             )?;
-            table.set("window", store.window)?;
+            table.set("window", store.window.as_deref())?;
             let zoomed = match layout.zoom() {
                 Some(crate::layout::Zoom::Module(id)) => Some(id.clone()),
                 Some(crate::layout::Zoom::Con(id)) => layout

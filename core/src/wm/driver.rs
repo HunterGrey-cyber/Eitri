@@ -409,9 +409,30 @@ impl Driver<Controller> {
         self.decide.borrow_mut().set_hint_delay(win, delay);
     }
 
+    /// Holds compositor mode's first-start toast for `win`: the first-start screen goes first, and what it writes can
+    /// drop the toast ([`Controller::hold_first_toast`]).
+    pub fn hold_first_toast(&self, win: WinId, text: String) {
+        self.decide.borrow_mut().hold_first_toast(win, text);
+    }
+
     /// What `win`'s module verbs place and kill by ([`Controller::set_module_setup`]).
     pub fn set_module_setup(&self, win: WinId, setup: super::verbs::modules::ModuleSetup) {
         self.decide.borrow_mut().set_module_setup(win, setup);
+    }
+
+    /// Which chat or page window `win` is ([`Controller::set_module_name`]).
+    pub fn set_module_name(&self, win: WinId, name: crate::window_link::names::WindowName) {
+        self.decide.borrow_mut().set_module_name(win, name);
+    }
+
+    /// What `win`'s start knows so far ([`Controller::set_early_facts`]).
+    pub fn set_early_facts(&self, win: WinId, early: super::start::EarlyFacts) {
+        self.decide.borrow_mut().set_early_facts(win, early);
+    }
+
+    /// What `win`'s start opens beside it as a hub ([`Controller::set_start_windows`]).
+    pub fn set_start_windows(&self, win: WinId, windows: super::start::StartWindows) {
+        self.decide.borrow_mut().set_start_windows(win, windows);
     }
 
     /// Where `win` goes at its start ([`Controller::set_placement`]).
@@ -420,15 +441,21 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
-    /// `win` is linked to the other window of the pair ([`Controller::attach_peer`]).
-    pub fn attach_peer(&self, win: WinId, peer: super::window::PeerId, port: Rc<dyn PeerPort>) {
-        let batch = self.decide.borrow_mut().attach_peer(win, peer, port);
+    /// `win` is linked to the window `peer`, called `name` ([`Controller::attach_peer`]).
+    pub fn attach_peer(
+        &self,
+        win: WinId,
+        peer: super::window::PeerId,
+        name: crate::window_link::names::WindowName,
+        port: Rc<dyn PeerPort>,
+    ) {
+        let batch = self.decide.borrow_mut().attach_peer(win, peer, name, port);
         self.submit(batch);
     }
 
-    /// `win`'s link has gone ([`Controller::detach_peer`]).
-    pub fn detach_peer(&self, win: WinId) {
-        let batch = self.decide.borrow_mut().detach_peer(win);
+    /// `win`'s link to `peer` has gone ([`Controller::detach_peer`]).
+    pub fn detach_peer(&self, win: WinId, peer: super::window::PeerId) {
+        let batch = self.decide.borrow_mut().detach_peer(win, peer);
         self.submit(batch);
     }
 

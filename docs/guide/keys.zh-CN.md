@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=b3b907844d25414a34a7e290c50da70767395aee0d65b563f25602e493c9644c -->
+<!-- translated-from: keys.md sha256=0f3ed3e80ae6405bb24ebfc6f47a197d29cea3e6cc2143c11f575a6f9f816a19 -->
 
 # 按键
 
@@ -22,6 +22,8 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 > - 在编辑器里运行 `:EitriTutor`，会一步步带你把这些键走一遍，用英文或简体中文（按你的语言环境来选，和
 >   Neovim 的 `:Tutor` 一样）。课文里凡是指“你的前缀”的地方都写你自己的前缀，教的是前缀之后的默认键，所以被
 >   tmux 配置改过的键不会体现在里面；你的前缀加 `?` 会列出你的键。
+> - **在 Hyprland、sway 和 niri 上，这一页的布局键默认关闭**，因为窗口由你的窗口管理器排布：`Ctrl+b %` 只显示一条提示，不做别的。
+>   [合成器窗口](compositor-windows.zh-CN.md#keys)说明哪些键在那里仍然有效，`window.tiling = "eitri"` 把其余的键带回来。教程不管怎样都会教这些键。
 
 ## 前缀
 
@@ -272,6 +274,8 @@ require("smart-splits").setup({
 | `:Eitri workspace <name>` | 切换到那个工作区，没有就先建出来 |
 | `:Eitri keys` | 按键表 |
 | `:Eitri setup` | [首次启动界面](configuration.zh-CN.md#first-start)，用来重新选一套按键 |
+
+使用[合成器窗口](compositor-windows.zh-CN.md#keys)时，`workspace`、`open terminal` 以及对编辑器或终端的 `split` 都关闭，和它们的键一样。
 
 补全按位置来：第一个词列出这些词和动作名，`split` 之后列出 `right` 和 `below`，`open` 之后列出 `terminal` 和 `agent`，该写模块的地方列出模块 id，其中每个带编号的实例不管开没开都在。第一个词既不是这些词也不是动作时，是一个 Neovim 错误，什么都不会发出去。窗口拒绝的其他情况（动作缺少必需的选项、模块没有打开、`tab.new` 这样的面板键）在窗口里弹一条提示说明原因，Neovim 这边听不到回音。
 

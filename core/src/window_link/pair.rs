@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::names::WindowName;
 use crate::state_paths::project_key;
 
 pub const PAIR_FILE_VERSION: u32 = 1;
@@ -55,9 +56,19 @@ pub fn pair_lock_name(project_root: &Path) -> String {
     format!("{}.pair.lock", project_key(project_root))
 }
 
-/// In `<state>/eitri/log/`.
+/// In `<state>/eitri/layout/`.
+pub fn group_claim_name(project_root: &Path) -> String {
+    format!("{}.group.lock", project_key(project_root))
+}
+
+/// Window 2's log, in `<state>/eitri/log/`.
 pub fn log_file_name(project_root: &Path) -> String {
-    format!("window-2-{}.log", project_key(project_root))
+    log_file_name_for(project_root, &WindowName::Second)
+}
+
+/// In `<state>/eitri/log/`.
+pub fn log_file_name_for(project_root: &Path, name: &WindowName) -> String {
+    format!("window-{}-{}.log", name.file_form(), project_key(project_root))
 }
 
 /// An exclusive `flock` on the pair's lock file. The lock belongs to the open file description, so every copy of
@@ -70,27 +81,8 @@ pub struct PairLock {
 impl PairLock {
     /// `Ok(None)` while another window holds the pair.
     pub fn try_take(layout_dir: &Path, project_root: &Path) -> io::Result<Option<PairLock>> {
-        crate::state_paths::create_state_dir(layout_dir)?;
-        let path = layout_dir.join(pair_lock_name(project_root));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path)?;
-        let fd = OwnedFd::from(file);
-        Self::check(&fd)?;
-        // SAFETY: `fd` is open for the call.
-        if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(PairLock { fd }));
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(None)
-        } else {
-            Err(err)
-        }
+        let taken = exclusive_flock(layout_dir, &pair_lock_name(project_root))?;
+        Ok(taken.map(|fd| PairLock { fd }))
     }
 
     /// The lock as the other window of the pair passed it: the same open file description, already locked.
@@ -120,6 +112,49 @@ impl PairLock {
 impl AsFd for PairLock {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+}
+
+/// An exclusive `flock` that names the one window 1 of a group. The pair lock cannot do this: every window of a group
+/// holds a copy of its open file description, so it stays held when window 1 dies, and two windows that each adopt a
+/// copy from an orphan do not exclude each other. This descriptor never leaves its process, so the claim ends with its
+/// window, and a window that took the group over from orphans holds it for as long as it runs: a later start finds it
+/// held and leaves the orphans that missed the first window's bound alone.
+#[derive(Debug)]
+pub struct GroupClaim {
+    _fd: OwnedFd,
+}
+
+impl GroupClaim {
+    /// `Ok(None)` while another window leads the group or is taking it over.
+    pub fn try_take(layout_dir: &Path, project_root: &Path) -> io::Result<Option<GroupClaim>> {
+        let taken = exclusive_flock(layout_dir, &group_claim_name(project_root))?;
+        Ok(taken.map(|fd| GroupClaim { _fd: fd }))
+    }
+}
+
+/// The descriptor of `name` in `layout_dir` under an exclusive `flock`; `Ok(None)` while another open file description
+/// holds it. The file must be a regular file of this user, reached through no link.
+fn exclusive_flock(layout_dir: &Path, name: &str) -> io::Result<Option<OwnedFd>> {
+    crate::state_paths::create_state_dir(layout_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(layout_dir.join(name))?;
+    let fd = OwnedFd::from(file);
+    PairLock::check(&fd)?;
+    // SAFETY: `fd` is open for the call.
+    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(fd));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(err)
     }
 }
 
@@ -273,6 +308,29 @@ mod tests {
         let dir = ScratchDir::new("nv-pair", "link");
         std::os::unix::fs::symlink("/dev/null", dir.join(pair_lock_name(&root()))).unwrap();
         assert!(PairLock::try_take(&dir, &root()).is_err());
+    }
+
+    #[test]
+    fn one_window_claims_the_group_whoever_holds_the_pair_lock() {
+        let dir = ScratchDir::new("nv-pair", "claim");
+        let pair = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let first = GroupClaim::try_take(&dir, &root()).unwrap();
+        assert!(first.is_some(), "the claim is a lock of its own");
+        assert!(GroupClaim::try_take(&dir, &root()).unwrap().is_none());
+        drop(first);
+        assert!(GroupClaim::try_take(&dir, &root()).unwrap().is_some());
+        drop(pair);
+        assert_eq!(
+            group_claim_name(&root()),
+            format!("{}.group.lock", &agent::conversation_id_for_cwd(&root())[..16])
+        );
+    }
+
+    #[test]
+    fn a_link_in_the_claims_place_is_refused() {
+        let dir = ScratchDir::new("nv-pair", "claim-link");
+        std::os::unix::fs::symlink("/dev/null", dir.join(group_claim_name(&root()))).unwrap();
+        assert!(GroupClaim::try_take(&dir, &root()).is_err());
     }
 
     #[test]

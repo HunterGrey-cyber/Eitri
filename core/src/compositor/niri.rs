@@ -16,6 +16,15 @@ pub fn parse_windows(json: &str) -> Result<Vec<WindowRef>, String> {
         };
         out.push(WindowRef {
             pid,
+            app_id: w.get("app_id").and_then(Value::as_str).map(str::to_owned),
+            title: w.get("title").and_then(Value::as_str).map(str::to_owned),
+            address: None,
+            workspace: w.get("workspace_id").and_then(|id| {
+                id.as_u64()
+                    .map(|n| n.to_string())
+                    .or_else(|| id.as_str().map(str::to_owned))
+            }),
+            output: w.get("output").and_then(Value::as_str).map(str::to_owned),
             id: w.get("id").and_then(Value::as_u64),
             focused: w.get("is_focused").and_then(Value::as_bool).unwrap_or(false),
             // niri does not say; nothing reads it there, since only sway is asked about edges.

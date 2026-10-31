@@ -21,6 +21,12 @@
 //! and from then until it says it can again it is another window like any other. Writes are kept
 //! one at a time across windows by the project's write slot ([`super::write_slot`]), which every
 //! window takes, linked or not.
+//!
+//! **A group of windows is a star, and window 1 decides.** A module window is linked to window 1
+//! alone, so every other module window's file would look like another window to it, and its own
+//! partners say nothing about them. Only window 1 knows the whole group, so a module window's
+//! [`PresenceGuard::check_own`] covers only itself and its revert asks window 1 through a
+//! [`GroupGuard`]; window 1 answers with its own [`PresenceGuard::check`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -284,6 +290,8 @@ pub enum Blocked {
     TurnRunningHere,
     /// This window's own lock is not held, so it cannot tell others it is here.
     NotHeld(String),
+    /// Window 1 refused a module window's write, for the reason it gave.
+    Group(String),
 }
 
 impl fmt::Display for Blocked {
@@ -292,6 +300,7 @@ impl fmt::Display for Blocked {
             Blocked::Busy(busy) => f.write_str(busy.reason()),
             Blocked::TurnRunningHere => f.write_str("an agent turn is running"),
             Blocked::NotHeld(why) => write!(f, "this window's presence lock is not held: {why}"),
+            Blocked::Group(why) => f.write_str(why),
         }
     }
 }
@@ -304,6 +313,17 @@ pub enum Held {
     NotYet,
     Yes,
     No(String),
+}
+
+/// How a module window's write reaches window 1 from its worker thread, off the GTK thread.
+pub trait GroupGuard: Send + Sync {
+    /// Asks whether the group lets this window write now. Never waits: gives the ask's job, and the
+    /// answer comes on the receiver, `Err` saying what blocks it, and a receiver that closes means the
+    /// link ended. `None`: there is no link to ask on.
+    fn ask(&self) -> Option<(u64, mpsc::Receiver<Result<(), String>>)>;
+
+    /// The worker that asked `job` has stopped waiting: nobody takes its answer any more.
+    fn gave_up(&self, job: u64);
 }
 
 /// Sent to the presence thread.
@@ -324,6 +344,7 @@ pub struct PresenceHolder {
     held: Arc<Mutex<Held>>,
     last_sent: Mutex<Option<BTreeSet<u64>>>,
     partners: Arc<Mutex<BTreeMap<u32, Partner>>>,
+    group: Arc<Mutex<Option<Arc<dyn GroupGuard>>>>,
 }
 
 fn set_held(held: &Mutex<Held>, to: Held) {
@@ -370,6 +391,7 @@ impl PresenceHolder {
             held,
             last_sent: Mutex::new(None),
             partners: Arc::new(Mutex::new(BTreeMap::new())),
+            group: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -412,6 +434,7 @@ impl PresenceHolder {
             running_here: Arc::clone(&self.running_here),
             held: Arc::clone(&self.held),
             partners: Arc::clone(&self.partners),
+            group: Arc::clone(&self.group),
         }
     }
 }
@@ -500,6 +523,8 @@ pub struct PresenceGuard {
     /// This window's linked partners by pid. Shared by every guard of one window, so a partner set
     /// or cleared reaches a worker's check at once.
     partners: Arc<Mutex<BTreeMap<u32, Partner>>>,
+    /// In a module window: how its writes ask window 1. Shared as `partners` is.
+    group: Arc<Mutex<Option<Arc<dyn GroupGuard>>>>,
 }
 
 impl PresenceGuard {
@@ -527,6 +552,17 @@ impl PresenceGuard {
     /// check on, and the other partners stay.
     pub fn remove_partner(&self, pid: u32) {
         self.partners().remove(&pid);
+    }
+
+    /// Makes this a module window's guard: from now on a write asks `group` instead of reading the
+    /// presence directories, for this window's guards already handed to workers too.
+    pub fn set_group(&self, group: Arc<dyn GroupGuard>) {
+        *self.group.lock().unwrap_or_else(|e| e.into_inner()) = Some(group);
+    }
+
+    /// How this window's writes ask window 1; `None` in any window but a module window.
+    pub(crate) fn group(&self) -> Option<Arc<dyn GroupGuard>> {
+        self.group.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The lowest-pid partner that has asked to be counted as another window: it is one whether or not its own
@@ -567,14 +603,7 @@ impl PresenceGuard {
     /// that has not asked to be counted is not another window, though its turns are turns. The
     /// answer holds for the moment it is given: the write slot is what keeps writers apart.
     pub fn check(&self) -> Result<(), Blocked> {
-        match self.held.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            Held::Yes => {}
-            Held::NotYet => return Err(Blocked::NotHeld("it has not been taken yet".into())),
-            Held::No(why) => return Err(Blocked::NotHeld(why)),
-        }
-        if self.running_here.load(Ordering::SeqCst) > 0 {
-            return Err(Blocked::TurnRunningHere);
-        }
+        self.check_own()?;
         match busy_elsewhere_beside(&self.review_dir, self.own_pid, &self.partners_to_skip()) {
             Ok(Some(running @ Busy::TurnRunning { .. })) => Err(Blocked::Busy(running)),
             // Read after the listing, so a partner that asks to be counted during it is. It comes before a file
@@ -589,6 +618,20 @@ impl PresenceGuard {
         }
     }
 
+    /// What this window can say for itself: its own lock is held and no turn of its own runs. Reads
+    /// no directory.
+    pub(crate) fn check_own(&self) -> Result<(), Blocked> {
+        match self.held.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Held::Yes => {}
+            Held::NotYet => return Err(Blocked::NotHeld("it has not been taken yet".into())),
+            Held::No(why) => return Err(Blocked::NotHeld(why)),
+        }
+        if self.running_here.load(Ordering::SeqCst) > 0 {
+            return Err(Blocked::TurnRunningHere);
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(review_dir: &Path, own_pid: u32, running_here: usize) -> PresenceGuard {
         PresenceGuard {
@@ -597,6 +640,7 @@ impl PresenceGuard {
             running_here: Arc::new(AtomicUsize::new(running_here)),
             held: Arc::new(Mutex::new(Held::Yes)),
             partners: Arc::new(Mutex::new(BTreeMap::new())),
+            group: Arc::new(Mutex::new(None)),
         }
     }
 }

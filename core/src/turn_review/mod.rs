@@ -56,17 +56,18 @@ pub use lifecycle::{
     monotonic_ns, DiffJob, HandedRecord, HandedTurn, JobEvent, JobHook, LeftOutEntry, LeftOutSides, MarksWire,
     MonotonicClock, Overview, OverviewFile, OverviewJob, PathBytes, PrintWire, ReviewDiff, ReviewError, ReviewHandoff,
     ReviewHint, ReviewOptions, Scope, Snap, TurnRecord, TurnRef, TurnReview, TurnState, Unbound,
-    MAX_OVERVIEW_DIFF_LINES,
+    MAX_OVERVIEW_DIFF_LINES, SOLE_PARTNER,
 };
 pub use message::{compose, Preview};
 pub use presence::{
-    busy_elsewhere, Blocked, Busy, Decision, Held, Partner, Presence, PresenceFallback, PresenceGuard, PresenceHolder,
-    CLOSING_NOTE, CONFIRM_WAIT,
+    busy_elsewhere, Blocked, Busy, Decision, GroupGuard, Held, Partner, Presence, PresenceFallback, PresenceGuard,
+    PresenceHolder, CLOSING_NOTE, CONFIRM_WAIT,
 };
 pub use revert::{
     buffer_state_args, parse_buffer_state, AnchorJob, AppliedRevert, BufferAsk, BufferState, EditorCheck, EditorClear,
     EmbeddedAsk, ExactHunk, ExactHunks, ExactHunksJob, RecoverAnswer, RecoverJob, Recovered, RecoveriesJob, Refusal,
-    RemoteAsk, RevertJob, RevertKind, RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
+    RemoteAsk, RevertJob, RevertKind, RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA, GUARD_WAIT, MAX_CLEAR_AGE,
+    NOT_LINKED,
 };
 pub use shadow::{
     review_dir_for, Entry, EntryKind, FilePrint, LeftOut, Limits, Shadow, ShadowError, ShadowLock, Snapshot,

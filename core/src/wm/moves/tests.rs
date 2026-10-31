@@ -6,6 +6,7 @@ use super::*;
 use crate::keymap::Action;
 use crate::layout::{Axis, Layout, ModuleId, Node, Size, Workspaces};
 use crate::window_link::moves::{MoveId, MOVE_DEADLINE};
+use crate::window_link::names::WindowName;
 use crate::window_link::{FocusTarget, Msg, Shape};
 use crate::wm::fake::{FakeHost, FakePeerPort, FakeScheduler, Logged, SentMsg};
 use crate::wm::module::ModuleState;
@@ -98,7 +99,7 @@ fn open_with(layout: Layout, role: WindowRole, presence: EditorPresence, page: O
     scheduler.attach(Rc::downgrade(&sink));
     driver.first_apply(WIN, hosted);
     let port = FakePeerPort::new();
-    driver.attach_peer(WIN, PEER, port.clone());
+    driver.attach_peer(WIN, PEER, WindowName::Second, port.clone());
     End {
         driver,
         host,
@@ -180,6 +181,10 @@ impl End {
             peer: PEER,
             id: MoveId(id),
         });
+    }
+
+    fn done_from(&self, peer: PeerId, id: u64) {
+        self.peer(PeerEvent::MoveDone { peer, id: MoveId(id) });
     }
 
     fn detached(&self, id: u64, record: serde_json::Value, handoff: Handoff) {
@@ -825,7 +830,7 @@ fn window_2_with_a_silent_window_1_says_how_the_module_comes_back_and_asks_nothi
 fn an_orphaned_window_2_says_its_editor_window_is_closed_and_how_to_start_it() {
     let dst = destination();
     dst.link_closed();
-    dst.driver.detach_peer(WIN);
+    dst.driver.detach_peer(WIN, PEER);
     for action in [
         Action::WindowOther,
         Action::MoveToWindow {
@@ -1456,7 +1461,7 @@ fn window_other_raises_the_peer_and_gives_it_the_keys() {
 fn a_detached_peer_ends_its_moves_and_the_verbs_refuse_again() {
     let src = source();
     sent_move(&src);
-    src.driver.detach_peer(WIN);
+    src.driver.detach_peer(WIN, PEER);
     assert!(src.ops().contains(&resume(terminal())));
     src.run(Action::WindowOther);
     assert_eq!(src.toast().as_deref(), Some(crate::wm::feedback::NO_SECOND_WINDOW_TEXT));
@@ -1493,7 +1498,7 @@ fn an_away_modules_key_sends_focus_to_the_other_window() {
                 token: Some("keys".into())
             }
         );
-        end.driver.detach_peer(WIN);
+        end.driver.detach_peer(WIN, PEER);
         end.driver.run(WIN, Action::Module(terminal2()), Origin::Chip);
         assert_eq!(end.toast().as_deref(), Some("'terminal#2' is in the other window"));
     }
@@ -1507,7 +1512,7 @@ fn an_away_modules_key_sends_focus_to_the_other_window() {
     assert!(end
         .ops_since(mark)
         .contains(&HostOp::RaisePeer { win: WIN, peer: PEER }));
-    end.driver.detach_peer(WIN);
+    end.driver.detach_peer(WIN, PEER);
     end.run(Action::Module(terminal2()));
     assert_eq!(end.toast(), Some(crate::wm::feedback::not_in_window_text(&terminal2())));
 }
@@ -1527,7 +1532,7 @@ fn the_editor_key_in_window_2_raises_window_1s_editor() {
             token: None
         }
     );
-    end.driver.detach_peer(WIN);
+    end.driver.detach_peer(WIN, PEER);
     end.run(Action::Module(editor()));
     let asked = end.driver.query(|c| c.chrome(WIN).prompt).map(|prompt| prompt.text);
     assert_eq!(asked.as_deref(), Some(crate::wm::feedback::START_EDITOR_PROMPT));
@@ -1606,13 +1611,13 @@ fn the_window_says_its_monitor_on_change_and_at_attach() {
         monitor: None,
     });
     assert_eq!(end.sent().len(), count);
-    end.driver.detach_peer(WIN);
+    end.driver.detach_peer(WIN, PEER);
     end.driver.post(HostEvent::WindowMonitor {
         win: WIN,
         monitor: Some(monitor.id),
     });
     let port = FakePeerPort::new();
-    end.driver.attach_peer(WIN, PEER, port.clone());
+    end.driver.attach_peer(WIN, PEER, WindowName::Second, port.clone());
     assert!(port.sent().iter().any(|s| s.msg == expected));
 }
 
@@ -1820,6 +1825,31 @@ fn a_tab_verb_summarizes_counts_after_the_host_applies_it() {
         .sent()
         .iter()
         .any(|s| matches!(&s.msg, Msg::Summary(s) if s.queued == 5)));
+}
+
+/// A turn's end changes the counts as much as its start: the window at the other end reads its top bar and its close
+/// question from the last summary, so a summary that stopped at the start would say the turn runs for ever.
+#[test]
+fn a_turn_that_ends_is_summarized_as_its_start_is() {
+    let e = source();
+    let turn = |busy, running| {
+        e.host.set_chat_summary(ChatSummary {
+            running,
+            ..Default::default()
+        });
+        e.driver.post(HostEvent::Chat(ChatEvent::Busy {
+            win: WIN,
+            view: crate::tabs::ViewId::BASE,
+            busy,
+        }));
+        e.scheduler.advance(Duration::from_millis(200));
+        e.port.sent().iter().rev().find_map(|s| match &s.msg {
+            Msg::Summary(s) => Some(s.running),
+            _ => None,
+        })
+    };
+    assert_eq!(turn(true, 1), Some(1));
+    assert_eq!(turn(false, 0), Some(0));
 }
 
 // A chat.
@@ -2861,7 +2891,7 @@ fn the_link_ending_while_a_page_waits_shows_and_maps_it_once() {
         .any(|op| { matches!(op, HostOp::Pair(PairOp::ReloadPage { module, .. }) if *module == page_id()) }));
     assert_eq!(mapped_page(&dst), 0);
     allocations.borrow_mut().clear();
-    dst.driver.detach_peer(WIN);
+    dst.driver.detach_peer(WIN, PEER);
     assert!(dst.layout.borrow().is_shown(&page_id()));
     assert_eq!(mapped_page(&dst), 1);
     let allocations = allocations.borrow();
@@ -2870,7 +2900,7 @@ fn the_link_ending_while_a_page_waits_shows_and_maps_it_once() {
     assert!(allocations[0].1.iter().any(|(id, _)| *id == page_id()));
     page_ready_event(&dst);
     dst.scheduler.advance(Duration::from_secs(2));
-    dst.driver.detach_peer(WIN);
+    dst.driver.detach_peer(WIN, PEER);
     assert_eq!(mapped_page(&dst), 1);
 }
 
@@ -3124,7 +3154,7 @@ fn a_committed_page_survives_the_link_detaching_while_its_document_loads() {
     let dst = page_end(true, false, true);
     commit_page(&dst, true);
     assert_eq!(mapped_page(&dst), 0);
-    dst.driver.detach_peer(WIN);
+    dst.driver.detach_peer(WIN, PEER);
     assert_eq!(mapped_page(&dst), 1);
     dst.scheduler.advance(Duration::from_secs(2));
     assert_eq!(mapped_page(&dst), 1);
@@ -4106,5 +4136,236 @@ fn a_workspace_deleted_after_its_round_trip_leaves_no_record_for_a_new_one_of_it
     assert_eq!(
         offered, 1,
         "the new workspace moves window 2's own tab, as any workspace with no record does"
+    );
+}
+
+// Several peers on one window: each link numbers its own moves.
+
+const CHAT_PEER: PeerId = PeerId(16);
+
+/// Window 1 holding `editor | (terminal / terminal#2)`, attached to window 2 (`PEER`) and to the chat window 1
+/// (`CHAT_PEER`), the chat peer's port apart.
+fn source_with_a_chat_peer(chat_peer: PeerId) -> (End, Rc<FakePeerPort>) {
+    let layout = Layout::new(
+        Node::split(
+            Axis::Row,
+            0.5,
+            Node::Leaf(editor()),
+            Node::split(Axis::Column, 0.5, Node::Leaf(terminal()), Node::Leaf(terminal2())),
+        ),
+        terminal(),
+    )
+    .unwrap();
+    let end = open(layout, WindowRole::Main, EditorPresence::Owned);
+    let chat_port = FakePeerPort::new();
+    end.driver
+        .attach_peer(WIN, chat_peer, WindowName::Chat(1), chat_port.clone());
+    (end, chat_port)
+}
+
+/// `module` offered to `peer` as the verb for that peer offers it.
+fn offer_to(end: &End, peer: PeerId, module: ModuleId) {
+    end.driver.test_batch(move |c| {
+        let (reads, keymap, setup) = c.module_parts(WIN);
+        let cx = Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        let mut batch = Batch::default();
+        offer(c.window_mut(WIN).unwrap(), &cx, WIN, peer, &module, false, &mut batch);
+        batch
+    });
+}
+
+/// The ids of the moves `peer` holds on `end`, with their stage.
+fn entries_of(end: &End, peer: PeerId) -> Vec<(u64, Stage)> {
+    end.driver.query(|c| {
+        c.window(WIN)
+            .and_then(|w| w.peer(peer))
+            .map(|p| p.entries.iter().map(|(id, e)| (id.0, e.stage)).collect())
+            .unwrap_or_default()
+    })
+}
+
+fn peer_ready(end: &End, peer: PeerId, id: u64) {
+    end.driver
+        .post(HostEvent::Peer(PeerEvent::MoveReady { peer, id: MoveId(id) }));
+}
+
+fn detached_module(end: &End, module: ModuleId, id: u64) {
+    end.driver.post(HostEvent::Terminal(TermEvent::Detached {
+        win: WIN,
+        module,
+        mv: MoveId(id),
+        record: serde_json::json!({ "screen": "x" }),
+        handoff: handoff(),
+    }));
+}
+
+#[test]
+fn a_source_numbers_each_links_moves_on_its_own() {
+    let (end, _) = source_with_a_chat_peer(CHAT_PEER);
+    offer_to(&end, PEER, terminal());
+    offer_to(&end, CHAT_PEER, terminal2());
+    assert_eq!(entries_of(&end, PEER), vec![(1, Stage::Offered)]);
+    assert_eq!(
+        entries_of(&end, CHAT_PEER),
+        vec![(1, Stage::Offered)],
+        "each link numbers its own moves, so both offers are move 1"
+    );
+    peer_ready(&end, PEER, 1);
+    detached_module(&end, terminal(), 1);
+    assert_eq!(entries_of(&end, PEER), vec![(1, Stage::Sent)]);
+    assert_eq!(
+        entries_of(&end, CHAT_PEER),
+        vec![(1, Stage::Offered)],
+        "an answer for the module named moved window 2's offer alone"
+    );
+    end.done_from(PEER, 1);
+    assert!(end.away(&terminal()), "window 2's move is done");
+    assert!(
+        !end.away(&terminal2()) && entries_of(&end, CHAT_PEER) == vec![(1, Stage::Offered)],
+        "the other link's move 1 is still pending"
+    );
+}
+
+/// `module` offered to this window by `peer` as move `id`, a terminal of the offerer's.
+fn offered_by(end: &End, peer: PeerId, id: u64, module: ModuleId) {
+    end.peer(PeerEvent::MoveOffer {
+        peer,
+        id: MoveId(id),
+        module,
+        kind: MoveKind::Terminal,
+        shape: Shape::Tiled,
+        size: (600, 400),
+        session: None,
+    });
+}
+
+/// The modules the host was asked to prepare a place for, in order.
+fn prepared_places(end: &End) -> Vec<ModuleId> {
+    end.ops()
+        .into_iter()
+        .filter_map(|op| match op {
+            HostOp::PrepareSurface { module, .. } => Some(module),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn move_ids_are_unique_per_peer_not_globally() {
+    let (end, _) = source_with_a_chat_peer(CHAT_PEER);
+    offered_by(&end, PEER, 2, terminal2());
+    offered_by(&end, CHAT_PEER, 2, terminal2());
+    assert_eq!(entries_of(&end, PEER).len(), 1, "{:?}", entries_of(&end, PEER));
+    assert_eq!(entries_of(&end, PEER)[0].0, 2);
+    assert_eq!(entries_of(&end, CHAT_PEER).len(), 1);
+    assert_eq!(
+        entries_of(&end, CHAT_PEER)[0].0,
+        2,
+        "both links' offers are move 2, and both are tracked"
+    );
+    assert_eq!(
+        prepared_places(&end),
+        vec![
+            ModuleId::parse("terminal#3").unwrap(),
+            ModuleId::parse("terminal#4").unwrap()
+        ],
+        "two arrivals of different links take different names in this window"
+    );
+    end.done_from(PEER, 2);
+    assert_eq!(
+        entries_of(&end, CHAT_PEER).len(),
+        1,
+        "a confirmation on one link leaves the other link's move 2 pending"
+    );
+}
+
+#[test]
+fn an_arrival_skips_the_names_any_peer_holds() {
+    let (end, _) = source_with_a_chat_peer(CHAT_PEER);
+    end.peer(PeerEvent::Held {
+        peer: CHAT_PEER,
+        ids: vec![ModuleId::parse("terminal#3").unwrap()],
+    });
+    offered_by(&end, PEER, 2, terminal2());
+    assert_eq!(
+        prepared_places(&end),
+        vec![ModuleId::parse("terminal#4").unwrap()],
+        "terminal#3 lives in the module window, whichever link the offer comes on"
+    );
+}
+
+#[test]
+fn detaching_one_peer_ends_only_its_moves() {
+    let (end, _) = source_with_a_chat_peer(CHAT_PEER);
+    offer_to(&end, PEER, terminal());
+    offer_to(&end, CHAT_PEER, terminal2());
+    peer_ready(&end, PEER, 1);
+    peer_ready(&end, CHAT_PEER, 1);
+    detached_module(&end, terminal(), 1);
+    detached_module(&end, terminal2(), 1);
+    assert_eq!(entries_of(&end, PEER), vec![(1, Stage::Sent)]);
+    assert_eq!(entries_of(&end, CHAT_PEER), vec![(1, Stage::Sent)]);
+    let mark = end.mark();
+    end.driver.detach_peer(WIN, PEER);
+    let ops = end.ops_since(mark);
+    assert!(
+        ops.contains(&resume(terminal())),
+        "the module of the ended link comes back"
+    );
+    assert!(!ops.contains(&resume(terminal2())));
+    assert!(end
+        .driver
+        .query(|c| c.window(WIN).is_some_and(|w| w.peer(PEER).is_none())));
+    assert_eq!(
+        entries_of(&end, CHAT_PEER),
+        vec![(1, Stage::Sent)],
+        "the other peer's move goes on"
+    );
+}
+
+#[test]
+fn the_pair_verbs_target_window_2_with_a_module_window_beside_it() {
+    // The module window's id sorts before window 2's, so a first-peer choice would pick it.
+    let (end, chat_port) = source_with_a_chat_peer(PeerId(1));
+    end.run(Action::MoveToWindow {
+        module: Some(terminal()),
+        follow: false,
+    });
+    assert_eq!(end.kinds(), vec!["move_offer"], "window 2 is offered the module");
+    assert!(chat_port.sent().iter().all(|s| matches!(s.msg, Msg::Summary(_))));
+    end.run(Action::WindowOther);
+    assert!(end.ops().contains(&HostOp::RaisePeer { win: WIN, peer: PEER }));
+}
+
+#[test]
+fn no_transitional_peer_accessor_is_left() {
+    use crate::source_scan::{code_only, require_anchors, rust_sources, word_ends, Source};
+    fn files_naming(sources: &[Source], words: &[&str]) -> Vec<String> {
+        sources
+            .iter()
+            .filter(|s| {
+                let code = code_only(&s.text);
+                words.iter().any(|word| !word_ends(&code, word).is_empty())
+            })
+            .map(|s| s.path.clone())
+            .collect()
+    }
+    let words = ["sole_peer", "sole_peer_mut"];
+    let sources = rust_sources(&["core/src/wm"]);
+    require_anchors(&sources, &["fn second_peer("]);
+    assert_eq!(files_naming(&sources, &words), Vec::<String>::new());
+    // The scan reads every file: the accessor in a second file, outside a comment, is found.
+    let mut planted = sources.clone();
+    planted.push(Source {
+        path: "core/src/wm/planted.rs".into(),
+        text: "// sole_peer in a comment\nfn f(w: &Window) { w.sole_peer(); }\n".into(),
+    });
+    assert_eq!(
+        files_naming(&planted, &words),
+        vec!["core/src/wm/planted.rs".to_owned()]
     );
 }

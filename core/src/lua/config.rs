@@ -68,11 +68,12 @@ impl ConfigStore {
 }
 
 /// The `init.lua` key: `eitri.config.set("window.restore", true | false)`. Whether the window that
-/// holds a pair brings the second window back at start when it was open at the pair's last end.
+/// holds a pair brings the second window back at start when it was open at the pair's last end, and
+/// whether window 1 of a compositor group reopens the recorded windows, their outputs and its terminal.
 pub const WINDOW_RESTORE_KEY: &str = "window.restore";
 
-/// [`WINDOW_RESTORE_KEY`] as stored. Unset means the second window comes back: it is part of the
-/// arrangement the user left, as the workspaces are.
+/// [`WINDOW_RESTORE_KEY`] as stored. Unset means they come back: they are part of the arrangement
+/// the user left, as the workspaces are.
 pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
 }

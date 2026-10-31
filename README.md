@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 
 <h1>Eitri</h1>
 
-<p><b>Your Neovim, tiled with your agents, terminals and the web pages you build, in one window.</b></p>
+<p><b>Your Neovim, tiled with your agents, terminals and the web pages you build.</b></p>
 
 <p>
 <a href="https://eitri.cc">Website</a> ·
@@ -26,7 +26,7 @@ A Neovim GUI for Linux. Eitri is a desktop window (MIT) around your own Neovim c
 supervise (Claude Code, Codex, or any agent that speaks ACP), terminals and web pages of your own tiled beside it.
 Replies come as rendered markdown and diffs with permission cards, all without reaching for the mouse.
 
-Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys: press `Ctrl+b`, then a key; `Ctrl+b ?` lists them all. i3's moves are there as Alt chords after the prefix, and `:EitriTutor` in the editor walks you through the keys.
+Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys: press `Ctrl+b`, then a key; `Ctrl+b ?` lists them all. i3's moves are there as Alt chords after the prefix, and `:EitriTutor` in the editor walks you through the keys. On Hyprland, sway or niri, chats and pages are by default windows your own window manager tiles instead, and these layout keys are off (`window.tiling`).
 
 **[eitri.cc](https://eitri.cc)** has the screenshots, the keys, how it compares, and the requirements and limits.
 

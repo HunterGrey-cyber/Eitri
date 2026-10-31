@@ -32,7 +32,7 @@ _spec.loader.exec_module(rc)
 
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
 # The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build, in one window."
+TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build."
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
@@ -1033,6 +1033,7 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(self.clone, "packaging", "icons"))
         shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.desktop"), os.path.join(self.clone, "packaging"))
         shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.Panel.desktop"), os.path.join(self.clone, "packaging"))
+        shutil.copy(os.path.join(_PACKAGING, "cn.huntergrey.eitri.Page.desktop"), os.path.join(self.clone, "packaging"))
         shutil.copytree(os.path.join(_PACKAGING, "..", "nvim", "eitri.nvim"),
                         os.path.join(self.clone, "nvim", "eitri.nvim"))
         # The whole extension directory, test code and notes included: only its four shipped files may be staged.
@@ -1051,10 +1052,10 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
 
     def test_the_staging_dir_holds_every_source_the_public_profile_names(self):
         with open(os.path.join(_PACKAGING, "nfpm-public.yaml"), encoding="utf-8") as f:
-            srcs = re.findall(rf"^\s*- src: \./((?:packaging/(?:icons/|{re.escape(rc.APP_ID)}(?:\.Panel)?\.desktop)|nvim/eitri\.nvim/|gnome-extension/)\S*)\s*$",
+            srcs = re.findall(rf"^\s*- src: \./((?:packaging/(?:icons/|{re.escape(rc.APP_ID)}(?:\.P(?:anel|age))?\.desktop)|nvim/eitri\.nvim/|gnome-extension/)\S*)\s*$",
                               f.read(), re.M)
-        # The desktop entry, the panel's entry, nine icons, the plugin's three files and the extension's four.
-        self.assertEqual(len(srcs), 18, srcs)
+        # The desktop entry, the panel's and the page window's entries, nine icons, the plugin's three files and the extension's four.
+        self.assertEqual(len(srcs), 19, srcs)
         for src in srcs:
             self.assertTrue(os.path.isfile(os.path.join(self.st, src)), src)
         # The staging dir also holds the legacy entry (for the tarball's own copy of it), which no
@@ -1069,7 +1070,7 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         top = "eitri-1.0.0-x86_64-linux/"
         roles = rc.tarball_roles("1.0.0")
         want = {path[len(top):] for role, path in roles.items()
-                if role in ("desktop", "panel-desktop", "legacy-desktop") or role.startswith(("icon-", "plugin-", "gnome-ext-"))}
+                if role in ("desktop", "panel-desktop", "page-desktop", "legacy-desktop") or role.startswith(("icon-", "plugin-", "gnome-ext-"))}
         self.assertIn("share/applications/eitri.desktop", want)
         # Nothing of the extension's test code or notes is in the tarball tree.
         for name in ("testing.js", "README.md"):

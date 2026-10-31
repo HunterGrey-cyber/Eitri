@@ -292,6 +292,14 @@ impl Kernel {
         eitri.set("window", name)
     }
 
+    /// Names a chat or page window for Lua by its window name's text (`"c3"`, `"p:markdown"`): `eitri.window` and
+    /// `eitri.layout.get().window` read it, as [`Kernel::set_window`] sets them for the other windows.
+    pub fn set_window_name(&self, name: &str) -> mlua::Result<()> {
+        self.layout.borrow_mut().set_window(Some(name));
+        let eitri: Table = self.lua.globals().get("eitri")?;
+        eitri.set("window", name)
+    }
+
     pub fn emit(&self, event_name: &str) {
         super::event::emit(&self.lua, &self.events, event_name, Value::Nil);
     }
@@ -594,6 +602,19 @@ mod tests {
             let config = kernel.config.borrow();
             assert_eq!(config.get("seen"), Some(seen), "{role:?}");
             assert_eq!(config.get("only.second"), only_second, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_module_window_reads_its_own_name_as_eitri_window() {
+        let scratch = crate::plugin::test_support::Scratch::new("lua-eitri-module-window");
+        let init = scratch.0.join("init.lua");
+        std::fs::write(&init, "eitri.config.set('seen', eitri.window)\n").unwrap();
+        for name in ["c3", "p:markdown"] {
+            let kernel = Kernel::new(scratch.0.clone(), refuse_panels).unwrap();
+            kernel.set_window_name(name).unwrap();
+            assert_eq!(kernel.run_and_check_init_file(&init), Ok(()));
+            assert_eq!(kernel.config.borrow().get("seen"), Some(name));
         }
     }
 

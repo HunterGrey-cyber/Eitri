@@ -252,6 +252,12 @@ wording! {
     DoneTutorStock "done.tutor_stock"
         "The tutor teaches the stock keys after the prefix; your tmux configuration changes some of them ({key} ? lists yours)."
         "教程讲的是前缀后的默认键；你的 tmux 配置改了其中一些（{key} ? 列出你的键）。"
+    DoneWindowsNext "done.windows_next"
+        "The window.tiling line applies at the next start too; this run keeps the windows it opened with."
+        "window.tiling 这一行同样在下次启动时生效；这次运行保持打开时的窗口。"
+    DoneTutorWindows "done.tutor_windows"
+        "The tutor teaches the keys of Eitri's own layout: where {wm} arranges the windows, its splits, zoom, floats and workspaces are off."
+        "教程讲的是 Eitri 自身布局的按键：由 {wm} 排布窗口时，其中的分屏、放大、浮窗和工作区都不起作用。"
     FootDone "foot.done"
         "t  open :EitriTutor now · Enter close"
         "t  现在打开 :EitriTutor · Enter 关闭"
@@ -346,7 +352,7 @@ wording! {
 
 /// The hash of the English column the Chinese was translated from: a changed English string fails a test
 /// until the Chinese has been brought up to date and this is set again.
-pub const TRANSLATED_FROM: &str = "ee1cd3d4e745744aefd37e025bc03b181e956311402cf84f25ebaafe9471c952";
+pub const TRANSLATED_FROM: &str = "54ea011c2a588e47f91ce72475bfac7cb7a6ffa4e6f35670aabb3c7e52d40fba";
 
 /// The template of `id` in `lang`.
 pub fn text(lang: Lang, id: TextId) -> &'static str {

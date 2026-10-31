@@ -1,17 +1,19 @@
 //! The panel's side of turn review across a linked pair of windows: the window reaches this panel's review flow
 //! and tab set through [`AgentPanelHandle::with_turn_review`], and hears after every tick what the pair's link
-//! owes the other window ([`PairOutbound`], taken by [`take_pair_outbound`]): what window 1's overlay driver found
-//! for window 2, this window's turn starts and ends, and whether the partner must be told that a turn's presence
-//! could not be confirmed. What the link carries back comes in through the same `with_turn_review`, so every
+//! owes the other windows ([`PairOutbound`], taken by [`take_pair_outbound`]): what window 1's overlay driver found
+//! for each linked window, this window's turn starts and ends, and whether the partners must be told that a turn's
+//! presence could not be confirmed. What the link carries back comes in through the same `with_turn_review`, so every
 //! answer the flow makes and every prompt the presence lets go reaches the page that waits for it, as it does
 //! from the panel's own requests.
 
 use super::*;
 use eitri_core::editor_rpc::EditorRpc;
-use eitri_core::review_editor::Window2Event;
+use eitri_core::review_editor::LinkedEvent;
 use eitri_core::tab_set::{Sent, TabSet};
 use eitri_core::turn_review::{Out, ReviewFlow};
 use eitri_core::window_link::TurnEdge;
+use eitri_core::wm::PeerId;
+use std::collections::BTreeMap;
 
 /// What a step on the turn review leaves for the pages: the flow's answers, and the prompts the tab set let go.
 #[derive(Default)]
@@ -33,8 +35,8 @@ impl ReviewSettled {
 /// What the link owes the other window after a tick.
 #[derive(Debug, Default, PartialEq)]
 pub struct PairOutbound {
-    /// What window 1's overlay driver found for window 2, in order.
-    pub window2: Vec<Window2Event>,
+    /// What window 1's overlay driver found for each linked window, in order.
+    pub linked: BTreeMap<PeerId, Vec<LinkedEvent>>,
     /// This window's turn starts and ends since the last tick.
     pub edges: Vec<TurnEdge>,
     /// A prompt's turn could not be confirmed as running: the partner is to count this window as another one.
@@ -46,7 +48,7 @@ pub struct PairOutbound {
 
 impl PairOutbound {
     pub fn is_empty(&self) -> bool {
-        self.window2.is_empty() && self.edges.is_empty() && !self.presence_false && self.results.is_empty()
+        self.linked.is_empty() && self.edges.is_empty() && !self.presence_false && self.results.is_empty()
     }
 }
 
@@ -68,7 +70,7 @@ pub fn take_pair_outbound(flow: &mut ReviewFlow, tabs: &mut TabSet) -> PairOutbo
         None => tabs.take_untracked_turn_edges(eitri_core::turn_review::monotonic_ns()),
     };
     PairOutbound {
-        window2: flow.take_window_2_events(),
+        linked: flow.take_linked_events(),
         edges,
         presence_false: tabs.take_presence_false_owed(),
         results,

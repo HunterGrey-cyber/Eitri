@@ -1,6 +1,7 @@
 //! Deterministic host services for testing decisions without a native window system.
 
 use super::{host::*, window::*};
+use crate::agent_backend::AgentId;
 use crate::keymap::action::Action;
 use crate::layout::{Direction, ModuleId, Size};
 use crate::tabs::{TabId, ViewId};
@@ -61,6 +62,8 @@ pub struct FakeHost {
     refuse_kind: RefCell<Option<RefuseKind>>,
     refuse_op: RefCell<Option<RefuseOp>>,
     reads: RefCell<Reads>,
+    compositor: Cell<Option<&'static str>>,
+    open_module_windows: RefCell<Vec<crate::window_link::names::WindowName>>,
     /// Each window's module hosts as its grid would stack them, bottom first: in the order they were made,
     /// until a restack moves its floats to the top.
     stacking: RefCell<BTreeMap<WinId, Vec<ModuleId>>>,
@@ -87,6 +90,7 @@ struct Reads {
     tab_moves: BTreeMap<TabId, Result<ChatMoveFacts, String>>,
     arrived_tabs: BTreeMap<MoveId, TabId>,
     moved_tab_keys: BTreeMap<TabId, crate::window_link::base_tabs::MovedTabKey>,
+    tab_agent: AgentId,
     chat_claims: Vec<(ViewId, Direction)>,
     module_min: BTreeMap<ModuleId, Size>,
     attention: BTreeMap<ViewId, crate::attention::Attention>,
@@ -121,6 +125,7 @@ impl Default for Reads {
             tab_moves: BTreeMap::new(),
             arrived_tabs: BTreeMap::new(),
             moved_tab_keys: BTreeMap::new(),
+            tab_agent: AgentId::Claude,
             chat_claims: Vec::new(),
             module_min: BTreeMap::new(),
             attention: BTreeMap::new(),
@@ -203,6 +208,8 @@ impl FakeHost {
             refuse_kind: RefCell::new(None),
             refuse_op: RefCell::new(None),
             reads: RefCell::new(Reads::default()),
+            compositor: Cell::new(None),
+            open_module_windows: RefCell::default(),
             stacking: RefCell::new(BTreeMap::new()),
             allocations: RefCell::new(BTreeMap::new()),
             font_sizes: RefCell::new(BTreeMap::new()),
@@ -219,6 +226,14 @@ impl FakeHost {
     }
     pub fn terminal_zoom(&self, win: WinId) -> Option<f32> {
         self.terminal_zooms.borrow().get(&win).copied()
+    }
+    /// What the compositor is called in a notice, from now on.
+    pub fn set_compositor_name(&self, name: &'static str) {
+        self.compositor.set(Some(name));
+    }
+    /// The module windows the shell holds, whoever started them, from now on.
+    pub fn set_open_module_windows(&self, names: Vec<crate::window_link::names::WindowName>) {
+        *self.open_module_windows.borrow_mut() = names;
     }
     pub fn set_grid_size(&self, size: Size) {
         self.reads.borrow_mut().grid_size = size;
@@ -244,6 +259,14 @@ impl FakeHost {
         reads.base_tabs = tabs.iter().map(|t| t.tab).collect();
         reads.active_base_tab = active;
         reads.tab_moves = tabs.into_iter().map(|t| (t.tab, Ok(t))).collect();
+    }
+    /// The agent every tab's hand-over names from now on.
+    pub fn set_tab_agent(&self, agent: AgentId) {
+        self.reads.borrow_mut().tab_agent = agent;
+    }
+    /// What the move facts of `tab` read as from now on.
+    pub fn set_tab_moves(&self, tab: TabId, facts: Result<ChatMoveFacts, String>) {
+        self.reads.borrow_mut().tab_moves.insert(tab, facts);
     }
     pub fn set_terminal_jobs(&self, jobs: usize) {
         self.reads.borrow_mut().terminal_jobs = jobs;
@@ -649,6 +672,12 @@ impl super::conformance::GridObserve for FakeHost {
 }
 
 impl HostReads for FakeHost {
+    fn compositor_name(&self) -> &'static str {
+        self.compositor.get().unwrap_or("the compositor")
+    }
+    fn module_window_open(&self, name: &crate::window_link::names::WindowName) -> bool {
+        self.open_module_windows.borrow().contains(name)
+    }
     fn running_chats(&self, _: WinId) -> Vec<(ModuleId, Option<TabId>)> {
         self.reads.borrow().running_chats.clone()
     }
@@ -671,6 +700,13 @@ impl HostReads for FakeHost {
             .get(&tab)
             .cloned()
             .unwrap_or_else(|| self.chat_move(win, ViewId::BASE, None))
+    }
+    fn tab_hand_over(&self, win: WinId, tab: TabId) -> Result<TabHandOver, String> {
+        self.tab_move(win, tab).map(|facts| TabHandOver {
+            agent: self.reads.borrow().tab_agent.clone(),
+            session: facts.session,
+            running: facts.running,
+        })
     }
     fn arrived_tab(&self, _: WinId, mv: MoveId) -> Option<TabId> {
         self.reads.borrow().arrived_tabs.get(&mv).copied()

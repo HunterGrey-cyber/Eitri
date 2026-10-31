@@ -25,7 +25,7 @@
 //! The flow never types into the editor: everything it asks is one of the overlay's own calls.
 //!
 //! **Two windows.** Window 1's flow keeps the one driver nvim's review module has; window 2's calls
-//! are queued on it and what it finds for window 2 waits in [`ReviewFlow::take_window_2_events`] for
+//! are queued on it and what it finds for each window waits in [`ReviewFlow::take_linked_events`] for
 //! the link. Window 2's flow drives a [`RemoteOverlay`] instead, and asks window 1's editor about a
 //! buffer through a [`RemoteAsk`]; everything else here is the same in both windows. An editor
 //! event finds its tab by the session it names, since tab numbers are each window's own.
@@ -44,11 +44,12 @@ use crate::agent_bridge::{
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 use crate::review_editor::{
-    overlay_hunks, EditorOverlay, EditorRevertEvent, OffEvent, Overlay, OverlayCall, OverlayOutcome, Owner,
-    RemoteOverlay, Routed, ShowHunk, ShowMeta, Window2Event,
+    overlay_hunks, EditorOverlay, EditorRevertEvent, LinkedEvent, OffEvent, Overlay, OverlayCall, OverlayOutcome,
+    Owner, RemoteOverlay, Routed, ShowHunk, ShowMeta,
 };
 use crate::tab_set::{Flush, ReviewTicket, Tab, TabBackend, TabSet};
 use crate::tabs::TabId;
+use crate::wm::PeerId;
 use serde::{Deserialize, Serialize};
 
 use super::draft::{check_reverts, NewRevert, RevertShape, RevertSource, ReviewDraft, UndoData, UndoState};
@@ -121,8 +122,8 @@ pub struct ReviewFlow {
     overlay_owner: Option<Owner>,
     /// Window 2's way to ask window 1's editor about a buffer; `None` in a window with its own.
     remote_ask: Option<Rc<RemoteAsk>>,
-    /// What window 1's driver found for window 2, until the link takes it.
-    window2_out: Vec<Window2Event>,
+    /// What window 1's driver found for each linked window, until its link takes it.
+    linked_out: BTreeMap<PeerId, Vec<LinkedEvent>>,
     /// Files being read (hunks and path) for an open or for a redraw.
     opens: Vec<OpenWork>,
     redraws: Vec<RedrawWork>,
@@ -263,7 +264,7 @@ impl ReviewFlow {
             && self.opens.is_empty()
             && self.redraws.is_empty()
             && self.early.is_empty()
-            && self.window2_out.is_empty()
+            && self.linked_out.is_empty()
             && !self.overlay.as_ref().is_some_and(Overlay::wants_ticks)
     }
 
@@ -329,9 +330,9 @@ impl ReviewFlow {
         }
     }
 
-    /// What window 1's driver found for window 2 since this was last asked, in order.
-    pub fn take_window_2_events(&mut self) -> Vec<Window2Event> {
-        std::mem::take(&mut self.window2_out)
+    /// What window 1's driver found for each linked window since this was last asked, each in order.
+    pub fn take_linked_events(&mut self) -> BTreeMap<PeerId, Vec<LinkedEvent>> {
+        std::mem::take(&mut self.linked_out)
     }
 
     /// The editor question of a write: through window 1 in window 2, else this window's own editor.
@@ -1147,8 +1148,10 @@ impl ReviewFlow {
         if !overlay.wants_ticks() {
             return;
         }
-        let Routed { mine, window2 } = overlay.tick(rpc, now);
-        self.window2_out.extend(window2);
+        let Routed { mine, linked } = overlay.tick(rpc, now);
+        for (peer, events) in linked {
+            self.linked_out.entry(peer).or_default().extend(events);
+        }
         for outcome in mine {
             match outcome {
                 OverlayOutcome::Answered { request_id, result } => {

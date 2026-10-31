@@ -1098,49 +1098,62 @@ mod tests {
     }
 
     /// A blocking `read_line` with `SO_RCVTIMEO` can hold the GTK loop for a whole trickled line:
-    /// each successful partial read resets the timeout. An approximately 80ms trickle held the
-    /// caller for 81ms despite a 30ms budget.
+    /// each successful partial read resets the timeout. `PaneSwitchReader::poll` instead uses
+    /// nonblocking reads and retains incomplete connections.
     ///
-    /// `PaneSwitchReader::poll` instead uses nonblocking reads and retains incomplete connections.
-    /// Slow sends must not hold a poll waiting for more bytes, and enough polls must eventually
-    /// deliver the complete message.
+    /// The sender writes most of the line, then waits on a channel the test holds, so the line stays
+    /// incomplete for exactly as long as the test wants and no measured duration decides the outcome.
+    /// A poll made while the sender is held must come back empty; once the sender finishes the line,
+    /// later polls must deliver the message. The only clocks are hang guards far above any scheduler
+    /// delay.
     #[test]
     fn a_trickled_message_never_holds_one_poll_past_its_budget() {
+        use std::sync::mpsc::channel;
+
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         std::fs::create_dir_all(&dir).expect("fixture");
         let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
         let listener = UnixListener::bind(&socket_path).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
-        let mut reader = PaneSwitchReader::new(listener);
+        let reader = PaneSwitchReader::new(listener);
 
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
+        let (partial_sent_tx, partial_sent_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
         let writer = std::thread::spawn(move || {
-            // Leading spaces are trimmed by `parse_message`, so this still parses as `Direction('R')`
-            // -- one byte every 10ms, enough bytes to make a stalled read measurable.
-            for byte in b"      R\n" {
-                std::thread::sleep(Duration::from_millis(10));
+            // Leading spaces are trimmed by `parse_message`, so this still parses as `Direction('R')`.
+            for byte in b"      R" {
                 stream.write_all(&[*byte]).unwrap();
             }
+            partial_sent_tx.send(()).unwrap();
+            // Hold the newline until the test has polled the incomplete line.
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            stream.write_all(b"\n").unwrap();
         });
 
+        partial_sent_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the sender wrote the partial line");
+
+        // The partial line is already in the socket, and the sender is held: a poll that waited for the
+        // rest of the line would not return until the hang guard fires.
+        let (reader, held) = poll_within(reader, Duration::from_secs(10), None);
+        assert!(held.is_empty(), "an incomplete line must not be delivered: {held:?}");
+        let (mut reader, held) = poll_within(reader, Duration::from_secs(10), None);
+        assert!(held.is_empty(), "a second poll on the incomplete line: {held:?}");
+
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+
         let mut messages = Vec::new();
-        let mut worst = Duration::ZERO;
-        for _ in 0..20 {
-            let before = Instant::now();
+        for _ in 0..1000 {
             messages.extend(reader.poll());
-            worst = worst.max(before.elapsed());
             if !messages.is_empty() {
                 break;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        writer.join().unwrap();
-
         assert_eq!(messages, vec![PaneMessage::Direction('R')]);
-        assert!(
-            worst < Duration::from_millis(20),
-            "one poll took {worst:?}, expected well under one POLL_INTERVAL ({POLL_INTERVAL:?})"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

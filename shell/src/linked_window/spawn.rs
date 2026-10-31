@@ -15,9 +15,16 @@
 //! read: [`watch_moved_child`] waits for it off the GTK thread, and the window tells whichever window runs that shell
 //! (`child_exited`). The other window's `child_exited` reaches this window's terminals through the hook set with
 //! [`Pair::set_child_exited`].
+//!
+//! Window 1 starts its chat and page windows the same way, one link and one process each ([`Pair::open_module`], kept in
+//! [`ModuleWindows`]): the same handshake and deadline, the same end through a pidfd, and a copy of the same lock. A
+//! module window's `hello` carries its own name, and a refused one ends the window, since it has no pair to go on
+//! without. The windows of a group are a star: each links to window 1 and to nothing else. A window 1 that came back
+//! for orphaned module windows holds them the same way ([`Pair::relinked_group`]), each with a pidfd it could open only
+//! by name, since another process started them.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -31,27 +38,41 @@ use agent::child::PidFd;
 
 use eitri_core::window_link::fdpass;
 use eitri_core::window_link::link::{LinkHandle, PresenceFlag};
-use eitri_core::window_link::pair::PairLock;
-use eitri_core::window_link::start::{spawn_second, SECOND_WINDOW};
+use eitri_core::window_link::names::WindowName;
+use eitri_core::window_link::pair::{GroupClaim, PairLock};
+use eitri_core::window_link::start::{spawn_linked, LinkedFlags, SECOND_WINDOW};
 use eitri_core::window_link::{FocusTarget, Msg, Summary, TurnEdge};
+use eitri_core::wm::feedback::TAB_ALREADY_MOVING_TEXT;
+use eitri_core::wm::PeerId;
 
 use super::driver::{LinkDriver, Partner, HANDSHAKE_WITHIN};
+use super::group_tabs::{GroupTabs, TabReports, REPORT_AFTER};
+use super::hand_over::{self, TabHolder, TabHolderSlot};
 use super::pair_files::PairWriter;
+use super::registry::{ModuleLink, ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_WINDOW_1S};
 use super::relink::{self, HeldNow, OrphanSocket, Relinked};
-use super::{LinkEnd, WindowNew, WindowRole, NO_OTHER_WINDOW};
+use super::{LinkEnd, WindowNew, WindowRole, KEPT_WORDS, NO_OTHER_WINDOW};
+use crate::agent_panel::TabAnswer;
+use eitri_core::saved_tabs::{SavedTab, SavedTabs};
 
 /// Window 1's name on the link.
 pub const FIRST_WINDOW: &str = "1";
 
-/// The `hello` window 1 accepts: from the child it started, of its own build.
+/// What window 1 calls window 2.
+pub const SECOND_PEER: PeerId = PeerId(2);
+/// What window 2 and a module window call window 1: their one other window.
+pub const HUB_PEER: PeerId = PeerId(1);
+
+/// The `hello` window 1 accepts: from the child it started under that name, of its own build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
     pub build: String,
+    pub name: WindowName,
     pub pid: u32,
     pub start: u64,
 }
 
-/// Checks window 2's `hello` against what window 1 started; the partner it names, or why it is refused.
+/// Checks a started window's `hello` against what window 1 started; the partner it names, or why it is refused.
 pub fn check_hello(msg: &Msg, expected: &Expected) -> Result<Partner, String> {
     let Msg::Hello {
         build,
@@ -61,19 +82,17 @@ pub fn check_hello(msg: &Msg, expected: &Expected) -> Result<Partner, String> {
         ..
     } = msg
     else {
-        return Err(format!(
-            "the second window's first message was `{}`, not hello",
-            msg.kind()
-        ));
+        return Err(format!("the window's first message was `{}`, not hello", msg.kind()));
     };
     if *build != expected.build {
         return Err(format!(
-            "the second window is another build ({build}, this one is {})",
+            "the window started here is another build ({build}, this one is {})",
             expected.build
         ));
     }
-    if window != SECOND_WINDOW {
-        return Err(format!("the second window calls itself window {window:?}"));
+    let name = expected.name.text();
+    if *window != name {
+        return Err(format!("the window started as {name} calls itself window {window:?}"));
     }
     if (*pid, *start) != (expected.pid, expected.start) {
         return Err(format!(
@@ -87,13 +106,13 @@ pub fn check_hello(msg: &Msg, expected: &Expected) -> Result<Partner, String> {
     })
 }
 
-/// Window 2's `hello`: its build, its process, and nothing confirmed yet about its own presence (the partner
-/// counts it as another window until it says so). It is said before the window's panel exists, so no turn of it
-/// runs yet.
-pub fn hello(build: String, pid: u32, start: u64) -> Msg {
+/// A started window's `hello`: its build, its name, its process, and nothing confirmed yet about its own presence
+/// (the partner counts it as another window until it says so). It is said before the window's panel exists, so no
+/// turn of it runs yet.
+pub fn hello(build: String, name: &WindowName, pid: u32, start: u64) -> Msg {
     Msg::Hello {
         build,
-        window: SECOND_WINDOW.to_string(),
+        window: name.text(),
         pid,
         start,
         presence_ready: false,
@@ -130,30 +149,39 @@ pub struct PairHooks {
     pub ended: OnEnded,
 }
 
-/// What runs once the link is made.
-pub type OnLinked = Rc<dyn Fn(&LinkDriver)>;
+/// What runs once a link is made: the window at the started end, what this window calls the other one, the link.
+pub type OnLinked = Rc<dyn Fn(&WindowName, PeerId, &LinkDriver)>;
+/// What a handshake runs once it has linked: [`OnLinked`] with its window and peer settled.
+pub type LinkMade = Rc<dyn Fn(&LinkDriver)>;
 /// The turns running in this window now, as started edges, for its `welcome`.
 pub type RunningTurns = Rc<dyn Fn() -> Vec<TurnEdge>>;
-/// What runs once the link ended without this window asking.
-pub type OnEnded = Rc<dyn Fn(&LinkDriver, &LinkEnd)>;
+/// What runs once a link ended without this window asking, named as in [`OnLinked`].
+pub type OnEnded = Rc<dyn Fn(&WindowName, PeerId, &LinkDriver, &LinkEnd)>;
 /// What a `child_exited` from the other window is given to: the shell's pid and start time, and its raw wait status.
 pub type OnChildExited = Rc<dyn Fn(u32, u64, Option<i32>)>;
+/// What a `run_action` from window 1 is given to, in a module window: the action's name and the options that rebuild it.
+pub type OnRunAction = Rc<dyn Fn(String, Vec<(String, serde_json::Value)>)>;
 /// What window 1 does when the window 2 it started again at its launch does not come back, with why.
 pub type OnRestoreFailed = Rc<dyn Fn(&str)>;
+/// What window 1 does when the module window it started did not come up: the window's name and why.
+pub type OnModuleFailed = Rc<dyn Fn(&WindowName, &str)>;
 
 type Hooks = Rc<RefCell<Option<PairHooks>>>;
 
 /// Runs a closure once `Duration` has passed, on the main loop.
 pub type After = Rc<dyn Fn(Duration, Box<dyn FnOnce()>)>;
+/// Makes the two ends of a new link: this window's, then the started window's.
+pub type LinkEnds = Rc<dyn Fn() -> io::Result<(OwnedFd, OwnedFd)>>;
 
-/// How this window starts another window of the pair: the executable it runs, and how long a window 2 it starts
-/// has for its handshake, measured by `after`. A window runs its own build ([`Starts::default`]); the tests run
-/// stand-ins with timers of their own.
+/// How this window starts another window of the group: the executable it runs, how long a window it starts has for
+/// its handshake, measured by `after`, and how the link is made. A window runs its own build ([`Starts::default`]);
+/// the tests run stand-ins with timers of their own, and keep a copy of the started end to speak for them.
 #[derive(Clone)]
 pub struct Starts {
     pub exe: PathBuf,
     pub handshake_within: Duration,
     pub after: After,
+    pub link_ends: LinkEnds,
 }
 
 impl Default for Starts {
@@ -165,6 +193,7 @@ impl Default for Starts {
             after: Rc::new(|within, run| {
                 gtk4::glib::timeout_add_local_once(within, run);
             }),
+            link_ends: Rc::new(fdpass::seqpacket_pair),
         }
     }
 }
@@ -189,16 +218,33 @@ pub struct Pair {
     running: Rc<RefCell<Option<RunningTurns>>>,
     /// The window 2 this window started, while it may run: what `HostOp::EndPeer` ends.
     second: RefCell<Option<Rc<SecondProcess>>>,
+    /// Window 1 only: the chat and page windows it started, for as long as each one's link lasts.
+    modules: Rc<RefCell<ModuleWindows>>,
     /// Where the other window's `child_exited` goes.
     child_exited: Rc<RefCell<Option<OnChildExited>>>,
+    /// A module window: where window 1's `run_action` goes.
+    peer_action: Rc<RefCell<Option<OnRunAction>>>,
+    /// A module window: what lets its tabs go and takes tabs up, for a hand-over.
+    tab_holder: TabHolderSlot,
+    /// A module window: the tabs it let go until window 1 can be sure to hear of them.
+    unwritten: Rc<hand_over::UnwrittenTabs>,
+    /// A module window: its tabs on their way to window 1, which saves them.
+    tab_reports: Rc<TabReports>,
+    /// A module window an end signal is closing, so its `bye` asks window 1 to keep it.
+    keep_window: Rc<std::cell::Cell<bool>>,
+    /// Window 1, waiting for its chat windows' last tabs: where the write that follows is announced, once the close has
+    /// asked. `Some(None)` from the ask on.
+    last_tabs_wait: RefCell<Option<Option<std::sync::mpsc::Sender<()>>>>,
     /// Window 2 only: window 1 started it again with `--restore`.
     restored: std::cell::Cell<bool>,
     /// Window 1 only: a window 2 started again at this launch has not linked yet, so its failure to come back is
     /// still to be handled (once).
     restore_pending: Rc<std::cell::Cell<bool>>,
     restore_failed: Rc<RefCell<Option<OnRestoreFailed>>>,
-    /// Window 2 only: the pair lock its `welcome` carried, kept for as long as the window lives, so an orphan can
-    /// hand a copy to the window 1 that comes back for it.
+    /// Window 1 only: what runs when a module window it started never linked.
+    module_failed: Rc<RefCell<Option<OnModuleFailed>>>,
+    /// Window 2 and a module window: the pair lock their `welcome` carried, kept for as long as the window lives, so
+    /// an orphan can hand a copy to the window 1 that comes back for it.
     second_lock: Rc<RefCell<Option<PairLock>>>,
     /// Window 2 only, while orphaned: the socket a new window 1 links through.
     orphan: RefCell<Option<Orphan>>,
@@ -206,6 +252,10 @@ pub struct Pair {
     relinked: RefCell<Option<BTreeMap<String, String>>>,
     /// That window's link was made before its hooks were set: the `linked` hook is still to run, once they are.
     relink_unannounced: std::cell::Cell<bool>,
+    /// A window 1 that came back for module windows: the pair's files stay as `eitri` mode left them.
+    relinked_modules: std::cell::Cell<bool>,
+    /// Window 1's claim on the group, held for as long as this window runs.
+    group_claim: RefCell<Option<GroupClaim>>,
     /// How a window this one starts is started.
     starts: RefCell<Starts>,
     /// Window 2 only: the editor window it started that has neither linked nor ended yet, so a second key press
@@ -213,7 +263,7 @@ pub struct Pair {
     editor_start: RefCell<Option<relink::StartedEditor>>,
 }
 
-/// An orphaned window 2's listener and the connection it is answering, if one is.
+/// An orphan's listener and the connection it is answering, if one is.
 struct Orphan {
     socket: Rc<OrphanSocket>,
     watch: Option<gtk4::glib::SourceId>,
@@ -239,16 +289,32 @@ impl Pair {
     pub fn second(sock: OwnedFd, root: &Path) -> io::Result<Rc<Pair>> {
         let hooks: Hooks = Rc::default();
         let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
-        let link = link_second(sock, linked_hook(&hooks), lock.clone())?;
+        let name = WindowName::Second;
+        let link = link_second(sock, &name, linked_hook(&hooks, name.clone(), HUB_PEER), lock.clone())?;
         // The link's handler fills the slot once `welcome` comes.
         let pair = Pair::with_hooks(WindowRole::Second { link }, None, root, hooks, lock);
         Ok(pair)
+    }
+
+    /// The module window `name`, on its checked link end: says `hello` under that name at once and links on `welcome`.
+    pub fn module(sock: OwnedFd, name: WindowName, root: &Path) -> io::Result<Rc<Pair>> {
+        let hooks: Hooks = Rc::default();
+        let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
+        let link = link_second(sock, &name, linked_hook(&hooks, name.clone(), HUB_PEER), lock.clone())?;
+        Ok(Pair::with_hooks(
+            WindowRole::Module { name, link },
+            None,
+            root,
+            hooks,
+            lock,
+        ))
     }
 
     /// A window 1 that found the pair lock held and linked to the orphaned window 2 holding it ([`relink::relink`]):
     /// window 1 of the pair, with that lock and that link. Its `linked` hook runs once the window sets its hooks.
     pub fn relinked(relinked: Relinked, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
         let Relinked {
+            name: _,
             handle,
             inbound,
             presence,
@@ -268,6 +334,62 @@ impl Pair {
         *pair.relinked.borrow_mut() = Some(holders);
         pair.relink_unannounced.set(true);
         println!("[link] linked to the waiting window 2 (process {})", partner.pid);
+        pair
+    }
+
+    /// A window 1 that found the pair lock held and linked to the orphaned module windows holding it
+    /// ([`relink::relink_all`]): window 1 of the group, with no window 2 and each orphan in the registry under a fresh
+    /// peer. One copy of the lock is kept, the first; every copy is one open file description, so closing the others
+    /// keeps it held. Their `linked` hooks run once the window sets its hooks. With nobody to link to it runs unpaired.
+    pub fn relinked_group(relinked: Vec<Relinked>, root: &Path, legacy_backend: bool, clean: bool) -> Rc<Pair> {
+        let mut lock = None;
+        let mut holders = BTreeMap::new();
+        let mut links = Vec::with_capacity(relinked.len());
+        for one in relinked {
+            lock.get_or_insert(one.lock);
+            holders.extend(one.holders);
+            let link = LinkDriver::new(one.handle, one.inbound);
+            link.set_presence(one.presence);
+            link.set_partner(one.partner);
+            link.set_partner_running(one.running);
+            link.set_linked();
+            links.push((one.name, one.partner, link));
+        }
+        let Some(lock) = lock else {
+            return Pair::full(Ok(None), root, legacy_backend, clean);
+        };
+        let pair = Pair::new(WindowRole::Main { link: None }, Some(lock), root);
+        pair.legacy_backend.set(legacy_backend);
+        pair.clean.set(clean);
+        for (name, partner, link) in links {
+            // Gone already, then: its link ends with this copy of it, and there is nothing to hold.
+            let process = match SecondProcess::adopted(partner) {
+                Ok(process) => Rc::new(process),
+                Err(err) => {
+                    eprintln!("[link] the waiting window {} is gone: {err}", name.text());
+                    continue;
+                }
+            };
+            let peer = pair.modules.borrow_mut().next_peer();
+            pair.wire_module(&name, peer, &link, Rc::new(std::cell::Cell::new(true)));
+            println!(
+                "[link] linked to the waiting window {} (process {})",
+                name.text(),
+                partner.pid
+            );
+            pair.modules.borrow_mut().insert(
+                name,
+                ModuleLink {
+                    peer,
+                    link,
+                    process,
+                    said: Default::default(),
+                },
+            );
+        }
+        *pair.relinked.borrow_mut() = Some(holders);
+        pair.relink_unannounced.set(true);
+        pair.relinked_modules.set(true);
         pair
     }
 
@@ -293,14 +415,24 @@ impl Pair {
             clean: std::cell::Cell::new(false),
             running: Rc::default(),
             second: RefCell::new(None),
+            modules: Rc::default(),
             child_exited: Rc::default(),
+            peer_action: Rc::default(),
+            tab_holder: Rc::default(),
+            unwritten: Rc::default(),
+            tab_reports: Rc::default(),
+            keep_window: Rc::default(),
+            last_tabs_wait: RefCell::default(),
             restored: std::cell::Cell::new(false),
             restore_pending: Rc::default(),
             restore_failed: Rc::default(),
+            module_failed: Rc::default(),
             second_lock,
             orphan: RefCell::new(None),
             relinked: RefCell::new(None),
             relink_unannounced: std::cell::Cell::new(false),
+            relinked_modules: std::cell::Cell::new(false),
+            group_claim: RefCell::default(),
             starts: RefCell::new(Starts::default()),
             editor_start: RefCell::new(None),
         });
@@ -346,6 +478,12 @@ impl Pair {
         *self.restore_failed.borrow_mut() = Some(hook);
     }
 
+    /// What this window does when a module window it started never links: its handshake was missed, its hello was
+    /// refused or its link ended first. The controller drops what waited for it and the name can be started again.
+    pub fn on_module_failed(&self, hook: OnModuleFailed) {
+        *self.module_failed.borrow_mut() = Some(hook);
+    }
+
     /// The window 2 started again at this launch did not come back, for `why`: the hook runs, once, and `true` is
     /// returned. `false` when no restore is waiting (none was asked, it linked, or its failure was handled).
     pub fn fail_restore(&self, why: &str) -> bool {
@@ -362,30 +500,155 @@ impl Pair {
         *self.child_exited.borrow_mut() = Some(hook);
     }
 
+    /// Where window 1's `run_action` goes, from here on: the module window's runner. Only a module window takes one.
+    pub fn set_peer_action(&self, hook: OnRunAction) {
+        *self.peer_action.borrow_mut() = Some(hook);
+    }
+
+    /// What lets this module window's tabs go and takes tabs up, from here on.
+    pub fn set_tab_holder(&self, holder: Rc<dyn TabHolder>) {
+        *self.tab_holder.borrow_mut() = Some(holder);
+    }
+
+    /// Window 1 keeps its group's tabs from here on, each module window telling it theirs.
+    pub fn keep_group_tabs(&self, tabs: GroupTabs) {
+        self.modules.borrow_mut().keep_tabs(tabs);
+    }
+
+    /// Window 1 is closing: the receiver reports once the group's tabs file holds what it was last handed, which comes
+    /// after the last tabs the chat windows were asked for.
+    pub fn finish_group_tabs(&self) -> Option<std::sync::mpsc::Receiver<()>> {
+        if let Some(announce) = self.last_tabs_wait.borrow_mut().as_mut() {
+            let (told, heard) = std::sync::mpsc::channel();
+            *announce = Some(told);
+            return Some(heard);
+        }
+        self.modules.borrow_mut().finish_tabs()
+    }
+
+    /// This module window's tabs are `tabs` now: window 1 hears at once, or with what else changes in the moment after
+    /// its last report.
+    pub fn tabs_changed(self: &Rc<Self>, tabs: SavedTabs) {
+        let link = self.link().filter(LinkDriver::linked);
+        if self.tab_reports.changed(tabs, link.as_ref()) {
+            let pair = Rc::downgrade(self);
+            let after = self.starts.borrow().after.clone();
+            after(
+                REPORT_AFTER,
+                Box::new(move || {
+                    if let Some(pair) = pair.upgrade() {
+                        pair.tab_reports
+                            .timer_ended(pair.link().filter(LinkDriver::linked).as_ref());
+                    }
+                }),
+            );
+        }
+    }
+
+    /// This module window's link is up: window 1 hears the tabs it holds, if it has told of any.
+    pub fn say_tabs(&self) {
+        if !self.is_module() {
+            return;
+        }
+        if let Some(link) = self.link().filter(LinkDriver::linked) {
+            self.tab_reports.linked(&link);
+        }
+    }
+
+    /// This module window's panel answered a hand-over: window 1 hears it. A tab it let go that window 1 will not hear
+    /// of is taken up here again, as nobody else will be given it; one that stays, or did not come up, is said here too.
+    pub fn answer_hand_over(&self, answer: TabAnswer) {
+        let holder = self.tab_holder.borrow().clone();
+        if let (TabAnswer::Kept { why, .. } | TabAnswer::NotAdopted { why, .. }, Some(holder)) = (&answer, &holder) {
+            holder.kept(why.clone());
+        }
+        let released = match &answer {
+            TabAnswer::Released { tab, .. } => Some(tab.clone()),
+            _ => None,
+        };
+        let link = self.link().filter(LinkDriver::linked);
+        let written = link.and_then(|link| {
+            link.send_confirmed(hand_over::answer_message(answer), Vec::new())
+                .map_err(|err| eprintln!("[link] window 1 could not be told how a hand-over went: {err}"))
+                .ok()
+        });
+        match (released, written) {
+            (Some(tab), Some(written)) => self.unwritten.hold(written, tab),
+            (Some(tab), None) => take_lost_tabs(vec![tab], &self.tab_holder),
+            (None, _) => {}
+        }
+        take_lost_tabs(self.unwritten.settle(), &self.tab_holder);
+    }
+
+    /// A release queued on a link, for a test that gives its answer itself.
+    #[cfg(test)]
+    pub(crate) fn hold_released(&self, written: std::sync::mpsc::Receiver<io::Result<()>>, tab: SavedTab) {
+        self.unwritten.hold(written, tab);
+    }
+
+    /// A module window's toplevel gained the keyboard: window 1 is told, for the window that holds the keys. Any
+    /// other window, and a link that is not up, say nothing.
+    pub fn say_window_focused(&self) {
+        if !self.is_module() {
+            return;
+        }
+        let Some(link) = self.link().filter(LinkDriver::linked) else {
+            return;
+        };
+        if let Err(err) = link.send(Msg::WindowFocused {}, Vec::new()) {
+            eprintln!("[link] window 1 could not be told this window has the keys: {err}");
+        }
+    }
+
     /// What the window does on the link's events, from here on. A link made before the window was built (a
     /// re-link) is announced to them now.
     pub fn set_hooks(&self, hooks: PairHooks) {
         *self.hooks.borrow_mut() = Some(hooks);
         if self.relink_unannounced.replace(false) {
             if let Some(link) = self.link().filter(LinkDriver::linked) {
-                linked_hook(&self.hooks)(&link);
+                linked_hook(&self.hooks, self.link_name(), self.link_peer())(&link);
+            }
+            for name in self.module_names() {
+                let known = self.modules.borrow().get(&name).map(|m| (m.peer, m.link.clone()));
+                if let Some((peer, link)) = known.filter(|(_, link)| link.linked()) {
+                    linked_hook(&self.hooks, name.clone(), peer)(&link);
+                    self.modules.borrow().give_tabs(&name);
+                }
             }
         }
     }
 
-    /// What the orphan this window linked to at its start said it holds; `None` for a window that did not re-link.
+    /// What the orphans this window linked to at its start said they hold; `None` for a window that did not re-link.
     pub fn relink_holders(&self) -> Option<BTreeMap<String, String>> {
         self.relinked.borrow().clone()
+    }
+
+    /// Starts watching the links of the module windows this window came back for.
+    pub fn watch_module_links(&self) {
+        for module in self.modules.borrow().links() {
+            module.link.watch();
+        }
     }
 
     pub fn owns_editor(&self) -> bool {
         self.role.borrow().owns_editor()
     }
 
+    /// Keeps `claim` until this window ends, whichever way it came to lead the group.
+    pub fn hold_group_claim(&self, claim: Option<GroupClaim>) {
+        *self.group_claim.borrow_mut() = claim;
+    }
+
     /// Whether this window holds the project's pair lock as its window 1: the one that reads the pair file at
     /// start and writes it while the pair runs.
     pub fn holds_pair(&self) -> bool {
         self.lock.is_some() && self.role.borrow().writes_main_files()
+    }
+
+    /// Whether this window reads the pair file at start and writes it. A window 1 that came back for module windows
+    /// does not: they have no place in it, and `eitri` mode finds it as it was left.
+    pub fn keeps_pair_file(&self) -> bool {
+        self.holds_pair() && !self.relinked_modules.get()
     }
 
     /// The pair file's writer, from the window's start on.
@@ -415,12 +678,40 @@ impl Pair {
         }
     }
 
+    /// Whether window 1 started this window: window 2 or a module window, neither of which has an editor or holds
+    /// the pair's files.
     pub fn is_second(&self) -> bool {
-        matches!(*self.role.borrow(), WindowRole::Second { .. })
+        matches!(
+            *self.role.borrow(),
+            WindowRole::Second { .. } | WindowRole::Module { .. }
+        )
+    }
+
+    /// The name of the chat or page window this is; `None` in every other window, window 2 included.
+    pub fn module_window(&self) -> Option<WindowName> {
+        match &*self.role.borrow() {
+            WindowRole::Module { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a module window: window 1 decides its reverts.
+    pub fn is_module(&self) -> bool {
+        matches!(*self.role.borrow(), WindowRole::Module { .. })
     }
 
     pub fn is_unpaired(&self) -> bool {
         matches!(*self.role.borrow(), WindowRole::Unpaired)
+    }
+
+    /// Whether this window found no pair lock to take: nothing could link to it.
+    pub fn is_alone(&self) -> bool {
+        matches!(*self.role.borrow(), WindowRole::Alone)
+    }
+
+    /// Whether this window linked at its start to the module windows an earlier window 1 left behind.
+    pub fn relinked_module_windows(&self) -> bool {
+        self.relinked_modules.get()
     }
 
     pub fn pair_role(&self) -> eitri_core::window_link::pair::Role {
@@ -435,10 +726,65 @@ impl Pair {
         self.role.borrow().link().cloned()
     }
 
+    /// The started window at the end of [`Pair::link`]: this window, when it is one, else window 2.
+    fn link_name(&self) -> WindowName {
+        match &*self.role.borrow() {
+            WindowRole::Module { name, .. } => name.clone(),
+            _ => WindowName::Second,
+        }
+    }
+
+    /// What this window calls the window at the other end of [`Pair::link`].
+    fn link_peer(&self) -> PeerId {
+        if self.is_second() {
+            HUB_PEER
+        } else {
+            SECOND_PEER
+        }
+    }
+
+    /// What window 1 calls the module window `name`, while its link lasts.
+    pub fn module_peer(&self, name: &WindowName) -> Option<PeerId> {
+        self.modules.borrow().get(name).map(|module| module.peer)
+    }
+
+    /// The peer of the window that holds the plugin `owner`'s page when this window does not: its own page window while
+    /// one is linked, window 2 otherwise.
+    pub fn page_peer(&self, owner: &str) -> PeerId {
+        self.module_peer(&WindowName::Page(owner.to_owned()))
+            .unwrap_or(SECOND_PEER)
+    }
+
+    /// The module windows window 1 has started and whose links last.
+    #[cfg_attr(not(test), allow(dead_code))] // The window verbs name windows through the controller.
+    pub fn module_names(&self) -> Vec<WindowName> {
+        self.modules.borrow().names()
+    }
+
+    /// Tells every linked module window what this window holds, each one only when it has not heard that set yet.
+    pub fn say_held_to_modules(&self, held: &BTreeSet<String>) {
+        for module in self.modules.borrow().links() {
+            module.said.say(&module.link, held.clone());
+        }
+    }
+
+    /// The module window `name`'s link, for a test that steps it.
+    #[cfg(test)]
+    pub(crate) fn module_link(&self, name: &WindowName) -> Option<LinkDriver> {
+        self.modules.borrow().get(name).map(|module| module.link.clone())
+    }
+
+    /// The module window `name`'s process, for a test that speaks for it.
+    #[cfg(test)]
+    pub(crate) fn module_process(&self, name: &WindowName) -> Option<Rc<SecondProcess>> {
+        self.modules.borrow().get(name).map(|module| module.process.clone())
+    }
+
     fn wire(&self, link: &LinkDriver) {
         let hooks = self.hooks.clone();
         let first = !self.is_second();
         let (pending, failed) = (self.restore_pending.clone(), self.restore_failed.clone());
+        let (name, peer) = (self.link_name(), self.link_peer());
         link.on_end(move |link, end| {
             // A window 2 started again at this launch that ended before it linked did not come back: the
             // restore's own take-back runs instead.
@@ -447,26 +793,113 @@ impl Pair {
             }
             let hook = hooks.borrow().as_ref().map(|h| h.ended.clone());
             if let Some(ended) = hook {
-                ended(link, end);
+                ended(&name, peer, link, end);
             }
         });
-        let peer = eitri_core::wm::PeerId(if self.is_second() { 1 } else { 2 });
-        for kind in ["summary", "workspace"] {
-            let hooks = self.hooks.clone();
-            link.on(kind, move |_, msg, _| {
-                let event = crate::gtk_host::peer::pair_event(peer, &msg);
-                let post = hooks.borrow().as_ref().map(|h| h.post.clone());
-                if let (Some(event), Some(post)) = (event, post) {
-                    post(event);
+        self.post_kind(link, "workspace", peer);
+        if self.is_module() {
+            hand_over::serve(link, self.tab_holder.clone());
+            // A write's answer wakes the link; the link's end answers every write still queued.
+            let (unwritten, holder) = (self.unwritten.clone(), self.tab_holder.clone());
+            link.on_wake(move |_| take_lost_tabs(unwritten.settle(), &holder));
+            let (unwritten, holder) = (self.unwritten.clone(), self.tab_holder.clone());
+            link.on_end(move |_, _| take_lost_tabs(unwritten.settle(), &holder));
+            let (reports, holder, keep) = (
+                self.tab_reports.clone(),
+                self.tab_holder.clone(),
+                self.keep_window.clone(),
+            );
+            link.on_closing(move |link| {
+                let held = holder.borrow().clone();
+                reports.closing(link, held.and_then(|held| last_tabs(&*held, keep.get())));
+            });
+            let (reports, holder) = (self.tab_reports.clone(), self.tab_holder.clone());
+            link.on("group_closing", move |link, _, _| {
+                let held = holder.borrow().clone();
+                reports.closing(link, held.and_then(|held| held.tabs_to_keep()));
+                if let Err(err) = link.send(Msg::TabsSaid {}, Vec::new()) {
+                    eprintln!("[link] window 1 could not be told this window's last tabs are out: {err}");
                 }
             });
         }
+        // The pair file names each window's monitor; the other window's comes over the link.
+        let other_window = if self.is_second() { FIRST_WINDOW } else { SECOND_WINDOW };
+        self.wire_messages(link, peer, Some(other_window));
+    }
+
+    /// A module window's link in window 1, as [`Pair::wire`] does a window 2's, keyed by its peer: its end forgets the
+    /// window, and the window's name is free to start again; a clean end after linking also drops its saved tabs. The
+    /// pair file has no place for a module window, so what it holds and which monitor it is on are the controller's
+    /// alone.
+    fn wire_module(&self, name: &WindowName, peer: PeerId, link: &LinkDriver, was_linked: Rc<std::cell::Cell<bool>>) {
         let hooks = self.hooks.clone();
-        link.on("focus", move |_, msg, _| {
-            let event = crate::gtk_host::peer::pair_event(peer, &msg);
-            let post = hooks.borrow().as_ref().map(|h| h.post.clone());
-            if let (Some(event), Some(post)) = (event, post) {
-                post(event);
+        let modules = Rc::downgrade(&self.modules);
+        let window = name.clone();
+        let failed = self.module_failed.clone();
+        link.on_end(move |link, end| {
+            if forget_module(&modules, peer).is_some() && !was_linked.get() {
+                module_failed(&failed, &window, &format!("its link ended before it linked ({end:?})"));
+            }
+            if let (true, true, Some(modules)) = (was_linked.get(), end.closed_for_good(), modules.upgrade()) {
+                modules.borrow_mut().tabs_window_closed(&window);
+            }
+            let hook = hooks.borrow().as_ref().map(|h| h.ended.clone());
+            if let Some(ended) = hook {
+                ended(&window, peer, link, end);
+            }
+        });
+        self.wire_messages(link, peer, None);
+        for kind in ["tab_released", "tab_kept", "tab_adopted"] {
+            let modules = Rc::downgrade(&self.modules);
+            let window = name.clone();
+            link.on(kind, move |_, msg, _| {
+                if let Some(modules) = modules.upgrade() {
+                    modules.borrow_mut().hand_over_heard(&window, msg);
+                }
+            });
+        }
+        let modules = Rc::downgrade(&self.modules);
+        let window = name.clone();
+        link.on("tabs_report", move |_, msg, _| {
+            if let (Msg::TabsReport { tabs }, Some(modules)) = (msg, modules.upgrade()) {
+                modules.borrow_mut().tabs_reported(&window, &tabs);
+            }
+        });
+        let modules = Rc::downgrade(&self.modules);
+        let window = name.clone();
+        link.on("tabs_said", move |_, _, _| {
+            if let Some(modules) = modules.upgrade() {
+                modules.borrow_mut().last_tabs_said(&window);
+            }
+        });
+    }
+
+    /// Hands `kind`'s messages to the controller as `peer`'s events.
+    fn post_kind(&self, link: &LinkDriver, kind: &'static str, peer: PeerId) {
+        let hooks = self.hooks.clone();
+        link.on(kind, move |_, msg, _| {
+            post_event(&hooks, crate::gtk_host::peer::pair_event(peer, &msg));
+        });
+    }
+
+    /// What every link of this window takes from `peer`. `pair_file` is the name the pair file has for that window,
+    /// when it has one.
+    fn wire_messages(&self, link: &LinkDriver, peer: PeerId, pair_file: Option<&'static str>) {
+        self.post_kind(link, "summary", peer);
+        self.post_kind(link, "focus", peer);
+        // What a module window asks of window 1, and its toplevel taking the keys: the controller of the window that
+        // holds the group decides both, any other refuses them.
+        self.post_kind(link, "hub_ask", peer);
+        self.post_kind(link, "window_focused", peer);
+        let peer_action = self.peer_action.clone();
+        link.on("run_action", move |_, msg, _| {
+            let Msg::RunAction { name, opts } = msg else {
+                return;
+            };
+            let hook = peer_action.borrow().clone();
+            match hook {
+                Some(hook) => hook(name, opts),
+                None => eprintln!("[link] run_action {name}: not an action here"),
             }
         });
         let child_exited = self.child_exited.clone();
@@ -481,29 +914,24 @@ impl Pair {
             }
         });
         let hooks = self.hooks.clone();
-        // The pair file names each window's monitor; the other window's comes from here, checked as its input.
-        let other_window = if self.is_second() { FIRST_WINDOW } else { SECOND_WINDOW };
         let pair_writer = self.pair_writer.clone();
         link.on("monitor", move |_, msg, _| {
+            // Checked as the other window's input.
             if let Msg::Monitor { connector, description } = &msg {
                 match super::pair_files::peer_monitor(connector, description) {
                     Some(monitor) => {
-                        if let Some(writer) = pair_writer.borrow_mut().as_mut() {
-                            writer.monitor(other_window, monitor);
+                        if let (Some(window), Some(writer)) = (pair_file, pair_writer.borrow_mut().as_mut()) {
+                            writer.monitor(window, monitor);
                         }
                     }
                     None => eprintln!("[link] the other window names a monitor {connector:?}; not kept"),
                 }
             }
-            let event = crate::gtk_host::peer::pair_event(peer, &msg);
-            let post = hooks.borrow().as_ref().map(|h| h.post.clone());
-            if let (Some(event), Some(post)) = (event, post) {
-                post(event);
-            }
+            post_event(&hooks, crate::gtk_host::peer::pair_event(peer, &msg));
         });
         // What window 2 holds is what the pair file names it the holder of; window 2 hears window 1's held set
         // only to keep its own numbers apart.
-        let records_holders = !self.is_second();
+        let records_holders = pair_file == Some(SECOND_WINDOW);
         let pair_writer = self.pair_writer.clone();
         let hooks = self.hooks.clone();
         link.on("away", move |_, msg, _| {
@@ -516,10 +944,7 @@ impl Pair {
                     }
                 }
             }
-            let post = hooks.borrow().as_ref().map(|h| h.post.clone());
-            if let (Some(event), Some(post)) = (event, post) {
-                post(event);
-            }
+            post_event(&hooks, event);
         });
     }
 
@@ -542,13 +967,9 @@ impl Pair {
                     &starts,
                     &self.root,
                     token.as_deref(),
-                    SecondFlags {
-                        legacy: self.legacy_backend.get(),
-                        clean: self.clean.get(),
-                        restore: false,
-                    },
+                    self.flags(false),
                     lock,
-                    linked_hook(&self.hooks),
+                    linked_hook(&self.hooks, WindowName::Second, SECOND_PEER),
                     self.running.clone(),
                     None,
                 )
@@ -583,11 +1004,11 @@ impl Pair {
         // Linked, it is restored: what it held is its own again, and nothing comes back here.
         let linked = {
             let pending = self.restore_pending.clone();
-            let linked = linked_hook(&self.hooks);
+            let linked = linked_hook(&self.hooks, WindowName::Second, SECOND_PEER);
             Rc::new(move |link: &LinkDriver| {
                 pending.set(false);
                 linked(link);
-            }) as OnLinked
+            }) as LinkMade
         };
         let overdue = {
             let (pending, hook) = (self.restore_pending.clone(), self.restore_failed.clone());
@@ -600,11 +1021,7 @@ impl Pair {
             &starts,
             &self.root,
             None,
-            SecondFlags {
-                legacy: self.legacy_backend.get(),
-                clean: self.clean.get(),
-                restore: true,
-            },
+            self.flags(true),
             lock,
             linked,
             self.running.clone(),
@@ -615,6 +1032,115 @@ impl Pair {
         self.wire(&link);
         *self.role.borrow_mut() = WindowRole::Main { link: Some(link) };
         Ok(())
+    }
+
+    /// What a window this one starts is passed on.
+    fn flags(&self, restore: bool) -> LinkedFlags {
+        LinkedFlags {
+            legacy: self.legacy_backend.get(),
+            clean: self.clean.get(),
+            restore,
+        }
+    }
+
+    /// Window 1 opens the module window `name`: starts it under the next peer, or, when it is open, raises it with
+    /// `token` (the key press's, so it gets the keys) and starts nothing. A window still in its handshake takes the keys
+    /// with the token it was started with. Refused in every window but window 1.
+    pub fn open_module(&self, name: WindowName, token: Option<String>) -> Result<OpenModule, String> {
+        self.start_module(name, token, false)
+    }
+
+    fn start_module(&self, name: WindowName, token: Option<String>, restore: bool) -> Result<OpenModule, String> {
+        if !matches!(*self.role.borrow(), WindowRole::Main { .. }) {
+            return Err(MODULE_WINDOWS_ARE_WINDOW_1S.to_string());
+        }
+        if name == WindowName::Second {
+            return Err("window 2 is not a module window".to_string());
+        }
+        let Some(lock) = self.lock.clone() else {
+            return Err(MODULE_WINDOWS_ARE_WINDOW_1S.to_string());
+        };
+        let open = self.modules.borrow().get(&name).map(|m| (m.peer, m.link.clone()));
+        if let Some((peer, link)) = open {
+            if link.linked() {
+                let focus = Msg::Focus {
+                    target: FocusTarget::Window,
+                    token,
+                };
+                link.send(focus, Vec::new())
+                    .map_err(|e| format!("the window {} could not be asked: {e}", name.text()))?;
+            }
+            return Ok(OpenModule::Raised(peer));
+        }
+        let peer = self.modules.borrow_mut().next_peer();
+        // A window that misses its handshake, or is refused at its hello, never links: the controller is told, or it
+        // would count the window as starting for good.
+        let forget = {
+            let modules = Rc::downgrade(&self.modules);
+            let (failed, name) = (self.module_failed.clone(), name.clone());
+            Rc::new(move || {
+                // Only a window still in the registry is reported: one whose link ended already was, and its name
+                // may have been started again since.
+                if forget_module(&modules, peer).is_some() {
+                    module_failed(&failed, &name, "its handshake was not finished in time");
+                }
+            }) as Rc<dyn Fn()>
+        };
+        // A window refused at its hello has no pair to go on without, and nothing else ends it.
+        let refused = {
+            let modules = Rc::downgrade(&self.modules);
+            let (failed, name) = (self.module_failed.clone(), name.clone());
+            Rc::new(move || {
+                if let Some(module) = forget_module(&modules, peer) {
+                    if let Some(ending) = end_second(&module.process, END_GRACE) {
+                        hold_until_finished(ending);
+                    }
+                    module_failed(&failed, &name, "its hello was refused");
+                }
+            }) as Rc<dyn Fn()>
+        };
+        // Whether the window linked, for the end of its link: one that ends after linking is the controller's
+        // detach, one that ends before it is a start that failed.
+        let was_linked = Rc::new(std::cell::Cell::new(false));
+        let made = linked_hook(&self.hooks, name.clone(), peer);
+        let linked: LinkMade = {
+            let was_linked = was_linked.clone();
+            let modules = Rc::downgrade(&self.modules);
+            let name = name.clone();
+            Rc::new(move |link| {
+                was_linked.set(true);
+                made(link);
+                if let Some(modules) = modules.upgrade() {
+                    modules.borrow().give_tabs(&name);
+                    modules.borrow_mut().hand_over_target_linked(&name);
+                }
+            })
+        };
+        let starts = self.starts.borrow().clone();
+        let (link, process) = start_window(
+            &starts,
+            &self.root,
+            &name,
+            token.as_deref(),
+            self.flags(restore),
+            lock,
+            linked,
+            self.running.clone(),
+            Some(forget),
+            Some(refused),
+        )
+        .map_err(|e| format!("the window {} could not be started: {e}", name.text()))?;
+        self.wire_module(&name, peer, &link, was_linked);
+        self.modules.borrow_mut().insert(
+            name,
+            ModuleLink {
+                peer,
+                link,
+                process,
+                said: Default::default(),
+            },
+        );
+        Ok(OpenModule::Spawned(peer))
     }
 
     /// Raises the other window and gives it the keys. The window controller's `window.other` sends the same
@@ -646,20 +1172,103 @@ impl Pair {
 }
 
 impl Pair {
-    /// Window 2, orphaned: binds the socket a window 1 starting for the project links through ([`relink`]), in
-    /// `dir`, and watches it on the main context. `held` is read for the `welcome`. Nothing is bound in a window
-    /// that is not window 2 or holds no pair lock, nor twice.
+    /// What this window's `bye` says of its own close. A module window that an end signal closes, or whose tabs on offer
+    /// nobody answered, says it is kept: the user has not closed them.
+    pub fn closed_words(&self) -> String {
+        let unopened = || self.tab_holder.borrow().as_ref().and_then(|held| held.unopened());
+        if self.is_module() && (self.keep_window.get() || unopened().is_some()) {
+            return format!("window {} {KEPT_WORDS}", self.link_name().text());
+        }
+        let name = if self.is_second() {
+            self.link_name().text()
+        } else {
+            FIRST_WINDOW.to_string()
+        };
+        format!("window {name} closed")
+    }
+
+    /// An end signal is closing this module window, which is not the user closing it.
+    pub fn keep_this_window(&self) {
+        self.keep_window.set(true);
+    }
+
+    /// Window 1 closes its group. The chat windows are asked for their last tabs first, while their links can carry
+    /// them; then every module window hears `bye`, with the application held until each has gone. Only the module
+    /// windows are told: window 2 outlives window 1.
+    pub fn end_group(self: &Rc<Self>) {
+        if !self.modules.borrow_mut().ask_last_tabs() {
+            self.end_group_now();
+            return;
+        }
+        *self.last_tabs_wait.borrow_mut() = Some(None);
+        self.await_last_tabs(Instant::now() + LAST_TABS_WITHIN, hold_application());
+    }
+
+    /// Comes back on a timer until every window asked has answered or `until` has passed: a window that cannot answer
+    /// costs only what it had not said.
+    fn await_last_tabs(self: &Rc<Self>, until: Instant, hold: Option<gtk4::gio::ApplicationHoldGuard>) {
+        if self.modules.borrow_mut().last_tabs_owed() && Instant::now() < until {
+            let pair = self.clone();
+            let after = self.starts.borrow().after.clone();
+            after(LAST_TABS_POLL, Box::new(move || pair.await_last_tabs(until, hold)));
+            return;
+        }
+        let announce = self.last_tabs_wait.borrow_mut().take().flatten();
+        self.end_group_now();
+        let write = self.modules.borrow_mut().finish_tabs();
+        match (announce, write) {
+            (Some(announce), Some(write)) => {
+                let relay = std::thread::Builder::new().name("group-tabs".into()).spawn(move || {
+                    let _ = write.recv();
+                    let _ = announce.send(());
+                });
+                if let Err(err) = relay {
+                    eprintln!("[tabs] no thread to wait for the group's last write ({err}); not waiting");
+                }
+            }
+            (Some(announce), None) => {
+                let _ = announce.send(());
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn end_group_now(&self) {
+        let told = eitri_core::wm::end_signals::told_within(END_GRACE, crate::end_signals::since_first_signal());
+        self.end_group_within(END_GRACE, told);
+    }
+
+    /// Every module window hears `bye` and is seen off, with [`SecondProcess::end_unless_closed`]'s two bounds.
+    pub(crate) fn end_group_within(&self, grace: Duration, told: Duration) {
+        let windows = ModuleWindows::end_group(&self.modules, &self.closed_words());
+        for process in windows {
+            if let Some(ending) = end_closing(&process, grace, told) {
+                hold_until_finished(ending);
+            }
+        }
+    }
+
+    /// Whether this window waits for a window 1 once its link ended like `end`. Window 2 outlives its window 1 however
+    /// that ended. A module window waits only for one that died: a `bye` is the group closing, and it closes too.
+    pub fn waits_for_relink_after(&self, end: &LinkEnd) -> bool {
+        !(matches!(*self.role.borrow(), WindowRole::Module { .. }) && matches!(end, LinkEnd::Bye { .. }))
+    }
+
+    /// A window window 1 started, orphaned: binds the socket a window 1 starting for the project links through
+    /// ([`relink`]), under this window's name, in `dir`, and watches it on the main context. `held` is read for the
+    /// `welcome`. Nothing is bound in a window that window 1 did not start or that holds no pair lock, nor twice.
     pub fn wait_for_relink(self: &Rc<Self>, dir: &Path, held: HeldNow) -> Result<(), String> {
         if !self.is_second() {
-            return Err("only window 2 waits for a window 1".into());
+            return Err("only a window window 1 started waits for a window 1".into());
         }
         if self.second_lock.borrow().is_none() {
-            return Err("window 2 holds no pair lock to hand over".into());
+            return Err("this window holds no pair lock to hand over".into());
         }
         if self.orphan.borrow().is_some() {
             return Ok(());
         }
-        let socket = Rc::new(OrphanSocket::bind(dir, &self.root)?);
+        let name = self.link_name();
+        let socket = Rc::new(OrphanSocket::bind_as(dir, &self.root, &name)?);
         let me = Rc::downgrade(self);
         let watch = neovide_editor::fd_watch::add_local(
             socket.raw_fd(),
@@ -680,7 +1289,11 @@ impl Pair {
                 None
             }
         };
-        println!("[window] window 2 waits for a window 1 at {}", socket.path().display());
+        println!(
+            "[window] window {} waits for a window 1 at {}",
+            name.text(),
+            socket.path().display()
+        );
         *self.orphan.borrow_mut() = Some(Orphan {
             socket,
             watch,
@@ -801,11 +1414,11 @@ impl Pair {
             .clone()
             .map(|running| running())
             .unwrap_or_default();
-        let welcome = relink::relink_welcome(&held, running);
+        let welcome = relink::relink_welcome_as(&self.link_name(), &held, running);
         let answered = match self.second_lock.borrow().as_ref() {
             Some(lock) => relink::answer_relink_hello(link, msg, &crate::version::fingerprint(), peer, lock, welcome),
             None => {
-                link.close("window 2 holds no pair lock to hand over");
+                link.close("this window holds no pair lock to hand over");
                 Err("no pair lock".to_string())
             }
         };
@@ -829,46 +1442,154 @@ impl Pair {
                 watch.remove();
             }
         }
-        *self.role.borrow_mut() = WindowRole::Second { link: link.clone() };
+        let name = self.link_name();
+        *self.role.borrow_mut() = match name.clone() {
+            WindowName::Second => WindowRole::Second { link: link.clone() },
+            name => WindowRole::Module {
+                name,
+                link: link.clone(),
+            },
+        };
         // Linked: the editor window started from here is this window 1, or no longer matters; a later start is
         // judged by the link.
         self.editor_start.borrow_mut().take();
         self.wire(link);
-        linked_hook(&self.hooks)(link);
+        linked_hook(&self.hooks, name, HUB_PEER)(link);
     }
 }
 
 /// The window controller's `window.new`, carried out by the GTK host: what the pair started or raised is not the
 /// controller's to know, since a window 2 it starts becomes its peer only once its `hello` links it.
 impl crate::gtk_host::LinkedWindows for Pair {
-    fn open(&self, _win: eitri_core::wm::WinId, token: Option<String>) -> Result<(), String> {
-        let plan = self.window_new(token)?;
-        println!("[window] window.new: {plan:?}");
+    fn open(&self, _win: eitri_core::wm::WinId, name: &WindowName, token: Option<String>) -> Result<(), String> {
+        if *name == WindowName::Second {
+            let plan = self.window_new(token)?;
+            println!("[window] window.new: {plan:?}");
+        } else {
+            let opened = self.open_module(name.clone(), token)?;
+            println!("[window] the window {}: {opened:?}", name.text());
+        }
         Ok(())
     }
 
-    /// Ends the window 2 this window started, as a failed start is ended: SIGTERM, then SIGKILL after the grace, the
-    /// application held meanwhile. The link's end then settles whatever was moving. Window 2 did not start window 1,
-    /// so it refuses.
-    fn end_peer(&self, _win: eitri_core::wm::WinId) -> Result<(), String> {
+    /// Ends the window `peer` this window started, as a failed start is ended: SIGTERM, then SIGKILL after the grace,
+    /// the application held meanwhile. The link's end then settles whatever was moving. A window that window 1 started
+    /// did not start window 1, so it refuses.
+    fn end_peer(&self, _win: eitri_core::wm::WinId, peer: PeerId) -> Result<(), String> {
         if self.is_second() {
             return Err("window 1 was not started by this window; close it there".into());
         }
-        let second = self.second.borrow().clone();
-        let second = second.ok_or_else(|| NO_OTHER_WINDOW.to_string())?;
+        let module = self.modules.borrow().by_peer(peer).map(|module| module.process.clone());
+        let second = self.second.borrow().clone().filter(|_| peer == SECOND_PEER);
+        let process = module.or(second).ok_or_else(|| NO_OTHER_WINDOW.to_string())?;
         println!(
-            "[window] ending window 2 (process {}), which is not answering",
-            second.pid()
+            "[window] ending the window in process {}, which is not answering",
+            process.pid()
         );
-        if let Some(ending) = end_second(&second, END_GRACE) {
+        if let Some(ending) = end_second(&process, END_GRACE) {
             hold_until_finished(ending);
         }
         Ok(())
     }
 
-    fn restore(&self, _win: eitri_core::wm::WinId) -> Result<(), String> {
-        self.restore()?;
-        println!("[window] window 2 is started again, as the pair last ended");
+    fn restore(&self, _win: eitri_core::wm::WinId, name: &WindowName) -> Result<(), String> {
+        if *name == WindowName::Second {
+            self.restore()?;
+            println!("[window] window 2 is started again, as the pair last ended");
+        } else {
+            self.start_module(name.clone(), None, true)?;
+            println!("[window] the window {} is started again", name.text());
+        }
+        Ok(())
+    }
+
+    /// Opens the module window `name`. One a start opens takes no token and is started as one started again is, which
+    /// maps without taking the keys; it is left alone when it is open already.
+    fn module_window_open(&self, name: &WindowName) -> bool {
+        self.modules.borrow().get(name).is_some()
+    }
+
+    fn open_module(
+        &self,
+        _win: eitri_core::wm::WinId,
+        name: &WindowName,
+        token: Option<String>,
+        keep_keys: bool,
+    ) -> Result<(), String> {
+        if !keep_keys {
+            let opened = Pair::open_module(self, name.clone(), token)?;
+            println!("[window] the window {}: {opened:?}", name.text());
+            return Ok(());
+        }
+        if *name == WindowName::Second {
+            return Err("window 2 is not a module window".to_string());
+        }
+        if self.modules.borrow().get(name).is_some() {
+            println!("[window] the window {} is open already", name.text());
+            return Ok(());
+        }
+        self.start_module(name.clone(), None, true)?;
+        println!(
+            "[window] the window {} is started, and leaves the keys here",
+            name.text()
+        );
+        Ok(())
+    }
+
+    /// Sends `msg` to the window `peer`: a module window's link in window 1, window 2's, or, in a window that window 1
+    /// started, window 1's.
+    fn send(&self, _win: eitri_core::wm::WinId, peer: PeerId, msg: Msg) -> Result<(), String> {
+        let module = self.modules.borrow().by_peer(peer).map(|module| module.link.clone());
+        let other = if self.is_second() { HUB_PEER } else { SECOND_PEER };
+        let link = module.or_else(|| self.link().filter(|_| peer == other));
+        let link = link
+            .filter(LinkDriver::linked)
+            .ok_or_else(|| NO_OTHER_WINDOW.to_string())?;
+        link.send(msg, Vec::new())
+            .map_err(|e| format!("the other window could not be told: {e}"))
+    }
+
+    fn send_to_hub(&self, win: eitri_core::wm::WinId, msg: Msg) -> Result<(), String> {
+        if !self.is_second() {
+            return Err("window 1 has no window 1 to ask".to_string());
+        }
+        crate::gtk_host::LinkedWindows::send(self, win, HUB_PEER, msg)
+    }
+
+    /// Hands a tab from the module window `from` to `to`, which is started or raised first. A hand-over that cannot
+    /// begin is told to the window that asked, on its own screen; only one nobody can be told of is an `Err`.
+    fn hand_over(
+        &self,
+        _win: eitri_core::wm::WinId,
+        from: PeerId,
+        agent: &eitri_core::agent_backend::AgentId,
+        session: &str,
+        to: &WindowName,
+        token: Option<String>,
+    ) -> Result<(), String> {
+        let Some(source) = self.modules.borrow().name_of(from) else {
+            return Err("the window that asked for the hand-over is gone".to_string());
+        };
+        let refused = if self.modules.borrow().hand_over_busy(&source) {
+            Some(TAB_ALREADY_MOVING_TEXT.to_string())
+        } else if source == *to {
+            Some("the tab is in that window already".to_string())
+        } else {
+            Pair::open_module(self, to.clone(), token).err()
+        };
+        match refused {
+            None => {
+                let tab = (agent.clone(), session.to_string());
+                self.modules.borrow_mut().begin_hand_over(source, tab, to.clone());
+            }
+            Some(why) => {
+                let msg = Msg::TabKept {
+                    session: session.to_string(),
+                    why,
+                };
+                self.modules.borrow().send(vec![(source, msg)]);
+            }
+        }
         Ok(())
     }
 
@@ -986,25 +1707,70 @@ fn fail_restore(pending: &std::cell::Cell<bool>, hook: &RefCell<Option<OnRestore
     true
 }
 
-/// The `linked` hook as the window sets it, read when the link is made.
-fn linked_hook(hooks: &Hooks) -> OnLinked {
+/// The `linked` hook as the window sets it, read when the link is made, for the link to the window `name`, which this
+/// window calls `peer`.
+fn linked_hook(hooks: &Hooks, name: WindowName, peer: PeerId) -> LinkMade {
     let hooks = hooks.clone();
     Rc::new(move |link| {
         let hook = hooks.borrow().as_ref().map(|h| h.linked.clone());
         if let Some(linked) = hook {
-            linked(link);
+            linked(&name, peer, link);
         }
     })
 }
 
-/// How long a window 2 told to end has before it is killed: enough to close its files, not enough to keep a start
-/// that failed around.
+/// Gives `event`, when the message made one, to the controller's queue.
+fn post_event(hooks: &Hooks, event: Option<eitri_core::wm::PeerEvent>) {
+    let post = hooks.borrow().as_ref().map(|h| h.post.clone());
+    if let (Some(event), Some(post)) = (event, post) {
+        post(event);
+    }
+}
+
+/// Takes up again the tabs this window let go that window 1 will never hear of, as nobody else will be given them.
+fn take_lost_tabs(tabs: Vec<SavedTab>, holder: &TabHolderSlot) {
+    let held = holder.borrow().clone();
+    for tab in tabs {
+        match &held {
+            Some(held) => {
+                println!("[link] window 1 will not hear of it; the tab it asked for stays here");
+                held.adopt(tab);
+            }
+            None => eprintln!("[link] a tab window 1 did not hear of has no window to go back to"),
+        }
+    }
+}
+
+/// Takes the module window `peer` out of the registry, for a link that ended, was refused or missed its handshake. A
+/// peer is never reused, so a later window of the same name is safe from this.
+fn forget_module(modules: &std::rc::Weak<RefCell<ModuleWindows>>, peer: PeerId) -> Option<ModuleLink> {
+    modules.upgrade().and_then(|modules| modules.borrow_mut().remove(peer))
+}
+
+/// Tells the hook, when one is set, that the module window `name` did not come up, for `why`.
+fn module_failed(hook: &RefCell<Option<OnModuleFailed>>, name: &WindowName, why: &str) {
+    eprintln!("[window] the window {} did not come up ({why})", name.text());
+    let hook = hook.borrow().clone();
+    if let Some(hook) = hook {
+        hook(name, why);
+    }
+}
+
+/// How long a started window told to end has before it is killed: enough to close its files, not enough to keep a
+/// start that failed around.
 pub const END_GRACE: Duration = Duration::from_secs(2);
 
-/// Window 2's process as the window that started it holds it. The pidfd is opened while the process is still this
-/// window's unreaped child, so it names that process and no other: once it has ended, a signal through it reaches
-/// nothing, even after its pid is reused. The `Child` itself is waited for on a thread of its own, which reaps it
-/// whenever it ends.
+/// How long a closing window 1 waits for its chat windows' last tabs. A window on its main loop answers at once; one
+/// that does not is past the window where a change could have been left unsaid.
+pub const LAST_TABS_WITHIN: Duration = Duration::from_millis(300);
+
+/// How often that wait looks.
+const LAST_TABS_POLL: Duration = Duration::from_millis(5);
+
+/// A window's process as window 1 holds it. The pidfd names that process and no other: once it has ended, a signal
+/// through it reaches nothing, even after its pid is reused. For a window this one started it is opened while the
+/// process is still an unreaped child, and the `Child` is waited for on a thread of its own, which reaps it whenever it
+/// ends. For a window it came back for ([`SecondProcess::adopted`]) it is opened by pid and start time.
 pub struct SecondProcess {
     pid: u32,
     start: u64,
@@ -1062,11 +1828,11 @@ impl SecondProcess {
                     };
                     match child.wait() {
                         Ok(status) => {
-                            println!("[window] window 2 (process {pid}) ended: {status}");
+                            println!("[window] the window in process {pid} ended: {status}");
                             *reaped.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
                             reaped.changed.notify_all();
                         }
-                        Err(err) => eprintln!("[window] window 2 (process {pid}) could not be waited for: {err}"),
+                        Err(err) => eprintln!("[window] the window in process {pid} could not be waited for: {err}"),
                     }
                 })
         };
@@ -1082,6 +1848,17 @@ impl SecondProcess {
             start,
             pidfd: Arc::new(pidfd),
             reaped,
+        })
+    }
+
+    /// The orphan at the other end of a re-link: an earlier window 1's child, so there is nothing here to reap, and the
+    /// pidfd ends it all the same.
+    pub fn adopted(partner: Partner) -> io::Result<SecondProcess> {
+        Ok(SecondProcess {
+            pid: partner.pid,
+            start: partner.start,
+            pidfd: Arc::new(PidFd::open(partner.pid, partner.start)?),
+            reaped: Arc::default(),
         })
     }
 
@@ -1108,9 +1885,28 @@ impl SecondProcess {
             })
     }
 
+    /// Ends a window that was told to close, on a thread of its own: nothing if it goes within `grace`, else SIGTERM,
+    /// and SIGKILL once `told` has passed with it still running. `told` has to outlast a healthy close, as SIGTERM's own
+    /// bound does, since a window killed while its chats are ending leaves their `claude` and sidecar running. A window
+    /// that stopped answering is ended sooner, by its own watchdog, which the SIGTERM wakes. One signal only: a second
+    /// forces a close that is under way.
+    pub fn end_unless_closed(&self, grace: Duration, told: Duration) -> io::Result<JoinHandle<Ending>> {
+        let pidfd = self.pidfd.clone();
+        let pid = self.pid;
+        std::thread::Builder::new().name("window-ender".into()).spawn(move || {
+            let ending = if pidfd.wait_exited(grace) {
+                Ending::AlreadyEnded
+            } else {
+                end_process(&pidfd, told)
+            };
+            report_ending(pid, &ending);
+            ending
+        })
+    }
+
     /// The reaped status, waiting at most `timeout` for it.
     #[cfg(test)]
-    fn wait_reaped(&self, timeout: Duration) -> Option<ExitStatus> {
+    pub(crate) fn wait_reaped(&self, timeout: Duration) -> Option<ExitStatus> {
         let status = self.reaped.status.lock().unwrap();
         let (status, _) = self
             .reaped
@@ -1236,8 +2032,31 @@ fn end_second(second: &SecondProcess, grace: Duration) -> Option<JoinHandle<Endi
         Ok(ending) => Some(ending),
         Err(err) => {
             // With no thread for the grace, the main loop keeps it.
-            eprintln!("[window] window 2 could not be ended on a thread ({err}); the main loop ends it");
+            eprintln!("[window] the window could not be ended on a thread ({err}); the main loop ends it");
             end_from_main_loop(second.pidfd.clone(), second.pid, grace);
+            None
+        }
+    }
+}
+
+/// What a closing module window says last. Going with what it holds kept, that is all of it. Closed by the user, tabs it
+/// never opened are what stays; its open tabs he closed.
+fn last_tabs(held: &dyn TabHolder, keep: bool) -> Option<SavedTabs> {
+    if keep {
+        held.tabs_to_keep()
+    } else {
+        held.unopened().or_else(|| held.tabs_now())
+    }
+}
+
+/// [`SecondProcess::end_unless_closed`], and with no thread for it, the main loop's end at once: the window was told to
+/// close, so SIGTERM asks nothing new of it.
+fn end_closing(window: &SecondProcess, grace: Duration, told: Duration) -> Option<JoinHandle<Ending>> {
+    match window.end_unless_closed(grace, told) {
+        Ok(ending) => Some(ending),
+        Err(err) => {
+            eprintln!("[window] the window could not be ended on a thread ({err}); the main loop ends it");
+            end_from_main_loop(window.pidfd.clone(), window.pid, told);
             None
         }
     }
@@ -1245,8 +2064,8 @@ fn end_second(second: &SecondProcess, grace: Duration) -> Option<JoinHandle<Endi
 
 fn report_ending(pid: u32, ending: &Ending) {
     match ending {
-        Ending::Failed(why) => eprintln!("[window] window 2 (process {pid}) could not be ended: {why}"),
-        done => println!("[window] window 2 (process {pid}): {done:?}"),
+        Ending::Failed(why) => eprintln!("[window] the window in process {pid} could not be ended: {why}"),
+        done => println!("[window] the window in process {pid}: {done:?}"),
     }
 }
 
@@ -1263,55 +2082,64 @@ fn end_if_overdue(
         return None;
     }
     eprintln!(
-        "[window] window 2 (process {}) did not finish its handshake; it is ended",
+        "[window] the window in process {} did not finish its handshake; it is ended",
         second.pid
     );
     end_second(second, grace)
 }
 
-/// The flags window 2 is started with. `legacy`: `--legacy`, its chats then running the backend this window's run.
-/// `clean`: `--clean`, so it neither reads nor writes the remembered state this launch leaves alone. `restore`:
-/// `--restore`, started again as the pair last ended.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SecondFlags {
-    pub legacy: bool,
-    pub clean: bool,
-    pub restore: bool,
-}
-
-/// Window 1: makes the socketpair, starts window 2 from `starts`' executable (this one's, in a window) with the
-/// other end and `flags`, and links when its `hello` matches. `linked` runs once `welcome` is sent. The child is
-/// reaped on a thread of its own, and ended if it has not finished the handshake in `starts`' time
-/// ([`HANDSHAKE_WITHIN`] in a window); `overdue`, when given, runs then if the link is not linked.
+/// Window 1 starts window 2 ([`start_window`]); a window 2 refused at its hello ends by itself, once it reads the
+/// `bye`.
 #[allow(clippy::too_many_arguments)]
 pub fn start_second(
     starts: &Starts,
     root: &Path,
     token: Option<&str>,
-    flags: SecondFlags,
+    flags: LinkedFlags,
     lock: Rc<PairLock>,
-    linked: OnLinked,
+    linked: LinkMade,
     running: Rc<RefCell<Option<RunningTurns>>>,
     overdue: Option<Rc<dyn Fn()>>,
 ) -> io::Result<(LinkDriver, Rc<SecondProcess>)> {
-    let (mine, theirs) = fdpass::seqpacket_pair()?;
-    let second = Rc::new(SecondProcess::started(spawn_second(
+    let name = WindowName::Second;
+    start_window(starts, root, &name, token, flags, lock, linked, running, overdue, None)
+}
+
+/// Window 1: makes the link, starts the window `name` from `starts`' executable (this one's, in a window) with the
+/// other end and `flags`, and links when its `hello` matches. `linked` runs once `welcome` is sent. The child is
+/// reaped on a thread of its own, and ended if it has not finished the handshake in `starts`' time
+/// ([`HANDSHAKE_WITHIN`] in a window); `overdue`, when given, runs then if the link is not linked. `refused`, when
+/// given, runs once a `hello` has been refused and the link closed.
+#[allow(clippy::too_many_arguments)]
+fn start_window(
+    starts: &Starts,
+    root: &Path,
+    name: &WindowName,
+    token: Option<&str>,
+    flags: LinkedFlags,
+    lock: Rc<PairLock>,
+    linked: LinkMade,
+    running: Rc<RefCell<Option<RunningTurns>>>,
+    overdue: Option<Rc<dyn Fn()>>,
+    refused: Option<Rc<dyn Fn()>>,
+) -> io::Result<(LinkDriver, Rc<SecondProcess>)> {
+    let (mine, theirs) = (starts.link_ends)()?;
+    let second = Rc::new(SecondProcess::started(spawn_linked(
         &starts.exe,
         theirs,
         root,
+        name,
         token,
-        flags.legacy,
-        flags.clean,
-        flags.restore,
+        flags,
     )?)?);
     let (pid, start) = (second.pid(), second.start());
     let presence = not_yet_confirmed();
     let (handle, inbound) = match LinkHandle::start(mine, presence.clone()) {
         Ok(started) => started,
         Err(err) => {
-            // No link means no handshake and no deadline to end it by: a window 2 hung before its toolkit came up
+            // No link means no handshake and no deadline to end it by: a window hung before its toolkit came up
             // would never see its socket close, so it is ended here.
-            eprintln!("[window] the link to window 2 (process {pid}) could not be started ({err}); it is ended");
+            eprintln!("[window] the link to process {pid} could not be started ({err}); it is ended");
             if let Some(ending) = end_second(&second, END_GRACE) {
                 hold_until_finished(ending);
             }
@@ -1322,18 +2150,24 @@ pub fn start_second(
     link.set_presence(presence);
     let expected = Expected {
         build: crate::version::fingerprint(),
+        name: name.clone(),
         pid,
         start,
     };
     link.on("hello", move |link, msg, _| {
         let running = running.borrow().clone();
         let running = move || running.as_ref().map(|running| running()).unwrap_or_default();
-        answer_hello(link, &msg, &expected, &lock, &linked, &running)
+        answer_hello(link, &msg, &expected, &lock, &linked, &running);
+        if !link.linked() {
+            if let Some(refused) = &refused {
+                refused();
+            }
+        }
     });
     link.watch();
-    // A window 2 that never says hello (it hung before its toolkit came up, or died in a way the link does not
-    // see) would otherwise leave this link up for good, and `window.new` could never start another; its process,
-    // left running, would keep whatever it opened.
+    // A window that never says hello (it hung before its toolkit came up, or died in a way the link does not see)
+    // would otherwise leave this link up for good, and it could never be started again; its process, left running,
+    // would keep whatever it opened.
     link.set_handshake_deadline(Instant::now() + starts.handshake_within);
     {
         let link = link.clone();
@@ -1353,7 +2187,7 @@ pub fn start_second(
             }),
         );
     }
-    println!("[window] started window 2 as process {pid}");
+    println!("[window] started window {} as process {pid}", name.text());
     Ok((link, second))
 }
 
@@ -1368,11 +2202,15 @@ fn answer_hello(
     msg: &Msg,
     expected: &Expected,
     lock: &PairLock,
-    linked: &OnLinked,
+    linked: &LinkMade,
     running: &dyn Fn() -> Vec<TurnEdge>,
 ) {
     if link.linked() {
         eprintln!("[link] a second hello on a linked link; ignored");
+        return;
+    }
+    // What was queued behind a refused hello is still handed over: the link it came on is closed, and stays so.
+    if !link.is_up() {
         return;
     }
     let partner = match check_hello(msg, expected) {
@@ -1403,14 +2241,19 @@ fn answer_hello(
         return;
     }
     link.set_linked();
-    println!("[link] linked to window 2 (process {})", partner.pid);
+    println!("[link] linked to the window in process {}", partner.pid);
     linked(link);
 }
 
-/// Window 2: starts the link on its checked end, says `hello`, and links on `welcome`, adopting the pair lock it
-/// carries into `lock`, which the window keeps, so the lock is held for as long as this window lives, after the link
-/// ended too. `linked` runs once linked.
-pub fn link_second(sock: OwnedFd, linked: OnLinked, lock: Rc<RefCell<Option<PairLock>>>) -> io::Result<LinkDriver> {
+/// The window `name`, started by window 1: starts the link on its checked end, says `hello`, and links on `welcome`,
+/// adopting the pair lock it carries into `lock`, which the window keeps, so the lock is held for as long as this
+/// window lives, after the link ended too. `linked` runs once linked.
+pub fn link_second(
+    sock: OwnedFd,
+    name: &WindowName,
+    linked: LinkMade,
+    lock: Rc<RefCell<Option<PairLock>>>,
+) -> io::Result<LinkDriver> {
     // SAFETY: neither call has preconditions or can fail.
     let (pid, parent) = unsafe { (libc::getpid(), libc::getppid()) };
     let (pid, parent) = (pid as u32, parent as u32);
@@ -1425,7 +2268,7 @@ pub fn link_second(sock: OwnedFd, linked: OnLinked, lock: Rc<RefCell<Option<Pair
             take_welcome(link, &msg, fds, parent, &lock, &linked);
         });
     }
-    link.send(hello(crate::version::fingerprint(), pid, start), Vec::new())
+    link.send(hello(crate::version::fingerprint(), name, pid, start), Vec::new())
         .map_err(|e| io::Error::other(e.to_string()))?;
     link.watch();
     Ok(link)
@@ -1437,7 +2280,7 @@ fn take_welcome(
     fds: Vec<OwnedFd>,
     parent: u32,
     lock: &Rc<RefCell<Option<PairLock>>>,
-    linked: &OnLinked,
+    linked: &LinkMade,
 ) {
     if link.linked() {
         eprintln!("[link] a second welcome on a linked link; ignored");
@@ -1481,6 +2324,7 @@ mod tests {
     fn expected() -> Expected {
         Expected {
             build: "0.4.0+abc".into(),
+            name: WindowName::Second,
             pid: 4242,
             start: 99,
         }
@@ -1488,23 +2332,23 @@ mod tests {
 
     #[test]
     fn the_handshake_refuses_another_build() {
-        let ok = hello("0.4.0+abc".into(), 4242, 99);
+        let ok = hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99);
         assert_eq!(check_hello(&ok, &expected()), Ok(Partner { pid: 4242, start: 99 }));
 
-        let other_build = hello("0.4.1+def".into(), 4242, 99);
+        let other_build = hello("0.4.1+def".into(), &WindowName::Second, 4242, 99);
         let err = check_hello(&other_build, &expected()).unwrap_err();
         assert!(err.contains("another build"), "{err}");
 
-        let other_child = hello("0.4.0+abc".into(), 4243, 99);
+        let other_child = hello("0.4.0+abc".into(), &WindowName::Second, 4243, 99);
         assert!(check_hello(&other_child, &expected())
             .unwrap_err()
             .contains("not the window started here"));
-        let reused_pid = hello("0.4.0+abc".into(), 4242, 100);
+        let reused_pid = hello("0.4.0+abc".into(), &WindowName::Second, 4242, 100);
         assert!(
             check_hello(&reused_pid, &expected()).is_err(),
             "the same pid started at another time is another process"
         );
-        let mut window_3 = hello("0.4.0+abc".into(), 4242, 99);
+        let mut window_3 = hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99);
         if let Msg::Hello { window, .. } = &mut window_3 {
             *window = "3".into();
         }
@@ -1518,7 +2362,7 @@ mod tests {
         let dir = crate::linked_window::tests::Scratch::new("refused-hello");
         let lock = Rc::new(PairLock::try_take(&dir.0, Path::new("/p")).unwrap().unwrap());
         let linked_calls: Rc<std::cell::Cell<u32>> = Rc::default();
-        let linked: OnLinked = {
+        let linked: LinkMade = {
             let calls = linked_calls.clone();
             Rc::new(move |_| calls.set(calls.get() + 1))
         };
@@ -1526,7 +2370,9 @@ mod tests {
         driver.on("hello", move |link, msg, _| {
             answer_hello(link, &msg, &exp, &lock, &linked, &Vec::new)
         });
-        theirs.send(hello("0.9.9+zzz".into(), 4242, 99), Vec::new()).unwrap();
+        theirs
+            .send(hello("0.9.9+zzz".into(), &WindowName::Second, 4242, 99), Vec::new())
+            .unwrap();
         assert!(pump_until(&driver, || !driver.is_up()));
         assert_eq!(linked_calls.get(), 0);
         let mut got = Vec::new();
@@ -1553,7 +2399,7 @@ mod tests {
         let root = Path::new("/p");
         let lock = Rc::new(PairLock::try_take(&dir.0, root).unwrap().unwrap());
         let linked_calls: Rc<std::cell::Cell<u32>> = Rc::default();
-        let linked: OnLinked = {
+        let linked: LinkMade = {
             let calls = linked_calls.clone();
             Rc::new(move |_| calls.set(calls.get() + 1))
         };
@@ -1564,7 +2410,9 @@ mod tests {
                 answer_hello(link, &msg, &exp, &lock, &linked, &Vec::new)
             });
         }
-        theirs.send(hello("0.4.0+abc".into(), 4242, 99), Vec::new()).unwrap();
+        theirs
+            .send(hello("0.4.0+abc".into(), &WindowName::Second, 4242, 99), Vec::new())
+            .unwrap();
         assert!(pump_until(&driver, || driver.linked()));
         assert_eq!(linked_calls.get(), 1);
         assert_eq!(driver.partner(), Some(Partner { pid: 4242, start: 99 }));
@@ -1806,9 +2654,9 @@ mod tests {
             let posted = Rc::new(RefCell::new(Vec::new()));
             let saved = posted.clone();
             pair.set_hooks(PairHooks {
-                linked: Rc::new(|_| {}),
+                linked: Rc::new(|_, _, _| {}),
                 post: Rc::new(move |event| saved.borrow_mut().push(event)),
-                ended: Rc::new(|_, _| {}),
+                ended: Rc::new(|_, _, _, _| {}),
             });
             let peer = PeerId(if second { 1 } else { 2 });
             let targets = [
@@ -1995,7 +2843,12 @@ mod tests {
         use eitri_core::wm::{ActivationToken, HostOp, WinId};
         let (wm, host) = crate::linked_window::driver::tests::controller();
         let (driver, theirs, _inbound) = pair();
-        driver.attach_controller(WinId::MAIN, eitri_core::wm::PeerId(2), &wm);
+        driver.attach_controller(
+            WinId::MAIN,
+            eitri_core::wm::PeerId(2),
+            eitri_core::window_link::names::WindowName::Second,
+            &wm,
+        );
         let pair = Pair::new(
             WindowRole::Main {
                 link: Some(driver.clone()),
@@ -2005,13 +2858,13 @@ mod tests {
         );
         let posted = Rc::downgrade(&wm);
         pair.set_hooks(PairHooks {
-            linked: Rc::new(|_| {}),
+            linked: Rc::new(|_, _, _| {}),
             post: Rc::new(move |event| {
                 if let Some(wm) = posted.upgrade() {
                     wm.post(eitri_core::wm::HostEvent::Peer(event));
                 }
             }),
-            ended: Rc::new(|_, _| {}),
+            ended: Rc::new(|_, _, _, _| {}),
         });
         theirs
             .send(
@@ -2075,6 +2928,7 @@ mod tests {
             exe,
             handshake_within: within,
             after,
+            ..Starts::default()
         });
         let failed: Rc<RefCell<Vec<String>>> = Rc::default();
         {
@@ -2085,9 +2939,9 @@ mod tests {
         {
             let ended = ended.clone();
             pair.set_hooks(PairHooks {
-                linked: Rc::new(|_| {}),
+                linked: Rc::new(|_, _, _| {}),
                 post: Rc::new(|_| {}),
-                ended: Rc::new(move |_, end| ended.borrow_mut().push(end.clone())),
+                ended: Rc::new(move |_, _, _, end| ended.borrow_mut().push(end.clone())),
             });
         }
         Restoring {
@@ -2222,6 +3076,64 @@ mod tests {
         assert!(
             !writing(&pair),
             "a linked window 2 may run on, orphaned, and write it itself"
+        );
+    }
+
+    #[test]
+    fn run_action_runs_the_named_action_in_the_module_window_and_drops_a_bad_name() {
+        use eitri_core::keymap::{Action, TabAction};
+        let panels = vec!["notes".to_string()];
+        assert_eq!(
+            crate::linked_window::registry::peer_action("tab.select", &[("n".into(), 3.into())], &panels),
+            Some(Action::Tab(TabAction::Select(3)))
+        );
+        for (name, opts) in [
+            ("no.such.action", vec![]),
+            ("tab.select", vec![("n".to_string(), serde_json::Value::from("three"))]),
+            ("module.missing", vec![]),
+        ] {
+            assert_eq!(
+                crate::linked_window::registry::peer_action(name, &opts, &panels),
+                None,
+                "{name}"
+            );
+        }
+        // Over the link: the module window's hook hears the name and options, and a window without a hook drops it.
+        let dir = crate::linked_window::tests::Scratch::new("run-action");
+        let root = Path::new("/p");
+        let lock = eitri_core::window_link::pair::PairLock::try_take(&dir.0, root)
+            .unwrap()
+            .unwrap();
+        let (one, two) = eitri_core::window_link::fdpass::seqpacket_pair().unwrap();
+        let pair = Pair::module(two, WindowName::Chat(2), root).unwrap();
+        type Heard = Vec<(String, Vec<(String, serde_json::Value)>)>;
+        let heard: Rc<RefCell<Heard>> = Rc::default();
+        {
+            let heard = heard.clone();
+            pair.set_peer_action(Rc::new(move |name, opts| heard.borrow_mut().push((name, opts))));
+        }
+        let (handle, _inbound) = eitri_core::window_link::link::LinkHandle::start(
+            one,
+            eitri_core::window_link::link::PresenceFlag::default(),
+        )
+        .unwrap();
+        handle
+            .send(welcome(Default::default(), Vec::new()), vec![lock.share().unwrap()])
+            .unwrap();
+        let link = pair.link().unwrap();
+        assert!(pump_until(&link, || link.linked()));
+        let run = Msg::RunAction {
+            name: "tab.select".into(),
+            opts: vec![("n".into(), 3.into())],
+        };
+        handle.send(run, Vec::new()).unwrap();
+        assert!(pump_until(&link, || !heard.borrow().is_empty()));
+        assert_eq!(
+            *heard.borrow(),
+            vec![(
+                "tab.select".to_string(),
+                vec![("n".to_string(), serde_json::Value::from(3))]
+            )]
         );
     }
 }
