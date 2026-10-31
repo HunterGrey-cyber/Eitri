@@ -78,6 +78,17 @@ pub fn child_environment(host: impl IntoIterator<Item = (OsString, OsString)>) -
     env
 }
 
+/// The terminal environment with per-spawn overrides appended after removing their inherited keys.
+pub fn child_environment_with(
+    host: impl IntoIterator<Item = (OsString, OsString)>,
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    let mut env = child_environment(host);
+    env.retain(|(key, _)| !extra.iter().any(|(overridden, _)| key == overridden));
+    env.extend_from_slice(extra);
+    env
+}
+
 /// `$SHELL` when set and non-empty, else the passwd entry's shell, else `/bin/sh`. `passwd_shell`
 /// is only called when `$SHELL` is missing: a passwd lookup can go through NSS, and the host calls
 /// this on its UI thread.
@@ -136,6 +147,8 @@ pub struct SpawnSpec {
     pub cwd: PathBuf,
     /// Set on the child after [`child_environment`], so each one beats the host's and the terminal's own.
     pub env: Vec<(OsString, OsString)>,
+    /// Per-spawn overrides of the terminal environment.
+    pub extra_env: Vec<(OsString, OsString)>,
 }
 
 impl SpawnSpec {
@@ -152,6 +165,7 @@ impl SpawnSpec {
             args: Vec::new(),
             cwd,
             env: Vec::new(),
+            extra_env: Vec::new(),
         }
     }
 }
@@ -258,7 +272,7 @@ impl PtyChild {
             cmd.args(&spec.args)
                 .current_dir(&spec.cwd)
                 .env_clear()
-                .envs(child_environment(std::env::vars_os()))
+                .envs(child_environment_with(std::env::vars_os(), &spec.extra_env))
                 .envs(spec.env.iter().cloned())
                 .stdin(Stdio::from(pty.user.try_clone()?))
                 .stdout(Stdio::from(pty.user.try_clone()?))
@@ -649,6 +663,56 @@ mod tests {
             .iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect()
+    }
+
+    #[test]
+    fn with_no_extra_the_environment_is_todays() {
+        let host = os(&[("PATH", "/usr/bin"), ("CLAUDE_CODE_SSE_PORT", "1")]);
+        let actual = child_environment_with(host.clone(), &[]);
+        assert_eq!(actual, child_environment(host));
+        assert!(actual.contains(&(OsString::from("CLAUDE_CODE_SSE_PORT"), OsString::from("1"))));
+    }
+
+    #[test]
+    fn an_extra_variable_replaces_an_inherited_one() {
+        let host = os(&[("CLAUDE_CODE_SSE_PORT", "1"), ("PATH", "/usr/bin")]);
+        let extra = os(&[("CLAUDE_CODE_SSE_PORT", "23456")]);
+        let actual = child_environment_with(host, &extra);
+        let ports: Vec<_> = actual.iter().filter(|(key, _)| key == "CLAUDE_CODE_SSE_PORT").collect();
+        assert_eq!(ports, extra.iter().collect::<Vec<_>>());
+        assert_eq!(&actual[actual.len() - extra.len()..], extra.as_slice());
+        assert!(actual.contains(&(OsString::from("PATH"), OsString::from("/usr/bin"))));
+    }
+
+    #[test]
+    fn the_real_shell_sees_it() {
+        let mut spec = SpawnSpec::shell("/bin/sh".into(), std::env::temp_dir());
+        spec.args = vec!["-c".into(), r#"printf '%s' "$CLAUDE_CODE_SSE_PORT""#.into()];
+        spec.extra_env = os(&[("CLAUDE_CODE_SSE_PORT", "23456")]);
+        let size = PtySize {
+            cols: 80,
+            rows: 24,
+            cell_width_px: 9,
+            cell_height_px: 18,
+        };
+        let mut child = PtyChild::spawn(&spec, size).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut buf = [0; 256];
+        loop {
+            match child.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "shell output did not close");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+                Err(err) => panic!("PTY read failed: {err}"),
+            }
+        }
+        assert_eq!(output, b"23456");
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

@@ -61,6 +61,7 @@ fn main() {
                 args: program[1..].iter().map(Into::into).collect(),
                 cwd: std::env::current_dir().unwrap(),
                 env: Vec::new(),
+                extra_env: Vec::new(),
             },
             size,
             colors: TerminalColors::default(),

@@ -95,6 +95,23 @@ const BUTTON_MIDDLE: u32 = 2;
 /// Wayland pipe milliseconds; two seconds is a clipboard owner that is not answering.
 pub(crate) const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A fixed environment remains usable alongside a callback evaluated for each new shell.
+pub(crate) trait ShellEnvSource {
+    fn read(&self) -> Vec<(OsString, OsString)>;
+}
+
+impl ShellEnvSource for Vec<(OsString, OsString)> {
+    fn read(&self) -> Vec<(OsString, OsString)> {
+        self.clone()
+    }
+}
+
+impl<F: Fn() -> Vec<(OsString, OsString)> + ?Sized> ShellEnvSource for Rc<F> {
+    fn read(&self) -> Vec<(OsString, OsString)> {
+        self()
+    }
+}
+
 struct State {
     skia: Option<SkiaState>,
     /// `None` until [`ensure_session`] is about to spawn a shell. Delaying metrics construction
@@ -154,7 +171,7 @@ struct State {
     focused: bool,
     cwd: PathBuf,
     /// What the window sets on this pane's shells ([`TerminalPane::set_shell_env`]).
-    shell_env: Vec<(OsString, OsString)>,
+    shell_env: Option<Rc<dyn Fn() -> Vec<(OsString, OsString)>>>,
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
     on_shell_exit: Option<Rc<dyn Fn(u64) -> bool>>,
@@ -225,7 +242,7 @@ impl State {
             colors: TerminalColors::default(),
             focused: false,
             cwd,
-            shell_env: Vec::new(),
+            shell_env: None,
             on_shell_exit: None,
             on_shell_start: None,
             frozen: false,
@@ -791,9 +808,9 @@ impl TerminalPane {
     }
 
     /// What every shell this pane starts gets on top of the host's environment. A shell that is already
-    /// running keeps what it has.
-    pub(crate) fn set_shell_env(&self, env: Vec<(OsString, OsString)>) {
-        self.state.borrow_mut().shell_env = env;
+    /// running keeps what it has. A callback runs once before trying the initial shell and its fallbacks.
+    pub(crate) fn set_shell_env(&self, env: impl ShellEnvSource + 'static) {
+        self.state.borrow_mut().shell_env = Some(Rc::new(move || env.read()));
     }
 
     /// `prefix x` (or the shell's own end): the shell is hung up if it still runs, and the pane
@@ -969,6 +986,15 @@ fn build_metrics(allocation: Allocation, face: &TerminalFace, zoom: f32) -> Resu
     )
 }
 
+fn shell_spec(program: Option<PathBuf>, cwd: PathBuf, extra: &[(OsString, OsString)]) -> SpawnSpec {
+    let mut spec = match program {
+        None => SpawnSpec::user_shell(cwd),
+        Some(program) => SpawnSpec::shell(program, cwd),
+    };
+    spec.extra_env = extra.to_vec();
+    spec
+}
+
 /// Spawns the session if one is wanted, the pane has real geometry, and none is running. Also
 /// where the terminal's font metrics are built, the first time they are needed -- never at
 /// construction, so a window whose terminal is never shown never touches a font manager.
@@ -994,17 +1020,14 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
         (s.cwd.clone(), s.shell_env.clone(), size, s.colors, s.focused)
     };
     let (wake, woken) = futures_channel::mpsc::unbounded::<()>();
-    let mut spec = SpawnSpec::user_shell(cwd.clone());
+    let extra = shell_env.map(|env| env()).unwrap_or_default();
+    let mut spec = shell_spec(None, cwd.clone(), &extra);
     let mut tried = Vec::new();
     let started = loop {
         let program = spec.program.clone();
         let wake = wake.clone();
         let config = SessionConfig {
-            // Here, for the shell tried first and for each fallback alike.
-            spawn: SpawnSpec {
-                env: shell_env.clone(),
-                ..spec
-            },
+            spawn: spec,
             size,
             colors,
             focused,
@@ -1023,7 +1046,7 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
                 // Looked up only now, on this rare path: a passwd lookup can go through NSS, and
                 // this is the GTK thread.
                 match fallback_shell(&tried, passwd_shell()) {
-                    Some(next) => spec = SpawnSpec::shell(next, cwd.clone()),
+                    Some(next) => spec = shell_spec(Some(next), cwd.clone(), &extra),
                     None => break Err(err),
                 }
             }
@@ -2022,6 +2045,27 @@ fn paste_from(
 mod tests {
     use super::*;
     use gtk4::gdk::ScrollUnit;
+
+    #[test]
+    fn the_fallback_spec_keeps_the_extra_list() {
+        let extra = vec![(OsString::from("CLAUDE_CODE_SSE_PORT"), OsString::from("23456"))];
+        let cwd = PathBuf::from("/work");
+        let first = shell_spec(None, cwd.clone(), &extra);
+        assert_eq!(first.extra_env, extra);
+        let fallback = shell_spec(Some(PathBuf::from("/bin/sh")), cwd.clone(), &extra);
+        assert_eq!(fallback.program, PathBuf::from("/bin/sh"));
+        assert_eq!(fallback.cwd, cwd);
+        assert_eq!(fallback.extra_env, extra);
+    }
+
+    #[test]
+    fn no_env_hook_means_an_empty_list() {
+        let state = State::new(PathBuf::from("/work"));
+        assert!(state.shell_env.is_none());
+        let extra = state.shell_env.as_ref().map(|env| env()).unwrap_or_default();
+        assert!(extra.is_empty());
+        assert!(shell_spec(None, state.cwd.clone(), &extra).extra_env.is_empty());
+    }
 
     /// One wheel notch scrolls 3 lines UP (into history): `WheelZoom`'s own "up is larger"
     /// convention (`dy` negative) carries straight through to "up is into history" with no sign

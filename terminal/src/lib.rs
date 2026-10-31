@@ -35,7 +35,7 @@ pub use mouse::MouseModes;
 pub use outbox::REPLY_CAP;
 pub use paint::{indicator_ops, paint, paint_ops};
 pub use preedit::{layout_preedit, PreeditLayout};
-pub use pty::{child_environment, PtyChild, PtySize, SpawnSpec};
+pub use pty::{child_environment, child_environment_with, PtyChild, PtySize, SpawnSpec};
 pub use screen::{CursorCell, Screen, SelectionRecord, TerminalColors, ViewState};
 pub use scroll::{ScrollRequest, ScrollView};
 pub use select::{SelectCommand, SelectKind};
