@@ -726,6 +726,41 @@ mod tests {
         std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    /// A skill link read through lets the answer be kept, and a root that is no boundary still takes none: the
+    /// record written for the first tab starts the second as untrusted too.
+    #[test]
+    fn a_codex_skill_link_read_through_does_not_trust_a_root_that_is_no_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, fx) = trust_panel("trust-no-boundary-link");
+        fx.write(".codex/config.toml", b"model = \"x\"\n");
+        fx.write(".claude/skills/vm/SKILL.md", b"skill\n");
+        std::fs::create_dir_all(fx.root.join(".codex/skills")).unwrap();
+        std::os::unix::fs::symlink("../../.claude/skills/vm", fx.root.join(".codex/skills/vm")).unwrap();
+        std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let first = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), first, first_send("r1", "hello codex")).unwrap();
+        let prompt = next_prompt(&state);
+        answer_prompt(&state, "a1", &prompt, true);
+        tick_until(&state, |_| !fx.external.borrow().is_empty());
+
+        let second = state.borrow_mut().tabs.open(AgentId::Codex);
+        gate_start(&mut state.borrow_mut(), second, first_send("r2", "hello again")).unwrap();
+        tick_until(&state, |_| fx.external.borrow().len() == 2);
+        for start in fx.external.borrow().iter() {
+            assert!(
+                start
+                    .plan
+                    .dirs
+                    .iter()
+                    .all(|(_, level)| *level == agent::DirTrust::Untrusted),
+                "{:?}",
+                start.plan.dirs
+            );
+            assert!(start.plan.skills_off);
+        }
+        std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     /// The external start is handed the trust plan of the discovery its answer was bound to: a `y`
     /// trusts the directories that discovery walked and nothing above them, names the project's own
     /// tool servers, and keeps skills on; an `n` in another tab untrusts every directory up to `/`
