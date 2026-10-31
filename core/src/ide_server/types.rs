@@ -298,6 +298,8 @@ pub trait Housekeeping: Send + 'static {
 pub trait MentionPort: Send + 'static {
     /// `None`: no socket, so no `:EitriMention`.
     fn open(&mut self) -> Option<PathBuf>;
+    /// What to wait on this turn; ask afresh each turn. Valid until the next `poll` or `close`, and the set changes
+    /// across a `poll`: the listener can leave it and come back.
     fn fds(&self) -> Vec<RawFd>;
     /// Lines in accept order; never one ahead of an older connection still being read.
     fn poll(&mut self, now: Instant) -> Vec<MentionLine>;

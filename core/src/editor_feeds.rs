@@ -13,14 +13,18 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::editor_context::feed::EditorContextReader;
-use crate::editor_context::{ContextSource, EditorContext};
+use crate::editor_context::compose::{IDE_FILE_SCHEME, IDE_PROPOSAL_SCHEME};
+use crate::editor_context::feed::{EditorContextReader, FeedUpdate, PushFacts};
+use crate::editor_context::ContextSource;
 use crate::nvim_keys::feed::NvimKeysReader;
 use crate::nvim_keys::NvimReport;
 use crate::pane_switch::{PaneMessage, PaneSwitchReader};
 use crate::plugin::follow_feed::{FollowBatch, FollowReader};
 use crate::theme::feed::ThemePayloadReader;
 use crate::theme::payload::NvimThemePayload;
+
+/// Optional push facts from the cached editor context, read only by a window with an IDE listener.
+pub type PushSource = Rc<dyn Fn() -> Option<PushFacts>>;
 
 /// What one poll of the feeds found, for the host to act on after the poll returned.
 #[derive(Default)]
@@ -90,7 +94,7 @@ impl<R> Cadenced<R> {
 /// The context feed's reader and the last context it delivered, which the panel reads at send time.
 struct ContextFeed {
     reader: Rc<RefCell<EditorContextReader>>,
-    cache: Rc<RefCell<Option<EditorContext>>>,
+    cache: Rc<RefCell<Option<FeedUpdate>>>,
     scratch_dir: Option<PathBuf>,
 }
 
@@ -104,15 +108,18 @@ impl ContextFeed {
     /// on the file the user was in before it.
     /// Whether the cache took a new context.
     fn poll(&self) -> bool {
-        let Some(context) = self.reader.borrow_mut().poll() else {
+        let Some(update) = self.reader.borrow_mut().poll_update() else {
             return false;
         };
+        let file = &update.context.file;
         let scratch = self
             .scratch_dir
             .as_deref()
-            .is_some_and(|dir| crate::scratch::holds(dir, &context.file));
+            .is_some_and(|dir| crate::scratch::holds(dir, file))
+            || file.starts_with(IDE_FILE_SCHEME)
+            || file.starts_with(IDE_PROPOSAL_SCHEME);
         if !scratch {
-            *self.cache.borrow_mut() = Some(context);
+            *self.cache.borrow_mut() = Some(update);
         }
         !scratch
     }
@@ -177,7 +184,7 @@ impl EditorFeeds {
         let cache = feed.cache.clone();
         let source: ContextSource = Rc::new({
             let cache = cache.clone();
-            move || cache.borrow().clone()
+            move || cache.borrow().as_ref().map(|update| update.context.clone())
         });
         let reset_reader = feed.reader.clone();
         let reset: Rc<dyn Fn()> = Rc::new(move || {
@@ -186,6 +193,14 @@ impl EditorFeeds {
         });
         self.context = Some(Cadenced::new(feed, crate::editor_context::feed::POLL_INTERVAL, now));
         (source, reset)
+    }
+
+    /// The facts of the cached context; a reset forgets both together.
+    pub fn push_source(&self) -> Option<PushSource> {
+        let cache = self.context.as_ref()?.reader.cache.clone();
+        Some(Rc::new(move || {
+            cache.borrow().as_ref().map(|update| update.facts.clone())
+        }))
     }
 
     /// The listening sockets of the readers added so far: what a host waits on while the feeds are
@@ -375,6 +390,77 @@ mod tests {
         assert!(!feeds.poll(now + every * 2).context, "a dropped one changes nothing");
         assert_eq!(file(&source), Some("/p/a.rs".to_owned()));
         feed.cleanup();
+    }
+
+    #[test]
+    fn a_view_buffer_never_becomes_the_context() {
+        use crate::editor_context::compose::{IDE_FILE_SCHEME, IDE_PROPOSAL_SCHEME};
+        let (mut feeds, feed, source, _reset, now) = context_feeds(None);
+        let every = crate::editor_context::feed::POLL_INTERVAL;
+        send(feed.socket_path(), &context_line("/p/a.rs"));
+        assert!(feeds.poll(now + every).context);
+        for (i, scheme) in [IDE_FILE_SCHEME, IDE_PROPOSAL_SCHEME].iter().enumerate() {
+            send(feed.socket_path(), &context_line(&format!("{scheme}1/a.rs")));
+            assert!(!feeds.poll(now + every * (i as u32 + 2)).context);
+            assert_eq!(file(&source), Some("/p/a.rs".into()));
+        }
+    }
+
+    #[test]
+    fn the_facts_follow_the_context_they_came_with() {
+        let (mut feeds, feed, source, _reset, now) = context_feeds(Some(PathBuf::from("/scratch")));
+        let push = feeds.push_source().expect("a context reader supplies facts");
+        let every = crate::editor_context::feed::POLL_INTERVAL;
+        assert_eq!(push(), None);
+        send(
+            feed.socket_path(),
+            r#"{"v":1,"file":"/p/a.rs","line":7,"selection":{"start_line":2,"end_line":3,"text":"x","start_col":1,"end_col":4}}"#,
+        );
+        assert!(feeds.poll(now + every).context);
+        let expected = PushFacts {
+            cursor_line: Some(7),
+            start_col: Some(1),
+            end_col: Some(4),
+        };
+        assert_eq!(push(), Some(expected.clone()));
+        for (i, file_name) in ["/scratch/draft", "eitri-file://1/a.rs", "eitri-proposal://1/a.rs"]
+            .iter()
+            .enumerate()
+        {
+            send(
+                feed.socket_path(),
+                &serde_json::json!({"v":1,"file":file_name,"line":99}).to_string(),
+            );
+            assert!(!feeds.poll(now + every * (i as u32 + 2)).context);
+            assert_eq!(file(&source), Some("/p/a.rs".into()));
+            assert_eq!(push(), Some(expected.clone()));
+        }
+        assert!(!feeds.poll(now + every * 5).context);
+        assert_eq!(push(), Some(expected));
+        send(feed.socket_path(), &context_line("/p/b.rs"));
+        assert!(feeds.poll(now + every * 6).context);
+        assert_eq!(file(&source), Some("/p/b.rs".into()));
+        assert_eq!(push(), Some(PushFacts::default()));
+    }
+
+    #[test]
+    fn a_reset_clears_the_facts() {
+        assert!(EditorFeeds::new().push_source().is_none());
+        let (mut feeds, feed, source, reset, now) = context_feeds(None);
+        let push = feeds.push_source().unwrap();
+        let every = crate::editor_context::feed::POLL_INTERVAL;
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/a.rs","line":7}"#);
+        feeds.poll(now + every);
+        assert_eq!(push().unwrap().cursor_line, Some(7));
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/old.rs","line":99}"#);
+        reset();
+        assert_eq!(push(), None);
+        assert_eq!(source(), None);
+        feeds.poll(now + every * 2);
+        assert_eq!(push(), None);
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/b.rs","line":2}"#);
+        feeds.poll(now + every * 3);
+        assert_eq!(push().unwrap().cursor_line, Some(2));
     }
 
     #[test]

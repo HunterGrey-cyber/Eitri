@@ -558,7 +558,8 @@ pub enum OutsideReason {
     /// for a new file still has to place it under the root.
     Missing,
     /// What is there could not be established: a lookup failed for a reason other than "not found",
-    /// a link leads nowhere, a limit or the work budget ran out, or the path is empty.
+    /// a link leads nowhere, a limit or the work budget ran out, or the path is empty. For an edit
+    /// ([`judge_edit_path`]) also a raw path it does not reason about, and a file with other names.
     Unresolvable,
     /// The path passes through `/proc`, `/sys` or `/dev` ([`KERNEL_TREES`]).
     ThroughAKernelTree,
@@ -602,6 +603,48 @@ fn judge_within_budget(project_root: &Path, home: Option<&Path>, path: &Path) ->
         Resolution::LinkLeavesTheRoot => OutsideReason::LinkLeavesTheRoot,
     };
     PathJudgement::Outside(reason)
+}
+
+/// Where an edit of `path` would land, with [`resolve_edit_target`]'s meaning: a file that does not exist yet is
+/// judged by where it would be created, in directories that do not exist yet too. `Inside` exactly where the edit
+/// gate has no reason of its own to card the path ([`classify_edit_target`], protected names aside, which say nothing
+/// of where a path lands; `the_edit_judgement_agrees_with_the_edit_gate`), and every uncertainty lands outside it.
+///
+/// A path with `..`, or starting with `~`, is `Outside(Unresolvable)`, as the edit gate cards it. Absolute and outside
+/// as written: `Outside(LeavesTheRoot)`, wherever it leads today. `Inside` is the resolved path, which may not exist.
+///
+/// `project_root` and `home` as for [`judge_project_path`]. A relative `path` is taken against the root.
+pub fn judge_edit_path(project_root: &Path, home: Option<&Path>, path: &Path) -> PathJudgement {
+    let (judgement, ran_out) = with_work_budget(MAX_WORK_PER_CLASSIFICATION, || {
+        judge_edit_within_budget(project_root, home, path)
+    });
+    if ran_out {
+        PathJudgement::Outside(OutsideReason::Unresolvable)
+    } else {
+        judgement
+    }
+}
+
+fn judge_edit_within_budget(project_root: &Path, home: Option<&Path>, path: &Path) -> PathJudgement {
+    let Ok(root) = boundary(project_root, home, &Identity::current()) else {
+        return PathJudgement::Outside(OutsideReason::NoBoundary);
+    };
+    // With no component to look up it would resolve to the root itself.
+    if path.as_os_str().is_empty() || edit_target_raw_path_is_suspect(&path.to_string_lossy()) {
+        return PathJudgement::Outside(OutsideReason::Unresolvable);
+    }
+    if !root.join(path).starts_with(&root) {
+        return PathJudgement::Outside(OutsideReason::LeavesTheRoot);
+    }
+    match resolve_edit_target(&root, path) {
+        Ok(target) if !target.logical.starts_with(&root) => PathJudgement::Outside(OutsideReason::LeavesTheRoot),
+        // Its other names may lie anywhere, so what an edit reaches is not established.
+        Ok(target) if target.is_hard_link => PathJudgement::Outside(OutsideReason::Unresolvable),
+        Ok(target) => PathJudgement::Inside(target.logical),
+        Err(REASON_LINK_LEAVES_THE_ROOT) => PathJudgement::Outside(OutsideReason::LinkLeavesTheRoot),
+        Err(REASON_THROUGH_A_KERNEL_TREE) => PathJudgement::Outside(OutsideReason::ThroughAKernelTree),
+        Err(_) => PathJudgement::Outside(OutsideReason::Unresolvable),
+    }
 }
 
 /// [`classify_permission_request`] with the home directory and the git environment passed in rather
@@ -7686,6 +7729,256 @@ mod tests {
                 judged_inside,
                 !read.needs_a_human(),
                 "{path}: {judgement:?} against {read:?}"
+            );
+            judged_inside
+        };
+        for path in inside {
+            assert!(agreed(ws.path(), path), "{path}");
+        }
+        for path in not_inside {
+            assert!(!agreed(ws.path(), path), "{path}");
+        }
+        // A root that is no boundary answers both the same way, for every path.
+        let moved = ws.path().join("moved");
+        for path in inside.iter().chain(not_inside.iter()) {
+            assert!(!agreed(&moved, path), "{path}");
+        }
+    }
+
+    // ---- where an edit would land, as a value: judge_edit_path --------------------------------------
+
+    fn edit_judged(ws: &Workspace, path: &str) -> PathJudgement {
+        judge_edit_path(ws.path(), None, Path::new(path))
+    }
+
+    fn landing(ws: &Workspace, relative: &str) -> PathJudgement {
+        PathJudgement::Inside(ws.path().join(relative))
+    }
+
+    #[test]
+    fn edit_judge_an_existing_file_gives_the_resolved_path() {
+        let ws = Workspace::new();
+        assert_eq!(edit_judged(&ws, "src/main.rs"), landing(&ws, "src/main.rs"));
+    }
+
+    #[test]
+    fn edit_judge_a_new_file_in_an_existing_directory_is_inside() {
+        let ws = Workspace::new();
+        let absolute = ws.path().join("src/new.rs");
+        assert_eq!(edit_judged(&ws, "src/new.rs"), landing(&ws, "src/new.rs"));
+        assert_eq!(edit_judged(&ws, absolute.to_str().unwrap()), landing(&ws, "src/new.rs"));
+    }
+
+    #[test]
+    fn edit_judge_a_new_file_in_a_new_directory_is_inside() {
+        let ws = Workspace::new();
+        let absolute = ws.path().join("absent/deeper/new.rs");
+        assert_eq!(
+            edit_judged(&ws, "absent/deeper/new.rs"),
+            landing(&ws, "absent/deeper/new.rs")
+        );
+        assert_eq!(
+            edit_judged(&ws, absolute.to_str().unwrap()),
+            landing(&ws, "absent/deeper/new.rs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_judge_a_new_file_through_a_link_in_the_root_lands_at_the_link_target() {
+        let ws = Workspace::new();
+        ws.link("dir", "src");
+        assert_eq!(edit_judged(&ws, "dir/new.rs"), landing(&ws, "src/new.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_judge_through_a_link_leaving_the_root_is_outside() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        ws.link("out", &elsewhere.dir);
+        ws.link("out_file", elsewhere.secret());
+        for path in ["out/secret", "out/new.rs", "out/absent/new.rs", "out_file"] {
+            assert_eq!(
+                edit_judged(&ws, path),
+                outside(OutsideReason::LinkLeavesTheRoot),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_judge_through_proc_is_outside() {
+        let ws = Workspace::new();
+        ws.link("d", "/proc/self/cwd/..");
+        for path in ["d/anything", "d/absent/new.rs"] {
+            assert_eq!(
+                edit_judged(&ws, path),
+                outside(OutsideReason::ThroughAKernelTree),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_judge_dotdot_is_outside() {
+        let ws = Workspace::new();
+        let inside_and_back = ws.path().join("src/../src/main.rs");
+        for path in [
+            "..",
+            "../x",
+            "src/../src/main.rs",
+            "src/absent/../new.rs",
+            inside_and_back.to_str().unwrap(),
+            "~",
+            "~/x",
+        ] {
+            assert_eq!(edit_judged(&ws, path), outside(OutsideReason::Unresolvable), "{path}");
+        }
+    }
+
+    #[test]
+    fn edit_judge_absolute_and_outside_as_written_leaves_the_root() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        let secret = elsewhere.secret();
+        let new = elsewhere.dir.join("new.rs");
+        for path in [secret.to_str().unwrap(), new.to_str().unwrap(), "/proc/self/cwd/secret"] {
+            assert_eq!(edit_judged(&ws, path), outside(OutsideReason::LeavesTheRoot), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_judge_a_path_spelled_elsewhere_that_lands_inside_is_outside() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        std::os::unix::fs::symlink(ws.path(), elsewhere.dir.join("back")).unwrap();
+        let spelled = elsewhere.dir.join("back/src/main.rs");
+        assert_eq!(
+            edit_judged(&ws, spelled.to_str().unwrap()),
+            outside(OutsideReason::LeavesTheRoot)
+        );
+    }
+
+    #[test]
+    fn edit_judge_an_empty_path_is_outside_and_not_the_root() {
+        let ws = Workspace::new();
+        assert_eq!(edit_judged(&ws, ""), outside(OutsideReason::Unresolvable));
+    }
+
+    #[test]
+    fn edit_judge_a_hard_linked_file_is_outside() {
+        let ws = Workspace::new();
+        ws.write("one.rs", "x\n");
+        std::fs::hard_link(ws.path().join("one.rs"), ws.path().join("two.rs")).unwrap();
+        assert_eq!(edit_judged(&ws, "one.rs"), outside(OutsideReason::Unresolvable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_judge_a_root_at_home_is_outside() {
+        let ws = Workspace::new();
+        let file = ws.path().join("src/main.rs");
+        let no_boundary = outside(OutsideReason::NoBoundary);
+        assert_eq!(judge_edit_path(ws.path(), Some(ws.path()), &file), no_boundary);
+        assert_eq!(
+            judge_edit_path(ws.path(), Some(&ws.path().join("src")), &file),
+            no_boundary
+        );
+        assert_eq!(judge_edit_path(Path::new("/"), None, &file), no_boundary);
+        ws.link("moved", "src");
+        assert_eq!(
+            judge_edit_path(&ws.path().join("moved"), None, Path::new("main.rs")),
+            no_boundary
+        );
+    }
+
+    #[test]
+    fn edit_judge_out_of_work_is_unresolvable() {
+        let ws = Workspace::new();
+        let (judgement, ran_out) = with_work_budget(0, || {
+            judge_edit_within_budget(ws.path(), None, Path::new("src/main.rs"))
+        });
+        assert!(ran_out);
+        assert_eq!(judgement, outside(OutsideReason::Unresolvable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_edit_judgement_agrees_with_the_edit_gate() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        ws.write("real/target.rs", "x\n");
+        ws.write("one.rs", "x\n");
+        std::fs::hard_link(ws.path().join("one.rs"), ws.path().join("two.rs")).unwrap();
+        ws.link("alias.rs", "real/target.rs");
+        ws.link("dir", "real");
+        ws.link("out", &elsewhere.dir);
+        ws.link("out_file", elsewhere.secret());
+        ws.link("kernel", "/proc/self/cwd/..");
+        ws.link("dangling", "absent");
+        ws.link("loop_a", "loop_b");
+        ws.link("loop_b", "loop_a");
+        ws.link("moved", "src");
+        link_chain(&ws, MAX_LINK_HOPS + 1);
+
+        let file = ws.path().join("src/main.rs");
+        let new_absolute = ws.path().join("absent/new.rs");
+        let dotdot_absolute = ws.path().join("src/../src/main.rs");
+        let secret = elsewhere.secret();
+        let name = elsewhere.dir.file_name().unwrap().to_str().unwrap();
+        let up = format!("../{name}/secret");
+        let too_long = "n".repeat(300);
+        let inside = [
+            "src/main.rs",
+            "./src/main.rs",
+            file.to_str().unwrap(),
+            "src/new.rs",
+            "new.rs",
+            "absent/new.rs",
+            "absent/deeper/new.rs",
+            new_absolute.to_str().unwrap(),
+            "src/main.rs/new.rs",
+            "alias.rs",
+            "dir/target.rs",
+            "dir/new.rs",
+            "chain/h1",
+        ];
+        let not_inside = [
+            "",
+            "..",
+            "src/../src/main.rs",
+            "src/absent/../new.rs",
+            dotdot_absolute.to_str().unwrap(),
+            "~",
+            "~/x",
+            up.as_str(),
+            secret.to_str().unwrap(),
+            "/etc/hosts",
+            "/proc/self/cwd/secret",
+            "out",
+            "out/secret",
+            "out/new.rs",
+            "out_file",
+            "kernel/x",
+            "dangling",
+            "loop_a",
+            "chain/h0",
+            "one.rs",
+            too_long.as_str(),
+        ];
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let agreed = |root: &Path, path: &str| {
+            let write = classify_permission_request("Write", &json!({ "file_path": path, "content": "" }), root);
+            let judgement = judge_edit_path(root, home.as_deref(), Path::new(path));
+            let judged_inside = matches!(judgement, PathJudgement::Inside(_));
+            assert_eq!(
+                judged_inside,
+                !write.needs_a_human(),
+                "{path}: {judgement:?} against {write:?}"
             );
             judged_inside
         };

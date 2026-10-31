@@ -139,6 +139,15 @@ local function content_end(mode, first, last)
   return nil
 end
 
+local function utf16_units(line, bytes)
+  bytes = math.min(math.max(bytes, 0), #line)
+  if vim.fn.has("nvim-0.11") == 1 then
+    return vim.str_utfindex(line, "utf-16", bytes, false)
+  end
+  local _, units = vim.str_utfindex(line, bytes)
+  return units
+end
+
 local function selection()
   local mode = vim.fn.mode()
   -- Visual (v), visual-line (V) and visual-block (\22) only. `'<` and `'>` are deliberately not
@@ -205,7 +214,25 @@ local function selection()
   if line_capped or char_capped then
     text = text .. TRUNCATION_MARKER
   end
-  return { start_line = first[2], end_line = last[2], text = text }
+  local result = { start_line = first[2], end_line = last[2], text = text }
+  -- Optional columns use the true range, even when the selected text is capped. A conversion
+  -- failure costs only these columns, so the selection's lines and text still reach the host.
+  local ok_cols, start_col, end_col = pcall(function()
+    if mode == "V" then
+      return 0, 0
+    end
+    local first_line = vim.fn.getline(first[2])
+    local last_line = vim.fn.getline(last[2])
+    local end_bytes = math.min(last[3] - 1, #last_line)
+    if end_bytes < #last_line and vim.o.selection ~= "exclusive" then
+      end_bytes = end_bytes + vim.str_utf_end(last_line, end_bytes + 1) + 1
+    end
+    return utf16_units(first_line, first[3] - 1), utf16_units(last_line, end_bytes)
+  end)
+  if ok_cols then
+    result.start_col, result.end_col = start_col, end_col
+  end
+  return result
 end
 
 local function send()

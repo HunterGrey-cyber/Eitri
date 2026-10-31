@@ -16,6 +16,55 @@ use eitri_core::editor_context::compose::{compose_turn_text, TRUNCATION_MARKER};
 use eitri_core::editor_context::feed::{EditorContextFeed, EditorContextReader};
 use eitri_core::editor_context::EditorContext;
 
+fn selection_facts(body: &str, commands: &[&str]) -> eitri_core::editor_context::feed::PushFacts {
+    let dir = std::env::temp_dir().join(format!("nv-w1-cols-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, body).unwrap();
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let update = drive_nvim_update(&feed, &mut reader, &file, &["--clean"], commands).expect("an update must arrive");
+    assert!(update.context.selection.is_some());
+    feed.cleanup();
+    std::fs::remove_dir_all(dir).unwrap();
+    update.facts
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_one_line_v_selection_says_its_columns() {
+    let facts = selection_facts("bravo\n", &["normal! gglvll"]);
+    assert_eq!((facts.start_col, facts.end_col), (Some(1), Some(4)));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_v_selection_of_a_non_bmp_character_counts_two_units() {
+    let facts = selection_facts("a🙂b\n", &["normal! gglv"]);
+    assert_eq!((facts.start_col, facts.end_col), (Some(1), Some(3)));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_v_selection_ending_on_an_empty_line_says_column_zero() {
+    let facts = selection_facts("abc\n\n", &["normal! gglvj0"]);
+    assert_eq!((facts.start_col, facts.end_col), (Some(1), Some(0)));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_linewise_selection_says_column_zero() {
+    let facts = selection_facts("abc\ndef\nghi\n", &["normal! gglVjj"]);
+    assert_eq!((facts.start_col, facts.end_col), (Some(0), Some(0)));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_exclusive_selection_ends_before_the_cursor() {
+    let facts = selection_facts("a🙂bc\n", &["set selection=exclusive", "normal! gglvl"]);
+    assert_eq!((facts.start_col, facts.end_col), (Some(1), Some(3)));
+}
+
 /// Opens `file`, runs `normal_command`, and returns whatever the snippet sent.
 ///
 /// The `sleep` is inside nvim's own command sequence rather than in this process: the snippet
@@ -39,6 +88,16 @@ fn drive_nvim_with(
     startup_args: &[&str],
     commands: &[&str],
 ) -> Option<EditorContext> {
+    drive_nvim_update(feed, reader, file, startup_args, commands).map(|update| update.context)
+}
+
+fn drive_nvim_update(
+    feed: &EditorContextFeed,
+    reader: &mut EditorContextReader,
+    file: &std::path::Path,
+    startup_args: &[&str],
+    commands: &[&str],
+) -> Option<eitri_core::editor_context::feed::FeedUpdate> {
     let mut command = std::process::Command::new("nvim");
     command.arg("--headless");
     command.args(startup_args);
@@ -61,7 +120,7 @@ fn drive_nvim_with(
         .status()
         .expect("nvim must be on PATH for this test");
     assert!(status.success(), "nvim exited with {status}");
-    reader.poll()
+    reader.poll_update()
 }
 
 #[test]

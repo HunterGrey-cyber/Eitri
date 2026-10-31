@@ -55,6 +55,13 @@ pub struct PushFacts {
     pub end_col: Option<u32>,
 }
 
+/// A context and the optional push facts read from the same wire line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedUpdate {
+    pub context: EditorContext,
+    pub facts: PushFacts,
+}
+
 pub struct EditorContextFeed {
     dir: PathBuf,
     socket_path: PathBuf,
@@ -186,6 +193,11 @@ impl EditorContextReader {
 
     /// Returns the newest valid update available without waiting, or `None` for no news.
     pub fn poll(&mut self) -> Option<EditorContext> {
+        self.poll_update().map(|update| update.context)
+    }
+
+    /// Returns the newest valid context together with its optional push facts, without waiting.
+    pub fn poll_update(&mut self) -> Option<FeedUpdate> {
         self.0.poll_parsed(|line| match parse_bytes(line) {
             Ok(parsed) => Some(parsed),
             Err(e) => {
@@ -199,8 +211,8 @@ impl EditorContextReader {
 /// A line that is not UTF-8 (nvim sends a file name's bytes as they are) is read with each invalid
 /// sequence as one U+FFFD: the update still says which file is open, close enough for a person or an agent to know it,
 /// where dropping it would leave the file open before it named as the current one.
-fn parse_bytes(line: &[u8]) -> Result<EditorContext, String> {
-    parse(&String::from_utf8_lossy(line))
+fn parse_bytes(line: &[u8]) -> Result<FeedUpdate, String> {
+    parse_update(&String::from_utf8_lossy(line))
 }
 
 /// The last line that parses. A malformed line is logged and skipped; it never discards an earlier
@@ -221,6 +233,20 @@ pub fn latest_context(lines: Vec<String>) -> Option<EditorContext> {
 }
 
 fn parse(line: &str) -> Result<EditorContext, String> {
+    parse_update(line).map(|update| update.context)
+}
+
+fn parse_facts(value: &serde_json::Value) -> PushFacts {
+    let column = |value: Option<&serde_json::Value>| value?.as_u64().and_then(|n| u32::try_from(n).ok());
+    let selection = value.get("selection");
+    PushFacts {
+        cursor_line: column(value.get("line")),
+        start_col: column(selection.and_then(|s| s.get("start_col"))),
+        end_col: column(selection.and_then(|s| s.get("end_col"))),
+    }
+}
+
+fn parse_update(line: &str) -> Result<FeedUpdate, String> {
     let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
     let version = value.get("v").and_then(serde_json::Value::as_u64);
     if version != Some(1) {
@@ -250,12 +276,95 @@ fn parse(line: &str) -> Result<EditorContext, String> {
             }
         }
     };
-    Ok(EditorContext { file, selection })
+    Ok(FeedUpdate {
+        context: EditorContext { file, selection },
+        facts: parse_facts(&value),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_without_columns_stays_valid() {
+        for (line, selection, cursor_line) in [
+            (
+                r#"{"v":1,"file":"/p/a.rs","line":13,"selection":{"start_line":12,"end_line":14,"text":"fn a() {}"}}"#,
+                Some(Selection {
+                    start_line: 12,
+                    end_line: 14,
+                    text: "fn a() {}".into(),
+                }),
+                Some(13),
+            ),
+            (r#"{"v":1,"file":"/p/a.rs","line":1,"selection":null}"#, None, Some(1)),
+            (r#"{"v":1,"file":"/p/a.rs"}"#, None, None),
+        ] {
+            let update = parse_update(line).unwrap();
+            assert_eq!(
+                update.context,
+                EditorContext {
+                    file: "/p/a.rs".into(),
+                    selection
+                }
+            );
+            assert_eq!(
+                update.facts,
+                PushFacts {
+                    cursor_line,
+                    start_col: None,
+                    end_col: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_column_type_reads_as_absent() {
+        for value in [
+            serde_json::json!("1"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!(4294967296_u64),
+        ] {
+            let line = serde_json::json!({"v": 1, "file": "/p/a.rs", "line": value,
+                "selection": {"start_line": 1, "end_line": 1, "text": "x", "start_col": value, "end_col": value}})
+            .to_string();
+            let update = parse_update(&line).unwrap();
+            assert_eq!(update.facts, PushFacts::default());
+            assert_eq!(update.context.selection.unwrap().text, "x");
+        }
+    }
+
+    #[test]
+    fn the_context_forwarded_to_window_2_has_no_columns() {
+        use std::io::Write;
+        let mut feed = EditorContextFeed::new().expect("feed");
+        let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+        let line = serde_json::json!({"v": 1, "file": "/p/a.rs", "line": 3,
+            "selection": {"start_line": 2, "end_line": 3, "text": "xy", "start_col": 1, "end_col": 4}});
+        let mut client = std::os::unix::net::UnixStream::connect(feed.socket_path()).unwrap();
+        writeln!(client, "{line}").unwrap();
+        drop(client);
+        let update = reader.poll_update().expect("the update arrives");
+        assert_eq!(
+            update.facts,
+            PushFacts {
+                cursor_line: Some(3),
+                start_col: Some(1),
+                end_col: Some(4)
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(update.context).unwrap(),
+            serde_json::json!({
+                "file": "/p/a.rs", "selection": {"start_line": 2, "end_line": 3, "text": "xy"}
+            })
+        );
+    }
 
     #[test]
     fn a_real_snippet_line_parses_into_a_selection() {
@@ -317,7 +426,9 @@ mod tests {
     /// naming the file that was open before it.
     #[test]
     fn an_update_with_bytes_that_are_not_utf8_still_names_its_file() {
-        let context = parse_bytes(b"{\"v\":1,\"file\":\"/p/caf\xe9.rs\"}").expect("the update is read");
+        let context = parse_bytes(b"{\"v\":1,\"file\":\"/p/caf\xe9.rs\"}")
+            .expect("the update is read")
+            .context;
         assert_eq!(context.file, "/p/caf\u{fffd}.rs");
     }
 
