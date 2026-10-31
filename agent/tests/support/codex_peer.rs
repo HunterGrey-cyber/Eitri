@@ -460,6 +460,7 @@ pub fn start_params(project: &Path, trust: DirTrust) -> Value {
     serde_json::to_value(ThreadStartParams::new(
         text_of(project).to_string(),
         Reviewer::User,
+        agent::Sandbox::Project,
         config,
     ))
     .expect("params")
@@ -472,6 +473,7 @@ pub fn resume_params(thread: &str, project: &Path, trust: DirTrust) -> Value {
         thread.to_string(),
         text_of(project).to_string(),
         Reviewer::User,
+        agent::Sandbox::Project,
         config,
     ))
     .expect("params")
@@ -491,8 +493,13 @@ pub fn start_thread(peer: &mut Peer, params: Value) -> Thread {
 
 /// Fails when a start or resume answer does not echo the narrow policy Eitri asked for.
 pub fn assert_narrow_echo(answer: &Value) {
+    assert_echo(answer, agent::Sandbox::Project);
+}
+
+/// [`assert_narrow_echo`] for a session asked to run under `sandbox`.
+pub fn assert_echo(answer: &Value, sandbox: agent::Sandbox) {
     let parsed: ThreadStartResponse = serde_json::from_value(answer.clone()).expect("a thread answer");
-    if let Err(mismatch) = tripwire::check_echo(&expected_echo(Reviewer::User), &parsed.echo()) {
+    if let Err(mismatch) = tripwire::check_echo(&expected_echo(Reviewer::User, sandbox), &parsed.echo()) {
         panic!("the policy echo differs from what was asked: {mismatch}");
     }
 }
@@ -507,10 +514,16 @@ pub fn instruction_sources(answer: &Value) -> Vec<String> {
 
 /// Starts a turn and returns its id.
 pub fn send_turn(peer: &mut Peer, thread: &str, text: &str) -> String {
+    send_turn_in(peer, thread, text, agent::Sandbox::Project)
+}
+
+/// [`send_turn`] under `sandbox`.
+pub fn send_turn_in(peer: &mut Peer, thread: &str, text: &str, sandbox: agent::Sandbox) -> String {
     let params = serde_json::to_value(TurnStartParams::new(
         thread.to_string(),
         text.to_string(),
         Reviewer::User,
+        sandbox,
     ))
     .expect("params");
     let answer = peer.call(method::TURN_START, params).expect("turn/start");

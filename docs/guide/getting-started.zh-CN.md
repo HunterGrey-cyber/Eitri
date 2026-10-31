@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=32225b715bc51b6631fc4f7b6caa3ee6b74527bc8461c41abce16c270b56d756 -->
+<!-- translated-from: getting-started.md sha256=692f184bc34dc38d38f93d6c44cb31d176e7dcd823ce6a8736201dee641f9d29 -->
 
 # 快速上手
 
@@ -52,11 +52,11 @@ eitri DIR FILE
 - `eitri DIR FILE...` 仍以 `DIR` 为项目，并先显示这些文件。
 - 不存在的文件夹、管道、套接字或设备文件，以及不是有效 UTF-8 的名字，会带着一条消息被拒绝。`eitri panel` 和 `eitri split` 仍然只接受目录，`EITRI_PROJECT_DIR` 也仍然只是目录。
 
-**这个项目已经开着一个窗口。** 这时 `eitri FILE` 不会再开一个窗口：正在运行的编辑器打开这个文件，窗口被带到前面、按键交给编辑器，命令立刻返回。如果那个窗口的编辑器是隐藏的或还没启动，会先显示出来，等它就绪后再打开文件。在某个 Eitri 窗口自己的底部终端里输入 `eitri FILE`，文件就在那个窗口里打开，即使你已经 `cd` 进了子文件夹，只要文件在该窗口的项目之内。`eitri DIR` 和不带参数的 `eitri` 总是开新窗口，`eitri --new-window FILE` 也是（`--clean` 和 `--account` 隐含它）。写在 `VERDANDI_CLAUDE_ACCOUNT` 里的账号不隐含它：正在运行的窗口保持自己的账号。在底部终端之外，已开的窗口必须正好在上面推出的项目上，更大的项目不算：`cd repo/crate; eitri src/x.rs` 推出的是 `crate`，所以即使 `repo` 上开着窗口，也会在 `crate` 上开新窗口，没见过的项目还会有它自己的信任问题。要用那个窗口，就从 `repo` 运行，或者在那个窗口的底部终端里运行。这个项目没有开着的窗口时开新窗口；窗口此刻无法接收文件时也开新窗口，比如它停在带未保存缓冲区的退出提示上。编辑器里当前缓冲区有未保存的修改时，文件在一个分割窗口里打开，那个缓冲区保持不动。
+**这个项目已经开着一个窗口。** 这时 `eitri FILE` 不会再开一个窗口：正在运行的编辑器打开这个文件，窗口被带到前面、按键交给编辑器，命令立刻返回。如果那个窗口的编辑器是隐藏的或还没启动，会先显示出来，等它就绪后再打开文件。在某个 Eitri 窗口自己的底部终端里输入 `eitri FILE`，文件就在那个窗口里打开，即使你已经 `cd` 进了子文件夹，只要文件在该窗口的项目之内。`eitri DIR` 和不带参数的 `eitri` 总是开新窗口，`eitri --new-window FILE` 也是（`--clean` 和 `--account` 隐含它）。写在 `VERDANDI_CLAUDE_ACCOUNT` 里的账号不隐含它：正在运行的窗口保持自己的账号。在底部终端之外，这里推出的项目以上的文件夹上的窗口也算，一直到文件所在的仓库，由近及远：`cd repo/crate; eitri src/x.rs` 推出的是 `crate`，如果 `crate` 上没有开着的窗口而 `repo` 上有，文件就在 `repo` 的窗口里打开。放不下你点名的全部文件的窗口会被跳过，没有仓库时只问这个项目自己。没有这样的窗口时开新窗口；窗口此刻无法接收文件时也开新窗口，比如它停在带未保存缓冲区的退出提示上。编辑器里当前缓冲区有未保存的修改时，文件在一个分割窗口里打开，那个缓冲区保持不动。
 
 在 GNOME 上，只有带激活令牌的启动才能把窗口提到前面，而在终端里输入的命令没有这个令牌：那里 GNOME 可能显示一条“窗口已就绪”的通知，而不是把窗口提到前面。预计 Sway、Hyprland 和 niri 会通过合成器把焦点交给窗口。只在 sway 上试过。
 
-**没有自己项目的文件。** `eitri ~/notes.md`、`eitri /etc/hosts` 和 `eitri /tmp/x.py` 也能打开，项目就是文件所在的文件夹。当这个文件夹不能作为 agent 的边界时（你的主目录、不属于你的文件夹、别的用户可写的文件夹、文件系统根），面板的每个页面都会显示一条提示：`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab can write anywhere in this folder.` 它会一直留着，直到你关掉它。各个模式下这意味着什么，见[权限](permissions.zh-CN.md#a-folder-that-is-no-boundary)。
+**没有自己项目的文件。** `eitri ~/notes.md`、`eitri /etc/hosts` 和 `eitri /tmp/x.py` 也能打开，项目就是文件所在的文件夹。当这个文件夹不能作为 agent 的边界时（你的主目录、不属于你的文件夹、别的用户可写的文件夹、文件系统根），面板的每个页面都会显示一条提示：`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab starts read-only, without the folder's configuration. Other agents keep their own rules.` 它会一直留着，直到你关掉它。各个模式下这意味着什么，见[权限](permissions.zh-CN.md#a-folder-that-is-no-boundary)。
 
 **从文件管理器打开。** Eitri 的桌面入口列出了纯文本、Markdown、C、C++、Python、Rust、JSON、TOML 和 shell 脚本，所以“打开方式”里会出现它（它不会成为默认程序）。这样的启动通常从你的主目录开始，所以项目按上面所说的从文件推出来。选中的多个文件像 `eitri a.rs b.rs` 那样一起打开，选中的多个文件夹各开一个窗口。
 

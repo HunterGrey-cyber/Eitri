@@ -184,6 +184,22 @@ pub(super) fn start_deferred(
     out
 }
 
+/// What a tab of `agent` takes from the project at `project_dir`, given the answer `project`. At a root that is no
+/// boundary what is in the folder is nobody's word, whatever was answered: a rule or a hook there would take a command
+/// out of Codex's read-only sandbox with no card. A registered agent's own configuration is out of reach, so the
+/// answer changes nothing for it.
+pub(super) fn project_trust_at_root(
+    agent: &AgentId,
+    project: ProjectTrust,
+    project_dir: &std::path::Path,
+) -> ProjectTrust {
+    if *agent == AgentId::Codex && !eitri_core::agent_backend::root_is_a_boundary(project_dir) {
+        ProjectTrust::Untrusted
+    } else {
+        project
+    }
+}
+
 /// [`start_deferred`] for a tab of another agent: its trust plan is built from the discovery the
 /// gate's answer is bound to, and the agent's own connect worker is begun with it. Without such a
 /// discovery (the trust check could not run) or with a root no agent configuration can name, the
@@ -202,6 +218,7 @@ pub(super) fn start_external_tab(
     if project == ProjectTrust::Untrusted && profile.requires_explicit_yes() {
         return put_off_start(state, tab, start, &crate::trust_gate::refused_without_yes(&profile));
     }
+    let project = project_trust_at_root(&agent, project, &state.project_dir);
     // A registered agent starts with the command its registration names; a tab of a name nothing
     // registers (saved while it was) has none to run.
     let acp = match &agent {

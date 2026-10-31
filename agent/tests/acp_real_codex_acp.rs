@@ -150,6 +150,7 @@ fn send(provider: &AcpProvider, session: &str, text: &str) {
             },
             TurnPolicy {
                 reviewer: Reviewer::Agent,
+                sandbox: agent::Sandbox::Project,
             },
         )
         .expect("the turn is sent");
@@ -188,6 +189,7 @@ fn codex_acp_as_a_registered_agent_in_a_trusted_scratch_root() {
             OsString::from("@agentclientprotocol/codex-acp"),
         ],
         auto_mode: Some("workspace-write".to_string()),
+        read_only_mode: None,
     };
     let provider = AcpProvider::connect(spec, root.clone()).expect("codex-acp starts and answers initialize");
     let session = provider
@@ -201,6 +203,7 @@ fn codex_acp_as_a_registered_agent_in_a_trusted_scratch_root() {
             },
             policy: TurnPolicy {
                 reviewer: Reviewer::Agent,
+                sandbox: agent::Sandbox::Project,
             },
             resume: None,
         })

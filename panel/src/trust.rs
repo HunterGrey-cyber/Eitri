@@ -37,6 +37,7 @@ pub(super) fn acp_spec(registered: &[AgentRegistration], name: &str) -> Option<a
         name: registration.name.clone(),
         argv: registration.command.iter().map(std::ffi::OsString::from).collect(),
         auto_mode: registration.auto_mode.clone(),
+        read_only_mode: registration.read_only_mode.clone(),
     })
 }
 
@@ -686,6 +687,43 @@ mod tests {
         let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c2").is_some());
         assert_eq!(result_for(&all_payloads(&seen), "c2"), Some(Ok(())));
         assert!(!codex_record.exists());
+    }
+
+    /// A `y` at a folder others can write is not the folder's to act on: a rule or a hook in it would leave Codex's
+    /// read-only sandbox with no card. The plan is an `n`'s, and the tab says the project is not loaded.
+    #[test]
+    fn a_codex_tab_at_a_root_that_is_no_boundary_starts_untrusted_after_a_yes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, fx) = trust_panel("trust-no-boundary");
+        fx.write(".codex/config.toml", b"model = \"x\"\n");
+        std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let tab = codex_tab(&state);
+        gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello codex")).unwrap();
+        let prompt = next_prompt(&state);
+        answer_prompt(&state, "a1", &prompt, true);
+        tick_until(&state, |_| !fx.external.borrow().is_empty());
+
+        let plan = fx.external.borrow()[0].plan.clone();
+        assert!(
+            plan.dirs.iter().all(|(_, level)| *level == agent::DirTrust::Untrusted),
+            "{:?}",
+            plan.dirs
+        );
+        assert!(plan.skills_off);
+        let tiers = state.borrow().tabs.get(tab).unwrap().session.project_tiers;
+        assert_eq!(tiers, Some(ProjectTrust::Untrusted));
+
+        // A tab with no session yet says the same as one started: the answer on record does not count here.
+        let empty = state.borrow_mut().tabs.open(AgentId::Codex);
+        let s = state.borrow();
+        let payload = crate::agent_panel::detail::detail_payload(&s, empty);
+        assert!(payload.contains("this project's: not loaded"), "{payload}");
+        assert!(
+            payload.contains("not applied here, this folder is no boundary"),
+            "{payload}"
+        );
+        drop(s);
+        std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     /// The external start is handed the trust plan of the discovery its answer was bound to: a `y`

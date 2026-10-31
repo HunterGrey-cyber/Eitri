@@ -12,8 +12,8 @@
 //!
 //! The account's details (its email) are never kept: `account/read` keeps only whether an account exists.
 
-use super::config::{sandbox_policy, SessionConfig, APPROVAL_POLICY, SANDBOX_MODE};
-use crate::external::{DirTrust, Reviewer};
+use super::config::{sandbox_mode, sandbox_policy, SessionConfig, APPROVAL_POLICY};
+use crate::external::{DirTrust, Reviewer, Sandbox};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -140,20 +140,34 @@ impl Default for AccountReadParams {
 pub struct SandboxPolicyWire {
     #[serde(rename = "type")]
     kind: &'static str,
-    writable_roots: [&'static str; 0],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writable_roots: Option<[&'static str; 0]>,
     network_access: bool,
-    exclude_tmpdir_env_var: bool,
-    exclude_slash_tmp: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_tmpdir_env_var: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_slash_tmp: Option<bool>,
 }
 
 impl SandboxPolicyWire {
     pub(super) fn narrow(kind: &'static str) -> Self {
         SandboxPolicyWire {
             kind,
-            writable_roots: [],
+            writable_roots: Some([]),
             network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
+            exclude_tmpdir_env_var: Some(false),
+            exclude_slash_tmp: Some(false),
+        }
+    }
+
+    /// The form Codex's read-only policy takes: the workspace fields are no part of it.
+    pub(super) fn read_only(kind: &'static str) -> Self {
+        SandboxPolicyWire {
+            kind,
+            writable_roots: None,
+            network_access: false,
+            exclude_tmpdir_env_var: None,
+            exclude_slash_tmp: None,
         }
     }
 
@@ -177,12 +191,12 @@ pub struct ThreadStartParams {
 }
 
 impl ThreadStartParams {
-    pub fn new(cwd: String, reviewer: Reviewer, config: SessionConfig) -> Self {
+    pub fn new(cwd: String, reviewer: Reviewer, sandbox: Sandbox, config: SessionConfig) -> Self {
         ThreadStartParams {
             cwd,
             approval_policy: APPROVAL_POLICY,
             approvals_reviewer: reviewer,
-            sandbox: SANDBOX_MODE,
+            sandbox: sandbox_mode(sandbox),
             config,
         }
     }
@@ -203,13 +217,13 @@ pub struct ThreadResumeParams {
 }
 
 impl ThreadResumeParams {
-    pub fn new(thread_id: String, cwd: String, reviewer: Reviewer, config: SessionConfig) -> Self {
+    pub fn new(thread_id: String, cwd: String, reviewer: Reviewer, sandbox: Sandbox, config: SessionConfig) -> Self {
         ThreadResumeParams {
             thread_id,
             cwd,
             approval_policy: APPROVAL_POLICY,
             approvals_reviewer: reviewer,
-            sandbox: SANDBOX_MODE,
+            sandbox: sandbox_mode(sandbox),
             config,
             exclude_turns: true,
         }
@@ -237,13 +251,13 @@ pub struct TurnStartParams {
 }
 
 impl TurnStartParams {
-    pub fn new(thread_id: String, text: String, reviewer: Reviewer) -> Self {
+    pub fn new(thread_id: String, text: String, reviewer: Reviewer, sandbox: Sandbox) -> Self {
         TurnStartParams {
             thread_id,
             input: vec![UserInput::Text { text }],
             approval_policy: APPROVAL_POLICY,
             approvals_reviewer: reviewer,
-            sandbox_policy: sandbox_policy(),
+            sandbox_policy: sandbox_policy(sandbox),
         }
     }
 }

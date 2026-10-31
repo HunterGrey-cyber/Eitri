@@ -156,6 +156,7 @@ fn running_as(argv: Vec<OsString>) -> AcpProvider {
         name: "stand-in".to_string(),
         argv,
         auto_mode: None,
+        read_only_mode: None,
     };
     let provider = AcpProvider::connect(spec, std::env::temp_dir()).expect("connects");
     provider
@@ -169,6 +170,7 @@ fn running_as(argv: Vec<OsString>) -> AcpProvider {
             },
             policy: TurnPolicy {
                 reviewer: Reviewer::Agent,
+                sandbox: agent::Sandbox::Project,
             },
             resume: None,
         })
@@ -181,6 +183,7 @@ fn running_as(argv: Vec<OsString>) -> AcpProvider {
             },
             TurnPolicy {
                 reviewer: Reviewer::Agent,
+                sandbox: agent::Sandbox::Project,
             },
         )
         .expect("sends");
@@ -442,6 +445,7 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
         name: "stand-in".to_string(),
         argv: logged_standin(&dir, script),
         auto_mode: None,
+        read_only_mode: None,
     };
     let provider = AcpProvider::connect(spec, std::env::temp_dir()).expect("connects");
     std::thread::scope(|scope| {
@@ -456,6 +460,7 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
                 },
                 policy: TurnPolicy {
                     reviewer: Reviewer::Agent,
+                    sandbox: agent::Sandbox::Project,
                 },
                 resume: Some("s1".to_string()),
             })

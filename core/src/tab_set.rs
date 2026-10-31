@@ -4112,6 +4112,7 @@ impl TabSet {
     /// `starting` first. `None` when the queue can no longer go (a turn started meanwhile, the tab
     /// left): its start is over, and the queue waits as it would have.
     fn release_turn_send(&mut self, gate: SendGate, what: moving::TurnSend) -> Option<Sent> {
+        let root = self.project_root.clone();
         let id = gate.tab();
         let sent = match what {
             moving::TurnSend::Queue => {
@@ -4154,10 +4155,10 @@ impl TabSet {
                         .filter(|item| !item.refused)
                         .all(|item| item.typed_by_person),
                 );
-                let outcome = tab
-                    .live_mut()
-                    .expect("checked above")
-                    .send_turn_in(&wire, &typed, mode, origin);
+                let outcome =
+                    tab.live_mut()
+                        .expect("checked above")
+                        .send_turn_in(&wire, &typed, mode, root.as_deref(), origin);
                 match &outcome {
                     Ok(submitted) => {
                         let mut message = Queued::held(&typed, wire, wall_clock_ms());
@@ -4320,12 +4321,15 @@ impl TabSet {
     /// now. Only [`TabSet::release_turn_send`] calls it, once the gate let the message go.
     fn send_one(&mut self, gate: &SendGate, turn: &FirstTurn) -> Result<(), BackendError> {
         let id = gate.tab();
+        let root = self.project_root.clone();
         let outcome = match self.get_mut(id) {
             Some(tab) => {
                 tab.session.turn_trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
                 match tab.live_mut() {
-                    Some(backend) => backend.send_turn_in(&turn.wire, &turn.typed, mode, turn.origin()),
+                    Some(backend) => {
+                        backend.send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin())
+                    }
                     None => Err(BackendError {
                         message: "no active session".to_string(),
                         benign: true,
@@ -15253,7 +15257,10 @@ mod external_tab_tests {
     }
 
     fn reviewer(r: Reviewer) -> TurnPolicy {
-        TurnPolicy { reviewer: r }
+        TurnPolicy {
+            reviewer: r,
+            sandbox: agent::Sandbox::Project,
+        }
     }
 
     fn background_count(set: &TabSet, tab: TabId) -> u32 {
@@ -15343,6 +15350,25 @@ mod external_tab_tests {
         set.stop_background(tab, 2).unwrap();
         assert_eq!(provider.stops(), 1);
         until("the count drops", || background_count(&set, tab) == 0);
+    }
+
+    /// The window's root, as the gate is given it at every pump, is what a turn is judged by: past a start, a
+    /// conversation's own path is what a replaced folder resolved to.
+    #[test]
+    fn a_turn_is_judged_by_the_root_the_window_holds() {
+        let target = workspace("external-window-root-target");
+        let window_root = target.with_file_name(format!("{}-link", target.file_name().unwrap().to_string_lossy()));
+        std::os::unix::fs::symlink(&target, &window_root).unwrap();
+        let (mut set, tab, provider) = codex_tab(&window_root, SessionModeChoice::Auto);
+        set.pump(&window_root, true);
+        send(&mut set, tab, "first");
+        assert_eq!(
+            provider.policies(),
+            vec![TurnPolicy {
+                reviewer: Reviewer::User,
+                sandbox: agent::Sandbox::ReadOnly,
+            }]
+        );
     }
 
     #[test]
@@ -18303,18 +18329,18 @@ mod prompt_origin_tests {
                 "core/src/agent_backend.rs",
                 "send_turn_as(wire_text,as_typed,origin,&client_message_id)",
             ),
-            (
-                "core/src/agent_backend.rs",
-                "send_turn_with(wire_text,turn_policy(mode))",
-            ),
+            ("core/src/agent_backend.rs", "send_turn_with(wire_text,policy)"),
             (
                 "core/src/agent_backend.rs",
                 "steer_turn(shown_turn,client_message_id,wire_text,as_typed,origin)",
             ),
-            ("core/src/tab_set.rs", "send_turn_in(&wire,&typed,mode,origin)"),
             (
                 "core/src/tab_set.rs",
-                "send_turn_in(&turn.wire,&turn.typed,mode,turn.origin())",
+                "send_turn_in(&wire,&typed,mode,root.as_deref(),origin)",
+            ),
+            (
+                "core/src/tab_set.rs",
+                "send_turn_in(&turn.wire,&turn.typed,mode,root.as_deref(),turn.origin())",
             ),
             (
                 "core/src/tab_set.rs",

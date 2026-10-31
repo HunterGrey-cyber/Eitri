@@ -264,8 +264,8 @@ pub(crate) fn checked_root(project_root: &Path, home: Option<&Path>, who: &Ident
 /// The line the panel shows at a root that is no boundary.
 pub fn note(refusal: NotABoundary) -> String {
     format!(
-        "No project boundary here ({}): a Claude tab asks before every file and command, and a Codex tab can \
-         write anywhere in this folder.",
+        "No project boundary here ({}): a Claude tab asks before every file and command, and a Codex tab starts \
+         read-only, without the folder's configuration. Other agents keep their own rules.",
         refusal.why()
     )
 }
@@ -572,7 +572,8 @@ mod tests {
         assert_eq!(
             note(NotABoundary::OthersCanWrite),
             "No project boundary here (other users can write to it): a Claude tab asks before every file and \
-             command, and a Codex tab can write anywhere in this folder."
+             command, and a Codex tab starts read-only, without the folder's configuration. Other agents keep their \
+             own rules."
         );
         assert_eq!(
             NotABoundary::ALL.map(|r| r.why()),

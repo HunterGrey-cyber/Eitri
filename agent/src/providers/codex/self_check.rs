@@ -30,6 +30,7 @@ use super::wire::{
     method, Decision, DecisionResponse, InitializeParams, InitializeResponse, ThreadResumeParams, ThreadStartParams,
     ThreadStartResponse, TurnStartParams,
 };
+use crate::external::Sandbox;
 use crate::external::{DirTrust, Reviewer, TrustPlan};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkSpec};
 use crate::private_fs::{create_private_dir_all, open_private, read_private_to_string, write_private};
@@ -70,7 +71,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// is judged by change**: a recorded pass names the revision it was earned under, and a pass of any other
 /// revision is not a pass, so a binary an older, weaker check let through is checked again. A verdict
 /// written before revisions were recorded has none and is not a pass either.
-const CHECK_REVISION: u32 = 2;
+const CHECK_REVISION: u32 = 3;
 /// The directory under Eitri's state directory that holds one directory per checked binary.
 const CHECK_DIR: &str = "codex-check";
 /// The file in a binary's check directory that records how its last run ended, so the starts that waited
@@ -82,6 +83,7 @@ const HOOKS_LIST: &str = "hooks/list";
 const PARENT_PROMPT: &str = "EITRI-CHECK-PARENT-PROMPT";
 const CHILD_TASK: &str = "EITRI-CHECK-CHILD-TASK";
 const RESUME_PROMPT: &str = "EITRI-CHECK-RESUME-PROMPT";
+const READ_ONLY_PROMPT: &str = "EITRI-CHECK-READ-ONLY-PROMPT";
 const AGENTS_MARKER: &str = "EITRI-CHECK-AGENTS-MARKER";
 const SKILL_NAME: &str = "eitri-check-skill";
 const EXTRA_PERMISSIONS_FIELD: &str = "with_additional_permissions";
@@ -318,12 +320,14 @@ pub struct CheckTweaks {
     pub drop_skills_lever: bool,
     /// The fixture project is trusted, as a lever that no longer holds would leave it.
     pub grant_trust: bool,
+    /// The thread that should be read-only gets the workspace sandbox, as a Codex that ignored the ask would.
+    pub widen_read_only: bool,
 }
 
 #[cfg(feature = "test-support")]
 impl CheckTweaks {
     fn any(&self) -> bool {
-        self.spawn_without_namespace || self.drop_skills_lever || self.grant_trust
+        self.spawn_without_namespace || self.drop_skills_lever || self.grant_trust || self.widen_read_only
     }
 }
 
@@ -686,6 +690,14 @@ impl Layout {
             ("the rule-matching touch in the child", self.outside.join("rule-child")),
             ("a plain write into the extra writable root", self.extra.join("plain")),
             ("the declined escalation", self.outside.join("escalated")),
+            (
+                "a plain write inside the project of a read-only thread",
+                self.project.join("read-only-plain"),
+            ),
+            (
+                "the declined escalation of a read-only thread",
+                self.project.join("read-only-escalated"),
+            ),
         ]
     }
 
@@ -949,14 +961,14 @@ struct ThreadFacts {
     reasoning_effort: Option<String>,
 }
 
-fn thread_facts(answer: Value, reviewer: Reviewer) -> Result<ThreadFacts, String> {
+fn thread_facts(answer: Value, reviewer: Reviewer, sandbox: Sandbox) -> Result<ThreadFacts, String> {
     let effort = answer
         .get("reasoningEffort")
         .and_then(Value::as_str)
         .map(str::to_string);
     let started: ThreadStartResponse =
         serde_json::from_value(answer).map_err(|e| format!("the thread answer could not be read: {e}"))?;
-    let echo_problem = tripwire::check_echo(&expected_echo(reviewer), &started.echo())
+    let echo_problem = tripwire::check_echo(&expected_echo(reviewer, sandbox), &started.echo())
         .err()
         .map(|mismatch| mismatch.to_string());
     Ok(ThreadFacts {
@@ -969,14 +981,26 @@ fn thread_facts(answer: Value, reviewer: Reviewer) -> Result<ThreadFacts, String
 
 fn script(layout: &Layout, tweaks: &CheckTweaks) -> Vec<Step> {
     let outside = layout.outside.display();
-    let touch = |name: &str| format!("touch {outside}/{name}");
+    // Quoted, as `plain_path` keeps a quote out of these: split on a space, a command would miss the file it names
+    // and fail, and a file that was never aimed at reads as a write the sandbox held.
+    let touch = |name: &str| format!("touch '{outside}/{name}'");
     let namespace = if tweaks.spawn_without_namespace {
         None
     } else {
         Some(AGENT_NAMESPACE)
     };
     let for_child = |step: Step| step.when_body_has(CHILD_TASK).unless_body_has(PARENT_PROMPT);
+    let project = layout.project.display();
     vec![
+        // A read-only thread: a plain write inside the project, where the workspace sandbox would let it through,
+        // then the same write asking to leave the sandbox.
+        Step::exec("ro1", &format!("touch '{project}/read-only-plain'"), false)
+            .when_body_has(READ_ONLY_PROMPT)
+            .unless_body_has("\"ro1\""),
+        Step::exec("ro2", &format!("touch '{project}/read-only-escalated'"), true)
+            .when_body_has(READ_ONLY_PROMPT)
+            .when_body_has("\"ro1\"")
+            .unless_body_has("\"ro2\""),
         // The parent: the rule-matching command alone, then a child, then waiting for it.
         Step::exec("p0", &touch("rule-parent"), false)
             .when_body_has(PARENT_PROMPT)
@@ -999,7 +1023,7 @@ fn script(layout: &Layout, tweaks: &CheckTweaks) -> Vec<Step> {
         for_child(Step::exec("cc1", &touch("rule-child"), false)).unless_body_has("\"cc1\""),
         for_child(Step::exec(
             "cc0",
-            &format!("touch {}/plain", layout.extra.display()),
+            &format!("touch '{}/plain'", layout.extra.display()),
             false,
         ))
         .when_body_has("\"cc1\"")
@@ -1015,6 +1039,9 @@ fn script(layout: &Layout, tweaks: &CheckTweaks) -> Vec<Step> {
 struct Evidence {
     start: Option<ThreadFacts>,
     resume: Option<ThreadFacts>,
+    read_only: Option<ThreadFacts>,
+    read_only_turn_done: bool,
+    read_only_asked: bool,
     announced_child: Option<String>,
     child_asked_after_announcement: bool,
     child_requests: usize,
@@ -1036,7 +1063,11 @@ fn judge(e: &Evidence) -> Vec<String> {
     if !e.version_ok {
         why.push("the version Codex reported is not the one its binary printed".to_string());
     }
-    for (label, facts) in [("start", &e.start), ("resume", &e.resume)] {
+    for (label, facts) in [
+        ("start", &e.start),
+        ("resume", &e.resume),
+        ("read-only start", &e.read_only),
+    ] {
         match facts {
             None => why.push(format!("the thread {label} gave no answer")),
             Some(facts) => {
@@ -1061,6 +1092,12 @@ fn judge(e: &Evidence) -> Vec<String> {
     for what in &e.created {
         why.push(format!("the sandbox let a write through: {what}"));
     }
+    if !e.read_only_turn_done {
+        why.push("the read-only thread's turn did not finish".to_string());
+    }
+    if !e.read_only_asked {
+        why.push("the read-only thread's escalation did not arrive on its own thread".to_string());
+    }
     if !e.first_turn_done {
         why.push("the first turn did not finish".to_string());
     }
@@ -1081,7 +1118,7 @@ fn judge(e: &Evidence) -> Vec<String> {
     if e.announced_child.is_some() && !e.child_asked_after_announcement {
         why.push("the child's escalation did not arrive on its own thread after the parent announced it".to_string());
     }
-    for call in ["p0", "cc1", "cc0"] {
+    for call in ["ro1", "p0", "cc1", "cc0"] {
         if !e.outputs.contains(call) {
             why.push(format!(
                 "the command {call} never reported back, so what the sandbox did with it is unknown"
@@ -1170,13 +1207,29 @@ fn run_check(
     let mut evidence = Evidence::default();
     let mut notes_for_log = Vec::new();
 
-    // ---- the first process: start, one turn with a child
     let ctx = Ctx {
         home: &layout.home,
         config: &config,
         cwd: &cwd,
         binary_version: &key.version,
     };
+
+    // ---- a process of its own: a read-only thread, whose steps count as scripted like every other
+    let mut peer = Peer::spawn(program, &layout.home, &layout.project, deadline).map_err(one)?;
+    #[cfg(feature = "test-support")]
+    let asked_for = if tweaks.widen_read_only {
+        Sandbox::Project
+    } else {
+        Sandbox::ReadOnly
+    };
+    #[cfg(not(feature = "test-support"))]
+    let asked_for = Sandbox::ReadOnly;
+    let outcome = read_only_process(&mut peer, &mut evidence, &ctx, asked_for, log);
+    notes_for_log.push(peer.stderr_tail());
+    peer.finish();
+    outcome.map_err(one)?;
+
+    // ---- the first process: start, one turn with a child
     let mut peer = Peer::spawn(program, &layout.home, &layout.project, deadline).map_err(one)?;
     let outcome = first_process(&mut peer, &mut evidence, &ctx, log);
     notes_for_log.push(peer.stderr_tail());
@@ -1323,10 +1376,61 @@ struct Ctx<'a> {
     binary_version: &'a str,
 }
 
-fn start_turn(peer: &mut Peer, thread_id: &str, text: String) -> Result<(), String> {
-    let turn = serde_json::to_value(TurnStartParams::new(thread_id.to_string(), text, Reviewer::User))
-        .map_err(|e| e.to_string())?;
+fn start_turn(peer: &mut Peer, thread_id: &str, sandbox: Sandbox, text: String) -> Result<(), String> {
+    let turn = serde_json::to_value(TurnStartParams::new(
+        thread_id.to_string(),
+        text,
+        Reviewer::User,
+        sandbox,
+    ))
+    .map_err(|e| e.to_string())?;
     peer.call(method::TURN_START, turn).map(|_| ())
+}
+
+/// What a tab at a root that is no boundary runs under. `asked_for` is the sandbox sent; the echo is held to
+/// read-only whatever was sent.
+fn read_only_process(
+    peer: &mut Peer,
+    evidence: &mut Evidence,
+    ctx: &Ctx,
+    asked_for: Sandbox,
+    log: &mut Log,
+) -> Result<(), String> {
+    peer.handshake(ctx.home)?;
+    let params = serde_json::to_value(ThreadStartParams::new(
+        ctx.cwd.to_string(),
+        Reviewer::User,
+        asked_for,
+        ctx.config.clone(),
+    ))
+    .map_err(|e| e.to_string())?;
+    let facts = thread_facts(
+        peer.call(method::THREAD_START, params)?,
+        Reviewer::User,
+        Sandbox::ReadOnly,
+    )?;
+    log.line(format!(
+        "read-only thread started; the policy echo was as asked = {}",
+        facts.echo_problem.is_none()
+    ));
+    let thread_id = facts.thread_id.clone();
+    evidence.read_only = Some(facts);
+    start_turn(
+        peer,
+        &thread_id,
+        asked_for,
+        format!("{READ_ONLY_PROMPT} run the commands"),
+    )?;
+    evidence.read_only_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(&thread_id));
+    evidence.read_only_asked = peer
+        .asked
+        .iter()
+        .any(|a| a.method.ends_with("requestApproval") && a.thread_id.as_deref() == Some(thread_id.as_str()));
+    log.line(format!(
+        "the read-only turn finished = {}; its escalation was asked about = {}",
+        evidence.read_only_turn_done, evidence.read_only_asked
+    ));
+    Ok(())
 }
 
 fn first_process(peer: &mut Peer, evidence: &mut Evidence, ctx: &Ctx, log: &mut Log) -> Result<(), String> {
@@ -1335,10 +1439,15 @@ fn first_process(peer: &mut Peer, evidence: &mut Evidence, ctx: &Ctx, log: &mut 
     let params = serde_json::to_value(ThreadStartParams::new(
         ctx.cwd.to_string(),
         Reviewer::User,
+        Sandbox::Project,
         ctx.config.clone(),
     ))
     .map_err(|e| e.to_string())?;
-    let facts = thread_facts(peer.call(method::THREAD_START, params)?, Reviewer::User)?;
+    let facts = thread_facts(
+        peer.call(method::THREAD_START, params)?,
+        Reviewer::User,
+        Sandbox::Project,
+    )?;
     log.line(format!(
         "thread started; the policy echo was as asked = {}",
         facts.echo_problem.is_none()
@@ -1346,7 +1455,12 @@ fn first_process(peer: &mut Peer, evidence: &mut Evidence, ctx: &Ctx, log: &mut 
     let thread_id = facts.thread_id.clone();
     evidence.start = Some(facts);
 
-    start_turn(peer, &thread_id, format!("{PARENT_PROMPT} run the commands"))?;
+    start_turn(
+        peer,
+        &thread_id,
+        Sandbox::Project,
+        format!("{PARENT_PROMPT} run the commands"),
+    )?;
     evidence.first_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(&thread_id));
     log.line(format!("first turn finished = {}", evidence.first_turn_done));
 
@@ -1398,16 +1512,21 @@ fn second_process(
         thread_id.to_string(),
         ctx.cwd.to_string(),
         Reviewer::User,
+        Sandbox::Project,
         ctx.config.clone(),
     ))
     .map_err(|e| e.to_string())?;
-    let facts = thread_facts(peer.call(method::THREAD_RESUME, params)?, Reviewer::User)?;
+    let facts = thread_facts(
+        peer.call(method::THREAD_RESUME, params)?,
+        Reviewer::User,
+        Sandbox::Project,
+    )?;
     log.line(format!(
         "thread resumed; the policy echo was as asked = {}",
         facts.echo_problem.is_none()
     ));
     evidence.resume = Some(facts);
-    start_turn(peer, thread_id, format!("{RESUME_PROMPT} once more"))?;
+    start_turn(peer, thread_id, Sandbox::Project, format!("{RESUME_PROMPT} once more"))?;
     evidence.resumed_turn_done = peer.wait_for(TURN_BUDGET, |p| p.turn_completed(thread_id));
     log.line(format!(
         "the turn after the resume finished = {}",
@@ -1788,10 +1907,13 @@ mod tests {
         Evidence {
             start: Some(facts("parent")),
             resume: Some(facts("parent")),
+            read_only: Some(facts("read-only")),
+            read_only_turn_done: true,
+            read_only_asked: true,
             announced_child: Some("child".into()),
             child_asked_after_announcement: true,
             child_requests: 4,
-            outputs: ["p0", "cc1", "cc0"].iter().map(|s| s.to_string()).collect(),
+            outputs: ["ro1", "p0", "cc1", "cc0"].iter().map(|s| s.to_string()).collect(),
             first_turn_done: true,
             child_turn_done: true,
             resumed_turn_done: true,
@@ -1823,6 +1945,23 @@ mod tests {
         says(|e| e.resumed_turn_done = false, "after the resume");
         says(|e| e.version_ok = false, "version");
         says(|e| e.resume = None, "resume gave no answer");
+        says(|e| e.read_only = None, "read-only start gave no answer");
+        says(|e| e.read_only_turn_done = false, "read-only thread's turn");
+        says(|e| e.read_only_asked = false, "read-only thread's escalation");
+        says(
+            |e| {
+                e.outputs.remove("ro1");
+            },
+            "ro1 never reported back",
+        );
+        says(
+            |e| {
+                if let Some(f) = e.read_only.as_mut() {
+                    f.echo_problem = Some("sandbox differs".into());
+                }
+            },
+            "read-only start did not echo",
+        );
         says(
             |e| {
                 if let Some(f) = e.start.as_mut() {

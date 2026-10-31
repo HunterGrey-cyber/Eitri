@@ -100,10 +100,14 @@ pub(super) fn detail_payload(state: &AgentPanelState, tab: TabId) -> String {
                 .as_ref()
                 .map(|d| eitri_core::permission_store::path(d, &state.project_dir))
                 .as_deref(),
-            &state.trust.row(&trust_profile(&state.acp_agents, t.agent())),
-            state
-                .trust
-                .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
+            &trust_row(state, t.agent()),
+            super::starts::project_trust_at_root(
+                t.agent(),
+                state
+                    .trust
+                    .next_session_trust(&trust_profile(&state.acp_agents, t.agent())),
+                &state.project_dir,
+            ),
             &state.acp_agents,
             stop_background_keys(state.keymap_help.as_deref()).as_deref(),
         ),
@@ -264,21 +268,42 @@ pub(super) fn detail_rows(
         .collect()
 }
 
+/// The `trust` row of a tab: the answer on record, and whether it counts for this tab at this root.
+fn trust_row(state: &AgentPanelState, agent: &AgentId) -> String {
+    let row = state.trust.row(&trust_profile(&state.acp_agents, agent));
+    let counts = super::starts::project_trust_at_root(agent, ProjectTrust::Trusted, &state.project_dir);
+    if counts == ProjectTrust::Trusted {
+        row
+    } else {
+        format!("{row}; not applied here, this folder is no boundary")
+    }
+}
+
 /// What Codex does without asking, for `prefix i`: the sandbox's reach and every route around it, as
 /// they were measured, not softened. `root` is the project the sandbox is rooted at; the second half
 /// of the sentence follows the tab's mode: in auto Codex's reviewer decides, in manual every such
-/// request is a card, and in bypass Eitri allows it.
-pub(super) fn codex_runs_without_asking(root: &Path, mode: SessionModeChoice) -> String {
+/// request is a card, and in bypass Eitri allows it. At a root that is no boundary the sandbox is
+/// read-only and auto's requests are cards too.
+pub(super) fn codex_runs_without_asking(root: &Path, mode: SessionModeChoice, root_is_a_boundary: bool) -> String {
     let who_decides = match mode {
         SessionModeChoice::Bypass => "Eitri allows anything else",
-        SessionModeChoice::Manual => "you decide anything else on a card",
-        SessionModeChoice::Auto => "its reviewer decides anything else",
+        SessionModeChoice::Auto if root_is_a_boundary => "its reviewer decides anything else",
+        SessionModeChoice::Auto | SessionModeChoice::Manual => "you decide anything else on a card",
+    };
+    let sandbox = if root_is_a_boundary {
+        format!(
+            "Codex runs commands and edits inside {} without asking, reads anywhere, no network or sockets",
+            root.display()
+        )
+    } else {
+        format!(
+            "{} is no boundary, so Codex runs read-only: it reads anywhere and writes nothing, no network or sockets",
+            root.display()
+        )
     };
     format!(
-        "Codex runs commands and edits inside {} without asking, reads anywhere, no network or sockets; \
-         your exec-policy allow rules run unsandboxed; {who_decides}, which then runs with your full \
-         rights; MCP tools follow their servers' approval modes",
-        root.display()
+        "{sandbox}; your exec-policy allow rules run unsandboxed; {who_decides}, which then runs with your full \
+         rights; MCP tools follow their servers' approval modes"
     )
 }
 
@@ -290,6 +315,11 @@ pub(super) const CODEX_MODE_LAG: &str =
      sandbox for the rest of it, and Eitri draws a card, or accepts in bypass; a turn started in auto: Codex's \
      reviewer still decides for the rest of it, and Eitri draws a card for what still arrives, or accepts it \
      in bypass)";
+
+/// [`CODEX_MODE_LAG`] at a root that is no boundary, where Codex's reviewer is never its own.
+pub(super) const CODEX_MODE_LAG_NO_BOUNDARY: &str =
+    "none for the reviewer: at this folder it is you in every mode; Eitri's own answers follow the mode at once \
+     (it accepts what Codex asks in bypass, and draws a card otherwise)";
 
 /// What an ACP agent runs without a question. Eitri sets only the mode the registration names, once at the
 /// start, and does not know what any mode of the agent lets through; without one the agent's own default
@@ -407,23 +437,28 @@ pub(super) fn external_detail_rows(
         ProjectTrust::Trusted => "loaded",
         ProjectTrust::Untrusted => "not loaded",
     };
+    let boundary = eitri_core::agent_backend::root_is_a_boundary(project_dir);
     let (backend_name, session_label, settings, runs_without_asking, mode_lag, limits_label, limits_value) = if is_codex
     {
         (
             "codex app-server".to_string(),
             "thread",
             codex_settings_row(configuration_home.as_deref(), project_loaded),
-            codex_runs_without_asking(project_dir, tab.mode()),
-            CODEX_MODE_LAG.to_string(),
+            codex_runs_without_asking(project_dir, tab.mode(), boundary),
+            if boundary {
+                CODEX_MODE_LAG
+            } else {
+                CODEX_MODE_LAG_NO_BOUNDARY
+            }
+            .to_string(),
             "limits",
             limits.as_ref().map(limits_row),
         )
     } else {
         let auto_mode = match agent {
-            AgentId::Acp(name) => registered
-                .iter()
-                .find(|a| a.name == *name)
-                .and_then(|a| a.auto_mode.clone()),
+            AgentId::Acp(name) => {
+                super::trust::acp_spec(registered, name).and_then(|spec| spec.at_root(boundary).auto_mode)
+            }
             _ => None,
         };
         let context = match backend {
@@ -933,7 +968,18 @@ mod tests {
         );
     }
 
+    /// The rows of a Codex tab at a root that exists and only this account can write: a boundary.
     fn codex_rows(mode: SessionModeChoice, next: ProjectTrust) -> Vec<DetailRow> {
+        codex_rows_at(mode, next, private_root())
+    }
+
+    /// A folder of this test run's, under a private parent; never removed, as the tests share it.
+    fn private_root() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| agent::state_dirs::test_workspace_dir("detail-root"))
+    }
+
+    fn codex_rows_at(mode: SessionModeChoice, next: ProjectTrust, root: &std::path::Path) -> Vec<DetailRow> {
         // A window never starts in bypass; only the user's own `agent.default_mode` puts new tabs there.
         let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
         set.apply_configured_default(mode);
@@ -942,13 +988,33 @@ mod tests {
             set.get(tab).unwrap(),
             BackendKind::Sidecar,
             Some("work"),
-            std::path::Path::new("/p/root"),
+            root,
             Some(std::path::Path::new("/s/eitri/permissions/x.json")),
             "trusted since 2026-10-02",
             next,
             &[],
             Some("Space k"),
         )
+    }
+
+    /// A root that cannot be resolved is no boundary, so what `prefix i` says of it is what the sandbox does there:
+    /// nothing written, and a person deciding in every mode but bypass.
+    #[test]
+    fn detail_rows_for_a_codex_tab_at_a_root_that_is_no_boundary_say_it_is_read_only() {
+        let root = std::path::Path::new("/nonexistent/eitri-detail-root");
+        let row = |rows: &[DetailRow], label: &str| rows.iter().find(|r| r.label == label).unwrap().value.clone();
+        let auto = codex_rows_at(SessionModeChoice::Auto, ProjectTrust::Untrusted, root);
+        assert_eq!(
+            row(&auto, "runs without asking"),
+            "/nonexistent/eitri-detail-root is no boundary, so Codex runs read-only: it reads anywhere and writes \
+             nothing, no network or sockets; your exec-policy allow rules run unsandboxed; you decide anything else \
+             on a card, which then runs with your full rights; MCP tools follow their servers' approval modes"
+        );
+        assert_eq!(row(&auto, "mode lag"), CODEX_MODE_LAG_NO_BOUNDARY);
+        let manual = codex_rows_at(SessionModeChoice::Manual, ProjectTrust::Untrusted, root);
+        assert!(row(&manual, "runs without asking").contains("you decide anything else on a card"));
+        let bypass = codex_rows_at(SessionModeChoice::Bypass, ProjectTrust::Untrusted, root);
+        assert!(row(&bypass, "runs without asking").contains("Eitri allows anything else"));
     }
 
     /// A Codex tab says, in `prefix i`, what its sandbox lets through without a question and how a mode
@@ -1006,9 +1072,12 @@ mod tests {
         );
         assert_eq!(
             value("runs without asking"),
-            "Codex runs commands and edits inside /p/root without asking, reads anywhere, no network or sockets; \
-             your exec-policy allow rules run unsandboxed; its reviewer decides anything else, which then runs with \
-             your full rights; MCP tools follow their servers' approval modes"
+            format!(
+                "Codex runs commands and edits inside {} without asking, reads anywhere, no network or sockets; your \
+                 exec-policy allow rules run unsandboxed; its reviewer decides anything else, which then runs with \
+                 your full rights; MCP tools follow their servers' approval modes",
+                private_root().display()
+            )
         );
         assert!(value("mode lag").contains("next turn"), "{}", value("mode lag"));
         assert!(value("mode lag").contains("keeps the reviewer it started with"));
@@ -1050,6 +1119,42 @@ mod tests {
         assert!(!shown.contains("1791522750000"));
     }
 
+    /// The mode a session at this root was set to, which is not always the one named `auto_mode`.
+    #[test]
+    fn the_row_of_an_acp_tab_names_the_mode_its_root_called_for() {
+        let row_at = |root: &std::path::Path, auto_mode: Option<&str>| {
+            let registered = [AgentRegistration {
+                name: "gem".into(),
+                command: vec!["gem-acp".into()],
+                project_files: vec![".gem/".into()],
+                auto_mode: auto_mode.map(str::to_string),
+                read_only_mode: Some("plan".into()),
+            }];
+            let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+            let tab = set.open(AgentId::Acp("gem".into()));
+            let rows = detail_rows(
+                set.get(tab).unwrap(),
+                BackendKind::Sidecar,
+                None,
+                root,
+                None,
+                "not checked yet",
+                ProjectTrust::Untrusted,
+                &registered,
+                Some("Space k"),
+            );
+            rows.iter()
+                .find(|r| r.label == "runs without asking")
+                .unwrap()
+                .value
+                .clone()
+        };
+        let no_boundary = std::path::Path::new("/nonexistent/eitri-detail-root");
+        assert!(row_at(no_boundary, Some("auto")).contains("mode plan"));
+        assert!(row_at(no_boundary, None).contains("mode plan"));
+        assert!(row_at(private_root(), Some("auto")).contains("mode auto"));
+    }
+
     #[test]
     fn detail_rows_for_an_acp_tab_follow_its_registration() {
         let registration = |auto_mode: Option<&str>| AgentRegistration {
@@ -1057,6 +1162,7 @@ mod tests {
             command: vec!["gem-acp".into()],
             project_files: vec![".gem/".into()],
             auto_mode: auto_mode.map(str::to_string),
+            read_only_mode: None,
         };
         let rows_for = |registered: &[AgentRegistration]| {
             let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);

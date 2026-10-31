@@ -97,6 +97,7 @@ fn request(resume: Option<&str>, project_only: &[&str]) -> ExternalStart {
         plan: plan(project_only),
         policy: TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
         resume: resume.map(str::to_string),
     }
@@ -162,15 +163,43 @@ fn good_echo() -> ThreadEcho {
 
 #[test]
 fn the_expected_echo_passes() {
-    assert!(check_echo(&expected_echo(Reviewer::User), &good_echo()).is_ok());
+    assert!(check_echo(&expected_echo(Reviewer::User, agent::Sandbox::Project), &good_echo()).is_ok());
     let mut auto = good_echo();
     auto.approvals_reviewer = Some(json!("auto_review"));
-    assert!(check_echo(&expected_echo(Reviewer::Agent), &auto).is_ok());
+    assert!(check_echo(&expected_echo(Reviewer::Agent, agent::Sandbox::Project), &auto).is_ok());
+}
+
+/// A session asked to be read-only that says it is not, and the other way round: either way what Eitri believes the
+/// tab runs under is not what it runs under.
+#[test]
+fn the_sandbox_echoed_must_be_the_one_asked_for() {
+    let read_only = ThreadEcho {
+        sandbox: Some(json!({"type": "readOnly", "networkAccess": false})),
+        ..good_echo()
+    };
+    let as_read_only = expected_echo(Reviewer::User, agent::Sandbox::ReadOnly);
+    let as_workspace = expected_echo(Reviewer::User, agent::Sandbox::Project);
+    assert!(check_echo(&as_read_only, &read_only).is_ok());
+    assert!(check_echo(&as_read_only, &good_echo()).is_err(), "a wider sandbox");
+    assert!(check_echo(&as_workspace, &read_only).is_err(), "a narrower one");
+    let with_network = ThreadEcho {
+        sandbox: Some(json!({"type": "readOnly", "networkAccess": true})),
+        ..good_echo()
+    };
+    assert!(
+        check_echo(&as_read_only, &with_network).is_err(),
+        "read-only with network"
+    );
+    let silent = ThreadEcho {
+        sandbox: None,
+        ..good_echo()
+    };
+    assert!(check_echo(&as_read_only, &silent).is_err(), "no sandbox reported");
 }
 
 #[test]
 fn echo_mismatch_trips() {
-    let sent = expected_echo(Reviewer::User);
+    let sent = expected_echo(Reviewer::User, agent::Sandbox::Project);
     let cases: Vec<(&str, Box<dyn Fn(&mut ThreadEcho)>)> = vec![
         (
             "a different reviewer",
@@ -220,7 +249,8 @@ fn echo_mismatch_trips() {
 fn echo_without_sandbox_field_trips() {
     let mut got = good_echo();
     got.sandbox = None;
-    let mismatch = check_echo(&expected_echo(Reviewer::User), &got).expect_err("an absent sandbox");
+    let mismatch =
+        check_echo(&expected_echo(Reviewer::User, agent::Sandbox::Project), &got).expect_err("an absent sandbox");
     assert!(mismatch.reported.contains("sandbox absent"), "{mismatch}");
 
     // The other two fields fail closed the same way.
@@ -230,7 +260,10 @@ fn echo_without_sandbox_field_trips() {
             "approvalPolicy" => got.approval_policy = None,
             _ => got.approvals_reviewer = None,
         }
-        assert!(check_echo(&expected_echo(Reviewer::User), &got).is_err(), "{field}");
+        assert!(
+            check_echo(&expected_echo(Reviewer::User, agent::Sandbox::Project), &got).is_err(),
+            "{field}"
+        );
     }
 }
 
@@ -390,6 +423,7 @@ fn a_turn_after_an_unread_tripwire_is_refused() {
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     );
     match sent {
@@ -505,6 +539,7 @@ fn a_tripped_session_takes_no_turn() {
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     );
     assert!(matches!(
@@ -777,6 +812,7 @@ fn resume_of_a_thread_held_elsewhere_is_rejected_with_codex_message() {
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     );
     assert!(refused.is_err());
@@ -820,6 +856,7 @@ fn a_resume_that_continues_another_thread_is_not_taken() {
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     );
     assert!(
@@ -873,6 +910,7 @@ fn a_tripwire_behind_a_flood_still_stops_the_next_turn() {
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     );
     assert!(

@@ -1462,6 +1462,7 @@ mod tests {
             command: vec!["gem-acp".into(), "--stdio".into()],
             project_files: vec![".gem/".into(), "GEM.md".into()],
             auto_mode: Some("auto_edit".into()),
+            read_only_mode: None,
         }
     }
 

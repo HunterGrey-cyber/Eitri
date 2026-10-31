@@ -153,6 +153,7 @@ fn start_for(cwd: &Path, resume: Option<&str>) -> ExternalStart {
         },
         policy: TurnPolicy {
             reviewer: Reviewer::Agent,
+            sandbox: agent::Sandbox::Project,
         },
         resume: resume.map(str::to_string),
     }
@@ -221,6 +222,7 @@ fn plain_send_turn_on_external_is_refused() {
     // The door that is open carries the policy.
     let policy = TurnPolicy {
         reviewer: Reviewer::User,
+        sandbox: agent::Sandbox::Project,
     };
     assert_eq!(conversation.send_turn_with("hello", policy).unwrap(), "turn-1");
     assert_eq!(
@@ -249,6 +251,7 @@ fn send_turn_with_refuses_while_a_turn_is_active() {
     });
     let policy = TurnPolicy {
         reviewer: Reviewer::Agent,
+        sandbox: agent::Sandbox::Project,
     };
     assert!(matches!(
         conversation.send_turn_with("again", policy),

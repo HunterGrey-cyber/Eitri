@@ -63,7 +63,10 @@ fn launch() -> CodexLaunch {
 }
 
 fn policy(reviewer: Reviewer) -> TurnPolicy {
-    TurnPolicy { reviewer }
+    TurnPolicy {
+        reviewer,
+        sandbox: agent::Sandbox::Project,
+    }
 }
 
 /// A started session on `thread` with one turn `turn` running, then `rest`.

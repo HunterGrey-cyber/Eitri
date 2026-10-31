@@ -20,7 +20,7 @@ use agent::setting_sources::ProjectTrust;
 use agent::{
     AgentConversation, AgentDomainEvent, AgentSession, AgentSessionProjection, ClaudeSidecarProvider,
     ConversationError, PermissionDecision, PermissionMode, ProjectionGuard, ProviderCapabilities, ProviderInfo,
-    ResumableSession, Reviewer, RevisedDelivery, TrustPlan, TurnPolicy,
+    ResumableSession, Reviewer, RevisedDelivery, Sandbox, TrustPlan, TurnPolicy,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -225,11 +225,20 @@ pub enum ExternalLaunch {
 /// The policy a turn of an external agent runs under, from the tab's mode: in Auto the agent's own
 /// reviewer decides what still needs asking; in Manual and Bypass every request reaches Eitri, which
 /// shows each one as a card in Manual and answers it in Bypass.
-pub fn turn_policy(mode: SessionModeChoice) -> TurnPolicy {
+///
+/// At a root that is no boundary the agent writes nothing unasked, and an Auto tab's requests come to
+/// Eitri as well: a reviewer that approves an escalation would make the sandbox no gate at all, and
+/// every uncertainty here ends on a card, as a Claude tab's does at such a root.
+pub fn turn_policy(mode: SessionModeChoice, root_is_a_boundary: bool) -> TurnPolicy {
     TurnPolicy {
         reviewer: match mode {
-            SessionModeChoice::Auto => Reviewer::Agent,
-            SessionModeChoice::Manual | SessionModeChoice::Bypass => Reviewer::User,
+            SessionModeChoice::Auto if root_is_a_boundary => Reviewer::Agent,
+            SessionModeChoice::Auto | SessionModeChoice::Manual | SessionModeChoice::Bypass => Reviewer::User,
+        },
+        sandbox: if root_is_a_boundary {
+            Sandbox::Project
+        } else {
+            Sandbox::ReadOnly
         },
     }
 }
@@ -665,8 +674,11 @@ impl AgentBackend {
                 )
             }
             (AgentId::Acp(name), ExternalLaunch::Acp(spec)) if spec.name == *name => std::sync::Arc::new(
-                agent::providers::acp::AcpProvider::connect(spec, canonical.clone())
-                    .map_err(|e| BackendError::fatal(format!("{name} could not start: {e}")))?,
+                agent::providers::acp::AcpProvider::connect(
+                    spec.at_root(root_is_a_boundary(project_dir)),
+                    canonical.clone(),
+                )
+                .map_err(|e| BackendError::fatal(format!("{name} could not start: {e}")))?,
             ),
             _ => {
                 return Err(BackendError::fatal(format!(
@@ -675,11 +687,13 @@ impl AgentBackend {
                 )))
             }
         };
-        Self::start_external_with(agent, provider, &canonical, plan, mode, resume)
+        Self::start_external_with(agent, provider, project_dir, plan, mode, resume)
     }
 
     /// [`start_external`](Self::start_external) over a provider the caller already has: what it does
     /// once its provider is connected, and the way a test drives an external tab without a child.
+    /// `project_dir` is the window's root as the window holds it, not what it resolves to: the judgement
+    /// of the root reads the difference.
     pub fn start_external_with(
         agent: AgentId,
         provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync>,
@@ -694,7 +708,7 @@ impl AgentBackend {
         let start = agent::ExternalStart {
             cwd: canonical.to_string_lossy().into_owned(),
             plan,
-            policy: turn_policy(mode),
+            policy: turn_policy(mode, root_is_a_boundary(project_dir)),
             resume: resume.map(str::to_string),
         };
         let conversation = match resume {
@@ -958,11 +972,16 @@ impl AgentBackend {
     /// its tab's mode is applied where requests are answered (`take_revised_ui_delivery`), never
     /// sent to the CLI. An external agent's turn carries it as the turn's reviewer, so a mode change
     /// reaches the agent at the next turn, while Eitri's own answering follows the mode at once.
+    ///
+    /// `project_root` is the window's root, which the gate judges; `None` before the window's first
+    /// pump. The conversation's own is what that path resolved to when it started, so it cannot show a
+    /// folder that had already been replaced by a link.
     pub fn send_turn_in(
         &mut self,
         wire_text: &str,
         as_typed: &str,
         mode: SessionModeChoice,
+        project_root: Option<&Path>,
         origin: agent::PromptOrigin,
     ) -> Result<SubmittedPrompt, BackendError> {
         if !self.agent().is_external() {
@@ -975,7 +994,9 @@ impl AgentBackend {
         // agent's first event of the turn.
         let after_revision = conversation.projection().last_revision;
         conversation.fold_locally(user_prompt_event(as_typed));
-        let turn_id = conversation.send_turn_with(wire_text, turn_policy(mode))?;
+        let root = project_root.unwrap_or(conversation.canonical_cwd());
+        let policy = turn_policy(mode, root_is_a_boundary(root));
+        let turn_id = conversation.send_turn_with(wire_text, policy)?;
         conversation.note_title(as_typed);
         Ok(SubmittedPrompt {
             client_message_id: uuid::Uuid::new_v4().to_string(),
@@ -1820,8 +1841,9 @@ struct GateRequest<'a> {
 }
 
 /// Whether the gate would take `project_root` for a boundary, with the home directory
-/// `agent::classify_permission_request` reads, so a deferral and a card never disagree about a root.
-fn root_is_a_boundary(project_root: &Path) -> bool {
+/// `agent::classify_permission_request` reads, so a deferral, a card and an external agent's sandbox
+/// never disagree about a root.
+pub fn root_is_a_boundary(project_root: &Path) -> bool {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     agent::project_boundary::refusal(
         project_root,
@@ -2753,9 +2775,26 @@ mod tests {
     /// Manual gives Codex's reviewer to the user, as Bypass does: every escalation reaches Eitri.
     #[test]
     fn a_manual_turn_hands_codex_reviews_to_the_user() {
-        assert_eq!(turn_policy(SessionModeChoice::Manual).reviewer, Reviewer::User);
-        assert_eq!(turn_policy(SessionModeChoice::Auto).reviewer, Reviewer::Agent);
-        assert_eq!(turn_policy(SessionModeChoice::Bypass).reviewer, Reviewer::User);
+        let at_a_boundary = |mode| turn_policy(mode, true);
+        assert_eq!(at_a_boundary(SessionModeChoice::Manual).reviewer, Reviewer::User);
+        assert_eq!(at_a_boundary(SessionModeChoice::Auto).reviewer, Reviewer::Agent);
+        assert_eq!(at_a_boundary(SessionModeChoice::Bypass).reviewer, Reviewer::User);
+        for mode in [
+            SessionModeChoice::Manual,
+            SessionModeChoice::Auto,
+            SessionModeChoice::Bypass,
+        ] {
+            assert_eq!(at_a_boundary(mode).sandbox, Sandbox::Project);
+            // Nobody but the user reviews where there is no boundary, in Auto too: a reviewer that approves
+            // an escalation would be a way past the read-only sandbox with no card.
+            assert_eq!(
+                turn_policy(mode, false),
+                TurnPolicy {
+                    reviewer: Reviewer::User,
+                    sandbox: Sandbox::ReadOnly,
+                }
+            );
+        }
     }
 
     #[test]
@@ -6116,16 +6155,103 @@ mod external_tests {
                 "hello",
                 "hello",
                 SessionModeChoice::Bypass,
+                Some(&dir),
                 agent::PromptOrigin::Composed,
             )
             .expect("the tab's door carries the mode");
         assert_eq!(
             provider.policies(),
             vec![TurnPolicy {
-                reviewer: Reviewer::User
+                reviewer: Reviewer::User,
+                sandbox: Sandbox::Project,
             }]
         );
         assert_eq!(provider.starts()[0].policy.reviewer, Reviewer::Agent, "started in Auto");
+        backend.shutdown();
+    }
+
+    /// The root is judged at a start and again at every turn, by what the gate reads: other users able to write
+    /// to the folder is what makes it no boundary here.
+    #[test]
+    fn an_external_tab_is_read_only_while_its_root_is_no_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let set_mode = |dir: &Path, mode: u32| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let dir = workspace("external-no-boundary");
+        set_mode(&dir, 0o777);
+        let (provider, mut backend) = codex_backend(&dir);
+        let read_only = TurnPolicy {
+            reviewer: Reviewer::User,
+            sandbox: Sandbox::ReadOnly,
+        };
+        assert_eq!(provider.starts()[0].policy, read_only, "an Auto tab, at the start");
+        let send = |backend: &mut AgentBackend| {
+            backend
+                .send_turn_in(
+                    "hello",
+                    "hello",
+                    SessionModeChoice::Auto,
+                    Some(&dir),
+                    agent::PromptOrigin::Composed,
+                )
+                .expect("the turn goes");
+        };
+        send(&mut backend);
+
+        // The folder closes up, and the next turn is the workspace's with the reviewer the tab asked for.
+        set_mode(&dir, 0o700);
+        send(&mut backend);
+
+        // And it opens again, with no restart: the next turn narrows at once.
+        set_mode(&dir, 0o777);
+        send(&mut backend);
+        set_mode(&dir, 0o700);
+
+        assert_eq!(
+            provider.policies(),
+            vec![
+                read_only,
+                TurnPolicy {
+                    reviewer: Reviewer::Agent,
+                    sandbox: Sandbox::Project,
+                },
+                read_only,
+            ]
+        );
+        backend.shutdown();
+    }
+
+    /// A window's folder replaced by a link to a private one, before the tab starts. What it resolves to is a
+    /// fine boundary, so judging that would miss what the gate calls a root that has moved, and the tab would
+    /// write there: the judgement is of the path the window holds, at the start and at every turn after it.
+    #[test]
+    fn a_root_replaced_by_a_link_is_read_only_at_the_start_and_after_it() {
+        let target = workspace("external-moved-target");
+        let window_root = target.with_file_name(format!("{}-link", target.file_name().unwrap().to_string_lossy()));
+        std::os::unix::fs::symlink(&target, &window_root).unwrap();
+        assert!(root_is_a_boundary(&target), "the folder it points at is one");
+        let read_only = TurnPolicy {
+            reviewer: Reviewer::User,
+            sandbox: Sandbox::ReadOnly,
+        };
+        let (provider, mut backend) = codex_backend(&window_root);
+        assert_eq!(provider.starts()[0].policy, read_only);
+        assert_eq!(
+            provider.starts()[0].cwd,
+            target.to_string_lossy(),
+            "the agent runs in what the link resolves to, so the conversation's own path looks clean"
+        );
+        backend
+            .send_turn_in(
+                "hello",
+                "hello",
+                SessionModeChoice::Auto,
+                Some(&window_root),
+                agent::PromptOrigin::Composed,
+            )
+            .expect("the turn goes");
+        assert_eq!(provider.policies(), vec![read_only]);
         backend.shutdown();
     }
 
@@ -6139,6 +6265,7 @@ mod external_tests {
                 name: name.into(),
                 argv: vec!["/nonexistent/eitri-never-run".into()],
                 auto_mode: None,
+                read_only_mode: None,
             })
         };
         for (agent, launch) in [
@@ -6167,7 +6294,7 @@ mod external_tests {
         let start = agent::ExternalStart {
             cwd: dir.to_string_lossy().into_owned(),
             plan: empty_trust_plan(),
-            policy: turn_policy(SessionModeChoice::Auto),
+            policy: turn_policy(SessionModeChoice::Auto, true),
             resume: None,
         };
         let conversation = AgentConversation::create_external(provider, start, &dir).unwrap();

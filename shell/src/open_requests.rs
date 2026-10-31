@@ -78,10 +78,10 @@ fn hand_over_in(
     if launch.open.is_empty() || launch.new_window || clean || backend == BackendKind::Legacy {
         return None;
     }
-    match deliver(&launch.open, &launch.root, dir, hint, token) {
+    match deliver(&launch.open, &launch.root, &launch.wider_roots, dir, hint, token) {
         Delivered::NotHere => None,
-        Delivered::Opened => {
-            println!("{}", opened_line(dir, &launch.root, hint));
+        Delivered::Opened { root } => {
+            println!("{}", opened_line(root.as_deref()));
             Some(glib::ExitCode::SUCCESS)
         }
         // The window has the rest, so a new window would hold those files twice.
@@ -94,14 +94,13 @@ fn hand_over_in(
     }
 }
 
-/// What a launch says once a window took its files. It names `root` only if `root`'s own socket was the one asked: the
-/// window behind a terminal's socket can be a wider root than the one worked out here (`cd crate` in a repository's
-/// window), and a client is not told the root of the window that answers.
-fn opened_line(dir: &Path, root: &Path, hint: Option<&Path>) -> String {
-    if hint.is_none_or(|hint| socket_path(dir, root).is_ok_and(|socket| socket == hint)) {
-        format!("eitri: opened in the running window of {}", root.display())
-    } else {
-        "eitri: opened in the running window".to_owned()
+/// What a launch says once a window took its files. It names a root only when that root's own socket was the one
+/// asked: the window behind a terminal's socket can be any window, and a client is not told the root of the window
+/// that answers.
+fn opened_line(root: Option<&Path>) -> String {
+    match root {
+        Some(root) => format!("eitri: opened in the running window of {}", root.display()),
+        None => "eitri: opened in the running window".to_owned(),
     }
 }
 
@@ -315,6 +314,7 @@ mod tests {
         fn launch(&self, open: &[&Path]) -> Launch {
             Launch {
                 root: self.root.clone(),
+                wider_roots: Vec::new(),
                 open: open
                     .iter()
                     .map(|path| OpenTarget {
@@ -632,21 +632,38 @@ mod tests {
     }
 
     #[test]
-    fn the_opened_line_names_the_root_only_when_its_own_socket_was_the_one_asked() {
-        let scratch = Scratch::new();
-        let named = format!("eitri: opened in the running window of {}", scratch.root.display());
-        let roots = socket_path(&scratch.dir, &scratch.root).unwrap();
-        assert_eq!(opened_line(&scratch.dir, &scratch.root, None), named);
-        assert_eq!(opened_line(&scratch.dir, &scratch.root, Some(&roots)), named);
+    fn the_opened_line_names_a_root_only_when_its_own_socket_was_the_one_asked() {
         assert_eq!(
-            opened_line(
-                &scratch.dir,
-                &scratch.root,
-                Some(Path::new("/run/user/1/eitri/open-other.sock"))
-            ),
-            "eitri: opened in the running window",
-            "the terminal's window can be a wider root than the one worked out here"
+            opened_line(Some(Path::new("/w/repo"))),
+            "eitri: opened in the running window of /w/repo"
         );
+        assert_eq!(
+            opened_line(None),
+            "eitri: opened in the running window",
+            "the terminal's window can be any window"
+        );
+    }
+
+    /// `cd repo/crate; eitri src/x.rs` with a window on `repo`: the launch goes no further.
+    #[test]
+    fn a_launch_a_window_on_a_wider_root_took_ends_with_success() {
+        let scratch = Scratch::new();
+        let sink = Rc::new(RecordingSink::default());
+        let requests = scratch.requests(&sink);
+        let narrow = scratch.root.join("crate");
+        std::fs::create_dir(&narrow).unwrap();
+        let file = narrow.join("x.rs");
+        std::fs::write(&file, "text").unwrap();
+        let launch = Launch {
+            wider_roots: vec![scratch.root.clone()],
+            root: narrow,
+            ..scratch.launch(&[&file])
+        };
+        assert_eq!(
+            launched(&scratch, launch, &requests, &sink, &[true]),
+            Some(glib::ExitCode::SUCCESS)
+        );
+        assert_eq!(opens(&sink)[0].1, file);
     }
 
     #[test]

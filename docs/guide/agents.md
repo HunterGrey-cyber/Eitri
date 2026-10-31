@@ -269,6 +269,13 @@ project's Codex configuration cannot widen it. Inside it:
 - A request to leave the sandbox is a card in Manual, decided by the reviewer in Auto and approved by Eitri in
   Bypass. A command approved that way runs with your full rights.
 
+At a [folder that is no boundary](permissions.md#a-folder-that-is-no-boundary) Codex runs in its `read-only` sandbox
+instead: it reads as above and writes nothing, with no network or sockets, so every write has to ask to leave the
+sandbox. There the request is a card in Auto as well, and only Bypass approves it unasked. The other routes above stay
+as they are: your exec-policy `allow` rules and the MCP tools. The project's own Codex configuration does not load
+there, even after a `y` to the trust question. Eitri looks at the folder at each start and each turn, and subagents
+inherit the sandbox.
+
 `<prefix> i` spells this out for the tab on screen in the `runs without asking` row, and the row follows the
 tab's mode.
 
@@ -320,6 +327,7 @@ eitri.agent.register({
   command = { "my-acp-agent", "--acp" },         -- the program and its arguments
   project_files = { ".myagent/", "MYAGENT.md" }, -- what the agent reads from a project
   auto_mode = "auto",                            -- optional: a mode id of the agent
+  read_only_mode = "plan",                       -- optional: the mode for a folder that is no boundary
 })
 ```
 
@@ -332,6 +340,9 @@ eitri.agent.register({
   directory) the agent reads from a project, one name each, with no `/` inside. Eitri uses it for the trust
   question below. List everything the agent reads: Eitri cannot know that for you.
 - **`auto_mode`** is optional: the id of one mode of the agent. See [Modes](#modes-and-the-agents-own-settings).
+- **`read_only_mode`** is optional: the id of the mode to use instead of `auto_mode` at a
+  [folder that is no boundary](permissions.md#a-folder-that-is-no-boundary). Eitri cannot tell what a mode does, so
+  name one that only reads. Without it the agent keeps its usual mode at such a folder.
 
 Any other key, or a bad value, stops Eitri at startup and names the key, and a `pcall` around the call does not
 hide it. Then `:tabnew myagent` opens a tab of it, and `agent.default` may name it; `agent.default` is read after
@@ -367,8 +378,9 @@ about that for a generic agent. (A Codex tab refuses a relative `CODEX_HOME` for
 Eitri offers the agent no file or terminal methods and never calls its authentication step. It sets nothing
 on the agent except one thing: when the registration has `auto_mode`, that mode id is set at the start of every session, in
 both Eitri modes. Eitri then checks every report of the agent's mode against it: a refusal to set it, or a
-difference, ends the tab with a mismatch message and nothing is answered after that. Without `auto_mode` Eitri
-sets and checks nothing, and `prefix i` says in its `runs without asking` row that Eitri does not know what the
+difference, ends the tab with a mismatch message and nothing is answered after that. At a folder that is no boundary
+`read_only_mode`, when there is one, takes the place of `auto_mode` in all of this. Without either Eitri sets and
+checks nothing, and `prefix i` says in its `runs without asking` row that Eitri does not know what the
 agent runs without asking.
 
 Eitri's Auto and Bypass are Eitri's own: they decide how Eitri answers the agent's requests, at once, and never

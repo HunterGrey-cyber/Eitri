@@ -123,8 +123,15 @@ own, such as `eitri ~/notes.md`. It applies to every window on such a folder, ho
   that would otherwise leave the call to Claude Code's own classifier is answered by Eitri's rules instead, which
   ask here.
 - **Bypass does not ask**, as everywhere: you chose it.
-- **A Codex tab is not covered by any of this.** It keeps its `workspace-write` sandbox, so it can write anywhere in
-  that folder without a card.
+- **A Codex tab starts read-only.** Nothing is written from inside its sandbox, and a write has to ask to leave it,
+  through Codex's own approval flow. That is a card in Manual and in Auto, because at such a folder Codex's own
+  reviewer does not decide; Bypass answers the request itself. The project's own Codex configuration does not load
+  there, whatever you answer to the trust question: a rule or a hook in the folder could take a command out of the
+  sandbox with no card. What your own exec-policy `allow` rules cover still runs outside the sandbox, and MCP tools
+  still follow their servers' approval modes. The folder is looked at again at every turn.
+- **A tab of a registered agent keeps its own rules.** ACP has no sandbox for Eitri to ask for, and Eitri cannot tell
+  what an agent's modes mean. A registration can name a [`read_only_mode`](agents.md#other-agents-over-acp), which is set
+  instead of `auto_mode` at such a folder, once, at the start. Without one the agent's mode stands.
 
 ## Saved rules
 
@@ -261,7 +268,9 @@ Claude tab the panel then asks a short question that takes only `n` (start witho
 or `Esc`; a `y` is refused. `:trust` says the configuration is too large to show and trusts nothing. Such a
 project cannot be trusted in Eitri at all.
 
-- `y` trusts the project and loads its configuration. `n` starts the session without it. `Esc` puts the
+- `y` trusts the project and loads its configuration, except for a Codex tab at
+  [a folder that is no boundary](#a-folder-that-is-no-boundary), which starts without it all the same.
+  `n` starts the session without it. `Esc` puts the
   question off: a first message goes back to the box, and a resume is dropped with the message "not started:
   the trust question was put off". A restore put off this way keeps its sessions: the tabs come back as failed
   tabs that still hold their conversations (`r` in a tab starts it again), and a restore you asked for from the

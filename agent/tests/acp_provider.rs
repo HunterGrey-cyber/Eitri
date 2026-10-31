@@ -129,6 +129,7 @@ fn spec(script: Vec<Value>, auto_mode: Option<&str>) -> AcpAgentSpec {
             OsString::from(Value::Array(script).to_string()),
         ],
         auto_mode: auto_mode.map(str::to_string),
+        read_only_mode: None,
     }
 }
 
@@ -147,6 +148,7 @@ fn start_request(resume: Option<&str>) -> ExternalStart {
         },
         policy: TurnPolicy {
             reviewer: Reviewer::Agent,
+            sandbox: agent::Sandbox::Project,
         },
         resume: resume.map(str::to_string),
     }
@@ -167,6 +169,7 @@ fn send(provider: &AcpProvider, text: &str) -> Result<String, ProviderError> {
         },
         TurnPolicy {
             reviewer: Reviewer::Agent,
+            sandbox: agent::Sandbox::Project,
         },
     )
 }
@@ -1024,6 +1027,70 @@ fn an_unreadable_mode_report_after_setting_the_mode_opens_and_trips() {
     }
 }
 
+/// ACP has no sandbox to ask for and Eitri cannot tell what a mode means, so only a registration can say which one is
+/// read-only. With none, the agent's own rules stand, as the window's note says.
+#[test]
+fn the_read_only_mode_stands_for_the_registered_one_at_a_root_that_is_no_boundary() {
+    let named = AcpAgentSpec {
+        name: "stand-in".to_string(),
+        argv: Vec::new(),
+        auto_mode: Some("auto".to_string()),
+        read_only_mode: Some("plan".to_string()),
+    };
+    let mode_at = |spec: &AcpAgentSpec, boundary: bool| spec.clone().at_root(boundary).auto_mode;
+    assert_eq!(mode_at(&named, true).as_deref(), Some("auto"));
+    assert_eq!(mode_at(&named, false).as_deref(), Some("plan"));
+    let unnamed = AcpAgentSpec {
+        read_only_mode: None,
+        ..named.clone()
+    };
+    assert_eq!(mode_at(&unnamed, false).as_deref(), Some("auto"));
+    let only_read_only = AcpAgentSpec {
+        auto_mode: None,
+        ..named
+    };
+    assert_eq!(mode_at(&only_read_only, true), None);
+    assert_eq!(mode_at(&only_read_only, false).as_deref(), Some("plan"));
+}
+
+/// Set at the start and held to from then on, by the path `auto_mode` takes: an agent that leaves it stops the tab.
+#[test]
+fn a_read_only_mode_is_set_and_held_like_the_registered_one() {
+    let mut script = boot("agent");
+    script.extend([
+        expect_request(3, "session/set_mode", json!({"sessionId": "s1", "modeId": "plan"})),
+        reply(3, json!({})),
+        update(
+            "s1",
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "auto"}),
+        ),
+    ]);
+    let at_such_a_root = AcpAgentSpec {
+        read_only_mode: Some("plan".to_string()),
+        ..spec(script, Some("auto"))
+    }
+    .at_root(false);
+    let provider = AcpProvider::connect(at_such_a_root, std::env::temp_dir()).expect("connects");
+    provider.start(start_request(None)).expect("starts");
+    assert_eq!(provider.auto_mode(), Some("plan"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let events = provider.pump();
+        if events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. }))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent left the mode unnoticed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(send(&provider, "x").is_err());
+}
+
 #[test]
 fn mode_mismatch_trips() {
     // The registered mode is set when the session is in another, and a later report of a different mode
@@ -1223,6 +1290,7 @@ fn send_to(provider: &AcpProvider, session: &str, text: &str) -> Result<String, 
         },
         TurnPolicy {
             reviewer: Reviewer::Agent,
+            sandbox: agent::Sandbox::Project,
         },
     )
 }
@@ -1423,6 +1491,7 @@ fn a_request_whose_input_would_be_cut_cannot_be_approved() {
                 OsString::from(format!("@{}", file.display())),
             ],
             auto_mode: None,
+            read_only_mode: None,
         },
         std::env::temp_dir(),
     )
@@ -1485,6 +1554,7 @@ fn a_request_whose_diff_would_not_be_shown_whole_cannot_be_approved() {
                 OsString::from(format!("@{}", file.display())),
             ],
             auto_mode: None,
+            read_only_mode: None,
         },
         std::env::temp_dir(),
     )
@@ -1706,6 +1776,7 @@ echo "stand-in: gone" >&2
             OsString::from(&gate),
         ],
         auto_mode: None,
+        read_only_mode: None,
     };
     let provider = std::sync::Arc::new(AcpProvider::connect(agent, std::env::temp_dir()).expect("connects"));
     provider.start(start_request(None)).expect("starts");

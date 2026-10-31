@@ -820,7 +820,12 @@ fn a_codex_app_server_keeps_its_turn_when_its_stdio_moves_to_another_process() {
     let thread = json_str(&wire.answer_to(2, "thread/start"), "/thread/id")
         .expect("a thread id")
         .to_string();
-    let params = TurnStartParams::new(thread.clone(), "PX0-PROMPT".to_string(), Reviewer::User);
+    let params = TurnStartParams::new(
+        thread.clone(),
+        "PX0-PROMPT".to_string(),
+        Reviewer::User,
+        agent::Sandbox::Project,
+    );
     wire.request(3, method::TURN_START, serde_json::to_value(params).expect("params"));
     let turn = json_str(&wire.answer_to(3, "turn/start"), "/turn/id")
         .expect("a turn id")

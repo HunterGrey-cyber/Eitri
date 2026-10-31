@@ -51,12 +51,12 @@ const FIELDS: &[(&str, &[&str], &[&str])] = &[
     (
         "sandbox",
         &["read-only", "workspace-write", "danger-full-access"],
-        &["workspace-write"],
+        &["read-only", "workspace-write"],
     ),
     (
         "sandboxPolicy.type",
         &["readOnly", "workspaceWrite", "dangerFullAccess", "externalSandbox"],
-        &["workspaceWrite"],
+        &["readOnly", "workspaceWrite"],
     ),
     (
         "decision",
@@ -629,7 +629,8 @@ fn refused_values_fail() {
         "const P: &str = \"never\";",
         "const P: &str = \"on-failure\";",
         "const S: &str = \"danger-full-access\";",
-        "const T: &str = \"readOnly\";",
+        "const T: &str = \"dangerFullAccess\";",
+        "const T: &str = \"externalSandbox\";",
         "fn d() -> &'static str { \"acceptForSession\" }",
         "const J: &str = r#\"{\"scope\":\"session\"}\"#;",
         "const J: &str = \"{\\\"approvalPolicy\\\":\\\"never\\\"}\";",

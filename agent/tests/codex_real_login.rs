@@ -139,8 +139,13 @@ fn login_thread(peer: &mut Peer, project: &Path, trust: DirTrust, reviewer: Revi
     let names = account_tool_servers(peer);
     let off: Vec<&str> = names.iter().map(String::as_str).collect();
     let config = codex_posture::config(project, trust, &off);
-    let mut params =
-        serde_json::to_value(ThreadStartParams::new(text_of(project).to_string(), reviewer, config)).expect("params");
+    let mut params = serde_json::to_value(ThreadStartParams::new(
+        text_of(project).to_string(),
+        reviewer,
+        agent::Sandbox::Project,
+        config,
+    ))
+    .expect("params");
     params["model"] = json!(model);
     params["config"]["model_reasoning_effort"] = json!(effort());
     // The tests leave nothing behind in the account's Codex home.
@@ -149,8 +154,13 @@ fn login_thread(peer: &mut Peer, project: &Path, trust: DirTrust, reviewer: Revi
 }
 
 fn login_turn(peer: &mut Peer, thread: &str, reviewer: Reviewer, text: &str) -> String {
-    let params =
-        serde_json::to_value(TurnStartParams::new(thread.to_string(), text.to_string(), reviewer)).expect("params");
+    let params = serde_json::to_value(TurnStartParams::new(
+        thread.to_string(),
+        text.to_string(),
+        reviewer,
+        agent::Sandbox::Project,
+    ))
+    .expect("params");
     let answer = peer.call(method::TURN_START, params).expect("turn/start");
     let turn = json_str(&answer, "/turn/id").expect("a turn id").to_string();
     peer.wait_turn(thread, &turn, REAL_TURN)

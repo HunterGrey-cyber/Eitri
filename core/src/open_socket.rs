@@ -681,8 +681,9 @@ impl fmt::Debug for OpenServer {
 /// What became of a client's targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivered {
-    /// A window took every target.
-    Opened,
+    /// A window took every target. `root` is that window's when its own socket was the one asked; a hint can be any
+    /// window's, and a client is not told which.
+    Opened { root: Option<PathBuf> },
     /// A window took the one that decides, and these failed after it, with the reason.
     Partly { failed: Vec<(PathBuf, String)> },
     /// No window took anything: start a new one.
@@ -749,16 +750,25 @@ fn send(sock: &Path, target: &OpenTarget, token: Option<&str>, me: u32, within: 
     }
 }
 
-/// Tries to give `open` to a running window: `hint` first, then the root's socket when every target
-/// is inside the root. Targets go last to first, one connection each, so the first ends up shown.
-/// `root` must be canonical, as for [`OpenServer::claim`].
-pub fn deliver(open: &[OpenTarget], root: &Path, dir: &Path, hint: Option<&Path>, token: Option<&str>) -> Delivered {
-    deliver_with(open, root, dir, hint, token, euid(), CLIENT_DEADLINE)
+/// Tries to give `open` to a running window: `hint` first, then the socket of `root`, then those of `wider`, nearest
+/// first, each only when every target is inside that root. Targets go last to first, one connection each, so the first
+/// ends up shown. Every root must be canonical, as for [`OpenServer::claim`].
+pub fn deliver(
+    open: &[OpenTarget],
+    root: &Path,
+    wider: &[PathBuf],
+    dir: &Path,
+    hint: Option<&Path>,
+    token: Option<&str>,
+) -> Delivered {
+    deliver_with(open, root, wider, dir, hint, token, euid(), CLIENT_DEADLINE)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deliver_with(
     open: &[OpenTarget],
     root: &Path,
+    wider: &[PathBuf],
     dir: &Path,
     hint: Option<&Path>,
     token: Option<&str>,
@@ -768,11 +778,16 @@ fn deliver_with(
     let Some((last, rest)) = open.split_last() else {
         return Delivered::NotHere;
     };
-    let mut candidates: Vec<PathBuf> = hint.map(Path::to_owned).into_iter().collect();
-    if open.iter().all(|target| target.path.starts_with(root)) {
-        candidates.extend(socket_path(dir, root).ok().filter(|sock| Some(sock.as_path()) != hint));
+    let mut candidates: Vec<(PathBuf, Option<&Path>)> = hint.map(|hint| (hint.to_owned(), None)).into_iter().collect();
+    let roots = std::iter::once(root).chain(wider.iter().map(PathBuf::as_path));
+    for root in roots.filter(|root| open.iter().all(|target| target.path.starts_with(root))) {
+        let Ok(sock) = socket_path(dir, root) else { continue };
+        match candidates.iter_mut().find(|(asked, _)| *asked == sock) {
+            Some(already) => already.1 = Some(root),
+            None => candidates.push((sock, Some(root))),
+        }
     }
-    for sock in candidates {
+    for (sock, root) in candidates {
         // The window that takes this one has opened something, so from here on there is no new
         // window to fall back to.
         if send(&sock, last, token, me, within).is_err() {
@@ -787,7 +802,9 @@ fn deliver_with(
             })
             .collect();
         return if failed.is_empty() {
-            Delivered::Opened
+            Delivered::Opened {
+                root: root.map(Path::to_owned),
+            }
         } else {
             Delivered::Partly { failed }
         };
@@ -852,6 +869,20 @@ mod tests {
         fn outside(&self, name: &str) -> PathBuf {
             let path = self.base.join(name);
             std::fs::write(&path, "text\n").unwrap();
+            path
+        }
+
+        /// What a client hears when the window of this fixture's root takes everything.
+        fn opened(&self) -> Delivered {
+            Delivered::Opened {
+                root: Some(self.root.clone()),
+            }
+        }
+
+        /// A folder under the root, for a launch whose root is narrower than a running window's.
+        fn below(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::create_dir(&path).unwrap();
             path
         }
 
@@ -1542,7 +1573,7 @@ mod tests {
 
     fn deliver_later(fixture: &Fixture, open: Vec<OpenTarget>, hint: Option<PathBuf>) -> JoinHandle<Delivered> {
         let (root, dir) = (fixture.root.clone(), fixture.dir.clone());
-        std::thread::spawn(move || deliver(&open, &root, &dir, hint.as_deref(), None))
+        std::thread::spawn(move || deliver(&open, &root, &[], &dir, hint.as_deref(), None))
     }
 
     /// What a drain on the GTK side would open.
@@ -1584,14 +1615,14 @@ mod tests {
         let connected = Instant::now();
         let second = deliver_later(&fixture, vec![target(second_file)], None);
         // The held request keeps the thread for three seconds.
-        assert_eq!(first.join().unwrap(), Delivered::Opened);
+        assert_eq!(first.join().unwrap(), fixture.opened());
         let (_, answering) = next_request(&server).take().unwrap();
         let past_a_deadline_from_the_connect = CLIENT_DEADLINE + Duration::from_millis(200);
         std::thread::sleep(past_a_deadline_from_the_connect.saturating_sub(connected.elapsed()));
         answering.answer(Answer::Accepted);
         assert_eq!(
             second.join().unwrap(),
-            Delivered::Opened,
+            fixture.opened(),
             "the window runs this request, so a new window would hold the file as well"
         );
     }
@@ -1602,7 +1633,7 @@ mod tests {
         let listener = UnixListener::bind(fixture.root_socket()).unwrap();
         let open = vec![target(fixture.file("a.rs"))];
         let within = Duration::from_millis(100);
-        let delivered = deliver_with(&open, &fixture.root, &fixture.dir, None, None, euid(), within);
+        let delivered = deliver_with(&open, &fixture.root, &[], &fixture.dir, None, None, euid(), within);
         assert_eq!(delivered, Delivered::NotHere);
         let (stream, _) = listener.accept().unwrap();
         let mut sent = Vec::new();
@@ -1622,7 +1653,7 @@ mod tests {
         let client = deliver_later(&fixture, vec![target(file.clone())], Some(hint.clone()));
         let (_, answering) = next_request(&at_hint).take().unwrap();
         answering.answer(Answer::Accepted);
-        assert_eq!(client.join().unwrap(), Delivered::Opened);
+        assert_eq!(client.join().unwrap(), Delivered::Opened { root: None });
         assert!(at_root.drain().is_empty());
 
         // A busy hint moves on to the root's socket.
@@ -1631,15 +1662,150 @@ mod tests {
         answering.answer(Answer::Busy);
         let (_, answering) = next_request(&at_root).take().unwrap();
         answering.answer(Answer::Accepted);
-        assert_eq!(client.join().unwrap(), Delivered::Opened);
+        assert_eq!(client.join().unwrap(), fixture.opened());
 
         // A hint nothing listens on, and one that is not a socket at all.
         for hint in [fixture.base.join("gone"), file.clone()] {
             let client = deliver_later(&fixture, vec![target(file.clone())], Some(hint));
             let (_, answering) = next_request(&at_root).take().unwrap();
             answering.answer(Answer::Accepted);
-            assert_eq!(client.join().unwrap(), Delivered::Opened);
+            assert_eq!(client.join().unwrap(), fixture.opened());
         }
+    }
+
+    /// `cd repo/crate; eitri src/x.rs`: the launch's root is `crate`, the running window's is `repo`.
+    #[test]
+    fn a_window_on_a_wider_root_takes_the_file() {
+        let fixture = fixture();
+        let wider = fixture.root.clone();
+        let root = fixture.below("crate");
+        let file = root.join("x.rs");
+        std::fs::write(&file, "text\n").unwrap();
+        let server = fixture.server();
+        let (open, dir) = (vec![target(file.clone())], fixture.dir.clone());
+        let client = {
+            let wider = [wider.clone()];
+            std::thread::spawn(move || deliver(&open, &root, &wider, &dir, None, None))
+        };
+        let (open, answering) = next_request(&server).take().unwrap();
+        answering.answer(Answer::Accepted);
+        assert_eq!(open.path, file);
+        assert_eq!(client.join().unwrap(), Delivered::Opened { root: Some(wider) });
+    }
+
+    #[test]
+    fn the_narrowest_window_of_the_project_goes_first_and_a_busy_one_moves_on() {
+        let fixture = fixture();
+        let top = fixture.root.clone();
+        let middle = fixture.below("a");
+        let root = middle.join("b");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("x.rs");
+        std::fs::write(&file, "text\n").unwrap();
+        let at_top = OpenServer::claim(&fixture.dir, &top).unwrap();
+        let at_middle = OpenServer::claim(&fixture.dir, &middle).unwrap();
+        let at_root = OpenServer::claim(&fixture.dir, &root).unwrap();
+        let run = || {
+            let (open, dir) = (vec![target(file.clone())], fixture.dir.clone());
+            let (root, wider) = (root.clone(), [middle.clone(), top.clone()]);
+            std::thread::spawn(move || deliver(&open, &root, &wider, &dir, None, None))
+        };
+
+        let client = run();
+        let (_, answering) = next_request(&at_root).take().unwrap();
+        answering.answer(Answer::Accepted);
+        assert_eq!(
+            client.join().unwrap(),
+            Delivered::Opened {
+                root: Some(root.clone())
+            }
+        );
+        assert!(at_middle.drain().is_empty() && at_top.drain().is_empty());
+
+        let client = run();
+        let (_, answering) = next_request(&at_root).take().unwrap();
+        answering.answer(Answer::Busy);
+        let (_, answering) = next_request(&at_middle).take().unwrap();
+        answering.answer(Answer::Accepted);
+        assert_eq!(
+            client.join().unwrap(),
+            Delivered::Opened {
+                root: Some(middle.clone())
+            }
+        );
+        assert!(at_top.drain().is_empty());
+    }
+
+    /// The window checks too, but a window that cannot hold every target must not be given the first of them: from
+    /// then on there is no new window to fall back to.
+    #[test]
+    fn a_wider_root_that_does_not_hold_every_target_is_not_asked() {
+        let fixture = fixture();
+        let root = fixture.below("crate");
+        let inside = root.join("x.rs");
+        std::fs::write(&inside, "text\n").unwrap();
+        let outside = fixture.outside("y.rs");
+        let server = fixture.server();
+        let open = vec![target(inside), target(outside)];
+        let wider = [fixture.root.clone()];
+        let delivered = deliver_with(&open, &root, &wider, &fixture.dir, None, None, euid(), CLIENT_DEADLINE);
+        assert_eq!(delivered, Delivered::NotHere);
+        assert!(server.drain().is_empty());
+    }
+
+    /// `eitri x.rs ../y.rs` from a crate: the second file is outside the launch's root and inside the repository.
+    #[test]
+    fn a_wider_root_can_hold_what_the_root_does_not() {
+        let fixture = fixture();
+        let root = fixture.below("crate");
+        let inside = root.join("x.rs");
+        std::fs::write(&inside, "text\n").unwrap();
+        let beside = fixture.file("y.rs");
+        let server = fixture.server();
+        let at_crate = OpenServer::claim(&fixture.dir, &root).unwrap();
+        let (open, dir, wider) = (
+            vec![target(inside), target(beside)],
+            fixture.dir.clone(),
+            [fixture.root.clone()],
+        );
+        let client = std::thread::spawn(move || deliver(&open, &root, &wider, &dir, None, None));
+        for _ in 0..2 {
+            let (_, answering) = next_request(&server).take().unwrap();
+            answering.answer(Answer::Accepted);
+        }
+        assert_eq!(client.join().unwrap(), fixture.opened());
+        assert!(at_crate.drain().is_empty(), "this window cannot hold the second file");
+    }
+
+    #[test]
+    fn a_hint_goes_before_every_root_and_a_hint_that_is_a_wider_root_is_named_and_asked_once() {
+        let fixture = fixture();
+        let root = fixture.below("crate");
+        let file = root.join("x.rs");
+        std::fs::write(&file, "text\n").unwrap();
+        let at_root = OpenServer::claim(&fixture.dir, &root).unwrap();
+        let at_wider = fixture.server();
+        let run = || {
+            let hint = at_wider.socket().to_owned();
+            let (open, dir) = (vec![target(file.clone())], fixture.dir.clone());
+            let (root, wider) = (root.clone(), [fixture.root.clone()]);
+            std::thread::spawn(move || deliver(&open, &root, &wider, &dir, Some(&hint), None))
+        };
+
+        let client = run();
+        let (_, answering) = next_request(&at_wider).take().unwrap();
+        answering.answer(Answer::Accepted);
+        assert_eq!(client.join().unwrap(), fixture.opened());
+        assert!(at_root.drain().is_empty(), "the terminal's own window comes first");
+
+        // Turned down by the window behind both names, it goes to the root's and not to that window again.
+        let client = run();
+        let (_, answering) = next_request(&at_wider).take().unwrap();
+        answering.answer(Answer::Busy);
+        let (_, answering) = next_request(&at_root).take().unwrap();
+        answering.answer(Answer::Busy);
+        assert_eq!(client.join().unwrap(), Delivered::NotHere);
+        assert!(at_wider.drain().is_empty());
     }
 
     #[test]
@@ -1663,11 +1829,20 @@ mod tests {
         let _never_accepts = UnixListener::bind(&silent).unwrap();
         let (root, dir, open) = (fixture.root.clone(), fixture.dir.clone(), vec![target(file)]);
         let client = std::thread::spawn(move || {
-            deliver_with(&open, &root, &dir, Some(&silent), None, euid(), Duration::from_secs(1))
+            deliver_with(
+                &open,
+                &root,
+                &[],
+                &dir,
+                Some(&silent),
+                None,
+                euid(),
+                Duration::from_secs(1),
+            )
         });
         let (_, answering) = next_request(&server).take().unwrap();
         answering.answer(Answer::Accepted);
-        assert_eq!(client.join().unwrap(), Delivered::Opened);
+        assert_eq!(client.join().unwrap(), fixture.opened());
     }
 
     #[test]
@@ -1677,7 +1852,16 @@ mod tests {
         let server = fixture.server();
         let open = [target(file)];
         let other = euid().wrapping_add(1);
-        let delivered = deliver_with(&open, &fixture.root, &fixture.dir, None, None, other, CLIENT_DEADLINE);
+        let delivered = deliver_with(
+            &open,
+            &fixture.root,
+            &[],
+            &fixture.dir,
+            None,
+            None,
+            other,
+            CLIENT_DEADLINE,
+        );
         assert_eq!(delivered, Delivered::NotHere);
         assert!(server.drain().is_empty());
 
@@ -1708,14 +1892,14 @@ mod tests {
             target(c.clone()),
         ];
         let (root, dir) = (fixture.root.clone(), fixture.dir.clone());
-        let client = std::thread::spawn(move || deliver(&open, &root, &dir, None, Some("token")));
+        let client = std::thread::spawn(move || deliver(&open, &root, &[], &dir, None, Some("token")));
         let mut seen = Vec::new();
         for _ in 0..3 {
             let (open, answering) = next_request(&server).take().unwrap();
             answering.answer(Answer::Accepted);
             seen.push(open);
         }
-        assert_eq!(client.join().unwrap(), Delivered::Opened);
+        assert_eq!(client.join().unwrap(), fixture.opened());
         let token = Some("token".to_owned());
         let plain = |path: &Path| Open {
             path: path.to_owned(),
@@ -1768,7 +1952,7 @@ mod tests {
         let server = fixture.server();
         let open = [target(inside), target(outside)];
         assert_eq!(
-            deliver(&open, &fixture.root, &fixture.dir, None, None),
+            deliver(&open, &fixture.root, &[], &fixture.dir, None, None),
             Delivered::NotHere
         );
         assert_eq!(
@@ -1783,17 +1967,17 @@ mod tests {
         let fixture = fixture();
         let open = [target(fixture.file("a"))];
         assert_eq!(
-            deliver(&open, &fixture.root, &fixture.dir, None, None),
+            deliver(&open, &fixture.root, &[], &fixture.dir, None, None),
             Delivered::NotHere
         );
         // A crashed window's socket: the file is there and the connect is refused.
         drop(UnixListener::bind(fixture.root_socket()).unwrap());
         assert_eq!(
-            deliver(&open, &fixture.root, &fixture.dir, None, None),
+            deliver(&open, &fixture.root, &[], &fixture.dir, None, None),
             Delivered::NotHere
         );
         assert_eq!(
-            deliver(&[], &fixture.root, &fixture.dir, None, None),
+            deliver(&[], &fixture.root, &[], &fixture.dir, None, None),
             Delivered::NotHere
         );
     }

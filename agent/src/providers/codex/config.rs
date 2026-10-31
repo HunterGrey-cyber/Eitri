@@ -1,15 +1,18 @@
 //! The policy a Codex session runs under, and the `config` object every `thread/start` and
 //! `thread/resume` carries.
 //!
-//! **The approval policy and the sandbox are constants.** The tab's mode changes only the reviewer
-//! (Codex's own in Auto, the user's in Bypass), so a Codex tab never runs a no-ask policy and never runs
-//! unsandboxed except for a single escalation someone approved.
+//! **The approval policy is a constant, and the sandbox is one of two.** The tab's mode changes only the
+//! reviewer (Codex's own in Auto, the user's in Bypass), so a Codex tab never runs a no-ask policy and never
+//! runs unsandboxed except for a single escalation someone approved.
 //!
 //! **The sandbox is `workspace-write`.** Inside it Codex runs every command and every edit within the
 //! project without asking, writes `/tmp` and `$TMPDIR`, and reads any file the user can read: the sandbox
 //! restricts writes, network and sockets, not reads. That is stated to the user as it is. The narrow
 //! `sandbox_workspace_write` table is always sent explicitly, because without it a user's or a trusted
 //! project's `network_access = true` or extra writable roots would widen the sandbox.
+//!
+//! **At a root that is no boundary it is `read-only`.** Keeping writes inside such a folder keeps nothing
+//! safe, so nothing is written without an escalation, which is `on-request` as ever.
 //!
 //! **The config is nested objects, never dotted keys.** The app-server splits each top-level `config`
 //! key on every `.` with no quoting, so `projects./a.b/c.trust_level` would name a garbage path; the
@@ -18,7 +21,7 @@
 //! `projects` object.
 
 use super::wire::{trust_level_word, SandboxPolicyWire};
-use crate::external::{DirTrust, Reviewer, TrustPlan};
+use crate::external::{DirTrust, Reviewer, Sandbox, TrustPlan};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -34,10 +37,27 @@ pub const SANDBOX_MODE: &str = "workspace-write";
 /// The per-turn sandbox policy's `type`; it must name the same sandbox as [`SANDBOX_MODE`].
 const SANDBOX_POLICY_TYPE: &str = "workspaceWrite";
 
-/// The sandbox policy sent with every `turn/start`: the workspace sandbox with no extra writable root,
-/// no network, and Codex's own defaults for the temporary directories.
-pub fn sandbox_policy() -> SandboxPolicyWire {
-    SandboxPolicyWire::narrow(SANDBOX_POLICY_TYPE)
+/// No writes, no network, no sockets; reads are not restricted.
+pub const READ_ONLY_SANDBOX_MODE: &str = "read-only";
+
+/// The per-turn sandbox policy's `type`; it must name the same sandbox as [`READ_ONLY_SANDBOX_MODE`].
+const READ_ONLY_POLICY_TYPE: &str = "readOnly";
+
+/// The sandbox a `thread/start` or `thread/resume` names.
+pub fn sandbox_mode(sandbox: Sandbox) -> &'static str {
+    match sandbox {
+        Sandbox::Project => SANDBOX_MODE,
+        Sandbox::ReadOnly => READ_ONLY_SANDBOX_MODE,
+    }
+}
+
+/// The sandbox policy sent with every `turn/start`: the workspace sandbox with no extra writable root, no
+/// network, and Codex's own defaults for the temporary directories, or the read-only one with no network.
+pub fn sandbox_policy(sandbox: Sandbox) -> SandboxPolicyWire {
+    match sandbox {
+        Sandbox::Project => SandboxPolicyWire::narrow(SANDBOX_POLICY_TYPE),
+        Sandbox::ReadOnly => SandboxPolicyWire::read_only(READ_ONLY_POLICY_TYPE),
+    }
 }
 
 /// Why a Codex session cannot be started for a plan. Each one reads as a sentence for a tab notice.
@@ -218,12 +238,12 @@ pub struct Echo {
     pub sandbox: SandboxPolicyWire,
 }
 
-/// The echo expected of a session started with `reviewer`: the constant policy, that reviewer, and the
-/// narrow sandbox exactly as [`sandbox_policy`] sends it.
-pub fn expected_echo(reviewer: Reviewer) -> Echo {
+/// The echo expected of a session started with `reviewer` and `sandbox`: the constant policy, that reviewer,
+/// and that sandbox exactly as [`sandbox_policy`] sends it.
+pub fn expected_echo(reviewer: Reviewer, sandbox: Sandbox) -> Echo {
     Echo {
         approval_policy: APPROVAL_POLICY,
         approvals_reviewer: reviewer,
-        sandbox: sandbox_policy(),
+        sandbox: sandbox_policy(sandbox),
     }
 }

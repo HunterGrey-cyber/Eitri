@@ -1,4 +1,4 @@
-//! `eitri.agent.register({ name, command, project_files, auto_mode })`: an agent spoken to over ACP.
+//! `eitri.agent.register({ name, command, project_files, auto_mode, read_only_mode })`: an agent spoken to over ACP.
 //!
 //! The registration is configuration the user wrote, so every refusal is a startup failure naming the
 //! key. The kernel records it at the function boundary while init.lua runs, so a `pcall` cannot hide it.
@@ -26,6 +26,8 @@ pub struct AgentRegistration {
     pub project_files: Vec<String>,
     /// The mode id set at the start of every session, if any.
     pub auto_mode: Option<String>,
+    /// The mode id set instead at a root that is no boundary, if any.
+    pub read_only_mode: Option<String>,
 }
 
 /// `pub`: `Kernel` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
@@ -72,7 +74,7 @@ pub fn valid_name(name: &str) -> bool {
 const PREFIX: &str = "eitri.agent.register";
 
 /// Every key a registration may carry; any other is refused, so a misspelt `auto_mode` is not dropped.
-const KEYS: &[&str] = &["name", "command", "project_files", "auto_mode"];
+const KEYS: &[&str] = &["name", "command", "project_files", "auto_mode", "read_only_mode"];
 
 /// Checks one registration table. `Err` names the key and is the startup-failure text.
 pub fn parse_registration(spec: &Table) -> Result<AgentRegistration, String> {
@@ -133,21 +135,28 @@ pub fn parse_registration(spec: &Table) -> Result<AgentRegistration, String> {
         }
     }
 
-    let auto_mode = match spec.raw_get::<Value>("auto_mode") {
-        Ok(Value::Nil) => None,
-        Ok(Value::String(text)) => match text.to_str() {
-            Ok(mode) if !mode.trim().is_empty() && !mode.chars().any(char::is_control) => Some(mode.to_string()),
-            _ => return Err(format!("{PREFIX}({name}): auto_mode must be a mode id")),
-        },
-        _ => return Err(format!("{PREFIX}({name}): auto_mode must be a string")),
-    };
+    let auto_mode = mode_id(&spec, "auto_mode", &name)?;
+    let read_only_mode = mode_id(&spec, "read_only_mode", &name)?;
 
     Ok(AgentRegistration {
         name,
         command,
         project_files,
         auto_mode,
+        read_only_mode,
     })
+}
+
+/// A key's value as one of the agent's mode ids, if it is there.
+fn mode_id(spec: &Table, key: &str, name: &str) -> Result<Option<String>, String> {
+    match spec.raw_get::<Value>(key) {
+        Ok(Value::Nil) => Ok(None),
+        Ok(Value::String(text)) => match text.to_str() {
+            Ok(mode) if !mode.trim().is_empty() && !mode.chars().any(char::is_control) => Ok(Some(mode.to_string())),
+            _ => Err(format!("{PREFIX}({name}): {key} must be a mode id")),
+        },
+        _ => Err(format!("{PREFIX}({name}): {key} must be a string")),
+    }
 }
 
 /// A key's value as a list of strings: a table whose keys are exactly 1..n, each value a UTF-8 string.
@@ -240,7 +249,7 @@ mod tests {
         let (lua, registry) = engine();
         lua.load(
             r#"eitri.agent.register({ name = "gemini", command = { "gemini", "--experimental-acp" },
-                 project_files = { ".gemini/", "GEMINI.md" }, auto_mode = "auto_edit" })
+                 project_files = { ".gemini/", "GEMINI.md" }, auto_mode = "auto_edit", read_only_mode = "plan" })
                eitri.agent.register({ name = "my.agent_2-x", command = { "/opt/a" }, project_files = { "A.md" } })"#,
         )
         .exec()
@@ -254,6 +263,7 @@ mod tests {
                 command: vec!["gemini".into(), "--experimental-acp".into()],
                 project_files: vec![".gemini/".into(), "GEMINI.md".into()],
                 auto_mode: Some("auto_edit".into()),
+                read_only_mode: Some("plan".into()),
             })
         );
         assert_eq!(registry.get("my.agent_2-x").unwrap().auto_mode, None);
@@ -326,6 +336,8 @@ mod tests {
         for (extra, why) in [
             ("auto_mode = 3,", "auto_mode must be a string"),
             ("auto_mode = \"\",", "auto_mode must be a mode id"),
+            ("read_only_mode = 3,", "read_only_mode must be a string"),
+            ("read_only_mode = \"\",", "read_only_mode must be a mode id"),
             ("automode = \"x\",", "unknown key \"automode\""),
         ] {
             let err = refusal(&format!(

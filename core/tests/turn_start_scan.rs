@@ -29,10 +29,13 @@ const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_as", "se
 /// conversation's turn, a Claude turn sent through the mode-carrying door, and an external agent's (a
 /// Codex `turn/start`, an ACP `session/prompt`).
 const SENDS: &[(&str, &str)] = &[
-    ("core/src/tab_set.rs", ".send_turn_in(&wire, &typed, mode, origin)"),
     (
         "core/src/tab_set.rs",
-        ".send_turn_in(&turn.wire, &turn.typed, mode, turn.origin())",
+        ".send_turn_in(&wire, &typed, mode, root.as_deref(), origin)",
+    ),
+    (
+        "core/src/tab_set.rs",
+        ".send_turn_in(&turn.wire, &turn.typed, mode, root.as_deref(), turn.origin())",
     ),
     ("core/src/agent_backend.rs", "session.send_turn(wire_text)"),
     (
@@ -45,7 +48,7 @@ const SENDS: &[(&str, &str)] = &[
     ),
     (
         "core/src/agent_backend.rs",
-        "conversation.send_turn_with(wire_text, turn_policy(mode))",
+        "conversation.send_turn_with(wire_text, policy)",
     ),
 ];
 

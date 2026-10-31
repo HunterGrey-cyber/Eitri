@@ -3540,13 +3540,13 @@ impl CodexProvider {
     fn open_session(&self, req: ExternalStart, resume: Option<&str>) -> Result<String, ProviderError> {
         let config = session_config(&req.plan)
             .map_err(|e| provider_error(ProviderErrorCode::InvalidConfiguration, e.to_string()))?;
-        let reviewer = req.policy.reviewer;
+        let TurnPolicy { reviewer, sandbox } = req.policy;
         let (verb, pending) = match resume {
             None => (
                 "the session start",
                 self.request(
                     method::THREAD_START,
-                    to_json(&ThreadStartParams::new(req.cwd.clone(), reviewer, config))?,
+                    to_json(&ThreadStartParams::new(req.cwd.clone(), reviewer, sandbox, config))?,
                 )?,
             ),
             Some(id) => (
@@ -3557,6 +3557,7 @@ impl CodexProvider {
                         id.to_string(),
                         req.cwd.clone(),
                         reviewer,
+                        sandbox,
                         config,
                     ))?,
                 )?,
@@ -3593,7 +3594,7 @@ impl CodexProvider {
 
         let thread_id = started.thread.id.clone();
         let model = started.model.clone().unwrap_or_default();
-        let mismatch = tripwire::check_echo(&expected_echo(reviewer), &started.echo())
+        let mismatch = tripwire::check_echo(&expected_echo(reviewer, sandbox), &started.echo())
             .and_then(|()| {
                 tripwire::check_instruction_sources(
                     &started.instruction_sources,
@@ -3782,7 +3783,12 @@ impl ExternalProvider for CodexProvider {
                 return Err(busy());
             }
             // Sent under the same lock as the check above: the pump cannot fold a tripwire in between.
-            let params = to_json(&TurnStartParams::new(req.session_id.clone(), req.text, policy.reviewer))?;
+            let params = to_json(&TurnStartParams::new(
+                req.session_id.clone(),
+                req.text,
+                policy.reviewer,
+                policy.sandbox,
+            ))?;
             let pending = self.request(method::TURN_START, params)?;
             let mut turn = ActiveTurn::new(None);
             turn.reviewer = Some(policy.reviewer);

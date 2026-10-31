@@ -98,6 +98,7 @@ fn start_request() -> ExternalStart {
         },
         policy: TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
         resume: None,
     }
@@ -189,6 +190,7 @@ fn send(provider: &CodexProvider, thread: &str, text: &str) -> Result<String, Pr
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     )
 }

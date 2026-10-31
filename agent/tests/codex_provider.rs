@@ -91,7 +91,10 @@ fn start_request(reviewer: Reviewer) -> ExternalStart {
     ExternalStart {
         cwd: "/work/proj".into(),
         plan: plan("/work/proj"),
-        policy: TurnPolicy { reviewer },
+        policy: TurnPolicy {
+            reviewer,
+            sandbox: agent::Sandbox::Project,
+        },
         resume: None,
     }
 }
@@ -154,6 +157,7 @@ fn send(provider: &CodexProvider, thread: &str, text: &str) -> Result<String, Pr
         },
         TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         },
     )
 }
@@ -602,6 +606,71 @@ fn thread_start_sends_session_config_and_policy() {
             model: "gpt-test".into(),
             cwd: "/work/proj".into(),
         }]
+    );
+}
+
+/// A session at a root that is no boundary: the start and each turn name the read-only sandbox, and an answer that
+/// names any other stops the tab.
+#[test]
+fn a_read_only_session_says_so_at_its_start_and_every_turn() {
+    let request = ExternalStart {
+        policy: TurnPolicy {
+            reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::ReadOnly,
+        },
+        ..start_request(Reviewer::User)
+    };
+    let read_only_answer = |id: u64| {
+        write(json!({"id": id, "result": {
+            "thread": {"id": "th-ro", "cwd": "/work/proj"},
+            "model": "gpt-test",
+            "cwd": "/work/proj",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {"type": "readOnly", "networkAccess": false},
+        }}))
+    };
+    let turn_line = concat!(
+        r#"{"id":4,"method":"turn/start","params":{"approvalPolicy":"on-request","approvalsReviewer":"user","#,
+        r#""input":[{"text":"hello","type":"text"}],"#,
+        r#""sandboxPolicy":{"networkAccess":false,"type":"readOnly"},"threadId":"th-ro"}}"#,
+    );
+    let mut script = handshake(UA, signed_in());
+    script.push(json!({ "expect": r#""sandbox":"read-only""# }));
+    script.push(read_only_answer(3));
+    script.push(expect_exact(turn_line));
+    script.push(turn_response(4, "turn-ro"));
+    let provider = connect(script).expect("connects");
+    assert_eq!(provider.start(request.clone()).expect("starts"), "th-ro");
+    let events = provider.pump();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. })),
+        "{events:?}"
+    );
+    let turn = provider
+        .send_turn_with(
+            SendTurnRequest {
+                session_id: "th-ro".to_string(),
+                text: "hello".to_string(),
+            },
+            request.policy,
+        )
+        .expect("the turn starts");
+    assert_eq!(turn, "turn-ro");
+
+    let mut script = handshake(UA, signed_in());
+    script.push(expect_request(3, "thread/start"));
+    script.push(thread_response(3, "th-wide"));
+    let provider = connect(script).expect("connects");
+    provider.start(request).expect("starts");
+    assert!(
+        provider
+            .pump()
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. })),
+        "a session that came up on the workspace sandbox runs nothing"
     );
 }
 

@@ -25,10 +25,11 @@ mod codex_peer;
 use agent::external::DirTrust;
 use agent::external::TrustPlan;
 use agent::jsonrpc_link::Skipped;
+use agent::providers::codex::config::session_config;
 use agent::providers::codex::family::{Family, FamilyEdge};
 use agent::providers::codex::scripted_model::{ScriptedModel, Step};
 use agent::providers::codex::tripwire::TrustWatch;
-use agent::providers::codex::wire::{method, ElicitationResponse};
+use agent::providers::codex::wire::{method, ElicitationResponse, ThreadResumeParams};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -766,6 +767,7 @@ fn turn_reviewer_user_overrides_an_auto_review_thread() {
     let params = serde_json::to_value(ThreadStartParams::new(
         text_of(&project).to_string(),
         Reviewer::Agent,
+        agent::Sandbox::Project,
         config,
     ))
     .expect("params");
@@ -778,8 +780,13 @@ fn turn_reviewer_user_overrides_an_auto_review_thread() {
 
     let thread_id = thread.id.clone();
     let turn = |peer: &mut Peer, text: &str, reviewer: Reviewer| -> (String, String) {
-        let params =
-            serde_json::to_value(TurnStartParams::new(thread_id.clone(), text.to_string(), reviewer)).expect("params");
+        let params = serde_json::to_value(TurnStartParams::new(
+            thread_id.clone(),
+            text.to_string(),
+            reviewer,
+            agent::Sandbox::Project,
+        ))
+        .expect("params");
         let answer = peer.call(method::TURN_START, params).expect("turn/start");
         let id = json_str(&answer, "/turn/id").expect("a turn id").to_string();
         let status = peer
@@ -1758,6 +1765,7 @@ fn plain_tool_spawn_is_followed_by_the_family() {
     .expect("the handshake passes");
     let policy = TurnPolicy {
         reviewer: Reviewer::User,
+        sandbox: agent::Sandbox::Project,
     };
     let thread = provider
         .start(ExternalStart {
@@ -1914,6 +1922,7 @@ fn interrupt_a_loop(
             plan: plan(project, DirTrust::Untrusted),
             policy: TurnPolicy {
                 reviewer: Reviewer::User,
+                sandbox: agent::Sandbox::Project,
             },
             resume: None,
         })
@@ -1926,6 +1935,7 @@ fn interrupt_a_loop(
             },
             TurnPolicy {
                 reviewer: Reviewer::User,
+                sandbox: agent::Sandbox::Project,
             },
         )
         .expect("the turn starts");
@@ -2127,6 +2137,7 @@ fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
     let provider = real_provider(&codex, &s, &home, &project);
     let policy = || TurnPolicy {
         reviewer: Reviewer::User,
+        sandbox: agent::Sandbox::Project,
     };
     let thread = provider
         .start(ExternalStart {
@@ -2208,6 +2219,7 @@ fn an_interrupt_the_moment_a_turn_starts_ends_it() {
         let provider = real_provider(&codex, &s, &home, &project);
         let policy = TurnPolicy {
             reviewer: Reviewer::User,
+            sandbox: agent::Sandbox::Project,
         };
         let thread = provider
             .start(ExternalStart {
@@ -2258,4 +2270,292 @@ fn an_interrupt_the_moment_a_turn_starts_ends_it() {
         assert_eq!(session_lost(&events), None, "round {round}: the session was stopped");
         let _ = provider.close_session(agent::CloseSessionRequest { session_id: thread });
     }
+}
+
+// ------------------------------------------------------------------------- read-only, at a root that is no boundary
+
+use agent::external::Reviewer;
+use agent::providers::codex::wire::ThreadStartParams;
+
+/// `touch` of a name in `dir`, as one scripted command.
+fn touch_in(dir: &Path, name: &str) -> String {
+    format!("touch {}", text_of(&dir.join(name)))
+}
+
+/// What a tab at a root that is no boundary relies on. `workspace-write` would let the plain write through, so its
+/// absence says the sandbox held; the escalation reaches the client on its thread, which declines it.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn read_only_holds_a_plain_write_and_asks_about_an_escalation() {
+    let codex = real_codex();
+    let s = Scratch::new("ro-start");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let model = ScriptedModel::start(vec![
+        Step::exec("r1", &touch_in(&project, "plain"), false)
+            .when_body_has("PROMPT-RO")
+            .unless_body_has("\"r1\""),
+        Step::exec("r2", &touch_in(&project, "escalated"), true)
+            .when_body_has("\"r1\"")
+            .unless_body_has("\"r2\""),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let params = serde_json::to_value(ThreadStartParams::new(
+        text_of(&project).to_string(),
+        Reviewer::User,
+        agent::Sandbox::ReadOnly,
+        config,
+    ))
+    .expect("params");
+    let thread = start_thread(&mut peer, params);
+    println!("echo: {}", thread.answer.get("sandbox").cloned().unwrap_or_default());
+    assert_echo(&thread.answer, agent::Sandbox::ReadOnly);
+
+    let turn = send_turn_in(&mut peer, &thread.id, "PROMPT-RO", agent::Sandbox::ReadOnly);
+    let status = peer.wait_turn(&thread.id, &turn, TURN_BUDGET);
+    assert_eq!(status.as_deref(), Some("completed"), "stderr: {}", peer.stderr_tail());
+    assert!(!project.join("plain").exists(), "the sandbox let a plain write through");
+    assert!(!project.join("escalated").exists(), "a declined escalation ran");
+    let asked: Vec<&str> = peer
+        .requests
+        .iter()
+        .filter(|r| is_decision_request(&r.method))
+        .map(|r| r.method.as_str())
+        .collect();
+    assert!(!asked.is_empty(), "the escalation was never asked about");
+    assert_eq!(model.steps_left(), 0, "the conversation did not run as scripted");
+}
+
+/// A root that stops being a boundary mid-session: the thread started on the workspace sandbox, and the next turn's
+/// own policy takes the write away.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_turn_narrows_a_workspace_thread_to_read_only() {
+    let codex = real_codex();
+    let s = Scratch::new("ro-turn");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let model = ScriptedModel::start(vec![
+        Step::exec("w1", &touch_in(&project, "while-wide"), false)
+            .when_body_has("PROMPT-WIDE")
+            .unless_body_has("PROMPT-NARROW")
+            .unless_body_has("\"w1\""),
+        Step::exec("n1", &touch_in(&project, "while-narrow"), false)
+            .when_body_has("PROMPT-NARROW")
+            .unless_body_has("\"n1\""),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let thread = start_thread(&mut peer, start_params(&project, DirTrust::Untrusted));
+
+    for (text, sandbox) in [
+        ("PROMPT-WIDE", agent::Sandbox::Project),
+        ("PROMPT-NARROW", agent::Sandbox::ReadOnly),
+    ] {
+        let turn = send_turn_in(&mut peer, &thread.id, text, sandbox);
+        assert!(
+            peer.wait_turn(&thread.id, &turn, TURN_BUDGET).is_some(),
+            "stderr: {}",
+            peer.stderr_tail()
+        );
+    }
+    assert!(project.join("while-wide").exists(), "the workspace turn should write");
+    assert!(!project.join("while-narrow").exists(), "the read-only turn wrote");
+}
+
+/// A saved tab brought back at a root that is no boundary: the thread was started on the workspace sandbox.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_resume_as_read_only_echoes_it_and_holds() {
+    let codex = real_codex();
+    let s = Scratch::new("ro-resume");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let model = ScriptedModel::start(vec![
+        Step::say("first")
+            .when_body_has("PROMPT-FIRST")
+            .unless_body_has("PROMPT-RESUMED"),
+        Step::exec("x1", &touch_in(&project, "after-resume"), false)
+            .when_body_has("PROMPT-RESUMED")
+            .unless_body_has("\"x1\""),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let thread = start_thread(&mut peer, start_params(&project, DirTrust::Untrusted));
+    run_turn(&mut peer, &thread.id, "PROMPT-FIRST");
+    drop(peer);
+
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let params = serde_json::to_value(ThreadResumeParams::new(
+        thread.id.clone(),
+        text_of(&project).to_string(),
+        Reviewer::User,
+        agent::Sandbox::ReadOnly,
+        config,
+    ))
+    .expect("params");
+    let answer = peer.call(method::THREAD_RESUME, params).expect("thread/resume");
+    assert_echo(&answer, agent::Sandbox::ReadOnly);
+    let turn = send_turn_in(&mut peer, &thread.id, "PROMPT-RESUMED", agent::Sandbox::ReadOnly);
+    assert!(
+        peer.wait_turn(&thread.id, &turn, TURN_BUDGET).is_some(),
+        "stderr: {}",
+        peer.stderr_tail()
+    );
+    assert!(!project.join("after-resume").exists(), "the resumed thread wrote");
+}
+
+/// Why a Codex tab at a root that is no boundary is never trusted: a trusted project's rule takes a command out of even
+/// the read-only sandbox, with no request. Untrusted, the same rule does nothing.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_project_rule_leaves_a_read_only_sandbox_only_when_the_project_is_trusted() {
+    let codex = real_codex();
+    for (name, trust, escapes) in [
+        ("ro-rule-t", DirTrust::Trusted, true),
+        ("ro-rule-u", DirTrust::Untrusted, false),
+    ] {
+        let s = Scratch::new(name);
+        let project = s.dir("proj");
+        write_project(&project, "");
+        let target = project.join("by-rule");
+        write_file(
+            &project.join(".codex/rules/default.rules"),
+            &format!(
+                "prefix_rule(pattern=[\"touch\", \"{}\"], decision=\"allow\")\n",
+                text_of(&target)
+            ),
+        );
+        let model = ScriptedModel::start(vec![Step::exec("r1", &format!("touch {}", text_of(&target)), false)
+            .when_body_has("PROMPT-RULE")
+            .unless_body_has("\"r1\"")])
+        .expect("model");
+        let home = s.dir("home");
+        write_home(&home, &model, "");
+        let mut peer = Peer::start(&codex, &home, &project, decline_all());
+        let config = session_config(&plan(&project, trust)).expect("config");
+        let params = serde_json::to_value(ThreadStartParams::new(
+            text_of(&project).to_string(),
+            Reviewer::User,
+            agent::Sandbox::ReadOnly,
+            config,
+        ))
+        .expect("params");
+        let thread = start_thread(&mut peer, params);
+        let turn = send_turn_in(&mut peer, &thread.id, "PROMPT-RULE", agent::Sandbox::ReadOnly);
+        assert!(
+            peer.wait_turn(&thread.id, &turn, TURN_BUDGET).is_some(),
+            "stderr: {}",
+            peer.stderr_tail()
+        );
+        assert_eq!(target.exists(), escapes, "{name}");
+    }
+}
+
+/// `eitri ~`: the root holds the user's own Codex home, so an untrusted session there has to keep the folder's own
+/// instruction file out and the user's in, or the watch on untrusted sessions would stop the tab with no way out.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn an_untrusted_session_at_the_home_directory_keeps_the_folders_instructions_out() {
+    let codex = real_codex();
+    let s = Scratch::new("ro-home");
+    let home_dir = s.dir("home");
+    let codex_home = home_dir.join(".codex");
+    std::fs::create_dir_all(&codex_home).expect("the Codex home");
+    write_file(&home_dir.join("AGENTS.md"), "MARKER-OF-THE-FOLDER\n");
+    write_file(&codex_home.join("AGENTS.md"), "MARKER-OF-THE-USER\n");
+    let model = ScriptedModel::start(vec![Step::say("done").when_body_has("PROMPT-HOME")]).expect("model");
+    write_home(&codex_home, &model, "");
+    let mut peer = Peer::start(&codex, &codex_home, &home_dir, decline_all());
+    let at_home = plan(&home_dir, DirTrust::Untrusted);
+    let params = serde_json::to_value(ThreadStartParams::new(
+        text_of(&home_dir).to_string(),
+        Reviewer::User,
+        agent::Sandbox::ReadOnly,
+        session_config(&at_home).expect("config"),
+    ))
+    .expect("params");
+    let thread = start_thread(&mut peer, params);
+    assert_echo(&thread.answer, agent::Sandbox::ReadOnly);
+    let sources = instruction_sources(&thread.answer);
+    println!("sources: {sources:?}");
+    agent::providers::codex::tripwire::check_instruction_sources(
+        &sources,
+        &agent::providers::codex::tripwire::dirs_not_trusted(&at_home),
+        &codex_home,
+    )
+    .expect("nothing of the folder is loaded");
+    let turn = send_turn_in(&mut peer, &thread.id, "PROMPT-HOME", agent::Sandbox::ReadOnly);
+    assert!(
+        peer.wait_turn(&thread.id, &turn, TURN_BUDGET).is_some(),
+        "stderr: {}",
+        peer.stderr_tail()
+    );
+    let sent = requests_text(&model, 0);
+    assert!(sent.contains("MARKER-OF-THE-USER"), "the user's own file should load");
+    assert!(
+        !sent.contains("MARKER-OF-THE-FOLDER"),
+        "the folder's file reached the model"
+    );
+}
+
+/// A subagent's commands reach no card of the parent's, so it must inherit the sandbox.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_child_of_a_read_only_thread_writes_nothing() {
+    let codex = real_codex();
+    let s = Scratch::new("ro-child");
+    let project = s.dir("proj");
+    write_project(&project, "");
+    let child_task = "CHILD-TASK-RO";
+    let parent_prompt = "PROMPT-PARENT-RO";
+    let model = ScriptedModel::start(vec![
+        Step::call(
+            "sp",
+            Some("collaboration"),
+            "spawn_agent",
+            &json!({"task_name": "child", "message": format!("{child_task} run"), "fork_turns": "none"}),
+        )
+        .when_body_has(parent_prompt)
+        .unless_body_has("\"sp\""),
+        Step::call("wa", Some("collaboration"), "wait_agent", &json!({"timeout_ms": 30000}))
+            .when_body_has(parent_prompt)
+            .when_body_has("\"sp\"")
+            .unless_body_has("\"wa\""),
+        Step::exec("cw", &touch_in(&project, "child-plain"), false)
+            .when_body_has(child_task)
+            .unless_body_has(parent_prompt)
+            .unless_body_has("\"cw\""),
+    ])
+    .expect("model");
+    let home = s.dir("home");
+    write_home(&home, &model, "");
+    let mut peer = Peer::start(&codex, &home, &project, decline_all());
+    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let params = serde_json::to_value(ThreadStartParams::new(
+        text_of(&project).to_string(),
+        Reviewer::User,
+        agent::Sandbox::ReadOnly,
+        config,
+    ))
+    .expect("params");
+    let thread = start_thread(&mut peer, params);
+    let turn = send_turn_in(&mut peer, &thread.id, parent_prompt, agent::Sandbox::ReadOnly);
+    assert!(
+        peer.wait_turn(&thread.id, &turn, TURN_BUDGET).is_some(),
+        "stderr: {}",
+        peer.stderr_tail()
+    );
+    assert_eq!(model.steps_left(), 0, "the child never ran its command");
+    assert!(!project.join("child-plain").exists(), "the child wrote");
 }

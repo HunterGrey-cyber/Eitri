@@ -143,6 +143,47 @@ fn self_check_passes_on_this_codex() {
     assert!(again.elapsed().as_secs() < 5, "a recorded pass is not run again");
 }
 
+/// A check that cannot tell the read-only sandbox from the workspace one proves nothing about it.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn self_check_fails_closed_when_a_read_only_thread_is_not() {
+    let scratch = Scratch::new("no-read-only");
+    fails_closed_with_the_sandbox_widened(&scratch.state());
+}
+
+/// The commands name their files in a path with a space: a split command would write nothing whatever the sandbox
+/// did, and this would pass.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn self_check_tells_the_sandboxes_apart_in_a_state_directory_with_a_space() {
+    let scratch = Scratch::new("spaced");
+    let state = scratch.state().join("with a space");
+    fails_closed_with_the_sandbox_widened(&state);
+    ensure_checked(&real_codex(), &state).expect("the check passes in such a directory");
+}
+
+fn fails_closed_with_the_sandbox_widened(state: &std::path::Path) {
+    let tweaks = CheckTweaks {
+        widen_read_only: true,
+        ..CheckTweaks::default()
+    };
+    let err = ensure_checked_tweaked(&real_codex(), state, &tweaks).expect_err("a wider sandbox fails the check");
+    let SelfCheckError::Failed { reasons, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("a plain write inside the project of a read-only thread")),
+        "the check should name the write that got through: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|r| r.contains("read-only start did not echo")),
+        "the check should name the echo: {reasons:?}"
+    );
+    assert_eq!(verdicts(state), 0);
+}
+
 #[test]
 #[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
 fn self_check_fails_closed_when_spawn_is_refused() {

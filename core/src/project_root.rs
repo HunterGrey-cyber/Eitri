@@ -354,6 +354,9 @@ pub struct OpenTarget {
 pub struct Launch {
     /// The project root, canonical.
     pub root: PathBuf,
+    /// The folders above `root` up to the first file's git top, nearest first: a running window on one of them is
+    /// a window of the same project. Empty unless the root came from a file and sits below that top.
+    pub wider_roots: Vec<PathBuf>,
     /// What nvim opens, first shown. Empty when no file was named.
     pub open: Vec<OpenTarget>,
     /// `--new-window` before `--`.
@@ -402,6 +405,7 @@ pub fn resolve_launch_in(
         }
         return Ok(Launch {
             root: resolve_from(std::iter::empty(), env, cwd)?,
+            wider_roots: Vec::new(),
             open: Vec::new(),
             new_window: parsed.new_window,
             notes: Vec::new(),
@@ -443,8 +447,8 @@ pub fn resolve_launch_in(
         (_, None) => {}
     }
 
-    let root = match directory {
-        Some(directory) => directory,
+    let (root, wider_roots) = match directory {
+        Some(directory) => (directory, Vec::new()),
         None => {
             let cwd = cwd.ok().and_then(|cwd| cwd.canonicalize().ok());
             // With a first path that is no directory, `open` holds it.
@@ -462,6 +466,7 @@ pub fn resolve_launch_in(
     }
     Ok(Launch {
         root,
+        wider_roots,
         open,
         new_window: parsed.new_window,
         notes,
@@ -690,15 +695,20 @@ fn number_suffix(name: &[u8]) -> Option<(&[u8], u32)> {
 ///
 /// The nearest usable git top holds the project, and a usable cwd inside it narrows that to where the
 /// user is working. With no top, a usable cwd holding the file serves, else the file's own folder.
-fn root_for_file(file: &Path, cwd: Option<&Path>, home: Option<&Path>, who: &Identity) -> PathBuf {
+///
+/// Second in the pair: the folders a narrowed root leaves out, up to that top. They are `Launch::wider_roots`.
+fn root_for_file(file: &Path, cwd: Option<&Path>, home: Option<&Path>, who: &Identity) -> (PathBuf, Vec<PathBuf>) {
     let folder = file.parent().unwrap_or(file);
     let cwd = cwd.filter(|cwd| file.starts_with(cwd) && is_usable(cwd, home, who));
     match usable_git_top(folder, home, who) {
         Some(top) => match cwd {
-            Some(cwd) if cwd.starts_with(&top) => cwd.to_path_buf(),
-            _ => top,
+            Some(cwd) if cwd.starts_with(&top) => {
+                let above = cwd.ancestors().skip(1).take_while(|dir| dir.starts_with(&top));
+                (cwd.to_path_buf(), above.map(Path::to_path_buf).collect())
+            }
+            _ => (top, Vec::new()),
         },
-        None => cwd.unwrap_or(folder).to_path_buf(),
+        None => (cwd.unwrap_or(folder).to_path_buf(), Vec::new()),
     }
 }
 
@@ -1206,6 +1216,63 @@ mod tests {
         let x = file(member.join("src/x.rs"));
         let launch = at(&home, &["src/x.rs"], &member).unwrap();
         assert_eq!((launch.root, launch.open), (member, vec![plain(x)]));
+        assert_eq!(launch.wider_roots, [repo]);
+    }
+
+    #[test]
+    fn the_wider_roots_climb_from_the_narrowed_root_to_the_git_top_nearest_first() {
+        let (_s, home) = scratch_home("rl-wider");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let member = dir(repo.join("crates/member"));
+        let crates = repo.join("crates");
+        file(member.join("x.rs"));
+        let launch = at(&home, &["x.rs"], &member).unwrap();
+        assert_eq!(launch.root, member);
+        assert_eq!(launch.wider_roots, [crates, repo]);
+    }
+
+    /// There is nothing above a root that is the git top, and the search stops at the top of the file's own
+    /// repository: a window on an outer repository is another project.
+    #[test]
+    fn the_wider_roots_stop_at_the_nearest_top_and_only_a_narrowed_root_has_any() {
+        let (_s, home) = scratch_home("rl-wider-stop");
+        let outer = dir(home.join("outer"));
+        fake_repo(&outer);
+        let inner = dir(outer.join("vendor/inner"));
+        fake_repo(&inner);
+        let member = dir(inner.join("member"));
+        let x = file(member.join("x.rs"));
+        let elsewhere = dir(home.join("elsewhere"));
+        let below = dir(elsewhere.join("below"));
+        file(below.join("y.rs"));
+
+        let cases: [(&[&str], &Path); 5] = [
+            // In the inner repository: up to its top, no further.
+            (&["x.rs"], &member),
+            // The cwd is the top.
+            (&["member/x.rs"], &inner),
+            // The cwd does not hold the file, so the root is the top.
+            (&[text(&x)], &elsewhere),
+            // No repository.
+            (&["y.rs"], &below),
+            // A directory names its root outright.
+            (&[text(&inner), text(&x)], &member),
+        ];
+        let wider: Vec<Vec<PathBuf>> = cases
+            .iter()
+            .map(|(args, cwd)| at(&home, args, cwd).unwrap().wider_roots)
+            .collect();
+        assert_eq!(wider, [vec![inner.clone()], vec![], vec![], vec![], vec![]]);
+    }
+
+    #[test]
+    fn a_launch_with_no_file_has_no_wider_roots() {
+        let (_s, home) = scratch_home("rl-wider-none");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let member = dir(repo.join("member"));
+        assert!(at(&home, &[], &member).unwrap().wider_roots.is_empty());
     }
 
     #[test]

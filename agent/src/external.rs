@@ -31,6 +31,16 @@ pub enum Reviewer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnPolicy {
     pub reviewer: Reviewer,
+    pub sandbox: Sandbox,
+}
+
+/// How far an agent's own sandbox lets it write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sandbox {
+    /// Inside the project, whose root is a boundary.
+    Project,
+    /// Nowhere. The root is no boundary, so there is nothing to keep a write inside of.
+    ReadOnly,
 }
 
 /// Whether the agent may treat one directory as trusted. Each provider spells it in its own wire

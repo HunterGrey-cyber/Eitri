@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=00cad545e776539285b7e17e154ec430bf59c2d227ec20c369c90c52eea7f1bb -->
+<!-- translated-from: agents.md sha256=6f3d38177133c5d5d7ee4256aaffedd4c5a3d6292895c81f37ab6ae63451fff8 -->
 
 # Codex 与其他 agent
 
@@ -154,6 +154,8 @@ Codex 在它的 `workspace-write` 沙箱里运行，批准策略是 `on-request`
 - **MCP 工具遵循它们所在服务器的批准模式。** 服务器不需要批准的工具，不经请求就运行。
 - 离开沙箱的请求，在 Manual 下是一张卡片，在 Auto 下由审查者决定，在 Bypass 下由 Eitri 批准。这样被批准的命令以你的全部权限运行。
 
+在[不算边界的文件夹](permissions.zh-CN.md#a-folder-that-is-no-boundary)里，Codex 改在它的 `read-only` 沙箱里运行：读取和上面一样，什么也不写，也没有网络和套接字，所以每次写入都必须请求离开沙箱。这个请求在 Auto 下也是一张卡片，只有 Bypass 会不问就批准。上面其他的途径不变：你的 exec-policy `allow` 规则和 MCP 工具。即使信任问题回答了 `y`，项目自己的 Codex 配置在那里也不会加载。Eitri 在每次启动和每个回合都会看一次这个文件夹，子 agent 继承这个沙箱。
+
 `<prefix> i` 在 `runs without asking` 一行里为屏幕上的标签页把这些写明，这一行随标签页的模式而变。
 
 <a id="interrupting-subagents-and-resuming"></a>
@@ -185,6 +187,7 @@ eitri.agent.register({
   command = { "my-acp-agent", "--acp" },         -- 程序和它的参数
   project_files = { ".myagent/", "MYAGENT.md" }, -- agent 从项目里读取的东西
   auto_mode = "auto",                            -- 可选：agent 的一个模式 id
+  read_only_mode = "plan",                       -- 可选：用于不算边界的文件夹的模式
 })
 ```
 
@@ -192,6 +195,7 @@ eitri.agent.register({
 - **`command`** 必填：一个字符串列表，程序在最前。程序必须是绝对路径，或在 `PATH` 里查找的裸命令名；带 `/` 的相对路径会指向项目里的某个文件，因此会被拒绝。启动时不检查程序是否存在：不存在的只会让那个标签页的启动失败。
 - **`project_files`** 必填且不能为空：agent 从项目里读取的文件和目录（结尾的 `/` 表示目录），每项一个名字，里面不能有 `/`。Eitri 用它来问下面的信任问题。请把 agent 读取的一切都列出来：这一点 Eitri 没法替你知道。
 - **`auto_mode`** 可选：agent 某个模式的 id。见[模式](#modes-and-the-agents-own-settings)。
+- **`read_only_mode`** 可选：在[不算边界的文件夹](permissions.zh-CN.md#a-folder-that-is-no-boundary)里代替 `auto_mode` 使用的模式 id。Eitri 不知道一个模式会做什么，所以要点名一个只读的模式。没有它时，agent 在这样的文件夹里保持平常的模式。
 
 任何其他键、或者不对的值，都会让 Eitri 在启动时停下并点出这个键，而且在调用外面包一层 `pcall` 也藏不住它。之后 `:tabnew myagent` 就打开一个它的标签页，`agent.default` 也可以写它的名字；`agent.default` 是在整个文件跑完之后才读的，所以它可以写在 `register` 调用的前面。
 
@@ -212,7 +216,7 @@ Eitri 用你当前的环境原样启动 agent。如果一个 agent 把环境变�
 <a id="modes-and-the-agents-own-settings"></a>
 ### 模式与 agent 自己的设置
 
-Eitri 不向 agent 提供文件或终端方法，也从不调用它的认证步骤。它对 agent 只设一件事：注册里有 `auto_mode` 时，这个模式 id 会在每个会话开始时设上，两种 Eitri 模式下都一样。之后 Eitri 会拿 agent 报告的每一次模式去和它对照：设置被拒绝，或者有差异，都会让标签页带着一条不一致的消息结束，之后什么也不再回答。没有 `auto_mode` 时，Eitri 什么也不设、什么也不检查，`prefix i` 的 `runs without asking` 一行会说 Eitri 不知道这个 agent 不经询问会运行什么。
+Eitri 不向 agent 提供文件或终端方法，也从不调用它的认证步骤。它对 agent 只设一件事：注册里有 `auto_mode` 时，这个模式 id 会在每个会话开始时设上，两种 Eitri 模式下都一样。之后 Eitri 会拿 agent 报告的每一次模式去和它对照：设置被拒绝，或者有差异，都会让标签页带着一条不一致的消息结束，之后什么也不再回答。在不算边界的文件夹里，有 `read_only_mode` 时，它在这一切里代替 `auto_mode`。两者都没有时，Eitri 什么也不设、什么也不检查，`prefix i` 的 `runs without asking` 一行会说 Eitri 不知道这个 agent 不经询问会运行什么。
 
 Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样回答 agent 的请求，并且从不改变 agent 的模式。`mode lag` 一行说的就是没有这种延迟。注册的 agent 的标签页没有 Manual 模式：agent 自己的模式只在开始时设一次，Eitri 之后没法让它更严格。在那里 `Shift+Tab` 在 Auto 和 Bypass 之间切换；新标签页默认以 Manual 开始时，新开的这种 agent 的标签页会以 Auto 开始，Eitri 会说一次。
 

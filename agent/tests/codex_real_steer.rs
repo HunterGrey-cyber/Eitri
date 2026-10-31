@@ -256,6 +256,7 @@ fn the_provider_delivers_a_message_read_and_drops_one_an_interrupt_lost() {
     assert!(provider.capabilities().steer);
     let policy = TurnPolicy {
         reviewer: Reviewer::User,
+        sandbox: agent::Sandbox::Project,
     };
     let thread = provider
         .start(ExternalStart {

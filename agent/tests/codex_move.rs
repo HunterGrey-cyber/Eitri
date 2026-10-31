@@ -205,6 +205,7 @@ fn started(dir: &Path, thread: &str, rest: Vec<Value>) -> CodexProvider {
             },
             policy: TurnPolicy {
                 reviewer: Reviewer::User,
+                sandbox: agent::Sandbox::Project,
             },
             resume: None,
         })
@@ -222,6 +223,7 @@ fn send(provider: &CodexProvider, thread: &str) -> String {
             },
             TurnPolicy {
                 reviewer: Reviewer::User,
+                sandbox: agent::Sandbox::Project,
             },
         )
         .expect("the turn starts")
@@ -755,6 +757,7 @@ fn a_real_codex_turn_with_an_approval_pending_completes_after_adoption() {
     let source = real_provider(&logged_program(&logs, &codex), &s, &home, &project);
     let policy = TurnPolicy {
         reviewer: Reviewer::User,
+        sandbox: agent::Sandbox::Project,
     };
     let thread = source
         .start(ExternalStart {

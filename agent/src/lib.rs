@@ -82,7 +82,7 @@ pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError, PromptOrigin};
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
-pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, TrustPlan, TurnPolicy};
+pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, Sandbox, TrustPlan, TurnPolicy};
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
 pub use move_seed::{
     ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,

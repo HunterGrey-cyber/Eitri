@@ -102,6 +102,22 @@ pub struct AcpAgentSpec {
     /// The mode id set at the start of every session, in both Eitri modes. Eitri never sets another. With
     /// none, the agent's own default mode stays and Eitri does not know what it runs without asking.
     pub auto_mode: Option<String>,
+    /// The mode id that stands for `auto_mode` where the project's root is no boundary, as the registration
+    /// says: ACP has no sandbox to ask for, and Eitri cannot tell what any mode of an agent means.
+    pub read_only_mode: Option<String>,
+}
+
+impl AcpAgentSpec {
+    /// The spec a session at this root starts from. Only the mode changes, before the provider sees it, so what
+    /// sets the mode and holds the agent to it is the same either way.
+    pub fn at_root(mut self, root_is_a_boundary: bool) -> AcpAgentSpec {
+        if !root_is_a_boundary {
+            if let Some(mode) = self.read_only_mode.take() {
+                self.auto_mode = Some(mode);
+            }
+        }
+        self
+    }
 }
 
 /// The provider name for an agent: leaked once per distinct name, since [`ExternalProvider::name`] hands

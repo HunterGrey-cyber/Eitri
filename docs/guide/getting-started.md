@@ -85,11 +85,12 @@ window's editor was hidden or has not started yet, it is shown and the file open
 window's own bottom terminal, `eitri FILE` opens in that window, even after a `cd` into a subfolder, as long as the
 file is inside the window's project. `eitri DIR` and a bare `eitri` always start a new window, and so does
 `eitri --new-window FILE` (`--clean` and `--account` imply it). An account set in `VERDANDI_CLAUDE_ACCOUNT` does not
-imply it: the running window keeps the account it has. Outside a bottom terminal the window must be on the very
-project worked out above, not a wider one: `cd repo/crate; eitri src/x.rs` works out `crate`, so it starts a window on
-`crate` even with one open on `repo`, and a project not seen before gets its own trust question. Run it from `repo`,
-or from that window's bottom terminal, to reach that window. With no window on the project a new one starts, and so it
-does when the window cannot take the file just now, for instance one sitting in a quit prompt with an unsaved buffer.
+imply it: the running window keeps the account it has. Outside a bottom terminal a window on a folder above the
+project worked out here also counts, up to the file's repository, nearest first: `cd repo/crate; eitri src/x.rs` works
+out `crate`, and opens in a window on `repo` when none is open on `crate`. A window that cannot hold every file you
+named is passed over, and with no repository only the project itself is asked. With no such window a new one starts,
+and so it does when the window cannot take the file just now, for instance one sitting in a quit prompt with an
+unsaved buffer.
 When the buffer in the editor has unsaved changes, the file opens in a split and that buffer stays.
 
 On GNOME a window can be raised only by a launch that carries an activation token, which a command typed in a
@@ -99,8 +100,8 @@ and niri are expected to focus the window through the compositor. Only sway has 
 **A file with no project of its own.** `eitri ~/notes.md`, `eitri /etc/hosts` and `eitri /tmp/x.py` open too, in the
 file's folder. When that folder cannot serve as a boundary for the agent (your home directory, a folder you do not
 own, a folder other users can write to, the filesystem root), the panel shows a note on every tab page:
-`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab can write
-anywhere in this folder.` It stays until you dismiss it. What that means for each mode is in
+`No project boundary here (<why>): a Claude tab asks before every file and command, and a Codex tab starts read-only,
+without the folder's configuration. Other agents keep their own rules.` It stays until you dismiss it. What that means for each mode is in
 [Permissions](permissions.md#a-folder-that-is-no-boundary).
 
 **From a file manager.** Eitri's desktop entry lists plain text, Markdown, C, C++, Python, Rust, JSON, TOML and shell

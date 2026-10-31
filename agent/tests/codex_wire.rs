@@ -3,7 +3,7 @@
 //! hand-built inputs for the shapes no recorded run produced.
 
 use agent::providers::codex::config::{
-    expected_echo, sandbox_policy, session_config, SessionConfigError, APPROVAL_POLICY, SANDBOX_MODE,
+    expected_echo, sandbox_mode, sandbox_policy, session_config, SessionConfigError, APPROVAL_POLICY, SANDBOX_MODE,
 };
 use agent::providers::codex::wire::{
     self, parse_notification, parse_server_request, AccountReadResponse, CodexErrorInfo, CommandApprovalKind, Decision,
@@ -11,6 +11,7 @@ use agent::providers::codex::wire::{
     ServerRequest, SubAgentKind, ThreadItem, ThreadResumeParams, ThreadStartParams, ThreadStartResponse,
     ThreadTurnsListResponse, TurnStartParams, TurnStartResponse, TurnStatus,
 };
+use agent::Sandbox;
 use agent::{DirTrust, Reviewer, TrustPlan};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -210,7 +211,13 @@ fn tool_servers_are_turned_off_by_name_for_tests_only() {
 #[test]
 fn params_carry_the_allowlisted_policy() {
     let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true)).expect("config");
-    let start = serde_json::to_value(ThreadStartParams::new("/p".into(), Reviewer::Agent, config.clone())).unwrap();
+    let start = serde_json::to_value(ThreadStartParams::new(
+        "/p".into(),
+        Reviewer::Agent,
+        Sandbox::Project,
+        config.clone(),
+    ))
+    .unwrap();
     assert_eq!(
         start,
         json!({"cwd": "/p", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review",
@@ -220,6 +227,7 @@ fn params_carry_the_allowlisted_policy() {
         "t1".into(),
         "/p".into(),
         Reviewer::User,
+        Sandbox::Project,
         config.clone(),
     ))
     .unwrap();
@@ -228,7 +236,13 @@ fn params_carry_the_allowlisted_policy() {
         json!({"threadId": "t1", "cwd": "/p", "approvalPolicy": "on-request", "approvalsReviewer": "user",
                "sandbox": "workspace-write", "config": config, "excludeTurns": true})
     );
-    let turn = serde_json::to_value(TurnStartParams::new("t1".into(), "hello".into(), Reviewer::User)).unwrap();
+    let turn = serde_json::to_value(TurnStartParams::new(
+        "t1".into(),
+        "hello".into(),
+        Reviewer::User,
+        Sandbox::Project,
+    ))
+    .unwrap();
     assert_eq!(
         turn,
         json!({"threadId": "t1", "input": [{"type": "text", "text": "hello"}], "approvalPolicy": "on-request",
@@ -272,6 +286,23 @@ fn answers_are_only_accept_decline_cancel_and_an_empty_turn_grant() {
     );
 }
 
+/// What Codex 0.163.0's schema calls `readOnly` carries only `networkAccess`, and it is what a start, a resume and a
+/// turn all say at a root that is no boundary.
+#[test]
+fn the_read_only_sandbox_on_the_wire() {
+    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true)).expect("config");
+    let start = ThreadStartParams::new("/p".into(), Reviewer::User, Sandbox::ReadOnly, config.clone());
+    assert_eq!(serde_json::to_value(start).unwrap()["sandbox"], "read-only");
+    let resume = ThreadResumeParams::new("t1".into(), "/p".into(), Reviewer::User, Sandbox::ReadOnly, config);
+    assert_eq!(serde_json::to_value(resume).unwrap()["sandbox"], "read-only");
+    let turn = TurnStartParams::new("t1".into(), "hello".into(), Reviewer::User, Sandbox::ReadOnly);
+    let read_only = json!({"type": "readOnly", "networkAccess": false});
+    assert_eq!(serde_json::to_value(turn).unwrap()["sandboxPolicy"], read_only);
+    assert_eq!(sandbox_policy(Sandbox::ReadOnly).to_value(), read_only);
+    assert_eq!(sandbox_mode(Sandbox::ReadOnly), "read-only");
+    assert_eq!(sandbox_mode(Sandbox::Project), SANDBOX_MODE);
+}
+
 #[test]
 fn expected_echo_is_the_recorded_narrow_echo() {
     // A recorded `thread/resume` answer echoed exactly the pinned sandbox; the expectation must equal it.
@@ -279,7 +310,7 @@ fn expected_echo_is_the_recorded_narrow_echo() {
     let result = response_to(&frames, "thread/resume").expect("a recorded thread/resume answer");
     let resp: ThreadStartResponse = serde_json::from_value(result).expect("a resume response");
     let echo = resp.echo();
-    let want = expected_echo(Reviewer::User);
+    let want = expected_echo(Reviewer::User, Sandbox::Project);
     assert_eq!(
         echo.sandbox.as_ref(),
         Some(&serde_json::to_value(&want.sandbox).unwrap())
@@ -290,7 +321,7 @@ fn expected_echo_is_the_recorded_narrow_echo() {
         Some(json!(wire::reviewer_word(want.approvals_reviewer)))
     );
     assert_eq!(
-        serde_json::to_value(sandbox_policy()).unwrap(),
+        serde_json::to_value(sandbox_policy(Sandbox::Project)).unwrap(),
         serde_json::to_value(&want.sandbox).unwrap()
     );
 }
