@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use agent::setting_sources::ProjectTrust;
 use agent::PermissionMode;
+use eitri_core::editor_context::feed::EditorContextFeed;
 use eitri_core::editor_context::EditorContext;
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
@@ -74,6 +75,7 @@ impl BrokerEnv for Env {
 }
 struct Test {
     rpc: Rc<Rpc>,
+    feed: EditorContextFeed,
     dir: PathBuf,
     root: PathBuf,
     path: PathBuf,
@@ -93,10 +95,12 @@ impl Test {
         let root = dir.join("project");
         let path = root.join("a.rs");
         std::fs::write(&path, "foo\n").unwrap();
-        let mut nvim = Embed::start(&dir, &[], &[]);
+        let feed = EditorContextFeed::new().expect("the feed must bind");
+        let mut nvim = Embed::start_fed(&dir, &feed, &[]);
         let buf = nvim.lua(OPEN, vec![path.to_string_lossy().as_ref().into()]);
         let mut t = Self {
             rpc: Rc::new(Rpc(RefCell::new(nvim))),
+            feed,
             dir,
             root,
             path,
@@ -214,7 +218,55 @@ impl Test {
 }
 impl Drop for Test {
     fn drop(&mut self) {
+        self.feed.cleanup();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A second buffer of the project, opened through a link to a file outside it, the link since replaced by a file.
+fn read_from_outside(t: &Test) -> PathBuf {
+    let outside = t.dir.join("outside.rs");
+    std::fs::write(&outside, "secret line\n").unwrap();
+    let name = t.root.join("b.rs");
+    std::os::unix::fs::symlink(&outside, &name).unwrap();
+    t.lua(OPEN, vec![name.to_string_lossy().as_ref().into()]);
+    std::fs::remove_file(&name).unwrap();
+    std::fs::write(&name, "plain\n").unwrap();
+    name
+}
+
+#[test]
+#[ignore]
+fn an_item_in_a_buffer_read_from_outside_tells_no_line() {
+    let mut t = Test::new();
+    let name = read_from_outside(&t);
+    t.server();
+    t.definitions(t.location(&name), 0);
+    let result = t.usages(&json!({"path": "a.rs", "line": 1, "symbol": "foo", "include": ["definitions"]}));
+    assert!(!result.is_error, "{}", result.text);
+    assert!(!result.text.contains("secret"), "{}", result.text);
+    let told: serde_json::Value = serde_json::from_str(&result.text).unwrap();
+    assert_eq!(
+        told["definitions"][0]["path"], "b.rs",
+        "the item keeps its place: {told}"
+    );
+    assert!(told["definitions"][0].get("text").is_none(), "{told}");
+}
+
+#[test]
+#[ignore]
+fn a_usages_call_on_a_buffer_read_from_outside_tells_nothing() {
+    let mut t = Test::new();
+    read_from_outside(&t);
+    t.definitions(t.location(&t.path), 0);
+    for symbol in ["secret", "absent"] {
+        let result = t.usages(&json!({"path": "b.rs", "line": 1, "symbol": symbol}));
+        assert!(result.is_error, "{}", result.text);
+        assert!(
+            result.text.contains("use Read"),
+            "whether it is there is the buffer's text: {}",
+            result.text
+        );
     }
 }
 
@@ -1090,6 +1142,37 @@ fn code_actions_list_id_and_title_and_keep_the_action_in_nvim() {
         "kept".into()
     );
 }
+/// What a server gets back in a code action's context can come out in the action's title.
+#[test]
+#[ignore]
+fn a_code_action_goes_out_with_no_entry_that_stood_through_a_reload() {
+    let mut t = Test::new();
+    t.lua(
+        "local b = ...
+         vim.diagnostic.set(vim.api.nvim_create_namespace('server'), b, {
+           { lnum = 0, col = 0, message = 'stood', user_data = { lsp = { message = 'stood' } } },
+         })
+         vim.b[b].eitri_read_from = '/a/file/read/before'
+         vim.api.nvim_buf_call(b, function() vim.cmd('edit!') end)",
+        vec![t.buf.clone()],
+    );
+    t.edit_server();
+    t.answers(map(&[("textDocument/codeAction", Value::Array(vec![]))]), &[], 0);
+    let asked = t.ask(&t.edit_args(LspKind::CodeActions));
+    assert!(matches!(asked, Asked::Started { .. }), "{asked:?}");
+    t.done();
+    assert_eq!(
+        t.lua(
+            "for _, r in ipairs(_G.__fake_lsp.seen) do
+               if r.method == 'textDocument/codeAction' then return #r.params.context.diagnostics end
+             end
+             return -1",
+            vec![]
+        ),
+        0.into()
+    );
+}
+
 #[test]
 #[ignore]
 fn the_range_is_in_each_clients_encoding() {

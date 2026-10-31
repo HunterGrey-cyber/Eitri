@@ -162,6 +162,7 @@ impl Drop for Scratch {
 fn entry(path: &Path) -> DiagnosticEntry {
     DiagnosticEntry {
         path: path.to_owned(),
+        read_from: Some(path.to_owned()),
         line: 1,
         column: 1,
         end_line: 1,
@@ -537,6 +538,58 @@ fn an_unsaved_new_file_can_be_selected() {
     let params = scratch.context(&new);
     assert_eq!(params["filePath"], json!(new.to_str().unwrap()));
     assert_eq!(params["text"], json!("private"));
+}
+
+#[test]
+fn entries_of_a_buffer_read_from_outside_are_dropped() {
+    let scratch = Scratch::new();
+    let file = scratch.write("kept.py", "x\n");
+    let read_elsewhere = scratch.write("replaced.py", "x\n");
+    let unrecorded = scratch.write("unrecorded.py", "x\n");
+    let new_file = scratch.at("new.py");
+    let entries = vec![
+        DiagnosticEntry {
+            read_from: Some(scratch.outside("secret")),
+            ..entry(&read_elsewhere)
+        },
+        DiagnosticEntry {
+            read_from: None,
+            ..entry(&unrecorded)
+        },
+        entry(&file),
+        DiagnosticEntry {
+            read_from: None,
+            ..entry(&new_file)
+        },
+    ];
+    let done = scratch.run(Job::Entries {
+        conn: CONN,
+        id: id(),
+        named_uri: None,
+        answer: DiagnosticsAnswer {
+            entries,
+            modified: Vec::new(),
+            left_out: 0,
+        },
+    });
+    let ToolAnswer::DiagnosticsText(text) = answered(done) else {
+        panic!("not diagnostics text");
+    };
+    let told: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let uris: Vec<&str> = told
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            format!("file://{}", file.display()),
+            format!("file://{}", new_file.display())
+        ],
+        "a project name says nothing of the text a buffer holds"
+    );
 }
 
 #[test]

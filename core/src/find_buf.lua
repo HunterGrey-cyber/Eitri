@@ -34,3 +34,29 @@ local function find_buf(path)
   end
   return exact or twin
 end
+
+-- What the buffer's text was read from, as the editor-context feed recorded it at load: a real path, or
+-- the name itself when nothing was on disk. Nil for a buffer loaded with no feed there to record it.
+local function read_from(buf)
+  local ok, record = pcall(vim.api.nvim_buf_get_var, buf, 'eitri_read_from')
+  if ok and type(record) == 'string' then
+    return record
+  end
+  return nil
+end
+
+-- What `vim.diagnostic` holds on a buffer, without what stood through the load that last moved its record: that was set
+-- about the text the load replaced, and it stands until its producer sets again.
+local function live_diagnostics(buf, opts)
+  local ok, stood = pcall(vim.api.nvim_buf_get_var, buf, 'eitri_diagnostics_stood')
+  if not ok or type(stood) ~= 'table' then
+    stood = {}
+  end
+  local live = {}
+  for _, diagnostic in ipairs(vim.diagnostic.get(buf, opts)) do
+    if not stood[tostring(diagnostic.namespace)] then
+      live[#live + 1] = diagnostic
+    end
+  end
+  return live
+end

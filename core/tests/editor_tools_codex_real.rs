@@ -91,6 +91,7 @@ impl EditorWay for FakeEditor {
                         "buffers",
                         Msgpack::Array(vec![map(vec![
                             ("path", Msgpack::from(lib)),
+                            ("read_from", Msgpack::from(lib)),
                             ("modified", Msgpack::from(false)),
                             ("lines", Msgpack::from(12)),
                             ("filetype", Msgpack::from("rust")),
@@ -101,7 +102,11 @@ impl EditorWay for FakeEditor {
                     ("left_out", Msgpack::from(0)),
                     (
                         "current",
-                        map(vec![("line", Msgpack::from(3)), ("path", Msgpack::from(lib))]),
+                        map(vec![
+                            ("line", Msgpack::from(3)),
+                            ("path", Msgpack::from(lib)),
+                            ("read_from", Msgpack::from(lib)),
+                        ]),
                     ),
                     ("mode", Msgpack::from("n")),
                 ])));

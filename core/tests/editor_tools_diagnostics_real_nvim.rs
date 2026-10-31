@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use agent::setting_sources::ProjectTrust;
 use agent::PermissionMode;
+use eitri_core::editor_context::feed::EditorContextFeed;
 use eitri_core::editor_tools::memory::Memory;
 use eitri_core::editor_tools::stamp::{wall_ms, Stamp};
 use eitri_core::editor_tools::step::{
@@ -20,7 +21,7 @@ use eitri_core::editor_tools::step::{
 };
 use eitri_core::editor_tools::tools::baseline::{appeared, counted, BaselineRun, TurnBaseline, BASELINE_LIMIT};
 use eitri_core::editor_tools::tools::diagnostics::{
-    answer_max, parse, DiagnosticEntry, DiagnosticsAnswer, Severity, DIAGNOSTICS_LUA,
+    answer_max, parse, result_of, DiagnosticEntry, DiagnosticsAnswer, Severity, DIAGNOSTICS_LUA,
 };
 use embed_client::Embed;
 use rmpv::Value;
@@ -46,6 +47,15 @@ local path, list = ...
 for _, b in ipairs(vim.api.nvim_list_bufs()) do
   if vim.api.nvim_buf_get_name(b) == path then
     vim.diagnostic.set(vim.api.nvim_create_namespace('test'), b, list)
+  end
+end";
+
+/// As `SET`, in the namespace `name`: two producers, each setting its own.
+const SET_IN: &str = "
+local path, name, list = ...
+for _, b in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_get_name(b) == path then
+    vim.diagnostic.set(vim.api.nvim_create_namespace(name), b, list)
   end
 end";
 
@@ -103,6 +113,7 @@ impl Diag {
 
 struct Nvim {
     embed: Embed,
+    feed: EditorContextFeed,
     dir: PathBuf,
     project: PathBuf,
     beside: PathBuf,
@@ -111,6 +122,7 @@ struct Nvim {
 
 impl Drop for Nvim {
     fn drop(&mut self) {
+        self.feed.cleanup();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -123,9 +135,11 @@ fn start(case: &str) -> Nvim {
     let dir = std::fs::canonicalize(&dir).expect("scratch dir");
     let project = dir.join("project");
     let beside = dir.join("beside");
-    let embed = Embed::start(&project, &[], &[]);
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let embed = Embed::start_fed(&project, &feed, &[]);
     Nvim {
         embed,
+        feed,
         dir,
         project,
         beside,
@@ -155,6 +169,16 @@ impl Nvim {
     fn set(&mut self, path: &Path, diags: &[Diag]) {
         let list = Value::Array(diags.iter().map(Diag::value).collect());
         self.embed.lua(SET, vec![bytes(path), list]);
+    }
+
+    fn set_in(&mut self, path: &Path, namespace: &str, diags: &[Diag]) {
+        let list = Value::Array(diags.iter().map(Diag::value).collect());
+        self.embed.lua(SET_IN, vec![bytes(path), namespace.into(), list]);
+    }
+
+    /// What `vim.diagnostic` itself still holds on the current buffer, whatever the tool tells of it.
+    fn standing(&mut self) -> Value {
+        self.embed.lua("return #vim.diagnostic.get(0)", vec![])
     }
 
     fn stamp(&mut self) -> Stamp {
@@ -252,6 +276,7 @@ fn entries_after_vim_diagnostic_set() {
         DiagnosticsAnswer {
             entries: vec![DiagnosticEntry {
                 path: file.clone(),
+                read_from: Some(file.clone()),
                 line: 3,
                 column: 4,
                 end_line: 3,
@@ -425,6 +450,215 @@ fn a_new_file_under_a_directory_that_became_a_link_out_takes_no_place_under_the_
     let answer = nvim.answer_with(None, "hint", false, 2);
     assert_eq!(messages(&answer), ["the project's unsaved file"]);
     assert_eq!(answer.left_out, 0, "nothing of the project was left out");
+}
+
+/// A buffer of the project opened through a link to a file outside it, the link since replaced by an ordinary file.
+fn read_from_outside(nvim: &mut Nvim, name: &str) -> PathBuf {
+    let secret = nvim.file(&nvim.beside.clone(), "secret.rs", "secret\n");
+    let link = nvim.project.join(name);
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    nvim.edit(&link);
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, "plain\n").unwrap();
+    link
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn diagnostics_of_a_buffer_read_from_outside_are_dropped() {
+    let mut nvim = start("read-elsewhere");
+    let own = nvim.inside("own.rs");
+    nvim.edit(&own);
+    nvim.set(&own, &[diag(0, 0, WARN, "the project's own")]);
+    let linked = read_from_outside(&mut nvim, "linked.rs");
+    nvim.set(&linked, &[diag(0, 0, ERROR, "from the secret file")]);
+
+    let answer = nvim.answer_with(None, "hint", false, 1);
+    assert_eq!(
+        messages(&answer),
+        ["the project's own"],
+        "it takes no place under the cap"
+    );
+    assert_eq!(answer.left_out, 0, "and it is not counted");
+
+    let stamp = nvim.stamp();
+    let value = nvim.ask_stamped(&stamp, Some(&linked), "hint", false, 500);
+    let memory = Memory::default();
+    let cx = ToolCx {
+        mode: PermissionMode::Manual,
+        trust: ProjectTrust::Trusted,
+        root: &nvim.project,
+        home: None,
+        reach: EditorReach::Own,
+        sight: EditorSight::OnScreen,
+        context: None,
+        tab: 1,
+        session: "session",
+        call: "call",
+        agent_call: AgentCall::Host,
+        memory: &memory,
+    };
+    let told = result_of(&cx, &value);
+    assert!(!told.is_error, "{}", told.text);
+    let told: serde_json::Value = serde_json::from_str(&told.text).unwrap();
+    assert_eq!(
+        told["entries"],
+        serde_json::json!([]),
+        "asked for by name, the entry stays out"
+    );
+}
+
+/// A project buffer opened through a link to an outside file, with an entry set on that file's text, the link since
+/// replaced by an ordinary file. The buffer still holds the outside text; nothing has reloaded it yet.
+fn set_on_a_link_then_replaced(nvim: &mut Nvim, name: &str, namespace: &str) -> PathBuf {
+    let secret = nvim.file(&nvim.beside.clone(), "secret.rs", "secret\n");
+    let link = nvim.project.join(name);
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    nvim.edit(&link);
+    nvim.set_in(&link, namespace, &[diag(0, 0, ERROR, "unused: secret words")]);
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, "plain\n").unwrap();
+    link
+}
+
+/// Both ways a file comes back into a buffer, and `checktime` is what the reload timer runs every second.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn an_entry_standing_through_a_reload_is_not_told() {
+    for (case, reload) in [("reload-edit", "edit!"), ("reload-checktime", "checktime")] {
+        let mut nvim = start(case);
+        let own = nvim.inside("own.rs");
+        nvim.edit(&own);
+        nvim.set(&own, &[diag(0, 0, WARN, "the project's own")]);
+        let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "test");
+        nvim.embed.command(reload);
+
+        let line = nvim.embed.lua("return vim.api.nvim_get_current_line()", vec![]);
+        assert_eq!(line.as_str(), Some("plain"), "{reload} read the new file");
+        let record = nvim.embed.lua("return vim.b.eitri_read_from", vec![]);
+        assert_eq!(record.as_str(), linked.to_str(), "{reload} moved the record");
+        assert_eq!(
+            nvim.standing(),
+            Value::from(1),
+            "vim.diagnostic keeps it through {reload}"
+        );
+
+        let whole = nvim.answer_with(None, "hint", false, 1);
+        assert_eq!(messages(&whole), ["the project's own"], "{reload}: it takes no place");
+        assert_eq!(whole.left_out, 0, "{reload}: and it is not counted");
+        let named = nvim.answer(Some(&linked));
+        assert!(messages(&named).is_empty(), "{reload}: asked for by name");
+    }
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_modified_buffer_with_only_stale_entries_is_not_named() {
+    let mut nvim = start("stale-modified");
+    let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "test");
+    nvim.embed.command("edit!");
+    nvim.embed.command("normal! ix");
+    let answer = nvim.answer(None);
+    assert!(answer.modified.is_empty(), "{:?}", answer.modified);
+    assert!(messages(&nvim.answer(Some(&linked))).is_empty());
+}
+
+/// A deleted link leaves nothing to read, and the text is gone from the buffer all the same.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn an_entry_standing_through_a_reload_of_a_deleted_link_is_not_told() {
+    let mut nvim = start("reload-deleted");
+    let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "test");
+    std::fs::remove_file(&linked).unwrap();
+    nvim.embed.command("edit!");
+    let record = nvim.embed.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(record.as_str(), linked.to_str(), "the record is the name");
+    assert_eq!(nvim.standing(), Value::from(1));
+    assert!(messages(&nvim.answer(Some(&linked))).is_empty());
+}
+
+/// `:bdelete` drops the buffer's variables and leaves what `vim.diagnostic` holds, so a record that is not there has
+/// moved as much as one that differs.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn an_entry_standing_through_a_deleted_buffer_is_not_told() {
+    let mut nvim = start("reload-bdelete");
+    let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "test");
+    nvim.embed.command("bdelete!");
+    nvim.edit(&linked);
+    assert_eq!(
+        nvim.standing(),
+        Value::from(1),
+        "the entry outlives the buffer's variables"
+    );
+    assert!(messages(&nvim.answer(Some(&linked))).is_empty());
+}
+
+/// Each producer's entries come back when that producer sets again, and no sooner.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_producer_that_sets_again_is_told_again() {
+    let mut nvim = start("sets-again");
+    let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "first");
+    nvim.set_in(&linked, "second", &[diag(0, 0, WARN, "unused: more secret words")]);
+    nvim.embed.command("edit!");
+    assert_eq!(nvim.standing(), Value::from(2));
+    assert!(messages(&nvim.answer(Some(&linked))).is_empty());
+
+    nvim.set_in(&linked, "first", &[]);
+    assert!(
+        messages(&nvim.answer(Some(&linked))).is_empty(),
+        "emptying one says nothing of the other"
+    );
+    nvim.set_in(&linked, "first", &[diag(0, 0, ERROR, "about the plain text")]);
+    assert_eq!(messages(&nvim.answer(Some(&linked))), ["about the plain text"]);
+    nvim.set_in(&linked, "second", &[diag(0, 0, WARN, "also about it")]);
+    let answer = nvim.answer(Some(&linked));
+    assert_eq!(messages(&answer), ["about the plain text", "also about it"]);
+    let note = nvim.embed.lua("return vim.b.eitri_diagnostics_stood", vec![]);
+    assert_eq!(note, Value::Nil, "nothing is left to hold back");
+}
+
+/// The record stays where it was, so the text is the file's as before and so are the entries.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_reload_of_the_same_file_keeps_its_entries() {
+    let mut nvim = start("same-file");
+    let own = nvim.inside("own.rs");
+    nvim.edit(&own);
+    nvim.set(&own, &[diag(0, 0, WARN, "the project's own")]);
+    std::fs::write(&own, "changed on disk\n").unwrap();
+    nvim.embed.command("edit!");
+    assert_eq!(messages(&nvim.answer(None)), ["the project's own"]);
+}
+
+/// Writing replaces no text: the entries are about what the file now holds.
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_write_that_moves_the_record_keeps_the_entries() {
+    let mut nvim = start("write-keeps");
+    let linked = set_on_a_link_then_replaced(&mut nvim, "linked.rs", "test");
+    nvim.embed.command("silent write!");
+    let record = nvim.embed.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(record.as_str(), linked.to_str());
+    assert_eq!(messages(&nvim.answer(Some(&linked))), ["unused: secret words"]);
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_buffer_with_no_record_takes_no_place_under_the_cap() {
+    let mut nvim = start("no-record");
+    let own = nvim.inside("own.rs");
+    nvim.edit(&own);
+    nvim.set(&own, &[diag(0, 0, WARN, "the project's own")]);
+    let other = nvim.inside("other.rs");
+    nvim.edit(&other);
+    nvim.embed.command("unlet b:eitri_read_from");
+    nvim.set(&other, &[diag(0, 0, ERROR, "no record")]);
+    assert_eq!(
+        messages(&nvim.answer_with(None, "hint", false, 1)),
+        ["the project's own"]
+    );
 }
 
 #[test]

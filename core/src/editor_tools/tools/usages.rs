@@ -1143,6 +1143,7 @@ mod tests {
             character: 0,
             text: None,
             text_from: None,
+            read_from: None,
             name: None,
             kind: None,
             container: None,
@@ -1157,6 +1158,7 @@ mod tests {
         let item = |from: &Path| RawItem {
             text: Some("the buffer's line".to_owned()),
             text_from: Some(from.to_path_buf()),
+            read_from: Some(from.to_path_buf()),
             ..raw(&inside, 1)
         };
         let shown = lsp::shown(&project.root, None, vec![item(&outside), item(&inside)]);
@@ -1169,6 +1171,37 @@ mod tests {
             term[0].text, None,
             "a name that is not absolute is no file of the project"
         );
+    }
+
+    #[test]
+    fn an_item_of_a_buffer_read_from_outside_keeps_only_its_place() {
+        let project = project("record-outside");
+        let inside = project.root.join("src/a.rs");
+        let outside = project.beside.join("b.rs");
+        let item = |record: Option<&Path>| RawItem {
+            text: Some("the buffer's line".to_owned()),
+            text_from: Some(inside.clone()),
+            read_from: record.map(Path::to_path_buf),
+            name: Some("name".to_owned()),
+            kind: Some("Function".to_owned()),
+            container: Some("container".to_owned()),
+            ..raw(&inside, 1)
+        };
+        let shown = lsp::shown(
+            &project.root,
+            None,
+            vec![item(Some(&outside)), item(None), item(Some(&inside))],
+        );
+        for (index, kept) in shown[..2].iter().enumerate() {
+            assert_eq!(kept.path, "src/a.rs", "{index}");
+            assert_eq!(
+                (&kept.text, &kept.name, &kept.kind, &kept.container),
+                (&None, &None, &None, &None),
+                "nothing taken from the buffer: {index}"
+            );
+        }
+        assert_eq!(shown[2].text.as_deref(), Some("the buffer's line"));
+        assert_eq!(shown[2].name.as_deref(), Some("name"));
     }
 
     #[test]

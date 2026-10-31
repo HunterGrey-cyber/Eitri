@@ -26,10 +26,13 @@ elseif args.path then
   end
 end
 if now_ms() > __stamp.deadline_ms then return { expired = true } end
+-- Whether a line or a symbol is there, and whatever a server says of this buffer, come from its text, and so does
+-- getting as far as asking for a client: the host judges the buffer before it takes any answer from here on.
+local about = buf and { name = api.nvim_buf_get_name(buf), read_from = read_from(buf) } or nil
 local row, byte = (args.line or 1) - 1, 0
 if args.line and buf then
   local count = api.nvim_buf_line_count(buf)
-  if args.line < 1 or args.line > count then return { no_line = true, line_count = count } end
+  if args.line < 1 or args.line > count then return { no_line = true, line_count = count, buffer = about } end
 end
 if args.symbol and buf then
   local line = api.nvim_buf_get_lines(buf, row, row + 1, true)[1] or ''
@@ -37,7 +40,7 @@ if args.symbol and buf then
     return b and (b >= 128 or b == 95 or b >= 48 and b <= 57 or b >= 65 and b <= 90 or b >= 97 and b <= 122)
   end
   local symbol, at, found = args.symbol, 1, nil
-  if #symbol == 0 then return { no_symbol = true } end
+  if #symbol == 0 then return { no_symbol = true, buffer = about } end
   while at <= #line do
     local first, last = line:find(symbol, at, true)
     if not first then break end
@@ -48,7 +51,7 @@ if args.symbol and buf then
     end
     at = first + 1
   end
-  if not found then return { no_symbol = true } end
+  if not found then return { no_symbol = true, buffer = about } end
   byte = found
 end
 local clients = {}
@@ -70,7 +73,7 @@ elseif buf then
     clients[#clients + 1] = { client = client, buf = buf }
   end
 end
-if #clients == 0 then return { no_client = true, loaded_now = loaded_now } end
+if #clients == 0 then return { no_client = true, loaded_now = loaded_now, buffer = about } end
 local methods
 if args.kind == 'usages' then
   methods = {
@@ -113,7 +116,7 @@ for _, method in ipairs(methods) do
   if part.pending == 0 then unsupported[#unsupported + 1] = name
   else parts[name] = part; order[#order + 1] = name end
 end
-if #jobs == 0 then return { no_client = true, loaded_now = loaded_now } end
+if #jobs == 0 then return { no_client = true, loaded_now = loaded_now, buffer = about } end
 -- An id is single-use until collected or expired: a second ask under it would drop the first's pending parts.
 if lsp.entries[key] then return { refused = 'the LSP id is already in use' } end
 lsp.order = (lsp.order or 0) + 1
@@ -147,7 +150,7 @@ for _, job in ipairs(jobs) do
       local line = api.nvim_buf_get_lines(target.buf, row, row + 1, true)[1] or ''
       params.range = { start = position(target.client, target.buf, row, 0), ['end'] = position(target.client, target.buf, row, #line) }
       local diagnostics = {}
-      for _, diagnostic in ipairs(vim.diagnostic.get(target.buf, { lnum = row })) do
+      for _, diagnostic in ipairs(live_diagnostics(target.buf, { lnum = row })) do
         if type(diagnostic.user_data) == 'table' and type(diagnostic.user_data.lsp) == 'table' then
           diagnostics[#diagnostics + 1] = diagnostic.user_data.lsp
         end
@@ -191,4 +194,4 @@ for _, job in ipairs(jobs) do
     if not ok or not sent then handler(true, nil) end
   end
 end
-return { started = true, unsupported = unsupported, action = entry.action }
+return { started = true, unsupported = unsupported, action = entry.action, buffer = about }

@@ -21,6 +21,9 @@ pub const NOT_READ: &str = "the editor did not answer within 5 s; nothing was re
 /// What follows a file's name when a swap file kept it from loading.
 pub const HAS_SWAP: &str = "has a swap file (another editor, or a crash); it was not opened";
 
+/// What follows a buffer's name when nothing says its text is that file's: it may have been read from elsewhere.
+pub const NOT_TOLD: &str = "may hold another file's text; nothing was read; use Read";
+
 /// One tab's queue is full.
 pub const TOO_MANY: &str = "too many editor calls are waiting";
 

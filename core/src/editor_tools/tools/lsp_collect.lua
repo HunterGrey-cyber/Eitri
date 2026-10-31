@@ -15,10 +15,14 @@ for _, name in ipairs(entry.names) do
       if not buf or not api.nvim_buf_is_loaded(buf) then buf = false end
       buffers[item.path] = buf
     end
-    if buf and item.line >= 1 and item.line <= api.nvim_buf_line_count(buf) then
-      local text = api.nvim_buf_get_lines(buf, item.line - 1, item.line, true)[1]
-      item.text = cut(text, 500)
+    if buf then
+      -- What an item says can come from this buffer's text, and the host judges the buffer before it tells any of it.
       item.text_from = api.nvim_buf_get_name(buf)
+      item.read_from = read_from(buf)
+      if item.line >= 1 and item.line <= api.nvim_buf_line_count(buf) then
+        local text = api.nvim_buf_get_lines(buf, item.line - 1, item.line, true)[1]
+        item.text = cut(text, 500)
+      end
     end
   end
   parts[#parts + 1] = { name = name, items = part.items, total = part.total }

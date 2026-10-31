@@ -173,6 +173,30 @@ mod tests {
             assert_eq!(answer(&steps), json!({"symbol":"foo", "text":text, "cut":false}));
         });
     }
+    /// A buffer of the project read from a file outside it: all a server says of it, and whether a line or a symbol is
+    /// there, come from that file's text.
+    #[test]
+    fn hover_tells_nothing_of_a_buffer_read_from_outside() {
+        with_cx(|cx| {
+            let buffer = json!({"name": cx.root.join("a.py"), "read_from": "/elsewhere/secret.py"});
+            for asked in [
+                json!({"started": true, "unsupported": [], "buffer": buffer}),
+                json!({"no_symbol": true, "buffer": buffer}),
+                json!({"no_line": true, "line_count": 3, "buffer": buffer}),
+                json!({"no_client": true, "buffer": buffer}),
+            ] {
+                let run = tool_named("hover").unwrap().begin(&input("a.py"), cx).unwrap();
+                let steps = drive(run, cx, |call| match call {
+                    EditorCall::LspAsk(_) => Ok(msg(asked.clone())),
+                    other => panic!("nothing is collected: {other:?}"),
+                });
+                let told = result(&steps);
+                assert!(told.is_error, "{told:?}");
+                assert!(told.text.contains("use Read"), "{told:?}");
+                assert!(!told.text.contains("secret"), "{told:?}");
+            }
+        });
+    }
     #[test]
     fn hover_says_when_the_server_has_nothing() {
         with_cx(|cx| {

@@ -102,10 +102,29 @@ pub fn names_the_file(name: &Path, allowed: &Path) -> bool {
     name == allowed || std::fs::canonicalize(name).is_ok_and(|real| real == allowed)
 }
 
-/// Whether a buffer's text may go in an answer: a buffer of the project, or of the one outside file that was allowed.
-/// A name that is not absolute is never a file of the project.
-pub fn buffer_told(cx: &ToolCx<'_>, name: &Path, allowed: Option<&Path>) -> bool {
-    name.is_absolute() && (buffer_inside(cx, name) || allowed.is_some_and(|allowed| names_the_file(name, allowed)))
+/// Whether a buffer's text may go in an answer: a buffer of the project, or of the one outside file that was allowed,
+/// by its name and by what it was read from. A name that is not absolute is never a file of the project.
+pub fn buffer_told(cx: &ToolCx<'_>, name: &Path, read_from: Option<&Path>, allowed: Option<&Path>) -> bool {
+    name.is_absolute()
+        && (buffer_inside(cx, name) || allowed.is_some_and(|allowed| names_the_file(name, allowed)))
+        && record_passes(cx.root, cx.home, name, read_from, allowed)
+}
+
+/// Whether the record of what a buffer was read from lets its text be told. A name is judged as the disk stands now and
+/// says nothing of that, so the record is judged too: it is a real path, in the project or the one file allowed. With no
+/// record, a name on disk may hold anything and fails, and a name with nothing on disk was never read from anywhere.
+pub fn record_passes(
+    root: &Path,
+    home: Option<&Path>,
+    name: &Path,
+    read_from: Option<&Path>,
+    allowed: Option<&Path>,
+) -> bool {
+    match read_from {
+        Some(record) => record.is_absolute() && (name_inside(root, home, record).is_some() || allowed == Some(record)),
+        None => std::fs::symlink_metadata(name)
+            .is_err_and(|error| matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)),
+    }
 }
 
 /// The same judgement with no tab. `Some(resolved)` for a name inside the root, or a name not yet on disk that lies
@@ -422,6 +441,66 @@ mod tests {
         assert_eq!(
             outside_target(&project.root, "../beside/nothing").unwrap_err().0,
             "no such file: ../beside/nothing"
+        );
+    }
+
+    #[test]
+    fn a_buffer_passes_by_its_name_and_by_what_it_was_read_from() {
+        let project = project("record");
+        let root = project.root.as_path();
+        let file = root.join("src/a.rs");
+        let new = root.join("src/new.rs");
+        let outside = project.beside.join("b.rs");
+        with_cx(root, EditorReach::Own, |cx| {
+            assert!(buffer_told(cx, &file, Some(&file), None));
+            assert!(
+                buffer_told(cx, &new, Some(&new), None),
+                "a new file records its own name"
+            );
+            assert!(
+                buffer_told(cx, &new, None, None),
+                "nothing on disk, so nothing was read"
+            );
+            assert!(
+                !buffer_told(cx, &file, None, None),
+                "on disk with no record, it may hold anything"
+            );
+            assert!(!buffer_told(cx, &file, Some(&outside), None));
+            assert!(!buffer_told(cx, &file, Some(Path::new("term://bash")), None));
+            assert!(
+                buffer_told(cx, &outside, Some(&outside), Some(&outside)),
+                "the file allowed"
+            );
+            assert!(
+                !buffer_told(cx, &outside, Some(&project.beside.join("c.rs")), Some(&outside)),
+                "named as the file allowed, read from another"
+            );
+            assert!(
+                buffer_told(cx, &file, Some(&outside), Some(&outside)),
+                "the text is the file allowed, whatever the buffer is called now"
+            );
+        });
+    }
+
+    #[test]
+    fn a_record_whose_file_went_is_judged_by_where_it_was() {
+        let project = project("record-gone");
+        let root = project.root.as_path();
+        let file = root.join("src/a.rs");
+        let gone = project.beside.join("gone.rs");
+        assert!(record_passes(root, None, &file, Some(&root.join("src/gone.rs")), None));
+        assert!(!record_passes(root, None, &file, Some(&gone), None));
+    }
+
+    #[test]
+    fn a_dangling_link_is_something_on_disk() {
+        let project = project("record-dangling");
+        let root = project.root.as_path();
+        let dangling = root.join("dangling");
+        symlink(project.beside.join("nothing"), &dangling).unwrap();
+        assert!(
+            !record_passes(root, None, &dangling, None, None),
+            "a link is something on disk"
         );
     }
 

@@ -25,8 +25,10 @@ local first = math.max(args.start or 1, 1)
 local last = math.min(args['end'] or count, count)
 local format = vim.bo[buf].fileformat
 local answer = {
-  -- find_buf can reach another file's buffer through a link: the host judges this name before it tells the lines.
+  -- find_buf can reach another file's buffer through a link, and a name says nothing of what a buffer was read
+  -- from: the host judges both before it tells the lines.
   name = name,
+  read_from = read_from(buf),
   lines = {},
   first = first,
   line_count = count,

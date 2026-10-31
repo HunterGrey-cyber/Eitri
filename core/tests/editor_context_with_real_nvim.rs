@@ -496,6 +496,234 @@ fn injected_editor_context_reports_and_tears_down() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A scratch project and an nvim started the way the embedded editor starts it.
+struct Recording {
+    nvim: embed_client::Embed,
+    feed: EditorContextFeed,
+    dir: std::path::PathBuf,
+}
+
+impl Recording {
+    fn start(case: &str, extra_args: &[&str]) -> Recording {
+        let dir =
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        for (name, text) in [("a.txt", "alpha\n"), ("b.txt", "bravo\n")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let feed = EditorContextFeed::new().expect("the feed must bind");
+        let nvim = embed_client::Embed::start_fed(&dir, &feed, extra_args);
+        Recording { nvim, feed, dir }
+    }
+
+    fn edit(&mut self, name: &str) -> std::path::PathBuf {
+        let path = self.dir.join(name);
+        self.nvim.command(&format!("edit {}", path.display()));
+        path
+    }
+
+    fn record(&mut self) -> Option<std::path::PathBuf> {
+        self.nvim
+            .lua("return vim.b.eitri_read_from", vec![])
+            .as_str()
+            .map(std::path::PathBuf::from)
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.feed.cleanup();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_saved_as_buffer_moves_its_record() {
+    let mut r = Recording::start("saveas", &[]);
+    r.edit("a.txt");
+    let copy = r.dir.join("c.txt");
+    r.nvim.command(&format!("saveas {}", copy.display()));
+    assert_eq!(r.record(), Some(copy));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_copy_written_elsewhere_keeps_the_record() {
+    let mut r = Recording::start("write-copy", &[]);
+    let outside = r.dir.join("outside.txt");
+    std::fs::write(&outside, "outside\n").unwrap();
+    let link = r.dir.join("link.txt");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    r.edit("link.txt");
+    assert_eq!(r.record(), Some(outside.clone()));
+    // Only now does the name's real path differ from the record, so a write moving the record would show.
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, "ordinary\n").unwrap();
+    let copy = r.dir.join("c.txt");
+    r.nvim.command(&format!("write {}", copy.display()));
+    assert_eq!(r.record(), Some(outside), "the buffer holds what it held");
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_renamed_buffer_keeps_its_record() {
+    let mut r = Recording::start("rename", &[]);
+    let file = r.edit("a.txt");
+    let other = r.dir.join("renamed.txt");
+    r.nvim.command(&format!("file {}", other.display()));
+    assert_eq!(r.record(), Some(file), ":file changes a name and no text");
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_new_file_records_its_own_name() {
+    let mut r = Recording::start("new-file", &[]);
+    let file = r.edit("nothing-there.txt");
+    assert!(!file.exists());
+    assert_eq!(r.record(), Some(file));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_new_file_written_records_where_it_landed() {
+    let mut r = Recording::start("new-file-written", &[]);
+    let target = r.dir.join("target.txt");
+    let link = r.dir.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    r.edit("link.txt");
+    assert_eq!(
+        r.record(),
+        Some(link),
+        "a link that leads nowhere has nothing on disk behind it"
+    );
+    r.nvim.command("write");
+    assert_eq!(r.record(), Some(target));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reloaded_buffer_records_what_was_read() {
+    let mut r = Recording::start("reload", &[]);
+    let first = r.dir.join("first.txt");
+    let second = r.dir.join("second.txt");
+    let link = r.dir.join("link.txt");
+    std::fs::write(&first, "one\n").unwrap();
+    std::fs::write(&second, "two\n").unwrap();
+    std::os::unix::fs::symlink(&first, &link).unwrap();
+    r.edit("link.txt");
+    assert_eq!(r.record(), Some(first));
+
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&second, &link).unwrap();
+    r.nvim.command("edit!");
+    assert_eq!(r.record(), Some(second.clone()), ":edit! reads it again");
+
+    let third = r.dir.join("third.txt");
+    std::fs::write(&third, "three, longer than the other\n").unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&third, &link).unwrap();
+    // nvim asks what to do with a changed file unless the buffer is set to follow it.
+    r.nvim.command("setlocal autoread");
+    r.nvim.command("checktime");
+    assert_eq!(r.record(), Some(third), ":checktime reloads through BufReadPost too");
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_file_argument_is_recorded_from_the_start() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-arg", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let file = dir.join("given.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut nvim = embed_client::Embed::start_fed(&dir, &feed, &[file.to_str().unwrap()]);
+    nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+    let name = nvim.lua("return vim.api.nvim_buf_get_name(0)", vec![]);
+    assert_eq!(
+        name.as_str(),
+        file.to_str(),
+        "the file on the command line is the current buffer"
+    );
+    let record = nvim.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(
+        record.as_str(),
+        file.to_str(),
+        "the loader ran ahead of the file arguments"
+    );
+    nvim.quit();
+    feed.cleanup();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// nvim loads `vim.diagnostic` on first use, and a first load has nothing there to note.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_load_does_not_pull_in_vim_diagnostic() {
+    use embed_client::Embed;
+    use rmpv::Value;
+
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-mod", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut nvim = Embed::start_fed(&dir, &feed, &[]);
+    nvim.command(&format!("edit {}", file.display()));
+    let record = nvim.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(record.as_str(), file.to_str());
+    let loaded = nvim.lua("return package.loaded['vim.diagnostic'] ~= nil", vec![]);
+    assert_eq!(loaded, Value::from(false));
+    nvim.quit();
+    feed.cleanup();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_teardown_forgets_the_records() {
+    use embed_client::{opts_map, Embed};
+    use rmpv::Value;
+
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-td", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "alpha\n").unwrap();
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut nvim = Embed::start(&dir, &[], &[]);
+    nvim.inject(
+        include_str!("../src/editor_context/nvim_editor_context.lua"),
+        opts_map(&[("socket", Value::from(feed.socket_path().display().to_string()))]),
+    );
+    nvim.command(&format!("edit {}", file.display()));
+    let record = nvim.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(record.as_str(), file.to_str());
+    nvim.lua(
+        "vim.diagnostic.set(vim.api.nvim_create_namespace('test'), 0, { { lnum = 0, col = 0, message = 'm' } })
+         vim.b.eitri_read_from = '/a/file/read/before'
+         vim.cmd('edit!')",
+        vec![],
+    );
+    let note = nvim.lua("return vim.b.eitri_diagnostics_stood ~= nil", vec![]);
+    assert_eq!(note, Value::from(true), "the reload noted the entry");
+    nvim.teardown();
+    let record = nvim.lua("return vim.b.eitri_read_from", vec![]);
+    assert_eq!(record, Value::Nil, "nothing keeps it true from here on");
+    let note = nvim.lua("return vim.b.eitri_diagnostics_stood", vec![]);
+    assert_eq!(note, Value::Nil, "nor the note beside it");
+    nvim.quit();
+    feed.cleanup();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Once it has sent what the editor shows, a snippet with nothing new to say leaves no timer
 /// running: an idle nvim is not woken by it (a repeating 150 ms timer woke it about 7 times a
 /// second, measured with nvim's own context switches).

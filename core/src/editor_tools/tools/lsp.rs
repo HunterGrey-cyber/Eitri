@@ -172,6 +172,8 @@ pub struct RawItem {
     pub text: Option<String>,
     /// The actual buffer's name, kept as bytes for the caller's boundary check.
     pub text_from: Option<PathBuf>,
+    /// What that buffer's text was read from, when the editor keeps a record of it.
+    pub read_from: Option<PathBuf>,
     pub name: Option<String>,
     pub kind: Option<String>,
     pub container: Option<String>,
@@ -486,20 +488,25 @@ pub fn parse_collected(value: &Value) -> Result<Collected, String> {
                     let items = array(required(part, "items")?)?
                         .iter()
                         .map(|item| {
-                            let text_from = field(item, "text_from")
-                                .filter(|v| !v.is_nil())
-                                .map(|v| {
-                                    v.as_slice()
-                                        .map(|b| PathBuf::from(OsStr::from_bytes(b)))
-                                        .ok_or_else(|| "the LSP answer has an invalid text_from".to_owned())
-                                })
-                                .transpose()?;
+                            let name_in = |key: &str| {
+                                field(item, key)
+                                    .filter(|v| !v.is_nil())
+                                    .map(|v| {
+                                        v.as_slice()
+                                            .map(|b| PathBuf::from(OsStr::from_bytes(b)))
+                                            .ok_or_else(|| format!("the LSP answer has an invalid {key}"))
+                                    })
+                                    .transpose()
+                            };
+                            let text_from = name_in("text_from")?;
+                            let read_from = name_in("read_from")?;
                             Ok(RawItem {
                                 path: text(required(item, "path")?)?,
                                 line: number(item, "line")?,
                                 character: number(item, "character")?,
                                 text: optional_text(item, "text")?,
                                 text_from,
+                                read_from,
                                 name: optional_text(item, "name")?,
                                 kind: optional_text(item, "kind")?,
                                 container: optional_text(item, "container")?,
@@ -643,6 +650,8 @@ pub struct AskCollect {
     unsupported: Vec<String>,
     action: Option<ActionFacts>,
     refuse_outside: bool,
+    /// The one outside file this run may tell of.
+    allowed: Option<PathBuf>,
 }
 
 fn failed(text: impl Into<String>) -> Progress {
@@ -666,6 +675,7 @@ impl AskCollect {
             unsupported: Vec::new(),
             action: None,
             refuse_outside: false,
+            allowed: None,
         }
     }
 
@@ -776,6 +786,7 @@ impl AskCollect {
         }
         match paths::file_check(&path) {
             Ok(()) => {
+                self.allowed = Some(path.clone());
                 self.template.path = Some(path);
                 self.ask(true, false, cx)
             }
@@ -882,6 +893,22 @@ impl AskCollect {
         }
     }
 
+    /// Whether the buffer the ask found may be told of. A server's answer, and whether a line or a symbol is there, come
+    /// from the buffer's text: an answer that names no buffer read none. What was judged before the ask is a path, so the
+    /// buffer is judged here, by its own name and by what it was read from.
+    fn may_tell(&self, value: &Value, cx: &ToolCx<'_>) -> bool {
+        let Some(buffer) = field(value, "buffer") else {
+            return true;
+        };
+        let path_in = |key: &str| {
+            field(buffer, key)
+                .and_then(Value::as_slice)
+                .map(|bytes| PathBuf::from(OsStr::from_bytes(bytes)))
+        };
+        let read_from = path_in("read_from");
+        path_in("name").is_some_and(|name| paths::buffer_told(cx, &name, read_from.as_deref(), self.allowed.as_deref()))
+    }
+
     fn asked(&mut self, answer: Result<Value, EditorFailure>, load: bool, missing: bool, cx: &ToolCx<'_>) -> Progress {
         let value = match answer {
             Ok(value) => value,
@@ -892,6 +919,9 @@ impl AskCollect {
             Err(why) => return failed(why),
         };
         let named = self.named();
+        if !self.may_tell(&value, cx) {
+            return failed(format!("the editor's buffer for {named} {}", words::NOT_TOLD));
+        }
         match asked {
             Asked::Started { unsupported, action } => {
                 self.unsupported = unsupported;
@@ -1012,8 +1042,9 @@ fn lines_of(path: &Path, wanted: &BTreeSet<u32>) -> HashMap<u32, String> {
 
 /// `items` as an answer tells them. It reads files and walks paths, so it runs on a [`worker`]. Each path is judged:
 /// an item inside the project keeps its line, and one outside is cut to its path and position, whatever a loaded
-/// buffer or the server said of it. A line from a buffer is told only when that buffer's own name is in the project:
-/// a lookup by path can reach another file's buffer through a link.
+/// buffer or the server said of it. What comes from a buffer is told only when that buffer's own name is in the project
+/// and what it was read from passes: a lookup by path can reach another file's buffer through a link, and a name says
+/// nothing of the file a buffer's text came from. A server's name, kind and container come from that text too.
 pub fn shown(root: &Path, home: Option<&Path>, items: Vec<RawItem>) -> Vec<ShownItem> {
     shown_with(root, home, items, true)
 }
@@ -1056,10 +1087,13 @@ fn shown_with(root: &Path, home: Option<&Path>, items: Vec<RawItem>, read_lines:
                     container: None,
                 };
             };
+            let told = item.text_from.as_deref().is_none_or(|from| {
+                from.is_absolute()
+                    && paths::name_inside(root, home, from).is_some()
+                    && paths::record_passes(root, home, from, item.read_from.as_deref(), None)
+            });
             let text = match (&item.text, &item.text_from) {
-                (Some(text), Some(from)) if from.is_absolute() && paths::name_inside(root, home, from).is_some() => {
-                    Some(some_chars(text))
-                }
+                (Some(text), Some(_)) if told => Some(some_chars(text)),
                 (Some(_), _) => None,
                 (None, _) => lines
                     .get(file.as_path())
@@ -1071,9 +1105,9 @@ fn shown_with(root: &Path, home: Option<&Path>, items: Vec<RawItem>, read_lines:
                 line: item.line,
                 column,
                 text,
-                name: item.name.clone(),
-                kind: item.kind.clone(),
-                container: item.container.clone(),
+                name: item.name.clone().filter(|_| told),
+                kind: item.kind.clone().filter(|_| told),
+                container: item.container.clone().filter(|_| told),
             }
         })
         .collect()
@@ -1615,6 +1649,7 @@ mod tests {
             character: 0,
             text: None,
             text_from: None,
+            read_from: None,
             name: Some("n".to_owned()),
             kind: None,
             container: None,

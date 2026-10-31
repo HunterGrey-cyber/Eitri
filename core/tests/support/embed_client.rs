@@ -68,6 +68,21 @@ impl Embed {
         Embed::start_under_umask(dir, extra_args, env, None)
     }
 
+    /// [`Embed::start`] with the editor-context feed loaded as the embedded editor loads it, ahead of everything else,
+    /// so a buffer has the record of what it was read from that the tools ask for. The feed outlives the child.
+    pub fn start_fed(
+        dir: &Path,
+        feed: &eitri_core::editor_context::feed::EditorContextFeed,
+        extra_args: &[&str],
+    ) -> Embed {
+        let args = feed.nvim_args();
+        let mut all: Vec<&str> = args.iter().map(String::as_str).collect();
+        all.extend_from_slice(extra_args);
+        let env = feed.child_env();
+        let env: Vec<(&str, &str)> = env.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        Embed::start(dir, &all, &env)
+    }
+
     /// [`Embed::start`] with the child's umask set to `umask` before it runs `nvim`; this process's own is untouched,
     /// so tests running beside it create files as they always did.
     pub fn start_under_umask(dir: &Path, extra_args: &[&str], env: &[(&str, &str)], umask: Option<u32>) -> Embed {

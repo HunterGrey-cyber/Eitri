@@ -105,6 +105,8 @@ pub struct DiagnosticsArgs {
 pub struct DiagnosticEntry {
     /// The buffer's name.
     pub path: PathBuf,
+    /// What the buffer's text was read from, when the editor keeps a record of it.
+    pub read_from: Option<PathBuf>,
     /// From 1.
     pub line: u32,
     /// From 1, in bytes.
@@ -376,6 +378,7 @@ fn entry_of(value: &Value) -> Option<DiagnosticEntry> {
     let optional = |name: &str| field(value, name).and_then(text_of);
     Some(DiagnosticEntry {
         path: name_of(field(value, "path")?)?,
+        read_from: field(value, "read_from").and_then(name_of),
         line: from_one("lnum")?,
         column: from_one("col")?,
         end_line: from_one("end_lnum")?,
@@ -416,16 +419,8 @@ pub fn parse(value: &Value) -> Result<DiagnosticsAnswer, String> {
 
 /// What the project, or the one outside file that was allowed, calls the buffer `name`: its path relative to the
 /// root, or the allowed file's own path. A name that is not absolute is never a file of the project.
-fn inside(
-    cx: &ToolCx<'_>,
-    name: &Path,
-    approved: Option<&Path>,
-    judged: &mut HashMap<PathBuf, Option<String>>,
-) -> Option<String> {
-    if let Some(known) = judged.get(name) {
-        return known.clone();
-    }
-    let shown = if !name.is_absolute() {
+fn called(cx: &ToolCx<'_>, name: &Path, approved: Option<&Path>) -> Option<String> {
+    if !name.is_absolute() {
         None
     } else if paths::buffer_inside(cx, name) {
         Some(
@@ -439,7 +434,22 @@ fn inside(
         approved
             .filter(|allowed| paths::names_the_file(name, allowed))
             .map(|allowed| allowed.to_string_lossy().into_owned())
-    };
+    }
+}
+
+/// [`called`] for an entry's buffer, which what it was read from can still keep out of the answer.
+fn inside(
+    cx: &ToolCx<'_>,
+    name: &Path,
+    read_from: Option<&Path>,
+    approved: Option<&Path>,
+    judged: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<String> {
+    if let Some(known) = judged.get(name) {
+        return known.clone();
+    }
+    let shown =
+        called(cx, name, approved).filter(|_| paths::record_passes(cx.root, cx.home, name, read_from, approved));
     judged.insert(name.to_path_buf(), shown.clone());
     shown
 }
@@ -538,12 +548,20 @@ fn told(cx: &ToolCx<'_>, answer: &DiagnosticsAnswer, approved: Option<&Path>, si
     let mut told: Vec<serde_json::Value> = answer
         .entries
         .iter()
-        .filter_map(|entry| inside(cx, &entry.path, approved, &mut judged).map(|path| entry_json(&path, entry)))
+        .filter_map(|entry| {
+            let path = inside(cx, &entry.path, entry.read_from.as_deref(), approved, &mut judged)?;
+            Some(entry_json(&path, entry))
+        })
         .collect();
+    // A buffer whose entries were dropped is dropped here too. One with no entry here lost them to a cut, and the chunk
+    // judged what it was read from before it counted it.
     let modified: Vec<String> = answer
         .modified
         .iter()
-        .filter_map(|name| inside(cx, name, approved, &mut judged))
+        .filter_map(|name| match judged.get(name) {
+            Some(known) => known.clone(),
+            None => called(cx, name, approved),
+        })
         .collect();
     // The chunk cut a plain answer at `DIAGNOSTICS_LIMIT`; a difference is cut here.
     let mut left_out = answer.left_out;
@@ -635,8 +653,14 @@ mod tests {
         Value::Map(entries.into_iter().map(|(k, v)| (Value::from(k), v)).collect())
     }
 
+    /// A chunk's entry of a buffer read from what `path` is now, as the feed records it.
     fn raw_entry(path: &Path, lnum: u32, severity: &str, message: &str) -> Value {
-        map(vec![
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        recorded_entry(path, Some(&real), lnum, severity, message)
+    }
+
+    fn recorded_entry(path: &Path, record: Option<&Path>, lnum: u32, severity: &str, message: &str) -> Value {
+        let mut fields = vec![
             ("path", Value::Binary(path.as_os_str().as_bytes().to_vec())),
             ("lnum", Value::from(lnum)),
             ("col", Value::from(4)),
@@ -644,7 +668,11 @@ mod tests {
             ("end_col", Value::from(9)),
             ("severity", Value::from(severity)),
             ("message", Value::from(message)),
-        ])
+        ];
+        if let Some(record) = record {
+            fields.push(("read_from", Value::Binary(record.as_os_str().as_bytes().to_vec())));
+        }
+        map(fields)
     }
 
     fn reply(entries: Vec<Value>, modified: &[&Path], left_out: u32) -> Value {
@@ -670,6 +698,54 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_read_from_outside_is_dropped_with_its_unsaved_name() {
+        let project = project("record-outside");
+        let root = project.root.as_path();
+        let name = root.join("src/a.rs");
+        let value = reply(
+            vec![recorded_entry(
+                &name,
+                Some(&project.beside.join("b.rs")),
+                0,
+                "error",
+                "secret",
+            )],
+            &[&name],
+            0,
+        );
+        let answer = told(root, &value);
+        assert_eq!(answer["entries"], json!([]));
+        assert_eq!(answer["modified_files"], json!([]));
+    }
+
+    #[test]
+    fn a_name_on_disk_with_no_record_is_dropped_and_a_new_one_is_told() {
+        let project = project("record-none");
+        let root = project.root.as_path();
+        let on_disk = root.join("src/a.rs");
+        let new = root.join("src/new.rs");
+        let value = reply(
+            vec![
+                recorded_entry(&on_disk, None, 0, "error", "secret"),
+                recorded_entry(&new, None, 0, "error", "unsaved"),
+            ],
+            &[],
+            0,
+        );
+        let answer = told(root, &value);
+        assert_eq!(answer["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(answer["entries"][0]["path"], "src/new.rs");
+    }
+
+    #[test]
+    fn a_buffer_that_lost_its_entries_to_a_cut_keeps_its_unsaved_name() {
+        let project = project("record-cut");
+        let root = project.root.as_path();
+        let answer = told(root, &reply(vec![], &[&root.join("src/a.rs")], 3));
+        assert_eq!(answer["modified_files"], json!(["src/a.rs"]));
+    }
+
+    #[test]
     fn parse_round_trips_every_field() {
         let mut full = raw_entry(Path::new("/p/src/a.rs"), 2, "warning", "unused variable");
         let Value::Map(fields) = &mut full else { unreachable!() };
@@ -683,6 +759,7 @@ mod tests {
             DiagnosticsAnswer {
                 entries: vec![DiagnosticEntry {
                     path: "/p/src/a.rs".into(),
+                    read_from: Some("/p/src/a.rs".into()),
                     line: 3,
                     column: 5,
                     end_line: 4,

@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use rmpv::Value;
 
 use super::path_value;
-use crate::editor_context::compose::truncate;
+use crate::editor_context::compose::{truncate, TRUNCATION_MARKER};
+use crate::editor_context::Selection;
 use crate::editor_rpc::EditorRpc;
 use crate::editor_tools::catalog::ToolRow;
 use crate::editor_tools::paths;
@@ -91,10 +92,19 @@ impl ToolRun for StateRun {
 /// A buffer the chunk listed under the root.
 struct Listed {
     path: PathBuf,
+    /// What the buffer's text was read from; a buffer not loaded answers its own name.
+    read_from: Option<PathBuf>,
     modified: bool,
     lines: u32,
     filetype: String,
     shown: bool,
+}
+
+/// The lines under the current window's live selection, from the same answer as the buffer's record.
+struct Selected {
+    start_line: u32,
+    end_line: u32,
+    lines: Vec<String>,
 }
 
 struct Reply {
@@ -103,6 +113,8 @@ struct Reply {
     left_out: u32,
     line: u32,
     current: Option<PathBuf>,
+    current_from: Option<PathBuf>,
+    selected: Option<Selected>,
     mode: String,
 }
 
@@ -118,14 +130,18 @@ fn count(value: &Value, name: &str) -> Option<u32> {
     u32::try_from(field(value, name)?.as_u64()?).ok()
 }
 
-/// A name from the editor. nvim sends a Lua string as msgpack str whatever its bytes are, and they are kept.
+/// A string from the editor. nvim sends a Lua string as msgpack str whatever its bytes are.
+fn bytes_of(value: &Value) -> Option<&[u8]> {
+    match value {
+        Value::String(text) => Some(text.as_bytes()),
+        Value::Binary(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
+/// A name from the editor, its bytes kept.
 fn name_of(value: &Value) -> Option<PathBuf> {
-    let bytes = match value {
-        Value::String(text) => text.as_bytes(),
-        Value::Binary(bytes) => bytes.as_slice(),
-        _ => return None,
-    };
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes_of(value)?)))
 }
 
 /// A word the editor named, kept to plain characters so it can sit in a sentence.
@@ -140,10 +156,23 @@ fn word(value: &Value) -> String {
 fn listed(value: &Value) -> Option<Listed> {
     Some(Listed {
         path: name_of(field(value, "path")?)?,
+        read_from: field(value, "read_from").and_then(name_of),
         modified: field(value, "modified")?.as_bool()?,
         lines: count(value, "lines")?,
         filetype: word(field(value, "filetype")?),
         shown: field(value, "shown")?.as_bool()?,
+    })
+}
+
+fn selected(value: &Value) -> Option<Selected> {
+    Some(Selected {
+        start_line: count(value, "start_line")?,
+        end_line: count(value, "end_line")?,
+        lines: field(value, "lines")?
+            .as_array()?
+            .iter()
+            .map(|line| Some(String::from_utf8_lossy(bytes_of(line)?).into_owned()))
+            .collect::<Option<_>>()?,
     })
 }
 
@@ -161,6 +190,8 @@ fn parse(value: &Value) -> Option<Reply> {
         left_out: count(value, "left_out")?,
         line: count(here, "line")?,
         current: field(here, "path").and_then(name_of),
+        current_from: field(here, "read_from").and_then(name_of),
+        selected: field(here, "selected").and_then(selected),
         mode: field(value, "mode")?.as_str()?.to_owned(),
     })
 }
@@ -177,19 +208,46 @@ fn mode_word(raw: &str) -> &'static str {
     }
 }
 
-/// Where the project holds `name`, relative to the root. A name that is not absolute is never a file of the
-/// project: a terminal buffer's `term://` name would otherwise read as one under the root.
-fn inside(cx: &ToolCx<'_>, name: &Path) -> Option<String> {
-    if !name.is_absolute() || !paths::buffer_inside(cx, name) {
+/// Where the project holds `name`, relative to the root, when its buffer may be told of. A name that is not absolute
+/// is never a file of the project: a terminal buffer's `term://` name would otherwise read as one under the root.
+fn inside(cx: &ToolCx<'_>, name: &Path, read_from: Option<&Path>) -> Option<String> {
+    if !paths::buffer_told(cx, name, read_from, None) {
         return None;
     }
     let shown = name.strip_prefix(cx.root).unwrap_or(name);
     Some(shown.to_string_lossy().into_owned())
 }
 
+/// What the buffer of the feed's `file` was read from, by the editor's answer: the feed's own line does not say, and a
+/// file the answer does not hold has no record here.
+fn file_read_from<'a>(reply: &'a Reply, file: &Path) -> Option<&'a Path> {
+    if reply.current.as_deref() == Some(file) {
+        return reply.current_from.as_deref();
+    }
+    let listed = reply.buffers.iter().find(|buffer| buffer.path == file)?;
+    listed.read_from.as_deref()
+}
+
+/// Whether the feed's copy of a selection is what the buffer holds under that selection now. The record says what the
+/// buffer holds, not what the feed copied before a reload, so the text is told only as text the buffer still has at
+/// those lines. Each line of it lies inside its line of the buffer, whichever visual mode cut it; a line the answer
+/// left out fails. The marker of a cut selection is the feed's own, and so are the spaces a block makes of a cut <Tab>.
+fn still_held(selected: &Selected, selection: &Selection) -> bool {
+    if (selected.start_line, selected.end_line) != (selection.start_line, selection.end_line) {
+        return false;
+    }
+    let text = selection
+        .text
+        .strip_suffix(TRUNCATION_MARKER)
+        .unwrap_or(&selection.text);
+    let mut lines = selected.lines.iter();
+    text.split('\n')
+        .all(|part| lines.next().is_some_and(|line| line.contains(part.trim_matches(' '))))
+}
+
 /// The live selection the feed last pushed: none, the words for one whose place the agent is not told, or its
-/// place and its text cut as the feed cuts it.
-fn selection(cx: &ToolCx<'_>) -> serde_json::Value {
+/// place and its text cut as the feed cuts it. One the buffer no longer holds is none: the feed has not caught up.
+fn selection(cx: &ToolCx<'_>, reply: &Reply) -> serde_json::Value {
     let Some(context) = cx.context else {
         return serde_json::Value::Null;
     };
@@ -199,15 +257,24 @@ fn selection(cx: &ToolCx<'_>) -> serde_json::Value {
     if context.file.is_empty() {
         return serde_json::Value::from(SELECTION_NO_FILE);
     }
-    match inside(cx, Path::new(&context.file)) {
-        Some(path) => serde_json::json!({
-            "path": path,
-            "start_line": selection.start_line,
-            "end_line": selection.end_line,
-            "text": truncate(&selection.text),
-        }),
-        None => serde_json::Value::from(SELECTION_OUTSIDE),
+    let file = Path::new(&context.file);
+    let Some(path) = inside(cx, file, file_read_from(reply, file)) else {
+        return serde_json::Value::from(SELECTION_OUTSIDE);
+    };
+    let held = reply.current.as_deref() == Some(file)
+        && reply
+            .selected
+            .as_ref()
+            .is_some_and(|selected| still_held(selected, selection));
+    if !held {
+        return serde_json::Value::Null;
     }
+    serde_json::json!({
+        "path": path,
+        "start_line": selection.start_line,
+        "end_line": selection.end_line,
+        "text": truncate(&selection.text),
+    })
 }
 
 /// The answer's JSON with the first `kept` buffers; the buffers after them, and those the chunk cut, are counted.
@@ -219,7 +286,11 @@ fn answer_text(
     kept: usize,
     selection: &serde_json::Value,
 ) -> String {
-    let current = match reply.current.as_deref().map(|name| inside(cx, name)) {
+    let current = match reply
+        .current
+        .as_deref()
+        .map(|name| inside(cx, name, reply.current_from.as_deref()))
+    {
         Some(Some(path)) => serde_json::json!({ "path": path, "line": reply.line }),
         Some(None) => serde_json::Value::from(CURRENT_OUTSIDE),
         None => serde_json::Value::from(CURRENT_NO_FILE),
@@ -253,7 +324,7 @@ pub fn result_of(cx: &ToolCx<'_>, value: &Value) -> ToolResult {
     let mut other = reply.other;
     let mut told = Vec::new();
     for buffer in &reply.buffers {
-        match inside(cx, &buffer.path) {
+        match inside(cx, &buffer.path, buffer.read_from.as_deref()) {
             Some(path) => told.push(serde_json::json!({
                 "path": path,
                 "modified": buffer.modified,
@@ -264,7 +335,7 @@ pub fn result_of(cx: &ToolCx<'_>, value: &Value) -> ToolResult {
             None => other = other.saturating_add(1),
         }
     }
-    let selection = selection(cx);
+    let selection = selection(cx, &reply);
     let ready = |kept: usize| answer_text(cx, &reply, &told, other, kept, &selection);
     // Whole buffers come off the end until the answer fits. What fits only shrinks as buffers are added, so the
     // largest count that does is found by halving.
@@ -356,9 +427,16 @@ mod tests {
         Value::Map(entries.into_iter().map(|(k, v)| (Value::from(k), v)).collect())
     }
 
+    /// What the feed records for a buffer read from what `path` is now.
+    fn record_of(path: &Path) -> Value {
+        let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        Value::from(real.to_str().unwrap())
+    }
+
     fn buffer(path: &Path, modified: bool) -> Value {
         map(vec![
             ("path", Value::from(path.to_str().unwrap())),
+            ("read_from", record_of(path)),
             ("modified", Value::from(modified)),
             ("lines", Value::from(3)),
             ("filetype", Value::from("rust")),
@@ -371,6 +449,7 @@ mod tests {
         let mut here = vec![("line", Value::from(2))];
         if let Some(path) = current {
             here.push(("path", Value::from(path.to_str().unwrap())));
+            here.push(("read_from", record_of(path)));
         }
         map(vec![
             ("buffers", Value::Array(buffers)),
@@ -381,7 +460,36 @@ mod tests {
         ])
     }
 
-    fn selected(file: &Path, text: &str) -> EditorContext {
+    /// [`reply`] with the current buffer `file` and the person in Visual mode over `text`, as [`feed_line`] places it.
+    fn selecting(file: &Path, text: &str) -> Value {
+        selecting_among(vec![], file, text)
+    }
+
+    fn selecting_among(buffers: Vec<Value>, file: &Path, text: &str) -> Value {
+        let lines = text.split('\n').map(Value::from).collect();
+        let selected = map(vec![
+            ("start_line", Value::from(3)),
+            ("end_line", Value::from(5)),
+            ("lines", Value::Array(lines)),
+        ]);
+        map(vec![
+            ("buffers", Value::Array(buffers)),
+            ("other", Value::from(0)),
+            ("left_out", Value::from(0)),
+            (
+                "current",
+                map(vec![
+                    ("line", Value::from(3)),
+                    ("path", Value::from(file.to_str().unwrap())),
+                    ("read_from", record_of(file)),
+                    ("selected", selected),
+                ]),
+            ),
+            ("mode", Value::from("V")),
+        ])
+    }
+
+    fn feed_line(file: &Path, text: &str) -> EditorContext {
         EditorContext {
             file: file.to_str().unwrap().to_owned(),
             selection: Some(Selection {
@@ -395,8 +503,10 @@ mod tests {
     #[test]
     fn a_selection_inside_carries_its_text() {
         let p = project("selection-inside");
-        let context = selected(&p.root.join("src/a.rs"), "let x = 1;\nlet y = 2;");
-        let (result, json) = told(&p, EditorReach::Own, Some(&context), &reply(vec![], 0, None));
+        let file = p.root.join("src/a.rs");
+        let context = feed_line(&file, "let x = 1;\nlet y = 2;");
+        let answer = selecting(&file, "let x = 1;\nlet y = 2;");
+        let (result, json) = told(&p, EditorReach::Own, Some(&context), &answer);
         assert!(!result.is_error, "{}", result.text);
         assert_eq!(
             json["selection"],
@@ -409,11 +519,128 @@ mod tests {
     #[test]
     fn a_selection_outside_carries_no_path_or_text() {
         let p = project("selection-outside");
-        let context = selected(&p.beside.join("b.rs"), "secret words");
+        let context = feed_line(&p.beside.join("b.rs"), "secret words");
         let (result, json) = told(&p, EditorReach::Own, Some(&context), &reply(vec![], 0, None));
         assert_eq!(json["selection"], "a selection in a file outside the project");
         assert!(!result.text.contains("secret words"));
         assert!(!result.text.contains("b.rs"));
+    }
+
+    #[test]
+    fn a_buffer_read_from_outside_is_only_counted_and_its_selection_stays_out() {
+        let p = project("record-outside");
+        let name = p.root.join("src/a.rs");
+        let outside = p.beside.join("b.rs");
+        let record = Value::from(outside.to_str().unwrap());
+        let fields = |path: Value| {
+            vec![
+                ("path", path),
+                ("read_from", record.clone()),
+                ("modified", Value::from(false)),
+                ("lines", Value::from(3)),
+                ("filetype", Value::from("rust")),
+                ("shown", Value::from(true)),
+            ]
+        };
+        let context = feed_line(&name, "secret words");
+        let value = map(vec![
+            (
+                "buffers",
+                Value::Array(vec![map(fields(Value::from(name.to_str().unwrap())))]),
+            ),
+            ("other", Value::from(0)),
+            ("left_out", Value::from(0)),
+            (
+                "current",
+                map(vec![
+                    ("line", Value::from(2)),
+                    ("path", Value::from(name.to_str().unwrap())),
+                    ("read_from", record.clone()),
+                ]),
+            ),
+            ("mode", Value::from("n")),
+        ]);
+        let (result, json) = told(&p, EditorReach::Own, Some(&context), &value);
+        assert_eq!(json["buffers"], serde_json::json!([]));
+        assert_eq!(json["other_buffers"], 1);
+        assert_eq!(json["current"], "a file outside the project");
+        assert_eq!(json["selection"], "a selection in a file outside the project");
+        assert!(!result.text.contains("secret"), "{}", result.text);
+    }
+
+    #[test]
+    fn a_selection_in_a_file_the_answer_does_not_hold_stays_out() {
+        let p = project("record-unknown");
+        let context = feed_line(&p.root.join("src/a.rs"), "secret words");
+        let (_, json) = told(&p, EditorReach::Own, Some(&context), &reply(vec![], 0, None));
+        assert_eq!(json["selection"], "a selection in a file outside the project");
+    }
+
+    #[test]
+    fn a_selection_the_buffer_no_longer_holds_is_not_told() {
+        let p = project("selection-gone");
+        let file = p.root.join("src/a.rs");
+        let context = feed_line(&file, "secret words");
+        let (result, json) = told(&p, EditorReach::Own, Some(&context), &selecting(&file, "plain"));
+        assert!(json["selection"].is_null(), "{json}");
+        assert_eq!(json["current"]["path"], "src/a.rs");
+        assert!(!result.text.contains("secret"), "{}", result.text);
+    }
+
+    #[test]
+    fn a_selection_is_held_only_at_its_own_lines() {
+        let held = |text: &str, lines: &[&str]| {
+            let selection = Selection {
+                start_line: 3,
+                end_line: 5,
+                text: text.to_owned(),
+            };
+            let lines = lines.iter().map(|line| (*line).to_owned()).collect();
+            let selected = Selected {
+                start_line: 3,
+                end_line: 5,
+                lines,
+            };
+            still_held(&selected, &selection)
+        };
+        assert!(held("two\nthr", &["one two", "three"]), "part of each line");
+        assert!(held("", &[""]), "an empty line");
+        assert!(held("  \nde", &["ab\tXY", "abcde"]), "a block's spaces for a cut tab");
+        assert!(!held("three\ntwo", &["one two", "three"]), "the lines swapped");
+        assert!(!held("one\ntwo", &["one"]), "more lines than the answer holds");
+        assert!(
+            !held("ab\ncd", &["ab\0cd"]),
+            "the feed's newline for a NUL byte fails toward none"
+        );
+        assert!(
+            held(&format!("one\ntw{TRUNCATION_MARKER}"), &["one", "two"]),
+            "the marker is not the buffer's"
+        );
+        let moved = Selected {
+            start_line: 4,
+            end_line: 5,
+            lines: vec!["one".to_owned()],
+        };
+        let selection = Selection {
+            start_line: 3,
+            end_line: 5,
+            text: "one".to_owned(),
+        };
+        assert!(!still_held(&moved, &selection), "another place in the buffer");
+    }
+
+    #[test]
+    fn a_selection_is_not_told_from_a_normal_mode_answer_or_another_buffer() {
+        let p = project("selection-not-live");
+        let file = p.root.join("src/a.rs");
+        let other = p.root.join("src/other.rs");
+        fs::write(&other, "x\n").unwrap();
+        let context = feed_line(&file, "words");
+        let (_, json) = told(&p, EditorReach::Own, Some(&context), &reply(vec![], 0, Some(&file)));
+        assert!(json["selection"].is_null(), "no live selection: {json}");
+        let value = selecting_among(vec![buffer(&file, false)], &other, "words");
+        let (_, json) = told(&p, EditorReach::Own, Some(&context), &value);
+        assert!(json["selection"].is_null(), "the person has moved on: {json}");
     }
 
     #[test]
@@ -449,23 +676,25 @@ mod tests {
     #[test]
     fn a_window_2_tab_reads_the_forwarded_context() {
         let p = project("window-2");
-        let context = selected(&p.root.join("src/a.rs"), "forwarded");
-        let value = reply(
+        let context = feed_line(&p.root.join("src/a.rs"), "forwarded");
+        let value = selecting_among(
             vec![buffer(&p.root.join("src/a.rs"), true)],
-            0,
-            Some(&p.root.join("src/a.rs")),
+            &p.root.join("src/a.rs"),
+            "forwarded",
         );
         let (result, json) = told(&p, EditorReach::Link, Some(&context), &value);
         assert!(!result.is_error, "{}", result.text);
         assert_eq!(json["selection"]["text"], "forwarded");
-        assert_eq!(json["current"], serde_json::json!({ "line": 2, "path": "src/a.rs" }));
+        assert_eq!(json["current"], serde_json::json!({ "line": 3, "path": "src/a.rs" }));
     }
 
     #[test]
     fn a_long_selection_carries_the_limit_and_its_marker() {
         let p = project("long");
-        let context = selected(&p.root.join("src/a.rs"), &"x".repeat(CONTENT_LIMIT + 50));
-        let (_, json) = told(&p, EditorReach::Own, Some(&context), &reply(vec![], 0, None));
+        let file = p.root.join("src/a.rs");
+        let text = "x".repeat(CONTENT_LIMIT + 50);
+        let context = feed_line(&file, &text);
+        let (_, json) = told(&p, EditorReach::Own, Some(&context), &selecting(&file, &text));
         let text = json["selection"]["text"].as_str().unwrap();
         assert!(text.ends_with(TRUNCATION_MARKER), "{text:?}");
         assert_eq!(text.chars().count(), CONTENT_LIMIT + TRUNCATION_MARKER.chars().count());

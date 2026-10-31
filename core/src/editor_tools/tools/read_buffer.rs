@@ -163,10 +163,9 @@ impl ReadRun {
             return Step::Done(failure("the editor was asked nothing"));
         };
         let result = match answer {
-            Ok(value) if !may_tell(cx, &value, outside.then_some(path.as_path())) => failure(format!(
-                "the editor's buffer for {} is another file's; nothing was read",
-                self.raw
-            )),
+            Ok(value) if !may_tell(cx, &value, outside.then_some(path.as_path())) => {
+                failure(format!("the editor's buffer for {} {}", self.raw, words::NOT_TOLD))
+            }
             Ok(value) => result_of(&path, self.end, &value),
             Err(EditorFailure::NotAnswered) => failure(words::NOT_READ),
             Err(EditorFailure::Unavailable(_)) if cx.reach == EditorReach::Link => failure(words::WINDOW_CLOSED),
@@ -188,13 +187,14 @@ impl ToolRun for ReadRun {
 }
 
 /// Whether the lines of a chunk's answer may be told. What was judged before the call is a path, and the chunk finds a
-/// buffer by that path as it runs, through any link made since: so the buffer it read is judged here, by its own name.
-/// An answer with no lines tells nothing of a buffer.
+/// buffer by that path as it runs, through any link made since: so the buffer it read is judged here, by its own name
+/// and by what it was read from. An answer with no lines tells nothing of a buffer.
 fn may_tell(cx: &ToolCx<'_>, value: &Value, outside: Option<&Path>) -> bool {
+    let read_from = field(value, "read_from").and_then(name_of);
     field(value, "lines").is_none()
         || field(value, "name")
             .and_then(name_of)
-            .is_some_and(|name| paths::buffer_told(cx, &name, outside))
+            .is_some_and(|name| paths::buffer_told(cx, &name, read_from.as_deref(), outside))
 }
 
 /// What the chunk read of a buffer: whole lines, from line `first`.
@@ -535,14 +535,23 @@ mod tests {
         );
     }
 
-    /// A chunk's answer of the text `secret`, read from the buffer called `name`.
-    fn read_from(name: &Path) -> Value {
+    /// A chunk's answer of the text `secret`, from the buffer called `name` and read from `record`, if any.
+    fn recorded(name: &Path, record: Option<&Path>) -> Value {
         let mut answer = reply(&[b"secret"], 1, "unix");
         let Value::Map(entries) = &mut answer else {
             unreachable!()
         };
         entries.push((Value::from("name"), path_value(name)));
+        if let Some(record) = record {
+            entries.push((Value::from("read_from"), path_value(record)));
+        }
         answer
+    }
+
+    /// [`recorded`] for a buffer read from what `name` is now, as the feed records it.
+    fn read_from(name: &Path) -> Value {
+        let real = fs::canonicalize(name).unwrap_or_else(|_| name.to_path_buf());
+        recorded(name, Some(&real))
     }
 
     fn answered(project: &Project, run: &mut ReadRun, answer: Value) -> ToolResult {
@@ -577,6 +586,41 @@ mod tests {
         let (mut run, _) = start(&project, PermissionMode::Manual, "src/a.rs");
         let result = answered(&project, &mut run, read_from(&link));
         assert!(result.is_error && !result.text.contains("secret"), "{result:?}");
+    }
+
+    #[test]
+    fn a_project_name_read_from_outside_tells_nothing_of_it() {
+        let project = project("record-outside");
+        let name = project.root.join("src/a.rs");
+        let outside = project.beside.join("b.rs");
+        let (mut run, _) = start(&project, PermissionMode::Manual, "src/a.rs");
+        let result = answered(&project, &mut run, recorded(&name, Some(&outside)));
+        assert!(result.is_error && !result.text.contains("secret"), "{result:?}");
+        assert!(
+            !result.text.contains("b.rs"),
+            "the outside file goes unnamed: {result:?}"
+        );
+        assert!(result.text.contains("use Read"), "{result:?}");
+    }
+
+    #[test]
+    fn a_name_on_disk_with_no_record_tells_nothing() {
+        let project = project("record-none");
+        let (mut run, _) = start(&project, PermissionMode::Manual, "src/a.rs");
+        let result = answered(&project, &mut run, recorded(&project.root.join("src/a.rs"), None));
+        assert!(result.is_error && !result.text.contains("secret"), "{result:?}");
+    }
+
+    #[test]
+    fn a_name_with_nothing_on_disk_needs_no_record() {
+        let project = project("record-new");
+        let (mut run, _) = start(&project, PermissionMode::Manual, "src/new.rs");
+        let told = parsed(&answered(
+            &project,
+            &mut run,
+            recorded(&project.root.join("src/new.rs"), None),
+        ));
+        assert_eq!(told["text"], "secret\n");
     }
 
     #[test]

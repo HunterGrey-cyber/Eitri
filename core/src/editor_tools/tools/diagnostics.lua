@@ -36,6 +36,15 @@ local function leads_to(name)
   return '/'
 end
 
+-- Whether a buffer's text came from under `real`: a buffer with a name on disk and no record may hold anything.
+local function read_under(real, buf, name)
+  local record = read_from(buf)
+  if record then
+    return under(real, slashed(leads_to(record)))
+  end
+  return not vim.uv.fs_lstat(name)
+end
+
 local buffers = {}
 if args.path then
   local buf = find_buf(args.path)
@@ -43,14 +52,14 @@ if args.path then
     buffers[1] = buf
   end
 else
-  -- A name under the root that leads out of it through a link stays out here: Rust would drop its entries, after they
-  -- had taken the places of the project's own under the limit.
+  -- A name under the root that leads out of it through a link, or a buffer read from elsewhere, stays out here: Rust
+  -- would drop its entries, after they had taken the places of the project's own under the limit.
   local root = slashed(args.root)
   local real = slashed(vim.uv.fs_realpath(args.root) or args.root)
   for _, buf in ipairs(api.nvim_list_bufs()) do
     if wanted(buf) then
       local name = api.nvim_buf_get_name(buf)
-      if under(root, name) and under(real, slashed(leads_to(name))) then
+      if under(root, name) and under(real, slashed(leads_to(name))) and read_under(real, buf, name) then
         buffers[#buffers + 1] = buf
       end
     end
@@ -61,7 +70,7 @@ local found, modified = {}, {}
 for _, buf in ipairs(buffers) do
   local name = api.nvim_buf_get_name(buf)
   local any = false
-  for _, d in ipairs(vim.diagnostic.get(buf)) do
+  for _, d in ipairs(live_diagnostics(buf)) do
     local severity = d.severity or 1
     if severity <= least then
       found[#found + 1] = { buf = buf, name = name, d = d, severity = severity, order = #found }
@@ -128,6 +137,7 @@ end
 
 local function entry_len(entry)
   local len = ENTRY_ROOM + wire_len(entry.path) + wire_len(entry.message)
+  if entry.read_from then len = len + wire_len(entry.read_from) end
   if entry.source then len = len + wire_len(entry.source) end
   if entry.code then len = len + wire_len(entry.code) end
   return len
@@ -146,6 +156,7 @@ for i = 1, math.min(#found, limit) do
   local end_lnum, end_col = whole(d.end_lnum, lnum), whole(d.end_col, col)
   local entry = {
     path = item.name,
+    read_from = read_from(item.buf),
     lnum = lnum,
     col = col,
     end_lnum = end_lnum,

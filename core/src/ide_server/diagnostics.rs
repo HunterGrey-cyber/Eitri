@@ -73,6 +73,7 @@ mod tests {
     fn entry(severity: Severity) -> DiagnosticEntry {
         DiagnosticEntry {
             path: "/p/a.py".into(),
+            read_from: None,
             line: 3,
             column: 9,
             end_line: 4,

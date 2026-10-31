@@ -5,12 +5,18 @@
 #[path = "support/embed_client.rs"]
 mod embed_client;
 
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
+use agent::setting_sources::ProjectTrust;
+use agent::PermissionMode;
+use eitri_core::editor_context::feed::EditorContextFeed;
+use eitri_core::editor_tools::memory::Memory;
 use eitri_core::editor_tools::stamp::{wall_ms, Stamp};
-use eitri_core::editor_tools::step::ToolResult;
-use eitri_core::editor_tools::tools::read_buffer::{result_of, READ_BUFFER_LUA};
-use embed_client::Embed;
+use eitri_core::editor_tools::step::{AgentCall, EditorReach, EditorSight, Step, StepEvent, Tool, ToolCx, ToolResult};
+use eitri_core::editor_tools::tools::read_buffer::{result_of, ReadBuffer, READ_BUFFER_LUA};
+use eitri_core::editor_tools::way::EditorCall;
+use embed_client::{opts_map, Embed};
 use rmpv::Value;
 
 const FAR: u64 = 60_000;
@@ -25,6 +31,7 @@ return { bufs = #vim.api.nvim_list_bufs(), named = named, wins = #vim.api.nvim_l
 
 struct Nvim {
     embed: Embed,
+    feed: Option<EditorContextFeed>,
     dir: PathBuf,
     project: PathBuf,
     seq: u64,
@@ -32,6 +39,9 @@ struct Nvim {
 
 impl Drop for Nvim {
     fn drop(&mut self) {
+        if let Some(feed) = &self.feed {
+            feed.cleanup();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -44,6 +54,26 @@ fn start(case: &str) -> Nvim {
     let embed = Embed::start(&project, &[], &[]);
     Nvim {
         embed,
+        feed: None,
+        dir,
+        project,
+        seq: 0,
+    }
+}
+
+/// [`start`] with the feed loaded as the embedded editor loads it, in a scratch directory with every link resolved.
+fn start_fed(case: &str) -> Nvim {
+    let dir = std::env::temp_dir().join(format!("eto-read-{}-{case}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("project")).expect("project dir");
+    std::fs::create_dir_all(dir.join("beside")).expect("outside dir");
+    let dir = std::fs::canonicalize(&dir).expect("scratch dir");
+    let project = dir.join("project");
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let embed = Embed::start_fed(&project, &feed, &[]);
+    Nvim {
+        embed,
+        feed: Some(feed),
         dir,
         project,
         seq: 0,
@@ -105,6 +135,47 @@ impl Nvim {
     fn counts(&mut self) -> Value {
         self.embed.lua(COUNTS, vec![])
     }
+
+    /// What the buffer in the current window keeps of where it was read from.
+    fn record(&mut self) -> Value {
+        self.embed.lua("return vim.b.eitri_read_from", vec![])
+    }
+
+    /// What the agent is told of `raw` through the tool itself: the judgement, the chunk, the judgement of its answer.
+    fn told(&mut self, raw: &str) -> ToolResult {
+        let root = self.project.clone();
+        let memory = Memory::default();
+        let cx = ToolCx {
+            mode: PermissionMode::Manual,
+            trust: ProjectTrust::Trusted,
+            root: &root,
+            home: None,
+            reach: EditorReach::Own,
+            sight: EditorSight::OnScreen,
+            context: None,
+            tab: 1,
+            session: "session",
+            call: "call",
+            agent_call: AgentCall::Host,
+            memory: &memory,
+        };
+        let mut run = ReadBuffer
+            .begin(&serde_json::json!({ "path": raw }), &cx)
+            .expect("the call is well formed");
+        let Step::Call {
+            call: EditorCall::ReadBuffer { path, start, end },
+            ..
+        } = run.step(StepEvent::Start, &cx)
+        else {
+            panic!("the tool must ask the editor");
+        };
+        let stamp = self.stamp();
+        let answer = self.read_stamped(&stamp, path.to_str().unwrap(), start, end);
+        let Step::Done(result) = run.step(StepEvent::Answer(Ok(answer)), &cx) else {
+            panic!("the tool must end on the editor's answer");
+        };
+        result
+    }
 }
 
 fn find<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -130,6 +201,88 @@ fn refusal_of(path: &Path, answer: &Value) -> String {
     let ToolResult { text, is_error } = result_of(path, None, answer);
     assert!(is_error, "{text}");
     text
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_buffer_read_through_a_link_keeps_where_it_came_from() {
+    let mut nvim = start_fed("link-replaced");
+    let secret = nvim.dir.join("beside/secret.env");
+    std::fs::write(&secret, "TOKEN=from-outside\n").unwrap();
+    let link = nvim.project.join("settings.env");
+    symlink(&secret, &link).unwrap();
+    nvim.edit(&link);
+    assert_eq!(nvim.record(), Value::from(secret.to_str().unwrap()));
+
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, "PLAIN=1\n").unwrap();
+    let result = nvim.told("settings.env");
+    assert!(result.is_error, "{}", result.text);
+    assert!(!result.text.contains("TOKEN"), "{}", result.text);
+    assert!(
+        !result.text.contains("secret.env"),
+        "the file goes unnamed: {}",
+        result.text
+    );
+    assert!(result.text.contains("use Read"), "{}", result.text);
+    assert_eq!(
+        nvim.record(),
+        Value::from(secret.to_str().unwrap()),
+        "only a read moves it"
+    );
+
+    // What is read now is the project's own file, so the record moves and the text is told.
+    nvim.embed.command("edit!");
+    assert_eq!(nvim.record(), Value::from(link.to_str().unwrap()));
+    let result = nvim.told("settings.env");
+    assert!(!result.is_error, "{}", result.text);
+    assert!(result.text.contains("PLAIN=1"), "{}", result.text);
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_buffer_with_no_record_is_not_told() {
+    let mut nvim = start("no-record");
+    let feed = EditorContextFeed::new().expect("the feed must bind");
+    let file = nvim.file("a.rs", "one\n");
+    nvim.edit(&file);
+    nvim.embed.inject(
+        include_str!("../src/editor_context/nvim_editor_context.lua"),
+        opts_map(&[("socket", Value::from(feed.socket_path().display().to_string()))]),
+    );
+    nvim.feed = Some(feed);
+    assert_eq!(nvim.record(), Value::Nil, "the chunk came after the buffer");
+    let result = nvim.told(file.to_str().unwrap());
+    assert!(result.is_error, "{}", result.text);
+    assert!(!result.text.contains("one"), "{}", result.text);
+
+    nvim.embed.command("edit!");
+    let result = nvim.told(file.to_str().unwrap());
+    assert!(!result.is_error, "a reload records what it read: {}", result.text);
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn an_ordinary_project_buffer_is_told() {
+    let mut nvim = start_fed("ordinary");
+    let file = nvim.file("a.rs", "one\ntwo\n");
+    nvim.edit(&file);
+    nvim.set_lines(&["unsaved"]);
+    let result = nvim.told("a.rs");
+    assert!(!result.is_error, "{}", result.text);
+    assert!(result.text.contains("unsaved"), "{}", result.text);
+}
+
+#[test]
+#[ignore = "needs nvim on PATH"]
+fn a_new_file_is_told_before_it_is_saved() {
+    let mut nvim = start_fed("new-file");
+    let file = nvim.project.join("new.rs");
+    nvim.edit(&file);
+    nvim.set_lines(&["fn fresh() {}"]);
+    let result = nvim.told("new.rs");
+    assert!(!result.is_error, "{}", result.text);
+    assert!(result.text.contains("fn fresh"), "{}", result.text);
 }
 
 #[test]

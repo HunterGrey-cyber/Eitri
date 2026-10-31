@@ -131,15 +131,18 @@ fn inside(config: &ServerConfig, name: &Path) -> Option<PathBuf> {
         .filter(|path| path.to_str().is_some_and(|text| !path_holds_control(text)))
 }
 
-/// The answer's JSON: the entries of buffers inside the project, each path judged once. A name the client asked about
-/// is echoed, since it compares that text; otherwise each entry goes under its file's URL, which is the client's key.
+/// The answer's JSON: the entries of buffers inside the project, each judged once, by its name and by what it was read
+/// from. A name the client asked about is echoed, since it compares that text; otherwise each entry goes under its
+/// file's URL, which is the client's key.
 fn entries_text(config: &ServerConfig, named_uri: Option<String>, answer: DiagnosticsAnswer) -> String {
     let mut judged: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let mut kept = Vec::with_capacity(answer.entries.len());
     for entry in answer.entries {
-        let resolved = judged
-            .entry(entry.path.clone())
-            .or_insert_with_key(|name| inside(config, name));
+        let read_from = entry.read_from.as_deref();
+        let resolved = judged.entry(entry.path.clone()).or_insert_with_key(|name| {
+            inside(config, name)
+                .filter(|_| paths::record_passes(&config.root, config.home.as_deref(), name, read_from, None))
+        });
         if let Some(path) = resolved {
             let uri = named_uri
                 .clone()

@@ -31,6 +31,9 @@ To propose a change, which writes nothing until `apply_proposal` (see [Proposals
 
 One tool stays off until you turn it on: [`nvim_exec`](#nvim-exec) runs Ex commands or Lua in your editor.
 
+In a [companion window](companion.md), the agent is told nothing of a buffer your Neovim loaded before the panel attached,
+until you reload it with `:e`.
+
 ## It never takes your cursor
 
 Showing a file leaves your current window, your cursor, your mode and your text as they were. If you are typing in

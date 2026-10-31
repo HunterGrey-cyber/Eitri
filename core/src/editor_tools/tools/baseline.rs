@@ -173,6 +173,7 @@ mod tests {
     fn entry(path: &str, line: u32, severity: Severity, message: &str) -> DiagnosticEntry {
         DiagnosticEntry {
             path: PathBuf::from(path),
+            read_from: None,
             line,
             column: 1,
             end_line: line,

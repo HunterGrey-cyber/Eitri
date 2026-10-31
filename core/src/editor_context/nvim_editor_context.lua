@@ -3,7 +3,8 @@
 --
 -- It writes one JSON line per update to EITRI_EDITOR_SOCKET: which file is focused, where the
 -- cursor is, and -- only while a visual selection is actually live -- the selected lines and their
--- text.
+-- text. It also keeps, in each buffer's `b:eitri_read_from`, what that buffer's text was read from,
+-- and in `b:eitri_diagnostics_stood` which diagnostics are about the text before that.
 
 -- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
 -- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
@@ -291,13 +292,70 @@ vim.api.nvim_create_autocmd(
     callback = changed,
   }
 )
+-- A buffer's name says what the disk holds under it now, and nvim keeps nothing of where the text
+-- came from: a buffer opened through a link keeps that file's text after the link is replaced. So the
+-- real path is recorded here at load, once per load, and goes nowhere until a tool asks for it. `:w
+-- other` leaves the record, since the buffer still holds what it held, and `:file` fires nothing here:
+-- it changes a name and no text. A reload fires BufReadPost, so the record follows what was read.
+--
+-- `vim.diagnostic` keeps its entries through a load, and an entry can quote the text it was set about.
+-- So a load that moves the record notes the namespaces standing on the buffer, and a tool leaves
+-- those out. A record that is missing has moved too: `:bdelete` drops it and leaves the entries. A write
+-- replaces no text, so it notes nothing. nvim loads `vim.diagnostic` on first use, and until then
+-- nothing can stand.
+local function note_what_stood(buf)
+  local diagnostic = package.loaded["vim.diagnostic"]
+  if not diagnostic then
+    return
+  end
+  local stood = {}
+  for _, entry in ipairs(diagnostic.get(buf)) do
+    stood[tostring(entry.namespace)] = true
+  end
+  vim.b[buf].eitri_diagnostics_stood = next(stood) and stood or nil
+end
+
+vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufWritePost" }, {
+  group = group,
+  callback = function(args)
+    local name = vim.api.nvim_buf_get_name(args.buf)
+    if name == "" or (args.event == "BufWritePost" and args.match ~= name) then
+      return
+    end
+    local record = vim.uv.fs_realpath(name) or name
+    if args.event ~= "BufWritePost" and vim.b[args.buf].eitri_read_from ~= record then
+      note_what_stood(args.buf)
+    end
+    vim.b[args.buf].eitri_read_from = record
+  end,
+})
+-- `vim.diagnostic.set` replaces a namespace's entries on a buffer, so the note on it goes with the first
+-- entry set after the load. An empty set says nothing: its event names no namespace.
+vim.api.nvim_create_autocmd("DiagnosticChanged", {
+  group = group,
+  callback = function(args)
+    local stood = vim.b[args.buf].eitri_diagnostics_stood
+    if not stood or not args.data then
+      return
+    end
+    for _, entry in ipairs(args.data.diagnostics or {}) do
+      stood[tostring(entry.namespace)] = nil
+    end
+    vim.b[args.buf].eitri_diagnostics_stood = next(stood) and stood or nil
+  end,
+})
+
 -- What the editor shows when this is loaded is news too.
 changed()
 
--- Undoes this chunk: the autocommands and the timer.
+-- Undoes this chunk: the autocommands, the timer and the records, which nothing keeps true from here on.
 return function()
   torn = true
   pcall(vim.api.nvim_del_augroup_by_id, group)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    pcall(vim.api.nvim_buf_del_var, buf, "eitri_read_from")
+    pcall(vim.api.nvim_buf_del_var, buf, "eitri_diagnostics_stood")
+  end
   if not timer:is_closing() then
     timer:stop()
     timer:close()

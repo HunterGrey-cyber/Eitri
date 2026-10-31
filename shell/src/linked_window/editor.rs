@@ -2137,11 +2137,10 @@ mod tests {
     /// One entry of the diagnostics chunk's answer, on `src/a.rs`.
     fn diagnostic(w: &Windows, message: &str) -> rmpv::Value {
         use rmpv::Value as M;
+        let path = M::Binary(w.root.join("src/a.rs").as_os_str().as_encoded_bytes().to_vec());
         M::Map(vec![
-            (
-                M::from("path"),
-                M::Binary(w.root.join("src/a.rs").as_os_str().as_encoded_bytes().to_vec()),
-            ),
+            (M::from("path"), path.clone()),
+            (M::from("read_from"), path),
             (M::from("lnum"), M::from(0)),
             (M::from("col"), M::from(0)),
             (M::from("end_lnum"), M::from(0)),

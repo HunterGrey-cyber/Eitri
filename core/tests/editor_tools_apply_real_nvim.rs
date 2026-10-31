@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use agent::setting_sources::ProjectTrust;
 use agent::PermissionMode;
 use eitri_core::buffer_reload::RELOAD_CMD;
+use eitri_core::editor_context::feed::EditorContextFeed;
 use eitri_core::editor_context::EditorContext;
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
@@ -100,6 +101,7 @@ impl BrokerEnv for Env {
 
 struct Test {
     rpc: Rc<Rpc>,
+    feed: EditorContextFeed,
     env: Env,
     broker: Broker,
     dir: PathBuf,
@@ -132,7 +134,8 @@ impl Test {
         std::fs::write(&a, "foo\n").unwrap();
         std::fs::write(&b, "foo\n").unwrap();
 
-        let mut nvim = Embed::start(&dir, &["--cmd", RELOAD_CMD], &[]);
+        let feed = EditorContextFeed::new().expect("the feed must bind");
+        let mut nvim = Embed::start_fed(&dir, &feed, &["--cmd", RELOAD_CMD]);
         let path = |file: &Path| Value::from(file.to_string_lossy().as_ref());
         let buf = nvim.lua(OPEN, vec![path(&a)]);
         let config = map(&[
@@ -158,6 +161,7 @@ impl Test {
         };
         Test {
             rpc,
+            feed,
             env,
             broker: Broker::new(),
             dir,
@@ -244,6 +248,7 @@ impl Test {
 
 impl Drop for Test {
     fn drop(&mut self) {
+        self.feed.cleanup();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

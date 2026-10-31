@@ -1,5 +1,5 @@
 [English](editor-tools.md) | 简体中文
-<!-- translated-from: editor-tools.md sha256=61970494d84b4e24411d1d0c0e2f9cdb3558f1972b79dddb4748aed242e6a1f1 -->
+<!-- translated-from: editor-tools.md sha256=f20bc2565e71c3fba09564e414672fcdd9ceba8769ed431a2b078e259f0fdf53 -->
 
 # 从 agent 标签页使用你的编辑器
 
@@ -26,6 +26,8 @@
 - `apply_proposal`：把一个提议写到磁盘上。
 
 有一个工具在你打开之前一直是关的：[`nvim_exec`](#nvim-exec) 在你的编辑器里运行 Ex 命令或 Lua。
+
+在 [companion 窗口](companion.zh-CN.md)里，面板附着之前 Neovim 已经加载的缓冲区，agent 什么也看不到，直到你用 `:e` 重新加载它。
 
 ## 它从不夺走你的光标
 
