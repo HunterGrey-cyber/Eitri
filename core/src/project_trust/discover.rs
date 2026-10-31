@@ -40,7 +40,7 @@ enum Role {
     Registered,
     /// Anything in a skill tree Codex reads (`.agents/skills/`, `.codex/skills/`): Codex follows a
     /// link anywhere in it and reads what it leads to, so a link here is one the fingerprint cannot
-    /// see through.
+    /// see through, unless it is in `.codex/skills/` and the walk read through it.
     SkillTree,
     /// Anything in a `.claude/` that is not its settings or memory file: commands, agents, skills,
     /// the scripts its hooks run. The CLI reads all of it and follows a link anywhere in it, so a
@@ -159,9 +159,10 @@ struct Through<'a> {
 
 struct Scan<'a> {
     top: PathBuf,
-    /// Links below a walked `.claude/` may be followed inside the top level. Off when the top level
-    /// may hold the user's home, since a link could then lead into the account's own files, and when
-    /// it is neither the root nor where a `.git` was accepted, since it may then be a shared directory
+    /// Links below a walked `.claude/`, in a walked `.codex/skills/` and in place of a memory file
+    /// beside a walked `.claude/` may be followed inside the top level. Off when the top level may
+    /// hold the user's home, since a link could then lead into the account's own files, and when it
+    /// is neither the root nor where a `.git` was accepted, since it may then be a shared directory
     /// the project does not own.
     follows_links: bool,
     /// The links named so far, by the path each was named at.
@@ -305,6 +306,63 @@ impl Scan<'_> {
             }
             if self.followed_link(&path, &target) {
                 self.push(path, EntryKind::Symlink { target, outside: false });
+            }
+        }
+    }
+
+    /// The link `name` in `dir`, which is really at `real` relative to the top level, walked to its
+    /// end, with its target as written.
+    fn follow(&self, dir: &DirHandle, name: &OsStr, real: &Path) -> Option<(PathBuf, Followed)> {
+        let target = dir.readlink(name).ok()?;
+        let followed = follow_within(&self.top, real, &target)?;
+        Some((target, followed))
+    }
+
+    /// What [`Scan::follow`] found for a link at `path`, when it is not a directory to walk: a regular
+    /// file is read under the link's own path, and anything else stays a link the walk did not follow.
+    fn file_behind_link(
+        &mut self,
+        dir: &DirHandle,
+        name: &OsStr,
+        path: PathBuf,
+        role: Role,
+        real: &Path,
+        followed: Option<(PathBuf, Followed)>,
+    ) {
+        match followed {
+            Some((
+                target,
+                Followed {
+                    reached:
+                        Reached::File {
+                            dir: holder,
+                            name: file,
+                            at,
+                        },
+                    links,
+                },
+            )) => {
+                self.followed_link(&path, &target);
+                self.chain(links);
+                let through = Through {
+                    target: &target,
+                    dir: self.top.join(at),
+                };
+                self.read_file(&holder, &file, path, role, Some(through));
+            }
+            other => {
+                let left = matches!(
+                    other,
+                    Some((
+                        _,
+                        Followed {
+                            reached: Reached::Left,
+                            ..
+                        }
+                    ))
+                );
+                let link_dir = self.top.join(real);
+                self.symlink_in(dir, name, path, role, &link_dir, left);
             }
         }
     }
@@ -460,17 +518,25 @@ impl Scan<'_> {
         }
     }
 
+    /// A memory file beside a walked `.claude/`: `base` is that directory relative to the top level. A
+    /// link here is often `CLAUDE.md -> AGENTS.md`, so it is read through like one below `.claude/`.
+    fn memory_beside_claude(&mut self, dir: &DirHandle, name: &OsStr, base: &Path) {
+        if !self.follows_links || !matches!(dir.lstat(name), Ok(FileKind::Symlink)) {
+            self.expected_file(dir, name, base.join(name), Role::Memory);
+        } else if self.room() {
+            let followed = self.follow(dir, name, base);
+            self.file_behind_link(dir, name, base.join(name), Role::Memory, base, followed);
+        }
+    }
+
     /// One directory on the walk for Claude: the files beside `.claude/`, then `.claude/` itself.
     fn claude_directory(&mut self, dir: &Path, at_home: bool) {
         let Some((base, handle)) = self.open_walked(dir) else {
             return;
         };
-        for (name, role) in [
-            (".mcp.json", Role::Mcp),
-            ("CLAUDE.md", Role::Memory),
-            ("CLAUDE.local.md", Role::Memory),
-        ] {
-            self.expected_file(&handle, OsStr::new(name), base.join(name), role);
+        self.expected_file(&handle, OsStr::new(".mcp.json"), base.join(".mcp.json"), Role::Mcp);
+        for name in ["CLAUDE.md", "CLAUDE.local.md"] {
+            self.memory_beside_claude(&handle, OsStr::new(name), &base);
         }
         let dot_claude = OsStr::new(".claude");
         let claude_path = base.join(".claude");
@@ -570,6 +636,8 @@ impl Scan<'_> {
     /// Everything under a directory read whole (a `.claude/`, a `.codex/`, ...), depth first,
     /// bounded by depth and entries.
     fn tree(&mut self, top_dir: DirHandle, top_path: PathBuf, tree: Tree) {
+        // A main checkout's `.codex/` is reached from above the top level, where nothing is followed.
+        let follows_links = self.follows_links && !top_path.starts_with("..");
         let mut stack = vec![Walked {
             dir: top_dir,
             path: top_path.clone(),
@@ -651,38 +719,17 @@ impl Scan<'_> {
                         }
                     }
                     Ok(FileKind::Symlink)
-                        if tree == Tree::Claude
-                            && self.follows_links
-                            && !(depth == 0 && name.as_bytes() == WORKTREES_DIR) =>
+                        if follows_links
+                            && match tree {
+                                Tree::Claude => !(depth == 0 && name.as_bytes() == WORKTREES_DIR),
+                                Tree::Codex => in_skills,
+                                _ => false,
+                            } =>
                     {
                         if !self.room() {
                             break;
                         }
-                        let followed = dir.readlink(&name).ok().and_then(|target| {
-                            let followed = follow_within(&self.top, &real, &target)?;
-                            Some((target, followed))
-                        });
-                        match followed {
-                            Some((
-                                target,
-                                Followed {
-                                    reached:
-                                        Reached::File {
-                                            dir: holder,
-                                            name: file,
-                                            at,
-                                        },
-                                    links,
-                                },
-                            )) => {
-                                self.followed_link(&child, &target);
-                                self.chain(links);
-                                let through = Through {
-                                    target: &target,
-                                    dir: self.top.join(at),
-                                };
-                                self.read_file(&holder, &file, child, role, Some(through));
-                            }
+                        match self.follow(&dir, &name, &real) {
                             // A directory holding this link, or one on the way here, would lead back.
                             Some((
                                 target,
@@ -694,6 +741,12 @@ impl Scan<'_> {
                                 self.followed_link(&child, &target);
                                 self.chain(links);
                                 self.push(child.clone(), EntryKind::Symlink { target, outside: false });
+                                if tree.is_skill(depth, parent.as_deref()) {
+                                    self.findings.push(Finding::Skill {
+                                        path: child.clone(),
+                                        name: name.to_string_lossy().into_owned(),
+                                    });
+                                }
                                 if self.too_deep(depth, tree, &top_path) {
                                     continue;
                                 }
@@ -708,20 +761,7 @@ impl Scan<'_> {
                                     crossed,
                                 });
                             }
-                            other => {
-                                let left = matches!(
-                                    other,
-                                    Some((
-                                        _,
-                                        Followed {
-                                            reached: Reached::Left,
-                                            ..
-                                        }
-                                    ))
-                                );
-                                let link_dir = self.top.join(&real);
-                                self.symlink_in(&dir, &name, child, role, &link_dir, left);
-                            }
+                            other => self.file_behind_link(&dir, &name, child, role, &real, other),
                         }
                     }
                     _ => {
@@ -1059,7 +1099,8 @@ fn fingerprint(
 /// accepted, up to the highest directory whose `.git` could not be checked), never above `home`
 /// when `root` is below it. For Claude, every directory above that top level up to `/` is looked at
 /// too, for the memory files and `.mcp.json` the CLI loads from there. Nothing blocks, and no link is
-/// followed but one below a walked `.claude/`, by [`follow_within`] and only inside the top level.
+/// followed but one below a walked `.claude/`, in a walked `.codex/skills/` or in place of a memory
+/// file beside a walked `.claude/`, by [`follow_within`] and only inside the top level.
 ///
 /// `home` must be canonical too: it is compared with `root`'s ancestors by path, and a home spelt
 /// through a link would match none of them, so the walk would neither stop there nor keep the user

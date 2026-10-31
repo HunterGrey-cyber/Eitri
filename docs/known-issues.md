@@ -150,10 +150,11 @@ one-window mode.
   `.claude/`, `.mcp.json` or `CLAUDE.md`, including one that terminal `claude` makes (its "don't ask again" rewrites
   `settings.local.json`). It never imports terminal `claude`'s own trust answer, so a project you already trusted in
   the terminal asks once more here. A file Eitri cannot check (larger than 4 MiB, unreadable, a pipe, a symlink
-  beside `.claude/` in place of a configuration file, a symlink below `.claude/` that Eitri cannot follow, or a
-  settings file that is not valid JSON) is named in the question, and your answer then covers that one start only.
-  On a Claude tab, a symlink below `.claude/` whose relative target stays inside the repository is followed and
-  checked; [the permissions guide](guide/permissions.md) lists the exceptions. Nothing in the question is cut, so a
+  Eitri cannot follow in place of a configuration file or below `.claude/`, or a settings file that is not valid
+  JSON) is named in the question, and your answer then covers that one start only. On a Claude tab, a symlink below
+  `.claude/` or in place of `CLAUDE.md` whose relative target stays inside the repository is followed and checked,
+  and so is one inside `.codex/skills/` on a Codex tab; [the permissions guide](guide/permissions.md) lists the
+  exceptions. Nothing in the question is cut, so a
   configuration whose question would pass 2 MiB cannot be shown and cannot be trusted at all: the project starts
   only without its configuration. A `CLAUDE.md` in a subdirectory of the project is not read by the check; Claude
   Code loads it once the agent reads a file there, and the question says so. A script a hook calls from outside

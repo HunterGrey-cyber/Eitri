@@ -2907,6 +2907,33 @@ mod tests {
         assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
     }
 
+    /// `CLAUDE.md -> AGENTS.md` is hashed through the link too: a `y` is recorded, and the prompt names
+    /// the link and its target.
+    #[test]
+    fn a_memory_file_linked_inside_the_root_is_asked_about_once() {
+        let fx = Fx::new("linked-memory");
+        fx.write(SETTINGS, b"{}");
+        fx.write("AGENTS.md", b"memory\n");
+        std::os::unix::fs::symlink("AGENTS.md", fx.root.join("CLAUDE.md")).unwrap();
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Yes);
+        let row = view
+            .items
+            .iter()
+            .find(|item| item.what == "symlink")
+            .expect("a row for the link");
+        assert_eq!(row.value, "AGENTS.md");
+        assert!(!row.outside);
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { tab: A, .. }))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: A, notice: None }));
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
+    }
+
     /// A settings file that is a link out of the root: the CLI follows it and the fingerprint cannot see
     /// its target change, so it counts as unchecked: a `y` covers one start, nothing is recorded and the
     /// window remembers neither answer.
@@ -3683,6 +3710,28 @@ mod tests {
         );
         assert_eq!(gate.row(&CLAUDE), "not trusted (answered n in this window)");
         assert_eq!(gate.row(&CODEX), "not trusted (answered n in this window)");
+    }
+
+    /// On a Codex tab a skill linked from `.codex/skills/` into `.claude/skills/` is hashed through the
+    /// link, so a `y` is recorded and the next tab starts without the question.
+    #[test]
+    fn a_codex_skill_linked_inside_the_root_is_asked_about_once() {
+        let fx = Fx::new("linked-codex-skill");
+        fx.write(".codex/config.toml", b"model = \"m\"\n");
+        fx.write(".claude/skills/vm/SKILL.md", b"skill\n");
+        std::fs::create_dir_all(fx.root.join(".codex/skills")).unwrap();
+        std::os::unix::fs::symlink("../../.claude/skills/vm", fx.root.join(".codex/skills/vm")).unwrap();
+        let mut gate = fx.gate();
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Ask);
+        let view = gate.show(B, 1, &CODEX).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Yes);
+        assert!(view.items.iter().any(|item| item.what == "symlink"));
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { .. }))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: B, notice: None }), "{seen:?}");
+        assert_eq!(start_as(&mut gate, B, &CODEX), Route::Start(ProjectTrust::Trusted));
     }
 
     /// A `y` in a Codex tab writes Codex's record and remembers Codex's answer; a Claude start in the

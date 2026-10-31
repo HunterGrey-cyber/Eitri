@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=ca20f283bb1ec2bfac9a86474c35fceff74fd52d5328e5fb92ab2e48ddf2a2a3 -->
+<!-- translated-from: known-issues.md sha256=f6eae3537a31675720671757644f29b1665b0f4440c6999490236513f19df08b -->
 
 # 已知问题与限制
 
@@ -71,7 +71,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 
 ## 安全
 
-- **Eitri 会先问一句，再加载项目自己的 Claude 配置，这一步有它的限度。** 在你信任一个项目之前，它的 agent 会话只加载你自己的用户设置，不加载项目里的 `.claude/settings.json`、`.claude/settings.local.json`、`.mcp.json` 和 `CLAUDE.md`，所以一个不是你写的仓库，没法在你发出第一条消息时启动它自己的 hook 和 MCP server，也没法预先批准工具调用。这个提问会列出找到的内容和确切的命令。信任按项目记住，并且和你看到的内容绑定：`.claude/`、`.mcp.json` 或 `CLAUDE.md` 有任何改动，Eitri 都会再问一次，包括终端里的 `claude` 做的改动（它的「不再询问」会改写 `settings.local.json`）。Eitri 不会导入终端 `claude` 自己的信任答案，所以你在终端里已经信任过的项目，在这里还会问一次。Eitri 检查不了的文件（超过 4 MiB、读不出来、管道、`.claude/` 之外顶替了某个配置文件的符号链接、`.claude/` 下 Eitri 跟不过去的符号链接，或者不是合法 JSON 的设置文件）会在提问里点名，你的回答只管这一次启动。在 Claude 标签页里，`.claude/` 下用相对路径指向仓库内部的符号链接会被跟过去并检查；例外情况见[权限指南](guide/permissions.zh-CN.md)。提问里的任何内容都不会被截断，所以提问会超过 2 MiB 的配置没法显示，也根本没法被信任：这样的项目只能不带它的配置启动。检查不会读项目子目录里的 `CLAUDE.md`；Claude Code 在 agent 读那里的文件时才会加载它，提问里也会这么说。hook 调用的、在 `.claude/` 之外的脚本，只通过 hook 的命令文本得到信任，所以信任一个项目，就是信任它的代码可以运行，和构建它一样。在真正的终端里继续一个对话，运行的是普通的 `claude`，适用它自己的信任提问。想忘掉所有回答，删掉 `~/.local/state/eitri/trust/`。
+- **Eitri 会先问一句，再加载项目自己的 Claude 配置，这一步有它的限度。** 在你信任一个项目之前，它的 agent 会话只加载你自己的用户设置，不加载项目里的 `.claude/settings.json`、`.claude/settings.local.json`、`.mcp.json` 和 `CLAUDE.md`，所以一个不是你写的仓库，没法在你发出第一条消息时启动它自己的 hook 和 MCP server，也没法预先批准工具调用。这个提问会列出找到的内容和确切的命令。信任按项目记住，并且和你看到的内容绑定：`.claude/`、`.mcp.json` 或 `CLAUDE.md` 有任何改动，Eitri 都会再问一次，包括终端里的 `claude` 做的改动（它的「不再询问」会改写 `settings.local.json`）。Eitri 不会导入终端 `claude` 自己的信任答案，所以你在终端里已经信任过的项目，在这里还会问一次。Eitri 检查不了的文件（超过 4 MiB、读不出来、管道、Eitri 跟不过去的符号链接（顶替了某个配置文件，或在 `.claude/` 下），或者不是合法 JSON 的设置文件）会在提问里点名，你的回答只管这一次启动。在 Claude 标签页里，`.claude/` 下或顶替 `CLAUDE.md` 的符号链接，如果用相对路径指向仓库内部，会被跟过去并检查，Codex 标签页里 `.codex/skills/` 内的符号链接也一样；例外情况见[权限指南](guide/permissions.zh-CN.md)。提问里的任何内容都不会被截断，所以提问会超过 2 MiB 的配置没法显示，也根本没法被信任：这样的项目只能不带它的配置启动。检查不会读项目子目录里的 `CLAUDE.md`；Claude Code 在 agent 读那里的文件时才会加载它，提问里也会这么说。hook 调用的、在 `.claude/` 之外的脚本，只通过 hook 的命令文本得到信任，所以信任一个项目，就是信任它的代码可以运行，和构建它一样。在真正的终端里继续一个对话，运行的是普通的 `claude`，适用它自己的信任提问。想忘掉所有回答，删掉 `~/.local/state/eitri/trust/`。
 - **在 Auto 标签页里，Claude Code 自己的 auto 模式可能不经询问就让 agent 在 `.git/` 下写文件**，包括新建一个 git hook。回合审阅不显示 `.git/` 下的改动，信任提问盯的是 `.claude/`、`.mcp.json` 和 `CLAUDE.md`，不是 `.git/`。在你在意的仓库里跑完一个回合后，值得看一眼 `ls .git/hooks`。相反，`.claude/` 下的改动会让 Eitri 在下一个会话之前重新提出信任提问。
 - **你自己 Claude Code 设置里的 hook（或者一个已信任项目的 hook）可以在你批准之后改掉工具调用。** Claude Code 在 Eitri 看过原始输入之后才应用 hook 改写过的输入；如果 Claude Code 随后再询问，它的卡片显示改写后的输入，而工具那一行显示原始的。在终端里 hook 也是这样工作的。
 - **已信任项目的 `permissions.allow` 规则，只有在你也在终端 `claude` 里信任过那个目录时，才会作用到 Auto 标签页。** 这是 Claude Code 自己的规则；你用户设置里的规则始终有效。

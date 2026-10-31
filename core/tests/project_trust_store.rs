@@ -709,6 +709,53 @@ fn a_link_inside_the_root_is_remembered_and_what_it_reaches_is_checked() {
     }
 }
 
+/// The two links people keep between Claude's and Codex's files: each is hashed through, so the answer
+/// is kept, and a change behind it asks again and is named where the agent reads it.
+#[test]
+fn links_between_claude_and_codex_files_are_remembered_and_checked() {
+    let fx = Fixture::new("link-both-ways");
+    let root = fx.repo("repo");
+    write(&root.join("AGENTS.md"), b"memory\n");
+    write(&root.join(".claude/skills/vm/SKILL.md"), b"skill\n");
+    write(&root.join(".codex/config.toml"), b"model = \"m\"\n");
+    std::fs::create_dir_all(root.join(".codex/skills")).unwrap();
+    symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+    symlink("../../.claude/skills/vm", root.join(".codex/skills/vm")).unwrap();
+
+    let store = fx.store();
+    let cases = [
+        (Profile::Claude, "AGENTS.md", b"edited\n".as_slice(), "CLAUDE.md"),
+        (
+            Profile::Codex,
+            ".claude/skills/vm/SKILL.md",
+            b"edited\n".as_slice(),
+            ".codex/skills/vm/SKILL.md",
+        ),
+    ];
+    for (profile, edit, edited, named) in cases {
+        let found = discover_as(&fx, &root, &profile);
+        match store.state(found.clone()) {
+            TrustState::Untrusted { remember, .. } => assert_eq!(remember, Remember::Yes, "{profile:?}"),
+            other => panic!("{other:?}"),
+        }
+        store.record(&found, 1_800_000_000).unwrap();
+        assert!(matches!(
+            store.state(discover_as(&fx, &root, &profile)),
+            TrustState::Trusted { .. }
+        ));
+        let before = std::fs::read(root.join(edit)).unwrap();
+        write(&root.join(edit), edited);
+        match store.state(discover_as(&fx, &root, &profile)) {
+            TrustState::Changed { diff, remember, .. } => {
+                assert_eq!(remember, Remember::Yes);
+                assert_eq!(diff.changed, vec![PathBuf::from(named)]);
+            }
+            other => panic!("{other:?}"),
+        }
+        write(&root.join(edit), &before);
+    }
+}
+
 /// A change behind a file link is named at that link, also when another link passes through it.
 #[test]
 fn a_change_behind_a_link_another_link_passes_through_names_both() {

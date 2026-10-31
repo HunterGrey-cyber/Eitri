@@ -911,6 +911,14 @@ fn a_link_in_a_reached_directory_is_outside_by_where_it_really_is() {
         found.findings
     );
     assert!(!found.fully_hashed());
+
+    // One the walk could not follow: from where it really is it stays inside, however deep the agent
+    // reads it from.
+    let repo = linked_repo(&fx, "repo-deep");
+    write(&repo.join("a/b/c/f.md"), b"f\n");
+    link("../../../gone.md", repo.join("a/b/c/dangling.md"));
+    link("../a/b/c", repo.join(".claude/s"));
+    assert_link_not_followed(&fx.discover(&repo), ".claude/s/dangling.md", "../../../gone.md", false);
 }
 
 /// A top level no repository vouches for may be a shared directory the project does not own: links are
@@ -924,9 +932,11 @@ fn an_unverified_top_level_does_not_widen_where_a_link_may_lead() {
     let root = shared.join("project");
     write(&root.join(".claude/settings.json"), b"{}");
     link("../../skill", root.join(".claude/s"));
+    link("../skill/SKILL.md", root.join("CLAUDE.md"));
     let found = fx.discover(&root);
     assert_eq!(found.top, shared);
     assert_link_not_followed(&found, "project/.claude/s", "../../skill", false);
+    assert_link_not_followed(&found, "project/CLAUDE.md", "../skill/SKILL.md", false);
 
     // With nothing above it in question, the root is its own boundary.
     let root = fx.home.join("plain");
@@ -1088,6 +1098,24 @@ fn a_linked_target_over_the_limits_is_not_fully_hashed() {
         .over_budget
         .as_deref()
         .is_some_and(|reason| reason.contains("more than 4 bytes of configuration")));
+
+    // A link at the limit is walked no deeper than a directory there would be.
+    let repo = linked_repo(&fx, "at-the-limit");
+    write(&repo.join("docs/f.md"), b"f\n");
+    link("../../docs", repo.join(".claude/a/l"));
+    let limits = Limits {
+        max_depth: 1,
+        ..Limits::default()
+    };
+    let found = discover(&repo, Some(&fx.home), &limits, &Profile::Claude, &ProfileEnv::default());
+    assert_eq!(
+        found.over_budget.as_deref(),
+        Some("deeper than 1 directories under .claude/")
+    );
+    assert!(!found
+        .entries
+        .iter()
+        .any(|entry| entry.path == Path::new(".claude/a/l/f.md")));
 }
 
 #[test]
@@ -1137,11 +1165,13 @@ fn no_link_is_followed_when_the_top_level_may_hold_the_home() {
     write(&root.join(".claude/settings.json"), b"{}");
     link("../../account.json", root.join(".claude/x.json"));
     link("../account.json", fx.home.join(".claude/settings.local.json"));
+    link("account.json", fx.home.join("CLAUDE.md"));
     assert!(root.join(".claude/x.json").exists(), "the link leads somewhere");
     let found = fx.discover(&root);
     assert_eq!(found.top, fx.home);
     assert_link_not_followed(&found, "sub/.claude/x.json", "../../account.json", false);
     assert_link_not_followed(&found, ".claude/settings.local.json", "../account.json", false);
+    assert_link_not_followed(&found, "CLAUDE.md", "account.json", false);
 
     // The home is below the repository.
     let fx = Fixture::new("link-below-home");
@@ -1150,9 +1180,11 @@ fn no_link_is_followed_when_the_top_level_may_hold_the_home() {
     write(&fx.base.join("home/account.json"), b"{}");
     write(&root.join(".claude/settings.json"), b"{}");
     link("../../home/account.json", root.join(".claude/x.json"));
+    link("../home/account.json", root.join("CLAUDE.md"));
     let found = fx.discover(&root);
     assert_eq!(found.top, fx.base);
     assert_link_not_followed(&found, "sub/.claude/x.json", "../../home/account.json", false);
+    assert_link_not_followed(&found, "sub/CLAUDE.md", "../home/account.json", false);
 
     // No home is known.
     let fx = Fixture::new("link-no-home");
@@ -1184,11 +1216,11 @@ fn links_outside_a_walked_dot_claude_are_not_followed() {
     let fx = Fixture::new("link-elsewhere");
     let repo = fx.home.join("repo");
     fx.repo(&repo, false);
-    write(&repo.join("real.md"), b"memory\n");
+    write(&repo.join("real.json"), b"{}");
     write(&repo.join("realdir/settings.json"), b"{}");
-    link("real.md", repo.join("CLAUDE.md"));
+    link("real.json", repo.join(".mcp.json"));
     let found = fx.discover(&repo);
-    assert_link_not_followed(&found, "CLAUDE.md", "real.md", false);
+    assert_link_not_followed(&found, ".mcp.json", "real.json", false);
 
     let repo = fx.home.join("repo2");
     fx.repo(&repo, false);
@@ -1198,10 +1230,244 @@ fn links_outside_a_walked_dot_claude_are_not_followed() {
 
     let repo = fx.home.join("repo3");
     fx.repo(&repo, false);
-    write(&repo.join(".codex/skills/real/SKILL.md"), b"s\n");
-    link("real", repo.join(".codex/skills/l"));
+    write(&repo.join(".agents/skills/real/SKILL.md"), b"s\n");
+    link("real", repo.join(".agents/skills/l"));
+    write(&repo.join("real.md"), b"memory\n");
+    link("real.md", repo.join("AGENTS.md"));
     let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
-    assert_link_not_followed(&found, ".codex/skills/l", "real", false);
+    assert_link_not_followed(&found, ".agents/skills/l", "real", false);
+    assert_link_not_followed(&found, "AGENTS.md", "real.md", false);
+}
+
+/// `CLAUDE.md -> AGENTS.md` is read through like a link below `.claude/`: the bytes are memory at the
+/// link's own path, and the target as written is part of what was trusted.
+#[test]
+fn a_memory_file_linked_inside_the_root_is_hashed_with_its_target() {
+    let fx = Fixture::new("link-memory");
+    let repo = linked_repo(&fx, "repo");
+    write(&repo.join("AGENTS.md"), b"same\n");
+    write(&repo.join("OTHER.md"), b"same\n");
+    write(&repo.join("docs/local.md"), b"local\n");
+    link("AGENTS.md", repo.join("CLAUDE.md"));
+    link("docs/local.md", repo.join("CLAUDE.local.md"));
+    let found = fx.discover(&repo);
+    assert!(found.fully_hashed(), "{:?}", found.uncheckable());
+    assert!(found.findings.contains(&Finding::Memory {
+        path: PathBuf::from("CLAUDE.md"),
+    }));
+    assert!(found.findings.contains(&Finding::Symlink {
+        path: PathBuf::from("CLAUDE.md"),
+        target: PathBuf::from("AGENTS.md"),
+        outside: false,
+    }));
+    assert_eq!(reached_len(&found, "CLAUDE.md"), Some(5));
+    assert_eq!(reached_len(&found, "CLAUDE.local.md"), Some(6));
+
+    let before = found.fingerprint;
+    write(&repo.join("AGENTS.md"), b"edit\n");
+    assert_ne!(fx.discover(&repo).fingerprint, before);
+    write(&repo.join("AGENTS.md"), b"same\n");
+    assert_eq!(fx.discover(&repo).fingerprint, before);
+    // The same bytes behind another target are another configuration.
+    std::fs::remove_file(repo.join("CLAUDE.md")).unwrap();
+    link("OTHER.md", repo.join("CLAUDE.md"));
+    assert_ne!(fx.discover(&repo).fingerprint, before);
+}
+
+/// Each directory from the root up to the top level follows its own memory link from where it is.
+#[test]
+fn a_memory_file_links_from_its_own_walked_directory() {
+    let fx = Fixture::new("link-memory-walked");
+    let repo = linked_repo(&fx, "repo");
+    let root = repo.join("sub");
+    write(&repo.join("AGENTS.md"), b"top\n");
+    write(&root.join("notes.md"), b"sub note\n");
+    link("../AGENTS.md", root.join("CLAUDE.md"));
+    link("sub/notes.md", repo.join("CLAUDE.md"));
+    let found = fx.discover(&root);
+    assert_eq!(found.top, repo);
+    assert!(found.fully_hashed(), "{:?}", found.uncheckable());
+    assert_eq!(reached_len(&found, "sub/CLAUDE.md"), Some(4));
+    assert_eq!(reached_len(&found, "CLAUDE.md"), Some(9));
+}
+
+/// A memory link that does not arrive at a regular file inside the top level by a way that stays there
+/// is a gap, named where the CLI reads it.
+#[test]
+fn a_memory_file_linked_any_other_way_is_not_followed() {
+    let fx = Fixture::new("link-memory-other");
+    write(&fx.home.join("outside.md"), b"o\n");
+    let cases: [(&str, &str, bool); 6] = [
+        ("out", "../outside.md", true),
+        ("back", "../repo-back/AGENTS.md", true),
+        ("dir", "docs", false),
+        ("absent", "gone.md", false),
+        ("pipe", "pipe", false),
+        ("loop", "CLAUDE.md", false),
+    ];
+    for (name, target, outside) in cases {
+        let repo = linked_repo(&fx, &format!("repo-{name}"));
+        write(&repo.join("AGENTS.md"), b"a\n");
+        write(&repo.join("docs/x.md"), b"x\n");
+        mkfifo(&repo.join("pipe"));
+        link(target, repo.join("CLAUDE.md"));
+        assert_link_not_followed(&fx.discover(&repo), "CLAUDE.md", target, outside);
+    }
+
+    // Absolute, even naming a place inside.
+    let repo = linked_repo(&fx, "repo-abs");
+    write(&repo.join("AGENTS.md"), b"a\n");
+    link(repo.join("AGENTS.md"), repo.join("CLAUDE.md"));
+    let target = repo.join("AGENTS.md");
+    assert_link_not_followed(&fx.discover(&repo), "CLAUDE.md", target.to_str().unwrap(), false);
+
+    // A chain that leaves through a later link.
+    let repo = linked_repo(&fx, "repo-chain");
+    link("../outside.md", repo.join("near.md"));
+    link("near.md", repo.join("CLAUDE.md"));
+    assert_link_not_followed(&fx.discover(&repo), "CLAUDE.md", "near.md", true);
+}
+
+/// Above the top level the CLI reads memory too, but no link is followed there.
+#[test]
+fn a_memory_file_linked_above_the_top_level_is_not_followed() {
+    let fx = Fixture::new("link-memory-above");
+    let outer = fx.home.join("outer");
+    write(&outer.join("real.md"), b"r\n");
+    link("real.md", outer.join("CLAUDE.md"));
+    let repo = outer.join("repo");
+    fx.repo(&repo, false);
+    assert_link_not_followed(&fx.discover(&repo), "../CLAUDE.md", "real.md", true);
+}
+
+/// The reverse of a skill linked from `.claude/`: on a Codex tab a skill linked from `.codex/skills/` is
+/// walked as Codex reads it, with `.codex/skills/` roles, and everything behind the link is hashed.
+#[test]
+fn a_codex_skill_linked_inside_the_root_is_walked_like_a_real_one() {
+    let fx = Fixture::new("link-codex-skill");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join(".codex/config.toml"), b"model = \"m\"\n");
+    write(
+        &repo.join(".claude/skills/vm/SKILL.md"),
+        b"---\nallowed-tools: Bash\n---\nbody\n",
+    );
+    write(&repo.join(".claude/skills/vm/refs/notes.md"), b"notes\n");
+    write(&repo.join("docs/skill.md"), b"doc\n");
+    write(&repo.join("docs/same.md"), b"doc\n");
+    link("../../.claude/skills/vm", repo.join(".codex/skills/vm"));
+    link("../../../docs/skill.md", repo.join(".codex/skills/x/SKILL.md"));
+    link("../../../.claude/skills/vm/refs", repo.join(".codex/skills/x/refs"));
+    let found = fx.discover_as(&repo, &Profile::Codex, &fx.codex_env());
+    assert!(found.fully_hashed(), "{:?}", found.uncheckable());
+    assert!(found.findings.contains(&Finding::Skill {
+        path: PathBuf::from(".codex/skills/vm"),
+        name: "vm".to_string(),
+    }));
+    assert!(found.findings.contains(&Finding::Symlink {
+        path: PathBuf::from(".codex/skills/vm"),
+        target: PathBuf::from("../../.claude/skills/vm"),
+        outside: false,
+    }));
+    assert!(found.findings.iter().any(|finding| matches!(
+        finding,
+        Finding::OtherFile { dir, name, frontmatter, .. }
+            if dir == Path::new(".codex/skills/vm")
+                && name == Path::new("SKILL.md")
+                && frontmatter.contains(&"allowed-tools".to_string())
+    )));
+    assert!(found
+        .entries
+        .iter()
+        .any(|entry| entry.path == Path::new(".codex/skills/x/refs/notes.md")));
+    assert_eq!(reached_len(&found, ".codex/skills/x/SKILL.md"), Some(4));
+
+    let before = found.fingerprint;
+    let codex = |fx: &Fixture| fx.discover_as(&repo, &Profile::Codex, &fx.codex_env()).fingerprint;
+    write(&repo.join(".claude/skills/vm/refs/notes.md"), b"Notes\n");
+    assert_ne!(codex(&fx), before);
+    write(&repo.join(".claude/skills/vm/refs/notes.md"), b"notes\n");
+    assert_eq!(codex(&fx), before);
+    // The same bytes behind another target are another configuration.
+    std::fs::remove_file(repo.join(".codex/skills/x/SKILL.md")).unwrap();
+    link("../../../docs/same.md", repo.join(".codex/skills/x/SKILL.md"));
+    assert_ne!(codex(&fx), before);
+}
+
+/// On a Codex tab only a link inside `.codex/skills/` is read through, and only by a way that stays
+/// inside the top level.
+#[test]
+fn a_codex_skill_linked_any_other_way_is_not_followed() {
+    let fx = Fixture::new("link-codex-other");
+    write(&fx.home.join("secret.md"), b"s\n");
+    write(&fx.home.join("outside/x/SKILL.md"), b"o\n");
+    let codex_repo = |name: &str| {
+        let repo = fx.home.join(name);
+        fx.repo(&repo, false);
+        write(&repo.join(".codex/config.toml"), b"model = \"m\"\n");
+        write(&repo.join(".claude/skills/x/SKILL.md"), b"s\n");
+        repo
+    };
+    let discover = |repo: &Path| fx.discover_as(repo, &Profile::Codex, &fx.codex_env());
+
+    let repo = codex_repo("repo-out");
+    link("../../../outside/x", repo.join(".codex/skills/x"));
+    assert_link_not_followed(&discover(&repo), ".codex/skills/x", "../../../outside/x", true);
+
+    let repo = codex_repo("repo-abs");
+    let target = repo.join(".claude/skills/x");
+    link(&target, repo.join(".codex/skills/x"));
+    assert_link_not_followed(&discover(&repo), ".codex/skills/x", target.to_str().unwrap(), false);
+
+    // The directory itself in place of `.codex/skills`, and a skill tree that is not `.codex/skills/`.
+    let repo = codex_repo("repo-dir");
+    link("../.claude/skills", repo.join(".codex/skills"));
+    assert_link_not_followed(&discover(&repo), ".codex/skills", "../.claude/skills", false);
+    let repo = codex_repo("repo-agents");
+    link("../../.claude/skills/x", repo.join(".agents/skills/x"));
+    assert_link_not_followed(&discover(&repo), ".agents/skills/x", "../../.claude/skills/x", false);
+
+    // Back up over the link itself.
+    let repo = codex_repo("repo-back");
+    link("..", repo.join(".codex/skills/l"));
+    assert_link_not_followed(&discover(&repo), ".codex/skills/l", "..", false);
+
+    // A link in what was reached leaves from where it really is.
+    let repo = codex_repo("repo-leaves");
+    link("../../../../secret.md", repo.join(".claude/skills/x/out.md"));
+    link("../../.claude/skills/x", repo.join(".codex/skills/x"));
+    assert_link_not_followed(
+        &discover(&repo),
+        ".codex/skills/x/out.md",
+        "../../../../secret.md",
+        true,
+    );
+
+    // The top level may hold the home.
+    let fx = Fixture::new("link-codex-home");
+    fx.repo(&fx.home, false);
+    let root = fx.home.join("sub");
+    write(&root.join(".codex/config.toml"), b"model = \"m\"\n");
+    write(&fx.home.join("account/SKILL.md"), b"a\n");
+    link("../../../account", root.join(".codex/skills/a"));
+    let found = fx.discover_as(&root, &Profile::Codex, &fx.codex_env());
+    assert_eq!(found.top, fx.home);
+    assert_link_not_followed(&found, "sub/.codex/skills/a", "../../../account", false);
+}
+
+/// A linked worktree's main checkout is above the top level, so a skill linked there is not read through
+/// and is judged from where it really is.
+#[test]
+fn a_codex_skill_link_in_the_main_checkout_is_not_followed() {
+    let fx = Fixture::new("link-codex-main");
+    let main = fx.home.join("main");
+    fx.repo(&main, true);
+    write(&main.join(".claude/skills/x/SKILL.md"), b"s\n");
+    link("../../.claude/skills/x", main.join(".codex/skills/x"));
+    let wt = fx.home.join("wt");
+    fx.git(&main, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+    let found = fx.discover_as(&wt, &Profile::Codex, &fx.codex_env());
+    assert_link_not_followed(&found, "../main/.codex/skills/x", "../../.claude/skills/x", true);
 }
 
 #[test]
@@ -2074,15 +2340,19 @@ fn a_linked_codex_read_directory_cannot_be_checked() {
 }
 
 #[test]
-fn a_link_inside_a_codex_skill_tree_cannot_be_checked() {
+fn a_link_a_codex_skill_tree_does_not_read_through_cannot_be_checked() {
     let fx = Fixture::new("codex-linked-skills");
-    // Codex follows links in a project's skill directories and reads what they lead to, which the
-    // fingerprint never sees: each such link makes the answer last one start.
+    // Codex follows links in a project's skill directories and reads what they lead to. Where the
+    // fingerprint does not see that, each such link makes the answer last one start.
     let cases: [(&str, &str, &str); 4] = [
         (".agents/skills/review", "../../shared/review", "shared/review/SKILL.md"),
         (".agents/skills/y/SKILL.md", "../../../docs/skill.md", "docs/skill.md"),
-        (".codex/skills/x/SKILL.md", "../../../docs/skill.md", "docs/skill.md"),
-        (".codex/skills/x/refs", "../../../shared/refs", "shared/refs/a.md"),
+        (
+            ".codex/skills/x/SKILL.md",
+            "../../../../held/skill.md",
+            "../held/skill.md",
+        ),
+        (".codex/skills/x/refs", "../../../../held/refs", "../held/refs/a.md"),
     ];
     for (i, (link, target, held)) in cases.iter().enumerate() {
         let repo = fx.home.join(format!("repo-{i}"));
