@@ -11,14 +11,16 @@
 //! The files are held by a thread of their own ([`PresenceHolder`]) so that the GTK thread never
 //! touches the disk for them: it only tells the thread which tabs run a turn.
 //!
-//! **A linked pair is one presence.** Two windows linked to each other (window 1 and the window 2
-//! it started) each hold their own `windows/<pid>`, but neither counts the other's as another
-//! window while the link is up: [`PresenceGuard::set_partner`] names the partner by pid and start
-//! time, and the check skips that one file. The partner's turns still count, through `running/`,
-//! which skips nothing but this process's own files. A partner that said it cannot mark its turns
-//! as running sets the partner's [`Partner::counts_as_other`], and from then until it says it can
-//! again it is another window like any other. Writes are kept one at a time across windows by the
-//! project's write slot ([`super::write_slot`]), which every window takes, linked or not.
+//! **Linked windows are one presence.** Windows linked to each other each hold their own
+//! `windows/<pid>`, but a window does not count a linked partner's as another window while the link
+//! is up: [`PresenceGuard::set_partner`] names the one partner of a pair, and
+//! [`PresenceGuard::add_partner`] and [`PresenceGuard::remove_partner`] keep the set of a window
+//! with several links, each by pid and start time, and the check skips those files. A partner's
+//! turns still count, through `running/`, which skips nothing but this process's own files. A
+//! partner that said it cannot mark its turns as running sets its [`Partner::counts_as_other`],
+//! and from then until it says it can again it is another window like any other. Writes are kept
+//! one at a time across windows by the project's write slot ([`super::write_slot`]), which every
+//! window takes, linked or not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -188,9 +190,9 @@ fn owner_pid(name: &str) -> Option<u32> {
 /// The first of `dir`'s files, other than `own_pid`'s, whose lock is held: its pid. Files whose
 /// lock is free are leftovers of a process that died, and are removed while the probe's own lock
 /// on them is still held, so nobody can take the file between the probe and the removal. A held
-/// file of `partner`'s pid is not reported while that pid is still the process that started at
-/// `partner`'s start time.
-fn first_held(dir: &Path, own_pid: u32, partner: Option<(u32, u64)>) -> Result<Option<u32>, ShadowError> {
+/// file of a pid in `skip` (pid, start time) is not reported while that pid is still the process
+/// that started at that time.
+fn first_held(dir: &Path, own_pid: u32, skip: &[(u32, u64)]) -> Result<Option<u32>, ShadowError> {
     match std::fs::symlink_metadata(dir) {
         // Nobody has made the directory: nobody has anything open.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -229,7 +231,7 @@ fn first_held(dir: &Path, own_pid: u32, partner: Option<(u32, u64)>) -> Result<O
                     let _ = std::fs::remove_file(&path);
                 }
             }
-            Ok(None) if is_partner(pid, partner) => {}
+            Ok(None) if is_partner(pid, skip) => {}
             Ok(None) => held = held.or(Some(pid)),
             // Gone since the listing, a symlink or not a regular file: not a lock.
             Err(ShadowError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -239,32 +241,29 @@ fn first_held(dir: &Path, own_pid: u32, partner: Option<(u32, u64)>) -> Result<O
     Ok(held)
 }
 
-/// Whether `pid` is the linked partner: its pid, and the process that has that pid now is the one
+/// Whether `pid` is a linked partner: its pid, and the process that has that pid now is the one
 /// that started when the partner did (a pid alone may have been reused since the partner died).
-fn is_partner(pid: u32, partner: Option<(u32, u64)>) -> bool {
-    partner.is_some_and(|(partner_pid, start)| partner_pid == pid && crate::split::proc_start_time(pid) == Some(start))
+fn is_partner(pid: u32, skip: &[(u32, u64)]) -> bool {
+    skip.iter()
+        .any(|&(partner_pid, start)| partner_pid == pid && crate::split::proc_start_time(pid) == Some(start))
 }
 
 /// What another window is doing that a revert must wait for, and sweeps the leftovers of windows
 /// that died. A running turn is reported before an open window.
 pub fn busy_elsewhere(review_dir: &Path, own_pid: u32) -> Result<Option<Busy>, ShadowError> {
-    busy_elsewhere_beside(review_dir, own_pid, None)
+    busy_elsewhere_beside(review_dir, own_pid, &[])
 }
 
-/// [`busy_elsewhere`] for a window linked to `partner` (pid, start time): the partner's
-/// `windows/` file is not another window. Its `running/` files are checked as anyone's.
-fn busy_elsewhere_beside(
-    review_dir: &Path,
-    own_pid: u32,
-    partner: Option<(u32, u64)>,
-) -> Result<Option<Busy>, ShadowError> {
-    if let Some(pid) = first_held(&running_dir(review_dir), own_pid, None)? {
+/// [`busy_elsewhere`] for a window linked to the partners in `skip` (pid, start time): their
+/// `windows/` files are not other windows. Their `running/` files are checked as anyone's.
+fn busy_elsewhere_beside(review_dir: &Path, own_pid: u32, skip: &[(u32, u64)]) -> Result<Option<Busy>, ShadowError> {
+    if let Some(pid) = first_held(&running_dir(review_dir), own_pid, &[])? {
         return Ok(Some(Busy::TurnRunning { pid }));
     }
-    Ok(first_held(&windows_dir(review_dir), own_pid, partner)?.map(|pid| Busy::OtherWindow { pid }))
+    Ok(first_held(&windows_dir(review_dir), own_pid, skip)?.map(|pid| Busy::OtherWindow { pid }))
 }
 
-/// The window this one is linked to, as the check knows it.
+/// A window this one is linked to, as the check knows it.
 #[derive(Debug, Clone)]
 pub struct Partner {
     pub pid: u32,
@@ -324,7 +323,7 @@ pub struct PresenceHolder {
     running_here: Arc<AtomicUsize>,
     held: Arc<Mutex<Held>>,
     last_sent: Mutex<Option<BTreeSet<u64>>>,
-    partner: Arc<Mutex<Option<Partner>>>,
+    partners: Arc<Mutex<BTreeMap<u32, Partner>>>,
 }
 
 fn set_held(held: &Mutex<Held>, to: Held) {
@@ -370,7 +369,7 @@ impl PresenceHolder {
             running_here: Arc::new(AtomicUsize::new(0)),
             held,
             last_sent: Mutex::new(None),
-            partner: Arc::new(Mutex::new(None)),
+            partners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -412,7 +411,7 @@ impl PresenceHolder {
             own_pid: self.pid,
             running_here: Arc::clone(&self.running_here),
             held: Arc::clone(&self.held),
-            partner: Arc::clone(&self.partner),
+            partners: Arc::clone(&self.partners),
         }
     }
 }
@@ -498,36 +497,54 @@ pub struct PresenceGuard {
     own_pid: u32,
     running_here: Arc<AtomicUsize>,
     held: Arc<Mutex<Held>>,
-    /// Shared by every guard of one window, so a partner set or cleared reaches a worker's check
-    /// at once.
-    partner: Arc<Mutex<Option<Partner>>>,
+    /// This window's linked partners by pid. Shared by every guard of one window, so a partner set
+    /// or cleared reaches a worker's check at once.
+    partners: Arc<Mutex<BTreeMap<u32, Partner>>>,
 }
 
 impl PresenceGuard {
-    /// Names the window this one is linked to (`None`: not linked). Every guard of this window,
-    /// those already handed to workers included, skips that window's `windows/` file from the
-    /// next check on; cleared on the link's end and before this window closes it.
-    pub fn set_partner(&self, partner: Option<Partner>) {
-        *self.partner.lock().unwrap_or_else(|e| e.into_inner()) = partner;
+    fn partners(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Partner>> {
+        self.partners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The partner that has asked to be counted as another window: it is one whether or not its own file is
-    /// there, since a window that cannot mark its turns may not have been able to take that file either.
+    /// Names the one window this one is linked to (`None`: not linked), in place of any partner
+    /// named before. Every guard of this window, those already handed to workers included, skips
+    /// that window's `windows/` file from the next check on; cleared on the link's end and before
+    /// this window closes it.
+    pub fn set_partner(&self, partner: Option<Partner>) {
+        let mut partners = self.partners();
+        partners.clear();
+        partners.extend(partner.map(|p| (p.pid, p)));
+    }
+
+    /// Adds a linked window beside the partners already named, for a window with several links. The
+    /// same pid again replaces the entry: a relink brings a new flag.
+    pub fn add_partner(&self, partner: Partner) {
+        self.partners().insert(partner.pid, partner);
+    }
+
+    /// Takes one linked window out of the set: its `windows/` file counts again from the next
+    /// check on, and the other partners stay.
+    pub fn remove_partner(&self, pid: u32) {
+        self.partners().remove(&pid);
+    }
+
+    /// The lowest-pid partner that has asked to be counted as another window: it is one whether or not its own
+    /// file is there, since a window that cannot mark its turns may not have been able to take that file either.
     fn partner_counted(&self) -> Option<u32> {
-        let partner = self.partner.lock().unwrap_or_else(|e| e.into_inner());
-        partner
-            .as_ref()
-            .filter(|p| p.counts_as_other.load(Ordering::SeqCst))
+        self.partners()
+            .values()
+            .find(|p| p.counts_as_other.load(Ordering::SeqCst))
             .map(|p| p.pid)
     }
 
-    /// The partner to skip, if it has not asked to be counted as another window.
-    fn partner_to_skip(&self) -> Option<(u32, u64)> {
-        let partner = self.partner.lock().unwrap_or_else(|e| e.into_inner());
-        partner
-            .as_ref()
+    /// The partners to skip: those that have not asked to be counted as another window.
+    fn partners_to_skip(&self) -> Vec<(u32, u64)> {
+        self.partners()
+            .values()
             .filter(|p| !p.counts_as_other.load(Ordering::SeqCst))
             .map(|p| (p.pid, p.start))
+            .collect()
     }
 
     /// Takes the project's write slot for a revert, an undo or a recovery: the first thing its
@@ -547,7 +564,8 @@ impl PresenceGuard {
 
     /// On a worker (it reads the directories and removes leftovers). Refused unless this window's
     /// own lock is held, no turn of this window runs and no other window is busy; a linked partner
-    /// that has not asked to be counted is not another window, though its turns are turns.
+    /// that has not asked to be counted is not another window, though its turns are turns. The
+    /// answer holds for the moment it is given: the write slot is what keeps writers apart.
     pub fn check(&self) -> Result<(), Blocked> {
         match self.held.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             Held::Yes => {}
@@ -557,12 +575,15 @@ impl PresenceGuard {
         if self.running_here.load(Ordering::SeqCst) > 0 {
             return Err(Blocked::TurnRunningHere);
         }
-        match busy_elsewhere_beside(&self.review_dir, self.own_pid, self.partner_to_skip()) {
-            Ok(None) => match self.partner_counted() {
-                Some(pid) => Err(Blocked::Busy(Busy::OtherWindow { pid })),
-                None => Ok(()),
+        match busy_elsewhere_beside(&self.review_dir, self.own_pid, &self.partners_to_skip()) {
+            Ok(Some(running @ Busy::TurnRunning { .. })) => Err(Blocked::Busy(running)),
+            // Read after the listing, so a partner that asks to be counted during it is. It comes before a file
+            // the listing found: a counted partner's file is not skipped, and the directory's order is no order.
+            Ok(open) => match (self.partner_counted(), open) {
+                (Some(pid), _) => Err(Blocked::Busy(Busy::OtherWindow { pid })),
+                (None, Some(busy)) => Err(Blocked::Busy(busy)),
+                (None, None) => Ok(()),
             },
-            Ok(Some(busy)) => Err(Blocked::Busy(busy)),
             // Not knowing is not the same as nobody being there.
             Err(e) => Err(Blocked::NotHeld(format!("the other windows could not be listed: {e}"))),
         }
@@ -575,7 +596,7 @@ impl PresenceGuard {
             own_pid,
             running_here: Arc::new(AtomicUsize::new(running_here)),
             held: Arc::new(Mutex::new(Held::Yes)),
-            partner: Arc::new(Mutex::new(None)),
+            partners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }

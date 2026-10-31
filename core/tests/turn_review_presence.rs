@@ -587,6 +587,213 @@ fn an_unrelated_window_still_blocks_the_pair_and_is_blocked() {
 }
 
 #[test]
+fn a_turn_running_in_c2_blocks_a_revert_in_window_1() {
+    let scratch = Scratch::new("group-turn");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let mut b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    guard.add_partner(b.partner().0);
+
+    b_presence.turn_started(1).unwrap();
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::TurnRunning { pid: b.pid() })),
+        "a linked partner's turn is still a turn"
+    );
+    b_presence.turn_ended(1);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn an_unlinked_third_window_blocks_the_group() {
+    let scratch = Scratch::new("group-third");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let _b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    guard.add_partner(b.partner().0);
+
+    let third_pid = 4242;
+    let third = Presence::open(&dir, third_pid).unwrap();
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { pid: third_pid })));
+    drop(third);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn a_partner_counting_as_other_blocks_until_its_presence_is_held() {
+    let scratch = Scratch::new("group-counted");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    let (b_partner, b_counted) = b.partner();
+    guard.add_partner(b_partner);
+
+    // Nothing of B is on disk: the flag alone refuses.
+    b_counted.store(true, Ordering::SeqCst);
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { pid: b.pid() })));
+    b_counted.store(false, Ordering::SeqCst);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn window_1_reverts_with_two_idle_linked_partners() {
+    let scratch = Scratch::new("group-idle");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _mine = Presence::open(&dir, ME).unwrap();
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let _b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    guard.add_partner(b.partner().0);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn removing_one_partner_counts_its_windows_file_again() {
+    let scratch = Scratch::new("group-remove");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let _b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    guard.add_partner(b.partner().0);
+    let worker_copy = guard.clone();
+
+    guard.remove_partner(b.pid());
+    let counted_again = Err(Blocked::Busy(Busy::OtherWindow { pid: b.pid() }));
+    assert_eq!(guard.check(), counted_again);
+    assert_eq!(
+        worker_copy.check(),
+        counted_again,
+        "a guard held by a worker sees it too"
+    );
+
+    guard.remove_partner(a.pid() + b.pid());
+    assert_eq!(
+        guard.check(),
+        counted_again,
+        "removing a pid not in the set changes nothing"
+    );
+}
+
+#[test]
+fn the_lowest_pid_partner_counting_as_other_is_the_one_named() {
+    let scratch = Scratch::new("group-lowest");
+    let dir = scratch.review_dir();
+    let (one, two) = (PartnerProcess::start(), PartnerProcess::start());
+    let (low, high) = if one.pid() < two.pid() {
+        (&one, &two)
+    } else {
+        (&two, &one)
+    };
+    let _low_presence = Presence::open(&dir, low.pid()).unwrap();
+    let _high_presence = Presence::open(&dir, high.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (low_partner, low_counted) = low.partner();
+    let (high_partner, high_counted) = high.partner();
+    guard.add_partner(high_partner);
+    guard.add_partner(low_partner);
+
+    low_counted.store(true, Ordering::SeqCst);
+    high_counted.store(true, Ordering::SeqCst);
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: low.pid() })),
+        "the order the directory lists its files in does not decide"
+    );
+    low_counted.store(false, Ordering::SeqCst);
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { pid: high.pid() })));
+}
+
+#[test]
+fn a_running_turn_is_reported_before_a_partner_counting_as_other() {
+    let scratch = Scratch::new("group-order");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let mut b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (a_partner, a_counted) = a.partner();
+    guard.add_partner(a_partner);
+    guard.add_partner(b.partner().0);
+
+    a_counted.store(true, Ordering::SeqCst);
+    b_presence.turn_started(1).unwrap();
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::TurnRunning { pid: b.pid() })));
+}
+
+#[test]
+fn a_reused_pid_in_the_group_is_another_window_and_the_others_stay_skipped() {
+    let scratch = Scratch::new("group-reused");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let _b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    let (mut reused, _) = b.partner();
+    reused.start += 1;
+    guard.add_partner(reused);
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { pid: b.pid() })));
+}
+
+#[test]
+fn adding_a_partner_again_replaces_it() {
+    let scratch = Scratch::new("group-again");
+    let dir = scratch.review_dir();
+    let a = PartnerProcess::start();
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (stale, stale_counted) = a.partner();
+    stale_counted.store(true, Ordering::SeqCst);
+    guard.add_partner(stale);
+    assert!(guard.check().is_err());
+
+    // A relink of the same process hands in a fresh flag.
+    guard.add_partner(a.partner().0);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn set_partner_replaces_the_whole_set() {
+    let scratch = Scratch::new("group-set");
+    let dir = scratch.review_dir();
+    let (a, b) = (PartnerProcess::start(), PartnerProcess::start());
+    let _a_presence = Presence::open(&dir, a.pid()).unwrap();
+    let _b_presence = Presence::open(&dir, b.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    guard.add_partner(a.partner().0);
+    guard.add_partner(b.partner().0);
+    assert_eq!(guard.check(), Ok(()));
+
+    guard.set_partner(Some(a.partner().0));
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: b.pid() })),
+        "naming one partner leaves only that one"
+    );
+    guard.set_partner(Some(b.partner().0));
+    assert_eq!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { pid: a.pid() })));
+    guard.add_partner(a.partner().0);
+    assert_eq!(guard.check(), Ok(()));
+
+    guard.set_partner(None);
+    assert!(
+        matches!(guard.check(), Err(Blocked::Busy(Busy::OtherWindow { .. }))),
+        "no partner: both are other windows"
+    );
+}
+
+#[test]
 fn a_linked_windows_prompt_waits_for_its_presence_file() {
     use eitri_core::turn_review::Held;
     let scratch = Scratch::new("confirmed");

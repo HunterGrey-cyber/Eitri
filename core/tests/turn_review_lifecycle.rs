@@ -1844,6 +1844,105 @@ fn edges_carried_in_hello_mark_turns_already_running() {
     assert!(!turn(&window_two.turns("s5"), "e1").overlapped_tab);
 }
 
+/// Starts a turn in a tab of its own at `at_ns` and says whether a partner's turn counted at that moment,
+/// then ends it, pumps before anything later, so it marks no later turn itself.
+fn next_turn_overlaps(review: &mut TurnReview, clock: &Clock, n: u64, at_ns: u64) -> bool {
+    let (session, id) = (format!("own{n}"), format!("t{n}"));
+    clock.set(at_ns);
+    review.observe(n, &session, &started(&id), now());
+    poll_until(review, &session, "the base", |t| has_base(t, &id));
+    let overlapped = turn(&review.turns(&session), &id).overlapped_tab;
+    review.observe(n, &session, &completed(&id), now());
+    let at = Instant::now();
+    for pump in 0..5 {
+        review.poll_at(at + turn_review_pump_interval() * pump);
+    }
+    overlapped
+}
+
+/// Well past the two pumps a partner's end stays in reach of a new turn.
+const FAR: u64 = 60_000_000_000;
+
+#[test]
+fn one_partner_leaving_ends_its_turns_and_leaves_the_others_running() {
+    let scratch = Scratch::new("partner-gone-of");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    review.partner_turn_of(11, edge("a", EdgeKind::Started, 1_000));
+    review.partner_turn_of(22, edge("b", EdgeKind::Started, 2_000));
+    assert!(next_turn_overlaps(&mut review, &clock, 1, FAR), "both still run");
+
+    clock.set(2 * FAR);
+    review.partner_gone_of(11);
+    assert!(
+        next_turn_overlaps(&mut review, &clock, 2, 3 * FAR),
+        "the other partner's turn still runs"
+    );
+
+    clock.set(4 * FAR);
+    review.partner_gone_of(22);
+    assert!(!next_turn_overlaps(&mut review, &clock, 3, 5 * FAR), "neither runs now");
+}
+
+#[test]
+fn two_partners_reporting_one_session_name_keep_their_own_turns() {
+    let scratch = Scratch::new("partner-same-session");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    review.partner_turn_of(11, edge("same", EdgeKind::Started, 1_000));
+    review.partner_turn_of(22, edge("same", EdgeKind::Started, 2_000));
+    review.partner_turn_of(11, edge("same", EdgeKind::Ended, 3_000));
+    assert!(
+        next_turn_overlaps(&mut review, &clock, 1, FAR),
+        "the end of one partner's turn is not the end of the other's"
+    );
+    review.partner_turn_of(22, edge("same", EdgeKind::Ended, 4_000));
+    assert!(!next_turn_overlaps(&mut review, &clock, 2, 2 * FAR));
+}
+
+#[test]
+fn an_end_compares_only_with_its_own_partners_start() {
+    let scratch = Scratch::new("partner-own-start");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    clock.set(10_000);
+    review.observe(1, "own", &started("t1"), now());
+    clock.set(20_000);
+    review.observe(1, "own", &completed("t1"), now());
+    poll_until(&mut review, "own", "t1", |t| is_ok(t, "t1"));
+
+    // Partner 22's turn was over before this one began. Partner 11's start was never heard of: taken from
+    // 22's entry under the same name, it would stretch back across this turn.
+    review.partner_turns_of(
+        22,
+        [
+            edge("same", EdgeKind::Started, 1_000),
+            edge("same", EdgeKind::Ended, 2_000),
+        ],
+    );
+    review.partner_turn_of(11, edge("same", EdgeKind::Ended, 40_000));
+    assert!(
+        !turn(&review.turns("own"), "t1").overlapped_tab,
+        "an end whose start was never heard of compares only its own instant"
+    );
+}
+
+#[test]
+fn the_form_without_a_pid_ends_every_partners_turns() {
+    let scratch = Scratch::new("partner-gone-all");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    review.partner_turn_of(11, edge("a", EdgeKind::Started, 1_000));
+    review.partner_turn(edge("b", EdgeKind::Started, 2_000));
+    clock.set(FAR);
+    review.partner_gone();
+    assert!(!next_turn_overlaps(&mut review, &clock, 1, 2 * FAR));
+}
+
 #[test]
 fn a_review_handoff_round_trips_with_ended_pump_reset_and_times_kept() {
     let at = Instant::now();

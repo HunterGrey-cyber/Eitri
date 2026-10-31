@@ -953,9 +953,9 @@ pub struct TurnReview {
     /// When the last poll ran: a window pumps only when something happened, so a quiet stretch counts as
     /// the pumps a steady tick would have made in it (see [`poll_at`](Self::poll_at)).
     last_poll: Option<std::time::Instant>,
-    /// A linked partner window's turns, one entry per partner session (its latest turn), for the
-    /// overlap note.
-    partner: BTreeMap<String, PartnerTurn>,
+    /// Linked partner windows' turns, one entry per partner pid and session (its latest turn), for
+    /// the overlap note. A pair's one partner goes under [`SOLE_PARTNER`].
+    partner: BTreeMap<(u32, String), PartnerTurn>,
     /// This window's turn starts and ends for the partner, while a partner listens.
     edges: Option<Vec<TurnEdge>>,
     /// Sessions whose review was handed to another window and whose move is not settled: what their
@@ -974,6 +974,10 @@ pub struct TurnReview {
     /// How many of those wait for the next poll.
     forwarded_waiting: AtomicUsize,
 }
+
+/// The key of a pair's one partner: no process has this pid, and a pair never needs to tell its
+/// partner from another.
+const SOLE_PARTNER: u32 = 0;
 
 /// A linked partner's turn, as its edges said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,6 +1209,18 @@ impl TurnReview {
     /// running: edges held up on the way arrive together, and a turn that ended long ago must not
     /// mark every turn of this window since.
     pub fn partner_turns(&mut self, edges: impl IntoIterator<Item = TurnEdge>) {
+        self.partner_turns_of(SOLE_PARTNER, edges);
+    }
+
+    /// [`partner_turn`](Self::partner_turn) for a window with several links: the edge is partner
+    /// `pid`'s, whose turns are kept apart from the other partners'.
+    pub fn partner_turn_of(&mut self, pid: u32, edge: TurnEdge) {
+        self.partner_turns_of(pid, std::iter::once(edge));
+    }
+
+    /// [`partner_turns`](Self::partner_turns) for a window with several links: every edge is
+    /// partner `pid`'s.
+    pub fn partner_turns_of(&mut self, pid: u32, edges: impl IntoIterator<Item = TurnEdge>) {
         // The intervals to mark, and for each session the one still open among them.
         let mut intervals: Vec<(u64, Option<u64>)> = Vec::new();
         let mut open: BTreeMap<String, usize> = BTreeMap::new();
@@ -1212,7 +1228,7 @@ impl TurnReview {
             match edge {
                 EdgeKind::Started => {
                     self.partner.insert(
-                        session.clone(),
+                        (pid, session.clone()),
                         PartnerTurn {
                             started_ns: at_ns,
                             ended_ns: None,
@@ -1223,9 +1239,10 @@ impl TurnReview {
                 }
                 EdgeKind::Ended => {
                     // A start never heard of leaves only the end's instant to compare.
-                    let started_ns = self.partner.get(&session).map_or(at_ns, |p| p.started_ns.min(at_ns));
+                    let key = (pid, session.clone());
+                    let started_ns = self.partner.get(&key).map_or(at_ns, |p| p.started_ns.min(at_ns));
                     self.partner.insert(
-                        session.clone(),
+                        key,
                         PartnerTurn {
                             started_ns,
                             ended_ns: Some(at_ns),
@@ -1244,12 +1261,24 @@ impl TurnReview {
         self.flush_marks();
     }
 
-    /// The link to the partner ended: its turns still running leave the overlap scan as ended now,
-    /// and tasks kept back for a numbering the partner was to send go to the worker, which reads it
-    /// itself.
+    /// The link to the partner ended, or every link of a window with several: their turns still
+    /// running leave the overlap scan as ended now, and tasks kept back for a numbering a partner
+    /// was to send go to the worker, which reads it itself.
     pub fn partner_gone(&mut self) {
+        self.partners_gone(|_| true);
+    }
+
+    /// [`partner_gone`](Self::partner_gone) for one link of a window with several: partner `pid`'s
+    /// turns end, the other partners' go on. Tasks kept back are not recorded by the partner they
+    /// wait for, so all of them go: a worker reading the numbering itself is right either way, and
+    /// a task kept for a partner that left would wait for ever.
+    pub fn partner_gone_of(&mut self, pid: u32) {
+        self.partners_gone(|partner| partner == pid);
+    }
+
+    fn partners_gone(&mut self, gone: impl Fn(u32) -> bool) {
         let now_ns = self.now_ns();
-        for turn in self.partner.values_mut() {
+        for (_, turn) in self.partner.iter_mut().filter(|((pid, _), _)| gone(*pid)) {
             turn.ended_ns.get_or_insert(now_ns);
         }
         let waiting: Vec<String> = self
@@ -1422,7 +1451,7 @@ impl TurnReview {
         self.moved_away.remove(&session);
         self.handing_over.remove(&session);
         // Its turn is this window's own from now on.
-        self.partner.remove(&session);
+        self.partner.retain(|(_, other), _| *other != session);
         self.ensure_session(&session);
         let pump = self.pump;
         let has_records = !records.is_empty();
@@ -1489,8 +1518,9 @@ impl TurnReview {
                 .get(session)
                 .and_then(|s| s.records.iter().find(|r| r.position == *position))
             {
+                // Only a pair moves a live tab, so the window it went to is the sole partner.
                 self.partner.insert(
-                    session.clone(),
+                    (SOLE_PARTNER, session.clone()),
                     PartnerTurn {
                         started_ns: rec.started_ns,
                         ended_ns: None,
