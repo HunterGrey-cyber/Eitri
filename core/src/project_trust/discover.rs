@@ -1,5 +1,6 @@
 //! The walk over a root's configuration, and its fingerprint.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use super::codex::{
 };
 use super::findings::{frontmatter_keys, mcp_findings, settings_findings};
 use super::git_top::git_top_level;
-use super::nofollow::{normalize_lexically, DirHandle, FileKind, Owner, Refusal};
+use super::nofollow::{follow_within, normalize_lexically, DirHandle, FileKind, Followed, Owner, Reached, Refusal};
 use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits, Profile, ProfileEnv};
 
 /// What a file found on the walk is to the agent, which decides how it is parsed and whether a link
@@ -43,15 +44,16 @@ enum Role {
     SkillTree,
     /// Anything in a `.claude/` that is not its settings or memory file: commands, agents, skills,
     /// the scripts its hooks run. The CLI reads all of it and follows a link anywhere in it, so a
-    /// link here leaves it reading something the fingerprint cannot see.
+    /// link here is hashed through to what it reaches, or leaves the CLI reading something the
+    /// fingerprint cannot see.
     ClaudeOther,
     /// Anything else under a directory read whole.
     Plain,
 }
 
 impl Role {
-    /// The agent reads this file itself, so a link here means it reads the link's target, whose
-    /// content the fingerprint never sees.
+    /// The agent reads this file itself, so a link here that the walk did not follow means it reads
+    /// the link's target, whose content the fingerprint never sees.
     fn read_by_the_cli(self) -> bool {
         !matches!(self, Role::Plain)
     }
@@ -132,8 +134,38 @@ impl Tree {
 const WORKTREES_DIR: &[u8] = b"worktrees";
 const WORKTREES_REASON: &str = "Claude Code's own worktree checkouts, not read";
 
+/// One directory waiting to be walked in [`Scan::tree`].
+struct Walked {
+    dir: DirHandle,
+    /// Where the agent reads it, relative to the top level; through a link this is not where it is.
+    path: PathBuf,
+    depth: usize,
+    /// Its own name, which gives the files in it their role.
+    name: Option<OsString>,
+    /// Where it really is, relative to the top level, for a tree that follows links.
+    real: PathBuf,
+    /// Where each link on the way here was, by where it really is: a link leading back to one of
+    /// these, or to a directory above one, would walk the same directories for ever.
+    crossed: Vec<PathBuf>,
+}
+
+/// How a file was reached, when it was through a link.
+struct Through<'a> {
+    /// The link's target as written.
+    target: &'a Path,
+    /// The directory the file really is in, absolute: a link swapped into its place leads from there.
+    dir: PathBuf,
+}
+
 struct Scan<'a> {
     top: PathBuf,
+    /// Links below a walked `.claude/` may be followed inside the top level. Off when the top level
+    /// may hold the user's home, since a link could then lead into the account's own files, and when
+    /// it is neither the root nor where a `.git` was accepted, since it may then be a shared directory
+    /// the project does not own.
+    follows_links: bool,
+    /// The links named so far, by the path each was named at.
+    named: BTreeSet<PathBuf>,
     /// Set while the walk is above the top level, where a directory such as `/tmp` may hold another
     /// user's file: such a file is a gap (that user can rewrite it after it was shown), not trust.
     above_top: bool,
@@ -216,6 +248,17 @@ impl Scan<'_> {
     }
 
     fn symlink(&mut self, dir: &DirHandle, name: &OsStr, path: PathBuf, role: Role) {
+        // Above the top level `path` starts with `..`, which is folded here so a link's target is
+        // judged from the directory it is really in.
+        let parent = path.parent().unwrap_or(Path::new(""));
+        let link_dir = normalize_lexically(&self.top, parent).unwrap_or_else(|| self.top.clone());
+        self.symlink_in(dir, name, path, role, &link_dir, false);
+    }
+
+    /// [`Scan::symlink`] for a link that is really in `link_dir`, which is not where `path` says when
+    /// the agent reaches it through another link. `left` says the way it leads was walked and leaves
+    /// the top level, whatever its own text says.
+    fn symlink_in(&mut self, dir: &DirHandle, name: &OsStr, path: PathBuf, role: Role, link_dir: &Path, left: bool) {
         let target = match dir.readlink(name) {
             Ok(target) => target,
             Err(refusal) => {
@@ -223,9 +266,8 @@ impl Scan<'_> {
                 return;
             }
         };
-        let link_dir = self.top.join(&path);
-        let link_dir = link_dir.parent().unwrap_or(&self.top);
-        let outside = normalize_lexically(link_dir, &target).is_none_or(|resolved| !resolved.starts_with(&self.top));
+        let outside =
+            left || normalize_lexically(link_dir, &target).is_none_or(|resolved| !resolved.starts_with(&self.top));
         self.findings.push(Finding::Symlink {
             path: path.clone(),
             target: target.clone(),
@@ -240,9 +282,42 @@ impl Scan<'_> {
         self.push(path, EntryKind::Symlink { target, outside });
     }
 
+    /// A link followed to something inside the top level, named once with its target as written.
+    /// Returns whether this was the first time.
+    fn followed_link(&mut self, path: &Path, target: &Path) -> bool {
+        let first = self.named.insert(path.to_path_buf());
+        if first {
+            self.findings.push(Finding::Symlink {
+                path: path.to_path_buf(),
+                target: target.to_path_buf(),
+                outside: false,
+            });
+        }
+        first
+    }
+
+    /// The further links a followed link passed through, each named once and where it really is: their
+    /// targets as written are part of what the agent reads, like the first link's.
+    fn chain(&mut self, links: Vec<(PathBuf, PathBuf)>) {
+        for (path, target) in links {
+            if !self.room() {
+                return;
+            }
+            if self.followed_link(&path, &target) {
+                self.push(path, EntryKind::Symlink { target, outside: false });
+            }
+        }
+    }
+
     /// Reads, hashes and parses a regular file. Returns whether it was a regular file that was
     /// hashed.
     fn file(&mut self, dir: &DirHandle, name: &OsStr, path: PathBuf, role: Role) -> bool {
+        self.read_file(dir, name, path, role, None)
+    }
+
+    /// [`Scan::file`], for the agent reading it at `path`; `link` says how it was reached when that was
+    /// through a link, whose target as written is then hashed with it.
+    fn read_file(&mut self, dir: &DirHandle, name: &OsStr, path: PathBuf, role: Role, link: Option<Through>) -> bool {
         let remaining = self.limits.max_total_bytes.saturating_sub(self.total_bytes);
         let allowed = self.limits.max_file_bytes.min(remaining);
         let owner = if self.above_top { Owner::MeOrRoot } else { Owner::Anyone };
@@ -278,13 +353,16 @@ impl Scan<'_> {
                         frontmatter: frontmatter_keys(name, &bytes),
                     });
                 }
-                self.push(
-                    path,
-                    EntryKind::File {
+                let len = bytes.len() as u64;
+                let kind = match link {
+                    Some(through) => EntryKind::LinkedFile {
+                        target: through.target.to_path_buf(),
                         sha256,
-                        len: bytes.len() as u64,
+                        len,
                     },
-                );
+                    None => EntryKind::File { sha256, len },
+                };
+                self.push(path, kind);
                 true
             }
             Err(Refusal::TooLarge(len)) if len > self.limits.max_file_bytes => {
@@ -301,7 +379,10 @@ impl Scan<'_> {
             }
             Err(Refusal::Symlink { .. }) => {
                 // Swapped for a link between the look and the read.
-                self.symlink(dir, name, path, role);
+                match link {
+                    Some(through) => self.symlink_in(dir, name, path, role, &through.dir, false),
+                    None => self.symlink(dir, name, path, role),
+                }
                 false
             }
             Err(refusal) => {
@@ -469,12 +550,43 @@ impl Scan<'_> {
         }
     }
 
+    /// Whether a directory one below `depth` is past the walk's depth, noting it in the budget if so.
+    fn too_deep(&mut self, depth: usize, tree: Tree, top_path: &Path) -> bool {
+        if depth < self.limits.max_depth {
+            return false;
+        }
+        // Keep Claude's wording stable: it is part of the record's fingerprint.
+        let under = match tree {
+            Tree::Claude => ".claude/".to_string(),
+            _ => format!("{}/", top_path.display()),
+        };
+        self.note_over_budget(format!(
+            "deeper than {} directories under {under}",
+            self.limits.max_depth
+        ));
+        true
+    }
+
     /// Everything under a directory read whole (a `.claude/`, a `.codex/`, ...), depth first,
     /// bounded by depth and entries.
     fn tree(&mut self, top_dir: DirHandle, top_path: PathBuf, tree: Tree) {
-        // Each directory on the stack carries its own name, which gives the files in it their role.
-        let mut stack: Vec<(DirHandle, PathBuf, usize, Option<OsString>)> = vec![(top_dir, top_path.clone(), 0, None)];
-        while let Some((dir, path, depth, parent)) = stack.pop() {
+        let mut stack = vec![Walked {
+            dir: top_dir,
+            path: top_path.clone(),
+            depth: 0,
+            name: None,
+            real: top_path.clone(),
+            crossed: Vec::new(),
+        }];
+        while let Some(walked) = stack.pop() {
+            let Walked {
+                dir,
+                path,
+                depth,
+                name: parent,
+                real,
+                crossed,
+            } = walked;
             let room = self.limits.max_entries.saturating_sub(self.entries.len());
             let mut names = match dir.entries(room.saturating_add(1)) {
                 Ok(names) => names,
@@ -490,7 +602,7 @@ impl Scan<'_> {
                 let reason = format!("more than {} entries of configuration", self.limits.max_entries);
                 self.note_over_budget(reason);
             }
-            let mut below: Vec<(DirHandle, PathBuf, OsString)> = Vec::new();
+            let mut below: Vec<Walked> = Vec::new();
             let in_skills = depth > 0
                 && path
                     .strip_prefix(&top_path)
@@ -519,24 +631,96 @@ impl Scan<'_> {
                                 name: name.to_string_lossy().into_owned(),
                             });
                         }
-                        if depth + 1 > self.limits.max_depth {
-                            // Keep Claude's wording stable: it is part of the record's fingerprint.
-                            let under = match tree {
-                                Tree::Claude => ".claude/".to_string(),
-                                _ => format!("{}/", top_path.display()),
-                            };
-                            self.note_over_budget(format!(
-                                "deeper than {} directories under {under}",
-                                self.limits.max_depth
-                            ));
+                        if self.too_deep(depth, tree, &top_path) {
                             continue;
                         }
                         match dir.open_dir(&name) {
-                            Ok(sub) => below.push((sub, child, name)),
+                            Ok(sub) => below.push(Walked {
+                                dir: sub,
+                                path: child,
+                                depth: depth + 1,
+                                real: real.join(&name),
+                                name: Some(name),
+                                crossed: crossed.clone(),
+                            }),
                             Err(refusal) => {
                                 // Not listed, so it cannot count as hashed.
                                 self.entries.pop();
                                 self.unreadable(child, format!("cannot be opened: {}", refusal.describe()));
+                            }
+                        }
+                    }
+                    Ok(FileKind::Symlink)
+                        if tree == Tree::Claude
+                            && self.follows_links
+                            && !(depth == 0 && name.as_bytes() == WORKTREES_DIR) =>
+                    {
+                        if !self.room() {
+                            break;
+                        }
+                        let followed = dir.readlink(&name).ok().and_then(|target| {
+                            let followed = follow_within(&self.top, &real, &target)?;
+                            Some((target, followed))
+                        });
+                        match followed {
+                            Some((
+                                target,
+                                Followed {
+                                    reached:
+                                        Reached::File {
+                                            dir: holder,
+                                            name: file,
+                                            at,
+                                        },
+                                    links,
+                                },
+                            )) => {
+                                self.followed_link(&child, &target);
+                                self.chain(links);
+                                let through = Through {
+                                    target: &target,
+                                    dir: self.top.join(at),
+                                };
+                                self.read_file(&holder, &file, child, role, Some(through));
+                            }
+                            // A directory holding this link, or one on the way here, would lead back.
+                            Some((
+                                target,
+                                Followed {
+                                    reached: Reached::Dir { dir: sub, at },
+                                    links,
+                                },
+                            )) if !real.starts_with(&at) && !crossed.iter().any(|at_link| at_link.starts_with(&at)) => {
+                                self.followed_link(&child, &target);
+                                self.chain(links);
+                                self.push(child.clone(), EntryKind::Symlink { target, outside: false });
+                                if self.too_deep(depth, tree, &top_path) {
+                                    continue;
+                                }
+                                let mut crossed = crossed.clone();
+                                crossed.push(real.clone());
+                                below.push(Walked {
+                                    dir: sub,
+                                    path: child,
+                                    depth: depth + 1,
+                                    real: at,
+                                    name: Some(name),
+                                    crossed,
+                                });
+                            }
+                            other => {
+                                let left = matches!(
+                                    other,
+                                    Some((
+                                        _,
+                                        Followed {
+                                            reached: Reached::Left,
+                                            ..
+                                        }
+                                    ))
+                                );
+                                let link_dir = self.top.join(&real);
+                                self.symlink_in(&dir, &name, child, role, &link_dir, left);
                             }
                         }
                     }
@@ -546,9 +730,7 @@ impl Scan<'_> {
                 }
             }
             // Pushed in reverse so the first name is walked first.
-            for (sub, child, name) in below.into_iter().rev() {
-                stack.push((sub, child, depth + 1, Some(name)));
-            }
+            stack.extend(below.into_iter().rev());
         }
     }
 
@@ -812,6 +994,18 @@ fn role_in(depth: usize, name: &OsStr) -> Role {
     }
 }
 
+/// Whether `link`, made for a link on another link's way, says nothing `kept` does not, because the walk
+/// met the same link itself. The walked entry is the one kept: it holds what a file link reached, which
+/// the record compares path by path.
+fn repeats(link: &Entry, kept: &Entry) -> bool {
+    link.path == kept.path
+        && match (&link.kind, &kept.kind) {
+            (EntryKind::Symlink { target, .. }, EntryKind::LinkedFile { target: same, .. }) => target == same,
+            (EntryKind::Symlink { .. }, EntryKind::Symlink { .. }) => link.kind == kept.kind,
+            _ => false,
+        }
+}
+
 /// The fingerprint over the profile's header, the top level's place relative to the root, every
 /// entry and the budget note. The header and the place (only `..` and `/`) each end in a newline;
 /// each entry's path, tag and payload each end in a NUL, which no path, link target, hex digest or
@@ -839,6 +1033,12 @@ fn fingerprint(
         let (tag, payload): (&[u8], Vec<u8>) = match &entry.kind {
             EntryKind::File { sha256, .. } => (b"f", super::hex(sha256).into_bytes()),
             EntryKind::Symlink { target, .. } => (b"l", target.as_os_str().as_bytes().to_vec()),
+            EntryKind::LinkedFile { target, sha256, .. } => {
+                let mut payload = target.as_os_str().as_bytes().to_vec();
+                payload.push(0);
+                payload.extend_from_slice(super::hex(sha256).as_bytes());
+                (b"t", payload)
+            }
             EntryKind::Dir => (b"d", Vec::new()),
             EntryKind::Unreadable { .. } => (b"u", Vec::new()),
             EntryKind::Other => (b"o", Vec::new()),
@@ -858,8 +1058,8 @@ fn fingerprint(
 /// from the project: every directory from `root` up to the git top level (or, when no repository was
 /// accepted, up to the highest directory whose `.git` could not be checked), never above `home`
 /// when `root` is below it. For Claude, every directory above that top level up to `/` is looked at
-/// too, for the memory files and `.mcp.json` the CLI loads from there. No link is followed and
-/// nothing blocks.
+/// too, for the memory files and `.mcp.json` the CLI loads from there. Nothing blocks, and no link is
+/// followed but one below a walked `.claude/`, by [`follow_within`] and only inside the top level.
 ///
 /// `home` must be canonical too: it is compared with `root`'s ancestors by path, and a home spelt
 /// through a link would match none of them, so the walk would neither stop there nor keep the user
@@ -883,8 +1083,11 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
             break;
         }
     }
+    let vouched_for = walk.top.is_some() || top == root;
     let mut scan = Scan {
         top: top.clone(),
+        follows_links: vouched_for && home.is_some_and(|home| !home.starts_with(&top)),
+        named: BTreeSet::new(),
         above_top: false,
         limits,
         entries: Vec::new(),
@@ -1000,7 +1203,13 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         }
     }
     let mut entries = scan.entries;
-    entries.sort_by(|a, b| a.path.as_os_str().as_bytes().cmp(b.path.as_os_str().as_bytes()));
+    // For one path a file reached through a link comes first, so `repeats` meets the two in that order.
+    let not_linked_file = |entry: &Entry| !matches!(entry.kind, EntryKind::LinkedFile { .. });
+    entries.sort_by(|a, b| {
+        let by_path = a.path.as_os_str().as_bytes().cmp(b.path.as_os_str().as_bytes());
+        by_path.then(not_linked_file(a).cmp(&not_linked_file(b)))
+    });
+    entries.dedup_by(|later, earlier| repeats(later, earlier));
     let over_budget = (!scan.over_budget.is_empty()).then(|| scan.over_budget.join("; "));
     let mut findings = scan.findings;
     for reason in &scan.over_budget {
@@ -1041,6 +1250,97 @@ mod tests {
         assert_eq!(size(100), "100 bytes");
     }
 
+    fn scan<'a>(top: &Path, limits: &'a Limits) -> Scan<'a> {
+        Scan {
+            top: top.to_path_buf(),
+            follows_links: true,
+            named: BTreeSet::new(),
+            above_top: false,
+            limits,
+            entries: Vec::new(),
+            findings: Vec::new(),
+            over_budget: Vec::new(),
+            total_bytes: 0,
+            project_servers: Vec::new(),
+            project_fallback_names: Vec::new(),
+        }
+    }
+
+    /// The file a link reached is swapped between the look and the read: for a link out of the root,
+    /// for a pipe. Neither is read, and either leaves the discovery with a gap.
+    #[test]
+    fn a_target_swapped_between_the_check_and_the_read_is_a_gap() {
+        for swap in ["link", "pipe"] {
+            let (_s, base) = super::super::nofollow::tests::canonical_scratch("swap");
+            let top = base.join("top");
+            std::fs::create_dir_all(top.join(".claude/commands")).unwrap();
+            std::fs::write(top.join("x.md"), b"inside\n").unwrap();
+            std::fs::write(base.join("secret"), b"outside\n").unwrap();
+            let target = Path::new("../../x.md");
+            let followed = follow_within(&top, Path::new(".claude/commands"), target).unwrap();
+            let Reached::File { dir, name, at } = followed.reached else {
+                panic!("the file was reached");
+            };
+            std::fs::remove_file(top.join("x.md")).unwrap();
+            match swap {
+                "link" => std::os::unix::fs::symlink(base.join("secret"), top.join("x.md")).unwrap(),
+                _ => super::super::nofollow::tests::mkfifo(&top.join("x.md")),
+            }
+            let limits = Limits::default();
+            let mut scan = scan(&top, &limits);
+            let path = PathBuf::from(".claude/commands/x.md");
+            scan.followed_link(&path, target);
+            let through = Through {
+                target,
+                dir: top.join(at),
+            };
+            assert!(!scan.read_file(&dir, &name, path.clone(), Role::ClaudeOther, Some(through)));
+            // Named as leading out from where it really is, though `path` reads as two levels deeper.
+            if swap == "link" {
+                assert!(scan.findings.contains(&Finding::Symlink {
+                    path: path.clone(),
+                    target: base.join("secret"),
+                    outside: true,
+                }));
+            }
+            assert!(
+                scan.findings
+                    .iter()
+                    .any(|f| matches!(f, Finding::Unreadable { path: at, .. } if *at == path)),
+                "{swap}: {:?}",
+                scan.findings
+            );
+            assert!(
+                !scan
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry.kind, EntryKind::File { .. } | EntryKind::LinkedFile { .. })),
+                "{swap}: {:?}",
+                scan.entries
+            );
+        }
+    }
+
+    /// A directory the walk has open stays the directory it opened: moved away and replaced by a link
+    /// out of the root, it is still listed through the handle and nothing outside is reached.
+    #[test]
+    fn a_directory_swapped_after_it_was_reached_is_read_through_its_handle() {
+        let (_s, base) = super::super::nofollow::tests::canonical_scratch("swap-dir");
+        let top = base.join("top");
+        std::fs::create_dir_all(top.join(".claude")).unwrap();
+        std::fs::create_dir(top.join("real")).unwrap();
+        std::fs::write(top.join("real/f.md"), b"inside\n").unwrap();
+        std::fs::create_dir(base.join("outside")).unwrap();
+        std::fs::write(base.join("outside/secret.md"), b"outside\n").unwrap();
+        let followed = follow_within(&top, Path::new(".claude"), Path::new("../real")).unwrap();
+        let Reached::Dir { dir, .. } = followed.reached else {
+            panic!("the directory was reached");
+        };
+        std::fs::rename(top.join("real"), top.join("moved")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), top.join("real")).unwrap();
+        assert_eq!(dir.entries(10).unwrap(), vec![OsString::from("f.md")]);
+    }
+
     #[test]
     fn the_fingerprint_separates_fields() {
         let link = |path: &str, target: &str| Entry {
@@ -1071,5 +1371,26 @@ mod tests {
             fingerprint(claude, root, root, &[], None),
             fingerprint(&Profile::Codex, root, root, &[], None)
         );
+        let linked = |target: &str, sha256: [u8; 32]| Entry {
+            path: PathBuf::from("p"),
+            kind: EntryKind::LinkedFile {
+                target: PathBuf::from(target),
+                sha256,
+                len: 1,
+            },
+        };
+        let print = |entry: Entry| fingerprint(claude, root, root, &[entry], None);
+        let hash = crate::project_trust::hex(&[7; 32]);
+        assert_ne!(print(linked("a", [7; 32])), print(linked("b", [7; 32])));
+        assert_ne!(print(linked("a", [7; 32])), print(linked("a", [8; 32])));
+        assert_ne!(print(linked("a", [7; 32])), print(link("p", &format!("a\0{hash}"))));
+        let file = Entry {
+            path: PathBuf::from("p"),
+            kind: EntryKind::File {
+                sha256: [7; 32],
+                len: 1,
+            },
+        };
+        assert_ne!(print(linked("a", [7; 32])), print(file));
     }
 }

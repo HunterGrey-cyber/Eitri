@@ -287,9 +287,15 @@ project cannot be trusted in Eitri at all.
   for itself.
 - **Something Eitri cannot check makes trust last one start only.** A file over 4 MiB, an unreadable one, a pipe
   or other special file, a settings file or `.mcp.json` that is not valid JSON ("could not be parsed for this
-  check"), a symbolic link in place of a configuration file or anywhere below `.claude/`, a file above the
-  repository that belongs to neither you nor root, or a project with too many files, is named in the question
-  as "cannot be checked", and `y` then covers that one start; nothing is saved and the next start asks again.
+  check"), a symbolic link beside `.claude/` in place of a configuration file, a link below `.claude/` that Eitri
+  cannot follow, a file above the repository that belongs to neither you nor root, or a project with too many
+  files, is named in the question as "cannot be checked", and `y` then covers that one start; nothing is saved
+  and the next start asks again. On a Claude tab, a link below `.claude/` is followed when its relative target
+  stays inside the repository (or the project folder, when it is not in one): Eitri checks what it reaches and
+  shows the link with its target, so a skill in `.claude/skills/` that links into `.codex/skills/` is remembered
+  like any other file. A link that leaves, an absolute target and a loop cannot be checked. No link is followed
+  when your home folder is inside the repository, or when there is a `.git` above the project and none of them
+  can be verified.
 - **A very large configuration is remembered by this window only.** If the record of an answer would pass
   1 MiB (roughly 1,900 files with long names), the question says so and `y` holds for this window; no record is
   written, so a new window asks again.

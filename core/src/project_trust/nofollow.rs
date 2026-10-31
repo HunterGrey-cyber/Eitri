@@ -11,7 +11,9 @@
 //! `O_NOFOLLOW|O_NONBLOCK|O_NOCTTY` and `fstat`ed on the handle, which must still be a regular file
 //! of an acceptable size before a byte is read: a name swapped for a FIFO or terminal between the
 //! look and the open is opened without blocking and without becoming a controlling terminal, then
-//! refused unread. A symlink is only ever read with `readlinkat`.
+//! refused unread. A symlink is only ever read with `readlinkat`: where discovery goes on past one
+//! ([`follow_within`]) it takes the target apart and walks it name by name, so the kernel never
+//! resolves a link for it.
 //!
 //! The standard library's path-based calls follow the last link and block opening a FIFO with no
 //! writer; one planted link must not make discovery read an account's files, and one planted FIFO
@@ -476,6 +478,126 @@ pub fn read_regular_nofollow(path: &Path, max_bytes: u64, owner: Owner) -> Resul
     dir.read_file_owned_by(name, max_bytes, owner)
 }
 
+/// How many links one target may pass through before it counts as a loop.
+const MAX_LINK_HOPS: usize = 16;
+
+/// How many names and `..`s one target may take, those of the links on the way included: a target of
+/// 4 KiB spells over a thousand, and a project could hold thousands of such links.
+const MAX_LINK_STEPS: usize = 256;
+
+/// Where [`follow_within`] arrived, each with where it really is relative to the top.
+#[derive(Debug)]
+pub enum Reached {
+    /// A regular file: the open directory holding it, at `at`, and its name there.
+    File {
+        dir: DirHandle,
+        name: OsString,
+        at: PathBuf,
+    },
+    /// A directory, open.
+    Dir { dir: DirHandle, at: PathBuf },
+    /// The way out of the top: a `..` above it, or a link on the way with an absolute target, which
+    /// counts as leaving wherever it names.
+    Left,
+}
+
+/// What [`follow_within`] found.
+#[derive(Debug)]
+pub struct Followed {
+    pub reached: Reached,
+    /// Every further link on the way: where it really is relative to the top, and its target as written.
+    pub links: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The names of `target` onto `steps`, the next one to take last; `None` is a `..`. An absolute target
+/// has no place in a walk from `top`, so it is refused.
+fn push_steps(steps: &mut Vec<Option<OsString>>, target: &Path) -> Option<()> {
+    for part in target.components().rev() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => steps.push(None),
+            Component::Normal(name) => steps.push(Some(name.to_os_string())),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(())
+}
+
+/// Follows the link text `target` from the directory `from` (relative to `top`, and holding no link),
+/// one name at a time on open directories, as the kernel would: a `..` is the directory before this
+/// one on the way actually walked, so after a link it is the parent of where the link led. A `..`
+/// above `top` is [`Reached::Left`] even if it would come back. `None` for anything else that does
+/// not arrive inside `top`: an absolute `target`, more than [`MAX_LINK_HOPS`] links or
+/// [`MAX_LINK_STEPS`] steps, a name that is not there, or anything but a directory or regular file.
+/// Nothing is read, and no name is ever looked up as `..`.
+pub fn follow_within(top: &Path, from: &Path, target: &Path) -> Option<Followed> {
+    let mut open = vec![DirHandle::open_absolute(top).ok()?];
+    let mut at = PathBuf::new();
+    for part in from.components() {
+        let Component::Normal(name) = part else {
+            return None;
+        };
+        let next = open.last()?.open_dir(name).ok()?;
+        open.push(next);
+        at.push(name);
+    }
+    let mut steps = Vec::new();
+    push_steps(&mut steps, target)?;
+    let mut links = Vec::new();
+    let mut taken = 0;
+    while let Some(step) = steps.pop() {
+        taken += 1;
+        if taken > MAX_LINK_STEPS {
+            return None;
+        }
+        let Some(name) = step else {
+            if open.len() == 1 {
+                return Some(Followed {
+                    reached: Reached::Left,
+                    links,
+                });
+            }
+            open.pop();
+            at.pop();
+            continue;
+        };
+        let here = open.last()?;
+        match here.lstat(&name).ok()? {
+            FileKind::Dir => {
+                let next = here.open_dir(&name).ok()?;
+                open.push(next);
+                at.push(&name);
+            }
+            FileKind::Symlink => {
+                if links.len() == MAX_LINK_HOPS {
+                    return None;
+                }
+                let next = here.readlink(&name).ok()?;
+                if push_steps(&mut steps, &next).is_none() {
+                    return Some(Followed {
+                        reached: Reached::Left,
+                        links,
+                    });
+                }
+                links.push((at.join(&name), next));
+            }
+            FileKind::Regular { .. } if steps.is_empty() => {
+                let dir = open.pop()?;
+                return Some(Followed {
+                    reached: Reached::File { dir, name, at },
+                    links,
+                });
+            }
+            _ => return None,
+        }
+    }
+    let dir = open.pop()?;
+    Some(Followed {
+        reached: Reached::Dir { dir, at },
+        links,
+    })
+}
+
 /// `named` joined to `base` without touching the disk: `.` is dropped, and a `..` is folded only at
 /// the start of `named`, over `base` (which the caller has already opened, so it holds no link). A
 /// `..` after a name is refused (`None`): folding `x/..` by text would skip a link `x` the kernel
@@ -698,6 +820,143 @@ pub(crate) mod tests {
             normalize_lexically(Path::new("/"), Path::new("../..")),
             Some(PathBuf::from("/"))
         );
+    }
+
+    fn reached_file(top: &Path, from: &str, target: &str) -> Option<Vec<u8>> {
+        match follow_within(top, Path::new(from), Path::new(target))?.reached {
+            Reached::File { dir, name, .. } => Some(dir.read_file(&name, 100).unwrap()),
+            other => panic!("{target} reached {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_within_reaches_a_file_or_a_directory_by_real_directories() {
+        let (_s, dir) = canonical_scratch("follow");
+        std::fs::create_dir_all(dir.join("top/.claude/skills")).unwrap();
+        std::fs::create_dir_all(dir.join("top/a/b")).unwrap();
+        std::fs::write(dir.join("top/a/f"), b"f").unwrap();
+        let top = dir.join("top");
+        assert_eq!(reached_file(&top, ".claude/skills", "../../a/f").unwrap(), b"f");
+        assert_eq!(reached_file(&top, ".claude/skills", "./../.././a/f").unwrap(), b"f");
+        let reached =
+            |from: &str, target: &str| follow_within(&top, Path::new(from), Path::new(target)).unwrap().reached;
+        match reached(".claude/skills", "../../a/b") {
+            Reached::Dir { at, .. } => assert_eq!(at, Path::new("a/b")),
+            other => panic!("{other:?}"),
+        }
+        match reached(".claude", "..") {
+            Reached::Dir { at, .. } => assert_eq!(at, Path::new("")),
+            other => panic!("{other:?}"),
+        }
+        match reached(".claude/skills", "../../a/f") {
+            Reached::File { at, .. } => assert_eq!(at, Path::new("a")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_within_refuses_every_way_out() {
+        let (_s, dir) = canonical_scratch("follow-out");
+        std::fs::create_dir_all(dir.join("top/.claude")).unwrap();
+        std::fs::create_dir(dir.join("top/d")).unwrap();
+        std::fs::write(dir.join("top/f"), b"f").unwrap();
+        std::fs::write(dir.join("secret"), b"s").unwrap();
+        let top = dir.join("top");
+        let left = |target: &str| {
+            let followed = follow_within(&top, Path::new(".claude"), Path::new(target));
+            matches!(
+                followed,
+                Some(Followed {
+                    reached: Reached::Left,
+                    ..
+                })
+            )
+        };
+        for target in ["../../secret", "../../top/f", "../..", "../d/../../secret"] {
+            assert!(left(target), "{target}");
+        }
+        // Absolute, even naming a place inside.
+        assert!(follow_within(&top, Path::new(".claude"), &top.join("f")).is_none());
+        // Through a file, and at nothing.
+        assert!(follow_within(&top, Path::new(".claude"), Path::new("../f/x")).is_none());
+        assert!(follow_within(&top, Path::new(".claude"), Path::new("../f/..")).is_none());
+        assert!(follow_within(&top, Path::new(".claude"), Path::new("../absent")).is_none());
+        // A link on the way that leaves, absolutely or by climbing.
+        symlink("../secret", top.join("out")).unwrap();
+        symlink(dir.join("secret"), top.join("abs")).unwrap();
+        assert!(left("../out"));
+        assert!(left("../abs"));
+        // `from` itself must be real directories.
+        symlink("d", top.join("linked")).unwrap();
+        assert!(follow_within(&top, Path::new("linked"), Path::new("../f")).is_none());
+        assert!(follow_within(&top, Path::new("../top"), Path::new("f")).is_none());
+    }
+
+    #[test]
+    fn follow_within_refuses_a_pipe_without_opening_it() {
+        let (_s, dir) = canonical_scratch("follow-fifo");
+        std::fs::create_dir(dir.join(".claude")).unwrap();
+        mkfifo(&dir.join("pipe"));
+        assert!(follow_within(&dir, Path::new(".claude"), Path::new("../pipe")).is_none());
+    }
+
+    #[test]
+    fn follow_within_goes_through_links_inside_and_gives_up_on_a_loop() {
+        let (_s, dir) = canonical_scratch("follow-links");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join("far/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("near")).unwrap();
+        std::fs::write(dir.join("far/f"), b"far").unwrap();
+        std::fs::write(dir.join("near/f"), b"near").unwrap();
+        symlink("../far/deep", dir.join("near/l")).unwrap();
+        assert_eq!(reached_file(&dir, ".claude", "../near/l/../f").unwrap(), b"far");
+        let followed = follow_within(&dir, Path::new(".claude"), Path::new("../near/l/../f")).unwrap();
+        assert_eq!(
+            followed.links,
+            vec![(PathBuf::from("near/l"), PathBuf::from("../far/deep"))]
+        );
+        symlink("b", dir.join("a")).unwrap();
+        symlink("a", dir.join("b")).unwrap();
+        assert!(follow_within(&dir, Path::new(".claude"), Path::new("../a")).is_none());
+        // As long a chain as the limit allows arrives, and one more does not.
+        std::fs::write(dir.join("end"), b"end").unwrap();
+        let mut next = "end".to_string();
+        for hop in 0..MAX_LINK_HOPS {
+            let name = format!("hop{hop}");
+            symlink(&next, dir.join(&name)).unwrap();
+            next = name;
+        }
+        assert_eq!(reached_file(&dir, "", &next).unwrap(), b"end");
+        symlink(&next, dir.join("over")).unwrap();
+        assert!(follow_within(&dir, Path::new(""), Path::new("over")).is_none());
+    }
+
+    #[test]
+    fn follow_within_takes_as_many_steps_as_the_limit_and_no_more() {
+        let (_s, dir) = canonical_scratch("follow-steps");
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("f"), b"f").unwrap();
+        // `d/..` is two steps and `f` one.
+        let target = |pairs: usize| format!("{}f", "d/../".repeat(pairs));
+        let most = (MAX_LINK_STEPS - 1) / 2;
+        assert_eq!(reached_file(&dir, "", &target(most)).unwrap(), b"f");
+        assert!(follow_within(&dir, Path::new(""), Path::new(&target(most + 1))).is_none());
+    }
+
+    #[test]
+    fn a_reached_file_swapped_for_a_link_is_refused_at_the_read() {
+        let (_s, dir) = canonical_scratch("follow-swap");
+        std::fs::create_dir_all(dir.join("top/.claude")).unwrap();
+        std::fs::write(dir.join("top/f"), b"f").unwrap();
+        std::fs::write(dir.join("secret"), b"secret").unwrap();
+        let top = dir.join("top");
+        let followed = follow_within(&top, Path::new(".claude"), Path::new("../f")).unwrap();
+        let Reached::File { dir: holder, name, .. } = followed.reached else {
+            panic!("the file was reached");
+        };
+        std::fs::remove_file(top.join("f")).unwrap();
+        symlink(dir.join("secret"), top.join("f")).unwrap();
+        assert!(matches!(holder.read_file(&name, 100), Err(Refusal::Symlink { .. })));
     }
 
     #[test]

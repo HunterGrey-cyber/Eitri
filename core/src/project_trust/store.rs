@@ -389,6 +389,7 @@ fn value_of(kind: &EntryKind) -> String {
     match kind {
         EntryKind::File { sha256, .. } => super::hex(sha256),
         EntryKind::Symlink { target, .. } => format!("symlink:{}", target.display()),
+        EntryKind::LinkedFile { target, sha256, .. } => format!("linked:{}:{}", super::hex(sha256), target.display()),
         EntryKind::Dir => "dir".to_string(),
         EntryKind::Unreadable { .. } => "unreadable".to_string(),
         EntryKind::Other => "other".to_string(),
@@ -491,6 +492,23 @@ mod path_tests {
         for discovery in discoveries {
             assert!(matches!(store.state(discovery), TrustState::Trusted { .. }));
         }
+    }
+
+    /// A link to a file and a link to a directory named after that file's hash are different
+    /// configurations, so a change from one to the other is named.
+    #[test]
+    fn a_linked_file_never_reads_as_a_link_to_a_directory() {
+        let sha256 = [7; 32];
+        let file = EntryKind::LinkedFile {
+            target: PathBuf::from("../docs/f"),
+            sha256,
+            len: 1,
+        };
+        let dir = EntryKind::Symlink {
+            target: PathBuf::from(format!("../docs/f:{}", crate::project_trust::hex(&sha256))),
+            outside: false,
+        };
+        assert_ne!(value_of(&file), value_of(&dir));
     }
 
     #[test]

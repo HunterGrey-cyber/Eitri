@@ -639,6 +639,8 @@ fn profile_fixture(fx: &Fixture) -> PathBuf {
     );
     write(&repo.join(".claude/agents/reviewer.md"), b"agent\n");
     write(&repo.join(".claude/worktrees/wt/x"), b"x");
+    // Leads nowhere, so it stays a link nobody could follow.
+    std::fs::remove_file(repo.join("README.md")).unwrap();
     symlink("../README.md", repo.join(".claude/link")).unwrap();
     write(
         &repo.join(".mcp.json"),
@@ -660,6 +662,72 @@ fn discover_as(fx: &Fixture, root: &Path, profile: &Profile) -> Discovery {
         user_config_unreadable: None,
     };
     discover(root, Some(&fx.home), &Limits::default(), profile, &env)
+}
+
+/// A skill linked from `.claude/` to another directory of the same root: every part of it is hashed, so
+/// the answer is kept, and a change behind the link asks again and is named where the CLI reads it.
+#[test]
+fn a_link_inside_the_root_is_remembered_and_what_it_reaches_is_checked() {
+    let fx = Fixture::new("link-inside");
+    let root = fx.repo("repo");
+    write(&root.join(".claude/settings.json"), b"{}");
+    write(&root.join(".codex/skills/vm/SKILL.md"), b"skill\n");
+    write(&root.join("docs/x.md"), b"same\n");
+    write(&root.join("docs/y.md"), b"same\n");
+    std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
+    std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
+    symlink("../../.codex/skills/vm", root.join(".claude/skills/vm")).unwrap();
+    symlink("../../docs/x.md", root.join(".claude/commands/x.md")).unwrap();
+
+    let store = fx.store();
+    let found = fx.discover(&root);
+    match store.state(found.clone()) {
+        TrustState::Untrusted { remember, .. } => assert_eq!(remember, Remember::Yes),
+        other => panic!("{other:?}"),
+    }
+    store.record(&found, 1_800_000_000).unwrap();
+    assert!(matches!(store.state(fx.discover(&root)), TrustState::Trusted { .. }));
+
+    write(&root.join(".codex/skills/vm/SKILL.md"), b"edited\n");
+    match store.state(fx.discover(&root)) {
+        TrustState::Changed { diff, remember, .. } => {
+            assert_eq!(remember, Remember::Yes);
+            assert_eq!(diff.changed, vec![PathBuf::from(".claude/skills/vm/SKILL.md")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    write(&root.join(".codex/skills/vm/SKILL.md"), b"skill\n");
+
+    // The same bytes behind another target are another configuration, and named as one.
+    std::fs::remove_file(root.join(".claude/commands/x.md")).unwrap();
+    symlink("../../docs/y.md", root.join(".claude/commands/x.md")).unwrap();
+    match store.state(fx.discover(&root)) {
+        TrustState::Changed { diff, .. } => {
+            assert_eq!(diff.changed, vec![PathBuf::from(".claude/commands/x.md")]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A change behind a file link is named at that link, also when another link passes through it.
+#[test]
+fn a_change_behind_a_link_another_link_passes_through_names_both() {
+    let fx = Fixture::new("link-through");
+    let root = fx.repo("repo");
+    write(&root.join("config/claude.json"), b"{}");
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    symlink("../config/claude.json", root.join(".claude/settings.json")).unwrap();
+    symlink("settings.json", root.join(".claude/z.json")).unwrap();
+    let store = fx.store();
+    store.record(&fx.discover(&root), 1_800_000_000).unwrap();
+    write(&root.join("config/claude.json"), br#"{"env":{}}"#);
+    match store.state(fx.discover(&root)) {
+        TrustState::Changed { diff, .. } => assert_eq!(
+            diff.changed,
+            vec![PathBuf::from(".claude/settings.json"), PathBuf::from(".claude/z.json")]
+        ),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -688,8 +756,8 @@ fn a_record_from_before_the_full_disclosure_is_asked_about_again() {
     plant(before.clone());
     match fx.store().state(fx.discover(&root)) {
         TrustState::Untrusted { remember, discovery } => {
-            // The tree holds a link below `.claude/`, which the CLI follows to bytes no fingerprint
-            // covers, so the answer lasts one start whatever the record says.
+            // The tree holds a link below `.claude/` that could not be followed, so the answer lasts
+            // one start whatever the record says.
             assert!(
                 matches!(&remember, Remember::SessionOnly(note) if note.contains(".claude/link")),
                 "{remember:?}"

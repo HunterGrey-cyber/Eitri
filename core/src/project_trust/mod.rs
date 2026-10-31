@@ -10,14 +10,15 @@
 //! `.agents/plugins/`, `AGENTS.md` and its alternate names over the same walk (see [`codex`]).
 //!
 //! The fingerprint covers all of it by content: every file's bytes, every symlink's target as
-//! written (never followed) and every directory's name. Anything that could not be hashed -- a file
-//! over the size limit, unreadable, a FIFO, a socket, a device, a configuration file that is a link
-//! (and every link below a `.claude/`, whose whole content the CLI reads), or a walk over its budget
-//! -- leaves a gap in the fingerprint, so such a discovery is never
-//! `fully_hashed` and no answer about it may outlive the start it was asked for.
+//! written and every directory's name. A link below a walked `.claude/`, whose whole content the CLI
+//! reads, is also hashed through to what it reaches, when that is inside the top level by a way that
+//! never leaves it. Anything that could not be hashed -- a file over the size limit, unreadable, a
+//! FIFO, a socket, a device, any other configuration file that is a link (and every other link below
+//! a `.claude/`), or a walk over its budget -- leaves a gap in the fingerprint, so such a discovery is
+//! never `fully_hashed` and no answer about it may outlive the start it was asked for.
 //!
 //! Every byte read from the disk here goes through [`nofollow`], which opens nothing through a link
-//! and never blocks on a FIFO.
+//! (a link is followed by walking its target's names one at a time) and never blocks on a FIFO.
 
 mod codex;
 mod discover;
@@ -197,8 +198,8 @@ pub struct Discovery {
 
 impl Discovery {
     /// Nothing went unhashed: no entry that could not be read, no configuration file that is a
-    /// link, and the walk stayed within its budget. Only then can an answer about this
-    /// configuration be kept beyond one start.
+    /// link nothing was read through, and the walk stayed within its budget. Only then can an answer
+    /// about this configuration be kept beyond one start.
     pub fn fully_hashed(&self) -> bool {
         self.over_budget.is_none()
             && !self
@@ -253,6 +254,13 @@ pub enum EntryKind {
     Symlink {
         target: PathBuf,
         outside: bool,
+    },
+    /// A link reaching a regular file inside the top level: the link's `target` as written and what
+    /// the file held when it was read through the link.
+    LinkedFile {
+        target: PathBuf,
+        sha256: [u8; 32],
+        len: u64,
     },
     Dir,
     /// Could not be hashed: too large, unreadable, a FIFO, a socket, a device.

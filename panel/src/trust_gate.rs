@@ -2878,11 +2878,40 @@ mod tests {
         assert!(!fx.record_file().exists());
     }
 
-    /// A settings file that is a link: the CLI follows it and the fingerprint cannot see its target
-    /// change, so it counts as unchecked: a `y` covers one start, nothing is recorded and the window
-    /// remembers neither answer.
+    /// A skill linked from `.claude/` to `.codex/` in the same root is hashed through the link, so a `y`
+    /// is recorded and the next tab starts without the question; the prompt names the link and its
+    /// target.
     #[test]
-    fn a_linked_settings_file_is_trusted_for_one_start_only() {
+    fn a_link_inside_the_root_is_asked_about_once() {
+        let fx = Fx::new("linked-skill");
+        fx.write(SETTINGS, b"{}");
+        fx.write(".codex/skills/vm/SKILL.md", b"skill\n");
+        std::fs::create_dir_all(fx.root.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink("../../.codex/skills/vm", fx.root.join(".claude/skills/vm")).unwrap();
+        let mut gate = fx.gate();
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        assert_eq!(view.remember, TrustRememberView::Yes);
+        let row = view
+            .items
+            .iter()
+            .find(|item| item.what == "symlink")
+            .expect("a row for the link");
+        assert_eq!(row.value, "../../.codex/skills/vm");
+        assert!(!row.outside);
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let seen = drain(&mut gate, |seen| {
+            seen.iter().any(|e| matches!(e, GateEvent::Recorded { tab: A, .. }))
+        });
+        assert!(seen.contains(&GateEvent::Recorded { tab: A, notice: None }));
+        assert_eq!(start(&mut gate, B), Route::Start(ProjectTrust::Trusted));
+    }
+
+    /// A settings file that is a link out of the root: the CLI follows it and the fingerprint cannot see
+    /// its target change, so it counts as unchecked: a `y` covers one start, nothing is recorded and the
+    /// window remembers neither answer.
+    #[test]
+    fn a_settings_file_linked_out_of_the_root_is_trusted_for_one_start_only() {
         let fx = Fx::new("linked");
         let target = fx.outer.join("elsewhere.json");
         std::fs::write(&target, hook("touch /tmp/a")).unwrap();
