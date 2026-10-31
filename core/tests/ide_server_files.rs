@@ -482,7 +482,7 @@ fn pass_keeps_its_place_behind_a_diff() {
     let (jobs, from_worker) = mpsc::channel();
     let (to_worker, done) = mpsc::channel();
     let wake = Arc::new(Wake::new().unwrap());
-    let thread = spawn(scratch.config(), from_worker, to_worker, wake.clone());
+    let thread = spawn(scratch.config(), from_worker, to_worker, wake.clone()).unwrap();
 
     jobs.send(Job::Diff {
         conn: CONN,
@@ -756,7 +756,7 @@ fn the_thread_ends_with_its_channel() {
     let scratch = Scratch::new();
     let (jobs, from_worker) = mpsc::channel();
     let (to_worker, _done) = mpsc::channel();
-    let thread = spawn(scratch.config(), from_worker, to_worker, Arc::new(Wake::new().unwrap()));
+    let thread = spawn(scratch.config(), from_worker, to_worker, Arc::new(Wake::new().unwrap())).unwrap();
     drop(jobs);
     unhung(move || thread.join().unwrap());
 }
@@ -766,7 +766,7 @@ fn the_thread_ends_when_nobody_reads_what_it_finishes() {
     let scratch = Scratch::new();
     let (jobs, from_worker) = mpsc::channel();
     let (to_worker, done) = mpsc::channel();
-    let thread = spawn(scratch.config(), from_worker, to_worker, Arc::new(Wake::new().unwrap()));
+    let thread = spawn(scratch.config(), from_worker, to_worker, Arc::new(Wake::new().unwrap())).unwrap();
     drop(done);
     jobs.send(Job::Pass(Event::Lost)).unwrap();
     unhung(move || thread.join().unwrap());

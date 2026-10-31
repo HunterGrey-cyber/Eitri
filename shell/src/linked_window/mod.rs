@@ -181,6 +181,8 @@ pub enum WindowStart {
         token: Option<String>,
         /// Started again by window 1's launch (`--restore`), as the pair last ended.
         restore: bool,
+        /// The port window 1's editor listens on (`--ide-port`), for this window's shells from the first.
+        ide_port: Option<u16>,
     },
     /// `eitri linked-window --module ...`: the chat or page window `name`, its link end checked and owned.
     Module {
@@ -224,6 +226,7 @@ fn linked_start(parsed: start::LinkedArgs, sock: OwnedFd) -> WindowStart {
         token,
         restore,
         module,
+        ide_port,
         ..
     } = parsed;
     if module.is_some() {
@@ -240,6 +243,7 @@ fn linked_start(parsed: start::LinkedArgs, sock: OwnedFd) -> WindowStart {
             sock,
             token,
             restore,
+            ide_port,
         }
     }
 }
@@ -754,7 +758,18 @@ pub(crate) mod tests {
             start_of(&["--module", "page:markdown", "3", "p:markdown", "/p"]),
             WindowStart::Module { name: WindowName::Page(id), token: None, restore: false, .. } if id == "markdown"
         ));
-        assert!(matches!(start_of(&["3", "2", "/p"]), WindowStart::Second { .. }));
+        assert!(matches!(
+            start_of(&["3", "2", "/p"]),
+            WindowStart::Second { ide_port: None, .. }
+        ));
+        assert!(matches!(
+            start_of(&["--restore", "--ide-port", "23456", "3", "2", "/p"]),
+            WindowStart::Second {
+                restore: true,
+                ide_port: Some(23456),
+                ..
+            }
+        ));
     }
 
     #[test]

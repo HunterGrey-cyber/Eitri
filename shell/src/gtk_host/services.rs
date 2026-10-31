@@ -293,6 +293,9 @@ pub(crate) struct Teardown {
     /// is never read.
     #[allow(dead_code)]
     pub(crate) lua_engine: Rc<LuaEngine>,
+    /// The terminal `claude`'s listener; `None` with `terminal.claude_ide` off and in a window with no editor.
+    #[cfg(target_os = "linux")]
+    pub(crate) ide: Option<Rc<crate::ide_wiring::IdeWiring>>,
 }
 
 impl Teardown {
@@ -314,8 +317,8 @@ impl Teardown {
         }
     }
 
-    /// The editor's feeds, the plugins' follow socket, the open socket and the tutorial's lessons: each removes its
-    /// socket or directory now, not at a `Drop` that may never come (a directory a close leaves behind is swept by the
+    /// The editor's feeds, the plugins' follow socket, the open socket, the tutorial's lessons and the terminal
+    /// `claude`'s listener: each removes its socket, directory or lock file now, not at a `Drop` that may never come (a directory a close leaves behind is swept by the
     /// next launch, as a backstop only).
     fn feeds(&self) {
         if let Some(feed) = &self.theme_feed {
@@ -335,6 +338,10 @@ impl Teardown {
         }
         if let Some(tutor) = &self.tutor {
             tutor.cleanup();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ide) = &self.ide {
+            ide.end();
         }
     }
 }

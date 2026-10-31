@@ -263,6 +263,12 @@ pub struct Pair {
     /// Window 2 only: the editor window it started that has neither linked nor ended yet, so a second key press
     /// does not start another.
     editor_start: RefCell<Option<relink::StartedEditor>>,
+    /// The port this window's next shell gets, the very cell its `ShellPort` reads. In a window with an editor it is
+    /// the listener's own; in window 2 it is window 1's, while a link lasts.
+    ide_port: Rc<std::cell::Cell<Option<u16>>>,
+    /// Window 1 only: the port on the command line of the window 2 it started, until that window's first link. A
+    /// listener lost in between has to reach that window, which nothing else can correct.
+    port_on_command_line: std::cell::Cell<Option<u16>>,
 }
 
 /// An orphan's listener and the connection it is answering, if one is.
@@ -439,6 +445,8 @@ impl Pair {
             group_claim: RefCell::default(),
             starts: RefCell::new(Starts::default()),
             editor_start: RefCell::new(None),
+            ide_port: Rc::default(),
+            port_on_command_line: std::cell::Cell::new(None),
         });
         if let Some(link) = pair.link() {
             pair.wire(&link);
@@ -469,6 +477,45 @@ impl Pair {
     pub fn set_launch_flags(&self, legacy_backend: bool, clean: bool) {
         self.legacy_backend.set(legacy_backend);
         self.clean.set(clean);
+    }
+
+    /// The cell the window's `ShellPort` reads, so the pair and the panes hold one value.
+    pub fn ide_port_cell(&self) -> Rc<std::cell::Cell<Option<u16>>> {
+        self.ide_port.clone()
+    }
+
+    pub fn ide_port(&self) -> Option<u16> {
+        self.ide_port.get()
+    }
+
+    /// The port this window's next shell gets. Nothing that runs is told.
+    pub fn set_ide_port(&self, port: Option<u16>) {
+        self.ide_port.set(port);
+    }
+
+    /// The listener's port is `port` from here on: a window 2 on a link that is up hears it now, and one still in its
+    /// handshake hears it from [`Pair::say_ide_port`].
+    pub fn ide_port_changed(&self, port: Option<u16>) {
+        self.set_ide_port(port);
+        if let Some(link) = self.link().filter(LinkDriver::linked) {
+            self.send_ide_port(&link, port);
+        }
+    }
+
+    /// A new link to window 2 is up: it hears the port as it stands. With no port there is nothing to tell, unless that
+    /// window was started with one. A window with no listener, so a window with the key off, says nothing.
+    pub fn say_ide_port(&self, link: &LinkDriver) {
+        let port = self.ide_port.get();
+        let started_with_one = self.port_on_command_line.take().is_some();
+        if self.owns_editor() && (port.is_some() || started_with_one) {
+            self.send_ide_port(link, port);
+        }
+    }
+
+    fn send_ide_port(&self, link: &LinkDriver, port: Option<u16>) {
+        if let Err(err) = link.send(Msg::IdePort { port }, Vec::new()) {
+            eprintln!("[link] window 2 could not be told the editor's port: {err}");
+        }
     }
 
     /// How a window this one starts is started: stand-ins in the tests.
@@ -789,7 +836,13 @@ impl Pair {
         let first = !self.is_second();
         let (pending, failed) = (self.restore_pending.clone(), self.restore_failed.clone());
         let (name, peer) = (self.link_name(), self.link_peer());
+        let port = self.ide_port.clone();
         link.on_end(move |link, end| {
+            // The port was window 1's, which may be gone: a shell started from here on has none, whatever `ended`
+            // goes on to do.
+            if !first {
+                port.set(None);
+            }
             // A window 2 started again at this launch that ended before it linked did not come back: the
             // restore's own take-back runs instead.
             if first && link.partner().is_none() && fail_restore(&pending, &failed, "window 2 ended before it linked") {
@@ -801,6 +854,14 @@ impl Pair {
             }
         });
         self.post_kind(link, "workspace", peer);
+        if self.is_second() {
+            let port = self.ide_port.clone();
+            link.on("ide_port", move |_, msg, _| {
+                if let Msg::IdePort { port: told } = msg {
+                    port.set(told);
+                }
+            });
+        }
         if self.is_module() {
             hand_over::serve(link, self.tab_holder.clone());
             // A write's answer wakes the link; the link's end answers every write still queued.
@@ -973,7 +1034,7 @@ impl Pair {
                     &starts,
                     &self.root,
                     token.as_deref(),
-                    self.flags(false),
+                    self.second_flags(false),
                     lock,
                     linked_hook(&self.hooks, WindowName::Second, SECOND_PEER),
                     self.running.clone(),
@@ -1027,7 +1088,7 @@ impl Pair {
             &starts,
             &self.root,
             None,
-            self.flags(true),
+            self.second_flags(true),
             lock,
             linked,
             self.running.clone(),
@@ -1046,6 +1107,18 @@ impl Pair {
             legacy: self.legacy_backend.get(),
             clean: self.clean.get(),
             restore,
+            ide_port: None,
+        }
+    }
+
+    /// What window 2 is passed on: [`Pair::flags`] and the port as it stands, so its first shell can have it. A
+    /// module window has no terminal, so nothing that gets the port.
+    fn second_flags(&self, restore: bool) -> LinkedFlags {
+        let ide_port = self.ide_port.get();
+        self.port_on_command_line.set(ide_port);
+        LinkedFlags {
+            ide_port,
+            ..self.flags(restore)
         }
     }
 
@@ -2342,8 +2415,10 @@ fn take_welcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ide_wiring::ShellPort;
     use crate::linked_window::driver::tests::{pair, pump_until};
     use eitri_core::window_link::link::Inbound;
+    use std::ffi::OsString;
     use std::time::Duration;
 
     fn expected() -> Expected {
@@ -3159,6 +3234,207 @@ mod tests {
                 "tab.select".to_string(),
                 vec![("n".to_string(), serde_json::Value::from(3))]
             )]
+        );
+    }
+
+    const PORT: u16 = 23456;
+
+    fn port_env(port: u16) -> Vec<(OsString, OsString)> {
+        vec![(OsString::from("CLAUDE_CODE_SSE_PORT"), OsString::from(port.to_string()))]
+    }
+
+    /// A window 1 and a window 2 on one link that is up, as a handshake or a re-link leaves them. Neither has hooks:
+    /// what is held here is the pair's own part.
+    fn two_windows() -> (Rc<Pair>, Rc<Pair>) {
+        let (one, two) = fdpass::seqpacket_pair().unwrap();
+        let (one, one_in) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
+        let (two, two_in) = LinkHandle::start(two, PresenceFlag::default()).unwrap();
+        let (one, two) = (LinkDriver::new(one, one_in), LinkDriver::new(two, two_in));
+        one.set_linked();
+        two.set_linked();
+        (
+            Pair::new(WindowRole::Main { link: Some(one) }, None, Path::new("/p")),
+            Pair::new(WindowRole::Second { link: two }, None, Path::new("/p")),
+        )
+    }
+
+    /// Pumps window 2 until its next shell's port reads `want`.
+    fn wait_for_port(two: &Pair, want: Option<u16>) {
+        let link = two.link().unwrap();
+        assert!(pump_until(&link, || two.ide_port() == want), "{:?}", two.ide_port());
+    }
+
+    #[test]
+    fn a_window_2_restored_with_a_terminal_shown_has_the_port_on_its_first_shell() {
+        let (_window1, two) = fdpass::seqpacket_pair().unwrap();
+        let second = Pair::second(two, Path::new("/p")).unwrap();
+        second.set_ide_port(Some(PORT));
+        assert!(!second.link().unwrap().linked(), "no welcome has come");
+        assert_eq!(ShellPort::shared(second.ide_port_cell()).env(), port_env(PORT));
+    }
+
+    #[test]
+    fn a_relink_brings_the_new_port() {
+        let (window1, window2) = two_windows();
+        let shell = ShellPort::shared(window2.ide_port_cell());
+        assert_eq!(shell.env(), Vec::new(), "welcome said nothing of a port");
+
+        window1.set_ide_port(Some(PORT));
+        window1.say_ide_port(&window1.link().unwrap());
+
+        wait_for_port(&window2, Some(PORT));
+        assert_eq!(shell.env(), port_env(PORT));
+    }
+
+    #[test]
+    fn a_shell_started_while_orphaned_has_no_port() {
+        let (window1, window2) = two_windows();
+        window2.set_ide_port(Some(PORT));
+        let shell = ShellPort::shared(window2.ide_port_cell());
+        let link = window2.link().unwrap();
+
+        window1.link().unwrap().close("window 1 closed");
+
+        assert!(pump_until(&link, || link.ended().is_some()));
+        assert_eq!(shell.env(), Vec::new());
+    }
+
+    #[test]
+    fn a_window_1_keeps_its_port_when_its_window_2_goes() {
+        let (window1, window2) = two_windows();
+        window1.set_ide_port(Some(PORT));
+        let link = window1.link().unwrap();
+        window2.link().unwrap().close("window 2 closed");
+        assert!(pump_until(&link, || link.ended().is_some()));
+        assert_eq!(window1.ide_port(), Some(PORT));
+    }
+
+    #[test]
+    fn a_port_message_changes_no_running_shell() {
+        let (window1, window2) = two_windows();
+        window2.set_ide_port(Some(PORT));
+        let shell = ShellPort::shared(window2.ide_port_cell());
+        let running = shell.env();
+
+        window1.ide_port_changed(Some(PORT + 1));
+        wait_for_port(&window2, Some(PORT + 1));
+
+        assert_eq!(running, port_env(PORT), "a shell keeps what it started with");
+        assert_eq!(shell.env(), port_env(PORT + 1), "the next one has the new port");
+    }
+
+    #[test]
+    fn a_window_1_with_the_key_off_sends_no_port() {
+        let (window1, window2) = two_windows();
+        let heard: Rc<std::cell::Cell<u32>> = Rc::default();
+        let done: Rc<std::cell::Cell<bool>> = Rc::default();
+        let link = window2.link().unwrap();
+        {
+            let heard = heard.clone();
+            link.on("ide_port", move |_, _, _| heard.set(heard.get() + 1));
+            let done = done.clone();
+            link.on("away", move |_, _, _| done.set(true));
+        }
+
+        window1.say_ide_port(&window1.link().unwrap());
+
+        // The link keeps order: a port sent above would arrive first.
+        window1
+            .link()
+            .unwrap()
+            .send(Msg::Away { ids: Vec::new() }, Vec::new())
+            .unwrap();
+        assert!(pump_until(&link, || done.get()));
+        assert_eq!(heard.get(), 0);
+    }
+
+    #[test]
+    fn a_late_attach_reaches_a_linked_window_2() {
+        let (window1, window2) = two_windows();
+        window1.ide_port_changed(Some(PORT));
+        assert_eq!(window1.ide_port(), Some(PORT), "window 1's own shells have it too");
+        wait_for_port(&window2, Some(PORT));
+    }
+
+    #[test]
+    fn a_lost_listener_clears_window_2s_port() {
+        let (window1, window2) = two_windows();
+        window1.ide_port_changed(Some(PORT));
+        wait_for_port(&window2, Some(PORT));
+
+        window1.ide_port_changed(None);
+
+        assert_eq!(window1.ide_port(), None);
+        wait_for_port(&window2, None);
+    }
+
+    #[test]
+    fn a_link_in_its_handshake_hears_no_port_until_it_is_up() {
+        let (one, _theirs, their_inbound) = pair();
+        let window1 = Pair::new(WindowRole::Main { link: Some(one) }, None, Path::new("/p"));
+
+        window1.ide_port_changed(Some(PORT));
+        assert!(
+            their_inbound.recv_timeout(Duration::from_millis(50)).is_err(),
+            "nothing goes ahead of welcome"
+        );
+
+        let link = window1.link().unwrap();
+        link.set_linked();
+        window1.say_ide_port(&link);
+        assert!(matches!(
+            their_inbound.recv_timeout(Duration::from_secs(5)),
+            Ok(Inbound::Msg {
+                msg: Msg::IdePort { port: Some(PORT) },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_listener_lost_during_the_handshake_clears_the_port_on_window_2s_command_line() {
+        let (window1, window2) = two_windows();
+        window2.set_ide_port(Some(PORT));
+        window1.set_ide_port(Some(PORT));
+        assert_eq!(window1.second_flags(false).ide_port, Some(PORT));
+
+        // The link was not up when this happened, so nothing was said.
+        window1.set_ide_port(None);
+        window1.say_ide_port(&window1.link().unwrap());
+
+        wait_for_port(&window2, None);
+    }
+
+    #[test]
+    fn only_window_2_is_started_with_the_port() {
+        let (window1, _window2) = two_windows();
+        window1.set_ide_port(Some(PORT));
+        assert_eq!(window1.second_flags(true).ide_port, Some(PORT));
+        assert!(window1.second_flags(true).restore);
+        assert_eq!(window1.flags(false).ide_port, None, "a module window has no terminal");
+    }
+
+    #[test]
+    fn a_restored_window_2_is_started_with_the_port_as_it_stands() {
+        let restoring = restoring(
+            "restore-port",
+            r#"echo "$*" > "$0.args.tmp"; mv "$0.args.tmp" "$0.args""#,
+            HANDSHAKE_WITHIN,
+        );
+        let args = restoring.report.with_file_name("window-2-stand-in.args");
+        restoring.pair.set_ide_port(Some(PORT));
+        restoring.pair.restore().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let line = loop {
+            if let Ok(line) = std::fs::read_to_string(&args) {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "the stand-in never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            line.starts_with(&format!("linked-window --restore --ide-port {PORT} 3 2 ")),
+            "{line}"
         );
     }
 }

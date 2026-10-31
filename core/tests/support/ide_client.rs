@@ -56,6 +56,15 @@ impl<'a> Upgrade<'a> {
     }
 }
 
+/// The upgrade the CLI sends, header for header: the token, the `mcp` subprotocol and a user agent, no `Origin`.
+pub fn cli_upgrade_text(port: u16, token: &str) -> String {
+    format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mcp\r\n\
+         X-Claude-Code-Ide-Authorization: {token}\r\nUser-Agent: claude-code/2.1.311\r\n\r\n"
+    )
+}
+
 pub fn dial(port: u16) -> TcpStream {
     let stream = TcpStream::connect(("127.0.0.1", port)).expect("the listener takes a connection");
     stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -145,6 +154,45 @@ impl IdeClient {
         let head = client.read_head();
         assert!(head.starts_with("HTTP/1.1 101 "), "not upgraded: {head}");
         client
+    }
+
+    /// Upgrades the way the CLI does and checks that the server selected `mcp`.
+    pub fn attach_like_cli(port: u16, token: &str) -> IdeClient {
+        let mut stream = dial(port);
+        stream.write_all(cli_upgrade_text(port, token).as_bytes()).unwrap();
+        let mut client = IdeClient {
+            stream,
+            held: Vec::new(),
+            next_id: 1_000,
+        };
+        let head = client.read_head();
+        assert!(head.starts_with("HTTP/1.1 101 "), "not upgraded: {head}");
+        assert!(
+            head.to_ascii_lowercase().contains("sec-websocket-protocol: mcp"),
+            "mcp not selected: {head}"
+        );
+        client
+    }
+
+    /// Whether something can be read now, or arrives within `within`. A closed socket counts: the read then says so.
+    /// Never an expected time: the caller asks again.
+    pub fn waiting_within(&mut self, within: Duration) -> bool {
+        if !self.held.is_empty() {
+            return true;
+        }
+        self.stream.set_read_timeout(Some(within)).unwrap();
+        let mut chunk = [0u8; 65536];
+        let waiting = match self.stream.read(&mut chunk) {
+            Ok(0) => true,
+            Ok(read) => {
+                self.held.extend_from_slice(&chunk[..read]);
+                true
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => false,
+            Err(_) => true,
+        };
+        self.stream.set_read_timeout(Some(WAIT)).unwrap();
+        waiting
     }
 
     /// Sends the request; reading its answer is the caller's.

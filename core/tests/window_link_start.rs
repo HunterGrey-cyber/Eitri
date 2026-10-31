@@ -66,6 +66,7 @@ fn spawn_and_read(exe: &Path, token: Option<&str>) -> String {
             false,
             false,
             false,
+            None,
         ) {
             Ok(mut child) => {
                 let status = child.wait().unwrap();

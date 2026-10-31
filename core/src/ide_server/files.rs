@@ -8,6 +8,7 @@
 //! shown. Every other name is a buffer's ([`paths::name_inside`]), so an unsaved new file counts as it does for a tab.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -35,8 +36,13 @@ const ONLY_SMALL_REGULAR: &str = "Eitri shows diffs only for regular files of at
 const NOT_UTF8: &str = "the edited text is not UTF-8";
 
 /// The judge thread. It ends when `jobs` closes, or when nobody is left to read what it finishes.
-pub fn spawn(config: ServerConfig, jobs: Receiver<Job>, done: Sender<Done>, wake: Arc<Wake>) -> JoinHandle<()> {
-    std::thread::spawn(move || {
+pub fn spawn(
+    config: ServerConfig,
+    jobs: Receiver<Job>,
+    done: Sender<Done>,
+    wake: Arc<Wake>,
+) -> io::Result<JoinHandle<()>> {
+    std::thread::Builder::new().name("ide-judge".to_owned()).spawn(move || {
         while let Ok(job) = jobs.recv() {
             if done.send(run_job(&config, job)).is_err() {
                 return;

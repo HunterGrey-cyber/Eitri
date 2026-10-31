@@ -2259,6 +2259,23 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_children_are_not_told_a_port() {
+        for keep_test_seams in [false, true] {
+            let command = sidecar_command_for(
+                Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+                &[],
+                Path::new("/never/bound"),
+                None,
+                keep_test_seams,
+                None,
+            );
+            assert!(command
+                .get_envs()
+                .all(|(name, _)| name != OsStr::new("CLAUDE_CODE_SSE_PORT")));
+        }
+    }
+
+    #[test]
     fn the_sidecar_gets_the_raised_background_ceiling() {
         for keep_test_seams in [false, true] {
             let command = sidecar_command_for(

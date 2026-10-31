@@ -347,6 +347,11 @@ pub enum Msg {
         tabs: Value,
         adopt: bool,
     },
+    /// Window 1's editor listens on `port` for a `claude` in a terminal, or no longer listens: what window 2's next
+    /// shells get. A shell that runs keeps what it started with.
+    IdePort {
+        port: Option<u16>,
+    },
     /// Window 1 is closing its group: the chat window says its tabs as they stand now, then [`Msg::TabsSaid`].
     GroupClosing {},
     /// The last [`Msg::TabsReport`] window 1 asked for is out, or there was none to send.
@@ -421,6 +426,7 @@ pub const KINDS: &[&str] = &[
     "guard",
     "tabs_report",
     "tabs_given",
+    "ide_port",
     "group_closing",
     "tabs_said",
     "tab_release",
@@ -472,6 +478,7 @@ impl Msg {
             Msg::Guard { .. } => "guard",
             Msg::TabsReport { .. } => "tabs_report",
             Msg::TabsGiven { .. } => "tabs_given",
+            Msg::IdePort { .. } => "ide_port",
             Msg::GroupClosing {} => "group_closing",
             Msg::TabsSaid {} => "tabs_said",
             Msg::TabRelease { .. } => "tab_release",
@@ -864,6 +871,7 @@ mod tests {
             Msg::Away {
                 ids: vec!["lua:notes".into()],
             },
+            Msg::IdePort { port: Some(23456) },
         ];
         all.extend(the_hubs_kinds());
         all
@@ -941,6 +949,28 @@ mod tests {
             assert!(KINDS.contains(&msg.kind()));
             assert_eq!(from_json(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn ide_port_round_trips_and_carries_nothing_else() {
+        for port in [Some(1), Some(23456), Some(u16::MAX), None] {
+            let msg = Msg::IdePort { port };
+            assert_eq!(msg.kind(), "ide_port");
+            assert!(KINDS.contains(&msg.kind()));
+            let json = to_json(&msg);
+            let value: Value = serde_json::from_slice(&json).unwrap();
+            let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["k", "port", "v"], "{value}");
+            assert_eq!(from_json(&json).unwrap(), msg);
+        }
+        assert!(check_fds("ide_port", false, 0).is_ok());
+        assert!(check_fds("ide_port", false, 1).is_err());
+        assert_eq!(body_cap("ide_port"), 0, "it fits one packet");
+        assert!(
+            from_json(br#"{"v":1,"k":"ide_port","port":65536}"#).is_err(),
+            "no such port"
+        );
     }
 
     #[test]

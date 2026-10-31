@@ -15,7 +15,7 @@ use gtk4::glib;
 
 use eitri_core::editor_context::feed::{EditorContextFeed, EditorContextReader};
 use eitri_core::editor_context::ContextSource;
-use eitri_core::editor_feeds::EditorFeeds;
+use eitri_core::editor_feeds::{EditorFeeds, PushSource};
 use eitri_core::nvim_keys::feed::{NvimKeysFeed, NvimKeysReader};
 use eitri_core::nvim_keys::NvimReport;
 use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
@@ -210,6 +210,12 @@ impl FeedPump {
                 handler(());
             }
         }
+    }
+
+    /// The facts beside the context [`listen_context`](Self::listen_context) reads, which only a window with a
+    /// listener asks for; `None` with no context reader.
+    pub(crate) fn push_source(&self) -> Option<PushSource> {
+        self.feeds.borrow().push_source()
     }
 
     /// Calls `on_change` each time the context source [`listen_context`](Self::listen_context) returned

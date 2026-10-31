@@ -20,6 +20,8 @@ mod end_signals;
 mod grid_probe;
 mod gtk_host;
 mod hint;
+#[cfg(target_os = "linux")]
+mod ide_wiring;
 mod kill_pane;
 mod layout;
 mod layout_state;
@@ -518,14 +520,23 @@ fn main() -> glib::ExitCode {
                 }
             }
             linked_window::WindowStart::Second {
-                sock, token, restore, ..
-            } => linked_pair(
-                linked_window::spawn::Pair::second(sock, &project_root),
+                sock,
                 token,
                 restore,
-                backend_kind,
-                want_clean,
-            ),
+                ide_port,
+                ..
+            } => {
+                let pair = linked_pair(
+                    linked_window::spawn::Pair::second(sock, &project_root),
+                    token,
+                    restore,
+                    backend_kind,
+                    want_clean,
+                );
+                // Before anything is built: a shell a reopened layout starts has it, and no link is needed for it.
+                pair.set_ide_port(ide_port);
+                pair
+            }
             linked_window::WindowStart::Module {
                 name,
                 sock,
@@ -920,14 +931,27 @@ fn build_ui(
     );
     let base_page = gtk_host_surfaces::BasePage::new(agent_panel_handle.clone(), panel_notice);
     wm_host.set_base_page_maker(base_page.clone());
+    // Filled once `init.lua` has said whether the terminal's `claude` may attach, which is after this hook is set.
+    #[cfg(target_os = "linux")]
+    let ide_wiring: Rc<std::cell::OnceCell<Rc<ide_wiring::IdeWiring>>> = Rc::default();
     // The panel reads the context when its tick runs, and its tick runs only when woken. Window 1 also tells
     // window 2 each new context, which wakes window 2's panel there.
     if let Some(one) = &window1_editor {
         let panel = agent_panel_handle.clone();
         let one = one.clone();
+        #[cfg(target_os = "linux")]
+        let ide_wiring = ide_wiring.clone();
+        #[cfg(target_os = "linux")]
+        let push_facts = feed_pump.push_source();
         feed_pump.on_context(move || {
             panel.wake();
-            one.context_changed(context_for_link().as_ref());
+            let context = context_for_link();
+            one.context_changed(context.as_ref());
+            #[cfg(target_os = "linux")]
+            if let Some(wiring) = ide_wiring.get() {
+                let facts = push_facts.as_ref().and_then(|facts| facts());
+                wiring.context_changed(context, facts.unwrap_or_default());
+            }
         });
     } else {
         crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
@@ -1167,6 +1191,36 @@ fn build_ui(
             std::process::exit(1);
         }
     };
+    // Whether a `claude` in this window's terminals may attach to its editor: read as the font is, and only where
+    // there is an editor. With it off nothing below happens: no thread, no socket, no file, no wait.
+    #[cfg(target_os = "linux")]
+    let claude_ide = owns_editor
+        && match eitri_core::lua::config::parse_terminal_claude_ide(
+            lua_engine
+                .config
+                .borrow()
+                .get(eitri_core::lua::config::TERMINAL_CLAUDE_IDE_KEY),
+        ) {
+            Ok(on) => on,
+            Err(message) => {
+                eprintln!("eitri: {message}");
+                std::process::exit(1);
+            }
+        };
+    #[cfg(target_os = "linux")]
+    let shell_port = ide_wiring::ShellPort::shared(pair.ide_port_cell());
+    #[cfg(target_os = "linux")]
+    if claude_ide {
+        if let Some(wiring) = ide_wiring::IdeWiring::start(project_root, shell_port.clone()) {
+            let pair = Rc::downgrade(&pair);
+            wiring.on_port(Rc::new(move |port: Option<u16>| {
+                if let Some(pair) = pair.upgrade() {
+                    pair.ide_port_changed(port);
+                }
+            }));
+            let _ = ide_wiring.set(wiring);
+        }
+    }
     let terminal_face = Rc::new(RefCell::new(terminal::face_for(
         start_theme.guifont(),
         terminal_font.as_ref(),
@@ -1175,12 +1229,18 @@ fn build_ui(
     let make_terminal_pane: Rc<dyn Fn() -> terminal::TerminalPane> = {
         let root = project_root.to_path_buf();
         let shell_env = open_requests::shell_env(incoming_opens.as_deref(), project_root);
+        #[cfg(target_os = "linux")]
+        let env_with_port = (claude_ide || !owns_editor).then(|| shell_port.over(shell_env.clone()));
         let colors = terminal_colors.clone();
         let face = terminal_face.clone();
         let zoom = terminal_zoom.clone();
         Rc::new(move || {
             let pane = terminal::TerminalPane::new(root.clone());
             pane.set_shell_env(shell_env.clone());
+            #[cfg(target_os = "linux")]
+            if let Some(env) = &env_with_port {
+                pane.set_shell_env(env.clone());
+            }
             // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to
             // zero reports a 1-row grid to its shell.
             pane.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
@@ -2661,6 +2721,16 @@ fn build_ui(
     // A root key of `init.lua` that an input method or the desktop may take first is logged, and toasted once per
     // change. Nothing starts when the root table is empty.
     root_conflicts::start(keymap.root_bindings(), toast.clone());
+    // The listener's events go to this window's editor, and what it has to say goes to the toast.
+    #[cfg(target_os = "linux")]
+    if let Some(wiring) = ide_wiring.get() {
+        let toast = toast.clone();
+        wiring.connect(
+            editor_rpc.clone(),
+            editor_repeat.clone(),
+            Rc::new(move |text: &str| toast.show_for(text, toast::NOTICE_FOR)),
+        );
+    }
 
     // The global `f` HINT (`hint.rs`). Three
     // triggers reach the same toggle: `prefix f` (the keymap's `hint`, below), `f` on the top bar,
@@ -4105,6 +4175,9 @@ fn build_ui(
                 if let Some(review) = &pair_review {
                     review.linked(peer, link);
                 }
+                if let Some(pair) = pair_weak.upgrade() {
+                    pair.say_ide_port(link);
+                }
                 attach();
                 // A chat or page window that took the keyboard before its link was up could not say so then: it
                 // says so now, or window 1 would send a chat key to the window that held the keys before it.
@@ -4373,6 +4446,8 @@ fn build_ui(
         tutor,
         open_requests: incoming_opens.clone(),
         lua_engine: lua_engine.clone(),
+        #[cfg(target_os = "linux")]
+        ide: ide_wiring.get().cloned(),
     }));
     // Last: the answer to a request goes through the teardown's handle, and a request is acted on as soon as it is read.
     if let Some(requests) = &incoming_opens {
@@ -5268,6 +5343,61 @@ mod tests {
         use eitri_core::source_scan as scan;
         let code = scan::code_only(&scan::read_required(path).text);
         scan::without(&code, &scan::modules(&code, "tests"))
+    }
+
+    /// The window's half of the terminal `claude` comes up where the font does: after `init.lua`, so the key has its
+    /// value, and before the layout, which can start a shell.
+    #[test]
+    fn the_key_is_read_after_the_config_step_as_the_terminal_font_is() {
+        use eitri_core::source_scan as scan;
+        let read = scan::rust_sources(&["shell/src"]);
+        let (_, ui) = scan::function_in(&read, "build_ui");
+        let at = |what: &str| ui.find(what).unwrap_or_else(|| panic!("`{what}` in build_ui"));
+        let key = at("TERMINAL_CLAUDE_IDE_KEY");
+        assert!(at("StartStep::Kernel") < at("TERMINAL_FONT_KEY"));
+        assert!(at("TERMINAL_FONT_KEY") < key);
+        assert!(key < at("IdeWiring::start"));
+        assert!(at("IdeWiring::start") < at("make_terminal_pane"));
+        assert!(at("IdeWiring::start") < at("StartStep::Layout"));
+    }
+
+    #[test]
+    fn a_bad_terminal_claude_ide_refuses_startup() {
+        use eitri_core::source_scan as scan;
+        let read = scan::rust_sources(&["shell/src"]);
+        let (_, ui) = scan::function_in_raw(&read, "build_ui");
+        let from = ui.find("let claude_ide").expect("the key's read");
+        let read_of_it = &ui[from..from + ui[from..].find("IdeWiring::start").expect("what it decides")];
+        assert!(
+            read_of_it.contains("owns_editor"),
+            "window 2 does not decide for itself"
+        );
+        assert!(read_of_it.contains("parse_terminal_claude_ide"));
+        assert!(
+            read_of_it.contains("eprintln!(\"eitri: {message}\")"),
+            "the message names the key"
+        );
+        assert!(read_of_it.contains("std::process::exit(1)"));
+    }
+
+    #[test]
+    fn every_product_pane_is_made_by_the_one_closure() {
+        use eitri_core::source_scan as scan;
+        let making = concat!("TerminalPane", "::new(");
+        let read = scan::rust_sources(&["shell/src"]);
+        scan::require_anchors(&read, &["fn build_ui("]);
+        let holding: Vec<String> = read
+            .iter()
+            .filter(|source| !source.path.starts_with("shell/src/grid_probe/"))
+            .flat_map(|source| {
+                let code = scan::code_only(&source.text);
+                let product = scan::without(&code, &scan::modules(&code, "tests"));
+                vec![source.path.clone(); product.matches(making).count()]
+            })
+            .collect();
+        assert_eq!(holding, vec!["shell/src/main.rs".to_owned()]);
+        let (_, ui) = scan::function_in(&read, "build_ui");
+        assert!(closure_of(&ui, "let make_terminal_pane").contains(making));
     }
 
     /// The body of the closure handed to the first `call` (ending in its `(`) in `code`.

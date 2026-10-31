@@ -1,8 +1,8 @@
 //! How a linked window comes to exist: window 1 starts window 2 with `eitri linked-window [--legacy] [--clean]
-//! [--restore] <fd> 2 <root> [token]`, and a module window with the same line plus `--module chat:<n>|page:<id>` and
-//! the window's own name in place of `2`, the link's other end placed at that descriptor number, and the window's
-//! first acts check that end before anything else runs. What follows says window 2; a module window is started and
-//! checked the same way.
+//! [--restore] [--ide-port <n>] <fd> 2 <root> [token]`, and a module window with the same line less the port, plus
+//! `--module chat:<n>|page:<id>` and the window's own name in place of `2`, the link's other end placed at that
+//! descriptor number, and the window's first acts check that end before anything else runs. What follows says window
+//! 2; a module window is started and checked the same way.
 //!
 //! The command line carries what window 2 needs because `main()`'s flags take no values and an environment variable
 //! would be inherited by every terminal window 2 starts; the activation token travels as an argument for the same
@@ -46,6 +46,8 @@ pub struct LinkedArgs {
     pub restore: bool,
     /// The module this window is started to show ([`MODULE_FLAG`]); `None` for window 2.
     pub module: Option<ModuleArg>,
+    /// The port window 1's editor listens on for a `claude` in a terminal ([`IDE_PORT_FLAG`]).
+    pub ide_port: Option<u16>,
 }
 
 impl LinkedArgs {
@@ -68,6 +70,11 @@ pub const CLEAN_FLAG: &str = "--clean";
 /// after `--clean`.
 pub const RESTORE_FLAG: &str = "--restore";
 
+/// The port window 1's editor listens on, for window 2's shells, written after `--restore`. A command line is known at
+/// exec, so no first shell can start ahead of it, and unlike a variable it reaches no child of window 2. A port is no
+/// secret: the token stays in the lock file. Absent unless window 1 has a listener with a lock behind it.
+pub const IDE_PORT_FLAG: &str = "--ide-port";
+
 /// The module a module window is started to show, written last among the flags. Its value has to agree with the window
 /// name that follows, so neither can be read without the other.
 pub const MODULE_FLAG: &str = "--module";
@@ -78,14 +85,15 @@ pub struct LinkedFlags {
     pub legacy: bool,
     pub clean: bool,
     pub restore: bool,
+    pub ide_port: Option<u16>,
 }
 
-/// Parses `[--legacy] [--clean] [--restore] [--module chat:<n>|page:<id>] <fd> <window> <root> [token]`, the arguments
-/// after `linked-window`; each flag at most once and in that order, as window 1 writes them. Without `--module` the
-/// window is `2`; with it, the window is the one the module names.
+/// Parses `[--legacy] [--clean] [--restore] [--ide-port <n>] [--module chat:<n>|page:<id>] <fd> <window> <root>
+/// [token]`, the arguments after `linked-window`; each flag at most once and in that order, as window 1 writes them.
+/// Without `--module` the window is `2`; with it, the window is the one the module names.
 pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
     let usage = format!(
-        "usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] [{CLEAN_FLAG}] [{RESTORE_FLAG}] \
+        "usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] [{CLEAN_FLAG}] [{RESTORE_FLAG}] [{IDE_PORT_FLAG} <n>] \
          [{MODULE_FLAG} chat:<n>|page:<id>] <fd> <window> <root> [token]"
     );
     let mut args = args;
@@ -96,6 +104,22 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
                 args = rest;
                 restore |= flag == RESTORE_FLAG;
             }
+        }
+    }
+    let mut ide_port = None;
+    if let Some((first, rest)) = args.split_first() {
+        if first == IDE_PORT_FLAG {
+            let (value, rest) = rest
+                .split_first()
+                .ok_or_else(|| format!("{SUBCOMMAND}: {IDE_PORT_FLAG} without a value; {usage}"))?;
+            ide_port = Some(
+                value
+                    .to_str()
+                    .and_then(|text| text.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| format!("{SUBCOMMAND}: {IDE_PORT_FLAG} {value:?} is not a port from 1 to 65535"))?,
+            );
+            args = rest;
         }
     }
     let mut module = None;
@@ -153,6 +177,7 @@ pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
         token,
         restore,
         module,
+        ide_port,
     })
 }
 
@@ -206,6 +231,7 @@ pub fn open_log(state_home: &Path, root: &Path, window: &WindowName) -> io::Resu
 }
 
 /// Starts window 2 ([`spawn_linked`]).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_second(
     exe: &Path,
     child_end: OwnedFd,
@@ -214,16 +240,22 @@ pub fn spawn_second(
     legacy: bool,
     clean: bool,
     restore: bool,
+    ide_port: Option<u16>,
 ) -> io::Result<Child> {
-    let flags = LinkedFlags { legacy, clean, restore };
+    let flags = LinkedFlags {
+        legacy,
+        clean,
+        restore,
+        ide_port,
+    };
     spawn_linked(exe, child_end, root, &WindowName::Second, token, flags)
 }
 
 /// Starts window `name` from `exe` (window 1's `/proc/self/exe`, so both windows are one build even after an upgrade
-/// replaced the installed file) as `linked-window [--legacy] [--clean] [--restore] [--module <arg>] 3 <name> <root>
-/// [token]`, with `child_end` at descriptor 3 and not close-on-exec there, stdio on `/dev/null`, in its own process
-/// group. `child_end` itself stays close-on-exec in this process and is closed when the spawn returns, so window 1
-/// keeps no copy of the other window's end.
+/// replaced the installed file) as `linked-window [--legacy] [--clean] [--restore] [--ide-port <n>] [--module <arg>] 3
+/// <name> <root> [token]`, with `child_end` at descriptor 3 and not close-on-exec there, stdio on `/dev/null`, in its
+/// own process group. `child_end` itself stays close-on-exec in this process and is closed when the spawn returns, so
+/// window 1 keeps no copy of the other window's end.
 pub fn spawn_linked(
     exe: &Path,
     child_end: OwnedFd,
@@ -257,6 +289,9 @@ fn linked_command(exe: &Path, root: &Path, name: &WindowName, token: Option<&str
     }
     if flags.restore {
         command.arg(RESTORE_FLAG);
+    }
+    if let Some(port) = flags.ide_port {
+        command.arg(IDE_PORT_FLAG).arg(port.to_string());
     }
     if let Some(module) = name.module_arg() {
         command.arg(MODULE_FLAG).arg(module.text());
@@ -313,13 +348,19 @@ mod tests {
         legacy: bool,
         clean: bool,
         restore: bool,
+        ide_port: Option<u16>,
     ) -> Command {
         linked_command(
             exe,
             root,
             &WindowName::Second,
             token,
-            LinkedFlags { legacy, clean, restore },
+            LinkedFlags {
+                legacy,
+                clean,
+                restore,
+                ide_port,
+            },
         )
     }
 
@@ -334,6 +375,7 @@ mod tests {
                 token: None,
                 restore: false,
                 module: None,
+                ide_port: None,
             }
         );
         assert_eq!(
@@ -374,6 +416,7 @@ mod tests {
             token: None,
             restore: false,
             module: None,
+            ide_port: None,
         };
         let err = first_acts(&args).expect_err("this process's own pair has no parent at its other end");
         assert!(err.contains("parent"), "the refusal names the peer check: {err}");
@@ -397,6 +440,7 @@ mod tests {
             token: None,
             restore: false,
             module: None,
+            ide_port: None,
         };
         let err = first_acts(&args(r.as_raw_fd())).unwrap_err();
         assert!(err.contains("socket"), "a pipe is refused as not a socket: {err}");
@@ -430,6 +474,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(
             command.get_envs().count(),
@@ -441,7 +486,15 @@ mod tests {
             [SUBCOMMAND, "3", "2", "/p", token],
             "the token is the last argument"
         );
-        let without = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), None, false, false, false);
+        let without = second_command(
+            Path::new("/usr/bin/eitri"),
+            Path::new("/p"),
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
         assert_eq!(without.get_args().collect::<Vec<_>>(), [SUBCOMMAND, "3", "2", "/p"]);
     }
 
@@ -454,6 +507,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
         let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
         assert_eq!(args, os(&[SUBCOMMAND, LEGACY_FLAG, "3", "2", "/p", "tok"]));
@@ -470,9 +524,25 @@ mod tests {
     fn a_clean_window_1_starts_window_2_with_the_same_flag_and_it_parses() {
         let exe = Path::new("/usr/bin/eitri");
         let args_of = |command: Command| -> Vec<OsString> { command.get_args().map(OsString::from).collect() };
-        let clean = args_of(second_command(exe, Path::new("/p"), Some("tok"), false, true, false));
+        let clean = args_of(second_command(
+            exe,
+            Path::new("/p"),
+            Some("tok"),
+            false,
+            true,
+            false,
+            None,
+        ));
         assert_eq!(clean, os(&[SUBCOMMAND, "--clean", "3", "2", "/p", "tok"]));
-        let both = args_of(second_command(exe, Path::new("/p"), Some("tok"), true, true, false));
+        let both = args_of(second_command(
+            exe,
+            Path::new("/p"),
+            Some("tok"),
+            true,
+            true,
+            false,
+            None,
+        ));
         assert_eq!(
             both,
             os(&[SUBCOMMAND, "--legacy", "--clean", "3", "2", "/p", "tok"]),
@@ -485,6 +555,7 @@ mod tests {
             token: Some("tok".into()),
             restore: false,
             module: None,
+            ide_port: None,
         };
         assert_eq!(
             parse_args(&clean[1..]).unwrap(),
@@ -521,9 +592,17 @@ mod tests {
     fn the_restore_flag_parses_beside_legacy_and_clean() {
         let exe = Path::new("/usr/bin/eitri");
         let args_of = |command: Command| -> Vec<OsString> { command.get_args().map(OsString::from).collect() };
-        let restore = args_of(second_command(exe, Path::new("/p"), None, false, false, true));
+        let restore = args_of(second_command(exe, Path::new("/p"), None, false, false, true, None));
         assert_eq!(restore, os(&[SUBCOMMAND, RESTORE_FLAG, "3", "2", "/p"]));
-        let all = args_of(second_command(exe, Path::new("/p"), Some("tok"), true, true, true));
+        let all = args_of(second_command(
+            exe,
+            Path::new("/p"),
+            Some("tok"),
+            true,
+            true,
+            true,
+            None,
+        ));
         assert_eq!(
             all,
             os(&[SUBCOMMAND, LEGACY_FLAG, CLEAN_FLAG, RESTORE_FLAG, "3", "2", "/p", "tok"]),
@@ -637,7 +716,7 @@ mod tests {
                         }
                         expected.extend(["3", "2", "/p"]);
                         expected.extend(token);
-                        let command = second_command(exe, Path::new("/p"), token, legacy, clean, restore);
+                        let command = second_command(exe, Path::new("/p"), token, legacy, clean, restore, None);
                         assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
                         assert_eq!(command.get_envs().count(), 0);
                     }
@@ -647,12 +726,96 @@ mod tests {
     }
 
     #[test]
+    fn the_port_flag_is_parsed_and_its_value_checked() {
+        for (value, port) in [("1", 1), ("23456", 23456), ("65535", 65535)] {
+            let parsed = parse_args(&os(&[IDE_PORT_FLAG, value, "3", "2", "/p", "tok"])).unwrap();
+            assert_eq!(parsed.ide_port, Some(port), "{value}");
+            assert_eq!(
+                (parsed.fd, parsed.token.as_deref()),
+                (3, Some("tok")),
+                "the value is not read as an argument"
+            );
+        }
+        assert_eq!(parse_args(&os(&["3", "2", "/p"])).unwrap().ide_port, None);
+        for value in ["0", "65536", "-1", "", "port", "23456 "] {
+            let err = parse_args(&os(&[IDE_PORT_FLAG, value, "3", "2", "/p"])).unwrap_err();
+            assert!(err.contains(IDE_PORT_FLAG), "{value:?} names the flag: {err}");
+        }
+        let err = parse_args(&os(&[IDE_PORT_FLAG])).unwrap_err();
+        assert!(err.contains(IDE_PORT_FLAG), "{err}");
+        let refused = [
+            (vec![IDE_PORT_FLAG, "1", IDE_PORT_FLAG, "2", "3", "2", "/p"], "twice"),
+            (
+                vec![IDE_PORT_FLAG, "1", RESTORE_FLAG, "3", "2", "/p"],
+                "before --restore",
+            ),
+            (
+                vec![IDE_PORT_FLAG, "3", "2", "/p"],
+                "with no value before the descriptor",
+            ),
+        ];
+        for (args, why) in refused {
+            assert!(parse_args(&os(&args)).is_err(), "{why} is refused: {args:?}");
+        }
+    }
+
+    #[test]
+    fn no_port_gives_todays_command_line() {
+        let exe = Path::new("/usr/bin/eitri");
+        let args_of = |command: Command| -> Vec<OsString> { command.get_args().map(OsString::from).collect() };
+        assert_eq!(
+            args_of(second_command(exe, Path::new("/p"), None, false, false, false, None)),
+            os(&[SUBCOMMAND, "3", "2", "/p"])
+        );
+        assert_eq!(
+            args_of(second_command(
+                exe,
+                Path::new("/p"),
+                Some("tok"),
+                true,
+                true,
+                true,
+                None
+            )),
+            os(&[SUBCOMMAND, LEGACY_FLAG, CLEAN_FLAG, RESTORE_FLAG, "3", "2", "/p", "tok"])
+        );
+    }
+
+    #[test]
+    fn the_flag_comes_after_restore() {
+        let exe = Path::new("/usr/bin/eitri");
+        let command = second_command(exe, Path::new("/p"), Some("tok"), true, true, true, Some(23456));
+        assert_eq!(command.get_envs().count(), 0, "the port is on no child's environment");
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(
+            args,
+            os(&[
+                SUBCOMMAND,
+                LEGACY_FLAG,
+                CLEAN_FLAG,
+                RESTORE_FLAG,
+                IDE_PORT_FLAG,
+                "23456",
+                "3",
+                "2",
+                "/p",
+                "tok"
+            ])
+        );
+        let parsed = parse_args(&args[1..]).unwrap();
+        assert_eq!(parsed.ide_port, Some(23456));
+        assert!(parsed.restore);
+        assert_eq!(parsed.token.as_deref(), Some("tok"));
+    }
+
+    #[test]
     fn a_module_windows_command_line_parses_back_to_its_name() {
         let exe = Path::new("/usr/bin/eitri");
         let all = LinkedFlags {
             legacy: true,
             clean: true,
             restore: true,
+            ide_port: None,
         };
         let chat = linked_command(exe, Path::new("/p"), &WindowName::Chat(3), Some("tok"), all);
         let args: Vec<OsString> = chat.get_args().map(OsString::from).collect();
