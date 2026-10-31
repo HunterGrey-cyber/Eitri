@@ -1099,6 +1099,45 @@ fn a_linked_target_over_the_limits_is_not_fully_hashed() {
         .as_deref()
         .is_some_and(|reason| reason.contains("more than 4 bytes of configuration")));
 
+    // The links on the way take room too, so the budget is said to be spent, however the chain ends.
+    for (name, end) in [("to-file", "two.md"), ("to-dir", "empty")] {
+        let repo = fx.home.join(format!("chain-{name}"));
+        fx.repo(&repo, false);
+        write(&repo.join(".claude/a.md"), b"a\n");
+        write(&repo.join("two.md"), b"t\n");
+        std::fs::create_dir(repo.join("empty")).unwrap();
+        link(end, repo.join("one"));
+        link("../one", repo.join(".claude/l"));
+        let limits = Limits {
+            max_entries: 2,
+            ..Limits::default()
+        };
+        let found = discover(&repo, Some(&fx.home), &limits, &Profile::Claude, &ProfileEnv::default());
+        assert_eq!(
+            found.over_budget.as_deref(),
+            Some("more than 2 entries of configuration"),
+            "{name}"
+        );
+        assert!(found.entries.len() <= 2, "{name}: {:?}", found.entries);
+    }
+    let repo = linked_repo(&fx, "chain-memory");
+    let root = repo.join("sub");
+    write(&root.join(".claude/a.md"), b"a\n");
+    write(&root.join(".claude/b.md"), b"b\n");
+    write(&repo.join("AGENTS.md"), b"m\n");
+    link("AGENTS.md", repo.join("alias.md"));
+    link("alias.md", repo.join("CLAUDE.md"));
+    let limits = Limits {
+        max_entries: 3,
+        ..Limits::default()
+    };
+    let found = discover(&root, Some(&fx.home), &limits, &Profile::Claude, &ProfileEnv::default());
+    assert_eq!(
+        found.over_budget.as_deref(),
+        Some("more than 3 entries of configuration")
+    );
+    assert!(found.entries.len() <= 3, "{:?}", found.entries);
+
     // A link at the limit is walked no deeper than a directory there would be.
     let repo = linked_repo(&fx, "at-the-limit");
     write(&repo.join("docs/f.md"), b"f\n");

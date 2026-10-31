@@ -159,11 +159,11 @@ struct Through<'a> {
 
 struct Scan<'a> {
     top: PathBuf,
-    /// Links below a walked `.claude/`, in a walked `.codex/skills/` and in place of a memory file
-    /// beside a walked `.claude/` may be followed inside the top level. Off when the top level may
-    /// hold the user's home, since a link could then lead into the account's own files, and when it
-    /// is neither the root nor where a `.git` was accepted, since it may then be a shared directory
-    /// the project does not own.
+    /// Links below a walked `.claude/`, in a walked `.codex/skills/` and in place of a memory file in
+    /// a walked directory may be followed inside the top level. Off when the top level may hold the
+    /// user's home, since a link could then lead into the account's own files, and when it is neither
+    /// the root nor where a `.git` was accepted, since it may then be a shared directory the project
+    /// does not own.
     follows_links: bool,
     /// The links named so far, by the path each was named at.
     named: BTreeSet<PathBuf>,
@@ -344,6 +344,10 @@ impl Scan<'_> {
             )) => {
                 self.followed_link(&path, &target);
                 self.chain(links);
+                // The links on the way may have taken the room this link was let in with.
+                if !self.room() {
+                    return;
+                }
                 let through = Through {
                     target: &target,
                     dir: self.top.join(at),
@@ -518,9 +522,9 @@ impl Scan<'_> {
         }
     }
 
-    /// A memory file beside a walked `.claude/`: `base` is that directory relative to the top level. A
-    /// link here is often `CLAUDE.md -> AGENTS.md`, so it is read through like one below `.claude/`.
-    fn memory_beside_claude(&mut self, dir: &DirHandle, name: &OsStr, base: &Path) {
+    /// A memory file in a walked directory, which is `base` relative to the top level. A link here is
+    /// often `CLAUDE.md -> AGENTS.md`, so it is read through like one below `.claude/`.
+    fn walked_memory_file(&mut self, dir: &DirHandle, name: &OsStr, base: &Path) {
         if !self.follows_links || !matches!(dir.lstat(name), Ok(FileKind::Symlink)) {
             self.expected_file(dir, name, base.join(name), Role::Memory);
         } else if self.room() {
@@ -536,7 +540,7 @@ impl Scan<'_> {
         };
         self.expected_file(&handle, OsStr::new(".mcp.json"), base.join(".mcp.json"), Role::Mcp);
         for name in ["CLAUDE.md", "CLAUDE.local.md"] {
-            self.memory_beside_claude(&handle, OsStr::new(name), &base);
+            self.walked_memory_file(&handle, OsStr::new(name), &base);
         }
         let dot_claude = OsStr::new(".claude");
         let claude_path = base.join(".claude");
@@ -740,6 +744,9 @@ impl Scan<'_> {
                             )) if !real.starts_with(&at) && !crossed.iter().any(|at_link| at_link.starts_with(&at)) => {
                                 self.followed_link(&child, &target);
                                 self.chain(links);
+                                if !self.room() {
+                                    break;
+                                }
                                 self.push(child.clone(), EntryKind::Symlink { target, outside: false });
                                 if tree.is_skill(depth, parent.as_deref()) {
                                     self.findings.push(Finding::Skill {
@@ -1100,7 +1107,7 @@ fn fingerprint(
 /// when `root` is below it. For Claude, every directory above that top level up to `/` is looked at
 /// too, for the memory files and `.mcp.json` the CLI loads from there. Nothing blocks, and no link is
 /// followed but one below a walked `.claude/`, in a walked `.codex/skills/` or in place of a memory
-/// file beside a walked `.claude/`, by [`follow_within`] and only inside the top level.
+/// file in a walked directory, by [`follow_within`] and only inside the top level.
 ///
 /// `home` must be canonical too: it is compared with `root`'s ancestors by path, and a home spelt
 /// through a link would match none of them, so the walk would neither stop there nor keep the user

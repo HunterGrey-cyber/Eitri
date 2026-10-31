@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=011738a3f5fdfa67288fd75919c0c01f5a06fe5d8f51d6399a4ed43769093a49 -->
+<!-- translated-from: permissions.md sha256=136a77c387dc7036b3442f2d5cdfd32af7392e14cbc2ba217c536a6330c655f6 -->
 
 # 权限与信任
 
@@ -146,7 +146,7 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 - `y` 信任这个项目并加载它的配置，但[不算边界的文件夹](#a-folder-that-is-no-boundary)里的 Codex 标签页除外，它仍然不带这份配置启动。`n` 不带它启动会话。`Esc` 把这个问题推后：第一条消息回到输入框里，继续一个会话则被丢弃，并给出一条 “not started: the trust question was put off” 的消息。以这种方式推后的恢复会保留它的会话：这些标签页会作为失败的标签页回来，仍然保存着各自的对话（在标签页里按 `r` 再次启动它），而你从空标签页的 `Restore last session` 那一行发起的恢复，只要那个标签页仍是空的，就仍然留在那里供你再选（否则它的标签页同样作为失败的标签页回来）。`y` 和 `n` 只有单独按下、并且在问题出现片刻之后按才算数；太早敲的键会闪出 “wait a moment, then y or n”。
 - **`y` 按项目记住，并且和你看到的内容严格绑定。** 这些文件的任何变化都会再问一次，并列出加了什么、去掉了什么、改了什么。这包括 agent 在 `.claude/` 下做的一次编辑，以及 Claude Code 自己的 “don't ask again”（它会写 `.claude/settings.local.json`）。它还和问题当时显示了多少内容绑定：某个版本让问题显示得比以前更多时，你信任过的每个项目都会再被问一次，即使项目里什么都没变。
 - **`n` 只对这个窗口记住**，只针对同样的内容，并且只在 Eitri 能检查所有东西时才记住（见下一条）；否则这个问题会在这个窗口的下一次启动时回来。另一个窗口自己再问。
-- **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、不是合法 JSON 的设置文件或 `.mcp.json`（“could not be parsed for this check”）、Eitri 跟不过去的符号链接（顶替了某个配置文件，或在 `.claude/` 下）、仓库之上那些既不属于你也不属于 root 的文件，或者文件太多的项目，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。在 Claude 标签页里，`.claude/` 下的符号链接，或它旁边顶替 `CLAUDE.md`、`CLAUDE.local.md` 的符号链接，如果用相对路径指向仓库内部（项目不在仓库里时，指项目文件夹内部），Eitri 会跟过去；Codex 标签页里 `.codex/skills/` 内的符号链接也一样。Eitri 检查它指向的内容，并连同目标一起显示，所以在 `.claude/skills/` 和 `.codex/skills/` 之间链接的 skill、链接到 `AGENTS.md` 的 `CLAUDE.md` 都和其他文件一样会被记住。离开这个范围的链接、绝对路径和循环链接都检查不了。如果你的主目录在仓库里面，或者项目之上有 `.git` 但都无法验证，任何链接都不会被跟随。
+- **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、不是合法 JSON 的设置文件或 `.mcp.json`（“could not be parsed for this check”）、Eitri 跟不过去的符号链接（顶替了某个配置文件，或在 `.claude/` 下）、仓库之上那些既不属于你也不属于 root 的文件，或者文件太多的项目，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。在 Claude 标签页里，`.claude/` 下的符号链接，或顶替 `CLAUDE.md`、`CLAUDE.local.md` 的符号链接，如果用相对路径指向仓库内部（项目不在仓库里时，指项目文件夹内部），Eitri 会跟过去；Codex 标签页里 `.codex/skills/` 内的符号链接也一样。Eitri 检查它指向的内容，并连同目标一起显示，所以在 `.claude/skills/` 和 `.codex/skills/` 之间链接的 skill、链接到 `AGENTS.md` 的 `CLAUDE.md` 都和其他文件一样会被记住。离开这个范围的链接、绝对路径和循环链接都检查不了。如果你的主目录在仓库里面，或者项目之上有 `.git` 但都无法验证，任何链接都不会被跟随。
 - **非常大的配置只对这个窗口记住。** 如果一次回答的记录会超过 1 MiB（大约 1,900 个长文件名的文件），问题里会这么说，`y` 只在这个窗口里有效；不写任何记录，所以新窗口会再问。
 - 用任何其他方式启动会话，恢复标签页或继续一个对话，也要等这个回答。
 

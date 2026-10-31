@@ -12,7 +12,7 @@
 //! The fingerprint covers all of it by content: every file's bytes, every symlink's target as
 //! written and every directory's name. A link below a walked `.claude/`, whose whole content the CLI
 //! reads, in a walked `.codex/skills/`, whose whole content Codex reads, or in place of a memory file
-//! beside a walked `.claude/`, is also hashed through to what it reaches, when that is inside the top
+//! in a walked directory, is also hashed through to what it reaches, when that is inside the top
 //! level by a way that never leaves it. Anything that could not be hashed -- a file over the size
 //! limit, unreadable, a FIFO, a socket, a device, any other configuration file that is a link (and
 //! every other link below a `.claude/` or in a skill tree), or a walk over its budget -- leaves a gap

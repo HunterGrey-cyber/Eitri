@@ -290,7 +290,7 @@ project cannot be trusted in Eitri at all.
   check"), a symbolic link Eitri cannot follow in place of a configuration file or below `.claude/`, a file above
   the repository that belongs to neither you nor root, or a project with too many files, is named in the question
   as "cannot be checked", and `y` then covers that one start; nothing is saved and the next start asks again. On
-  a Claude tab, a link below `.claude/`, or in place of `CLAUDE.md` or `CLAUDE.local.md` beside it, is followed
+  a Claude tab, a link below `.claude/`, or in place of `CLAUDE.md` or `CLAUDE.local.md`, is followed
   when its relative target stays inside the repository (or the project folder, when it is not in one), and so is
   a link inside `.codex/skills/` on a Codex tab: Eitri checks what it reaches and shows the link with its target,
   so a skill linked between `.claude/skills/` and `.codex/skills/`, or a `CLAUDE.md` that links to `AGENTS.md`, is
