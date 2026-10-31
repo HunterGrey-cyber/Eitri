@@ -42,6 +42,11 @@ pub struct EditorContext {
 pub const CONTENT_LIMIT: usize = 2000;
 pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
+/// The name prefix of a proposal view's file side, a scratch buffer holding the file as it stands.
+pub const IDE_FILE_SCHEME: &str = "eitri-file://";
+/// The name prefix of a proposal view's proposal side, a buffer that writes nothing to disk.
+pub const IDE_PROPOSAL_SCHEME: &str = "eitri-proposal://";
+
 /// The built-in slash commands Claude Code 2.1.283 defines as `type: "local"` under a fixed name,
 /// with their aliases -- the commands its own code runs, rather than handing their argument to the
 /// model as prompt text.

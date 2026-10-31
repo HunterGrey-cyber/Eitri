@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 # `unbounded_depth` only adds a switch to lift the parser's 128-level limit, which a deep layout file
 # exceeds (three levels of JSON per container); the layout reader sets its own bound before parsing.
 serde_json = { version = "1", features = ["unbounded_depth"] }
+# `Sec-WebSocket-Accept` in the IDE listener's handshake. RustCrypto, beside `sha2` and on its `digest`; its licence
+# is `MIT OR Apache-2.0`. A new crate in the shipped set, with nothing behind it that the tree does not have already.
+sha1 = { version = "0.10", default-features = false }
 # Already linked through `agent`, so no new crate ships: the tmux import's fingerprint.
 sha2 = "0.10"
 # Reads Codex's TOML configuration for the trust prompt. Already linked into `shell` at 0.9.12 through

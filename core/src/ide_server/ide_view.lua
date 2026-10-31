@@ -1,0 +1,1 @@
+-- The proposal view in nvim: the Lua the constant chunks of view.rs run.

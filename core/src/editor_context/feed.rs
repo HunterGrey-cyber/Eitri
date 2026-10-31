@@ -41,6 +41,20 @@ pub(crate) const NVIM_EDITOR_CONTEXT_LUA: &str = include_str!("nvim_editor_conte
 pub(crate) const LOADER_CMD: &str =
     "lua local p = vim.env.EITRI_EDITOR_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
+/// What a selection push needs beyond [`EditorContext`], taken from the same line of the wire. Kept apart from it
+/// because only the window with an IDE listener asks: every other reader of a context, and the copy a linked window
+/// gets, stays as it was. Each field is absent on a line that does not carry it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushFacts {
+    /// 1-based, as the wire's lines are.
+    pub cursor_line: Option<u32>,
+    /// In UTF-16 units from the start of the selection's first line.
+    pub start_col: Option<u32>,
+    /// In UTF-16 units, exclusive, from the start of its last line. 0 for a linewise selection and for one ending on
+    /// an empty line.
+    pub end_col: Option<u32>,
+}
+
 pub struct EditorContextFeed {
     dir: PathBuf,
     socket_path: PathBuf,

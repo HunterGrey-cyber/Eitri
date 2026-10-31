@@ -91,6 +91,16 @@ pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
 }
 
+/// The `init.lua` key: `eitri.config.set("terminal.claude_ide", true | false)`. Whether a `claude` started in this
+/// window's bottom terminal can attach to its editor through the CLI's IDE lock file.
+pub const TERMINAL_CLAUDE_IDE_KEY: &str = "terminal.claude_ide";
+
+/// [`TERMINAL_CLAUDE_IDE_KEY`] as stored. Unset means off: it opens a port and writes under the CLI's own directory,
+/// which only someone who asked for it should get.
+pub fn parse_terminal_claude_ide(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(TERMINAL_CLAUDE_IDE_KEY, value, false)
+}
+
 /// The editor's presentation preference, read after init.lua has run.
 pub const EDITOR_PRESENTATION_KEY: &str = "editor.presentation";
 
@@ -366,6 +376,41 @@ mod tests {
                 .unwrap();
             let err = read().unwrap_err();
             assert!(err.contains("\"window.restore\""), "the refusal names its key: {err}");
+            assert!(err.contains("must be true or \"on\" / false or \"off\""), "{err}");
+        }
+    }
+
+    #[test]
+    fn terminal_claude_ide_is_off_by_default() {
+        assert_eq!(TERMINAL_CLAUDE_IDE_KEY, "terminal.claude_ide");
+        assert_eq!(parse_terminal_claude_ide(None), Ok(false));
+    }
+
+    #[test]
+    fn terminal_claude_ide_takes_both_spellings() {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+
+        for (set, want) in [("true", true), ("false", false), ("'on'", true), ("'off'", false)] {
+            lua.load(format!("eitri.config.set('terminal.claude_ide', {set})"))
+                .exec()
+                .unwrap();
+            let read = parse_terminal_claude_ide(store.borrow().get(TERMINAL_CLAUDE_IDE_KEY));
+            assert_eq!(read, Ok(want), "{set}");
+        }
+    }
+
+    #[test]
+    fn a_bad_terminal_claude_ide_names_the_key() {
+        for bad in ["yes", "1", "0", "", "TRUE", "nil"] {
+            let err = parse_terminal_claude_ide(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("\"terminal.claude_ide\""),
+                "the refusal names its key: {err}"
+            );
             assert!(err.contains("must be true or \"on\" / false or \"off\""), "{err}");
         }
     }

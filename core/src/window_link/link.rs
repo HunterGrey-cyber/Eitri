@@ -84,7 +84,7 @@ fn closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "the link closed before this was written")
 }
 
-fn eventfd() -> io::Result<OwnedFd> {
+pub(crate) fn eventfd() -> io::Result<OwnedFd> {
     // SAFETY: `eventfd` takes no pointers; a negative return is an error.
     let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if raw < 0 {
@@ -95,14 +95,14 @@ fn eventfd() -> io::Result<OwnedFd> {
 }
 
 /// Makes an eventfd readable. The only failure is a counter at its maximum, which is readable already.
-fn signal(fd: BorrowedFd<'_>) {
+pub(crate) fn signal(fd: BorrowedFd<'_>) {
     let one: u64 = 1;
     // SAFETY: writes the 8 bytes of `one`, which lives for the call.
     unsafe { libc::write(fd.as_raw_fd(), (&one as *const u64).cast(), 8) };
 }
 
 /// Makes an eventfd unreadable until the next `signal`.
-fn clear(fd: BorrowedFd<'_>) {
+pub(crate) fn clear(fd: BorrowedFd<'_>) {
     let mut count: u64 = 0;
     // SAFETY: reads at most 8 bytes into `count`, which lives for the call; a non-blocking eventfd at zero fails at once.
     unsafe { libc::read(fd.as_raw_fd(), (&mut count as *mut u64).cast(), 8) };

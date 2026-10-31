@@ -27,6 +27,8 @@ pub mod editor_open;
 pub mod editor_rpc;
 pub mod editor_tools;
 pub mod hint;
+#[cfg(target_os = "linux")]
+pub mod ide_server;
 pub mod instance_dir;
 pub mod keymap;
 pub mod layout;
