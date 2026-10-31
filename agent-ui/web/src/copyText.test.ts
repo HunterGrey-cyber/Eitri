@@ -21,6 +21,14 @@ describe("what y and Y copy", () => {
     expect(primaryText(run)).toBe("Read 2 files");
   });
 
+  it("y on a broker card copies its title and lines, not a null input", () => {
+    const card: TimelineItem = { kind: "permission", seq: 2, key: "ec-1", request: {
+      seq: 2, permissionId: "ec-1", toolUseId: null, toolName: "open_file", input: null,
+      editorCard: { title: "Load src/a.rs in your editor?", body: [{ kind: "plain", text: "It is not open." }, { kind: "code", text: "/p/src/a.rs" }] },
+    } };
+    expect(primaryText(card)).toBe("Load src/a.rs in your editor?\nIt is not open.\n/p/src/a.rs");
+  });
+
   it("Y copies a tool's whole output, never the cut one, and nothing else has an output", () => {
     const long = "x".repeat(10000);
     expect(outputText(tool("Bash", { command: "yes" }, long))).toBe(long);

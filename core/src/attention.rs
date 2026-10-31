@@ -68,7 +68,7 @@ fn draws_a_row(event: &AgentDomainEvent) -> bool {
 /// What the agent's tray chip shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attention {
-    /// Permission cards and structured questions waiting for the user.
+    /// Permission cards, structured questions and the tool broker's cards waiting for the user.
     pub pending: usize,
     /// A turn completed, or the session ended, while the chat was not on screen, and it has not
     /// been on screen since.
@@ -85,6 +85,8 @@ pub struct Attention {
 pub struct AttentionTracker {
     cards: BTreeMap<String, u64>,
     questions: BTreeMap<String, u64>,
+    /// The tool broker's cards, kept apart from `cards` so nothing that approves a tab's waiting cards can name one.
+    editor_cards: BTreeMap<String, u64>,
     unread: bool,
     arrived: u64,
     turn: TurnSeen,
@@ -112,6 +114,7 @@ impl AttentionTracker {
     pub fn restart(&mut self) {
         self.cards.clear();
         self.questions.clear();
+        self.editor_cards.clear();
         self.unread = false;
         self.turn = TurnSeen::Unknown;
         self.empty_cli_turn = false;
@@ -174,6 +177,7 @@ impl AttentionTracker {
     pub fn session_ended(&mut self, on_screen: bool) {
         self.cards.clear();
         self.questions.clear();
+        self.editor_cards.clear();
         if !on_screen {
             self.unread = true;
         }
@@ -215,6 +219,19 @@ impl AttentionTracker {
         }
     }
 
+    /// The tool broker's cards need attention the same way, and for the same reason are not in `card_ids`: only a
+    /// person's answer on a card's own id settles one.
+    pub fn sync_editor_cards(&mut self, waiting: impl IntoIterator<Item = String>) {
+        let ids: BTreeSet<String> = waiting.into_iter().collect();
+        self.editor_cards.retain(|id, _| ids.contains(id));
+        for id in ids {
+            self.editor_cards.entry(id).or_insert_with(|| {
+                self.arrived += 1;
+                next_stamp()
+            });
+        }
+    }
+
     /// Forgets every card the projection no longer holds.
     pub fn retain_pending(&mut self, still_pending: impl Fn(&str) -> bool) {
         self.cards.retain(|id, _| still_pending(id));
@@ -237,17 +254,24 @@ impl AttentionTracker {
 
     /// When the oldest card still pending arrived, on the process-wide clock; `None` with no card.
     pub fn oldest_pending_stamp(&self) -> Option<u64> {
-        self.cards.values().chain(self.questions.values()).min().copied()
+        self.stamps().min().copied()
     }
 
     /// When the newest card still pending arrived.
     pub fn newest_pending_stamp(&self) -> Option<u64> {
-        self.cards.values().chain(self.questions.values()).max().copied()
+        self.stamps().max().copied()
+    }
+
+    fn stamps(&self) -> impl Iterator<Item = &u64> {
+        self.cards
+            .values()
+            .chain(self.questions.values())
+            .chain(self.editor_cards.values())
     }
 
     pub fn attention(&self) -> Attention {
         Attention {
-            pending: self.cards.len() + self.questions.len(),
+            pending: self.cards.len() + self.questions.len() + self.editor_cards.len(),
             unread: self.unread,
             arrived: self.arrived,
         }
@@ -750,5 +774,39 @@ mod tests {
                 reveal: false
             }
         );
+    }
+
+    #[test]
+    fn a_broker_card_is_counted_and_stamped_and_is_never_a_card_id() {
+        let mut tracker = AttentionTracker::default();
+        tracker.sync_editor_cards(["ec-1".to_owned()]);
+        let attention = tracker.attention();
+        assert_eq!((attention.pending, attention.arrived), (1, 1));
+        assert!(tracker.card_ids().is_empty());
+        assert!(tracker.oldest_pending_stamp().is_some());
+        assert_eq!(tracker.oldest_pending_stamp(), tracker.newest_pending_stamp());
+
+        tracker.sync_editor_cards(["ec-1".to_owned()]);
+        assert_eq!(tracker.attention().arrived, 1, "the same list again is no new arrival");
+        tracker.resync(Vec::new());
+        tracker.retain_pending(|_| false);
+        assert_eq!(tracker.attention().pending, 1, "a rebuilt card list says nothing of it");
+
+        tracker.sync_editor_cards(Vec::new());
+        assert_eq!(tracker.attention().pending, 0);
+        assert_eq!(tracker.attention().arrived, 1);
+    }
+
+    #[test]
+    fn a_session_that_ends_or_starts_over_owes_no_broker_card() {
+        let mut tracker = AttentionTracker::default();
+        tracker.sync_editor_cards(["ec-1".to_owned()]);
+        tracker.session_ended(true);
+        assert_eq!(tracker.attention().pending, 0);
+
+        tracker.sync_editor_cards(["ec-2".to_owned()]);
+        tracker.restart();
+        assert_eq!(tracker.attention().pending, 0);
+        assert_eq!(tracker.attention().arrived, 2, "what arrived stays counted");
     }
 }

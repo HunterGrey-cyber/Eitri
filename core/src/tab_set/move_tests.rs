@@ -50,7 +50,7 @@ fn set() -> TabSet {
 
 /// `TabSet::freeze_for_move`, asked again while its conversation folds a batch, as a window asks again on
 /// its next tick (the freeze itself never waits for the ingest thread).
-fn freeze_settled(set: &mut TabSet, tab: TabId) -> Result<FrozenTab, MoveRefusedWhy> {
+pub(super) fn freeze_settled(set: &mut TabSet, tab: TabId) -> Result<FrozenTab, MoveRefusedWhy> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match set.freeze_for_move(tab) {
@@ -148,6 +148,16 @@ fn moved(
     view: ViewId,
 ) -> TabId {
     let frozen = freeze_settled(source, tab).expect("the tab freezes");
+    take_up(frozen, dest, provider, view)
+}
+
+/// What a freeze gave, through JSON as the link carries it, taken up in `dest`'s `view` over `provider`.
+pub(super) fn take_up(
+    frozen: FrozenTab,
+    dest: &mut TabSet,
+    provider: Arc<dyn agent::AgentProvider + Send + Sync>,
+    view: ViewId,
+) -> TabId {
     let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
     let chat: FrozenChat =
         serde_json::from_str(&serde_json::to_string(&frozen.chat.expect("a live tab's chat")).unwrap()).unwrap();
@@ -172,7 +182,7 @@ fn kept(tab: &Tab) -> String {
     format!(
         "name {:?}\nmode {:?}\nagent {:?}\ncards {:?} unread {}\nfailed {} {:?}\nreview {:?}\nnotes {:?}\n\
          title {:?} {}\ntiers {:?}\nstart failure {}\nqueue {:?} {:?} {:?}\ndraft {:?}\noffers {:?}\n\
-         running {}\nledger {:?}\ncreates {:?}\nseen {:?}\nclock {:?} {}\nhost {:?}\nhuman {:?}\nuser {:?}\ngates {:?}",
+         running {}\nledger {:?}\ncreates {:?}\nseen {:?}\nclock {:?} {:?} {}\nhost {:?}\nhuman {:?}\nuser {:?}\ngates {:?}",
         tab.name,
         tab.mode,
         tab.agent,
@@ -196,6 +206,7 @@ fn kept(tab: &Tab) -> String {
         s.creates_file_unsent,
         s.rule_offers_seen,
         s.turn_clock,
+        s.last_began_turn,
         s.turn_times_unsent,
         s.host_answered,
         s.human_allowed,
@@ -2183,4 +2194,186 @@ fn a_moved_codex_or_acp_chats_lease_names_the_destination() {
         let _ = source.hand_over(tab);
         let _ = std::fs::remove_dir_all(&scratch);
     }
+}
+
+/// The turn ids a tab set reported as begun since the last call.
+fn began(set: &mut TabSet) -> Vec<String> {
+    set.take_client_news()
+        .into_iter()
+        .filter_map(|(_, news)| match news {
+            ClientCallNews::TurnBegan { turn_id } => Some(turn_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A window with no editor whose tabs were given `diagnostics`, for the broker's answers that need none.
+struct WithoutAnEditor {
+    root: PathBuf,
+}
+
+impl crate::editor_tools::broker::BrokerEnv for WithoutAnEditor {
+    fn way(&self) -> Option<&dyn crate::editor_tools::way::EditorWay> {
+        None
+    }
+
+    fn facts(&self, _tab: TabId) -> Option<crate::editor_tools::broker::TabFacts> {
+        Some(crate::editor_tools::broker::TabFacts {
+            mode: agent::PermissionMode::Manual,
+            trust: agent::setting_sources::ProjectTrust::Trusted,
+            session: "session".to_owned(),
+            process: "process".to_owned(),
+            revision: 1,
+            declared: std::rc::Rc::new(BTreeSet::from(["diagnostics".to_owned()])),
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn home(&self) -> Option<&Path> {
+        None
+    }
+
+    fn context(&self) -> Option<crate::editor_context::EditorContext> {
+        None
+    }
+}
+
+/// The clock crosses a move, and so does the note of the turn it names as begun: the destination's first pump finds
+/// them equal and reports nothing, so no baseline is taken mid-turn that would hide what appeared before the move.
+#[test]
+fn a_moved_tab_mid_turn_takes_no_baseline() {
+    use crate::editor_tools::broker::{Broker, BrokerOut, Caller};
+    let dir = workspace("move-no-baseline");
+    let mut source = set();
+    let (provider, tab) = live_tab(&mut source, &dir);
+    provider.queue_all(vec![opened(&dir), started("t1")]);
+    let mut told = Vec::new();
+    until("the source to report the turn", || {
+        source.pump(&dir, true);
+        told.extend(began(&mut source));
+        !told.is_empty()
+    });
+    assert_eq!(told, ["t1"], "the source reports the turn it saw begin");
+
+    let mut dest = set();
+    let arrived = moved(&mut source, tab, &mut dest, provider.clone(), ViewId::BASE);
+    dest.pump(&dir, true);
+    dest.pump(&dir, true);
+    dest.state_payloads(arrived);
+    dest.pump(&dir, true);
+    assert!(began(&mut dest).is_empty(), "the turn did not begin again");
+    let session = &dest.get(arrived).unwrap().session;
+    assert_eq!(session.last_began_turn.as_deref(), Some("t1"));
+    assert!(session.turn_clock.is_some(), "the clock crossed too");
+
+    let env = WithoutAnEditor { root: dir.clone() };
+    let mut broker = Broker::new();
+    let now = Instant::now();
+    let caller = Caller::Sidecar { call_id: "c1".into() };
+    let mut out = broker.submit(arrived, caller, None, "diagnostics", r#"{"since":"turn"}"#, &env, now);
+    out.extend(broker.tick(&env, now));
+    let [BrokerOut::Answer { result, .. }] = &out[..] else {
+        panic!("one answer: {out:?}");
+    };
+    assert!(result.is_error);
+    assert_eq!(result.text, "no baseline for this turn");
+
+    // The next turn there is the destination's to report.
+    provider.queue_all(vec![completed("t1"), started("t2")]);
+    pump_until(&mut dest, &dir, "the next turn", |s| {
+        s.get(arrived).unwrap().session.last_began_turn.as_deref() == Some("t2")
+    });
+    assert_eq!(began(&mut dest), ["t2"]);
+    let _ = source.hand_over(tab);
+}
+
+/// A freeze's last pump can find a call. Nothing of a moving tab may start, and a refused move still owes it.
+#[test]
+fn a_frozen_tab_keeps_its_client_news_until_the_move_is_called_off() {
+    let dir = workspace("move-client-news");
+    let mut set = set();
+    let (provider, tab) = live_tab(&mut set, &dir);
+    provider.queue_all(vec![opened(&dir), started("t1")]);
+    pump_until(&mut set, &dir, "the turn", |s| s.get(tab).unwrap().turn_running());
+    provider.queue(AgentDomainEvent::ClientToolCall {
+        call_id: "c1".into(),
+        tool_use_id: None,
+        tool: "open_file".into(),
+        arguments_json: "{}".into(),
+        sequence: 1,
+    });
+    until("the call to fold", || {
+        !set.get(tab).unwrap().live().unwrap().open_client_calls().is_empty()
+    });
+    let _frozen = freeze_settled(&mut set, tab).expect("the tab freezes");
+    assert!(set.take_client_news().is_empty());
+
+    set.unfreeze(tab);
+    // The turn's beginning was found by the same pumps; this is about the call.
+    let news: Vec<_> = set
+        .take_client_news()
+        .into_iter()
+        .filter(|(_, news)| !matches!(news, ClientCallNews::TurnBegan { .. }))
+        .collect();
+    assert!(
+        matches!(&news[..], [(id, ClientCallNews::Opened(call))] if *id == tab && call.call_id == "c1"),
+        "{news:?}"
+    );
+}
+
+/// The line is for a page of the window that saw the report, and stays there: the window the tab lands
+/// in reads the same report from the moved projection and says it once on its own page.
+#[test]
+fn the_window_a_tab_lands_in_says_a_foreign_server_on_its_own_page() {
+    let dir = workspace("move-foreign-server");
+    let provider = Arc::new(RecordingProvider::client_tooling());
+    let tools = agent::ClientToolSet {
+        server_name: "eitri".into(),
+        timeout_ms: 900_000,
+        tools: vec![agent::ClientToolDecl {
+            name: "open_file".into(),
+            description: "opens a file".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+            always_load: true,
+        }],
+    };
+    let conversation = AgentConversation::create_with_tools(
+        provider.clone(),
+        &dir,
+        agent::setting_sources::ProjectTrust::Untrusted,
+        Some(tools),
+    )
+    .unwrap();
+    let mut source = set();
+    let tab = source.active();
+    source.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+        agent: AgentId::Claude,
+        conversation: Box::new(conversation),
+    });
+    provider.queue_all(vec![
+        opened(&dir),
+        AgentDomainEvent::SessionServers {
+            servers: vec![agent::InitServer {
+                name: "eitri".into(),
+                status: "connected".into(),
+                source: "project".into(),
+            }],
+        },
+    ]);
+    until("the line in the window it leaves", || {
+        source.pump(&dir, true);
+        !source.take_editor_notes().is_empty()
+    });
+
+    let mut dest = set();
+    let arrived = moved(&mut source, tab, &mut dest, provider.clone(), ViewId::BASE);
+    dest.pump(&dir, true);
+    let said: Vec<TabId> = dest.take_editor_notes().into_iter().map(|(tab, _)| tab).collect();
+    assert_eq!(said, [arrived]);
+    dest.pump(&dir, true);
+    assert!(dest.take_editor_notes().is_empty(), "once in this window too");
+    let _ = source.hand_over(tab);
 }

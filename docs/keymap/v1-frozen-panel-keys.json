@@ -109,6 +109,13 @@
   {
     "keys": [
       "<leader>",
+      "e"
+    ],
+    "action": "tab.follow"
+  },
+  {
+    "keys": [
+      "<leader>",
       "?"
     ],
     "action": "panel.keymap"

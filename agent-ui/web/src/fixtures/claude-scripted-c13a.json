@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793217968198,
+      "occurred_at": 1793397400594,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+      "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "07b23c17-052f-4bf7-b476-d697b3e96db4",
-      "session_id": "d32f37bc-f98a-4768-a145-2e758040d981",
+      "provider_session_id": "9801f112-c9ef-44f9-908d-1086808856ac",
+      "session_id": "a5e5a220-a89e-4b8f-8417-3f8ade761180",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -240,7 +244,7 @@
         "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
         "error_status": 529,
         "max_retries": 2,
-        "retry_delay_ms": 576
+        "retry_delay_ms": 578
       },
       "task_id": null,
       "task_status": null,
@@ -256,7 +260,7 @@
         "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
         "error_status": 529,
         "max_retries": 2,
-        "retry_delay_ms": 1024
+        "retry_delay_ms": 1144
       },
       "task_id": null,
       "task_status": null,
@@ -266,7 +270,7 @@
     {
       "kind": "text",
       "text": "C13A-OK",
-      "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+      "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
       "type": "content_delta"
     },
     {
@@ -279,7 +283,7 @@
       "outcome": "completed",
       "result_text": "C13A-OK",
       "stop_reason": "end_turn",
-      "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+      "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -297,12 +301,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793217968198,
+        "occurred_at": 1793397400594,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+        "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
         "type": "turn_started"
       },
       {
@@ -509,13 +513,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "07b23c17-052f-4bf7-b476-d697b3e96db4",
-        "session_id": "d32f37bc-f98a-4768-a145-2e758040d981",
+        "provider_session_id": "9801f112-c9ef-44f9-908d-1086808856ac",
+        "session_id": "a5e5a220-a89e-4b8f-8417-3f8ade761180",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -536,7 +544,7 @@
           "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
           "error_status": 529,
           "max_retries": 2,
-          "retry_delay_ms": 576
+          "retry_delay_ms": 578
         },
         "task_id": null,
         "task_status": null,
@@ -552,7 +560,7 @@
           "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
           "error_status": 529,
           "max_retries": 2,
-          "retry_delay_ms": 1024
+          "retry_delay_ms": 1144
         },
         "task_id": null,
         "task_status": null,
@@ -562,7 +570,7 @@
       {
         "kind": "text",
         "text": "C13A-OK",
-        "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+        "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
         "type": "content_delta"
       },
       {
@@ -575,7 +583,7 @@
         "outcome": "completed",
         "result_text": "C13A-OK",
         "stop_reason": "end_turn",
-        "turn_id": "d1b2a4ad-8bcf-4d5e-90a6-e81c66260cea",
+        "turn_id": "9eed35be-a202-4d70-b154-2cfa7217836b",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -593,7 +601,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 10
+    "throughRevision": 11
   },
   "scenario": "c13a",
   "snapshot": {
@@ -820,7 +828,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 5,
+          "seq": 6,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -838,7 +846,7 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 8,
+          "seq": 9,
           "text": "C13A-OK"
         }
       ],
@@ -857,7 +865,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 10,
+    "throughRevision": 11,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

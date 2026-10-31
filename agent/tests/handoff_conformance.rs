@@ -57,6 +57,7 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
             cwd: cwd.clone(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
 

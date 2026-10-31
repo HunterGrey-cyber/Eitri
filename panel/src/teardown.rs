@@ -513,6 +513,7 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
                 }
                 // Its question goes with it: a record still being written for it starts nothing.
                 state.trust.forget_tab(tab);
+                editor_glue::tab_gone(state, tab);
             }
         }
     }

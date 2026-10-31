@@ -5,7 +5,7 @@ import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (left of the
  *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -74,6 +74,7 @@ export type BandFacts = {
    *  nothing: optional things show nothing until there is something to show. */
   background?: number | null;
   backgroundTasks?: BackgroundTaskRecord[];
+  following?: boolean;
 };
 
 /** The band's count of the commands an agent left running after its turns ended. */
@@ -297,6 +298,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${revealedText(f.approve.tool)}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
     ...(background ? [{ id: "background", text: background, side: "left" } as Seg] : []),
+    ...(f.following ? [{ id: "following", text: "following", side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),
     ...(f.recovery ? [{ id: "recovery", text: recoverySegment(f.recovery.path, f.recovery.more), side: "left" } as Seg] : []),
     ...(f.message ? [{ id: "message", text: f.message, side: "left" } as Seg] : []),
@@ -325,6 +327,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.filter((x) => x.id !== "position"),
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
     (s) => s.filter((x) => x.id !== "queue"),
+    (s) => s.filter((x) => x.id !== "following"),
     // The Ctrl+y segment keeps the tool it names before it goes, and goes before the card
     // count -- `⚑N` is shorter, and still says a card waits.
     (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${revealedText(f.approve.tool)}` } : x)),

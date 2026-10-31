@@ -124,6 +124,7 @@ fn grpc_fresh_resume_and_adopt_preserve_the_prompt_choice() {
                 cwd: dir.0.to_string_lossy().into_owned(),
                 streaming: StreamingPreference::Partial,
                 project: ProjectTrust::Untrusted,
+                client_tools: None,
             })
             .unwrap();
         let provider_id = opened(&source, &fresh);
@@ -133,6 +134,7 @@ fn grpc_fresh_resume_and_adopt_preserve_the_prompt_choice() {
             cwd: dir.0.to_string_lossy().into_owned(),
             streaming: StreamingPreference::Partial,
             project: ProjectTrust::Untrusted,
+            client_tools: None,
         };
         let session = source.resume_session(resume()).expect("resume must run, never skip");
         assert_eq!(opened(&source, &session), provider_id);

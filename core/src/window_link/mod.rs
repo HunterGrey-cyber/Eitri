@@ -23,7 +23,7 @@ pub mod start;
 pub mod summary;
 pub mod workspace_move;
 
-pub use editor_op::{EditorOp, WireEol, WireHunk, WireLine, WireMeta, WireScope};
+pub use editor_op::{EditorOp, WireEol, WireHunk, WireLine, WireMeta, WireScope, WireStamp};
 pub use msg::{
     DraftEnd, Drawn, EdgeKind, EditorRequest, FocusTarget, Frame, Header, HubAsk, LinkError, Msg, ReplyResult, Shape,
     Side, Summary, TurnEdge, INLINE_MAX, MAX_MOVE_FDS, PROTOCOL_VERSION,

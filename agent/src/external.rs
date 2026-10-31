@@ -65,6 +65,16 @@ pub struct TrustPlan {
     pub project_only: Vec<String>,
 }
 
+/// A stdio tool server the host wants this session's agent to run: the host starts nothing itself, and the agent
+/// takes the server up in its own way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorServerSpec {
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+}
+
 /// Everything a start or a resume needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalStart {
@@ -73,6 +83,8 @@ pub struct ExternalStart {
     pub policy: TurnPolicy,
     /// The agent's own id of the session to continue; `None` starts a fresh one.
     pub resume: Option<String>,
+    /// The tool server this session is to run; `None` when it was given no tools.
+    pub editor_server: Option<EditorServerSpec>,
 }
 
 /// How full an agent says its context window is. A gauge, not a count of tokens spent.
@@ -102,6 +114,11 @@ pub trait ExternalProvider: AgentProvider {
     /// returns these events.
     fn take_history(&self) -> Vec<AgentDomainEvent> {
         Vec::new()
+    }
+    /// What the tab should say about editor tools the host gave this session and the provider left out, handed
+    /// over once. The host reads it after the start, when the provider's own check has had its say.
+    fn editor_note(&self) -> Option<String> {
+        None
     }
     /// How full the agent last said its context window is, for an agent that reports it that way.
     fn context_gauge(&self) -> Option<ContextGauge> {

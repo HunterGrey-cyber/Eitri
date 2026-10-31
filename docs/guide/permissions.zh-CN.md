@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=136a77c387dc7036b3442f2d5cdfd32af7392e14cbc2ba217c536a6330c655f6 -->
+<!-- translated-from: permissions.md sha256=fc77bc4f9b34f5dd3c629dd599ca5be250707145c8757f662bd8b8a5335e2227 -->
 
 # 权限与信任
 
@@ -8,6 +8,8 @@
 怎样用键盘回答一张卡片，见[快速上手](getting-started.zh-CN.md)和[按键](keys.zh-CN.md#answering-a-card)。
 
 这一页讲的是 Claude 标签页。运行 Codex 或你注册的 agent 的标签页有它自己的沙箱、审查者和信任问题，它们在 [Codex 与其他 agent](agents.zh-CN.md) 里描述。
+
+agent 的[编辑器工具](editor-tools.zh-CN.md)（`mcp__eitri__open_file` 等）在每一种标签页里都不受这些约束：保存的规则、下面 Manual 和 Auto 的规则、Claude Code 的 auto 模式都不判断它们。Eitri 给它们的表[在它们自己那一页](editor-tools.zh-CN.md#cards)，它们的卡片有哪些不同也写在那里。
 
 ## 谁来决定一次工具调用
 
@@ -45,7 +47,7 @@ Claude Code 可能回退到它普通的默认模式，而且某些已安装的�
 
 ### Bypass
 
-在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。只能从 auto 进入 bypass。离开 bypass 不需要确认，并且会落到 manual。
+在 bypass 下，Eitri 自己批准每一次调用，不出卡片。这也包括 Claude Code 自己提出的问题（[下一节](#when-claude-code-itself-asks)），连你自己的 `permissions.ask` 规则强制发出的问题也在内：在 bypass 标签页里，ask 规则什么也拦不住。唯一的例外是 [`nvim_exec`](editor-tools.zh-CN.md#nvim-exec)，一个你打开之前一直关着的编辑器工具：它的每次调用都是一张卡片，在 bypass 下也一样。因为这意味着很大的信任，`Shift+Tab` 进入 bypass 时会先问。这个问题是一个 `y/n`，会说明还有什么会变：如果标签页里有卡片在等，它写的是 “Switch to bypass and approve the N waiting cards?”，每一张在等的卡片都算在内，但 agent 的[编辑器工具](editor-tools.zh-CN.md#cards)的卡片除外，进入 bypass 从不回答它。只有单独按下、并且在问题出现片刻之后按的 `y` 才算数，而且只有此刻仍在等待的卡片会被批准。只能从 auto 进入 bypass。离开 bypass 不需要确认，并且会落到 manual。
 
 Claude 问你的选择题，bypass 永远不会回答（[Claude 问你的问题](#claudes-questions-to-you)）。
 

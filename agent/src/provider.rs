@@ -40,6 +40,9 @@ pub struct CreateSessionRequest {
     pub streaming: StreamingPreference,
     /// Whether the project's own settings tiers load (`crate::setting_sources::for_session`).
     pub project: ProjectTrust,
+    /// The tools this host answers itself. A provider sends them only when its peer offers the
+    /// capability `client_tools` and the set names at least one tool.
+    pub client_tools: Option<ClientToolSet>,
 }
 
 /// Continue an existing provider (Claude) session rather than starting a fresh one.
@@ -56,6 +59,62 @@ pub struct ResumeSessionRequest {
     /// Whether the project's own settings tiers load. Stated afresh for every resume: the
     /// conversation continues, but what the project may run is decided now, not when it began.
     pub project: ProjectTrust,
+    /// As on [`CreateSessionRequest`]: stated for every resume, since each start of the CLI gets the
+    /// list its request names and a resumed session inherits none.
+    pub client_tools: Option<ClientToolSet>,
+}
+
+/// Tools the host declares on a session and answers itself, seen by the model as
+/// `mcp__<server_name>__<tool>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientToolSet {
+    pub server_name: String,
+    /// The CLI's own limit on one call. Past it the call fails to the model, whatever the host does.
+    pub timeout_ms: u32,
+    pub tools: Vec<ClientToolDecl>,
+}
+
+/// One tool of a [`ClientToolSet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientToolDecl {
+    /// Without the `mcp__<server>__` prefix.
+    pub name: String,
+    pub description: String,
+    /// The tool's JSON Schema as JSON text.
+    pub input_schema_json: String,
+    /// In the model's tool list from the first request, instead of waiting for a tool search.
+    pub always_load: bool,
+}
+
+/// The host's answer to one call of a declared tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientToolAnswer {
+    pub session_id: String,
+    pub call_id: String,
+    /// The answer's text blocks, in order.
+    pub text: Vec<String>,
+    /// The tool failed: the model reads `text` as the error.
+    pub is_error: bool,
+}
+
+/// One call still waiting for an answer, as a read of the open calls gives it: its ids and no
+/// arguments, because that read serves a host answering calls it will not run. The arguments are on the
+/// call's event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCallRef {
+    pub call_id: String,
+    pub tool_use_id: Option<String>,
+    pub tool: String,
+}
+
+/// The calls open at one point of the session's event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientToolCallState {
+    /// The event sequence this reading is consistent with: a call at or below it and not in `open` has
+    /// settled, and later events apply on top of it.
+    pub through_sequence: u64,
+    /// Oldest first.
+    pub open: Vec<ClientCallRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +440,10 @@ pub struct ProviderCapabilities {
     /// The sidecar can hand Claude's questions to this host to answer, when the session asks for it.
     #[serde(default)]
     pub structured_questions_v1: bool,
+    /// The sidecar serves tools this host declares and answers (`ClientToolCall`), when the session
+    /// declares some. Protocol 3.23; read from the handshake's list alone, as the flags above.
+    #[serde(default)]
+    pub client_tools: bool,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -459,6 +522,10 @@ pub enum ProviderErrorCode {
     InteractionNotFound,
     /// An answer to a question was refused as it was given.
     InteractionAnswerRefused,
+    /// An answer named a call of a tool this host serves that the session does not hold.
+    ClientToolCallNotFound,
+    /// An answer named a call that is already over: answered first, or settled some other way.
+    ClientToolCallAlreadyAnswered,
 }
 
 impl ProviderErrorCode {
@@ -482,6 +549,8 @@ impl ProviderErrorCode {
                 | ProviderErrorCode::TaskOutputUnavailable
                 | ProviderErrorCode::InteractionNotFound
                 | ProviderErrorCode::InteractionAnswerRefused
+                | ProviderErrorCode::ClientToolCallNotFound
+                | ProviderErrorCode::ClientToolCallAlreadyAnswered
         )
     }
 }
@@ -619,6 +688,20 @@ pub trait AgentProvider {
     fn get_interaction_state(&self, session_id: &str) -> Result<InteractionState, ProviderError> {
         let _ = session_id;
         Err(ProviderError::UnsupportedCapability("structured_questions_v1"))
+    }
+    /// Hands one answer to the agent without waiting for it: the caller is the UI thread. `Err` is a
+    /// refusal before anything was sent, `Ok` the send on its way, and what becomes of it arrives
+    /// through [`pump`](Self::pump) (`ClientToolCallSettled`). The first answer to a call wins, and a
+    /// call that has settled, or a session that has closed, makes an answer pointless rather than wrong,
+    /// so neither comes back as an error.
+    fn answer_client_tool_call(&self, answer: ClientToolAnswer) -> Result<(), ProviderError> {
+        let _ = answer;
+        Err(ProviderError::UnsupportedCapability("client_tools"))
+    }
+    /// Reads the session's open calls on the provider runtime. The receiver carries the outcome.
+    fn client_tool_call_state(&self, session_id: &str) -> Result<TaskReply<ClientToolCallState>, ProviderError> {
+        let _ = session_id;
+        Err(ProviderError::UnsupportedCapability("client_tools"))
     }
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError>;
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --

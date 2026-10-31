@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=ba4a0ffd65f4d2fb1c090ccbb754b9567cf58627c7394e831169077829d06d16 -->
+<!-- translated-from: README.md sha256=de0d5c9ff0a9a11209cf0e7569d5c970d4f070c8c73ede316fc7946cacacd843 -->
 
 # Eitri 文档
 
@@ -38,5 +38,6 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [Markdown 预览](markdown-preview.zh-CN.md)：在编辑器旁边显示渲染后的 Markdown 文件，和编辑器一起滚动，用 Vim 键阅读。
 - [权限](permissions.zh-CN.md)：什么不经询问就运行，什么要等一张卡片，以及 bypass 模式。
 - [Codex 与其他 agent](agents.zh-CN.md)：运行 Codex，或你注册的、说 ACP 的 agent 的标签页。
+- [从 agent 标签页使用你的编辑器](editor-tools.zh-CN.md)：任何标签页里的 agent 怎样给你看文件、读你的编辑器里有什么、询问你的语言服务器、提议改动等你批准，以及怎样关掉。
 - [你自己做的页面](pages.zh-CN.md)：把你自己的 HTML 页面作为 Lua 面板，或者带清单的插件页面（实验性）。
 - [已知问题](../known-issues.zh-CN.md)：今天不支持的和还比较粗糙的地方。

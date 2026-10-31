@@ -21,17 +21,25 @@
 //! The verdict is cached per [`BinaryKey`] (path, size, modification time, version) and names the revision
 //! of the check that earned it, so a pass from an older check does not answer for a newer one; a failure is
 //! not cached, so a transient one is retried at the next start, with the reasons kept in a log.
+//!
+//! **One lever is read apart from the pass.** A session given the editor's server relies on its approval mode
+//! keeping Codex from asking about the server's tools. Codex ignores a key it does not know without a word, so
+//! the only proof is the effect: once the run has passed, one more process calls a tool that no hint makes
+//! quiet and looks for the call having run with nothing asked. The result is recorded beside the pass and never
+//! fails it: without this lever a tab loses only the editor's tools. It is kept with the pass, so a lever that
+//! merely could not be read, unlike a failed run, stays false until the binary or [`CHECK_REVISION`] changes.
 
 use super::config::{expected_echo, session_config};
+use super::provider::MCP_STARTING;
 use super::scripted_model::{ScriptedModel, Step};
 use super::translate::{parse_user_agent_version, version_text};
 use super::tripwire;
 use super::wire::{
-    method, Decision, DecisionResponse, InitializeParams, InitializeResponse, ThreadResumeParams, ThreadStartParams,
-    ThreadStartResponse, TurnStartParams,
+    method, Decision, DecisionResponse, ElicitationResponse, InitializeParams, InitializeResponse, ThreadResumeParams,
+    ThreadStartParams, ThreadStartResponse, TurnStartParams,
 };
 use crate::external::Sandbox;
-use crate::external::{DirTrust, Reviewer, TrustPlan};
+use crate::external::{DirTrust, EditorServerSpec, Reviewer, TrustPlan};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkSpec};
 use crate::private_fs::{create_private_dir_all, open_private, read_private_to_string, write_private};
 use serde_json::{json, Value};
@@ -54,13 +62,18 @@ pub const SCRIPTED_MODEL_SLUG: &str = "gpt-6-luna";
 /// The notice every refused start carries; `{}` is the log's path.
 const NOTICE: &str = "Eitri could not confirm that this Codex keeps its levers; see";
 
-/// Everything the check does must be over in this time.
+/// Everything that decides whether the check passes must be over in this time.
 const CHECK_BUDGET: Duration = Duration::from_secs(150);
-/// How long a start waits for another start's check of the same binary: that check's own budget, and some
-/// time for what it does around it.
-const LOCK_WAIT: Duration = Duration::from_secs(CHECK_BUDGET.as_secs() + 30);
+/// What the process that reads the editor server's lever may take, on top of [`CHECK_BUDGET`]. Its answer is
+/// kept with the pass, so a run that used up the check's own budget must not leave it short of time.
+const LEVER_BUDGET: Duration = Duration::from_secs(45);
+/// How long a start waits for another start's check of the same binary: that check's own budgets, and some
+/// time for what it does around them.
+const LOCK_WAIT: Duration = Duration::from_secs(CHECK_BUDGET.as_secs() + LEVER_BUDGET.as_secs() + 30);
 /// How long `codex --version` may take.
 const VERSION_BUDGET: Duration = Duration::from_secs(10);
+/// How long a tool server may take to leave `starting`: a little over what the session config gives it.
+const SERVER_START_BUDGET: Duration = Duration::from_secs(20);
 /// One request's answer.
 const CALL_BUDGET: Duration = Duration::from_secs(30);
 /// A turn, children included.
@@ -71,7 +84,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// is judged by change**: a recorded pass names the revision it was earned under, and a pass of any other
 /// revision is not a pass, so a binary an older, weaker check let through is checked again. A verdict
 /// written before revisions were recorded has none and is not a pass either.
-const CHECK_REVISION: u32 = 3;
+const CHECK_REVISION: u32 = 4;
 /// The directory under Eitri's state directory that holds one directory per checked binary.
 const CHECK_DIR: &str = "codex-check";
 /// The file in a binary's check directory that records how its last run ended, so the starts that waited
@@ -83,6 +96,7 @@ const HOOKS_LIST: &str = "hooks/list";
 const PARENT_PROMPT: &str = "EITRI-CHECK-PARENT-PROMPT";
 const CHILD_TASK: &str = "EITRI-CHECK-CHILD-TASK";
 const RESUME_PROMPT: &str = "EITRI-CHECK-RESUME-PROMPT";
+const LEVER_PROMPT: &str = "EITRI-CHECK-LEVER-PROMPT";
 const READ_ONLY_PROMPT: &str = "EITRI-CHECK-READ-ONLY-PROMPT";
 const AGENTS_MARKER: &str = "EITRI-CHECK-AGENTS-MARKER";
 const SKILL_NAME: &str = "eitri-check-skill";
@@ -91,6 +105,15 @@ const EXTRA_PERMISSIONS_FIELD: &str = "with_additional_permissions";
 const PROJECT_TOOL_SERVER: &str = "eitri_check_tool_server";
 /// The namespace Codex's multi-agent tools live in.
 const AGENT_NAMESPACE: &str = "collaboration";
+/// The name the editor's server goes by in a session, and the namespace the model sees its tools under.
+const EDITOR_SERVER: &str = "eitri";
+const EDITOR_NAMESPACE: &str = "mcp__eitri";
+/// The tool of `check_fixture/tool_server.sh`.
+const EDITOR_TOOL: &str = "probe";
+/// The scripted model's call of that tool.
+const EDITOR_CALL: &str = "ed1";
+/// What the tool's call leaves in the run's marker directory.
+const EDITOR_MARKER: &str = "editor-server";
 
 const FIXTURE_HOME: &str = include_str!("check_fixture/home.toml");
 /// The fixture project: where each file goes, and the templates they are written from.
@@ -104,6 +127,7 @@ const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
 ];
 const FIXTURE_HOOK_STATE: &str = include_str!("check_fixture/hook_state.toml");
 const FIXTURE_MARKER_SH: &str = include_str!("check_fixture/marker.sh");
+const FIXTURE_TOOL_SERVER_SH: &str = include_str!("check_fixture/tool_server.sh");
 
 // ------------------------------------------------------------------------------------ the error
 
@@ -301,12 +325,22 @@ fn probe_version(program: &Path) -> Result<String, String> {
 ///
 /// `state_home` is Eitri's own state directory; the check keeps `codex-check/<key>/` in it (0700, its
 /// files 0600): the verdict, the log of the last run, and, while a run is going, its scratch directory.
-/// Concurrent callers take turns on a lock, so the second finds the first's verdict. Returns the key of
-/// the binary that passed, so the caller can tell whether what it starts afterwards is still that binary.
-pub fn ensure_checked(program: &Path, state_home: &Path) -> Result<BinaryKey, SelfCheckError> {
+/// Concurrent callers take turns on a lock, so the second finds the first's verdict. Answers what a start needs
+/// from the pass: see [`Checked`].
+pub fn ensure_checked(program: &Path, state_home: &Path) -> Result<Checked, SelfCheckError> {
     ensure_checked_with(program, state_home, true, |key, run_dir, log| {
         run_check(program, key, run_dir, log, &CheckTweaks::default())
     })
+}
+
+/// What a pass leaves a start with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    /// The binary that passed, so the caller can tell whether what it starts afterwards is still that binary.
+    pub key: BinaryKey,
+    /// Whether a session's approval mode kept this binary from asking about a call of the editor's server.
+    /// Not part of the pass: a binary without it runs every tab, only without the editor's tools.
+    pub editor_server_lever: bool,
 }
 
 /// Deliberate faults for the check's own tests: a check that cannot fail proves nothing. A run with
@@ -320,6 +354,8 @@ pub struct CheckTweaks {
     pub drop_skills_lever: bool,
     /// The fixture project is trusted, as a lever that no longer holds would leave it.
     pub grant_trust: bool,
+    /// The editor server's entry loses its approval mode, as a Codex that ignores the key would treat it.
+    pub drop_approval_lever: bool,
     /// The thread that should be read-only gets the workspace sandbox, as a Codex that ignored the ask would.
     pub widen_read_only: bool,
 }
@@ -327,7 +363,11 @@ pub struct CheckTweaks {
 #[cfg(feature = "test-support")]
 impl CheckTweaks {
     fn any(&self) -> bool {
-        self.spawn_without_namespace || self.drop_skills_lever || self.grant_trust || self.widen_read_only
+        self.spawn_without_namespace
+            || self.drop_skills_lever
+            || self.grant_trust
+            || self.drop_approval_lever
+            || self.widen_read_only
     }
 }
 
@@ -338,19 +378,20 @@ pub fn ensure_checked_tweaked(
     program: &Path,
     state_home: &Path,
     tweaks: &CheckTweaks,
-) -> Result<BinaryKey, SelfCheckError> {
+) -> Result<Checked, SelfCheckError> {
     ensure_checked_with(program, state_home, !tweaks.any(), |key, run_dir, log| {
         run_check(program, key, run_dir, log, tweaks)
     })
 }
 
-/// The cache around a check: `run` is the check itself, given the key, a scratch directory and the log.
+/// The cache around a check: `run` is the check itself, given the key, a scratch directory and the log. It
+/// answers the editor server's lever when the binary passed.
 fn ensure_checked_with(
     program: &Path,
     state_home: &Path,
     record: bool,
-    run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<(), Vec<String>>,
-) -> Result<BinaryKey, SelfCheckError> {
+    run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<bool, Vec<String>>,
+) -> Result<Checked, SelfCheckError> {
     Pending::new(program, state_home)?.finish(LOCK_WAIT, record, run)
 }
 
@@ -392,8 +433,8 @@ impl Pending {
         self,
         lock_wait: Duration,
         record: bool,
-        run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<(), Vec<String>>,
-    ) -> Result<BinaryKey, SelfCheckError> {
+        run: impl FnOnce(&BinaryKey, &Path, &mut Log) -> Result<bool, Vec<String>>,
+    ) -> Result<Checked, SelfCheckError> {
         let Pending {
             key,
             state_home,
@@ -407,8 +448,11 @@ impl Pending {
             log: log_path.clone(),
         };
         let verdict_path = dir.join("verdict.json");
-        if verdict_is_pass(&verdict_path, &key) {
-            return Ok(key);
+        if let Some(editor_server_lever) = recorded_pass(&verdict_path, &key) {
+            return Ok(Checked {
+                key,
+                editor_server_lever,
+            });
         }
         // One check at a time per binary; whoever waits finds the verdict, or the failure of the run it
         // waited for. Waiting has an end, so a check that hangs past its own budget does not hold every
@@ -417,8 +461,11 @@ impl Pending {
             std::io::ErrorKind::TimedOut => SelfCheckError::Unfinished { waited: lock_wait },
             _ => fail(format!("the check's lock could not be taken: {e}")),
         })?;
-        if verdict_is_pass(&verdict_path, &key) {
-            return Ok(key);
+        if let Some(editor_server_lever) = recorded_pass(&verdict_path, &key) {
+            return Ok(Checked {
+                key,
+                editor_server_lever,
+            });
         }
         // A run that failed while this start waited answers it too: running the same check again at once
         // would only make every waiting start pay a few seconds for the same answer. A start that comes
@@ -438,7 +485,7 @@ impl Pending {
         let result = run(&key, &run_dir, &mut log);
         let _ = std::fs::remove_dir_all(&run_dir);
         log.line(match &result {
-            Ok(()) => format!("passed in {:.1}s", started.elapsed().as_secs_f32()),
+            Ok(_) => format!("passed in {:.1}s", started.elapsed().as_secs_f32()),
             Err(_) => format!("FAILED after {:.1}s", started.elapsed().as_secs_f32()),
         });
         if let Err(reasons) = &result {
@@ -462,20 +509,24 @@ impl Pending {
             }
         }
         match result {
-            Ok(()) => {
+            Ok(editor_server_lever) => {
                 if record {
                     let verdict = json!({
                         "version": 1,
                         "result": "passed",
                         "check_revision": CHECK_REVISION,
                         "key": key.describe(),
+                        "editor_server_lever": editor_server_lever,
                         "checked_at": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
                     });
                     if let Err(e) = write_replacing(&dir, "verdict.json", &verdict) {
                         eprintln!("agent: the Codex check's verdict could not be recorded: {e}");
                     }
                 }
-                Ok(key)
+                Ok(Checked {
+                    key,
+                    editor_server_lever,
+                })
             }
             Err(reasons) => Err(SelfCheckError::Failed { reasons, log: log_path }),
         }
@@ -516,19 +567,20 @@ fn failed_since(path: &Path, seen: Option<&str>, key: &BinaryKey) -> Option<Vec<
     (!reasons.is_empty()).then_some(reasons)
 }
 
-/// A recorded pass for exactly this key, earned under this revision of the check. Anything unreadable,
-/// foreign, malformed, about another key or from another revision of the check is not a pass.
-fn verdict_is_pass(path: &Path, key: &BinaryKey) -> bool {
-    let Ok(text) = read_private_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    value.get("version") == Some(&json!(1))
+/// The editor server's lever of a recorded pass for exactly this key, earned under this revision of the check.
+/// Anything unreadable, foreign, malformed, about another key, from another revision of the check or silent
+/// about the lever is not a pass.
+fn recorded_pass(path: &Path, key: &BinaryKey) -> Option<bool> {
+    let text = read_private_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let pass = value.get("version") == Some(&json!(1))
         && value.get("result") == Some(&json!("passed"))
         && value.get("check_revision") == Some(&json!(CHECK_REVISION))
-        && value.get("key") == Some(&key.describe())
+        && value.get("key") == Some(&key.describe());
+    if !pass {
+        return None;
+    }
+    value.get("editor_server_lever")?.as_bool()
 }
 
 /// An exclusive `flock` on a private file, released when dropped.
@@ -600,11 +652,13 @@ impl Log {
 struct Layout {
     home: PathBuf,
     probe_home: PathBuf,
+    lever_home: PathBuf,
     project: PathBuf,
     outside: PathBuf,
     extra: PathBuf,
     markers: PathBuf,
     marker_sh: PathBuf,
+    tool_server_sh: PathBuf,
     /// Holds `outside` and `extra` when they could not be under the run directory; removed with the layout.
     _elsewhere: Elsewhere,
 }
@@ -751,16 +805,19 @@ fn build_layout(run_dir: &Path, tweaks: &CheckTweaks) -> Result<Layout, String> 
     let layout = Layout {
         home: run.join("home"),
         probe_home: run.join("probe-home"),
+        lever_home: run.join("lever-home"),
         project: run.join("project"),
         outside: forbidden.join("outside"),
         extra: forbidden.join("extra"),
         markers: run.join("markers"),
         marker_sh: run.join("marker.sh"),
+        tool_server_sh: run.join("tool_server.sh"),
         _elsewhere: elsewhere,
     };
     for dir in [
         &layout.home,
         &layout.probe_home,
+        &layout.lever_home,
         &layout.outside,
         &layout.extra,
         &layout.markers,
@@ -768,6 +825,7 @@ fn build_layout(run_dir: &Path, tweaks: &CheckTweaks) -> Result<Layout, String> 
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     write_file(&layout.marker_sh, FIXTURE_MARKER_SH)?;
+    write_file(&layout.tool_server_sh, FIXTURE_TOOL_SERVER_SH)?;
     let values = [
         ("@MARKER_SH@", plain_path(&layout.marker_sh)?),
         ("@MARKERS@", plain_path(&layout.markers)?),
@@ -856,7 +914,8 @@ impl Peer {
         })
     }
 
-    /// Reads what has arrived. Approvals are declined, anything else Codex asks is answered "not found".
+    /// Reads what has arrived. Approvals and elicitations are declined, anything else Codex asks is answered
+    /// "not found".
     fn pump(&mut self) {
         while let Some(message) = self.link.try_recv() {
             match message {
@@ -868,6 +927,9 @@ impl Peer {
                             decision: Decision::Decline,
                         })
                         .unwrap_or(Value::Null);
+                        self.link.respond(id, answer);
+                    } else if method == method::MCP_ELICITATION {
+                        let answer = serde_json::to_value(ElicitationResponse::decline()).unwrap_or(Value::Null);
                         self.link.respond(id, answer);
                     } else {
                         self.link.respond_error(id, -32601, "method not found");
@@ -920,6 +982,15 @@ impl Peer {
         self.notes
             .iter()
             .any(|(m, p)| m == method::TURN_COMPLETED && p.get("threadId").and_then(Value::as_str) == Some(thread_id))
+    }
+
+    /// The first word Codex gave for the tool server `name` that is not `starting`: it has left that state.
+    fn server_started(&self, name: &str) -> Option<&str> {
+        self.notes
+            .iter()
+            .filter(|(m, p)| m == method::MCP_STARTUP_STATUS && p.get("name").and_then(Value::as_str) == Some(name))
+            .filter_map(|(_, p)| p.get("status").and_then(Value::as_str))
+            .find(|status| *status != MCP_STARTING)
     }
 
     /// `initialize`, then `initialized`. Returns the version Codex reports and refuses to go on when
@@ -1146,7 +1217,7 @@ fn run_check(
     run_dir: &Path,
     log: &mut Log,
     tweaks: &CheckTweaks,
-) -> Result<(), Vec<String>> {
+) -> Result<bool, Vec<String>> {
     let deadline = Instant::now() + CHECK_BUDGET;
     let one = |reason: String| vec![reason];
     let layout = build_layout(run_dir, tweaks).map_err(one)?;
@@ -1198,7 +1269,7 @@ fn run_check(
         fingerprint: "self-check".to_string(),
         project_only: vec![PROJECT_TOOL_SERVER.to_string()],
     };
-    let mut config = session_config(&plan).map_err(|e| one(e.to_string()))?;
+    let mut config = session_config(&plan, None).map_err(|e| one(e.to_string()))?;
     if tweaks.drop_skills_lever {
         config = drop_skills_lever(config);
     }
@@ -1290,11 +1361,141 @@ fn run_check(
         ));
     }
     let reasons = judge(&evidence);
-    if reasons.is_empty() {
-        Ok(())
-    } else {
-        Err(reasons)
+    if !reasons.is_empty() {
+        return Err(reasons);
     }
+
+    // ---- the run has passed; nothing from here on can change that
+    let run = LeverRun {
+        program,
+        layout: &layout,
+        plan: &plan,
+        hostile_tables: &state,
+        cwd: &cwd,
+    };
+    let held = match editor_server_lever(&run, tweaks, log) {
+        Ok(held) => held,
+        Err(why) => {
+            log.line(format!("the editor server's approval mode could not be read: {why}"));
+            false
+        }
+    };
+    log.line(format!("the editor server's approval mode held = {held}"));
+    Ok(held)
+}
+
+/// What the process that reads the editor server's lever is given.
+struct LeverRun<'a> {
+    program: &'a Path,
+    layout: &'a Layout,
+    plan: &'a TrustPlan,
+    /// What the check's own home adds to the hostile file, so this home says the same.
+    hostile_tables: &'a str,
+    cwd: &'a str,
+}
+
+/// Whether a session given the editor's server, in a process and a home of its own under the same hostile file,
+/// runs a call of a tool that no hint makes quiet and asks nothing about it. It takes a model of its own, so the
+/// run that was judged is told nothing of it. An error says why the answer could not be had.
+fn editor_server_lever(run: &LeverRun, tweaks: &CheckTweaks, log: &mut Log) -> Result<bool, String> {
+    let layout = run.layout;
+    let marker = layout.markers.join(EDITOR_MARKER);
+    let model = ScriptedModel::start(vec![Step::call(
+        EDITOR_CALL,
+        Some(EDITOR_NAMESPACE),
+        EDITOR_TOOL,
+        &json!({}),
+    )
+    .when_body_has(LEVER_PROMPT)
+    .unless_body_has(&format!("\"{EDITOR_CALL}\""))])
+    .map_err(|e| format!("the scripted model could not start: {e}"))?;
+    write_file(
+        &layout.lever_home.join("config.toml"),
+        &home_config(&model, layout, run.hostile_tables)?,
+    )?;
+    let server = EditorServerSpec {
+        name: EDITOR_SERVER.to_string(),
+        command: PathBuf::from("/bin/sh"),
+        args: vec![
+            plain_path(&layout.tool_server_sh)?.to_string(),
+            plain_path(&marker)?.to_string(),
+        ],
+        cwd: layout.project.clone(),
+    };
+    let mut config = session_config(run.plan, Some(&server)).map_err(|e| e.to_string())?;
+    if tweaks.drop_approval_lever {
+        config = drop_approval_lever(config);
+    }
+    let mut peer = Peer::spawn(
+        run.program,
+        &layout.lever_home,
+        &layout.project,
+        Instant::now() + LEVER_BUDGET,
+    )?;
+    let outcome = lever_conversation(&mut peer, &layout.lever_home, config, run.cwd, log);
+    let tail = peer.stderr_tail();
+    peer.finish();
+    if !tail.trim().is_empty() {
+        log.line(format!(
+            "codex stderr (tail): {}",
+            without_colours(tail.trim()).replace('\n', " | ")
+        ));
+    }
+    let asked = outcome?;
+    let ran = marker.exists();
+    log.line(format!("the tool's call ran = {ran}; Codex asked about it = {asked}"));
+    Ok(ran && !asked)
+}
+
+/// Starts the session, lets its tool server start, runs the one turn, and says whether Codex asked the client
+/// anything. Every question counts: an elicitation is one way to ask before a call, and a Codex that asked another
+/// way and ran the call on the refusal would otherwise read as quiet. A turn started while the server is still
+/// starting would not have the tool.
+fn lever_conversation(
+    peer: &mut Peer,
+    home: &Path,
+    config: super::config::SessionConfig,
+    cwd: &str,
+    log: &mut Log,
+) -> Result<bool, String> {
+    peer.handshake(home)?;
+    let params = serde_json::to_value(ThreadStartParams::new(
+        cwd.to_string(),
+        Reviewer::User,
+        Sandbox::Project,
+        config,
+    ))
+    .map_err(|e| e.to_string())?;
+    let answer = peer.call(method::THREAD_START, params)?;
+    let thread_id = thread_facts(answer, Reviewer::User, Sandbox::Project)?.thread_id;
+    peer.wait_for(SERVER_START_BUDGET, |p| p.server_started(EDITOR_SERVER).is_some());
+    log.line(format!(
+        "the editor server's startup ended as {}",
+        peer.server_started(EDITOR_SERVER).unwrap_or("nothing Codex said")
+    ));
+    start_turn(
+        peer,
+        &thread_id,
+        Sandbox::Project,
+        format!("{LEVER_PROMPT} call the tool"),
+    )?;
+    if !peer.wait_for(TURN_BUDGET, |p| p.turn_completed(&thread_id)) {
+        return Err("the turn did not finish".to_string());
+    }
+    for asked in &peer.asked {
+        log.line(format!("Codex asked the client: {}", asked.method));
+    }
+    Ok(!peer.asked.is_empty())
+}
+
+#[cfg(feature = "test-support")]
+fn drop_approval_lever(config: super::config::SessionConfig) -> super::config::SessionConfig {
+    config.without_approval_lever()
+}
+
+#[cfg(not(feature = "test-support"))]
+fn drop_approval_lever(config: super::config::SessionConfig) -> super::config::SessionConfig {
+    config
 }
 
 #[cfg(feature = "test-support")]
@@ -1631,7 +1832,7 @@ mod tests {
     ) -> Result<(), SelfCheckError> {
         ensure_checked_with(program, state, true, |_, _, _| {
             runs.set(runs.get() + 1);
-            outcome
+            outcome.map(|()| true)
         })
         .map(|_| ())
     }
@@ -1733,7 +1934,7 @@ mod tests {
         let shared = waiting
             .finish(LOCK_WAIT, true, |_, _, _| {
                 runs.set(runs.get() + 1);
-                Ok(())
+                Ok(true)
             })
             .expect_err("the waiting start shares the failure");
         assert_eq!(runs.get(), 1, "a start that waited for a failed run does not run again");
@@ -1866,13 +2067,125 @@ mod tests {
     fn ensure_checked_names_the_binary_it_checked() {
         let scratch = Scratch::new("returns-key");
         let program = scratch.program("codex", "codex-cli 0.161.0");
-        let key = ensure_checked_with(&program, &scratch.state(), true, |_, _, _| Ok(())).expect("passes");
+        let key = ensure_checked_with(&program, &scratch.state(), true, |_, _, _| Ok(true))
+            .expect("passes")
+            .key;
         assert_eq!(key, BinaryKey::of(&program).expect("key"));
         let cached = ensure_checked_with(&program, &scratch.state(), true, |_, _, _| {
             Err(vec!["not asked".into()])
         })
         .expect("the cached pass");
-        assert_eq!(cached, key);
+        assert_eq!(cached.key, key);
+    }
+
+    /// The verdict file of `program` under `state`, read as JSON.
+    fn verdict_of(state: &Path, program: &Path) -> (PathBuf, Value) {
+        let key = BinaryKey::of(program).expect("key");
+        let path = state.join(CHECK_DIR).join(key.id()).join("verdict.json");
+        let value = serde_json::from_str(&std::fs::read_to_string(&path).expect("reads")).expect("json");
+        (path, value)
+    }
+
+    #[test]
+    fn a_verdict_keeps_the_lever_beside_the_pass() {
+        for lever in [true, false] {
+            let scratch = Scratch::new("lever-kept");
+            let program = scratch.program("codex", "codex-cli 0.163.0");
+            let state = scratch.state();
+            let first = ensure_checked_with(&program, &state, true, |_, _, _| Ok(lever)).expect("a lost lever passes");
+            assert_eq!(first.editor_server_lever, lever);
+            let (_, verdict) = verdict_of(&state, &program);
+            assert_eq!(verdict["result"], json!("passed"));
+            assert_eq!(verdict["editor_server_lever"], json!(lever));
+
+            // The start after it reads the lever off the file; the run is not asked again.
+            let cached = ensure_checked_with(&program, &state, true, |_, _, _| Err(vec!["not asked".into()]))
+                .expect("the cached pass");
+            assert_eq!(cached.editor_server_lever, lever);
+        }
+    }
+
+    #[test]
+    fn a_verdict_without_the_lever_key_is_not_a_pass() {
+        let scratch = Scratch::new("lever-missing");
+        let program = scratch.program("codex", "codex-cli 0.163.0");
+        let state = scratch.state();
+        let runs = Cell::new(0);
+        check(&program, &state, &runs, Ok(())).expect("passes");
+        assert_eq!(runs.get(), 1);
+        let (path, mut verdict) = verdict_of(&state, &program);
+        verdict
+            .as_object_mut()
+            .expect("an object")
+            .remove("editor_server_lever");
+        std::fs::write(&path, verdict.to_string()).expect("writes");
+        check(&program, &state, &runs, Ok(())).expect("passes again");
+        assert_eq!(runs.get(), 2, "a verdict silent about the lever is run again");
+
+        // A value that is not a yes or a no says nothing about the lever either.
+        let (path, mut verdict) = verdict_of(&state, &program);
+        verdict["editor_server_lever"] = json!("yes");
+        std::fs::write(&path, verdict.to_string()).expect("writes");
+        check(&program, &state, &runs, Ok(())).expect("passes again");
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// One conversation with the fixture's tool server, as Codex would hold it.
+    #[test]
+    fn the_tool_server_answers_what_codex_asks_and_a_call_leaves_the_marker() {
+        use std::io::Write;
+        let scratch = Scratch::new("tool-server");
+        let script = scratch.0.join("tool_server.sh");
+        std::fs::write(&script, FIXTURE_TOOL_SERVER_SH).expect("writes");
+        let marker = scratch.0.join("marker");
+        let mut child = Command::new("/bin/sh")
+            .arg(&script)
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh runs");
+        let frames = [
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "codex", "version": "0"}}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": "two", "method": "tools/call", "params": {
+                "name": EDITOR_TOOL, "arguments": {}, "_meta": {"callId": "ed1", "id": "not the request's"}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        ];
+        let mut stdin = child.stdin.take().expect("stdin");
+        for frame in &frames {
+            writeln!(stdin, "{frame}").expect("writes");
+        }
+        drop(stdin);
+        let out = child
+            .wait_with_output()
+            .expect("the server ends at the end of its input");
+        assert!(out.status.success(), "{out:?}");
+        let answers: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each answer is one line of JSON"))
+            .collect();
+        assert_eq!(answers.len(), 4, "a notification is not answered: {answers:?}");
+        assert_eq!(answers[0]["id"], json!(0));
+        assert_eq!(answers[0]["result"]["protocolVersion"], json!("2025-06-18"));
+        assert!(answers[0]["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(answers[1]["id"], json!(1));
+        let tools = answers[1]["result"]["tools"].as_array().expect("a tool list");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!(EDITOR_TOOL));
+        assert!(
+            tools[0].get("annotations").is_none(),
+            "a read-only hint alone would keep Codex quiet, whatever the approval mode does"
+        );
+        assert_eq!(answers[2]["id"], json!("two"));
+        assert!(answers[2]["result"]["content"].is_array());
+        assert_eq!(answers[3]["id"], json!(3));
+        assert!(answers[3]["error"].is_object());
+        assert!(marker.is_file(), "the call left no marker");
     }
 
     #[test]

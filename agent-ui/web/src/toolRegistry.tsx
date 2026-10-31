@@ -4,6 +4,7 @@ import type { InputChange, ToolCallDenial, ToolCallRecord } from "./types";
 import { codexChangePreview, editPreview, lineDiff, splitLines } from "./diff";
 import { EditDiff } from "./components/EditDiff";
 import { HiddenWarning, Revealed } from "./components/Revealed";
+import { editorRow } from "./editorRows";
 import { subagentOf } from "./externalTools";
 import { countEscapes, revealHidden } from "./revealHidden";
 import { toolCardLine } from "./display";
@@ -21,11 +22,18 @@ export type ToolRenderConfig = {
    * invocation renderers must not declare result parameters they do not use.
    *
    * `opts.expanded`: a renderer that draws diffs (`editConfig`, Codex's file changes, an ACP call's
-   * diffs) folds them to a summary when it is `false` and shows the whole thing when it is `true`. */
-  renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
+   * diffs) folds them to a summary when it is `false` and shows the whole thing when it is `true`.
+   * `opts.result`: the call's answer, `null` while it runs, for a row that says what the answer held. */
+  renderInvocation: (
+    input: unknown,
+    opts: { expanded: boolean; createsFile?: boolean; result?: ToolCallRecord["result"] },
+  ) => ReactNode;
   /** `false` for a tool whose own row already says what it did (`Edit`/`Write`/`NotebookEdit`: the diff),
    *  so a folded success draws no result preview under it. A failure is previewed whatever this says. */
   previewSuccess?: boolean;
+  /** Whether the call's answer is text another party wrote and is drawn through `revealHidden`, in the
+   *  folded preview and expanded alike. Rows of the editor's own tools say yes; the others draw as before. */
+  revealResult?: (input: unknown) => boolean;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -309,11 +317,63 @@ const codexFileChange: ToolRenderConfig = {
   },
 };
 
+/** The server name the editor's own tools are served under. */
+const EDITOR_SERVER = "eitri";
+const EDITOR_TOOL_PREFIX = `mcp__${EDITOR_SERVER}__`;
+
+/** One editor tool's row: what happened in words (`editorRows.ts`), the tool's name and a one-line summary of
+ *  its input for a tool that table does not know. */
+function editorToolRow(tool: string, input: unknown, result: ToolCallRecord["result"] | undefined): ReactNode {
+  return (
+    <div className="tool-card">
+      <Shown text={editorRow(tool, input, result ?? null) ?? `${tool}: ${summarizeInput(input)}`} />
+    </div>
+  );
+}
+
+function editorConfig(tool: string): ToolRenderConfig {
+  return {
+    label: tool,
+    revealResult: () => true,
+    renderInvocation: (input, { result }) => editorToolRow(tool, input, result),
+  };
+}
+
+const execConfig: ToolRenderConfig = {
+  label: "nvim_exec",
+  revealResult: () => true,
+  renderInvocation: (input, { expanded, result }) => {
+    const code = textField(input, "code");
+    const kind = textField(input, "kind");
+    const label = kind === "lua" ? "Lua" : kind === "ex" ? "Ex" : kind;
+    const lines = splitLines(code);
+    const hidden = Math.max(0, lines.length - 1);
+    return (
+      <div className="tool-card tool-card-exec">
+        <div><Shown text={editorRow("nvim_exec", input, result ?? null) ?? "nvim_exec"} /></div>
+        <div><Shown text={`${label}: ${lines[0] ?? ""}`} /></div>
+        {expanded ? (
+          <pre style={{ fontFamily: "var(--nv-font-mono)", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+            <Revealed pieces={revealHidden(code)} />
+          </pre>
+        ) : hidden > 0 ? (
+          <div className="tool-result-preview-more">{hidden} {hidden === 1 ? "line" : "lines"} not shown</div>
+        ) : null}
+      </div>
+    );
+  },
+};
+
 const codexMcp: ToolRenderConfig = {
   label: "Tool call",
-  renderInvocation: (input) => {
+  revealResult: (input) => textField(input, "server") === EDITOR_SERVER,
+  renderInvocation: (input, { expanded, result }) => {
     if (saysNothing(input)) return <div className="tool-card">tool call</div>;
     const args = input && typeof input === "object" ? (input as Record<string, unknown>).arguments : undefined;
+    if (textField(input, "server") === EDITOR_SERVER) {
+      if (textField(input, "tool") === "nvim_exec") return execConfig.renderInvocation(args, { expanded, result });
+      return editorToolRow(textField(input, "tool"), args, result);
+    }
     return (
       <div className="tool-card">
         <Shown text={`${textField(input, "server")} · ${textField(input, "tool")}`} />{" "}
@@ -471,6 +531,8 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
  * arrive off the provider wire and an MCP server may name its tools anything it likes. */
 export function lookupTool(name: string): ToolRenderConfig | undefined {
   if (name.startsWith("acp:")) return acpConfig(name);
+  if (name === `${EDITOR_TOOL_PREFIX}nvim_exec`) return execConfig;
+  if (name.startsWith(EDITOR_TOOL_PREFIX)) return editorConfig(name.slice(EDITOR_TOOL_PREFIX.length));
   return Object.prototype.hasOwnProperty.call(TOOL_REGISTRY, name) ? TOOL_REGISTRY[name] : undefined;
 }
 
@@ -493,10 +555,12 @@ const ToolResult = memo(function ToolResult({
   result,
   detailed = false,
   abandoned = false,
+  reveal = false,
 }: {
   result: ToolCallRecord["result"];
   detailed?: boolean;
   abandoned?: boolean;
+  reveal?: boolean;
 }) {
   if (result === null) {
     // A `null` result the panel knows can never arrive -- the call predates the
@@ -519,9 +583,10 @@ const ToolResult = memo(function ToolResult({
   const { shown, hiddenChars } = detailed
     ? truncateResult(formatResultContent(result.content), DETAILED_HEAD_CHARS, DETAILED_TAIL_CHARS)
     : truncateResult(formatResultContent(result.content));
+  const draw = (part: string): ReactNode => (reveal ? <Shown text={part} /> : part);
   return (
     <div className="tool-result" data-state={result.isError ? "error" : "done"}>
-      <pre className="tool-result-body">{shown === "" ? "(no output)" : result.isError ? withFailureWords(shown) : shown}</pre>
+      <pre className="tool-result-body">{shown === "" ? "(no output)" : result.isError ? withFailureWords(shown, draw) : draw(shown)}</pre>
       {hiddenChars > 0 && (
         <div className="tool-result-truncated">
           {hiddenChars.toLocaleString("en-US")} characters not shown
@@ -602,13 +667,16 @@ function cutLine(raw: string, chars: number): string {
 const ToolResultPreview = memo(function ToolResultPreview({
   result,
   wrapped = false,
+  reveal = false,
 }: {
   result: NonNullable<ToolCallRecord["result"]>;
   wrapped?: boolean;
+  reveal?: boolean;
 }) {
   const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
   if (total === 0) return null;
   const hidden = total - shown.length;
+  const draw = (part: string): ReactNode => (reveal ? <Shown text={part} /> : part);
   return (
     <div
       className={`tool-result-preview${wrapped ? " tool-result-preview-wrapped" : ""}`}
@@ -616,7 +684,7 @@ const ToolResultPreview = memo(function ToolResultPreview({
     >
       {shown.map((line, i) => (
         <div key={i} className="tool-result-preview-line">
-          {line === "" ? "\u00a0" : result.isError ? withFailureWords(line) : line}
+          {line === "" ? "\u00a0" : result.isError ? withFailureWords(line, draw) : draw(line)}
         </div>
       ))}
       {hidden > 0 && (
@@ -714,6 +782,7 @@ export function renderToolCall(
     config.renderInvocation(call.input, {
       expanded: (opts.expanded ?? showResult) || opts.detailed === true,
       createsFile: call.createsFile,
+      result: call.result,
     })
   ) : (
     // Generic fallback for unrecognized tools -- never "Unrecognized": a name and a one-line
@@ -767,6 +836,7 @@ export function renderToolCall(
   // the kind of refusal only when it was not the classifier's (a settings deny rule, the mode).
   const deniedNote = call.denied === undefined ? null : <div className="tool-rule-note tool-denied-note">{deniedNoteText(call.denied)}</div>;
   const changedNote = call.changedInput === undefined ? null : <ChangedInputNote name={call.name} change={call.changedInput} />;
+  const reveal = config?.revealResult?.(call.input) === true;
   const shown = call.result === null || showResult || opts.detailed === true;
   const subagent = subagentOf(call.name, call.input);
   return (
@@ -783,9 +853,9 @@ export function renderToolCall(
       {deniedNote}
       {changedNote}
       {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note">{withFailureWords(cardLine, (part) => <Shown text={part} />)}</div>}
-      {showOrdinaryResult && shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} />}
+      {showOrdinaryResult && shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
       {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
-        <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} />
+        <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
       )}
     </div>
   );

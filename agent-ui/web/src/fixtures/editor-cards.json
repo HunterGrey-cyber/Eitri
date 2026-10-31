@@ -1,0 +1,74 @@
+[
+  {
+    "id": "ec-0123456789abcdef-1",
+    "seq": 41,
+    "tool": "open_file",
+    "toolUseId": "toolu_01",
+    "title": "Load src/a.rs in your editor?",
+    "body": [
+      {
+        "kind": "plain",
+        "text": "It is not open there."
+      }
+    ]
+  },
+  {
+    "id": "ec-0123456789abcdef-2",
+    "seq": 42,
+    "tool": "open_file",
+    "toolUseId": "toolu_02",
+    "title": "Show /etc/hosts in your editor?",
+    "body": [
+      {
+        "kind": "code",
+        "text": "/etc/hosts"
+      }
+    ]
+  },
+  {
+    "id": "ec-0123456789abcdef-3",
+    "seq": 43,
+    "tool": "open_file",
+    "toolUseId": null,
+    "title": "Read /etc/hosts from your editor?",
+    "body": [
+      {
+        "kind": "agent",
+        "text": "I need the host table."
+      }
+    ]
+  },
+  {
+    "id": "ec-0123456789abcdef-4",
+    "seq": 44,
+    "tool": "open_file",
+    "toolUseId": null,
+    "title": "Run this in your editor?",
+    "body": [
+      {
+        "kind": "warning",
+        "text": "It is outside the project."
+      }
+    ]
+  },
+  {
+    "id": "ec-0123456789abcdef-5",
+    "seq": 45,
+    "tool": "apply_proposal",
+    "toolUseId": "toolu_05",
+    "title": "Apply rename foo to bar to 2 files?",
+    "body": [
+      {
+        "kind": "plain",
+        "text": "Files: src/a.rs, src/b.rs"
+      }
+    ],
+    "proposal": {
+      "id": "p-3",
+      "files": [
+        "src/a.rs",
+        "src/b.rs"
+      ]
+    }
+  }
+]

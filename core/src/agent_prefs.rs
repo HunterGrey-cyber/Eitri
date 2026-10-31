@@ -120,6 +120,14 @@ pub fn parse_user_settings(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(USER_SETTINGS_KEY, value, true)
 }
 
+/// The `init.lua` key: `eitri.config.set("agent.editor.follow", true | false)`.
+pub const EDITOR_FOLLOW_KEY: &str = "agent.editor.follow";
+
+/// Whether new tabs show the agent's edits in the editor. Unset keeps following off.
+pub fn parse_editor_follow(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(EDITOR_FOLLOW_KEY, value, false)
+}
+
 /// The `init.lua` key: `eitri.config.set("review.enabled", true | false)`.
 pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
 
@@ -335,6 +343,22 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")
+    }
+
+    #[test]
+    fn follow_is_off_by_default() {
+        assert_eq!(parse_editor_follow(None), Ok(false));
+        for (value, on) in [("true", true), ("on", true), ("false", false), ("off", false)] {
+            assert_eq!(parse_editor_follow(Some(value)), Ok(on));
+        }
+    }
+
+    #[test]
+    fn a_bad_value_fails_naming_the_key() {
+        for bad in ["", "maybe", "1", "{}"] {
+            let why = parse_editor_follow(Some(bad)).unwrap_err();
+            assert!(why.contains("agent.editor.follow"), "{why}");
+        }
     }
 
     #[test]

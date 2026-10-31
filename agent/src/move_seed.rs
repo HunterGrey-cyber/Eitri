@@ -19,14 +19,14 @@
 use crate::ingestion::{IngestStats, ResumeOutcomeRecord};
 use crate::lease::SessionLease;
 use crate::projection::{
-    AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, CallIndex, GateInput, HistoryNotice, InputChange,
-    NoticeRecord, QuestionRecord, SlashCommand, SteerOutcome, ThinkingBlock, ToolCallDenial, ToolCallRecord,
-    TranscriptMessage, TurnEndingKind, TurnEndingRecord, TurnStartRecord, UngatedCliModeRecord, UsageInfo,
-    UserPromptRecord,
+    AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection, CallIndex, GateInput, HistoryNotice, InitServer,
+    InputChange, NoticeRecord, QuestionRecord, SlashCommand, SteerOutcome, ThinkingBlock, ToolCallDenial,
+    ToolCallRecord, TranscriptMessage, TurnEndingKind, TurnEndingRecord, TurnStartRecord, UngatedCliModeRecord,
+    UsageInfo, UserPromptRecord,
 };
 use crate::provider::{AgentProvider, ProviderCapabilities, ProviderInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,6 +55,10 @@ pub struct MoveSeed {
     pub(crate) history: Option<HistoryNotice>,
     pub(crate) ungated_cli_mode: Option<UngatedCliModeRecord>,
     pub(crate) cli_mode_reported: Option<String>,
+    /// The CLI's latest report of its MCP servers: the next one may be a turn away, and until it comes
+    /// the host's check on a declared server has only this to read.
+    #[serde(default)]
+    pub(crate) init_servers: Vec<InitServer>,
     pub(crate) policy_mismatch: Option<(String, String)>,
     pub(crate) account_limits: Option<AccountLimitsRecord>,
     #[serde(default)]
@@ -171,6 +175,10 @@ pub struct ConversationHandoff {
     /// call's start or its settle) was folded since the history was last written: lost, it would never
     /// be written.
     pub history_dirty: bool,
+    /// The tools the session was given: wrong, the destination's gate would not know its own tools.
+    /// Absent from a record of a build that had none.
+    #[serde(default)]
+    pub declared_client_tools: BTreeSet<String>,
 }
 
 /// Why a conversation did not move.
@@ -293,6 +301,9 @@ impl AgentSessionProjection {
             changed_inputs_before_their_call,
             call_index,
             steer_outcomes,
+            // Live: a call folded at the source arrives only through the running turn's events.
+            open_client_calls: _,
+            init_servers,
             // Not carried: the adopting projection marks its own seed when it takes this one.
             move_seeded: _,
             cli_unseen_busy,
@@ -322,6 +333,7 @@ impl AgentSessionProjection {
             history: history.clone(),
             ungated_cli_mode: ungated_cli_mode.clone(),
             cli_mode_reported: cli_mode_reported.clone(),
+            init_servers: init_servers.clone(),
             policy_mismatch: policy_mismatch.clone(),
             account_limits: account_limits.clone(),
             background_tasks: background_tasks.clone(),
@@ -457,6 +469,7 @@ impl AgentSessionProjection {
             history,
             ungated_cli_mode,
             cli_mode_reported,
+            init_servers,
             policy_mismatch,
             account_limits,
             background_tasks,
@@ -491,6 +504,7 @@ impl AgentSessionProjection {
         self.history = history.clone();
         self.ungated_cli_mode = ungated_cli_mode.clone();
         self.cli_mode_reported = cli_mode_reported.clone();
+        self.init_servers = init_servers.clone();
         self.policy_mismatch = policy_mismatch.clone();
         self.account_limits = account_limits.clone();
         self.background_tasks = background_tasks.clone();
@@ -702,6 +716,72 @@ mod tests {
             adopted.export_settled(),
             source.export_settled(),
             "the values a snapshot leaves out are carried too"
+        );
+    }
+
+    fn own_server() -> AgentDomainEvent {
+        AgentDomainEvent::SessionServers {
+            servers: vec![InitServer {
+                name: "eitri".into(),
+                status: "connected".into(),
+                source: "sdk".into(),
+            }],
+        }
+    }
+
+    fn client_call(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ClientToolCall {
+            call_id: id.into(),
+            tool_use_id: None,
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 9,
+        }
+    }
+
+    #[test]
+    fn the_server_check_holds_after_a_move() {
+        let mut source = source_with(&[opened()]);
+        source.apply(&own_server());
+        assert!(source.single_sdk_server("eitri"));
+        let seed = source.export_settled();
+
+        let wire = serde_json::to_string(&seed).unwrap();
+        let read_back: MoveSeed = serde_json::from_str(&wire).unwrap();
+        let idle = AgentSessionProjection::adopt(&core(vec![opened()], read_back, Vec::new())).unwrap();
+        assert!(idle.single_sdk_server("eitri"), "an idle tab");
+
+        let turn = vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }];
+        let mid_turn = AgentSessionProjection::adopt(&core(vec![opened()], seed, turn)).unwrap();
+        assert!(mid_turn.single_sdk_server("eitri"), "in the middle of a turn");
+    }
+
+    /// A seed written before the servers were carried reads as no report, which fails the check.
+    #[test]
+    fn a_seed_without_the_field_reads_as_no_report() {
+        let source = source_with(&[opened()]);
+        let mut wire = serde_json::to_value(source.export_settled()).unwrap();
+        wire.as_object_mut().unwrap().remove("init_servers");
+        let seed: MoveSeed = serde_json::from_value(wire).unwrap();
+        assert!(seed.init_servers.is_empty());
+    }
+
+    #[test]
+    fn a_call_folded_in_the_running_turn_arrives_open_and_an_idle_one_does_not() {
+        let mut source = source_with(&[opened()]);
+        source.apply(&client_call("idle"));
+        assert_eq!(source.open_client_calls.len(), 1);
+
+        let seed = source.export_settled();
+        let turn = vec![
+            AgentDomainEvent::TurnStarted { turn_id: "t1".into() },
+            client_call("running"),
+        ];
+        let adopted = AgentSessionProjection::adopt(&core(vec![opened()], seed, turn)).unwrap();
+        assert_eq!(
+            adopted.open_client_calls.keys().collect::<Vec<_>>(),
+            ["running"],
+            "only what the running turn folded crosses"
         );
     }
 

@@ -22,6 +22,18 @@ describe("search", () => {
     expect(rowSearchText(rows[3])).toContain("src/parser.rs");
   });
 
+  it("finds a broker card by its title and its lines, and not by the null of its missing input", () => {
+    const card: TimelineItem = { kind: "permission", seq: 5, key: "ec-1", request: {
+      seq: 5, permissionId: "ec-1", toolUseId: null, toolName: "open_file", input: null,
+      editorCard: { title: "Load src/a.rs in your editor?", body: [{ kind: "code", text: "/etc/hosts" }] },
+    } };
+    expect(rowSearchText(card)).toContain("Load src/a.rs");
+    expect(rowSearchText(card)).toContain("/etc/hosts");
+    expect(rowSearchText(card)).not.toContain("null");
+    expect(findMatch([card], "hosts", 0, 1, true)).toBe(0);
+    expect(findMatch([card], "null", 0, 1, true)).toBeNull();
+  });
+
   /* A collapsed run's own row shows a summary, not any one call's input -- so `/`
      still finds it by what a folded call would show, each name and input. */
   it("reads a collapsed run by its calls, not just its summary", () => {

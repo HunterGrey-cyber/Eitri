@@ -15,6 +15,7 @@ fn a_real_turn_s_reply_arrives_via_pump() {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
 

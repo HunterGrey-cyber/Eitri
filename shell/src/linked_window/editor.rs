@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use eitri_core::editor_context::{ContextSource, EditorContext};
 use eitri_core::editor_rpc::EditorRpc;
+use eitri_core::editor_tools::stamp::EDITOR_BUDGET_MAX;
+use eitri_core::editor_tools::way::RemoteWay;
 use eitri_core::nvim_keys::NvimReport;
 use eitri_core::nvim_rpc::{Answer, Pending, RpcError};
 use eitri_core::plugin::follow_feed::{self, FollowBatch, FollowCmd, Ordered, ViewLine};
@@ -46,6 +48,11 @@ pub type Repeat = Rc<dyn Fn(Duration, Box<dyn Fn() -> bool>)>;
 /// How long window 2 waits for the answer to an editor operation: the plugin host's own deadline for an editor
 /// call, so a page asks the editor across the link on the terms it asks it in one window.
 pub const OP_DEADLINE: Duration = eitri_core::plugin::host::EDITOR_DEADLINE;
+
+/// How long window 2 waits for the answer to an editor tool's operation: past any budget the broker gives a call,
+/// so the broker gives up first and says the editor did not answer. Ended here, the wait would read as a link that
+/// is down, and tell the agent the editor's window is closed.
+const AGENT_OP_DEADLINE: Duration = EDITOR_BUDGET_MAX;
 
 /// How often window 1 looks for answers to window 2's operations and for drafts written back in nvim while either
 /// is out.
@@ -1157,6 +1164,16 @@ impl EditorOps {
     /// [`send`](Self::send), with the id the operation went under, which window 1's later reports about it
     /// (`review_drawn`) name. An id is given while unlinked too, though nothing is sent.
     pub fn send_with_id(&self, op: EditorOp) -> (u64, Pending) {
+        self.send_within(op, OP_DEADLINE)
+    }
+
+    /// The way a window-2 tab's editor tools reach window 1 through these operations.
+    pub fn editor_way(self: &Rc<Self>, root: &Path) -> RemoteWay {
+        let ops = self.clone();
+        RemoteWay::new(root, Box::new(move |op| ops.send_within(op, AGENT_OP_DEADLINE).1))
+    }
+
+    fn send_within(&self, op: EditorOp, deadline: Duration) -> (u64, Pending) {
         let id = self.next.get();
         self.next.set(id + 1);
         let link = self.link.borrow().clone();
@@ -1169,7 +1186,7 @@ impl EditorOps {
         }
         self.waiting
             .borrow_mut()
-            .insert(id, (answer, Instant::now() + OP_DEADLINE));
+            .insert(id, (answer, Instant::now() + deadline));
         self.expire_soon();
         (id, pending)
     }
@@ -1742,7 +1759,18 @@ mod tests {
     use super::*;
     use crate::linked_window::spawn::SECOND_PEER;
     use crate::linked_window::tests::Scratch;
+    use agent::setting_sources::ProjectTrust;
+    use agent::PermissionMode;
     use eitri_core::editor_context::Selection;
+    use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
+    use eitri_core::editor_tools::stamp::{Stamp, EDITOR_BUDGET};
+    use eitri_core::editor_tools::step::ToolResult;
+    use eitri_core::editor_tools::tools::baseline::{BASELINE_LIMIT, NO_BASELINE};
+    use eitri_core::editor_tools::tools::diagnostics::DIAGNOSTICS_LUA;
+    use eitri_core::editor_tools::tools::lsp::{LSP_ASK_LUA, LSP_COLLECT_LUA};
+    use eitri_core::editor_tools::tools::open_file::OPEN_FILE_LUA;
+    use eitri_core::editor_tools::way::{EditorCall, EditorWay};
+    use eitri_core::editor_tools::words::WINDOW_CLOSED;
     use eitri_core::window_link::fdpass;
     use eitri_core::window_link::link::{LinkHandle, PresenceFlag};
 
@@ -1981,6 +2009,435 @@ mod tests {
             2,
             "the window on the old link heard nothing more"
         );
+    }
+
+    /// Window 1's editor for a tab's tools: it records every call and keeps each answer for the test to give.
+    #[derive(Default)]
+    struct HeldNvim {
+        calls: RefCell<Vec<(&'static str, Vec<rmpv::Value>)>>,
+        answers: RefCell<Vec<Answer>>,
+    }
+
+    impl EditorRpc for HeldNvim {
+        fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>) -> Pending {
+            self.calls.borrow_mut().push((code, args));
+            let (answer, pending) = Pending::pair();
+            self.answers.borrow_mut().push(answer);
+            pending
+        }
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    /// One tab of window 2, as its broker sees it: in Bypass, so a load needs no card, and reaching the editor over
+    /// the link.
+    struct Window2Tab {
+        way: RemoteWay,
+        root: PathBuf,
+    }
+
+    impl BrokerEnv for Window2Tab {
+        fn way(&self) -> Option<&dyn EditorWay> {
+            Some(&self.way)
+        }
+        fn facts(&self, _tab: TabId) -> Option<TabFacts> {
+            Some(TabFacts {
+                mode: PermissionMode::Bypass,
+                trust: ProjectTrust::Trusted,
+                session: "s-window-2".into(),
+                process: "s-window-2".into(),
+                revision: 0,
+                declared: Rc::new(BTreeSet::from([
+                    "open_file".to_owned(),
+                    "usages".to_owned(),
+                    "diagnostics".to_owned(),
+                ])),
+            })
+        }
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn home(&self) -> Option<&Path> {
+            None
+        }
+        fn context(&self) -> Option<EditorContext> {
+            None
+        }
+    }
+
+    const TAB: TabId = TabId(3);
+
+    fn window_2_tab(w: &Windows) -> Window2Tab {
+        Window2Tab {
+            way: w.two.ops().editor_way(&w.root),
+            root: w.root.clone(),
+        }
+    }
+
+    fn open_a_file(broker: &mut Broker, tab: &Window2Tab) -> Vec<BrokerOut> {
+        broker.submit(
+            TAB,
+            Caller::Sidecar { call_id: "c-1".into() },
+            Some("t-1".into()),
+            "open_file",
+            r#"{"path":"src/a.rs","line":1}"#,
+            tab,
+            Instant::now(),
+        )
+    }
+
+    fn ask_for_usages(broker: &mut Broker, tab: &Window2Tab) -> Vec<BrokerOut> {
+        broker.submit(
+            TAB,
+            Caller::Sidecar { call_id: "c-2".into() },
+            Some("t-2".into()),
+            "usages",
+            r#"{"path":"src/a.rs","line":1,"symbol":"a"}"#,
+            tab,
+            Instant::now(),
+        )
+    }
+
+    fn since_the_turn_began(broker: &mut Broker, tab: &Window2Tab) -> Vec<BrokerOut> {
+        broker.submit(
+            TAB,
+            Caller::Sidecar { call_id: "c-3".into() },
+            Some("t-3".into()),
+            "diagnostics",
+            r#"{"since":"turn"}"#,
+            tab,
+            Instant::now(),
+        )
+    }
+
+    /// The `name` argument of the chunk call `at`, as window 1's editor was given it.
+    fn chunk_field(nvim: &HeldNvim, at: usize, name: &str) -> Option<rmpv::Value> {
+        nvim.calls.borrow()[at].1[1]
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Ticks the broker while `w` settles, until window 1's editor has been called `count` times.
+    fn until_called(w: &Windows, broker: &RefCell<Broker>, tab: &Window2Tab, nvim: &HeldNvim, count: usize) {
+        let called = w.settle(|| {
+            broker.borrow_mut().tick(tab, Instant::now());
+            nvim.calls.borrow().len() >= count
+        });
+        assert!(
+            called,
+            "window 1's editor was called {} times",
+            nvim.calls.borrow().len()
+        );
+    }
+
+    /// One entry of the diagnostics chunk's answer, on `src/a.rs`.
+    fn diagnostic(w: &Windows, message: &str) -> rmpv::Value {
+        use rmpv::Value as M;
+        M::Map(vec![
+            (
+                M::from("path"),
+                M::Binary(w.root.join("src/a.rs").as_os_str().as_encoded_bytes().to_vec()),
+            ),
+            (M::from("lnum"), M::from(0)),
+            (M::from("col"), M::from(0)),
+            (M::from("end_lnum"), M::from(0)),
+            (M::from("end_col"), M::from(1)),
+            (M::from("severity"), M::from("error")),
+            (M::from("message"), M::from(message)),
+        ])
+    }
+
+    fn diagnostics_answer(entries: Vec<rmpv::Value>) -> rmpv::Value {
+        use rmpv::Value as M;
+        M::Map(vec![
+            (M::from("entries"), M::Array(entries)),
+            (M::from("modified"), M::Array(vec![])),
+            (M::from("left_out"), M::from(0)),
+        ])
+    }
+
+    /// Ticks the broker while `w` settles, until it answers the call; that answer.
+    fn the_answer(w: &Windows, broker: &RefCell<Broker>, tab: &Window2Tab) -> ToolResult {
+        let found = RefCell::new(None);
+        let answered = w.settle(|| {
+            for out in broker.borrow_mut().tick(tab, Instant::now()) {
+                if let BrokerOut::Answer { result, .. } = out {
+                    *found.borrow_mut() = Some(result);
+                }
+            }
+            found.borrow().is_some()
+        });
+        assert!(answered, "the broker never answered the call");
+        found.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_window_2_tab_opens_a_file_through_the_link() {
+        use rmpv::Value as M;
+        let w = windows("agent-open");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        assert!(open_a_file(&mut broker.borrow_mut(), &tab).is_empty());
+
+        // The stand-in for window 1's nvim answers what the chunk would, once the op has reached it.
+        assert!(w.settle(|| {
+            broker.borrow_mut().tick(&tab, Instant::now());
+            !nvim.calls.borrow().is_empty()
+        }));
+        let (code, args) = nvim.calls.borrow()[0].clone();
+        assert_eq!(code, OPEN_FILE_LUA, "window 1 picks the tool's own chunk");
+        let field = |name: &str| {
+            args[1]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value.clone())
+        };
+        let absolute = w.root.join("src/a.rs");
+        assert_eq!(
+            field("path"),
+            Some(M::Binary(absolute.as_os_str().as_encoded_bytes().to_vec())),
+            "the path window 1 gives its editor is its own absolute one"
+        );
+        assert_eq!(field("load"), Some(M::from(true)));
+        assert_eq!(field("line"), Some(M::from(1)));
+
+        nvim.answers.borrow_mut().remove(0).send(Ok(M::Map(vec![
+            (M::from("shown"), M::from(true)),
+            (M::from("where"), M::from("new_split")),
+            (M::from("line"), M::from(1)),
+        ])));
+        let result = the_answer(&w, &broker, &tab);
+        assert!(!result.is_error, "{}", result.text);
+        let told: serde_json::Value = serde_json::from_str(&result.text).unwrap();
+        assert_eq!(told["shown"], true, "{told}");
+        assert_eq!(told["where"], "new_split", "{told}");
+        assert_eq!(told["line"], 1, "{told}");
+        assert_eq!(
+            told["other_window"], true,
+            "window 2 cannot see window 1's editor: {told}"
+        );
+        assert_eq!(nvim.calls.borrow().len(), 1, "one call, one chunk");
+    }
+
+    #[test]
+    fn a_window_2_tab_asks_the_language_server_through_the_link() {
+        use rmpv::Value as M;
+        let w = windows("agent-lsp");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        assert!(ask_for_usages(&mut broker.borrow_mut(), &tab).is_empty());
+
+        until_called(&w, &broker, &tab, &nvim, 1);
+        assert_eq!(
+            nvim.calls.borrow()[0].0,
+            LSP_ASK_LUA,
+            "window 1 picks the tool's own chunk"
+        );
+        let bytes = |path: &Path| M::Binary(path.as_os_str().as_encoded_bytes().to_vec());
+        assert_eq!(
+            chunk_field(&nvim, 0, "path"),
+            Some(bytes(&w.root.join("src/a.rs"))),
+            "the path window 1 gives its editor is its own absolute one"
+        );
+        assert_eq!(chunk_field(&nvim, 0, "root"), Some(bytes(&w.root)));
+        assert_eq!(chunk_field(&nvim, 0, "kind"), Some(M::from("usages")));
+        assert_eq!(chunk_field(&nvim, 0, "symbol"), Some(M::from("a")));
+        assert_eq!(chunk_field(&nvim, 0, "line"), Some(M::from(1)));
+        assert_eq!(chunk_field(&nvim, 0, "load"), Some(M::from(true)));
+
+        nvim.answers.borrow_mut().remove(0).send(Ok(M::Map(vec![
+            (M::from("started"), M::from(true)),
+            (M::from("unsupported"), M::Array(vec![])),
+        ])));
+        until_called(&w, &broker, &tab, &nvim, 2);
+        assert_eq!(nvim.calls.borrow()[1].0, LSP_COLLECT_LUA);
+        assert_eq!(
+            chunk_field(&nvim, 1, "id"),
+            chunk_field(&nvim, 0, "id"),
+            "the collect goes under the ask's id"
+        );
+
+        let item = M::Map(vec![
+            (M::from("path"), M::from(w.root.join("src/a.rs").to_str().unwrap())),
+            (M::from("line"), M::from(1)),
+            (M::from("character"), M::from(3)),
+        ]);
+        let part = M::Map(vec![
+            (M::from("name"), M::from("definitions")),
+            (M::from("items"), M::Array(vec![item])),
+            (M::from("total"), M::from(1)),
+        ]);
+        nvim.answers.borrow_mut().remove(0).send(Ok(M::Map(vec![
+            (M::from("status"), M::from("done")),
+            (M::from("parts"), M::Array(vec![part])),
+            (M::from("missing"), M::Array(vec![])),
+        ])));
+        let result = the_answer(&w, &broker, &tab);
+        assert!(!result.is_error, "{}", result.text);
+        let told: serde_json::Value = serde_json::from_str(&result.text).unwrap();
+        let definition = &told["definitions"][0];
+        assert_eq!(definition["path"], "src/a.rs", "{told}");
+        assert_eq!(definition["line"], 1, "{told}");
+        assert_eq!(definition["column"], 4, "{told}");
+        assert_eq!(definition["text"], "fn a() {}", "{told}");
+        assert_eq!(nvim.calls.borrow().len(), 2, "one ask, one collect");
+    }
+
+    #[test]
+    fn a_window_2_tab_takes_its_baseline_through_the_link() {
+        use rmpv::Value as M;
+        let w = windows("agent-baseline");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        assert!(broker
+            .borrow_mut()
+            .turn_began(TAB, "turn-1", &tab, Instant::now())
+            .is_empty());
+
+        until_called(&w, &broker, &tab, &nvim, 1);
+        assert_eq!(nvim.calls.borrow()[0].0, DIAGNOSTICS_LUA);
+        assert_eq!(
+            chunk_field(&nvim, 0, "root"),
+            Some(M::Binary(w.root.as_os_str().as_encoded_bytes().to_vec())),
+            "the root is window 1's own"
+        );
+        assert_eq!(chunk_field(&nvim, 0, "path"), None);
+        assert_eq!(chunk_field(&nvim, 0, "min_severity"), Some(M::from("hint")));
+        assert_eq!(chunk_field(&nvim, 0, "limit"), Some(M::from(BASELINE_LIMIT)));
+
+        let known = diagnostic(&w, "there before the turn");
+        nvim.answers
+            .borrow_mut()
+            .remove(0)
+            .send(Ok(diagnostics_answer(vec![known.clone()])));
+        assert!(w.settle(|| {
+            broker.borrow_mut().tick(&tab, Instant::now());
+            broker.borrow().is_idle()
+        }));
+
+        // What the baseline is for: only what appeared since is told, and window 2 alone took the difference.
+        since_the_turn_began(&mut broker.borrow_mut(), &tab);
+        until_called(&w, &broker, &tab, &nvim, 2);
+        assert_eq!(chunk_field(&nvim, 1, "limit"), Some(M::from(BASELINE_LIMIT)));
+        nvim.answers
+            .borrow_mut()
+            .remove(0)
+            .send(Ok(diagnostics_answer(vec![known, diagnostic(&w, "made by the turn")])));
+        let result = the_answer(&w, &broker, &tab);
+        assert!(!result.is_error, "{}", result.text);
+        let told: serde_json::Value = serde_json::from_str(&result.text).unwrap();
+        let entries = told["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{told}");
+        assert_eq!(entries[0]["message"], "made by the turn", "{told}");
+    }
+
+    #[test]
+    fn window_1_refuses_a_session_it_holds_and_the_tool_says_so() {
+        let w = windows("agent-own-session");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        w.one.set_own_session(Rc::new(|session: &str| session == "s-window-2"));
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        open_a_file(&mut broker.borrow_mut(), &tab);
+        let result = the_answer(&w, &broker, &tab);
+        assert!(result.is_error);
+        assert_eq!(result.text, "session s-window-2 is not held by window 2");
+        assert!(nvim.calls.borrow().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_link_that_is_down_answers_the_editors_window_is_closed() {
+        let w = windows("agent-down");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        w.two.unlinked();
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        open_a_file(&mut broker.borrow_mut(), &tab);
+        let result = the_answer(&w, &broker, &tab);
+        assert!(result.is_error);
+        assert_eq!(result.text, WINDOW_CLOSED);
+
+        ask_for_usages(&mut broker.borrow_mut(), &tab);
+        let result = the_answer(&w, &broker, &tab);
+        assert!(result.is_error);
+        assert_eq!(result.text, WINDOW_CLOSED);
+
+        // A baseline that could not be taken leaves the turn without one, and the tool says that.
+        broker.borrow_mut().turn_began(TAB, "turn-1", &tab, Instant::now());
+        assert!(w.settle(|| {
+            broker.borrow_mut().tick(&tab, Instant::now());
+            broker.borrow().is_idle()
+        }));
+        since_the_turn_began(&mut broker.borrow_mut(), &tab);
+        let result = the_answer(&w, &broker, &tab);
+        assert!(result.is_error);
+        assert_eq!(result.text, NO_BASELINE);
+
+        assert!(nvim.calls.borrow().is_empty(), "nothing crossed a link that is down");
+    }
+
+    #[test]
+    fn a_late_answer_after_the_link_ended_is_dropped() {
+        let w = windows("agent-late");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        let tab = window_2_tab(&w);
+        let broker = RefCell::new(Broker::new());
+        open_a_file(&mut broker.borrow_mut(), &tab);
+        assert!(w.settle(|| {
+            broker.borrow_mut().tick(&tab, Instant::now());
+            !nvim.answers.borrow().is_empty()
+        }));
+
+        w.two.unlinked();
+        let result = the_answer(&w, &broker, &tab);
+        assert_eq!(result.text, WINDOW_CLOSED);
+
+        // The chunk ends after all, and window 1 replies to an operation nobody waits for.
+        nvim.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Nil));
+        w.pump_a_while();
+        assert!(w.two.ops().waiting.borrow().is_empty());
+        assert!(
+            broker.borrow_mut().tick(&tab, Instant::now()).is_empty(),
+            "a call answered once is not answered again"
+        );
+        assert!(broker.borrow().is_idle());
+    }
+
+    #[test]
+    fn an_editor_tools_op_waits_past_the_brokers_budget() {
+        let w = windows("agent-deadline");
+        let nvim = Rc::new(HeldNvim::default());
+        w.one.set_rpc(nvim.clone());
+        let ops = w.two.ops();
+        let way = ops.editor_way(&w.root);
+        let stamp = Stamp {
+            deadline_ms: 1,
+            scope: "abc-3-1".into(),
+            seq: 1,
+        };
+        let root = w.root.clone();
+        let asked = way.call("s-window-2", &EditorCall::EditorState { root }, &stamp);
+        let sent = Instant::now();
+        assert!(ops.expire(sent + EDITOR_BUDGET), "the broker's budget ends first");
+        assert!(ops.expire(sent + OP_DEADLINE), "a page's deadline does not apply");
+        assert!(asked.try_take().is_none());
+        assert!(!ops.expire(sent + EDITOR_BUDGET_MAX + Duration::from_secs(1)));
+        assert!(matches!(asked.try_take(), Some(Err(RpcError::Unavailable(_)))));
     }
 
     /// Records every Lua call and answers each with a value of its own.

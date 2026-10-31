@@ -714,6 +714,21 @@ pub(super) fn handle_inbound_message(
                 Ok(outcome) => apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out),
             }
         }
+        // A broker card's answer goes to the broker, by the card's own id, past the same gates as any card
+        // (admission). The call runs from the tick; the page learns the card went from its `editor_cards`.
+        InboundMessage::EditorCardAnswer {
+            card_id,
+            decision,
+            origin,
+            ..
+        } => {
+            let tab = tab_of(target);
+            let decision = decision.card_decision();
+            match super::editor_glue::answer_card(state, tab, &card_id, decision, origin.origin(), &mut out) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, &why),
+            }
+        }
         // Only the person answers Claude's question, from the page that shows its tab, past the window's
         // gate (admission); `answer_question` checks the page again and checks the answer against the
         // set before anything is sent. A refusal leaves the question waiting and the page keeps its
@@ -915,6 +930,23 @@ pub(super) fn handle_inbound_message(
                 }
             }
             ok(&mut out);
+        }
+        InboundMessage::ToggleFollowing { .. } => {
+            let tab = tab_of(target);
+            if state.tabs.toggle_following(tab) {
+                if !state.tabs.get(tab).unwrap().following {
+                    state.editor_follower.forget(tab.0);
+                }
+                send_tabs(state, &mut out);
+                ok(&mut out);
+            } else {
+                let why = if state.tabs.is_moving(tab) {
+                    eitri_core::tab_set::MOVING.to_string()
+                } else {
+                    format!("no tab {}", tab.0)
+                };
+                refuse(&mut out, &why);
+            }
         }
         InboundMessage::RenameTab { name, .. } => {
             let tab = tab_of(target);
@@ -1183,10 +1215,22 @@ pub(super) fn handle_inbound_message(
             let started = if state.scratch.is_none() {
                 Err("the scratch directory could not be created at startup".to_string())
             } else {
-                proposal_target(&state.project_dir, &path)
-                    .and_then(|file| start_proposal_job(state, view, &request_id, file, change))
+                proposal_target(&state.project_dir, &path).and_then(|file| {
+                    let name = file.to_string_lossy().into_owned();
+                    start_proposal_job(state, view, &request_id, name, move || {
+                        eitri_core::scratch::proposal_texts(&file, &change)
+                    })
+                })
             };
             if let Err(why) = started {
+                refuse(&mut out, &why);
+            }
+        }
+        // `Ctrl+g` on a proposal an editor tool computed: the two sides come from the review store, by the
+        // proposal's id in this tab's memory; the page names only which proposal and which file.
+        InboundMessage::EditorCardView { proposal, file, .. } => {
+            let tab = tab_of(target);
+            if let Err(why) = super::editor_glue::view_proposal(state, view, &request_id, tab, &proposal, file) {
                 refuse(&mut out, &why);
             }
         }

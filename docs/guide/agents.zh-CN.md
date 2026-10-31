@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=0a9e69ba5e90e06eb7ed5b9283a89492249ffad4e549cbbeba3c95d562b65a5b -->
+<!-- translated-from: agents.md sha256=4f759e11e2d25330ef5f591fcb4e9913c2d96e182dcc76f4f5cd1a1b44c41dfc -->
 
 # Codex 与其他 agent
 
@@ -96,7 +96,7 @@ Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，�
 ### 需要什么
 
 - `codex` 命令，已经安装，并用 `codex login` 登录。没有登录时，标签页会说 “Codex is not signed in: run `codex login` in a terminal”。
-- Codex 0.160.0 或更新。Eitri 试过 0.160.0 到 0.161.0；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
+- Codex 0.160.0 或更新。Eitri 试过 0.160.0 到 0.163.0；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
 
 Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的绝对路径），然后是 `init.lua` 里的 `agent.codex.command`（绝对路径，或在 `PATH` 里查找的裸命令名），最后是 `PATH` 上的 `codex`。`EITRI_CODEX` 不是一个现有文件的绝对路径，Eitri 会在启动时停下并点出这个变量；`agent.codex.command` 是带目录部分的相对路径时也一样。其他找不到 `codex` 的情况只让 Codex 标签页的启动失败：`PATH` 上什么都没有时，消息是 “codex not found: install it and run `codex login`, or set EITRI_CODEX”，而 `agent.codex.command` 指向的文件不存在时，消息会点出它的名字。`PATH` 里为空或相对的条目会被跳过，因为 agent 是在你的项目目录里运行的，这样的条目会指向项目自己放的文件。
 
@@ -239,6 +239,10 @@ Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样�
 ### ACP 标签页没有什么
 
 ACP 没有办法把消息插进正在运行的回合，所以回合运行时按 `Enter`，消息会留到回合结束再发。ACP agent 可能发来的计划、会话标题和其他更新都不显示；这类标签页没有速率限制、没有上下文条，也没有模型选择器。agent 报告的命令列表就是输入框里的 `/` 菜单（见[输入框的按键](keys.zh-CN.md)）：名字和说明都按纯文本绘制，agent 还没报告过命令的标签页没有菜单。agent 报告上下文有多满时，`prefix i` 有一行 `context`，agent 报告之后它显示 agent 的上下文有多满。token 不带费用。
+
+## 从 agent 标签页使用你的编辑器
+
+任何标签页里的 agent，包括 Codex 和 ACP，都可以给你看一个文件、读你的编辑器里现在有什么、向你的语言服务器询问代码，并提议改动等你批准。这些工具做什么、Eitri 什么时候先问你、Codex 标签页不带它们时会说什么、怎样关掉它们，都在单独一页：[从 agent 标签页使用你的编辑器](editor-tools.zh-CN.md)。[跟随 agent 的修改](editor-tools.zh-CN.md#following)和 [`nvim_exec`](editor-tools.zh-CN.md#nvim-exec)（唯一一个你打开之前一直关着的工具）也在那里。
 
 <a id="chat-views"></a>
 ## 聊天视图

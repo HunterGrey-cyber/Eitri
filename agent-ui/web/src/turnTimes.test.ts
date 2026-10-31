@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { durationsFromSnapshot, durationsWith, endingDuration, formatDuration, NO_TURN_DURATIONS, workedFooters } from "./turnTimes";
+import { durationsFromSnapshot, durationsWith, endingDuration, formatDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "./turnTimes";
 import { turnEndingText } from "./turnEnding";
-import type { TurnEnding, TurnTimeWire } from "./types";
+import { applyEvent, applySnapshot, initialState, withEditorCards } from "./reducer";
+import { buildTimeline } from "./timeline";
+import type { AgentUiSnapshot, EditorCardWire, TurnEnding, TurnTimeWire } from "./types";
 
 const wire = (turnId: string, durationMs: number, anchorSeq: number | null = 5): TurnTimeWire => ({
   turnId,
@@ -100,6 +102,40 @@ describe("workedFooters", () => {
 
   it("is empty when no turn has a known time", () => {
     expect(workedFooters(rows(null, [], 1), NO_TURN_DURATIONS).size).toBe(0);
+  });
+
+  /* A broker card is numbered from the tab's revision without taking one: the page's counter stays Rust's, so the
+     next reply folded gets the number Rust gave it and the turn's footer, anchored on that number, still finds it. */
+  it("a_turns_footer_still_places_after_an_editor_card", () => {
+    const card: EditorCardWire = {
+      id: "ec-0123456789abcdef-1", seq: 12, tool: "open_file", toolUseId: null, title: "Show a?", body: [{ kind: "plain", text: "x" }],
+    };
+    const snapshot = { ...initialState(), transcript: [{ seq: 10, text: "before" }], editorCards: [card] } as unknown as AgentUiSnapshot;
+    let state = applySnapshot(initialState(), snapshot, 12);
+    expect(state.editorCards.map((c) => c.permissionId)).toEqual([card.id]);
+    state = withEditorCards(state, [card, { ...card, id: "ec-0123456789abcdef-2", seq: 12 }]);
+    expect(state.nextSeq).toBe(12);
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "after" });
+    expect(state.transcript.map((m) => m.seq)).toEqual([10, 12]);
+    const footers = workedFooters(state, durationsFromSnapshot([wire("t1", 5_000, 12)]));
+    expect([...footers]).toEqual([[12, "Worked for 5s"]]);
+    expect(placeFooters(buildTimeline(state), footers).get("m-12")).toBe("Worked for 5s");
+  });
+
+  /* The card's number is the revision the next event takes, so a reply may share it; the footer is the reply's. */
+  it("a_footer_anchored_on_a_number_a_card_shares_stands_under_the_reply", () => {
+    const card: EditorCardWire = {
+      id: "ec-0123456789abcdef-1", seq: 12, tool: "open_file", toolUseId: "toolu_c", title: "Show a?", body: [{ kind: "plain", text: "x" }],
+    };
+    let state = withEditorCards(initialState(), [card]);
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_c", name: "mcp__eitri__open_file", input: {} });
+    state = { ...state, nextSeq: 12 };
+    state = applyEvent(state, { type: "content_delta", turn_id: "t1", kind: "text", text: "after" });
+    const items = buildTimeline(state);
+    expect(items.map((item) => item.key)).toContain("ec-ec-0123456789abcdef-1");
+    const footers = workedFooters(state, durationsFromSnapshot([wire("t1", 5_000, 12)]));
+    const placed = placeFooters(items, footers);
+    expect([...placed.keys()]).toEqual(["m-12"]);
   });
 });
 

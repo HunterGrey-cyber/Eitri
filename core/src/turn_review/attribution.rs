@@ -93,10 +93,38 @@ pub fn named_paths(tool_calls: &[agent::ToolCallRecord], turn_ids: &[&str]) -> N
             Some(result) if result.is_error => {}
             // Codex words a finished `fileChange` by its status; only an applied one changed anything.
             Some(result) if kind == Kind::CodexFileChange && !is_applied(&result.content) => {}
-            Some(_) => kind.collect(&call.input, &mut named.paths),
+            Some(_) => named
+                .paths
+                .extend(edited_by(std::slice::from_ref(call), &call.tool_use_id)),
         }
     }
     named
+}
+
+/// What a successful changing call named, including calls nested under subagents. A Codex file change
+/// names nothing until it is applied, and a call without a result names nothing yet.
+pub fn edited_by(tool_calls: &[agent::ToolCallRecord], tool_use_id: &str) -> Vec<PathBuf> {
+    for call in tool_calls {
+        if call.tool_use_id == tool_use_id {
+            let Some(kind) = call_kind(&call.name) else {
+                return Vec::new();
+            };
+            let Some(result) = &call.result else { return Vec::new() };
+            if result.is_error || (kind == Kind::CodexFileChange && !is_applied(&result.content)) {
+                return Vec::new();
+            }
+            let mut paths = BTreeSet::new();
+            kind.collect(&call.input, &mut paths);
+            return paths.into_iter().collect();
+        }
+        if let Some(children) = &call.children {
+            let paths = edited_by(&children.tool_calls, tool_use_id);
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// How a changing call spells the files it targets.
@@ -233,6 +261,91 @@ mod tests {
             denied: None,
             changed_input: None,
         }
+    }
+
+    #[test]
+    fn edited_by_names_each_changing_tool() {
+        for (name, input, content, paths) in [
+            ("Write", json!({"file_path":"a"}), json!("ok"), vec!["a"]),
+            ("Edit", json!({"file_path":"b"}), json!("ok"), vec!["b"]),
+            ("MultiEdit", json!({"file_path":"c"}), json!("ok"), vec!["c"]),
+            ("NotebookEdit", json!({"notebook_path":"d"}), json!("ok"), vec!["d"]),
+            (
+                "fileChange",
+                json!({"changes":[{"path":"e","movePath":"f"}]}),
+                json!("applied"),
+                vec!["e", "f"],
+            ),
+            ("acp:edit", json!({"diffs":[{"path":"g"}]}), json!("ok"), vec!["g"]),
+            (
+                "acp:delete",
+                json!({"locations":[{"path":"h"}]}),
+                json!("ok"),
+                vec!["h"],
+            ),
+            ("acp:move", json!({"locations":[{"path":"i"}]}), json!("ok"), vec!["i"]),
+        ] {
+            let c = call_with("t", name, input, content, false);
+            assert_eq!(
+                edited_by(std::slice::from_ref(&c), &c.tool_use_id),
+                paths.into_iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn an_errored_call_names_nothing() {
+        let c = call("t", "Write", json!({"file_path":"a"}), Some(true));
+        assert!(edited_by(std::slice::from_ref(&c), &c.tool_use_id).is_empty());
+    }
+
+    #[test]
+    fn an_unapplied_file_change_names_nothing() {
+        for result in [None, Some("in progress"), Some("declined")] {
+            let mut c = call("t", "fileChange", json!({"changes":[{"path":"a"}]}), None);
+            c.result = result.map(|content| ToolCallResult {
+                content: json!(content),
+                is_error: false,
+            });
+            assert!(edited_by(std::slice::from_ref(&c), &c.tool_use_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_subagents_call_is_found() {
+        let child = call("t", "Edit", json!({"file_path":"child"}), Some(false));
+        let id = child.tool_use_id.clone();
+        let mut parent = call("t", "Agent", json!({}), Some(false));
+        parent
+            .children
+            .get_or_insert_with(Default::default)
+            .tool_calls
+            .push(child);
+        assert_eq!(edited_by(&[parent], &id), vec![PathBuf::from("child")]);
+    }
+
+    #[test]
+    fn a_read_names_nothing() {
+        let c = call("t", "Read", json!({"file_path":"a"}), Some(false));
+        assert!(edited_by(std::slice::from_ref(&c), &c.tool_use_id).is_empty());
+        assert!(edited_by(&[c], "missing").is_empty());
+    }
+
+    #[test]
+    fn named_paths_is_unchanged() {
+        let calls = vec![
+            call("t", "Edit", json!({"file_path":"a"}), Some(false)),
+            call("t", "Write", json!({"file_path":"pending"}), None),
+            call("other", "Write", json!({"file_path":"other"}), Some(false)),
+        ];
+        assert_eq!(
+            named_paths(&calls, &["t"]),
+            NamedPaths {
+                paths: set(&["a"]),
+                pending_no_result: 1
+            }
+        );
+        assert_eq!(edited_by(&calls, &calls[0].tool_use_id), vec![PathBuf::from("a")]);
     }
 
     #[test]

@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793218280179,
+      "occurred_at": 1793397478594,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+      "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-      "session_id": "886ff244-654a-4ac6-b11f-5f24bcf7c557",
+      "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+      "session_id": "cbf63953-b55e-48e3-8558-923622c81073",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -234,7 +238,7 @@
     {
       "kind": "text",
       "text": "C20G-OPEN-DONE",
-      "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+      "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
       "type": "content_delta"
     },
     {
@@ -247,7 +251,7 @@
       "outcome": "completed",
       "result_text": "C20G-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+      "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -262,11 +266,11 @@
       }
     },
     {
-      "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+      "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
       "type": "turn_started"
     },
     {
-      "interaction_id": "3de86c38-85b1-414a-a44e-a3ba94850af1",
+      "interaction_id": "8e209115-c1a8-478d-b598-5a11d26caedd",
       "questions": [
         {
           "header": "Go",
@@ -293,13 +297,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-      "session_id": "886ff244-654a-4ac6-b11f-5f24bcf7c557",
+      "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+      "session_id": "cbf63953-b55e-48e3-8558-923622c81073",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "input": {
@@ -323,12 +331,12 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+      "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
       "type": "tool_call_started"
     },
     {
       "answers": [],
-      "interaction_id": "3de86c38-85b1-414a-a44e-a3ba94850af1",
+      "interaction_id": "8e209115-c1a8-478d-b598-5a11d26caedd",
       "outcome": "session_closed",
       "reason": null,
       "type": "question_settled"
@@ -342,7 +350,7 @@
       "outcome": "failed",
       "result_text": "",
       "stop_reason": null,
-      "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+      "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
       "type": "turn_completed",
       "usage": null
     },
@@ -351,12 +359,12 @@
       "type": "session_closed"
     },
     {
-      "occurred_at": 1793218282678,
+      "occurred_at": 1793397481091,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+      "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
       "type": "turn_started"
     },
     {
@@ -561,23 +569,27 @@
       "type": "commands_available"
     },
     {
-      "attached_provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
+      "attached_provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
       "detail": null,
       "forked": false,
-      "requested_provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
+      "requested_provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
       "status": "attached",
       "type": "resume_outcome"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-      "session_id": "5705c3da-cf84-4cf6-8540-62518ff2d650",
+      "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+      "session_id": "220def3a-567b-4df1-8b52-d69f3d7042a0",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -592,7 +604,7 @@
     {
       "kind": "text",
       "text": "C20G-AFTER-DONE",
-      "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+      "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
       "type": "content_delta"
     },
     {
@@ -605,7 +617,7 @@
       "outcome": "completed",
       "result_text": "C20G-AFTER-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+      "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -623,12 +635,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793218280179,
+        "occurred_at": 1793397478594,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+        "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
         "type": "turn_started"
       },
       {
@@ -835,13 +847,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-        "session_id": "886ff244-654a-4ac6-b11f-5f24bcf7c557",
+        "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+        "session_id": "cbf63953-b55e-48e3-8558-923622c81073",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -856,7 +872,7 @@
       {
         "kind": "text",
         "text": "C20G-OPEN-DONE",
-        "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+        "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
         "type": "content_delta"
       },
       {
@@ -869,7 +885,7 @@
         "outcome": "completed",
         "result_text": "C20G-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "c1873128-6d49-4bc8-890b-972db4c3a5e4",
+        "turn_id": "3ced01ad-1d18-4d9d-92e0-33bde96bacbb",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -884,11 +900,11 @@
         }
       },
       {
-        "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+        "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
         "type": "turn_started"
       },
       {
-        "interaction_id": "3de86c38-85b1-414a-a44e-a3ba94850af1",
+        "interaction_id": "8e209115-c1a8-478d-b598-5a11d26caedd",
         "questions": [
           {
             "header": "Go",
@@ -915,13 +931,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-        "session_id": "886ff244-654a-4ac6-b11f-5f24bcf7c557",
+        "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+        "session_id": "cbf63953-b55e-48e3-8558-923622c81073",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "input": {
@@ -945,12 +965,12 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+        "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
         "type": "tool_call_started"
       },
       {
         "answers": [],
-        "interaction_id": "3de86c38-85b1-414a-a44e-a3ba94850af1",
+        "interaction_id": "8e209115-c1a8-478d-b598-5a11d26caedd",
         "outcome": "session_closed",
         "reason": null,
         "type": "question_settled"
@@ -964,7 +984,7 @@
         "outcome": "failed",
         "result_text": "",
         "stop_reason": null,
-        "turn_id": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+        "turn_id": "25767858-0248-4ab0-8109-a95ddbd2223d",
         "type": "turn_completed",
         "usage": null
       },
@@ -973,12 +993,12 @@
         "type": "session_closed"
       },
       {
-        "occurred_at": 1793218282678,
+        "occurred_at": 1793397481091,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+        "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
         "type": "turn_started"
       },
       {
@@ -1183,23 +1203,27 @@
         "type": "commands_available"
       },
       {
-        "attached_provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
+        "attached_provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
         "detail": null,
         "forked": false,
-        "requested_provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
+        "requested_provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
         "status": "attached",
         "type": "resume_outcome"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "e0082ec3-8a8f-4e63-bab9-9ccfcc428416",
-        "session_id": "5705c3da-cf84-4cf6-8540-62518ff2d650",
+        "provider_session_id": "e1941622-19e7-43d6-9ee6-be8e0e7d5014",
+        "session_id": "220def3a-567b-4df1-8b52-d69f3d7042a0",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -1214,7 +1238,7 @@
       {
         "kind": "text",
         "text": "C20G-AFTER-DONE",
-        "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+        "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
         "type": "content_delta"
       },
       {
@@ -1227,7 +1251,7 @@
         "outcome": "completed",
         "result_text": "C20G-AFTER-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "b8584b50-edbd-4708-9760-397712e63d7b",
+        "turn_id": "ce5fa3e4-66e5-49e5-b494-f8c8b6de2b8f",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1245,7 +1269,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 25
+    "throughRevision": 28
   },
   "scenario": "c20g",
   "snapshot": {
@@ -1472,7 +1496,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 5,
+          "seq": 6,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1482,7 +1506,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 22,
+          "seq": 25,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1493,7 +1517,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "3de86c38-85b1-414a-a44e-a3ba94850af1",
+          "interactionId": "8e209115-c1a8-478d-b598-5a11d26caedd",
           "questions": [
             {
               "header": "Go",
@@ -1513,7 +1537,7 @@
               "question": "Should the C20 change go ahead?"
             }
           ],
-          "seq": 9,
+          "seq": 10,
           "state": {
             "answers": [],
             "kind": "settled",
@@ -1521,7 +1545,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "340341dc-2a6d-4b07-9d11-d717c441a27a",
+          "turnId": "25767858-0248-4ab0-8109-a95ddbd2223d",
           "unsupportedReason": null
         }
       ],
@@ -1554,18 +1578,18 @@
           },
           "name": "AskUserQuestion",
           "result": null,
-          "seq": 12,
+          "seq": 14,
           "toolUseId": "toolu_q1",
-          "turnId": "340341dc-2a6d-4b07-9d11-d717c441a27a"
+          "turnId": "25767858-0248-4ab0-8109-a95ddbd2223d"
         }
       ],
       "transcript": [
         {
-          "seq": 6,
+          "seq": 7,
           "text": "C20G-OPEN-DONE"
         },
         {
-          "seq": 23,
+          "seq": 26,
           "text": "C20G-AFTER-DONE"
         }
       ],
@@ -1576,8 +1600,8 @@
           "message": null,
           "reason": null,
           "resetsAt": null,
-          "seq": 14,
-          "turnId": "340341dc-2a6d-4b07-9d11-d717c441a27a"
+          "seq": 16,
+          "turnId": "25767858-0248-4ab0-8109-a95ddbd2223d"
         }
       ],
       "usage": {
@@ -1594,7 +1618,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 25,
+    "throughRevision": 28,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

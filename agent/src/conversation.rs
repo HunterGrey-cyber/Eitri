@@ -52,11 +52,13 @@ use crate::move_seed::{ChatMoveCore, ConversationHandoff, HandoffRefused, MovedP
 use crate::persistence::{save_conversation_record, ConversationRecord};
 use crate::projection::{AgentDomainEvent, PermissionOutcome};
 use crate::provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
-    ProviderCapabilities, ProviderError, ProviderInfo, ResolvePermissionRequest, SendTurnRequest, TurnStamp,
+    AgentProvider, ClientToolAnswer, ClientToolCallState, ClientToolSet, CloseSessionRequest, CreateSessionRequest,
+    InterruptTurnRequest, PermissionDecision, ProviderCapabilities, ProviderError, ProviderInfo,
+    ResolvePermissionRequest, SendTurnRequest, TurnStamp,
 };
 use crate::setting_sources::ProjectTrust;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -375,6 +377,17 @@ pub struct AgentConversation {
     /// conversation: another session's revisions start again from their own seed and mean nothing
     /// against this one's snapshot.
     ui_snapshot_revision: Option<u64>,
+    /// The tools this session was given (`create_with_tools`, `resume_with_tools`): the set's names when
+    /// the provider offers the capability, otherwise none, whatever the caller asked for.
+    declared_client_tools: BTreeSet<String>,
+}
+
+/// The tools a session gets of those `set` declares, on a provider with `capabilities`.
+fn declared_tools(capabilities: &ProviderCapabilities, set: Option<&ClientToolSet>) -> BTreeSet<String> {
+    match set {
+        Some(set) if capabilities.client_tools => set.tools.iter().map(|tool| tool.name.clone()).collect(),
+        _ => BTreeSet::new(),
+    }
 }
 
 impl AgentConversation {
@@ -394,16 +407,28 @@ impl AgentConversation {
         cwd: &Path,
         project: ProjectTrust,
     ) -> Result<Self, ConversationError> {
+        Self::create_with_tools(provider, cwd, project, None)
+    }
+
+    /// [`create`](Self::create) with the tools this host answers itself.
+    pub fn create_with_tools(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        cwd: &Path,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
+    ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
         let info = provider.info();
+        let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
         let session_id = provider.create_session(CreateSessionRequest {
             cwd: canonical_cwd.to_string_lossy().to_string(),
             // A UI client always wants incremental presentation.
             streaming: crate::provider::StreamingPreference::Partial,
             project,
+            client_tools,
         })?;
-        Ok(Self::assembled(
+        let mut conversation = Self::assembled(
             provider,
             None,
             PROVIDER_NAME,
@@ -411,7 +436,9 @@ impl AgentConversation {
             capabilities,
             info,
             session_id,
-        ))
+        );
+        conversation.declared_client_tools = declared_client_tools;
+        Ok(conversation)
     }
 
     /// Creates a fresh session on an external provider. The provider's name keys the lease and the
@@ -491,6 +518,7 @@ impl AgentConversation {
             title_noted: false,
             close_failed: false,
             ui_snapshot_revision: None,
+            declared_client_tools: BTreeSet::new(),
         }
     }
 
@@ -538,6 +566,19 @@ impl AgentConversation {
         provider_session_id: &str,
         held: Option<SessionLease>,
         project: ProjectTrust,
+    ) -> Result<Self, ConversationError> {
+        Self::resume_with_tools(provider, cwd, provider_session_id, held, project, None)
+    }
+
+    /// [`resume_holding`](Self::resume_holding) with the tools this host answers itself, stated
+    /// afresh as `project` is: a resumed session has only what this call names.
+    pub fn resume_with_tools(
+        provider: Arc<dyn AgentProvider + Send + Sync>,
+        cwd: &Path,
+        provider_session_id: &str,
+        held: Option<SessionLease>,
+        project: ProjectTrust,
+        client_tools: Option<ClientToolSet>,
     ) -> Result<Self, ConversationError> {
         let canonical_cwd = cwd.canonicalize().map_err(ConversationError::Cwd)?;
         let capabilities = provider.capabilities();
@@ -596,11 +637,13 @@ impl AgentConversation {
         // that one outsized session. Every other transcript here is a few milliseconds.
         let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
 
+        let declared_client_tools = declared_tools(&capabilities, client_tools.as_ref());
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
             provider_session_id: provider_session_id.to_string(),
             cwd: cwd_string.clone(),
             streaming: crate::provider::StreamingPreference::Partial,
             project,
+            client_tools,
         })?;
 
         let ingest = ConversationIngest::start(
@@ -627,6 +670,7 @@ impl AgentConversation {
             title_noted: false,
             close_failed: false,
             ui_snapshot_revision: None,
+            declared_client_tools,
         };
 
         Self::confirm_resume(conversation, PROVIDER_NAME, &cwd_string, provider_session_id)
@@ -705,6 +749,7 @@ impl AgentConversation {
             title_noted: false,
             close_failed: false,
             ui_snapshot_revision: None,
+            declared_client_tools: BTreeSet::new(),
         };
         Self::confirm_resume(conversation, name, &cwd_string, &provider_session_id)
     }
@@ -922,6 +967,12 @@ impl AgentConversation {
         self.external.as_ref().and_then(|e| e.context_gauge())
     }
 
+    /// What the tab should say about editor tools its session was left without
+    /// (`ExternalProvider::editor_note`), handed over once; nothing for a Claude session.
+    pub fn editor_note(&self) -> Option<String> {
+        self.external.as_ref().and_then(|e| e.editor_note())
+    }
+
     /// Whether the provider stopped this session itself with the conversation whole
     /// (`ExternalProvider::stopped_resumable`); false for a Claude session.
     pub fn stopped_resumable(&self) -> bool {
@@ -949,6 +1000,34 @@ impl AgentConversation {
 
     pub fn task_output(&self, task_id: &str) -> Result<crate::TaskReply<crate::TaskOutput>, ConversationError> {
         Ok(self.provider.task_output(&self.require_session()?, task_id)?)
+    }
+
+    /// The tools this session was given: empty on a provider without the capability.
+    pub fn declared_client_tools(&self) -> &BTreeSet<String> {
+        &self.declared_client_tools
+    }
+
+    /// Answers one call of a declared tool without waiting
+    /// ([`AgentProvider::answer_client_tool_call`]).
+    pub fn answer_client_tool_call(
+        &self,
+        call_id: &str,
+        text: Vec<String>,
+        is_error: bool,
+    ) -> Result<(), ConversationError> {
+        let session_id = self.require_session()?;
+        self.provider.answer_client_tool_call(ClientToolAnswer {
+            session_id,
+            call_id: call_id.to_string(),
+            text,
+            is_error,
+        })?;
+        Ok(())
+    }
+
+    /// Reads the session's open calls on the provider's side.
+    pub fn client_tool_call_state(&self) -> Result<crate::TaskReply<ClientToolCallState>, ConversationError> {
+        Ok(self.provider.client_tool_call_state(&self.require_session()?)?)
     }
 
     pub fn provider_info(&self) -> &ProviderInfo {
@@ -1429,6 +1508,7 @@ impl AgentConversation {
             close_failed: _,
             // Revisions are per projection: the destination notes its own first snapshot's.
             ui_snapshot_revision: _,
+            declared_client_tools,
         } = &*self;
         let crate::ingestion::IngestHandoff {
             provider_session_id,
@@ -1455,6 +1535,7 @@ impl AgentConversation {
             pending_name: pending_name.map(|name| PendingName { name }),
             record_written,
             history_dirty,
+            declared_client_tools: declared_client_tools.clone(),
         };
         Ok((core, handoff))
     }
@@ -1502,6 +1583,7 @@ impl AgentConversation {
             pending_name,
             record_written,
             history_dirty,
+            declared_client_tools,
         } = handoff;
         let MovedProvider { agent, external, lease } = provider;
         let name: &'static str = external.as_ref().map_or(PROVIDER_NAME, |external| external.name());
@@ -1553,6 +1635,7 @@ impl AgentConversation {
             title_noted,
             close_failed: false,
             ui_snapshot_revision: None,
+            declared_client_tools,
         })
     }
 

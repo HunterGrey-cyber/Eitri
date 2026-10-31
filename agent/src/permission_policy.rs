@@ -586,7 +586,7 @@ pub fn judge_project_path(project_root: &Path, home: Option<&Path>, path: &Path)
 }
 
 fn judge_within_budget(project_root: &Path, home: Option<&Path>, path: &Path) -> PathJudgement {
-    let Ok(root) = boundary(project_root, home) else {
+    let Ok(root) = boundary(project_root, home, &Identity::current()) else {
         return PathJudgement::Outside(OutsideReason::NoBoundary);
     };
     // With no component to look up it would resolve to the root itself.

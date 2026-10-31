@@ -46,7 +46,7 @@ build)
 	done
 	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
 	mkdir -p "$_cfs_target_dir/release" || exit 1
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard agent-hook; do
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge agent-hook; do
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done

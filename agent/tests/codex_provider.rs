@@ -3,12 +3,14 @@
 //! recording has the shape, and by hand for the shapes no run produced (reasoning, a file change, a
 //! failed turn). No real Codex runs here and no model turn is spent.
 
-use agent::providers::codex::provider::NOT_FOUND;
-use agent::providers::codex::{parse_user_agent_version, BinaryKey, CodexLaunch, CodexProvider, MIN_CODEX};
+use agent::providers::codex::config::session_config;
+use agent::providers::codex::provider::{EDITOR_SERVER_WAIT, EDITOR_TOOLS_OFF, INTERRUPT_SETTLE, NOT_FOUND};
+use agent::providers::codex::wire::{ThreadResumeParams, ThreadStartParams};
+use agent::providers::codex::{parse_user_agent_version, BinaryKey, Checked, CodexLaunch, CodexProvider, MIN_CODEX};
 use agent::{
-    AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, ExternalProvider, ExternalStart,
-    InterruptTurnRequest, ProviderError, ProviderErrorCode, Reviewer, SendTurnRequest, TrustPlan, TurnOutcome,
-    TurnPolicy,
+    AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, EditorServerSpec, ExternalProvider,
+    ExternalStart, InterruptTurnRequest, ProviderError, ProviderErrorCode, Reviewer, SendTurnRequest, TrustPlan,
+    TurnOutcome, TurnPolicy,
 };
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -96,6 +98,7 @@ fn start_request(reviewer: Reviewer) -> ExternalStart {
             sandbox: agent::Sandbox::Project,
         },
         resume: None,
+        editor_server: None,
     }
 }
 
@@ -326,19 +329,19 @@ fn a_newer_codex_runs_with_a_note_and_a_tested_one_states_the_tested_range() {
     assert!(tested.info().startup_diagnostics.is_empty());
     assert_eq!(
         tested.info().build_description.as_deref(),
-        Some("Codex 0.160.0 (tested 0.160.0 to 0.161.0)")
+        Some("Codex 0.160.0 (tested 0.160.0 to 0.163.0)")
     );
-    let highest = connect(handshake("codex/0.161.0 (Arch)", signed_in())).expect("connects");
-    assert!(highest.info().startup_diagnostics.is_empty(), "0.161.0 is tested");
+    let highest = connect(handshake("codex/0.163.0 (Arch)", signed_in())).expect("connects");
+    assert!(highest.info().startup_diagnostics.is_empty(), "0.163.0 is tested");
     assert_eq!(
         highest.info().build_description.as_deref(),
-        Some("Codex 0.161.0 (tested 0.160.0 to 0.161.0)")
+        Some("Codex 0.163.0 (tested 0.160.0 to 0.163.0)")
     );
-    let newer = connect(handshake("codex/0.162.0 (Arch)", signed_in())).expect("connects");
-    assert_eq!(newer.info().build_description.as_deref(), Some("Codex 0.162.0"));
+    let newer = connect(handshake("codex/0.164.0 (Arch)", signed_in())).expect("connects");
+    assert_eq!(newer.info().build_description.as_deref(), Some("Codex 0.164.0"));
     assert_eq!(
         newer.info().startup_diagnostics,
-        vec!["untested Codex 0.162.0 (tested up to 0.161.0)".to_string()]
+        vec!["untested Codex 0.164.0 (tested up to 0.163.0)".to_string()]
     );
 }
 
@@ -607,6 +610,178 @@ fn thread_start_sends_session_config_and_policy() {
             cwd: "/work/proj".into(),
         }]
     );
+}
+
+/// Codex's word on how a thread's tool server is getting on.
+fn server_status(thread: &str, name: &str, status: &str) -> Value {
+    write(json!({"method": "mcpServer/startupStatus/updated", "params": {
+        "threadId": thread, "name": name, "status": status, "error": null, "failureReason": null,
+    }}))
+}
+
+/// A start that gives the session the editor's server.
+fn start_with_editor_server() -> ExternalStart {
+    let mut request = start_request(Reviewer::User);
+    request.editor_server = Some(EditorServerSpec {
+        name: "eitri".into(),
+        command: PathBuf::from("/opt/eitri/eitri-editor-bridge"),
+        args: vec!["/run/ed-00".into(), "a-key".into()],
+        cwd: PathBuf::from("/work/proj"),
+    });
+    request
+}
+
+/// How long a start with `request` takes when Codex says `rest` after answering it.
+fn timed_start(thread: &str, request: ExternalStart, rest: Vec<Value>) -> (CodexProvider, Duration) {
+    let provider = connect(session_script(thread, rest)).expect("the handshake passes");
+    let began = Instant::now();
+    assert_eq!(provider.start(request).expect("the session starts"), thread);
+    (provider, began.elapsed())
+}
+
+#[test]
+fn the_start_waits_for_the_server_to_leave_starting_and_no_longer_than_3_s() {
+    assert_eq!(EDITOR_SERVER_WAIT, Duration::from_secs(3));
+    let (t, took_up) = ("th-70", Duration::from_millis(400));
+    let (_up, came_up) = timed_start(
+        t,
+        start_with_editor_server(),
+        vec![
+            server_status(t, "eitri", "starting"),
+            json!({"sleep_ms": took_up.as_millis() as u64}),
+            server_status(t, "eitri", "ready"),
+        ],
+    );
+    assert!(came_up >= took_up, "the start did not wait for the server: {came_up:?}");
+
+    // Another server's word is not this one's.
+    let (_stuck, gave_up) = timed_start(
+        t,
+        start_with_editor_server(),
+        vec![
+            server_status(t, "eitri", "starting"),
+            server_status(t, "theirs", "ready"),
+        ],
+    );
+    assert!(gave_up >= EDITOR_SERVER_WAIT, "gave up after {gave_up:?}");
+    assert!(
+        gave_up <= EDITOR_SERVER_WAIT + Duration::from_secs(2),
+        "gave up after {gave_up:?}"
+    );
+    assert!(
+        came_up < gave_up,
+        "a server that came up took as long as one that never did"
+    );
+}
+
+#[test]
+fn no_editor_server_means_no_wait() {
+    let t = "th-71";
+    let (_provider, took) = timed_start(
+        t,
+        start_request(Reviewer::User),
+        vec![server_status(t, "eitri", "starting")],
+    );
+    assert!(took < EDITOR_SERVER_WAIT, "the start waited: {took:?}");
+}
+
+#[test]
+fn a_failed_server_leaves_a_usable_session() {
+    let (t, u) = ("th-72", "turn-72");
+    let (provider, took) = timed_start(
+        t,
+        start_with_editor_server(),
+        vec![
+            server_status(t, "eitri", "starting"),
+            server_status(t, "eitri", "failed"),
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    assert!(took < EDITOR_SERVER_WAIT, "a failure ends the wait: {took:?}");
+    assert_eq!(send(&provider, t, "go").expect("the turn starts"), u);
+    let events = until_turn_completed(&provider);
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
+}
+
+#[test]
+fn what_codex_says_during_the_wait_still_reaches_the_tripwire() {
+    let t = "th-73";
+    let mut request = start_with_editor_server();
+    request.plan.project_only = vec!["theirs".to_string()];
+    let (provider, _) = timed_start(
+        t,
+        request,
+        vec![
+            server_status(t, "theirs", "starting"),
+            server_status(t, "eitri", "ready"),
+        ],
+    );
+    pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. }))
+    });
+}
+
+#[test]
+fn a_session_given_an_editor_server_sends_it_on_start_and_on_resume() {
+    for resume in [None, Some("th-1")] {
+        let mut request = start_with_editor_server();
+        request.resume = resume.map(str::to_string);
+        let config = session_config(&request.plan, request.editor_server.as_ref()).expect("config");
+        assert!(config.as_value()["mcp_servers"]["eitri"].is_object());
+        let cwd = request.cwd.clone();
+        let (method, params) = match resume {
+            None => (
+                "thread/start",
+                serde_json::to_value(ThreadStartParams::new(
+                    cwd,
+                    Reviewer::User,
+                    agent::Sandbox::Project,
+                    config,
+                )),
+            ),
+            Some(id) => (
+                "thread/resume",
+                serde_json::to_value(ThreadResumeParams::new(
+                    id.into(),
+                    cwd,
+                    Reviewer::User,
+                    agent::Sandbox::Project,
+                    config,
+                )),
+            ),
+        };
+        let line = json!({"id": 3, "method": method, "params": params.unwrap()}).to_string();
+        let mut script = handshake(UA, signed_in());
+        script.push(expect_exact(&line));
+        script.push(thread_response_for(3, "th-1", "user"));
+        // On a resume this is read while the history is, and the wait after it still finds it.
+        script.push(server_status("th-1", "eitri", "ready"));
+        if resume.is_some() {
+            script.push(expect_request(4, "thread/turns/list"));
+            script.push(write(json!({"id": 4, "result": {"data": [], "nextCursor": null}})));
+        }
+        let provider = connect(script).expect("connects");
+        let began = Instant::now();
+        assert_eq!(provider.start(request).expect("starts"), "th-1");
+        assert!(
+            began.elapsed() < EDITOR_SERVER_WAIT,
+            "the server's status was missed: {:?}",
+            began.elapsed()
+        );
+    }
 }
 
 /// A session at a root that is no boundary: the start and each turn name the read-only sandbox, and an answer that
@@ -1824,6 +1999,98 @@ fn a_tool_server_call_left_running_is_not_a_reason_to_stop() {
     );
 }
 
+fn mcp_call(id: &str) -> Value {
+    json!({"type": "mcpToolCall", "id": id, "server": "eitri", "tool": "open_file", "status": "inProgress", "arguments": {}})
+}
+
+/// The results rows got, as row id, result and whether it is an error.
+fn row_ends(events: &[AgentDomainEvent]) -> Vec<(String, Value, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::ToolCallCompleted {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_interrupted_mcp_call_ends_its_row_and_is_no_background_work() {
+    let (t, u, next) = ("th-74", "turn-74", "turn-75");
+    let (provider, thread) = interrupted_with(
+        t,
+        u,
+        mcp_call("k1"),
+        vec![
+            expect_request(6, "turn/start"),
+            turn_response(6, next),
+            expect_exact(&format!(
+                r#"{{"id":7,"method":"turn/interrupt","params":{{"threadId":"{t}","turnId":"{next}"}}}}"#
+            )),
+            turn_completed(t, next, "interrupted", Value::Null),
+        ],
+    );
+    let events = until_turn_completed(&provider);
+    assert_eq!(row_ends(&events), [("k1".to_string(), json!("interrupted"), true)]);
+    let row_ended = position(&events, |e| matches!(e, AgentDomainEvent::ToolCallCompleted { .. }));
+    let turn_ended = position(&events, |e| matches!(e, AgentDomainEvent::TurnCompleted { .. }));
+    assert!(row_ended < turn_ended, "the row must end inside its turn");
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Interrupted,
+            ..
+        }
+    ));
+    assert_eq!(background_counts(&events), Vec::<u32>::new());
+
+    // Nothing of it stays running: an interrupt of the next turn has no call to wait for.
+    assert_eq!(send(&provider, &thread, "next").expect("the session goes on"), next);
+    let pressed = Instant::now();
+    provider
+        .interrupt_turn(InterruptTurnRequest {
+            session_id: thread.clone(),
+        })
+        .expect("the interrupt is accepted");
+    let events = until_turn_completed(&provider);
+    assert!(
+        pressed.elapsed() < INTERRUPT_SETTLE,
+        "it waited: {:?}",
+        pressed.elapsed()
+    );
+    assert_eq!(background_counts(&events), Vec::<u32>::new());
+}
+
+#[test]
+fn a_completed_turns_mcp_call_is_left_alone() {
+    let (t, u) = ("th-76", "turn-76");
+    let (provider, thread) = open(
+        t,
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            item_note("item/started", t, u, mcp_call("k1")),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+    );
+    send(&provider, &thread, "go").expect("starts");
+    let events = until_turn_completed(&provider);
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+    assert_eq!(row_ends(&events), []);
+    assert_eq!(background_counts(&events), Vec::<u32>::new());
+}
+
 #[test]
 fn an_interrupt_with_nothing_running_ends_the_turn_at_once() {
     // A command that ended before the key: nothing is waited on.
@@ -1939,7 +2206,129 @@ fn checked_as(version: &str) -> BinaryKey {
 }
 
 fn connect_checked(script: Vec<Value>, key: &BinaryKey) -> Result<CodexProvider, ProviderError> {
-    CodexProvider::connect_checked_with_args(launch(), vec![OsString::from(Value::Array(script).to_string())], key)
+    let checked = Checked {
+        key: key.clone(),
+        editor_server_lever: true,
+    };
+    connect_found(script, &checked)
+}
+
+fn connect_found(script: Vec<Value>, checked: &Checked) -> Result<CodexProvider, ProviderError> {
+    CodexProvider::connect_checked_with_args(
+        launch(),
+        vec![OsString::from(Value::Array(script).to_string())],
+        checked,
+    )
+}
+
+/// What the self-check found out about the editor server's lever, on the binary the script plays.
+fn found_lever(held: bool) -> Checked {
+    Checked {
+        key: checked_as("0.160.0"),
+        editor_server_lever: held,
+    }
+}
+
+/// The exact line `request`'s start sends, whichever server the session ended up with.
+fn start_line(request: &ExternalStart, server: Option<&EditorServerSpec>) -> Value {
+    let config = session_config(&request.plan, server).expect("config");
+    let params = ThreadStartParams::new(request.cwd.clone(), Reviewer::User, agent::Sandbox::Project, config);
+    expect_exact(&json!({"id": 3, "method": "thread/start", "params": params}).to_string())
+}
+
+/// A Codex that takes exactly `line` as its session's start, says `rest`, and has found `held` in the check.
+fn started_with(thread: &str, line: Value, rest: Vec<Value>, held: bool) -> (CodexProvider, Duration) {
+    let mut script = handshake(UA, signed_in());
+    script.push(line);
+    script.push(thread_response(3, thread));
+    script.extend(rest);
+    let provider = connect_found(script, &found_lever(held)).expect("the handshake passes");
+    let began = Instant::now();
+    let opened = provider.start(start_with_editor_server()).expect("the session starts");
+    assert_eq!(opened, thread);
+    (provider, began.elapsed())
+}
+
+#[test]
+fn a_failed_lever_attaches_no_server_and_the_session_runs() {
+    let (t, u) = ("th-80", "turn-80");
+    let request = start_with_editor_server();
+    let (provider, took) = started_with(
+        t,
+        start_line(&request, None),
+        vec![
+            expect_request(4, "turn/start"),
+            turn_response(4, u),
+            turn_completed(t, u, "completed", Value::Null),
+        ],
+        false,
+    );
+    assert!(took < EDITOR_SERVER_WAIT, "no server, no wait: {took:?}");
+    assert_eq!(send(&provider, t, "go").expect("the turn starts"), u);
+    let events = until_turn_completed(&provider);
+    assert!(matches!(
+        the_completion(&events),
+        AgentDomainEvent::TurnCompleted {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_failed_lever_attaches_no_server_to_a_resume_either() {
+    let t = "th-81";
+    let mut request = start_with_editor_server();
+    request.resume = Some(t.to_string());
+    let config = session_config(&request.plan, None).expect("config");
+    let params = ThreadResumeParams::new(
+        t.to_string(),
+        request.cwd.clone(),
+        Reviewer::User,
+        agent::Sandbox::Project,
+        config,
+    );
+    let mut script = handshake(UA, signed_in());
+    script.push(expect_exact(
+        &json!({"id": 3, "method": "thread/resume", "params": params}).to_string(),
+    ));
+    script.push(thread_response(3, t));
+    script.push(expect_request(4, "thread/turns/list"));
+    script.push(write(json!({"id": 4, "result": {"data": [], "nextCursor": null}})));
+    let provider = connect_found(script, &found_lever(false)).expect("the handshake passes");
+    assert_eq!(provider.start(request).expect("the session resumes"), t);
+    assert_eq!(provider.editor_note().as_deref(), Some(EDITOR_TOOLS_OFF));
+}
+
+#[test]
+fn a_failed_lever_says_so_once() {
+    assert_eq!(
+        EDITOR_TOOLS_OFF,
+        "this Codex would ask about the editor tools, so they are off in this tab; a newer Codex may keep them on"
+    );
+    let request = start_with_editor_server();
+    let (provider, _) = started_with("th-82", start_line(&request, None), Vec::new(), false);
+    assert_eq!(provider.editor_note().as_deref(), Some(EDITOR_TOOLS_OFF));
+    assert_eq!(provider.editor_note(), None, "said once");
+
+    // A session that was given no server lost nothing, whatever the check found.
+    let plain = start_request(Reviewer::User);
+    let mut script = handshake(UA, signed_in());
+    script.push(start_line(&plain, None));
+    script.push(thread_response(3, "th-83"));
+    let provider = connect_found(script, &found_lever(false)).expect("the handshake passes");
+    provider.start(plain).expect("the session starts");
+    assert_eq!(provider.editor_note(), None);
+}
+
+#[test]
+fn a_held_lever_attaches_the_server() {
+    let t = "th-84";
+    let request = start_with_editor_server();
+    let line = start_line(&request, request.editor_server.as_ref());
+    let (provider, took) = started_with(t, line, vec![server_status(t, "eitri", "ready")], true);
+    assert!(took < EDITOR_SERVER_WAIT, "the server's status was missed: {took:?}");
+    assert_eq!(provider.editor_note(), None);
 }
 
 #[test]

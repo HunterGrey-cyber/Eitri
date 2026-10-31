@@ -41,7 +41,8 @@ agent = { path = ".", features = ["test-support"] }
 
 # The legacy gate's relay, located only by `settings::locate_agent_hook_binary` on the legacy spawn
 # path: without the feature there is nothing for it to relay to, so it is not built. A release then
-# has four binaries: shell, eitri-supervisor, eitri-tmux-shim, eitri-claude-handoff.
+# has six binaries: shell, eitri-supervisor, eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard,
+# eitri-editor-bridge.
 [[bin]]
 name = "agent-hook"
 path = "src/bin/agent-hook.rs"

@@ -211,7 +211,7 @@ pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> St
 /// Truncates on a CHARACTER boundary, not a byte one.
 ///
 /// `&s[..CONTENT_LIMIT]` panics mid-codepoint; selections can contain CJK or emoji.
-fn truncate(content: &str) -> String {
+pub(crate) fn truncate(content: &str) -> String {
     if content.chars().count() <= CONTENT_LIMIT {
         return content.to_string();
     }

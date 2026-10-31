@@ -188,7 +188,7 @@ class EitriBinPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         top = os.path.join(self.srcdir, "eitri-0.2.0-x86_64-linux")
-        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-setup"):
+        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-setup"):
             _touch(os.path.join(top, "lib", "eitri", name), mode=0o755)
         _touch(os.path.join(top, "lib", "eitri", "RELEASE"))
         _touch(os.path.join(top, "bin", "eitri"), mode=0o755)
@@ -257,7 +257,7 @@ class EitriGitPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         tree = os.path.join(self.srcdir, "eitri-git")
-        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard"):
+        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"):
             _touch(os.path.join(tree, "target", "release", name), mode=0o755)
         for name in ("install.sh", "eitri.launcher.sh"):
             _touch(os.path.join(tree, "packaging", name), mode=0o755)

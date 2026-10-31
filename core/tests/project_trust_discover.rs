@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use agent::DirTrust;
 use eitri_core::project_trust::{
-    codex_fallback_names, discover, git_top_level, read_user_codex_config, trust_plan, Discovery, EntryKind, Finding,
-    Limits, Profile, ProfileEnv, ServerDefinition,
+    codex_fallback_names, discover, eitri_server_name, eitri_server_taken, git_top_level, read_user_codex_config,
+    trust_plan, Discovery, EditorServerName, EntryKind, Finding, Limits, Profile, ProfileEnv, ServerDefinition,
 };
 
 /// A scratch directory (canonical) holding a fake home; removed on drop.
@@ -60,6 +60,7 @@ impl Fixture {
             codex_home: Some(self.base.join("codex-home")),
             fallback_names: Vec::new(),
             user_mcp_servers: None,
+            user_mcp_names: None,
             user_config_unreadable: None,
         }
     }
@@ -2169,6 +2170,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
         codex_home: Some(fx.home.join(".codex")),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_mcp_names: None,
         user_config_unreadable: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &as_codex_home);
@@ -2198,6 +2200,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
         codex_home: Some(only.join(".codex")),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_mcp_names: None,
         user_config_unreadable: None,
     };
     write(&only.join(".codex/config.toml"), b"model = \"x\"\n");
@@ -2427,6 +2430,7 @@ fn a_dot_codex_linked_to_codex_home_is_not_read() {
         codex_home: Some(dotfiles.clone()),
         fallback_names: Vec::new(),
         user_mcp_servers: None,
+        user_mcp_names: None,
         user_config_unreadable: None,
     };
     let found = fx.discover_as(&root, &Profile::Codex, &env);
@@ -2543,6 +2547,7 @@ command = "y"
         codex_home: Some(codex_home.clone()),
         fallback_names: vec!["TEAM.md".into()],
         user_mcp_servers: None,
+        user_mcp_names: None,
         user_config_unreadable: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
@@ -2559,6 +2564,7 @@ command = "y"
         codex_home: Some(codex_home),
         fallback_names: codex_fallback_names(&fx.base.join("codex-home")),
         user_mcp_servers: None,
+        user_mcp_names: None,
         user_config_unreadable: None,
     };
     let found = fx.discover_as(&repo.join("src"), &Profile::Codex, &env);
@@ -2902,6 +2908,120 @@ fn user_servers(fx: &Fixture, name: &str, text: &[u8]) -> Option<std::collection
     read_user_codex_config(&file).mcp_servers
 }
 
+/// Both configurations reach the check of the editor's server name through a discovery.
+#[test]
+fn a_discovery_says_whether_the_editor_servers_name_is_taken() {
+    let fx = Fixture::new("eitri-name-taken");
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    let env = |names: &[&str]| ProfileEnv {
+        user_mcp_names: Some(names.iter().map(|name| name.to_string()).collect()),
+        ..fx.codex_env()
+    };
+    let taken = |names: &[&str]| eitri_server_taken(&fx.discover_as(&repo, &Profile::Codex, &env(names)));
+    assert!(!taken(&["mine"]));
+    assert!(taken(&["mine", "eitri"]));
+    write(
+        &repo.join(".codex/config.toml"),
+        "[mcp_servers.eitri]\ncommand = \"x\"\n".as_bytes(),
+    );
+    assert!(taken(&["mine"]));
+    let found = fx.discover_as(&repo, &Profile::Codex, &env(&["mine"]));
+    assert_eq!(eitri_server_name(&found), EditorServerName::Defined);
+}
+
+/// A project `.codex/config.toml` discovery could not read may define the name as well as one it read:
+/// Codex follows a link and has a parser of its own, so what is unknown here counts as taken.
+#[test]
+fn a_project_configuration_that_went_unread_leaves_the_name_taken() {
+    let fx = Fixture::new("eitri-name-unread");
+    let env = ProfileEnv {
+        user_mcp_names: Some(Default::default()),
+        ..fx.codex_env()
+    };
+    let elsewhere = fx.base.join("elsewhere/config.toml");
+    let definition = "[mcp_servers.eitri]\ncommand = \"x\"\n";
+    write(&elsewhere, definition.as_bytes());
+    let fresh = |name: &str| {
+        let repo = fx.home.join(name);
+        fx.repo(&repo, false);
+        repo
+    };
+    let taken = |root: &Path| eitri_server_taken(&fx.discover_as(root, &Profile::Codex, &env));
+
+    let linked_file = fresh("linked-file");
+    std::fs::create_dir_all(linked_file.join(".codex")).unwrap();
+    symlink(&elsewhere, linked_file.join(".codex/config.toml")).unwrap();
+    assert!(
+        taken(&linked_file),
+        "a link to a configuration whose servers were never read"
+    );
+
+    let linked_dir = fresh("linked-dir");
+    symlink(elsewhere.parent().unwrap(), linked_dir.join(".codex")).unwrap();
+    assert!(taken(&linked_dir), "a link in place of the whole directory");
+
+    let above_root = fresh("above-root");
+    let root = above_root.join("sub");
+    std::fs::create_dir_all(above_root.join(".codex")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    symlink(&elsewhere, above_root.join(".codex/config.toml")).unwrap();
+    assert!(taken(&root), "a link in a directory above the root, on the walk");
+
+    let bad_toml = fresh("bad-toml");
+    write(&bad_toml.join(".codex/config.toml"), b"not toml [");
+    assert!(taken(&bad_toml), "a file this parser refuses and Codex's may not");
+    assert_eq!(
+        eitri_server_name(&fx.discover_as(&bad_toml, &Profile::Codex, &env)),
+        EditorServerName::Unknown,
+        "nothing says the name is there"
+    );
+
+    let too_large = fresh("too-large");
+    write(&too_large.join(".codex/config.toml"), definition.as_bytes());
+    let small = Limits {
+        max_file_bytes: 8,
+        ..Limits::default()
+    };
+    let found = discover(&too_large, Some(&fx.home), &small, &Profile::Codex, &env);
+    assert!(eitri_server_taken(&found), "a file over the budget is never read");
+
+    let crowded = fresh("crowded");
+    write(&crowded.join("AGENTS.md"), b"memory");
+    write(&crowded.join(".codex/config.toml"), definition.as_bytes());
+    let one_entry = Limits {
+        max_entries: 1,
+        ..Limits::default()
+    };
+    let found = discover(&crowded, Some(&fx.home), &one_entry, &Profile::Codex, &env);
+    assert!(
+        eitri_server_taken(&found),
+        "a walk out of entries never looked at the file"
+    );
+}
+
+/// Only what could hold a server definition counts: a link to a memory file is common and defines none.
+#[test]
+fn a_gap_elsewhere_leaves_the_name_free() {
+    let fx = Fixture::new("eitri-name-free");
+    let env = ProfileEnv {
+        user_mcp_names: Some(Default::default()),
+        ..fx.codex_env()
+    };
+    let repo = fx.home.join("repo");
+    fx.repo(&repo, false);
+    write(&repo.join("memory.md"), b"memory");
+    symlink("memory.md", repo.join("AGENTS.md")).unwrap();
+    write(
+        &repo.join(".codex/config.toml"),
+        b"[mcp_servers.mine]\ncommand = \"x\"\n",
+    );
+    symlink("elsewhere.json", repo.join(".codex/hooks.json")).unwrap();
+    let found = fx.discover_as(&repo, &Profile::Codex, &env);
+    assert!(!found.fully_hashed(), "the links are gaps in what was hashed");
+    assert!(!eitri_server_taken(&found));
+}
+
 /// A server the project defines exactly as the user's own configuration does is no sign that the
 /// project's configuration loaded, so the plan does not watch for it; when the user's servers are
 /// not known, every project server is watched for.
@@ -2913,6 +3033,7 @@ fn trust_plan_leaves_out_servers_the_user_also_runs() {
     write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
     let env = |user| ProfileEnv {
         user_mcp_servers: user,
+        user_mcp_names: None,
         ..fx.codex_env()
     };
 
@@ -2953,6 +3074,7 @@ fn trust_plan_watches_a_project_server_that_redefines_one_of_the_users() {
     write(&repo.join(".codex/config.toml"), CODEX_CONFIG);
     let env = |user| ProfileEnv {
         user_mcp_servers: user,
+        user_mcp_names: None,
         ..fx.codex_env()
     };
     for (what, text) in [

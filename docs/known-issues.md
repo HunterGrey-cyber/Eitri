@@ -24,7 +24,7 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **Claude Code**, installed and logged in, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
 - **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and signed in
-  (tried with 0.160.0 to 0.161.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
+  (tried with 0.160.0 to 0.163.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
   input and output. See [Codex and other agents](guide/agents.md).
 
 ## Installing
@@ -219,6 +219,9 @@ Tabs for Codex and for agents registered with `eitri.agent.register` are new ([t
 have been tried against stand-in models and stand-in agents, and, in a few runs, a real Codex and the `codex-acp`
 adapter; they have not been tried on every setup.
 
+- **What an agent reads from your editor in an ACP tab is drawn as that tab's other tool results are.** ACP names no
+  server, so Eitri cannot tell an [editor tool's](guide/editor-tools.md) result from the agent's others there, and
+  hidden characters in it are not made visible as they are in Claude and Codex tabs.
 - **The first start with a `codex` Eitri has not checked runs a short self-check, and every Codex start is refused
   until it passes.** It takes a few seconds, is remembered per binary (path, size, modification time and version)
   and runs again after an update. It fails, naming `XDG_STATE_HOME`, when the state directory is under `/tmp` or `$TMPDIR`

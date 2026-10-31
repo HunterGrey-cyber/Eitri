@@ -66,6 +66,8 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
         // client_interactions (protocol 3.22): stated here so the assertion below
         // proves the generated message carries its one field.
         client_interactions: Some(claude_runtime_protocol::v1::ClientInteractions { questions: true }),
+        // client_tools (protocol 3.23): unexercised here.
+        client_tools: None,
     };
     assert_eq!(request.cwd, "/tmp/example");
     assert_eq!(

@@ -324,6 +324,34 @@ describe("MessageList tool calls and permissions", () => {
     expect(awaiting[0].textContent).not.toContain("rm -rf /");
   });
 
+  it("a_call_on_an_editor_card_shows_waiting_for_approval", () => {
+    const { container } = render(
+      <MessageList
+        state={state({
+          toolCalls: [
+            { seq: 0, toolUseId: "toolu_1", name: "mcp__eitri__open_file", input: { path: "a.rs" }, result: null },
+            { seq: 1, toolUseId: "toolu_2", name: "mcp__eitri__open_file", input: { path: "/etc/hosts" }, result: null },
+          ],
+          editorCards: [
+            {
+              seq: 2, permissionId: "ec-0123456789abcdef-1", toolUseId: "toolu_2", toolName: "open_file", input: null,
+              editorCard: { title: "Show /etc/hosts in your editor?", body: [{ kind: "code", text: "/etc/hosts" }] },
+            },
+          ],
+        })}
+        sessionEnded={false}
+        expanded={{}}
+        cursor={-1}
+        onAnswerPermission={vi.fn()}
+      />,
+    );
+    const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0].textContent).toContain("waiting for approval");
+    // The card is drawn under its call, with its own title.
+    expect(container.querySelector(".permission-card")!.textContent).toContain("Show /etc/hosts in your editor?");
+  });
+
   /* In the legacy hook-relay shape, permissionId and toolUseId are the same string from the
      PreToolUse payload. The waiting marker still matches by toolUseId; card keying must not affect it. */
   it("marks the right call when the permission's id is also its tool_use_id", () => {

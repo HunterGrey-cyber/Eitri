@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { installDispatch, nextRequestId } from "./bridge";
 import type { OutboundMessage } from "./bridge";
+import editorCards from "./fixtures/editor-cards.json";
 
 describe("nextRequestId", () => {
   it("returns distinct values on successive calls", () => {
@@ -247,6 +248,23 @@ describe("installDispatch", () => {
 
   /* A `y` can only ever echo a real nonce back -- one this side never made up itself -- so
      an envelope with none is rejected up front, the same as invalid JSON or an unrecognized kind. */
+  it("demuxes the editor_cards envelope Rust serialises, and rejects a list the card view cannot draw", () => {
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    installDispatch(handler);
+    const good = { kind: "editor_cards", tab: 1, cards: editorCards };
+    window.__eitriDispatch!(JSON.stringify(good));
+    expect(handler.mock.calls.map((call) => call[0])).toEqual([good]);
+    for (const cards of [
+      "nope",
+      [{ ...editorCards[0], body: "text" }],
+      [{ ...editorCards[0], body: [{ kind: "markdown", text: "x" }] }],
+      [{ ...editorCards[0], id: 7 }],
+    ]) window.__eitriDispatch!(JSON.stringify({ kind: "editor_cards", tab: 1, cards }));
+    expect(handler).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
   it("rejects a confirm_bypass envelope with no nonce, like other malformed envelopes", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

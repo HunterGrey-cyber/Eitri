@@ -69,6 +69,9 @@ pub struct TabHandoff {
     creates_file_unsent: BTreeSet<String>,
     rule_offers_seen: Vec<String>,
     turn_clock: Option<(String, u64)>,
+    /// Crosses with `turn_clock`: the destination would otherwise report the turn in progress as begun.
+    #[serde(default)]
+    last_began_turn: Option<String>,
     turn_times_unsent: usize,
     host_answered: BTreeSet<String>,
     human_allowed: HumanApprovals,
@@ -149,6 +152,7 @@ struct MovedResumeCommand {
 enum MovedTiers {
     Trusted,
     Untrusted,
+    NothingFound,
 }
 
 impl From<agent::setting_sources::ProjectTrust> for MovedTiers {
@@ -156,6 +160,7 @@ impl From<agent::setting_sources::ProjectTrust> for MovedTiers {
         match trust {
             agent::setting_sources::ProjectTrust::Trusted => MovedTiers::Trusted,
             agent::setting_sources::ProjectTrust::Untrusted => MovedTiers::Untrusted,
+            agent::setting_sources::ProjectTrust::NothingFound => MovedTiers::NothingFound,
         }
     }
 }
@@ -165,6 +170,7 @@ impl From<MovedTiers> for agent::setting_sources::ProjectTrust {
         match tiers {
             MovedTiers::Trusted => agent::setting_sources::ProjectTrust::Trusted,
             MovedTiers::Untrusted => agent::setting_sources::ProjectTrust::Untrusted,
+            MovedTiers::NothingFound => agent::setting_sources::ProjectTrust::NothingFound,
         }
     }
 }
@@ -368,6 +374,8 @@ impl SendGate {
 /// not compile here until it is placed in the record or named as staying behind, with why.
 fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
     let Tab {
+        // The panel record carries following across windows.
+        following: _,
         // Allocated by the window the tab lands in.
         id: _,
         number: _,
@@ -418,10 +426,21 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         creates_file_unsent,
         rule_offers_seen,
         turn_clock,
+        last_began_turn,
         turn_times_unsent,
         host_answered,
         human_allowed,
         user_answered,
+        // A line for a page of this window. The landing window reads the same server report from the
+        // moved projection and says it once on its own page. A provider's line was the source's to say: the
+        // adopted provider never opens a session, so it has none.
+        foreign_server_note: _,
+        // What this window's broker was told. An external session's tool list crosses in the panel's record, with
+        // the socket it belongs to.
+        client_calls: _,
+        editor_declared: _,
+        // A card ends with its call when the tab leaves: the other window's broker never raised it.
+        editor_cards: _,
     } = session;
     let state = match backend {
         TabBackend::NotStarted => MovedState::Empty,
@@ -484,6 +503,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         creates_file_unsent: creates_file_unsent.clone(),
         rule_offers_seen: rule_offers_seen.clone(),
         turn_clock: turn_clock.clone(),
+        last_began_turn: last_began_turn.clone(),
         turn_times_unsent: *turn_times_unsent,
         host_answered: host_answered.clone(),
         human_allowed: human_allowed.clone(),
@@ -1425,6 +1445,7 @@ impl TabSet {
             creates_file_unsent,
             rule_offers_seen,
             turn_clock,
+            last_began_turn,
             turn_times_unsent,
             host_answered,
             human_allowed,
@@ -1492,10 +1513,16 @@ impl TabSet {
             creates_file_unsent,
             rule_offers_seen,
             turn_clock,
+            last_began_turn,
             turn_times_unsent,
             host_answered,
             human_allowed,
             user_answered,
+            foreign_server_note: ForeignServerNote::default(),
+            // This window's broker has heard of no call of the tab yet.
+            client_calls: ClientCalls::default(),
+            editor_declared: BTreeSet::new(),
+            editor_cards: Vec::new(),
         };
         #[cfg(any(test, feature = "test-support"))]
         {

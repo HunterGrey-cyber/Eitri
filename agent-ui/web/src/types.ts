@@ -221,6 +221,28 @@ export type PermissionRequestRecord = {
    *  (Verdandi's PERMISSION_ORIGIN_PROVIDER_PROMPT; Rust's `ProviderPrompt`). Absent on the gate's
    *  own request. Answered like any card, with the same permission id. */
   providerPrompt?: ProviderPrompt;
+  /** Set on a card Eitri's own tool broker raised (`editorCards`), never on a provider's request: the title and
+   *  lines it shows. `toolName` is the broker tool's name and `input` is `null`; there is no provider behind it. */
+  editorCard?: EditorCardView;
+};
+/** One line of a broker card by what it is. Every kind is plain text: the lines may come from a repository or the
+ *  agent, so they are drawn through `revealHidden`, never as Markdown. */
+export type EditorCardLine = { kind: "plain" | "code" | "agent" | "warning"; text: string };
+/** The proposal a card would apply: its id in the tab, and the project-relative path of each file it changes, in the
+ *  order `editor_card_view` numbers them. */
+export type EditorCardProposal = { id: string; files: string[] };
+export type EditorCardView = { title: string; body: EditorCardLine[]; proposal?: EditorCardProposal };
+/** A broker card as Rust serialises it (`EditorCardWire`): `id` is the card's own id (`ec-<hex>-<n>`), `seq` the
+ *  tab's revision when it was raised. */
+export type EditorCardWire = {
+  id: string;
+  seq: Seq;
+  tool: string;
+  toolUseId: string | null;
+  title: string;
+  body: EditorCardLine[];
+  /** Present on a card that would apply a proposal (`apply_proposal`). */
+  proposal?: EditorCardProposal;
 };
 /** The input of a Codex `commandExecution` card, as the Codex provider writes it (`approvals.rs`,
  *  `CardKind::input`). `command` and `cwd` are `null` for a network request, which names a host and no
@@ -447,6 +469,10 @@ export type AgentUiState = {
   userPrompts: UserPromptRecord[];
   transcript: TranscriptMessage[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
+  /** The cards Eitri's own tool broker is waiting on, as records the card view draws like a provider's. A snapshot
+   *  carries them (`editorCards`, wire shape) and the `editor_cards` envelope replaces them whole. They are never
+   *  in `pendingPermissions` and never move `nextSeq`: Rust numbers them from the tab's revision without taking one. */
+  editorCards: PermissionRequestRecord[];
   capabilities: Capabilities;
   provider: ProviderInfo | null;
   /** The last usage this tab's provider reported, or `null` before it has (what the band's usage
@@ -590,7 +616,11 @@ export type AgentUiSnapshot = Omit<
   | "cliUnseenBusy"
   | "openingPromptSeq"
   | "runningTurnCli"
+  | "editorCards"
 > & {
+  /** Sent only while the tab holds any: a payload without it is a tab with none. Rust sends the wire shape; records
+   *  are accepted too, so a caller holding a folded state can hand it to `applySnapshot` unchanged. */
+  editorCards?: Array<EditorCardWire | PermissionRequestRecord>;
   /** Sent only while there are any: a payload without them is a conversation with none. */
   turnStarts?: AgentUiState["turnStarts"];
   notices?: AgentUiState["notices"];
@@ -774,6 +804,11 @@ export type AgentDomainEvent =
       summary: string | null; last_tool_name: string | null; usage: TaskUsage | null; end_time_ms: number | null; error: string | null;
       is_backgrounded: boolean | null; reason: string | null; output_file: string | null; workflow_progress: WorkflowProgress | null }
   | { type: "conversation_reset"; new_conversation_id: string; trigger: string | null }
+  /** The host's own records of a tool it serves. Rust keeps them from every page; only a recorded twin
+   *  holds them, and the reducer ignores them. */
+  | { type: "session_servers"; servers: { name: string; status: string; source: string }[] }
+  | { type: "client_tool_call"; call_id: string; tool_use_id: string | null; tool: string; arguments_json: string; sequence: number }
+  | { type: "client_tool_call_settled"; call_id: string }
   | { type: "subagent_frame"; parent_tool_use_id: string; frame: SubagentContent }
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "effort_reported"; effort: string | null }
@@ -904,6 +939,7 @@ export type TabState = "not_started" | "starting" | "awaiting_trust" | "live" | 
 /** `eitri_core::tabs::Marker::wire()`. Precedence is Rust's: ⚑ > ✕ > working > •. */
 export type TabMarker = "needs_input" | "ended" | "working" | "unread";
 export type TabInfo = {
+  following?: boolean;
   /** Opaque host mirrors, keyed by interaction id; the dock checks each draft before using it. */
   questionDraft?: Record<string, unknown>;
   id: TabId;

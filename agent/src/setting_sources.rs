@@ -12,7 +12,7 @@
 //! - **The project and local tiers, per session** ([`ProjectTrust`]). A repository's own
 //!   configuration can run commands as the user (a `SessionStart` hook, an `.mcp.json` server) and
 //!   pre-approve tool calls, so it loads only for a session the window's trust gate started as
-//!   `Trusted`. An untrusted session gets the user tier alone, or nothing at all when the user tier
+//!   `Trusted`. Any other session gets the user tier alone, or nothing at all when the user tier
 //!   is off. Every caller that starts a session names the value; there is no default, so a new
 //!   session path cannot quietly inherit the wider selection.
 //!
@@ -37,7 +37,20 @@ pub enum Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectTrust {
     Trusted,
+    /// A person answered no, or the check that would have asked could not run.
     Untrusted,
+    /// The project holds nothing to ask about, so nobody was asked. The tiers stay out all the same, which keeps out
+    /// a `.claude/` appearing between the check and the CLI's own read. The tools a no refuses are declared, since
+    /// nobody said no; a load that can run the repository's code still takes a card, since nobody said yes.
+    NothingFound,
+}
+
+impl ProjectTrust {
+    /// Whether the session is held to what a no at the trust question withholds. Anything but the project tiers
+    /// asks this; [`for_session`] alone decides those.
+    pub fn refused(self) -> bool {
+        self == ProjectTrust::Untrusted
+    }
 }
 
 // Each in the order the tiers stack: user, then project, then local.
@@ -68,7 +81,7 @@ pub const NOTE_UNTRUSTED_WITHOUT_USER: &str =
 
 /// The tiers a session loads, in stacking order:
 ///
-/// | `user_settings` | `Trusted`                 | `Untrusted` |
+/// | `user_settings` | `Trusted`                 | `Untrusted`, `NothingFound` |
 /// |---|---|---|
 /// | `true`          | `[User, Project, Local]`  | `[User]`    |
 /// | `false`         | `[Project, Local]`        | `[]`        |
@@ -76,8 +89,8 @@ pub fn for_session(user_settings: bool, project: ProjectTrust) -> &'static [Sour
     match (user_settings, project) {
         (true, ProjectTrust::Trusted) => ALL_THREE,
         (false, ProjectTrust::Trusted) => PROJECT_AND_LOCAL,
-        (true, ProjectTrust::Untrusted) => USER_ONLY,
-        (false, ProjectTrust::Untrusted) => NONE,
+        (true, ProjectTrust::Untrusted | ProjectTrust::NothingFound) => USER_ONLY,
+        (false, ProjectTrust::Untrusted | ProjectTrust::NothingFound) => NONE,
     }
 }
 
@@ -101,8 +114,8 @@ pub fn note_for_session(user_settings: bool, project: ProjectTrust) -> &'static 
     match (user_settings, project) {
         (true, ProjectTrust::Trusted) => NOTE_TRUSTED_WITH_USER,
         (false, ProjectTrust::Trusted) => NOTE_TRUSTED_WITHOUT_USER,
-        (true, ProjectTrust::Untrusted) => NOTE_UNTRUSTED_WITH_USER,
-        (false, ProjectTrust::Untrusted) => NOTE_UNTRUSTED_WITHOUT_USER,
+        (true, ProjectTrust::Untrusted | ProjectTrust::NothingFound) => NOTE_UNTRUSTED_WITH_USER,
+        (false, ProjectTrust::Untrusted | ProjectTrust::NothingFound) => NOTE_UNTRUSTED_WITHOUT_USER,
     }
 }
 
@@ -129,7 +142,7 @@ pub fn loads_user_settings() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ProjectTrust::{Trusted, Untrusted};
+    use ProjectTrust::{NothingFound, Trusted, Untrusted};
     use Source::{Local, Project, User};
 
     #[test]
@@ -144,6 +157,21 @@ mod tests {
         assert_eq!(for_session(false, Trusted), &[Project, Local]);
         assert_eq!(for_session(true, Untrusted), &[User]);
         assert_eq!(for_session(false, Untrusted), &[] as &[Source]);
+    }
+
+    #[test]
+    fn a_project_with_nothing_to_ask_about_loads_no_project_tier() {
+        for user in [true, false] {
+            assert_eq!(for_session(user, NothingFound), for_session(user, Untrusted));
+            assert_eq!(note_for_session(user, NothingFound), note_for_session(user, Untrusted));
+        }
+    }
+
+    #[test]
+    fn only_a_refusal_is_a_refusal() {
+        assert!(Untrusted.refused());
+        assert!(!Trusted.refused());
+        assert!(!NothingFound.refused(), "nobody was asked");
     }
 
     #[test]

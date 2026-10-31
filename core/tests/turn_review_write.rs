@@ -438,7 +438,7 @@ fn a_hard_linked_file_is_never_written() {
     );
     let message = WriteError::HardLinked { links: 2 }.to_string();
     assert!(
-        message.contains("2 hard links") && message.contains("nothing was written"),
+        message.contains("2 hard links") && message.contains("was not written"),
         "{message}"
     );
 
@@ -741,7 +741,10 @@ fn restore_never_replaces_a_path_that_appeared() {
         })),
         ..FsHooks::default()
     };
-    let note = fx.note("restored.txt", b"", 0o644, b"restored\n");
+    let note = JournalNote {
+        pre: None,
+        ..fx.note("restored.txt", b"", 0o644, b"restored\n")
+    };
     let content = Content::Bytes {
         bytes: b"restored\n".to_vec(),
         mode: 0o644,
@@ -880,8 +883,32 @@ fn a_long_file_name_still_gets_a_temp() {
     fx.replace(&long, &content, &note, &FsHooks::default()).unwrap();
     assert_eq!(std::fs::read(fx.file(&long)).unwrap(), b"new\n");
     std::fs::remove_file(fx.file(&long)).unwrap();
+    let note = JournalNote { pre: None, ..note };
     fx.replace(&long, &content, &note, &FsHooks::default()).unwrap();
     assert_eq!(std::fs::read(fx.file(&long)).unwrap(), b"new\n");
+    no_temp_left(&fx.project);
+}
+
+#[test]
+fn a_path_found_empty_when_bytes_were_expected_stays_empty() {
+    let scratch = Scratch::new("removed");
+    let fx = Fixture::at(&scratch.0);
+    let note = fx.note("gone.txt", b"old\n", 0o644, b"new\n");
+    for content in [
+        Content::Bytes {
+            bytes: b"new\n".to_vec(),
+            mode: 0o644,
+        },
+        Content::Symlink {
+            target: b"elsewhere".to_vec(),
+        },
+    ] {
+        assert_eq!(
+            fx.replace("gone.txt", &content, &note, &FsHooks::default()),
+            Err(WriteError::Changed)
+        );
+        assert!(fx.file("gone.txt").symlink_metadata().is_err());
+    }
     no_temp_left(&fx.project);
 }
 
@@ -1178,7 +1205,10 @@ fn a_missing_parent_is_created_for_a_restore() {
     // Without creating, the target reads as absent and makes nothing.
     let looked = fx.root.target(Path::new("a/b/c"), false).unwrap();
     assert_eq!(read_current(&looked).unwrap(), Current::Absent);
-    let note = fx.note("a/b/c", b"", 0o644, b"restored\n");
+    let note = JournalNote {
+        pre: None,
+        ..fx.note("a/b/c", b"", 0o644, b"restored\n")
+    };
     let content = Content::Bytes {
         bytes: b"restored\n".to_vec(),
         mode: 0o644,
@@ -1428,14 +1458,21 @@ fn the_projects_git_is_never_written_by_a_write() {
     fx.replace(
         "new/made.txt",
         &bytes(b"made\n"),
-        &note("new/made.txt", b"", b"made\n"),
+        &JournalNote {
+            pre: None,
+            ..note("new/made.txt", b"", b"made\n")
+        },
         &hooks,
     )
     .unwrap();
     let link = Content::Symlink {
         target: b"tracked.txt".to_vec(),
     };
-    fx.replace("link", &link, &note("link", b"", b""), &hooks).unwrap();
+    let made = JournalNote {
+        pre: None,
+        ..note("link", b"", b"")
+    };
+    fx.replace("link", &link, &made, &hooks).unwrap();
     if in_place {
         let journalled = Arc::new(AtomicUsize::new(0));
         let seen = journalled.clone();

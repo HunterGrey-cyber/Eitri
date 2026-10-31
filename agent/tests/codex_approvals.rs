@@ -112,6 +112,7 @@ fn running_under(
         },
         policy: policy(reviewer),
         resume: None,
+        editor_server: None,
     };
     let id = provider.start(start).expect("the session starts");
     assert_eq!(id, thread);

@@ -29,18 +29,33 @@
 //!
 //! A steered message's text is the number of milliseconds after which it is delivered (500 if it is
 //! not a number).
+//!
+//! With `--client-tools` the stand-in offers protocol 3.23's `client_tools`, and answers its two RPCs as
+//! the sidecar does: the first answer to a call wins and settles it, a later one is refused with
+//! `CLIENT_TOOL_CALL_ALREADY_ANSWERED`, an unknown id with `CLIENT_TOOL_CALL_NOT_FOUND`, a closed session
+//! with `SESSION_NOT_FOUND`, and a request of `--max-message-bytes <n>` or more with `RESOURCE_EXHAUSTED`,
+//! leaving the call open. A script can drive it:
+//! - `client-call <call id> <tool> [<tool use id>]`: the model called a tool, with fixed arguments;
+//! - `hold-answers`: every later `AnswerClientToolCall` gets no reply until `release-answers`.
+//!
+//! `--record-answers <file>` appends a line per `AnswerClientToolCall`, as it arrives and before any
+//! hold: `<call id> <taken, or the refusal> <is_error> <its text, blocks joined by |>`, and
+//! `replied <call id>` when its reply goes out.
 
+use claude_runtime_protocol::v1::client_tool_content::Kind as ContentKind;
 use claude_runtime_protocol::v1::session_event::Event;
 use claude_runtime_protocol::v1::{
-    CliCycleStarted, CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
-    HandshakeRequest, HandshakeResponse, InterruptTurnRequest, InterruptTurnResponse, PermissionOutcome,
+    AnswerClientToolCallRequest, AnswerClientToolCallResponse, CliCycleStarted, ClientToolCall, ClientToolCallOutcome,
+    ClientToolCallSettled, CloseSessionRequest, CloseSessionResponse, CreateSessionRequest, CreateSessionResponse,
+    ErrorCode, ErrorDetail, GetClientToolCallStateRequest, GetClientToolCallStateResponse, HandshakeRequest,
+    HandshakeResponse, InterruptTurnRequest, InterruptTurnResponse, OpenClientToolCall, PermissionOutcome,
     PermissionRequested, PermissionResolved, ResolvePermissionRequest, ResolvePermissionResponse, SendTurnRequest,
     SendTurnResponse, SessionCloseReason, SessionClosed, SessionEvent, SessionReady, SteerTurnRequest,
     SteerTurnResponse, TextDelta, TurnCause, TurnCauseKind, TurnCauseUpdated, TurnCompleted, TurnOrigin, TurnOutcome,
     TurnStarted, UserMessageDelivered, UserMessageDropReason, UserMessageDropped, WatchSessionEventsRequest,
 };
 use prost::Message as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,6 +70,9 @@ use tonic_prost::ProstCodec;
 
 const SERVICE: &str = "verdandi.claude.runtime.v1.RuntimeService";
 
+/// The largest request a real sidecar's handshake states.
+const MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+
 type Watcher = tokio::sync::mpsc::UnboundedSender<Result<SessionEvent, Status>>;
 
 #[derive(Default)]
@@ -66,6 +84,10 @@ struct Session {
     waiting: HashMap<String, (String, Vec<String>)>,
     /// The client id of the latest `SendTurn`'s message, if it named one.
     last_client_id: Option<String>,
+    /// The client tool calls waiting for an answer, oldest first.
+    open_calls: Vec<OpenClientToolCall>,
+    /// The client tool calls answered, each of them spent.
+    answered_calls: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -76,6 +98,12 @@ struct Shared {
     record_create: Mutex<Option<std::fs::File>>,
     cli_turns: bool,
     record_sends: Mutex<Option<std::fs::File>>,
+    client_tools: bool,
+    /// The handshake's limit, and what `AnswerClientToolCall` holds a request to. Unset, [`MAX_MESSAGE_BYTES`].
+    max_message_bytes: Option<u64>,
+    record_answers: Mutex<Option<std::fs::File>>,
+    /// While true, `AnswerClientToolCall` replies wait.
+    holding_answers: tokio::sync::watch::Sender<bool>,
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -116,12 +144,67 @@ impl Shared {
             .unwrap_or_default()
     }
 
+    fn record_answer(&self, line: &str) {
+        if let Some(file) = self.record_answers.lock().unwrap().as_mut() {
+            writeln!(file, "{line}").unwrap();
+            file.flush().unwrap();
+        }
+    }
+
+    fn max_message_bytes(&self) -> u64 {
+        self.max_message_bytes.unwrap_or(MAX_MESSAGE_BYTES)
+    }
+
+    /// One `AnswerClientToolCall`, decided at once: `Ok` is the answer that won its call.
+    fn take_answer(&self, request: &AnswerClientToolCallRequest) -> Result<(), Status> {
+        if request.encoded_len() as u64 >= self.max_message_bytes() {
+            return Err(Status::resource_exhausted("the request passes max_message_bytes"));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(&request.session_id)
+            .filter(|session| !session.closed)
+            .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
+        match session
+            .open_calls
+            .iter()
+            .position(|call| call.call_id == request.call_id)
+        {
+            Some(index) => {
+                session.open_calls.remove(index);
+                session.answered_calls.insert(request.call_id.clone());
+                Ok(())
+            }
+            None if session.answered_calls.contains(&request.call_id) => Err(refusal(
+                tonic::Code::FailedPrecondition,
+                ErrorCode::ClientToolCallAlreadyAnswered,
+                "answered",
+            )),
+            None => Err(refusal(tonic::Code::NotFound, ErrorCode::ClientToolCallNotFound, "")),
+        }
+    }
+
     fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool) {
         if let Some(file) = self.record_sends.lock().unwrap().as_mut() {
             writeln!(file, "{rpc} {} {typed}", client_id.unwrap_or("-")).unwrap();
             file.flush().unwrap();
         }
     }
+}
+
+/// A refusal carrying its `ErrorDetail`, as the real service sends every one.
+fn refusal(status: tonic::Code, code: ErrorCode, reason: &str) -> Status {
+    Status::with_details(
+        status,
+        "refused by the stand-in",
+        ErrorDetail {
+            code: code as i32,
+            message: "refused by the stand-in".to_string(),
+            reason: reason.to_string(),
+        }
+        .encode_to_vec()
+        .into(),
+    )
 }
 
 /// A cause of `kind`, with the slots that kind fills.
@@ -190,6 +273,34 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                         }),
                     );
                     return;
+                }
+                Some("client-call") => {
+                    let call_id = words.next().unwrap_or("c").to_string();
+                    let tool = words.next().unwrap_or("t").to_string();
+                    let tool_use_id = words.next().unwrap_or_default().to_string();
+                    if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
+                        session.open_calls.push(OpenClientToolCall {
+                            call_id: call_id.clone(),
+                            tool_use_id: tool_use_id.clone(),
+                            tool: tool.clone(),
+                        });
+                    }
+                    shared.emit(
+                        &session_id,
+                        None,
+                        Event::ClientToolCall(ClientToolCall {
+                            call_id,
+                            tool_use_id,
+                            tool,
+                            arguments_json: r#"{"path":"/the/arguments"}"#.to_string(),
+                        }),
+                    );
+                }
+                Some("hold-answers") => {
+                    shared.holding_answers.send_replace(true);
+                }
+                Some("release-answers") => {
+                    shared.holding_answers.send_replace(false);
                 }
                 Some("drop-watches") => {
                     if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
@@ -268,7 +379,7 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
     });
 }
 
-fn handshake(without_system_prompt_preset: bool, cli_turns: bool) -> HandshakeResponse {
+fn handshake(shared: &Shared) -> HandshakeResponse {
     let mut response = HandshakeResponse {
         protocol_major: 3,
         protocol_minor: 21,
@@ -290,16 +401,21 @@ fn handshake(without_system_prompt_preset: bool, cli_turns: bool) -> HandshakeRe
         .map(ToString::to_string)
         .collect(),
         permission_modes: vec!["interactive".to_string()],
+        max_message_bytes: shared.max_message_bytes(),
         ..Default::default()
     };
-    if without_system_prompt_preset {
+    if shared.without_system_prompt_preset {
         response.capabilities.retain(|c| c != "system_prompt_preset");
     }
-    if cli_turns {
+    if shared.cli_turns {
         response.protocol_minor = 22;
         response
             .capabilities
             .extend(["cli_turns".to_string(), "human_origin".to_string()]);
+    }
+    if shared.client_tools {
+        response.protocol_minor = 23;
+        response.capabilities.push("client_tools".to_string());
     }
     response
 }
@@ -349,12 +465,7 @@ impl Service<http::Request<Body>> for StandIn {
                 .unwrap_or_default()
                 .to_string();
             let response = match method.as_str() {
-                "Handshake" => {
-                    unary(req, move |_: HandshakeRequest| async move {
-                        Ok(handshake(shared.without_system_prompt_preset, shared.cli_turns))
-                    })
-                    .await
-                }
+                "Handshake" => unary(req, move |_: HandshakeRequest| async move { Ok(handshake(&shared)) }).await,
                 "CreateSession" => {
                     unary(req, move |request: CreateSessionRequest| async move {
                         // Record before consuming any fields, so assertions see exactly the decoded wire request.
@@ -464,6 +575,55 @@ impl Service<http::Request<Body>> for StandIn {
                     })
                     .await
                 }
+                "AnswerClientToolCall" => {
+                    unary(req, move |request: AnswerClientToolCallRequest| async move {
+                        let taken = shared.take_answer(&request);
+                        let verdict = match &taken {
+                            Ok(()) => "taken".to_string(),
+                            Err(status) => format!("{:?}", status.code()),
+                        };
+                        let text: Vec<&str> = request
+                            .content
+                            .iter()
+                            .filter_map(|block| block.kind.as_ref())
+                            .map(|ContentKind::Text(text)| text.as_str())
+                            .collect();
+                        shared.record_answer(&format!(
+                            "{} {verdict} {} {}",
+                            request.call_id,
+                            request.is_error,
+                            text.join("|")
+                        ));
+                        if taken.is_ok() {
+                            shared.emit(
+                                &request.session_id,
+                                None,
+                                Event::ClientToolCallSettled(ClientToolCallSettled {
+                                    call_id: request.call_id.clone(),
+                                    outcome: ClientToolCallOutcome::Answered as i32,
+                                }),
+                            );
+                        }
+                        let mut holding = shared.holding_answers.subscribe();
+                        let _ = holding.wait_for(|held| !*held).await;
+                        shared.record_answer(&format!("replied {}", request.call_id));
+                        taken.map(|()| AnswerClientToolCallResponse {})
+                    })
+                    .await
+                }
+                "GetClientToolCallState" => {
+                    unary(req, move |request: GetClientToolCallStateRequest| async move {
+                        let sessions = shared.sessions.lock().unwrap();
+                        let session = sessions
+                            .get(&request.session_id)
+                            .ok_or_else(|| refusal(tonic::Code::NotFound, ErrorCode::SessionNotFound, ""))?;
+                        Ok(GetClientToolCallStateResponse {
+                            through_sequence: session.ring.len() as u64,
+                            open: session.open_calls.clone(),
+                        })
+                    })
+                    .await
+                }
                 "InterruptTurn" => unary(req, |_: InterruptTurnRequest| async { Ok(InterruptTurnResponse {}) }).await,
                 "CloseSession" => {
                     unary(req, move |request: CloseSessionRequest| async move {
@@ -521,6 +681,16 @@ fn main() {
         match arg.to_str() {
             Some("--without-system-prompt-preset") => shared.without_system_prompt_preset = true,
             Some("--cli-turns") => shared.cli_turns = true,
+            Some("--client-tools") => shared.client_tools = true,
+            Some("--max-message-bytes") => {
+                let limit = args.next().expect("a limit");
+                shared.max_message_bytes = Some(limit.to_str().and_then(|n| n.parse().ok()).expect("a number"));
+            }
+            Some("--record-answers") => {
+                let path = std::path::PathBuf::from(args.next().expect("record file"));
+                assert!(path.is_absolute(), "record file must be absolute");
+                *shared.record_answers.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+            }
             Some("--record-sends") => {
                 let path = std::path::PathBuf::from(args.next().expect("record file"));
                 assert!(path.is_absolute(), "record file must be absolute");

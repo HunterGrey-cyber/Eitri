@@ -39,7 +39,7 @@ RS_SIGN_NAMESPACE=eitri-release
 RS_SIGN_IDENTITY=release@eitri
 RS_PUBLIC_REPO=https://github.com/HunterGrey-cyber/eitri
 RS_IMAGE_REPO=eitri-release-build
-RS_BINARIES=(shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard)
+RS_BINARIES=(shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge)
 RS_VERSION_ERE='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 RS_LEGACY_MESSAGE='the legacy backend is not in this build'
 # Public identity required by public_commits_check for the released commit.
@@ -1093,7 +1093,7 @@ ctr_phase_b() {
 	skia_out="$(python3 packaging/release_check.py build-script-out-dir "$logs/build.json" skia-bindings)"
 	python3 packaging/release_check.py check-skia-output "$(dirname "$skia_out")/output" "$skia_url"
 
-	step "check-abi-floor.py over the five (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
+	step "check-abi-floor.py over the six (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
 	python3 packaging/check-abi-floor.py "${exes[@]}" --gtk "$RS_GTK_FLOOR" --glibc "$RS_GLIBC_FLOOR" \
 		| tee "$logs/abi.txt"
 	nm -C "$CARGO_TARGET_DIR/release/shell" > "$logs/shell.nm"

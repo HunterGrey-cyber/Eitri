@@ -23,12 +23,14 @@ pub(super) enum SpawnCall {
     Connect {
         resume: Option<String>,
         project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
     },
     /// One tab of a restore, with the lease already taken for it.
     Resume {
         id: String,
         lease: agent::lease::SessionLease,
         project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
     },
     /// A tab of another agent, fresh or resumed, with the trust plan it was given and, for an ACP
     /// agent, its registration.
@@ -40,6 +42,8 @@ pub(super) enum SpawnCall {
         acp: Option<agent::providers::acp::AcpAgentSpec>,
         /// The teardown of the tab's previous backend, which the start waits for (`r` continuing a session).
         after_old: Option<mpsc::Receiver<()>>,
+        /// The tool server the session is to run.
+        editor_server: Option<agent::EditorServerSpec>,
     },
 }
 
@@ -102,12 +106,17 @@ pub(super) fn start_deferred(
         return start_external_tab(state, tab, agent, start, project);
     }
     let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
+    let client_tools = editor_glue::tools_for_start(state, project);
     match start {
         DeferredStart::FirstSend { request_id, first_turn } => {
             let result_rx = match &state.spawner {
-                Spawner::Real => spawn_connect(kind, project_dir, None, project),
+                Spawner::Real => spawn_connect(kind, project_dir, None, project, client_tools),
                 #[cfg(test)]
-                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect { resume: None, project }),
+                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect {
+                    resume: None,
+                    project,
+                    client_tools,
+                }),
             };
             let t = state.tabs.get_mut(tab).expect("checked above");
             t.session.project_tiers = Some(project);
@@ -135,9 +144,13 @@ pub(super) fn start_deferred(
         } => {
             let resume = Some(provider_session_id.clone());
             let result_rx = match &state.spawner {
-                Spawner::Real => spawn_connect(kind, project_dir, resume, project),
+                Spawner::Real => spawn_connect(kind, project_dir, resume, project, client_tools),
                 #[cfg(test)]
-                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect { resume, project }),
+                Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::Connect {
+                    resume,
+                    project,
+                    client_tools,
+                }),
             };
             let t = state.tabs.get_mut(tab).expect("checked above");
             t.session.project_tiers = Some(project);
@@ -158,7 +171,7 @@ pub(super) fn start_deferred(
         DeferredStart::Restore { go } => {
             let result = match &state.spawner {
                 Spawner::Real => {
-                    let mut spawn = resume_spawner(state);
+                    let mut spawn = resume_spawner(state, client_tools);
                     start_restore(state, tab, go, &mut spawn, project)
                 }
                 #[cfg(test)]
@@ -169,6 +182,7 @@ pub(super) fn start_deferred(
                             id: id.to_string(),
                             lease,
                             project,
+                            client_tools: client_tools.clone(),
                         })
                     };
                     start_restore(state, tab, go, &mut spawn, project)
@@ -215,7 +229,7 @@ pub(super) fn start_external_tab(
     // Taken whatever happens to this start, so a wait left for it never holds a later one.
     let wait = state.resume_after.remove(&tab);
     let profile = trust_profile(&state.acp_agents, &agent);
-    if project == ProjectTrust::Untrusted && profile.requires_explicit_yes() {
+    if project != ProjectTrust::Trusted && profile.requires_explicit_yes() {
         return put_off_start(state, tab, start, &crate::trust_gate::refused_without_yes(&profile));
     }
     let project = project_trust_at_root(&agent, project, &state.project_dir);
@@ -233,7 +247,7 @@ pub(super) fn start_external_tab(
     };
     let answer = match project {
         ProjectTrust::Trusted => agent::DirTrust::Trusted,
-        ProjectTrust::Untrusted => agent::DirTrust::Untrusted,
+        ProjectTrust::Untrusted | ProjectTrust::NothingFound => agent::DirTrust::Untrusted,
     };
     let plan = match state.trust.bound_discovery(&profile) {
         Some(discovery) => {
@@ -266,6 +280,11 @@ pub(super) fn start_external_tab(
     let after_old = wait
         .filter(|(id, _)| resume.as_deref() == Some(id.as_str()))
         .map(|(_, gone)| gone);
+    let editor_name = state.trust.bound_discovery(&profile).map_or(
+        eitri_core::project_trust::EditorServerName::Unknown,
+        eitri_core::project_trust::eitri_server_name,
+    );
+    let editor_server = editor_glue::server_for_start(state, tab, &agent, project, editor_name);
     let result_rx = match &state.spawner {
         Spawner::Real => spawn_external(
             agent,
@@ -277,6 +296,7 @@ pub(super) fn start_external_tab(
             acp,
             state.start_notes.sender(),
             after_old,
+            editor_server,
         ),
         #[cfg(test)]
         Spawner::Fake(fake) => (fake.borrow_mut())(SpawnCall::External {
@@ -286,6 +306,7 @@ pub(super) fn start_external_tab(
             resume: resume.clone(),
             acp,
             after_old,
+            editor_server,
         }),
     };
     let Some(t) = state.tabs.get_mut(tab) else {
@@ -343,8 +364,9 @@ pub(super) fn spawn_connect(
     project_dir: PathBuf,
     resume: Option<String>,
     project: ProjectTrust,
+    client_tools: Option<agent::ClientToolSet>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
-    spawn_connect_holding(kind, project_dir, resume, None, project)
+    spawn_connect_holding(kind, project_dir, resume, None, project, client_tools)
 }
 
 /// What the band says while a Codex binary Eitri has not checked yet goes through its self-check.
@@ -421,6 +443,7 @@ pub(super) fn spawn_external(
     acp: Option<agent::providers::acp::AcpAgentSpec>,
     notes: mpsc::Sender<String>,
     after_old: Option<mpsc::Receiver<()>>,
+    editor_server: Option<agent::EditorServerSpec>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     use eitri_core::agent_backend::ExternalLaunch;
     let (result_tx, result_rx) = mpsc::channel();
@@ -469,7 +492,15 @@ pub(super) fn spawn_external(
             }),
         };
         let result = launch.and_then(|launch| {
-            AgentBackend::start_external(agent, launch, &project_dir, plan, mode, resume.as_deref())
+            AgentBackend::start_external(
+                agent,
+                launch,
+                &project_dir,
+                plan,
+                mode,
+                resume.as_deref(),
+                editor_server,
+            )
         });
         // As in `spawn_connect_holding`: a receiver dropped mid-connect makes this drop the cleanup.
         let _ = result_tx.send(result);
@@ -485,10 +516,11 @@ pub(super) fn spawn_connect_holding(
     resume: Option<String>,
     lease: Option<agent::lease::SessionLease>,
     project: ProjectTrust,
+    client_tools: Option<agent::ClientToolSet>,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease, project);
+        let result = AgentBackend::start_holding(kind, &project_dir, resume.as_deref(), lease, project, client_tools);
         // The receiver is gone only if the tab or the panel was torn down mid-connect; dropping
         // the backend here is then the cleanup (`Retiring` normally holds the receiver instead).
         let _ = result_tx.send(result);
@@ -705,6 +737,124 @@ pub(super) fn send_first_turn(
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    type Connected = Rc<RefCell<Vec<(Option<String>, ProjectTrust, Option<agent::ClientToolSet>)>>>;
+
+    /// A panel whose spawner records each fresh start or resume by hand it is asked for, with the tools it was given.
+    fn recording_panel() -> (Rc<RefCell<AgentPanelState>>, Connected) {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let connected: Connected = Rc::default();
+        let record = connected.clone();
+        state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
+            match call {
+                SpawnCall::Connect {
+                    resume,
+                    project,
+                    client_tools,
+                } => record.borrow_mut().push((resume, project, client_tools)),
+                _ => panic!("only a connect is expected here"),
+            }
+            mpsc::channel().1
+        })));
+        (state, connected)
+    }
+
+    fn what_is_on(project: ProjectTrust) -> agent::ClientToolSet {
+        eitri_core::editor_tools::catalog::client_tool_set(
+            &eitri_core::editor_tools::switches::Switches::on_by_default(),
+            project,
+        )
+        .expect("the catalogue declares tools")
+    }
+
+    fn resume_of(session: &str) -> DeferredStart {
+        DeferredStart::Resume {
+            request_id: "r1".into(),
+            provider_session_id: session.into(),
+            resumed_title: None,
+            resumed_name: None,
+        }
+    }
+
+    #[test]
+    fn a_first_send_declares_the_tools() {
+        let (state, connected) = recording_panel();
+        let tab = state.borrow().tabs.active();
+        start_deferred(
+            &mut state.borrow_mut(),
+            tab,
+            first_send("r1", "hi"),
+            ProjectTrust::Trusted,
+        );
+        let connected = connected.borrow();
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected[0].0, None);
+        assert_eq!(connected[0].2, Some(what_is_on(ProjectTrust::Trusted)));
+        assert_eq!(connected[0].2.as_ref().unwrap().server_name, "eitri");
+    }
+
+    #[test]
+    fn a_resume_by_hand_declares_them() {
+        let (state, connected) = recording_panel();
+        let tab = state.borrow().tabs.active();
+        start_deferred(&mut state.borrow_mut(), tab, resume_of("s-1"), ProjectTrust::Trusted);
+        let connected = connected.borrow();
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected[0].0.as_deref(), Some("s-1"));
+        assert_eq!(connected[0].2, Some(what_is_on(ProjectTrust::Trusted)));
+    }
+
+    /// A session of an untrusted project is given the rows that may be in one, and the same code path gives them.
+    #[test]
+    fn an_n_start_declares_what_an_n_start_may_have() {
+        use eitri_core::editor_tools::{catalog, switches::Switches};
+        let (state, connected) = recording_panel();
+        let tab = state.borrow().tabs.active();
+        start_deferred(
+            &mut state.borrow_mut(),
+            tab,
+            first_send("r1", "hi"),
+            ProjectTrust::Untrusted,
+        );
+        let second = state.borrow_mut().tabs.open(AgentId::Claude);
+        start_deferred(
+            &mut state.borrow_mut(),
+            second,
+            resume_of("s-2"),
+            ProjectTrust::Untrusted,
+        );
+        let expected: Vec<String> = catalog::declared(&Switches::on_by_default(), ProjectTrust::Untrusted)
+            .iter()
+            .map(|row| row.name.to_owned())
+            .collect();
+        assert!(!expected.is_empty());
+        let connected = connected.borrow();
+        assert_eq!(connected.len(), 2);
+        for (_, project, tools) in connected.iter() {
+            assert_eq!(*project, ProjectTrust::Untrusted);
+            let names: Vec<String> = tools.as_ref().unwrap().tools.iter().map(|t| t.name.clone()).collect();
+            assert_eq!(names, expected);
+        }
+    }
+
+    #[test]
+    fn tools_off_declares_nothing() {
+        use eitri_core::editor_tools::switches::Switches;
+        let (state, connected) = recording_panel();
+        state.borrow_mut().editor_switches = Switches::parse(Some("off"), &[]).unwrap();
+        let tab = state.borrow().tabs.active();
+        start_deferred(
+            &mut state.borrow_mut(),
+            tab,
+            first_send("r1", "hi"),
+            ProjectTrust::Trusted,
+        );
+        let second = state.borrow_mut().tabs.open(AgentId::Claude);
+        start_deferred(&mut state.borrow_mut(), second, resume_of("s-2"), ProjectTrust::Trusted);
+        let connected = connected.borrow();
+        assert_eq!(connected.len(), 2);
+        assert!(connected.iter().all(|(_, _, tools)| tools.is_none()));
+    }
 
     /// Pins `SIDECAR_STOPPED_MARKER` against the Rust that actually produces it, the same way
     /// `agent-ui/web/src/problems.test.ts`'s own "matches watch.rs's own wording" test pins the

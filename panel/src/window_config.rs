@@ -50,8 +50,12 @@ pub struct WindowConfig {
     /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
     /// puts a hint in the status band.
     pub review: ReviewConfig,
+    /// `agent.editor.follow`: following for new tabs, off by default.
+    pub editor_follow: bool,
     /// `agent.thinking`: how the agent panel shows the agent's thinking.
     pub thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
+    /// `agent.editor.tools` and `agent.editor.tool.<name>`: which editor tools a session is given.
+    pub editor_tools: eitri_core::editor_tools::switches::Switches,
     /// `keymap.nvim_prefix`: the left-hand side of the group of Normal-mode keys in the embedded nvim that run the
     /// prefix table's window and layout actions, or `None` (the default) for no group.
     pub nvim_prefix: Option<String>,
@@ -302,6 +306,10 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
 
     let companion_wm = parse_companion_wm(kernel.config.borrow().get(eitri_core::compositor::CONFIG_KEY))?;
 
+    let editor_follow = eitri_core::agent_prefs::parse_editor_follow(
+        kernel.config.borrow().get(eitri_core::agent_prefs::EDITOR_FOLLOW_KEY),
+    )?;
+
     // How chats and pages open (`window.tiling`: "auto", the default, "eitri" or "compositor"). Anything else is a
     // startup failure naming the key, like `companion.wm`; macOS has no compositor mode to ask for.
     let tiling = parse_tiling(kernel.config.borrow().get(eitri_core::compositor::mode::TILING_KEY))?;
@@ -331,6 +339,14 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         );
     }
 
+    // Which editor tools a session is given (`agent.editor.tools`, and `agent.editor.tool.<name>` for each). A value
+    // that is not on or off, or a name no tool has, is a startup failure naming the key, like the keys above.
+    let editor_tools = {
+        use eitri_core::editor_tools::switches::{Switches, TOOLS_KEY, TOOL_KEY_PREFIX};
+        let config = kernel.config.borrow();
+        Switches::parse(config.get(TOOLS_KEY), &config.keys_under(TOOL_KEY_PREFIX))?
+    };
+
     // The group of keys in the embedded nvim (`keymap.nvim_prefix`): off unless `init.lua` names a left-hand side.
     // Anything that cannot be one is a startup failure naming the key, like the keys above.
     let nvim_prefix = eitri_core::nvim_verbs::leader::parse_nvim_prefix(
@@ -357,7 +373,9 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         companion_wm,
         tiling,
         review,
+        editor_follow,
         thinking_display,
+        editor_tools,
         nvim_prefix,
     })
 }
@@ -377,7 +395,9 @@ impl WindowConfig {
             enabled: self.review.enabled,
             hint: self.review.hint,
         });
+        panel.set_editor_follow(self.editor_follow);
         panel.set_thinking_display(self.thinking_display);
+        panel.set_editor_tools(self.editor_tools.clone());
     }
 }
 
@@ -626,6 +646,125 @@ mod tests {
         let loaded = ran.and_then(|()| load(&kernel, panels));
         std::fs::remove_dir_all(&scratch).unwrap();
         loaded
+    }
+
+    #[test]
+    fn a_bad_follow_key_fails_startup_naming_it() {
+        #[derive(Default)]
+        struct FollowPage(std::cell::RefCell<Vec<serde_json::Value>>);
+        impl crate::panel_page::PageSurface for FollowPage {
+            fn send(&self, json: &str) {
+                self.0.borrow_mut().push(serde_json::from_str(json).unwrap());
+            }
+            fn is_visible(&self) -> bool {
+                false
+            }
+            fn load_document(&self, _: &str, _: &str) {}
+            fn set_background(&self, _: [u8; 3]) {}
+        }
+        assert!(!load_from("", &[]).unwrap().editor_follow);
+        for source in [
+            "eitri.config.set(\"agent.editor.follow\", true)",
+            "eitri.config.set(\"agent.editor.follow\", \"on\")",
+        ] {
+            let config = load_from(source, &[]).unwrap();
+            assert!(config.editor_follow);
+            let page = Rc::new(FollowPage::default());
+            let panel = AgentPanelHandle::for_host_test(page.clone());
+            config.apply_to_panel(&panel);
+            panel.page_message(
+                eitri_core::tabs::ViewId::BASE,
+                r#"{"type":"ready","request_id":"ready"}"#,
+            );
+            let initial = page
+                .0
+                .borrow()
+                .iter()
+                .rev()
+                .find(|v| v["kind"] == "tabs")
+                .unwrap()
+                .clone();
+            assert_eq!(initial["tabs"][0]["following"], true);
+            panel.new_tab();
+            let new = page
+                .0
+                .borrow()
+                .iter()
+                .rev()
+                .find(|v| v["kind"] == "tabs")
+                .unwrap()
+                .clone();
+            assert_eq!(new["tabs"].as_array().unwrap().len(), 2);
+            assert!(new["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tab| tab["following"] == true));
+        }
+        for bad in ["\"maybe\"", "{}", "17"] {
+            let source = format!("eitri.config.set(\"agent.editor.follow\", {bad})");
+            let why = load_from(&source, &[]).err().expect("a bad switch refuses startup");
+            assert!(why.contains("agent.editor.follow"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_bad_editor_tool_key_fails_startup_naming_it() {
+        for (source, key) in [
+            (
+                "eitri.config.set(\"agent.editor.tool.no_such_tool\", \"off\")\n",
+                "agent.editor.tool.no_such_tool",
+            ),
+            (
+                "eitri.config.set(\"agent.editor.tool.open_file\", \"maybe\")\n",
+                "agent.editor.tool.open_file",
+            ),
+            (
+                "eitri.config.set(\"agent.editor.tools\", \"maybe\")\n",
+                "agent.editor.tools",
+            ),
+        ] {
+            let err = load_from(source, &[]).err().expect(source);
+            assert!(err.contains(key), "{err}");
+        }
+        assert!(load_from("eitri.config.set(\"agent.editor.tool.open_file\", \"off\")\n", &[]).is_ok());
+    }
+
+    struct NoPage;
+
+    impl crate::panel_page::PageSurface for NoPage {
+        fn send(&self, _envelope_json: &str) {}
+        fn is_visible(&self) -> bool {
+            false
+        }
+        fn load_document(&self, _html: &str, _base_uri: &str) {}
+        fn set_background(&self, _rgb: [u8; 3]) {}
+    }
+
+    #[test]
+    fn apply_to_panel_hands_the_switches_over() {
+        use agent::setting_sources::ProjectTrust;
+        let names = |panel: &AgentPanelHandle| -> Vec<String> {
+            panel
+                .editor_tools_declared(ProjectTrust::Trusted)
+                .map(|set| set.tools.into_iter().map(|tool| tool.name).collect())
+                .unwrap_or_default()
+        };
+        let panel = AgentPanelHandle::for_host_test(Rc::new(NoPage));
+        let all = names(&panel);
+        assert!(all.iter().any(|name| name == "open_file"), "{all:?}");
+
+        load_from("eitri.config.set(\"agent.editor.tool.open_file\", \"off\")\n", &[])
+            .unwrap()
+            .apply_to_panel(&panel);
+        let without = names(&panel);
+        assert!(!without.iter().any(|name| name == "open_file"), "{without:?}");
+        assert_eq!(without.len() + 1, all.len());
+
+        load_from("eitri.config.set(\"agent.editor.tools\", \"off\")\n", &[])
+            .unwrap()
+            .apply_to_panel(&panel);
+        assert!(names(&panel).is_empty());
     }
 
     /// `window.tiling` through the real Lua engine: unset is `auto`, each word is read, anything else is a startup

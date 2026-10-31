@@ -619,6 +619,12 @@ impl SpawnedSidecar {
 ///   `CreateSessionRequest.client_interactions`, `typed_by_person` and
 ///   `SendTurnRequest.client_message_id`. Not called: `StopTask`, `GetTaskOutput`,
 ///   `ResolveInteraction`, `GetInteractionState`.
+/// - 3.23: tools a host declares and answers itself, behind the capability `client_tools`:
+///   `CreateSessionRequest.client_tools`, the `AnswerClientToolCall` and `GetClientToolCallState`
+///   RPCs, the `ClientToolCall` and `ClientToolCallSettled` events (`SessionEvent` arms 50 and 51),
+///   `InitMcpServer.source`, error codes `CLIENT_TOOL_CALL_NOT_FOUND` and
+///   `CLIENT_TOOL_CALL_ALREADY_ANSWERED`. Read: the capability flag, both events and
+///   `SessionReady.init_fingerprint.mcp_servers` with its `source`.
 pub const EXPECTED_VERDANDI_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
@@ -1288,6 +1294,9 @@ fn sidecar_command_for(
         // goes to this window's group and must not reach a sidecar another window may hold by then.
         // Its end is its stdin's EOF, which every holder's end brings about, a crash included.
         .process_group(0)
+        // An Eitri tab reaches its own editor and never attaches to an IDE the CLI finds on the machine:
+        // the SDK's sessions do not look for one today, and a later CLI that does stops here.
+        .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "false")
         // The sidecar merges this variable's MCP servers into every session it serves. Eitri states
         // which servers a session gets and states none today, so a value left in the user's shell
         // must not turn into servers (and tools) in an Eitri session.
@@ -2234,6 +2243,22 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_children_never_look_for_an_ide() {
+        for keep_test_seams in [false, true] {
+            let command = sidecar_command_for(
+                Path::new("/usr/lib/eitri/verdandi-claude-sidecar"),
+                &[],
+                Path::new("/never/bound"),
+                None,
+                keep_test_seams,
+                None,
+            );
+            let env: Vec<_> = command.get_envs().collect();
+            assert!(env.contains(&(OsStr::new("CLAUDE_CODE_AUTO_CONNECT_IDE"), Some(OsStr::new("false")))));
+        }
+    }
+
+    #[test]
     fn the_sidecar_gets_the_raised_background_ceiling() {
         for keep_test_seams in [false, true] {
             let command = sidecar_command_for(
@@ -2367,6 +2392,7 @@ mod tests {
             keys,
             vec![
                 "BASH_MAX_TIMEOUT_MS".to_string(),
+                "CLAUDE_CODE_AUTO_CONNECT_IDE".to_string(),
                 "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_FAULT_DROP_WATCH_AFTER".to_string(),
                 "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH".to_string(),

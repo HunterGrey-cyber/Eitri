@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793218272785,
+      "occurred_at": 1793397465915,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+      "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "3e1708f1-5c23-4585-9404-5892486ab1d7",
-      "session_id": "76f59298-7e58-4080-b761-546010bc0fad",
+      "provider_session_id": "1fb11c89-dd58-4621-90b2-4e2a3fb5acb9",
+      "session_id": "db13b361-9e0f-4253-9eee-7cb48840751c",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -234,7 +238,7 @@
     {
       "kind": "text",
       "text": "C20D-OPEN-DONE",
-      "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+      "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
       "type": "content_delta"
     },
     {
@@ -247,7 +251,7 @@
       "outcome": "completed",
       "result_text": "C20D-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+      "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -262,11 +266,11 @@
       }
     },
     {
-      "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+      "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
       "type": "turn_started"
     },
     {
-      "interaction_id": "66f89dea-5c9a-43d0-a9a6-bbf0516075a7",
+      "interaction_id": "49c31545-5e4f-4024-bca3-0db667cd212a",
       "questions": [
         {
           "header": "Cache",
@@ -298,13 +302,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "3e1708f1-5c23-4585-9404-5892486ab1d7",
-      "session_id": "76f59298-7e58-4080-b761-546010bc0fad",
+      "provider_session_id": "1fb11c89-dd58-4621-90b2-4e2a3fb5acb9",
+      "session_id": "db13b361-9e0f-4253-9eee-7cb48840751c",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "input": {
@@ -332,7 +340,7 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+      "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
       "type": "tool_call_started"
     },
     {
@@ -343,7 +351,7 @@
           "question_index": 0
         }
       ],
-      "interaction_id": "66f89dea-5c9a-43d0-a9a6-bbf0516075a7",
+      "interaction_id": "49c31545-5e4f-4024-bca3-0db667cd212a",
       "outcome": "answered",
       "reason": null,
       "type": "question_settled"
@@ -352,13 +360,13 @@
       "content": "<cli-text chars=221 sha256=032ff157d6e64c80>",
       "is_error": false,
       "tool_use_id": "toolu_q1",
-      "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+      "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "C20D-DONE",
-      "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+      "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
       "type": "content_delta"
     },
     {
@@ -371,7 +379,7 @@
       "outcome": "completed",
       "result_text": "C20D-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+      "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -389,12 +397,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793218272785,
+        "occurred_at": 1793397465915,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+        "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
         "type": "turn_started"
       },
       {
@@ -601,13 +609,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "3e1708f1-5c23-4585-9404-5892486ab1d7",
-        "session_id": "76f59298-7e58-4080-b761-546010bc0fad",
+        "provider_session_id": "1fb11c89-dd58-4621-90b2-4e2a3fb5acb9",
+        "session_id": "db13b361-9e0f-4253-9eee-7cb48840751c",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -622,7 +634,7 @@
       {
         "kind": "text",
         "text": "C20D-OPEN-DONE",
-        "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+        "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
         "type": "content_delta"
       },
       {
@@ -635,7 +647,7 @@
         "outcome": "completed",
         "result_text": "C20D-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "e056c27e-073e-4198-815f-23018b686c60",
+        "turn_id": "577ee520-8360-4ff6-90e6-2128ddd9b72d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -650,11 +662,11 @@
         }
       },
       {
-        "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+        "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
         "type": "turn_started"
       },
       {
-        "interaction_id": "66f89dea-5c9a-43d0-a9a6-bbf0516075a7",
+        "interaction_id": "49c31545-5e4f-4024-bca3-0db667cd212a",
         "questions": [
           {
             "header": "Cache",
@@ -686,13 +698,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "3e1708f1-5c23-4585-9404-5892486ab1d7",
-        "session_id": "76f59298-7e58-4080-b761-546010bc0fad",
+        "provider_session_id": "1fb11c89-dd58-4621-90b2-4e2a3fb5acb9",
+        "session_id": "db13b361-9e0f-4253-9eee-7cb48840751c",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "input": {
@@ -720,7 +736,7 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+        "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
         "type": "tool_call_started"
       },
       {
@@ -731,7 +747,7 @@
             "question_index": 0
           }
         ],
-        "interaction_id": "66f89dea-5c9a-43d0-a9a6-bbf0516075a7",
+        "interaction_id": "49c31545-5e4f-4024-bca3-0db667cd212a",
         "outcome": "answered",
         "reason": null,
         "type": "question_settled"
@@ -740,13 +756,13 @@
         "content": "<cli-text chars=221 sha256=032ff157d6e64c80>",
         "is_error": false,
         "tool_use_id": "toolu_q1",
-        "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+        "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "C20D-DONE",
-        "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+        "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
         "type": "content_delta"
       },
       {
@@ -759,7 +775,7 @@
         "outcome": "completed",
         "result_text": "C20D-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+        "turn_id": "361df80a-900b-4e24-a786-a18b7efbed1a",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -777,7 +793,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 17
+    "throughRevision": 19
   },
   "scenario": "c20d",
   "snapshot": {
@@ -1004,7 +1020,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 5,
+          "seq": 6,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1015,7 +1031,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "66f89dea-5c9a-43d0-a9a6-bbf0516075a7",
+          "interactionId": "49c31545-5e4f-4024-bca3-0db667cd212a",
           "questions": [
             {
               "header": "Cache",
@@ -1040,7 +1056,7 @@
               "question": "Which C20D cache notes apply?"
             }
           ],
-          "seq": 9,
+          "seq": 10,
           "state": {
             "answers": [
               {
@@ -1054,7 +1070,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec",
+          "turnId": "361df80a-900b-4e24-a786-a18b7efbed1a",
           "unsupportedReason": null
         }
       ],
@@ -1094,18 +1110,18 @@
             "content": "<cli-text chars=221 sha256=032ff157d6e64c80>",
             "isError": false
           },
-          "seq": 12,
+          "seq": 14,
           "toolUseId": "toolu_q1",
-          "turnId": "e3b943db-1a7b-4623-9c0e-396bffbcd9ec"
+          "turnId": "361df80a-900b-4e24-a786-a18b7efbed1a"
         }
       ],
       "transcript": [
         {
-          "seq": 6,
+          "seq": 7,
           "text": "C20D-OPEN-DONE"
         },
         {
-          "seq": 15,
+          "seq": 17,
           "text": "C20D-DONE"
         }
       ],
@@ -1124,7 +1140,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 17,
+    "throughRevision": 19,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

@@ -23,15 +23,28 @@ fn the_pinned_protocol_exposes_the_preset() {
     assert!(preset.append.is_none());
 }
 
-/// The pinned revision speaks protocol 3.22, whose capabilities Eitri reads by name. Each constant the
-/// protocol crate exports must be the word Eitri compares the handshake against, and each must be one
-/// the crate lists as new in minor 22: a rename on either side fails here, not as a feature that
-/// silently reads as absent.
+/// The pinned revision speaks protocol 3.23, whose one new capability Eitri reads by name: a protocol
+/// bump the client does not know fails here.
 #[test]
-fn the_pinned_protocol_is_3_22_and_names_its_capabilities_as_eitri_reads_them() {
+fn the_pinned_protocol_is_3_23_and_names_client_tools() {
     use claude_runtime_protocol as wire;
     assert_eq!(wire::PROTOCOL_MAJOR, 3);
-    assert_eq!(wire::PROTOCOL_MINOR, 22);
+    assert_eq!(wire::PROTOCOL_MINOR, 23);
+    assert_eq!(wire::CAP_CLIENT_TOOLS, "client_tools");
+    let new_in_23: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
+        .iter()
+        .filter(|(_, minor)| *minor == 23)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(new_in_23, ["client_tools"], "the one capability of minor 23");
+}
+
+/// Eitri reads minor 22's capabilities by name. Each constant the protocol crate exports must be the
+/// word Eitri compares the handshake against, and each must be one the crate lists as new in minor 22:
+/// a rename on either side fails here, not as a feature that silently reads as absent.
+#[test]
+fn the_capabilities_of_minor_22_are_named_as_eitri_reads_them() {
+    use claude_runtime_protocol as wire;
     let read_by_eitri = [
         (wire::CAP_CLI_TURNS, "cli_turns"),
         (wire::CAP_HUMAN_ORIGIN, "human_origin"),

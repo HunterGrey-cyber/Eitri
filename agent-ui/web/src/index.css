@@ -693,6 +693,26 @@ pre {
   color: var(--nv-warn-tint-muted);
   margin: 10px 0;
 }
+.permission-card-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  margin: 10px 0;
+}
+/* The title and the lines Eitri words name a path: laid out ltr in the order written, as the command blocks are, and
+   with every space kept, so the name shown is the name approved. The agent's own words are isolated instead. */
+.permission-card-tool-broker, .permission-card-line[data-line-kind="plain"], .permission-card-line[data-line-kind="warning"] {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.permission-card-line[data-line-kind="agent"] {
+  unicode-bidi: isolate;
+}
+.permission-card-line-warning {
+  font-weight: 650;
+}
 .permission-card-provider-label {
   display: block;
   font-size: var(--fs-xs);

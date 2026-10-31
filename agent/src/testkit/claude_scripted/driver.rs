@@ -17,6 +17,8 @@
 //! | `release` | hold name |
 //! | `stop_task`, `task_output` | task id; `task_output` also `{task, refused?, min_bytes?, contains?}`: the host must refuse, with that text in the refusal, or the output it returns must be at least `min_bytes` long and hold `contains` |
 //! | `set_per_task_stop` | bool |
+//! | `client_answer` | `{text, is_error?, tool?}` or `{fill: {unit, bytes}, is_error?, tool?}`: answers the oldest open call of a tool this host declared (of `tool` when given) with that text; `fill` repeats `unit` up to `bytes` bytes |
+//! | `freeze`, `adopt`, `commit` | anything: the three steps of a window move of the tab, in the source and then the destination window (a host with the `chat_move` capability) |
 //! | `answer_question` | `{picks: [[option...]...], other?: [text\|null...], notes?: [text\|null...], refused?: text}` |
 //! | `decline_question` | `{kind: "cancel"\|"chat"}`, with `picks`, `other` and `notes` as the answers so far (chat only) and `refused?` |
 //! | `request`, `request_done` | step id or side kind, or `{id, count}` |
@@ -30,6 +32,11 @@
 //! | `roster` | `{task, status}` |
 //! | `card` | `{tool}`: a request of that tool needed (or got) a driver answer |
 //! | `wall_floor` | `{after, seconds}`: `after` is a part's `name` or `<verb>:<target>` of an earlier wait |
+//! | `client_call` | tool name (bare, or with the `mcp__<server>__` prefix), or `{tool, count?}`: the host has been handed a call of that tool, with its `tool_use_id` |
+//! | `client_state` | `{open: n, tool?}`: the session's own read of its open calls (`GetClientToolCallState`) holds exactly `n` (of `tool` when given) |
+//!
+//! A part may carry `layer: "a"|"b"`: it runs only on a host of that layer and is skipped, with no `PENDING` line,
+//! on the other. Layer (a) is the sidecar provider driven directly; layer (b) is Eitri's own host.
 //!
 //! String values may hold `{name}` captures of the scripted requests and `{RUN}`.
 //!
@@ -109,6 +116,31 @@ pub struct QuestionAnswer {
 /// The tool whose calls are questions for the person, never permission requests.
 pub const QUESTION_TOOL: &str = "AskUserQuestion";
 
+/// A call of a tool this host declared, as the host was handed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientCallSeen {
+    pub call_id: String,
+    pub tool_use_id: Option<String>,
+    /// The declared name, without the `mcp__<server>__` prefix.
+    pub tool: String,
+}
+
+/// What a `client_answer` part gives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientAnswer {
+    /// The declared name of the call to answer, or the oldest open call when `None`.
+    pub tool: Option<String>,
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// The session's read of its open calls.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ClientState {
+    pub through_sequence: u64,
+    pub open: Vec<ClientCallSeen>,
+}
+
 /// What a driver needs from the thing under test. Layer (a) implements it over the sidecar provider; the
 /// companion plans implement it over Eitri's host.
 ///
@@ -132,6 +164,11 @@ pub trait Host {
     fn slash(&mut self, command: &str) -> Result<(), DriverError>;
     fn close(&mut self) -> Result<(), DriverError>;
     fn resume(&mut self) -> Result<(), DriverError>;
+
+    /// The layer this host is: `a` drives the sidecar provider directly, `b` is Eitri's host.
+    fn layer(&self) -> &'static str {
+        "a"
+    }
 
     /// Called on every poll of a wait: the host pumps its events and answers what its mode answers by itself.
     fn poll(&mut self) -> Result<(), DriverError> {
@@ -180,6 +217,30 @@ pub trait Host {
     fn decline_question(&mut self, kind: DeclineKind, so_far: &[QuestionAnswer]) -> Result<(), DriverError> {
         let _ = (kind, so_far);
         Err(DriverError::CapabilityMissing("structured_questions_v1"))
+    }
+    /// Every call of a declared tool the host has been handed, settled or not, oldest first.
+    fn client_calls_seen(&self) -> Result<Vec<ClientCallSeen>, DriverError> {
+        Err(DriverError::CapabilityMissing("client_tools"))
+    }
+    /// Answers the oldest open call of a declared tool, of `answer.tool` when it names one.
+    fn client_answer(&mut self, answer: &ClientAnswer) -> Result<(), DriverError> {
+        let _ = answer;
+        Err(DriverError::CapabilityMissing("client_tools"))
+    }
+    /// The session's own read of its open calls.
+    fn client_state(&mut self) -> Result<ClientState, DriverError> {
+        Err(DriverError::CapabilityMissing("client_tools"))
+    }
+    /// A window move of the tab, in three steps. `freeze` stops the source window's side and hands the session
+    /// over, `adopt` takes it up in the destination window, and `commit` lets the destination read and answer.
+    fn move_freeze(&mut self) -> Result<(), DriverError> {
+        Err(DriverError::CapabilityMissing("chat_move"))
+    }
+    fn move_adopt(&mut self) -> Result<(), DriverError> {
+        Err(DriverError::CapabilityMissing("chat_move"))
+    }
+    fn move_commit(&mut self) -> Result<(), DriverError> {
+        Err(DriverError::CapabilityMissing("chat_move"))
     }
     /// Whether the host's question records hold what `want` describes (`question: waiting|settled`, or an
     /// `interaction` wait's object).
@@ -277,6 +338,10 @@ const ACTIONS: &[&str] = &[
     "set_per_task_stop",
     "answer_question",
     "decline_question",
+    "client_answer",
+    "freeze",
+    "adopt",
+    "commit",
 ];
 const WAITS: &[&str] = &[
     "request",
@@ -291,8 +356,10 @@ const WAITS: &[&str] = &[
     "roster",
     "card",
     "wall_floor",
+    "client_call",
+    "client_state",
 ];
-const META: &[&str] = &["requires", "name", "timeout"];
+const META: &[&str] = &["requires", "name", "timeout", "layer"];
 /// Actions that start something the CLI answers: the session-state wait only looks at tap lines after the latest.
 const STARTS_WORK: &[&str] = &["send", "steer", "queue", "interrupt", "slash", "resume"];
 
@@ -443,6 +510,9 @@ impl<'a> Driver<'a> {
         let mut report = Report::default();
         for (i, part) in parts.iter().enumerate() {
             let (verb, label) = self.describe(i, part)?;
+            if part["layer"].as_str().is_some_and(|layer| layer != self.host.layer()) {
+                continue;
+            }
             let missing = self.missing(part);
             if !missing.is_empty() {
                 for name in missing {
@@ -609,6 +679,13 @@ impl<'a> Driver<'a> {
                 Ok(self.host.set_per_task_stop(on)?)
             }
             "answer_question" | "decline_question" => self.question_action(verb, arg),
+            "client_answer" => {
+                let answer = client_answer_of(arg)?;
+                Ok(self.host.client_answer(&answer)?)
+            }
+            "freeze" => Ok(self.host.move_freeze()?),
+            "adopt" => Ok(self.host.move_adopt()?),
+            "commit" => Ok(self.host.move_commit()?),
             other => Err(Failure::text(format!("no action `{other}`"))),
         }
     }
@@ -825,6 +902,31 @@ impl<'a> Driver<'a> {
                 let tool = text_arg(arg, "tool").ok_or_else(|| Failure::text("`card` needs a tool"))?;
                 self.wait_for(&what, limit, true, move |d| {
                     Ok(d.host.cards_shown().iter().any(|c| c.tool() == tool))
+                })
+            }
+            "client_call" => {
+                let tool =
+                    bare_tool(&text_arg(arg, "tool").ok_or_else(|| Failure::text("`client_call` needs a tool"))?);
+                let count = want_count(arg);
+                self.wait_for(&what, limit, false, move |d| {
+                    let seen = d.host.client_calls_seen()?;
+                    Ok(seen.iter().filter(|c| c.tool == tool).count() >= count)
+                })
+            }
+            "client_state" => {
+                let open = arg["open"]
+                    .as_u64()
+                    .ok_or_else(|| Failure::text("`client_state` needs `open`: how many calls the read holds"))?
+                    as usize;
+                let tool = text_arg(arg, "tool").map(|t| bare_tool(&t));
+                self.wait_for(&what, limit, false, move |d| {
+                    let state = d.host.client_state()?;
+                    let n = state
+                        .open
+                        .iter()
+                        .filter(|c| tool.as_deref().is_none_or(|t| c.tool == t))
+                        .count();
+                    Ok(n == open)
                 })
             }
             "wall_floor" => {
@@ -1226,11 +1328,40 @@ fn check_against(verb: &str, answers: &[QuestionAnswer], asked: &AskedQuestion) 
     Ok(())
 }
 
+/// A tool name without the `mcp__<server>__` prefix the model sees it under.
+fn bare_tool(name: &str) -> String {
+    match name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
+        Some((_server, tool)) => tool.to_owned(),
+        None => name.to_owned(),
+    }
+}
+
+/// A `client_answer` part's arguments: the text given whole, or built by repeating a unit up to a size.
+fn client_answer_of(arg: &Value) -> Result<ClientAnswer, Failure> {
+    let tool = text_arg(arg, "tool").map(|t| bare_tool(&t));
+    let is_error = arg["is_error"].as_bool().unwrap_or(false);
+    let text = if let Some(fill) = arg.get("fill") {
+        let unit = fill["unit"].as_str().filter(|u| !u.is_empty() && u.is_ascii());
+        let bytes = fill["bytes"].as_u64();
+        let (Some(unit), Some(bytes)) = (unit, bytes) else {
+            return Err(Failure::text(
+                "`client_answer` `fill` needs an ASCII `unit` and a `bytes` count",
+            ));
+        };
+        let mut text = unit.repeat(bytes.div_ceil(unit.len() as u64) as usize);
+        text.truncate(bytes as usize);
+        text
+    } else {
+        text_arg(arg, "text").ok_or_else(|| Failure::text("`client_answer` needs a `text` or a `fill`"))?
+    };
+    Ok(ClientAnswer { tool, text, is_error })
+}
+
 fn target_of(verb: &str, arg: &Value) -> Option<String> {
     match verb {
         "request" | "request_done" => text_arg(arg, "id"),
         "held" => text_arg(arg, "name"),
-        "tap_line" | "card" => text_arg(arg, "kind").or_else(|| text_arg(arg, "tool")),
+        "tap_line" | "card" | "client_call" => text_arg(arg, "kind").or_else(|| text_arg(arg, "tool")),
         "session_state" => arg.as_str().map(str::to_owned),
         _ => None,
     }
@@ -1286,6 +1417,11 @@ mod tests {
         refuse: Option<String>,
         /// What a task's output reads as.
         output: String,
+        /// The calls of declared tools the host was handed; the last `open` of them are still open.
+        client_calls: Vec<ClientCallSeen>,
+        open: usize,
+        /// The layer this host says it is.
+        layer: &'static str,
     }
 
     impl Fake {
@@ -1300,6 +1436,9 @@ mod tests {
                 interaction: false,
                 refuse: None,
                 output: "tail".into(),
+                client_calls: Vec::new(),
+                open: 0,
+                layer: "a",
             }
         }
         fn note(&self, text: impl Into<String>) {
@@ -1409,6 +1548,41 @@ mod tests {
             } else {
                 Err(DriverError::CapabilityMissing("structured_questions_v1"))
             }
+        }
+        fn layer(&self) -> &'static str {
+            self.layer
+        }
+        fn client_calls_seen(&self) -> Result<Vec<ClientCallSeen>, DriverError> {
+            Ok(self.client_calls.clone())
+        }
+        fn client_answer(&mut self, answer: &ClientAnswer) -> Result<(), DriverError> {
+            self.note(format!(
+                "client_answer {:?} {} bytes error={}",
+                answer.tool,
+                answer.text.len(),
+                answer.is_error
+            ));
+            self.open = self.open.saturating_sub(1);
+            Ok(())
+        }
+        fn client_state(&mut self) -> Result<ClientState, DriverError> {
+            let start = self.client_calls.len() - self.open;
+            Ok(ClientState {
+                through_sequence: 7,
+                open: self.client_calls[start..].to_vec(),
+            })
+        }
+        fn move_freeze(&mut self) -> Result<(), DriverError> {
+            self.note("freeze");
+            Ok(())
+        }
+        fn move_adopt(&mut self) -> Result<(), DriverError> {
+            self.note("adopt");
+            Ok(())
+        }
+        fn move_commit(&mut self) -> Result<(), DriverError> {
+            self.note("commit");
+            Ok(())
         }
     }
 
@@ -2221,6 +2395,97 @@ mod tests {
             let err = drive(&mut host, &endpoint, &run, json!([{ "projection": bad }])).unwrap_err();
             assert!(err.contains("exactly"), "{bad}: {err}");
         }
+    }
+
+    fn a_call(tool: &str) -> ClientCallSeen {
+        ClientCallSeen {
+            call_id: format!("call-{tool}"),
+            tool_use_id: Some(format!("toolu_{tool}")),
+            tool: tool.into(),
+        }
+    }
+
+    #[test]
+    fn client_waits_and_answers_reach_the_host_by_bare_tool_name() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.client_calls = vec![a_call("open_file")];
+        host.open = 1;
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([
+                {"client_call": "mcp__eitri__open_file"},
+                {"client_call": {"tool": "open_file", "count": 1}},
+                {"client_state": {"open": 1, "tool": "mcp__eitri__open_file"}},
+                {"client_answer": {"text": "shown", "tool": "open_file"}},
+                {"client_answer": {"fill": {"unit": "abc\n", "bytes": 10}, "is_error": true}},
+                {"client_state": {"open": 0}}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            host.calls.lock().unwrap().join("|"),
+            "client_answer Some(\"open_file\") 5 bytes error=false|client_answer None 10 bytes error=true"
+        );
+    }
+
+    #[test]
+    fn a_client_call_wait_for_a_tool_never_called_times_out() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.client_calls = vec![a_call("editor_state")];
+        let err = drive(&mut host, &endpoint, &run, json!([{"client_call": "open_file"}])).unwrap_err();
+        assert!(err.contains("timed out") && err.contains("client_call"), "{err}");
+    }
+
+    #[test]
+    fn a_client_state_wait_holds_only_for_the_exact_count() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.client_calls = vec![a_call("open_file"), a_call("diagnostics")];
+        host.open = 2;
+        let err = drive(&mut host, &endpoint, &run, json!([{"client_state": {"open": 1}}])).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn the_three_steps_of_a_move_reach_the_host_in_order() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"freeze": true}, {"adopt": true}, {"commit": true}]),
+        )
+        .unwrap();
+        assert_eq!(host.calls.lock().unwrap().join("|"), "freeze|adopt|commit");
+    }
+
+    #[test]
+    fn a_part_for_the_other_layer_is_skipped_without_a_pending_line() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        host.layer = "b";
+        let report = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"send": "only a", "layer": "a"}, {"send": "only b", "layer": "b"}, {"send": "both"}]),
+        )
+        .unwrap();
+        assert_eq!(host.calls.lock().unwrap().join("|"), "send only b|send both");
+        assert_eq!((report.parts_run, report.pending.len()), (2, 0));
+    }
+
+    #[test]
+    fn an_answer_with_no_text_or_with_a_unit_that_is_not_ascii_fails_before_the_host() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        for part in [
+            json!({"client_answer": {}}),
+            json!({"client_answer": {"fill": {"unit": "é", "bytes": 4}}}),
+        ] {
+            let err = drive(&mut host, &endpoint, &run, json!([part])).unwrap_err();
+            assert!(err.contains("client_answer"), "{err}");
+        }
+        assert!(host.calls.lock().unwrap().is_empty());
     }
 
     #[test]

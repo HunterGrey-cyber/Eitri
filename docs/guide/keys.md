@@ -614,7 +614,7 @@ Codex tab shows what Codex reports and offers no list.
 | `Ctrl+w` / `Ctrl+u` | delete a word / to the start of the line |
 | `Ctrl+a` / `Ctrl+e` | move the caret to the start / end of the line it is on |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
-| `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
+| `Ctrl+y` | approve the oldest card waiting in this tab, leaving out a card from an agent's [editor tools](editor-tools.md#cards) (see [Answering a card](#answering-a-card)) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
 | `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)) |
@@ -661,7 +661,7 @@ there are no Claude command holdbacks or pickers.
 | `Ctrl+o` | the detailed view: every result, longer excerpts, no collapsed runs |
 | `y` | copy the row (the message, command or path), or the code block HINT landed on; the copy also goes to the primary selection, so a middle-click pastes it too |
 | `Y` | copy a tool row's whole output |
-| `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim; on a pending edit card for one file (a Claude `Edit`, `MultiEdit` or `Write`, a Codex change that adds one file, an ACP agent's edit of one file), the file as it is on disk beside the file as the edit would leave it, read-only, in a new Neovim tab page (`q` closes it; see [Reviewing a turn](turn-review.md#before-you-approve)); any other card shows its text, as before |
+| `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim; on a pending edit card for one file (a Claude `Edit`, `MultiEdit` or `Write`, a Codex change that adds one file, an ACP agent's edit of one file), the file as it is on disk beside the file as the edit would leave it, read-only, in a new Neovim tab page (`q` closes it; see [Reviewing a turn](turn-review.md#before-you-approve)); on a card of an agent's [proposal](editor-tools.md#proposals), the same view of one of its files, the next file at each press; any other card shows its text, as before |
 | `gf` | open the file path on this row in the editor, including a card's or edit row's file headers (several: pick by letter) |
 | `gx` | open this row's web link in your browser (several: pick by letter) |
 | `/` | search the conversation; `Enter` keeps the match, `Esc` goes back |
@@ -698,6 +698,7 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
 | `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
+| `Space e` (`<leader>e`) | toggle following the agent in the editor for this tab; off by default, never moves your cursor |
 | `<leader>?` | the list of keys |
 
 You can change them in [your configuration](configuration.md).
@@ -770,7 +771,9 @@ A permission card waits for you in the conversation, next to the tool call it ga
 | `]p` / `[p` | move the cursor to the next / the previous waiting card |
 
 From INSERT, `Ctrl+y` approves the oldest card waiting in this tab, and the band names the card it would
-approve. There is no key that denies from the box, since a denial can carry a reason you want to type.
+approve. There is no key that denies from the box, since a denial can carry a reason you want to type. A card from
+an agent's [editor tools](editor-tools.md#cards) is not `Ctrl+y`'s: press `Esc`, then `a` or `d` on it. `D` on one
+takes no reason.
 
 These keys answer only when they stand alone. `a`, `d`, `D` and `Enter` on a button do nothing if another key
 was pressed within about a quarter of a second before or after; `Ctrl+y` is refused in the same way, right

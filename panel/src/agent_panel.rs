@@ -46,6 +46,8 @@ mod admission;
 mod chat_moves;
 #[path = "detail.rs"]
 mod detail;
+#[path = "editor_glue.rs"]
+mod editor_glue;
 #[path = "hand_over.rs"]
 mod hand_over;
 #[path = "handle.rs"]
@@ -290,6 +292,27 @@ struct AgentPanelState {
     /// How to ask the editor something and poll the answer: the embedded pane or the companion's
     /// link. `None` until the window hands one over.
     editor_rpc: Option<Rc<dyn eitri_core::editor_rpc::EditorRpc>>,
+    /// The editor tools' broker: one per window, with a line for each tab that has a session.
+    editor_tools: eitri_core::editor_tools::broker::Broker,
+    editor_follower: eitri_core::editor_tools::follow::Follower,
+    /// What each tab that arrived from the other window is waiting to hear: which of its session's calls are open.
+    client_call_reads: Vec<(TabId, agent::TaskReply<agent::ClientToolCallState>)>,
+    /// `agent.editor.tools` and `agent.editor.tool.<name>` as `init.lua` left them; a session reads them when it
+    /// starts and keeps the list it was given.
+    editor_switches: eitri_core::editor_tools::switches::Switches,
+    /// Where a tool's call to the editor goes when it is not this window's own (the second window's link to the
+    /// first). `None`: this window's `editor_rpc`.
+    editor_way: Option<Rc<dyn eitri_core::editor_tools::way::EditorWay>>,
+    /// The sockets the bridges of this window's external sessions connect to, made on first use. `None` until then,
+    /// or while it cannot start.
+    editor_bridge: Option<editor_glue::BridgeHost>,
+    /// The socket of each tab that has one, by name, with what the session was given: what a move hands on.
+    editor_bridge_tabs: BTreeMap<TabId, editor_glue::TabBridge>,
+    /// What a test's window takes for its own binary: a test binary has no bridge beside it.
+    #[cfg(test)]
+    bridge_beside: Option<PathBuf>,
+    /// The user's home directory, which a tool's path check treats as the policy does; read once when the state is made.
+    home: Option<PathBuf>,
     /// The review's reverts, undos, comments, sends and recoveries in flight; the tick drives it.
     review_flow: eitri_core::turn_review::ReviewFlow,
     /// What the window gives the flow's editor overlay: who owns the module in its nvim, and what to
@@ -557,9 +580,19 @@ impl AgentPanelState {
             shown_hints: Vec::new(),
             review_hint: false,
             review_enabled: false,
+            home: review_roots.home.as_ref().map(PathBuf::from),
             review_roots,
             editor_request_hook: None,
             editor_rpc: None,
+            editor_tools: eitri_core::editor_tools::broker::Broker::new(),
+            editor_follower: eitri_core::editor_tools::follow::Follower::default(),
+            client_call_reads: Vec::new(),
+            editor_switches: eitri_core::editor_tools::switches::Switches::on_by_default(),
+            editor_way: None,
+            editor_bridge: None,
+            editor_bridge_tabs: BTreeMap::new(),
+            #[cfg(test)]
+            bridge_beside: None,
             review_flow: eitri_core::turn_review::ReviewFlow::new(),
             review_editor: crate::review_editor::ReviewEditor::default(),
             pair_outbound_hook: None,
@@ -1129,6 +1162,7 @@ mod tests {
         pub(super) trusts: Vec<ProjectTrust>,
         pub(super) senders: Vec<mpsc::Sender<Result<AgentBackend, BackendError>>>,
         pub(super) held_when_first_asked: Option<Vec<bool>>,
+        pub(super) client_tools: Vec<Option<agent::ClientToolSet>>,
         pub(super) all: Vec<String>,
     }
 
@@ -1196,8 +1230,14 @@ mod tests {
         let shared = Rc::new(RefCell::new(std::mem::take(resumes)));
         let fake = shared.clone();
         state.borrow_mut().spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| match call {
-            SpawnCall::Resume { id, lease, project } => {
+            SpawnCall::Resume {
+                id,
+                lease,
+                project,
+                client_tools,
+            } => {
                 let mut fake = fake.borrow_mut();
+                fake.client_tools.push(client_tools);
                 let mut spawn = fake.spawner(canonical.clone());
                 spawn(&id, lease, project)
             }
@@ -1295,6 +1335,8 @@ mod tests {
         pub(super) acp: Option<(Vec<std::ffi::OsString>, Option<String>)>,
         /// Whether the start waits for the tab's old backend to be gone (`r` continuing its session).
         pub(super) waits_for_old: bool,
+        /// The tool server the start was given.
+        pub(super) editor_server: Option<agent::EditorServerSpec>,
     }
 
     /// One start a counting spawner was asked for: the session it resumes, if any, and its tiers.
@@ -1349,7 +1391,7 @@ mod tests {
             let counted_external = external.clone();
             s.spawner = Spawner::Fake(Rc::new(RefCell::new(move |call: SpawnCall| {
                 match call {
-                    SpawnCall::Connect { resume, project } => counted.borrow_mut().push((resume, project)),
+                    SpawnCall::Connect { resume, project, .. } => counted.borrow_mut().push((resume, project)),
                     SpawnCall::Resume { id, project, .. } => counted.borrow_mut().push((Some(id), project)),
                     SpawnCall::External {
                         agent,
@@ -1358,6 +1400,7 @@ mod tests {
                         resume,
                         acp,
                         after_old,
+                        editor_server,
                     } => counted_external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
@@ -1365,6 +1408,7 @@ mod tests {
                         resume,
                         acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
                         waits_for_old: after_old.is_some(),
+                        editor_server,
                     }),
                 }
                 mpsc::channel().1

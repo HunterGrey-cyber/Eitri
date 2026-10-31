@@ -11,7 +11,7 @@
 //! struct's shape when whichever later phase actually needs one of those, not before.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 #[cfg(test)]
 thread_local! {
@@ -526,6 +526,25 @@ pub enum AgentDomainEvent {
         parent_tool_use_id: String,
         frame: Box<AgentDomainEvent>,
     },
+    /// The model called a tool this host declared on the session, and the call waits for the host's
+    /// answer. Held in [`AgentSessionProjection::open_client_calls`], which is what the host reads: the
+    /// event itself may be lost to a resync, and no page sees it.
+    ClientToolCall {
+        call_id: String,
+        tool_use_id: Option<String>,
+        tool: String,
+        arguments_json: String,
+        /// The event's position on the session's stream.
+        sequence: u64,
+    },
+    /// The call is over, however it ended. No host branches on how.
+    ClientToolCallSettled {
+        call_id: String,
+    },
+    /// The MCP servers the CLI's latest `system/init` listed, whole.
+    SessionServers {
+        servers: Vec<InitServer>,
+    },
     /// Who started the turn the `TurnStarted` just before it names, and why: folded right after that
     /// `TurnStarted`. A turn with none is a [`TurnOrigin::Client`] turn, which is every turn of a
     /// provider that does not say, so `TurnStarted` itself stays as it always was. Only a turn whose
@@ -1038,6 +1057,25 @@ pub struct ToolCallDenial {
 pub struct UngatedCliModeRecord {
     pub reported: String,
     pub detail: String,
+}
+
+/// One MCP server of the CLI's `system/init` report. `source` is the CLI's own word for where the
+/// server came from, `sdk` for an in-process one, empty when the CLI gave none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitServer {
+    pub name: String,
+    pub status: String,
+    pub source: String,
+}
+
+/// A call of a tool this host declared, waiting for its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenClientCall {
+    pub call_id: String,
+    pub tool_use_id: Option<String>,
+    pub tool: String,
+    pub arguments_json: String,
+    pub sequence: u64,
 }
 
 /// One slash command an agent advertises. **Untrusted text from the agent**: the producer bounds it
@@ -1854,6 +1892,17 @@ pub struct AgentSessionProjection {
     /// nothing outside it can read or change what it holds.
     #[serde(skip)]
     pub call_index: CallIndex,
+    /// The calls of tools this host declared that wait for its answer, by the sidecar's call id. The
+    /// host reads this and never the events: a resync loses queued events, and a lost call would hang
+    /// until the CLI's limit. A settled event removes one. The session's end empties it, since a lost
+    /// stream, an event gap and an unknown session end every call with no settled event. Not serialized.
+    #[serde(skip)]
+    pub open_client_calls: BTreeMap<String, OpenClientCall>,
+    /// The MCP servers of the latest [`AgentDomainEvent::SessionServers`], empty before the first. The
+    /// host's check that a declared server is the session's own reads it; nothing a view draws. Not
+    /// serialized.
+    #[serde(skip)]
+    pub init_servers: Vec<InitServer>,
     /// What became of each message put into the running turn, by the host's client id, oldest first and
     /// at most [`MAX_STEER_OUTCOMES`]. Kept here rather than only in the events so the host still learns
     /// it after a resync dropped them (`eitri_core::tab_set` reads it after every delivery). The
@@ -2235,6 +2284,15 @@ impl AgentSessionProjection {
         self.cli_mode_reported.as_deref() == Some("auto")
     }
 
+    /// Whether the CLI's latest report holds exactly one MCP server called `name`, and that one is
+    /// in-process. A server of the same name from a project or `--mcp-config` shows as that one entry
+    /// with its own source, and its tools run beside the host's, so the source decides; an empty source
+    /// and no report yet both fail.
+    pub fn single_sdk_server(&self, name: &str) -> bool {
+        let mut named = self.init_servers.iter().filter(|server| server.name == name);
+        matches!((named.next(), named.next()), (Some(only), None) if only.source == "sdk")
+    }
+
     /// The reducer: folds one event's effect into this projection, unconditionally bumping
     /// `last_revision` by exactly one regardless of whether the event has any other observable
     /// effect (an event with a real revision but no other effect -- e.g. a `CliPermissionMode` or a
@@ -2280,6 +2338,7 @@ impl AgentSessionProjection {
             AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
                 roster::on_session_end(self, event);
                 questions::on_session_end(self, event);
+                self.open_client_calls.clear();
             }
             // A resume replaces the CLI process; `SessionOpened` repeats on every turn of one process and
             // ends nothing.
@@ -2341,6 +2400,28 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::ConversationReset { .. } => reset::fold(self, event),
             AgentDomainEvent::SubagentFrame { .. } => subagents::fold(self, event),
+            AgentDomainEvent::ClientToolCall {
+                call_id,
+                tool_use_id,
+                tool,
+                arguments_json,
+                sequence,
+            } => {
+                self.open_client_calls.insert(
+                    call_id.clone(),
+                    OpenClientCall {
+                        call_id: call_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        tool: tool.clone(),
+                        arguments_json: arguments_json.clone(),
+                        sequence: *sequence,
+                    },
+                );
+            }
+            AgentDomainEvent::ClientToolCallSettled { call_id } => {
+                self.open_client_calls.remove(call_id);
+            }
+            AgentDomainEvent::SessionServers { servers } => self.init_servers = servers.clone(),
             AgentDomainEvent::EffortReported { effort } => self.effort = effort.clone(),
             AgentDomainEvent::SessionOpened {
                 session_id,
@@ -2852,7 +2933,11 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::BackgroundTasksChanged { .. }
         | AgentDomainEvent::TaskEvent { .. }
         | AgentDomainEvent::ConversationReset { .. }
-        | AgentDomainEvent::SubagentFrame { .. } => open,
+        | AgentDomainEvent::SubagentFrame { .. }
+        // The host's own records of a tool it serves: no row, in any view.
+        | AgentDomainEvent::ClientToolCall { .. }
+        | AgentDomainEvent::ClientToolCallSettled { .. }
+        | AgentDomainEvent::SessionServers { .. } => open,
     }
 }
 
@@ -3850,6 +3935,115 @@ mod tests {
 
 /// What a turn's end does when the turn is not the one this projection runs, the rows a turn's end
 /// leaves behind, the note of work out of sight, and a prompt taken back.
+#[cfg(test)]
+mod client_calls {
+    use super::*;
+
+    fn call(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ClientToolCall {
+            call_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 7,
+        }
+    }
+
+    fn servers(entries: &[(&str, &str)]) -> AgentDomainEvent {
+        AgentDomainEvent::SessionServers {
+            servers: entries
+                .iter()
+                .map(|(name, source)| InitServer {
+                    name: (*name).into(),
+                    status: "connected".into(),
+                    source: (*source).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn open(p: &AgentSessionProjection) -> Vec<&str> {
+        p.open_client_calls.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_settled_call_leaves_open_client_calls() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&call("a"));
+        p.apply(&call("b"));
+        assert_eq!(open(&p), ["a", "b"]);
+        assert_eq!(
+            p.open_client_calls["a"],
+            OpenClientCall {
+                call_id: "a".into(),
+                tool_use_id: Some("toolu_a".into()),
+                tool: "open_file".into(),
+                arguments_json: "{}".into(),
+                sequence: 7,
+            }
+        );
+        p.apply(&AgentDomainEvent::ClientToolCallSettled { call_id: "a".into() });
+        assert_eq!(open(&p), ["b"]);
+        p.apply(&AgentDomainEvent::ClientToolCallSettled {
+            call_id: "never-held".into(),
+        });
+        assert_eq!(open(&p), ["b"], "a settled event for a call not held changes nothing");
+    }
+
+    #[test]
+    fn single_sdk_server_refuses_two_and_a_foreign_source() {
+        let mut p = AgentSessionProjection::default();
+        assert!(!p.single_sdk_server("eitri"), "no report yet");
+        type Case<'a> = (&'a [(&'a str, &'a str)], bool, &'a str);
+        let cases: [Case; 7] = [
+            (&[("eitri", "sdk")], true, "the one in-process server"),
+            (
+                &[("other", "project"), ("eitri", "sdk")],
+                true,
+                "another name beside it",
+            ),
+            (&[("eitri", "project")], false, "a project's server of that name"),
+            (&[("eitri", "dynamic")], false, "an --mcp-config server of that name"),
+            (&[("eitri", "")], false, "no source reported"),
+            (&[("eitri", "sdk"), ("eitri", "sdk")], false, "two of that name"),
+            (&[("other", "sdk")], false, "none of that name"),
+        ];
+        for (entries, expected, what) in cases {
+            p.apply(&servers(entries));
+            assert_eq!(p.single_sdk_server("eitri"), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn each_report_replaces_the_last() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&servers(&[("eitri", "sdk")]));
+        p.apply(&servers(&[]));
+        assert!(p.init_servers.is_empty());
+        assert!(!p.single_sdk_server("eitri"));
+    }
+
+    #[test]
+    fn a_lost_stream_empties_open_client_calls() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&call("a"));
+        p.apply(&AgentDomainEvent::SessionUnavailable {
+            reason: "the sidecar exited".into(),
+        });
+        assert!(p.open_client_calls.is_empty());
+    }
+
+    #[test]
+    fn a_closed_session_empties_them() {
+        let mut p = AgentSessionProjection::default();
+        p.apply(&call("a"));
+        p.apply(&AgentDomainEvent::SessionClosed {
+            reason: "closed".into(),
+        });
+        assert!(p.open_client_calls.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod unseen_turns {
     use super::*;

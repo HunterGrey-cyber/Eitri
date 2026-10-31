@@ -192,6 +192,9 @@ fn print_event(event: &AgentDomainEvent) {
         } => {
             println!("[new conversation] {new_conversation_id}")
         }
+        // This demo declares no tools of its own, so no call comes.
+        AgentDomainEvent::ClientToolCall { .. } | AgentDomainEvent::ClientToolCallSettled { .. } => {}
+        AgentDomainEvent::SessionServers { servers } => println!("[MCP servers] {}", servers.len()),
         AgentDomainEvent::SubagentFrame {
             parent_tool_use_id,
             frame,

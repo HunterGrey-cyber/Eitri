@@ -13,6 +13,7 @@
 //! Nothing under `_meta` and none of the `_auth/*` notifications is read: they carry the account's
 //! details, which are not Eitri's to keep or to log.
 
+use crate::external::EditorServerSpec;
 use crate::projection::SlashCommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -88,14 +89,29 @@ impl InitializeParams {
     }
 }
 
-/// `session/new`. No tool servers are passed: the agent runs the ones its own configuration names.
-pub fn session_new_params(cwd: &str) -> Value {
-    json!({ "cwd": cwd, "mcpServers": [] })
+/// The `mcpServers` of `session/new` and `session/load`: the editor's tool server as one stdio entry, or no entry
+/// when the session is given none. Eitri starts nothing itself; the agent runs the command. `env` stays empty: the
+/// server reads its socket and key from its arguments.
+fn mcp_servers(editor: Option<&EditorServerSpec>) -> Value {
+    match editor {
+        Some(server) => json!([{
+            "name": server.name,
+            "command": server.command.to_string_lossy(),
+            "args": server.args,
+            "env": [],
+        }]),
+        None => json!([]),
+    }
 }
 
-/// `session/load`.
-pub fn session_load_params(session_id: &str, cwd: &str) -> Value {
-    json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] })
+/// `session/new`. The agent runs the tool servers its own configuration names, and the editor's if one is given.
+pub fn session_new_params(cwd: &str, editor: Option<&EditorServerSpec>) -> Value {
+    json!({ "cwd": cwd, "mcpServers": mcp_servers(editor) })
+}
+
+/// `session/load`; the tool servers go out again, as on `session/new`.
+pub fn session_load_params(session_id: &str, cwd: &str, editor: Option<&EditorServerSpec>) -> Value {
+    json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers(editor) })
 }
 
 /// `session/prompt`: the user's text as the one text block of the turn.

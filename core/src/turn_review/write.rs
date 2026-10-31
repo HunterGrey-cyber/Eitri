@@ -1,4 +1,5 @@
-//! Writing a project file back: the only way a revert, an undo or a recovery touches the disk.
+//! Writing a project file: the only way a revert, an undo, a recovery or an applied proposal
+//! ([`super::proposal_write`]) touches the disk.
 //!
 //! **Containment.** Every file is reached from the project root one directory at a time, never
 //! following a symbolic link. [`ProjectDir`] holds a descriptor of the canonical root; a
@@ -25,6 +26,8 @@
 //! before the rename, the unlink, or (in place) the truncate. A regular file is overwritten or
 //! removed only when the caller named the bytes it expects there (`JournalNote::pre`) and the file
 //! still holds exactly them; one the caller did not expect is left alone ([`WriteError::Changed`]).
+//! A path found empty when the caller named bytes is the same refusal: writing would bring back a
+//! file someone removed.
 
 use std::ffi::CString;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -213,15 +216,15 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::NoSpace { need, free } => write!(
                 f,
-                "not enough free space ({need} bytes needed, {free} free); nothing was written"
+                "not enough free space ({need} bytes needed, {free} free); the file was not written"
             ),
-            WriteError::Appeared => write!(f, "the file appeared since it was checked; nothing was written"),
+            WriteError::Appeared => write!(f, "the file appeared since it was checked; it was not written"),
             WriteError::Outside(why) => write!(f, "{why}"),
             WriteError::HardLinked { links } => write!(
                 f,
-                "the file has {links} hard links; writing it would change the other links too, so nothing was written"
+                "the file has {links} hard links; writing it would change the other links too, so it was not written"
             ),
-            WriteError::Changed => write!(f, "the file changed while it was being written; nothing was written"),
+            WriteError::Changed => write!(f, "the file changed while it was being written; it was not written"),
             WriteError::Io(e) => write!(f, "the write failed: {e}"),
             WriteError::RolledBack(e) => write!(f, "the write failed and the file was put back as it was: {e}"),
             WriteError::Broken(e) => write!(
@@ -330,6 +333,12 @@ impl ProjectDir {
 /// What `target` is on disk now, read through its parent's descriptor without following a link.
 /// This is the only way a revert, an undo or a recovery reads a project file.
 pub fn read_current(target: &Target) -> io::Result<Current> {
+    read_current_within(target, u64::MAX)
+}
+
+/// [`read_current`], reading a regular file only up to one byte past `limit`: enough for the caller
+/// to tell it is longer, however far it has grown since anyone asked its size.
+pub fn read_current_within(target: &Target, limit: u64) -> io::Result<Current> {
     let Some(parent) = &target.parent else {
         return Ok(Current::Absent);
     };
@@ -345,9 +354,9 @@ pub fn read_current(target: &Target) -> io::Result<Current> {
             Err(e) => Err(e),
         },
         libc::S_IFREG => {
-            let (mut file, fst) = open_leaf(parent, &target.leaf, libc::O_RDONLY, &st)?;
+            let (file, fst) = open_leaf(parent, &target.leaf, libc::O_RDONLY, &st)?;
             let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
+            file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
             Ok(Current::Regular {
                 bytes,
                 // `st_mode` is `u16` on macOS, `u32` on Linux; widen so `Current::Regular::mode`
@@ -356,6 +365,36 @@ pub fn read_current(target: &Target) -> io::Result<Current> {
             })
         }
         _ => Ok(Current::Other),
+    }
+}
+
+/// `target`'s size in bytes without following a link; `None` when nothing is there. Opens nothing,
+/// so asking about a FIFO or a device has no effect on it.
+pub fn file_len(target: &Target) -> io::Result<Option<u64>> {
+    let Some(parent) = &target.parent else {
+        return Ok(None);
+    };
+    match stat_at(parent, &target.leaf) {
+        Ok(st) => Ok(Some(st.st_size as u64)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// When the file at `target` last changed, in whole milliseconds since the epoch, rounded down. `None`: nothing is
+/// there. No link is followed.
+pub fn file_modified_ms(target: &Target) -> io::Result<Option<u64>> {
+    let Some(parent) = &target.parent else {
+        return Ok(None);
+    };
+    match stat_at(parent, &target.leaf) {
+        Ok(st) => {
+            // A time before the epoch is older than any ask.
+            let seconds = u64::try_from(st.st_mtime).unwrap_or(0);
+            Ok(Some(seconds * 1000 + st.st_mtime_nsec as u64 / 1_000_000))
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -410,7 +449,8 @@ pub fn write_mode(target: &Target) -> io::Result<WriteMode> {
 /// looked, and for a regular file exactly `note.pre`'s bytes. A link must still point to
 /// `judged_link`, the target the caller read before this call. A regular file when `note.pre` names
 /// none, a link when it names some, or any difference, is [`WriteError::Changed`] and nothing is
-/// written.
+/// written. So is nothing at all when `note.pre` names bytes: the caller saw a file, and a write
+/// would bring back what someone removed since.
 ///
 /// The mode written is always the one in `new`.
 #[allow(clippy::too_many_arguments)]
@@ -456,6 +496,7 @@ pub fn replace(
     match (new, kind) {
         (_, Some(k)) if k != libc::S_IFREG && k != libc::S_IFLNK => Err(not_regular()),
         (Content::Absent, None) => Err(WriteError::Io(format!("{shown} disappeared since it was checked"))),
+        (Content::Bytes { .. } | Content::Symlink { .. }, None) if note.pre.is_some() => Err(WriteError::Changed),
         (Content::Absent, Some(_)) => {
             let st = st.expect("a kind comes from a stat");
             // An unlink cannot be taken back: the file must still be what the caller judged.

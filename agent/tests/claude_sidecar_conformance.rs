@@ -35,6 +35,7 @@ fn real_pretooluse_permission_allow_end_to_end() {
             cwd,
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
 
@@ -134,6 +135,7 @@ fn real_interrupt_mid_permission_fail_closes_the_pending_request() {
             cwd,
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
 
@@ -204,6 +206,7 @@ fn real_close_session_fail_closes_a_pending_permission() {
             cwd,
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
 
@@ -267,6 +270,7 @@ fn real_edit_under_the_auto_gate_on_the_sidecar_path() {
             cwd: dir.to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
     provider

@@ -34,14 +34,17 @@ pub(super) struct MovedHint {
 
 /// What the panel keeps for a tab beyond the tab set, as the tab moves to the other window: its
 /// status-band hints, shown or not yet shown, which the page it lands in is owed as a reloaded document
-/// would be. Not moved: a scratch edit out in the editor (the editor's window sends its draft to the
-/// tab's holder) and review jobs on workers (they finish where they run and report to the holder). A
-/// tab with a start in flight, an `r` continuing a session in it, or a review request of its page not
-/// yet answered does not move; each lasts seconds at most.
+/// would be, and the bridge socket its agent's tool server connects to. Not moved: a scratch edit out
+/// in the editor (the editor's window sends its draft to the tab's holder) and review jobs on workers
+/// (they finish where they run and report to the holder). A tab with a start in flight, an `r`
+/// continuing a session in it, or a review request of its page not yet answered does not move; each
+/// lasts seconds at most.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelTabHandoff {
+    pub following: bool,
     pub(super) shown_hints: Vec<MovedHint>,
     pub(super) review_hints: Vec<MovedHint>,
+    pub(super) editor_bridge: Option<editor_glue::TabBridge>,
 }
 
 impl PanelTabHandoff {
@@ -53,9 +56,17 @@ impl PanelTabHandoff {
                 .map(|h| serde_json::json!({ "turn": h.turn, "files": h.files }))
                 .collect::<Vec<_>>()
         };
+        let bridge = self.editor_bridge.as_ref().map(|bridge| {
+            serde_json::json!({
+                "name": { "hex": bridge.name.hex, "key": bridge.name.key },
+                "tools": bridge.tools,
+            })
+        });
         serde_json::json!({
+            "following": self.following,
             "shown_hints": hints(&self.shown_hints),
             "review_hints": hints(&self.review_hints),
+            "editor_bridge": bridge,
         })
     }
 
@@ -81,10 +92,40 @@ impl PanelTabHandoff {
                 .collect()
         };
         Ok(PanelTabHandoff {
+            following: value
+                .get("following")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| "the panel's record has no boolean `following`".to_string())?,
             shown_hints: hints("shown_hints")?,
             review_hints: hints("review_hints")?,
+            editor_bridge: moved_bridge(value)?,
         })
     }
+}
+
+/// The record's bridge. Its name goes into a file name here and its tools become what the session may call, so
+/// both are read as strictly as the rest of the record.
+fn moved_bridge(value: &serde_json::Value) -> Result<Option<editor_glue::TabBridge>, String> {
+    let bridge = value
+        .get("editor_bridge")
+        .ok_or_else(|| "the panel's record has no `editor_bridge`".to_string())?;
+    if bridge.is_null() {
+        return Ok(None);
+    }
+    let word = |key: &str| bridge["name"][key].as_str().map(str::to_owned);
+    let (Some(hex), Some(key)) = (word("hex"), word("key")) else {
+        return Err("the record's bridge has no name".to_string());
+    };
+    let name = editor_glue::BridgeName { hex, key };
+    name.check().map_err(|why| format!("the record's bridge: {why}"))?;
+    let tools = bridge["tools"]
+        .as_array()
+        .ok_or_else(|| "the record's bridge has no tool list".to_string())?
+        .iter()
+        .map(|tool| tool.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "a tool in the record's bridge is not a name".to_string())?;
+    Ok(Some(editor_glue::TabBridge { name, tools }))
 }
 
 /// The panel's record of `tab` for a move, or why the tab does not move now. Every field of the panel's
@@ -95,6 +136,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // The tab's own state beyond the tab set.
         shown_hints,
         review_hints,
+        editor_bridge_tabs,
         // Refusals: each is the tab's for a few seconds at most.
         owed,
         resume_after,
@@ -154,6 +196,18 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         review_roots: _,
         editor_request_hook: _,
         editor_rpc: _,
+        // The window's: the broker's lines are per tab but end with the tab's leaving (they are not carried).
+        editor_tools: _,
+        editor_follower: _,
+        // Asked by the window a tab arrived in, for that window's hold; the next window asks again.
+        client_call_reads: _,
+        editor_switches: _,
+        editor_way: _,
+        // The window's listener: what crosses is the tab's socket by name, and the other window binds it.
+        editor_bridge: _,
+        #[cfg(test)]
+            bridge_beside: _,
+        home: _,
         review_flow: _,
         review_editor: _,
         pair_outbound_hook: _,
@@ -215,18 +269,29 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
             .collect()
     };
     Ok(PanelTabHandoff {
+        following: tabs.get(tab).ok_or_else(|| format!("no tab {}", tab.0))?.following,
         shown_hints: of_tab(shown_hints),
         review_hints: of_tab(review_hints),
+        editor_bridge: editor_bridge_tabs.get(&tab).cloned(),
     })
 }
 
 /// Takes up the panel's record of a tab another window moved here, now `tab`: every hint it carries is
-/// owed to the page that shows it, which is sent them once it is ready.
+/// owed to the page that shows it, which is sent them once it is ready, and its agent's tool server finds its
+/// socket here under the same name.
 pub(super) fn adopt_panel_tab(state: &mut AgentPanelState, tab: TabId, handoff: PanelTabHandoff) {
     let PanelTabHandoff {
+        following,
         shown_hints,
         review_hints,
+        editor_bridge,
     } = handoff;
+    if let Some(t) = state.tabs.get_mut(tab) {
+        t.following = following;
+    }
+    if let Some(bridge) = editor_bridge {
+        editor_glue::tab_brought(state, tab, bridge);
+    }
     let hints: Vec<eitri_core::turn_review::ReviewHint> = shown_hints
         .into_iter()
         .chain(review_hints)
@@ -602,6 +667,42 @@ mod tests {
             }],
             "owed to the page that shows the tab now"
         );
+    }
+
+    /// The name goes into a file name and the tools into what the session may call, so nothing else is taken.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_records_bridge_is_read_by_its_shape() {
+        let good = || {
+            serde_json::json!({
+                "following": false,
+                "shown_hints": [],
+                "review_hints": [],
+                "editor_bridge": {
+                    "name": { "hex": "0123456789abcdef", "key": "0123456789abcdef0123456789abcdef" },
+                    "tools": ["open_file"],
+                },
+            })
+        };
+        let read = PanelTabHandoff::from_value(&good()).expect("the shape the record writes");
+        assert_eq!(read.editor_bridge.as_ref().unwrap().tools, ["open_file"]);
+        assert_eq!(PanelTabHandoff::from_value(&read.to_value()).unwrap(), read);
+
+        let spoilt = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut record = good();
+            change(&mut record);
+            PanelTabHandoff::from_value(&record)
+        };
+        assert!(spoilt(&|r| r["editor_bridge"]["name"]["hex"] = "../../x".into()).is_err());
+        assert!(spoilt(&|r| r["editor_bridge"]["name"]["key"] = 7.into()).is_err());
+        assert!(spoilt(&|r| r["editor_bridge"]["tools"] = serde_json::json!([1])).is_err());
+        assert!(spoilt(&|r| r["editor_bridge"]["tools"] = "open_file".into()).is_err());
+        assert!(spoilt(&|r| {
+            r.as_object_mut().unwrap().remove("editor_bridge");
+        })
+        .is_err());
+        let none = spoilt(&|r| r["editor_bridge"] = serde_json::Value::Null).unwrap();
+        assert_eq!(none.editor_bridge, None);
     }
 
     /// A session handed to a terminal must not also be offered for resume on the start screen --

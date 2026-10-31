@@ -3,8 +3,9 @@ import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState } from "../types";
 /* `/clear`: Claude Code starts a new conversation in the same process. The view keeps nothing of the
  * conversation before it and keeps what the process still holds, as Rust's `projection::reset` does:
  * the session's identity and status, the running turn (the `/clear` turn ends after the reset), cards
- * still waiting with the calls they ask about, questions still waiting, the count of commands left
- * running, the account's limits, the command list, the live band fields and the held bookkeeping. */
+ * still waiting with the calls they ask about (a broker's card stays too, but not its call: the projection
+ * holds no broker card to keep it for), questions still waiting, the count of commands left running, the
+ * account's limits, the command list, the live band fields and the held bookkeeping. */
 
 /** The conversation's fields, as a reset leaves them. */
 const EMPTIED = {
@@ -27,7 +28,7 @@ const EMPTIED = {
 
 /** The fields the process still holds, which a reset leaves as they are. */
 const KEPT = [
-  "backend", "conversationId", "sessionId", "model", "cwd", "status", "activeTurnId", "pendingPermissions",
+  "backend", "conversationId", "sessionId", "model", "cwd", "status", "activeTurnId", "pendingPermissions", "editorCards",
   "capabilities", "provider", "accountLimits", "backgroundCalls", "backgroundTasks", "availableCommands", "apiRetry",
   "compacting", "rateLimitWarning", "fallbackModel", "effort", "notification", "cliUnseenBusy", "nextSeq", "turnThinking",
   "denialsBeforeTheirCall", "changedInputsBeforeTheirCall", "runningTurnCli",

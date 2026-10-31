@@ -1531,6 +1531,23 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
         },
         AgentDomainEvent::CliWorkUnseen,
         AgentDomainEvent::UserPromptWithdrawn,
+        AgentDomainEvent::SessionServers {
+            servers: vec![agent::InitServer {
+                name: "eitri".into(),
+                status: "connected".into(),
+                source: "sdk".into(),
+            }],
+        },
+        AgentDomainEvent::ClientToolCall {
+            call_id: "call-1".into(),
+            tool_use_id: Some("toolu-1".into()),
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 1,
+        },
+        AgentDomainEvent::ClientToolCallSettled {
+            call_id: "call-1".into(),
+        },
     ];
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/protocol-322.json")).unwrap();
@@ -1605,6 +1622,9 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::TaskEvent { .. } => "TaskEvent",
         AgentDomainEvent::ConversationReset { .. } => "ConversationReset",
         AgentDomainEvent::SubagentFrame { .. } => "SubagentFrame",
+        AgentDomainEvent::ClientToolCall { .. } => "ClientToolCall",
+        AgentDomainEvent::ClientToolCallSettled { .. } => "ClientToolCallSettled",
+        AgentDomainEvent::SessionServers { .. } => "SessionServers",
         AgentDomainEvent::EffortReported { .. } => "EffortReported",
     }
 }
@@ -1828,6 +1848,15 @@ fn thinking_open_after_says_what_apply_does() {
         },
         AgentDomainEvent::CliWorkUnseen,
         AgentDomainEvent::UserPromptWithdrawn,
+        AgentDomainEvent::SessionServers { servers: vec![] },
+        AgentDomainEvent::ClientToolCall {
+            call_id: "c1".into(),
+            tool_use_id: None,
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 1,
+        },
+        AgentDomainEvent::ClientToolCallSettled { call_id: "c1".into() },
     ];
     for open in [true, false] {
         for event in &events {

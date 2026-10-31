@@ -9,7 +9,7 @@ import { isMirrorRequest } from "./bridge";
 const STALE_MIRROR_REFUSAL = /no longer waiting|no tab \d+|no such tab|has no live session/;
 import { withChooserTitles } from "./chooser";
 import { failureEvidence } from "./problems";
-import { applyCallNotes, applyEvents, applySnapshot, initialState, keepAfterFailure, resumeAttached } from "./reducer";
+import { applyCallNotes, applyEvents, applySnapshot, initialState, keepAfterFailure, resumeAttached, withEditorCards } from "./reducer";
 import { failRequest, receiveDiff, receiveDraft, receivePreview, receiveRecovery, receiveReview, withStatus } from "./review";
 import type { ReviewState } from "./review";
 import { acceptsEnvelope, withoutHandoff } from "./tabs";
@@ -57,9 +57,11 @@ export type Envelope = InboundPayload & { receivedAt: number; monotonicAt?: numb
  *  - `"tabnew"`: `:tabnew <agent>`. A word Rust does not know as an agent is refused naming the accepted ones, a
  *    footer flash like `gx`'s.
  *  - `"stop-background"`: the confirmed `<leader>k`. Rust refuses one whose moment has passed (a turn started,
- *    the commands ended, the count moved), and the session goes on, so a flash says why. */
+ *    the commands ended, the count moved), and the session goes on, so a flash says why.
+ *  - `"follow"`: `<leader>e`. Rust refuses it for a tab a float covers, one that is moving, or one that is gone; the
+ *    page has already said what it expects, so the refusal is the flash that follows it. */
 export type CommandRecord = {
-  kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background";
+  kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow";
   tab: TabId;
   text?: string;
   permissionId?: string;
@@ -392,6 +394,9 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         handoff: null, commandNotice: null, fatalError: null,
       };
     }
+    case "editor_cards":
+      // The tab on screen (the router dropped any other's): its broker cards, replaced whole.
+      return { ...model, state: withEditorCards(model.state, envelope.cards) };
     case "events": {
       // The clock's exact provenance is a real `turn_started` inside this batch. Everything that ends a turn
       // clears it, mirroring what clears `state.activeTurnId` in the conversation reducer -- read here off the raw
@@ -442,7 +447,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           // nothing waited for it and the conversation is untouched, so it is not the user's error. The page's
           // log keeps it. Any other refusal of a mirror (a draft too large to keep) means the person's text will
           // not survive a switch, so it is said like any other refusal.
-        } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background"].includes(record.kind)) {
+        } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow"].includes(record.kind)) {
           // The kinds left out are already said (trust) or are a footer flash the page shows; everything else,
           // a refused permission answer included, is the banner.
           next.commandNotice = envelope.error;

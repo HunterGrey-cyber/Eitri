@@ -208,6 +208,7 @@ fn started(dir: &Path, thread: &str, rest: Vec<Value>) -> CodexProvider {
                 sandbox: agent::Sandbox::Project,
             },
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
     assert_eq!(id, thread);
@@ -765,6 +766,7 @@ fn a_real_codex_turn_with_an_approval_pending_completes_after_adoption() {
             plan: codex_peer::plan(&project, DirTrust::Untrusted),
             policy,
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
     source

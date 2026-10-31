@@ -163,6 +163,10 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::BackgroundTasksChanged { .. }
         | AgentDomainEvent::TaskEvent { .. }
         | AgentDomainEvent::ConversationReset { .. } => false,
+        // The host's own records of a tool it serves, which no page is sent.
+        AgentDomainEvent::ClientToolCall { .. }
+        | AgentDomainEvent::ClientToolCallSettled { .. }
+        | AgentDomainEvent::SessionServers { .. } => false,
         // A subagent's text and calls stream like the parent's.
         AgentDomainEvent::SubagentFrame { frame, .. } => is_plain_stream_content(frame),
     }

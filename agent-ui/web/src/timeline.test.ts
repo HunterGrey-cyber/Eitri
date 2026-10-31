@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, oldestPendingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import { primaryText } from "./copyText";
-import { initialState } from "./reducer";
-import type { AgentUiState, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
+import { editorCardRecord, initialState } from "./reducer";
+import type { AgentUiState, EditorCardWire, PermissionRequestRecord, ToolCallRecord, TranscriptMessage, TurnEnding } from "./types";
 
 function msg(seq: number, text: string): TranscriptMessage {
   return { seq, text };
@@ -659,4 +659,53 @@ it("marks every question of a set with its own ?, the first as the rest, since t
   const lines = questionLines({ seq: 1, interactionId: "q", toolUseId: null, turnId: null, unsupportedReason: null,
     state: { kind: "waiting" }, questions: [spec("Mode", "Choose a mode"), spec("Checks", "Choose checks")] });
   expect(lines.filter((line) => !line.muted).map((line) => line.text)).toEqual(["? Mode: Choose a mode", "? Checks: Choose checks"]);
+});
+
+/* A card Eitri's own tool broker raised sits where a provider's would: under the call it gates, or on a row of its own
+   at the revision it was raised. Its key is its own id, because a later event may take the same number. */
+describe("a broker card in the timeline", () => {
+  function brokerCard(seq: number, n: number, toolUseId: string | null): PermissionRequestRecord {
+    const wire: EditorCardWire = {
+      id: `ec-0123456789abcdef-${n}`, seq, tool: "open_file", toolUseId, title: "Load a.rs in your editor?",
+      body: [{ kind: "plain", text: "It is not open there." }],
+    };
+    return editorCardRecord(wire);
+  }
+
+  it("an_editor_card_sits_under_its_call", () => {
+    const s = state({
+      transcript: [msg(1, "before"), msg(5, "after")],
+      toolCalls: [tool(2, "toolu_1"), tool(4, "toolu_2")],
+      editorCards: [brokerCard(9, 1, "toolu_1")],
+    });
+    expect(labels(s)).toEqual(["text:before", "tool:toolu_1", "perm:ec-0123456789abcdef-1", "tool:toolu_2", "text:after"]);
+    expect(buildTimeline(s)[2].key).toBe("ec-ec-0123456789abcdef-1");
+  });
+
+  it("one_with_no_call_gets_a_row", () => {
+    // Its `seq` is the revision the next event would take, so a reply folded next shares it: both rows are there,
+    // and the keys tell them apart.
+    const s = state({
+      transcript: [msg(1, "before"), msg(6, "next event")],
+      toolCalls: [tool(2, "toolu_1")],
+      editorCards: [brokerCard(6, 1, null), brokerCard(4, 2, "toolu_gone")],
+    });
+    const items = buildTimeline(s);
+    expect(items.map((i) => i.key)).toEqual(["m-1", "t-2", "ec-ec-0123456789abcdef-2", "m-6", "ec-ec-0123456789abcdef-1"]);
+    expect(labels(s)).toEqual([
+      "text:before", "tool:toolu_1", "perm:ec-0123456789abcdef-2", "text:next event", "perm:ec-0123456789abcdef-1",
+    ]);
+    expect(new Set(items.map((i) => i.key)).size).toBe(items.length);
+  });
+
+  it("is_one_card_among_the_pending_ones_for_the_landing_and_never_for_ctrl_y", () => {
+    const provider = perm(8, "perm-1", null);
+    const s = state({ pendingPermissions: [provider], editorCards: [brokerCard(3, 1, null)] });
+    expect(allCards(s).map((c) => c.permissionId)).toEqual(["perm-1", "ec-0123456789abcdef-1"]);
+    const timeline = buildTimeline(s);
+    // The landing takes the lowest `seq` of any card; `Ctrl+y` skips the broker card for the provider's.
+    expect(oldestPendingPermission(timeline)).toBe(0);
+    expect(oldestWaitingPermission(timeline, new Set())).toBe(1);
+    expect(oldestWaitingPermission(buildTimeline(state({ editorCards: [brokerCard(3, 1, null)] })), new Set())).toBeNull();
+  });
 });

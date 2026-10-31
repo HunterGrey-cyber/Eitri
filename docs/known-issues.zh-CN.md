@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=b78e3a5e9da4c1c451aaa91294311234430cd6424257063b89800121aab57f4a -->
+<!-- translated-from: known-issues.md sha256=84c955e13be7238176106456a2a40e31dfde958db546b5271ffc52532d5a480d -->
 
 # 已知问题与限制
 
@@ -13,7 +13,7 @@
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.10 或更新**：用你自己 `PATH` 里的，或者让安装脚本为 Eitri 单独下载的一份私有副本。
 - **Claude Code**，已安装并已登录，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
-- **Codex 和其他 agent 是可选的。** Codex 标签页需要 0.160.0 或更新的 `codex`，已安装并已登录（试过 0.160.0 到 0.161.0）；其他 agent 的标签页需要一个通过标准输入输出说 ACP 第 1 版的 agent。见 [Codex 与其他 agent](guide/agents.zh-CN.md)。
+- **Codex 和其他 agent 是可选的。** Codex 标签页需要 0.160.0 或更新的 `codex`，已安装并已登录（试过 0.160.0 到 0.163.0）；其他 agent 的标签页需要一个通过标准输入输出说 ACP 第 1 版的 agent。见 [Codex 与其他 agent](guide/agents.zh-CN.md)。
 
 ## 安装
 
@@ -100,6 +100,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 
 Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签页都是新的（[指南](guide/agents.zh-CN.md)）。它们拿替身模型和替身 agent 试过，也在少数几次运行里用过真实的 Codex 和 `codex-acp` 适配器；没有在每一种环境上试过。
 
+- **ACP 标签页里 agent 从你的编辑器读到的内容，和这个标签页别的工具结果一样绘制。** ACP 不说明工具属于哪个服务，所以 Eitri 分不清那里哪个结果来自[编辑器工具](guide/editor-tools.zh-CN.md)，其中的隐藏字符不会像在 Claude 和 Codex 标签页里那样显示出来。
 - **第一次用一个 Eitri 没检查过的 `codex` 启动时，会运行一次简短的自检，通过之前每一次 Codex 启动都会被拒绝。** 它要几秒钟，按程序（路径、大小、修改时间和版本）记住，更新之后会再运行。如果状态目录在 `/tmp` 或 `$TMPDIR` 之下，而 `XDG_RUNTIME_DIR` 和缓存目录又都不在别处，它会失败，并点出 `XDG_STATE_HOME`。比试过的范围更新的 Codex 能运行，并被标为未测试。
 - **Codex 标签页的沙箱限制写入、网络和套接字，不限制读取。** Codex 能读取你能读取的任何文件。你自己的 exec-policy `allow` 规则覆盖的命令在沙箱之外运行，MCP 工具遵循它们所在服务器的批准模式，被批准离开沙箱的命令以你的全部权限运行。你自己的 Codex 配置（`CODEX_HOME`，或 `~/.codex`）总会加载，Eitri 没办法关掉它。
 - **子 agent 关不掉。** Codex 的子 agent 继承标签页的沙箱和信任回答；它们自己的文字不会显示。

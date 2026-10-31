@@ -60,6 +60,9 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
         gate_inputs: _,
         changed_inputs_before_their_call: _,
         call_index,
+        // A call belongs to the process, whose MCP servers stay until its next report.
+        open_client_calls: _,
+        init_servers: _,
         steer_outcomes: _,
         move_seeded: _,
         cli_unseen_busy: _,

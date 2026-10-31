@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793218276543,
+      "occurred_at": 1793397474258,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-      "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -234,7 +238,7 @@
     {
       "kind": "text",
       "text": "C20F-OPEN-DONE",
-      "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
       "type": "content_delta"
     },
     {
@@ -247,7 +251,7 @@
       "outcome": "completed",
       "result_text": "C20F-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -262,11 +266,11 @@
       }
     },
     {
-      "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
       "type": "turn_started"
     },
     {
-      "interaction_id": "0d20cc17-b1fe-4ca3-a4e5-25cda1bbba27",
+      "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
       "questions": [
         {
           "header": "Go",
@@ -293,13 +297,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-      "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "servers": [],
+      "type": "session_servers"
     },
     {
       "input": {
@@ -323,12 +331,12 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
       "type": "tool_call_started"
     },
     {
       "answers": [],
-      "interaction_id": "0d20cc17-b1fe-4ca3-a4e5-25cda1bbba27",
+      "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
       "outcome": "interrupted",
       "reason": null,
       "type": "question_settled"
@@ -337,7 +345,7 @@
       "content": "<cli-text chars=225 sha256=8621ef054998d150>",
       "is_error": true,
       "tool_use_id": "toolu_q1",
-      "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
       "type": "tool_call_completed"
     },
     {
@@ -350,7 +358,7 @@
       "outcome": "interrupted",
       "result_text": "",
       "stop_reason": "tool_use",
-      "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -365,14 +373,14 @@
       }
     },
     {
-      "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-      "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
       "type": "session_opened"
     },
     {
@@ -380,9 +388,13 @@
       "type": "cli_permission_mode"
     },
     {
+      "servers": [],
+      "type": "session_servers"
+    },
+    {
       "kind": "text",
       "text": "C20F-NEXT-DONE",
-      "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
       "type": "content_delta"
     },
     {
@@ -395,7 +407,7 @@
       "outcome": "completed",
       "result_text": "C20F-NEXT-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -413,12 +425,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793218276543,
+        "occurred_at": 1793397474258,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
         "type": "turn_started"
       },
       {
@@ -625,13 +637,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-        "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "content": "<cli-text chars=445 sha256=16b94d4abf4831e2>",
@@ -646,7 +662,7 @@
       {
         "kind": "text",
         "text": "C20F-OPEN-DONE",
-        "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
         "type": "content_delta"
       },
       {
@@ -659,7 +675,7 @@
         "outcome": "completed",
         "result_text": "C20F-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "fed2901c-53a2-489c-b3a8-dd586a980ca4",
+        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -674,11 +690,11 @@
         }
       },
       {
-        "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
         "type": "turn_started"
       },
       {
-        "interaction_id": "0d20cc17-b1fe-4ca3-a4e5-25cda1bbba27",
+        "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
         "questions": [
           {
             "header": "Go",
@@ -705,13 +721,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-        "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "servers": [],
+        "type": "session_servers"
       },
       {
         "input": {
@@ -735,12 +755,12 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
         "type": "tool_call_started"
       },
       {
         "answers": [],
-        "interaction_id": "0d20cc17-b1fe-4ca3-a4e5-25cda1bbba27",
+        "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
         "outcome": "interrupted",
         "reason": null,
         "type": "question_settled"
@@ -749,7 +769,7 @@
         "content": "<cli-text chars=225 sha256=8621ef054998d150>",
         "is_error": true,
         "tool_use_id": "toolu_q1",
-        "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
         "type": "tool_call_completed"
       },
       {
@@ -762,7 +782,7 @@
         "outcome": "interrupted",
         "result_text": "",
         "stop_reason": "tool_use",
-        "turn_id": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -777,14 +797,14 @@
         }
       },
       {
-        "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "daa4b74a-3dab-4854-906a-4e9fd43c9547",
-        "session_id": "2fd45d43-4a31-449d-a613-9462754702eb",
+        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
+        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
         "type": "session_opened"
       },
       {
@@ -792,9 +812,13 @@
         "type": "cli_permission_mode"
       },
       {
+        "servers": [],
+        "type": "session_servers"
+      },
+      {
         "kind": "text",
         "text": "C20F-NEXT-DONE",
-        "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
         "type": "content_delta"
       },
       {
@@ -807,7 +831,7 @@
         "outcome": "completed",
         "result_text": "C20F-NEXT-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "9407a7c4-47e6-453b-aec9-679ebf44064c",
+        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -825,7 +849,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 21
+    "throughRevision": 24
   },
   "scenario": "c20f",
   "snapshot": {
@@ -1052,7 +1076,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 5,
+          "seq": 6,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1063,7 +1087,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "0d20cc17-b1fe-4ca3-a4e5-25cda1bbba27",
+          "interactionId": "94a01acd-d376-405b-9a72-c6b3874f509e",
           "questions": [
             {
               "header": "Go",
@@ -1083,7 +1107,7 @@
               "question": "Should the C20 change go ahead?"
             }
           ],
-          "seq": 9,
+          "seq": 10,
           "state": {
             "answers": [],
             "kind": "settled",
@@ -1091,7 +1115,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "9274df8a-73db-4ffa-b8c9-a43aab1f174c",
+          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805",
           "unsupportedReason": null
         }
       ],
@@ -1127,18 +1151,18 @@
             "content": "<cli-text chars=225 sha256=8621ef054998d150>",
             "isError": true
           },
-          "seq": 12,
+          "seq": 14,
           "toolUseId": "toolu_q1",
-          "turnId": "9274df8a-73db-4ffa-b8c9-a43aab1f174c"
+          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805"
         }
       ],
       "transcript": [
         {
-          "seq": 6,
+          "seq": 7,
           "text": "C20F-OPEN-DONE"
         },
         {
-          "seq": 19,
+          "seq": 22,
           "text": "C20F-NEXT-DONE"
         }
       ],
@@ -1150,8 +1174,8 @@
           "numTurns": 3,
           "reason": "<cli-text chars=13 sha256=fa0a718c164f4d46>",
           "resetsAt": null,
-          "seq": 15,
-          "turnId": "9274df8a-73db-4ffa-b8c9-a43aab1f174c"
+          "seq": 17,
+          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805"
         }
       ],
       "usage": {
@@ -1168,7 +1192,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 21,
+    "throughRevision": 24,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

@@ -3,8 +3,8 @@
 //!
 //! Codex's wire has a no-ask approval policy (`never`), an unsandboxed mode (`danger-full-access`),
 //! answers that widen what later runs without asking (`acceptForSession`, an exec-policy amendment), a
-//! session-wide permission grant, and config keys that would trust hooks or pre-approve tool servers. Any
-//! one of them, written once as a literal, would put a Codex tab outside the posture its card and its
+//! session-wide permission grant, and config keys that would trust hooks or pre-approve tool servers other
+//! than the editor's own. Any one of them, written once as a literal, would put a Codex tab outside the posture its card and its
 //! `prefix i` line describe, without a single signature changing. So:
 //!
 //! - every literal that is a value of one of the guarded fields (approval policy, reviewer, sandbox mode,
@@ -15,7 +15,11 @@
 //! - no literal names a dotted config path such as `projects./a/b.trust_level`: the app-server splits a
 //!   top-level config key on every `.`, so a dotted key names a garbage path and Codex then writes trust
 //!   into the user's own file;
-//! - `mcp_servers` is sent by tests only;
+//! - `"mcp_servers"` may appear exactly once, as the editor's server, on the line annotated
+//!   `// codex-wire-guard: EditorServer` in `config.rs`; tests turn servers off under a test-only key;
+//! - a keyed field's refused values are everyday words (`auto`, `prompt`), so they are refused only as the
+//!   value of the key: the key is spelled exactly once, as a literal of its own, and the literal after it
+//!   is the allowed value;
 //! - no identifier spells a refused value either: serde derives wire words from names
 //!   (`#[serde(rename_all = "camelCase")]` turns a variant `AcceptForSession` into `"acceptForSession"`), so
 //!   a name equal to a refused value once case, `-` and `_` are ignored is refused, except the one trust
@@ -35,6 +39,7 @@ const CODEX_DIR: &str = "src/providers/codex";
 /// The definition the scan exists to cover: a scan that no longer finds it is reading the wrong place.
 const ANCHOR: &str = "fn session_config(";
 const ANNOTATION: &str = "codex-wire-guard: DirTrust";
+const EDITOR_ANNOTATION: &str = "codex-wire-guard: EditorServer";
 
 /// Each guarded field: every value Codex 0.160.0 accepts for it, and the ones Eitri may send.
 const FIELDS: &[(&str, &[&str], &[&str])] = &[
@@ -72,6 +77,15 @@ const FIELDS: &[(&str, &[&str], &[&str])] = &[
     ),
     ("scope", &["turn", "session"], &["turn"]),
 ];
+
+/// A field whose values are everyday words, which a name (`Handling::Auto`) or a key of something else
+/// (`"prompt"` in a sub-agent's call) may spell: its key, every value Codex 0.163.0 accepts, and the ones Eitri
+/// may send. The key is what the scan holds, so a value can only be sent through it.
+const KEYED_FIELDS: &[(&str, &[&str], &[&str])] = &[(
+    "default_tools_approval_mode",
+    &["auto", "prompt", "writes", "approve"],
+    &["approve"],
+)];
 
 /// Refused anywhere inside a literal: none of these can be part of an innocent sentence.
 const DENIED_ANYWHERE: &[&str] = &[
@@ -449,6 +463,8 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     let mut anchor_seen = false;
     let mut annotated_untrusted = 0usize;
+    let mut annotated_editor = 0usize;
+    let mut keys_seen: Vec<&str> = Vec::new();
     let lexed: Vec<(String, &str, Lexed)> = files.iter().map(|(n, s)| (n.clone(), s.as_str(), lex(s))).collect();
     let mut test_only_files = BTreeSet::new();
     for (_, src, l) in &lexed {
@@ -463,6 +479,7 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
         .iter()
         .flat_map(|(_, universe, ok)| universe.iter().filter(move |v| !ok.contains(v)))
         .filter(|v| !allowed_anywhere.contains(*v))
+        .chain(KEYED_FIELDS.iter().map(|(key, _, _)| key))
         .chain(DENIED_ANYWHERE.iter())
         .chain(DENIED_WORDS.iter())
         .filter(|v| !v.contains('/'))
@@ -491,14 +508,19 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
         if find_squeezed(&live_code, 0, ANCHOR).is_some() || live_code.contains(ANCHOR) {
             anchor_seen = true;
         }
-        let annotated_lines: BTreeSet<usize> = l
-            .comments
-            .iter()
-            .filter(|(_, t)| t.contains(ANNOTATION))
-            .map(|(n, _)| *n)
-            .collect();
+        let lines_marked = |mark: &str| -> BTreeSet<usize> {
+            l.comments
+                .iter()
+                .filter(|(_, t)| t.contains(mark))
+                .map(|(n, _)| *n)
+                .collect()
+        };
+        let annotated_lines = lines_marked(ANNOTATION);
+        let editor_lines = lines_marked(EDITOR_ANNOTATION);
         let mut annotated_used = BTreeSet::new();
-        for lit in l.lits.iter().filter(|lit| !in_test(lit.offset)) {
+        let mut editor_used = BTreeSet::new();
+        let live_lits: Vec<&Lit> = l.lits.iter().filter(|lit| !in_test(lit.offset)).collect();
+        for (index, lit) in live_lits.iter().enumerate() {
             let t = lit.text.as_str();
             let at = format!("{name}:{}", lit.line);
             for (field, universe, ok) in FIELDS {
@@ -522,7 +544,30 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
                     annotated_used.insert(lit.line);
                     continue;
                 }
+                if *w == "mcp_servers" && whole && name == "config.rs" && editor_lines.contains(&lit.line) {
+                    annotated_editor += 1;
+                    editor_used.insert(lit.line);
+                    continue;
+                }
                 out.push(format!("{at}: {t:?} is refused ({w:?})"));
+            }
+            for (key, universe, ok) in KEYED_FIELDS {
+                if t == *key {
+                    keys_seen.push(key);
+                    match live_lits.get(index + 1).map(|next| next.text.as_str()) {
+                        Some(value) if ok.contains(&value) => {}
+                        Some(value) if universe.contains(&value) => {
+                            out.push(format!("{at}: {value:?} is a {key} value Eitri never sends"));
+                        }
+                        value => out.push(format!(
+                            "{at}: {key} is followed by {value:?}: its value must be the next literal"
+                        )),
+                    }
+                } else if t.contains(key) {
+                    out.push(format!(
+                        "{at}: {t:?} holds {key:?} inside a longer literal; it is written as a key of its own"
+                    ));
+                }
             }
             for table in CONFIG_TABLES {
                 if t.starts_with(&format!("{table}.")) {
@@ -560,6 +605,11 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
                 "{name}:{n}: the {ANNOTATION:?} annotation marks no \"untrusted\" literal"
             ));
         }
+        for n in editor_lines.difference(&editor_used) {
+            out.push(format!(
+                "{name}:{n}: the {EDITOR_ANNOTATION:?} annotation marks no \"mcp_servers\" literal"
+            ));
+        }
     }
     if !anchor_seen {
         out.push(format!(
@@ -570,6 +620,17 @@ fn violations(files: &[(String, String)]) -> Vec<String> {
         out.push(format!(
             "\"untrusted\" must be spelled exactly once, as the annotated trust level in wire.rs; found {annotated_untrusted}"
         ));
+    }
+    if annotated_editor != 1 {
+        out.push(format!(
+            "\"mcp_servers\" must be spelled exactly once, as the annotated editor server in config.rs; found {annotated_editor}"
+        ));
+    }
+    for (key, _, _) in KEYED_FIELDS {
+        let found = keys_seen.iter().filter(|seen| *seen == key).count();
+        if found != 1 {
+            out.push(format!("{key:?} must be spelled exactly once; found {found}"));
+        }
     }
     out
 }
@@ -614,9 +675,13 @@ fn with_base(extra: &str) -> Vec<(String, String)> {
     let config = "pub fn session_config(p: &P) {}\n";
     vec![
         ("wire.rs".into(), wire.into()),
-        ("config.rs".into(), format!("{config}{extra}")),
+        ("config.rs".into(), format!("{config}{EDITOR_SERVER}{extra}")),
     ]
 }
+
+/// The editor's server as `config.rs` spells it: the annotated key and the one approval mode.
+const EDITOR_SERVER: &str = "fn s(c: &mut C) { c.insert(\"mcp_servers\", e()); // codex-wire-guard: EditorServer\n}\n\
+     fn e() -> V { json!({ \"default_tools_approval_mode\": \"approve\" }) }\n";
 
 #[test]
 fn a_clean_tree_passes() {
@@ -658,6 +723,57 @@ fn untrusted_only_on_the_annotated_line() {
     // An annotation that marks nothing is stale.
     let stale = with_base("// codex-wire-guard: DirTrust\nconst A: u8 = 1;");
     assert!(!violations(&stale).is_empty());
+}
+
+#[test]
+fn an_annotated_mcp_servers_passes_once() {
+    assert_eq!(violations(&with_base("")), Vec::<String>::new());
+    // Gone: the scan no longer sees the one place it was told about.
+    let mut none = with_base("");
+    none[1].1 = none[1].1.replace("\"mcp_servers\"", "\"other\"");
+    let found = violations(&none);
+    assert!(found.iter().any(|v| v.contains("mcp_servers")), "{found:?}");
+    // An annotation with no literal under it, and the annotated line in another file.
+    assert!(!violations(&with_base("// codex-wire-guard: EditorServer\nconst A: u8 = 1;")).is_empty());
+    let mut moved = with_base("");
+    moved.swap(0, 1);
+    moved[0].0 = "provider.rs".into();
+    assert!(!violations(&moved).is_empty());
+}
+
+#[test]
+fn a_second_mcp_servers_fails() {
+    for second in [
+        "const M: &str = \"mcp_servers\";",
+        "const M: &str = \"mcp_servers\"; // codex-wire-guard: EditorServer",
+        "const J: &str = \"{\\\"mcp_servers\\\":{}}\";",
+        "const K: &str = \"mcp_servers.eitri.enabled\";",
+        "pub struct Config { pub mcp_servers: u8 }",
+    ] {
+        assert!(!violations(&with_base(second)).is_empty(), "{second}");
+    }
+}
+
+#[test]
+fn another_approval_mode_fails() {
+    for mode in ["auto", "prompt", "writes", "other"] {
+        let mut files = with_base("");
+        files[1].1 = files[1].1.replace("\"approve\"", &format!("\"{mode}\""));
+        assert!(!violations(&files).is_empty(), "{mode}");
+    }
+    for spelling in [
+        // The value out of the scan's sight, the key inside a longer text, the key a second time, a derived key.
+        "const M: &str = \"auto\"; fn f() { json!({ \"default_tools_approval_mode\": M }) }",
+        "const J: &str = \"{\\\"default_tools_approval_mode\\\":\\\"auto\\\"}\";",
+        "fn f() { json!({ \"default_tools_approval_mode\": \"approve\" }) }",
+        "pub struct Entry { pub default_tools_approval_mode: u8 }",
+    ] {
+        assert!(!violations(&with_base(spelling)).is_empty(), "{spelling}");
+    }
+    // The words themselves stay free away from the key: a sub-agent's call has a `prompt`.
+    let free =
+        "enum H { Auto, Prompt } fn f(c: &C) -> V { let auto = 1; json!({ \"prompt\": c.prompt, \"x\": \"writes\" }) }";
+    assert_eq!(violations(&with_base(free)), Vec::<String>::new());
 }
 
 #[test]

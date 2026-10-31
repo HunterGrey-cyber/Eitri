@@ -41,7 +41,7 @@ NV_SIGNATURE_NAMESPACE='eitri-release'
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.10.0'
-NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard'
+NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -2670,7 +2670,7 @@ fetch_verified_release() {
 }
 
 # from_source_stage SRC RELEASE_PATH: SRC is the tree that was just built (target/release/ holds the
-# five binaries); RELEASE_PATH is the RELEASE this build matches. Builds the same on-disk shape
+# six binaries); RELEASE_PATH is the RELEASE this build matches. Builds the same on-disk shape
 # unpack_new produces from a downloaded tarball (NV_STAGE_TOP, NV_LIB.new), so ensure_sidecar,
 # maybe_offer_nvim, stage_files, swap_in, commit_files and prune_sidecars -- finish_install's own
 # body -- are the one path both a prebuilt install and a from-source one share from here on. There

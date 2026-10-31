@@ -7,8 +7,7 @@
 //! other's revert while both report success. So every window also takes an `flock` on
 //! `<review dir>/write.lock`: a write job exclusively, from the first thing its worker does until
 //! after its write; a review send shared, around its read of the disk. Neither ever waits: a slot
-//! someone else holds refuses the job with the note one window gives today, naming the other
-//! window.
+//! someone else holds refuses the job with a note saying what holds it.
 //!
 //! Each take opens the file afresh, so two takes in one process exclude each other as two windows
 //! do (`flock` belongs to an open file description, not to a process). A hold lets go with
@@ -33,7 +32,7 @@ const ATTEMPTS: usize = 8;
 /// Why the slot was not taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotBusy {
-    /// Another window is writing a revert, an undo or a recovery.
+    /// A revert, an undo, a recovery or an applied proposal is being written, here or in another window.
     Writing,
     /// Another window is making a review message from the disk.
     Reading,
@@ -45,7 +44,7 @@ impl fmt::Display for SlotBusy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SlotBusy::Writing => {
-                f.write_str("a revert is still being written in another Eitri window; try again in a moment")
+                f.write_str("another write to this project is still going on in Eitri; try again in a moment")
             }
             SlotBusy::Reading => {
                 f.write_str("the review message is still being prepared in another Eitri window; try again in a moment")
@@ -343,7 +342,7 @@ mod tests {
 
         let free = once_free(|| other.try_exclusive()).expect("a slot nobody holds is free");
         drop(free);
-        assert!(SlotBusy::Writing.to_string().contains("another Eitri window"));
+        assert!(SlotBusy::Writing.to_string().contains("another write"));
         assert!(SlotBusy::Reading.to_string().contains("another Eitri window"));
     }
 

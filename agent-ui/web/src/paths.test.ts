@@ -15,6 +15,15 @@ describe("the paths a card or row offers to open", () => {
     call: { seq: 1, toolUseId: "t", name: "acp:edit", input, result: { content: "", isError: false } },
   });
 
+  it("Ctrl+g on a broker card opens its title and lines, never a null", () => {
+    const card: TimelineItem = { kind: "permission", seq: 1, key: "ec-1", request: {
+      seq: 1, permissionId: "ec-1", toolUseId: null, toolName: "open_file", input: null,
+      editorCard: { title: "Load src/a.rs in your editor?", body: [{ kind: "plain", text: "Not open yet." }] },
+    } };
+    expect(viewText(card)).toEqual({ title: "open_file request", text: "Load src/a.rs in your editor?\nNot open yet." });
+    expect(pathsIn(card)).toEqual([]);
+  });
+
   it("an_acp_edit_card_offers_the_path_its_header_draws", () => {
     expect(pathsIn(editCard())).toEqual([{ path: "notes.txt", line: null }]);
   });

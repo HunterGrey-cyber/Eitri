@@ -47,5 +47,6 @@ you register, and you supervise each of them yourself, in a window you control.
 - [Markdown preview](markdown-preview.md): a Markdown file rendered beside the editor, scrolling with it, read with Vim keys.
 - [Permissions](permissions.md): what runs without asking, what waits on a card, and the bypass mode.
 - [Codex and other agents](agents.md): tabs that run Codex, or an agent you register that speaks ACP.
+- [Your editor, from an agent's tab](editor-tools.md): how an agent in any tab shows you a file, reads what your editor holds, asks your language servers and proposes changes for you to approve, and how to turn that off.
 - [Pages you build](pages.md): your own HTML page as a Lua panel, or a plugin page with a manifest (experimental).
 - [Known issues](../known-issues.md): what is unsupported or rough today.

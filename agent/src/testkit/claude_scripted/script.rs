@@ -205,6 +205,12 @@ pub struct Variant {
     pub user_settings: Option<UserSettings>,
     #[serde(default)]
     pub requires: Vec<String>,
+    /// The tab's mode in this variant, when it differs from the scenario's.
+    #[serde(default)]
+    pub mode: Option<Mode>,
+    /// The tools the session declares in this variant, when they differ from the scenario's.
+    #[serde(default)]
+    pub client_tools: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -223,6 +229,10 @@ pub struct Scenario {
     pub project: BTreeMap<String, String>,
     #[serde(default)]
     pub mode: Option<Mode>,
+    /// The tools the session declares as its own and the host answers: `phase_a`, the rows of the first phase of
+    /// the editor tools. Layer (a) declares a literal copy of them, layer (b) the host's own catalogue.
+    #[serde(default)]
+    pub client_tools: Option<String>,
     #[serde(default)]
     pub classifier: Option<Classifier>,
     #[serde(default)]
@@ -249,7 +259,9 @@ fn default_layers() -> Vec<String> {
 }
 
 /// Capabilities a driver part or variant may require.
-pub const KNOWN_CAPABILITIES: [&str; 7] = [
+pub const KNOWN_CAPABILITIES: [&str; 9] = [
+    "client_tools",
+    "chat_move",
     "task_control",
     "task_output",
     "per_task_stop",
@@ -315,6 +327,15 @@ pub fn check_env_name(id: &str, variant: Option<&str>, name: &str, place: EnvPla
     }
 }
 
+/// A driver part's `layer`, when it has one, is `a` or `b`.
+fn check_layer(part: &Value, what: &str) -> Result<(), String> {
+    match part.get("layer") {
+        None => Ok(()),
+        Some(Value::String(layer)) if layer == "a" || layer == "b" => Ok(()),
+        Some(other) => Err(format!("{what}: `layer` is `a` or `b`, not {other}")),
+    }
+}
+
 fn check_requires(names: &[String], what: &str) -> Result<(), String> {
     for n in names {
         if !KNOWN_CAPABILITIES.contains(&n.as_str()) {
@@ -365,11 +386,28 @@ impl Scenario {
                 check_env_name(id, None, name, EnvPlace::UserSettingsEnv)?;
             }
         }
+        if let Some(name) = &self.client_tools {
+            if !CLIENT_TOOL_SETS.contains(&name.as_str()) {
+                return Err(format!(
+                    "scenario `{id}`: `client_tools` is one of {CLIENT_TOOL_SETS:?}, not `{name}`"
+                ));
+            }
+        }
+        for (variant, v) in &self.variants {
+            if let Some(name) = &v.client_tools {
+                if !CLIENT_TOOL_SETS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "scenario `{id}` variant `{variant}`: `client_tools` is one of {CLIENT_TOOL_SETS:?}, not `{name}`"
+                    ));
+                }
+            }
+        }
         for part in &self.driver {
             if !part.is_object() {
                 return Err(format!("scenario `{id}`: every driver part is an object"));
             }
             check_requires(&requires_of(part), &format!("scenario `{id}` driver"))?;
+            check_layer(part, &format!("scenario `{id}` driver"))?;
         }
         if self.expect.as_ref().is_some_and(|e| !e.is_object()) {
             return Err(format!("scenario `{id}`: `expect` is an object"));
@@ -388,6 +426,7 @@ impl Scenario {
             check_requires(&v.requires, &format!("scenario `{id}` variant `{name}`"))?;
             for part in v.driver.iter().flatten() {
                 check_requires(&requires_of(part), &format!("scenario `{id}` variant `{name}` driver"))?;
+                check_layer(part, &format!("scenario `{id}` variant `{name}` driver"))?;
             }
             if let Some(steps) = &v.model {
                 validate_steps(&format!("{id}/{name}"), steps, &self.branches)?;
@@ -403,6 +442,27 @@ impl Scenario {
             env.extend(v.env.clone());
         }
         env
+    }
+
+    /// The tab's mode in this scenario and variant: the variant's own when it states one.
+    pub fn mode_of(&self, variant: Option<&str>) -> Option<Mode> {
+        variant
+            .and_then(|name| self.variants.get(name))
+            .and_then(|v| v.mode)
+            .or(self.mode)
+    }
+
+    /// The tools the session declares as its own, from the `client_tools` of the variant when it states one and
+    /// of the scenario otherwise.
+    pub fn declared_client_tools(&self, variant: Option<&str>) -> Option<crate::ClientToolSet> {
+        let own = variant
+            .and_then(|name| self.variants.get(name))
+            .and_then(|v| v.client_tools.as_deref());
+        match own.or(self.client_tools.as_deref()) {
+            Some("phase_a") => Some(phase_a_client_tools()),
+            Some("phase_a_exec") => Some(phase_a_exec_client_tools()),
+            _ => None,
+        }
     }
 
     /// The model script of this scenario and variant, with the scenario's mode, classifier and branches.
@@ -421,11 +481,113 @@ impl Scenario {
         Ok(Script {
             steps,
             branches: self.branches.clone(),
-            mode: self.mode,
+            mode: self.mode_of(variant),
             classifier: self.classifier.clone(),
             ..Script::default()
         })
     }
+}
+
+/// The sets of client tools a scenario may name.
+const CLIENT_TOOL_SETS: [&str; 2] = ["phase_a", "phase_a_exec"];
+
+/// The tools the editor tools declare in their first phase, written out here because this crate cannot reach
+/// the host's catalogue. The host's tests compare this copy with the catalogue, row by row.
+pub fn phase_a_client_tools() -> crate::ClientToolSet {
+    let decl = |name: &str, description: &str, schema: &str| crate::ClientToolDecl {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        input_schema_json: schema.to_owned(),
+        always_load: true,
+    };
+    crate::ClientToolSet {
+        server_name: "eitri".to_owned(),
+        timeout_ms: 900_000,
+        tools: vec![
+            decl(
+                "open_file",
+                "Show the person a file at a line in their editor, in a side window. Their cursor, window and mode \
+                 do not change. The path is absolute or relative to the project root.",
+                r#"{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string", "description": "The file, absolute or relative to the project root." },
+    "line": { "type": "integer", "minimum": 1, "description": "The line to show, from 1." },
+    "end_line": { "type": "integer", "minimum": 1, "description": "The last line to highlight." }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}"#,
+            ),
+            decl(
+                "editor_state",
+                "What the person's editor holds: this project's open files and which have unsaved changes, the \
+                 current file and line, the mode, and the live selection.",
+                r#"{
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}"#,
+            ),
+            decl(
+                "read_buffer",
+                "The text of a file as the editor holds it, unsaved changes included, for a file already open \
+                 there. The answer says whether it differs from the file on disk. For a file not open, use Read.",
+                r#"{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string", "description": "The file, absolute or relative to the project root." },
+    "start_line": { "type": "integer", "minimum": 1, "description": "The first line to read, from 1." },
+    "end_line": { "type": "integer", "minimum": 1, "description": "The last line to read." }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}"#,
+            ),
+            decl(
+                "diagnostics",
+                "The editor's diagnostics, from language servers and linters, for one open file or for every open \
+                 file of this project, the most severe first. The answer names the files with unsaved changes: \
+                 their diagnostics describe text not yet on disk.",
+                r#"{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string", "description": "One open file; every open file of the project when left out." },
+    "min_severity": { "type": "string", "enum": ["error", "warning", "info", "hint"], "description": "The least severe to include." },
+    "since": { "type": "string", "enum": ["turn"], "description": "Only the diagnostics that appeared since this turn began." }
+  },
+  "additionalProperties": false
+}"#,
+            ),
+        ],
+    }
+}
+
+/// The first phase's tools and `nvim_exec`, which a session has only when its key turns it on and which the model
+/// finds through a search, as the catalogue declares it. The host's tests compare this copy with the catalogue.
+pub fn phase_a_exec_client_tools() -> crate::ClientToolSet {
+    let mut set = phase_a_client_tools();
+    set.tools.push(crate::ClientToolDecl {
+        name: "nvim_exec".to_owned(),
+        description:
+            "Run Ex commands or Lua in the person's editor, with their full rights and no sandbox. Every call \
+                      shows the person the code on a card, in every permission mode, and runs only on their \
+                      answer. Use it when no other editor tool can do the job."
+                .to_owned(),
+        input_schema_json: r#"{
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "enum": ["ex", "lua"], "description": "ex: Ex commands. lua: a Lua chunk." },
+    "code": { "type": "string", "description": "The text to run, at most 16 KiB. The person reads it whole." },
+    "why": { "type": "string", "description": "Why this needs to run, in a sentence for the person." }
+  },
+  "required": ["kind", "code", "why"],
+  "additionalProperties": false
+}"#
+        .to_owned(),
+        always_load: false,
+    });
+    set
 }
 
 /// What `eitri-claude-scripted serve` reads from `script.json`.
@@ -1311,5 +1473,71 @@ mod tests {
         let p = rt.select(&prompt("x"), &cfg(), false).unwrap().unwrap();
         assert!(p.reply.error.is_none());
         assert_eq!(rt.uses()["e"], 1);
+    }
+
+    #[test]
+    fn client_tools_name_a_known_set_and_a_variant_may_state_its_own_mode() {
+        let s = parse(scenario(
+            "c30_editor_tools",
+            json!({"client_tools": "phase_a", "mode": "manual", "variants": {"auto": {"mode": "auto"}, "plain": {}}}),
+        ))
+        .unwrap();
+        assert_eq!(s.mode_of(None), Some(Mode::Manual));
+        assert_eq!(s.mode_of(Some("auto")), Some(Mode::Auto));
+        assert_eq!(s.mode_of(Some("plain")), Some(Mode::Manual));
+        assert_eq!(s.script(Some("auto")).unwrap().mode, Some(Mode::Auto));
+        let set = s.declared_client_tools(None).expect("the set");
+        let names: Vec<&str> = set.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["open_file", "editor_state", "read_buffer", "diagnostics"]);
+        assert!(set.tools.iter().all(|t| t.always_load));
+        for tool in &set.tools {
+            let schema: Value = serde_json::from_str(&tool.input_schema_json).expect("a schema");
+            assert_eq!(schema["type"], "object", "{}", tool.name);
+        }
+        assert!(parse(scenario("c00", json!({})))
+            .unwrap()
+            .declared_client_tools(None)
+            .is_none());
+        let e = parse(scenario("c30", json!({"client_tools": "phase_z"}))).unwrap_err();
+        assert!(e.contains("phase_z"), "{e}");
+    }
+
+    #[test]
+    fn a_variant_may_declare_the_exec_tool_beside_the_first_phase() {
+        let s = parse(scenario(
+            "c30_editor_tools",
+            json!({"client_tools": "phase_a", "mode": "manual",
+                   "variants": {"exec": {"mode": "bypass", "client_tools": "phase_a_exec"}, "plain": {}}}),
+        ))
+        .unwrap();
+        let names = |set: crate::ClientToolSet| set.tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        assert_eq!(names(s.declared_client_tools(None).unwrap()).len(), 4);
+        assert_eq!(names(s.declared_client_tools(Some("plain")).unwrap()).len(), 4);
+        let exec = s.declared_client_tools(Some("exec")).unwrap();
+        assert_eq!(exec.tools.last().map(|t| t.name.as_str()), Some("nvim_exec"));
+        assert!(exec
+            .tools
+            .iter()
+            .filter(|t| !t.always_load)
+            .map(|t| &t.name)
+            .eq(["nvim_exec"]));
+        let bad = parse(scenario("c30", json!({"variants": {"v": {"client_tools": "phase_z"}}}))).unwrap_err();
+        assert!(bad.contains("variant `v`") && bad.contains("phase_z"), "{bad}");
+    }
+
+    #[test]
+    fn a_driver_part_names_its_layer_a_or_b() {
+        let ok = scenario(
+            "c30",
+            json!({"driver": [{"send": "x", "layer": "a"}, {"send": "y", "layer": "b"}]}),
+        );
+        assert!(parse(ok).is_ok());
+        let bad = scenario("c30", json!({"driver": [{"send": "x", "layer": "c"}]}));
+        assert!(parse(bad).unwrap_err().contains("`layer` is `a` or `b`"));
+        let in_variant = scenario(
+            "c30",
+            json!({"variants": {"v": {"driver": [{"send": "x", "layer": 1}]}}}),
+        );
+        assert!(parse(in_variant).unwrap_err().contains("variant `v`"));
     }
 }

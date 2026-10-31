@@ -158,7 +158,7 @@ including `runs without asking` and `mode lag`.
 
 - The `codex` command, installed, and signed in with `codex login`. Without a login the tab says "Codex is not
   signed in: run `codex login` in a terminal".
-- Codex 0.160.0 or newer. Eitri has been tried with 0.160.0 to 0.161.0; the tab's `agent` row says so. A newer
+- Codex 0.160.0 or newer. Eitri has been tried with 0.160.0 to 0.163.0; the tab's `agent` row says so. A newer
   Codex still runs, and the row then reads "untested Codex" with its version and the newest one tried. An older one is
   refused with "update Codex".
 
@@ -419,6 +419,14 @@ limits, no context bar and no model picker for these tabs. The command list an a
 its composer (see [the composer's keys](keys.md)): the names and descriptions are drawn as plain text, and a tab
 whose agent has reported none has no menu. `prefix i` has a `context` row,
 which shows how full the agent's context is once the agent reports it. Tokens come without a cost.
+
+## Your editor, from an agent's tab
+
+An agent in any tab, Codex and ACP included, can show you a file, read what your editor holds, ask your language
+servers about the code and propose changes for you to approve. What the tools do, when Eitri asks first, what a Codex
+tab says when it goes without them and how to turn them off are on their own page:
+[Your editor, from an agent's tab](editor-tools.md). So are [following the agent's edits](editor-tools.md#following) and
+[`nvim_exec`](editor-tools.md#nvim-exec), the one tool that stays off until you turn it on.
 
 ## Chat views
 

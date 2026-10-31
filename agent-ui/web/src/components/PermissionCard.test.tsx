@@ -663,3 +663,88 @@ describe("the Workflow card's script", () => {
     expect(view.container.textContent).not.toContain("ORIGINAL-SOURCE");
   });
 });
+
+/* A card Eitri's own tool broker raised: its title and lines are plain text from a repository or the agent, each
+   drawn through `revealHidden`; it takes no reason and offers no rule. */
+describe("a broker card", () => {
+  const BROKER: PermissionRequestRecord = {
+    seq: 4,
+    permissionId: "ec-0123456789abcdef-1",
+    toolUseId: "toolu_01",
+    toolName: "open_file",
+    input: null,
+    editorCard: { title: "Show /etc/hosts in your editor?", body: [] },
+  };
+  const withBody = (title: string, body: NonNullable<PermissionRequestRecord["editorCard"]>["body"]): PermissionRequestRecord => ({
+    ...BROKER,
+    editorCard: { title, body },
+  });
+
+  it("hidden_characters_in_a_card_are_revealed", () => {
+    const { container } = render(
+      <PermissionCard
+        request={withBody("Show a\u202Etxt.exe in your editor?", [
+          { kind: "code", text: "/tmp/a\u202Etxt.exe" },
+          { kind: "plain", text: "from\u200Bhere" },
+          { kind: "agent", text: "open it\u2066" },
+          { kind: "warning", text: "outside\u202D" },
+        ])}
+        sessionEnded={false}
+        onAnswer={vi.fn()}
+      />,
+    );
+    const text = container.textContent ?? "";
+    for (const hidden of ["\u202E", "\u200B", "\u2066", "\u202D"]) expect(text).not.toContain(hidden);
+    expect(container.querySelector(".permission-card-tool")!.textContent).toBe("Show a⟨U+202E⟩txt.exe in your editor?");
+    expect(container.querySelector('[data-line-kind="code"]')!.textContent).toBe("/tmp/a⟨U+202E⟩txt.exe");
+    // Title (1) and four lines (1 each) all show their characters, and each line says so.
+    expect(container.querySelectorAll(".permission-card-escape")).toHaveLength(5);
+    expect(container.querySelectorAll(".permission-card-warning")).toHaveLength(4);
+  });
+
+  it("a_title_keeps_every_space_and_lays_out_left_to_right", () => {
+    const { container } = render(<PermissionCard request={withBody("Load src/a  b.rs in your editor?", [])} sessionEnded={false} onAnswer={vi.fn()} />);
+    const title = container.querySelector(".permission-card-tool")!;
+    expect(title.textContent).toBe("Load src/a  b.rs in your editor?");
+    expect(title.classList.contains("permission-card-tool-broker")).toBe(true);
+  });
+
+  it("markdown_in_a_card_stays_text", () => {
+    const { container } = render(
+      <PermissionCard
+        request={withBody("**Open** `a.rs`?", [
+          { kind: "plain", text: "# heading\n- item [link](https://example.com) <b>bold</b>" },
+          { kind: "code", text: "`rm -rf`" },
+          { kind: "agent", text: "*I* need `this`" },
+        ])}
+        sessionEnded={false}
+        onAnswer={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".permission-card-tool")!.textContent).toBe("**Open** `a.rs`?");
+    expect(container.querySelector('[data-line-kind="plain"]')!.textContent).toBe("# heading\n- item [link](https://example.com) <b>bold</b>");
+    expect(container.querySelector('[data-line-kind="code"]')!.textContent).toBe("`rm -rf`");
+    expect(container.querySelector('[data-line-kind="agent"]')!.textContent).toBe("The agent says: *I* need `this`");
+    // No element a Markdown or HTML renderer would make.
+    for (const tag of ["a", "b", "em", "strong", "h1", "ul", "li", "code"]) expect(container.querySelector(tag), tag).toBeNull();
+    // Monospace for code, a preformatted block.
+    expect(container.querySelector('pre[data-line-kind="code"]')).not.toBeNull();
+  });
+
+  it("an_editor_card_has_no_reason_box_and_no_always", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(
+      <PermissionCard
+        request={withBody("Show a in your editor?", [{ kind: "plain", text: "x" }])}
+        sessionEnded={false}
+        ruleOffer="open_file *"
+        onAnswer={onAnswer}
+      />,
+    );
+    expect(container.querySelector(".permission-card input")).toBeNull();
+    expect(Array.from(container.querySelectorAll("button")).map((b) => b.textContent)).toEqual(["Approve", "Deny"]);
+    expect(container.textContent).not.toContain("Always allow");
+    fireEvent.click(buttons(container).approve);
+    expect(onAnswer).toHaveBeenCalledWith("ec-0123456789abcdef-1", "allow", undefined);
+  });
+});

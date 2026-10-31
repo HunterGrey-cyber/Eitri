@@ -8,7 +8,7 @@
 //! project's own configuration names), and the user's MCP servers, which an untrusted session may
 //! start without loading the project's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -110,6 +110,9 @@ pub struct UserCodexConfig {
     /// TOML (a link, a FIFO, over 4 MiB, not UTF-8, bad TOML, `mcp_servers` not a table): which
     /// servers the user has is then unknown. A file that is not there defines none.
     pub mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// Every name under `mcp_servers`, the switched-off ones too: a runtime entry merges per key with
+    /// those as well. `None` when [`mcp_servers`](Self::mcp_servers) is.
+    pub all_server_names: Option<BTreeSet<String>>,
     /// The file, and why it could not be read as TOML, when it is there and could not be: the
     /// alternate names it may give are then unknown, and so are the files a session would load
     /// under them. `None` when it was read, or is not there.
@@ -180,6 +183,7 @@ pub fn read_user_codex_config(file: &Path) -> UserCodexConfig {
     let unknown = |why: String| UserCodexConfig {
         fallback_names: Vec::new(),
         mcp_servers: None,
+        all_server_names: None,
         unreadable: Some((file.to_path_buf(), why)),
     };
     let bytes = match read_regular_nofollow(file, MAX_USER_CONFIG_BYTES, Owner::Anyone) {
@@ -188,6 +192,7 @@ pub fn read_user_codex_config(file: &Path) -> UserCodexConfig {
             return UserCodexConfig {
                 fallback_names: Vec::new(),
                 mcp_servers: Some(BTreeMap::new()),
+                all_server_names: Some(BTreeSet::new()),
                 unreadable: None,
             }
         }
@@ -200,23 +205,26 @@ pub fn read_user_codex_config(file: &Path) -> UserCodexConfig {
         return unknown("not TOML this check can read".to_string());
     };
     let fallback_names = fallback_names_in(&table);
-    let mcp_servers = match table.remove(MCP_SERVERS_KEY) {
-        None => Some(BTreeMap::new()),
-        Some(toml::Value::Table(servers)) => Some(
-            servers
+    let (mcp_servers, all_server_names) = match table.remove(MCP_SERVERS_KEY) {
+        None => (Some(BTreeMap::new()), Some(BTreeSet::new())),
+        Some(toml::Value::Table(servers)) => {
+            let names = servers.keys().cloned().collect();
+            let running = servers
                 .into_iter()
                 .filter(|(_, server)| server.get("enabled") != Some(&toml::Value::Boolean(false)))
                 .map(|(name, server)| {
                     let definition = ServerDefinition::of(&server);
                     (name, definition)
                 })
-                .collect(),
-        ),
-        Some(_) => None,
+                .collect();
+            (Some(running), Some(names))
+        }
+        Some(_) => (None, None),
     };
     UserCodexConfig {
         fallback_names,
         mcp_servers,
+        all_server_names,
         unreadable: None,
     }
 }

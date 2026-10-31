@@ -1,5 +1,6 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
+import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
 import type { ProposedChange } from "./proposal";
@@ -21,6 +22,7 @@ export type OutboundMessage =
    *  session, another agent's tab ends its session. `running` is
    *  the count the question named; Rust stops nothing when the tab's count is another by then. */
   | { type: "stop_background"; request_id: string; tab: TabId; running: number }
+  | { type: "toggle_following"; request_id: string; tab: TabId }
   | { type: "stop_task"; request_id: string; tab: TabId; task_id: string }
   | { type: "task_output"; request_id: string; tab: TabId; task_id: string }
   /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
@@ -30,6 +32,10 @@ export type OutboundMessage =
   /** `remember: true` on an allow is "always allow" -- Rust honours it only for
    *  a permission id it itself offered a rule for; the panel's own text is never trusted. */
   | { type: "permission_response"; request_id: string; tab: TabId; permission_id: string; decision: PermissionDecision; reason?: string; remember?: boolean }
+  /** The answer to a card Eitri's own tool broker raised (`editor_cards`), by the card's own id. It carries no
+   *  reason and no `remember`: a broker card offers neither. `origin` is how the person answered -- `"key"` from
+   *  `a`/`d`, `"click"` from the card's button -- and Rust takes no other word. */
+  | { type: "editor_card_answer"; request_id: string; tab: TabId; card_id: string; decision: PermissionDecision; origin: "key" | "click" }
   /** How long this WebView took to draw a turn's first assistant text, from its own receipt of the
    *  payload to the animation frame that rendered it. A SPAN, not an instant: `performance.now()`
    *  and Rust's `Instant` have unrelated epochs, so a timestamp crossing this boundary would be a
@@ -80,6 +86,9 @@ export type OutboundMessage =
   /** A copy's text for the primary selection too (`primaryCopy.ts`). The shell's page handler takes this
    *  one kind itself and answers nothing, so it carries no request id. */
   | { type: "copy_primary"; text: string }
+  /** `Ctrl+g` on a broker card that would apply a proposal: file number `file` of proposal `proposal` of this tab, as
+   *  the shell's review store holds it. The texts never come from the page. */
+  | { type: "editor_card_view"; request_id: string; tab: TabId; proposal: string; file: number }
   /** `Ctrl+g` on a pending edit card for one file: the file as it is on disk beside the file as the card
    *  would leave it, read-only (`proposal.ts#proposalOf`). `path` is the card's own. */
   | { type: "view_proposal"; request_id: string; path: string; change: ProposedChange }
@@ -283,6 +292,9 @@ type InboundHandler = (
      *  (or absent, from an older build) when none runs. `turnTimes`: how long every finished turn of the
      *  tab ran, replacing the panel's whole table (absent from an older build). */
     | { kind: "snapshot"; tab: TabId; throughRevision: number; state: AgentUiSnapshot; turnStartedAtMs?: number | null; turnTimes?: TurnTimeWire[] }
+    /** The tab's broker cards, replacing the whole list (Rust's `serialize_editor_cards_for_js`). Sent whenever the
+     *  set changes, empty included; the page keeps them only for the tab it shows. */
+    | { kind: "editor_cards"; tab: TabId; cards: EditorCardWire[] }
     | ({ kind: "handoff"; tab: TabId } & HandoffCommand)
     | { kind: "theme"; vars: Record<string, string> }
     /** How the panel shows the agent's thinking (`init.lua`'s `agent.thinking`;
@@ -429,6 +441,11 @@ type InboundHandler = (
     | ({ kind: "review_recovery" } & ReviewRecoveryEnvelope),
 ) => void;
 
+/** Whether `cards` is a list of broker cards the card view can draw. */
+function isWellFormedEditorCards(cards: unknown): boolean {
+  return Array.isArray(cards) && cards.every(isEditorCardWire);
+}
+
 /** The handler's own payload type, exported so callers (`tabs.ts`'s `acceptsEnvelope`, `App.tsx`)
  *  can name it without re-declaring the union. */
 export type InboundPayload = Parameters<InboundHandler>[0];
@@ -480,6 +497,11 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed trust_prompt envelope", parsed);
         return;
       }
+      // A card that cannot be drawn whole cannot be answered knowingly, so the list is dropped rather than drawn.
+      if (obj.kind === "editor_cards" && !isWellFormedEditorCards((obj as { cards?: unknown }).cards)) {
+        console.warn("agent-ui: __eitriDispatch received a malformed editor_cards envelope", parsed);
+        return;
+      }
       if (
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
@@ -487,6 +509,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "question_other_edited" ||
         obj.kind === "events" ||
         obj.kind === "snapshot" ||
+        obj.kind === "editor_cards" ||
         obj.kind === "handoff" ||
         obj.kind === "theme" ||
         obj.kind === "display" ||

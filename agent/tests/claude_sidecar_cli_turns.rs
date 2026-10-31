@@ -351,6 +351,7 @@ fn open(provider: &ClaudeSidecarProvider) -> String {
             cwd: "/".to_string(),
             streaming: StreamingPreference::Partial,
             project: ProjectTrust::Untrusted,
+            client_tools: None,
         })
         .expect("the stand-in opens a session")
 }

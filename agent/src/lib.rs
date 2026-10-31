@@ -82,7 +82,9 @@ pub use account::{AccountError, ClaudeAccount};
 pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationError, PromptOrigin};
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
-pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, Sandbox, TrustPlan, TurnPolicy};
+pub use external::{
+    DirTrust, EditorServerSpec, ExternalProvider, ExternalStart, Reviewer, Sandbox, TrustPlan, TurnPolicy,
+};
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
 pub use move_seed::{
     ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,
@@ -120,21 +122,22 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 
 pub use projection::{
     describe_failed_resume, thinking_open_after, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection,
-    BackgroundTask, BackgroundTaskRecord, ContentKind, HistoryNotice, HistorySource, InputChange, MatchedAskRule,
-    NoticeLevel, NoticeRecord, PermissionOutcome, PermissionRequestRecord, ProjectionStatus, ProviderPrompt,
-    QuestionOptionSpec, QuestionOutcome, QuestionRecord, QuestionSpec, QuestionState, ResumeStatus, SessionNoticeKind,
-    ShownAnswer, SlashCommand, SteerOutcome, TaskEdge, TaskKind, TaskRoster, TaskStatus, TaskUsage, ThinkingBlock,
-    TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult, TranscriptMessage, TurnCause, TurnCauseKind,
-    TurnEndDetail, TurnEndingKind, TurnEndingRecord, TurnOrigin, TurnOutcome, TurnStartRecord, UngatedCliModeRecord,
-    UsageInfo, UserPromptRecord, WorkflowAgent, WorkflowPhase, WorkflowProgress, CLI_REFUSED_DROP,
-    MAX_HOOK_BLOCK_CHARS, MAX_STEER_OUTCOMES, MAX_TURN_END_MESSAGE_CHARS, NO_OPEN_TURN_ID, NO_RESULT_REASON,
+    BackgroundTask, BackgroundTaskRecord, ContentKind, HistoryNotice, HistorySource, InitServer, InputChange,
+    MatchedAskRule, NoticeLevel, NoticeRecord, OpenClientCall, PermissionOutcome, PermissionRequestRecord,
+    ProjectionStatus, ProviderPrompt, QuestionOptionSpec, QuestionOutcome, QuestionRecord, QuestionSpec, QuestionState,
+    ResumeStatus, SessionNoticeKind, ShownAnswer, SlashCommand, SteerOutcome, TaskEdge, TaskKind, TaskRoster,
+    TaskStatus, TaskUsage, ThinkingBlock, TokenUsage, ToolCallDenial, ToolCallRecord, ToolCallResult,
+    TranscriptMessage, TurnCause, TurnCauseKind, TurnEndDetail, TurnEndingKind, TurnEndingRecord, TurnOrigin,
+    TurnOutcome, TurnStartRecord, UngatedCliModeRecord, UsageInfo, UserPromptRecord, WorkflowAgent, WorkflowPhase,
+    WorkflowProgress, CLI_REFUSED_DROP, MAX_HOOK_BLOCK_CHARS, MAX_STEER_OUTCOMES, MAX_TURN_END_MESSAGE_CHARS,
+    NO_OPEN_TURN_ID, NO_RESULT_REASON,
 };
 pub use provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, EventSignal, InteractionReply, InteractionResolution,
-    InteractionSend, InteractionState, InterruptTurnRequest, PermissionDecision, ProviderCapabilities, ProviderError,
-    ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind, ResolveInteractionRequest,
-    ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SteerTurnRequest, StreamingPreference, TaskOutput,
-    TaskReply, TurnStamp,
+    AgentProvider, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl, ClientToolSet,
+    CloseSessionRequest, CreateSessionRequest, EventSignal, InteractionReply, InteractionResolution, InteractionSend,
+    InteractionState, InterruptTurnRequest, PermissionDecision, ProviderCapabilities, ProviderError, ProviderErrorCode,
+    ProviderInfo, QuestionAnswer, QuestionDeclineKind, ResolveInteractionRequest, ResolvePermissionRequest,
+    ResumeSessionRequest, SendTurnRequest, SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnStamp,
 };
 pub use providers::claude_sidecar::{
     sidecar_availability, sidecar_missing_message, user_sidecar_path, BackpressureStats, ClaudeSidecarProvider,

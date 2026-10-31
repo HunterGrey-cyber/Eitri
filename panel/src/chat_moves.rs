@@ -14,6 +14,15 @@
 //! reads. In the other window all of it is the other window's input: read with the typed records, its shape and its
 //! descriptor count checked before anything is built, and refused whole otherwise.
 //!
+//! **No editor call crosses.** Before the source's provider freezes, each call of the tab is told to try again and
+//! each of its cards goes ([`editor_glue::tab_leaving`]). After the commit the destination
+//! holds the session's calls until the session has said which are open ([`editor_glue::tab_arrived`]).
+//!
+//! **A bridge socket crosses by name.** The agent's tool server stays where it is and connects again by the path it
+//! was started with. Once the provider froze the source lets the name go, because a refused freeze keeps the session
+//! here and a session here keeps its socket; the destination binds it when the tab is taken up, and a move called
+//! off binds it here again ([`editor_glue::tab_brought`], [`editor_glue::bridge_back`]).
+//!
 //! **Nothing is written to the agent before the commit.** The arriving tab is taken up only when the window carries
 //! out the commit's adopt, and its provider then starts reading and answering at once. Before that the window holds
 //! the arriving session in its presence ([`hold_presence`]), under the id the tab then takes.
@@ -370,7 +379,7 @@ pub(super) fn poll_chat_moves(state: &mut AgentPanelState, out: &mut Outbox) {
         };
         let (view, tab) = (freezing.view, freezing.tab);
         let blob = freezing.answer.clone().flatten();
-        match freeze(state, tab, blob) {
+        match freeze(state, tab, blob, out) {
             Attempt::Done { record, fds, provider } => {
                 state.chat_moves.frozen.insert(tab, Frozen { view, provider });
                 println!("[chat_move] tab {}: frozen for move {mv}", tab.0);
@@ -421,7 +430,7 @@ pub(super) fn poll_chat_moves(state: &mut AgentPanelState, out: &mut Outbox) {
 
 /// Freezes `tab` and its provider, and builds the record that crosses. Anything refused after the tab froze unfreezes
 /// it (and the provider, if it froze): a refused freeze leaves the tab as it was.
-fn freeze(state: &mut AgentPanelState, tab: TabId, view: Option<serde_json::Value>) -> Attempt {
+fn freeze(state: &mut AgentPanelState, tab: TabId, view: Option<serde_json::Value>, out: &mut Outbox) -> Attempt {
     if state.shutting_down {
         return Attempt::Refused("the window is closing".into());
     }
@@ -434,6 +443,8 @@ fn freeze(state: &mut AgentPanelState, tab: TabId, view: Option<serde_json::Valu
         Err(why) if why.is_retryable() => return Attempt::Again,
         Err(why) => return Attempt::Refused(why.to_string()),
     };
+    // Here and no later: a frozen provider takes no answer. A freeze refused below leaves the agent told to try again.
+    editor_glue::tab_leaving(state, tab, out);
     let taken = match &chat {
         None => Ok((None, None)),
         Some(_) => freeze_provider(state, tab),
@@ -445,6 +456,7 @@ fn freeze(state: &mut AgentPanelState, tab: TabId, view: Option<serde_json::Valu
             return Attempt::Refused(why);
         }
     };
+    editor_glue::bridge_leaving(state, tab);
     let built =
         build_record(&record, chat.as_ref(), provider.as_ref(), lease.is_some(), &panel, view).and_then(|record| {
             let mut fds = match &provider {
@@ -528,6 +540,7 @@ fn take_back(state: &mut AgentPanelState, tab: TabId, provider: Option<FrozenPro
         }
     }
     state.tabs.unfreeze(tab);
+    editor_glue::bridge_back(state, tab);
 }
 
 /// The frozen tab of `view` the window names (`tab`), or the one `view` has frozen when it names none.
@@ -577,6 +590,7 @@ pub(super) fn forget_moved(
     let left = state.tabs.hand_over(tab);
     drop(left);
     state.trust.forget_tab(tab);
+    editor_glue::tab_gone(state, tab);
     state.shown_hints.retain(|hint| hint.tab != tab.0);
     state.review_hints.retain(|hint| hint.tab != tab.0);
     if shown_in.is_base() {
@@ -730,6 +744,7 @@ pub(super) fn adopt_moved(
             let provider_fds: Vec<OwnedFd> = fds.by_ref().take(kind.descriptors()).collect();
             let lease_fd = if lease { fds.next() } else { None };
             let session = chat.conversation.provider_session_id.clone();
+            let folded_through = chat.core.folded_through;
             let provider_name = chat.conversation.provider_name.clone();
             let cwd = chat.conversation.canonical_cwd.to_string_lossy().into_owned();
             let Adopted { agent, external } = (state.chat_moves.adopter)(kind, &provider_record, provider_fds)?;
@@ -749,7 +764,7 @@ pub(super) fn adopt_moved(
             )
             .map_err(|e| e.message)?;
             let id = state.tabs.adopt_moved(tab, backend, view);
-            commit_adopted(state, id);
+            commit_adopted(state, id, folded_through);
             id
         }
     };
@@ -781,8 +796,9 @@ pub(super) fn adopt_moved(
     Ok(id)
 }
 
-/// The adopted tab's provider starts reading and answering, and the lease names this process.
-fn commit_adopted(state: &mut AgentPanelState, id: TabId) {
+/// The adopted tab's provider starts reading and answering, the lease names this process, and the session is asked
+/// which of its editor calls are open.
+fn commit_adopted(state: &mut AgentPanelState, id: TabId, folded_through: u64) {
     let Some(backend) = state.tabs.get_mut(id).and_then(Tab::live_mut) else {
         return;
     };
@@ -797,13 +813,17 @@ fn commit_adopted(state: &mut AgentPanelState, id: TabId) {
             id.0
         );
     }
+    editor_glue::tab_arrived(state, id, folded_through);
 }
 
 // The tests drive the providers' own movers and their stand-ins, which exist only where providers move.
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::agent_panel::editor_glue::tests::bridged::{serve, Peer};
+    use crate::agent_panel::editor_glue::tests::state_reply;
     use crate::agent_panel::tests::*;
+    use eitri_core::editor_tools::testing::FakeEditor;
     use eitri_core::test_providers::{adopt_moving, MovingProvider};
     use std::sync::Arc;
 
@@ -835,8 +855,18 @@ mod tests {
     /// The window's active tab, given a live Claude conversation over a moving double, its session opened and
     /// one turn finished, the tab set pumped until it shows.
     fn moving_tab(w: &Window, dir: &Path) -> (TabId, Arc<MovingProvider>) {
-        let provider = MovingProvider::new(RecordingProvider::default(), true);
-        let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
+        session_tab(w, dir, RecordingProvider::default(), None)
+    }
+
+    fn session_tab(
+        w: &Window,
+        dir: &Path,
+        provider: RecordingProvider,
+        tools: Option<agent::ClientToolSet>,
+    ) -> (TabId, Arc<MovingProvider>) {
+        let provider = MovingProvider::new(provider, true);
+        let conversation =
+            agent::AgentConversation::create_with_tools(provider.clone(), dir, ProjectTrust::Untrusted, tools).unwrap();
         let tab = {
             let mut state = w.handle.state.borrow_mut();
             let tab = state.tabs.active();
@@ -945,6 +975,17 @@ mod tests {
         let request = export_asked(&src.page, tab).expect("the page is asked for its view of the tab");
         answer_export(src, request, page_view());
         let (record, fds) = frozen(src, 1);
+        land(src, dst, tab, record, fds)
+    }
+
+    /// The second half of [`move_tab`], for a test that froze the tab itself.
+    fn land(
+        src: &Window,
+        dst: &Window,
+        tab: TabId,
+        record: serde_json::Value,
+        fds: Vec<OwnedFd>,
+    ) -> (TabId, serde_json::Value) {
         dst.handle.hold_presence(SESSION, 1);
         assert!(
             dst.heard
@@ -961,6 +1002,24 @@ mod tests {
             .forget_moved(ViewId::BASE, Some(tab))
             .expect("the source lets it go");
         (arrived, record)
+    }
+
+    #[test]
+    fn a_moved_tab_keeps_following() {
+        for following in [false, true] {
+            let (src, dst) = (window(), window());
+            let tab = src.handle.state.borrow().tabs.active();
+            src.handle.state.borrow_mut().tabs.get_mut(tab).unwrap().following = following;
+            dst.handle.set_editor_follow(!following);
+            let (arrived, _) = move_tab(&src, &dst, tab);
+            assert_eq!(
+                dst.handle.state.borrow().tabs.get(arrived).unwrap().following,
+                following
+            );
+            let state = dst.handle.state.borrow();
+            let payload: serde_json::Value = serde_json::from_str(&state.tabs.tabs_payload()).unwrap();
+            assert_eq!(payload["tabs"][0].get("following").is_some(), following);
+        }
     }
 
     #[test]
@@ -1307,5 +1366,667 @@ mod tests {
             "a view with no tab moves nothing"
         );
         drop(provider);
+    }
+
+    const STATE_TOOL: &str = "editor_state";
+    const OPEN_TOOL: &str = "open_file";
+
+    fn declared_tools() -> agent::ClientToolSet {
+        let declared = |name: &str| agent::ClientToolDecl {
+            name: name.into(),
+            description: "reads the editor".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+            always_load: true,
+        };
+        agent::ClientToolSet {
+            server_name: eitri_core::editor_tools::SERVER_NAME.into(),
+            timeout_ms: eitri_core::editor_tools::CALL_TIMEOUT_MS,
+            tools: vec![declared(STATE_TOOL), declared(OPEN_TOOL)],
+        }
+    }
+
+    /// A pair of windows with an editor each, and in the source a chat given the editor tools, in the middle of a turn.
+    struct Pair {
+        src: Window,
+        dst: Window,
+        src_editor: Rc<FakeEditor>,
+        dst_editor: Rc<FakeEditor>,
+        provider: Arc<MovingProvider>,
+        tab: TabId,
+        /// A file outside the project: a call for it raises a card.
+        outside: PathBuf,
+    }
+
+    fn window_with_editor(dir: &Path) -> (Window, Rc<FakeEditor>) {
+        let w = window();
+        let editor = Rc::new(FakeEditor::default());
+        w.handle.set_editor_rpc(editor.clone());
+        w.handle.state.borrow_mut().project_dir = dir.to_path_buf();
+        (w, editor)
+    }
+
+    fn pair(label: &str) -> Pair {
+        let dir = workspace(label);
+        let (src, src_editor) = window_with_editor(&dir);
+        let (dst, dst_editor) = window_with_editor(&dir);
+        let provider = RecordingProvider::client_tooling();
+        let (tab, provider) = session_tab(&src, &dir, provider, Some(declared_tools()));
+        stream(&provider.inner, "t2", "working");
+        tick_handle_until(&src.handle, "the second turn", || {
+            src.handle.state.borrow().tabs.get(tab).is_some_and(Tab::turn_running)
+        });
+        let outside = workspace(&format!("{label}-outside")).join("notes.txt");
+        std::fs::write(&outside, "notes\n").unwrap();
+        Pair {
+            src,
+            dst,
+            src_editor,
+            dst_editor,
+            provider,
+            tab,
+            outside,
+        }
+    }
+
+    fn call_at(id: &str, sequence: u64, tool: &str, arguments: String) -> agent::AgentDomainEvent {
+        agent::AgentDomainEvent::ClientToolCall {
+            call_id: id.into(),
+            tool_use_id: Some(format!("toolu-{id}")),
+            tool: tool.into(),
+            arguments_json: arguments,
+            sequence,
+        }
+    }
+
+    fn state_call_at(id: &str, sequence: u64) -> agent::AgentDomainEvent {
+        call_at(id, sequence, STATE_TOOL, "{}".into())
+    }
+
+    fn open_refs(ids: &[&str]) -> Vec<agent::ClientCallRef> {
+        ids.iter()
+            .map(|id| agent::ClientCallRef {
+                call_id: (*id).into(),
+                tool_use_id: None,
+                tool: STATE_TOOL.into(),
+            })
+            .collect()
+    }
+
+    /// The call ids that reached the agent, in order.
+    fn answered(provider: &MovingProvider) -> Vec<String> {
+        provider.inner.client_answers().into_iter().map(|a| a.call_id).collect()
+    }
+
+    fn assert_told_to_try_again(answer: &agent::ClientToolAnswer) {
+        assert!(answer.is_error, "{answer:?}");
+        assert_eq!(answer.text, [eitri_core::editor_tools::words::MOVED]);
+    }
+
+    fn open_in(w: &Window, tab: TabId) -> Vec<String> {
+        let state = w.handle.state.borrow();
+        let backend = state.tabs.get(tab).and_then(Tab::live).expect("a live tab");
+        let open = backend.open_client_calls();
+        open.into_iter().map(|call| call.call_id).collect()
+    }
+
+    fn reads(w: &Window) -> usize {
+        w.handle.state.borrow().client_call_reads.len()
+    }
+
+    fn read_done(w: &Window) {
+        tick_handle_until(&w.handle, "the read of the open calls", || reads(w) == 0);
+    }
+
+    fn settle(w: &Window) {
+        for _ in 0..4 {
+            w.handle.tick();
+        }
+    }
+
+    /// A call for the file outside the project, as far as its card: returns the card's id.
+    fn raise_a_card(pair: &Pair, id: &str, sequence: u64) -> String {
+        let arguments = serde_json::json!({ "path": pair.outside }).to_string();
+        pair.provider.inner.queue(call_at(id, sequence, OPEN_TOOL, arguments));
+        let cards = || pair.src.handle.state.borrow().editor_tools.cards(pair.tab);
+        tick_handle_until(&pair.src.handle, "the card", || !cards().is_empty());
+        cards()[0].id.clone()
+    }
+
+    /// Waits, ticking nothing, until `id` has folded and the ingest has put its batch down: the next freeze is taken
+    /// at once, and it is that freeze's last pump that finds the call.
+    fn wait_for_the_fold(w: &Window, tab: TabId, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let folded = open_in(w, tab).iter().any(|call| call == id);
+            let mut state = w.handle.state.borrow_mut();
+            let backend = state.tabs.get_mut(tab).and_then(Tab::live_mut).expect("a live tab");
+            if folded && backend.freeze_folding().is_ok() {
+                backend.unfreeze_folding();
+                return;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "{id} never folded");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Freezes the tab for move 1 with no tick in between, so no ordinary pump can reach what the last pump finds. A
+    /// freeze asked again is asked here, not on a tick.
+    fn freeze_with_no_tick(w: &Window, tab: TabId) -> (serde_json::Value, Vec<OwnedFd>) {
+        w.handle.freeze_for_move(ViewId::BASE, Some(tab), 1);
+        answer_export(w, export_asked(&w.page, tab).unwrap(), page_view());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.heard.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "the freeze never answered");
+            w.handle.run(poll_chat_moves);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        frozen(w, 1)
+    }
+
+    /// A pair whose tab has a bridge socket, and the bridge connected to it.
+    fn bridged_pair(label: &str) -> (Pair, agent::EditorServerSpec, Peer) {
+        let pair = pair(label);
+        let dir = pair.src.handle.state.borrow().project_dir.clone();
+        let server = serve(&pair.src.handle, pair.tab, &dir);
+        let (peer, _) = Peer::connect(&server);
+        (pair, server, peer)
+    }
+
+    fn freeze_for_move_one(pair: &Pair) -> (serde_json::Value, Vec<OwnedFd>) {
+        pair.src.handle.freeze_for_move(ViewId::BASE, Some(pair.tab), 1);
+        answer_export(&pair.src, export_asked(&pair.src.page, pair.tab).unwrap(), page_view());
+        frozen(&pair.src, 1)
+    }
+
+    fn nothing_open(pair: &Pair) {
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 3,
+            open: Vec::new(),
+        });
+    }
+
+    /// The agent's tool server stays where it is and was told one path and one key, so both hold in the other window.
+    #[test]
+    fn a_moved_tab_keeps_its_socket_name_and_key() {
+        let (pair, server, mut peer) = bridged_pair("move-bridge-name");
+        nothing_open(&pair);
+        let (arrived, record) = move_tab(&pair.src, &pair.dst, pair.tab);
+        assert!(peer.is_ended(), "the source let the socket go");
+        let bridge = &record["panel"]["editor_bridge"];
+        assert_eq!(bridge["name"]["key"], server.args[1].as_str());
+        assert!(server.args[0].contains(bridge["name"]["hex"].as_str().unwrap()));
+
+        let (mut moved, _) = Peer::connect(&server);
+        moved.call(1, STATE_TOOL, serde_json::json!({}));
+        tick_handle_until(&pair.dst.handle, "the call to reach the destination's editor", || {
+            pair.dst_editor.asked().len() == 1
+        });
+        pair.dst_editor.answer_oldest(&state_reply());
+        tick_handle_until(&pair.dst.handle, "the broker to finish", || {
+            pair.dst.handle.state.borrow().editor_tools.is_idle()
+        });
+        assert!(matches!(
+            moved.hear(),
+            eitri_core::editor_tools::bridge_wire::Message::Result {
+                id: 1,
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(pair.src.handle.state.borrow().editor_bridge_tabs.is_empty());
+        assert!(pair.dst.handle.state.borrow().editor_bridge_tabs.contains_key(&arrived));
+    }
+
+    /// The list is the session's: the other window's switches say what a session started there gets.
+    #[test]
+    fn a_moved_tab_keeps_what_it_was_declared() {
+        let (pair, server, _peer) = bridged_pair("move-bridge-declared");
+        nothing_open(&pair);
+        let given = pair.src.handle.state.borrow().editor_bridge_tabs[&pair.tab]
+            .tools
+            .clone();
+        assert!(!given.is_empty());
+        pair.dst.handle.state.borrow_mut().editor_switches =
+            eitri_core::editor_tools::switches::Switches::parse(Some("off"), &[]).unwrap();
+
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        let declared = pair.dst.handle.state.borrow().tabs.editor_declared(arrived).cloned();
+        assert_eq!(declared, Some(given.iter().cloned().collect()));
+        let (_moved, served) = Peer::connect(&server);
+        assert_eq!(served, given);
+    }
+
+    #[test]
+    fn a_bridge_call_open_across_a_move_is_answered_once() {
+        let (pair, _server, mut peer) = bridged_pair("move-bridge-call");
+        peer.call(1, STATE_TOOL, serde_json::json!({}));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+        nothing_open(&pair);
+
+        move_tab(&pair.src, &pair.dst, pair.tab);
+        pair.src_editor.answer_oldest(&state_reply());
+        settle(&pair.src);
+        settle(&pair.dst);
+
+        let eitri_core::editor_tools::bridge_wire::Message::Result { id, text, is_error } = peer.hear() else {
+            panic!("a result")
+        };
+        assert_eq!(id, 1);
+        assert!(is_error);
+        assert_eq!(text, eitri_core::editor_tools::words::MOVED);
+        assert!(peer.is_ended(), "and nothing after it");
+        assert!(
+            pair.dst_editor.asked().is_empty(),
+            "a call answered there does not run here"
+        );
+    }
+
+    #[test]
+    fn a_move_called_off_binds_again() {
+        let (pair, server, mut peer) = bridged_pair("move-bridge-off");
+        let _sent = freeze_for_move_one(&pair);
+        assert!(peer.is_ended());
+        assert!(
+            std::os::unix::net::UnixStream::connect(&server.args[0]).is_err(),
+            "the name is free for the other window"
+        );
+
+        pair.src.handle.resume_moved(ViewId::BASE, None);
+        let (mut again, _) = Peer::connect(&server);
+        again.call(1, STATE_TOOL, serde_json::json!({}));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+    }
+
+    /// The session stays here, and the server it runs has nowhere else to go.
+    #[test]
+    fn a_refused_provider_freeze_keeps_the_socket() {
+        let (pair, server, mut peer) = bridged_pair("move-bridge-refused");
+        pair.provider
+            .refuse_freezes(Some("a message sent into the turn has not been read yet"));
+        pair.src.handle.freeze_for_move(ViewId::BASE, Some(pair.tab), 1);
+        answer_export(&pair.src, export_asked(&pair.src.page, pair.tab).unwrap(), page_view());
+        heard_back(&pair.src);
+        assert!(!pair.src.handle.state.borrow().tabs.is_moving(pair.tab));
+
+        peer.call(1, STATE_TOOL, serde_json::json!({}));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+        pair.src_editor.answer_oldest(&state_reply());
+        tick_handle_until(&pair.src.handle, "the broker to finish", || {
+            pair.src.handle.state.borrow().editor_tools.is_idle()
+        });
+        assert!(matches!(
+            peer.hear(),
+            eitri_core::editor_tools::bridge_wire::Message::Result {
+                id: 1,
+                is_error: false,
+                ..
+            }
+        ));
+        let (_second, _) = Peer::connect(&server);
+    }
+
+    #[test]
+    fn a_call_open_across_a_move_is_answered_once_by_the_source() {
+        let pair = pair("move-call-source");
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 3,
+            open: Vec::new(),
+        });
+
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        read_done(&pair.dst);
+        pair.src_editor.answer_oldest(&state_reply());
+        settle(&pair.src);
+        settle(&pair.dst);
+
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1"]);
+        assert_told_to_try_again(&answers[0]);
+        assert_eq!(
+            open_in(&pair.dst, arrived),
+            ["c1"],
+            "its settled event has not come yet"
+        );
+        assert!(
+            pair.dst_editor.asked().is_empty(),
+            "a call answered there does not run here"
+        );
+    }
+
+    #[test]
+    fn a_card_goes_with_the_freeze() {
+        let pair = pair("move-card-goes");
+        let card = raise_a_card(&pair, "c1", 3);
+        assert!(pair.provider.inner.client_answers().is_empty());
+
+        let _sent = {
+            pair.src.handle.freeze_for_move(ViewId::BASE, Some(pair.tab), 1);
+            answer_export(&pair.src, export_asked(&pair.src.page, pair.tab).unwrap(), page_view());
+            frozen(&pair.src, 1)
+        };
+
+        let state = pair.src.handle.state.borrow();
+        assert!(
+            state.editor_tools.cards(pair.tab).is_empty(),
+            "the broker holds it no more"
+        );
+        assert!(state.editor_tools.is_idle());
+        assert_eq!(state.tabs.get(pair.tab).unwrap().attention.attention().pending, 0);
+        drop(state);
+        let newest = pair
+            .src
+            .page
+            .sent
+            .borrow()
+            .iter()
+            .rev()
+            .map(|envelope| json_of(envelope))
+            .find(|value| value["kind"] == "editor_cards" && value["tab"] == pair.tab.0)
+            .expect("the page is told");
+        assert_eq!(newest["cards"], serde_json::json!([]));
+
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1"]);
+        assert_told_to_try_again(&answers[0]);
+        let late = serde_json::json!({
+            "type": "editor_card_answer", "request_id": "card-1", "tab": pair.tab.0, "card_id": card,
+            "decision": "allow", "origin": "key",
+        });
+        pair.src.handle.page_message(ViewId::BASE, &late.to_string());
+        settle(&pair.src);
+        assert!(pair.src_editor.asked().is_empty(), "a key on its way meets no card");
+    }
+
+    #[test]
+    fn the_destination_has_no_card_and_is_not_blocked() {
+        let pair = pair("move-no-card");
+        raise_a_card(&pair, "c1", 3);
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 3,
+            open: Vec::new(),
+        });
+        clear(&[&pair.dst.page]);
+
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        read_done(&pair.dst);
+
+        let snapshot = pair
+            .dst
+            .page
+            .sent
+            .borrow()
+            .iter()
+            .rev()
+            .map(|envelope| json_of(envelope))
+            .find(|value| value["kind"] == "snapshot" && value["tab"] == arrived.0)
+            .expect("a snapshot of the arrived tab");
+        assert!(snapshot["state"].get("editorCards").is_none(), "{snapshot}");
+        let state = pair.dst.handle.state.borrow();
+        assert_eq!(state.tabs.get(arrived).unwrap().attention.attention().pending, 0);
+        assert!(state.editor_tools.cards(arrived).is_empty());
+        drop(state);
+
+        pair.provider.inner.queue(state_call_at("c2", 4));
+        tick_handle_until(&pair.dst.handle, "the next call to run", || {
+            pair.dst_editor.asked().len() == 1
+        });
+    }
+
+    /// The events behind a read reach the window after it, so a call the read counted can fold after the release.
+    #[test]
+    fn the_destination_answers_what_is_still_open_and_runs_nothing_at_or_below_the_snapshot() {
+        let pair = pair("move-snapshot");
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 6,
+            open: open_refs(&["c1", "c2"]),
+        });
+
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        read_done(&pair.dst);
+
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1", "c2"]);
+        answers.iter().for_each(assert_told_to_try_again);
+
+        pair.provider.inner.queue_all(vec![
+            state_call_at("c1", 4),
+            state_call_at("c2", 5),
+            state_call_at("settled-since", 6),
+        ]);
+        tick_handle_until(&pair.dst.handle, "the calls behind the read", || {
+            open_in(&pair.dst, arrived).len() == 3
+        });
+        settle(&pair.dst);
+        assert!(
+            pair.dst_editor.asked().is_empty(),
+            "nothing at or below the snapshot runs"
+        );
+        assert!(pair.dst.handle.state.borrow().editor_tools.is_idle());
+        assert_eq!(pair.provider.inner.client_answers().len(), 2, "each told once");
+    }
+
+    /// A call that folds during the hold raises no wake once the hold ends, so the release itself has to report it.
+    #[test]
+    fn a_call_after_the_snapshot_runs_at_the_destination() {
+        let pair = pair("move-after-snapshot");
+        pair.provider.inner.hold_client_reads(true);
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 3,
+            open: Vec::new(),
+        });
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        assert_eq!(reads(&pair.dst), 1);
+
+        pair.provider.inner.queue(state_call_at("c2", 4));
+        tick_handle_until(&pair.dst.handle, "the call to fold", || {
+            open_in(&pair.dst, arrived) == ["c2"]
+        });
+        settle(&pair.dst);
+        assert!(pair.dst_editor.asked().is_empty(), "held until the session has said");
+
+        pair.provider.inner.reply_to_held_client_reads();
+        pair.dst.handle.tick();
+        assert_eq!(
+            pair.dst_editor.asked(),
+            [eitri_core::editor_tools::tools::editor_state::EDITOR_STATE_LUA]
+        );
+        pair.dst_editor.answer_oldest(&state_reply());
+        tick_handle_until(&pair.dst.handle, "the answer", || {
+            !pair.provider.inner.client_answers().is_empty()
+        });
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c2"]);
+        assert!(!answers[0].is_error, "{:?}", answers[0].text);
+    }
+
+    #[test]
+    fn a_failed_read_runs_nothing_at_or_below_folded_through_and_runs_later_calls() {
+        let pair = pair("move-failed-read");
+        pair.provider.report_position(3);
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+
+        let (arrived, record) = move_tab(&pair.src, &pair.dst, pair.tab);
+        assert_eq!(record["chat"]["core"]["folded_through"], 3);
+        read_done(&pair.dst);
+        assert_eq!(answered(&pair.provider), ["c1"], "told once, by the source");
+
+        pair.provider
+            .inner
+            .queue_all(vec![state_call_at("behind", 2), state_call_at("c2", 4)]);
+        tick_handle_until(&pair.dst.handle, "the later call to run", || {
+            pair.dst_editor.asked().len() == 1
+        });
+        assert!(open_in(&pair.dst, arrived).contains(&"behind".to_string()));
+        settle(&pair.dst);
+        assert_eq!(pair.dst_editor.asked().len(), 1, "only the later call ran");
+    }
+
+    /// A read can fail with the session alive, and then no second window asks: a call the broker never heard of has
+    /// its one answer from the window that found it, or none until the agent's tool timeout.
+    #[test]
+    fn a_failed_read_leaves_no_call_of_the_last_pump_waiting() {
+        let pair = pair("move-failed-read-last-pump");
+        pair.provider.report_position(3);
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        wait_for_the_fold(&pair.src, pair.tab, "c1");
+
+        let (record, fds) = freeze_with_no_tick(&pair.src, pair.tab);
+        land(&pair.src, &pair.dst, pair.tab, record, fds);
+        read_done(&pair.dst);
+        settle(&pair.dst);
+
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1"]);
+        assert_told_to_try_again(&answers[0]);
+        assert!(pair.dst_editor.asked().is_empty());
+    }
+
+    /// A window that holds a tab's calls has reported none of them, so nothing but its leaving can answer one that
+    /// folded during the hold when the next window's read fails.
+    #[test]
+    fn a_tab_that_leaves_during_its_read_tells_the_calls_it_held() {
+        let pair = pair("move-held-read");
+        pair.provider.inner.hold_client_reads(true);
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        pair.provider.report_position(3);
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        tick_handle_until(&pair.dst.handle, "the call to fold during the hold", || {
+            open_in(&pair.dst, arrived).contains(&"c1".to_string())
+        });
+        assert!(
+            pair.provider.inner.client_answers().is_empty(),
+            "the read is waited for"
+        );
+
+        pair.provider.inner.hold_client_reads(false);
+        move_tab(&pair.dst, &pair.src, arrived);
+        read_done(&pair.src);
+
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1"]);
+        assert_told_to_try_again(&answers[0]);
+        assert!(pair.dst_editor.asked().is_empty());
+        assert!(pair.src_editor.asked().is_empty());
+    }
+
+    #[test]
+    fn a_call_opened_by_the_last_pump_is_not_run_by_the_source() {
+        let pair = pair("move-last-pump");
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        wait_for_the_fold(&pair.src, pair.tab, "c1");
+        pair.provider.inner.serve_client_state(agent::ClientToolCallState {
+            through_sequence: 3,
+            open: Vec::new(),
+        });
+
+        let (record, fds) = freeze_with_no_tick(&pair.src, pair.tab);
+        settle(&pair.src);
+        assert!(pair.src_editor.asked().is_empty());
+        assert!(pair.src.handle.state.borrow().editor_tools.is_idle());
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(
+            answered(&pair.provider),
+            ["c1"],
+            "the source answers what it found last"
+        );
+        assert_told_to_try_again(&answers[0]);
+
+        land(&pair.src, &pair.dst, pair.tab, record, fds);
+        read_done(&pair.dst);
+        settle(&pair.dst);
+        assert_eq!(answered(&pair.provider), ["c1"], "told once");
+        assert!(pair.dst_editor.asked().is_empty());
+    }
+
+    /// The call the broker held was told to try again and stays told. The one the last pump found was told nothing,
+    /// so it runs, and later calls run as ever.
+    #[test]
+    fn a_move_called_off_loses_nothing_but_the_open_calls() {
+        let pair = pair("move-called-off");
+        pair.provider.inner.queue(state_call_at("c1", 3));
+        tick_handle_until(&pair.src.handle, "the call to reach the editor", || {
+            pair.src_editor.asked().len() == 1
+        });
+        pair.provider.inner.queue(state_call_at("c2", 4));
+        wait_for_the_fold(&pair.src, pair.tab, "c2");
+
+        let _sent = freeze_with_no_tick(&pair.src, pair.tab);
+        pair.src.handle.resume_moved(ViewId::BASE, None);
+        assert_eq!(pair.provider.steps().last(), Some(&"resume"));
+
+        pair.src_editor.answer_oldest(&state_reply());
+        settle(&pair.src);
+        let answers = pair.provider.inner.client_answers();
+        assert_eq!(answered(&pair.provider), ["c1", "c2"], "each answered once");
+        answers.iter().for_each(assert_told_to_try_again);
+        assert_eq!(
+            pair.src_editor.asked().len(),
+            1,
+            "a call told to try again does not run"
+        );
+
+        pair.provider.inner.queue(state_call_at("c3", 5));
+        tick_handle_until(&pair.src.handle, "a later call", || pair.src_editor.asked().len() == 2);
+        let state = pair.src.handle.state.borrow();
+        assert!(
+            state.tabs.get(pair.tab).is_some_and(Tab::turn_running),
+            "the turn went on"
+        );
+    }
+
+    /// A closed session leaves a read that nothing will ever answer, and the steady tick must not wait for it.
+    #[test]
+    fn a_closed_session_ends_the_wait() {
+        let pair = pair("move-closed");
+        pair.provider.inner.hold_client_reads(true);
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        assert_eq!(reads(&pair.dst), 1);
+        settle(&pair.dst);
+        assert_eq!(reads(&pair.dst), 1, "the read is waited for");
+        assert!(crate::agent_panel::tick::needs_polling(&pair.dst.handle.state.borrow()));
+
+        pair.provider.inner.drop_held_client_reads();
+        read_done(&pair.dst);
+        assert_eq!(pair.dst.handle.state.borrow().tabs.held_client_calls(arrived), None);
+    }
+
+    #[test]
+    fn a_tab_that_goes_during_the_read_ends_the_wait() {
+        let pair = pair("move-tab-gone");
+        pair.provider.inner.hold_client_reads(true);
+        let (arrived, _) = move_tab(&pair.src, &pair.dst, pair.tab);
+        {
+            let mut state = pair.dst.handle.state.borrow_mut();
+            let state = &mut *state;
+            let removed = state.tabs.remove(arrived).expect("the tab was there");
+            let _owed = state.retiring.tab(removed);
+        }
+        read_done(&pair.dst);
+        pair.provider.inner.drop_held_client_reads();
+    }
+
+    /// The read is one RPC more on a commit, and an older sidecar has no such call.
+    #[test]
+    fn a_sidecar_with_no_client_tools_is_neither_read_nor_held() {
+        let dir = workspace("move-no-tools");
+        let (src, dst) = (window(), window());
+        let (tab, _provider) = moving_tab(&src, &dir);
+        let (arrived, _) = move_tab(&src, &dst, tab);
+        assert_eq!(reads(&dst), 0);
+        assert_eq!(dst.handle.state.borrow().tabs.held_client_calls(arrived), None);
     }
 }

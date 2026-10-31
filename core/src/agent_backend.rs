@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::agent_bridge::SessionModeChoice;
+use crate::editor_tools::SERVER_NAME;
 
 fn task_command_error(error: ConversationError) -> BackendError {
     match error {
@@ -70,6 +71,7 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     session_notices: false,
     conversation_reset: false,
     structured_questions_v1: false,
+    client_tools: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -551,6 +553,11 @@ pub enum AgentBackend {
 }
 
 impl AgentBackend {
+    /// The files named by one successful changing call, read while holding only the projection's guard.
+    pub fn edited_by(&self, tool_use_id: &str) -> Vec<PathBuf> {
+        crate::editor_tools::follow::edited_by(&self.projection().tool_calls, tool_use_id)
+    }
+
     /// Constructs the selected backend. **Blocking, and for the sidecar path potentially for
     /// minutes** (a cold Verdandi checkout runs `npm ci` and `npm run build`), so callers must run
     /// this off the GTK main thread -- see `agent_panel`'s connect worker.
@@ -574,18 +581,22 @@ impl AgentBackend {
         resume: Option<&str>,
         project: ProjectTrust,
     ) -> Result<Self, BackendError> {
-        Self::start_holding(kind, project_dir, resume, None, project)
+        Self::start_holding(kind, project_dir, resume, None, project, None)
     }
 
     /// [`start`](Self::start) for a resume whose session lease the caller already holds
     /// (`AgentConversation::resume_holding`): the lease goes to the conversation, and is released
     /// with it or with a failed start. Ignored when nothing is being resumed.
+    ///
+    /// `client_tools` is what this host answers itself, stated for every session of the sidecar; the
+    /// legacy backend has no way to carry it.
     pub fn start_holding(
         kind: BackendKind,
         project_dir: &Path,
         resume: Option<&str>,
         lease: Option<agent::lease::SessionLease>,
         project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
     ) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Legacy => {
@@ -609,24 +620,30 @@ impl AgentBackend {
                     BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}"))
                 })?;
                 match resume {
-                    Some(provider_session_id) => AgentConversation::resume_holding(
+                    Some(provider_session_id) => AgentConversation::resume_with_tools(
                         std::sync::Arc::new(provider),
                         project_dir,
                         provider_session_id,
                         lease,
                         project,
+                        client_tools,
                     )
                     .map(|c| AgentBackend::Conversation {
                         agent: AgentId::Claude,
                         conversation: Box::new(c),
                     })
                     .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}"))),
-                    None => AgentConversation::create(std::sync::Arc::new(provider), project_dir, project)
-                        .map(|c| AgentBackend::Conversation {
-                            agent: AgentId::Claude,
-                            conversation: Box::new(c),
-                        })
-                        .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
+                    None => AgentConversation::create_with_tools(
+                        std::sync::Arc::new(provider),
+                        project_dir,
+                        project,
+                        client_tools,
+                    )
+                    .map(|c| AgentBackend::Conversation {
+                        agent: AgentId::Claude,
+                        conversation: Box::new(c),
+                    })
+                    .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
                 }
             }
         }
@@ -642,7 +659,8 @@ impl AgentBackend {
     /// the same trust gate as a Claude start, so nothing here decides what the project may load.
     ///
     /// `launch` is what starts the agent's child: the located `codex`, or a registered ACP agent's
-    /// command. One that does not belong to `agent` is refused.
+    /// command. One that does not belong to `agent` is refused. `editor_server` is the tool server the
+    /// session is to run, when it was given tools.
     pub fn start_external(
         agent: AgentId,
         launch: ExternalLaunch,
@@ -650,6 +668,7 @@ impl AgentBackend {
         plan: TrustPlan,
         mode: SessionModeChoice,
         resume: Option<&str>,
+        editor_server: Option<agent::EditorServerSpec>,
     ) -> Result<Self, BackendError> {
         let canonical = project_dir
             .canonicalize()
@@ -687,13 +706,11 @@ impl AgentBackend {
                 )))
             }
         };
-        Self::start_external_with(agent, provider, project_dir, plan, mode, resume)
+        Self::start_external_serving(agent, provider, project_dir, plan, mode, resume, editor_server)
     }
 
-    /// [`start_external`](Self::start_external) over a provider the caller already has: what it does
-    /// once its provider is connected, and the way a test drives an external tab without a child.
-    /// `project_dir` is the window's root as the window holds it, not what it resolves to: the judgement
-    /// of the root reads the difference.
+    /// [`start_external`](Self::start_external) over a provider the caller already has, with no tool
+    /// server: the way a test drives an external tab without a child.
     pub fn start_external_with(
         agent: AgentId,
         provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync>,
@@ -701,6 +718,21 @@ impl AgentBackend {
         plan: TrustPlan,
         mode: SessionModeChoice,
         resume: Option<&str>,
+    ) -> Result<Self, BackendError> {
+        Self::start_external_serving(agent, provider, project_dir, plan, mode, resume, None)
+    }
+
+    /// What [`start_external`](Self::start_external) does once its provider is connected.
+    /// `project_dir` is the window's root as the window holds it, not what it resolves to: the judgement
+    /// of the root reads the difference.
+    pub fn start_external_serving(
+        agent: AgentId,
+        provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync>,
+        project_dir: &Path,
+        plan: TrustPlan,
+        mode: SessionModeChoice,
+        resume: Option<&str>,
+        editor_server: Option<agent::EditorServerSpec>,
     ) -> Result<Self, BackendError> {
         let canonical = project_dir
             .canonicalize()
@@ -710,6 +742,7 @@ impl AgentBackend {
             plan,
             policy: turn_policy(mode, root_is_a_boundary(project_dir)),
             resume: resume.map(str::to_string),
+            editor_server,
         };
         let conversation = match resume {
             Some(id) => {
@@ -1066,6 +1099,15 @@ impl AgentBackend {
         }
     }
 
+    /// What the tab should say about editor tools its session was given and the agent's provider left out,
+    /// handed over once (`AgentConversation::editor_note`).
+    pub fn editor_note(&self) -> Option<String> {
+        match self {
+            AgentBackend::Legacy(_) => None,
+            AgentBackend::Conversation { conversation, .. } => conversation.editor_note(),
+        }
+    }
+
     /// Whether the agent stopped this session itself with the conversation whole, so `r` on the ended tab
     /// continues it (`AgentConversation::stopped_resumable`). Only an external agent's can be.
     pub fn stopped_resumable(&self) -> bool {
@@ -1116,6 +1158,77 @@ impl AgentBackend {
             } => conversation.task_output(task_id).map_err(task_command_error),
             _ => Err(BackendError {
                 message: "this agent cannot read task output".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    /// The calls of declared tools still waiting for an answer, oldest first. Read here rather than
+    /// from delivered events, which a resync can lose. Its own statement: on the sidecar `projection()`
+    /// holds the ingestion mutex, so the guard must be gone before a caller answers one of these.
+    pub fn open_client_calls(&self) -> Vec<agent::OpenClientCall> {
+        let mut open: Vec<_> = self.projection().open_client_calls.values().cloned().collect();
+        open.sort_by_key(|call| call.sequence);
+        open
+    }
+
+    /// The tools this session was given; none on the legacy backend and on an external agent, whose
+    /// tools reach it some other way.
+    pub fn declared_client_tools(&self) -> &std::collections::BTreeSet<String> {
+        static NONE: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.declared_client_tools(),
+            _ => &NONE,
+        }
+    }
+
+    /// Whether this session was given tools and the CLI's latest report names a server of the same name
+    /// that fails [`agent::AgentSessionProjection::single_sdk_server`]: the session's calls under that
+    /// name are then no different from any other MCP tool's. Its own statement, for the reason
+    /// [`Self::open_client_calls`] gives.
+    pub fn foreign_tool_server(&self) -> bool {
+        if self.declared_client_tools().is_empty() {
+            return false;
+        }
+        let projection = self.projection();
+        projection.init_servers.iter().any(|server| server.name == SERVER_NAME)
+            && !projection.single_sdk_server(SERVER_NAME)
+    }
+
+    /// Answers one call of a declared tool. Never waits on the agent, so the GTK thread may call it. An
+    /// answer to a call that has settled is no error.
+    pub fn answer_client_tool_call(
+        &self,
+        call_id: &str,
+        text: Vec<String>,
+        is_error: bool,
+    ) -> Result<(), BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation
+                .answer_client_tool_call(call_id, text, is_error)
+                .map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot take a client tool answer".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    /// Reads the session's open calls from the provider. The receiver carries the outcome.
+    pub fn client_tool_call_state(&self) -> Result<agent::TaskReply<agent::ClientToolCallState>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.client_tool_call_state().map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent has no client tool calls".into(),
                 benign: true,
             }),
         }
@@ -1297,8 +1410,8 @@ impl AgentBackend {
     /// events payload whatever the last snapshot already carried ([`Self::note_ui_snapshot`]); a
     /// caller that sends none drops them with `RevisedDelivery::without_revisions`. Both backends tag
     /// an event with the projection's `last_revision` right after its own fold, so the tags compare
-    /// directly with a snapshot's. An event answered here without a card is dropped with its tag; the
-    /// others keep theirs, in order.
+    /// directly with a snapshot's. An event answered here without a card, and one only the host reads,
+    /// is dropped with its tag; the others keep theirs, in order.
     pub fn take_revised_ui_delivery(
         &mut self,
         project_root: &Path,
@@ -1471,6 +1584,17 @@ impl AgentBackend {
     /// The CLI's own prompts are answered as in `Auto`, and an external agent's requests are all
     /// cards, as in `Auto`. It is never more permissive than `Auto` on any request.
     ///
+    /// **The session's own declared tools are answered `allow` here, in every mode**, ahead of the
+    /// bypass answer, the deferral and both classifiers: the call then reaches the editor broker, which
+    /// judges it by a table of its own and raises its own card where that table says so. The hook's
+    /// answer is the same in `Auto` and `Manual`, so `Manual` stays no more permissive than `Auto`, and
+    /// the read tools cost no call to the CLI's classifier. It holds only for the exact declared name,
+    /// and only while the CLI's latest report lists one server of that name, in process, read again for
+    /// each request as the tripwire is. A same-named project or `--mcp-config` server shows as that one
+    /// entry with its own source while its tools run beside the host's, and a server named
+    /// `eitri__x` has tools under the same prefix: both are unknown MCP tools. An external agent never
+    /// comes here (its tools reach Eitri some other way), and the CLI's own prompts keep their rules.
+    ///
     /// Each event travels with its fold revision (`take_revised_ui_delivery`), untouched: a kept
     /// event keeps its own, a dropped one takes its with it.
     ///
@@ -1495,6 +1619,16 @@ impl AgentBackend {
         let mut tripped = false;
         let mut kept = Vec::with_capacity(events.len());
         for (revision, event) in events {
+            // The host reads these from the projection, where a resync cannot lose them; no page has
+            // anything to do with one.
+            if matches!(
+                event,
+                AgentDomainEvent::ClientToolCall { .. }
+                    | AgentDomainEvent::ClientToolCallSettled { .. }
+                    | AgentDomainEvent::SessionServers { .. }
+            ) {
+                continue;
+            }
             tripped |= matches!(
                 event,
                 AgentDomainEvent::UngatedCliMode { .. } | AgentDomainEvent::PolicyMismatch { .. }
@@ -1514,9 +1648,13 @@ impl AgentBackend {
             // holds the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK
             // freeze), so the guard is gone before any answer below. Both halves are needed for a
             // deferral: the session asked for the CLI's auto mode, and the CLI says it is running it.
-            let (projection_tripped, cli_reports_auto) = {
+            let (projection_tripped, cli_reports_auto, one_own_server) = {
                 let projection = self.projection();
-                (session_tripped(&projection), projection.cli_runs_auto())
+                (
+                    session_tripped(&projection),
+                    projection.cli_runs_auto(),
+                    projection.single_sdk_server(SERVER_NAME),
+                )
             };
             tripped |= projection_tripped;
             // Only an Auto tab leaves anything to the CLI's classifier: Manual is Eitri's policy
@@ -1536,6 +1674,7 @@ impl AgentBackend {
             if host_answered.contains(permission_id) {
                 continue;
             }
+            let declared = self.declared_client_tools();
             let planned = decide(
                 GateRequest {
                     permission_id,
@@ -1548,6 +1687,7 @@ impl AgentBackend {
                     mode,
                     external: self.agent().is_external(),
                     defers_to_the_cli,
+                    own_tools: (one_own_server && !declared.is_empty()).then_some(declared),
                     rules,
                     project_root,
                     approvals,
@@ -1861,6 +2001,9 @@ struct Judge<'a> {
     /// An Auto tab on a session whose CLI runs its own auto mode, at a root that is a boundary
     /// (`answer_what_needs_no_human`).
     defers_to_the_cli: bool,
+    /// The tools this session declared, while the CLI's latest report lists exactly one server of the
+    /// tool server's name and that one is in process; otherwise nothing here is the session's own.
+    own_tools: Option<&'a BTreeSet<String>>,
     rules: &'a agent::PrefixRules,
     project_root: &'a Path,
     approvals: &'a HumanApprovals,
@@ -1913,6 +2056,20 @@ impl PlannedAnswer {
     }
 }
 
+/// Whether `tool_name` is a tool the session declared, under the tool server's name. The rest of the
+/// name is looked up whole, never matched by prefix: a foreign server called `eitri__x` has tools named
+/// `mcp__eitri__x__<tool>`, and the check on the name `eitri` says nothing about that server.
+fn is_own_tool(tool_name: &str, own_tools: Option<&BTreeSet<String>>) -> bool {
+    let Some(declared) = own_tools else {
+        return false;
+    };
+    tool_name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.strip_prefix(SERVER_NAME))
+        .and_then(|rest| rest.strip_prefix("__"))
+        .is_some_and(|tool| declared.contains(tool))
+}
+
 /// How the host answers one gate request without a card, or `None` when it is a card (the reason
 /// logged here). The rules are `AgentBackend::answer_what_needs_no_human`'s; this only chooses, and
 /// reads whatever must be read before an answer is sent (whether a `Write` creates its file: once
@@ -1922,6 +2079,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         mode,
         external,
         defers_to_the_cli,
+        own_tools,
         rules,
         project_root,
         approvals,
@@ -2004,6 +2162,17 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
                 format!("allow the CLI's own prompt for {tool_name}"),
             )
         });
+    }
+    if is_own_tool(tool_name, own_tools) {
+        // Allowed at this gate so that the broker's table decides, the same in every mode: a card is
+        // the broker's to raise, and neither a classifier here nor the CLI's sees the call.
+        return Some(PlannedAnswer::plain(
+            &request,
+            PermissionDecision::Allow,
+            GateOrigin::GateRequest,
+            format!("left to the editor broker: {tool_name}"),
+            format!("leave {tool_name} to the editor broker"),
+        ));
     }
     if mode == PermissionMode::Bypass {
         return Some(PlannedAnswer {
@@ -4333,6 +4502,133 @@ mod tests {
         backend.shutdown();
     }
 
+    fn one_tool(name: &str) -> agent::ClientToolSet {
+        agent::ClientToolSet {
+            server_name: "eitri".into(),
+            timeout_ms: 900_000,
+            tools: vec![agent::ClientToolDecl {
+                name: name.into(),
+                description: "a tool".into(),
+                input_schema_json: r#"{"type":"object"}"#.into(),
+                always_load: true,
+            }],
+        }
+    }
+
+    fn sidecar_backend_with(provider: std::sync::Arc<RecordingProvider>, dir: &Path) -> AgentBackend {
+        let conversation =
+            AgentConversation::create_with_tools(provider, dir, ProjectTrust::Untrusted, Some(one_tool("open_file")))
+                .unwrap();
+        AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        }
+    }
+
+    /// The destination's gate reads this set to know the session's own tools, so a record that lost it
+    /// would send them to the classifier. The record crosses processes as JSON.
+    #[test]
+    fn the_declared_tools_survive_a_move() {
+        let dir = agent::state_dirs::test_workspace_dir("client-tools-move");
+        let provider = std::sync::Arc::new(RecordingProvider::client_tooling());
+        let mut source = sidecar_backend_with(provider.clone(), &dir);
+        provider.queue(AgentDomainEvent::SessionOpened {
+            session_id: "fake-session".into(),
+            provider_session_id: "claude-client-tools-move".into(),
+            model: "stand-in".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while source.projection().session_id.is_none() {
+            assert!(std::time::Instant::now() < until, "the session never opened");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (core, handoff, backend) = loop {
+            assert!(std::time::Instant::now() < until, "the chat never came to rest");
+            match source.freeze_folding() {
+                Ok(()) => {}
+                Err(agent::HandoffRefused::Folding) => continue,
+                Err(other) => panic!("the freeze was refused: {other}"),
+            }
+            let AgentBackend::Conversation { conversation, .. } = &source else {
+                unreachable!("a sidecar backend");
+            };
+            let _ = conversation.take_ui_delivery();
+            match source.take_frozen() {
+                Ok(frozen) => break frozen,
+                Err(agent::HandoffRefused::Undelivered) => {}
+                Err(other) => panic!("the move was refused: {other}"),
+            }
+        };
+        let over_the_wire = serde_json::to_string(&handoff).unwrap();
+        let handoff: agent::ConversationHandoff = serde_json::from_str(&over_the_wire).unwrap();
+        let adopted = AgentBackend::adopt_moved(
+            core,
+            handoff,
+            backend,
+            agent::MovedProvider {
+                agent: provider,
+                external: None,
+                lease: None,
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = adopted.declared_client_tools().iter().map(String::as_str).collect();
+        assert_eq!(names, ["open_file"]);
+    }
+
+    #[test]
+    fn a_provider_without_client_tools_gives_a_session_none() {
+        let dir = agent::state_dirs::test_workspace_dir("client-tools-unoffered");
+        let provider = std::sync::Arc::new(RecordingProvider::default());
+        let mut backend = sidecar_backend_with(provider, &dir);
+        assert!(backend.declared_client_tools().is_empty());
+        let error = backend.answer_client_tool_call("call", vec![], false).unwrap_err();
+        assert!(error.benign, "an answer to a provider without tools ends nothing");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn the_open_calls_read_comes_in_call_order_and_answers_reach_the_provider() {
+        let dir = agent::state_dirs::test_workspace_dir("client-tools-open");
+        let provider = std::sync::Arc::new(RecordingProvider::client_tooling());
+        let mut backend = sidecar_backend_with(provider.clone(), &dir);
+        for (call_id, sequence) in [("z-first", 1), ("a-second", 2)] {
+            provider.queue(AgentDomainEvent::ClientToolCall {
+                call_id: call_id.into(),
+                tool_use_id: None,
+                tool: "open_file".into(),
+                arguments_json: "{}".into(),
+                sequence,
+            });
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.open_client_calls().len() < 2 {
+            assert!(std::time::Instant::now() < until, "the calls never folded");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let order: Vec<String> = backend.open_client_calls().into_iter().map(|c| c.call_id).collect();
+        assert_eq!(order, ["z-first", "a-second"]);
+
+        backend
+            .answer_client_tool_call("z-first", vec!["done".into()], false)
+            .unwrap();
+        let answers = provider.client_answers();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].call_id, "z-first");
+        assert_eq!(answers[0].session_id, "fake-session");
+        assert_eq!(answers[0].text, ["done"]);
+
+        let state = agent::ClientToolCallState {
+            through_sequence: 9,
+            open: vec![],
+        };
+        provider.serve_client_state(state.clone());
+        let reply = backend.client_tool_call_state().unwrap();
+        assert_eq!(reply.recv().unwrap().unwrap(), state);
+        backend.shutdown();
+    }
+
     #[test]
     fn a_provider_without_the_method_gets_the_benign_wording() {
         let dir = agent::state_dirs::test_workspace_dir("claude-task-control");
@@ -5865,6 +6161,16 @@ mod external_tests {
     }
 
     #[test]
+    fn a_providers_editor_note_reaches_the_backend_once() {
+        let dir = workspace("codex-editor-note");
+        let (provider, backend) = codex_backend(&dir);
+        assert_eq!(backend.editor_note(), None);
+        provider.owe_editor_note("the tools are off");
+        assert_eq!(backend.editor_note().as_deref(), Some("the tools are off"));
+        assert_eq!(backend.editor_note(), None);
+    }
+
+    #[test]
     fn a_codex_tab_still_stops_its_session() {
         let dir = workspace("codex-stop-background");
         let (provider, mut backend) = codex_backend(&dir);
@@ -6278,8 +6584,15 @@ mod external_tests {
             (AgentId::Claude, spec("gem")),
         ] {
             let label = agent.label();
-            let refused =
-                AgentBackend::start_external(agent, launch, &dir, empty_trust_plan(), SessionModeChoice::Auto, None);
+            let refused = AgentBackend::start_external(
+                agent,
+                launch,
+                &dir,
+                empty_trust_plan(),
+                SessionModeChoice::Auto,
+                None,
+                None,
+            );
             match refused {
                 Err(e) => assert_eq!(e.message, format!("this build cannot start a {label} tab")),
                 Ok(_) => panic!("{label} started on another agent's launch"),
@@ -6296,6 +6609,7 @@ mod external_tests {
             plan: empty_trust_plan(),
             policy: turn_policy(SessionModeChoice::Auto, true),
             resume: None,
+            editor_server: None,
         };
         let conversation = AgentConversation::create_external(provider, start, &dir).unwrap();
         let refused = ExternalConversation::new(AgentId::Acp("gemini".into()), conversation);
@@ -6487,6 +6801,60 @@ mod question_tests {
         delivered.iter().any(
             |event| matches!(event, AgentDomainEvent::QuestionAsked { interaction_id, .. } if interaction_id == id),
         )
+    }
+
+    /// No page draws anything from these: the host reads them from the projection, so they are kept
+    /// from every delivery in every mode, the projection folds them all, and what follows still arrives.
+    #[test]
+    fn client_tool_events_never_reach_a_page() {
+        let dir = workspace("client-tool-events");
+        let call = |id: &str| AgentDomainEvent::ClientToolCall {
+            call_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 1,
+        };
+        for mode in [PermissionMode::Manual, PermissionMode::Auto, PermissionMode::Bypass] {
+            let (provider, mut backend) = backend_on(RecordingProvider::default(), &dir);
+            provider.queue(AgentDomainEvent::SessionServers {
+                servers: vec![agent::InitServer {
+                    name: "eitri".into(),
+                    status: "connected".into(),
+                    source: "sdk".into(),
+                }],
+            });
+            provider.queue(call("c1"));
+            provider.queue(AgentDomainEvent::ClientToolCallSettled { call_id: "c1".into() });
+            provider.queue(call("c2"));
+            provider.queue(asked("q1"));
+            let delivered = deliver_until(
+                &mut backend,
+                &dir,
+                mode,
+                &mut BTreeSet::new(),
+                "what follows the client tool events",
+                |_, delivered| holds_question(delivered, "q1"),
+            );
+            assert!(
+                !delivered.iter().any(|event| matches!(
+                    event,
+                    AgentDomainEvent::SessionServers { .. }
+                        | AgentDomainEvent::ClientToolCall { .. }
+                        | AgentDomainEvent::ClientToolCallSettled { .. }
+                )),
+                "{mode:?}: {delivered:?}"
+            );
+            let projection = backend.projection();
+            assert_eq!(
+                projection.open_client_calls.keys().collect::<Vec<_>>(),
+                ["c2"],
+                "{mode:?}"
+            );
+            assert!(projection.single_sdk_server("eitri"), "{mode:?}");
+            drop(projection);
+            backend.shutdown();
+        }
     }
 
     #[test]
@@ -6729,5 +7097,513 @@ mod question_tests {
         backend.wait_question_send(&send, Duration::from_secs(5)).unwrap();
         assert_eq!(state_of(&backend, "q1"), Some(QuestionState::Answering));
         backend.shutdown();
+    }
+}
+
+/// A session's own declared tools at the gate: which calls are left to the editor broker, on what check,
+/// and what every other `mcp__eitri__*` call gets.
+#[cfg(test)]
+mod eitri_gate_tests {
+    use super::*;
+    use crate::tab_set::{TabBackend, TabSet};
+    use crate::test_providers::{empty_trust_plan, ExternalRecordingProvider, RecordingProvider};
+    use agent::{ClientToolDecl, ClientToolSet, InitServer, UiDelivery};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const OURS: &str = "mcp__eitri__open_file";
+    const LINE: &str = "a server named eitri that is not Eitri's is loaded; its tools get no special treatment";
+
+    fn workspace(label: &str) -> PathBuf {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    /// A Claude session over `provider`, given the tool `open_file` or none.
+    fn session(provider: RecordingProvider, dir: &Path, tools: bool) -> (Arc<RecordingProvider>, AgentBackend) {
+        let provider = Arc::new(provider);
+        let set = tools.then(|| ClientToolSet {
+            server_name: SERVER_NAME.into(),
+            timeout_ms: 900_000,
+            tools: vec![ClientToolDecl {
+                name: "open_file".into(),
+                description: "opens a file".into(),
+                input_schema_json: r#"{"type":"object"}"#.into(),
+                always_load: true,
+            }],
+        });
+        let conversation =
+            AgentConversation::create_with_tools(provider.clone(), dir, ProjectTrust::Untrusted, set).unwrap();
+        (
+            provider,
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            },
+        )
+    }
+
+    fn servers(entries: &[(&str, &str)]) -> AgentDomainEvent {
+        AgentDomainEvent::SessionServers {
+            servers: entries
+                .iter()
+                .map(|(name, source)| InitServer {
+                    name: (*name).into(),
+                    status: "connected".into(),
+                    source: (*source).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn only_ours() -> AgentDomainEvent {
+        servers(&[(SERVER_NAME, "sdk")])
+    }
+
+    fn cli_runs_auto() -> AgentDomainEvent {
+        AgentDomainEvent::CliPermissionMode {
+            reported: "auto".into(),
+        }
+    }
+
+    fn call(id: &str, tool: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some(format!("tu-{id}")),
+            tool_name: tool.into(),
+            input: serde_json::json!({ "path": "main.rs" }),
+            provider_prompt: None,
+        }
+    }
+
+    struct Answered {
+        cards: Vec<String>,
+        decisions: Vec<(String, PermissionDecision)>,
+        gate_answers: Vec<GateAnswer>,
+    }
+
+    /// Takes deliveries until each of `ids` is a card or an answer. Most batches here leave nothing to
+    /// deliver, so a helper that waits for a delivery would wait out its deadline.
+    fn settle(
+        provider: &RecordingProvider,
+        backend: &mut AgentBackend,
+        dir: &Path,
+        mode: PermissionMode,
+        ids: &[&str],
+    ) -> Answered {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut answered = AnsweredForYou::default();
+        let mut cards = Vec::new();
+        let rules = agent::PrefixRules::default();
+        loop {
+            let delivery = backend
+                .take_revised_ui_delivery(
+                    dir,
+                    &rules,
+                    mode,
+                    &mut BTreeSet::new(),
+                    &mut HumanApprovals::default(),
+                    &mut answered,
+                )
+                .without_revisions();
+            if let UiDelivery::Events(events) = delivery {
+                cards.extend(events.into_iter().filter_map(|event| match event {
+                    AgentDomainEvent::PermissionRequested { permission_id, .. } => Some(permission_id),
+                    _ => None,
+                }));
+            }
+            let decisions = provider.decisions();
+            let done = |id: &&str| cards.iter().any(|c| c == id) || decisions.iter().any(|(d, _)| d == id);
+            if ids.iter().all(done) {
+                return Answered {
+                    cards,
+                    decisions,
+                    gate_answers: answered.gate_answers,
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{ids:?} never settled: {cards:?} {decisions:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// One session from start to shutdown: `batch` folds as one, and one request `p1` for `tool` closes it.
+    fn gated(
+        provider: RecordingProvider,
+        tools: bool,
+        mode: PermissionMode,
+        batch: Vec<AgentDomainEvent>,
+        tool: &str,
+    ) -> Answered {
+        let dir = workspace("gate");
+        let (provider, mut backend) = session(provider, &dir, tools);
+        let mut events = batch;
+        events.push(call("p1", tool));
+        provider.queue_all(events);
+        let answered = settle(&provider, &mut backend, &dir, mode, &["p1"]);
+        backend.shutdown();
+        answered
+    }
+
+    fn allowed(id: &str) -> Vec<(String, PermissionDecision)> {
+        vec![(id.to_string(), PermissionDecision::Allow)]
+    }
+
+    /// Any other MCP tool's path, in the three places it differs from a session's own: a card in Manual,
+    /// a card in Auto under Eitri's policy, and the CLI's classifier on a session that runs it.
+    fn assert_unknown_tool(tools: bool, batch: Vec<AgentDomainEvent>, tool: &str) {
+        for (mode, what) in [(PermissionMode::Manual, "Manual"), (PermissionMode::Auto, "Auto")] {
+            let got = gated(RecordingProvider::client_tooling(), tools, mode, batch.clone(), tool);
+            assert_eq!(got.cards, ["p1"], "{what}: a card");
+            assert!(got.decisions.is_empty(), "{what}: {:?}", got.decisions);
+        }
+        let mut on_cli_auto = vec![cli_runs_auto()];
+        on_cli_auto.extend(batch);
+        let got = gated(
+            RecordingProvider::client_tooling_cli_auto(),
+            tools,
+            PermissionMode::Auto,
+            on_cli_auto,
+            tool,
+        );
+        assert!(got.cards.is_empty(), "{:?}", got.cards);
+        assert_eq!(got.decisions, [("p1".to_string(), PermissionDecision::Defer)]);
+    }
+
+    /// What `decide` says about one request, with the declared set in hand: the log line tells the broker's
+    /// answer from bypass's, which are the same `allow`.
+    fn decided(mode: PermissionMode, own: bool) -> Option<String> {
+        let declared: BTreeSet<String> = ["open_file".to_string()].into();
+        let (id, tool_use_id, input) = ("p1", Some("tu-1".to_string()), serde_json::json!({}));
+        decide(
+            GateRequest {
+                permission_id: id,
+                tool_use_id: &tool_use_id,
+                tool_name: OURS,
+                input: &input,
+                provider_prompt: None,
+            },
+            Judge {
+                mode,
+                external: false,
+                defers_to_the_cli: false,
+                own_tools: own.then_some(&declared),
+                rules: &agent::PrefixRules::default(),
+                project_root: Path::new("/nonexistent"),
+                approvals: &HumanApprovals::default(),
+            },
+        )
+        .map(|planned| planned.sent)
+    }
+
+    #[test]
+    fn our_tool_is_allowed_before_the_defer_branch_on_an_auto_session() {
+        let got = gated(
+            RecordingProvider::client_tooling_cli_auto(),
+            true,
+            PermissionMode::Auto,
+            vec![cli_runs_auto(), only_ours()],
+            OURS,
+        );
+        assert_eq!(got.decisions, allowed("p1"), "answered here, never deferred");
+        assert!(got.cards.is_empty(), "{:?}", got.cards);
+        assert_eq!(got.gate_answers.len(), 1);
+        assert!(!got.gate_answers[0].deferred);
+        assert_eq!(got.gate_answers[0].origin, GateOrigin::GateRequest);
+    }
+
+    /// `classify_in_manual` cards any MCP tool, so an allow here means it was never asked.
+    #[test]
+    fn in_manual_too() {
+        for (provider, mut batch) in [
+            (RecordingProvider::client_tooling(), vec![]),
+            (RecordingProvider::client_tooling_cli_auto(), vec![cli_runs_auto()]),
+        ] {
+            batch.push(only_ours());
+            let got = gated(provider, true, PermissionMode::Manual, batch, OURS);
+            assert_eq!(got.decisions, allowed("p1"));
+            assert!(got.cards.is_empty(), "{:?}", got.cards);
+        }
+    }
+
+    #[test]
+    fn in_bypass_too() {
+        let got = gated(
+            RecordingProvider::client_tooling(),
+            true,
+            PermissionMode::Bypass,
+            vec![only_ours()],
+            OURS,
+        );
+        assert_eq!(got.decisions, allowed("p1"));
+        let broker = format!("left to the editor broker: {OURS}");
+        assert_eq!(decided(PermissionMode::Bypass, true), Some(broker), "ahead of bypass");
+        assert_eq!(
+            decided(PermissionMode::Bypass, false),
+            Some(format!("allowed in bypass: {OURS}")),
+            "the premise: bypass allows it too, under its own line"
+        );
+    }
+
+    #[test]
+    fn no_declared_tools_is_an_unknown_mcp_tool() {
+        assert_unknown_tool(false, vec![only_ours()], OURS);
+    }
+
+    #[test]
+    fn two_servers_named_eitri_are_an_unknown_mcp_tool() {
+        assert_unknown_tool(true, vec![servers(&[("eitri", "sdk"), ("eitri", "sdk")])], OURS);
+    }
+
+    #[test]
+    fn a_project_eitri_shows_one_entry_of_source_project_and_is_unknown() {
+        assert_unknown_tool(true, vec![servers(&[("eitri", "project")])], OURS);
+    }
+
+    #[test]
+    fn a_dynamic_eitri_likewise() {
+        assert_unknown_tool(true, vec![servers(&[("eitri", "dynamic")])], OURS);
+    }
+
+    #[test]
+    fn a_user_scope_eitri_is_an_unknown_mcp_tool() {
+        assert_unknown_tool(true, vec![servers(&[("eitri", "user")])], OURS);
+    }
+
+    #[test]
+    fn a_missing_source_fails_the_check() {
+        assert_unknown_tool(true, vec![servers(&[("eitri", "")])], OURS);
+    }
+
+    #[test]
+    fn no_session_servers_yet_is_an_unknown_mcp_tool() {
+        assert_unknown_tool(true, vec![], OURS);
+    }
+
+    /// A report folded while a batch is answered reaches the next request of that batch.
+    #[test]
+    fn the_check_reads_the_latest_init_for_each_request() {
+        for mode in [PermissionMode::Manual, PermissionMode::Auto] {
+            let dir = workspace("gate-latest-init");
+            let (provider, mut backend) = session(RecordingProvider::client_tooling(), &dir, true);
+            provider.fold_after_next_resolution(vec![servers(&[("eitri", "project")])]);
+            provider.queue_all(vec![only_ours(), call("p1", OURS), call("p2", OURS)]);
+            let got = settle(&provider, &mut backend, &dir, mode, &["p1", "p2"]);
+            assert_eq!(got.decisions, allowed("p1"), "{mode:?}");
+            assert_eq!(got.cards, ["p2"], "{mode:?}");
+            backend.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_tool_outside_the_declared_list_is_an_unknown_mcp_tool() {
+        for tool in [
+            "mcp__eitri__x__y",
+            "mcp__eitri__nvim_exec",
+            "mcp__eitri__open_file_again",
+            "mcp__eitri__",
+            "mcp__eitri2__open_file",
+            "mcp__other__open_file",
+        ] {
+            assert_unknown_tool(true, vec![only_ours()], tool);
+        }
+    }
+
+    fn tab_over(set: &mut TabSet, backend: AgentBackend) -> crate::tabs::TabId {
+        let tab = set.active();
+        set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        tab
+    }
+
+    fn close(set: &mut TabSet, tab: crate::tabs::TabId) {
+        if let TabBackend::Live(mut backend) = set.get_mut(tab).unwrap().set_backend(TabBackend::NotStarted) {
+            backend.shutdown();
+        }
+    }
+
+    /// Pumps until the session's latest report is `want`, and once more.
+    fn pump_past_report(set: &mut TabSet, tab: crate::tabs::TabId, dir: &Path, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            set.pump(dir, true);
+            let TabBackend::Live(backend) = set.get(tab).unwrap().backend() else {
+                panic!("the tab lost its session");
+            };
+            if backend
+                .projection()
+                .init_servers
+                .iter()
+                .any(|server| server.source == want)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the report never folded");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        set.pump(dir, true);
+    }
+
+    #[test]
+    fn a_foreign_eitri_is_said_once() {
+        let dir = workspace("gate-said-once");
+        let (provider, backend) = session(RecordingProvider::client_tooling(), &dir, true);
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tab_over(&mut set, backend);
+        set.pump(&dir, true);
+        assert!(set.take_editor_notes().is_empty(), "no report yet");
+
+        provider.queue(servers(&[("eitri", "project")]));
+        pump_past_report(&mut set, tab, &dir, "project");
+        assert_eq!(set.take_editor_notes(), [(tab, LINE.to_string())]);
+        assert!(set.take_editor_notes().is_empty(), "taken");
+
+        provider.queue(servers(&[("eitri", "dynamic")]));
+        pump_past_report(&mut set, tab, &dir, "dynamic");
+        assert!(
+            set.take_editor_notes().is_empty(),
+            "a later report of the same session says nothing"
+        );
+        close(&mut set, tab);
+    }
+
+    /// A line taken with no page to show it comes back with the next take, and the pump does not make a
+    /// second one.
+    #[test]
+    fn a_line_handed_back_is_still_said_once() {
+        let dir = workspace("gate-handed-back");
+        let (provider, backend) = session(RecordingProvider::client_tooling(), &dir, true);
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tab_over(&mut set, backend);
+        provider.queue(servers(&[("eitri", "project")]));
+        pump_past_report(&mut set, tab, &dir, "project");
+        assert_eq!(set.take_editor_notes().len(), 1);
+        set.owe_editor_note(tab);
+        set.pump(&dir, true);
+        assert_eq!(set.take_editor_notes(), [(tab, LINE.to_string())]);
+        assert!(set.take_editor_notes().is_empty());
+        close(&mut set, tab);
+    }
+
+    /// What a provider owes is taken from the backend by the pump, so it is the tab's, in the provider's words.
+    #[test]
+    fn a_providers_line_is_its_tabs_and_is_said_once() {
+        use crate::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        let dir = workspace("gate-provider-line");
+        let provider = Arc::new(ExternalRecordingProvider::codex());
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .expect("a scripted external start succeeds");
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tab_over(&mut set, backend);
+        set.pump(&dir, true);
+        assert!(set.take_editor_notes().is_empty(), "nothing is owed");
+
+        provider.owe_editor_note("the tools are off");
+        set.pump(&dir, true);
+        let said = set.take_editor_notes();
+        assert_eq!(said, [(tab, "the tools are off".to_string())]);
+        set.owe_editor_note(tab);
+        set.pump(&dir, true);
+        assert_eq!(set.take_editor_notes(), said, "handed back in the same words");
+        assert!(set.take_editor_notes().is_empty(), "once");
+        close(&mut set, tab);
+    }
+
+    #[test]
+    fn our_own_server_and_a_session_with_no_tools_say_nothing() {
+        for (tools, report) in [
+            (true, servers(&[("eitri", "sdk")])),
+            (true, servers(&[("other", "project")])),
+            (false, servers(&[("eitri", "project")])),
+        ] {
+            let dir = workspace("gate-says-nothing");
+            let (provider, backend) = session(RecordingProvider::client_tooling(), &dir, tools);
+            let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+            let tab = tab_over(&mut set, backend);
+            let AgentDomainEvent::SessionServers { servers: entries } = &report else {
+                unreachable!()
+            };
+            let source = entries[0].source.clone();
+            provider.queue(report);
+            pump_past_report(&mut set, tab, &dir, &source);
+            assert!(set.take_editor_notes().is_empty(), "tools {tools}, {source}");
+            close(&mut set, tab);
+        }
+    }
+
+    /// The shape of `manual_never_answers_what_auto_leaves_to_a_human`, on sessions that declare a tool:
+    /// the mock backends of that test declare none, so rows added there pass whatever `decide` does.
+    #[test]
+    fn manual_and_auto_answer_our_tools_alike() {
+        for auto_session in [false, true] {
+            let run = |mode: PermissionMode, report: AgentDomainEvent| {
+                let mut batch = if auto_session { vec![cli_runs_auto()] } else { vec![] };
+                batch.push(report);
+                let provider = if auto_session {
+                    RecordingProvider::client_tooling_cli_auto()
+                } else {
+                    RecordingProvider::client_tooling()
+                };
+                gated(provider, true, mode, batch, OURS)
+            };
+            for report in [only_ours(), servers(&[("eitri", "project")])] {
+                let holds =
+                    matches!(&report, AgentDomainEvent::SessionServers { servers } if servers[0].source == "sdk");
+                let auto = run(PermissionMode::Auto, report.clone());
+                let manual = run(PermissionMode::Manual, report);
+                let manual_allowed = manual.decisions == allowed("p1");
+                assert!(
+                    !manual_allowed || !auto.decisions.is_empty(),
+                    "auto session {auto_session}: Manual allowed what Auto put to a human"
+                );
+                if !auto.cards.is_empty() {
+                    assert_eq!(manual.cards, ["p1"], "auto session {auto_session}");
+                }
+                assert!(
+                    manual.decisions.iter().all(|(_, d)| *d == PermissionDecision::Allow),
+                    "Manual never defers: {:?}",
+                    manual.decisions
+                );
+                if holds {
+                    assert_eq!(auto.decisions, allowed("p1"), "auto session {auto_session}");
+                    assert_eq!(manual.decisions, allowed("p1"), "auto session {auto_session}");
+                } else {
+                    assert_eq!(manual.cards, ["p1"], "a failed check is a card in Manual");
+                    assert!(manual.decisions.is_empty(), "{:?}", manual.decisions);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_external_agent_is_not_touched() {
+        for (mode, id) in [(PermissionMode::Auto, "p1"), (PermissionMode::Manual, "p2")] {
+            let dir = workspace("gate-external");
+            let provider = Arc::new(ExternalRecordingProvider::codex());
+            let mut backend = AgentBackend::start_external_with(
+                AgentId::Codex,
+                provider.clone(),
+                &dir,
+                empty_trust_plan(),
+                SessionModeChoice::Auto,
+                None,
+            )
+            .expect("a scripted external start succeeds");
+            provider.inner.queue_all(vec![only_ours(), call(id, OURS)]);
+            let got = settle(&provider.inner, &mut backend, &dir, mode, &[id]);
+            assert_eq!(got.cards, [id], "{mode:?}");
+            assert!(got.decisions.is_empty(), "{mode:?}: {:?}", got.decisions);
+            backend.shutdown();
+        }
     }
 }

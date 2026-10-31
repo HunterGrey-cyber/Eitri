@@ -1,7 +1,7 @@
 # Maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 #
-# eitri-bin -- the prebuilt release tarball's four binaries (shell, eitri-supervisor,
-# eitri-tmux-shim, eitri-claude-handoff), plus a Claude Agent SDK sidecar built here, on the
+# eitri-bin -- the prebuilt release tarball's six binaries (shell, eitri-supervisor,
+# eitri-tmux-shim, eitri-claude-handoff, eitri-run-guard, eitri-editor-bridge), plus a Claude Agent SDK sidecar built here, on the
 # user's own machine, at install time.
 # Building it is not redistribution by this project; see the licence note below.
 #
@@ -107,6 +107,7 @@ package() {
 	install -m0755 "$top/lib/eitri/eitri-supervisor" "$pkgdir/usr/lib/eitri/eitri-supervisor"
 	install -m0755 "$top/lib/eitri/eitri-tmux-shim" "$pkgdir/usr/lib/eitri/eitri-tmux-shim"
 	install -m0755 "$top/lib/eitri/eitri-run-guard" "$pkgdir/usr/lib/eitri/eitri-run-guard"
+	install -m0755 "$top/lib/eitri/eitri-editor-bridge" "$pkgdir/usr/lib/eitri/eitri-editor-bridge"
 	install -m0755 "$top/lib/eitri/eitri-claude-handoff" "$pkgdir/usr/lib/eitri/eitri-claude-handoff"
 	install -m0755 "$top/lib/eitri/eitri-setup" "$pkgdir/usr/lib/eitri/eitri-setup"
 	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar"

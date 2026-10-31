@@ -960,10 +960,13 @@ impl TrustGate {
     pub(crate) fn route(&self, state: &TrustState) -> Route {
         let profile = state_profile(state);
         match state {
-            // Nothing exists to load, so the untrusted tiers lose nothing, and they keep out a
-            // `.claude/` that appears between this check and the CLI's own read. An agent that needs
-            // a `y` never gets here: the store asks about its empty discovery.
-            TrustState::NothingToTrust(_) if !profile.requires_explicit_yes() => Route::Start(ProjectTrust::Untrusted),
+            // Nothing exists to load, so leaving the project tiers out loses nothing, and it keeps out a
+            // `.claude/` that appears between this check and the CLI's own read. Nobody was asked, so the
+            // tools a no would withhold are declared and what only a yes opens stays closed. An agent
+            // that needs a `y` never gets here: the store asks about its empty discovery.
+            TrustState::NothingToTrust(_) if !profile.requires_explicit_yes() => {
+                Route::Start(ProjectTrust::NothingFound)
+            }
             TrustState::NothingToTrust(_) => Route::Ask,
             TrustState::Trusted { .. } => Route::Start(ProjectTrust::Trusted),
             TrustState::Untrusted { discovery, .. } | TrustState::Changed { discovery, .. } => {
@@ -1901,10 +1904,15 @@ fn codex_home_guess(var: Option<&std::ffi::OsStr>, home: Option<&Path>, root: &P
 /// exempt its own server from the check an untrusted session makes. The alternate names are passed
 /// on either way, since they can only add files to ask about. Touches no disk.
 fn codex_profile_env(codex_home: Option<PathBuf>, user: UserCodexConfig) -> ProfileEnv {
-    let user_mcp_servers = if codex_home.is_some() { user.mcp_servers } else { None };
+    let (user_mcp_servers, user_mcp_names) = if codex_home.is_some() {
+        (user.mcp_servers, user.all_server_names)
+    } else {
+        (None, None)
+    };
     ProfileEnv {
         fallback_names: user.fallback_names,
         user_mcp_servers,
+        user_mcp_names,
         user_config_unreadable: user.unreadable,
         codex_home,
     }
@@ -1952,6 +1960,7 @@ fn run_worker(
                 || UserCodexConfig {
                     fallback_names: Vec::new(),
                     mcp_servers: None,
+                    all_server_names: None,
                     unreadable: None,
                 },
                 read_codex_user_config,
@@ -2328,10 +2337,11 @@ mod tests {
         fx.write("src/main.rs", b"fn main() {}\n");
         let mut gate = fx.gate();
         assert_eq!(gate.row(&CLAUDE), "not checked yet");
-        assert_eq!(start(&mut gate, A), Route::Start(ProjectTrust::Untrusted));
+        assert_eq!(start(&mut gate, A), Route::Start(ProjectTrust::NothingFound));
         assert!(gate.show(A, 1, &CLAUDE).is_none(), "nothing to ask about");
         assert_eq!(gate.row(&CLAUDE), "nothing to trust");
-        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::Untrusted);
+        assert_eq!(gate.next_session_trust(&CLAUDE), ProjectTrust::NothingFound);
+        assert!(!ProjectTrust::NothingFound.refused(), "nobody said no");
     }
 
     #[test]
@@ -2738,7 +2748,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             gate.poll(),
-            vec![GateEvent::Route(A, Route::Start(ProjectTrust::Untrusted))]
+            vec![GateEvent::Route(A, Route::Start(ProjectTrust::NothingFound))]
         );
         assert!(!gate.is_waiting(A));
     }
@@ -3437,6 +3447,7 @@ mod tests {
             fingerprint: Fingerprint([2; 32]),
             over_budget: None,
             user_mcp_servers: None,
+            user_mcp_names: None,
             project_mcp_servers: Vec::new(),
         };
         let (mut gate, _jobs, done) = TrustGate::detached(p("/home/u/p"));
@@ -3952,6 +3963,22 @@ mod tests {
         assert!(!found.fully_hashed());
     }
 
+    /// A relative home may name a directory of the project, so its names are no evidence that a server of
+    /// the editor's name is absent, and a home with no file at all holds none.
+    #[test]
+    fn a_relative_codex_home_leaves_the_editor_servers_name_taken() {
+        let fx = Fx::new("codex-relative-home-name");
+        let taken_with = |var: Option<&str>| {
+            let guess = codex_home_guess(var.map(std::ffi::OsStr::new), Some(&fx.home), &fx.root);
+            let env = codex_profile_env(guess.skip, read_codex_user_config(guess.config.as_deref().unwrap()));
+            let found =
+                eitri_core::project_trust::discover(&fx.root, Some(&fx.home), &Default::default(), &CODEX, &env);
+            eitri_core::project_trust::eitri_server_taken(&found)
+        };
+        assert!(taken_with(Some("../elsewhere")));
+        assert!(!taken_with(None));
+    }
+
     /// A registered agent cannot leave the project's configuration out, so its `n` starts nothing and
     /// is not remembered, and a project with none of its files is still asked about: a `y` records the
     /// empty configuration, and a file that appears later asks again.
@@ -3961,7 +3988,10 @@ mod tests {
         let acp = gem();
         let mut gate = fx.gate();
         // Claude in the same empty root starts at once, without the project's tiers.
-        assert_eq!(start_as(&mut gate, A, &CLAUDE), Route::Start(ProjectTrust::Untrusted));
+        assert_eq!(
+            start_as(&mut gate, A, &CLAUDE),
+            Route::Start(ProjectTrust::NothingFound)
+        );
         assert_eq!(start_as(&mut gate, B, &acp), Route::Ask);
         let view = gate.show(B, 1, &acp).expect("an empty project is still asked about");
         assert!(view.items.is_empty());

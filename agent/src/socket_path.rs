@@ -430,6 +430,16 @@ mod tests {
             ("src/settings.rs", "dir.join(\"s.sock\")"),
             ("src/settings.rs", "\"/tmp/a.sock\""),
             ("src/settings.rs", "\"/tmp/b.sock\""),
+            // The editor tool server's argv as an ACP session/new request carries it; the strings are
+            // compared against the request JSON and nothing binds them.
+            (
+                "tests/acp_provider.rs",
+                "args: vec![\"/run/user/1000/eitri/bridge.sock\".to_string()",
+            ),
+            (
+                "tests/acp_provider.rs",
+                "\"args\": [\"/run/user/1000/eitri/bridge.sock\"",
+            ),
             // Probes that the agent-hook binary exists; never bound.
             ("src/process.rs", "dir.join(\"probe.sock\")"),
             // Absolute paths of a host that the sandbox self-check's tests re-create inside a scratch

@@ -229,6 +229,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         requested_cli_mode(&control.capabilities),
         ProjectTrust::Trusted,
         control.question_policy(),
+        None,
     );
     request.policy.as_mut().unwrap().setting_sources = None;
     let session_id = control.open_session(request).expect("control session");
@@ -267,6 +268,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
             cwd: cwd.path().to_string_lossy().to_string(),
             streaming: StreamingPreference::Complete,
             project: ProjectTrust::Trusted,
+            client_tools: None,
         })
         .expect("default session");
     provider
@@ -482,6 +484,7 @@ fn questions_opt_in_requires_capability_and_host_readiness() {
                         crate::RequestedCliMode::Auto,
                         ProjectTrust::Trusted,
                         QuestionPolicy::default(),
+                        None,
                     );
                     let mut request = build_create_request(
                         "/project".into(),
@@ -496,6 +499,7 @@ fn questions_opt_in_requires_capability_and_host_readiness() {
                             capable,
                             client_implements,
                         },
+                        None,
                     );
                     assert_eq!(
                         request.client_interactions.as_ref().map(|config| config.questions),

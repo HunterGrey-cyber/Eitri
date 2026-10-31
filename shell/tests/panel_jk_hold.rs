@@ -451,6 +451,7 @@ fn replay_fixture() -> Vec<String> {
         resumes_on_r: false,
         title: None,
         agent: "claude".into(),
+        following: false,
     }];
     vec![
         serialize_hello_for_js(&greeting),

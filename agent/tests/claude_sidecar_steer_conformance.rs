@@ -43,6 +43,7 @@ fn create_session(provider: &ClaudeSidecarProvider) -> String {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Untrusted,
+            client_tools: None,
         })
         .expect("create_session should succeed")
 }

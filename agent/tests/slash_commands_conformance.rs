@@ -174,6 +174,7 @@ fn probe_which_slash_commands_do_something_through_the_sidecar() {
             // command's tool calls ran unasked; now `run_probe_turn` answers each request `Allow`.
             streaming: StreamingPreference::Complete,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         }) {
             Ok(id) => id,
             Err(err) => {

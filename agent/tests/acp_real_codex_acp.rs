@@ -206,6 +206,7 @@ fn codex_acp_as_a_registered_agent_in_a_trusted_scratch_root() {
                 sandbox: agent::Sandbox::Project,
             },
             resume: None,
+            editor_server: None,
         })
         .expect("a session opens in workspace-write mode");
     eprintln!(

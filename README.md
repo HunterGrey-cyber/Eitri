@@ -44,6 +44,8 @@ Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's
   edit as its own diff row.
 - **Agents you supervise.** Claude Code, Codex, or an agent you register over ACP, one per tab, in Manual, Auto
   or Bypass mode (an ACP agent has no Manual); `Enter` while a turn runs steers it. See [Codex and other agents](docs/guide/agents.md).
+- **An agent that can point.** Any tab's agent can show you a file at a line and read what your editor holds, unsaved
+  changes included, without touching your cursor: [Your editor, from an agent's tab](docs/guide/editor-tools.md).
 - **Pages you build.** A Markdown preview ships with Eitri, and your own HTML page or plugin becomes a module of the
   window (experimental): [Pages you build](docs/guide/pages.md).
 - **Keyboard end to end.** vim keys in the panel, tmux keys for the window, `Ctrl+h/j/k/l` across panes.

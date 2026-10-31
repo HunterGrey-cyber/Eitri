@@ -456,7 +456,7 @@ pub fn plan(dir: &Path, trust: DirTrust) -> TrustPlan {
 
 /// The `thread/start` params Eitri sends for this project and trust.
 pub fn start_params(project: &Path, trust: DirTrust) -> Value {
-    let config = session_config(&plan(project, trust)).expect("config");
+    let config = session_config(&plan(project, trust), None).expect("config");
     serde_json::to_value(ThreadStartParams::new(
         text_of(project).to_string(),
         Reviewer::User,
@@ -468,7 +468,7 @@ pub fn start_params(project: &Path, trust: DirTrust) -> Value {
 
 /// The `thread/resume` params Eitri sends.
 pub fn resume_params(thread: &str, project: &Path, trust: DirTrust) -> Value {
-    let config = session_config(&plan(project, trust)).expect("config");
+    let config = session_config(&plan(project, trust), None).expect("config");
     serde_json::to_value(ThreadResumeParams::new(
         thread.to_string(),
         text_of(project).to_string(),

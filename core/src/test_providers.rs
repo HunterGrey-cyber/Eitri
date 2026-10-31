@@ -51,9 +51,70 @@ pub struct RecordingProvider {
     held_interaction_replies: std::sync::Mutex<Vec<std::sync::mpsc::Sender<agent::InteractionReply>>>,
     turn_stamps: std::sync::Mutex<Vec<agent::TurnStamp>>,
     steer_stamps: std::sync::Mutex<Vec<agent::TurnStamp>>,
+    /// Advertises `client_tools` and takes answers to client tool calls.
+    client_tools: bool,
+    /// Every answer to a client tool call that reached it, in order.
+    client_answers: std::sync::Mutex<Vec<agent::ClientToolAnswer>>,
+    /// While set, every answer to a client tool call is recorded and refused with this code.
+    refusing_client_answers: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
+    /// What a read of the open calls replies, or `Err` when none is set: a sidecar that is gone.
+    client_state: std::sync::Mutex<Option<agent::ClientToolCallState>>,
+    /// While on, a read of the open calls gets no reply until the test gives or drops it.
+    holding_client_reads: AtomicBool,
+    held_client_reads: std::sync::Mutex<Vec<ClientReadReply>>,
 }
 
+type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
+
 impl RecordingProvider {
+    /// A provider that serves tools the host declares, as a Claude sidecar of protocol 3.23 does.
+    pub fn client_tooling() -> Self {
+        Self {
+            client_tools: true,
+            ..Default::default()
+        }
+    }
+    /// A provider that serves declared tools on a session running the CLI's own auto mode.
+    pub fn client_tooling_cli_auto() -> Self {
+        Self {
+            client_tools: true,
+            cli_auto: true,
+            ..Default::default()
+        }
+    }
+    /// Every answer to a client tool call, in order.
+    pub fn client_answers(&self) -> Vec<agent::ClientToolAnswer> {
+        self.client_answers.lock().unwrap().clone()
+    }
+    /// While `code` is set, every later answer to a client tool call is refused with it.
+    pub fn refuse_client_answers(&self, code: Option<agent::ProviderErrorCode>) {
+        *self.refusing_client_answers.lock().unwrap() = code;
+    }
+    /// What every later read of the open calls replies.
+    pub fn serve_client_state(&self, state: agent::ClientToolCallState) {
+        *self.client_state.lock().unwrap() = Some(state);
+    }
+    /// Leaves the reply to every later read of the open calls out: a sidecar that is slow to say.
+    pub fn hold_client_reads(&self, on: bool) {
+        self.holding_client_reads.store(on, Ordering::SeqCst);
+    }
+    /// Replies to every read held so far, with what [`Self::serve_client_state`] set.
+    pub fn reply_to_held_client_reads(&self) {
+        for reply in self.held_client_reads.lock().unwrap().drain(..) {
+            let _ = reply.send(self.scripted_client_state());
+        }
+    }
+    /// Every read held so far goes unanswered for good, as one does when its session closes.
+    pub fn drop_held_client_reads(&self) {
+        self.held_client_reads.lock().unwrap().clear();
+    }
+    fn scripted_client_state(&self) -> Result<agent::ClientToolCallState, agent::ProviderError> {
+        self.client_state
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| agent::ProviderError::Transport("no state was scripted".into()))
+    }
     pub fn task_controlling() -> Self {
         Self {
             task_control: true,
@@ -181,8 +242,37 @@ impl agent::AgentProvider for RecordingProvider {
             steer: self.steering,
             task_control: self.task_control,
             task_output: self.task_control,
+            client_tools: self.client_tools,
             ..ProviderCapabilities::default()
         }
+    }
+    fn answer_client_tool_call(&self, answer: agent::ClientToolAnswer) -> Result<(), agent::ProviderError> {
+        if !self.client_tools {
+            return Err(agent::ProviderError::UnsupportedCapability("client_tools"));
+        }
+        self.client_answers.lock().unwrap().push(answer);
+        match *self.refusing_client_answers.lock().unwrap() {
+            Some(code) => Err(agent::ProviderError::Provider {
+                code,
+                message: "answers refused by the test".into(),
+            }),
+            None => Ok(()),
+        }
+    }
+    fn client_tool_call_state(
+        &self,
+        _session_id: &str,
+    ) -> Result<agent::TaskReply<agent::ClientToolCallState>, agent::ProviderError> {
+        if !self.client_tools {
+            return Err(agent::ProviderError::UnsupportedCapability("client_tools"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.holding_client_reads.load(Ordering::SeqCst) {
+            self.held_client_reads.lock().unwrap().push(tx);
+        } else {
+            tx.send(self.scripted_client_state()).unwrap();
+        }
+        Ok(rx)
     }
     fn steer_turn(&self, request: agent::SteerTurnRequest) -> Result<(), agent::ProviderError> {
         if !self.steering {
@@ -366,6 +456,8 @@ pub struct ExternalRecordingProvider {
     steers: std::sync::Mutex<Vec<agent::SteerTurnRequest>>,
     /// While set, every `steer_turn` is refused with this code (nothing sent).
     steer_refusal: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
+    /// What `editor_note` hands over next.
+    editor_note: std::sync::Mutex<Option<String>>,
 }
 
 impl ExternalRecordingProvider {
@@ -389,7 +481,13 @@ impl ExternalRecordingProvider {
             steering: false,
             steers: std::sync::Mutex::new(Vec::new()),
             steer_refusal: std::sync::Mutex::new(None),
+            editor_note: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Has `editor_note` hand `note` over, as a provider that left the session's tool server out.
+    pub fn owe_editor_note(&self, note: &str) {
+        *self.editor_note.lock().unwrap() = Some(note.to_string());
     }
 
     /// A Codex provider that takes messages into the running turn (`steer`).
@@ -539,6 +637,9 @@ impl agent::ExternalProvider for ExternalRecordingProvider {
         self.policies.lock().unwrap().push(policy);
         agent::AgentProvider::send_turn(&self.inner, request)
     }
+    fn editor_note(&self) -> Option<String> {
+        self.editor_note.lock().unwrap().take()
+    }
     /// As Codex: a session it stopped itself can be continued.
     fn stopped_resumable(&self) -> bool {
         self.stops() > 0
@@ -566,6 +667,8 @@ pub struct MovingProvider {
     live: AtomicBool,
     refuse_freeze: std::sync::Mutex<Option<String>>,
     steps: std::sync::Mutex<Vec<&'static str>>,
+    /// The position of the stream it says it pumped through.
+    position: std::sync::Mutex<Option<u64>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -585,6 +688,7 @@ impl MovingProvider {
             live: AtomicBool::new(live),
             refuse_freeze: std::sync::Mutex::new(None),
             steps: std::sync::Mutex::new(Vec::new()),
+            position: std::sync::Mutex::new(None),
         });
         MOVING.lock().unwrap().push((id, std::sync::Arc::downgrade(&provider)));
         provider
@@ -592,6 +696,10 @@ impl MovingProvider {
     /// The steps of a move asked of it so far, in order: `freeze`, `resume`, `adopt`, `commit`, `forget`.
     pub fn steps(&self) -> Vec<&'static str> {
         self.steps.lock().unwrap().clone()
+    }
+    /// Whatever it pumps from now on is at `position` of its stream, the place a move's record reads on from.
+    pub fn report_position(&self, position: u64) {
+        *self.position.lock().unwrap() = Some(position);
     }
     /// The next freezes are refused with `why`, or go through again with `None`.
     pub fn refuse_freezes(&self, why: Option<&str>) {
@@ -691,8 +799,20 @@ impl agent::AgentProvider for MovingProvider {
     fn close_session(&self, request: agent::CloseSessionRequest) -> Result<(), agent::ProviderError> {
         self.inner.close_session(request)
     }
+    fn answer_client_tool_call(&self, answer: agent::ClientToolAnswer) -> Result<(), agent::ProviderError> {
+        self.inner.answer_client_tool_call(answer)
+    }
+    fn client_tool_call_state(
+        &self,
+        session_id: &str,
+    ) -> Result<agent::TaskReply<agent::ClientToolCallState>, agent::ProviderError> {
+        self.inner.client_tool_call_state(session_id)
+    }
     fn pump(&self) -> Vec<AgentDomainEvent> {
         self.inner.pump()
+    }
+    fn pumped_through(&self) -> Option<u64> {
+        *self.position.lock().unwrap()
     }
     fn mover(&self) -> Option<&dyn agent::chat_mover::ChatMover> {
         Some(self)

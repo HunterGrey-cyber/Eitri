@@ -1046,6 +1046,11 @@ impl TurnReview {
         &self.spec.root
     }
 
+    /// A way to read, store and write proposed files, on this review's store.
+    pub fn proposal_writer(&self) -> super::proposal_write::ProposalWriter {
+        super::proposal_write::ProposalWriter::on_spec(self.spec.clone())
+    }
+
     /// Takes in one delivered event of `tab`. `session` is the tab's provider session as its
     /// backend knows it now, empty when it has none yet. Only enqueues work; never waits.
     pub fn observe(&mut self, tab: u64, session: &str, event: &AgentDomainEvent, now_ms: u64) {
@@ -1847,6 +1852,15 @@ impl TurnReview {
             turn,
             scope,
             named,
+        }
+    }
+
+    /// The newest turn's first changed line, built without reading git or the disk.
+    pub fn first_change_job(&self, session: &str) -> FirstChangeJob {
+        FirstChangeJob {
+            spec: self.spec.clone(),
+            session: session.to_owned(),
+            records: self.turns(session),
         }
     }
 
@@ -2782,6 +2796,43 @@ impl OverviewJob {
     }
 }
 
+/// A single file compared with the newest turn's base. Run on a worker: opening the store runs git.
+#[derive(Debug, Clone)]
+pub struct FirstChangeJob {
+    spec: ShadowSpec,
+    session: String,
+    records: Vec<TurnRecord>,
+}
+
+impl FirstChangeJob {
+    /// The first differing line, from one. No base, a new or identical file, or an unreadable side gives `None`.
+    pub fn run(self, rel: &Path) -> Option<u32> {
+        let shadow = self.spec.open().ok()?;
+        let compare = resolve_compare(&shadow, &self.session, &self.records, TurnRef::Latest, Scope::Turn).ok()?;
+        let base = shadow.read_entry(&compare.from, rel).ok()??;
+        if base.kind != super::shadow::EntryKind::Blob {
+            return None;
+        }
+        let project = super::write::ProjectDir::open(&self.spec.root).ok()?;
+        let target = project.target(rel, false).ok()?;
+        let super::write::Current::Regular { bytes, .. } = super::write::read_current(&target).ok()? else {
+            return None;
+        };
+        let before = lines_of(&base.bytes);
+        let after = lines_of(&bytes);
+        let first = before
+            .iter()
+            .zip(&after)
+            .position(|(a, b)| a != b)
+            .or_else(|| (before.len() != after.len()).then_some(before.len().min(after.len())))?;
+        u32::try_from(first.checked_add(1)?).ok()
+    }
+}
+
+fn lines_of(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes.split_inclusive(|b| *b == b'\n').collect()
+}
+
 /// One file's patch in a review, computed with git by [`run`](Self::run) on whatever thread runs it.
 #[derive(Debug, Clone)]
 pub struct DiffJob {
@@ -3276,6 +3327,61 @@ mod tests {
 
     fn taken(c: &str) -> Snap {
         Snap::Taken { commit: c.into() }
+    }
+
+    fn first_change_fixture(label: &str) -> (crate::test_scratch_dir::ScratchDir, TurnReview) {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-first-change", label);
+        let root = dir.join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a"), "one\ntwo\nthree\n").unwrap();
+        let mut review = TurnReview::with_options(Some(dir.join("review")), &root, ReviewOptions::default());
+        review.observe(1, "s1", &AgentDomainEvent::TurnStarted { turn_id: "t1".into() }, 1);
+        let limit = Instant::now() + Duration::from_secs(10);
+        loop {
+            review.poll();
+            if review.turns("s1").first().is_some_and(|t| t.base.commit().is_some()) {
+                break;
+            }
+            assert!(Instant::now() < limit, "the base snapshot finishes");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (dir, review)
+    }
+
+    #[test]
+    fn the_first_changed_line_is_found() {
+        let (dir, review) = first_change_fixture("changed");
+        for (text, line) in [
+            ("one\nchanged\nthree\n", 2),
+            ("one\ntwo\nthree\nfour\n", 4),
+            ("one\n", 2),
+            ("one\ntwo\nthree", 3),
+        ] {
+            std::fs::write(dir.join("project/a"), text).unwrap();
+            assert_eq!(review.first_change_job("s1").run(Path::new("a")), Some(line));
+        }
+    }
+
+    #[test]
+    fn a_new_file_is_none() {
+        let (dir, review) = first_change_fixture("new");
+        std::fs::write(dir.join("project/new"), "new\n").unwrap();
+        assert_eq!(review.first_change_job("s1").run(Path::new("new")), None);
+    }
+
+    #[test]
+    fn no_base_yet_is_none() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-first-change", "no-base");
+        let review = TurnReview::with_options(Some(dir.join("review")), &dir, ReviewOptions::default());
+        let mut job = review.first_change_job("s1");
+        job.records = vec![record(Snap::Pending, Snap::Pending)];
+        assert_eq!(job.run(Path::new("a")), None);
+    }
+
+    #[test]
+    fn an_identical_file_is_none() {
+        let (_dir, review) = first_change_fixture("identical");
+        assert_eq!(review.first_change_job("s1").run(Path::new("a")), None);
     }
 
     #[test]

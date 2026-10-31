@@ -15,8 +15,27 @@
 //!   method by name on a link would go around the typed calls (a test may name it to check what
 //!   went over the wire).
 //!
+//! A constant is not enough for the one chunk that evaluates an argument: `exec_lua(AGENT_EXEC_LUA, anything)` would
+//! pass all of the above. So this also fails on:
+//!
+//! - `AGENT_EXEC_LUA`, or its file's name, anywhere but the exec module;
+//! - the chunk's arguments coming from anything but the approval record, or that record being made anywhere but
+//!   `from_card`, being public, going by a second name, being cloned, defaulted or deserialized into existence, or
+//!   being written to after the card;
+//! - a Lua chunk or a Rust literal that can evaluate text, outside the short list in [`EVALUATORS`];
+//! - another tool chunk that builds source, by the words `review_lua_builds_no_source` holds `review.lua` to, or that
+//!   can run text some other way ([`RUNNERS`]), but for the constant calls in [`LISTED_COMMANDS`];
+//! - a caller of the broker's `answer_card` other than a person's answer: a sweep through it with `Key` would make a
+//!   real `CardAnswer`. The one call of `TabSet::answer_card` is pinned as well, so the name of a receiver lets nothing
+//!   through.
+//!
 //! Comments and literals are blanked before anything is matched, and calls are found by their
 //! tokens, never by where a line ends, so formatting can neither hide a call nor invent one.
+
+use std::collections::BTreeSet;
+use std::ops::Range;
+
+use eitri_core::source_scan::{self, word_ends, Source};
 
 const ANNOTATION: &str = "// editor-rpc-scan: forwards a caller's constant";
 
@@ -514,16 +533,155 @@ fn the_scan_catches_built_lua_a_leak_and_a_bypass() {
     assert_eq!(flagged("#[cfg(test)]\nfn g() { s.leak(); }").len(), 1);
 }
 
+/// What the editor-op dispatcher may call of the agent tools: `(tool, function)`.
+const TOOL_CALLS: [(&str, &str); 6] = [
+    ("open_file", "send"),
+    ("editor_state", "send"),
+    ("read_buffer", "send"),
+    ("diagnostics", "send"),
+    ("lsp", "ask"),
+    ("lsp", "collect"),
+];
+
+/// The typed records those calls take. Named only where one is built.
+const TOOL_RECORDS: [&str; 2] = ["diagnostics::DiagnosticsArgs", "lsp::AskArgs"];
+
+/// Values of the tools the dispatcher may read, none of which sends anything: the bounds an op is held to, and the
+/// severity a baseline asks from.
+const TOOL_VALUES: [&str; 4] = [
+    "lsp::LSP_BUDGET",
+    "lsp::COLLECT_MARGIN",
+    "baseline::BASELINE_LIMIT",
+    "diagnostics::Severity::Hint",
+];
+
+/// The `tool::function` calls of [`TOOL_CALLS`] this whitespace-free product code makes. Like the plugin host's
+/// functions, each is named by its full path at the call, so an alias cannot hide another; `Err` says what breaks
+/// that, or names a function outside the table. The stamp's module and `paths::file_check` are checks that send nothing.
+fn tool_calls(squeezed: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let excerpt = |text: &str| text.chars().take(40).collect::<String>();
+    let mut sends = std::collections::BTreeSet::new();
+    let mut calls = 0;
+    for (at, _) in squeezed.match_indices("editor_tools") {
+        if squeezed[..at].chars().next_back().is_some_and(is_ident) {
+            continue;
+        }
+        let after = &squeezed[at + "editor_tools".len()..];
+        let Some(rest) = after.strip_prefix("::") else {
+            return Err(format!("`editor_tools` is named but not as a path: {}", excerpt(after)));
+        };
+        if rest.starts_with("stamp::") || rest.starts_with("paths::file_check(") {
+            continue;
+        }
+        let named = rest.strip_prefix("tools::").and_then(|tool_on| {
+            let tool: String = tool_on.chars().take_while(|c| is_ident(*c)).collect();
+            Some((tool_on[tool.len()..].strip_prefix("::")?, tool))
+        });
+        let Some((function, tool)) = named else {
+            return Err(format!(
+                "the dispatcher reaches into the editor tools: {}",
+                excerpt(rest)
+            ));
+        };
+        let name: String = function.chars().take_while(|c| is_ident(*c)).collect();
+        let after_name = &function[name.len()..];
+        let item = format!("{tool}::{name}");
+        let path = format!("{tool}::{function}");
+        let is_value = TOOL_VALUES.iter().any(|value| {
+            path.strip_prefix(value)
+                .is_some_and(|after| !after.chars().next().is_some_and(is_ident))
+        });
+        let is_record = after_name.starts_with('{') && TOOL_RECORDS.contains(&item.as_str());
+        if after_name.starts_with('(') && TOOL_CALLS.contains(&(tool.as_str(), name.as_str())) {
+            calls += 1;
+            sends.insert(item);
+        } else if !is_value && !is_record {
+            return Err(format!("the dispatcher names {tool}::{}", excerpt(function)));
+        }
+    }
+    let functions: std::collections::BTreeSet<&str> = TOOL_CALLS.iter().map(|(_, function)| *function).collect();
+    let spelled: usize = functions
+        .iter()
+        .map(|function| squeezed.matches(&format!("::{function}(")).count())
+        .sum();
+    if spelled != calls {
+        return Err("the dispatcher makes a call outside its table".to_owned());
+    }
+    Ok(sends)
+}
+
+#[test]
+fn a_dispatcher_naming_an_unlisted_tool_function_fails() {
+    let listed = |text: &str| tool_calls(text).unwrap().into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        listed("crate::editor_tools::tools::open_file::send(rpc,&stamp)"),
+        ["open_file::send"]
+    );
+    assert_eq!(
+        listed(
+            "usecrate::editor_tools::stamp::{wall_ms,Stamp};crate::editor_tools::paths::file_check(&path);\
+             crate::editor_tools::tools::diagnostics::send(rpc,&stamp,&crate::editor_tools::tools::diagnostics::DiagnosticsArgs{})"
+        ),
+        ["diagnostics::send"]
+    );
+    assert_eq!(
+        listed(
+            "constMAX:Duration=crate::editor_tools::tools::lsp::LSP_BUDGET.saturating_add(crate::editor_tools::tools::lsp::COLLECT_MARGIN);\
+             crate::editor_tools::tools::lsp::ask(rpc,&stamp,&crate::editor_tools::tools::lsp::AskArgs{id});\
+             crate::editor_tools::tools::lsp::collect(rpc,&stamp,&id,last);"
+        ),
+        ["lsp::ask", "lsp::collect"]
+    );
+    assert_eq!(
+        listed(
+            "crate::editor_tools::tools::diagnostics::send(rpc,&stamp,&crate::editor_tools::tools::diagnostics::DiagnosticsArgs{\
+             min_severity:crate::editor_tools::tools::diagnostics::Severity::Hint,\
+             limit:crate::editor_tools::tools::baseline::BASELINE_LIMIT})"
+        ),
+        ["diagnostics::send"]
+    );
+    for bad in [
+        "crate::editor_tools::tools::nvim_exec::send(rpc,&stamp)",
+        "crate::editor_tools::tools::open_file::parse(&value)",
+        "crate::editor_tools::tools::open_file::OPEN_FILE::x",
+        "usecrate::editor_tools::tools::open_fileaso;o::send(rpc,&stamp)",
+        "usecrate::editor_tools::tools;tools::nvim_exec::send(rpc)",
+        "usecrate::editor_tools::tools::{open_file};open_file::send(rpc)",
+        "usecrate::editor_toolsastools;tools::tools::nvim_exec::send(rpc)",
+        "usecrate::editor_tools::{tools};",
+        "crate::editor_tools::paths::judge(root,home,raw)",
+        "crate::editor_tools::broker::Broker::new()",
+        "nvim_exec::send(rpc,&stamp)",
+        "crate::editor_tools::tools::lsp::rename(rpc,&stamp)",
+        "crate::editor_tools::tools::lsp::send(rpc,&stamp)",
+        "crate::editor_tools::tools::open_file::ask(rpc,&stamp)",
+        "crate::editor_tools::tools::lsp::parse_asked(&value)",
+        "crate::editor_tools::tools::lsp::ask",
+        "usecrate::editor_tools::tools::lsp::askasq;q(rpc,&stamp)",
+        "usecrate::editor_tools::tools::lsp::{ask};ask(rpc,&stamp)",
+        "usecrate::editor_tools::tools::lspasl;l::rename(rpc,&stamp)",
+        "crate::editor_tools::tools::lsp::AskArgsasA",
+        "crate::editor_tools::tools::lsp::LSP_BUDGET_MORE",
+        "crate::editor_tools::tools::lsp::LSP_ASK_LUA",
+        "crate::editor_tools::tools::baseline::BaselineRun::new(turn)",
+        "crate::editor_tools::tools::diagnostics::Severity::Error",
+        "lsp::ask(rpc,&stamp)",
+        "lsp::collect(rpc,&stamp,&id,last)",
+    ] {
+        assert!(tool_calls(bad).is_err(), "not caught: {bad}");
+    }
+}
+
 /// Window 2 reaches the editor only through the editor-op dispatcher, so the dispatcher's product code may name
-/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call) and the plugin host's editor
-/// functions of its table, and nothing else that runs in the editor: no follow teardown (the snippet and its commands
-/// are window 1's, whatever window 2's page does), no review chunk (the review ops become calls on window 1's own
-/// review driver), no scratch call, no event drain, no navigation fallback, and no pane kill. Comments and literals
-/// are blanked and whitespace is dropped, so formatting changes nothing.
+/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call), the plugin host's editor
+/// functions of its table and the agent tools' functions of theirs, and nothing else that runs in the editor: no follow
+/// teardown (the snippet and its commands are window 1's, whatever window 2's page does), no review chunk (the review
+/// ops become calls on window 1's own review driver), no scratch call, no event drain, no navigation fallback, and no
+/// pane kill. Comments and literals are blanked and whitespace is dropped, so formatting changes nothing.
 #[test]
 fn the_editor_op_dispatcher_names_only_its_table() {
     use eitri_core::source_scan::{code_only, modules, read_required, without};
-    use std::collections::BTreeSet;
 
     let source = read_required("core/src/window_link/editor_ops.rs");
     let all = code_only(&source.text);
@@ -560,6 +718,7 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         "CLEAR_ALL_LUA",
         "PLUGIN_OPEN_LUA",
         "PLUGIN_ASSIST_LUA",
+        "AGENT_EXEC_LUA",
     ] {
         assert!(!constants.contains(forbidden), "the dispatcher names {forbidden}");
     }
@@ -604,6 +763,14 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         ]),
         "the dispatcher calls a plugin editor function outside its table"
     );
+    assert_eq!(
+        tool_calls(&squeezed),
+        Ok(TOOL_CALLS
+            .iter()
+            .map(|(tool, function)| format!("{tool}::{function}"))
+            .collect()),
+        "the dispatcher calls a tool function outside its table"
+    );
     for (at, _) in squeezed.match_indices("plugin::") {
         let rest = &squeezed[at + "plugin::".len()..];
         // The follow text's two bounds are the ones window 1's own pages are held to: constants, not functions.
@@ -635,4 +802,1319 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         squeezed.contains("exec_lua(BUFFER_STATE_LUA,"),
         "the dispatcher's one `exec_lua` call does not send the buffer-state chunk"
     );
+
+    // Neither the op's type nor its dispatcher has a way to carry code to run.
+    let ops = read_required("core/src/window_link/editor_op.rs");
+    assert!(
+        product_code(&ops.text).contains("enum EditorOp"),
+        "`enum EditorOp` was not found: the scan reads nothing"
+    );
+    for text in [&ops.text, &source.text] {
+        assert_eq!(exec_op_wrong(text), Vec::<String>::new());
+    }
+}
+
+// ---- the exec chunk ------------------------------------------------------------------------------------------------
+
+const EXEC_MODULE: &str = "core/src/editor_tools/tools/nvim_exec.rs";
+const EXEC_CHUNK: &str = "core/src/editor_tools/tools/nvim_exec.lua";
+/// The panel's one function that calls the broker's `answer_card`.
+const CARD_GLUE: &str = "panel/src/editor_glue.rs";
+/// The file of the one arm that calls [`CARD_GLUE`]'s function, on an `editor_card_answer` from the page.
+const CARD_ARM: &str = "panel/src/inbound.rs";
+/// The function of [`CARD_ARM`] holding the one call of `TabSet::answer_card`, on a provider's cards.
+const PROVIDER_ANSWER: &str = "answer_permission_response";
+/// A test module of `tab_set.rs` kept in a file of its own, whose calls are `TabSet::answer_card` on a local `set`.
+const TAB_SET_TESTS: &str = "core/src/tab_set/move_tests.rs";
+
+/// Every file that may evaluate text in the editor, and how. Reviewed: `nvim_exec.lua` takes only the text of an
+/// approval, and `install.lua` compiles its parts, the compile-time constants `install_args` names. A new pair is red
+/// until someone has looked at it, and a pair that is gone is red too.
+const EVALUATORS: &[(&str, &str)] = &[
+    (EXEC_CHUNK, "nvim_exec2"),
+    (EXEC_CHUNK, "loadstring("),
+    ("core/src/companion/install.lua", "loadstring("),
+];
+
+/// What `review_lua_builds_no_source` refuses in `review.lua`, but for the word `load(`, read by [`tool_chunk_words`],
+/// and without the parens of `execute` and `vim.fn.bufnr`: either runs just the same when it is handed on as a value.
+const SOURCE_WORDS: [&str; 8] = [
+    "vim.cmd",
+    "nvim_command",
+    "nvim_exec",
+    "loadstring",
+    "dofile",
+    "fnameescape",
+    "execute",
+    "vim.fn.bufnr",
+];
+
+/// What else runs text in the editor, which [`SOURCE_WORDS`] does not name. Each takes a string or a function's name,
+/// and typed keys reach the command line.
+const RUNNERS: [&str; 8] = [
+    "nvim_cmd",
+    "luaeval",
+    "nvim_eval",
+    ".eval",
+    "nvim_call_function",
+    "nvim_call_dict_function",
+    "feedkeys",
+    "nvim_input",
+];
+
+/// Words too common to refuse bare (`args.load`), so they count called or handed on: `pcall(load, x)`, `vim.call(x)`,
+/// `fn.call(x, {})`. `nvim_buf_call`, which takes a function, is another word.
+const CALLED: [(&str, &str); 2] = [("load", "load("), ("call", "call(")];
+
+const LOAD_FILE_CHUNK: &str = "core/src/editor_tools/tools/load_file.lua";
+
+/// The calls of a [`RUNNERS`] word a tool chunk may hold, as [`tight`] reads them. Reviewed: every part is constant
+/// text, the `:lua` line calls a function held on `__state`, and `:set` takes one flag of 'shortmess'. Each stands in
+/// its chunk once, so a further call there is red, and a call that is gone is red too.
+const LISTED_COMMANDS: [(&str, &str); 3] = [
+    (
+        LOAD_FILE_CHUNK,
+        "nvim_cmd({cmd='lua',args={'_G.__eitri_agent.silently()'},mods={silent=true}},{})",
+    ),
+    (
+        LOAD_FILE_CHUNK,
+        "nvim_cmd({cmd='set',args={'shortmess+=A'},mods={noautocmd=true}},{})",
+    ),
+    (
+        LOAD_FILE_CHUNK,
+        "nvim_cmd,{cmd='set',args={'shortmess-=A'},mods={noautocmd=true}},{})",
+    ),
+];
+
+fn squeeze(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// `text` with its comments, its literals and its `#[cfg(test)]` modules blanked. Only a module with the attribute is
+/// cut: one without it ships, so it is read.
+fn product_code(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut code = code_only(&chars, &kinds(&chars));
+    for (from, to) in test_modules(&code) {
+        for c in code[from..=to].iter_mut().filter(|c| **c != '\n') {
+            *c = ' ';
+        }
+    }
+    code.into_iter().collect()
+}
+
+/// The literals of `text`, quotes included, and with `tests` those of its `#[cfg(test)]` modules too.
+fn literals(text: &str, tests: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let kinds = kinds(&chars);
+    let cut = if tests {
+        Vec::new()
+    } else {
+        test_modules(&code_only(&chars, &kinds))
+    };
+    let mut found = Vec::new();
+    let mut current = String::new();
+    for (at, (c, kind)) in chars.iter().zip(&kinds).enumerate() {
+        if *kind == Kind::Literal && !cut.iter().any(|&(from, to)| from < at && at < to) {
+            current.push(*c);
+        } else if !current.is_empty() {
+            found.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        found.push(current);
+    }
+    found
+}
+
+/// The text of `body`, a slice of `whole`, as a range of `whole`.
+fn span(whole: &str, body: &str) -> Range<usize> {
+    let start = body.as_ptr() as usize - whole.as_ptr() as usize;
+    start..start + body.len()
+}
+
+/// The braces following the first `head` in `text`, as a range.
+fn block_after(text: &str, head: &str) -> Option<Range<usize>> {
+    let at = text.find(head)?;
+    let open = at + text[at..].find('{')?;
+    Some(span(text, source_scan::braced(text, open)))
+}
+
+/// `AGENT_EXEC_LUA` and its file are named in the exec module and nowhere else. Comments may say the name.
+fn exec_chunk_naming(sources: &[Source]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let mut named = 0;
+    for source in sources {
+        let words = word_ends(&source_scan::code_only(&source.text), "AGENT_EXEC_LUA").len();
+        let file = literals(&source.text, true).iter().any(|l| l.contains("nvim_exec.lua"));
+        if source.path == EXEC_MODULE {
+            named = words;
+            if !file {
+                wrong.push(format!("{EXEC_MODULE} does not load `nvim_exec.lua`"));
+            }
+        } else if words > 0 || file {
+            wrong.push(format!("{} names the exec chunk", source.path));
+        }
+    }
+    if named < 2 {
+        wrong.push(format!(
+            "{EXEC_MODULE} names `AGENT_EXEC_LUA` {named} times: no `const` and call to check"
+        ));
+    }
+    wrong
+}
+
+/// Whether the call's argument, at the start of `rest`, is `exec_args(..)` and the call ends with it.
+fn only_exec_args(rest: &str) -> bool {
+    let rest: Vec<char> = rest.chars().collect();
+    let open = "exec_args".len();
+    let named = rest.iter().take(open + 1).collect::<String>() == "exec_args(";
+    named
+        && closing(&rest, open).is_some_and(|close| {
+            let after: String = rest[close + 1..].iter().take(2).collect();
+            after.starts_with(')') || after == ",)"
+        })
+}
+
+/// What in the exec module's text lets code reach the chunk from anywhere but a person's answer on a card. The text is
+/// whitespace-squeezed where a shape is matched, so formatting changes nothing.
+fn exec_record_wrong(text: &str) -> Vec<String> {
+    const CALL: &str = "exec_lua(AGENT_EXEC_LUA,";
+    const CONSTRUCTOR: &str = "fnfrom_card(pending:PendingExec,answer:CardAnswer,";
+    const ARGS: &str = "fnexec_args(stamp:&Stamp,record:ApprovalRecord)";
+    const RECORD: &str = "ApprovalRecord";
+
+    let code = product_code(text);
+    let squeezed = squeeze(&code);
+    let mut wrong = Vec::new();
+    let mut need = |holds: bool, what: &str| {
+        if !holds {
+            wrong.push(what.to_owned());
+        }
+    };
+
+    let calls: Vec<usize> = squeezed.match_indices(CALL).map(|(at, _)| at).collect();
+    need(calls.len() == 1, "the chunk has exactly one call");
+    need(
+        word_ends(&code, "AGENT_EXEC_LUA").len() == 2,
+        "`AGENT_EXEC_LUA` stands in its `const` and its call, and nowhere else in product code",
+    );
+    let after_call = |at: &usize| &squeezed[at + CALL.len()..];
+    need(
+        calls.iter().all(|at| only_exec_args(after_call(at))),
+        "its arguments are exactly `exec_args(..)`",
+    );
+    let send = block_after(&squeezed, "pubfnsend(");
+    need(
+        squeezed.matches("pubfnsend(").count() == 1
+            && send.is_some_and(|body| calls.iter().all(|at| body.contains(at))),
+        "the chunk's call stands in `pub fn send`",
+    );
+
+    need(
+        squeezed.matches(ARGS).count() == 1,
+        "`fn exec_args` takes a stamp and the record, once",
+    );
+    need(squeezed.matches("exec_args(").count() == 2, "`exec_args` has one call");
+
+    let struct_literals: Vec<usize> = squeezed
+        .match_indices("ApprovalRecord{")
+        .map(|(at, _)| at)
+        .filter(|&at| !squeezed[..at].ends_with("struct") && !squeezed[..at].ends_with("impl"))
+        .collect();
+    let constructor = block_after(&squeezed, "fnfrom_card(");
+    need(
+        struct_literals.len() == 1 && constructor.is_some_and(|body| body.contains(&struct_literals[0])),
+        "the record has one struct literal, in `from_card`",
+    );
+    let impls = source_scan::impl_blocks(&code, RECORD);
+    need(
+        !impls.iter().any(|body| {
+            let body = squeeze(body);
+            body.contains("Self{") || body.contains("Self(")
+        }),
+        "the record is not built through `Self`",
+    );
+
+    let heads: Vec<usize> = squeezed.match_indices(CONSTRUCTOR).map(|(at, _)| at).collect();
+    need(
+        heads.len() == 1,
+        "`fn from_card` takes a pending call and a card's answer, once",
+    );
+    need(
+        heads.iter().all(|&at| squeezed[..at].ends_with(['{', '}', ';', ']'])),
+        "`from_card` is not private",
+    );
+    // By word as well: `let f = ApprovalRecord::from_card;` is a call the `(` cannot see.
+    need(
+        squeezed.matches("from_card(").count() == 2 && word_ends(&code, "from_card").len() == 2,
+        "`from_card` has one call",
+    );
+
+    let name = word_ends(&code, RECORD)
+        .into_iter()
+        .find(|end| code[..end - RECORD.len()].trim_end().ends_with("struct"));
+    let fields = name.and_then(|end| {
+        let after = &code[end..];
+        let rest = after.trim_start();
+        rest.starts_with('{')
+            .then(|| source_scan::braced(&code, end + (after.len() - rest.len())))
+    });
+    need(fields.is_some(), "the record is a struct with named fields");
+    need(
+        fields.is_none_or(|body| word_ends(body, "pub").is_empty()),
+        "the record has a public field",
+    );
+
+    // The attributes on the struct: what stands between the last item's end and its name.
+    let before = squeezed.find("structApprovalRecord").map_or("", |at| &squeezed[..at]);
+    let above = &before[before.rfind([';', '}']).map_or(0, |at| at + 1)..];
+    for forged in ["Clone", "Default", "Serialize", "Deserialize"] {
+        need(!above.contains(forged), &format!("the record derives {forged}"));
+    }
+
+    // Only the inherent block names it: a trait is one more way in, and red until someone has looked at it.
+    let trait_impl = word_ends(&code, "impl").into_iter().any(|end| {
+        let rest = &code[end..];
+        let header = &rest[..rest.find('{').unwrap_or(rest.len())];
+        !word_ends(header, RECORD).is_empty() && squeeze(header) != RECORD
+    });
+    need(!trait_impl, "the record has an `impl` other than the inherent one");
+
+    // A second name is a literal, or a call of `from_card`, that the counts above cannot see.
+    let renamed = word_ends(&code, RECORD).into_iter().any(|end| {
+        let before = code[..end - RECORD.len()].trim_end();
+        let after = code[end..].trim_start();
+        let as_before = word_ends(before, "as").last() == Some(&before.len());
+        as_before || after.starts_with(';') || after.split_whitespace().next() == Some("as")
+    });
+    need(!renamed, "the record has another name");
+
+    // What runs is what the card showed: nothing writes to the record or its text after the card made it.
+    let written = [".code=", ".kind="].into_iter().any(|field| {
+        squeezed
+            .match_indices(field)
+            .any(|(at, _)| !squeezed[at + field.len()..].starts_with('='))
+    });
+    need(
+        !written && !squeezed.contains("mutrecord") && !impls.iter().any(|body| squeeze(body).contains("mutself")),
+        "the record is changed after the card",
+    );
+
+    wrong
+}
+
+/// `text` with its Lua comments dropped, each for one blank. Strings stay: a word in one counts, and `--` in one opens
+/// no comment, so a string cannot hide the code after it.
+fn lua_code(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    // The end of what a long bracket at `at` closes, if one opens there: `[[`, `[=[`, ...
+    let long_end = |at: usize| {
+        if chars.get(at) != Some(&'[') {
+            return None;
+        }
+        let level = chars[at + 1..].iter().take_while(|c| **c == '=').count();
+        if chars.get(at + 1 + level) != Some(&'[') {
+            return None;
+        }
+        let close: Vec<char> = std::iter::once(']')
+            .chain(std::iter::repeat_n('=', level))
+            .chain(std::iter::once(']'))
+            .collect();
+        let found = (at..chars.len()).find(|&p| chars[p..].starts_with(&close));
+        Some(found.map_or(chars.len(), |p| p + close.len()))
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i = long_end(i + 2).unwrap_or_else(|| (i..chars.len()).find(|&p| chars[p] == '\n').unwrap_or(chars.len()));
+            out.push(' ');
+        } else if let Some(end) = long_end(i) {
+            out.extend(&chars[i..end]);
+            i = end;
+        } else if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < chars.len() && chars[i] != c && chars[i] != '\n' {
+                let escaped = usize::from(chars[i] == '\\' && i + 1 < chars.len());
+                out.extend(&chars[i..=i + escaped]);
+                i += 1 + escaped;
+            }
+            if let Some(quote) = chars.get(i) {
+                out.push(*quote);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `code` with its blanks dropped, but for one between two words: `vim . cmd (x)` and `vim.cmd\n(x)` read as
+/// `vim.cmd(x)`, and `return load` stays two words. Strings are squeezed too: this text is only matched.
+fn tight(code: &str) -> String {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(code.len());
+    let mut blank = false;
+    for c in code.chars() {
+        if c.is_whitespace() {
+            blank = true;
+            continue;
+        }
+        if blank && word(c) && out.chars().next_back().is_some_and(word) {
+            out.push(' ');
+        }
+        out.push(c);
+        blank = false;
+    }
+    out
+}
+
+/// Whether the word `name` stands in `text` with one of `next` after it, past blanks.
+fn word_before(text: &str, name: &str, next: &[char]) -> bool {
+    word_ends(text, name)
+        .into_iter()
+        .any(|end| text[end..].trim_start().starts_with(next))
+}
+
+/// The word `name` called, or in Lua handed on as a value: `pcall(load, x)` evaluates `x` too. Not `bufload(`, and not
+/// an English sentence in a Rust string.
+fn names_call(text: &str, name: &str, lua: bool) -> bool {
+    let next: &[char] = if lua { &['(', ',', ')'] } else { &['('] };
+    word_before(text, name, next)
+}
+
+/// What can evaluate text in a file: in a chunk with its comments dropped, in Rust in its string literals outside its
+/// test modules, since a chunk can stand in one.
+fn evaluators(path: &str, text: &str) -> BTreeSet<&'static str> {
+    let lua = path.ends_with(".lua");
+    let texts = if lua {
+        vec![lua_code(text)]
+    } else {
+        literals(text, false)
+    };
+    // These names are no English word: in a chunk the bare name counts, as `local run = loadstring` evaluates too. A
+    // Rust literal may name the tool or say the word, so there only a call counts.
+    let names = |text: &str, name: &str| {
+        if lua {
+            !word_ends(text, name).is_empty()
+        } else {
+            word_before(text, name, &['('])
+        }
+    };
+    let mut found = BTreeSet::new();
+    for text in &texts {
+        if text.contains("nvim_exec2") {
+            found.insert("nvim_exec2");
+        }
+        if names(text, "loadstring") {
+            found.insert("loadstring(");
+        }
+        if names(text, "nvim_exec") || names(text, "nvim_exec_lua") {
+            found.insert("nvim_exec(");
+        }
+        if names_call(text, "load", lua) {
+            found.insert("load(");
+        }
+    }
+    found
+}
+
+/// Every evaluator in `sources` that [`EVALUATORS`] does not list.
+fn unlisted(sources: &[Source]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for source in sources {
+        for word in evaluators(&source.path, &source.text) {
+            if !EVALUATORS.contains(&(source.path.as_str(), word)) {
+                wrong.push(format!("{} holds `{word}`", source.path));
+            }
+        }
+    }
+    wrong
+}
+
+/// The words of [`SOURCE_WORDS`], [`RUNNERS`] and [`CALLED`] in `code`, a chunk as [`tight`] reads it.
+fn words_in(code: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = SOURCE_WORDS
+        .into_iter()
+        .chain(RUNNERS)
+        .filter(|word| code.contains(word))
+        .collect();
+    found.extend(
+        CALLED
+            .into_iter()
+            .filter(|(name, _)| names_call(code, name, true))
+            .map(|(_, word)| word),
+    );
+    found
+}
+
+/// The words of [`words_in`] in a chunk, comments dropped.
+fn tool_chunk_words(text: &str) -> Vec<&'static str> {
+    words_in(&tight(&lua_code(text)))
+}
+
+/// What `chunks` hold beyond [`LISTED_COMMANDS`], and every listed call that is no longer there, once.
+fn tool_chunks_wrong(chunks: &[&Source]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (path, _) in LISTED_COMMANDS
+        .iter()
+        .filter(|(path, _)| !chunks.iter().any(|chunk| chunk.path == *path))
+    {
+        wrong.push(format!("{path} is gone: the list is out of date"));
+    }
+    for chunk in chunks {
+        let mut code = tight(&lua_code(&chunk.text));
+        for (_, call) in LISTED_COMMANDS.iter().filter(|(path, _)| *path == chunk.path) {
+            if code.matches(call).count() != 1 {
+                wrong.push(format!(
+                    "{} does not hold `{call}` once: the list is out of date",
+                    chunk.path
+                ));
+            }
+            code = code.replace(call, " ");
+        }
+        wrong.extend(
+            words_in(&code)
+                .into_iter()
+                .map(|word| format!("{} holds `{word}`", chunk.path)),
+        );
+    }
+    wrong
+}
+
+/// The bodies of the `pattern { .. } => { .. }` match arms of `code`, as ranges.
+fn arm_bodies(code: &str, pattern: &str) -> Vec<Range<usize>> {
+    code.match_indices(pattern)
+        .filter_map(|(at, _)| {
+            let after = at + pattern.len();
+            let open = after + code[after..].find('{')?;
+            let end = open + source_scan::braced(code, open).len();
+            let body = code[end..].trim_start().strip_prefix("=>")?.trim_start();
+            body.starts_with('{')
+                .then(|| span(code, source_scan::braced(code, code.len() - body.len())))
+        })
+        .collect()
+}
+
+/// Who calls an `answer_card`, on product code. `TabSet::answer_card`, on a provider's cards, has one call, through
+/// `tabs.` in [`PROVIDER_ANSWER`]: text cannot tell the type behind a name, so that one call is what is let through.
+/// The broker's goes through `editor_tools.` in [`CARD_GLUE`]'s own `answer_card`, whose one call stands in the
+/// `EditorCardAnswer` arm of [`CARD_ARM`]. Anything else that names the function, by a call or as a path, is refused.
+fn card_path_wrong(sources: &[Source]) -> Vec<String> {
+    const NAME: &str = "answer_card";
+    const ARM: &str = "InboundMessage::EditorCardAnswer";
+    let mut wrong = Vec::new();
+    let (mut broker_calls, mut arm_calls, mut provider_calls) = (0, 0, 0);
+    for source in sources {
+        let code = product_code(&source.text);
+        let bodies_of = |name: &str| -> Vec<Range<usize>> {
+            source_scan::functions(&code, name)
+                .into_iter()
+                .map(|body| span(&code, body))
+                .collect()
+        };
+        let glue = bodies_of(NAME);
+        let provider = bodies_of(PROVIDER_ANSWER);
+        let arms = arm_bodies(&code, ARM);
+        for end in word_ends(&code, NAME) {
+            let at = end - NAME.len();
+            let reversed: String = code[..at]
+                .chars()
+                .rev()
+                .filter(|c| !c.is_whitespace())
+                .take(16)
+                .collect();
+            let before: String = reversed.chars().rev().collect();
+            let called = code[end..].trim_start().starts_with('(');
+            let inside = |bodies: &[Range<usize>]| bodies.iter().any(|body| body.contains(&at));
+            if called && before.ends_with("fn") {
+                continue;
+            }
+            let tabs = before
+                .strip_suffix("tabs.")
+                .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.'));
+            if called && source.path == CARD_GLUE && before.ends_with("editor_tools.") && inside(&glue) {
+                broker_calls += 1;
+            } else if called && source.path == CARD_ARM && before.ends_with("editor_glue::") && inside(&arms) {
+                arm_calls += 1;
+            } else if called && source.path == CARD_ARM && tabs && inside(&provider) {
+                provider_calls += 1;
+            } else {
+                let line = code[..at].matches('\n').count() + 1;
+                wrong.push(format!("{}:{line}: `{NAME}` outside the card path", source.path));
+            }
+        }
+    }
+    if broker_calls != 1 {
+        wrong.push(format!("{CARD_GLUE} calls the broker's `{NAME}` {broker_calls} times"));
+    }
+    if arm_calls != 1 {
+        wrong.push(format!("the `{ARM}` arm of {CARD_ARM} calls it {arm_calls} times"));
+    }
+    if provider_calls != 1 {
+        wrong.push(format!(
+            "`{PROVIDER_ANSWER}` of {CARD_ARM} calls `TabSet::{NAME}` {provider_calls} times"
+        ));
+    }
+    wrong
+}
+
+/// What in a file of the op's type or dispatcher could carry code to run: nothing here may name it, in code or in a
+/// wire name.
+fn exec_op_wrong(text: &str) -> Vec<String> {
+    let said = format!("{}\n{}", product_code(text), literals(text, false).join("\n"));
+    ["Exec", "nvim_exec"]
+        .into_iter()
+        .filter(|word| said.contains(word))
+        .map(|word| format!("the op names `{word}`"))
+        .collect()
+}
+
+#[test]
+fn exec_chunk_is_named_only_in_its_module() {
+    let read = source_scan::rust_sources(&["core/src", "shell/src", "panel/src", "mac/src"]);
+    assert!(
+        read.iter().any(|source| source.path == EXEC_MODULE),
+        "the walk missed the exec module"
+    );
+    assert_eq!(exec_chunk_naming(&read), Vec::<String>::new());
+}
+
+#[test]
+fn exec_code_comes_only_from_the_record() {
+    let module = source_scan::read_required(EXEC_MODULE);
+    assert!(
+        squeeze(&product_code(&module.text)).contains("pubfnsend("),
+        "`fn send` was not found: the scan reads nothing"
+    );
+    assert_eq!(exec_record_wrong(&module.text), Vec::<String>::new());
+}
+
+#[test]
+fn only_the_exec_chunk_evaluates_an_argument() {
+    // Rust as well: only `core/src` holds Lua today, and a directory with no file of the kind asked for is refused.
+    let read = source_scan::sources(&["core/src", "shell/src", "panel/src", "mac/src"], &["lua", "rs"]);
+    assert_eq!(unlisted(&read), Vec::<String>::new());
+    for (path, word) in EVALUATORS {
+        let source = read.iter().find(|source| source.path == *path);
+        let found = source
+            .map(|source| evaluators(&source.path, &source.text))
+            .unwrap_or_default();
+        assert!(
+            found.contains(word),
+            "{path} no longer holds `{word}`: the list is out of date"
+        );
+    }
+}
+
+#[test]
+fn no_other_tool_chunk_builds_source() {
+    let read = source_scan::sources(&["core/src/editor_tools"], &["lua"]);
+    let others: Vec<&Source> = read.iter().filter(|source| source.path != EXEC_CHUNK).collect();
+    assert_eq!(others.len() + 1, read.len(), "the walk missed the exec chunk");
+    assert!(others.len() >= 6, "the walk found only {} chunks", others.len());
+    assert_eq!(tool_chunks_wrong(&others), Vec::<String>::new());
+}
+
+#[test]
+fn only_the_card_path_answers_a_broker_card() {
+    assert!(
+        squeeze(&source_scan::read_required("core/src/tab_set.rs").text).contains("#[cfg(test)]modmove_tests;"),
+        "{TAB_SET_TESTS} is no longer a test module, so it is read as product code"
+    );
+    let read: Vec<Source> = source_scan::rust_sources(&["core/src", "panel/src", "shell/src"])
+        .into_iter()
+        .filter(|source| source.path != TAB_SET_TESTS)
+        .collect();
+    assert_eq!(card_path_wrong(&read), Vec::<String>::new());
+}
+
+/// The shape of the exec module, with everything the checks read and nothing else.
+const EXEC_SHAPE: &str = r#"
+const AGENT_EXEC_LUA: &str = chunk!("nvim_exec.lua");
+
+pub struct ApprovalRecord {
+    tab: u64,
+    code: String,
+}
+
+impl ApprovalRecord {
+    fn from_card(pending: PendingExec, answer: CardAnswer, tab: u64) -> Result<ApprovalRecord, ExecRefused> {
+        Ok(ApprovalRecord {
+            tab,
+            code: pending.code,
+        })
+    }
+}
+
+pub fn send(rpc: &dyn EditorRpc, stamp: &Stamp, slot: &ExecSlot) -> Pending {
+    let record = slot.take();
+    rpc.exec_lua(AGENT_EXEC_LUA, exec_args(stamp, record))
+}
+
+fn exec_args(stamp: &Stamp, record: ApprovalRecord) -> Vec<Value> {
+    vec![stamp.to_value(), Value::from(record.code)]
+}
+
+fn run_approved(pending: PendingExec, answer: CardAnswer) {
+    let record = ApprovalRecord::from_card(pending, answer, 1);
+}
+"#;
+
+/// [`EXEC_SHAPE`] with one piece replaced, which has to be there.
+fn shape_with(from: &str, to: &str) -> String {
+    assert!(EXEC_SHAPE.contains(from), "the shape has no `{from}`");
+    EXEC_SHAPE.replacen(from, to, 1)
+}
+
+fn refused(text: &str, why: &str) {
+    let wrong = exec_record_wrong(text);
+    assert!(wrong.iter().any(|line| line.contains(why)), "`{why}` not in {wrong:?}");
+}
+
+fn accepted(text: &str) {
+    assert_eq!(exec_record_wrong(text), Vec::<String>::new());
+}
+
+fn file(path: &str, text: &str) -> Source {
+    Source {
+        path: path.to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+#[test]
+fn a_file_with_nothing_to_count_fails() {
+    assert!(!exec_record_wrong("fn unrelated() {}").is_empty());
+    assert!(!exec_chunk_naming(&[file("x.rs", "fn unrelated() {}")]).is_empty());
+    assert!(!card_path_wrong(&[file("x.rs", "fn unrelated() {}")]).is_empty());
+}
+
+#[test]
+fn a_second_caller_of_the_chunk_fails() {
+    let second = format!("{EXEC_SHAPE}\nfn other(rpc: &dyn EditorRpc) {{ rpc.exec_lua(AGENT_EXEC_LUA, vec![]); }}");
+    refused(&second, "exactly one call");
+    let alias = format!("{EXEC_SHAPE}\nconst SAME: &str = AGENT_EXEC_LUA;");
+    refused(&alias, "its `const` and its call");
+
+    let module = file(EXEC_MODULE, EXEC_SHAPE);
+    assert_eq!(exec_chunk_naming(std::slice::from_ref(&module)), Vec::<String>::new());
+    for text in [
+        "fn other() { use exec::AGENT_EXEC_LUA; }",
+        "const X: &str = chunk!(\"nvim_exec.lua\");",
+    ] {
+        let wrong = exec_chunk_naming(&[module.clone(), file("core/src/other.rs", text)]);
+        assert_eq!(wrong.len(), 1, "{text}: {wrong:?}");
+        assert!(wrong[0].contains("core/src/other.rs"), "{wrong:?}");
+    }
+    // A comment may name it.
+    let said = file("core/src/other.rs", "// AGENT_EXEC_LUA in nvim_exec.lua\nfn other() {}");
+    assert_eq!(exec_chunk_naming(&[module, said]), Vec::<String>::new());
+}
+
+#[test]
+fn a_built_code_argument_fails() {
+    const CALL: &str = "exec_lua(AGENT_EXEC_LUA, exec_args(stamp, record))";
+    for built in [
+        "exec_lua(AGENT_EXEC_LUA, vec![Value::from(code)])",
+        "exec_lua(AGENT_EXEC_LUA, built(exec_args(stamp, record)))",
+        "exec_lua(AGENT_EXEC_LUA, exec_args(stamp, record).into_iter().chain(more).collect())",
+    ] {
+        refused(&shape_with(CALL, built), "its arguments are exactly");
+    }
+    accepted(&shape_with(
+        CALL,
+        "exec_lua(\n        AGENT_EXEC_LUA,\n        exec_args(stamp, record),\n    )",
+    ));
+    refused(
+        &shape_with(
+            "pub fn send(rpc: &dyn EditorRpc, stamp: &Stamp, slot: &ExecSlot) -> Pending {",
+            "pub fn run(rpc: &dyn EditorRpc, stamp: &Stamp, slot: &ExecSlot) -> Pending {",
+        ),
+        "`pub fn send`",
+    );
+    refused(
+        &shape_with(
+            "fn exec_args(stamp: &Stamp, record: ApprovalRecord) -> Vec<Value> {",
+            "fn exec_args(stamp: &Stamp, record: String) -> Vec<Value> {",
+        ),
+        "`fn exec_args",
+    );
+    let again = format!("{EXEC_SHAPE}\nfn more(stamp: &Stamp, record: ApprovalRecord) {{ exec_args(stamp, record); }}");
+    refused(&again, "`exec_args` has one call");
+}
+
+#[test]
+fn a_public_constructor_fails() {
+    for public in [
+        "pub fn from_card(",
+        "pub(crate) fn from_card(",
+        "pub(super) fn from_card(",
+    ] {
+        refused(&shape_with("fn from_card(", public), "`from_card` is not private");
+    }
+    accepted(&shape_with("fn from_card(", "#[must_use]\n    fn from_card("));
+    refused(
+        &shape_with("answer: CardAnswer, tab", "answer: &CardAnswer, tab"),
+        "`fn from_card",
+    );
+    let second = format!("{EXEC_SHAPE}\nfn again() {{ ApprovalRecord::from_card(p, a, 2); }}");
+    refused(&second, "`from_card` has one call");
+    refused(
+        &shape_with("ApprovalRecord::from_card(pending, answer, 1)", "todo!()"),
+        "`from_card` has one call",
+    );
+    // Taken as a value it is called through a name the count cannot see.
+    let handed = format!("{EXEC_SHAPE}\nfn again() {{ let f = ApprovalRecord::from_card; f(p, a, 2); }}");
+    refused(&handed, "`from_card` has one call");
+}
+
+#[test]
+fn a_public_field_fails() {
+    refused(
+        &shape_with("    tab: u64,\n    code", "    pub tab: u64,\n    code"),
+        "a public field",
+    );
+    refused(
+        &shape_with("    code: String,\n}", "    pub(crate) code: String,\n}"),
+        "a public field",
+    );
+    refused(
+        &shape_with(
+            "pub struct ApprovalRecord {\n    tab: u64,\n    code: String,\n}",
+            "pub struct ApprovalRecord(String);",
+        ),
+        "named fields",
+    );
+}
+
+#[test]
+fn a_derived_clone_fails() {
+    for derive in ["Clone", "Default", "Serialize", "Deserialize"] {
+        let derived = format!("#[derive(Debug, {derive})]\npub struct ApprovalRecord");
+        refused(&shape_with("pub struct ApprovalRecord", &derived), derive);
+    }
+    accepted(&shape_with(
+        "pub struct ApprovalRecord",
+        "#[derive(Debug)]\npub struct ApprovalRecord",
+    ));
+    // A derive on the item above says nothing of the record.
+    accepted(&shape_with(
+        "pub struct ApprovalRecord",
+        "#[derive(Clone)]\npub struct Other {\n    a: u8,\n}\n\npub struct ApprovalRecord",
+    ));
+}
+
+#[test]
+fn an_impl_of_a_trait_for_the_record_fails() {
+    for header in [
+        "impl Clone for ApprovalRecord {\n    fn clone(&self) -> Self { todo!() }\n}",
+        "impl<T> From<T> for ApprovalRecord {\n    fn from(_: T) -> Self { todo!() }\n}",
+        "impl From<String> for ApprovalRecord {\n    fn from(_: String) -> Self { todo!() }\n}",
+        "impl From<ApprovalRecord> for String {\n    fn from(_: ApprovalRecord) -> Self { todo!() }\n}",
+    ] {
+        refused(
+            &format!("{EXEC_SHAPE}\n{header}"),
+            "an `impl` other than the inherent one",
+        );
+    }
+}
+
+#[test]
+fn a_second_struct_literal_fails() {
+    let forged = "fn forged() -> Option<ApprovalRecord> { Some(ApprovalRecord { tab: 1, code: String::new() }) }";
+    refused(&format!("{EXEC_SHAPE}\n{forged}"), "one struct literal");
+    let elsewhere = shape_with(
+        "Ok(ApprovalRecord {\n            tab,\n            code: pending.code,\n        })",
+        "todo!()",
+    );
+    refused(&format!("{elsewhere}\n{forged}"), "one struct literal");
+    let by_self =
+        "impl ApprovalRecord {\n    fn forged() -> Option<Self> { Some(Self { tab: 1, code: String::new() }) }\n}";
+    refused(&format!("{EXEC_SHAPE}\n{by_self}"), "`Self`");
+}
+
+#[test]
+fn a_second_name_for_the_record_fails() {
+    for named in [
+        "type R = ApprovalRecord;\nfn forged() -> R { R { tab: 1, code: String::new() } }",
+        "type R = self::ApprovalRecord;",
+        "use self::ApprovalRecord as R;",
+        "use other::Forged as ApprovalRecord;",
+    ] {
+        refused(&format!("{EXEC_SHAPE}\n{named}"), "another name");
+    }
+    // The call of its constructor and a type in a signature are the record under its own name.
+    accepted(&format!(
+        "{EXEC_SHAPE}\nfn read(record: &ApprovalRecord) -> Option<ApprovalRecord> {{ None }}"
+    ));
+}
+
+#[test]
+fn a_record_changed_after_the_card_fails() {
+    for changed in [
+        shape_with(
+            "let record = slot.take();",
+            "let mut record = slot.take();\n    record.code = other();",
+        ),
+        shape_with(
+            "let record = slot.take();",
+            "let record = slot.take();\n    forged(&mut record);",
+        ),
+        format!("{EXEC_SHAPE}\nfn f(slot: &S) {{ slot.get().code = other(); }}"),
+        format!("{EXEC_SHAPE}\nfn f(slot: &S) {{ slot.get().kind = other(); }}"),
+        format!(
+            "{EXEC_SHAPE}\nimpl ApprovalRecord {{\n    pub fn set_code(&mut self, c: String) {{ self.code = c; }}\n}}"
+        ),
+        format!("{EXEC_SHAPE}\nimpl ApprovalRecord {{\n    pub fn with(mut self, c: String) -> Self {{ self }}\n}}"),
+    ] {
+        refused(&changed, "changed after the card");
+    }
+    accepted(&format!(
+        "{EXEC_SHAPE}\nfn same(a: &A, b: &B) -> bool {{ a.code == b.code }}"
+    ));
+    accepted(&format!("{EXEC_SHAPE}\nfn other(mut slot: u8) {{ slot = 1; }}"));
+}
+
+#[test]
+fn the_impl_block_is_no_literal() {
+    accepted(EXEC_SHAPE);
+    accepted(&format!(
+        "{EXEC_SHAPE}\nimpl ApprovalRecord {{\n    pub fn tab(&self) -> u64 {{ self.tab }}\n}}"
+    ));
+}
+
+#[test]
+fn a_test_module_and_a_comment_are_not_product_code() {
+    let tests = "#[cfg(test)]\nmod tests {\n    fn t() { rpc.exec_lua(AGENT_EXEC_LUA, vec![]); }\n}";
+    accepted(&format!("{EXEC_SHAPE}\n{tests}"));
+    accepted(&format!("{EXEC_SHAPE}\n// rpc.exec_lua(AGENT_EXEC_LUA, vec![])"));
+    // Without the attribute it ships, so it counts.
+    refused(
+        &format!("{EXEC_SHAPE}\n{}", tests.replace("#[cfg(test)]\n", "")),
+        "exactly one call",
+    );
+}
+
+fn flagged(path: &str, text: &str) -> Vec<String> {
+    unlisted(&[file(path, text)])
+}
+
+#[test]
+fn a_new_chunk_with_loadstring_fails() {
+    assert_eq!(flagged("core/src/x.lua", "return loadstring(args.code)()").len(), 1);
+    assert_eq!(flagged("core/src/x.lua", "vim.api.nvim_exec2(args.code, {})").len(), 1);
+    // The Lua of a Rust literal is a chunk too, and a test's is not.
+    assert_eq!(
+        flagged("core/src/x.rs", "const C: &str = \"return loadstring(c)()\";").len(),
+        1
+    );
+    assert_eq!(
+        flagged("core/src/x.rs", "const C: &str = r#\"nvim_exec2(c, {})\"#;").len(),
+        1
+    );
+    assert_eq!(
+        flagged(
+            "core/src/x.rs",
+            "#[cfg(test)]\nmod t { const C: &str = \"loadstring(c)\"; }"
+        ),
+        Vec::<String>::new()
+    );
+    // A listed file holds what is listed for it and nothing more.
+    assert_eq!(
+        flagged("core/src/companion/install.lua", "local f = loadstring(part.src)"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        flagged("core/src/companion/install.lua", "vim.api.nvim_exec2(x, {})").len(),
+        1
+    );
+    assert_eq!(flagged(EXEC_CHUNK, "return load(args.code)").len(), 1);
+    assert_eq!(
+        flagged(EXEC_CHUNK, "loadstring(args.code)\nvim.api.nvim_exec2(args.code, {})"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_evaluator_handed_on_fails() {
+    for bad in [
+        "pcall(loadstring, x)",
+        "local run = loadstring",
+        "vim.api.nvim_exec(x, true)",
+        "pcall(vim.api.nvim_exec, x)",
+        "vim.api.nvim_exec_lua(x, {})",
+        "local exec = vim.api.nvim_exec_lua",
+    ] {
+        assert_eq!(flagged("core/src/x.lua", bad).len(), 1, "not caught: {bad}");
+    }
+    assert_eq!(
+        flagged("core/src/x.rs", "const C: &str = \"vim.api.nvim_exec(c, true)\";").len(),
+        1
+    );
+    // A Rust literal may name the tool, or say the word in a sentence.
+    assert_eq!(
+        flagged("core/src/x.rs", "const N: &str = \"nvim_exec\";"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        flagged("core/src/x.rs", "const N: &str = \"the loadstring of a chunk\";"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_string_opens_no_comment() {
+    for hidden in [
+        "local s = '--' return loadstring(x)",
+        "local s = \"--\" return loadstring(x)",
+        "local s = [[--]] return loadstring(x)",
+        "local s = 'it\\'s --' return loadstring(x)",
+        "--[[ long ]] return loadstring(x)",
+        "--[==[ long ]] ]==] return loadstring(x)",
+    ] {
+        assert_eq!(flagged("core/src/x.lua", hidden).len(), 1, "not caught: {hidden}");
+    }
+}
+
+#[test]
+fn load_of_a_function_name_fails() {
+    for bad in [
+        "return load(name)",
+        "return load (name)",
+        "local ok = pcall(load, name)",
+        "vim.load(name)",
+    ] {
+        assert_eq!(flagged("core/src/x.lua", bad).len(), 1, "not caught: {bad}");
+    }
+    assert_eq!(
+        flagged("core/src/x.rs", "const C: &str = \"return load(name)\";").len(),
+        1
+    );
+    assert_eq!(tool_chunk_words("return load(name)"), ["load("]);
+    assert_eq!(tool_chunk_words("pcall(load, name)"), ["load("]);
+}
+
+#[test]
+fn bufload_passes() {
+    for good in [
+        "vim.fn.bufload(buf)",
+        "reload(buf)",
+        "local function load_file(path) end",
+        "-- load(x) and loadstring(y) in a comment",
+        "--[[ nvim_exec2(x)\nloadstring(y) ]]",
+        "--[=[ load(x) ]] ]=]",
+    ] {
+        assert_eq!(flagged("core/src/x.lua", good), Vec::<String>::new(), "{good}");
+        assert_eq!(tool_chunk_words(good), Vec::<&str>::new(), "{good}");
+    }
+    // An English sentence in a Rust string is no call.
+    assert_eq!(
+        flagged("core/src/x.rs", "const C: &str = \"could not load, or load the file\";"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_tool_chunk_with_vim_cmd_fails() {
+    assert_eq!(tool_chunk_words("vim.cmd(args.x)"), ["vim.cmd"]);
+    for (text, word) in [
+        ("vim.cmd.edit(args.x)", "vim.cmd"),
+        ("vim.api.nvim_command(args.x)", "nvim_command"),
+        ("vim.api.nvim_exec2(args.x, {})", "nvim_exec"),
+        ("vim.api.nvim_exec_lua(args.x, {})", "nvim_exec"),
+        ("dofile(args.x)", "dofile"),
+        ("vim.fn.fnameescape(args.x)", "fnameescape"),
+        ("vim.fn.execute(args.x)", "execute"),
+        ("vim.fn.bufnr(args.x)", "vim.fn.bufnr"),
+    ] {
+        assert_eq!(tool_chunk_words(text), [word], "{text}");
+    }
+    assert_eq!(
+        tool_chunk_words("vim.api.nvim_buf_get_lines(0, 0, -1, false)"),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn pcall_of_loadstring_fails() {
+    assert_eq!(tool_chunk_words("pcall(loadstring, x)"), ["loadstring"]);
+}
+
+#[test]
+fn a_tool_chunk_that_runs_text_by_another_name_fails() {
+    for (text, word) in [
+        ("vim.api.nvim_cmd({ cmd = 'lua', args = { args.x } }, {})", "nvim_cmd"),
+        ("pcall(vim.api.nvim_cmd, args.x, {})", "nvim_cmd"),
+        ("vim.fn.luaeval(args.x)", "luaeval"),
+        ("vim.api.nvim_eval(args.x)", "nvim_eval"),
+        ("vim.fn.eval(args.x)", ".eval"),
+        ("local fn = vim.fn return fn.eval(args.x)", ".eval"),
+        ("pcall(vim.fn.eval, args.x)", ".eval"),
+        ("local run = vim.fn.eval", ".eval"),
+        ("vim.api.nvim_call_function(args.f, {})", "nvim_call_function"),
+        (
+            "vim.api.nvim_call_dict_function(d, args.f, {})",
+            "nvim_call_dict_function",
+        ),
+        ("vim.call(args.f)", "call("),
+        ("vim.fn.call(args.f, {})", "call("),
+        ("vim.api.nvim_feedkeys(args.x, 'n', false)", "feedkeys"),
+        ("vim.fn.feedkeys(args.x)", "feedkeys"),
+        ("vim.api.nvim_input(args.x)", "nvim_input"),
+    ] {
+        assert_eq!(tool_chunk_words(text), [word], "{text}");
+    }
+    for good in [
+        "vim.api.nvim_buf_call(buf, function() end)",
+        "vim.api.nvim_win_call(win, function() end)",
+        "pcall(run, x)",
+        "local retrieval = medieval(x)",
+        "vim.api.nvim_create_autocmd('SwapExists', { callback = function() end })",
+    ] {
+        assert_eq!(tool_chunk_words(good), Vec::<&str>::new(), "{good}");
+    }
+}
+
+/// `load_file.lua`'s listed calls, written as a chunk would.
+const LISTED_CHUNK: &str = "
+vim.api.nvim_cmd({ cmd = 'lua', args = { '_G.__eitri_agent.silently()' }, mods = { silent = true } }, {})
+vim.api.nvim_cmd({ cmd = 'set', args = { 'shortmess+=A' }, mods = { noautocmd = true } }, {})
+pcall(vim.api.nvim_cmd, { cmd = 'set', args = { 'shortmess-=A' }, mods = { noautocmd = true } }, {})
+";
+
+fn chunks_wrong(path: &str, text: &str) -> Vec<String> {
+    let listed = file(LOAD_FILE_CHUNK, LISTED_CHUNK);
+    let other = file(path, text);
+    if path == LOAD_FILE_CHUNK {
+        tool_chunks_wrong(&[&other])
+    } else {
+        tool_chunks_wrong(&[&listed, &other])
+    }
+}
+
+#[test]
+fn only_a_listed_constant_call_runs_text_in_a_tool_chunk() {
+    assert_eq!(chunks_wrong(LOAD_FILE_CHUNK, LISTED_CHUNK), Vec::<String>::new());
+    // The same calls laid out otherwise are the same calls.
+    assert_eq!(
+        chunks_wrong(LOAD_FILE_CHUNK, &LISTED_CHUNK.replace(", ", ",\n    ")),
+        Vec::<String>::new()
+    );
+
+    let fourth = format!("{LISTED_CHUNK}\nvim.api.nvim_cmd({{ cmd = 'lua', args = {{ args.x }} }}, {{}})");
+    assert_eq!(chunks_wrong(LOAD_FILE_CHUNK, &fourth).len(), 1);
+    // A call with an argument in place of the constant is a call that is gone and a word that stays.
+    let built = LISTED_CHUNK.replace("'shortmess+=A'", "args.x");
+    assert_eq!(chunks_wrong(LOAD_FILE_CHUNK, &built).len(), 2);
+    let twice = format!("{LISTED_CHUNK}{LISTED_CHUNK}");
+    assert_eq!(chunks_wrong(LOAD_FILE_CHUNK, &twice).len(), 3);
+
+    // Listed for one chunk, it is refused in another.
+    assert_eq!(chunks_wrong("core/src/editor_tools/tools/x.lua", LISTED_CHUNK).len(), 1);
+    assert_eq!(
+        chunks_wrong("core/src/editor_tools/tools/x.lua", "local a = 1"),
+        Vec::<String>::new()
+    );
+
+    // A list that has gone out of date is red.
+    assert_eq!(chunks_wrong(LOAD_FILE_CHUNK, "local a = 1").len(), 3);
+    assert_eq!(
+        tool_chunks_wrong(&[&file("core/src/editor_tools/tools/x.lua", "local a = 1")]).len(),
+        3
+    );
+}
+
+#[test]
+fn tight_keeps_words_apart() {
+    assert_eq!(tight("return  load\n( x )"), "return load(x)");
+    assert_eq!(tight("vim . fn\n.eval"), "vim.fn.eval");
+    assert_eq!(tight("local a = b"), "local a=b");
+}
+
+#[test]
+fn where_a_line_ends_changes_nothing() {
+    for (text, word) in [
+        ("return vim.fn.execute\n(args.code)", "execute"),
+        ("return vim\n.fn\n.execute(args.code)", "execute"),
+        ("pcall(vim.fn.execute, args.code)", "execute"),
+        ("local run = vim.fn.execute", "execute"),
+        ("vim.fn.win_execute(win, args.code)", "execute"),
+        ("vim\n.cmd(args.x)", "vim.cmd"),
+        ("vim . cmd (args.x)", "vim.cmd"),
+        ("vim.fn\n.bufnr\n(args.x)", "vim.fn.bufnr"),
+        ("vim.api\n.nvim_cmd\n(args.x, {})", "nvim_cmd"),
+        ("return vim.fn\n.eval\n(args.x)", ".eval"),
+        ("return load\n(args.x)", "load("),
+    ] {
+        assert_eq!(tool_chunk_words(text), [word], "{text}");
+    }
+}
+
+/// The panel's card path: the glue's one call of the broker, and the arm's one call of the glue.
+fn card_path() -> [Source; 2] {
+    [
+        file(
+            CARD_GLUE,
+            r#"
+pub(super) fn answer_card(state: &mut State, tab: TabId) {
+    let outs = state
+        .editor_tools
+        .answer_card(tab, card, decision, origin, now)?;
+}
+"#,
+        ),
+        file(
+            CARD_ARM,
+            r#"
+fn handle(state: &mut State) {
+    match message {
+        InboundMessage::EditorCardAnswer { card_id, .. } => {
+            match super::editor_glue::answer_card(state, tab) {}
+        }
+        InboundMessage::Other => {}
+    }
+}
+
+fn answer_permission_response(tabs: &mut TabSet) {
+    Ok(tabs.answer_card(tab, page, id, decision))
+}
+"#,
+        ),
+    ]
+}
+
+fn with_card_path(path: &str, text: &str) -> Vec<String> {
+    let mut read = card_path().to_vec();
+    match read.iter_mut().find(|source| source.path == path) {
+        Some(source) => source.text.push_str(text),
+        None => read.push(file(path, text)),
+    }
+    card_path_wrong(&read)
+}
+
+#[test]
+fn a_second_answer_card_caller_fails() {
+    assert_eq!(card_path_wrong(&card_path()), Vec::<String>::new());
+    for (path, text) in [
+        (
+            "core/src/sweep.rs",
+            "fn sweep(s: &mut S) { s.editor_tools.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            CARD_GLUE,
+            "fn sweep(s: &mut S) { s.editor_tools.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            CARD_ARM,
+            "fn sweep(s: &mut S) { super::editor_glue::answer_card(s, t); }",
+        ),
+        (
+            "core/src/sweep.rs",
+            "fn sweep(b: &mut Broker) { b.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            "core/src/sweep.rs",
+            "fn sweep(b: &mut Broker) { Broker::answer_card(b, t, c, Allow, Key, now); }",
+        ),
+        (
+            "core/src/sweep.rs",
+            "fn sweep() { cards.iter().map(Broker::answer_card); }",
+        ),
+        (CARD_ARM, "use super::editor_glue::answer_card;"),
+        // The name `tabs` says nothing of the type behind it: only the one provider call is let through.
+        (
+            "core/src/sweep.rs",
+            "fn sweep(s: &mut S) { let tabs = &mut s.editor_tools; tabs.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            CARD_ARM,
+            "fn sweep(s: &mut S) { let tabs = &mut s.editor_tools; tabs.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            "core/src/sweep.rs",
+            "fn sweep(my_tabs: &mut Broker) { my_tabs.answer_card(t, c, Allow, Key, now); }",
+        ),
+        (
+            "core/src/sweep.rs",
+            "fn sweep(s: &mut S) { s.tabs.answer_card(t, c, Allow, Key, now); }",
+        ),
+    ] {
+        let wrong = with_card_path(path, text);
+        assert_eq!(wrong.len(), 1, "{text}: {wrong:?}");
+    }
+    // A definition and a test are not callers.
+    assert_eq!(
+        with_card_path("core/src/t.rs", "pub fn answer_card(&self) {}"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        with_card_path(
+            "core/src/t.rs",
+            "#[cfg(test)]\npub(super) mod tests { fn t() { b.answer_card(); } }"
+        ),
+        Vec::<String>::new()
+    );
+
+    // A card path that is gone is refused, not passed.
+    let [glue, arm] = card_path();
+    assert!(!card_path_wrong(std::slice::from_ref(&glue)).is_empty());
+    assert!(!card_path_wrong(std::slice::from_ref(&arm)).is_empty());
+    let outside = file(
+        CARD_ARM,
+        &arm.text
+            .replace("InboundMessage::EditorCardAnswer", "InboundMessage::Sweep"),
+    );
+    assert!(!card_path_wrong(&[glue.clone(), outside]).is_empty());
+
+    // The provider's call is pinned too: a second one beside it, or none, is red.
+    const PROVIDER: &str = "Ok(tabs.answer_card(tab, page, id, decision))";
+    assert!(arm.text.contains(PROVIDER));
+    for changed in [
+        format!("tabs.answer_card(t, c, Allow, Key, now);\n    {PROVIDER}"),
+        "Ok(())".to_owned(),
+    ] {
+        let wrong = card_path_wrong(&[glue.clone(), file(CARD_ARM, &arm.text.replace(PROVIDER, &changed))]);
+        assert_eq!(wrong.len(), 1, "{changed}: {wrong:?}");
+    }
+}
+
+#[test]
+fn an_exec_op_fails() {
+    for bad in [
+        "pub enum EditorOp { Exec { code: String } }",
+        "pub enum EditorOp { NvimExec { code: String } }",
+        "fn dispatch() { crate::editor_tools::tools::nvim_exec::send(rpc, &stamp, &slot); }",
+        "#[serde(rename = \"nvim_exec\")]\npub struct Op;",
+    ] {
+        assert!(!exec_op_wrong(bad).is_empty(), "not caught: {bad}");
+    }
+    for good in [
+        "pub enum EditorOp { Open { path: String } }",
+        "// no Exec op, and no nvim_exec\npub enum EditorOp {}",
+        "pub enum EditorOp {}\n#[cfg(test)]\nmod tests { const NAME: &str = \"nvim_exec\"; }",
+        "fn f() { rpc.exec_lua(BUFFER_STATE_LUA, args); }",
+    ] {
+        assert_eq!(exec_op_wrong(good), Vec::<String>::new(), "flagged: {good}");
+    }
+}
+
+#[test]
+fn lua_comments_are_dropped_and_strings_kept() {
+    assert_eq!(lua_code("a -- b\nc"), "a  \nc");
+    assert_eq!(lua_code("a --[[ b\nc ]] d"), "a   d");
+    assert_eq!(lua_code("'a -- b' c"), "'a -- b' c");
+    assert_eq!(lua_code("[==[ -- ]] ]==] c"), "[==[ -- ]] ]==] c");
+}
+
+#[test]
+fn literals_are_read_with_and_without_the_tests() {
+    let text = "const A: &str = \"one\";\n#[cfg(test)]\nmod t { const B: &str = \"two\"; }\n";
+    assert_eq!(literals(text, false), ["\"one\""]);
+    assert_eq!(literals(text, true), ["\"one\"", "\"two\""]);
 }

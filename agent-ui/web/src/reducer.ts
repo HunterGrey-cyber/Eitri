@@ -4,10 +4,14 @@ import * as subagents from "./fold/subagents";
 import * as questions from "./fold/questions";
 import * as reset from "./fold/reset";
 import { cleanCommands } from "./slashCommands";
+import { isEditorCardWire } from "./editorCardWire";
 import type {
   AgentDomainEvent,
   AgentUiSnapshot,
   AgentUiState,
+  EditorCardProposal,
+  EditorCardWire,
+  PermissionRequestRecord,
   ProviderPrompt,
   Seq,
   ToolCallRecord,
@@ -37,6 +41,7 @@ export function initialState(): AgentUiState {
     status: { kind: "starting" },
     activeTurnId: null,
     pendingPermissions: [],
+    editorCards: [],
     capabilities: { resume: false, fork: false, interrupt: false, bypassPermissionMode: false },
     provider: null,
     usage: null,
@@ -65,6 +70,46 @@ export function initialState(): AgentUiState {
     turnThinking: false,
     ...NOTHING_HELD,
   };
+}
+
+/** The proposal a card names, when the wire gave one the page can use: an id and a list of paths. Anything else is
+ *  left off, and the card is then viewed as plain text. */
+function proposalOfCard(proposal: unknown): { proposal?: EditorCardProposal } {
+  if (proposal === null || typeof proposal !== "object") return {};
+  const { id, files } = proposal as { id?: unknown; files?: unknown };
+  if (typeof id !== "string" || !Array.isArray(files) || files.length === 0 || !files.every((f) => typeof f === "string")) return {};
+  return { proposal: { id, files: files as string[] } };
+}
+
+/** A broker card as the record the card view draws. `permissionId` is the card's own id, `toolName` the broker tool,
+ *  `seq` the wire's: Rust stamps it, and nothing here takes one from `nextSeq`, so the page's numbering stays Rust's
+ *  and a turn's footer keeps its anchor. `input` is `null`: no provider request stands behind it. */
+export function editorCardRecord(card: EditorCardWire): PermissionRequestRecord {
+  return {
+    seq: card.seq,
+    permissionId: card.id,
+    toolUseId: card.toolUseId ?? null,
+    toolName: card.tool,
+    input: null,
+    editorCard: { title: card.title, body: card.body, ...proposalOfCard(card.proposal) },
+  };
+}
+
+/** A snapshot's card: the wire shape becomes a record, and a record (a state folded already) stays one. */
+function asCardRecord(card: EditorCardWire | PermissionRequestRecord): PermissionRequestRecord {
+  return "permissionId" in card ? card : editorCardRecord(card);
+}
+
+/** A snapshot's card list as records: an entry the card view cannot draw is dropped, as the envelope's is. */
+function cardRecords(cards: unknown): PermissionRequestRecord[] {
+  if (!Array.isArray(cards)) return [];
+  return cards.filter((card) => (card !== null && typeof card === "object" && "permissionId" in card) || isEditorCardWire(card)).map(asCardRecord);
+}
+
+/** The `editor_cards` envelope: the tab's cards replaced whole. A card the broker no longer holds is gone from the
+ *  list, and nothing else in the state moves. */
+export function withEditorCards(state: AgentUiState, cards: readonly EditorCardWire[]): AgentUiState {
+  return { ...state, editorCards: cards.map(editorCardRecord) };
 }
 
 /** What the state holds for calls that have not been folded: none of it on the wire, all of it
@@ -235,6 +280,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       break;
   }
   if (event.type === "permission_mode_changed") return { ...incoming, nextSeq: seq + 1 };
+  // The host's own records of a tool it serves: only a recorded twin holds them.
+  if (event.type === "session_servers" || event.type === "client_tool_call" || event.type === "client_tool_call_settled") {
+    return { ...incoming, nextSeq: seq + 1 };
+  }
   if (event.type === "subagent_frame") return subagents.fold({ ...state, turnThinking: incoming.turnThinking }, event, foldEvent);
   return foldEvent(state, event, seq);
 }
@@ -819,6 +868,7 @@ export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiSt
     openingPromptSeq: null,
     runningTurnCli: false,
     pendingPermissions: [],
+    editorCards: [],
     assistantMessageOpen: false,
     thinkingOpen: false,
     turnThinking: false,
@@ -891,6 +941,8 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     runningTurnCli: snapshot.runningTurnCli ?? false,
     nextSeq: throughRevision,
     turnThinking: false,
+    // The broker's cards, wire shape in the snapshot; a payload without the key is a tab with none.
+    editorCards: cardRecords(snapshot.editorCards),
     ...NOTHING_HELD,
     // The one held list Rust serializes: a change whose call has not started yet.
     changedInputsBeforeTheirCall: snapshot.changedInputsBeforeTheirCall ?? [],

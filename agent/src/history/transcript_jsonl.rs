@@ -1846,9 +1846,18 @@ mod tests {
             ]
         );
         assert!(!format!("{:?}", history.events).contains("PRIVATE SUMMARY"));
-        let recorded = fold(include_str!(
-            "../../tests/fixtures/claude_scripted/c10/transcript/0c888376-deae-4f45-96e4-b6ff56a20d1a.jsonl"
-        ));
+        // The file is named after the recorded session's id, which every recording changes.
+        let transcripts = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/claude_scripted/c10/transcript"
+        );
+        let transcript = std::fs::read_dir(transcripts)
+            .expect("c10's transcript directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+            .expect("c10's transcript");
+        let recorded = fold(&std::fs::read_to_string(transcript).expect("c10's transcript"));
         assert_eq!(
             turn_outline(&recorded),
             ["turn", "prompt C10-START", "turn", "prompt /compact", "compaction"]

@@ -5,14 +5,21 @@
 //! The review ops send no Lua at all: they become calls on the review driver window 1 already runs, so that
 //! driver's install, its one call in flight and its draining apply to window 2's calls as to its own.
 //!
+//! An agent op comes from a window-2 tab whose broker has already judged the call. Window 2's answers are taken for
+//! nothing here: the session, each path, the stamp and, for a load, the file are all checked again, so this window
+//! admits only project paths that follow no link, however the tab's own judgement went.
+//!
 //! The only constant named here is the buffer-state chunk; the plugin ops go through the plugin host's own
-//! functions. A scan in `core/tests/editor_rpc_scan.rs` holds this file to that.
+//! functions and the agent ops through their tools' own `send`, `ask` or `collect`. A scan in
+//! `core/tests/editor_rpc_scan.rs` holds this file to that.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::editor_rpc::EditorRpc;
+use crate::editor_tools::stamp::{wall_ms, Stamp};
 use crate::nvim_rpc::Pending;
 use crate::plugin::roots::{file_inside, Roots};
 use crate::review_editor::{linked_request_id, OverlayCall, ShowHunk, ShowMeta};
@@ -20,7 +27,23 @@ use crate::turn_review::revert::{buffer_state_args, BUFFER_STATE_LUA};
 use crate::turn_review::write::ProjectDir;
 use crate::wm::PeerId;
 
-use super::editor_op::EditorOp;
+use super::editor_op::{severity_from_wire, EditorOp, WireLspKind, WireStamp};
+
+/// The most diagnostics window 1 answers one op with, whatever it asks.
+const DIAGNOSTICS_LIMIT_MAX: u32 = 2000;
+
+/// The longest id an ask goes under, the limit its chunk holds an ask to.
+const LSP_ID_MAX: usize = 40;
+
+/// The longest symbol window 1 hands a language server, as a tool's own argument is held to.
+const SYMBOL_MAX: usize = 256;
+
+/// The longest query window 1 hands a language server, as a tool's own argument is held to.
+const QUERY_MAX: usize = 1024;
+
+/// The longest an ask's entry may stay in the editor: a language server's budget and the last collect's margin.
+const LSP_LIFE_MAX: Duration =
+    crate::editor_tools::tools::lsp::LSP_BUDGET.saturating_add(crate::editor_tools::tools::lsp::COLLECT_MARGIN);
 
 /// What window 1 knows that the checks need. Every answer comes from window 1's own state, never from the op.
 pub trait OpContext {
@@ -71,7 +94,8 @@ impl fmt::Debug for Dispatch {
 /// Why an op was refused. Nothing reached the editor for any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpRefused {
-    /// The path leaves the project or the plugin's work tree, or could not be checked.
+    /// The path leaves the project or the plugin's work tree or could not be checked, or a value of the op is not one
+    /// this window takes.
     Outside(String),
     /// The review names a session whose chat window 2 does not hold.
     SessionNotHeld(String),
@@ -243,6 +267,182 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             held_plugin(ctx, &plugin)?;
             Ok(Dispatch::Rpc(crate::plugin::editor::assist_clear(rpc, &plugin)))
         }
+        EditorOp::AgentOpen {
+            session,
+            path,
+            line,
+            end_line,
+            load,
+            stamp,
+        } => {
+            held_session(ctx, &session)?;
+            let path = project_path(ctx, &path)?;
+            let stamp = checked_stamp(stamp)?;
+            // Loading is what could block on a FIFO or take in a huge file, and window 2 looked at the file a while
+            // ago and from another process: only what is there now counts.
+            if load {
+                crate::editor_tools::paths::file_check(&path).map_err(|refused| OpRefused::Outside(refused.0))?;
+            }
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::open_file::send(
+                rpc, &stamp, &path, line, end_line, load,
+            )))
+        }
+        EditorOp::AgentEditorState { session, stamp } => {
+            held_session(ctx, &session)?;
+            let stamp = checked_stamp(stamp)?;
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::editor_state::send(
+                rpc,
+                &stamp,
+                ctx.project_root(),
+            )))
+        }
+        EditorOp::AgentReadBuffer {
+            session,
+            path,
+            start,
+            end,
+            stamp,
+        } => {
+            held_session(ctx, &session)?;
+            let path = project_path(ctx, &path)?;
+            let stamp = checked_stamp(stamp)?;
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::read_buffer::send(
+                rpc, &stamp, &path, start, end,
+            )))
+        }
+        EditorOp::AgentDiagnostics {
+            session,
+            path,
+            min_severity,
+            limit,
+            stamp,
+        } => {
+            held_session(ctx, &session)?;
+            let path = path.map(|path| project_path(ctx, &path)).transpose()?;
+            let stamp = checked_stamp(stamp)?;
+            let min_severity = severity_from_wire(min_severity)
+                .ok_or_else(|| OpRefused::Outside(format!("{min_severity} is not a severity")))?;
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::diagnostics::send(
+                rpc,
+                &stamp,
+                &crate::editor_tools::tools::diagnostics::DiagnosticsArgs {
+                    root: ctx.project_root().to_owned(),
+                    path,
+                    min_severity,
+                    utf16: false,
+                    limit: limit.min(DIAGNOSTICS_LIMIT_MAX),
+                },
+            )))
+        }
+        EditorOp::AgentLspAsk {
+            session,
+            id,
+            kind,
+            path,
+            line,
+            symbol,
+            include,
+            query,
+            budget_ms,
+            load,
+            stamp,
+        } => {
+            held_session(ctx, &session)?;
+            let stamp = checked_stamp(stamp)?;
+            checked_id(&id)?;
+            checked_text("symbol", symbol.as_deref(), SYMBOL_MAX)?;
+            checked_text("query", query.as_deref(), QUERY_MAX)?;
+            if u128::from(budget_ms) > LSP_LIFE_MAX.as_millis() {
+                return Err(OpRefused::Outside(format!("{budget_ms} ms is past an ask's limit")));
+            }
+            if path.is_none() && kind != WireLspKind::WorkspaceSymbols {
+                return Err(OpRefused::Outside("only a workspace search names no file".into()));
+            }
+            let path = path.map(|path| project_path(ctx, &path)).transpose()?;
+            // As for `AgentOpen`: what window 2 saw a while ago says nothing of what a load would read now.
+            if let (true, Some(path)) = (load, &path) {
+                crate::editor_tools::paths::file_check(path).map_err(|refused| OpRefused::Outside(refused.0))?;
+            }
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::lsp::ask(
+                rpc,
+                &stamp,
+                &crate::editor_tools::tools::lsp::AskArgs {
+                    id,
+                    kind: kind.into(),
+                    root: ctx.project_root().to_owned(),
+                    path,
+                    line,
+                    symbol,
+                    include: include.into_iter().map(Into::into).collect(),
+                    query,
+                    // The edits never cross the link, so the wire ask carries neither.
+                    new_name: None,
+                    action: None,
+                    budget_ms,
+                    load,
+                },
+            )))
+        }
+        EditorOp::AgentLspCollect {
+            session,
+            id,
+            last,
+            stamp,
+        } => {
+            held_session(ctx, &session)?;
+            let stamp = checked_stamp(stamp)?;
+            checked_id(&id)?;
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::lsp::collect(
+                rpc, &stamp, &id, last,
+            )))
+        }
+        // The arguments of window 1's own `EditorCall::Baseline`, and nothing of them is the op's.
+        EditorOp::AgentBaseline { session, stamp } => {
+            held_session(ctx, &session)?;
+            let stamp = checked_stamp(stamp)?;
+            Ok(Dispatch::Rpc(crate::editor_tools::tools::diagnostics::send(
+                rpc,
+                &stamp,
+                &crate::editor_tools::tools::diagnostics::DiagnosticsArgs {
+                    root: ctx.project_root().to_owned(),
+                    path: None,
+                    min_severity: crate::editor_tools::tools::diagnostics::Severity::Hint,
+                    utf16: false,
+                    limit: crate::editor_tools::tools::baseline::BASELINE_LIMIT,
+                },
+            )))
+        }
+    }
+}
+
+/// Window 2's stamp, held to this window's limits; the chunk is given only what comes back.
+fn checked_stamp(stamp: WireStamp) -> Result<Stamp, OpRefused> {
+    Stamp::from(stamp).checked(wall_ms()).map_err(OpRefused::Outside)
+}
+
+/// An ask's id, the shape its chunk takes: it becomes part of a key in the editor's table of asks, and a collect's
+/// chunk does not look at it.
+fn checked_id(id: &str) -> Result<(), OpRefused> {
+    let shaped = !id.is_empty()
+        && id.len() <= LSP_ID_MAX
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if shaped {
+        Ok(())
+    } else {
+        Err(OpRefused::Outside(format!("an ask's id has the wrong shape: {id:?}")))
+    }
+}
+
+/// Text on its way to a language server, held to what the tools hold an agent's to.
+fn checked_text(name: &str, text: Option<&str>, max: usize) -> Result<(), OpRefused> {
+    match text {
+        Some(text) if text.len() > max => Err(OpRefused::Outside(format!("{name} is over {max} bytes"))),
+        Some(text) if text.chars().any(char::is_control) => {
+            Err(OpRefused::Outside(format!("{name} may not hold a control character")))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -307,13 +507,20 @@ fn plugin_file(plugin: &str, tree: &Path, rel: &str) -> Result<PathBuf, OpRefuse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_tools::stamp::EDITOR_BUDGET_MAX;
+    use crate::editor_tools::tools::baseline::BASELINE_LIMIT;
+    use crate::editor_tools::tools::diagnostics::{self, DiagnosticsArgs, Severity, DIAGNOSTICS_LIMIT};
+    use crate::editor_tools::tools::lsp::{self, AskArgs, LspKind, UsagePart, COLLECT_MARGIN, LSP_BUDGET};
+    use crate::editor_tools::tools::{editor_state, open_file, read_buffer};
+    use crate::editor_tools::way::{EditorCall, EditorWay, LocalWay};
     use crate::nvim_rpc::RpcError;
     use crate::plugin::editor::{PLUGIN_ASSIST_LUA, PLUGIN_OPEN_LUA};
     use crate::test_scratch_dir::ScratchDir;
-    use crate::window_link::editor_op::{WireEol, WireHunk, WireLine, WireMeta, WireScope};
+    use crate::window_link::editor_op::{WireEol, WireHunk, WireLine, WireMeta, WireScope, WireUsagePart};
     use rmpv::Value;
     use std::cell::RefCell;
     use std::os::unix::fs::symlink;
+    use std::rc::Rc;
 
     /// Records every Lua call and answers that there is no editor.
     #[derive(Default)]
@@ -947,5 +1154,711 @@ mod tests {
             );
         }
         assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    const SCOPE: &str = "abc-3-1";
+
+    fn stamp() -> WireStamp {
+        WireStamp {
+            deadline_ms: wall_ms() + 1000,
+            scope: SCOPE.into(),
+            seq: 4,
+        }
+    }
+
+    fn agent_open(session: &str, path: &str, load: bool, stamp: WireStamp) -> EditorOp {
+        EditorOp::AgentOpen {
+            session: session.into(),
+            path: path.into(),
+            line: Some(3),
+            end_line: Some(5),
+            load,
+            stamp,
+        }
+    }
+
+    fn agent_read(session: &str, path: &str) -> EditorOp {
+        EditorOp::AgentReadBuffer {
+            session: session.into(),
+            path: path.into(),
+            start: Some(1),
+            end: None,
+            stamp: stamp(),
+        }
+    }
+
+    fn agent_state(session: &str) -> EditorOp {
+        EditorOp::AgentEditorState {
+            session: session.into(),
+            stamp: stamp(),
+        }
+    }
+
+    fn agent_diagnostics(session: &str, path: Option<&str>) -> EditorOp {
+        EditorOp::AgentDiagnostics {
+            session: session.into(),
+            path: path.map(str::to_owned),
+            min_severity: 2,
+            limit: DIAGNOSTICS_LIMIT,
+            stamp: stamp(),
+        }
+    }
+
+    /// A `usages` ask of `path`, as a tab's run makes it.
+    fn lsp_ask(session: &str, path: &str, load: bool, stamp: WireStamp) -> EditorOp {
+        EditorOp::AgentLspAsk {
+            session: session.into(),
+            id: "abc-3-1".into(),
+            kind: WireLspKind::Usages,
+            path: Some(path.into()),
+            line: Some(3),
+            symbol: Some("frob".into()),
+            include: vec![WireUsagePart::Definitions, WireUsagePart::References],
+            query: None,
+            budget_ms: LSP_LIFE_MAX.as_millis() as u32,
+            load,
+            stamp,
+        }
+    }
+
+    fn lsp_search(query: &str, id: &str) -> EditorOp {
+        EditorOp::AgentLspAsk {
+            session: "s-held".into(),
+            id: id.into(),
+            kind: WireLspKind::WorkspaceSymbols,
+            path: None,
+            line: None,
+            symbol: None,
+            include: vec![],
+            query: Some(query.into()),
+            budget_ms: 1000,
+            load: false,
+            stamp: stamp(),
+        }
+    }
+
+    fn lsp_collect(session: &str, id: &str) -> EditorOp {
+        EditorOp::AgentLspCollect {
+            session: session.into(),
+            id: id.into(),
+            last: true,
+            stamp: stamp(),
+        }
+    }
+
+    fn agent_baseline(session: &str) -> EditorOp {
+        EditorOp::AgentBaseline {
+            session: session.into(),
+            stamp: stamp(),
+        }
+    }
+
+    /// One recorded call's stamp, read back from what the chunk would get.
+    fn sent_stamp(args: &[Value]) -> (u64, String) {
+        let field = |name: &str| {
+            args[0]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(name))
+                .unwrap()
+                .1
+                .clone()
+        };
+        (
+            field("deadline_ms").as_u64().unwrap(),
+            field("scope").as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn an_agent_open_runs_its_chunk_on_window_1s_path() {
+        let f = fixture("agent-open");
+        let rpc = Recorder::default();
+        let wire = stamp();
+        let op = agent_open("s-held", "src/a.rs", true, wire.clone());
+        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        let expected = Recorder::default();
+        let _ = open_file::send(
+            &expected,
+            &Stamp::from(wire),
+            &f.ctx.root.join("src/a.rs"),
+            Some(3),
+            Some(5),
+            true,
+        );
+        assert_eq!(rpc.calls(), expected.calls());
+        assert_eq!(rpc.calls()[0].0, open_file::OPEN_FILE_LUA);
+    }
+
+    #[test]
+    fn each_read_op_runs_its_tools_own_chunk_with_window_1s_values() {
+        let f = fixture("agent-reads");
+        let rpc = Recorder::default();
+        let path = f.ctx.root.join("src/a.rs");
+        let wire = stamp();
+        let local = Stamp::from(wire.clone());
+        for op in [
+            EditorOp::AgentEditorState {
+                session: "s-held".into(),
+                stamp: wire.clone(),
+            },
+            EditorOp::AgentReadBuffer {
+                session: "s-held".into(),
+                path: "src/a.rs".into(),
+                start: Some(2),
+                end: Some(4),
+                stamp: wire.clone(),
+            },
+            EditorOp::AgentDiagnostics {
+                session: "s-held".into(),
+                path: Some("src/a.rs".into()),
+                min_severity: 2,
+                limit: DIAGNOSTICS_LIMIT,
+                stamp: wire.clone(),
+            },
+        ] {
+            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        }
+        let expected = Recorder::default();
+        let _ = editor_state::send(&expected, &local, &f.ctx.root);
+        let _ = read_buffer::send(&expected, &local, &path, Some(2), Some(4));
+        let _ = diagnostics::send(
+            &expected,
+            &local,
+            &DiagnosticsArgs {
+                root: f.ctx.root.clone(),
+                path: Some(path.clone()),
+                min_severity: Severity::Warning,
+                utf16: false,
+                limit: DIAGNOSTICS_LIMIT,
+            },
+        );
+        assert_eq!(rpc.calls(), expected.calls());
+    }
+
+    #[test]
+    fn a_file_not_on_disk_can_still_be_asked_about_as_a_buffer() {
+        let f = fixture("agent-missing");
+        let rpc = Recorder::default();
+        for op in [
+            agent_open("s-held", "new/b.rs", false, stamp()),
+            agent_read("s-held", "new/b.rs"),
+            agent_diagnostics("s-held", Some("new/b.rs")),
+        ] {
+            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        }
+        assert_eq!(rpc.calls().len(), 3);
+    }
+
+    /// Every op that names `path` is refused as outside, and nothing reaches the editor.
+    fn refused_as_outside(f: &Fixture, path: &str) {
+        let rpc = Recorder::default();
+        for op in [
+            agent_open("s-held", path, false, stamp()),
+            agent_open("s-held", path, true, stamp()),
+            agent_read("s-held", path),
+            agent_diagnostics("s-held", Some(path)),
+            lsp_ask("s-held", path, false, stamp()),
+            lsp_ask("s-held", path, true, stamp()),
+        ] {
+            let name = op.name();
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(
+                matches!(result, Err(OpRefused::Outside(_))),
+                "{name} of {path:?}: {result:?}"
+            );
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn an_outside_path_is_refused_in_window_1() {
+        let f = fixture("agent-outside");
+        for path in [
+            "../x",
+            "/etc/passwd",
+            "a//b",
+            ".git/config",
+            "",
+            "./src/a.rs",
+            "src/../a/b",
+        ] {
+            refused_as_outside(&f, path);
+        }
+    }
+
+    #[test]
+    fn a_link_is_refused_in_window_1() {
+        let f = fixture("agent-link");
+        for path in ["out/passwd", "out", "src/secret.rs", "src/alias.rs"] {
+            refused_as_outside(&f, path);
+        }
+    }
+
+    #[test]
+    fn a_session_window_1_holds_is_refused() {
+        let f = fixture("agent-session");
+        let rpc = Recorder::default();
+        for op in [
+            agent_open("s-other", "src/a.rs", true, stamp()),
+            agent_state("s-other"),
+            agent_read("s-other", "src/a.rs"),
+            agent_diagnostics("s-other", None),
+            lsp_ask("s-other", "src/a.rs", true, stamp()),
+            agent_baseline("s-other"),
+        ] {
+            assert_eq!(
+                dispatch(1, op, &f.ctx, &rpc).unwrap_err(),
+                OpRefused::SessionNotHeld("s-other".into())
+            );
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_scope_of_the_wrong_shape_is_refused() {
+        let f = fixture("agent-scope");
+        let rpc = Recorder::default();
+        let bad = || WireStamp {
+            scope: "Not A Scope".into(),
+            ..stamp()
+        };
+        for op in [
+            agent_open("s-held", "src/a.rs", false, bad()),
+            EditorOp::AgentEditorState {
+                session: "s-held".into(),
+                stamp: bad(),
+            },
+            EditorOp::AgentReadBuffer {
+                session: "s-held".into(),
+                path: "src/a.rs".into(),
+                start: None,
+                end: None,
+                stamp: bad(),
+            },
+            EditorOp::AgentDiagnostics {
+                session: "s-held".into(),
+                path: None,
+                min_severity: 1,
+                limit: 1,
+                stamp: bad(),
+            },
+        ] {
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_far_deadline_is_held_to_the_limit() {
+        let f = fixture("agent-deadline");
+        let rpc = Recorder::default();
+        let before = wall_ms();
+        let far = WireStamp {
+            deadline_ms: u64::MAX,
+            ..stamp()
+        };
+        assert!(matches!(
+            dispatch(1, agent_open("s-held", "src/a.rs", false, far), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        let after = wall_ms();
+        let (deadline, scope) = sent_stamp(&rpc.calls()[0].1);
+        let limit = EDITOR_BUDGET_MAX.as_millis() as u64;
+        assert!(
+            (before + limit..=after + limit).contains(&deadline),
+            "{deadline} is not {limit} ms from now"
+        );
+        assert_eq!(scope, SCOPE);
+    }
+
+    #[test]
+    fn a_fifo_named_with_load_is_refused() {
+        let f = fixture("agent-fifo");
+        let path = f.ctx.root.join("src/pipe");
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let rpc = Recorder::default();
+        let result = dispatch(1, agent_open("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
+        assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+        // Without a load the chunk only looks among the editor's buffers, so no file is touched.
+        assert!(matches!(
+            dispatch(2, agent_open("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        let calls = rpc.calls().len();
+        let result = dispatch(3, lsp_ask("s-held", "src/pipe", true, stamp()), &f.ctx, &rpc);
+        assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        assert_eq!(rpc.calls().len(), calls, "a refused op reached the editor");
+        assert!(matches!(
+            dispatch(4, lsp_ask("s-held", "src/pipe", false, stamp()), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+    }
+
+    #[test]
+    fn an_lsp_ask_runs_its_chunk_on_window_1s_path() {
+        let f = fixture("agent-lsp");
+        let rpc = Recorder::default();
+        let wire = stamp();
+        let op = lsp_ask("s-held", "src/a.rs", true, wire.clone());
+        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        let expected = Recorder::default();
+        let _ = lsp::ask(
+            &expected,
+            &Stamp::from(wire),
+            &AskArgs {
+                id: "abc-3-1".into(),
+                kind: LspKind::Usages,
+                root: f.ctx.root.clone(),
+                path: Some(f.ctx.root.join("src/a.rs")),
+                line: Some(3),
+                symbol: Some("frob".into()),
+                include: vec![UsagePart::Definitions, UsagePart::References],
+                query: None,
+                new_name: None,
+                action: None,
+                budget_ms: (LSP_BUDGET + COLLECT_MARGIN).as_millis() as u32,
+                load: true,
+            },
+        );
+        assert_eq!(rpc.calls(), expected.calls());
+        assert_eq!(rpc.calls()[0].0, lsp::LSP_ASK_LUA);
+    }
+
+    #[test]
+    fn each_kind_reaches_the_chunk_under_its_own_word() {
+        let f = fixture("agent-lsp-kinds");
+        for (kind, word) in [
+            (WireLspKind::Usages, "usages"),
+            (WireLspKind::Hover, "hover"),
+            (WireLspKind::DocumentSymbols, "document_symbols"),
+            (WireLspKind::WorkspaceSymbols, "workspace_symbols"),
+        ] {
+            let rpc = Recorder::default();
+            let op = EditorOp::AgentLspAsk {
+                session: "s-held".into(),
+                id: "abc-3-1".into(),
+                kind,
+                path: Some("src/a.rs".into()),
+                line: None,
+                symbol: None,
+                include: vec![],
+                query: None,
+                budget_ms: 1000,
+                load: false,
+                stamp: stamp(),
+            };
+            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+            assert_eq!(sent_field(&rpc.calls()[0].1, "kind").as_str(), Some(word));
+        }
+    }
+
+    #[test]
+    fn an_lsp_collect_runs_its_chunk() {
+        let f = fixture("agent-collect");
+        let rpc = Recorder::default();
+        let wire = stamp();
+        let op = EditorOp::AgentLspCollect {
+            session: "s-held".into(),
+            id: "abc-3-1".into(),
+            last: true,
+            stamp: wire.clone(),
+        };
+        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        let expected = Recorder::default();
+        let _ = lsp::collect(&expected, &Stamp::from(wire), "abc-3-1", true);
+        assert_eq!(rpc.calls(), expected.calls());
+        assert_eq!(rpc.calls()[0].0, lsp::LSP_COLLECT_LUA);
+    }
+
+    #[test]
+    fn a_collect_for_a_session_it_does_not_hold_is_refused() {
+        let f = fixture("agent-collect-session");
+        let rpc = Recorder::default();
+        assert_eq!(
+            dispatch(1, lsp_collect("s-other", "abc-3-1"), &f.ctx, &rpc).unwrap_err(),
+            OpRefused::SessionNotHeld("s-other".into())
+        );
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn an_id_of_the_wrong_shape_is_refused() {
+        let f = fixture("agent-id");
+        let rpc = Recorder::default();
+        let longest = "a".repeat(LSP_ID_MAX);
+        for id in [longest.as_str(), "0123abcdef-7-1"] {
+            assert!(matches!(
+                dispatch(1, lsp_collect("s-held", id), &f.ctx, &rpc),
+                Ok(Dispatch::Rpc(_))
+            ));
+        }
+        let accepted = rpc.calls().len();
+        let long = "a".repeat(LSP_ID_MAX + 1);
+        for id in ["", "Abc", "a_b", "a b", "a:b", "a\nb", "é", long.as_str()] {
+            for op in [lsp_collect("s-held", id), lsp_search("frob", id)] {
+                let result = dispatch(1, op, &f.ctx, &rpc);
+                assert!(matches!(result, Err(OpRefused::Outside(_))), "{id:?}: {result:?}");
+            }
+        }
+        assert_eq!(rpc.calls().len(), accepted, "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_budget_past_its_limit_is_refused() {
+        let f = fixture("agent-budget");
+        let rpc = Recorder::default();
+        let limit = (LSP_BUDGET + COLLECT_MARGIN).as_millis() as u32;
+        let with_budget = |budget_ms: u32| EditorOp::AgentLspAsk {
+            session: "s-held".into(),
+            id: "abc-3-1".into(),
+            kind: WireLspKind::Hover,
+            path: Some("src/a.rs".into()),
+            line: Some(1),
+            symbol: Some("a".into()),
+            include: vec![],
+            query: None,
+            budget_ms,
+            load: false,
+            stamp: stamp(),
+        };
+        assert!(matches!(
+            dispatch(1, with_budget(limit), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        for budget_ms in [limit + 1, u32::MAX] {
+            let result = dispatch(1, with_budget(budget_ms), &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert_eq!(rpc.calls().len(), 1, "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_symbol_with_a_control_character_is_refused() {
+        let f = fixture("agent-symbol");
+        let rpc = Recorder::default();
+        let with_symbol = |symbol: String| EditorOp::AgentLspAsk {
+            session: "s-held".into(),
+            id: "abc-3-1".into(),
+            kind: WireLspKind::Usages,
+            path: Some("src/a.rs".into()),
+            line: Some(1),
+            symbol: Some(symbol),
+            include: vec![],
+            query: None,
+            budget_ms: 1000,
+            load: false,
+            stamp: stamp(),
+        };
+        assert!(matches!(
+            dispatch(1, with_symbol("a".repeat(SYMBOL_MAX)), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        for symbol in ["a\nb".to_owned(), "a\u{7}".to_owned(), "a".repeat(SYMBOL_MAX + 1)] {
+            let result = dispatch(1, with_symbol(symbol), &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert!(matches!(
+            dispatch(1, lsp_search(&"q".repeat(QUERY_MAX), "abc-3-1"), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        for query in ["a\rb".to_owned(), "q".repeat(QUERY_MAX + 1)] {
+            let result = dispatch(1, lsp_search(&query, "abc-3-1"), &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert_eq!(rpc.calls().len(), 2, "a refused op reached the editor");
+    }
+
+    #[test]
+    fn only_a_workspace_search_names_no_file() {
+        let f = fixture("agent-no-path");
+        let rpc = Recorder::default();
+        for kind in [WireLspKind::Usages, WireLspKind::Hover, WireLspKind::DocumentSymbols] {
+            let op = EditorOp::AgentLspAsk {
+                session: "s-held".into(),
+                id: "abc-3-1".into(),
+                kind,
+                path: None,
+                line: None,
+                symbol: None,
+                include: vec![],
+                query: None,
+                budget_ms: 1000,
+                load: true,
+                stamp: stamp(),
+            };
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{kind:?}: {result:?}");
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_stamp_of_the_wrong_shape_is_refused_on_the_lsp_ops() {
+        let f = fixture("agent-lsp-scope");
+        let rpc = Recorder::default();
+        let bad = || WireStamp {
+            scope: "Not A Scope".into(),
+            ..stamp()
+        };
+        for op in [
+            lsp_ask("s-held", "src/a.rs", false, bad()),
+            EditorOp::AgentLspCollect {
+                session: "s-held".into(),
+                id: "abc-3-1".into(),
+                last: false,
+                stamp: bad(),
+            },
+            EditorOp::AgentBaseline {
+                session: "s-held".into(),
+                stamp: bad(),
+            },
+        ] {
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    /// One argument of a recorded call.
+    fn sent_field(args: &[Value], name: &str) -> Value {
+        args[1]
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn a_query_uses_window_1s_root() {
+        let f = fixture("agent-query");
+        let rpc = Recorder::default();
+        assert!(matches!(
+            dispatch(1, lsp_search("frob", "abc-3-1"), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        let calls = rpc.calls();
+        assert_eq!(calls[0].0, lsp::LSP_ASK_LUA);
+        assert_eq!(
+            sent_field(&calls[0].1, "root"),
+            Value::Binary(f.ctx.root.as_os_str().as_encoded_bytes().to_vec())
+        );
+        assert_eq!(sent_field(&calls[0].1, "query").as_str(), Some("frob"));
+    }
+
+    #[test]
+    fn a_baseline_uses_window_1s_root_and_limit() {
+        let f = fixture("agent-baseline");
+        let rpc = Recorder::default();
+        let wire = stamp();
+        let op = EditorOp::AgentBaseline {
+            session: "s-held".into(),
+            stamp: wire.clone(),
+        };
+        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        assert_eq!(rpc.calls()[0].0, diagnostics::DIAGNOSTICS_LUA);
+        assert_eq!(
+            sent_field(&rpc.calls()[0].1, "limit"),
+            Value::from(BASELINE_LIMIT),
+            "the op names no limit: window 1 picks it"
+        );
+        assert_eq!(
+            sent_field(&rpc.calls()[0].1, "answer_max"),
+            Value::from(diagnostics::answer_max())
+        );
+        // Exactly what a tab of window 1 sends its own editor.
+        let expected = Rc::new(Recorder::default());
+        let _ = LocalWay(expected.clone()).call(
+            "any",
+            &EditorCall::Baseline {
+                root: f.ctx.root.clone(),
+            },
+            &Stamp::from(wire),
+        );
+        assert_eq!(rpc.calls(), expected.calls());
+    }
+
+    #[test]
+    fn a_file_gone_since_window_2_looked_is_refused_for_a_load() {
+        let f = fixture("agent-gone");
+        let rpc = Recorder::default();
+        let result = dispatch(1, agent_open("s-held", "src/gone.rs", true, stamp()), &f.ctx, &rpc);
+        assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn the_editor_state_root_is_window_1s_own() {
+        let f = fixture("agent-root");
+        let rpc = Recorder::default();
+        assert!(matches!(
+            dispatch(1, agent_state("s-held"), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        assert!(matches!(
+            dispatch(2, agent_diagnostics("s-held", None), &f.ctx, &rpc),
+            Ok(Dispatch::Rpc(_))
+        ));
+        let calls = rpc.calls();
+        let root = Value::Binary(f.ctx.root.as_os_str().as_encoded_bytes().to_vec());
+        for (_, args) in &calls {
+            let sent = args[1]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("root"))
+                .unwrap()
+                .1
+                .clone();
+            assert_eq!(sent, root);
+        }
+    }
+
+    #[test]
+    fn a_severity_no_tool_has_is_refused() {
+        let f = fixture("agent-severity");
+        let rpc = Recorder::default();
+        for min_severity in [0, 5, u8::MAX] {
+            let op = EditorOp::AgentDiagnostics {
+                session: "s-held".into(),
+                path: None,
+                min_severity,
+                limit: 1,
+                stamp: stamp(),
+            };
+            let result = dispatch(1, op, &f.ctx, &rpc);
+            assert!(matches!(result, Err(OpRefused::Outside(_))), "{result:?}");
+        }
+        assert!(rpc.calls().is_empty(), "a refused op reached the editor");
+    }
+
+    #[test]
+    fn a_large_diagnostics_limit_is_held_to_window_1s_largest() {
+        let f = fixture("agent-limit");
+        let rpc = Recorder::default();
+        let op = EditorOp::AgentDiagnostics {
+            session: "s-held".into(),
+            path: None,
+            min_severity: 4,
+            limit: u32::MAX,
+            stamp: stamp(),
+        };
+        assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
+        let limit = rpc.calls()[0].1[1]
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("limit"))
+            .unwrap()
+            .1
+            .as_u64();
+        assert_eq!(limit, Some(u64::from(DIAGNOSTICS_LIMIT_MAX)));
     }
 }

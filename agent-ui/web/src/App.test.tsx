@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT, statusWarning } from "./App";
 import { applyEvent, initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
-import type { AgentDomainEvent, AgentUiState, Hello, ProviderInfo, UsageInfo } from "./types";
+import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello, ProviderInfo, UsageInfo } from "./types";
 import { WHICH_KEY_DELAY_MS } from "./leader";
 import { REFUSED_ECHO_MS } from "./tabs";
 import { EMPTY_PANEL_TABLE } from "./keymap";
@@ -2644,6 +2644,51 @@ describe("the leader", () => {
   function tabVerbsPosted(): string[] {
     return posted.filter((m) => m.type === "tab_verb").map((m) => m.verb as string);
   }
+
+  it("the_leader_key_posts_the_toggle_for_the_active_tab", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable({ ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "e"], "tab.follow", "follow in the editor")] });
+      dispatch({ kind: "tabs", active: 7, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 7, number: 2 }] });
+      act(() => root(container).focus());
+      press(" ");
+      press("e");
+      expect(lastOfType("toggle_following")).toMatchObject({ type: "toggle_following", tab: 7, request_id: expect.any(String) });
+      expect(container.textContent).toContain("following the agent in the editor");
+      dispatch({ kind: "tabs", active: 7, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 7, number: 2, following: true }] });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 1));
+      press(" ");
+      press("e");
+      expect(posted.filter((m) => m.type === "toggle_following")).toHaveLength(2);
+      expect(container.textContent).toContain("not following");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a_refused_toggle_flashes_in_the_band_and_raises_no_banner", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = started();
+      act(() => widen(container));
+      sendTable({ ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "e"], "tab.follow", "follow in the editor")] });
+      act(() => root(container).focus());
+      press(" ");
+      press("e");
+      const sent = lastOfType("toggle_following")!;
+      dispatch({ kind: "command_result", requestId: sent.request_id as string, ok: false, error: "tab is moving" });
+      expect(container.querySelector(".band-message")!.textContent).toBe("tab is moving");
+      expect(container.querySelector(".command-notice")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
 
   it("shows the box 200ms after Space, titled Space, with m/b/f in order", () => {
     vi.useFakeTimers();
@@ -15569,4 +15614,221 @@ it("shows retry and rate warnings and the reported fallback model in the band", 
     expect(container.querySelector(".band-warn")?.getAttribute("title")).toBe("Usage limit warning · limit resets 15:45");
     expect(container.querySelector(".band-model")?.textContent).toBe("fallback-model");
   } finally { vi.unstubAllGlobals(); }
+});
+
+/* A card Eitri's own tool broker raised is drawn and answered like a provider's, but on its own message, by its own
+   id, and with how the person answered. It is not in `pendingPermissions`, so a reload brings it back from the
+   snapshot's `editorCards` and a refusal gives it back by the same path a provider card takes. */
+describe("a broker card in the page", () => {
+  let widen: (container: HTMLElement) => void;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  const CARD_ID = "ec-0123456789abcdef-1";
+  function wire(over: Partial<EditorCardWire> = {}): EditorCardWire {
+    return {
+      id: CARD_ID, seq: 4, tool: "open_file", toolUseId: "toolu_1", title: "Show /etc/hosts in your editor?",
+      body: [{ kind: "code", text: "/etc/hosts" }], ...over,
+    };
+  }
+  const press = (key: string, init: Record<string, unknown> = {}) =>
+    fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
+  const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const band = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+  const brokerAnswers = () => posted.filter((m) => m.type === "editor_card_answer");
+  const providerAnswers = () => posted.filter((m) => m.type === "permission_response");
+  const button = (container: HTMLElement, label: string) =>
+    Array.from(container.querySelectorAll<HTMLButtonElement>(".permission-card button")).find((b) => b.textContent === label)!;
+
+  /** A running turn with one call and a broker card on it, the keys arrived on the card. Returns the render. */
+  function arrivedOnABrokerCard(cards: EditorCardWire[] = [wire()]) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ capabilities: { ...initialState().capabilities, interrupt: true } }), 0);
+    const list: AgentDomainEvent[] = [
+      { type: "user_prompt_submitted", text: "show me the hosts" },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "mcp__eitri__open_file", input: { path: "/etc/hosts" } },
+      { type: "content_delta", turn_id: "t1", kind: "text", text: "meanwhile" },
+    ];
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+    dispatch({ kind: "editor_cards", tab: 1, cards });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "arrive" });
+    act(() => widen(rendered.container));
+    return rendered;
+  }
+
+  it("a_on_the_cursor_sends_the_cards_own_answer_with_origin_key", () => {
+    const { container } = arrivedOnABrokerCard();
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    press("a");
+    wait(249);
+    expect(brokerAnswers()).toEqual([]);
+    wait(1);
+    expect(brokerAnswers()).toEqual([
+      expect.objectContaining({ type: "editor_card_answer", tab: 1, card_id: CARD_ID, decision: "allow", origin: "key" }),
+    ]);
+    // On its own message: never a provider's, and no reason or rule rides along.
+    expect(providerAnswers()).toEqual([]);
+    expect(brokerAnswers()[0]).not.toHaveProperty("reason");
+    expect(brokerAnswers()[0]).not.toHaveProperty("remember");
+    expect(brokerAnswers()[0]).not.toHaveProperty("permission_id");
+  });
+
+  it("d_denies_it_with_origin_key_and_a_second_key_changes_nothing", () => {
+    arrivedOnABrokerCard();
+    press("d");
+    wait(250);
+    expect(brokerAnswers()).toEqual([expect.objectContaining({ card_id: CARD_ID, decision: "deny", origin: "key" })]);
+    wait(1000);
+    press("a");
+    wait(1000);
+    expect(brokerAnswers()).toHaveLength(1);
+  });
+
+  it("a_click_sends_origin_click", () => {
+    const { container } = arrivedOnABrokerCard();
+    fireEvent.click(button(container, "Approve"));
+    expect(brokerAnswers()).toEqual([
+      expect.objectContaining({ type: "editor_card_answer", tab: 1, card_id: CARD_ID, decision: "allow", origin: "click" }),
+    ]);
+    expect(providerAnswers()).toEqual([]);
+    expect(button(container, "Approve").disabled).toBe(true);
+  });
+
+  it("the_typing_guard_holds_an_editor_card_too", () => {
+    const { container } = arrivedOnABrokerCard();
+    // An `a` with a key just before it, or just after it, is one of a run and answers nothing.
+    press("s");
+    wait(80);
+    press("a");
+    wait(1000);
+    press("a");
+    wait(100);
+    press("s");
+    wait(1000);
+    expect(brokerAnswers()).toEqual([]);
+    expect(providerAnswers()).toEqual([]);
+    expect(container.querySelector(".permission-card")).not.toBeNull();
+  });
+
+  it("a_snapshot_brings_the_cards_back", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({
+      kind: "snapshot", tab: 1, throughRevision: 6,
+      state: { ...snapshotState(), editorCards: [wire({ toolUseId: null }), wire({ id: "ec-0123456789abcdef-2", seq: 5, toolUseId: null, title: "Second?" })] },
+    });
+    const cards = () => Array.from(container.querySelectorAll(".permission-card")).map((c) => c.querySelector(".permission-card-tool")!.textContent);
+    expect(cards()).toEqual(["Show /etc/hosts in your editor?", "Second?"]);
+    // The envelope replaces the list whole, and a resync that no longer holds a card takes it away.
+    dispatch({ kind: "editor_cards", tab: 1, cards: [wire({ id: "ec-0123456789abcdef-2", seq: 5, toolUseId: null, title: "Second?" })] });
+    expect(cards()).toEqual(["Second?"]);
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 7, state: snapshotState() });
+    expect(cards()).toEqual([]);
+    // For another tab it changes nothing.
+    dispatch({ kind: "editor_cards", tab: 2, cards: [wire()] });
+    expect(cards()).toEqual([]);
+  });
+
+  it("a_refusal_gives_the_card_back", () => {
+    const { container } = arrivedOnABrokerCard();
+    press("a");
+    wait(250);
+    const first = brokerAnswers();
+    expect(first).toHaveLength(1);
+    expect(button(container, "Approve").disabled).toBe(true);
+    dispatch({ kind: "command_result", requestId: first[0].request_id as string, ok: false, error: "that card is no longer waiting" });
+    expect(button(container, "Approve").disabled).toBe(false);
+    wait(1000);
+    press("a");
+    wait(250);
+    expect(brokerAnswers()).toHaveLength(2);
+    expect(brokerAnswers()[1]).toEqual(expect.objectContaining({ card_id: CARD_ID, decision: "allow", origin: "key" }));
+  });
+
+  it("the_tray_landing_finds_an_editor_card", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({
+      kind: "snapshot", tab: 1, throughRevision: 6,
+      state: { ...snapshotState({ userPrompts: [{ seq: 0, text: "go" }, { seq: 5, text: "and more" }] }), editorCards: [wire({ seq: 2, toolUseId: null })] },
+    });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    const current = container.querySelector(".row-current")!;
+    expect(current.classList.contains("row-permission")).toBe(true);
+    expect(current.textContent).toContain("Show /etc/hosts in your editor?");
+  });
+
+  it("a_switch_to_a_tab_holding_an_editor_card_puts_the_keys_on_it", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] });
+    dispatch({
+      kind: "snapshot", tab: 2, throughRevision: 6,
+      state: { ...snapshotState({ userPrompts: [{ seq: 0, text: "go" }, { seq: 5, text: "and more" }] }), editorCards: [wire({ seq: 2, toolUseId: null })] },
+    });
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+  });
+
+  it("D_on_an_editor_card_says_no_reason_is_taken", () => {
+    const { container } = arrivedOnABrokerCard();
+    expect(container.querySelector(".permission-card input")).toBeNull();
+    press("D", { shiftKey: true });
+    wait(1000);
+    expect(band(container)).toBe("an editor card takes no reason with a deny; d denies");
+    expect(brokerAnswers()).toEqual([]);
+    expect(providerAnswers()).toEqual([]);
+  });
+
+  /** A card that would apply proposal `p-3` to `files`. */
+  const proposalCard = (files: string[]) => wire({ tool: "apply_proposal", proposal: { id: "p-3", files } });
+  const ctrlG = (container: HTMLElement) =>
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "g", ctrlKey: true });
+  const views = () => posted.filter((m) => m.type === "editor_card_view");
+
+  it("ctrl_g_on_a_proposal_card_posts_its_first_file", () => {
+    const { container } = arrivedOnABrokerCard([proposalCard(["src/a.rs"])]);
+    ctrlG(container);
+    expect(views()).toEqual([
+      expect.objectContaining({ type: "editor_card_view", tab: 1, proposal: "p-3", file: 0 }),
+    ]);
+    // The shell reads the texts from its store: the page sends no path and no text with it.
+    expect(views()[0]).not.toHaveProperty("path");
+    expect(views()[0]).not.toHaveProperty("text");
+    expect(lastOfType("view_in_editor")).toBeUndefined();
+    expect(lastOfType("view_proposal")).toBeUndefined();
+    expect(band(container)).toBeNull();
+  });
+
+  it("a_second_press_steps_to_the_next_file", () => {
+    const { container } = arrivedOnABrokerCard([proposalCard(["src/a.rs", "src/b.rs"])]);
+    ctrlG(container);
+    expect(band(container)).toBe("1 of 2: src/a.rs");
+    ctrlG(container);
+    expect(band(container)).toBe("2 of 2: src/b.rs");
+    ctrlG(container);
+    expect(views().map((m) => m.file)).toEqual([0, 1, 0]);
+    expect(band(container)).toBe("1 of 2: src/a.rs");
+  });
+
+  it("ctrl_g_on_another_editor_card_views_its_text", () => {
+    const { container } = arrivedOnABrokerCard();
+    ctrlG(container);
+    expect(views()).toEqual([]);
+    expect(lastOfType("view_in_editor")).toMatchObject({ text: "Show /etc/hosts in your editor?\n/etc/hosts" });
+  });
 });

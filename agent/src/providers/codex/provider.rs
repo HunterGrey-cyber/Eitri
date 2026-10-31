@@ -22,7 +22,7 @@ use super::approvals::{self, AnswerForm, CardAnswer, Handling, HeldItems, HeldIt
 use super::config::{expected_echo, session_config};
 use super::family::{Family, FamilyEdge, Full, MEMBERS_MAX, UNREAD_TURN};
 use super::resume;
-use super::self_check::{ensure_checked, BinaryKey, SelfCheckError};
+use super::self_check::{ensure_checked, BinaryKey, Checked, SelfCheckError};
 use super::translate::{self, parse_user_agent_version, version_text, SIGNED_OUT};
 use super::tripwire::{self, PolicyMismatch, TrustWatch};
 use super::wire::{
@@ -61,7 +61,7 @@ pub const MIN_CODEX: (u32, u32, u32) = (0, 160, 0);
 
 /// The newest Codex whose traffic was recorded against this code and whose scripted suite and self-check
 /// passed. A newer one runs, with a note.
-pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 161, 0);
+pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 163, 0);
 
 /// How long the handshake and the session start may take.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -85,6 +85,17 @@ const EARLY_TURNS_KEPT: usize = 64;
 /// interrupted turn at once but lets a running command go on to its own end, so a command or file change
 /// still running when this has passed is stopped with the whole session.
 pub const INTERRUPT_SETTLE: Duration = Duration::from_secs(3);
+/// The longest a session's start waits for the editor's server. Codex gives a turn only the tools of the
+/// servers that finished starting, so a first turn sent sooner goes without this one's.
+pub const EDITOR_SERVER_WAIT: Duration = Duration::from_secs(3);
+/// How often that wait looks for what Codex said.
+const EDITOR_SERVER_POLL: Duration = Duration::from_millis(10);
+/// The startup status of a tool server Codex has not finished starting.
+pub(super) const MCP_STARTING: &str = "starting";
+/// What a tab says when its session was given the editor's server and this Codex did not show the check that
+/// it keeps quiet about the server's tools: every call would raise Codex's own question beside Eitri's card.
+pub const EDITOR_TOOLS_OFF: &str =
+    "this Codex would ask about the editor tools, so they are off in this tab; a newer Codex may keep them on";
 /// How long after Codex refused a `turn/interrupt` it is sent again, while the turn still runs. Codex refuses
 /// one that comes the moment `turn/start` was answered ("no active turn to interrupt") and runs the turn on.
 const INTERRUPT_RETRY: Duration = Duration::from_millis(100);
@@ -202,10 +213,13 @@ enum Running {
     FileChange,
     /// An item whose kind or start Eitri could not read, which may be either.
     Unread,
-    /// A call Eitri does not stop the session for: a subagent call, which ends with its child, or a tool
-    /// server's call, which may be a long read as well as anything else. It is waited on only up to the
-    /// settle time, so what a tool server writes after that is not in the turn's end snapshot.
+    /// A call Eitri does not stop the session for: a subagent call, which ends with its child. It is waited
+    /// on only up to the settle time.
     Other,
+    /// A tool server's call, which may be a long read as well as anything else, so it is no reason to stop
+    /// the session either. It is waited on only up to the settle time, so what a tool server writes after
+    /// that is not in the turn's end snapshot.
+    ToolServer,
 }
 
 impl Running {
@@ -218,7 +232,8 @@ impl Running {
             // Anything else it may add, an image it saves, a tool Eitri never offered, a known type that
             // did not read: may be writing.
             ThreadItem::Unknown { .. } | ThreadItem::Malformed { .. } => Some(Running::Unread),
-            ThreadItem::McpToolCall(_) | ThreadItem::CollabAgentToolCall(_) => Some(Running::Other),
+            ThreadItem::McpToolCall(_) => Some(Running::ToolServer),
+            ThreadItem::CollabAgentToolCall(_) => Some(Running::Other),
             ThreadItem::UserMessage(_)
             | ThreadItem::AgentMessage(_)
             | ThreadItem::Reasoning(_)
@@ -232,7 +247,7 @@ impl Running {
             Running::Command => Some("kept running a command"),
             Running::FileChange => Some("kept applying a file change"),
             Running::Unread => Some("kept running something Eitri could not read"),
-            Running::Other => None,
+            Running::Other | Running::ToolServer => None,
         }
     }
 }
@@ -758,6 +773,11 @@ pub struct CodexProvider {
     /// Codex does not know `turn/steer`: every later message waits for the turn's end. Outside `state` so
     /// `capabilities` never waits for a pump.
     steer_unsupported: AtomicBool,
+    /// Whether this binary keeps a session's approval mode for the editor's server (the self-check's answer).
+    /// Without it, no session of this provider is given that server.
+    editor_server_lever: bool,
+    /// A session lost the server it was given, and the tab has not been told.
+    editor_note_due: AtomicBool,
 }
 
 /// A failed call on the link as the error the host shows.
@@ -957,7 +977,7 @@ impl CodexProvider {
         // Before the self-check too: nothing is started under a home the project could supply.
         refuse_codex_home(&launch.cwd)?;
         let checked = match ensure_checked(&launch.program, &launch.state_home) {
-            Ok(key) => key,
+            Ok(checked) => checked,
             Err(SelfCheckError::NotFound) => {
                 return Err(provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND));
             }
@@ -974,12 +994,12 @@ impl CodexProvider {
     }
 
     /// [`connect`](Self::connect) with the self-check's answer given and the child's arguments given: the
-    /// tests start a scripted stand-in and say which version the check passed.
+    /// tests start a scripted stand-in and say what the check found.
     #[doc(hidden)]
     pub fn connect_checked_with_args(
         launch: CodexLaunch,
         args: Vec<OsString>,
-        checked: &BinaryKey,
+        checked: &Checked,
     ) -> Result<CodexProvider, ProviderError> {
         Self::connect_child(launch, args, Vec::new(), Vec::new(), Some(checked))
     }
@@ -1002,14 +1022,15 @@ impl CodexProvider {
         Self::connect_child(launch, args, env, env_remove, None)
     }
 
-    /// Starts the child and runs the handshake. `checked` is the binary the self-check passed, whose version
-    /// the child must report; only the tests' own doors start a child with none.
+    /// Starts the child and runs the handshake. `checked` is what the self-check found: the child must report
+    /// the version that passed. Only the tests' own doors start a child with none, and they speak for
+    /// themselves about the editor's server, so with none its lever counts as held.
     fn connect_child(
         launch: CodexLaunch,
         args: Vec<OsString>,
         env: Vec<(OsString, OsString)>,
         env_remove: Vec<OsString>,
-        checked: Option<&BinaryKey>,
+        checked: Option<&Checked>,
     ) -> Result<CodexProvider, ProviderError> {
         let child_home = child_codex_home(&env, &env_remove);
         refuse_relative_home(child_home.as_deref())?;
@@ -1031,7 +1052,7 @@ impl CodexProvider {
             std::io::ErrorKind::NotFound => provider_error(ProviderErrorCode::ProviderUnavailable, NOT_FOUND),
             _ => ProviderError::Transport(format!("Codex could not be started: {e}")),
         })?;
-        let (version, codex_home) = Self::handshake(&link, checked)?;
+        let (version, codex_home) = Self::handshake(&link, checked.map(|c| &c.key))?;
         let pid = link.pid();
         Ok(CodexProvider {
             link: Mutex::new(Some(link)),
@@ -1041,6 +1062,8 @@ impl CodexProvider {
             state_home: launch.state_home,
             codex_home,
             steer_unsupported: AtomicBool::new(false),
+            editor_server_lever: checked.is_none_or(|c| c.editor_server_lever),
+            editor_note_due: AtomicBool::new(false),
         })
     }
 
@@ -2497,7 +2520,38 @@ impl CodexProvider {
             None if !asked => (TurnOutcome::Completed, TurnEndDetail::default()),
             _ => translate::turn_ending(&TurnStatus::Interrupted, None),
         };
+        if outcome == TurnOutcome::Interrupted {
+            Self::end_cut_off_tool_calls(st);
+        }
         self.end_turn(st, outcome, detail);
+    }
+
+    /// An interrupted turn takes its tool servers' calls with it: Codex tells the server nothing, ignores a
+    /// late reply and never reports such a call ended, so left in `running` it would count as running for
+    /// the rest of the session. Its row ends here, inside its turn.
+    fn end_cut_off_tool_calls(st: &mut State) {
+        let mut cut_off: Vec<(String, String)> = st
+            .running
+            .iter()
+            .filter(|(_, kind)| **kind == Running::ToolServer)
+            .map(|(key, _)| key.clone())
+            .collect();
+        cut_off.sort();
+        for key in cut_off {
+            st.running.remove(&key);
+            let row = row_of(st, &key.0, &key.1);
+            if !st.open_tools.remove(&row) {
+                continue;
+            }
+            if let Some(turn_id) = Self::tab_turn_id(st) {
+                st.events.push_back(AgentDomainEvent::ToolCallCompleted {
+                    turn_id,
+                    tool_use_id: row,
+                    content: Value::String("interrupted".to_string()),
+                    is_error: true,
+                });
+            }
+        }
     }
 
     /// Ends the running turn with an event and forgets its per-turn bookkeeping.
@@ -2739,6 +2793,23 @@ fn end_added_row(st: &mut State, card: WaitingCard, outcome: PermissionOutcome) 
     });
 }
 
+/// Whether a message means the start need not wait for `server` any more: its status left `starting`, or
+/// the child is gone.
+fn ends_editor_wait(message: &Incoming, server: &str) -> bool {
+    match message {
+        Incoming::Closed { .. } => true,
+        Incoming::Notification { method: name, params } if name == method::MCP_STARTUP_STATUS => {
+            match wire::parse_notification(name, params.clone()) {
+                ServerNotification::McpStartupStatus(status) => {
+                    status.name == server && status.status.is_some_and(|word| word != MCP_STARTING)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The row id of item `item` of `thread` (`translate::row_id`).
 fn row_of(st: &State, thread: &str, item: &str) -> String {
     translate::row_id(st.thread_id.as_deref().unwrap_or_default(), thread, item)
@@ -2909,6 +2980,9 @@ impl CodexProvider {
             state_home,
             codex_home,
             steer_unsupported,
+            // Read when a session opens and right after, which a chat that can move is past.
+            editor_server_lever: _,
+            editor_note_due: _,
         } = self;
         let State {
             thread_id,
@@ -3050,6 +3124,8 @@ impl CodexProvider {
             state_home: _,
             codex_home: _,
             steer_unsupported,
+            editor_server_lever: _,
+            editor_note_due: _,
         } = Self::rebuilt(handoff, link, pid, &handed)?;
         self.steer_unsupported
             .store(steer_unsupported.load(Ordering::Acquire), Ordering::Release);
@@ -3189,6 +3265,9 @@ impl CodexProvider {
             state_home,
             codex_home,
             steer_unsupported: AtomicBool::new(steer_unsupported),
+            // A moved chat has its session; nothing opens another on this provider.
+            editor_server_lever: false,
+            editor_note_due: AtomicBool::new(false),
         })
     }
 }
@@ -3538,7 +3617,11 @@ impl CodexProvider {
 
     /// `thread/start`, or `thread/resume` and the history after it.
     fn open_session(&self, req: ExternalStart, resume: Option<&str>) -> Result<String, ProviderError> {
-        let config = session_config(&req.plan)
+        let editor_server = req.editor_server.as_ref().filter(|_| self.editor_server_lever);
+        if req.editor_server.is_some() && editor_server.is_none() {
+            self.editor_note_due.store(true, Ordering::Release);
+        }
+        let config = session_config(&req.plan, editor_server)
             .map_err(|e| provider_error(ProviderErrorCode::InvalidConfiguration, e.to_string()))?;
         let TurnPolicy { reviewer, sandbox } = req.policy;
         let (verb, pending) = match resume {
@@ -3636,7 +3719,51 @@ impl CodexProvider {
         if resume.is_some() {
             self.read_history(&thread_id);
         }
+        if let Some(server) = editor_server {
+            self.wait_for_editor_server(&server.name);
+        }
         Ok(thread_id)
+    }
+
+    /// Waits, at most [`EDITOR_SERVER_WAIT`], for Codex to say the session's tool server has left `starting`.
+    /// How it left does not matter, and neither does running out of time: a failed server leaves a usable
+    /// session with no tool. This runs on the connect worker, before anything pumps the session, so what
+    /// Codex says meanwhile is only moved aside, in order, for the first pump to read.
+    fn wait_for_editor_server(&self, server: &str) {
+        let until = Instant::now() + EDITOR_SERVER_WAIT;
+        let mut seen = 0;
+        loop {
+            {
+                let mut st = lock(&self.state);
+                if st.blocked.is_some() {
+                    return;
+                }
+                let link = lock(&self.link);
+                let Some(link) = link.as_ref() else { return };
+                while st.held.len() < PUMP_BATCH {
+                    let Some(message) = link.try_recv() else { break };
+                    st.held.push_back(message);
+                }
+                if st
+                    .held
+                    .iter()
+                    .skip(seen)
+                    .any(|message| ends_editor_wait(message, server))
+                {
+                    return;
+                }
+                seen = st.held.len();
+                // What does not fit stays in the link's queue, so nothing more can be read here.
+                if seen >= PUMP_BATCH {
+                    return;
+                }
+            }
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            std::thread::sleep(EDITOR_SERVER_POLL.min(until - now));
+        }
     }
 
     /// A resume that did not continue the conversation asked for (Codex refused it, or continued another),
@@ -3745,6 +3872,12 @@ impl ExternalProvider for CodexProvider {
 
     fn take_history(&self) -> Vec<AgentDomainEvent> {
         std::mem::take(&mut lock(&self.state).history)
+    }
+
+    fn editor_note(&self) -> Option<String> {
+        self.editor_note_due
+            .swap(false, Ordering::AcqRel)
+            .then(|| EDITOR_TOOLS_OFF.to_string())
     }
 
     fn stopped_resumable(&self) -> bool {

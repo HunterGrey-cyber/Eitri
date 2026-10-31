@@ -13,6 +13,10 @@ How to answer a card with the keyboard is in [Getting started](getting-started.m
 This page is about Claude tabs. A tab that runs Codex, or an agent you registered, has its own sandbox,
 reviewer and trust question; they are described in [Codex and other agents](agents.md).
 
+The agent's [editor tools](editor-tools.md) (`mcp__eitri__open_file` and the others) are outside all of this, in every
+kind of tab: neither saved rules, nor Manual's or Auto's rules below, nor Claude Code's auto mode judge them. Eitri's
+own table for them is [on their page](editor-tools.md#cards), and so are the ways their cards differ.
+
 ## Who decides a tool call
 
 Every tool call Claude Code wants to run is sent to Eitri first, in every mode, before it runs. What happens
@@ -84,11 +88,13 @@ Eitri cannot be sure about is a card.
 
 In bypass Eitri approves every call itself, without a card. That includes Claude Code's own questions (the
 [next section](#when-claude-code-itself-asks)), even the ones your own `permissions.ask` rules force: in a bypass
-tab an ask rule stops nothing. Because that is a lot of trust, `Shift+Tab` into bypass asks first. The question is
+tab an ask rule stops nothing. The one exception is [`nvim_exec`](editor-tools.md#nvim-exec), an editor tool that is
+off until you turn it on: every call of it is a card, in bypass too. Because that is a lot of trust, `Shift+Tab` into bypass asks first. The question is
 a `y/n` that says what else changes: if cards are waiting in the tab it reads "Switch to bypass and approve the N
-waiting cards?", and every waiting card is counted. The `y` counts only when it is pressed on its own and a moment
-after the question appears, and only the cards still waiting at that moment are approved. Bypass is entered only
-from auto. Leaving bypass needs no question and lands in manual.
+waiting cards?", and every waiting card is counted, except a card from an agent's
+[editor tools](editor-tools.md#cards), which entering bypass never answers. The `y` counts only when it is pressed
+on its own and a moment after the question appears, and only the cards still waiting at that moment are approved.
+Bypass is entered only from auto. Leaving bypass needs no question and lands in manual.
 
 Bypass never answers a question Claude asks you ([Claude's questions to you](#claudes-questions-to-you)).
 

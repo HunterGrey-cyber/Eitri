@@ -2150,10 +2150,19 @@ fn build_ui(
     // restarted one still starting).
     let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> = match &pane {
         Some(pane) => {
-            let module_layout = module_layout.clone();
-            let editor_present: Rc<dyn Fn() -> bool> =
-                Rc::new(move || !module_layout.read().is_gone(&ModuleId::editor()));
-            Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present))
+            let editor_present: Rc<dyn Fn() -> bool> = {
+                let module_layout = module_layout.clone();
+                Rc::new(move || !module_layout.read().is_gone(&ModuleId::editor()))
+            };
+            let editor_visible: Rc<dyn Fn() -> bool> = {
+                let module_layout = module_layout.clone();
+                Rc::new(move || module_layout.read().is_visible(&ModuleId::editor()))
+            };
+            Rc::new(editor_rpc::EmbeddedEditorRpc::new(
+                pane.clone(),
+                editor_present,
+                editor_visible,
+            ))
         }
         None => Rc::new(linked_window::NoEditor),
     };
@@ -3363,6 +3372,7 @@ fn build_ui(
         plugin_panels.set_editor(editor_rpc);
         if let Some(two) = &window2_editor {
             plugin_panels.set_link_editor(two.ops());
+            agent_panel_handle.set_editor_way(Rc::new(two.ops().editor_way(project_root)));
         }
     }
     // The review overlay in this window's own nvim: the module goes with the window, and a file the

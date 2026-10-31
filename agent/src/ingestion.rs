@@ -335,7 +335,12 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::CliCycleStarted { .. }
         | AgentDomainEvent::BackgroundTasksChanged { .. }
         | AgentDomainEvent::TaskEvent { .. }
-        | AgentDomainEvent::ConversationReset { .. } => false,
+        | AgentDomainEvent::ConversationReset { .. }
+        // A call needs no turn's copy: one the running turn's copy misses is one the adopter's read of
+        // the session's open calls covers, and the servers are in the seed.
+        | AgentDomainEvent::ClientToolCall { .. }
+        | AgentDomainEvent::ClientToolCallSettled { .. }
+        | AgentDomainEvent::SessionServers { .. } => false,
         // A subagent's frame starts what its inner event would.
         AgentDomainEvent::SubagentFrame { frame, .. } => may_start_a_turn(frame),
     }
@@ -1710,6 +1715,42 @@ pub(crate) mod tests {
             st.history_saved_through, 11,
             "with the write done, folds that owe nothing move it again"
         );
+    }
+
+    /// Tool calls and servers reports fold without opening a turn's copy, so a call between turns stays
+    /// behind while the running turn's call and the servers report cross.
+    #[test]
+    fn client_tool_events_open_no_turns_copy_and_the_running_turn_carries_them() {
+        let call = |id: &str| AgentDomainEvent::ClientToolCall {
+            call_id: id.into(),
+            tool_use_id: None,
+            tool: "open_file".into(),
+            arguments_json: "{}".into(),
+            sequence: 3,
+        };
+        let mut source = state();
+        source.fold(AgentDomainEvent::SessionServers {
+            servers: vec![crate::InitServer {
+                name: "eitri".into(),
+                status: "connected".into(),
+                source: "sdk".into(),
+            }],
+        });
+        source.fold(call("between-turns"));
+        source.fold(AgentDomainEvent::ClientToolCallSettled {
+            call_id: "never-held".into(),
+        });
+        assert!(source.running_turn.is_none(), "none of them starts a turn's copy");
+        source.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        source.fold(call("in-the-turn"));
+        let _ = source.take_delivery();
+
+        let Ok((core, _)) = source.take_move_record(None) else {
+            panic!("a conversation in the middle of a turn moves");
+        };
+        let adopted = AgentSessionProjection::adopt(&core).expect("the destination rebuilds the projection");
+        assert_eq!(adopted.open_client_calls.keys().collect::<Vec<_>>(), ["in-the-turn"]);
+        assert!(adopted.single_sdk_server("eitri"));
     }
 
     /// A conversation moved between turns after its last history write failed owes the destination that

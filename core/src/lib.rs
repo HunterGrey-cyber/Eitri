@@ -25,6 +25,7 @@ pub mod editor_feeds;
 pub mod editor_lines;
 pub mod editor_open;
 pub mod editor_rpc;
+pub mod editor_tools;
 pub mod hint;
 pub mod instance_dir;
 pub mod keymap;

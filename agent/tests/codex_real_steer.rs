@@ -264,6 +264,7 @@ fn the_provider_delivers_a_message_read_and_drops_one_an_interrupt_lost() {
             plan: plan(&project, DirTrust::Untrusted),
             policy,
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
 

@@ -11,7 +11,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
-import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
+import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello } from "./types";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS } from "./typingGuard";
 
@@ -123,6 +123,7 @@ function started(
   cards: 0 | 1 | 2,
   tabs: readonly Record<string, unknown>[] = [TAB1],
   events: AgentDomainEvent[] = cardEvents(cards),
+  brokerCards: readonly EditorCardWire[] = [],
 ) {
   const rendered = render(<App />);
   dispatch({ kind: "hello", ...HELLO });
@@ -130,6 +131,7 @@ function started(
   dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
   const list = events;
   dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
+  if (brokerCards.length > 0) dispatch({ kind: "editor_cards", tab: 1, cards: brokerCards });
   dispatch({
     kind: "keymap",
     prefix: "Ctrl+b",
@@ -145,8 +147,12 @@ function started(
 }
 
 /** `started`, then `i` into INPUT and a pause longer than the guard, so the next key stands alone. */
-function inInput(cards: 0 | 1 | 2, tabs: readonly Record<string, unknown>[] = [TAB1]) {
-  const rendered = started(cards, tabs);
+function inInput(
+  cards: 0 | 1 | 2,
+  tabs: readonly Record<string, unknown>[] = [TAB1],
+  brokerCards: readonly EditorCardWire[] = [],
+) {
+  const rendered = started(cards, tabs, cardEvents(cards), brokerCards);
   wait(TYPING_GUARD_MS + 50);
   fireEvent.keyDown(root(rendered.container), { key: "i" });
   wait(TYPING_GUARD_MS + 50);
@@ -738,5 +744,64 @@ describe("a card Approve cannot answer: neither Ctrl+y nor a sends an approval",
     fireEvent.keyDown(root(container), { key: "d" });
     wait(1000);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "acp-1", decision: "deny" })]);
+  });
+});
+
+/** A card Eitri's own tool broker raised, as Rust serialises it. `seq` is where it sits among the conversation's rows. */
+function brokerCard(id: string, seq: number, toolUseId: string | null = null): EditorCardWire {
+  return {
+    id, seq, tool: "open_file", toolUseId, title: "Show /etc/hosts in your editor?",
+    body: [{ kind: "code", text: "/etc/hosts" }],
+  };
+}
+const EDITOR_CARD_FLASH = "Ctrl+y does not answer an editor card: Esc, then a or d on the card";
+const brokerAnswers = () => posted.filter((m) => m.type === "editor_card_answer");
+
+describe("a card of Eitri's own tool broker is never Ctrl+y's", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    widen = stubBandWidth();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("ctrl_y_never_answers_an_editor_card", () => {
+    const { box } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
+    ctrlY(box);
+    wait(TYPING_GUARD_MS + 1000);
+    expect(brokerAnswers()).toEqual([]);
+    expect(answered()).toEqual([]);
+    // Neither does a second, after a pause.
+    ctrlY(box);
+    wait(TYPING_GUARD_MS + 1000);
+    expect(brokerAnswers()).toEqual([]);
+    expect(answered()).toEqual([]);
+  });
+
+  it("ctrl_y_skips_it_for_a_provider_card_behind_it", () => {
+    // The broker card is the older row (the lowest `seq`); the provider's card behind it is the one named.
+    const { container, box } = inInput(1, [TAB1], [brokerCard("ec-0123456789abcdef-1", 0)]);
+    expect(bandText(container)).toContain("Ctrl+y approves Bash: rm build");
+    ctrlY(box);
+    wait(TYPING_GUARD_MS);
+    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+    expect(brokerAnswers()).toEqual([]);
+  });
+
+  it("ctrl_y_alone_with_an_editor_card_flashes", () => {
+    const { container, box } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
+    // The key is claimed: it neither yanks into the box nor answers anything.
+    expect(ctrlY(box)).toBe(false);
+    expect(bandMessage(container)).toBe(EDITOR_CARD_FLASH);
+    wait(TYPING_GUARD_MS + 1000);
+    expect(brokerAnswers()).toEqual([]);
+    expect(answered()).toEqual([]);
+  });
+
+  it("the_band_names_no_ctrl_y_for_an_editor_card", () => {
+    const { container } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
+    expect(bandText(container)).not.toContain("Ctrl+y");
   });
 });

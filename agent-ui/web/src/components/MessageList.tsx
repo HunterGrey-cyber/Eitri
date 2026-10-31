@@ -2,7 +2,7 @@ import { toolCardLine, agentCard, isAgentCall } from "../display";
 import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
-import { buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
+import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
@@ -626,12 +626,12 @@ export function MessageList({
 
   const footers = useMemo(
     () => workedFooters(state, turnDurations),
-    [state.activeTurnId, state.turnEndings, state.transcript, state.thinking, state.toolCalls, state.pendingPermissions, turnDurations],
+    [state.activeTurnId, state.turnEndings, state.transcript, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, turnDurations],
   );
   // By row key, over the rows actually drawn: a turn's newest row may be a hidden or folded thought.
   const placedFooters = useMemo(() => placeFooters(timeline, footers), [timeline, footers]);
 
-  const awaitingPermission = new Set(state.pendingPermissions.map((p) => p.toolUseId).filter(isUsableLink));
+  const awaitingPermission = new Set(allCards(state).map((p) => p.toolUseId).filter(isUsableLink));
 
   return (
     <>

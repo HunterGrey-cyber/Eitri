@@ -319,10 +319,30 @@ function toolItem(call: ToolCallRecord): TimelineItem {
   return item;
 }
 
+/** Every card waiting on this tab: the provider's (`pendingPermissions`) and the ones Eitri's own tool broker raised
+ *  (`editorCards`). Anything that asks "is a card pending" reads this, so a broker card is never missed; the one
+ *  reader that leaves broker cards out says so (`oldestWaitingPermission`). Provider cards first, each list in its own
+ *  order. With no broker card it is `pendingPermissions` itself, so a memo keyed on that list keeps its identity. */
+export function allCards(
+  state: Pick<AgentUiState, "pendingPermissions"> & Partial<Pick<AgentUiState, "editorCards">>,
+): PermissionRequestRecord[] {
+  const own = state.editorCards;
+  return own === undefined || own.length === 0 ? state.pendingPermissions : [...state.pendingPermissions, ...own];
+}
+
+/** What a broker card says, as plain text: its title, then each line. `null` for a provider's request, whose
+ *  readers use its `input`. */
+export function editorCardText(request: PermissionRequestRecord): string | null {
+  const card = request.editorCard;
+  return card === undefined ? null : [card.title, ...card.body.map((line) => line.text)].join("\n");
+}
+
 function permissionItem(request: PermissionRequestRecord): TimelineItem {
   const held = permissionItems.get(request);
   if (held !== undefined && held.seq === request.seq) return held;
-  const item: TimelineItem = { kind: "permission", seq: request.seq, key: `p-${request.seq}`, request };
+  // A broker card's `seq` is the revision the next event would take, so a later row may share it: its key is its id.
+  const key = request.editorCard === undefined ? `p-${request.seq}` : `ec-${request.permissionId}`;
+  const item: TimelineItem = { kind: "permission", seq: request.seq, key, request };
   permissionItems.set(request, item);
   return item;
 }
@@ -412,7 +432,7 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
   const unanchored: PermissionRequestRecord[] = [];
   const knownToolUseIds = new Set(state.toolCalls.map((call) => call.toolUseId).filter(isUsableLink));
 
-  for (const request of state.pendingPermissions) {
+  for (const request of allCards(state)) {
     const link = request.toolUseId;
     if (isUsableLink(link) && knownToolUseIds.has(link)) {
       const siblings = anchored.get(link);
@@ -532,11 +552,13 @@ function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boole
 /** The card INPUT's `Ctrl+y` approves -- the timeline index of the OLDEST card
  *  still waiting (lowest `seq`), the same rule a card landing uses (`oldestPendingPermission`)
  *  with the cards this panel has already answered left out, since those wait only for the provider.
- *  `null` when none waits. `timeline` is the active tab's, so another tab's card is never a candidate. */
+ *  A card Eitri's own tool broker raised is never one: only a key on that card's own row answers it, so a provider
+ *  card behind it may be the one named. `null` when none waits. `timeline` is the active tab's, so another tab's
+ *  card is never a candidate. */
 export function oldestWaitingPermission(timeline: TimelineItem[], answered: ReadonlySet<string>): number | null {
   let best: number | null = null;
   timeline.forEach((item, index) => {
-    if (!isWaitingCard(item, answered)) return;
+    if (!isWaitingCard(item, answered) || (item.kind === "permission" && item.request.editorCard !== undefined)) return;
     const current = best === null ? null : timeline[best];
     if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
   });

@@ -468,7 +468,10 @@ impl AcpProvider {
 
     fn open_new(&self, req: ExternalStart) -> Result<String, ProviderError> {
         let mut boot = Boot::default();
-        let pending = self.request(method::SESSION_NEW, wire::session_new_params(&req.cwd))?;
+        let pending = self.request(
+            method::SESSION_NEW,
+            wire::session_new_params(&req.cwd, req.editor_server.as_ref()),
+        )?;
         let answer = self
             .serve(pending, START_TIMEOUT, &mut boot)
             .map_err(|e| self.failure(e, "the session start"))?;
@@ -492,7 +495,10 @@ impl AcpProvider {
             history: Some(History::default()),
             closed: None,
         };
-        let pending = self.request(method::SESSION_LOAD, wire::session_load_params(&saved, &req.cwd))?;
+        let pending = self.request(
+            method::SESSION_LOAD,
+            wire::session_load_params(&saved, &req.cwd, req.editor_server.as_ref()),
+        )?;
         let answer = match self.serve(pending, LOAD_TIMEOUT, &mut boot) {
             Ok(answer) => answer,
             // The agent's own words are what the user needs, shown as the verdict on the resume.

@@ -7,7 +7,8 @@
 use super::translate_322;
 use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
 use crate::{
-    AgentDomainEvent, ContentKind, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome, UsageInfo,
+    AgentDomainEvent, ContentKind, InitServer, PermissionOutcome, ResumeStatus, TokenUsage, TurnEndDetail, TurnOutcome,
+    UsageInfo,
 };
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
@@ -26,7 +27,8 @@ use claude_runtime_protocol::v1::{
 /// session accepts: the session did open, AND it must be closed -- so both are said,
 /// in that order, rather than one hiding the other. Two also on every `SessionReady` of a session
 /// that asked for the CLI's auto mode and got a mode it accepts: the opening, then the mode
-/// (`CliPermissionMode`), which the host's answer path reads.
+/// (`CliPermissionMode`), which the host's answer path reads. A `SessionReady` that carries the CLI's
+/// init report adds its MCP servers last (`SessionServers`).
 ///
 /// `requested` is what this session asked the CLI to run in (`build_create_request`), and is what
 /// the CLI's report is judged against (`classify_reported_cli_mode`).
@@ -52,6 +54,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
     // client does not depend on it being fixed.
     let envelope_session_id = event.session_id;
     let envelope_turn_id = event.turn_id;
+    let envelope_sequence = event.sequence;
     let one = |event: AgentDomainEvent| Some(vec![event]);
     let occurred_at = (event.occurred_at != 0).then_some(event.occurred_at);
     match event.event? {
@@ -78,8 +81,35 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 }
                 CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => {}
             }
+            if let Some(init) = ready.init_fingerprint {
+                out.push(AgentDomainEvent::SessionServers {
+                    servers: init
+                        .mcp_servers
+                        .into_iter()
+                        .map(|server| InitServer {
+                            name: server.name,
+                            status: server.status,
+                            source: server.source,
+                        })
+                        .collect(),
+                });
+            }
             Some(out)
         }
+        // The call's position on the session's stream is the envelope's: an adopting host reads on from
+        // it (`GetClientToolCallStateResponse.through_sequence`).
+        ProtoEvent::ClientToolCall(call) => one(AgentDomainEvent::ClientToolCall {
+            call_id: call.call_id,
+            tool_use_id: (!call.tool_use_id.is_empty()).then_some(call.tool_use_id),
+            tool: call.tool,
+            arguments_json: call.arguments_json,
+            sequence: envelope_sequence,
+        }),
+        // The outcome stays behind: every outcome means the call is over, and the labels other than
+        // answered, interrupted and closed are best-effort.
+        ProtoEvent::ClientToolCallSettled(settled) => one(AgentDomainEvent::ClientToolCallSettled {
+            call_id: settled.call_id,
+        }),
         ProtoEvent::TurnStarted(started) => Some(translate_322::turn_started(started)),
         ProtoEvent::TextDelta(delta) => one(translate_322::delta(
             delta.turn_id,
@@ -637,10 +667,11 @@ impl CliModeNote {
 mod tests {
     use super::*;
     use claude_runtime_protocol::v1::{
-        MatchedAskRule, PermissionModeChanged, PermissionOrigin as ProtoPermissionOrigin,
-        PermissionOutcome as ProtoPermOutcome, PermissionRequested, PermissionResolved, ProviderNotice,
-        SessionCloseReason, SessionClosed, SessionReady, TextDelta, ThinkingDelta, ToolCallCompleted, ToolCallStarted,
-        TurnCompleted, TurnOutcome as ProtoTOutcome, TurnStarted,
+        ClientToolCall, ClientToolCallOutcome, ClientToolCallSettled, InitFingerprint, InitMcpServer, MatchedAskRule,
+        PermissionModeChanged, PermissionOrigin as ProtoPermissionOrigin, PermissionOutcome as ProtoPermOutcome,
+        PermissionRequested, PermissionResolved, ProviderNotice, SessionCloseReason, SessionClosed, SessionReady,
+        TextDelta, ThinkingDelta, ToolCallCompleted, ToolCallStarted, TurnCompleted, TurnOutcome as ProtoTOutcome,
+        TurnStarted,
     };
 
     /// The single event the old `Option`-returning `translate` gave, for the tests written against
@@ -1430,6 +1461,102 @@ mod tests {
         ] {
             assert_eq!(translate(notice(kind, subtype)), None, "{kind} {subtype:?}");
         }
+    }
+
+    #[test]
+    fn a_client_tool_call_keeps_its_envelope_sequence_and_an_empty_use_id_is_none() {
+        let call = |tool_use_id: &str| ProtoSessionEvent {
+            sequence: 41,
+            ..wrap(ProtoEvent::ClientToolCall(ClientToolCall {
+                call_id: "call-1".into(),
+                tool_use_id: tool_use_id.into(),
+                tool: "open_file".into(),
+                arguments_json: r#"{"path":"a"}"#.into(),
+            }))
+        };
+        let expected = |tool_use_id: Option<&str>| AgentDomainEvent::ClientToolCall {
+            call_id: "call-1".into(),
+            tool_use_id: tool_use_id.map(str::to_owned),
+            tool: "open_file".into(),
+            arguments_json: r#"{"path":"a"}"#.into(),
+            sequence: 41,
+        };
+        assert_eq!(translate(call("")), Some(expected(None)));
+        assert_eq!(translate(call("toolu_1")), Some(expected(Some("toolu_1"))));
+    }
+
+    /// Every outcome means the call is over, so nothing past the id reaches the host.
+    #[test]
+    fn a_settled_call_is_its_id_whatever_the_outcome() {
+        for outcome in [ClientToolCallOutcome::Answered, ClientToolCallOutcome::TimedOut] {
+            let event = wrap(ProtoEvent::ClientToolCallSettled(ClientToolCallSettled {
+                call_id: "call-1".into(),
+                outcome: outcome as i32,
+            }));
+            assert_eq!(
+                translate(event),
+                Some(AgentDomainEvent::ClientToolCallSettled {
+                    call_id: "call-1".into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn session_ready_reports_its_servers_with_their_source() {
+        let ready_with = |mcp_servers: Vec<InitMcpServer>| {
+            wrap(ProtoEvent::SessionReady(SessionReady {
+                provider_session_id: "claude-1".into(),
+                model: "m".into(),
+                cwd: "/tmp".into(),
+                init_fingerprint: Some(InitFingerprint {
+                    mcp_servers,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        let events = super::translate(
+            ready_with(vec![
+                InitMcpServer {
+                    name: "eitri".into(),
+                    status: "connected".into(),
+                    source: "sdk".into(),
+                },
+                InitMcpServer {
+                    name: "theirs".into(),
+                    status: "failed".into(),
+                    source: String::new(),
+                },
+            ]),
+            RequestedCliMode::Default,
+        );
+        assert_eq!(
+            events,
+            [
+                opened(),
+                AgentDomainEvent::SessionServers {
+                    servers: vec![
+                        InitServer {
+                            name: "eitri".into(),
+                            status: "connected".into(),
+                            source: "sdk".into(),
+                        },
+                        InitServer {
+                            name: "theirs".into(),
+                            status: "failed".into(),
+                            source: String::new(),
+                        },
+                    ],
+                },
+            ]
+        );
+        // A report that lists none replaces an earlier list; a `SessionReady` with no report says nothing.
+        assert_eq!(
+            super::translate(ready_with(Vec::new()), RequestedCliMode::Default),
+            [opened(), AgentDomainEvent::SessionServers { servers: Vec::new() }]
+        );
+        assert_eq!(super::translate(ready(""), RequestedCliMode::Default), [opened()]);
     }
 
     fn ready(permission_mode: &str) -> ProtoSessionEvent {

@@ -203,7 +203,8 @@ In browsing:
   waiting card without answering anything.
 - `D` denies and lets you type a reason first; `Enter` then sends the denial with that reason.
 - `h`, `l` and `Enter` work the buttons for you if you prefer to walk to one.
-- From the box, `Ctrl+y` approves the oldest card waiting in this tab. There is no key to deny from the box.
+- From the box, `Ctrl+y` approves the oldest card waiting in this tab, leaving out a card from an agent's
+  [editor tools](editor-tools.md#cards), which takes `a` or `d`. There is no key to deny from the box.
 
 A key answers a card only when it is pressed on its own: `a`, `d` and `D` do nothing if another key was
 pressed within about a quarter of a second before or after, and none of them takes a count. That is so the

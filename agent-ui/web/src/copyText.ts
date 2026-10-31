@@ -1,5 +1,5 @@
 import { runSummary } from "./display";
-import { noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
+import { editorCardText, noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
@@ -21,7 +21,7 @@ export function primaryText(item: TimelineItem): string {
     case "tool":
       return toolPrimary(item.call.name, item.call.input);
     case "permission":
-      return toolPrimary(item.request.toolName, item.request.input);
+      return editorCardText(item.request) ?? toolPrimary(item.request.toolName, item.request.input);
     case "run":
       return runSummary(item.calls);
     case "ending":

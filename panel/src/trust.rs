@@ -782,6 +782,7 @@ mod tests {
         assert_eq!(started.agent, AgentId::Codex);
         assert_eq!(started.mode, SessionModeChoice::Auto);
         assert_eq!(started.resume, None);
+        assert_eq!(started.editor_server, None, "a test binary has no bridge beside it");
         let plan = &started.plan;
         assert_eq!(
             plan.fingerprint, prompt.fingerprint,

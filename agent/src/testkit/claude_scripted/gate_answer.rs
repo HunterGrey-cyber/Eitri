@@ -160,6 +160,23 @@ impl Gate {
         })
     }
 
+    /// A hook request for a tool the session declared as its own, while the CLI reports one in-process server of
+    /// that name: allowed in every mode, as the host's gate leaves such a call to the tool's own broker. The CLI's
+    /// prompt for the same call is not covered: it goes through [`Gate::on_request`], so a prompt that follows this
+    /// allow shows as a request the driver must answer.
+    pub fn allow_own_tool(&mut self, request: Request) -> ToSend {
+        let decision = PermissionDecision::Allow;
+        self.automatic.push(Answered {
+            request: request.clone(),
+            decision: Some(decision.clone()),
+        });
+        ToSend {
+            request,
+            decision,
+            source: Source::Automatic,
+        }
+    }
+
     /// The driver answers a card of `tool`. The oldest waiting request of that tool is answered now; with none
     /// waiting the answer is kept for the next one.
     pub fn driver_answer(&mut self, tool: &str, allow: bool) -> Option<ToSend> {
@@ -313,6 +330,24 @@ mod tests {
             gate.on_request(request("p2", "Bash", Origin::Hook)).is_none(),
             "used once"
         );
+    }
+
+    #[test]
+    fn a_declared_tool_of_the_hosts_own_is_allowed_by_the_hook_in_every_mode_and_its_prompt_is_not() {
+        for mode in [Mode::Manual, Mode::Auto, Mode::Bypass] {
+            let mut gate = Gate::new(mode);
+            let sent = gate.allow_own_tool(request("p1", "mcp__eitri__open_file", Origin::Hook));
+            assert_eq!(sent.decision, PermissionDecision::Allow, "{mode:?}");
+            assert_eq!(sent.source, Source::Automatic);
+            assert_eq!(gate.automatic_answers().len(), 1);
+            assert!(gate.cards_shown().is_empty());
+        }
+        let mut gate = Gate::new(Mode::Manual);
+        gate.allow_own_tool(request("p1", "mcp__eitri__open_file", Origin::Hook));
+        assert!(gate
+            .on_request(request("p2", "mcp__eitri__open_file", Origin::CliPrompt))
+            .is_none());
+        assert_eq!(gate.unanswered().map(|r| r.permission_id.as_str()), Some("p2"));
     }
 
     #[test]

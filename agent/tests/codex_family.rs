@@ -101,6 +101,7 @@ fn start_request() -> ExternalStart {
             sandbox: agent::Sandbox::Project,
         },
         resume: None,
+        editor_server: None,
     }
 }
 

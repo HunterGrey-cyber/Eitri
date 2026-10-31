@@ -322,7 +322,7 @@ mk_release() {
 	mkdir -p "$b/bin" "$b/lib/eitri" "$b/share/applications" "$b/share/icons" "$b/share/licenses/eitri" "$S/fix/v$v"
 	cp "$PKG/eitri.launcher.sh" "$b/bin/eitri"
 	chmod 0755 "$b/bin/eitri"
-	for bin in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard; do
+	for bin in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge; do
 		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/eitri/$bin"
 		chmod 0755 "$b/lib/eitri/$bin"
 	done

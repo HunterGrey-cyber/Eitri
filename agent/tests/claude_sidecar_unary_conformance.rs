@@ -22,6 +22,7 @@ fn create_session_returns_a_real_session_id() {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .unwrap();
     assert!(!session_id.is_empty());
@@ -52,6 +53,7 @@ fn resume_is_now_advertised_and_an_empty_id_is_rejected_before_the_wire() {
         cwd: "/tmp".into(),
         streaming: agent::StreamingPreference::Partial,
         project: agent::setting_sources::ProjectTrust::Trusted,
+        client_tools: None,
     });
     match result {
         Err(agent::ProviderError::Provider { code, .. }) => {
@@ -168,12 +170,13 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "session_notices",
         "conversation_reset",
         "structured_questions_v1",
+        "client_tools",
         "executable_host_cli",
     ]
     .iter()
     .map(ToString::to_string)
     .collect();
-    // Order and length included for the protocol 3.22 list, not just set membership: the fixture is
+    // Order and length included for the protocol 3.23 list, not just set membership: the fixture is
     // transcribed from the sidecar's own literal, and this is what keeps the transcription honest.
     //
     // `task_output` is advertised only when the sidecar can open a file without following a link and

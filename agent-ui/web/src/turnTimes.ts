@@ -1,3 +1,4 @@
+import { allCards } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import type { AgentUiState, Seq, TurnTimeWire } from "./types";
 
@@ -42,14 +43,15 @@ export function formatDuration(ms: number): string {
  *  whose row Rust could not name or that is not in this state at all, and the second of two turns naming
  *  the same row (it produced none of its own, so the line would stand under the wrong turn's work). */
 export function workedFooters(
-  state: Pick<AgentUiState, "activeTurnId" | "turnEndings" | "transcript" | "thinking" | "toolCalls" | "pendingPermissions">,
+  state: Pick<AgentUiState, "activeTurnId" | "turnEndings" | "transcript" | "thinking" | "toolCalls" | "pendingPermissions"> &
+    Partial<Pick<AgentUiState, "editorCards">>,
   durations: TurnDurations,
 ): ReadonlyMap<Seq, string> {
   if (durations.size === 0) return new Map();
   const ended = new Set(state.turnEndings.map((ending) => ending.turnId));
   // The rows Rust's anchor can name (`newest_item_seq`): everything the agent wrote, never a prompt.
   const rows = new Set<Seq>();
-  for (const list of [state.transcript, state.thinking, state.toolCalls, state.pendingPermissions, state.turnEndings])
+  for (const list of [state.transcript, state.thinking, state.toolCalls, allCards(state), state.turnEndings])
     for (const item of list) rows.add(item.seq);
   const out = new Map<Seq, string>();
   for (const [turnId, { durationMs, anchorSeq }] of durations) {
@@ -60,8 +62,15 @@ export function workedFooters(
   return out;
 }
 
+/** A broker card's `seq` is the revision the next event would take, so a later reply may share it; Rust's anchor never
+ *  names a card, and a footer never stands under one. */
+function isEditorCardItem(item: TimelineItem): boolean {
+  return item.kind === "permission" && item.request.editorCard !== undefined;
+}
+
 /** Whether `item` is the row `seq` names, or a run holding the call or thought numbered `seq`. */
 function holds(item: TimelineItem, seq: Seq): boolean {
+  if (isEditorCardItem(item)) return false;
   if (item.kind !== "run") return item.seq === seq;
   return item.calls.some((call) => call.seq === seq) || (item.thoughts ?? []).some((thought) => thought.seq === seq);
 }
@@ -88,7 +97,7 @@ export function placeFooters(items: readonly TimelineItem[], footers: ReadonlyMa
     let under: TimelineItem | null = null;
     for (const item of items) {
       if (item.kind === "prompt" && item.seq > anchor) break;
-      if (item.seq <= anchor) under = item;
+      if (item.seq <= anchor && !isEditorCardItem(item)) under = item;
     }
     if (under !== null && !out.has(under.key)) out.set(under.key, footers.get(anchor)!);
   }

@@ -69,7 +69,8 @@ left and the file as the edit would leave it on the right, in diff mode, both re
 Nothing is written to the file, and your own buffers are not touched. This works for a Claude `Edit`, `MultiEdit`
 or `Write`, a Codex change that adds one file, and an ACP agent's edit of one file. A Codex change to an existing
 file, a change to several files, a delete or a move shows the card's text instead, as `Ctrl+g` does on any other
-row.
+row. The card of an agent's [proposal](editor-tools.md#proposals) is the exception for several files: it opens this
+view for one file at each press.
 
 If the file changed after the card appeared and the edit no longer fits it, the band says
 `the proposal no longer applies to <path> as it is on disk` rather than showing a diff against the wrong text. A

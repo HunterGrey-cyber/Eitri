@@ -48,7 +48,8 @@ A project has one pair of windows. A second full Eitri window opened on the same
 - **No editor.** Window 2 has no Neovim and no editor module. Everything that touches the editor goes to window 1,
   which raises itself and does it with its own Neovim: opening a file from a path click or `gf`, `Ctrl+g`, turn review,
   the context a prompt carries, the Markdown preview following the buffer, the colour scheme. They work in window 2 as
-  they do in window 1.
+  they do in window 1. An agent's [editor tools](editor-tools.md#window-2) are the exception: they do not raise
+  window 1, and from window 2 they reach only paths inside the project that follow no link.
 - **A file from the command line.** [`eitri FILE`](getting-started.md#open-a-file), typed in either window's bottom
   terminal, opens the file in window 1's editor and raises window 1, since that is where the editor is. Reuse
   was tried with one window; it has not been run with the pair.

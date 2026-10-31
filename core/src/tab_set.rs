@@ -328,6 +328,8 @@ impl ReviewTicket {
 }
 
 pub struct Tab {
+    /// Whether completed edits are shown in the editor without taking focus.
+    pub following: bool,
     pub id: TabId,
     pub number: u16,
     /// The rename (`prefix ,`), already normalized.
@@ -443,6 +445,11 @@ pub struct SessionState {
     /// projection, not from a `TurnStarted` event, so a snapshot and a pumped batch use the same
     /// clock; it is at most one 33 ms tick late, on every backend.
     turn_clock: Option<(String, u64)>,
+    /// The id of the newest turn reported to the broker as begun. Read against `turn_clock`, so a turn is reported
+    /// once, whichever pump stamped it, and ending one clears nothing. It goes with `turn_clock` when a tab moves:
+    /// left behind, it would differ from the clock at the first pump after the move and report the turn as begun
+    /// again, mid-turn.
+    last_began_turn: Option<String>,
     /// How many of the newest entries in `notes.turn_times` no payload has carried yet. The active
     /// tab's events payload takes exactly those; a snapshot carries all of them and zeroes this.
     turn_times_unsent: usize,
@@ -468,9 +475,134 @@ pub struct SessionState {
     /// with `host_answered` once the id leaves the projection. Private for the reason
     /// `host_answered` is.
     user_answered: BTreeSet<String>,
+    /// Where the tab stands with the line about a server of the tool server's name that is not Eitri's.
+    foreign_server_note: ForeignServerNote,
+    /// What the panel's broker has been told of this session's calls of declared tools.
+    client_calls: ClientCalls,
+    /// What an external agent's session was given. It is read on the broker's facts because that agent's calls
+    /// reach the broker with whatever name it sends; a sidecar session keeps its own list on its conversation.
+    editor_declared: BTreeSet<String>,
+    /// The cards the panel's broker holds for this tab, for the snapshots that rebuild a page. A copy: the broker
+    /// is the only thing that answers one. Not in [`CallNotes`], which a move carries: a card ends with its call
+    /// when a tab leaves the window.
+    editor_cards: Vec<crate::editor_tools::cards::EditorCardWire>,
 }
 
+/// What a pump found about a tab's calls of declared tools, for the panel's broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCallNews {
+    /// A call the broker has not heard of.
+    Opened(agent::OpenClientCall),
+    /// The call is over, however it ended. A lost stream has no event of its own: it empties the session's open
+    /// calls, so every call the tab held ends here.
+    Settled { call_id: String },
+    /// A turn of the tab began. Reported once for each turn the tab's clock stamped, however the pump came to see it.
+    TurnBegan { turn_id: String },
+    /// A turn of the tab ended interrupted.
+    TurnInterrupted,
+}
+
+/// The tab's side of the broker's calls. Call lifecycle news is read from the projection on each pump,
+/// so a call, its end and an interrupted turn survive a `Resync`. Follow paths come from event batches
+/// and may be lost on a resync.
+#[derive(Default)]
+struct ClientCalls {
+    /// The calls reported open and not yet reported over.
+    seen: BTreeSet<String>,
+    /// While set, the session's open calls are not this window's to report; nothing is compared. The value is how
+    /// far the session had folded when it arrived: what a failed read of its open calls falls back on.
+    hold: Option<u64>,
+    /// Calls at or below this position of the session's stream were settled before this window took the tab up, or
+    /// were told to try again on its arrival. None is reported, however late it folds here: the session's events
+    /// reach this window behind the read that counted them.
+    arrived_through: u64,
+    /// Waiting for the panel, each tab's in order.
+    news: Vec<ClientCallNews>,
+    /// Successful edits for the follower, separate from the broker's call lifecycle.
+    edited: Vec<PathBuf>,
+    /// The position of the newest interrupted turn already reported.
+    last_interrupt: Option<u64>,
+}
+
+impl ClientCalls {
+    /// Reports what changed since the last pump. An end comes first, so a call that finished makes room for one
+    /// that opened beside it.
+    fn note(&mut self, backend: &AgentBackend) {
+        if self.hold.is_none() {
+            let open = backend.open_client_calls();
+            for call_id in std::mem::take(&mut self.seen) {
+                if open.iter().any(|call| call.call_id == call_id) {
+                    self.seen.insert(call_id);
+                } else {
+                    self.news.push(ClientCallNews::Settled { call_id });
+                }
+            }
+            for call in open {
+                if self.seen.insert(call.call_id.clone()) && call.sequence > self.arrived_through {
+                    self.news.push(ClientCallNews::Opened(call));
+                }
+            }
+        }
+        // The newest interrupted ending, not the newest ending: one that fails straight after is still an interrupt.
+        let interrupted = backend
+            .projection()
+            .turn_endings
+            .iter()
+            .rfind(|ending| ending.kind == agent::TurnEndingKind::Interrupted)
+            .map(|ending| ending.seq);
+        if interrupted > self.last_interrupt {
+            self.last_interrupt = interrupted;
+            self.news.push(ClientCallNews::TurnInterrupted);
+        }
+    }
+}
+
+/// The line a tab owes the person when its session's tool server turns out not to be Eitri's alone, or could
+/// not be given because the name is taken, or was left out by the agent's provider, said once per session: it is
+/// true for as long as the session lives, and repeating it would tell nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ForeignServerNote {
+    #[default]
+    Unseen,
+    /// Seen, and no page has shown it yet.
+    Owed,
+    Said,
+    /// The start left the tool server out, and no page has shown that yet. Set before the backend lands.
+    NameTakenOwed(&'static str),
+    NameTakenSaid(&'static str),
+    /// The provider left the tool server out and said this; no page has shown it yet.
+    ProviderOwed(String),
+    /// Shown. The words stay for a caller that hands the line back.
+    ProviderSaid(String),
+}
+
+const FOREIGN_SERVER_LINE: &str =
+    "a server named eitri that is not Eitri's is loaded; its tools get no special treatment";
+
+/// What the line says when the start left the tool server out for a name it saw.
+pub const NAME_TAKEN_LINE: &str =
+    "a server named eitri is in your Codex configuration, so the editor tools are off in this tab; rename it to have them";
+
+/// What the line says when no such name was seen: a file that could hold one went unread.
+pub const NAME_UNKNOWN_LINE: &str = "Eitri could not read all of your Codex configuration, so a server named eitri \
+                                     may be in it; the editor tools are off in this tab (see the agents guide)";
+
 impl SessionState {
+    /// Reports a turn the clock now names and has not been reported. The clock is stamped from the projection on every
+    /// path (the early read and a resync's snapshot alike), so a turn whose `TurnStarted` a resync dropped is still
+    /// found here.
+    fn note_turn_began(&mut self) {
+        let Some((turn_id, _)) = &self.turn_clock else {
+            return;
+        };
+        if self.last_began_turn.as_ref() == Some(turn_id) {
+            return;
+        }
+        let turn_id = turn_id.clone();
+        self.last_began_turn = Some(turn_id.clone());
+        self.client_calls.news.push(ClientCallNews::TurnBegan { turn_id });
+    }
+
     /// What a tab without a backend forgets: the backend that answered, noted or timed these on the
     /// user's behalf is gone, so there is nothing left to hide or note. The title, tiers, draft and
     /// queue stay until the next session boundary.
@@ -480,26 +612,35 @@ impl SessionState {
         self.was_running = false;
         self.was_unseen_busy = false;
         self.turn_clock = None;
+        self.last_began_turn = None;
         self.host_answered.clear();
         self.human_allowed.clear();
         self.note_ledger.clear();
         self.creates_file_unsent.clear();
         self.user_answered.clear();
+        self.client_calls = ClientCalls::default();
+        self.editor_cards.clear();
     }
 
     /// The part a freshly installed backend starts with. What the tab gathered while its backend
-    /// connected is kept: the tiers it was spawned with, what the user typed or queued meanwhile, and
-    /// whether the page's copy is behind. Everything the earlier session answered, noted or timed is
-    /// dropped, and so is any field added later unless it is named here.
+    /// connected is kept: the tiers it was spawned with and the tools it was given, what the user typed
+    /// or queued meanwhile, and whether the page's copy is behind. Everything the earlier session
+    /// answered, noted or timed is dropped, and so is any field added later unless it is named here.
     fn for_installed_backend(self) -> SessionState {
         SessionState {
             project_tiers: self.project_tiers,
+            editor_declared: self.editor_declared,
             left_view: self.left_view,
             draft: self.draft,
             queue: self.queue,
             queue_error: self.queue_error,
             queue_note: self.queue_note,
             stale: self.stale,
+            // Owed by the start of this very session, so the landing does not end it.
+            foreign_server_note: match self.foreign_server_note {
+                ForeignServerNote::NameTakenOwed(line) => ForeignServerNote::NameTakenOwed(line),
+                _ => ForeignServerNote::Unseen,
+            },
             ..SessionState::default()
         }
     }
@@ -524,8 +665,9 @@ impl Tab {
         &self.gate_log
     }
 
-    fn new(id: TabId, number: u16, mode: SessionModeChoice, agent: AgentId) -> Self {
+    fn new(id: TabId, number: u16, mode: SessionModeChoice, agent: AgentId, following: bool) -> Self {
         Tab {
+            following,
             id,
             number,
             name: None,
@@ -806,6 +948,7 @@ impl Tab {
     fn view(&self, resumable: bool) -> TabView {
         let facts = self.facts();
         TabView {
+            following: self.following,
             question_draft: self.session.question_draft.clone(),
             id: self.id,
             number: self.number,
@@ -1253,6 +1396,7 @@ pub struct TabSet {
     next_id: u64,
     kind: BackendKind,
     default_mode: SessionModeChoice,
+    following_default: bool,
     /// The agent a tab the set opens by itself runs (the base view's fresh tab once its last one
     /// left): Claude until `agent.default` is applied ([`TabSet::apply_configured_agent`]).
     configured_agent: AgentId,
@@ -1396,6 +1540,7 @@ impl TabSet {
             next_id: 1,
             kind,
             default_mode,
+            following_default: false,
             configured_agent: AgentId::Claude,
             pending_bypass: None,
             next_nonce: 1,
@@ -1436,6 +1581,24 @@ impl TabSet {
         set.open(AgentId::Claude);
         set.last_active = None;
         set
+    }
+
+    /// The configured following choice for tabs opened after this call.
+    pub fn set_following_default(&mut self, following: bool) {
+        self.following_default = following;
+    }
+
+    /// Changes one tab's following choice; an absent or frozen tab cannot be changed.
+    pub fn toggle_following(&mut self, tab: TabId) -> bool {
+        if self.is_moving(tab) {
+            return false;
+        }
+        let Some(tab) = self.get_mut(tab) else { return false };
+        tab.following = !tab.following;
+        if !tab.following {
+            tab.session.client_calls.edited.clear();
+        }
+        true
     }
 
     pub fn kind(&self) -> BackendKind {
@@ -1815,6 +1978,217 @@ impl TabSet {
         self.mode_note.take()
     }
 
+    /// What each tab owes the person about its session's tool server, taken: a caller with no page to
+    /// show a line on hands it back with [`TabSet::owe_editor_note`].
+    pub fn take_editor_notes(&mut self) -> Vec<(TabId, String)> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|tab| {
+                let (said, line) = match &tab.session.foreign_server_note {
+                    ForeignServerNote::Owed => (ForeignServerNote::Said, FOREIGN_SERVER_LINE.to_string()),
+                    ForeignServerNote::NameTakenOwed(line) => {
+                        (ForeignServerNote::NameTakenSaid(line), (*line).to_string())
+                    }
+                    ForeignServerNote::ProviderOwed(line) => {
+                        (ForeignServerNote::ProviderSaid(line.clone()), line.clone())
+                    }
+                    _ => return None,
+                };
+                tab.session.foreign_server_note = said;
+                Some((tab.id, line))
+            })
+            .collect()
+    }
+
+    /// `tab`'s line stays owed: the tab is on no page that can show it yet.
+    pub fn owe_editor_note(&mut self, tab: TabId) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.session.foreign_server_note = match std::mem::take(&mut tab.session.foreign_server_note) {
+                ForeignServerNote::NameTakenSaid(line) | ForeignServerNote::NameTakenOwed(line) => {
+                    ForeignServerNote::NameTakenOwed(line)
+                }
+                ForeignServerNote::ProviderSaid(line) | ForeignServerNote::ProviderOwed(line) => {
+                    ForeignServerNote::ProviderOwed(line)
+                }
+                _ => ForeignServerNote::Owed,
+            };
+        }
+    }
+
+    /// `tab`'s session is starting without the tool server, because the agent's own configuration holds a server of
+    /// its name or may hold one, and `line` says which. A session already told is not told again.
+    pub fn owe_name_taken_note(&mut self, tab: TabId, line: &'static str) {
+        if let Some(tab) = self.get_mut(tab) {
+            if !matches!(tab.session.foreign_server_note, ForeignServerNote::NameTakenSaid(_)) {
+                tab.session.foreign_server_note = ForeignServerNote::NameTakenOwed(line);
+            }
+        }
+    }
+
+    /// What the pumps found about calls of declared tools, in order within each tab. A tab frozen for a move keeps
+    /// its own: nothing of it may start here now.
+    pub fn take_client_news(&mut self) -> Vec<(TabId, ClientCallNews)> {
+        let moving = &self.moving;
+        self.tabs
+            .iter_mut()
+            .filter(|tab| !moving.contains(&tab.id.0))
+            .flat_map(|tab| {
+                let id = tab.id;
+                std::mem::take(&mut tab.session.client_calls.news)
+                    .into_iter()
+                    .map(move |news| (id, news))
+            })
+            .collect()
+    }
+
+    /// Successful edits observed while following was on, in order within each tab. A frozen tab
+    /// keeps its pending paths until its move ends, just as it keeps its call news.
+    pub fn take_follow_edits(&mut self) -> Vec<(TabId, PathBuf)> {
+        let moving = &self.moving;
+        self.tabs
+            .iter_mut()
+            .filter(|tab| !moving.contains(&tab.id.0))
+            .flat_map(|tab| {
+                let id = tab.id;
+                std::mem::take(&mut tab.session.client_calls.edited)
+                    .into_iter()
+                    .map(move |path| (id, path))
+            })
+            .collect()
+    }
+
+    /// `tab` is leaving and the broker will not take a call of it, so what the pumps found goes unreported. Returned
+    /// are the calls the broker never heard of, for the caller to answer: each found since the last report and, on a
+    /// tab still waiting for its read, each open one. They stay in `seen`: a move called off runs none of them.
+    pub fn take_unreported_client_calls(&mut self, tab: TabId) -> Vec<String> {
+        let Some(tab) = self.get_mut(tab) else {
+            return Vec::new();
+        };
+        let calls = &mut tab.session.client_calls;
+        calls.edited.clear();
+        let mut unreported = Vec::new();
+        for news in std::mem::take(&mut calls.news) {
+            if let ClientCallNews::Opened(call) = news {
+                unreported.push(call.call_id);
+            }
+        }
+        if let (Some(_), TabBackend::Live(backend)) = (calls.hold, &tab.backend) {
+            unreported.extend(backend.open_client_calls().into_iter().map(|call| call.call_id));
+            calls.seen.extend(unreported.iter().cloned());
+        }
+        unreported
+    }
+
+    /// `tab` arrived with its session folded through `folded_through`: its open calls are not reported until
+    /// [`Self::release_client_calls`], because some of them were answered in the window it came from.
+    pub fn hold_client_calls(&mut self, tab: TabId, folded_through: u64) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.session.client_calls.hold = Some(folded_through);
+        }
+    }
+
+    /// The position `tab` holds its calls at; `None` when it holds none, a tab that left or changed session included.
+    pub fn held_client_calls(&self, tab: TabId) -> Option<u64> {
+        self.get(tab)?.session.client_calls.hold
+    }
+
+    /// `tab`'s calls are reported again, from where the read of its open calls stands: `open` was told to try again,
+    /// and nothing at or below `through` will run here. Compared at once, since a call that folded during the hold
+    /// raises no wake of its own.
+    pub fn release_client_calls(&mut self, tab: TabId, through: u64, open: &[String]) {
+        let Some(tab) = self.get_mut(tab) else { return };
+        let calls = &mut tab.session.client_calls;
+        let Some(folded_through) = calls.hold.take() else {
+            return;
+        };
+        calls.arrived_through = through.max(folded_through);
+        calls.seen.extend(open.iter().cloned());
+        if let TabBackend::Live(backend) = &tab.backend {
+            calls.note(backend);
+        }
+    }
+
+    /// Hands `result` to the agent. Never waits on it, so the GTK thread may call this. A tab with no session has
+    /// nobody left to tell.
+    pub fn answer_client_call(
+        &self,
+        tab: TabId,
+        call_id: &str,
+        result: &crate::editor_tools::step::ToolResult,
+    ) -> Result<(), BackendError> {
+        match self.get(tab).and_then(Tab::live) {
+            Some(backend) => backend.answer_client_tool_call(call_id, vec![result.text.clone()], result.is_error),
+            None => Ok(()),
+        }
+    }
+
+    /// The cards the panel's broker now holds for `tab`, the whole list: what the tray counts and a snapshot carries.
+    /// They stay out of every list a sweep reads, so this is all a card ever is to the tab set.
+    pub fn set_editor_cards(&mut self, tab: TabId, cards: Vec<crate::editor_tools::cards::EditorCardWire>) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.attention
+                .sync_editor_cards(cards.iter().map(|card| card.id.clone()));
+            tab.session.editor_cards = cards;
+        }
+    }
+
+    /// What `tab`'s external session was given, set before it starts or as it arrives from the other window: the
+    /// broker refuses any other name.
+    pub fn set_editor_declared(&mut self, tab: TabId, declared: BTreeSet<String>) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.session.editor_declared = declared;
+        }
+    }
+
+    /// What [`TabSet::set_editor_declared`] last said for `tab`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn editor_declared(&self, tab: TabId) -> Option<&BTreeSet<String>> {
+        self.get(tab).map(|tab| &tab.session.editor_declared)
+    }
+
+    /// Whether `tab`'s newest turn was interrupted and no turn has started since. A bridge call read now belongs to
+    /// that turn, however late: an agent calls from within a turn.
+    pub fn last_turn_was_interrupted(&self, tab: TabId) -> bool {
+        self.get(tab)
+            .and_then(Tab::live)
+            .is_some_and(|backend| backend.projection().last_turn_ending == Some(agent::TurnEndingKind::Interrupted))
+    }
+
+    /// What the broker reads of `tab`; `None` when it has no session. Each read is a statement of its own: on the
+    /// sidecar both the session's id and the projection take the ingestion mutex. `/clear` empties the id's slot
+    /// until the new conversation opens, and the projection names that conversation meanwhile: the process goes on
+    /// through it, and so do its calls. An external agent's session that ended leaves its backend in the tab and
+    /// never opens again, and nothing else ends its calls, so it has no facts: a sidecar's calls settle by themselves.
+    pub fn broker_facts(&self, tab: TabId) -> Option<crate::editor_tools::broker::TabFacts> {
+        let tab = self.get(tab)?;
+        let backend = tab.live()?;
+        if backend.agent().is_external() && tab.wire_state() == TabStateWire::Ended {
+            return None;
+        }
+        let (revision, named) = {
+            let projection = backend.projection();
+            (projection.last_revision, projection.provider_session_id.clone())
+        };
+        let session = backend.provider_session_id().or(named)?;
+        let process = backend.session_id()?.to_owned();
+        let declared = if backend.agent().is_external() {
+            &tab.session.editor_declared
+        } else {
+            backend.declared_client_tools()
+        };
+        Some(crate::editor_tools::broker::TabFacts {
+            mode: tab.mode.into(),
+            trust: tab
+                .session
+                .project_tiers
+                .unwrap_or(agent::setting_sources::ProjectTrust::Untrusted),
+            session,
+            process,
+            revision,
+            declared: std::rc::Rc::new(declared.clone()),
+        })
+    }
+
     /// The rules apply to every tab from the next pump; a card already on screen is not
     /// answered by a rule added after it arrived.
     pub fn set_rules(&mut self, rules: agent::PrefixRules) {
@@ -1857,7 +2231,8 @@ impl TabSet {
         } else {
             agent.offered_mode(self.default_mode)
         };
-        self.tabs.push(Tab::new(id, number, mode, agent));
+        self.tabs
+            .push(Tab::new(id, number, mode, agent, self.following_default));
         self.tabs.sort_by_key(|t| t.number);
         id
     }
@@ -3114,6 +3489,15 @@ impl TabSet {
             Self::pump_trip(tab, tick.retiring, reason, place.on_screen, out);
             return;
         }
+        // From the projection, never the delivery: a `Resync` loses the report that says so.
+        if tab.session.foreign_server_note == ForeignServerNote::Unseen && backend.foreign_tool_server() {
+            tab.session.foreign_server_note = ForeignServerNote::Owed;
+        }
+        // Read here, not by the worker that started the session: only the tab knows which page it is on.
+        if let Some(line) = backend.editor_note() {
+            tab.session.foreign_server_note = ForeignServerNote::ProviderOwed(line);
+        }
+        tab.session.client_calls.note(backend);
         // Keeps `tab.turn_clock` in step for the `Events` arm, which builds its payload straight
         // from the drained batch and takes no further lock after this -- there is no later,
         // fresher read to prefer. The `Resync` arm is different (see its own comment) and
@@ -3131,6 +3515,7 @@ impl TabSet {
         }
         let resynced = matches!(delivery, RevisedDelivery::Resync);
         let mut live = LiveTab {
+            following: tab.following,
             id: tab.id,
             mode: tab.mode,
             backend,
@@ -3177,6 +3562,7 @@ impl TabSet {
             tick.untracked_starts.insert(live.id.0);
         }
         let still = Self::pump_after_match(live.backend, live.id, review, resynced);
+        tab.session.note_turn_began();
         Self::pump_settle(tab, arm, place, &still, tick.project_root, out);
     }
 
@@ -3254,6 +3640,24 @@ impl TabSet {
             .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
         let (revisions, events): (Vec<u64>, Vec<AgentDomainEvent>) = tagged.into_iter().unzip();
         let (in_snapshot, fresh) = events.split_at(shown);
+        if live.following {
+            for event in &events {
+                let mut event = event;
+                while let AgentDomainEvent::SubagentFrame { frame, .. } = event {
+                    event = frame.as_ref();
+                }
+                if let AgentDomainEvent::ToolCallCompleted {
+                    tool_use_id,
+                    is_error: false,
+                    ..
+                } = event
+                {
+                    // Release the projection's guard before touching any other backend state.
+                    let paths = live.backend.edited_by(tool_use_id);
+                    live.session.client_calls.edited.extend(paths);
+                }
+            }
+        }
         for event in &events {
             match event {
                 AgentDomainEvent::TurnStarted { .. } => live.session.was_running = true,
@@ -3450,6 +3854,7 @@ impl TabSet {
                 &view,
                 live.session.turn_clock.as_ref().map(|(_, at)| *at),
                 live.notes,
+                &live.session.editor_cards,
             );
             live.session.turn_times_unsent = 0;
             // Under the guard the snapshot is serialized from (see `pump_arm_resync`'s doc).
@@ -3717,6 +4122,7 @@ impl TabSet {
                         &view,
                         tab.session.turn_clock.as_ref().map(|(_, at)| *at),
                         &tab.notes,
+                        &tab.session.editor_cards,
                     );
                     tab.session.turn_times_unsent = 0;
                     (payload, view.projection.last_revision)
@@ -5716,6 +6122,7 @@ struct PumpPlace {
 
 /// The parts of a live tab a pump arm works on, borrowed apart so the backend is used beside them.
 struct LiveTab<'a> {
+    following: bool,
     id: TabId,
     mode: SessionModeChoice,
     backend: &'a mut AgentBackend,
@@ -5885,6 +6292,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// The start owes this line before its backend exists, and a page may not have shown it by the time the
+    /// backend lands. What an earlier session owed or said ends with that session.
+    #[test]
+    fn a_line_the_start_owes_outlives_the_landing() {
+        let landed = |note| {
+            let session = SessionState {
+                foreign_server_note: note,
+                ..SessionState::default()
+            };
+            session.for_installed_backend().foreign_server_note
+        };
+        assert_eq!(
+            landed(ForeignServerNote::NameTakenOwed(NAME_UNKNOWN_LINE)),
+            ForeignServerNote::NameTakenOwed(NAME_UNKNOWN_LINE)
+        );
+        assert_eq!(
+            landed(ForeignServerNote::NameTakenSaid(NAME_TAKEN_LINE)),
+            ForeignServerNote::Unseen
+        );
+        assert_eq!(landed(ForeignServerNote::Owed), ForeignServerNote::Unseen);
+        assert_eq!(landed(ForeignServerNote::Said), ForeignServerNote::Unseen);
+    }
+
     fn workspace(label: &str) -> PathBuf {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir(label);
@@ -5948,6 +6378,44 @@ mod tests {
             input: serde_json::json!({ "file_path": "/etc/hostname" }),
             provider_prompt: None,
         }
+    }
+
+    #[test]
+    fn a_new_tab_takes_the_default() {
+        let mut set = set();
+        let first = set.active();
+        assert!(!set.get(first).unwrap().following);
+        set.set_following_default(true);
+        let second = set.open(AgentId::Claude);
+        assert!(set.get(second).unwrap().following);
+        assert!(!set.get(first).unwrap().following);
+        set.set_following_default(false);
+        let third = set.open(AgentId::Codex);
+        assert!(!set.get(third).unwrap().following);
+        assert!(set.get(second).unwrap().following);
+    }
+
+    #[test]
+    fn the_toggle_is_per_tab() {
+        let mut set = set();
+        let first = set.active();
+        let second = set.open(AgentId::Claude);
+        assert!(set.toggle_following(first));
+        assert!(set.get(first).unwrap().following);
+        assert!(!set.get(second).unwrap().following);
+        set.get_mut(first)
+            .unwrap()
+            .session
+            .client_calls
+            .edited
+            .push(PathBuf::from("a.rs"));
+        assert!(set.toggle_following(first));
+        assert!(!set.get(first).unwrap().following);
+        assert!(set.take_follow_edits().is_empty());
+        assert!(!set.toggle_following(TabId(u64::MAX)));
+        set.freeze_for_move(first).unwrap();
+        assert!(!set.toggle_following(first));
+        assert!(!set.get(first).unwrap().following);
     }
 
     fn set() -> TabSet {
@@ -15358,6 +15826,56 @@ mod external_tab_tests {
         set.get(tab).unwrap().live().unwrap().projection().background_calls
     }
 
+    /// The turn ids the tab set has reported as begun since the last call.
+    fn began(set: &mut TabSet) -> Vec<String> {
+        set.take_client_news()
+            .into_iter()
+            .filter_map(|(_, news)| match news {
+                ClientCallNews::TurnBegan { turn_id } => Some(turn_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_external_tab_reports_its_turns() {
+        let dir = workspace("codex-turn-news");
+        let (mut set, tab, provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        let mut told = Vec::new();
+        for turn in ["turn-1", "turn-2"] {
+            provider
+                .inner
+                .queue(AgentDomainEvent::TurnStarted { turn_id: turn.into() });
+            until("the turn to be reported", || {
+                set.pump(&dir, true);
+                told.extend(began(&mut set));
+                told.last().is_some_and(|last| last == turn)
+            });
+            provider.inner.queue(turn_completed(turn));
+            until("the turn to end", || {
+                set.pump(&dir, true);
+                set.get(tab)
+                    .unwrap()
+                    .live()
+                    .unwrap()
+                    .projection()
+                    .active_turn_id
+                    .is_none()
+            });
+            told.extend(began(&mut set));
+        }
+        assert_eq!(
+            told,
+            ["turn-1", "turn-2"],
+            "one report for each turn, none for an ending"
+        );
+        for taken in set.take_all() {
+            if let Some(retired) = taken.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
     #[test]
     fn a_codex_tab_with_commands_left_running_asks() {
         let dir = workspace("codex-background-close");
@@ -17720,6 +18238,430 @@ mod question_gate_tests {
             t.retired.into_backend().shutdown();
         }
         shut_down_all(&mut set);
+    }
+}
+
+#[cfg(test)]
+mod broker_card_tests {
+    //! A broker card is drawn and counted and nothing else: it is in no list the tab set's own sweeps read, so the
+    //! paths that answer cards by themselves cannot reach one, and a move does not carry one.
+    use super::move_tests::{freeze_settled, take_up};
+    use super::*;
+    use crate::editor_tools::cards::EditorCardWire;
+    use crate::test_providers::RecordingProvider;
+    use agent::{AgentConversation, AgentDomainEvent};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const CARD: &str = "ec-0123456789abcdef-1";
+
+    fn editor_card(id: &str) -> EditorCardWire {
+        EditorCardWire {
+            id: id.to_owned(),
+            seq: 7,
+            tool: "open_file".to_owned(),
+            tool_use_id: Some("toolu_open".to_owned()),
+            title: "Show /etc/hosts in your editor?".to_owned(),
+            body: Vec::new(),
+            proposal: None,
+        }
+    }
+
+    /// A `Write` into `.git`: a card in Manual and Auto, answered in Bypass.
+    fn provider_card(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+            provider_prompt: None,
+        }
+    }
+
+    fn live(label: &str) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let provider = Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        });
+        (dir, set, tab, provider)
+    }
+
+    fn pump_until(set: &mut TabSet, dir: &Path, what: &str, done: impl Fn(&TabSet) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(set) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            set.pump(dir, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn pending(set: &TabSet, tab: TabId) -> usize {
+        set.get(tab).unwrap().attention.attention().pending
+    }
+
+    fn enter_bypass(set: &mut TabSet, tab: TabId) -> ConfirmOutcome {
+        let plan = match set.cycle_mode(tab, ViewId::BASE) {
+            Ok(ModeCycle::Confirm(plan)) => plan,
+            other => panic!("expected a bypass prompt, got {other:?}"),
+        };
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap()
+    }
+
+    fn shut_down_all(set: &mut TabSet) {
+        for tab in set.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn waiting_cards_never_names_a_broker_card() {
+        let (dir, mut set, tab, provider) = live("broker-card-waiting");
+        provider.queue(provider_card("perm-1"));
+        pump_until(&mut set, &dir, "the provider's card", |set| pending(set, tab) == 1);
+        set.set_editor_cards(tab, vec![editor_card(CARD)]);
+        assert_eq!(pending(&set, tab), 2, "the premise: both wait");
+        assert_eq!(waiting_cards(set.get(tab).unwrap()), ["perm-1"]);
+        assert!(
+            !set.get(tab).unwrap().card_is_waiting(CARD),
+            "a provider's answer cannot name it"
+        );
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn entering_bypass_leaves_a_broker_card_waiting() {
+        let (dir, mut set, tab, provider) = live("broker-card-enter-bypass");
+        provider.queue(provider_card("perm-1"));
+        pump_until(&mut set, &dir, "the provider's card", |set| pending(set, tab) == 1);
+        set.set_editor_cards(tab, vec![editor_card(CARD)]);
+
+        assert_eq!(enter_bypass(&mut set, tab), ConfirmOutcome::Entered { approved: 1 });
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
+        assert_eq!(pending(&set, tab), 1, "the broker's card still counts");
+        assert_eq!(set.get(tab).unwrap().session.editor_cards, [editor_card(CARD)]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_bypass_resync_leaves_a_broker_card_waiting() {
+        let (dir, mut set, tab, provider) = live("broker-card-resync");
+        assert_eq!(enter_bypass(&mut set, tab), ConfirmOutcome::Entered { approved: 0 });
+        set.set_editor_cards(tab, vec![editor_card(CARD)]);
+        let mut overflow = vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }];
+        for i in 0..300 {
+            overflow.push(AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: format!("chunk {i}"),
+            });
+        }
+        overflow.push(provider_card("lost1"));
+        provider.queue_all(overflow);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            assert!(Instant::now() < deadline, "timed out waiting for the resync");
+            let out = set.pump(&dir, true);
+            if let Some(payload) = out.active_payload {
+                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if value["kind"] == "snapshot" && value["state"]["pendingPermissions"].is_array() {
+                    break value;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        pump_until(&mut set, &dir, "the swept card", |set| {
+            set.get(tab).unwrap().session.host_answered.contains("lost1")
+        });
+        assert_eq!(provider.resolutions(), vec![("lost1".to_string(), true)]);
+        assert_eq!(pending(&set, tab), 1, "the sweep took the provider's card only");
+        assert_eq!(snapshot["state"]["editorCards"][0]["id"], CARD, "{snapshot}");
+        assert_eq!(set.get(tab).unwrap().session.editor_cards, [editor_card(CARD)]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_tray_counts_a_broker_card() {
+        let (dir, mut set, tab, _provider) = live("broker-card-tray");
+        set.pump(&dir, true);
+        let before = set.attention().arrived;
+        set.set_editor_cards(tab, vec![editor_card(CARD)]);
+        let attention = set.attention();
+        assert_eq!((attention.pending, attention.arrived), (1, before + 1));
+        assert_eq!(
+            set.oldest_card_tab(),
+            Some(tab),
+            "the key for the oldest card reaches it"
+        );
+
+        let frozen = freeze_settled(&mut set, tab).expect("the tab freezes");
+        let record = serde_json::to_value(&frozen.tab).unwrap();
+        assert_eq!(record["attention"]["cards"], serde_json::json!([]));
+        assert_eq!(record["attention"]["questions"], serde_json::json!([]));
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_cards_mirror_is_not_in_the_call_notes_a_move_carries() {
+        let (dir, mut source, tab, provider) = live("broker-card-move");
+        source.pump(&dir, true);
+        let notes = source.get(tab).unwrap().notes.clone();
+        source.set_editor_cards(tab, vec![editor_card(CARD)]);
+        assert_eq!(source.get(tab).unwrap().notes, notes);
+
+        let frozen = freeze_settled(&mut source, tab).expect("the tab freezes");
+        let record = serde_json::to_string(&frozen.tab).unwrap();
+        assert!(!record.contains(CARD), "{record}");
+
+        let mut dest = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let landed = take_up(frozen, &mut dest, provider.clone(), ViewId::BASE);
+        assert!(dest.get(landed).unwrap().session.editor_cards.is_empty());
+        assert_eq!(pending(&dest, landed), 0);
+        shut_down_all(&mut dest);
+    }
+}
+
+#[cfg(test)]
+mod turn_news_tests {
+    //! A turn's beginning is reported to the broker once, from the tab's clock.
+    use super::*;
+    use crate::test_providers::RecordingProvider;
+    use agent::{AgentConversation, AgentDomainEvent};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn live(label: &str) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir(label);
+        std::fs::write(dir.join("main.rs"), "fn main() {}").unwrap();
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let provider = Arc::new(RecordingProvider::default());
+        let conversation =
+            AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        });
+        (dir, set, tab, provider)
+    }
+
+    fn began(set: &mut TabSet) -> Vec<String> {
+        set.take_client_news()
+            .into_iter()
+            .filter_map(|(_, news)| match news {
+                ClientCallNews::TurnBegan { turn_id } => Some(turn_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pumps, collecting what is reported, until `done` holds of the reports so far.
+    fn pump_until_told(set: &mut TabSet, dir: &Path, what: &str, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut told = Vec::new();
+        while !done(&told) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            set.pump(dir, true);
+            told.extend(began(set));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        told
+    }
+
+    fn pump_a_while(set: &mut TabSet, dir: &Path) -> Vec<String> {
+        let mut told = Vec::new();
+        for _ in 0..20 {
+            set.pump(dir, true);
+            told.extend(began(set));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        told
+    }
+
+    fn completed(turn: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        }
+    }
+
+    fn editing(id: &str, is_error: bool) -> Vec<AgentDomainEvent> {
+        vec![
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: id.into(),
+                name: "Edit".into(),
+                input: serde_json::json!({"file_path":"main.rs"}),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: "t1".into(),
+                tool_use_id: id.into(),
+                content: serde_json::json!("ok"),
+                is_error,
+            },
+        ]
+    }
+
+    fn edit_news(set: &mut TabSet, dir: &Path, id: &str) -> Vec<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut paths = Vec::new();
+        loop {
+            set.pump(dir, true);
+            paths.extend(set.take_follow_edits().into_iter().map(|(_, path)| path));
+            if set
+                .active_tab()
+                .live()
+                .unwrap()
+                .projection()
+                .tool_calls
+                .iter()
+                .any(|c| c.tool_use_id == id && c.result.is_some())
+            {
+                // The projection can finish folding after this pump took its delivery. Drain that
+                // delivery before changing the tab's following flag.
+                set.pump(dir, true);
+                paths.extend(set.take_follow_edits().into_iter().map(|(_, path)| path));
+                return paths;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn follow_edits_are_independent_of_client_call_news() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        let calls = &mut set.get_mut(tab).unwrap().session.client_calls;
+        calls.edited.push(PathBuf::from("main.rs"));
+        calls.news.push(ClientCallNews::TurnInterrupted);
+        assert_eq!(set.take_client_news(), [(tab, ClientCallNews::TurnInterrupted)]);
+        assert_eq!(set.take_follow_edits(), [(tab, PathBuf::from("main.rs"))]);
+        assert!(set.take_follow_edits().is_empty());
+    }
+
+    #[test]
+    fn a_leaving_tab_discards_unreported_follow_edits() {
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = set.active();
+        set.get_mut(tab)
+            .unwrap()
+            .session
+            .client_calls
+            .edited
+            .push(PathBuf::from("main.rs"));
+        assert!(set.take_unreported_client_calls(tab).is_empty());
+        assert!(set.take_follow_edits().is_empty());
+    }
+
+    #[test]
+    fn an_edit_is_news_only_while_following() {
+        let (dir, mut set, tab, provider) = live("edit-news");
+        assert!(!set.get(tab).unwrap().following);
+        provider.queue_all(editing("off", false));
+        assert!(edit_news(&mut set, &dir, "off").is_empty());
+        set.get_mut(tab).unwrap().following = true;
+        provider.queue_all(editing("on", false));
+        assert_eq!(edit_news(&mut set, &dir, "on"), [PathBuf::from("main.rs")]);
+    }
+
+    #[test]
+    fn a_failed_edit_is_no_news() {
+        let (dir, mut set, tab, provider) = live("failed-edit-news");
+        set.get_mut(tab).unwrap().following = true;
+        provider.queue_all(editing("failed", true));
+        assert!(edit_news(&mut set, &dir, "failed").is_empty());
+    }
+
+    #[test]
+    fn a_turn_start_is_news_once() {
+        let (dir, mut set, tab, provider) = live("turn-news-once");
+        assert!(pump_a_while(&mut set, &dir).is_empty(), "no turn, no news");
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        let told = pump_until_told(&mut set, &dir, "the turn's news", |told| !told.is_empty());
+        assert_eq!(told, ["t1"]);
+        assert!(
+            pump_a_while(&mut set, &dir).is_empty(),
+            "a turn running on is not news again"
+        );
+
+        provider.queue(completed("t1"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while set
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .active_turn_id
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "timed out waiting for the turn to end");
+            set.pump(&dir, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pump_a_while(&mut set, &dir).is_empty(), "an ending is no news");
+
+        provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        let told = pump_until_told(&mut set, &dir, "the next turn's news", |told| !told.is_empty());
+        assert_eq!(told, ["t2"]);
+        for tab in set.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
+    /// A resync drops the events a pump would have read, and the clock is stamped from the projection all the same.
+    #[test]
+    fn a_turn_seen_only_through_a_resync_is_news() {
+        let (dir, mut set, _tab, provider) = live("turn-news-resync");
+        let mut flood = vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }];
+        for i in 0..300 {
+            flood.push(AgentDomainEvent::ContentDelta {
+                turn_id: "t1".into(),
+                kind: agent::ContentKind::Text,
+                text: format!("chunk {i}"),
+            });
+        }
+        provider.queue_all(flood);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut snapshots = 0;
+        let mut told = Vec::new();
+        while told.is_empty() {
+            assert!(Instant::now() < deadline, "timed out waiting for the turn's news");
+            let out = set.pump(&dir, true);
+            if let Some(payload) = out.active_payload {
+                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                snapshots += usize::from(value["kind"] == "snapshot");
+            }
+            told.extend(began(&mut set));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(told, ["t1"]);
+        assert!(snapshots > 0, "the events were delivered as a snapshot");
+        assert!(pump_a_while(&mut set, &dir).is_empty(), "and it is reported once");
+        for tab in set.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
     }
 }
 

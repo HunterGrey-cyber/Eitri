@@ -98,13 +98,22 @@ pub(super) type SpawnResume<'a> = &'a mut dyn FnMut(
     ProjectTrust,
 ) -> mpsc::Receiver<Result<AgentBackend, BackendError>>;
 
-/// A restore's resumes, as the real workers start them. Only [`start_deferred`] calls it.
+/// A restore's resumes, as the real workers start them, each with `client_tools`. Only
+/// [`start_deferred`] calls it.
 pub(super) fn resume_spawner(
     state: &AgentPanelState,
+    client_tools: Option<agent::ClientToolSet>,
 ) -> impl FnMut(&str, agent::lease::SessionLease, ProjectTrust) -> mpsc::Receiver<Result<AgentBackend, BackendError>> {
     let (kind, project_dir) = (state.backend_kind, state.project_dir.clone());
     move |id, lease, project| {
-        spawn_connect_holding(kind, project_dir.clone(), Some(id.to_string()), Some(lease), project)
+        spawn_connect_holding(
+            kind,
+            project_dir.clone(),
+            Some(id.to_string()),
+            Some(lease),
+            project,
+            client_tools.clone(),
+        )
     }
 }
 
@@ -659,6 +668,24 @@ mod tests {
         assert!(!restore_is_on_offer(&nothing.borrow()));
     }
 
+    #[test]
+    fn a_restore_declares_them() {
+        let (state, _dir) = restore_panel(
+            "restore-tools",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        let mut resumes = FakeResumes::default();
+        assert_eq!(started(ask(&state, &mut resumes, RestoreAsk::Dashboard)), None);
+        assert_eq!(resumes.asked, ["s-1", "s-2"]);
+        let expected = eitri_core::editor_tools::catalog::client_tool_set(
+            &eitri_core::editor_tools::switches::Switches::on_by_default(),
+            ProjectTrust::NothingFound,
+        );
+        assert!(expected.is_some());
+        assert_eq!(resumes.client_tools, [expected.clone(), expected]);
+    }
+
     /// Every lease is held before the first resume is begun, so nothing can claim a saved session
     /// -- or prune its record -- in between.
     #[test]
@@ -679,7 +706,7 @@ mod tests {
         assert_eq!(resumes.leases.len(), 3);
         assert_eq!(
             resumes.trusts,
-            [ProjectTrust::Untrusted; 3],
+            [ProjectTrust::NothingFound; 3],
             "no restored session loads the project's own configuration"
         );
         assert!(state.borrow().restore_source.is_none(), "used up");
@@ -2037,6 +2064,7 @@ mod tests {
                         resume,
                         acp,
                         after_old,
+                        editor_server,
                     } => external.borrow_mut().push(ExternalSpawned {
                         agent,
                         plan,
@@ -2044,6 +2072,7 @@ mod tests {
                         resume,
                         acp: acp.map(|spec| (spec.argv, spec.auto_mode)),
                         waits_for_old: after_old.is_some(),
+                        editor_server,
                     }),
                 }
                 mpsc::channel().1

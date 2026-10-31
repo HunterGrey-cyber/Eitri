@@ -22,11 +22,21 @@ pub(crate) struct EmbeddedEditorRpc {
     /// Whether the editor module is still in this window: a module marked gone never comes back. An editor whose
     /// nvim ended is not gone; its pane answers that nvim is not running until a restart's nvim runs.
     editor_present: Rc<dyn Fn() -> bool>,
+    /// Whether the layout has the editor on screen now: not hidden, zoomed away or tabbed away.
+    editor_visible: Rc<dyn Fn() -> bool>,
 }
 
 impl EmbeddedEditorRpc {
-    pub(crate) fn new(pane: Rc<NeovideEditorPane>, editor_present: Rc<dyn Fn() -> bool>) -> EmbeddedEditorRpc {
-        EmbeddedEditorRpc { pane, editor_present }
+    pub(crate) fn new(
+        pane: Rc<NeovideEditorPane>,
+        editor_present: Rc<dyn Fn() -> bool>,
+        editor_visible: Rc<dyn Fn() -> bool>,
+    ) -> EmbeddedEditorRpc {
+        EmbeddedEditorRpc {
+            pane,
+            editor_present,
+            editor_visible,
+        }
     }
 }
 
@@ -54,5 +64,9 @@ impl EditorRpc for EmbeddedEditorRpc {
             return None;
         }
         self.pane.session_serial()
+    }
+
+    fn on_screen(&self) -> bool {
+        (self.editor_visible)()
     }
 }

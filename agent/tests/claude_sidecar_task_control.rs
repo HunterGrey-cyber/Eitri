@@ -81,6 +81,7 @@ fn open(provider: &ClaudeSidecarProvider) {
             cwd: "/".into(),
             streaming: agent::StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Untrusted,
+            client_tools: None,
         })
         .unwrap();
 }
@@ -282,6 +283,7 @@ fn per_task_stop_is_present_with_the_test_override() {
                 cwd: "/".into(),
                 streaming: agent::StreamingPreference::Partial,
                 project: agent::setting_sources::ProjectTrust::Untrusted,
+                client_tools: None,
             })
             .unwrap();
         assert!(calls()

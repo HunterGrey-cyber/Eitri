@@ -332,23 +332,23 @@ pub(super) struct PendingProposal {
     pub(super) rx: mpsc::Receiver<Result<(String, String), eitri_core::scratch::ProposalRefused>>,
 }
 
-/// Reads `file` and applies `change` on a worker thread; the tick hands nvim the result (see
-/// [`poll_proposal_jobs`]). Refused while [`MAX_REVIEW_JOBS`] are already out.
+/// Runs `read` on a worker thread, which gives nvim's diff tab its two sides; the tick hands nvim the result (see
+/// [`poll_proposal_jobs`]). `name` is the file's name, from which nvim takes the filetype. Refused while
+/// [`MAX_REVIEW_JOBS`] are already out.
 pub(super) fn start_proposal_job(
     state: &mut AgentPanelState,
     view: ViewId,
     request_id: &str,
-    file: PathBuf,
-    change: eitri_core::agent_bridge::ProposedChange,
+    name: String,
+    read: impl FnOnce() -> Result<(String, String), eitri_core::scratch::ProposalRefused> + Send + 'static,
 ) -> Result<(), String> {
     if state.proposal_jobs.len() >= MAX_REVIEW_JOBS {
         return Err("proposals are still being read; try again in a moment".to_string());
     }
-    let name = file.to_string_lossy().into_owned();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
-        let _ = tx.send(eitri_core::scratch::proposal_texts(&file, &change));
+        let _ = tx.send(read());
     });
     state.proposal_jobs.push(PendingProposal {
         request_id: request_id.to_string(),

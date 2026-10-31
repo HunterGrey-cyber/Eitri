@@ -31,22 +31,24 @@ pub use spawn::{
 };
 
 use crate::provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities,
-    ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
-    SteerTurnRequest, StreamingPreference, TurnStamp,
+    AgentProvider, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl, ClientToolSet,
+    CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, ProviderCapabilities, ProviderError,
+    ProviderErrorCode, ProviderInfo, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
+    StreamingPreference, TurnStamp,
 };
 use crate::runtime_thread::RuntimeThread;
 use crate::setting_sources::{ProjectTrust, Source};
 use crate::AgentDomainEvent;
 use claude_runtime_protocol::v1::runtime_service_client::RuntimeServiceClient;
 use claude_runtime_protocol::v1::{
-    ClaudeHostPolicy, CliPermissionMode, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
+    client_tool_content, AnswerClientToolCallRequest, ClaudeHostPolicy, CliPermissionMode, ClientToolContent,
+    ClientToolDeclaration, ClientTools, CloseSessionRequest as ProtoCloseSessionRequest, ConfigurationProfile,
     CreateSessionRequest as ProtoCreateSessionRequest, ErrorCode as ProtoErrorCode, ErrorDetail, ExecutableSource,
-    HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
-    PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
-    ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest, SettingSource,
-    SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode, SystemPromptPreset, ToolPolicy,
-    WatchSessionEventsRequest,
+    GetClientToolCallStateRequest, GetClientToolCallStateResponse, HandshakeRequest, HandshakeResponse,
+    InterruptTurnRequest as ProtoInterruptTurnRequest, PermissionMode as ProtoPermissionMode, PersistenceMode,
+    ReplayStart, ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest,
+    SettingSource, SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode,
+    SystemPromptPreset, ToolPolicy, WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
@@ -101,6 +103,7 @@ const CAP_SUBAGENT_FRAMES: &str = claude_runtime_protocol::CAP_SUBAGENT_FRAMES;
 const CAP_SESSION_NOTICES: &str = claude_runtime_protocol::CAP_SESSION_NOTICES;
 const CAP_CONVERSATION_RESET: &str = claude_runtime_protocol::CAP_CONVERSATION_RESET;
 const CAP_STRUCTURED_QUESTIONS_V1: &str = claude_runtime_protocol::CAP_STRUCTURED_QUESTIONS_V1;
+const CAP_CLIENT_TOOLS: &str = claude_runtime_protocol::CAP_CLIENT_TOOLS;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -200,6 +203,7 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         session_notices: has(CAP_SESSION_NOTICES),
         conversation_reset: has(CAP_CONVERSATION_RESET),
         structured_questions_v1: has(CAP_STRUCTURED_QUESTIONS_V1),
+        client_tools: has(CAP_CLIENT_TOOLS),
     }
 }
 
@@ -257,6 +261,8 @@ fn provider_error_code(code: ProtoErrorCode) -> ProviderErrorCode {
         ProtoErrorCode::TaskOutputUnavailable => ProviderErrorCode::TaskOutputUnavailable,
         ProtoErrorCode::InteractionNotFound => ProviderErrorCode::InteractionNotFound,
         ProtoErrorCode::InteractionAnswerRefused => ProviderErrorCode::InteractionAnswerRefused,
+        ProtoErrorCode::ClientToolCallNotFound => ProviderErrorCode::ClientToolCallNotFound,
+        ProtoErrorCode::ClientToolCallAlreadyAnswered => ProviderErrorCode::ClientToolCallAlreadyAnswered,
     }
 }
 
@@ -300,6 +306,8 @@ pub struct ClaudeSidecarProvider {
     provider_prompts: bool,
     /// Whether this peer offers Claude Code's preset for fresh and resumed sessions.
     claude_code_prompt: bool,
+    /// The handshake's limit on one request; 0 when the peer stated none. Read by the answer path.
+    max_message_bytes: u64,
     #[cfg(feature = "test-support")]
     questions_override: Option<bool>,
     /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
@@ -418,6 +426,7 @@ struct Handshaken {
     splits_messages: bool,
     provider_prompts: bool,
     claude_code_prompt: bool,
+    max_message_bytes: u64,
 }
 
 /// Connects to the sidecar's socket and runs the real `Handshake`, refusing a socket served by another
@@ -532,6 +541,7 @@ fn handshake_with(
         splits_messages,
         provider_prompts,
         claude_code_prompt,
+        max_message_bytes: handshake.max_message_bytes,
     })
 }
 
@@ -561,6 +571,7 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            max_message_bytes,
         } = handshake_with(&runtime, &sidecar, None)?;
         Ok(Self {
             sidecar: Mutex::new(sidecar),
@@ -573,6 +584,7 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            max_message_bytes,
             #[cfg(feature = "test-support")]
             questions_override: None,
             #[cfg(target_os = "linux")]
@@ -1155,6 +1167,7 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
 /// offered. `cli_mode` (`requested_cli_mode`): `Auto` only when the handshake offered both `cli_auto_mode` and
 /// `permission_defer`, and `Default` leaves the field unset, so a request to a sidecar without them
 /// is byte-for-byte what it was before the field existed.
+#[allow(clippy::too_many_arguments)]
 fn build_create_request(
     cwd: String,
     streaming: StreamingPreference,
@@ -1165,8 +1178,9 @@ fn build_create_request(
     cli_mode: crate::RequestedCliMode,
     project: ProjectTrust,
     questions: QuestionPolicy,
+    client_tools: Option<ClientTools>,
 ) -> ProtoCreateSessionRequest {
-    build_create_request_loading(
+    let mut request = build_create_request_loading(
         cwd,
         streaming,
         resume_provider_session_id,
@@ -1177,7 +1191,42 @@ fn build_create_request(
         project,
         cli_mode,
         questions,
-    )
+    );
+    request.client_tools = client_tools;
+    request
+}
+
+/// The wire's form of what a session declares, for a request to a peer that does (`offered`) or does
+/// not offer `client_tools`. Absent for a peer without it, which would run the session with no tools
+/// and no word about it, and for a set with no tool in it, which the wire refuses.
+fn client_tools_for(set: Option<ClientToolSet>, offered: bool) -> Option<ClientTools> {
+    let ClientToolSet {
+        server_name,
+        timeout_ms,
+        tools,
+    } = set.filter(|set| offered && !set.tools.is_empty())?;
+    let tools = tools
+        .into_iter()
+        .map(|tool| {
+            let ClientToolDecl {
+                name,
+                description,
+                input_schema_json,
+                always_load,
+            } = tool;
+            ClientToolDeclaration {
+                name,
+                description,
+                input_schema_json,
+                always_load,
+            }
+        })
+        .collect();
+    Some(ClientTools {
+        server_name,
+        timeout_ms,
+        tools,
+    })
 }
 
 /// The settings tiers on the wire, in the order given. The one place the proto's tier names are
@@ -1308,6 +1357,8 @@ fn build_create_request_loading(
         model: None,  // absent = the CLI's default model
         effort: None, // absent = the CLI's default reasoning effort
         system_prompt: None,
+        // Stated by `build_create_request`, which alone knows what the session declares.
+        client_tools: None,
         system_prompt_preset: claude_code_prompt.then(|| SystemPromptPreset {
             append: Some(EITRI_APPEND.to_string()),
         }),
@@ -1352,11 +1403,13 @@ fn fresh_request(
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     questions: QuestionPolicy,
+    offers_client_tools: bool,
 ) -> ProtoCreateSessionRequest {
     let CreateSessionRequest {
         cwd,
         streaming,
         project,
+        client_tools,
     } = request;
     build_create_request(
         cwd,
@@ -1368,6 +1421,7 @@ fn fresh_request(
         cli_mode,
         project,
         questions,
+        client_tools_for(client_tools, offers_client_tools),
     )
 }
 
@@ -1379,12 +1433,14 @@ fn resume_request(
     claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     questions: QuestionPolicy,
+    offers_client_tools: bool,
 ) -> ProtoCreateSessionRequest {
     let ResumeSessionRequest {
         provider_session_id,
         cwd,
         streaming,
         project,
+        client_tools,
     } = request;
     build_create_request(
         cwd,
@@ -1396,6 +1452,7 @@ fn resume_request(
         cli_mode,
         project,
         questions,
+        client_tools_for(client_tools, offers_client_tools),
     )
 }
 
@@ -1445,6 +1502,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
             self.question_policy(),
+            self.capabilities.client_tools,
         ))
     }
 
@@ -1477,6 +1535,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
             self.question_policy(),
+            self.capabilities.client_tools,
         ))
     }
 
@@ -1720,6 +1779,48 @@ impl AgentProvider for ClaudeSidecarProvider {
         };
         let response = self.run_unary(async move { client.get_interaction_state(proto_request).await })?;
         Ok(translate_322::interaction_state(response))
+    }
+
+    /// One `AnswerClientToolCall`, spawned on the provider's runtime and bounded by `UNARY_RPC_TIMEOUT`.
+    /// Nothing waits for it, since the person's side of a call runs on the GTK thread, and nothing
+    /// holds a move back for it either: unlike a question's answer, a refused one has nothing to put
+    /// back. Each answer has its own `command_id`, because the service replays an id it has seen.
+    fn answer_client_tool_call(&self, answer: ClientToolAnswer) -> Result<(), ProviderError> {
+        if !self.capabilities.client_tools {
+            return Err(ProviderError::UnsupportedCapability("client_tools"));
+        }
+        self.require_driving()?;
+        let request = answer_request_for(answer, uuid::Uuid::new_v4().to_string(), self.max_message_bytes);
+        let call_id = request.call_id.clone();
+        let mut client = self.client.clone();
+        self.runtime.handle().spawn(async move {
+            let failure = match tokio::time::timeout(UNARY_RPC_TIMEOUT, client.answer_client_tool_call(request)).await {
+                Ok(Ok(_)) => return,
+                Ok(Err(status)) => map_task_status(status),
+                Err(_) => ProviderError::Timeout,
+            };
+            eprintln!("{}", answer_failure_line(&call_id, &failure));
+        });
+        Ok(())
+    }
+
+    fn client_tool_call_state(&self, session_id: &str) -> Result<crate::TaskReply<ClientToolCallState>, ProviderError> {
+        if !self.capabilities.client_tools {
+            return Err(ProviderError::UnsupportedCapability("client_tools"));
+        }
+        self.require_driving()?;
+        let request = GetClientToolCallStateRequest {
+            session_id: session_id.to_owned(),
+        };
+        let mut client = self.client.clone();
+        Ok(self.task_rpc(async move {
+            let response = client
+                .get_client_tool_call_state(request)
+                .await
+                .map_err(map_task_status)?
+                .into_inner();
+            Ok(client_call_state(response))
+        }))
     }
 
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError> {
@@ -2253,6 +2354,86 @@ fn resolve_request_for(
     })
 }
 
+/// How far under the handshake's limit an answer stays: the room gRPC's own framing needs, and a margin
+/// for a sidecar that counts a little differently.
+const ANSWER_MARGIN_BYTES: u64 = 4 * 1024;
+
+/// What the model reads for an answer too long to send. An answer over the limit would fail with the
+/// call left open until the CLI's own limit runs out, so a short error goes in its place.
+const ANSWER_TOO_LONG: &str = "The tool's answer was too long to send.";
+
+fn answer_block(text: String) -> ClientToolContent {
+    ClientToolContent {
+        kind: Some(client_tool_content::Kind::Text(text)),
+    }
+}
+
+/// The wire's form of one answer. `max_message_bytes` is the handshake's; 0 says the peer stated no
+/// limit, since proto3 cannot tell that from a limit of nothing.
+fn answer_request_for(
+    answer: ClientToolAnswer,
+    command_id: String,
+    max_message_bytes: u64,
+) -> AnswerClientToolCallRequest {
+    let ClientToolAnswer {
+        session_id,
+        call_id,
+        text,
+        is_error,
+    } = answer;
+    let mut request = AnswerClientToolCallRequest {
+        session_id,
+        command_id,
+        call_id,
+        content: text.into_iter().map(answer_block).collect(),
+        is_error,
+    };
+    let limit = max_message_bytes.saturating_sub(ANSWER_MARGIN_BYTES);
+    if max_message_bytes != 0 && prost::Message::encoded_len(&request) as u64 >= limit {
+        request.content = vec![answer_block(ANSWER_TOO_LONG.to_string())];
+        request.is_error = true;
+    }
+    request
+}
+
+/// Whether a failed answer is one the host has nothing to learn from: a first answer won, the call
+/// settled some other way, or the session closed, each of which ended the call the answer was for.
+fn answer_refusal_is_ordinary(failure: &ProviderError) -> bool {
+    matches!(
+        failure,
+        ProviderError::Provider {
+            code: ProviderErrorCode::ClientToolCallNotFound
+                | ProviderErrorCode::ClientToolCallAlreadyAnswered
+                | ProviderErrorCode::SessionNotFound,
+            ..
+        }
+    )
+}
+
+/// The one line a failed answer leaves. It reaches nobody else: the send was never waited on.
+fn answer_failure_line(call_id: &str, failure: &ProviderError) -> String {
+    if answer_refusal_is_ordinary(failure) {
+        format!("agent: ClaudeSidecarProvider: answer to client tool call {call_id} not needed: {failure}")
+    } else {
+        format!("agent: ClaudeSidecarProvider: answer to client tool call {call_id} failed: {failure}")
+    }
+}
+
+fn client_call_state(response: GetClientToolCallStateResponse) -> ClientToolCallState {
+    let GetClientToolCallStateResponse { through_sequence, open } = response;
+    ClientToolCallState {
+        through_sequence,
+        open: open
+            .into_iter()
+            .map(|call| ClientCallRef {
+                call_id: call.call_id,
+                tool_use_id: Some(call.tool_use_id).filter(|id| !id.is_empty()),
+                tool: call.tool,
+            })
+            .collect(),
+    }
+}
+
 /// The `ResolveInteraction` for the person's answer: option indexes, typed text and notes, each
 /// question by its index in the set, and nothing else. The sidecar builds the tool's input from the
 /// question it kept, so no text the page shows or sends becomes tool input, and no request this
@@ -2554,6 +2735,7 @@ mod tests {
                                     resume_provider_session_id: resume,
                                     fork: false,
                                     client_interactions: None,
+                                    client_tools: None,
                                     model: None,
                                     effort: None,
                                     system_prompt: None,
@@ -2572,11 +2754,13 @@ mod tests {
                     cwd: "/p".into(),
                     streaming: StreamingPreference::Partial,
                     project: ProjectTrust::Untrusted,
+                    client_tools: None,
                 },
                 true,
                 offered,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                false,
             );
             let resumed = resume_request(
                 ResumeSessionRequest {
@@ -2584,11 +2768,13 @@ mod tests {
                     cwd: "/p".into(),
                     streaming: StreamingPreference::Partial,
                     project: ProjectTrust::Untrusted,
+                    client_tools: None,
                 },
                 true,
                 offered,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                false,
             );
             assert_eq!(fresh.system_prompt_preset.is_some(), offered);
             assert_eq!(resumed.system_prompt_preset, fresh.system_prompt_preset);
@@ -2617,6 +2803,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        None,
                     ),
                 ),
                 (
@@ -2631,6 +2818,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        None,
                     ),
                 ),
                 (
@@ -2645,6 +2833,7 @@ mod tests {
                         cli_mode,
                         ProjectTrust::Untrusted,
                         QuestionPolicy::default(),
+                        None,
                     ),
                 ),
             ]
@@ -2703,6 +2892,7 @@ mod tests {
                     crate::RequestedCliMode::Default,
                     ProjectTrust::Untrusted,
                     QuestionPolicy::default(),
+                    None,
                 )
                 .policy
                 .expect("a policy is always sent");
@@ -2839,11 +3029,13 @@ mod tests {
                     cwd: "/p".into(),
                     streaming: StreamingPreference::Partial,
                     project,
+                    client_tools: None,
                 },
                 false,
                 false,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                false,
             )
         };
         let fresh = |project| {
@@ -2852,11 +3044,13 @@ mod tests {
                     cwd: "/p".into(),
                     streaming: StreamingPreference::Partial,
                     project,
+                    client_tools: None,
                 },
                 false,
                 false,
                 crate::RequestedCliMode::Default,
                 QuestionPolicy::default(),
+                false,
             )
         };
         let sources = |request: ProtoCreateSessionRequest| request.policy.unwrap().setting_sources.unwrap().sources;
@@ -2932,6 +3126,7 @@ mod tests {
                 crate::RequestedCliMode::Default,
                 project,
                 QuestionPolicy::default(),
+                None,
             )
             .policy
             .expect("a policy is always sent")
@@ -2971,8 +3166,8 @@ mod tests {
         HandshakeResponse {
             protocol_major: 3,
             // The handshake reports `capabilities.json`'s minor (it was the literal 0 until
-            // 2026-09-30): 22 at the pinned revision.
-            protocol_minor: 22,
+            // 2026-09-30): 23 at the pinned revision.
+            protocol_minor: 23,
             sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
@@ -3059,6 +3254,8 @@ mod tests {
                 "session_notices",
                 "conversation_reset",
                 "structured_questions_v1",
+                // Protocol 3.23: `ProviderCapabilities::client_tools`.
+                "client_tools",
                 // Which executable sources this build can actually serve, advertised as capability
                 // strings rather than a new wire field. `executable_host_cli` is always present;
                 // a checkout build adds one more, `executable_sdk_bundled`, which a PACKAGED build
@@ -3243,6 +3440,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_tools_is_read_from_the_handshake_alone() {
+        assert!(capabilities_from_handshake(&real_handshake_today()).client_tools);
+        let mut without = real_handshake_today();
+        without.capabilities.retain(|c| c != "client_tools");
+        assert!(!capabilities_from_handshake(&without).client_tools);
+    }
+
     /// `capabilities` with every 3.22 flag cleared.
     fn all_off(capabilities: ProviderCapabilities) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -3341,6 +3546,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Each ordinary refusal leaves its call settled or gone, so the line says the answer was not
+    /// needed; any other failure is named as one.
+    #[test]
+    fn a_refused_answer_is_ordinary_only_for_a_call_or_session_that_is_over() {
+        let provider = |code| ProviderError::Provider {
+            code,
+            message: "refused".into(),
+        };
+        for code in [
+            ProviderErrorCode::ClientToolCallNotFound,
+            ProviderErrorCode::ClientToolCallAlreadyAnswered,
+            ProviderErrorCode::SessionNotFound,
+        ] {
+            assert!(answer_refusal_is_ordinary(&provider(code)));
+            assert!(answer_failure_line("c1", &provider(code)).contains("c1 not needed"));
+        }
+        for failure in [
+            provider(ProviderErrorCode::InvalidConfiguration),
+            ProviderError::Timeout,
+            ProviderError::Transport("the pipe closed".into()),
+        ] {
+            assert!(!answer_refusal_is_ordinary(&failure));
+            assert!(answer_failure_line("c1", &failure).contains("c1 failed"));
+        }
+    }
+
+    #[test]
+    fn a_peer_that_states_no_limit_gets_the_answer_as_it_is() {
+        let answer = ClientToolAnswer {
+            session_id: "s".into(),
+            call_id: "c".into(),
+            text: vec!["x".repeat(16 * 1024)],
+            is_error: false,
+        };
+        let request = answer_request_for(answer.clone(), "id".into(), 0);
+        assert!(!request.is_error);
+        let request = answer_request_for(answer, "id".into(), 8 * 1024);
+        assert!(request.is_error, "a stated limit holds");
     }
 
     fn detail(code: ProtoErrorCode, reason: &str, message: &str) -> ErrorDetail {
@@ -3466,10 +3711,10 @@ mod tests {
         );
     }
 
-    /// Protocol 3.22's four codes each answer one request about one task or one question, which may
-    /// simply have ended first; the session stays healthy, so none of them is a reason to end it.
+    /// These codes each answer one request about one task, question or tool call, which may simply have
+    /// ended first; the session stays healthy, so none of them is a reason to end it.
     #[test]
-    fn the_task_and_question_refusals_map_one_to_one_and_are_benign() {
+    fn the_task_question_and_call_refusals_map_one_to_one_and_are_benign() {
         for (wire, mirrored) in [
             (ProtoErrorCode::TaskNotFound, ProviderErrorCode::TaskNotFound),
             (
@@ -3483,6 +3728,14 @@ mod tests {
             (
                 ProtoErrorCode::InteractionAnswerRefused,
                 ProviderErrorCode::InteractionAnswerRefused,
+            ),
+            (
+                ProtoErrorCode::ClientToolCallNotFound,
+                ProviderErrorCode::ClientToolCallNotFound,
+            ),
+            (
+                ProtoErrorCode::ClientToolCallAlreadyAnswered,
+                ProviderErrorCode::ClientToolCallAlreadyAnswered,
             ),
         ] {
             assert_eq!(provider_error_code(wire), mirrored);
@@ -3871,12 +4124,12 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Fifty-two: the PACKAGED shape at the pinned revision (twenty-four up to
-        // `provider_permission_prompts`, five from protocol 3.13, three from 3.14, seven from 3.15-3.19, two from 3.20, one from 3.21 and ten from
-        // 3.22), which a shipped install meets. A checkout build advertises one more,
+        // Fifty-three: the PACKAGED shape at the pinned revision (twenty-four up to
+        // `provider_permission_prompts`, five from protocol 3.13, three from 3.14, seven from 3.15-3.19, two from 3.20, one from 3.21, ten from
+        // 3.22 and one from 3.23), which a shipped install meets. A checkout build advertises one more,
         // executable_sdk_bundled, and a sidecar with egress restrictions enabled advertises
         // egress_restricted besides. See real_handshake_today().
-        assert_eq!(info.advertised_capabilities.len(), 52);
+        assert_eq!(info.advertised_capabilities.len(), 53);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }

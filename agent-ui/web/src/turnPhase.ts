@@ -1,3 +1,4 @@
+import { allCards } from "./timeline";
 import type { AgentUiState } from "./types";
 
 /**
@@ -64,7 +65,7 @@ export type TurnPhase =
  * Read raw collections, not `buildTimeline`: its permission anchoring is display order, not chronology.
  */
 export function phaseOf(state: AgentUiState): TurnPhase {
-  if (state.pendingPermissions.length > 0) return { kind: "blocked" };
+  if (allCards(state).length > 0) return { kind: "blocked" };
 
   // Four running maxima in one pass per collection, comparing strictly greater than what came
   // before -- correct regardless of collection order, since only the running maximum survives.

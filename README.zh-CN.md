@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=505c0f922d6ce98663ba530ba8a106f0e85dff1a2a6c0bad9bf18ce68952f9a6 -->
+<!-- translated-from: README.md sha256=07d03057e36c3f448e65482d85c60e5933d2620e720efaadc464482ad4baae4b -->
 
 <div align="center">
 
@@ -39,6 +39,7 @@
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide 渲染器的一个 fork 在 GPU 上绘制。
 - **读得下去的回复。** markdown、按你配色高亮的代码、可以折叠的工具调用，每一次编辑单独一行 diff。
 - **你监督的 agent。** Claude Code、Codex，或者你通过 ACP 注册的 agent，每个标签页一个，可以是 manual、auto 或 bypass 模式（ACP agent 没有 manual）；回合进行中按 `Enter` 会把消息插进这个回合。见 [Codex 与其他 agent](docs/guide/agents.zh-CN.md)。
+- **能指给你看的 agent。** 任何标签页里的 agent 都能把一个文件打开到某一行给你看，也能读你的编辑器里现在有什么，包括未保存的改动，而且不碰你的光标：[从 agent 标签页使用你的编辑器](docs/guide/editor-tools.zh-CN.md)。
 - **你自己做的页面。** Eitri 随附一个 Markdown 预览，你自己的 HTML 页面或插件也能成为窗口里的一个模块（实验性）：[你自己做的页面](docs/guide/pages.zh-CN.md)。
 - **从头到尾用键盘。** 面板里用 vim 的按键，窗口用 tmux 的按键，`Ctrl+h/j/k/l` 在窗格之间移动。
 - **逐个回合审阅。** 按 `c` 列出 agent 这个回合期间磁盘上改了什么；可以撤销一个 hunk，也可以把评论发回去。

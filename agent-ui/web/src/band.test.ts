@@ -9,6 +9,22 @@ const idle: BandFacts = { ...running, mode: "browse", unread: null, cards: 0, qu
 const ids = (w: number, f: BandFacts) => bandLayout(f, w, 7.2).map((s) => s.id);
 
 describe("the band degrades by priority", () => {
+  it("following_shows_and_goes_when_narrow", () => {
+    const facts = { ...idle, queued: 1, background: 1, following: true };
+    const wide = bandLayout(facts, 900, 7.2);
+    expect(wide.find((s) => s.id === "following")).toEqual({ id: "following", text: "following", side: "left" });
+    expect(wide.map((s) => s.id).indexOf("following")).toBe(wide.map((s) => s.id).indexOf("background") + 1);
+    expect(ids(900, { ...facts, following: false })).not.toContain("following");
+    expect(ids(120, facts)).not.toContain("following");
+    const intermediate: string[][] = [];
+    for (let width = 120; width <= 900; width++) {
+      const shown = ids(width, facts);
+      if (shown.includes("following")) expect(shown).toContain("background");
+      if (shown.includes("queue")) expect(shown).toContain("following");
+      if (shown.includes("following") && !shown.includes("queue")) intermediate.push(shown);
+    }
+    expect(intermediate.length).toBeGreaterThan(0);
+  });
   it("fits the mockup's two states whole", () => {
     expect(ids(520, running)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "position", "unread"]);
     expect(ids(360, idle)).toEqual(["mode", "pill", "model", "position"]);

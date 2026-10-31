@@ -940,3 +940,188 @@ it("draws a foreground command the CLI follows as a task as the ordinary call it
     result: { content: "Command was moved to the background (ID: bp1). Output is being written", isError: false } });
   expect(toolCardLine(moved, s)).toBe("⎿ Running in the background · /tasks");
 });
+
+describe("an editor tool's result", () => {
+  const hidden = "a​b‮c";
+  const escaped = "a⟨U+200B⟩b⟨U+202E⟩c";
+  const eitri = (result: ToolCallRecord["result"]) =>
+    call({ name: "mcp__eitri__read_buffer", input: { path: "a.py" }, result });
+  const codexEitri = (server: string, result: ToolCallRecord["result"]) =>
+    call({ name: "mcpToolCall", input: { server, tool: "read_buffer", arguments: { path: "a.py" } }, result });
+  const folded = (c: ToolCallRecord) => renderToStaticMarkup(<>{renderToolCall(c, false)}</>);
+  const expanded = (c: ToolCallRecord) => renderToStaticMarkup(<>{renderToolCall(c, true)}</>);
+  const textOf = (html: string) => html.replace(/<[^>]+>/g, "");
+  const rows: Array<[string, (result: ToolCallRecord["result"]) => ToolCallRecord]> = [
+    ["an mcp__eitri__ row", eitri],
+    ["a Codex eitri row", (result) => codexEitri("eitri", result)],
+  ];
+
+  for (const [what, make] of rows) {
+    it(`hidden_characters_in_a_result_are_revealed_in_the_preview (${what})`, () => {
+      const c = make({ content: `first ${hidden}\nsecond`, isError: false });
+      const html = folded(c);
+      expect(html).toContain("tool-result-preview");
+      expect(textOf(html)).toContain(escaped);
+      expect(html).not.toContain("​");
+      expect(html).not.toContain("‮");
+    });
+
+    it(`hidden_characters_in_a_result_are_revealed_when_expanded (${what})`, () => {
+      const c = make({ content: `first ${hidden}\nsecond`, isError: false });
+      const html = expanded(c);
+      expect(html).toContain("tool-result-body");
+      expect(textOf(html)).toContain(escaped);
+      expect(html).not.toContain("​");
+      expect(html).not.toContain("‮");
+      // The words around the escapes, the empty answer and the counts are what they were.
+      expect(expanded(make({ content: "", isError: false }))).toContain("(no output)");
+    });
+  }
+
+  it("hidden_characters_in_a_usages_result_are_revealed", () => {
+    const answer = JSON.stringify({
+      symbol: "foo",
+      definitions: [{ path: "a.py", line: 1, column: 1, text: hidden }],
+      missing: [],
+      unsupported: [],
+      left_out: 0,
+    });
+    const c = call({
+      name: "mcp__eitri__usages",
+      input: { path: "a.py", line: 1, symbol: `foo${hidden}` },
+      result: { content: answer, isError: false },
+    });
+    for (const html of [folded(c), expanded(c)]) {
+      expect(textOf(html)).toContain(escaped);
+      expect(html).not.toContain("\u200b");
+      expect(html).not.toContain("\u202e");
+    }
+    expect(textOf(expanded(c))).toContain(`1 usage of foo${escaped}`);
+  });
+
+  it("a_result_row_says_what_happened_once_it_has_an_answer", () => {
+    const answer = JSON.stringify({ path: "a.py", modified: true, text: "x" });
+    expect(expanded(eitri({ content: answer, isError: false }))).toContain("read a.py from the editor (unsaved)");
+    expect(expanded(eitri(null))).toContain("read_buffer a.py");
+    expect(expanded(codexEitri("eitri", { content: answer, isError: false }))).toContain("read a.py from the editor (unsaved)");
+  });
+
+  it("another_servers_result_draws_as_before", () => {
+    for (const c of [codexEitri("other", { content: `x ${hidden}`, isError: false }), call({ name: "mcp__other__read_buffer", input: {}, result: { content: `x ${hidden}`, isError: false } })]) {
+      for (const html of [folded(c), expanded(c)]) {
+        expect(textOf(html)).toContain(hidden);
+        expect(html).not.toContain("⟨U+200B⟩");
+      }
+    }
+    expect(lookupTool("mcp__other__read_buffer")).toBeUndefined();
+    // The row of another server's tool still reads as a Codex tool call.
+    expect(expanded(codexEitri("other", { content: "x", isError: false }))).toContain("other · read_buffer");
+    expect(expanded(codexEitri("other", { content: "x", isError: false }))).not.toContain("from the editor");
+  });
+
+  it("the_registry_answers_every_editor_tool_name", () => {
+    for (const tool of ["open_file", "read_buffer", "diagnostics", "editor_state", "usages", "lsp_ask"]) {
+      const config = lookupTool(`mcp__eitri__${tool}`);
+      expect(config?.revealResult?.({})).toBe(true);
+    }
+    expect(lookupTool("Bash")?.revealResult).toBeUndefined();
+  });
+});
+
+
+describe("nvim_exec row", () => {
+  const code = "local first = 1\nlocal second = 2\nreturn first + second\n";
+  const exec = (input: unknown = { kind: "lua", code }, content = "3") =>
+    call({ name: "mcp__eitri__nvim_exec", input, result: { content, isError: false } });
+  const draw = (c: ToolCallRecord, expanded = false) => {
+    const view = render(<>{renderToolCall(c, expanded)}</>);
+    expect(view.container.querySelector(".tool-card-exec")).toBeTruthy();
+    return view.container;
+  };
+
+  it("the_row_shows_the_first_line", () => {
+    const container = draw(exec());
+    expect(container.querySelector(".tool-card-exec")?.textContent).toContain("Lua: local first = 1");
+    expect(container.querySelector(".tool-card-exec")?.textContent).toContain("2 lines not shown");
+    expect(container.querySelector(".tool-card-exec")?.textContent).not.toContain("local second");
+    expect(container.querySelector(".tool-result-preview")?.textContent).toBe("3");
+  });
+
+  it("expanded_shows_the_code_whole", () => {
+    const container = draw(exec(), true);
+    expect(container.querySelector(".tool-card-exec pre")?.textContent).toBe(code);
+    expect(container.querySelector(".tool-card-exec")?.textContent).not.toContain("lines not shown");
+  });
+
+  it("hidden_characters_in_the_code_are_revealed", () => {
+    for (const expanded of [false, true]) {
+      const container = draw(exec({ kind: "lua\u202e", code: "a\u200bb\u202ec\nreturn 2" }), expanded);
+      expect(container.querySelector(".tool-card-exec")?.textContent).toContain("lua⟨U+202E⟩: a⟨U+200B⟩b⟨U+202E⟩c");
+      expect(container.textContent).not.toMatch(/[\u200b\u202e]/);
+      cleanup();
+    }
+  });
+
+  it("markdown_in_the_code_stays_text", () => {
+    const text = "**bold** [link](https://example.com) <img src=x>\n# heading";
+    const container = draw(exec({ kind: "ex", code: text }), true);
+    expect(container.querySelector(".tool-card-exec pre")?.textContent).toBe(text);
+    expect(container.querySelector("a, img, strong, h1")).toBeNull();
+  });
+
+  it("markdown_in_the_result_stays_text", () => {
+    const text = "**bold** [link](https://example.com) <img src=x>";
+    for (const expanded of [false, true]) {
+      const container = draw(exec(undefined, text), expanded);
+      expect(container.querySelector(expanded ? ".tool-result-body" : ".tool-result-preview")?.textContent).toBe(text);
+      expect(container.querySelector("a, img, strong")).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("hidden_characters_in_the_result_are_revealed", () => {
+    for (const expanded of [false, true]) {
+      const container = draw(exec(undefined, "a\u200bb\u202ec"), expanded);
+      expect(container.querySelector(expanded ? ".tool-result-body" : ".tool-result-preview")?.textContent).toBe(
+        "a⟨U+200B⟩b⟨U+202E⟩c",
+      );
+      expect(container.textContent).not.toMatch(/[\u200b\u202e]/);
+      cleanup();
+    }
+  });
+
+  it("a_malformed_input_does_not_throw", () => {
+    for (const input of [null, undefined, "text", 4, [], { kind: 3, code: {} }, { kind: "lua", code: null }]) {
+      for (const expanded of [false, true]) {
+        expect(() => draw(exec(input), expanded)).not.toThrow();
+        cleanup();
+      }
+    }
+  });
+
+  it("a_codex_exec_row_uses_it", () => {
+    for (const expanded of [false, true]) {
+      const c = exec();
+      const direct = draw(c, expanded).innerHTML;
+      cleanup();
+      const codex = draw(call({ ...c, name: "mcpToolCall", input: { server: "eitri", tool: "nvim_exec", arguments: c.input } }), expanded);
+      expect(codex.querySelector(".tool-card-exec")?.textContent).toContain("Lua: local first = 1");
+      expect(codex.innerHTML.replace("mcpToolCall", c.name)).toBe(direct);
+      cleanup();
+    }
+  });
+
+  it("a_foreign_servers_nvim_exec_is_left_alone", () => {
+    draw(exec());
+    cleanup();
+    expect(lookupTool("mcp__other__nvim_exec")).toBeUndefined();
+    const c = call({ name: "mcpToolCall", input: { server: "other", tool: "nvim_exec", arguments: { kind: "lua", code } } });
+    const { container } = render(<>{renderToolCall(c, true)}</>);
+    expect(container.querySelector(".tool-card-exec")).toBeNull();
+    expect(container.textContent).toContain("other · nvim_exec");
+    cleanup();
+    const acp = render(<>{renderToolCall(call({ name: "acp:execute", input: { title: "Agent's own title", kind: "lua", code } }))}</>);
+    expect(acp.container.textContent).toContain("Agent's own title");
+    expect(acp.container.querySelector(".tool-card-exec")).toBeNull();
+  });
+});

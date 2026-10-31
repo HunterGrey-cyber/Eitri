@@ -435,7 +435,7 @@ pub(super) fn external_detail_rows(
     };
     let project_loaded = match tab.session.project_tiers.unwrap_or(next) {
         ProjectTrust::Trusted => "loaded",
-        ProjectTrust::Untrusted => "not loaded",
+        ProjectTrust::Untrusted | ProjectTrust::NothingFound => "not loaded",
     };
     let boundary = eitri_core::agent_backend::root_is_a_boundary(project_dir);
     let (backend_name, session_label, settings, runs_without_asking, mode_lag, limits_label, limits_value) = if is_codex

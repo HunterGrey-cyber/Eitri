@@ -195,6 +195,26 @@ pub fn file_hunks(
     }))
 }
 
+/// The patch between two stored blobs, parsed. A pair git calls binary has no hunks.
+pub fn blob_hunks(shadow: &Shadow, before: &str, after: &str) -> Result<Vec<Hunk>, ShadowError> {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    check_id(before)?;
+    check_id(after)?;
+    let _lock = shadow.lock_shared_until(deadline)?;
+    let mut cmd = shadow.git(None);
+    cmd.args([
+        "diff",
+        "--no-renames",
+        "-U3",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+    ]);
+    cmd.arg(before).arg(after).arg("--");
+    let output = diff_output("diff", cmd, before, after, deadline)?;
+    Ok(parse_unified(&String::from_utf8_lossy(&output)))
+}
+
 /// A tree-ish git can compare: the snapshot given, or the files on disk written out as a tree.
 fn resolve(shadow: &Shadow, side: &Side) -> Result<String, ShadowError> {
     match side {

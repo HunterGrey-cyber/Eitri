@@ -30,7 +30,7 @@ pub mod nofollow;
 mod plan;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use codex::{
@@ -40,7 +40,7 @@ pub use codex::{
 pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
-pub use plan::{trust_plan, NonUtf8};
+pub use plan::{eitri_server_name, eitri_server_taken, trust_plan, EditorServerName, NonUtf8};
 pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore, DISCLOSURE};
 
 /// How much discovery may look at before it stops and says so.
@@ -147,6 +147,9 @@ pub struct ProfileEnv {
     /// The MCP servers the user's own Codex configuration starts, with their definitions
     /// ([`UserCodexConfig::mcp_servers`]); `None` when that is not known.
     pub user_mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// Every server name in that configuration, the switched-off ones too
+    /// ([`UserCodexConfig::all_server_names`]); `None` when that is not known.
+    pub user_mcp_names: Option<BTreeSet<String>>,
     /// The user's Codex `config.toml` and why it could not be read, when it is there and could not be
     /// ([`UserCodexConfig::unreadable`]): the alternate names of `AGENTS.md` it may give are unknown,
     /// so a discovery cannot have hashed every file a session would load, and no answer about it
@@ -192,9 +195,13 @@ pub struct Discovery {
     /// [`ProfileEnv::user_mcp_servers`] as it was read for this discovery. Not part of the
     /// fingerprint: it is the user's own configuration, not the project's.
     pub user_mcp_servers: Option<BTreeMap<String, ServerDefinition>>,
+    /// [`ProfileEnv::user_mcp_names`] as it was read for this discovery. Not part of the fingerprint
+    /// either.
+    pub user_mcp_names: Option<BTreeSet<String>>,
     /// Each MCP server a project `.codex/config.toml` on the walk defines, by name with its
-    /// definition (a name defined in two walked directories is here twice). Not part of the
-    /// fingerprint, which already holds the files it is read from. Empty for every other profile.
+    /// definition (a name defined in two walked directories is here twice). A file that was not read
+    /// or parsed adds nothing here, and the entries and findings say so. Not part of the fingerprint,
+    /// which already holds the files it is read from. Empty for every other profile.
     pub project_mcp_servers: Vec<(String, ServerDefinition)>,
 }
 

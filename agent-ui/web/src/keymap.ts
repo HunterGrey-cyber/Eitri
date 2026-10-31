@@ -61,7 +61,8 @@ export type PanelActionName =
   | "panel.keymap"
   | "panel.handoff"
   | "mode.cycle"
-  | "tab.stop-background";
+  | "tab.stop-background"
+  | "tab.follow";
 
 /** One binding in the panel's key table, as `serialize_keymap_for_js`'s `panel.bindings` sends it:
  *  `keys` is vim notation split into tokens (`["<leader>", "b", "d"]`, `["H"]`), `source` says which

@@ -11,8 +11,8 @@ import * as reset322 from "./fold/reset";
 import protocol322 from "./fixtures/protocol-322.json";
 import questionsFixture from "./fixtures/questions.json";
 import { describe, expect, it, vi } from "vitest";
-import { applyCallNotes, applyEvent, applyEvents, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen } from "./reducer";
-import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
+import { applyCallNotes, applyEvent, applyEvents, applySnapshot, keepAfterFailure, initialState, MAX_HELD_DENIALS, resetToStartScreen, withEditorCards } from "./reducer";
+import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, EditorCardWire, TurnEndDetail, TurnOutcome, UsageInfo } from "./types";
 /** What Rust really sends for the turn-ending cases; written from its serializer. */
 import fixture from "./fixtures/turn-endings.json";
 /** Turn starts, notices and questions as Rust folds and sends them; written from its serializer. */
@@ -21,6 +21,8 @@ import historyRecords from "./fixtures/history-records.json";
  *  folds and sends them; written from its serializer. */
 import unseenTurns from "./fixtures/unseen-turns.json";
 import cliTurns from "./fixtures/cli-turns.json";
+/** The broker cards as Rust serialises them (`EditorCardWire`); `core/src/editor_tools/cards.rs` checks the same file byte for byte. */
+import editorCardsFixture from "./fixtures/editor-cards.json";
 
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
@@ -1893,5 +1895,58 @@ describe("event fold revisions", () => {
     ], [3]);
     expect(state.transcript[0].seq).toBe(10);
     expect(state.nextSeq).toBe(11);
+  });
+});
+
+describe("broker cards", () => {
+  const wires = editorCardsFixture as EditorCardWire[];
+
+  it("the_card_fixture_folds_as_rust_serialises_it", () => {
+    const snapshot = { ...initialState(), editorCards: wires } as unknown as AgentUiSnapshot;
+    const state = applySnapshot(initialState(), snapshot, 50);
+    expect(state.editorCards.map((card) => [card.permissionId, card.seq, card.toolName, card.toolUseId])).toEqual([
+      ["ec-0123456789abcdef-1", 41, "open_file", "toolu_01"],
+      ["ec-0123456789abcdef-2", 42, "open_file", "toolu_02"],
+      ["ec-0123456789abcdef-3", 43, "open_file", null],
+      ["ec-0123456789abcdef-4", 44, "open_file", null],
+      ["ec-0123456789abcdef-5", 45, "apply_proposal", "toolu_05"],
+    ]);
+    expect(state.editorCards.map((card) => card.editorCard)).toEqual(
+      wires.map((wire) => ({ title: wire.title, body: wire.body, ...(wire.proposal ? { proposal: wire.proposal } : {}) })),
+    );
+    expect(state.editorCards.map((card) => card.editorCard!.body[0].kind)).toEqual(["plain", "code", "agent", "warning", "plain"]);
+    // A card is never a provider's request and never takes the page's counter.
+    expect(state.pendingPermissions).toEqual([]);
+    expect(state.nextSeq).toBe(50);
+    expect(withEditorCards(state, []).editorCards).toEqual([]);
+    expect(withEditorCards(state, wires.slice(1)).nextSeq).toBe(50);
+  });
+
+  it("a snapshot without the key is a tab with none, and one that cannot be a list is too", () => {
+    expect(applySnapshot(initialState(), { ...initialState() } as unknown as AgentUiSnapshot, 0).editorCards).toEqual([]);
+    expect(applySnapshot(initialState(), { ...initialState(), editorCards: "x" } as unknown as AgentUiSnapshot, 0).editorCards).toEqual([]);
+  });
+
+  it("a snapshot drops a card the view cannot draw and keeps the rest", () => {
+    const good = wires[0];
+    const bad = { ...wires[1], body: "not a list" };
+    const state = applySnapshot(initialState(), { ...initialState(), editorCards: [good, bad, null, 7] } as unknown as AgentUiSnapshot, 0);
+    expect(state.editorCards.map((c) => c.permissionId)).toEqual([good.id]);
+  });
+
+  it("a conversation reset keeps a waiting broker card, and the call goes as Rust's projection drops it", () => {
+    const card = wires[0];
+    let state = withEditorCards(initialState(), [card]);
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: card.toolUseId!, name: "mcp__eitri__open_file", input: {} });
+    state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_other", name: "Read", input: {} });
+    state = applyEvent(state, { type: "conversation_reset", new_conversation_id: "c2", trigger: null });
+    expect(state.editorCards.map((c) => c.permissionId)).toEqual([card.id]);
+    expect(state.toolCalls).toEqual([]);
+  });
+
+  it("a lost session keeps no card, and the start screen none", () => {
+    const state = withEditorCards({ ...initialState(), userPrompts: [{ seq: 0, text: "hi" }] }, wires);
+    expect(keepAfterFailure(state, "gone")!.editorCards).toEqual([]);
+    expect(resetToStartScreen(state).editorCards).toEqual([]);
   });
 });

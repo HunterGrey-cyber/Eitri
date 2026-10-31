@@ -132,6 +132,11 @@ pub enum InboundMessage {
         tab: Option<u64>,
         running: u32,
     },
+    ToggleFollowing {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
     StopTask {
         request_id: String,
         #[serde(default)]
@@ -183,6 +188,17 @@ pub enum InboundMessage {
         /// rule broader than the one it was shown.
         #[serde(default)]
         remember: bool,
+    },
+    /// A person's answer to a card of the tool broker, by the card's own id. Gated exactly as a card answer. It
+    /// carries no reason and no rule, since a broker card offers neither, and goes to the broker, not to a
+    /// provider. A `decision` or an `origin` outside its closed set does not parse.
+    EditorCardAnswer {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        card_id: String,
+        decision: DecisionChoice,
+        origin: CardOriginChoice,
     },
     /// The question dock's submit: the person's answers to Claude's question set `interaction_id`, by
     /// option index and typed text, never as the answer's words (the sidecar builds those from the
@@ -419,6 +435,16 @@ pub enum InboundMessage {
         path: String,
         change: ProposedChange,
     },
+    /// `Ctrl+g` in BROWSE on the card of a proposal an editor tool computed: file number `file` of
+    /// proposal `proposal` of this tab, as the review store holds its two sides, in the read-only diff
+    /// tab. The page names the proposal and the file; the texts never come from it.
+    EditorCardView {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        proposal: String,
+        file: u32,
+    },
     /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
     HintRequest {
         request_id: String,
@@ -651,11 +677,14 @@ impl InboundMessage {
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::StopBackground { tab, .. }
+            | InboundMessage::ToggleFollowing { tab, .. }
             | InboundMessage::StopTask { tab, .. }
             | InboundMessage::TaskOutput { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
             | InboundMessage::HandoffToTerminal { tab, .. }
             | InboundMessage::PermissionResponse { tab, .. }
+            | InboundMessage::EditorCardAnswer { tab, .. }
+            | InboundMessage::EditorCardView { tab, .. }
             | InboundMessage::QuestionAnswer { tab, .. }
             | InboundMessage::QuestionDecline { tab, .. }
             | InboundMessage::Resume { tab, .. }
@@ -772,6 +801,23 @@ impl QuestionDeclineChoice {
     }
 }
 
+/// How an `editor_card_answer` was given, as a closed set: an unknown word is a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardOriginChoice {
+    Key,
+    Click,
+}
+
+impl CardOriginChoice {
+    pub fn origin(self) -> crate::editor_tools::cards::CardOrigin {
+        match self {
+            CardOriginChoice::Key => crate::editor_tools::cards::CardOrigin::Key,
+            CardOriginChoice::Click => crate::editor_tools::cards::CardOrigin::Click,
+        }
+    }
+}
+
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
 ///
 /// Typed on the wire so an unrecognized value is a PARSE failure, not a value some later `match`
@@ -785,6 +831,14 @@ pub enum DecisionChoice {
 }
 
 impl DecisionChoice {
+    /// The choice as a broker card takes it: a card has no reason to carry.
+    pub fn card_decision(self) -> crate::editor_tools::cards::CardDecision {
+        match self {
+            DecisionChoice::Allow => crate::editor_tools::cards::CardDecision::Allow,
+            DecisionChoice::Deny => crate::editor_tools::cards::CardDecision::Deny,
+        }
+    }
+
     /// Pairs the choice with its reason into the typed decision the backends take. An empty or
     /// whitespace-only reason becomes `None`: sending the model an empty string as its explanation
     /// is worse than sending it nothing.
@@ -805,11 +859,14 @@ impl InboundMessage {
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::Interrupt { request_id, .. }
             | InboundMessage::StopBackground { request_id, .. }
+            | InboundMessage::ToggleFollowing { request_id, .. }
             | InboundMessage::StopTask { request_id, .. }
             | InboundMessage::TaskOutput { request_id, .. }
             | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::HandoffToTerminal { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. }
+            | InboundMessage::EditorCardAnswer { request_id, .. }
+            | InboundMessage::EditorCardView { request_id, .. }
             | InboundMessage::QuestionAnswer { request_id, .. }
             | InboundMessage::QuestionDecline { request_id, .. }
             | InboundMessage::Resume { request_id, .. }
@@ -1851,7 +1908,7 @@ pub fn serialize_snapshot_for_js(
     view: &SnapshotView<'_>,
     turn_started_at_ms: Option<u64>,
 ) -> String {
-    serialize_snapshot_with_notes_for_js(tab, view, turn_started_at_ms, &CallNotes::default())
+    serialize_snapshot_with_notes_for_js(tab, view, turn_started_at_ms, &CallNotes::default(), &[])
 }
 
 /// [`serialize_snapshot_for_js`], with what `notes` says so a reload or a tab switch keeps it:
@@ -1860,12 +1917,14 @@ pub fn serialize_snapshot_for_js(
 /// card was raised OR when a card was never raised at all because the acceptEdits fast path
 /// answered it (`CallNotes::creates_file_call`), and `allowedByAuto: true` on
 /// a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered. Absent on
-/// every other entry, as in the events payload.
+/// every other entry, as in the events payload. `cards` are the tab's broker cards, which no projection holds:
+/// `editorCards`, left out when there are none.
 pub fn serialize_snapshot_with_notes_for_js(
     tab: crate::tabs::TabId,
     view: &SnapshotView<'_>,
     turn_started_at_ms: Option<u64>,
     notes: &CallNotes,
+    cards: &[crate::editor_tools::cards::EditorCardWire],
 ) -> String {
     let projection = &*view.projection;
     // Written out for the same stated reason as `transcript` just below: both field names happen
@@ -2148,6 +2207,9 @@ pub fn serialize_snapshot_with_notes_for_js(
         }
     }
     projection.snapshot_modules(&mut state);
+    if !cards.is_empty() {
+        state["editorCards"] = json!(cards);
+    }
 
     // Changes whose call has not started (Rust holds them and attaches them when it does): sent only
     // while there are any, so a page rebuilt from this snapshot attaches them at the same moment.
@@ -2483,6 +2545,7 @@ impl TabStateWire {
 /// One tab as the panel draws it (the tab bar, the chooser's open rows, the footer's mode pill).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabView {
+    pub following: bool,
     /// Live form mirrors keyed by interaction id; absent on the wire when empty.
     pub question_draft: std::collections::BTreeMap<String, Value>,
     pub id: crate::tabs::TabId,
@@ -2537,6 +2600,9 @@ pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], defau
                 "title": t.title,
                 "agent": t.agent,
             });
+            if t.following {
+                row["following"] = json!(true);
+            }
             if !t.question_draft.is_empty() {
                 row["questionDraft"] = json!(t.question_draft);
             }
@@ -2655,6 +2721,15 @@ pub fn serialize_confirm_close_others_for_js(tabs: &[crate::tabs::TabId], lines:
 /// `prefix ,`: open the inline rename field on the tab's label, prefilled with `current`.
 pub fn serialize_begin_rename_for_js(tab: crate::tabs::TabId, current: Option<&str>) -> String {
     json!({ "kind": "begin_rename", "tab": tab.0, "current": current }).to_string()
+}
+
+/// `{"kind":"editor_cards","tab":N,"cards":[...]}`: the tab's broker cards, replacing the page's whole list, sent
+/// whenever the set changes, empty included.
+pub fn serialize_editor_cards_for_js(
+    tab: crate::tabs::TabId,
+    cards: &[crate::editor_tools::cards::EditorCardWire],
+) -> String {
+    json!({ "kind": "editor_cards", "tab": tab.0, "cards": cards }).to_string()
 }
 
 /// A tab's queue (the `⧗` lines of held messages, and the `↪` lines of messages sent into the running turn and
@@ -8068,9 +8143,30 @@ mod tests {
     }
 
     #[test]
+    fn toggle_following_parses_and_names_its_tab() {
+        let message: InboundMessage =
+            serde_json::from_str(r#"{"type":"toggle_following","request_id":"follow-1","tab":3}"#).unwrap();
+        assert!(matches!(message, InboundMessage::ToggleFollowing { tab: Some(3), .. }));
+        assert_eq!(message.request_id(), "follow-1");
+        assert!(matches!(message.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+    }
+
+    #[test]
+    fn a_following_tab_says_so_and_another_says_nothing() {
+        let mut tabs = crate::tab_set::TabSet::new(crate::agent_backend::BackendKind::Sidecar, SessionModeChoice::Auto);
+        let first = tabs.active();
+        tabs.get_mut(first).unwrap().following = true;
+        tabs.open(crate::agent_backend::AgentId::Claude);
+        let value: Value = serde_json::from_str(&tabs.tabs_payload()).unwrap();
+        assert_eq!(value["tabs"][0]["following"], true);
+        assert!(value["tabs"][1].get("following").is_none());
+    }
+
+    #[test]
     fn the_tabs_envelope_lists_every_tab_with_its_marker_and_the_active_one() {
         let tabs = [
             TabView {
+                following: false,
                 question_draft: Default::default(),
                 id: TabId(1),
                 number: 1,
@@ -8088,6 +8184,7 @@ mod tests {
                 agent: "claude".into(),
             },
             TabView {
+                following: false,
                 question_draft: Default::default(),
                 id: TabId(4),
                 number: 2,
@@ -8130,6 +8227,7 @@ mod tests {
     #[test]
     fn a_manual_tab_and_a_manual_default_are_sent_as_manual() {
         let tabs = vec![TabView {
+            following: false,
             question_draft: Default::default(),
             id: TabId(1),
             number: 1,
@@ -8984,6 +9082,109 @@ mod question_message_tests {
         assert_eq!(kind.kind(), agent::QuestionDeclineKind::Chat);
         assert_eq!(so_far.len(), 1);
         assert_eq!(QuestionDeclineChoice::Cancel.kind(), agent::QuestionDeclineKind::Cancel);
+    }
+
+    #[test]
+    fn an_editor_card_answer_parses_its_decision_and_origin() {
+        let parsed = parse_inbound_message(
+            r#"{"type":"editor_card_answer","request_id":"r1","tab":3,"card_id":"ec-0-1","decision":"allow","origin":"key"}"#,
+        )
+        .expect("parses");
+        assert_eq!(parsed.request_id(), "r1");
+        assert!(matches!(parsed.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+        let InboundMessage::EditorCardAnswer {
+            card_id,
+            decision,
+            origin,
+            ..
+        } = parsed
+        else {
+            panic!("an editor_card_answer");
+        };
+        assert_eq!(card_id, "ec-0-1");
+        assert_eq!(
+            decision.card_decision(),
+            crate::editor_tools::cards::CardDecision::Allow
+        );
+        assert_eq!(origin.origin(), crate::editor_tools::cards::CardOrigin::Key);
+        assert_eq!(
+            CardOriginChoice::Click.origin(),
+            crate::editor_tools::cards::CardOrigin::Click
+        );
+        assert_eq!(
+            DecisionChoice::Deny.card_decision(),
+            crate::editor_tools::cards::CardDecision::Deny
+        );
+    }
+
+    #[test]
+    fn editor_card_view_parses() {
+        let parsed =
+            parse_inbound_message(r#"{"type":"editor_card_view","request_id":"r1","tab":3,"proposal":"p-2","file":1}"#)
+                .expect("parses");
+        assert_eq!(parsed.request_id(), "r1");
+        assert!(matches!(parsed.tab_ref(), TabRef::Named(crate::tabs::TabId(3))));
+        let InboundMessage::EditorCardView { proposal, file, .. } = parsed else {
+            panic!("an editor_card_view");
+        };
+        assert_eq!((proposal.as_str(), file), ("p-2", 1));
+    }
+
+    #[test]
+    fn a_missing_file_index_does_not_parse() {
+        for raw in [
+            r#"{"type":"editor_card_view","request_id":"r","tab":1,"proposal":"p-1"}"#,
+            r#"{"type":"editor_card_view","request_id":"r","tab":1,"proposal":"p-1","file":-1}"#,
+            r#"{"type":"editor_card_view","request_id":"r","tab":1,"file":0}"#,
+        ] {
+            assert!(parse_inbound_message(raw).is_none(), "{raw}");
+        }
+    }
+
+    /// `origin` says how the person answered, so nothing but the two words the page sends may stand for one.
+    #[test]
+    fn an_editor_card_answer_without_a_known_origin_does_not_parse() {
+        for raw in [
+            r#"{"type":"editor_card_answer","request_id":"r","tab":1,"card_id":"c","decision":"allow"}"#,
+            r#"{"type":"editor_card_answer","request_id":"r","tab":1,"card_id":"c","decision":"allow","origin":"agent"}"#,
+            r#"{"type":"editor_card_answer","request_id":"r","tab":1,"card_id":"c","decision":"always","origin":"key"}"#,
+            r#"{"type":"editor_card_answer","request_id":"r","tab":1,"decision":"allow","origin":"key"}"#,
+        ] {
+            assert!(parse_inbound_message(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_editor_card_answer_with_any_other_origin_does_not_parse() {
+        let answer = |origin: &str| {
+            format!(
+                r#"{{"type":"editor_card_answer","request_id":"r","tab":1,"card_id":"c","decision":"allow","origin":"{origin}"}}"#
+            )
+        };
+        for origin in ["agent", "host", "sweep", "bypass", "ctrl_y", "Key", "KEY", "click ", ""] {
+            assert!(parse_inbound_message(&answer(origin)).is_none(), "{origin:?}");
+        }
+        for origin in ["key", "click"] {
+            assert!(parse_inbound_message(&answer(origin)).is_some(), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn the_editor_cards_envelope_holds_the_shared_wire_shape() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../agent-ui/web/src/fixtures/editor-cards.json")).unwrap();
+        let cards: Vec<crate::editor_tools::cards::EditorCardWire> = serde_json::from_value(fixture.clone()).unwrap();
+        let envelope: Value =
+            serde_json::from_str(&serialize_editor_cards_for_js(crate::tabs::TabId(7), &cards)).unwrap();
+        assert_eq!(envelope["kind"], "editor_cards");
+        assert_eq!(envelope["tab"], 7);
+        assert_eq!(envelope["cards"], fixture);
+        let empty: Value = serde_json::from_str(&serialize_editor_cards_for_js(crate::tabs::TabId(7), &[])).unwrap();
+        assert_eq!(
+            empty["cards"],
+            json!([]),
+            "an empty list is what takes a card off the page"
+        );
     }
 
     #[test]

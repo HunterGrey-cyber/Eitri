@@ -78,6 +78,7 @@ fn open(provider: &ClaudeSidecarProvider, streaming: StreamingPreference) -> Str
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .expect("create_session should succeed")
 }

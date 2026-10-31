@@ -23,8 +23,9 @@ pub(super) enum Admission {
 /// Which messages from `view`'s page meet the window's gate: every answer that resolves a card or one
 /// of Claude's questions, starts a session the user was asked about, or loosens permissions -- a card
 /// answer, a question's answer or decline, a bypass `y`, a restore `y` (it resumes the saved bypass
-/// tabs in bypass) and a trust `y` or `n` (a covered page's question may not be the one the user
-/// read). `target` is the tab the message resolved to. Every
+/// tabs in bypass), a trust `y` or `n` (a covered page's question may not be the one the user
+/// read) and turning following on (the consent that lets edited files be loaded in the editor).
+/// `target` is the tab the message resolved to. Every
 /// variant is named, so a new message is classified when it is added rather than falling through
 /// ungated. Changes nothing.
 pub(super) fn admission(
@@ -75,6 +76,27 @@ pub(super) fn admission(
             Some(tab) => from_its_page(tab),
             // Unreachable (an answer names its tab, or it was refused when resolved); asking the
             // window is the side that refuses more.
+            None => Admission::Gated(view),
+        },
+        // A broker card meets the same gates. A tab frozen for a move answers no card: its calls end when it leaves,
+        // and one queued again now would run for a window the agent no longer talks to.
+        InboundMessage::EditorCardAnswer { .. } => match target {
+            Some(tab) => match from_its_page(tab) {
+                Admission::Gated(_) if state.tabs.is_moving(tab) => {
+                    Admission::Refused(eitri_core::tab_set::MOVING.into())
+                }
+                admitted => admitted,
+            },
+            None => Admission::Gated(view),
+        },
+        // Enabling following permits file loads, so only the tab's uncovered page can give that consent.
+        InboundMessage::ToggleFollowing { .. } => match target {
+            Some(tab) => match from_its_page(tab) {
+                Admission::Gated(_) if state.tabs.is_moving(tab) => {
+                    Admission::Refused(eitri_core::tab_set::MOVING.into())
+                }
+                admitted => admitted,
+            },
             None => Admission::Gated(view),
         },
         InboundMessage::ConfirmBypass { tab, scope, .. } => match scope.scope(*tab) {
@@ -137,6 +159,7 @@ pub(super) fn admission(
         | InboundMessage::OpenInEditor { .. }
         | InboundMessage::ViewInEditor { .. }
         | InboundMessage::ViewProposal { .. }
+        | InboundMessage::EditorCardView { .. }
         | InboundMessage::HintRequest { .. }
         | InboundMessage::HintTargets { .. }
         | InboundMessage::TabVerb { .. }
@@ -273,7 +296,74 @@ pub(super) fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_panel::editor_glue::tests::fixture as card_fixture;
     use crate::agent_panel::tests::*;
+
+    fn toggle(handle: &AgentPanelHandle, view: ViewId, tab: TabId, request: &str) {
+        handle.page_message(
+            view,
+            &serde_json::json!({
+                "type": "toggle_following", "request_id": request, "tab": tab.0,
+            })
+            .to_string(),
+        );
+    }
+
+    #[test]
+    fn a_toggle_from_a_covered_view_is_refused() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let tab = handle.state.borrow().tabs.active();
+        handle.set_answer_gate(Rc::new(|_| Err("agent is under terminal 2".into())));
+        toggle(&handle, ViewId::BASE, tab, "f1");
+        assert_eq!(
+            result_for(&page.sent.borrow(), "f1"),
+            Some(Err("agent is under terminal 2".into()))
+        );
+        assert!(!handle.state.borrow().tabs.get(tab).unwrap().following);
+        handle.set_answer_gate(Rc::new(|_| Ok(())));
+        toggle(&handle, ViewId::BASE, tab, "f2");
+        assert_eq!(result_for(&page.sent.borrow(), "f2"), Some(Ok(())));
+        assert!(handle.state.borrow().tabs.get(tab).unwrap().following);
+        handle.state.borrow_mut().editor_follower.edited(tab.0, "a.rs".into());
+        assert!(!handle.state.borrow().editor_follower.is_idle());
+        toggle(&handle, ViewId::BASE, tab, "f3");
+        assert_eq!(result_for(&page.sent.borrow(), "f3"), Some(Ok(())));
+        assert!(!handle.state.borrow().tabs.get(tab).unwrap().following);
+        assert!(handle.state.borrow().editor_follower.is_idle());
+    }
+
+    #[test]
+    fn a_toggle_from_another_page_is_refused() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let tab = handle.state.borrow().tabs.active();
+        attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_eq!(handle.break_out(view(2)), Ok(other));
+        toggle(&handle, ViewId::BASE, other, "f1");
+        assert!(result_for(&page.sent.borrow(), "f1")
+            .unwrap()
+            .unwrap_err()
+            .contains("not shown in this page"));
+        assert!(!handle.state.borrow().tabs.get(other).unwrap().following);
+        assert!(!handle.state.borrow().tabs.get(tab).unwrap().following);
+    }
+
+    #[test]
+    fn a_toggle_for_a_moving_tab_is_refused() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let tab = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.freeze_for_move(tab).unwrap();
+        toggle(&handle, ViewId::BASE, tab, "f1");
+        assert_eq!(
+            result_for(&page.sent.borrow(), "f1"),
+            Some(Err(eitri_core::tab_set::MOVING.into()))
+        );
+        assert!(!handle.state.borrow().tabs.get(tab).unwrap().following);
+    }
 
     #[test]
     fn task_commands_refuse_an_unknown_task_and_a_codex_tab() {
@@ -462,6 +552,111 @@ mod tests {
                 retired.into_backend().shutdown();
             }
         }
+    }
+
+    /// A covered page's card may not be the one the person read, so its key answers nothing, and the card waits.
+    #[test]
+    fn a_card_answer_from_a_covered_view_is_refused() {
+        const COVERED: &str = "agent is under terminal 2: C-b M-- from terminal 2 stows it";
+        let panel = card_fixture("admission-card-covered");
+        let card = panel.raise_a_card("c1");
+        let covered = Rc::new(Cell::new(true));
+        panel.handle.set_answer_gate(Rc::new({
+            let covered = covered.clone();
+            move |view: ViewId| {
+                assert_eq!(view, ViewId::BASE, "asked with the view of the page that answered");
+                if covered.get() {
+                    Err(COVERED.to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+
+        panel.answer_card(ViewId::BASE, "card-1", &card, "allow");
+        assert_eq!(
+            result_for(&panel.page.sent.borrow(), "card-1"),
+            Some(Err(COVERED.to_string()))
+        );
+        assert_eq!(panel.held_cards(), 1, "a refused answer leaves the card waiting");
+        panel.settle();
+        assert!(panel.editor.asked().is_empty());
+
+        covered.set(false);
+        panel.answer_card(ViewId::BASE, "card-2", &card, "allow");
+        assert_eq!(result_for(&panel.page.sent.borrow(), "card-2"), Some(Ok(())));
+        assert_eq!(panel.held_cards(), 0);
+    }
+
+    #[test]
+    fn a_card_answer_from_another_page_is_refused() {
+        let panel = card_fixture("admission-card-other-page");
+        let card = panel.raise_a_card("c1");
+        let second = attach_recording_page(&panel.handle, view(2));
+        panel.handle.page_message(view(2), READY);
+        assert_eq!(panel.handle.break_out(view(2)), Ok(panel.tab));
+        let asked_views = recording_gate(&panel.handle, &[], Rc::new(Cell::new(false)));
+        let number = panel.handle.state.borrow().tabs.get(panel.tab).unwrap().number;
+
+        panel.answer_card(ViewId::BASE, "card-1", &card, "allow");
+        assert_eq!(
+            result_for(&panel.page.sent.borrow(), "card-1"),
+            Some(Err(format!("tab {number} is not shown in this page")))
+        );
+        assert!(asked_views.borrow().is_empty(), "refused before the window is asked");
+        assert_eq!(panel.held_cards(), 1);
+
+        panel.answer_card(view(2), "card-2", &card, "allow");
+        assert_eq!(result_for(&second.sent.borrow(), "card-2"), Some(Ok(())));
+        assert_eq!(*asked_views.borrow(), vec![view(2)]);
+        assert_eq!(panel.held_cards(), 0);
+    }
+
+    /// A frozen tab's calls end when it leaves, so an answer now would run a call for an agent gone elsewhere.
+    #[test]
+    fn a_card_answer_for_a_moving_tab_is_refused() {
+        let panel = card_fixture("admission-card-moving");
+        let card = panel.raise_a_card("c1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let frozen = panel.handle.state.borrow_mut().tabs.freeze_for_move(panel.tab);
+            match frozen {
+                Ok(_) => break,
+                Err(eitri_core::tab_set::MoveRefusedWhy::Folding) if std::time::Instant::now() < deadline => {}
+                Err(why) => panic!("the tab does not freeze: {why:?}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        panel.answer_card(ViewId::BASE, "card-1", &card, "allow");
+        assert_eq!(
+            result_for(&panel.page.sent.borrow(), "card-1"),
+            Some(Err(eitri_core::tab_set::MOVING.to_string()))
+        );
+        assert_eq!(panel.held_cards(), 1);
+    }
+
+    /// A key can only name a card it was shown: an id the broker no longer holds answers nothing, once answered
+    /// included, and leaves the card that is waiting alone.
+    #[test]
+    fn a_stale_card_id_meets_no_such_card() {
+        const STALE: &str = "ec-0000000000000000-9";
+        let panel = card_fixture("admission-card-stale");
+        let card = panel.raise_a_card("c1");
+        panel.answer_card(ViewId::BASE, "card-1", STALE, "allow");
+        assert_eq!(
+            result_for(&panel.page.sent.borrow(), "card-1"),
+            Some(Err(format!("no such card: {STALE}")))
+        );
+        assert_eq!(panel.held_cards(), 1);
+
+        panel.answer_card(ViewId::BASE, "card-2", &card, "allow");
+        panel.answer_card(ViewId::BASE, "card-3", &card, "allow");
+        assert_eq!(result_for(&panel.page.sent.borrow(), "card-2"), Some(Ok(())));
+        assert_eq!(
+            result_for(&panel.page.sent.borrow(), "card-3"),
+            Some(Err(format!("no such card: {card}")))
+        );
     }
 
     /// A chat a float covers is off screen for attention: what finished in it stays unread while the

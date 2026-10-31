@@ -46,6 +46,7 @@ fn open(provider: &ClaudeSidecarProvider) -> String {
             cwd: std::env::temp_dir().to_string_lossy().to_string(),
             streaming: StreamingPreference::Partial,
             project: agent::setting_sources::ProjectTrust::Trusted,
+            client_tools: None,
         })
         .expect("create_session should succeed")
 }
@@ -120,6 +121,9 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::TaskEvent { .. } => "TaskEvent",
             AgentDomainEvent::ConversationReset { .. } => "ConversationReset",
             AgentDomainEvent::SubagentFrame { .. } => "SubagentFrame",
+            AgentDomainEvent::ClientToolCall { .. } => "ClientToolCall",
+            AgentDomainEvent::ClientToolCallSettled { .. } => "ClientToolCallSettled",
+            AgentDomainEvent::SessionServers { .. } => "SessionServers",
         };
         *counts.entry(kind).or_default() += 1;
     }

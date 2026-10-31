@@ -140,6 +140,12 @@ pub const BETA_POLICY: &[(&str, Policy)] = &[
             reason: "marks the session as unattended for the server; changes no answer",
         },
     ),
+    (
+        "token-counting-2024-11-01",
+        Policy::Accept {
+            reason: "sent on the count_tokens request the CLI makes before it puts an in-process MCP tool's answer in the conversation; the stand-in answers a character-based estimate",
+        },
+    ),
 ];
 
 /// Top-level body fields the CLI 2.1.311 sends beside the ones the stand-in reads, each with the stand-in's decision.

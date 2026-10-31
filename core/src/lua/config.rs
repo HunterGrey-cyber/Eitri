@@ -47,6 +47,19 @@ impl ConfigStore {
         self.values.get(key).map(Stored::as_str)
     }
 
+    /// Every key starting with `prefix` and its value as [`ConfigStore::get`] reads it, in key order, so a
+    /// reader that stops at the first bad key names the same one on every start.
+    pub fn keys_under(&self, prefix: &str) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = self
+            .values
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.as_str().to_owned()))
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Every key with the value [`Self::get`] gives for it, sorted by key.
     pub fn entries(&self) -> Vec<(String, String)> {
         let mut entries: Vec<(String, String)> = self
@@ -209,6 +222,26 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_under_a_prefix_come_in_key_order_as_get_reads_them() {
+        let mut store = ConfigStore::default();
+        for (key, value) in [
+            ("agent.editor.tool.b", Stored::Switch(false)),
+            ("agent.editor.tool.a", Stored::Text("on".to_owned())),
+            ("agent.editor.tools", Stored::Switch(true)),
+        ] {
+            store.values.insert(key.to_owned(), value);
+        }
+        assert_eq!(
+            store.keys_under("agent.editor.tool."),
+            vec![
+                ("agent.editor.tool.a".to_owned(), "on".to_owned()),
+                ("agent.editor.tool.b".to_owned(), "false".to_owned()),
+            ]
+        );
+        assert!(store.keys_under("nothing.").is_empty());
+    }
 
     #[test]
     fn entries_are_sorted_and_read_as_get_reads() {

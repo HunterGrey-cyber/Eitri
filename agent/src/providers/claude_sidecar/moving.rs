@@ -141,6 +141,7 @@ impl ClaudeSidecarProvider {
             splits_messages: _,
             provider_prompts: _,
             claude_code_prompt: _,
+            max_message_bytes: _,
             // Not carried: only a session create or resume reads it, and the taking side opens none.
             #[cfg(feature = "test-support")]
                 questions_override: _,
@@ -261,6 +262,7 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            max_message_bytes,
         } = handshake_with(&runtime, &sidecar, Some(child.pid))?;
         let mark = WatchMark {
             sequence: folded_through,
@@ -279,6 +281,7 @@ impl ClaudeSidecarProvider {
             splits_messages,
             provider_prompts,
             claude_code_prompt,
+            max_message_bytes,
             #[cfg(feature = "test-support")]
             questions_override: None,
             watches: Mutex::new(Vec::new()),

@@ -5,8 +5,8 @@
 
 use agent::providers::acp::{AcpAgentSpec, AcpProvider, ContextGauge};
 use agent::{
-    AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, ExternalProvider, ExternalStart,
-    InterruptTurnRequest, PermissionDecision, PermissionOutcome, ProviderError, ProviderErrorCode,
+    AgentDomainEvent, AgentProvider, CloseSessionRequest, ContentKind, DirTrust, EditorServerSpec, ExternalProvider,
+    ExternalStart, InterruptTurnRequest, PermissionDecision, PermissionOutcome, ProviderError, ProviderErrorCode,
     ResolvePermissionRequest, ResumeStatus, Reviewer, SendTurnRequest, TokenUsage, TrustPlan, TurnOutcome, TurnPolicy,
 };
 use serde_json::{json, Value};
@@ -151,6 +151,7 @@ fn start_request(resume: Option<&str>) -> ExternalStart {
             sandbox: agent::Sandbox::Project,
         },
         resume: resume.map(str::to_string),
+        editor_server: None,
     }
 }
 
@@ -1223,6 +1224,71 @@ fn replay() -> Vec<Value> {
         chunk("agent_message_chunk", "a2", "Ok"),
         update("saved-1", json!({"sessionUpdate": "session_info_update", "title": "t"})),
     ]
+}
+
+/// The editor's tool server as a host hands it over.
+fn editor_server() -> EditorServerSpec {
+    EditorServerSpec {
+        name: "eitri".to_string(),
+        command: PathBuf::from("/opt/eitri/eitri-editor-bridge"),
+        args: vec!["/run/user/1000/eitri/bridge.sock".to_string(), "key-1".to_string()],
+        cwd: PathBuf::from("/work"),
+    }
+}
+
+fn editor_entry() -> Value {
+    json!([{
+        "name": "eitri",
+        "command": "/opt/eitri/eitri-editor-bridge",
+        "args": ["/run/user/1000/eitri/bridge.sock", "key-1"],
+        "env": []
+    }])
+}
+
+#[test]
+fn the_editor_server_goes_out_on_new_and_on_load() {
+    let mut script = handshake(false);
+    script.extend([
+        expect_request(2, "session/new", json!({"cwd": "/work", "mcpServers": editor_entry()})),
+        reply(
+            2,
+            json!({"sessionId": "s1", "modes": {"currentModeId": "agent", "availableModes": []}}),
+        ),
+    ]);
+    let provider = connect(script, None).expect("connects");
+    let mut request = start_request(None);
+    request.editor_server = Some(editor_server());
+    assert_eq!(provider.start(request).expect("starts"), "s1");
+
+    let mut script = handshake(true);
+    script.extend([
+        expect_request(
+            2,
+            "session/load",
+            json!({"sessionId": "saved-1", "cwd": "/work", "mcpServers": editor_entry()}),
+        ),
+        reply(2, json!({"modes": {"currentModeId": "agent", "availableModes": []}})),
+    ]);
+    let provider = connect(script, None).expect("connects");
+    let mut request = start_request(Some("saved-1"));
+    request.editor_server = Some(editor_server());
+    assert_eq!(provider.start(request).expect("loads"), "saved-1");
+}
+
+#[test]
+fn no_server_sends_an_empty_list() {
+    // `boot` and `load_expect` expect `"mcpServers": []`, and a start with no server must match them.
+    let provider = connect(boot("agent"), None).expect("connects");
+    assert!(start_request(None).editor_server.is_none());
+    provider.start(start_request(None)).expect("starts");
+
+    let mut script = handshake(true);
+    script.extend([
+        load_expect(),
+        reply(2, json!({"modes": {"currentModeId": "agent", "availableModes": []}})),
+    ]);
+    let provider = connect(script, None).expect("connects");
+    provider.start(start_request(Some("saved-1"))).expect("loads");
 }
 
 #[test]

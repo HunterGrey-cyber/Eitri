@@ -45,7 +45,7 @@ import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { TurnChanges } from "./components/TurnChanges";
-import { buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
 import { codeBlockText, renderedText } from "./markdown";
@@ -269,6 +269,9 @@ const CTRL_Y_YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank
 /** What the band says when INPUT's `Ctrl+y` was let go more than `RELEASE_WAIT_MAX_MS` after it was
  *  pressed: a held key, which approves nothing even where no repeat came to refuse it. */
 const CTRL_Y_HELD_FLASH = "Ctrl+y held down approves nothing — tap it to approve";
+/** What the band says when INPUT's `Ctrl+y` is pressed with only a card of Eitri's own tool broker waiting: such a
+ *  card is answered by a key on its own row, never by a key that names no card. */
+const CTRL_Y_EDITOR_CARD_FLASH = "Ctrl+y does not answer an editor card: Esc, then a or d on the card";
 /** What the band says when `a` or INPUT's `Ctrl+y` would approve a card whose Approve is disabled: an ACP card
  *  whose agent offered no allow-once option, or one Eitri held back because the card cannot show the whole
  *  call. Nothing is sent; sending would only bring back the agent's refusal under a misleading reason. */
@@ -479,7 +482,7 @@ type FrozenSnapshot = {
  *  nothing waits. */
 function oldestPendingTool(state: AgentUiState): string | null {
   let oldest: (typeof state.pendingPermissions)[number] | null = null;
-  for (const request of state.pendingPermissions) {
+  for (const request of allCards(state)) {
     if (oldest === null || request.seq < oldest.seq) oldest = request;
   }
   return oldest?.toolName ?? null;
@@ -887,6 +890,8 @@ export default function App() {
   const [tasksInitialId, setTasksInitialId] = useState<string | null>(null);
   const tasksRef = useRef<TasksOverlayHandle>(null);
   const taskRequests = useRef(new Map<string, TabId>());
+  /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
+  const cardViews = useRef(new Map<string, number>());
   const taskScratchTab = useRef<TabId | null>(null);
   const stopTasksSignature = useRef("");
   /** The footer's transient line. `seq` so the same text twice is two flashes. */
@@ -1151,7 +1156,7 @@ export default function App() {
     }
   }
   /** Runs a table binding reached through the leader engine or a reserved-prefix pair (`[b`).
-   *  `tab.*` posts the window-level `tab_verb` `postToRust` directly
+   *  Tab navigation posts the window-level `tab_verb` through `postToRust` directly
    *  (never `post()`, which would add a `tab` this message has no field for -- Rust's own
    *  `InboundMessage::TabVerb` names none, since whichever tab is under the keys decides). */
   function runPanelAction(binding: PanelBinding) {
@@ -1205,6 +1210,13 @@ export default function App() {
         // running), that component shows why instead of the confirm dialog, rather than this key
         // doing nothing with no explanation.
         setHandoffOpen(true);
+        break;
+      }
+      case "tab.follow": {
+        const tab = activeTabInfo(tabsRef.current);
+        if (tab === null) break;
+        post({ type: "toggle_following" });
+        showFlash(tab.following ? "not following" : "following the agent in the editor");
         break;
       }
       case "tab.stop-background": {
@@ -1748,14 +1760,15 @@ export default function App() {
      is no longer pending: nothing can answer it any more, and an id the provider hands out again
      later names a new card. `state` is always the active tab's (a switch resets it, and both of
      these, in the same dispatch), so this never drops another tab's entry. */
+  const { pendingPermissions: heldCards, editorCards: heldEditorCards } = state;
   useEffect(() => {
-    const pending = new Set(state.pendingPermissions.map((p) => p.permissionId));
+    const pending = new Set(allCards({ pendingPermissions: heldCards, editorCards: heldEditorCards }).map((p) => p.permissionId));
     for (const id of permissionReasons.current.keys()) if (!pending.has(id)) permissionReasons.current.delete(id);
     const kept = [...answeredRef.current].filter((id) => pending.has(id));
     if (kept.length === answeredRef.current.size) return;
     answeredRef.current = new Set(kept);
     setAnsweredPermissions(answeredRef.current);
-  }, [state.pendingPermissions]);
+  }, [heldCards, heldEditorCards]);
   /** The typing guard (`./typingGuard`): every keydown `onKeyDown` sees is fed to it first; `a`/`d`/
    *  `D` wait `TYPING_GUARD_MS` through it, and Enter on a card button asks it. One per panel, kept
    *  across renders (the dispatch below is installed once and reads this same instance). */
@@ -3135,7 +3148,7 @@ export default function App() {
           if (switchedRef.current) {
             switchedRef.current = false;
             landOnLastRef.current = restoreRef.current === null || (restoreRef.current.atBottom && !arrived);
-            if (paneFocusedRef.current && payload.state.pendingPermissions.length > 0) setPermissionRequest((n) => n + 1);
+            if (paneFocusedRef.current && (payload.state.pendingPermissions.length > 0 || (payload.state.editorCards?.length ?? 0) > 0)) setPermissionRequest((n) => n + 1);
           }
           break;
         }
@@ -3214,7 +3227,7 @@ export default function App() {
                 mirrorDraft(recovered);
                 refusedEchoRef.current = { tab: record.tab, requestId: payload.requestId, at: performance.now() };
               }
-            } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background") {
+            } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow") {
               // A footer nicety, not the banner reserved for conversation-breaking errors.
               showFlash(payload.error);
             } else {
@@ -3531,12 +3544,13 @@ export default function App() {
    *  a tab is a protocol error, and this side must not manufacture the outbound mirror of that).
    *
    *  `edit_draft` is recorded as an `"editor"` in-flight request so its own refusal
-   *  flashes in the footer rather than filling `commandNotice`'s banner. */
+   *  flashes in the footer rather than filling `commandNotice`'s banner; so is `toggle_following`. */
   function post<M extends { type: string }>(message: M) {
     const tab = activeTabRef.current;
     if (tab === null) return;
     const requestId = nextRequestId();
     if (message.type === "edit_draft") trackRequest(requestId, { kind: "editor", tab });
+    if (message.type === "toggle_following") trackRequest(requestId, { kind: "follow", tab });
     postToRust({ ...message, request_id: requestId, tab } as unknown as OutboundMessage);
   }
 
@@ -3671,7 +3685,13 @@ export default function App() {
 
   /** Every answer to a card goes through here -- its own buttons, Enter in its reason box, and
    *  `a`/`d` -- so one card is answered once, whichever of them gets there first. */
-  function answerPermission(permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) {
+  function answerPermission(
+    permissionId: string,
+    decision: PermissionDecision,
+    reason?: string,
+    remember?: boolean,
+    origin: "key" | "click" = "click",
+  ) {
     const tab = activeTabRef.current;
     if (answeredRef.current.has(permissionId) || tab === null) return;
     answeredRef.current = new Set(answeredRef.current).add(permissionId);
@@ -3679,6 +3699,12 @@ export default function App() {
     // Recorded, so a refusal gives the card back (`inFlight`'s doc).
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "permission", tab, permissionId });
+    // A card Eitri's own tool broker raised is answered on its own message, by its own id, and carries how the
+    // person answered: no reason and no rule, which a broker card does not offer. Anything else is a provider's.
+    if (stateRef.current.editorCards.some((card) => card.permissionId === permissionId)) {
+      postToRust({ type: "editor_card_answer", request_id: requestId, tab, card_id: permissionId, decision, origin });
+      return;
+    }
     postToRust({
       type: "permission_response",
       request_id: requestId,
@@ -4447,7 +4473,7 @@ export default function App() {
     key = "",
   ) {
     if (stillThere === null) {
-      const waitingElsewhere = stateRef.current.pendingPermissions.some((p) => !answeredRef.current.has(p.permissionId));
+      const waitingElsewhere = allCards(stateRef.current).some((p) => !answeredRef.current.has(p.permissionId));
       showFlash(waitingElsewhere ? CARD_ELSEWHERE_FLASH : NO_CARD_FLASH);
       return;
     }
@@ -4495,13 +4521,13 @@ export default function App() {
               !answeredRef.current.has(permissionId) &&
               now.status.kind !== "unavailable" &&
               now.status.kind !== "closed" &&
-              now.pendingPermissions.some((p) => p.permissionId === permissionId)
+              allCards(now).some((p) => p.permissionId === permissionId)
             );
           };
     waitThenAnswer(event, typedAt, stillThere, () => {
       if (permissionId === null) return;
       const reason = decision === "deny" ? permissionReasons.current.get(permissionId) || undefined : undefined;
-      answerPermission(permissionId, decision, reason);
+      answerPermission(permissionId, decision, reason, undefined, "key");
     });
   }
 
@@ -4523,7 +4549,18 @@ export default function App() {
     if (!isComposerBox(box) && !(box instanceof HTMLElement && box.closest(".question-dock"))) return;
     const index = sessionEnded ? null : oldestWaitingPermission(timeline, answeredRef.current);
     const item = index === null ? undefined : timeline[index];
-    if (item?.kind !== "permission") return;
+    if (item?.kind !== "permission") {
+      // Nothing a `Ctrl+y` may answer waits. A broker card does, though: only a key on its own row answers it, so
+      // the key is claimed and says so, rather than yanking text as if nothing were waiting.
+      const brokerWaiting = !sessionEnded && timeline.some(
+        (row) => row.kind === "permission" && row.request.editorCard !== undefined && !answeredRef.current.has(row.request.permissionId),
+      );
+      if (brokerWaiting) {
+        event.preventDefault();
+        showFlash(CTRL_Y_EDITOR_CARD_FLASH);
+      }
+      return;
+    }
     event.preventDefault();
     if (!cardApprovable(item.request)) {
       showFlash(NOT_APPROVABLE_FLASH);
@@ -4566,7 +4603,7 @@ export default function App() {
           answeredRef.current.has(permissionId) ||
           now.status.kind === "unavailable" ||
           now.status.kind === "closed" ||
-          !now.pendingPermissions.some((p) => p.permissionId === permissionId)
+          !allCards(now).some((p) => p.permissionId === permissionId)
         ) {
           return;
         }
@@ -5808,6 +5845,10 @@ export default function App() {
         // Another agent's card has no reason box: its deny carries no reason, so `D` says what happens
         // instead of waiting for a box that is not there.
         const targetItem = target === null ? undefined : timeline[target];
+        if (targetItem?.kind === "permission" && targetItem.request.editorCard !== undefined) {
+          showFlash("an editor card takes no reason with a deny; d denies");
+          break;
+        }
         if (targetItem?.kind === "permission" && isExternalTool(targetItem.request.toolName)) {
           showFlash(`${agentTitle(activeTabInfo(tabsRef.current)?.agent)} takes no reason with a deny; d denies`);
           break;
@@ -6146,6 +6187,17 @@ export default function App() {
         if (item === undefined) break;
         const requestId = nextRequestId();
         trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+        const stored = item.kind === "permission" ? item.request.editorCard?.proposal : undefined;
+        const tab = activeTabRef.current;
+        if (item.kind === "permission" && stored !== undefined && tab !== null) {
+          // A proposal an editor tool computed: the shell holds both sides of each file, and one file shows per press.
+          const { files } = stored;
+          const shown = (cardViews.current.get(item.request.permissionId) ?? 0) % files.length;
+          cardViews.current.set(item.request.permissionId, shown + 1);
+          if (files.length > 1) showFlash(revealedText(`${shown + 1} of ${files.length}: ${files[shown]}`));
+          postToRust({ type: "editor_card_view", request_id: requestId, tab, proposal: stored.id, file: shown });
+          break;
+        }
         const proposal = proposalOf(item, answeredRef.current);
         if (proposal !== null) {
           postToRust({ type: "view_proposal", request_id: requestId, path: proposal.path, change: proposal.change });
@@ -6659,7 +6711,7 @@ export default function App() {
             ?? (state.apiRetry ? revealedText(cliPhaseText(state) ?? "API retry") : null)
             ?? (state.rateLimitWarning ? `Usage limit warning${typeof state.rateLimitWarning.scalars.resets_at_ms === "number" ? ` · limit resets ${new Date(state.rateLimitWarning.scalars.resets_at_ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false })}` : ""}` : null),
           unread: unreadLabel,
-          cards: state.pendingPermissions.length,
+          cards: allCards(state).length,
           questions: waitingQuestions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
@@ -6680,6 +6732,7 @@ export default function App() {
           recovery: reviewRecovery.length > 0 ? { path: reviewRecovery[0].path, more: reviewRecovery.length - 1 } : null,
           // Commands this tab's agent left running after its turns ended; nothing while there are none.
           background: sessionEnded ? null : state.backgroundCalls,
+          following: activeTab?.following,
           backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}
         paneFocused={paneFocused}

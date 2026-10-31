@@ -25,7 +25,7 @@ pub fn plan(project: &Path, trust: DirTrust) -> TrustPlan {
 
 /// The session config for a project, with the account's own tool servers `user_mcp_names` disabled.
 pub fn config(project: &Path, trust: DirTrust, user_mcp_names: &[&str]) -> SessionConfig {
-    session_config(&plan(project, trust))
+    session_config(&plan(project, trust), None)
         .expect("a config for the test project")
         .with_tool_servers_off(user_mcp_names)
 }

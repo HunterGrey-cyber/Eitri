@@ -39,6 +39,12 @@ pub trait EditorRpc {
     /// The order above holds within one target: a call to the next editor is not ordered with one
     /// still out at the last.
     fn target(&self) -> Option<u64>;
+
+    /// Whether the person can see this editor now. Only a window that lays the editor out can say no: any other
+    /// transport reaches an nvim of the person's own, in a place Eitri does not know.
+    fn on_screen(&self) -> bool {
+        true
+    }
 }
 
 impl EditorRpc for NvimLink {

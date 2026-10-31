@@ -12,7 +12,7 @@ use agent::providers::codex::wire::{
     ThreadTurnsListResponse, TurnStartParams, TurnStartResponse, TurnStatus,
 };
 use agent::Sandbox;
-use agent::{DirTrust, Reviewer, TrustPlan};
+use agent::{DirTrust, EditorServerSpec, Reviewer, TrustPlan};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -43,7 +43,7 @@ fn untrusted_up_to_slash(root: &str) -> TrustPlan {
 
 /// The config for a plan, as the JSON that goes on the wire.
 fn config_json(p: &TrustPlan) -> Value {
-    session_config(p).expect("config").as_value().clone()
+    session_config(p, None).expect("config").as_value().clone()
 }
 
 fn projects(config: &Value) -> BTreeMap<String, String> {
@@ -168,7 +168,7 @@ fn non_utf8_root_refuses_codex() {
         fingerprint: "f".into(),
         project_only: Vec::new(),
     };
-    match session_config(&p) {
+    match session_config(&p, None) {
         Err(SessionConfigError::NonUtf8Root(path)) => assert_eq!(path, root),
         other => panic!("a non-UTF-8 directory must refuse the start, got {other:?}"),
     }
@@ -177,15 +177,15 @@ fn non_utf8_root_refuses_codex() {
 #[test]
 fn a_plan_that_could_not_be_named_exactly_refuses() {
     assert!(matches!(
-        session_config(&plan(&[], true)),
+        session_config(&plan(&[], true), None),
         Err(SessionConfigError::NoDirectories)
     ));
     assert!(matches!(
-        session_config(&plan(&[("relative/dir", DirTrust::Untrusted)], true)),
+        session_config(&plan(&[("relative/dir", DirTrust::Untrusted)], true), None),
         Err(SessionConfigError::NotCanonical(_))
     ));
     assert!(matches!(
-        session_config(&plan(&[("/a/../b", DirTrust::Untrusted)], true)),
+        session_config(&plan(&[("/a/../b", DirTrust::Untrusted)], true), None),
         Err(SessionConfigError::NotCanonical(_))
     ));
     // Each refusal reads as a sentence a notice can carry.
@@ -195,7 +195,7 @@ fn a_plan_that_could_not_be_named_exactly_refuses() {
 
 #[test]
 fn tool_servers_are_turned_off_by_name_for_tests_only() {
-    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true))
+    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true), None)
         .expect("config")
         .with_tool_servers_off(&["computer.use", "probe"]);
     let servers = &config.as_value()["mcp_servers"];
@@ -208,9 +208,107 @@ fn tool_servers_are_turned_off_by_name_for_tests_only() {
     assert_eq!(config.as_value()["projects"]["/p"]["trust_level"], "untrusted");
 }
 
+/// The server a session is asked to run, with absolute paths as the panel gives them.
+fn editor_spec() -> EditorServerSpec {
+    EditorServerSpec {
+        name: "eitri".into(),
+        command: PathBuf::from("/opt/eitri/eitri-editor-bridge"),
+        args: vec!["/run/user/1000/eitri/ed-00".into(), "a-key".into()],
+        cwd: PathBuf::from("/p"),
+    }
+}
+
+#[test]
+fn the_editor_server_entry_is_nested_and_states_every_field() {
+    let trusted = plan(&[("/p", DirTrust::Trusted)], false);
+    let config = session_config(&trusted, Some(&editor_spec())).expect("config");
+    assert_eq!(
+        config.as_value()["mcp_servers"],
+        json!({"eitri": {
+            "command": "/opt/eitri/eitri-editor-bridge",
+            "args": ["/run/user/1000/eitri/ed-00", "a-key"],
+            "env": {},
+            "cwd": "/p",
+            "enabled": true,
+            "startup_timeout_sec": 15,
+            "tool_timeout_sec": 900,
+            "default_tools_approval_mode": "approve",
+        }}),
+        "an unstated field would fall to whatever the user's or Codex's default says"
+    );
+    // Nothing else in the config moves for it.
+    let mut rest = config.as_value().clone();
+    rest.as_object_mut().unwrap().remove("mcp_servers");
+    assert_eq!(rest, config_json(&trusted));
+}
+
+#[test]
+fn no_editor_server_sends_no_mcp_servers() {
+    let config = config_json(&plan(&[("/p", DirTrust::Trusted)], false));
+    assert!(config.get("mcp_servers").is_none(), "{config}");
+}
+
+#[test]
+fn resume_sends_it_again() {
+    let config = session_config(&plan(&[("/p", DirTrust::Trusted)], false), Some(&editor_spec())).expect("config");
+    let resume = serde_json::to_value(ThreadResumeParams::new(
+        "t1".into(),
+        "/p".into(),
+        Reviewer::User,
+        Sandbox::Project,
+        config.clone(),
+    ))
+    .unwrap();
+    assert_eq!(resume["config"]["mcp_servers"], config.as_value()["mcp_servers"]);
+    assert!(resume["config"]["mcp_servers"]["eitri"].is_object(), "{resume}");
+}
+
+#[test]
+fn no_dotted_key_appears() {
+    let mut spec = editor_spec();
+    // A dot in a path or a name stays inside one key or one value: the app-server splits only top-level keys.
+    spec.name = "ei.tri".into();
+    spec.cwd = PathBuf::from("/a.b/c");
+    let config = session_config(&plan(&[("/a.b/c", DirTrust::Trusted)], false), Some(&spec)).expect("config");
+    let keys: Vec<&String> = config.as_value().as_object().unwrap().keys().collect();
+    assert!(keys.iter().all(|key| !key.contains('.')), "{keys:?}");
+    assert_eq!(config.as_value()["mcp_servers"]["ei.tri"]["cwd"], "/a.b/c");
+}
+
+#[test]
+fn a_relative_cwd_is_refused() {
+    let trusted = plan(&[("/p", DirTrust::Trusted)], false);
+    let relative_cwd = EditorServerSpec {
+        cwd: PathBuf::from("p"),
+        ..editor_spec()
+    };
+    assert_eq!(
+        session_config(&trusted, Some(&relative_cwd)),
+        Err(SessionConfigError::NotCanonical(PathBuf::from("p")))
+    );
+    let relative_command = EditorServerSpec {
+        command: PathBuf::from("eitri-editor-bridge"),
+        ..editor_spec()
+    };
+    assert_eq!(
+        session_config(&trusted, Some(&relative_command)),
+        Err(SessionConfigError::NotCanonical(PathBuf::from("eitri-editor-bridge")))
+    );
+}
+
+#[test]
+fn turning_tool_servers_off_keeps_the_editor_server() {
+    let config = session_config(&plan(&[("/p", DirTrust::Trusted)], false), Some(&editor_spec()))
+        .expect("config")
+        .with_tool_servers_off(&["probe"]);
+    let servers = &config.as_value()["mcp_servers"];
+    assert_eq!(servers["probe"], json!({"enabled": false}));
+    assert_eq!(servers["eitri"]["enabled"], true);
+}
+
 #[test]
 fn params_carry_the_allowlisted_policy() {
-    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true)).expect("config");
+    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true), None).expect("config");
     let start = serde_json::to_value(ThreadStartParams::new(
         "/p".into(),
         Reviewer::Agent,
@@ -290,7 +388,7 @@ fn answers_are_only_accept_decline_cancel_and_an_empty_turn_grant() {
 /// turn all say at a root that is no boundary.
 #[test]
 fn the_read_only_sandbox_on_the_wire() {
-    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true)).expect("config");
+    let config = session_config(&plan(&[("/p", DirTrust::Untrusted)], true), None).expect("config");
     let start = ThreadStartParams::new("/p".into(), Reviewer::User, Sandbox::ReadOnly, config.clone());
     assert_eq!(serde_json::to_value(start).unwrap()["sandbox"], "read-only");
     let resume = ThreadResumeParams::new("t1".into(), "/p".into(), Reviewer::User, Sandbox::ReadOnly, config);

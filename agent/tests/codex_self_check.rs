@@ -248,6 +248,64 @@ fn self_check_fails_when_the_project_is_trusted() {
     assert!(reasons.iter().any(|r| r.contains("instruction file")), "{reasons:?}");
 }
 
+/// The one binary's verdict and log under `state`, as they lay after a run.
+fn recorded(state: &Path) -> (Option<serde_json::Value>, String) {
+    let dir = std::fs::read_dir(state.join("codex-check"))
+        .expect("the check's directory")
+        .flatten()
+        .next()
+        .expect("one binary")
+        .path();
+    let verdict = std::fs::read_to_string(dir.join("verdict.json"))
+        .ok()
+        .map(|text| serde_json::from_str(&text).expect("the verdict is JSON"));
+    (
+        verdict,
+        std::fs::read_to_string(dir.join("check.log")).expect("the log"),
+    )
+}
+
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_good_binary_passes_with_the_lever_held() {
+    let scratch = Scratch::new("lever-held");
+    let checked = ensure_checked(&real_codex(), &scratch.state()).expect("the check passes");
+    let (verdict, log) = recorded(&scratch.state());
+    assert!(checked.editor_server_lever, "{log}");
+    let verdict = verdict.expect("the pass is recorded");
+    assert_eq!(verdict["editor_server_lever"], serde_json::json!(true), "{log}");
+    assert!(
+        log.contains("the tool's call ran = true; Codex asked about it = false"),
+        "{log}"
+    );
+
+    // The verdict answers the next start with the lever, without running anything.
+    let again = ensure_checked(&real_codex(), &scratch.state()).expect("the cached verdict");
+    assert_eq!(again, checked);
+}
+
+/// A check that could not notice the lever gone would prove nothing, and the verdict must still be a pass:
+/// what was lost is the editor's tools, not the tab.
+#[test]
+#[ignore = "runs the real codex (on PATH) against the scripted model; no login, no network"]
+fn a_lost_approval_lever_passes_the_check_and_records_it_false() {
+    let scratch = Scratch::new("lever-lost");
+    let tweaks = CheckTweaks {
+        drop_approval_lever: true,
+        ..CheckTweaks::default()
+    };
+    let checked =
+        ensure_checked_tweaked(&real_codex(), &scratch.state(), &tweaks).expect("a lost lever fails no start");
+    let (verdict, log) = recorded(&scratch.state());
+    assert!(!checked.editor_server_lever, "{log}");
+    assert!(log.contains("the editor server's approval mode held = false"), "{log}");
+    assert!(
+        log.contains("Codex asked about it = true"),
+        "the lever must be lost to Codex asking, not to a server that never ran: {log}"
+    );
+    assert!(verdict.is_none(), "a run with a deliberate fault records no verdict");
+}
+
 /// A state directory under `/tmp`, where Codex's sandbox always lets commands write: the check puts the files
 /// it must keep commands from writing elsewhere and passes on a Codex that keeps its levers.
 #[test]

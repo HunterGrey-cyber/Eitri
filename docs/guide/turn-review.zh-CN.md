@@ -1,5 +1,5 @@
 [English](turn-review.md) | 简体中文
-<!-- translated-from: turn-review.md sha256=3d5bfe4e894f902384b0ffa076603de6a79942d065db4681576b60b74eec3542 -->
+<!-- translated-from: turn-review.md sha256=c17bdbac71cf2265709b3cd617dba348fe1a13c2866969a5d9c6d0d6c2f5115b -->
 
 # 审阅一个回合
 
@@ -47,7 +47,7 @@ agent 在你的项目上工作之后，回合审阅回答一个问题：在那�
 `Ctrl+g on its card shows the proposal`。
 
 在浏览模式里，对一张还在等待的编辑卡片按 `Ctrl+g`，会在 Neovim 里打开一个新标签页：左边是磁盘上现在的文件，右边是这次编辑之后的文件，以 diff 模式对比，两边都只读；`q` 关闭这个标签页。
-文件本身不会被写入，你自己的缓冲区也不会被动到。这适用于 Claude 的 `Edit`、`MultiEdit` 或 `Write`，Codex 新增一个文件的改动，以及 ACP 智能体对一个文件的编辑。Codex 对已有文件的改动、涉及多个文件的改动、删除或移动，会像 `Ctrl+g` 在其他行上那样显示卡片的文字。
+文件本身不会被写入，你自己的缓冲区也不会被动到。这适用于 Claude 的 `Edit`、`MultiEdit` 或 `Write`，Codex 新增一个文件的改动，以及 ACP 智能体对一个文件的编辑。Codex 对已有文件的改动、涉及多个文件的改动、删除或移动，会像 `Ctrl+g` 在其他行上那样显示卡片的文字。agent 的[提议](editor-tools.zh-CN.md#proposals)的卡片在多个文件时是例外：每按一次，为其中一个文件打开这样的对比。
 
 如果卡片出现之后文件变了、这次编辑已经对不上它，状态栏会显示
 `the proposal no longer applies to <path> as it is on disk`，而不是拿错的文字去做对比。不是普通文件的路径、超过 4 MiB 的文件或提议文本，以及不是 UTF-8 文本的文件也会这样被拒绝，并说明原因。只改换行符的改动也会显示出来：一侧是 CR-LF、另一侧是 LF 时，CR 显示为 `^M`；加上或去掉末尾的换行，会显示为最后多出一个空行。

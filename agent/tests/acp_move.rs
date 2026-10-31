@@ -173,6 +173,7 @@ fn running_as(argv: Vec<OsString>) -> AcpProvider {
                 sandbox: agent::Sandbox::Project,
             },
             resume: None,
+            editor_server: None,
         })
         .expect("starts");
     provider
@@ -463,6 +464,7 @@ fn a_saved_session_still_replaying_refuses_the_move_at_once() {
                     sandbox: agent::Sandbox::Project,
                 },
                 resume: Some("s1".to_string()),
+                editor_server: None,
             })
         });
         let end = Instant::now() + Duration::from_secs(10);

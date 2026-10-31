@@ -709,6 +709,7 @@ fn on_ready_batch(projection: &AgentSessionProjection) -> Vec<String> {
         resumes_on_r: false,
         title: None,
         agent: "claude".into(),
+        following: false,
     }];
     vec![
         serialize_hello_for_js(&greeting),

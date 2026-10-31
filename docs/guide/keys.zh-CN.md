@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=28604921bbaeb86f8202e18cfd7ea25e4c04830d8bef6a4dfb2d316d901f33ce -->
+<!-- translated-from: keys.md sha256=1ada51e6ec4ef4a61753380fbce179b422190b87e4ad9d16d735dcefa0024b73 -->
 
 # 按键
 
@@ -379,7 +379,7 @@ end
 | `Ctrl+w` / `Ctrl+u` | 删除一个词 / 删到行首 |
 | `Ctrl+a` / `Ctrl+e` | 把光标移到当前行的行首 / 行尾 |
 | `Ctrl+c` | 中断正在运行的回合；空闲时，把输入框清空并存入历史 |
-| `Ctrl+y` | 批准这个标签页里等得最久的卡片（见[回答一张卡片](#answering-a-card)） |
+| `Ctrl+y` | 批准这个标签页里等得最久的卡片，agent 的[编辑器工具](editor-tools.zh-CN.md#cards)的卡片除外（见[回答一张卡片](#answering-a-card)） |
 | `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来；`:q!` 什么都不改，除非你已经用 `:w` 保存过草稿，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（BROWSE 里也有） |
 | `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)；Claude 问你的选择题它永远不会回答（[Claude 的提问](#claudes-questions)） |
@@ -419,7 +419,7 @@ end
 | `Ctrl+o` | 详细视图：每个结果、更长的摘录、没有折叠的连续调用 |
 | `y` | 复制这一行（消息、命令或路径），或 HINT 落到的那个代码块；复制的内容也会进入主选区（primary selection），所以鼠标中键也能粘贴 |
 | `Y` | 复制一个工具行的全部输出 |
-| `Ctrl+g` | 在 Neovim 的一个临时缓冲区里打开这一行的全部文字；在一张只改一个文件、还在等待的编辑卡片上（Claude 的 `Edit`、`MultiEdit` 或 `Write`，Codex 新增一个文件的改动，ACP 智能体对一个文件的编辑），则在 Neovim 的一个新标签页里把磁盘上的文件和这次编辑之后的文件并排对比，两边都只读（`q` 关闭；见[审阅一个回合](turn-review.zh-CN.md#before-you-approve)）；其他卡片照旧显示它的文字 |
+| `Ctrl+g` | 在 Neovim 的一个临时缓冲区里打开这一行的全部文字；在一张只改一个文件、还在等待的编辑卡片上（Claude 的 `Edit`、`MultiEdit` 或 `Write`，Codex 新增一个文件的改动，ACP 智能体对一个文件的编辑），则在 Neovim 的一个新标签页里把磁盘上的文件和这次编辑之后的文件并排对比，两边都只读（`q` 关闭；见[审阅一个回合](turn-review.zh-CN.md#before-you-approve)）；在 agent 的[提议](editor-tools.zh-CN.md#proposals)的卡片上，对其中一个文件显示同样的对比，每按一次换下一个文件；其他卡片照旧显示它的文字 |
 | `gf` | 在编辑器里打开这一行上的文件路径，包括权限卡片或编辑行的文件标题里的路径（有多个时按字母选） |
 | `gx` | 在浏览器里打开这一行的网页链接（有多个时按字母选） |
 | `/` | 在对话里搜索；`Enter` 保留匹配，`Esc` 返回 |
@@ -453,6 +453,7 @@ end
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
 | `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
+| `Space e`（`<leader>e`） | 为当前标签页开关编辑器跟随；默认关闭，不会移动你的光标 |
 | `<leader>?` | 按键列表 |
 
 你可以在[自己的配置](configuration.zh-CN.md)里修改它们。
@@ -516,7 +517,7 @@ BROWSE 里的 `v` 在光标所在的那一行上放一个插入符，`V` 直接�
 | `h` / `l`，然后 `Enter` | 走到卡片的某个按钮上并按下它 |
 | `]p` / `[p` | 把光标移到下一张 / 上一张等待中的卡片 |
 
-在 INSERT 里，`Ctrl+y` 批准这个标签页里等得最久的卡片，状态条会点出它将要批准的那张卡片。输入框里没有用来拒绝的键，因为拒绝可以带一个你想输入的理由。
+在 INSERT 里，`Ctrl+y` 批准这个标签页里等得最久的卡片，状态条会点出它将要批准的那张卡片。输入框里没有用来拒绝的键，因为拒绝可以带一个你想输入的理由。agent 的[编辑器工具](editor-tools.zh-CN.md#cards)的卡片不归 `Ctrl+y` 管：先按 `Esc`，再在卡片上按 `a` 或 `d`。在这种卡片上按 `D` 不带理由。
 
 这些键只有单独按下时才回答。如果在之前或之后大约四分之一秒内按过别的键，`a`、`d`、`D` 和按钮上的 `Enter` 什么都不做；`Ctrl+y` 以同样的方式被拒绝，在 readline 的删除键（`Ctrl+u`、`Ctrl+w`、`Ctrl+k`）之后也是，在它指向的那张卡片变化后的四分之一秒内也是。按键被拒绝时，状态条会说明原因。它们都不接受数字，按住不放的重复键绝不会回答，按住 `Ctrl`、`Alt`、`Super` 或 `AltGr` 的键也不会回答（`D` 是用 `Shift` 打出来的）。按钮上的 `Enter` 只有在 `h`、`l` 或 `Tab` 刚把焦点移到它上面之后，或者 HINT 刚落到它上面时才回答。已经结束的会话的卡片无法回答。
 

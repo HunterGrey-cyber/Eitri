@@ -19,9 +19,14 @@
 //! directory would then have no entry, and Codex writes `trusted` for it into the user's own
 //! `config.toml`. Keys inside an object are not split, so a directory name is always one key of the
 //! `projects` object.
+//!
+//! **The editor's tool server is the one server Eitri adds.** Every field of its entry is stated, because a
+//! runtime entry merges per key with a same-named one in the user's or the project's file; the host does not
+//! ask for it when either names the server. It runs outside the command sandbox, as every MCP server of
+//! Codex's does: the bridge is Eitri's own program and writes nothing.
 
 use super::wire::{trust_level_word, SandboxPolicyWire};
-use crate::external::{DirTrust, Reviewer, Sandbox, TrustPlan};
+use crate::external::{DirTrust, EditorServerSpec, Reviewer, Sandbox, TrustPlan};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -33,6 +38,12 @@ pub const APPROVAL_POLICY: &str = "on-request";
 
 /// Writes inside the project, no network, no sockets; reads are not restricted.
 pub const SANDBOX_MODE: &str = "workspace-write";
+
+/// How long Codex waits for the editor's server to answer `initialize`: a turn started before that gets no tool.
+const EDITOR_SERVER_STARTUP_SEC: u32 = 15;
+
+/// How long a call of the editor's server may run: above the ten minutes a card may wait for a person.
+const EDITOR_SERVER_TOOL_TIMEOUT_SEC: u32 = 900;
 
 /// The per-turn sandbox policy's `type`; it must name the same sandbox as [`SANDBOX_MODE`].
 const SANDBOX_POLICY_TYPE: &str = "workspaceWrite";
@@ -103,7 +114,7 @@ impl std::error::Error for SessionConfigError {}
 /// The `config` object a `thread/start` or `thread/resume` carries.
 ///
 /// Its contents are private and only [`session_config`] makes one, so no caller can add a top-level key
-/// (a dotted path, `hooks`, a tool server, a wider sandbox table) to what goes on the wire.
+/// (a dotted path, `hooks`, a tool server of its own, a wider sandbox table) to what goes on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SessionConfig(Value);
@@ -116,15 +127,19 @@ impl SessionConfig {
 
     /// The same config with each of the named tool servers of the user's own Codex configuration turned
     /// off, for tests that run a real Codex on a real account: its servers must not start there. Each
-    /// name is one key of a nested object, so a name holding `.` still names exactly that server.
+    /// name is one key of a nested object, so a name holding `.` still names exactly that server, and
+    /// the names join what the config already runs.
     #[cfg(feature = "test-support")]
     pub fn with_tool_servers_off(mut self, names: &[&str]) -> Self {
-        let mut servers = Map::new();
-        for name in names {
-            servers.insert((*name).to_string(), json!({ "enabled": false }));
-        }
         if let Value::Object(config) = &mut self.0 {
-            config.insert(TOOL_SERVERS_KEY.to_string(), Value::Object(servers));
+            let servers = config
+                .entry(TOOL_SERVERS_KEY.to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(servers) = servers {
+                for name in names {
+                    servers.insert((*name).to_string(), json!({ "enabled": false }));
+                }
+            }
         }
         self
     }
@@ -140,9 +155,23 @@ impl SessionConfig {
         }
         self
     }
+
+    /// The same config with no approval mode on any tool server it runs, for the self-check's own test: a Codex
+    /// that ignores the key treats a server as this entry asks it to.
+    #[cfg(feature = "test-support")]
+    pub fn without_approval_lever(mut self) -> Self {
+        let servers = self.0.get_mut(TOOL_SERVERS_KEY).and_then(Value::as_object_mut);
+        for entry in servers.into_iter().flat_map(|servers| servers.values_mut()) {
+            if let Value::Object(entry) = entry {
+                entry.remove("default_tools_approval_mode");
+            }
+        }
+        self
+    }
 }
 
-/// The config table of the user's tool servers; written only by tests.
+/// The config table of the tool servers, as tests write it. Product code spells it once, for the editor's
+/// server.
 #[cfg(feature = "test-support")]
 const TOOL_SERVERS_KEY: &str = "mcp_servers";
 
@@ -157,7 +186,11 @@ const TOOL_SERVERS_KEY: &str = "mcp_servers";
 /// - `features`: Codex's extra-permission requests off, so a command approval can never grant more than
 ///   its card shows.
 /// - `sandbox_workspace_write`: the narrow sandbox, always.
-pub fn session_config(plan: &TrustPlan) -> Result<SessionConfig, SessionConfigError> {
+/// - `mcp_servers`: the editor's server, when the session was given one, and nothing otherwise.
+pub fn session_config(
+    plan: &TrustPlan,
+    editor: Option<&EditorServerSpec>,
+) -> Result<SessionConfig, SessionConfigError> {
     if plan.dirs.is_empty() {
         return Err(SessionConfigError::NoDirectories);
     }
@@ -200,10 +233,32 @@ pub fn session_config(plan: &TrustPlan) -> Result<SessionConfig, SessionConfigEr
             "exclude_slash_tmp": false,
         }),
     );
+    if let Some(editor) = editor {
+        let mut servers = Map::new();
+        servers.insert(editor.name.clone(), editor_server_entry(editor)?);
+        config.insert("mcp_servers".into(), Value::Object(servers)); // codex-wire-guard: EditorServer
+    }
     Ok(SessionConfig(Value::Object(config)))
 }
 
-/// The exact name Codex keys a directory by: absolute, no `.` or `..`, no trailing slash, UTF-8.
+/// One `mcp_servers` entry, every field stated. Codex accepts a relative `cwd` and the server then fails to
+/// start, so both paths are held to the form a directory key is. Only `approve` keeps Codex from asking about a
+/// tool that is not read-only; Eitri's own gate decides these calls.
+fn editor_server_entry(spec: &EditorServerSpec) -> Result<Value, SessionConfigError> {
+    Ok(json!({
+        "command": config_key(&spec.command)?,
+        "args": spec.args,
+        "env": {},
+        "cwd": config_key(&spec.cwd)?,
+        "enabled": true,
+        "startup_timeout_sec": EDITOR_SERVER_STARTUP_SEC,
+        "tool_timeout_sec": EDITOR_SERVER_TOOL_TIMEOUT_SEC,
+        "default_tools_approval_mode": "approve",
+    }))
+}
+
+/// The exact name Codex keys a directory by, and the form every path it is given takes: absolute, no `.` or
+/// `..`, no trailing slash, UTF-8.
 fn config_key(dir: &Path) -> Result<String, SessionConfigError> {
     if !dir.is_absolute() {
         return Err(SessionConfigError::NotCanonical(dir.to_path_buf()));

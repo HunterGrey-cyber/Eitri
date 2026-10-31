@@ -1,4 +1,4 @@
-import { noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
+import { editorCardText, noticeText, wakeText, noticeBody, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
@@ -15,7 +15,7 @@ export function rowSearchText(item: TimelineItem): string {
         item.call.result ? formatResultContent(item.call.result.content) : "",
       ].join("\n");
     case "permission":
-      return [item.request.toolName, JSON.stringify(item.request.input)].join("\n");
+      return [item.request.toolName, editorCardText(item.request) ?? JSON.stringify(item.request.input)].join("\n");
     case "ending":
       return turnEndingText(item.ending, item.ending.resetsAt ?? null);
     case "wake":

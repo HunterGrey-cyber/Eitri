@@ -2349,10 +2349,7 @@ fn every_disk_job_takes_the_slot_and_refuses_with_the_busy_note_while_another_pr
 
     let holder = SlotHolder::start(&f);
     let note = SlotBusy::Writing.to_string();
-    assert!(
-        note.contains("another Eitri window"),
-        "the note names the other window: {note}"
-    );
+    assert!(note.contains("another write"), "the note says what holds it: {note}");
     for (id, message) in [
         ("r1", revert_file("r1", f.tab, n, "b.txt")),
         ("u1", undo("u1", f.tab)),

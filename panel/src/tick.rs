@@ -175,6 +175,7 @@ pub(super) fn tick_send(
     poll_scratch_edits(state, out);
     poll_review_jobs(state, out);
     poll_question_sends(state, out);
+    super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
@@ -184,11 +185,26 @@ pub(super) fn tick_send(
     send_tabs_if_changed(state, out);
     remember_tabs(state);
     send_hello_if_open_sessions_changed(state, out);
+    send_editor_notes(state, out);
     // After the payload, not before it: a reaction that sends the panel an envelope -- one
     // that lands on a card, say -- must find the card it names already there.
     report_attention(state, attention_before, out);
     judge_empty_views(state);
     tell_emptied_views(state, out);
+}
+
+/// What a tab owes the person about its tool server, in the page that shows the tab. A tab with no
+/// ready page keeps its line: the slot it goes to is the page's, so nothing would ever say it.
+fn send_editor_notes(state: &mut AgentPanelState, out: &mut Outbox) {
+    for (tab, note) in state.tabs.take_editor_notes() {
+        match state.page_of(tab) {
+            Some(view) => {
+                eprintln!("[permission] {note}");
+                out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(&note));
+            }
+            None => state.tabs.owe_editor_note(tab),
+        }
+    }
 }
 
 /// The oldest pending card among `view`'s tabs.
@@ -318,7 +334,7 @@ pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate
 /// Whether something the tick acts on can become ready without raising the wake, so the tick has to run on
 /// its steady cadence: a worker reporting through a channel (a connect, a teardown, the supervisor's
 /// connect, the trust check, a review or scratch job, the history's writer), a backend that does not announce
-/// its folds, the review flow waiting on the editor, or a move waiting on its page or its presence.
+/// its folds, the review flow or the broker waiting on the editor, or a move waiting on its page or its presence.
 pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
         || state.chat_moves.is_waiting()
@@ -332,8 +348,19 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.question_sends.is_empty()
         || !state.proposal_jobs.is_empty()
         || !state.review_flow.is_idle()
+        || state.editor_tools.needs_polling()
+        || !state.editor_follower.is_idle()
+        || !state.client_call_reads.is_empty()
         || state.trust.is_busy()
         || state.history_writer.is_busy()
+}
+
+/// The sooner of two moments a tick is due, either of which may not be set.
+pub(super) fn earliest(a: Option<std::time::Instant>, b: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// One stream payload for a page's pacer: the envelope, whose first text it carries, and its class.
@@ -401,6 +428,180 @@ pub(super) fn trace_discarded_first_texts(
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    /// A new tab whose session was given a tool, opened (so selected) in the base view.
+    fn declaring_tab(handle: &AgentPanelHandle, dir: &std::path::Path) -> (TabId, std::sync::Arc<RecordingProvider>) {
+        let provider = std::sync::Arc::new(RecordingProvider::client_tooling());
+        let tools = agent::ClientToolSet {
+            server_name: eitri_core::editor_tools::SERVER_NAME.into(),
+            timeout_ms: 900_000,
+            tools: vec![agent::ClientToolDecl {
+                name: "open_file".into(),
+                description: "opens a file".into(),
+                input_schema_json: r#"{"type":"object"}"#.into(),
+                always_load: true,
+            }],
+        };
+        let conversation = agent::AgentConversation::create_with_tools(
+            provider.clone(),
+            dir,
+            agent::setting_sources::ProjectTrust::Untrusted,
+            Some(tools),
+        )
+        .unwrap();
+        let mut state = handle.state.borrow_mut();
+        let tab = state.tabs.open(AgentId::Claude);
+        state
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        (tab, provider)
+    }
+
+    /// A chunk's reply raises no wake, so the tick that reads it has to be on its way already.
+    #[test]
+    fn a_call_in_flight_keeps_the_steady_tick_and_an_idle_broker_does_not() {
+        use crate::agent_panel::editor_glue::tests::{fixture, state_call, state_reply};
+        let panel = fixture("panel-broker-tick");
+        let polls = || needs_polling(&panel.handle.state.borrow());
+        panel.tick_until("the session to settle", || !polls());
+
+        panel.provider.queue(state_call("c1"));
+        panel.tick_until("the call to reach the editor", || panel.editor.asked().len() == 1);
+        assert!(polls(), "the editor's answer has no wake of its own");
+        let at = std::time::Instant::now();
+        assert_eq!(
+            panel.handle.run_tick(at),
+            crate::panel_wake::NextTick::At(at + AgentPanelHandle::TICK)
+        );
+
+        panel.editor.answer_oldest(&state_reply());
+        panel.tick_until("the answer", || !panel.provider.client_answers().is_empty());
+        assert!(!polls(), "an idle broker leaves the tick to the wake");
+    }
+
+    /// A card can wait for minutes. Its answer comes as a page message, which raises the wake, so only its limit needs
+    /// a tick of its own.
+    #[test]
+    fn a_waiting_card_leaves_the_tick_to_the_wake_and_its_limit() {
+        use crate::agent_panel::editor_glue::tests::fixture;
+        use crate::panel_wake::NextTick;
+        let panel = fixture("panel-card-tick");
+        let polls = || needs_polling(&panel.handle.state.borrow());
+        panel.tick_until("the session to settle", || !polls());
+        panel.raise_a_card("c1");
+        panel.tick_until("the broker to stop polling", || !polls());
+        let limit = {
+            let state = panel.handle.state.borrow();
+            assert!(!state.editor_tools.is_idle(), "the call is still open");
+            state.editor_tools.next_card_limit().expect("the card's limit")
+        };
+        let at = std::time::Instant::now();
+        assert_eq!(
+            panel.handle.run_tick(at),
+            NextTick::At(limit),
+            "no 33 ms tick for a card"
+        );
+    }
+
+    /// The line goes to the footer of the page in front of the person, so one about a tab out of sight
+    /// waits until the tab is shown, and is said once.
+    #[test]
+    fn a_foreign_tool_server_is_said_once_its_tab_is_on_a_page() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-foreign-server");
+        let (handle, page) = settled_panel();
+        let (tab, provider) = declaring_tab(&handle, &dir);
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_eq!(handle.state.borrow().tabs.active(), other, "the tab is out of sight");
+        provider.queue(agent::AgentDomainEvent::SessionServers {
+            servers: vec![agent::InitServer {
+                name: "eitri".into(),
+                status: "connected".into(),
+                source: "project".into(),
+            }],
+        });
+        let said = || {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|envelope| json_of(envelope))
+                .filter(|envelope| envelope["kind"] == "notice")
+                .filter(|envelope| {
+                    envelope["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("not Eitri's"))
+                })
+                .count()
+        };
+        let reported = || {
+            let state = handle.state.borrow();
+            let Some(TabBackend::Live(backend)) = state.tabs.get(tab).map(|t| t.backend()) else {
+                return false;
+            };
+            let folded = !backend.projection().init_servers.is_empty();
+            folded
+        };
+        tick_handle_until(&handle, "the report", reported);
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert_eq!(said(), 0, "nothing is said for a tab out of sight");
+        handle.state.borrow_mut().tabs.select(tab);
+        tick_handle_until(&handle, "the line", || said() > 0);
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert_eq!(said(), 1, "said once");
+        let _ = handle.shutdown();
+    }
+
+    /// The line says "this tab", so it goes to the page that shows that tab, once, and to no other.
+    #[test]
+    fn a_providers_line_goes_to_the_page_of_its_tab() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        let dir = agent::state_dirs::test_workspace_dir("panel-provider-line");
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
+        let backend = AgentBackend::start_external_with(
+            AgentId::Codex,
+            provider.clone(),
+            &dir,
+            empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .expect("a scripted external start succeeds");
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        let said = |page: &RecordingPage| {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|envelope| json_of(envelope))
+                .filter(|envelope| envelope["kind"] == "notice" && envelope["text"] == "the tools are off")
+                .count()
+        };
+        handle.tick();
+        assert_eq!(said(&second), 0, "nothing is owed yet");
+        provider.owe_editor_note("the tools are off");
+        tick_handle_until(&handle, "the line", || said(&second) > 0);
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert_eq!(said(&second), 1, "said once");
+        assert_eq!(said(&base), 0, "the base page shows another tab");
+        let _ = handle.shutdown();
+    }
 
     #[test]
     fn the_tick_runs_until_the_close_and_never_after() {

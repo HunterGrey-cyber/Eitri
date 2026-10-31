@@ -11,7 +11,7 @@ description: |
   ours to redistribute, so this package never contains it).
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-# The licence expression covers this package (the tarball's five binaries, statically linking
+# The licence expression covers this package (the tarball's six binaries, statically linking
 # nvim-rs LGPL-3.0-only) plus the MIT/Apache-2.0/MPL-2.0 licences the collector finds. No
 # LicenseRef-Anthropic-Claude-Agent-SDK here: this profile never carries the sidecar.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
@@ -48,6 +48,8 @@ contents:
     dst: /usr/lib/eitri/eitri-tmux-shim
   - src: ./target/release/eitri-run-guard
     dst: /usr/lib/eitri/eitri-run-guard
+  - src: ./target/release/eitri-editor-bridge
+    dst: /usr/lib/eitri/eitri-editor-bridge
   - src: ./target/release/eitri-claude-handoff
     dst: /usr/lib/eitri/eitri-claude-handoff
 

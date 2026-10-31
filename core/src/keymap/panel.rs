@@ -25,6 +25,7 @@ pub enum PanelAction {
     /// Stop the commands the tab's agent left running after its turns ended (by stopping its session),
     /// after a y/n question.
     StopBackground,
+    Follow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
         "panel.handoff" => PanelAction::Handoff,
         "mode.cycle" => PanelAction::ModeCycle,
         "tab.stop-background" => PanelAction::StopBackground,
+        "tab.follow" => PanelAction::Follow,
         other => {
             return Err(format!(
                 "{other:?} is not a panel action (init.lua's panel table names)"
@@ -124,6 +126,7 @@ impl PanelAction {
             PanelAction::Handoff => "panel.handoff",
             PanelAction::ModeCycle => "mode.cycle",
             PanelAction::StopBackground => "tab.stop-background",
+            PanelAction::Follow => "tab.follow",
         }
     }
 
@@ -147,6 +150,7 @@ impl PanelAction {
             PanelAction::Handoff => "continue in a terminal",
             PanelAction::ModeCycle => "mode",
             PanelAction::StopBackground => "stop background work",
+            PanelAction::Follow => "follow in the editor",
         }
     }
 }
@@ -216,7 +220,7 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// new tab).
 pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new")];
 
-/// The 17 default rows, in table order: direct
+/// The 18 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
 /// LazyVim/nvim/which-key line it copies, or `eitri-only` with why, so no row is invented.
 pub fn default_bindings() -> Vec<PanelBinding> {
@@ -319,6 +323,12 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("<leader>k").unwrap(),
             action: PanelAction::StopBackground,
+            source: PanelSource::Default,
+        },
+        // eitri-only: Zed's agent panel has such a toggle; e as in editor
+        PanelBinding {
+            seq: parse_seq("<leader>e").unwrap(),
+            action: PanelAction::Follow,
             source: PanelSource::Default,
         },
         // lazyvim: plugins/editor.lua:105-110 ("Buffer Keymaps (which-key)")
@@ -589,6 +599,7 @@ mod tests {
             ("Space t", "panel.handoff"),
             ("Space m", "mode.cycle"),
             ("Space k", "tab.stop-background"),
+            ("Space e", "tab.follow"),
             ("Space ?", "panel.keymap"),
         ];
         assert_eq!(
@@ -614,6 +625,7 @@ mod tests {
             "panel.handoff",
             "mode.cycle",
             "tab.stop-background",
+            "tab.follow",
         ] {
             assert_eq!(parse_action(name).unwrap().name(), name);
         }

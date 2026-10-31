@@ -88,6 +88,11 @@ impl AgentPanelHandle {
     pub fn ticks_run(&self) -> u64 {
         self.state.borrow().ticks_run
     }
+
+    /// The tools a session started now with `project` trust would be declared.
+    pub fn editor_tools_declared(&self, project: agent::setting_sources::ProjectTrust) -> Option<agent::ClientToolSet> {
+        super::editor_glue::tools_for_start(&self.state.borrow(), project)
+    }
 }
 
 /// A handle back into this panel's session state, held by `main.rs` alongside the `gtk4::Widget`
@@ -779,18 +784,18 @@ impl AgentPanelHandle {
         }
         let state = self.state.borrow();
         let mut next = (polled_before || needs_polling(&state)).then_some(now + Self::TICK);
+        // A deadline that would not move cannot spin the loop: never at the moment this tick started.
+        let after_now = |at: std::time::Instant| at.max(now + std::time::Duration::from_millis(1));
+        // A card nobody answers ends at its limit, and nothing else would run a tick then.
+        next = earliest(next, state.editor_tools.next_card_limit().map(after_now));
         // Every live page's typing cadence, each against its own document.
         for (view, page) in self.pages.live_views() {
             let paced = page
                 .pacer()
                 .borrow()
                 .next_deadline(std::time::Instant::now(), state.ready(view))
-                // Never at the moment this tick started: a deadline that would not move cannot spin the loop.
-                .map(|at| at.max(now + std::time::Duration::from_millis(1)));
-            next = match (next, paced) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+                .map(after_now);
+            next = earliest(next, paced);
         }
         next.map_or(NextTick::OnWake, NextTick::At)
     }
@@ -967,6 +972,9 @@ impl AgentPanelHandle {
             // Read by the tick, by `poll_activate` and by every path into the tab set, all of
             // which keep running now that the loop outlives the window. See the field's own doc.
             state.shutting_down = true;
+            // Its drop removes the sockets, which nothing else would once the loop ends.
+            state.editor_bridge = None;
+            state.editor_bridge_tabs.clear();
             state.tabs.take_all()
         };
         let mut entries = Vec::new();
@@ -1397,6 +1405,23 @@ impl AgentPanelHandle {
         self.state.borrow_mut().acp_agents = agents;
     }
 
+    /// The following default from `init.lua`, applied once at startup to new tabs and the empty tabs already made.
+    pub fn set_editor_follow(&self, following: bool) {
+        self.wake();
+        let mut state = self.state.borrow_mut();
+        state.tabs.set_following_default(following);
+        let empty: Vec<_> = state
+            .tabs
+            .tabs()
+            .iter()
+            .filter(|tab| matches!(tab.backend(), TabBackend::NotStarted) && !state.tabs.is_moving(tab.id))
+            .map(|tab| tab.id)
+            .collect();
+        for tab in empty {
+            state.tabs.get_mut(tab).unwrap().following = following;
+        }
+    }
+
     /// `review.enabled` and `review.hint` as `init.lua` left them, applied once after it ran. Enabled
     /// installs the turn review (the legacy backend has no turn boundaries to follow and says so);
     /// disabled leaves none, and a request for one says why. The hint only decides whether a
@@ -1663,6 +1688,20 @@ impl AgentPanelHandle {
     pub fn set_editor_rpc(&self, rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
         self.wake();
         self.state.borrow_mut().editor_rpc = Some(rpc);
+    }
+
+    /// `agent.editor.tools` and `agent.editor.tool.<name>` as `init.lua` left them, applied once after it ran. A session
+    /// started afterwards is given the tools these leave on; one already running keeps its list.
+    pub fn set_editor_tools(&self, switches: eitri_core::editor_tools::switches::Switches) {
+        self.wake();
+        self.state.borrow_mut().editor_switches = switches;
+    }
+
+    /// How a tool's call reaches the editor when the editor is not this window's own. `main.rs` of the second window
+    /// installs this once; without it the window's own `editor_rpc` is used.
+    pub fn set_editor_way(&self, way: Rc<dyn eitri_core::editor_tools::way::EditorWay>) {
+        self.wake();
+        self.state.borrow_mut().editor_way = Some(way);
     }
 
     /// Who owns the review module in this window's editor, asked before every review request: the

@@ -6,6 +6,7 @@ import type {
   CodexFileChange,
   CodexFileChangeInput,
   CodexMcpInput,
+  EditorCardLine,
   MatchedAskRule,
   PermissionRequestRecord,
   ProviderPrompt,
@@ -72,7 +73,9 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
      (`alreadyAnswered`) when `a`/`d` answered it. Neither of these clears the card; only a provider
      event does that. */
   const inert = answered || sessionEnded;
-  const external = isExternalTool(request.toolName);
+  const broker = request.editorCard;
+  // A broker card takes no reason and offers no third button, like another agent's card: its answer carries neither.
+  const external = broker !== undefined || isExternalTool(request.toolName);
   const approvable = cardApprovable(request);
   const subagent = !external && view ? subagentOf(request.toolName, request.input, {
     toolUseId: request.toolUseId, toolCalls: view.state.toolCalls, backgroundTasks: view.state.backgroundTasks.rows,
@@ -97,15 +100,17 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
           card already sits beside the call it gates. Only a USABLE id (`isUsableLink`, which rules
           out `null` and the sidecar's proto3 `""`) -- a tooltip naming nothing is worse than none. */}
       <div
-        className="permission-card-tool"
+        className={broker !== undefined ? "permission-card-tool permission-card-tool-broker" : "permission-card-tool"}
         title={isUsableLink(request.toolUseId) ? `tool call ${request.toolUseId}` : undefined}
         data-tool-use-id={isUsableLink(request.toolUseId) ? request.toolUseId : undefined}
       >
-        {request.toolName === "Workflow" ? "Run a dynamic workflow?" : <>Permission requested: <ShownInline text={request.toolName} /></>}
+        {broker !== undefined ? <ShownInline text={broker.title} /> :
+          request.toolName === "Workflow" ? "Run a dynamic workflow?" : <>Permission requested: <ShownInline text={request.toolName} /></>}
       </div>
       {subagent !== null && <div className="permission-card-provider">asked by <ShownInline text={subagent} /></div>}
       {request.providerPrompt && <ProviderPromptLine prompt={request.providerPrompt} />}
-      {request.toolName === "Workflow" ? <WorkflowInput input={request.input} onViewScript={view?.onViewScript} /> :
+      {broker !== undefined ? broker.body.map((line, i) => <BrokerLine key={i} line={line} />) :
+        request.toolName === "Workflow" ? <WorkflowInput input={request.input} onViewScript={view?.onViewScript} /> :
         <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />}
       {/* A deny from another agent carries no reason (Codex's decline has no field for one), so there is
           no box to type into; `D` says so (`App.tsx`). */}
@@ -149,7 +154,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         <button data-nav-order={2} data-nav-action="deny" data-key="d" onClick={() => handleAnswer("deny")} disabled={inert}>
           Deny
         </button>
-        {ruleOffer && (
+        {ruleOffer && broker === undefined && (
           <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
             Always allow <ShownInline text={ruleOffer} /> in this project
           </button>
@@ -162,6 +167,43 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
       )}
     </div>
   );
+}
+
+/** One line of a broker card. Every kind is plain text drawn through `revealHidden`, never Markdown: the line may
+ *  hold a path, a command or a sentence from a repository or the agent. `code` is monospace, `agent` is labelled as
+ *  the agent's own words and not Eitri's, `warning` stands out from the rest. */
+function BrokerLine({ line }: { line: EditorCardLine }) {
+  switch (line.kind) {
+    case "code": {
+      const pieces = revealHidden(line.text);
+      return (
+        <>
+          <pre className="permission-card-command permission-card-line" data-line-kind="code">
+            <Revealed pieces={pieces} />
+          </pre>
+          <HiddenWarning count={countEscapes(pieces)} what="text" />
+        </>
+      );
+    }
+    case "agent":
+      return (
+        <div className="permission-card-description permission-card-says permission-card-line" data-line-kind="agent">
+          The agent says: <Shown text={line.text} what="text" />
+        </div>
+      );
+    case "warning":
+      return (
+        <div className="permission-card-line permission-card-line-warning" data-line-kind="warning">
+          <Shown text={line.text} what="text" />
+        </div>
+      );
+    default:
+      return (
+        <div className="permission-card-line" data-line-kind="plain">
+          <Shown text={line.text} what="text" />
+        </div>
+      );
+  }
 }
 
 /** Model- or hook-supplied text on the card, with the characters `revealHidden` knows drawn as escapes. */

@@ -100,6 +100,7 @@ fn request(resume: Option<&str>, project_only: &[&str]) -> ExternalStart {
             sandbox: agent::Sandbox::Project,
         },
         resume: resume.map(str::to_string),
+        editor_server: None,
     }
 }
 

@@ -763,7 +763,7 @@ fn turn_reviewer_user_overrides_an_auto_review_thread() {
     write_project(&project, "");
 
     let mut peer = Peer::start(&codex, &home, &project, decline_all());
-    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let config = session_config(&plan(&project, DirTrust::Untrusted), None).expect("config");
     let params = serde_json::to_value(ThreadStartParams::new(
         text_of(&project).to_string(),
         Reviewer::Agent,
@@ -1773,6 +1773,7 @@ fn plain_tool_spawn_is_followed_by_the_family() {
             plan: plan(&project, DirTrust::Untrusted),
             policy,
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
     provider
@@ -1925,6 +1926,7 @@ fn interrupt_a_loop(
                 sandbox: agent::Sandbox::Project,
             },
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
     provider
@@ -2145,6 +2147,7 @@ fn an_interrupt_with_a_command_card_waiting_does_not_stop_the_session() {
             plan: plan(&project, DirTrust::Untrusted),
             policy: policy(),
             resume: None,
+            editor_server: None,
         })
         .expect("the session starts");
     provider
@@ -2227,6 +2230,7 @@ fn an_interrupt_the_moment_a_turn_starts_ends_it() {
                 plan: plan(&project, DirTrust::Untrusted),
                 policy,
                 resume: None,
+                editor_server: None,
             })
             .expect("the session starts");
         provider
@@ -2304,7 +2308,7 @@ fn read_only_holds_a_plain_write_and_asks_about_an_escalation() {
     write_home(&home, &model, "");
 
     let mut peer = Peer::start(&codex, &home, &project, decline_all());
-    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let config = session_config(&plan(&project, DirTrust::Untrusted), None).expect("config");
     let params = serde_json::to_value(ThreadStartParams::new(
         text_of(&project).to_string(),
         Reviewer::User,
@@ -2395,7 +2399,7 @@ fn a_resume_as_read_only_echoes_it_and_holds() {
     drop(peer);
 
     let mut peer = Peer::start(&codex, &home, &project, decline_all());
-    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let config = session_config(&plan(&project, DirTrust::Untrusted), None).expect("config");
     let params = serde_json::to_value(ThreadResumeParams::new(
         thread.id.clone(),
         text_of(&project).to_string(),
@@ -2443,7 +2447,7 @@ fn a_project_rule_leaves_a_read_only_sandbox_only_when_the_project_is_trusted() 
         let home = s.dir("home");
         write_home(&home, &model, "");
         let mut peer = Peer::start(&codex, &home, &project, decline_all());
-        let config = session_config(&plan(&project, trust)).expect("config");
+        let config = session_config(&plan(&project, trust), None).expect("config");
         let params = serde_json::to_value(ThreadStartParams::new(
             text_of(&project).to_string(),
             Reviewer::User,
@@ -2482,7 +2486,7 @@ fn an_untrusted_session_at_the_home_directory_keeps_the_folders_instructions_out
         text_of(&home_dir).to_string(),
         Reviewer::User,
         agent::Sandbox::ReadOnly,
-        session_config(&at_home).expect("config"),
+        session_config(&at_home, None).expect("config"),
     ))
     .expect("params");
     let thread = start_thread(&mut peer, params);
@@ -2541,7 +2545,7 @@ fn a_child_of_a_read_only_thread_writes_nothing() {
     let home = s.dir("home");
     write_home(&home, &model, "");
     let mut peer = Peer::start(&codex, &home, &project, decline_all());
-    let config = session_config(&plan(&project, DirTrust::Untrusted)).expect("config");
+    let config = session_config(&plan(&project, DirTrust::Untrusted), None).expect("config");
     let params = serde_json::to_value(ThreadStartParams::new(
         text_of(&project).to_string(),
         Reviewer::User,

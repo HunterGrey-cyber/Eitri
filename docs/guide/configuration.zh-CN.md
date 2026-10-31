@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=ccff5ef8f8194af385a8ac623e8ca0490a354dd6e17beb6b409d2476235d866d -->
+<!-- translated-from: configuration.md sha256=4eed570fc199fae281d9304741ec9be311107a67b720de77b7cf80ec54e072e1 -->
 
 # 配置
 
@@ -40,6 +40,9 @@ eitri.config.set("review.hint", true)
 | `agent.restore` | `"offer"`、`"auto"`、`"off"` 或 `false` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |
 | `agent.user_settings` | `true` / `"on"` 或 `false` / `"off"` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
+| `agent.editor.tools` | `true` / `"on"` 或 `false` / `"off"` | `true` | 任何标签页里的 agent 是否得到[编辑器工具](editor-tools.zh-CN.md)。`false` 一个都不声明；已经在运行的会话沿用它开始时的工具。 |
+| `agent.editor.tool.<name>` | `true` / `"on"` 或 `false` / `"off"` | `true`，`nvim_exec` 是 `false` | 按名字指定其中一个工具：`open_file`、`read_buffer`、`editor_state`、`diagnostics`、`usages`、`hover`、`symbols`、`lsp_rename`、`format`、`lsp_code_actions`、`apply_code_action`、`apply_proposal` 或 `nvim_exec`。每个工具都是开着的，除非你关掉；[`nvim_exec`](editor-tools.zh-CN.md#nvim-exec) 相反，你打开之前一直是关的。Eitri 不认识的名字会让启动失败，并指出是哪个键。 |
+| `agent.editor.follow` | `true` / `"on"` 或 `false` / `"off"` | `false` | 新标签页是否在编辑器里跟随 agent 已完成的修改（[编辑器工具](editor-tools.zh-CN.md#following)）。此后每个标签页自己的选择（`Space e`）优先。值不对会让启动失败，并指出是哪个键。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
