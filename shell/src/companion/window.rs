@@ -527,7 +527,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                         focus_module(&ModuleId::agent());
                         agent.open_command_line(ViewId::BASE);
                     }
-                    CompanionVerb::Text(change) => text_size.pane_step(ModuleId::agent(), change.into()),
+                    CompanionVerb::Text(change) => text_size.all_step(change.into()),
                     CompanionVerb::Hint => hint.toggle_from_prefix(keycode),
                     CompanionVerb::Literal => {
                         if let Some(key) = super::prefix::literal_for(&action, &keymap) {

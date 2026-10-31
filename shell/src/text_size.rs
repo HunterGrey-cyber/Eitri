@@ -99,6 +99,20 @@ impl TextSizeController {
         }));
     }
 
+    /// A step of every module, by a key that took it before the accelerators saw it (a companion window's prefix).
+    pub(crate) fn all_step(&self, step: TextStep) {
+        self.driver
+            .post(HostEvent::TextSize(TextSizeEvent::Both { win: WinId::MAIN, step }));
+    }
+
+    /// What the user's config left in `g:neovide_scale_factor`: where `Ctrl+0` returns to.
+    pub(crate) fn set_configured(&self, scale: f64) {
+        self.driver.post(HostEvent::TextSize(TextSizeEvent::Configured {
+            win: WinId::MAIN,
+            scale,
+        }));
+    }
+
     /// The page `page` now has a view: it follows the editor from here on, at 1.0 relative to it the
     /// first time (a view built again for the same module keeps the factor it had). The level is set
     /// again at every committed load, though WebKit keeps it across loads (see

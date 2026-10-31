@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=0f3ed3e80ae6405bb24ebfc6f47a197d29cea3e6cc2143c11f575a6f9f816a19 -->
+<!-- translated-from: keys.md sha256=28604921bbaeb86f8202e18cfd7ea25e4c04830d8bef6a4dfb2d316d901f33ce -->
 
 # 按键
 
@@ -52,7 +52,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> Left`、`Right`、`Up`、`Down` | 把按键移到那一侧的模块（repeats） |
 | `<prefix> ;` | 把按键移回之前拿着它的模块 |
 | `<prefix> o` | 把按键移到屏幕上的下一个模块 |
-| `<prefix> z` | 放大这个模块，或恢复 |
+| `<prefix> z` | 放大这个模块，占满窗口，或恢复。本指南里“放大”只指这件事；改文字的大小叫“文字大小” |
 | `<prefix> %` 或 `<prefix> "`，然后 `e`、`a` 或 `t` | 在这个模块的右边 / 下面打开那个模块，或者把它移到那里；按键在终端里时，`t` 会在那里打开一个新的终端（见[容器和终端](#containers-and-terminals)） |
 | `<prefix> d`，然后 `e`、`a` 或 `t`（或者面板自己的键） | 隐藏那个模块，不管按键在哪里；它照常运行。按键留在原处，除非隐藏的正是拿着按键的那个模块，那时按键交给它旁边的模块；`Esc` 取消 |
 | `<prefix> !` | 按键在 agent 面板里时：把正在用的标签页拆出来，放进面板右边它自己的聊天视图；按键在这样的视图里时：把它的标签页并回去（见[聊天视图](#chat-views)） |
@@ -71,7 +71,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri，这时的问题和关闭窗口时一样，还会列出正在运行或排队的聊天回合，以及正在运行命令的终端（`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`）；在 shell 提示符下放到后台的任务不算在内。对编辑器按时，它像 `:confirm qall` 那样退出 nvim（有未保存的缓冲区时 nvim 自己会问），之后按 `<prefix> e` 编辑器就带着一个新的 nvim 回来 |
 | `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处会闪一下拒绝提示，提示框写着 `prefix [ scrolls the terminal` |
 | `<prefix> F11` | 沉浸模式：不带顶栏的全屏 |
-| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 只放大 / 缩小 / 还原拿着按键的那个窗格的文字：编辑器、聊天、某个插件页面或终端（repeats：按住 Ctrl 再按 `=` 或 `-` 继续调） |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 只把拿着按键的那个窗格的文字调大 / 调小 / 回到和其他模块一致：编辑器、聊天、某个插件页面或终端。一次前缀可以调任意多步：只要 Ctrl 还按着，以及最后一步之后的半秒内，`=`、`-` 和 `0` 都留在这个窗格上 |
 
 上面这些排布在真的改变了东西时会结束放大，什么都没做时则保持放大。按键仍留在原来拿着它的模块上，被隐藏的模块仍然隐藏。屏幕上少于两个模块时它们什么都不改，只闪一下拒绝提示；`Alt+3`、`Alt+4`、`Alt+5` 和 `Space` 在屏幕上超过 20 个模块时也会拒绝。
 
@@ -111,12 +111,20 @@ end
 | 按键 | 作用 |
 |---|---|
 | `F11` | 全屏 |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 文字放大 / 缩小 / 还原，编辑器、面板、所有插件页面和终端一起（小键盘的 `+`、`-` 和 `0` 也行） |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 把窗口里每个模块的文字调大 / 调小 / 还原：编辑器、聊天、所有插件页面和所有终端（小键盘的 `+`、`-` 和 `0` 也行；`+` 单独占一个键的键盘，比如德语键盘，`Ctrl++` 也行） |
 | `Ctrl+wheel` | 只改指针所在那个窗格的文字大小 |
 
-插件页面（学习插件、Markdown 预览）整页缩放，版面随文字一起变，并跟着编辑器的大小走：`Ctrl+=` 让编辑器和所有页面一起变大；单独放大或缩小过的页面会一直保持这个差别，直到按 `Ctrl+0`，或在它上面按 `<prefix> Ctrl+0`；页面重新加载后大小不变。这些键页面本身收不到。
+**文字大小怎么算。** 窗口有一个文字大小，每个模块各有一个和它的差别。`Ctrl+=` 和 `Ctrl+-` 改窗口的大小，所以每个模块都跟着动，各自的差别不变。`<prefix> Ctrl+=`、`Ctrl+-` 和 `Ctrl+wheel` 改一个差别：所有聊天视图共用一个，所有终端共用一个，编辑器一个，每个插件页面各一个。`<prefix> Ctrl+0` 清掉拿着按键的那个窗格的差别，它就回到和其他模块一致的大小，不管那时其他模块是多大。`Ctrl+0` 清掉所有差别，并把窗口的大小还原成你的配置写的值：`init.lua` 设了 `g:neovide_scale_factor` 就是它，否则是 100%。
 
-终端用编辑器的字体绘制，也就是你的 `guifont` 里的字体和字号（在 `init.lua` 里设 `terminal.font` 可以改，见[配置](configuration.zh-CN.md#settings)），并以同样的方式跟着编辑器的大小走：`Ctrl+=` 让它和编辑器一起变大；在终端上 `Ctrl+wheel`，或在终端里按 `<prefix> Ctrl+=`，只改终端，直到在那里按 `Ctrl+0` 或 `<prefix> Ctrl+0`。窗口里所有终端是同一个大小，就像所有聊天视图是同一个大小。改字号就是给 shell 换一个网格：字越大，行数和列数越少，里面运行的程序会收到通知，和窗格本身改变大小时一样（`stty size` 会显示新的数字）。这些键和 `Ctrl+wheel` 程序本身收不到。
+- **哪些会动。** 这个窗口的每个模块，显示着的和隐藏的都算。顶栏和提示面板的大小不变；按键在顶栏上时，窗格键不起作用。
+- **其他窗口。** Eitri 的每个窗口有自己的文字大小。第二个窗口从 100% 开始。只有一个模块的窗口（[companion 窗口](companion.zh-CN.md)、[合成器窗口](compositor-windows.zh-CN.md)下的聊天或页面窗口）只有一个大小，所以那里 `<prefix> Ctrl+=` 和 `Ctrl+=` 是同一个动作。
+- **重启后什么都不保留。** 想长期保留，在配置里设 `guifont`、`agent.font_size`、`terminal.font` 或 `g:neovide_scale_factor`。
+- **你自己的映射。** `Ctrl+=`、`Ctrl+-`、`Ctrl+0`、`Ctrl++` 和 `Ctrl+wheel` 在 Neovim 看到之前就被 Eitri 拿走了，所以 Neovim 里的 `<C-=>` 映射不会运行。`<C-+>` 在要按 Shift 才能打出 `+` 的键盘上仍然有效：那里的 `Ctrl+Shift+=` 照旧传给 Neovim。你自己的映射要影响每个模块，就写 `g:neovide_scale_factor`：Eitri 跟随对它的任何写入，包括 `:let`，并保留每个模块的差别。
+- **要按 Shift 才能打出这些键的键盘。** 如果 `=` 或 `0` 要按 Shift，就像打这个字符时一样按住它：德语键盘上 `<prefix> Ctrl+Shift+0` 就是 `<prefix> Ctrl+=`，单独的 `Ctrl+Shift+0` 调整每个模块。
+
+插件页面（学习插件、Markdown 预览）整页一起变大变小，版面随文字一起变，并跟着窗口的文字大小走：`Ctrl+=` 让所有页面和其他模块一起变大；单独调大或调小过的页面会一直保持这个差别，直到按 `Ctrl+0`，或在它上面按 `<prefix> Ctrl+0`；页面重新加载后大小不变。这些键页面本身收不到。
+
+终端用编辑器的字体绘制，也就是你的 `guifont` 里的字体和字号（在 `init.lua` 里设 `terminal.font` 可以改，见[配置](configuration.zh-CN.md#settings)），并以同样的方式跟着窗口的文字大小走：`Ctrl+=` 让它和其他模块一起变大；在终端上 `Ctrl+wheel`，或在终端里按 `<prefix> Ctrl+=`，只改终端，直到在那里按 `Ctrl+0` 或 `<prefix> Ctrl+0`。窗口里所有终端是同一个大小，就像所有聊天视图是同一个大小。改字号就是给 shell 换一个网格：字越大，行数和列数越少，里面运行的程序会收到通知，和窗格本身改变大小时一样（`stty size` 会显示新的数字）。这些键和 `Ctrl+wheel` 程序本身收不到。
 
 companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的布局，所以那里的前缀只保留标签页键、`r`、`?`、`:`、`f`、文字大小键（`Ctrl+=`、`Ctrl+-`、`Ctrl+0`）、发送前缀本身或某个 `Ctrl+h/j/k/l` 组合键，以及方向键（它们朝相邻的窗口移动）；每个布局键都回答 `not in a companion window`。
 
@@ -176,7 +184,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<prefix> Alt+_` | 把这个模块送进便笺板：它浮起来并被收起 |
 | `<prefix> Alt+-` | 便笺板：收起拿着按键的那个正在显示的便笺浮动窗口；否则抬起一个正在显示的便笺浮动窗口；否则显示收起得最久的那一个。反复按会轮着来。便笺板是空的时，会闪一下并说明怎样往里放 |
 | `<prefix> Alt+H`、`Alt+J`、`Alt+K`、`Alt+L` | 按键在浮动窗口上时：把它向那个方向移五格，不出窗口（repeats） |
-| `<prefix> Ctrl+Left` ... `Ctrl+Down`、`Alt+Left` ... `Alt+Down` | 按键在浮动窗口上时：调整它的大小，一格 / 五格，中心不动：`Right` 和 `Down` 放大，`Left` 和 `Up` 缩小，不会小于模块的最小尺寸，也不会超出窗口（repeats） |
+| `<prefix> Ctrl+Left` ... `Ctrl+Down`、`Alt+Left` ... `Alt+Down` | 按键在浮动窗口上时：调整它的大小，一格 / 五格，中心不动：`Right` 和 `Down` 变大，`Left` 和 `Up` 变小，不会小于模块的最小尺寸，也不会超出窗口（repeats） |
 | `<prefix> H` / `J` / `K` | 按键在浮动窗口上时：把它作为平铺模块停靠到最左 / 最下 / 最上边缘 |
 | `Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l` | 从浮动窗口出发：如果那个方向上最近的是一个浮动窗口，就去它；否则去那一侧的平铺模块；再否则去浮动窗口中心下面的平铺模块。浮动窗口永远不会通向顶栏 |
 | `<prefix> (` / `<prefix> )` | 上一个 / 下一个工作区，首尾相接 |
@@ -314,11 +322,25 @@ k.set("root", "C-Space", "select.next")
 
 - **键必须带 Ctrl 或 Alt**（`C-`、`M-`、`C-M-`，命名键可以再加 `S-`）。光秃秃的键、光秃秃的功能键和只带 Shift 的键，会在 Neovim、你的 shell 和面板里到处被拿走，所以 Eitri 在启动时停下并说明。不提供 Super 组合键。
 - **前缀键能运行的动作都可以**，除了 `send-prefix` 和 `send-keys`，也没有 `repeatable` 选项（按住的根键不会重复；再按一次）。分割动作会等模块键，`select.number` 和工作区动作会等它们的数字或名字，和前缀之后一样。
-- **冲突会让启动停下，并点出双方：**前缀本身；内置的组合键（`F11`、`Ctrl+=`、`Ctrl+-`、`Ctrl+0` 和小键盘的写法、`Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l`）；在根表里绑了两次的键；`eitri.command.register` 的键位；以及同时绑在前缀之后的键（默认的或你的 `init.lua` 里的）。对最后一种，先 `eitri.keymap.del("prefix", "<key>")`，这样 `<prefix> <key>` 才能把这个键本身发出去。只来自 tmux 导入的前缀绑定会被丢掉，tmux 设的前缀等于某个根键时也一样（前缀退回 `Ctrl+b`）；每一条 Eitri 都会记一行日志。你的 `init.lua` 自己设的前缀则仍是错误。
-- **按住的键只运行一次。** 自动重复被吞掉，直到你松手；失去焦点或一次点击也会清掉它。
-- **在哪里有效。** 前缀有效的地方：窗口、第二个窗口、companion 窗口和 Mac 主机。在最后两处，动作被那个窗口拒绝的根键（比如 companion 窗口里的布局动作）会原样交给拿着按键的东西，而不是被吃掉。
+- **冲突会让启动停下，并点出双方：**前缀本身；内置的组合键（`F11`、`Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l`）；在根表里绑了两次的键；`eitri.command.register` 的键位；以及同时绑在前缀之后的键（默认的或你的 `init.lua` 里的）。对最后一种，先 `eitri.keymap.del("prefix", "<key>")`，这样 `<prefix> <key>` 才能把这个键本身发出去。只来自 tmux 导入的前缀绑定会被丢掉，tmux 设的前缀等于某个根键时也一样（前缀退回 `Ctrl+b`）；每一条 Eitri 都会记一行日志。你的 `init.lua` 自己设的前缀则仍是错误。
+- **文字大小的组合键可以由你占用。** `C-=`、`C--`、`C-0` 和 `C-+` 可以做根键，同时也可以继续绑在前缀之后，所以单按组合键和先按前缀的两种作用可以互换（见下面）。
+- **按住的键只运行一次。** 自动重复被吞掉，直到你松手；失去焦点或一次点击也会清掉它。绑到文字大小动作的键按住时会连续调整，和 `Ctrl+=` 一样。
+- **在哪里有效。** 前缀有效的地方：窗口、第二个窗口、companion 窗口和 Mac 主机。在最后两处，动作被那个窗口拒绝的根键（比如 companion 窗口里的布局动作）会原样交给拿着按键的东西，而不是被吃掉；在那里被拒绝的文字大小组合键保持内置的作用。
 - **按键表会列出它们**，在“Anywhere in the window”下，动作后面跟着 ` (init.lua)`。提示面板不列，因为它们不在前缀之后。
 - **tmux 的 `bind -n` 导入时仍然跳过**（按键表里会这么说）；改在这里设。
+
+**互换两种文字大小键。** 动作名是：拿着按键的窗格用 `text.larger`、`text.smaller`、`text.reset`，每个模块用 `text.all.larger`、`text.all.smaller`、`text.all.reset`。要让单按组合键只调一个窗格、先按前缀调整所有模块：
+
+```lua
+local k = eitri.keymap
+for key, change in pairs({ ["C-="] = "larger", ["C--"] = "smaller", ["C-0"] = "reset" }) do
+  k.set("root", key, "text." .. change)
+  k.del("prefix", key)
+  k.set("prefix", key, "text.all." .. change, { repeatable = true })
+end
+```
+
+`Ctrl++` 和小键盘的 `+` 都是 `C-+`；把它以 `"larger"` 加进这张表，它们也一起互换。
 
 **把组合键发过去。** Neovim、终端里的程序、agent 面板和插件页面都看不到根键。想让模块拿到它，就按 `<prefix> <key>`：Neovim 收到的是一个键，底部终端收到的是敲这个键会产生的字节（`Ctrl+Space` 是 NUL，`Alt+z` 是 Escape 加 `z`）。agent 面板和插件页面拿不回这样的组合键：面板只认字面的 `Ctrl+a`，页面不接受字面键。你能重新绑定的面板键表里没有 Ctrl 或 Alt 组合键，但面板固定的键里有，而且没有警告覆盖它们：`Ctrl+a`、`Ctrl+c`、`Ctrl+d`、`Ctrl+e`、`Ctrl+f`、`Ctrl+g`、`Ctrl+n`、`Ctrl+o`、`Ctrl+p`、`Ctrl+r`、`Ctrl+u`、`Ctrl+w`、`Ctrl+y`、`Ctrl+Enter` 和 `Alt+Enter`（见下面的 INSERT 和 BROWSE 两张表）。根键占了其中一个，它在面板里就不再起作用。把组合键重新发给这些页面，是以后的改动。
 

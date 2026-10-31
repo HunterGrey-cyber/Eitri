@@ -17,6 +17,11 @@
 //! the chord. A host that cannot run some actions says so with `set_root_keep`; a root key whose action it
 //! refuses passes on untouched. The auto-repeat of a held root key is swallowed like any consumed key's.
 //!
+//! A run of text size steps on Ctrl chords (`text.*` after the prefix, with Ctrl held) lasts while Ctrl stays down as
+//! well as for the repeat time after its last step, whichever ends later: a person sizing a pane with Ctrl held has
+//! not left the pane by pausing to look. Every other `-r` key keeps tmux's timer. Hosts report Ctrl's release through
+//! [`Prefix::ctrl_released`]; a release lost to another window is covered by [`Prefix::cancel`].
+//!
 //! Presses arrive already translated (`Press`), and a consumed key is remembered by its hardware
 //! keycode, not its name: an auto-repeat of a held key carries the same keycode however the layout
 //! or modifiers rename it, and a release must find the key it ends. Nothing here knows a toolkit:
@@ -26,7 +31,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::keymap::action::SplitCwd;
-use crate::keymap::{Action, KeySpec, Keymap};
+use crate::keymap::{root, Action, KeyName, KeySpec, Keymap};
 use crate::layout::{Axis, ModuleId, ModuleKeys, ModuleKind};
 
 /// tmux's default `repeat-time`.
@@ -42,6 +47,11 @@ pub enum Press {
     Key(KeySpec),
     Escape,
     Modifier,
+    /// Ctrl and Shift held on a text size key, where Shift typed the character: `=` is Shift+0 on a German keyboard,
+    /// `0` is Shift+à on a French one. After the prefix it reads as the chord it names. With nothing armed it is no
+    /// key of the prefix's unless a user root key names it, so an accelerator still gets it. `+` this way is a US
+    /// keyboard's `Ctrl+Shift+=`, which only the prefix reads.
+    ShiftTyped(KeySpec),
     /// Super/Hyper/Meta held, `C-S-<char>`, or a key with no tmux name.
     Other,
 }
@@ -121,9 +131,11 @@ enum State {
     AwaitNumber {
         until: Instant,
     },
-    /// After a repeatable binding: another repeatable key before `until` runs without the prefix.
+    /// After a repeatable binding: another repeatable key before `until` runs without the prefix. `ctrl`: a run of
+    /// text size steps on Ctrl chords with Ctrl still down, which `until` does not end.
     Repeat {
         until: Instant,
+        ctrl: bool,
     },
 }
 
@@ -146,6 +158,8 @@ pub struct Prefix {
     state: State,
     /// Which actions this host runs for a root key; a root key whose action it refuses is not a root key here.
     root_keep: Rc<dyn Fn(&Action) -> bool>,
+    /// Whether the built-in root keys the prefix runs itself (`root::key_stage_action`) are this host's.
+    key_stage_roots: bool,
     /// The hardware keycode of the last key this machine consumed, until it is released. Its
     /// auto-repeat is not a new key: holding the prefix must not turn into `prefix prefix`.
     held: Option<u32>,
@@ -159,6 +173,7 @@ impl Prefix {
         Prefix {
             state: State::Idle,
             root_keep: Rc::new(|_| true),
+            key_stage_roots: true,
             held: None,
             keymap,
             module_keys,
@@ -174,6 +189,12 @@ impl Prefix {
     /// Limits root keys to the actions `keep` accepts (a companion window has no layout to run most of them on).
     pub fn set_root_keep(&mut self, keep: Rc<dyn Fn(&Action) -> bool>) {
         self.root_keep = keep;
+    }
+
+    /// Whether this host has the built-in chords at all. A host without them leaves `Ctrl++` to the pane, as it does
+    /// `Ctrl+=`.
+    pub fn set_key_stage_roots(&mut self, on: bool) {
+        self.key_stage_roots = on;
     }
 
     pub fn is_armed(&self) -> bool {
@@ -233,6 +254,18 @@ impl Prefix {
         self.held == Some(keycode)
     }
 
+    /// Whether a run is waiting on Ctrl: the one time a host need report Ctrl's release.
+    pub fn watches_ctrl(&self) -> bool {
+        matches!(self.state, State::Repeat { ctrl: true, .. })
+    }
+
+    /// Ctrl went up: a text size run has what is left of its repeat time.
+    pub fn ctrl_released(&mut self) {
+        if let State::Repeat { ctrl, .. } = &mut self.state {
+            *ctrl = false;
+        }
+    }
+
     /// The module a key names while a wait for a module key is up: the exact key first (a Lua panel may own a
     /// capital), then a capital's lowercase.
     fn module_named(&self, press: Press) -> Option<ModuleId> {
@@ -245,20 +278,46 @@ impl Prefix {
     }
 
     fn repeatable(&self, press: Press) -> Option<Action> {
-        let Press::Key(key) = press else { return None };
+        let (Press::Key(key) | Press::ShiftTyped(key)) = press else {
+            return None;
+        };
         self.keymap
             .lookup(&key)
             .filter(|b| b.repeatable)
             .map(|b| b.action.clone())
     }
 
-    /// The action of the root key `press` is, when this host keeps it.
+    /// The action of the root key `press` is, when this host keeps it: the user's root table first, so `init.lua` can
+    /// take a text size chord, then the built-in chords run here. A chord whose user action the host refuses keeps its
+    /// built-in one, as an accelerator's does.
     fn root_action(&self, press: Press) -> Option<Action> {
-        let Press::Key(key) = press else { return None };
+        let key = match press {
+            Press::Key(key) => key,
+            Press::ShiftTyped(key) if key.key != KeyName::Char('+') => key,
+            _ => return None,
+        };
+        let built_in = || {
+            if self.key_stage_roots && matches!(press, Press::Key(_)) {
+                root::key_stage_action(&key)
+            } else {
+                None
+            }
+        };
+        let keep = |action: &Action| (self.root_keep)(action);
         self.keymap
             .root_lookup(&key)
-            .filter(|b| (self.root_keep)(&b.action))
             .map(|b| b.action.clone())
+            .filter(keep)
+            .or_else(|| built_in().filter(keep))
+    }
+
+    /// The run a repeatable `action` starts or goes on with, from a press at `now`.
+    fn run_state(press: Press, action: &Action, now: Instant) -> State {
+        let on_ctrl = matches!(press, Press::Key(key) | Press::ShiftTyped(key) if key.ctrl);
+        State::Repeat {
+            until: now + REPEAT_TIME,
+            ctrl: on_ctrl && action.is_text_size(),
+        }
     }
 
     /// A root key pressed with nothing armed: consumed, and run (a split waits for its module key first).
@@ -277,7 +336,7 @@ impl Prefix {
     }
 
     pub fn press(&mut self, press: Press, keycode: u32, now: Instant) -> Outcome {
-        if let State::Repeat { until } | State::AwaitNumber { until } = self.state {
+        if let State::Repeat { until, ctrl: false } | State::AwaitNumber { until } = self.state {
             if now > until {
                 self.state = State::Idle;
             }
@@ -287,9 +346,13 @@ impl Prefix {
             // A consumed key's auto-repeat: a repeatable binding keeps repeating, as under tmux's -r.
             if let State::Repeat { .. } = self.state {
                 if let Some(action) = self.repeatable(press) {
-                    self.state = State::Repeat {
-                        until: now + REPEAT_TIME,
-                    };
+                    self.state = Self::run_state(press, &action, now);
+                    return Outcome::Run(PrefixCommand::Run(action));
+                }
+            }
+            // A text size root key steps while held, as the chords an accelerator takes do.
+            if self.state == State::Idle {
+                if let Some(action) = self.root_action(press).filter(Action::is_text_size) {
                     return Outcome::Run(PrefixCommand::Run(action));
                 }
             }
@@ -350,7 +413,7 @@ impl Prefix {
                 }
                 self.held = Some(keycode);
                 self.state = State::Idle;
-                let Press::Key(key) = press else {
+                let (Press::Key(key) | Press::ShiftTyped(key)) = press else {
                     return Outcome::Swallow;
                 };
                 match self.keymap.lookup(&key) {
@@ -365,9 +428,7 @@ impl Prefix {
                         }
                         ref action => {
                             if binding.repeatable {
-                                self.state = State::Repeat {
-                                    until: now + REPEAT_TIME,
-                                };
+                                self.state = Self::run_state(press, action, now);
                             }
                             Outcome::Run(PrefixCommand::Run(action.clone()))
                         }
@@ -417,9 +478,7 @@ impl Prefix {
                 }
                 if let Some(action) = self.repeatable(press) {
                     self.held = Some(keycode);
-                    self.state = State::Repeat {
-                        until: now + REPEAT_TIME,
-                    };
+                    self.state = Self::run_state(press, &action, now);
                     return Outcome::Run(PrefixCommand::Run(action));
                 }
                 // Not repeatable: repeat mode ends. A root key runs; any other key goes to the pane as usual (tmux).
@@ -594,6 +653,285 @@ mod tests {
             p.press(key("C-Up"), K1, t3),
             Outcome::Pass,
             "past the window it reaches the pane"
+        );
+    }
+
+    fn text(change: TextChange) -> Outcome {
+        run(Action::Text(change))
+    }
+
+    /// `prefix C-=`, released with Ctrl held, is a run on the pane for as long as Ctrl stays down. The same press
+    /// after the run ends goes on to the accelerator, which sizes every module.
+    #[test]
+    fn a_text_size_run_lasts_while_ctrl_is_down_and_past_its_time() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        assert_eq!(p.press(key("C-="), K1, t0), text(TextChange::Larger));
+        p.release(K1);
+        assert!(p.watches_ctrl());
+        let t1 = t0 + Duration::from_secs(30);
+        assert_eq!(
+            p.press(key("C--"), K2, t1),
+            text(TextChange::Smaller),
+            "half a minute on"
+        );
+        p.release(K2);
+        let t2 = t1 + Duration::from_secs(30);
+        assert_eq!(p.press(key("C-="), K1, t2), text(TextChange::Larger));
+        p.release(K1);
+        p.ctrl_released();
+        assert!(!p.watches_ctrl());
+        let t3 = t2 + Duration::from_millis(600);
+        assert_eq!(
+            p.press(key("C-="), K1, t3),
+            Outcome::Pass,
+            "Ctrl went up and the time ran out"
+        );
+    }
+
+    /// Letting go does not shorten what the timer gives: a press 400 ms after the last step stays on the pane, as it
+    /// does with no Ctrl rule at all, and goes on to last while Ctrl is down again.
+    #[test]
+    fn a_text_size_run_ends_at_the_later_of_the_release_and_the_time() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        p.press(key("C-="), K1, t0);
+        p.release(K1);
+        p.ctrl_released();
+        let t1 = t0 + Duration::from_millis(400);
+        assert_eq!(p.press(key("C-="), K1, t1), text(TextChange::Larger));
+        p.release(K1);
+        assert!(p.watches_ctrl(), "Ctrl is down again");
+        let t2 = t1 + Duration::from_secs(5);
+        assert_eq!(p.press(key("C-="), K1, t2), text(TextChange::Larger));
+    }
+
+    #[test]
+    fn a_reset_joins_the_run_at_any_point_of_it() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        assert_eq!(p.press(key("C-="), K1, t0), text(TextChange::Larger));
+        p.release(K1);
+        let t1 = t0 + Duration::from_secs(2);
+        assert_eq!(p.press(key("C-0"), K2, t1), text(TextChange::Reset), "in the run");
+        p.release(K2);
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(p.press(key("C-="), K1, t2), text(TextChange::Larger), "and it goes on");
+
+        let mut p = armed(defaults(), t0);
+        assert_eq!(p.press(key("C-0"), K2, t0), text(TextChange::Reset), "it can start one");
+        p.release(K2);
+        assert_eq!(p.press(key("C-="), K1, t1), text(TextChange::Larger));
+    }
+
+    /// With a keyboard repeat delay past the repeat time the first auto-repeat came after the run had ended.
+    #[test]
+    fn a_held_text_key_keeps_stepping_however_late_its_repeat_starts() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        assert_eq!(p.press(key("C-="), K1, t0), text(TextChange::Larger));
+        let t1 = t0 + Duration::from_millis(660);
+        assert_eq!(p.press(key("C-="), K1, t1), text(TextChange::Larger), "the auto-repeat");
+    }
+
+    #[test]
+    fn a_non_repeatable_key_ends_a_text_size_run_with_ctrl_still_down() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        p.press(key("C-="), K1, t0);
+        p.release(K1);
+        assert_eq!(p.press(key("C-h"), K2, t0 + Duration::from_secs(1)), Outcome::Pass);
+        p.release(K2);
+        assert!(!p.watches_ctrl());
+        assert_eq!(p.press(key("C-="), K1, t0 + Duration::from_secs(2)), Outcome::Pass);
+    }
+
+    /// Only `text.*` on a Ctrl chord: the arrows keep tmux's timer, and so does a text key with no Ctrl on it.
+    #[test]
+    fn every_other_repeat_keeps_the_timer() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        p.press(key("C-Up"), K1, t0);
+        p.release(K1);
+        assert!(!p.watches_ctrl(), "a resize holds Ctrl and is no text size step");
+
+        let bare = KeymapOp::Set {
+            table: "prefix".into(),
+            key: "=".into(),
+            action: "text.larger".into(),
+            opts: vec![("repeatable".into(), crate::keymap::OptValue::Bool(true))],
+        };
+        let mut p = armed(with(Keymap::apply_user(&[bare], &[]).unwrap(), &[]), t0);
+        assert_eq!(p.press(key("="), K1, t0), text(TextChange::Larger));
+        p.release(K1);
+        assert!(!p.watches_ctrl());
+        assert_eq!(p.press(key("="), K1, t0 + Duration::from_millis(600)), Outcome::Pass);
+    }
+
+    #[test]
+    fn a_step_of_another_key_after_a_ctrl_run_is_that_keys_rule() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        p.press(key("C-="), K1, t0);
+        p.release(K1);
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(
+            p.press(key("C-Up"), K2, t1),
+            run(Action::Resize {
+                dir: Direction::Up,
+                cells: 1
+            }),
+            "still in the run, and a repeatable key"
+        );
+        p.release(K2);
+        assert!(!p.watches_ctrl());
+        assert_eq!(p.press(key("C-="), K1, t1 + Duration::from_millis(600)), Outcome::Pass);
+    }
+
+    #[test]
+    fn losing_the_window_ends_a_run_whose_ctrl_release_never_comes() {
+        let t0 = Instant::now();
+        let mut p = armed(defaults(), t0);
+        p.press(key("C-="), K1, t0);
+        p.release(K1);
+        p.cancel();
+        assert!(!p.watches_ctrl());
+        assert_eq!(p.press(key("C-="), K1, t0 + Duration::from_secs(1)), Outcome::Pass);
+    }
+
+    fn shift_typed(s: &str) -> Press {
+        Press::ShiftTyped(KeySpec::parse(s).unwrap())
+    }
+
+    /// Swiss and JIS keyboards type `=` with Shift, and French `0`: after the prefix those presses are the chords
+    /// they name, and they keep a run going. With nothing armed the prefix leaves them to the accelerators.
+    #[test]
+    fn a_key_shift_typed_reads_as_its_chord_after_the_prefix_and_nowhere_else() {
+        let t0 = Instant::now();
+        let mut p = defaults();
+        assert_eq!(p.press(shift_typed("C-="), K1, t0), Outcome::Pass);
+        p.release(K1);
+        p = armed(p, t0);
+        assert_eq!(p.press(shift_typed("C-="), K1, t0), text(TextChange::Larger));
+        p.release(K1);
+        assert!(p.watches_ctrl());
+        let t1 = t0 + Duration::from_secs(2);
+        assert_eq!(p.press(shift_typed("C-0"), K2, t1), text(TextChange::Reset));
+        p.release(K2);
+        assert_eq!(p.press(shift_typed("C-+"), K1, t1), text(TextChange::Larger));
+        p.release(K1);
+        let mut p = armed(defaults(), t0);
+        assert_eq!(
+            p.press(Press::Modifier, SHIFT_L, t0),
+            Outcome::Swallow,
+            "Shift going down first keeps the wait"
+        );
+        assert_eq!(p.press(shift_typed("C-="), K1, t0), text(TextChange::Larger));
+    }
+
+    fn all(change: TextChange) -> Outcome {
+        run(Action::TextAll(change))
+    }
+
+    #[test]
+    fn ctrl_plus_with_no_shift_sizes_every_module_with_nothing_armed() {
+        let t = Instant::now();
+        let mut p = defaults();
+        assert_eq!(p.press(key("C-+"), K1, t), all(TextChange::Larger));
+        assert_eq!(
+            p.press(key("C-+"), K1, t),
+            all(TextChange::Larger),
+            "held, it steps as the accelerators do"
+        );
+        p.release(K1);
+        assert_eq!(
+            p.press(shift_typed("C-+"), K1, t),
+            Outcome::Pass,
+            "a US Ctrl+Shift+= stays the pane's: a <C-+> mapping keeps working"
+        );
+        p.release(K1);
+        let mut p = armed(defaults(), t);
+        assert_eq!(
+            p.press(key("C-+"), K1, t),
+            text(TextChange::Larger),
+            "after the prefix, the pane"
+        );
+    }
+
+    /// `+` with Shift is a US keyboard's `Ctrl+Shift+=`, so a user root key on `C-+` is the press with no Shift alone.
+    #[test]
+    fn a_root_key_on_plus_is_not_a_us_ctrl_shift_equal() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("C-+", "text.larger")]);
+        assert_eq!(p.press(shift_typed("C-+"), K1, t), Outcome::Pass);
+        p.release(K1);
+        assert_eq!(p.press(key("C-+"), K1, t), text(TextChange::Larger));
+    }
+
+    #[test]
+    fn a_host_without_the_built_in_chords_leaves_ctrl_plus_to_the_pane() {
+        let t = Instant::now();
+        let mut p = defaults();
+        p.set_key_stage_roots(false);
+        assert_eq!(p.press(key("C-+"), K1, t), Outcome::Pass);
+    }
+
+    #[test]
+    fn ctrl_plus_keeps_its_built_in_step_where_the_users_action_is_refused() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("C-+", "zoom")]);
+        p.set_root_keep(Rc::new(|action| !matches!(action, Action::Zoom)));
+        assert_eq!(p.press(key("C-+"), K1, t), all(TextChange::Larger));
+    }
+
+    #[test]
+    fn a_host_that_refuses_the_action_leaves_ctrl_plus_to_the_pane() {
+        let t = Instant::now();
+        let mut p = defaults();
+        p.set_root_keep(Rc::new(|action| !action.is_text_size()));
+        assert_eq!(p.press(key("C-+"), K1, t), Outcome::Pass);
+    }
+
+    fn swapped() -> Prefix {
+        let mut ops = Vec::new();
+        for (chord, change) in [("C-=", "larger"), ("C--", "smaller"), ("C-0", "reset")] {
+            ops.push(root_op(chord, &format!("text.{change}")));
+            ops.push(KeymapOp::Del {
+                table: "prefix".into(),
+                key: chord.into(),
+            });
+            ops.push(KeymapOp::Set {
+                table: "prefix".into(),
+                key: chord.into(),
+                action: format!("text.all.{change}"),
+                opts: vec![("repeatable".into(), crate::keymap::OptValue::Bool(true))],
+            });
+        }
+        with_root(&ops)
+    }
+
+    /// `init.lua` swaps the two scopes: the plain chord is the pane, the prefix before it every module, whose run
+    /// lasts on Ctrl as well. A held text size root key steps, as a built-in chord does.
+    #[test]
+    fn the_two_scopes_can_change_places() {
+        let t0 = Instant::now();
+        let mut p = swapped();
+        assert_eq!(p.press(key("C-="), K1, t0), text(TextChange::Larger));
+        assert_eq!(p.press(key("C-="), K1, t0), text(TextChange::Larger), "held");
+        p.release(K1);
+        assert_eq!(
+            p.press(shift_typed("C-="), K1, t0),
+            text(TextChange::Larger),
+            "the same chord where Shift types the key"
+        );
+        p.release(K1);
+        p = armed(p, t0);
+        assert_eq!(p.press(key("C-="), K1, t0), all(TextChange::Larger));
+        p.release(K1);
+        assert!(p.watches_ctrl());
+        assert_eq!(
+            p.press(key("C-0"), K2, t0 + Duration::from_secs(3)),
+            all(TextChange::Reset)
         );
     }
 

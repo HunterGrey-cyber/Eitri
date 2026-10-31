@@ -63,7 +63,7 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 | `<prefix> Left`, `Right`, `Up`, `Down` | move the keys to the module on that side (repeats) |
 | `<prefix> ;` | move the keys back to the module that had them before |
 | `<prefix> o` | move the keys to the next module on screen |
-| `<prefix> z` | zoom this module, or restore it |
+| `<prefix> z` | zoom this module to fill the window, or restore it. In this guide "zoom" only ever means this; changing the size of text is "text size" |
 | `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there; with the keys in a terminal, `t` opens a new terminal there (see [Containers and terminals](#containers-and-terminals)) |
 | `<prefix> d`, then `e`, `a` or `t` (or a panel's own key) | hide that module wherever the keys are; it keeps running. The keys stay where they are unless that module had them, and then go to its neighbour; `Esc` cancels |
 | `<prefix> !` | with the keys in the agent panel: break the active tab out into a chat view of its own, to the right of the panel; with the keys in such a view, join its tab back (see [Chat views](#chat-views)) |
@@ -82,7 +82,7 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 | `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri, and then the question, like closing the window, also names the chat turns running or queued and the terminals running a command (`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`); a job left in the background at a shell prompt is not counted. On the editor it quits nvim as `:confirm qall` does (nvim asks about unsaved buffers itself), and the editor comes back with a fresh nvim on `<prefix> e` |
 | `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal and the toast says `prefix [ scrolls the terminal` |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
-| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only: the editor, the chat, a plugin's page or the terminal (repeats: keep Ctrl down and press `=` or `-` again) |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only: the editor, the chat, a plugin's page or the terminal. One prefix takes as many steps as you like: `=`, `-` and `0` stay on this pane for as long as Ctrl is down, and until half a second after the last step |
 
 Each of these arrangements ends a zoom when it changes something and leaves it on when there was nothing to do. The
 keys stay with the module that had them, and a hidden module stays hidden. With fewer than two modules on screen they
@@ -141,18 +141,39 @@ adds yours):
 | keys | what they do |
 |---|---|
 | `F11` | fullscreen |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for the editor, the panel, every plugin page and the terminal together (the keypad's `+`, `-` and `0` work too) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for every module of the window: the editor, the chat, every plugin page and every terminal (the keypad's `+`, `-` and `0` work too, and so does `Ctrl++` where `+` is a key of its own, as on a German keyboard) |
 | `Ctrl+wheel` | text size of the pane under the pointer only |
 
-A plugin's page (the learning plugin, the Markdown preview) is zoomed whole, its layout with its text, and follows the
-editor's size: `Ctrl+=` grows the editor and every page together, a page made larger or smaller on its own keeps that
+**How text sizes add up.** The window has one text size, and each module has its own difference from it. `Ctrl+=` and
+`Ctrl+-` move the window's size, so every module moves and keeps its difference. `<prefix> Ctrl+=`, `Ctrl+-` and
+`Ctrl+wheel` change one difference: every chat view shares one, every terminal shares one, the editor has one and each
+plugin page has its own. `<prefix> Ctrl+0` clears the difference of the pane with the keys, so that pane rejoins the
+others wherever they are. `Ctrl+0` clears every difference and puts the window's size back to what your configuration
+says: `g:neovide_scale_factor` if your `init.lua` sets it, otherwise 100%.
+
+- **What moves.** Every module of this window, shown or hidden. The top bar and the hint panel keep their size, and
+  with the top bar holding the keys the pane keys do nothing.
+- **Other windows.** Each window of Eitri has its own text size. A second window starts at 100%. A window that holds
+  one module (a [companion window](companion.md), a chat or page window in [compositor mode](compositor-windows.md))
+  has one size, so there `<prefix> Ctrl+=` and `Ctrl+=` are the same action.
+- **Nothing lasts past a restart.** For a size that does, set `guifont`, `agent.font_size`, `terminal.font` or
+  `g:neovide_scale_factor` in your configuration.
+- **Your own mappings.** Eitri takes `Ctrl+=`, `Ctrl+-`, `Ctrl+0`, `Ctrl++` and `Ctrl+wheel` before Neovim sees them, so
+  a `<C-=>` mapping in Neovim does not run. `<C-+>` does on a keyboard that types `+` with Shift, where `Ctrl+Shift+=`
+  goes on to Neovim as it always has. A mapping of your own reaches every module through `g:neovide_scale_factor`:
+  Eitri follows any write to it, a `:let` included, and keeps each module's difference.
+- **Keyboards that type these with Shift.** Where `=` or `0` needs Shift, hold it as you would to type the key: on a
+  German keyboard `<prefix> Ctrl+Shift+0` is `<prefix> Ctrl+=`, and `Ctrl+Shift+0` alone sizes every module.
+
+A plugin's page (the learning plugin, the Markdown preview) scales whole, its layout with its text, and follows the
+window's text size: `Ctrl+=` grows every page with everything else, a page made larger or smaller on its own keeps that
 difference until `Ctrl+0` or `<prefix> Ctrl+0` on it, and the page keeps its size when it reloads. The page never
 sees these keys.
 
 The terminal draws in the editor's font, the families and the size of your `guifont` (`terminal.font` in
-`init.lua` changes that, see [Configuration](configuration.md#settings)), and follows the editor's size the same way:
-`Ctrl+=` grows it with the editor, and `Ctrl+wheel` over a terminal or `<prefix> Ctrl+=` in one sizes it alone, until
-`Ctrl+0` or `<prefix> Ctrl+0` there. Every terminal of the window is one size, as every chat view is. A size change is
+`init.lua` changes that, see [Configuration](configuration.md#settings)), and follows the window's text size the same
+way: `Ctrl+=` grows it with everything else, and `Ctrl+wheel` over a terminal or `<prefix> Ctrl+=` in one sizes it alone,
+until `Ctrl+0` or `<prefix> Ctrl+0` there. Every terminal of the window is one size, as every chat view is. A size change is
 a new grid for the shell: a larger font is fewer rows and columns, and the program running in it is told, as when the
 pane itself is resized (`stty size` shows the new numbers). The program never sees these keys or `Ctrl+wheel`.
 
@@ -499,19 +520,37 @@ k.set("root", "C-Space", "select.next")
 - **Any action a prefix key can run**, except `send-prefix` and `send-keys`, and with no `repeatable` option (a held
   root key does not repeat; press it again). A split action waits for the module key, and `select.number` and the
   workspace actions wait for their digit or name, as after the prefix.
-- **Collisions stop the launch, naming both sides:** the prefix itself; a built-in chord (`F11`, `Ctrl+=`, `Ctrl+-`,
-  `Ctrl+0` and the keypad forms, `Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l`); a key bound twice in the root table; an
+- **Collisions stop the launch, naming both sides:** the prefix itself; a built-in chord (`F11`, `Ctrl+h`, `Ctrl+j`,
+  `Ctrl+k`, `Ctrl+l`); a key bound twice in the root table; an
   `eitri.command.register` keybinding; and a key that is also bound after the prefix, by default or in your
   `init.lua`. For the last one, `eitri.keymap.del("prefix", "<key>")` first, so that `<prefix> <key>` can send the key
   itself. A prefix binding that only came from your tmux import is dropped instead, as is a tmux prefix equal to a root
   key (the prefix falls back to `Ctrl+b`); Eitri logs one line for each. A prefix your `init.lua` set stays an error.
-- **A held key runs once.** The auto-repeat is swallowed until you let go, and losing focus or a click clears it.
+- **The text size chords are yours to take.** `C-=`, `C--`, `C-0` and `C-+` may be root keys, and they may stay bound
+  after the prefix too, so the plain chord and the prefix before it can change places (the block below).
+- **A held key runs once.** The auto-repeat is swallowed until you let go, and losing focus or a click clears it. A key
+  bound to a text size action steps while held, as `Ctrl+=` does.
 - **Where it works.** Wherever the prefix works: the window, a second window, the companion window and the Mac host.
   In the last two, a root key whose action that window refuses (a layout action in a companion window) is passed on to
-  whatever has the keys instead of being eaten.
+  whatever has the keys instead of being eaten; a text size chord refused there keeps its built-in action.
 - **The keys sheet lists them** under "Anywhere in the window", with ` (init.lua)` after the action. The hint panel
   does not, since they are not after the prefix.
 - **tmux's `bind -n` is still skipped on import** (the sheet says so); set the key here instead.
+
+**Swapping the two text size keys.** The actions are `text.larger`, `text.smaller` and `text.reset` for the pane with
+the keys, and `text.all.larger`, `text.all.smaller` and `text.all.reset` for every module. To make the plain chord size
+one pane and the prefix before it size everything:
+
+```lua
+local k = eitri.keymap
+for key, change in pairs({ ["C-="] = "larger", ["C--"] = "smaller", ["C-0"] = "reset" }) do
+  k.set("root", key, "text." .. change)
+  k.del("prefix", key)
+  k.set("prefix", key, "text.all." .. change, { repeatable = true })
+end
+```
+
+`Ctrl++` and the keypad's `+` are `C-+`; add it to the table with `"larger"` to swap those too.
 
 **Sending the chord through.** Neovim, programs in the terminal, the agent panel and plugin pages never see a root key.
 When you want the module to have it, `<prefix> <key>` sends it: Neovim gets it as a key, the bottom terminal as the

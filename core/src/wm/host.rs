@@ -1142,6 +1142,8 @@ pub enum TextSizeEvent {
     PageAttached { win: WinId, module: ModuleId },
     /// The unzoomed chat font size changed.
     Base { win: WinId, px: f32 },
+    /// What the user's config left in `g:neovide_scale_factor`, read at nvim's VimEnter: where `Ctrl+0` returns to.
+    Configured { win: WinId, scale: f64 },
 }
 
 /// Facts posted by the native host and services.
@@ -1151,6 +1153,8 @@ pub enum HostEvent {
     TextSize(TextSizeEvent),
     /// A watched hardware key was released.
     KeyReleased { win: WinId, keycode: u32 },
+    /// A Control key went up while the prefix asked to hear it ([`crate::wm::Controller::watches_ctrl`]).
+    CtrlReleased { win: WinId },
     /// A pointer event on a controller target.
     Pointer {
         win: WinId,

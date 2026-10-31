@@ -1,8 +1,8 @@
 //! The prefix table: the defaults (stock tmux), what `init.lua`'s `eitri.keymap` calls
 //! make of it (`apply_user`), the user's `"root"` table of keys that need no prefix, and the collision rules
 //! that are hard startup failures naming both sides (`set` on a bound key; the prefix equals a root chord; a
-//! root key equals the prefix, a built-in root chord or a prefix-table key; a Lua command's `keybinding` equals
-//! the prefix or a root chord). A Lua panel's key is
+//! root key equals the prefix, a built-in root chord other than the text size chords, or a prefix-table key; a Lua
+//! command's `keybinding` equals the prefix or a root chord). A Lua panel's key is
 //! `crate::layout::keys`'s, since it is checked where panel keys are built.
 
 use std::collections::BTreeMap;
@@ -400,14 +400,14 @@ fn default_bindings() -> Vec<Binding> {
         );
     }
     bind("F11", Action::WindowImmersive, false);
-    // The text size of the module with the keys alone: the prefix before the chord that sizes every pane
-    // together (`Ctrl+=`/`Ctrl+-`/`Ctrl+0`, the root table). Larger and smaller repeat like a resize, so
-    // one prefix takes a run of steps with Ctrl still held; a reset is one press.
+    // The text size of the module with the keys alone: the prefix before the chord that sizes every module
+    // (`Ctrl+=`/`Ctrl+-`/`Ctrl+0`, the root table). One prefix takes a run of steps, a reset among them, for as long
+    // as Ctrl stays down (`prefix.rs`).
     bind("C-=", Action::Text(TextChange::Larger), true);
     // The keypad's `+` with Ctrl reads as `C-+`; its `-` and `0` are already the two below.
     bind("C-+", Action::Text(TextChange::Larger), true);
     bind("C--", Action::Text(TextChange::Smaller), true);
-    bind("C-0", Action::Text(TextChange::Reset), false);
+    bind("C-0", Action::Text(TextChange::Reset), true);
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
@@ -861,6 +861,9 @@ impl Keymap {
                     "the prefix; choose another root key, or another prefix with eitri.keymap.prefix".to_string(),
                 ));
             }
+            if root::rebindable(&chord) {
+                continue;
+            }
             if let Some((_, named)) = builtin.iter().find(|(c, _)| *c == chord) {
                 return Err(collides(format!("{named}, which Eitri keeps")));
             }
@@ -1188,7 +1191,7 @@ mod tests {
         ("C-=", "text.larger", true),
         ("C-+", "text.larger", true),
         ("C--", "text.smaller", true),
-        ("C-0", "text.reset", false),
+        ("C-0", "text.reset", true),
         ("e", "module.editor", false),
         ("a", "module.agent", false),
         ("t", "module.terminal", false),
@@ -1987,11 +1990,58 @@ mod tests {
         assert!(err.to_string().contains("the prefix"), "{err}");
         let err = root_err(&[prefix("M-y"), root_set("M-y", "tab.next")]);
         assert!(err.to_string().contains("the prefix"), "{err}");
-        for (key, named) in [("C-h", "Ctrl+h"), ("C-=", "Ctrl+=")] {
+        for (key, named) in [("C-h", "Ctrl+h"), ("C-l", "Ctrl+l")] {
             let err = root_err(&[root_set(key, "tab.next")]);
             assert!(matches!(err, KeymapError::RootCollides { .. }), "{key}: {err:?}");
             assert!(err.to_string().contains(named), "{key}: {err}");
             assert!(err.to_string().contains("Eitri keeps"), "{err}");
+        }
+    }
+
+    /// The text size chords are the built-in chords `init.lua` may take. They stay bound after the prefix by default,
+    /// and that is no collision: the prefix before the chord is how the two scopes are told apart.
+    #[test]
+    fn the_text_size_chords_can_be_root_keys_beside_their_prefix_bindings() {
+        for key in ["C-=", "C-+", "C--", "C-0"] {
+            let map = Keymap::apply_user(&[root_set(key, "text.larger")], &[]).unwrap();
+            assert_eq!(
+                map.root_lookup(&k(key)).unwrap().action,
+                Action::Text(TextChange::Larger)
+            );
+            assert_eq!(
+                map.lookup(&k(key)).unwrap().action,
+                match key {
+                    "C--" => Action::Text(TextChange::Smaller),
+                    "C-0" => Action::Text(TextChange::Reset),
+                    _ => Action::Text(TextChange::Larger),
+                },
+                "{key} after the prefix stays"
+            );
+        }
+        let swap = Keymap::apply_user(
+            &[
+                root_set("C-=", "text.larger"),
+                del("C-="),
+                KeymapOp::Set {
+                    table: "prefix".into(),
+                    key: "C-=".into(),
+                    action: "text.all.larger".into(),
+                    opts: vec![("repeatable".into(), OptValue::Bool(true))],
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        let bound = swap.lookup(&k("C-=")).unwrap();
+        assert_eq!(bound.action, Action::TextAll(TextChange::Larger));
+        assert!(bound.repeatable);
+    }
+
+    #[test]
+    fn a_text_size_chord_is_still_no_prefix() {
+        for key in ["C-=", "C--", "C-0", "C-+"] {
+            let err = Keymap::apply_user(&[prefix(key)], &[]).unwrap_err();
+            assert!(matches!(err, KeymapError::PrefixIsRoot { .. }), "{key}: {err:?}");
         }
     }
 
@@ -2056,11 +2106,9 @@ mod tests {
     /// the keypad's plus is the character `+`; a collision check that compares the spellings as written misses both.
     #[test]
     fn a_root_key_or_prefix_collides_with_a_chord_however_the_press_spells_it() {
-        let err = root_err(&[del("C-+"), root_set("C-+", "tab.next")]);
-        assert!(matches!(err, KeymapError::RootCollides { .. }), "{err:?}");
-        assert!(err.to_string().contains("Keypad+"), "{err}");
         let err = root_err(&[prefix("C-+")]);
         assert!(matches!(err, KeymapError::PrefixIsRoot { .. }), "{err:?}");
+        assert!(err.to_string().contains("Keypad+"), "{err}");
 
         let map = Keymap::apply_user(&[root_set("M-Y", "tab.next")], &[]).unwrap();
         let err = check_command_keybinding("cmd", "<Alt><Shift>y", &map).unwrap_err();

@@ -1,11 +1,14 @@
 //! The root keys work with no prefix. `ROOT_ACCELS` holds the chords registered by the shell;
 //! `Ctrl+h/j/k/l` use capture-phase navigation controllers and are listed for collision checks.
 //!
-//! No root chord holds `Ctrl+Shift`, which conflicts with input-method hotkeys. `plus` is omitted
-//! because it requires Shift on a US keyboard.
+//! No root chord holds `Ctrl+Shift`, which conflicts with input-method hotkeys. `plus` is no accelerator, because
+//! GTK ignores a Shift that typed the key, so `<Control>plus` would also fire on a US keyboard's `Ctrl+Shift+=`.
+//! `Ctrl++` is a key the prefix's machine runs instead ([`key_stage_action`]), where a press with Shift held is
+//! told apart: it works where `+` is a key of its own (German, Nordic, Spanish, Italian) and a US `<C-+>` mapping
+//! keeps working.
 
-use super::key::Chord;
-use super::{Action, Keymap};
+use super::key::{Chord, KeyName, KeySpec};
+use super::{Action, Keymap, TextChange};
 
 /// A static root chord, independent of the host's accelerator spelling.
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +66,7 @@ pub const ROOT_ACCELS: &[RootAccel] = &[
                 key: "KP_Add",
             },
         ],
-        what: "Text size larger (both panes)",
+        what: "Text size larger (every module)",
     },
     RootAccel {
         action: "text-smaller",
@@ -81,7 +84,7 @@ pub const ROOT_ACCELS: &[RootAccel] = &[
                 key: "KP_Subtract",
             },
         ],
-        what: "Text size smaller (both panes)",
+        what: "Text size smaller (every module)",
     },
     RootAccel {
         action: "text-reset",
@@ -106,9 +109,23 @@ pub const ROOT_ACCELS: &[RootAccel] = &[
                 key: "KP_Insert",
             },
         ],
-        what: "Text size reset (both panes)",
+        what: "Text size reset (every module)",
     },
 ];
+
+/// The built-in root key no accelerator can hold: `Ctrl++` with no Shift. `key` is a press, so Shift is not on it: a
+/// US `Ctrl+Shift+=` reads as [`super::prefix::Press::ShiftTyped`] and never gets here.
+pub fn key_stage_action(key: &KeySpec) -> Option<Action> {
+    (key.ctrl && !key.meta && !key.shift && key.key == KeyName::Char('+'))
+        .then_some(Action::TextAll(TextChange::Larger))
+}
+
+/// Whether `init.lua` may take this built-in chord in its root table: the text size chords, so the plain chord and
+/// the prefix before it can change places. The prefix before such a chord is already its own key, so a prefix binding
+/// of it is no collision either.
+pub fn rebindable(chord: &Chord) -> bool {
+    chord.ctrl && !chord.alt && !chord.shift && matches!(chord.key.as_str(), "=" | "+" | "-" | "0")
+}
 
 /// `Ctrl+<letter>`: move the keys to the module that way (vim-tmux-navigator's convention).
 pub const NAV_KEYS: [(char, &str); 4] = [
@@ -249,9 +266,15 @@ pub fn compositor_help_rows() -> Vec<HelpRow> {
 fn accel_rows() -> Vec<HelpRow> {
     let mut rows: Vec<HelpRow> = ROOT_ACCELS
         .iter()
-        .map(|row| HelpRow {
-            keys: row.chords.iter().map(spell_chord).collect::<Vec<_>>().join(" / "),
-            what: row.what.to_string(),
+        .map(|row| {
+            let mut keys: Vec<String> = row.chords.iter().map(spell_chord).collect();
+            if row.action == "text-larger" {
+                keys.insert(1, "Ctrl++".into());
+            }
+            HelpRow {
+                keys: keys.join(" / "),
+                what: row.what.to_string(),
+            }
         })
         .collect();
     rows.push(HelpRow {
@@ -323,7 +346,7 @@ mod tests {
     }
 
     /// Control and Shift together conflict with input-method hotkeys. `plus` is Shift+= on a US
-    /// layout, and an uppercase letter needs Shift, so both count.
+    /// layout, and an uppercase letter needs Shift, so both count: `Ctrl++` is no accelerator.
     #[test]
     fn no_root_chord_holds_control_and_shift() {
         for (chord, what) in chords() {
@@ -453,6 +476,26 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_plus_with_no_shift_is_the_one_key_stage_root() {
+        let key = |text: &str| KeySpec::parse(text).unwrap();
+        assert_eq!(key_stage_action(&key("C-+")), Some(Action::TextAll(TextChange::Larger)));
+        for other in ["C-=", "+", "M-+", "C-M-+", "C--", "C-0"] {
+            assert_eq!(key_stage_action(&key(other)), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn only_the_text_size_chords_can_be_taken_by_a_root_key() {
+        let chord = |text: &str| Chord::of(&KeySpec::parse(text).unwrap());
+        for text in ["C-=", "C-+", "C--", "C-0"] {
+            assert!(rebindable(&chord(text)), "{text}");
+        }
+        for text in ["C-h", "C-j", "C-k", "C-l", "F11", "M-=", "C-M-="] {
+            assert!(!rebindable(&chord(text)), "{text}");
+        }
+    }
+
+    #[test]
     fn every_root_accelerator_and_every_nav_key_is_in_the_help() {
         let rows = help_rows();
         let keys: Vec<&str> = rows.iter().flat_map(|r| r.keys.split(" / ")).collect();
@@ -467,6 +510,7 @@ mod tests {
         for (letter, _) in NAV_KEYS {
             assert!(keys.contains(&format!("Ctrl+{letter}").as_str()), "Ctrl+{letter}");
         }
+        assert!(keys.contains(&"Ctrl++"), "the key stage's own chord: {keys:?}");
         assert!(rows.iter().any(|r| r.keys == "Ctrl+wheel"), "the per-pane wheel row");
         assert!(rows.iter().all(|r| !r.keys.contains("Shift")), "{rows:?}");
     }

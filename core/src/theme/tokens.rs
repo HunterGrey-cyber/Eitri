@@ -768,6 +768,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "t".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         }
     }

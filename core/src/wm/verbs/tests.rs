@@ -225,7 +225,8 @@ fn decided_here(action: &Action) -> bool {
         | Action::PanelCommandLine
         | Action::Tab(_)
         | Action::TabBreak
-        | Action::Text(_) => true,
+        | Action::Text(_)
+        | Action::TextAll(_) => true,
     }
 }
 

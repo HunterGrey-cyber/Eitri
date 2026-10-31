@@ -51,6 +51,7 @@ pub fn classify_window1(action: &Action) -> HubVerb {
         | Action::SendKeys(_)
         | Action::CopyMode { .. }
         | Action::Text(_)
+        | Action::TextAll(_)
         | Action::WindowImmersive
         | Action::WindowSetup
         | Action::ModuleHide
@@ -116,6 +117,7 @@ pub fn classify_module(action: &Action) -> ModuleVerb {
         | Action::PanelKeymap
         | Action::PanelCommandLine
         | Action::Text(_)
+        | Action::TextAll(_)
         | Action::Hint
         | Action::SendPrefix
         | Action::SendKeys(_)

@@ -3,7 +3,7 @@
 use crate::keymap::TextChange;
 use crate::layout::ModuleId;
 use crate::wm::host::{Batch, ChatOp, EditorCall, HostOp, PluginOp, TermOp, TextSizeEvent};
-use crate::wm::text_size::{describe_write, route_focused_module, TextSizeTarget};
+use crate::wm::text_size::{describe_write, route_focused_module, TextSizeTarget, TextStep};
 use crate::wm::window::{EditorPresence, WinId, Window};
 
 /// A focused text-size step uses the module holding the keys at the time of the action.
@@ -55,33 +55,34 @@ pub fn run(w: &mut Window, win: WinId, change: TextChange, keys: Option<&ModuleI
     }
 }
 
+/// `Ctrl+=`/`Ctrl+-`/`Ctrl+0`, and a key bound to `text.all.*`: every module that exists moves. A Lua `main` panel
+/// hides the full window's editor rather than replacing it; a linked second window has none, and then there is no S
+/// to write.
+pub(in crate::wm) fn all(w: &mut Window, win: WinId, step: TextStep, batch: &mut Batch) {
+    let Some(state) = w.text_size.clone() else { return };
+    if *w.presence() == EditorPresence::None {
+        w.warn(format!("[text-size] {step:?} (every module): no editor pane"));
+        w.text_size = Some(state.apply_app_step(step));
+        push_sizes(w, win, batch);
+        log_panel(w, "panel");
+    } else {
+        let (state, write) = state.apply_both_step(step);
+        w.text_size = Some(state);
+        write_scale(win, write, batch);
+        push_sizes(w, win, batch);
+        log_write(w, "both", write);
+    }
+}
+
 pub(in crate::wm) fn event(w: &mut Window, event: TextSizeEvent, batch: &mut Batch) {
     let Some(state) = w.text_size.clone() else { return };
     match event {
-        // `app.text-larger`/`-smaller`/`-reset`: both panes move together, or -- with no editor --
-        // the panel and terminals: "together" means "every pane that exists". A Lua `main` panel hides
-        // the full window's editor rather than replacing it; a linked second window has none.
-        TextSizeEvent::Both { win, step } => {
-            if *w.presence() == EditorPresence::None {
-                w.warn(format!(
-                    "[text-size] {step:?} (both panes): no editor pane, scaling the panel and terminals"
-                ));
-                w.text_size = Some(state.apply_panel_step(step).apply_terminal_step(step));
-                push_sizes(w, win, batch);
-                log_panel(w, "panel");
-            } else {
-                let (state, write) = state.apply_both_step(step);
-                w.text_size = Some(state);
-                write_scale(win, write, batch);
-                push_sizes(w, win, batch);
-                log_write(w, "both", write);
-            }
-        }
+        TextSizeEvent::Both { win, step } => all(w, win, step, batch),
         TextSizeEvent::Pane { win, module, step } => {
             let change = match step {
-                super::super::text_size::TextStep::Larger => TextChange::Larger,
-                super::super::text_size::TextStep::Smaller => TextChange::Smaller,
-                super::super::text_size::TextStep::Reset => TextChange::Reset,
+                TextStep::Larger => TextChange::Larger,
+                TextStep::Smaller => TextChange::Smaller,
+                TextStep::Reset => TextChange::Reset,
             };
             run(w, win, change, Some(&module), batch);
         }
@@ -97,6 +98,7 @@ pub(in crate::wm) fn event(w: &mut Window, event: TextSizeEvent, batch: &mut Bat
             }));
             w.warn(format!("[text-size] page {module} shown at {level:.2}"));
         }
+        TextSizeEvent::Configured { scale, .. } => w.text_size = Some(state.with_configured(scale as f32)),
         TextSizeEvent::Base { win, px } => {
             w.text_size = Some(state.with_base(px));
             push_sizes(w, win, batch);
@@ -289,6 +291,65 @@ mod tests {
     }
 
     #[test]
+    fn text_all_is_the_accelerators_action_wherever_the_keys_are() {
+        for keys in [ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()] {
+            let mut r = rig(Layout::new(Node::Leaf(keys.clone()), keys).unwrap());
+            r.controller.set_text_size(WIN, 14.0, 1.0);
+            let batch = r.run(crate::keymap::Action::TextAll(TextChange::Larger));
+            let writes: Vec<_> = ops(&batch)
+                .into_iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        HostOp::Editor(EditorCall::SetScale { .. })
+                            | HostOp::Chat(ChatOp::SetFontSize { .. })
+                            | HostOp::Terminal(TermOp::SetZoom { .. })
+                    )
+                })
+                .collect();
+            assert_eq!(
+                writes,
+                vec![scale(1.1_f32 as f64), font(14.0 * 1.1), terminal_zoom(1.1)]
+            );
+        }
+    }
+
+    /// A window of one module has one size: the pane keys there are the every-module action, so a reset clears the
+    /// app size too rather than leaving a window that only ever had the one size where it was.
+    #[test]
+    fn in_a_module_window_the_pane_keys_are_the_every_module_action() {
+        let mut r = rig(Layout::new(Node::Leaf(ModuleId::agent()), ModuleId::agent()).unwrap());
+        let window = r.controller.window_mut(WIN).unwrap();
+        window.tiling = crate::wm::window::Tiling::ModuleWindow;
+        window.spec.presence = EditorPresence::None;
+        r.controller.set_text_size(WIN, 14.0, 1.0);
+        r.run(crate::keymap::Action::Text(TextChange::Larger));
+        let batch = r.run(crate::keymap::Action::Text(TextChange::Reset));
+        assert!(ops(&batch).contains(&font(14.0)), "{:?}", ops(&batch));
+    }
+
+    #[test]
+    fn the_configured_size_is_what_the_reset_writes_and_it_moves_nothing_by_itself() {
+        let mut r = rig(Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap());
+        r.controller.set_text_size(WIN, 14.0, 1.0);
+        let told = r
+            .controller
+            .handle(HostEvent::TextSize(TextSizeEvent::Configured { win: WIN, scale: 1.25 }));
+        assert!(told.is_empty());
+        r.controller
+            .handle(HostEvent::Editor(EditorEvent::ScaleReported { win: WIN, scale: 1.25 }));
+        r.controller.handle(HostEvent::TextSize(TextSizeEvent::Both {
+            win: WIN,
+            step: TextStep::Larger,
+        }));
+        let reset = r.controller.handle(HostEvent::TextSize(TextSizeEvent::Both {
+            win: WIN,
+            step: TextStep::Reset,
+        }));
+        assert!(ops(&reset).contains(&scale(1.25)), "{:?}", ops(&reset));
+    }
+
+    #[test]
     fn page_attachment_and_base_changes_keep_the_existing_zoom() {
         let mut r = rig(Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap());
         let page = ModuleId::lua("md");
@@ -359,7 +420,7 @@ mod tests {
         assert_eq!(
             w.notes(),
             &[
-                "[text-size] Larger (both panes): no editor pane, scaling the panel and terminals",
+                "[text-size] Larger (every module): no editor pane",
                 "[text-size] panel 1.10 (15.4px)",
             ]
         );

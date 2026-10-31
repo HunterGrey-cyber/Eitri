@@ -198,8 +198,10 @@ pub enum Action {
     /// Opens the first-start screen again: what Eitri found, the presets, and the `init.lua` it would write.
     /// Not bound by default; `:Eitri setup` asks for it too.
     WindowSetup,
-    /// The pane with the keys only (not bound by default).
+    /// The pane with the keys only (after the prefix by default).
     Text(TextChange),
+    /// Every module of the window: what `Ctrl+=`, `Ctrl+-` and `Ctrl+0` do.
+    TextAll(TextChange),
     /// tmux `copy-mode` (`up: false`) / `copy-mode -u` (`up: true`): enter the terminal's read-only
     /// scrollback view, where the view is or scrolled up one page. Acts only when the
     /// terminal holds the keys; elsewhere it flashes the refusal (`shell`).
@@ -470,6 +472,9 @@ pub const NAMES: &[&str] = &[
     "text.larger",
     "text.smaller",
     "text.reset",
+    "text.all.larger",
+    "text.all.smaller",
+    "text.all.reset",
     "copy-mode",
 ];
 
@@ -650,6 +655,9 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "text.larger" => (Action::Text(TextChange::Larger), &[]),
         "text.smaller" => (Action::Text(TextChange::Smaller), &[]),
         "text.reset" => (Action::Text(TextChange::Reset), &[]),
+        "text.all.larger" => (Action::TextAll(TextChange::Larger), &[]),
+        "text.all.smaller" => (Action::TextAll(TextChange::Smaller), &[]),
+        "text.all.reset" => (Action::TextAll(TextChange::Reset), &[]),
         "copy-mode" => (
             Action::CopyMode {
                 up: o.up.unwrap_or(false),
@@ -763,6 +771,7 @@ impl Action {
             | Action::WindowImmersive
             | Action::WindowSetup
             | Action::Text(_)
+            | Action::TextAll(_)
             | Action::CopyMode { .. }
             | Action::MarkClear
             | Action::SelectNumber
@@ -822,6 +831,7 @@ impl Action {
             | Action::WindowImmersive
             | Action::WindowSetup
             | Action::Text(_)
+            | Action::TextAll(_)
             | Action::CopyMode { .. }
             | Action::Rotate { .. }
             | Action::MainHorizontal
@@ -908,8 +918,14 @@ impl Action {
             | Action::WindowImmersive
             | Action::WindowSetup
             | Action::Text(_)
+            | Action::TextAll(_)
             | Action::CopyMode { .. } => false,
         }
+    }
+
+    /// Whether this changes a text size, on one pane or on every module.
+    pub fn is_text_size(&self) -> bool {
+        matches!(self, Action::Text(_) | Action::TextAll(_))
     }
 
     /// The Lua name `eitri.keymap.set` takes, without options.
@@ -996,6 +1012,9 @@ impl Action {
             Action::Text(TextChange::Larger) => "text.larger".into(),
             Action::Text(TextChange::Smaller) => "text.smaller".into(),
             Action::Text(TextChange::Reset) => "text.reset".into(),
+            Action::TextAll(TextChange::Larger) => "text.all.larger".into(),
+            Action::TextAll(TextChange::Smaller) => "text.all.smaller".into(),
+            Action::TextAll(TextChange::Reset) => "text.all.reset".into(),
             Action::CopyMode { .. } => "copy-mode".into(),
         }
     }
@@ -1180,7 +1199,10 @@ impl Action {
             Action::WindowSetup => "Show the first-start screen: pick a key layout and write init.lua".into(),
             Action::Text(TextChange::Larger) => "Text size larger, the pane with the keys only".into(),
             Action::Text(TextChange::Smaller) => "Text size smaller, the pane with the keys only".into(),
-            Action::Text(TextChange::Reset) => "Text size reset, the pane with the keys only".into(),
+            Action::Text(TextChange::Reset) => "Text size back in step, the pane with the keys only".into(),
+            Action::TextAll(TextChange::Larger) => "Text size larger, every module".into(),
+            Action::TextAll(TextChange::Smaller) => "Text size smaller, every module".into(),
+            Action::TextAll(TextChange::Reset) => "Text size reset, every module".into(),
             Action::CopyMode { .. } => "Scroll the terminal back (copy mode)".into(),
         }
     }
@@ -1289,6 +1311,9 @@ impl Action {
             Action::Text(TextChange::Larger) => "text larger",
             Action::Text(TextChange::Smaller) => "text smaller",
             Action::Text(TextChange::Reset) => "text size reset",
+            Action::TextAll(TextChange::Larger) => "all text larger",
+            Action::TextAll(TextChange::Smaller) => "all text smaller",
+            Action::TextAll(TextChange::Reset) => "all text reset",
             Action::CopyMode { up: false } => "copy mode",
             Action::CopyMode { up: true } => "copy mode, page up",
         }
@@ -1409,6 +1434,7 @@ mod tests {
         }
         for change in [TextChange::Larger, TextChange::Smaller, TextChange::Reset] {
             all.push(Action::Text(change));
+            all.push(Action::TextAll(change));
         }
         all
     }
@@ -1534,6 +1560,7 @@ mod tests {
             | Action::WindowImmersive
             | Action::WindowSetup
             | Action::Text(_)
+            | Action::TextAll(_)
             | Action::CopyMode { .. } => {}
         }
     }

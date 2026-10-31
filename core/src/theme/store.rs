@@ -280,6 +280,7 @@ mod tests {
                 guifont: "Mono:h14".into(),
                 colors_name: "rosé-pine-dawn".into(),
                 cmdheight: Some(0),
+                start_scale: None,
             },
         }
     }

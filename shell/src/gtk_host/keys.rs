@@ -17,8 +17,8 @@
 //! key the page did not handle back to GTK once more, starting at the window ([`LetThrough`]), and asking the
 //! controller again would move the keys twice.
 
-use std::cell::RefCell;
-use std::rc::Weak;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
 use eitri_core::keymap::{key::keysym_name, prefix::Press, Chord, KeyName, KeySpec};
 use eitri_core::wm::{
@@ -82,9 +82,12 @@ pub(crate) fn install_window_layers(
 fn add_prefix_layer(window: &gtk4::Window, driver: Weak<Driver<Controller>>) {
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let ctrl_keys = Rc::new(CtrlKeys::default());
     {
         let driver = driver.clone();
+        let ctrl_keys = ctrl_keys.clone();
         keys.connect_key_pressed(move |_, key, keycode, state| {
+            ctrl_keys.pressed(key, keycode, state);
             let Some(driver) = driver.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -95,14 +98,25 @@ fn add_prefix_layer(window: &gtk4::Window, driver: Weak<Driver<Controller>>) {
         });
     }
     {
+        let ctrl_keys = ctrl_keys.clone();
+        window.connect_notify_local(Some("is-active"), move |window, _| {
+            if !window.is_active() {
+                ctrl_keys.forget();
+            }
+        });
+    }
+    {
         let driver = driver.clone();
-        keys.connect_key_released(move |_, _, keycode, _| {
+        keys.connect_key_released(move |_, key, keycode, _| {
             let Some(driver) = driver.upgrade() else { return };
             if driver.query(move |c| c.watches_release(WinId::MAIN, keycode)) {
                 driver.post(HostEvent::KeyReleased {
                     win: WinId::MAIN,
                     keycode,
                 });
+            }
+            if ctrl_keys.released(key, keycode) && driver.query(|c| c.watches_ctrl(WinId::MAIN)) {
+                driver.post(HostEvent::CtrlReleased { win: WinId::MAIN });
             }
         });
     }
@@ -263,6 +277,40 @@ const MODIFIER_KEYS: [Key; 16] = [
     Key::Num_Lock,
 ];
 
+/// The Control keys down in this window, by keycode (a remapped Caps Lock types `Control_L` too), for the release that
+/// ends a text size run: the last one's. What is held elsewhere is unknown here, so the list is forgotten when the
+/// window loses the keys, and a press with Control off clears anything a lost release left in it.
+#[derive(Debug, Default)]
+pub(crate) struct CtrlKeys {
+    down: RefCell<Vec<u32>>,
+}
+
+impl CtrlKeys {
+    pub(crate) fn pressed(&self, key: Key, keycode: u32, state: ModifierType) {
+        let mut down = self.down.borrow_mut();
+        if !state.contains(ModifierType::CONTROL_MASK) {
+            down.clear();
+        }
+        if matches!(key, Key::Control_L | Key::Control_R) && !down.contains(&keycode) {
+            down.push(keycode);
+        }
+    }
+
+    /// Whether this release leaves no Control key down.
+    pub(crate) fn released(&self, key: Key, keycode: u32) -> bool {
+        if !matches!(key, Key::Control_L | Key::Control_R) {
+            return false;
+        }
+        let mut down = self.down.borrow_mut();
+        down.retain(|held| *held != keycode);
+        down.is_empty()
+    }
+
+    pub(crate) fn forget(&self) {
+        self.down.borrow_mut().clear();
+    }
+}
+
 fn named(key: Key) -> Option<KeyName> {
     Some(match key {
         Key::Up | Key::KP_Up => KeyName::Up,
@@ -315,7 +363,10 @@ pub(crate) fn classify(key: Key, state: ModifierType) -> Press {
     match ch {
         Some(ch) if !ch.is_control() && !ch.is_whitespace() => {
             if ctrl && shift {
-                return Press::Other;
+                return match ch {
+                    '=' | '+' | '-' | '0' if !meta => Press::ShiftTyped(KeySpec::char(ch, true, false)),
+                    _ => Press::Other,
+                };
             }
             Press::Key(KeySpec::char(ch, ctrl, meta))
         }
@@ -358,11 +409,7 @@ mod tests {
     use eitri_core::keymap::{root::ROOT_ACCELS, Chord};
     use eitri_core::layout::{Direction, ModuleKeys};
     use gtk4::gdk::{Key, ModifierType};
-    use std::cell::Cell;
-    use std::{
-        rc::Rc,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn gtk_accel_round_trips_every_root_chord() {
@@ -449,11 +496,68 @@ mod tests {
         assert_eq!(classify(Key::_0, ctrl), key("C-0"));
         assert_eq!(classify(Key::KP_Add, ctrl), key("C-+"));
         assert_eq!(classify(Key::KP_Subtract, ctrl), key("C--"));
+        // `+` where it is a key of its own, and the four when Shift typed them.
+        assert_eq!(classify(Key::plus, ctrl), key("C-+"));
+        for (native, name) in [
+            (Key::equal, "C-="),
+            (Key::plus, "C-+"),
+            (Key::minus, "C--"),
+            (Key::_0, "C-0"),
+        ] {
+            assert_eq!(
+                classify(native, ctrl | shift),
+                Press::ShiftTyped(KeySpec::parse(name).unwrap())
+            );
+            assert_eq!(classify(native, ctrl | shift | ModifierType::ALT_MASK), Press::Other);
+        }
+        assert_eq!(classify(Key::underscore, ctrl | shift), Press::Other);
         assert_eq!(classify(Key::Shift_L, shift), Press::Modifier);
         assert_eq!(classify(Key::Control_L, ctrl), Press::Modifier);
         assert_eq!(classify(Key::x, ModifierType::SUPER_MASK), Press::Other);
         assert_eq!(classify(Key::Return, ModifierType::empty()), key("Enter"));
         assert_eq!(classify(Key::space, ModifierType::empty()), key("Space"));
+    }
+
+    /// A run lasts until no Control key is down, whichever went first, and a release never seen does not hold it open.
+    #[test]
+    fn the_last_control_key_up_is_the_release_that_counts() {
+        const LEFT: u32 = 37;
+        const RIGHT: u32 = 105;
+        const CAPS: u32 = 66;
+        let keys = CtrlKeys::default();
+        let ctrl = ModifierType::CONTROL_MASK;
+        keys.pressed(Key::Control_L, LEFT, ModifierType::empty());
+        assert!(keys.released(Key::Control_L, LEFT), "the only one");
+
+        keys.pressed(Key::Control_L, LEFT, ModifierType::empty());
+        keys.pressed(Key::Control_R, RIGHT, ctrl);
+        assert!(!keys.released(Key::Control_L, LEFT), "the right one is still down");
+        assert!(keys.released(Key::Control_R, RIGHT));
+        assert!(!keys.released(Key::a, 38), "no other key is a Control key");
+
+        keys.pressed(Key::Control_L, LEFT, ModifierType::empty());
+        keys.pressed(Key::Control_L, CAPS, ctrl);
+        assert!(
+            !keys.released(Key::Control_L, CAPS),
+            "Caps Lock as Ctrl types the same keysym"
+        );
+        assert!(keys.released(Key::Control_L, LEFT));
+
+        keys.pressed(Key::Control_L, LEFT, ModifierType::empty());
+        keys.pressed(Key::Control_R, RIGHT, ModifierType::empty());
+        assert!(keys.released(Key::Control_R, RIGHT), "the left one's release was lost");
+
+        assert!(
+            keys.released(Key::Control_L, LEFT),
+            "held since before the window had the keys"
+        );
+
+        keys.pressed(Key::Control_L, LEFT, ModifierType::empty());
+        keys.forget();
+        assert!(
+            keys.released(Key::Control_R, RIGHT),
+            "released elsewhere while another window had the keys"
+        );
     }
 
     #[test]

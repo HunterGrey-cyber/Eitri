@@ -48,7 +48,8 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::PanelReload => CompanionVerb::Reload,
         Action::PanelKeymap => CompanionVerb::Keymap,
         Action::PanelCommandLine => CompanionVerb::CommandLine,
-        Action::Text(change) => CompanionVerb::Text(*change),
+        // One module, so one size: both scopes are the same action here.
+        Action::Text(change) | Action::TextAll(change) => CompanionVerb::Text(*change),
         Action::Hint => CompanionVerb::Hint,
         Action::SendPrefix | Action::SendKeys(_) => CompanionVerb::Literal,
         Action::Select(dir) => CompanionVerb::Select(*dir),

@@ -263,10 +263,22 @@ pub(super) fn watches_release(w: &Window, keycode: u32) -> bool {
     w.keys.prefix.as_ref().is_some_and(|prefix| prefix.holds(keycode))
 }
 
+/// Whether a text size run lasts on Ctrl, so its release is to be reported.
+pub(super) fn watches_ctrl(w: &Window) -> bool {
+    w.keys.prefix.as_ref().is_some_and(Prefix::watches_ctrl)
+}
+
 /// A watched key was released.
 pub(super) fn released(w: &mut Window, keycode: u32) {
     if let Some(prefix) = w.keys.prefix.as_mut() {
         prefix.release(keycode);
+    }
+}
+
+/// Ctrl went up during a text size run.
+pub(super) fn ctrl_released(w: &mut Window) {
+    if let Some(prefix) = w.keys.prefix.as_mut() {
+        prefix.ctrl_released();
     }
 }
 

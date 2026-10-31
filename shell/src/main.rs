@@ -2449,9 +2449,13 @@ fn build_ui(
         let one = window1_editor.clone();
         let tutor = tutor.clone();
         let nvim_verbs = nvim_verbs.clone();
+        let text_size_controller = text_size_controller.clone();
         feed_pump.listen_theme(feed, move |payload| {
             if let Some(w) = &theme_writer {
                 w.borrow_mut().remember(&payload);
+            }
+            if let Some(scale) = payload.options.start_scale {
+                text_size_controller.set_configured(scale);
             }
             if let Some(one) = &one {
                 one.theme_changed(&payload);

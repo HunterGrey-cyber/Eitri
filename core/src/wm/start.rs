@@ -374,6 +374,7 @@ impl Controller {
 pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
     let win = match event {
         HostEvent::KeyReleased { win, .. }
+        | HostEvent::CtrlReleased { win }
         | HostEvent::Pointer { win, .. }
         | HostEvent::NativeFocus { win, .. }
         | HostEvent::Active { win, .. }
@@ -406,6 +407,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             TextSizeEvent::Both { win, .. }
             | TextSizeEvent::Pane { win, .. }
             | TextSizeEvent::PageAttached { win, .. }
+            | TextSizeEvent::Configured { win, .. }
             | TextSizeEvent::Base { win, .. },
         )
         | HostEvent::Editor(

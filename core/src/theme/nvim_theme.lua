@@ -35,6 +35,19 @@ local GROUPS = {
   "lualine_a_normal", "lualine_a_insert", "lualine_a_visual",
 }
 
+-- What the user's config left in `g:neovide_scale_factor`: where `Ctrl+0` returns to. Read once at VimEnter, so a
+-- `:let` later in the session never counts; nvim has no other moment that says the config has run. A value JSON
+-- cannot carry stays out, or the whole payload would be lost with it.
+local start_scale = nil
+local function read_start_scale()
+  local scale = vim.g.neovide_scale_factor
+  if scale == nil then
+    start_scale = 1.0
+  elseif type(scale) == "number" and scale > 0 and scale < math.huge then
+    start_scale = scale
+  end
+end
+
 -- Runs on the main loop (autocmd callback): `nvim_get_hl` is not allowed in a fast event.
 local function snapshot()
   local groups = vim.empty_dict()
@@ -54,6 +67,7 @@ local function snapshot()
       -- How many rows the command line takes under the editor's statusline: the panel's own status
       -- band sits that many rows above the window's bottom so the two lines are one row.
       cmdheight = vim.o.cmdheight,
+      start_scale = start_scale,
     },
   })
 end
@@ -103,6 +117,9 @@ local function send_now()
 end
 
 local augroup = vim.api.nvim_create_augroup("EitriThemeFeed", { clear = true })
+vim.api.nvim_create_autocmd("VimEnter", { group = augroup, once = true, callback = function()
+  read_start_scale()
+end })
 vim.api.nvim_create_autocmd({ "VimEnter", "ColorScheme" }, { group = augroup, callback = send_now })
 vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont", "cmdheight" }, callback = send_now })
 

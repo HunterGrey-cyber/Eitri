@@ -1,19 +1,23 @@
-//! Zoom the editor, the chat, the terminals and the plugin pages together, and each one alone.
+//! Size every module together, and each one alone.
 //!
-//! Two numbers and a base: **S** is `g:neovide_scale_factor`, nvim's own variable and the source of
-//! truth every writer (Eitri's keys, the user's mappings, a typed `:let`) goes through and everyone
-//! follows. **R** is the chat's factor relative to S, held here so it survives a chat reload, 1.0 at
-//! startup, never persisted across restarts. **base** is `agent.font_size` (or the shipped default).
-//! `chat px = base × clamp(S × R, ZOOM_MIN, ZOOM_MAX)`; call `P = S × R` the chat's effective scale.
-//! A non-finite or non-positive S counts as 1.0 for that arithmetic, and every value written is
-//! clamped to the zoom range and rounded to two decimals.
+//! **A** is the app size, and every module's size is A times that module's own offset. The editor's is **E**, and
+//! `S = clamp(A × E)` is `g:neovide_scale_factor`, nvim's own variable: the one value any writer (Eitri's keys, the
+//! user's mappings, a typed `:let`) goes through. The chat's offset is **R**, held here so it survives a chat reload.
+//! `chat px = base × clamp(A × R, ZOOM_MIN, ZOOM_MAX)`, where **base** is `agent.font_size` (or the shipped default);
+//! call `P = A × R` the chat's effective scale. Offsets start at 1.0 and are never persisted across restarts. A
+//! non-finite or non-positive S counts as 1.0 for that arithmetic, and every value written is clamped to the zoom
+//! range and rounded to two decimals.
 //!
-//! [`TextSize`] is the pure model: one function per key's row (both panes, the editor alone, the
+//! A write of S by anyone else moves A, offsets kept, so every writer moves every module. A pane reset clears that
+//! pane's offset, so it always rejoins the others. `Ctrl+0` clears them all and returns A to [`TextSize::configured`],
+//! what the user's config left in S at nvim's VimEnter; 1.0 unless the config set it.
+//!
+//! [`TextSize`] is the pure model: one function per key's row (every module, the editor alone, the
 //! chat alone, the terminals alone, a page alone), each returning the new state and, where the row
 //! writes S, the value to hand the editor (if any). It holds no toolkit type and no clock. The GTK wiring around it --
-//! the three app-level "both panes" accelerators, nvim's echo of S, the chat's live px and the page
+//! the three app-level accelerators, nvim's echo of S, the chat's live px and the page
 //! views -- is `shell/src/text_size.rs`'s `TextSizeController`; [`route_focused_module`] decides
-//! which of them a `Ctrl+a =`/`-`/`0` press moves.
+//! which of them a pane step moves.
 //!
 //! ## Why the pending model has no clock
 //!
@@ -27,8 +31,8 @@
 //! stale pending would keep the chat at the old size, and the next `Ctrl+=` would step off the
 //! stale value -- shrinking the editor from 2.0 rather than growing it. A deadline on the pending
 //! value does not rescue that either: whenever an echo arrives later than the deadline, the next
-//! editor-only step computes its `R' = R·S/S'` compensation from the stale report, and the wrong R
-//! never corrects itself once the real echoes catch up -- the chat stays the wrong size for good.
+//! editor-only step computes its `E' = S'/A` from the stale report, and the wrong offset
+//! never corrects itself once the real echoes catch up -- the editor stays out of step for good.
 //! Any timeout is a guess at how long nvim takes, and every guess is wrong on some machine on
 //! some day.
 //!
@@ -37,7 +41,7 @@
 //! external write, treated as authoritative); or a write of a value equal to `reported_s` (rule 2
 //! of the write rules below). An echo of an OLDER write still in `burst` clears nothing -- it only
 //! moves `reported_s`. A write nvim never answers at all has one recovery, and it already has a
-//! key: `Ctrl+0`/`app.text-reset` writes `1.0`, and when nvim's last real value is `1.0` that
+//! key: `Ctrl+0`/`app.text-reset` writes the configured size, and when that is nvim's last real value the
 //! write takes rule 2 and clears the stuck `pending`. See `nvim_reported_s`'s and `write`'s own
 //! docs for the rules, and `reset_heals_a_pending_stuck_on_a_write_nvim_never_echoed` for the
 //! exact scenario.
@@ -45,7 +49,7 @@
 //! **Two races this model does not survive, neither reachable by hand.** (1) Two *different* keys
 //! inside one frame, the second reversing the first, with nvim applying and a tick reporting
 //! between them in one particular order (0.7% of all three-key interleavings, never under
-//! autorepeat or a busy-nvim catch-up): `R` and the step count stay wrong until a reset.
+//! autorepeat or a busy-nvim catch-up): `A` and the step count stay wrong until a reset.
 //! (2) Another program writing `g:neovide_scale_factor` back to its last-reported value within one
 //! tick of our write: the tick sees no change, so `pending` stays stuck until the next key. Both
 //! need two writers or two chords inside ~16ms.
@@ -60,8 +64,10 @@
 //!   a fast sequence (not just the latest one) as still "ours", rather than mistaking it for an
 //!   external change and clearing a pending write that is still genuinely outstanding.
 //! - `current_s() = pending.unwrap_or(reported_s)` (substituted with `1.0` when not finite and
-//!   positive) -- both what the chat displays against and what every step computes its next value
-//!   from. A pending value is trusted until a report says otherwise, however long that takes.
+//!   positive) -- what an editor-only step computes its next value from. A pending value is trusted until a
+//!   report says otherwise, however long that takes.
+//! - `app`: A. Moved by an every-module step at the moment of the step, so the chat, the terminals and the pages
+//!   never wait for nvim, and by a report only when the report is an external change.
 //! - **A write of `v`** (already rounded to two decimals, as every write here is):
 //!   1. If `v` equals the raw current value (`pending`, else `reported_s`), nothing is written and
 //!      nothing changes at all -- nvim's watcher would see no change either, so there is nothing
@@ -78,40 +84,43 @@
 //!     current run: `pending` (and `burst`) are left alone -- an intermediate echo must not be
 //!     mistaken for confirmation that nothing is outstanding.
 //!   - Else, it is an external change (the user's own mapping, a typed `:let`) or simply nothing
-//!     we recognise: `pending = None`, `burst` cleared. R is never touched by a report --
+//!     we recognise: `pending = None`, `burst` cleared, and `A = r/E`. No offset is touched by a report --
 //!     "together" is the default for every writer, not just this window's own keys.
-//! - **Editor-only steps** (`editor_larger`/`-smaller`/`-reset`) compute `R' = R · current_s() / S'`
-//!   from `current_s()` at the moment of the step, so the chat's px does not move.
-//! - **Chat-only steps** (`panel_larger`/`-smaller`) never write S at all: `P' = clamp(current_s() ×
-//!   R ± 0.1)`, `R' = P'/current_s()`.
-//! - **Reset** (`app.text-reset`, `Ctrl+a 0` on the editor) sets `R = 1` and writes `1.0` through
+//! - **Every-module steps** (`both_larger`/`-smaller`) move A and write `clamp(A' × E)`. The editor can sit at an end
+//!   of the range while A goes on moving, and no offset is lost to the clamp.
+//! - **Editor-only steps** (`editor_larger`/`-smaller`) step from `current_s()` at the moment of the step and set
+//!   `E' = S'/A`, so A, and with it every other module, does not move. `editor_reset` writes A and sets `E = 1`.
+//! - **Chat-only steps** (`panel_larger`/`-smaller`) never write S at all: `P' = clamp(A × R ± 0.1)`, `R' = P'/A`.
+//! - **Reset** (`app.text-reset`) clears every offset, sets A to the configured size and writes it through
 //!   the same `write` rules above -- which is what makes it a heal, not just a jump to a known
-//!   value: if nvim's `reported_s` is already `1.0` (a pending write nvim never answered is stuck on
+//!   value: if nvim's `reported_s` is already that value (a pending write nvim never answered is stuck on
 //!   some OTHER value), rule 2 fires and the stuck `pending` is cleared unconditionally.
-//! - **A new base** (`with_base`, the editor's font changed while the chat follows it) keeps S, R
-//!   and any outstanding write, so a zoom in effect stays in effect at the new size.
+//! - **A new base** (`with_base`, the editor's font changed while the chat follows it) keeps A, the offsets
+//!   and any outstanding write, so a size in effect stays in effect at the new base.
 //!
 //! ## Pages
 //!
 //! A Lua panel's page, including a plugin's page,
-//! follows the editor the way the chat does, with a factor of its own:
-//! `page zoom = clamp(S × R_page, ZOOM_MIN, ZOOM_MAX)`, handed to WebKit as the view's zoom level
+//! follows the app size the way the chat does, with an offset of its own:
+//! `page zoom = clamp(A × R_page, ZOOM_MIN, ZOOM_MAX)`, handed to WebKit as the view's zoom level
 //! (whole-page, so the page's layout scales with its text). `R_page` is 1.0 when the page is first
 //! shown, kept per module for the session, never persisted. Every rule above that touches R
-//! touches each `R_page` the same way: a both-panes step leaves it (the page follows S), a
-//! both-panes reset sets it to 1.0, an editor-only step compensates it so the page does not move,
-//! and the prefix keys with the page holding them step or reset that page's `R_page` alone. The
-//! page reads S through the same `current_s()` as the chat, so the pending and echo rules hold for
-//! it unchanged.
+//! touches each `R_page` the same way: an every-module step leaves it (the page follows A), `Ctrl+0`
+//! sets it to 1.0, an editor-only step leaves it, and the prefix keys with the page holding them step or reset
+//! that page's `R_page` alone.
 //!
 //! ## Terminals
 //!
-//! Every terminal of the window shares one factor `R_t`, like the chat's R:
-//! `terminal zoom = clamp(S × R_t, ZOOM_MIN, ZOOM_MAX)`, relative to its un-zoomed font. `R_t` starts
-//! at 1.0 and is never persisted. A both-panes step leaves it so terminals follow S; a both-panes
-//! reset sets it to 1.0. An editor-only step compensates it so terminals stay in place. A terminal
-//! step or reset changes only `R_t`, without writing S. Reports leave it untouched, and terminals
-//! read the same `current_s()` as the chat, so the pending and echo rules hold for them too.
+//! Every terminal of the window shares one offset `R_t`, like the chat's R:
+//! `terminal zoom = clamp(A × R_t, ZOOM_MIN, ZOOM_MAX)`, relative to its un-zoomed font. `R_t` starts
+//! at 1.0 and is never persisted. An every-module step leaves it so terminals follow A; `Ctrl+0`
+//! sets it to 1.0. An editor-only step leaves it. A terminal step or reset changes only `R_t`, without writing S.
+//! Reports leave it untouched.
+//!
+//! ## No editor
+//!
+//! A window with no editor (a linked second window, a module window, a companion window) has no S. A is its own, it
+//! starts at 1.0 and nothing is written ([`TextSize::apply_app_step`]).
 
 use crate::layout::{ModuleId, ModuleKind};
 use std::collections::BTreeMap;
@@ -149,6 +158,15 @@ fn is_our_echo(a: f32, b: f32) -> bool {
     round2(a) == round2(b)
 }
 
+/// `s`, or 1.0 when it is not finite and positive: the app size stays a number the arithmetic can use.
+fn usable(s: f32) -> f32 {
+    if s.is_finite() && s > 0.0 {
+        s
+    } else {
+        1.0
+    }
+}
+
 /// Pushes `v` onto `burst`, dropping the oldest entry first if it is already at [`BURST_CAP`].
 fn push_burst(burst: &mut Vec<f32>, v: f32) {
     if burst.len() >= BURST_CAP {
@@ -157,8 +175,7 @@ fn push_burst(burst: &mut Vec<f32>, v: f32) {
     burst.push(v);
 }
 
-/// What a plain `=`/`-`/`0` after the prefix (or an app accelerator) means, before
-/// [`route_focused_module`] decides which module it applies to.
+/// What a text size key means, before [`route_focused_module`] decides which module it applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextStep {
     Larger,
@@ -176,8 +193,8 @@ impl From<crate::keymap::TextChange> for TextStep {
     }
 }
 
-/// S, the relative factors, a pending write and the burst it belongs to, and the panel's base size. See this module's
-/// own doc for what each means; every operation here is a pure function of the state alone -- there
+/// S, the app size, the offsets, a pending write and the burst it belongs to, and the panel's base size. See this
+/// module's own doc for what each means; every operation here is a pure function of the state alone -- there
 /// is no notion of time anywhere in this type, because any timeout is a guess at nvim's speed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSize {
@@ -185,11 +202,15 @@ pub struct TextSize {
     /// Starts at the editor's `scale_factor_setting()` read at startup, never this module's own
     /// 1.0 assumption, so a value the user's `init.lua` set is respected from the first frame.
     reported_s: f32,
-    /// The panel's factor relative to `reported_s` (or the outstanding pending, if any -- see
-    /// [`current_s`](Self::current_s)). 1.0 keeps the panel in step with the editor, which is the
-    /// default for every writer of S except the panel-focused prefix keys.
+    /// A: the size every module follows.
+    app: f32,
+    /// E: the editor's offset. `S = clamp(app × editor)`.
+    editor: f32,
+    /// Where `Ctrl+0` returns A to.
+    configured: f32,
+    /// The panel's offset relative to A. 1.0 keeps the panel in step, which is the default for every writer of S.
     r: f32,
-    /// Every terminal's factor relative to S, kept for the window even before a terminal is shown.
+    /// Every terminal's offset relative to A, kept for the window even before a terminal is shown.
     terminal_r: f32,
     /// A write this window made that nvim has not yet echoed back. See this module's own doc
     /// ("The model") for exactly when this is set, cleared, or left alone.
@@ -199,18 +220,21 @@ pub struct TextSize {
     burst: Vec<f32>,
     /// `agent.font_size`, or the shipped default -- the panel's un-zoomed size.
     base: f32,
-    /// Each page shown this session and its factor relative to S (this module's "Pages" section). A
+    /// Each page shown this session and its offset relative to A (this module's "Pages" section). A
     /// page not in the map reads 1.0.
     pages: BTreeMap<ModuleId, f32>,
 }
 
 impl TextSize {
-    /// The starting state for a window: R and R_t untouched (1.0), no write outstanding, S seeded from
-    /// `reported_s` -- the editor's own `scale_factor_setting()` at startup, or `1.0` with no editor
-    /// (every window has the editor today, so the shell always passes the live value).
+    /// The starting state for a window: every offset 1.0, no write outstanding, S seeded from
+    /// `reported_s` -- the editor's own `scale_factor_setting()` at startup, or `1.0` with no editor.
     pub fn new(base: f32, reported_s: f32) -> Self {
+        let app = usable(reported_s);
         TextSize {
             reported_s,
+            app,
+            editor: 1.0,
+            configured: app,
             r: 1.0,
             terminal_r: 1.0,
             pending: None,
@@ -220,32 +244,32 @@ impl TextSize {
         }
     }
 
-    /// The value every operation below steps from: the outstanding pending write, or `reported_s`
-    /// if none -- substituted with 1.0 when that is not finite and positive, for the chat's, terminals'
-    /// and pages' arithmetic only. An operation stepping off a
+    /// The value an editor-only step moves from: the outstanding pending write, or `reported_s`
+    /// if none -- substituted with 1.0 when that is not finite and positive. An operation stepping off a
     /// garbage report would otherwise propagate it (`NaN + 0.1` is still `NaN`) rather than
     /// recovering from it the moment the user next touches a text-size key. No deadline gates
     /// `pending`: it is trusted until a report says otherwise, however long that takes (a deadline
-    /// shorter than a slow echo would make the next step compensate R against a stale S).
+    /// shorter than a slow echo would make the next step set E against a stale S).
     fn current_s(&self) -> f32 {
-        let raw = self.pending.unwrap_or(self.reported_s);
-        if raw.is_finite() && raw > 0.0 {
-            raw
-        } else {
-            1.0
-        }
+        usable(self.pending.unwrap_or(self.reported_s))
     }
 
-    /// A new un-zoomed size for the panel (the editor's font changed while the panel follows it): S, R
-    /// and any outstanding write are untouched, so a zoom in effect stays in effect at the new size.
+    /// A new un-zoomed size for the panel (the editor's font changed while the panel follows it): A, the offsets
+    /// and any outstanding write are untouched, so a size in effect stays in effect at the new base.
     pub fn with_base(mut self, base: f32) -> Self {
         self.base = base;
         self
     }
 
-    /// `P = S × R`, clamped -- the chat's effective scale before it is multiplied by `base`.
+    /// Where `Ctrl+0` returns the app size to, from nvim's VimEnter. Nothing moves until it is used.
+    pub fn with_configured(mut self, scale: f32) -> Self {
+        self.configured = usable(scale);
+        self
+    }
+
+    /// `P = A × R`, clamped -- the chat's effective scale before it is multiplied by `base`.
     pub fn panel_scale(&self) -> f32 {
-        (self.current_s() * self.r).clamp(ZOOM_MIN, ZOOM_MAX)
+        (self.app * self.r).clamp(ZOOM_MIN, ZOOM_MAX)
     }
 
     /// `base × panel_scale()` -- what the host hands the chat as its font size in px.
@@ -253,37 +277,37 @@ impl TextSize {
         self.base * self.panel_scale()
     }
 
-    /// `clamp(S × R_t)` -- every terminal's zoom relative to its un-zoomed font.
+    /// `clamp(A × R_t)` -- every terminal's zoom relative to its un-zoomed font.
     pub fn terminal_scale(&self) -> f32 {
-        (self.current_s() * self.terminal_r).clamp(ZOOM_MIN, ZOOM_MAX)
+        (self.app * self.terminal_r).clamp(ZOOM_MIN, ZOOM_MAX)
     }
 
-    // --- Both panes (the app-level accelerators). R is never touched here. ---
+    // --- Every module (the app-level accelerators, `text.all.*`). No offset is touched by a step. ---
 
-    /// `app.text-larger`: `S' = clamp(S + 0.1)`; R unchanged.
+    /// `app.text-larger`: `A' = clamp(A + 0.1)`, `S' = clamp(A' × E)`.
     pub fn both_larger(self) -> (Self, Option<f32>) {
-        let s = clamp_round_s(self.current_s() + ZOOM_STEP);
-        let r = self.r;
-        self.write_with_r(s, r)
+        let app = clamp_round_s(self.app + ZOOM_STEP);
+        self.write_app(app)
     }
 
-    /// `app.text-smaller`: `S' = clamp(S - 0.1)`; R unchanged.
+    /// `app.text-smaller`: `A' = clamp(A - 0.1)`, `S' = clamp(A' × E)`.
     pub fn both_smaller(self) -> (Self, Option<f32>) {
-        let s = clamp_round_s(self.current_s() - ZOOM_STEP);
-        let r = self.r;
-        self.write_with_r(s, r)
+        let app = clamp_round_s(self.app - ZOOM_STEP);
+        self.write_app(app)
     }
 
-    /// `app.text-reset`: `S' = 1.0`, `R' = 1.0`, `R_t' = 1.0` and every `R_page' = 1.0` -- also the
-    /// universal heal for a `pending` stuck on a write nvim never answered (see this module's own doc): if
-    /// `reported_s` is already `1.0`, `write`'s rule 2 fires regardless of what `pending` currently
-    /// holds.
+    /// `app.text-reset`: A back to the configured size and every offset 1.0 -- also the universal heal for a
+    /// `pending` stuck on a write nvim never answered (see this module's own doc): if `reported_s` is already that
+    /// value, `write`'s rule 2 fires regardless of what `pending` currently holds.
     pub fn both_reset(mut self) -> (Self, Option<f32>) {
+        self.r = 1.0;
         self.terminal_r = 1.0;
+        self.editor = 1.0;
         for r in self.pages.values_mut() {
             *r = 1.0;
         }
-        self.write_with_r(clamp_round_s(1.0), 1.0)
+        let app = clamp_round_s(self.configured);
+        self.write_app(app)
     }
 
     pub fn apply_both_step(self, step: TextStep) -> (Self, Option<f32>) {
@@ -294,24 +318,36 @@ impl TextSize {
         }
     }
 
-    // --- One pane, editor focused (`Ctrl+a =`/`-`/`0`).
-    // Each writes a fresh S and adjusts R so the PANEL's px does not move. ---
+    /// The same step in a window with no editor, where nothing holds S: only A moves, and no write stays outstanding.
+    pub fn apply_app_step(self, step: TextStep) -> Self {
+        let (state, _) = self.apply_both_step(step);
+        TextSize {
+            pending: None,
+            burst: Vec::new(),
+            ..state
+        }
+    }
 
-    /// `S' = clamp(S + 0.1)`; `R' = R·S/S'` (panel px unchanged).
+    // --- One pane, editor focused (`prefix C-=`/`C--`/`C-0`, or the wheel). Each writes a fresh S; only E moves with
+    // it, so no other module does. ---
+
+    /// `S' = clamp(S + 0.1)`; `E' = S'/A`.
     pub fn editor_larger(self) -> (Self, Option<f32>) {
         let target = self.current_s() + ZOOM_STEP;
-        self.write_s_keeping_panel_px(target)
+        self.write_s_keeping_app(target)
     }
 
-    /// `S' = clamp(S - 0.1)`; `R' = R·S/S'` (panel px unchanged).
+    /// `S' = clamp(S - 0.1)`; `E' = S'/A`.
     pub fn editor_smaller(self) -> (Self, Option<f32>) {
         let target = self.current_s() - ZOOM_STEP;
-        self.write_s_keeping_panel_px(target)
+        self.write_s_keeping_app(target)
     }
 
-    /// `S' = 1.0`; `R' = R·S/S'` (panel px unchanged).
-    pub fn editor_reset(self) -> (Self, Option<f32>) {
-        self.write_s_keeping_panel_px(1.0)
+    /// `E' = 1`, `S' = A`: the editor back in step with every other module.
+    pub fn editor_reset(mut self) -> (Self, Option<f32>) {
+        self.editor = 1.0;
+        let s = clamp_round_s(self.app);
+        self.write(s)
     }
 
     pub fn apply_editor_step(self, step: TextStep) -> (Self, Option<f32>) {
@@ -322,22 +358,22 @@ impl TextSize {
         }
     }
 
-    // --- One pane, chat focused (`Ctrl+a =`/`-`/`0`).
+    // --- One pane, chat focused (`prefix C-=`/`C--`/`C-0`, or the wheel).
     // None of these write S at all -- only R moves. ---
 
-    /// `P' = clamp(P + 0.1)`; `R' = P'/S`.
+    /// `P' = clamp(P + 0.1)`; `R' = P'/A`.
     pub fn panel_larger(self) -> Self {
         let target = self.panel_scale() + ZOOM_STEP;
         self.set_panel_scale(target)
     }
 
-    /// `P' = clamp(P - 0.1)`; `R' = P'/S`.
+    /// `P' = clamp(P - 0.1)`; `R' = P'/A`.
     pub fn panel_smaller(self) -> Self {
         let target = self.panel_scale() - ZOOM_STEP;
         self.set_panel_scale(target)
     }
 
-    /// `R' = 1` -- the panel back in step with the editor.
+    /// `R' = 1` -- the panel back in step with the app size.
     pub fn panel_reset(self) -> Self {
         TextSize { r: 1.0, ..self }
     }
@@ -353,19 +389,19 @@ impl TextSize {
     // --- One pane, a terminal holding the keys: the panel's three rows, on the shared factor.
     // None of these write S, and neither the panel nor any page moves. ---
 
-    /// `P_t' = clamp(P_t + 0.1)`; `R_t' = P_t'/S`.
+    /// `P_t' = clamp(P_t + 0.1)`; `R_t' = P_t'/A`.
     pub fn terminal_larger(self) -> Self {
         let target = self.terminal_scale() + ZOOM_STEP;
         self.set_terminal_scale(target)
     }
 
-    /// `P_t' = clamp(P_t - 0.1)`; `R_t' = P_t'/S`.
+    /// `P_t' = clamp(P_t - 0.1)`; `R_t' = P_t'/A`.
     pub fn terminal_smaller(self) -> Self {
         let target = self.terminal_scale() - ZOOM_STEP;
         self.set_terminal_scale(target)
     }
 
-    /// `R_t' = 1` -- every terminal back in step with the editor.
+    /// `R_t' = 1` -- every terminal back in step with the app size.
     pub fn terminal_reset(self) -> Self {
         TextSize {
             terminal_r: 1.0,
@@ -381,18 +417,18 @@ impl TextSize {
         }
     }
 
-    /// `R_t' = clamp(target)/S`, clamping the target itself so repeated steps at an end of the
-    /// range keep the raw factor bounded, as [`set_panel_scale`](Self::set_panel_scale) does.
+    /// `R_t' = clamp(target)/A`, clamping the target itself so repeated steps at an end of the
+    /// range keep the raw offset bounded, as [`set_panel_scale`](Self::set_panel_scale) does.
     fn set_terminal_scale(self, target: f32) -> Self {
-        let terminal_r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.current_s();
+        let terminal_r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.app;
         TextSize { terminal_r, ..self }
     }
 
-    // --- One pane, a page holding the keys: the panel's three rows, on that page's own factor.
+    // --- One pane, a page holding the keys: the panel's three rows, on that page's own offset.
     // None of these write S, and neither the panel nor any other page moves. ---
 
-    /// The page is shown: from now on an editor-only step keeps it in place. A page already known
-    /// keeps its factor (a page hidden and shown again, or rebuilt after a kill).
+    /// The page is shown. A page already known keeps its offset (a page hidden and shown again, or rebuilt after a
+    /// kill).
     pub fn page_shown(mut self, page: &ModuleId) -> Self {
         self.pages.entry(page.clone()).or_insert(1.0);
         self
@@ -403,24 +439,24 @@ impl TextSize {
         self.pages.get(page).copied().unwrap_or(1.0)
     }
 
-    /// `clamp(S × R_page)` -- the zoom level the page's view is given.
+    /// `clamp(A × R_page)` -- the zoom level the page's view is given.
     pub fn page_scale(&self, page: &ModuleId) -> f32 {
-        (self.current_s() * self.page_r(page)).clamp(ZOOM_MIN, ZOOM_MAX)
+        (self.app * self.page_r(page)).clamp(ZOOM_MIN, ZOOM_MAX)
     }
 
-    /// `P_page' = clamp(P_page + 0.1)`; `R_page' = P_page'/S`.
+    /// `P_page' = clamp(P_page + 0.1)`; `R_page' = P_page'/A`.
     pub fn page_larger(self, page: &ModuleId) -> Self {
         let target = self.page_scale(page) + ZOOM_STEP;
         self.set_page_scale(page, target)
     }
 
-    /// `P_page' = clamp(P_page - 0.1)`; `R_page' = P_page'/S`.
+    /// `P_page' = clamp(P_page - 0.1)`; `R_page' = P_page'/A`.
     pub fn page_smaller(self, page: &ModuleId) -> Self {
         let target = self.page_scale(page) - ZOOM_STEP;
         self.set_page_scale(page, target)
     }
 
-    /// `R_page' = 1` -- the page back in step with the editor.
+    /// `R_page' = 1` -- the page back in step with the app size.
     pub fn page_reset(mut self, page: &ModuleId) -> Self {
         self.pages.insert(page.clone(), 1.0);
         self
@@ -434,11 +470,11 @@ impl TextSize {
         }
     }
 
-    /// `R_page' = clamp(target)/S`, clamping the target itself for the same reason as
-    /// [`set_panel_scale`](Self::set_panel_scale): the raw factor stays bounded under repeated
+    /// `R_page' = clamp(target)/A`, clamping the target itself for the same reason as
+    /// [`set_panel_scale`](Self::set_panel_scale): the raw offset stays bounded under repeated
     /// presses at an end of the range.
     fn set_page_scale(mut self, page: &ModuleId, target: f32) -> Self {
-        let r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.current_s();
+        let r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.app;
         self.pages.insert(page.clone(), r);
         self
     }
@@ -449,9 +485,8 @@ impl TextSize {
     /// OLDER write of ours still inside the current burst, or a real external change (the user's
     /// own mapping, a typed `:let`). `reported_s` follows the report unconditionally -- nvim's
     /// report is authoritative for the editor regardless of what this window happens to be waiting
-    /// for. `r` is untouched in every case -- for our own echo it was already set correctly at
-    /// write time, and for an external change "together" is the default for every writer, not just
-    /// this window's own keys.
+    /// for. An external change moves A and leaves every offset, because "together" is the default for every writer,
+    /// not just this window's own keys.
     pub fn nvim_reported_s(self, reported: f32) -> Self {
         match self.pending {
             Some(p) if is_our_echo(p, reported) => TextSize {
@@ -466,6 +501,7 @@ impl TextSize {
             },
             _ => TextSize {
                 reported_s: reported,
+                app: usable(reported) / self.editor,
                 pending: None,
                 burst: Vec::new(),
                 ..self
@@ -515,38 +551,30 @@ impl TextSize {
         )
     }
 
-    /// [`write`](Self::write), also setting `r` to a value the caller already computed (used by
-    /// the "both panes" operations, which never adjust R, and by `write_s_keeping_panel_px`, which
-    /// does).
-    fn write_with_r(self, s: f32, r: f32) -> (Self, Option<f32>) {
-        TextSize { r, ..self }.write(s)
+    /// A new app size, already clamped and rounded, and the S it makes with the editor's offset.
+    fn write_app(self, app: f32) -> (Self, Option<f32>) {
+        let s = clamp_round_s(app * self.editor);
+        TextSize { app, ..self }.write(s)
     }
 
-    /// Writes a fresh S, adjusting R by the ratio the write moved S so `panel_scale()` (and so
-    /// `panel_px()`) comes out unchanged -- see `editor_larger`/`editor_smaller`/`editor_reset`.
-    /// The terminals' and every shown page's factors are adjusted by the same ratio, so none move either.
-    fn write_s_keeping_panel_px(mut self, target: f32) -> (Self, Option<f32>) {
-        let old_s = self.current_s();
+    /// A fresh S for the editor alone: `E' = S'/A`, so A and every other module stay where they are.
+    fn write_s_keeping_app(self, target: f32) -> (Self, Option<f32>) {
         let s = clamp_round_s(target);
-        let r = self.r * old_s / s;
-        self.terminal_r = self.terminal_r * old_s / s;
-        for page_r in self.pages.values_mut() {
-            *page_r = *page_r * old_s / s;
-        }
-        self.write_with_r(s, r)
+        let editor = s / self.app;
+        TextSize { editor, ..self }.write(s)
     }
 
-    /// `R' = clamp(target)/S`, the shared step behind `panel_larger`/`panel_smaller`. Clamps
+    /// `R' = clamp(target)/A`, the shared step behind `panel_larger`/`panel_smaller`. Clamps
     /// `target` itself (not just what `panel_scale()` later reports) so `r` cannot run away
     /// unboundedly under repeated presses even though `panel_scale()` would mask that by clamping
     /// its own output regardless -- see `panel_larger_clamps_the_raw_r_too_not_just_panel_scales_own_clamp`.
     fn set_panel_scale(self, target: f32) -> Self {
-        let r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.current_s();
+        let r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.app;
         TextSize { r, ..self }
     }
 }
 
-/// One pane, decided by which module holds the keys (`Ctrl+a =`/`-`/`0`) -- pure, so the prefix
+/// One pane, decided by which module holds the keys (`prefix C-=`/`C--`/`C-0`) -- pure, so the prefix
 /// routing has exactly one place to get right rather than re-deriving "the editor, the chat, the
 /// terminals, a page, anything else a no-op" inline at the call site, where a swap of two arms would go unnoticed by
 /// any test of the model alone.
@@ -583,8 +611,8 @@ pub fn route_focused_module(focused: Option<&ModuleId>) -> TextSizeTarget {
 /// Every `app.text-*` action the shell registers: its GTK action name and which [`TextStep`] it
 /// performs -- one table the shell's `TextSizeController::install` iterates, so a name and a step
 /// cannot drift apart. The accelerators are `crate::keymap::root`'s: `Ctrl+=`,
-/// `Ctrl+-`, `Ctrl+0` and their keypad forms. `<Control>plus` is gone -- on a US layout it is
-/// `Ctrl+Shift+=`, and no root chord holds `Ctrl+Shift`.
+/// `Ctrl+-`, `Ctrl+0` and their keypad forms. `Ctrl++` is no accelerator: `<Control>plus` also fires on a US
+/// layout's `Ctrl+Shift+=`, and no root chord holds `Ctrl+Shift`.
 pub const TEXT_SIZE_ACTIONS: &[(&str, TextStep)] = &[
     ("text-larger", TextStep::Larger),
     ("text-smaller", TextStep::Smaller),
@@ -616,6 +644,9 @@ mod tests {
     fn ts(s: f32, r: f32, base: f32) -> TextSize {
         TextSize {
             reported_s: s,
+            app: s,
+            editor: 1.0,
+            configured: 1.0,
             r,
             terminal_r: 1.0,
             pending: None,
@@ -777,14 +808,167 @@ mod tests {
         assert!((next.panel_px() - before_px).abs() < 1e-3);
     }
 
+    /// The editor's offset cleared, with the rest where it was: from `Ctrl+=` three times, then the editor two steps
+    /// past the others, a reset puts the editor at the app size, not at 1.0.
     #[test]
-    fn editor_reset_sets_s_to_one_and_keeps_panel_px() {
-        let before = ts(2.0, 0.5, 14.0);
-        let before_px = before.panel_px();
-        let (next, write) = before.editor_reset();
-        assert_eq!(write, Some(1.0));
-        assert_eq!(next.pending, Some(1.0));
-        assert!((next.panel_px() - before_px).abs() < 1e-3);
+    fn editor_reset_rejoins_the_app_size_and_moves_nothing_else() {
+        let mut state = TextSize::new(14.0, 1.0);
+        for _ in 0..3 {
+            let (next, write) = state.both_larger();
+            state = next.nvim_reported_s(write.unwrap());
+        }
+        for _ in 0..2 {
+            let (next, write) = state.editor_larger();
+            state = next.nvim_reported_s(write.unwrap());
+        }
+        assert_eq!(state.reported_s, 1.5);
+        let px = state.panel_px();
+        let (next, write) = state.editor_reset();
+        assert_eq!(write, Some(1.3));
+        assert_eq!(next.editor, 1.0);
+        assert!(close(next.panel_px(), px));
+        assert!(close(next.panel_scale(), 1.3));
+    }
+
+    /// In step already, a reset has nothing to write: three `Ctrl+=` leave the editor at 1.3 with everyone else.
+    #[test]
+    fn editor_reset_in_step_writes_nothing() {
+        let (next, write) = ts(1.3, 1.0, 14.0).editor_reset();
+        assert_eq!(write, None);
+        assert_eq!(next.current_s(), 1.3);
+    }
+
+    // --- The app size and the offsets. ---
+
+    /// Every module steps from the app size, and each keeps its offset, the editor's among them.
+    #[test]
+    fn an_every_module_step_keeps_every_offset() {
+        let state = TextSize::new(14.0, 1.0).page_shown(&page("a"));
+        let (state, _) = state.editor_larger();
+        let state = state
+            .nvim_reported_s(1.1)
+            .panel_larger()
+            .terminal_larger()
+            .page_larger(&page("a"));
+        let (state, write) = state.both_larger();
+        assert_eq!(write, Some(1.21), "S = A × E");
+        assert!(close(state.app, 1.1));
+        assert!(close(state.panel_scale(), 1.1 * 1.1));
+        assert!(close(state.terminal_scale(), 1.1 * 1.1));
+        assert!(close(state.page_scale(&page("a")), 1.1 * 1.1));
+        let state = state.nvim_reported_s(1.21);
+        assert!(close(state.panel_scale(), 1.1 * 1.1), "the echo moves nothing");
+    }
+
+    /// Every writer moves every module: a `:let` of S moves the app size, and the editor keeps its offset.
+    #[test]
+    fn an_external_write_moves_the_app_size_through_the_editors_offset() {
+        let (state, write) = ts(1.0, 1.0, 14.0).editor_larger();
+        let state = state.nvim_reported_s(write.unwrap()).nvim_reported_s(2.2);
+        assert!(close(state.app, 2.0));
+        assert!(close(state.editor, 1.1));
+        assert!(close(state.panel_scale(), 2.0));
+        let (reset, write) = state.editor_reset();
+        assert_eq!(write, Some(2.0), "a pane reset rejoins wherever the app size went");
+        assert!(close(reset.panel_scale(), 2.0));
+    }
+
+    /// The editor stops at the top of the range and the others go on; on the way back it keeps its offset, where a
+    /// model reading A off S would have lost it to the clamp.
+    #[test]
+    fn the_clamp_on_s_costs_the_app_size_nothing() {
+        let (state, write) = ts(2.5, 1.0, 14.0).editor_larger();
+        let mut state = state.nvim_reported_s(write.unwrap());
+        for _ in 0..5 {
+            let (next, write) = state.editor_larger();
+            state = write.map_or(next.clone(), |s| next.nvim_reported_s(s));
+        }
+        assert_eq!(state.reported_s, 3.0);
+        let editor = state.editor;
+        assert!(close(editor, 1.2));
+        let (state, write) = state.both_larger();
+        assert_eq!(write, None, "S stays at the top");
+        assert!(close(state.panel_scale(), 2.6), "the app size went on");
+        let (state, write) = state.both_smaller();
+        assert_eq!(write, None);
+        assert!(close(state.panel_scale(), 2.5));
+        let (state, write) = state.both_smaller();
+        assert_eq!(write, Some(2.88));
+        assert_eq!(state.editor, editor, "still the offset it had");
+    }
+
+    /// A write that rounds to the value last reported is still another writer's, with one of ours outstanding: S is
+    /// what nvim holds now, and the app size follows it rather than the write that lost.
+    #[test]
+    fn an_external_write_near_the_last_report_still_moves_the_app_size() {
+        let mut state = TextSize::new(14.0, 1.0);
+        for _ in 0..10 {
+            state = state.both_larger().0;
+        }
+        assert_eq!(state.pending, Some(2.0));
+        let state = state.nvim_reported_s(1.004);
+        assert_eq!(state.pending, None);
+        assert!(close(state.panel_scale(), 1.004));
+    }
+
+    /// A pair of every-module steps inside one tick, with the echoes arriving after rule 2 cleared the write: each
+    /// reads as external on the way, and the end state is where the pair started, offset kept.
+    #[test]
+    fn a_net_zero_pair_with_an_offset_ends_where_it_started() {
+        let (state, write) = ts(1.0, 1.0, 14.0).editor_larger();
+        let (state, _) = state.nvim_reported_s(write.unwrap()).editor_larger();
+        let state = state.nvim_reported_s(1.2);
+        let editor = state.editor;
+        let (state, first) = state.both_larger();
+        let (state, second) = state.both_smaller();
+        assert_eq!(first, Some(1.32));
+        assert_eq!(second, Some(1.2), "rule 2");
+        assert_eq!(state.pending, None);
+        let state = state.nvim_reported_s(1.32).nvim_reported_s(1.2);
+        assert!(close(state.app, 1.0));
+        assert_eq!(state.editor, editor);
+    }
+
+    /// `Ctrl+0` returns to what the config said, every offset cleared.
+    #[test]
+    fn reset_returns_to_the_configured_size() {
+        let state = TextSize::new(14.0, 1.0).with_configured(1.25).nvim_reported_s(1.25);
+        let (state, write) = state.both_larger();
+        let (state, _) = state.nvim_reported_s(write.unwrap()).editor_larger();
+        let state = state.nvim_reported_s(1.45).panel_larger().terminal_smaller();
+        let (state, write) = state.both_reset();
+        assert_eq!(write, Some(1.25));
+        assert_eq!(state.editor, 1.0);
+        assert_eq!(state.panel_scale(), 1.25);
+        assert_eq!(state.terminal_scale(), 1.25);
+    }
+
+    /// The configured size moves nothing by itself, and a bad value is no size.
+    #[test]
+    fn the_configured_size_is_used_only_by_a_reset() {
+        let state = TextSize::new(14.0, 1.1);
+        let next = state.clone().with_configured(2.0);
+        assert_eq!(next.panel_scale(), state.panel_scale());
+        assert_eq!(next.reported_s, state.reported_s);
+        for bad in [f32::NAN, 0.0, -1.0, f32::INFINITY] {
+            assert_eq!(state.clone().with_configured(bad).configured, 1.0, "{bad}");
+        }
+    }
+
+    /// With no editor nothing holds S: the app size moves, every offset is kept, pages follow, no write is left
+    /// outstanding, and a reset clears the offsets.
+    #[test]
+    fn with_no_editor_an_every_module_step_writes_nothing_and_moves_everything() {
+        let state = TextSize::new(14.0, 1.0).page_shown(&page("a")).page_larger(&page("a"));
+        let state = state.apply_app_step(TextStep::Larger);
+        assert_eq!(state.pending, None);
+        assert!(close(state.panel_scale(), 1.1));
+        assert!(close(state.terminal_scale(), 1.1));
+        assert!(close(state.page_scale(&page("a")), 1.21));
+        let state = state.apply_app_step(TextStep::Larger).apply_app_step(TextStep::Reset);
+        assert_eq!(state.panel_scale(), 1.0);
+        assert_eq!(state.page_scale(&page("a")), 1.0);
+        assert_eq!(state.pending, None);
     }
 
     /// An editor-only step must leave `panel_px` alone regardless of which of the three it is --
@@ -1326,7 +1510,7 @@ mod tests {
 
     #[test]
     fn both_steps_move_the_terminal_with_s_and_reset_its_factor() {
-        let state = TextSize::new(14.0, 1.5).terminal_larger();
+        let state = TextSize::new(14.0, 1.5).with_configured(1.0).terminal_larger();
         let factor = state.terminal_r;
         for (step, s) in [(TextStep::Larger, 1.6), (TextStep::Smaller, 1.4)] {
             let (next, write) = state.clone().apply_both_step(step);
@@ -1559,7 +1743,7 @@ mod tests {
     }
 
     /// An editor-only step keeps every shown page where it was, as it keeps the panel; a page shown
-    /// only afterwards starts in step with the new S.
+    /// only afterwards starts at the app size, not at the editor's.
     #[test]
     fn an_editor_only_step_leaves_every_shown_page_in_place() {
         let state = ts(1.0, 1.0, 14.0)
@@ -1582,7 +1766,7 @@ mod tests {
         assert!(close(moved.page_scale(&page("a")), 2.0));
         let (later, write) = state.editor_larger();
         assert_eq!(write, Some(1.1));
-        assert!(close(later.page_shown(&page("c")).page_scale(&page("c")), 1.1));
+        assert!(close(later.page_shown(&page("c")).page_scale(&page("c")), 1.0));
     }
 
     /// A page shown again (hidden and shown, or its view rebuilt after a kill) keeps its factor.

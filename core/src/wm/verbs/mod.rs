@@ -99,7 +99,7 @@ pub fn family(action: &Action) -> Family {
         Action::PanelReload | Action::PanelKeymap | Action::PanelCommandLine | Action::Tab(_) | Action::TabBreak => {
             Family::Panel
         }
-        Action::Text(_) => Family::TextSize,
+        Action::Text(_) | Action::TextAll(_) => Family::TextSize,
     }
 }
 

@@ -127,8 +127,14 @@ pub fn press_for(key: &KeyDown) -> Press {
     };
     // With Ctrl the letter is read lowercase, so Caps Lock does not turn `Ctrl+b` into `C-B`.
     let ch = if key.ctrl { ch.to_ascii_lowercase() } else { ch };
-    if ch.is_control() || ch.is_whitespace() || (key.ctrl && key.shift) {
+    if ch.is_control() || ch.is_whitespace() {
         return Press::Other;
+    }
+    if key.ctrl && key.shift {
+        return match ch {
+            '=' | '+' | '-' | '0' if !key.option => Press::ShiftTyped(KeySpec::char(ch, true, false)),
+            _ => Press::Other,
+        };
     }
     Press::Key(KeySpec::char(ch, key.ctrl, key.option))
 }
@@ -171,6 +177,8 @@ impl Keys {
         // A root key for what this host does not run is left to the pane it was typed in: a HINT only toasts
         // here, and nothing lies above or below either pane.
         prefix.set_root_keep(Rc::new(eitri_core::keymap::companion::beside_keep));
+        // This host takes no text size chord without the prefix, so `Ctrl++` stays the pane's as `Ctrl+=` does.
+        prefix.set_key_stage_roots(false);
         Keys {
             prefix,
             nav_intercept,
@@ -252,6 +260,14 @@ impl Keys {
         }
     }
 
+    /// The modifier keys changed: with Control up, a text size run has what is left of its repeat time. AppKit reports
+    /// a bare modifier as a flags change, never as a key-up.
+    pub fn modifiers_changed(&mut self, ctrl: bool) {
+        if !ctrl {
+            self.prefix.ctrl_released();
+        }
+    }
+
     /// The window was deactivated or a click arrived: whatever the prefix waits for ends.
     ///
     /// The key still down keeps its pane. A click into the other pane while a key is held would otherwise
@@ -274,8 +290,9 @@ impl Keys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eitri_core::keymap::{Action, TabAction};
+    use eitri_core::keymap::{Action, TabAction, TextChange};
     use std::cell::RefCell;
+    use std::time::Duration;
 
     // Real `kVK_ANSI_*` codes.
     const B: u16 = 11;
@@ -726,7 +743,50 @@ mod tests {
             Press::Other,
             "C-S-<char> has no tmux name"
         );
+        assert_eq!(
+            press_for(&KeyDown {
+                shift: true,
+                ..ctrl("=", 24)
+            }),
+            Press::ShiftTyped(KeySpec::parse("C-=").unwrap()),
+            "a key Shift typed is the chord after the prefix"
+        );
         assert_eq!(press_for(&plain("%", 23)), key("%"));
+    }
+
+    /// A text size run waits on Ctrl, and AppKit reports Ctrl only as a flags change.
+    #[test]
+    fn a_text_size_run_ends_when_the_flags_say_ctrl_went_up() {
+        let mut f = fixture(&[]);
+        let t = Instant::now();
+        assert_eq!(
+            f.keys.key_down(&ctrl("b", B), Pane::Editor, false, t),
+            KeyAction::Swallow
+        );
+        f.keys.key_up(B);
+        let step = KeyAction::RunPrefix(PrefixCommand::Run(Action::Text(TextChange::Larger)));
+        assert_eq!(f.keys.key_down(&ctrl("=", 24), Pane::Editor, false, t), step);
+        f.keys.key_up(24);
+        let later = t + Duration::from_secs(5);
+        f.keys.modifiers_changed(true);
+        assert_eq!(f.keys.key_down(&ctrl("=", 24), Pane::Editor, false, later), step);
+        f.keys.key_up(24);
+        f.keys.modifiers_changed(false);
+        let past = later + Duration::from_secs(1);
+        assert_eq!(
+            f.keys.key_down(&ctrl("=", 24), Pane::Editor, false, past),
+            KeyAction::Pass
+        );
+    }
+
+    /// This host takes no text size chord without the prefix, so `Ctrl++` stays the pane's.
+    #[test]
+    fn ctrl_plus_with_nothing_armed_stays_the_panes() {
+        let mut f = fixture(&[]);
+        assert_eq!(
+            f.keys.key_down(&ctrl("+", 24), Pane::Editor, false, Instant::now()),
+            KeyAction::Pass
+        );
     }
 
     #[test]

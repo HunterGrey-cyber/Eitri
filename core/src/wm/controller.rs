@@ -110,6 +110,11 @@ impl Controller {
         Some(window.text_size.as_ref()?.page_scale(module))
     }
 
+    #[cfg(test)]
+    pub(crate) fn panel_scale_for_test(&self, win: WinId) -> Option<f32> {
+        Some(self.windows.get(&win)?.text_size.as_ref()?.panel_scale())
+    }
+
     /// What the controller reads of the shell from now on; until it is given, [`NoReads`]' answers.
     pub fn set_reads(&mut self, reads: Rc<dyn HostReads>) {
         self.reads = reads;
@@ -1090,6 +1095,12 @@ impl Controller {
             .is_some_and(|window| super::keys::watches_release(window, keycode))
     }
 
+    /// Whether a Control key's release in `win` is to be reported as [`HostEvent::CtrlReleased`]: only while a text
+    /// size run lasts on it. Asked on every release, so it allocates nothing.
+    pub fn watches_ctrl(&self, win: WinId) -> bool {
+        self.windows.get(&win).is_some_and(super::keys::watches_ctrl)
+    }
+
     /// The workspace chooser was drawn: `win`'s prefix waits for its key, including a top-bar click.
     pub fn await_workspace(&mut self, win: WinId) -> Batch {
         let mut batch = Batch::default();
@@ -1170,6 +1181,11 @@ impl Controller {
             HostEvent::KeyReleased { win, keycode } => {
                 if let Some(window) = self.windows.get_mut(win) {
                     super::keys::released(window, *keycode);
+                }
+            }
+            HostEvent::CtrlReleased { win } => {
+                if let Some(window) = self.windows.get_mut(win) {
+                    super::keys::ctrl_released(window);
                 }
             }
             HostEvent::Active { win, active: false }
@@ -1600,6 +1616,7 @@ impl Decide for Controller {
                     TextSizeEvent::Both { win, .. }
                     | TextSizeEvent::Pane { win, .. }
                     | TextSizeEvent::PageAttached { win, .. }
+                    | TextSizeEvent::Configured { win, .. }
                     | TextSizeEvent::Base { win, .. } => *win,
                 };
                 if let Some(window) = self.windows.get_mut(&win) {
@@ -2334,13 +2351,18 @@ impl Controller {
                 };
                 verbs::chat::run(window, &cx, win, &action, &mut batch);
             }
-            verbs::Family::TextSize => {
-                if let Action::Text(change) = action {
+            verbs::Family::TextSize => match action {
+                // A window of one module has one size, so both scopes are the same action there.
+                Action::Text(change) if window.tiling != super::window::Tiling::ModuleWindow => {
                     // The module that holds the keys right now, where a key typed now would go.
                     let keys = window.focus.native_module().cloned();
                     verbs::text_size::run(window, win, change, keys.as_ref(), &mut batch);
                 }
-            }
+                Action::Text(change) | Action::TextAll(change) => {
+                    verbs::text_size::all(window, win, change.into(), &mut batch);
+                }
+                _ => {}
+            },
         }
         if reset && window.clear_selection() {
             window.layout_touched();

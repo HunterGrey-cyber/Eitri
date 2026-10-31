@@ -30,6 +30,10 @@ pub struct NvimOptions {
     /// field, which reads as unknown rather than as any one number.
     #[serde(default)]
     pub cmdheight: Option<u32>,
+    /// What the user's config left in `g:neovide_scale_factor`, read once at VimEnter so a later `:let` never counts.
+    /// Absent before VimEnter, and from an nvim the feed was injected into after it.
+    #[serde(default)]
+    pub start_scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -51,6 +55,7 @@ impl NvimThemePayload {
                 guifont: String::new(),
                 colors_name: String::new(),
                 cmdheight: None,
+                start_scale: None,
             },
         }
     }

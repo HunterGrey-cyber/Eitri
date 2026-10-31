@@ -540,6 +540,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "rose-pine".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         })
     }
@@ -625,6 +626,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "lunaperche".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         });
         let css = gtk_css(&t);
@@ -689,6 +691,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "any".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         };
         let quiet = ThemeTokens::derive(&payload(HlAttrs {
@@ -888,6 +891,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "lunaperche".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         })
     }
@@ -923,6 +927,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: "rose-pine".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         })
     }

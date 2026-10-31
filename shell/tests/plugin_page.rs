@@ -477,6 +477,7 @@ fn light_theme() -> PageTheme {
             guifont: String::new(),
             colors_name: "dawn".to_owned(),
             cmdheight: None,
+            start_scale: None,
         },
     };
     PageTheme::from_tokens(&ThemeTokens::derive(&payload))

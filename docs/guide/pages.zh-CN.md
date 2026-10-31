@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=29ecbceeb8cfe23e9e21b01e175c28c0057453e56f71a6575b8fcb4d206954f6 -->
+<!-- translated-from: pages.md sha256=f2edc0b9e3de153f045e55c508342d4ee0498c58fd9ce64403251bd988f11cef -->
 
 # 你自己做的页面
 
@@ -193,7 +193,7 @@ start();
 - **配色和字体**以 `--nv-*` CSS 变量的形式出现在页面的根元素上（`--nv-bg`、`--nv-fg`、`--nv-surface`、`--nv-border`、`--nv-link`、`--nv-font-mono`、`--nv-font-prose`、`--nv-syn-*` 语法配色等等），并随你的配色实时变化。`prefers-color-scheme` 跟随 Eitri 的浅色或深色。
 - **按键工具包**在 `/.eitri/keys.js`，给页面所有插件页面共用的按键：`j`/`k` 和 `d`/`u` 滚动，`gg`/`G`，`/` 查找，`f` 给能按的东西标上标签，`?` 列出按键，`H`/`L` 后退和前进。`window.eitriKeys.install({rows, run, initial})` 加上你自己的行；`run(action)` 处理了这个键就返回 `true`。文本框拿着按键时，除了 `Esc`，每个键都交给它。你可以在 `init.lua` 里用 `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` 改一个页面的按键。
 - **Eitri 的按键优先**：前缀和它后面的键、`Ctrl+h/j/k/l`、`Ctrl+=`、`Ctrl+-`、`Ctrl+0` 和 `F11` 永远不会到达页面，一行按键也不能用它们、`Ctrl+Shift` 组合键或 `Super` 组合键。不经过工具包、自己处理按键并把按键交给编辑器的页面，应该调用 `preventDefault()`，否则这个键也会传到编辑器。
-- 文字大小跟随编辑器（`Ctrl+=`），`<prefix> Ctrl+=` 只调整这个页面。
+- 文字大小跟随窗口（`Ctrl+=`），`<prefix> Ctrl+=` 只调整这个页面。
 
 <a id="a-brief-for-your-own-agent"></a>
 ## 给你自己的 agent 的说明

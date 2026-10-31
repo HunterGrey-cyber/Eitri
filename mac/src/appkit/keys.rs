@@ -65,7 +65,7 @@ pub(super) fn install(host: Weak<Host>) -> Option<Retained<AnyObject>> {
     // by AppKit until the monitor is removed.
     unsafe {
         NSEvent::addLocalMonitorForEventsMatchingMask_handler(
-            NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::LeftMouseDown,
+            NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged | NSEventMask::LeftMouseDown,
             &block,
         )
     }
@@ -113,6 +113,13 @@ fn on_event(host: &Host, event: &NSEvent) -> bool {
         NSEventType::KeyUp => {
             if let Some(assembly) = host.assembly() {
                 assembly.keys.borrow_mut().key_up(event.keyCode());
+            }
+            true
+        }
+        NSEventType::FlagsChanged => {
+            if let Some(assembly) = host.assembly() {
+                let ctrl = event.modifierFlags().contains(NSEventModifierFlags::Control);
+                assembly.keys.borrow_mut().modifiers_changed(ctrl);
             }
             true
         }

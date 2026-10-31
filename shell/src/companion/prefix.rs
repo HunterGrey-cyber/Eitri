@@ -18,7 +18,7 @@ use eitri_core::layout::ModuleKeys;
 pub(crate) use eitri_core::keymap::prefix::{literal_for, PrefixCommand, Waiting};
 use eitri_core::keymap::prefix::{Outcome, Prefix, Press};
 
-use crate::gtk_host::keys::classify;
+use crate::gtk_host::keys::{classify, CtrlKeys};
 use eitri_core::wm::keys::prefix_escape;
 
 /// Installs the prefix on `window`. `on_command` runs a command and is told the keycode of the key
@@ -41,12 +41,15 @@ pub(crate) fn install(
     let prefix = Rc::new(RefCell::new(machine));
     let on_waiting: Rc<dyn Fn(Waiting)> = Rc::new(on_waiting);
 
+    let ctrl_keys = Rc::new(CtrlKeys::default());
     let keys = gtk4::EventControllerKey::new();
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
     {
         let prefix = prefix.clone();
         let on_waiting = on_waiting.clone();
+        let ctrl_keys = ctrl_keys.clone();
         keys.connect_key_pressed(move |_, key, keycode, state| {
+            ctrl_keys.pressed(key, keycode, state);
             let press = classify(key, state);
             let escape = press == Press::Escape;
             let (outcome, was, now) = {
@@ -84,14 +87,23 @@ pub(crate) fn install(
     }
     {
         let prefix = prefix.clone();
-        keys.connect_key_released(move |_, _, keycode, _| prefix.borrow_mut().release(keycode));
+        let ctrl_keys = ctrl_keys.clone();
+        keys.connect_key_released(move |_, key, keycode, _| {
+            let mut prefix = prefix.borrow_mut();
+            prefix.release(keycode);
+            if ctrl_keys.released(key, keycode) {
+                prefix.ctrl_released();
+            }
+        });
     }
     window.add_controller(keys);
 
     let cancel = {
         let prefix = prefix.clone();
         let on_waiting = on_waiting.clone();
+        let ctrl_keys = ctrl_keys.clone();
         Rc::new(move || {
+            ctrl_keys.forget();
             // Cancelled either way: a root key held while the window lost focus never sees its release.
             let mut p = prefix.borrow_mut();
             let armed = p.is_armed();

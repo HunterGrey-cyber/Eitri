@@ -1814,6 +1814,7 @@ mod tests {
                 guifont: String::new(),
                 colors_name: format!("{background}-test"),
                 cmdheight: None,
+                start_scale: None,
             },
         })
     }

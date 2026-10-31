@@ -214,6 +214,7 @@ mod tests {
                 guifont: guifont.into(),
                 colors_name: "t".into(),
                 cmdheight: None,
+                start_scale: None,
             },
         }
     }

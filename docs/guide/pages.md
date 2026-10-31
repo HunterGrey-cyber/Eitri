@@ -232,7 +232,7 @@ The capabilities:
   reach the page, and a row may not use them, a `Ctrl+Shift` chord or a `Super` chord. A page that handles a key
   itself, without the kit, and moves the keys to the editor should call `preventDefault()`, or the key reaches the
   editor too.
-- The text size follows the editor's (`Ctrl+=`), and `<prefix> Ctrl+=` sizes the page alone.
+- The text size follows the window's (`Ctrl+=`), and `<prefix> Ctrl+=` sizes the page alone.
 
 ## A brief for your own agent
 

@@ -2373,7 +2373,7 @@ describe("index.css: the ? overlay never scrolls sideways", () => {
   });
 
   function keyCells(extraCss = ""): HTMLElement[] {
-    const long = { keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)", what: "Text size reset (both panes)" };
+    const long = { keys: "Ctrl+0 / Ctrl+Keypad0 / Ctrl+Keypad0 (NumLock off)", what: "Text size reset (every module)" };
     document.head.innerHTML = `<style>${css}${extraCss}</style>`;
     document.body.innerHTML = renderToStaticMarkup(
       createElement(KeymapOverlay, {

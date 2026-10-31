@@ -492,6 +492,51 @@ mod tests {
         assert!(seen.is_some(), "the busy main loop must not lose the payload entirely");
     }
 
+    /// What `Ctrl+0` returns to is what the config left at VimEnter: `--cmd` runs before it, `-c` after the config and
+    /// before VimEnter, so the second write here is a config's, and a `:let` after VimEnter is not.
+    #[test]
+    #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
+    fn the_start_scale_is_the_configs_and_a_later_let_does_not_move_it() {
+        for (config, want) in [
+            (Some("let g:neovide_scale_factor = 1.25"), 1.25),
+            (None, 1.0),
+            (Some("let g:neovide_scale_factor = 'big'"), f64::NAN),
+        ] {
+            let mut feed = ThemeFeed::new().expect("feed");
+            let mut reader = reader_for(&mut feed);
+            let mut command = std::process::Command::new("nvim");
+            command.args(["--headless", "--clean"]).args(feed.nvim_args());
+            if let Some(config) = config {
+                command.args(["-c", config]);
+            }
+            let mut child = command
+                .args([
+                    "-c",
+                    "autocmd VimEnter * ++nested lua vim.g.neovide_scale_factor = 2.0; vim.cmd.colorscheme('retrobox')",
+                ])
+                .envs(feed.child_env())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("nvim on PATH");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = None;
+            while Instant::now() < deadline && seen.is_none() {
+                seen = reader.poll().filter(|p| p.options.colors_name == "retrobox");
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            feed.cleanup();
+            let payload = seen.expect("the payload after the later write");
+            match want {
+                want if want.is_nan() => assert_eq!(payload.options.start_scale, None, "{config:?}"),
+                want => assert_eq!(payload.options.start_scale, Some(want), "{config:?}"),
+            }
+        }
+    }
+
     /// Nvim has no general highlight-change event. A plugin autocmd registered after the loader
     /// can override a highlight after the initial snapshot. Here a second `++once VimEnter`
     /// handler changes `Normal.fg` after `colorscheme retrobox`; periodic snapshots must detect it

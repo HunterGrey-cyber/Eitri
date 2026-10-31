@@ -1,5 +1,6 @@
 use super::*;
 use crate::alloc_count::bytes_allocated_by;
+use crate::keymap::prefix::REPEAT_TIME;
 use crate::keymap::{Action, KeySpec, Keymap, KeymapOp};
 use crate::layout::{Axis, Layout, ModuleKeys, Node, Size};
 use crate::wm::chrome::ChromeModel;
@@ -574,6 +575,8 @@ fn a_pass_through_key_allocates_nothing_in_either_stage_or_on_release() {
     assert_eq!((verdict, bytes), (Verdict::PassThrough, 0), "nvim's own chord");
     let (watched, bytes) = bytes_allocated_by(|| driver.query(|c| c.watches_release(WIN, K1)));
     assert_eq!((watched, bytes), (false, 0), "a release nobody watches");
+    let (watched, bytes) = bytes_allocated_by(|| driver.query(|c| c.watches_ctrl(WIN)));
+    assert_eq!((watched, bytes), (false, 0), "a Ctrl release nobody watches");
 }
 
 // --- The window stage and the prefix's commands.
@@ -1057,6 +1060,50 @@ fn a_key_released_is_watched_only_for_the_prefix_and_the_command_key() {
     assert!(!watches(K1));
     assert_eq!(r.window_key(key("a", K2)), Verdict::PassThrough);
     assert!(!watches(K2), "a key that passed is nobody's");
+}
+
+/// `prefix C-=` stays on the pane while Ctrl is down, however long, and the same chord goes on to the accelerator
+/// once Ctrl went up and the repeat time ran out: a host hears of Ctrl only while a run waits on it.
+#[test]
+fn a_text_size_run_ends_through_the_reported_ctrl_release() {
+    let r = driven(three(agent()));
+    r.driver.set_text_size(WIN, 14.0, 1.0);
+    r.native(&agent());
+    let watches = || r.driver.query(|c| c.watches_ctrl(WIN));
+    assert!(!watches());
+    assert_eq!(r.prefix_then("C-=", K1), Verdict::Consumed);
+    assert!(watches());
+    r.scheduler.advance(Duration::from_secs(5));
+    assert_eq!(r.window_key(key("C-=", K1)), Verdict::Consumed, "Ctrl is still down");
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K1 });
+    assert_eq!(r.driver.query(|c| c.panel_scale_for_test(WIN)), Some(1.2));
+    r.host.post(HostEvent::CtrlReleased { win: WIN });
+    assert!(!watches());
+    r.scheduler.advance(REPEAT_TIME + Duration::from_millis(1));
+    assert_eq!(
+        r.window_key(key("C-=", K1)),
+        Verdict::PassThrough,
+        "the accelerator's now"
+    );
+}
+
+/// `Ctrl++` with nothing armed is the accelerators' step, run by the window stage.
+#[test]
+fn ctrl_plus_at_the_window_stage_moves_every_module() {
+    let r = driven(three(editor()));
+    r.driver.set_text_size(WIN, 14.0, 1.0);
+    r.native(&editor());
+    let mark = r.mark();
+    assert_eq!(r.window_key(key("C-+", K1)), Verdict::Consumed);
+    let ops = r.ops_since(mark);
+    assert!(
+        ops.contains(&HostOp::Editor(EditorCall::SetScale {
+            win: WIN,
+            scale: 1.1_f32 as f64
+        })),
+        "{ops:?}"
+    );
+    assert_eq!(r.driver.query(|c| c.panel_scale_for_test(WIN)), Some(1.1));
 }
 
 // --- The keys verbs.
