@@ -74,7 +74,7 @@ pub fn family(action: &Action) -> Family {
         Action::SelectNumber | Action::Hint | Action::SendPrefix | Action::SendKeys(_) | Action::CopyMode { .. } => {
             Family::Keys
         }
-        Action::WindowImmersive => Family::Chrome,
+        Action::WindowImmersive | Action::WindowSetup => Family::Chrome,
         Action::Module(_)
         | Action::ModuleHide
         | Action::ModuleHideByKey

@@ -1,0 +1,2324 @@
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=none mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-a mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=C-Space mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (none found, so Ctrl+b).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（未找到，所以是 Ctrl+b）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim + tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux's. The prefix and the keys after it come from your tmux configuration (now Ctrl+a).
+eitri.config.set("keymap.from_tmux", "on")
+-- A panel listing the keys after the prefix (milliseconds before it shows, or "off"):
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+-- Your tmux prefix (Ctrl+a) is not used in Eitri; this line wins.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimTmux prefix=M-" mod=Alt lhs=none tmux=true ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim + tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：沿用 tmux。前缀和之后的键来自你的 tmux 配置（目前是 Ctrl+a）。
+eitri.config.set("keymap.from_tmux", "on")
+-- 列出前缀之后按键的面板（显示前等待的毫秒数，或 "off"）：
+-- eitri.config.set("keymap.which_key_delay", 200)
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+-- 你的 tmux 前缀（Ctrl+a）在 Eitri 里不用；以这一行为准。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=none mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-a mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space, whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=C-Space mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- No report from Neovim yet; uncomment to get the window keys under <leader>W:
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 还没有收到 Neovim 的报告；取消注释即可在 <leader>W 下使用窗口键：
+-- eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the next keys; set it to "off" once you know them.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Neovim, no tmux).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+", whatever a tmux configuration on this computer says.
+eitri.config.set("keymap.from_tmux", "off")
+-- After the prefix a panel lists the keys after the prefix that still work here.
+eitri.config.set("keymap.which_key_delay", 200)
+-- The same window keys in Neovim under <leader>W, which which-key lists (:Eitri runs them too):
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板会列出接下来的键；熟悉后可设为 "off"。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== NvimNoTmux prefix=M-" mod=Alt lhs=<leader>W tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：Neovim，不用 tmux）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"，不管这台电脑上的 tmux 配置怎么写。
+eitri.config.set("keymap.from_tmux", "off")
+-- 按下前缀后，面板列出这里仍然可用的键。
+eitri.config.set("keymap.which_key_delay", 200)
+-- 在 Neovim 的 <leader>W 下也有这些窗口键，which-key 会列出（:Eitri 也能运行）：
+eitri.config.set("keymap.nvim_prefix", "<leader>W")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+b as the prefix; Ctrl+b twice sends Ctrl+b itself.
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+b as the prefix; Ctrl+b twice sends Ctrl+b itself.
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+b as the prefix; Ctrl+b twice sends Ctrl+b itself.
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b；按两次 Ctrl+b 发送 Ctrl+b 本身。
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b；按两次 Ctrl+b 发送 Ctrl+b 本身。
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b；按两次 Ctrl+b 发送 Ctrl+b 本身。
+eitri.keymap.prefix("C-b")
+eitri.keymap.del("prefix", "C-b")
+eitri.keymap.set("prefix", "C-b", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: Eitri arranges its own modules (window.tiling "auto" would have picked sway here).
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Another prefix).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：Eitri 排布自己的模块（这里 window.tiling "auto" 本会选 sway）。
+eitri.config.set("window.tiling", "eitri")
+=== OtherPrefix prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：换个前缀）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== I3Style prefix=none mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+=== I3Style prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+=== I3Style prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+b. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+=== I3Style prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+=== I3Style prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+=== I3Style prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+b。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+=== I3Style prefix=none mod=Super lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+=== I3Style prefix=none mod=Super lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+=== I3Style prefix=none mod=Super lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+=== I3Style prefix=none mod=Super lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+=== I3Style prefix=none mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+=== I3Style prefix=none mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+a. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+a。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-a mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Ctrl+Space. Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到
+-- Ctrl+Alt（与 docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到
+-- Ctrl+Alt（与 docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到
+-- Ctrl+Alt（与 docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=C-Space mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+". Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+". Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Keys: tmux-style, prefix Alt+". Your window manager's $mod is Alt, so the Alt keys after the
+-- prefix move to Ctrl+Alt (the same moves as docs/keymap/i3-alt-mod.lua):
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 按键：tmux 风格，前缀 Alt+"。你的窗口管理器 $mod 是 Alt，所以前缀之后的 Alt 键改到 Ctrl+Alt（与
+-- docs/keymap/i3-alt-mod.lua 相同）：
+eitri.keymap.use("i3-alt")
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false En compositor_mode=false tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: i3 / sway style).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- $mod is Super: nothing after the prefix collides with it.
+eitri.config.set("window.tiling", "eitri")            -- Eitri arranges its own modules
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false ZhCn compositor_mode=false tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== I3Style prefix=M-" mod=Super lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：i3 / sway 风格）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- $mod 是 Super：前缀之后的键不与它冲突。
+eitri.config.set("window.tiling", "eitri")            -- Eitri 排布自己的模块
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== Compositor prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== Compositor prefix=none mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+=== Compositor prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== Compositor prefix=none mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+=== Compositor prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== Compositor prefix=C-a mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Ctrl+a as the prefix; Ctrl+a twice sends Ctrl+a itself.
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== Compositor prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== Compositor prefix=C-a mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Ctrl+a；按两次 Ctrl+a 发送 Ctrl+a 本身。
+eitri.keymap.prefix("C-a")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-a", "send-prefix")
+=== Compositor prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== Compositor prefix=C-Space mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Ctrl+Space as the prefix; Ctrl+Space twice sends Ctrl+Space itself.
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== Compositor prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== Compositor prefix=C-Space mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Ctrl+Space；按两次 Ctrl+Space 发送 Ctrl+Space 本身。
+eitri.keymap.prefix("C-Space")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "C-Space", "send-prefix")
+=== Compositor prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Eitri
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== Compositor prefix=M-" mod=Alt lhs=none tmux=false En compositor_mode=true tiling=Compositor
+-- Eitri configuration, written by Eitri's first-start screen on 2026-11-02 (preset: Tiling compositor).
+-- Eitri reads it at startup and never changes it. Every setting is explained in the guide, "Configuration".
+
+-- Windows: sway arranges chats and pages as its own windows; Eitri's layout keys are off.
+eitri.config.set("window.tiling", "compositor")
+
+-- Keys: tmux-style with Alt+" as the prefix; Alt+" twice sends Alt+" itself.
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b goes back to whatever has the keys
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== Compositor prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Eitri
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")
+=== Compositor prefix=M-" mod=Alt lhs=none tmux=false ZhCn compositor_mode=true tiling=Compositor
+-- Eitri 配置，由 Eitri 首次启动界面于 2026-11-02 写入（预设：平铺合成器）。
+-- Eitri 启动时读取它，从不修改。每项设置见指南的“配置”一章。
+
+-- 窗口：sway 把对话和页面当作自己的窗口排布；Eitri 的布局键关闭。
+eitri.config.set("window.tiling", "compositor")
+
+-- 按键：tmux 风格，前缀 Alt+"；按两次 Alt+" 发送 Alt+" 本身。
+eitri.keymap.prefix("M-\"")
+eitri.keymap.del("prefix", "C-b")                     -- Ctrl+b 交还给当前持有按键的模块
+eitri.keymap.set("prefix", "M-\"", "send-prefix")

@@ -77,6 +77,11 @@ windows can hand a move off the edge to Eitri, which moves focus to the panel
 "left", "down", "up", "right". Returns true when a panel took the move, false
 when none is attached (nothing happens then).
 
+In the nvim of an Eitri window itself, the same call hands the move to that
+window's own tiling (the next module, or the neighbouring window). Any other
+word than the four directions returns false and sends nothing. If both a panel
+and a window are there, the panel is asked first.
+
 For smart-splits.nvim, call it from the `at_edge` callback:
 >lua
   require("smart-splits").setup({
@@ -89,6 +94,16 @@ For smart-splits.nvim, call it from the `at_edge` callback:
 <
 vim-tmux-navigator needs nothing here: when nvim is not inside tmux, the panel
 treats its TmuxNavigate maps as plain window moves.
+
+                                                                  *eitri.run()*
+require("eitri").run({word}, ...)
+
+In the nvim of an Eitri window, runs one of the window's actions, as
+`:Eitri {word} ...` does: `require("eitri").run("split", "right", "agent")`.
+Up to six words of letters, digits and . _ : = < > # - (64 bytes each); a word
+outside that is refused with an error message and nothing is sent. Returns
+true when the line was sent, false in any other nvim (including a terminal
+nvim that only has the panel attached) or when it could not be sent.
 
 ==============================================================================
 5. INSIDE TMUX                                                     *eitri-tmux*

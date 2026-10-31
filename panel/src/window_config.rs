@@ -39,6 +39,9 @@ pub struct WindowConfig {
     pub keymap: Rc<eitri_core::keymap::Keymap>,
     pub tmux_import: Option<eitri_core::keymap::TmuxImport>,
     pub tmux_skipped: Vec<eitri_core::keymap::HelpRow>,
+    /// `keymap.which_key_delay`: how long the prefix waits for a key before the hint panel shows; `None` (the
+    /// default) never shows it.
+    pub which_key_delay: Option<std::time::Duration>,
     /// Which window manager the companion window asks to move focus (`companion.wm`). Read by every
     /// window so a bad value fails the same way everywhere; only the companion window uses it.
     pub companion_wm: eitri_core::compositor::WmChoice,
@@ -47,6 +50,9 @@ pub struct WindowConfig {
     pub review: ReviewConfig,
     /// `agent.thinking`: how the agent panel shows the agent's thinking.
     pub thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
+    /// `keymap.nvim_prefix`: the left-hand side of the group of Normal-mode keys in the embedded nvim that run the
+    /// prefix table's window and layout actions, or `None` (the default) for no group.
+    pub nvim_prefix: Option<String>,
 }
 
 /// How big the agent panel's text is. One number: every other size in `index.css` is a ratio of
@@ -266,6 +272,15 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         keymap.bindings().len()
     );
 
+    // The hint panel's delay (`keymap.which_key_delay`): a whole number of milliseconds from 0 to 5000, or
+    // `false`/`"off"`; anything else is a startup failure naming the key, like the keys around it.
+    let which_key_delay = eitri_core::keymap::hints::parse_which_key_delay(
+        kernel
+            .config
+            .borrow()
+            .get(eitri_core::keymap::hints::WHICH_KEY_DELAY_KEY),
+    )?;
+
     let companion_wm = parse_companion_wm(kernel.config.borrow().get(eitri_core::compositor::CONFIG_KEY))?;
 
     // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
@@ -292,6 +307,15 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         );
     }
 
+    // The group of keys in the embedded nvim (`keymap.nvim_prefix`): off unless `init.lua` names a left-hand side.
+    // Anything that cannot be one is a startup failure naming the key, like the keys above.
+    let nvim_prefix = eitri_core::nvim_verbs::leader::parse_nvim_prefix(
+        kernel
+            .config
+            .borrow()
+            .get(eitri_core::nvim_verbs::leader::NVIM_PREFIX_KEY),
+    )?;
+
     Ok(WindowConfig {
         panel_font_size,
         panel_font_follows_editor,
@@ -305,9 +329,11 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         keymap,
         tmux_import,
         tmux_skipped,
+        which_key_delay,
         companion_wm,
         review,
         thinking_display,
+        nvim_prefix,
     })
 }
 
@@ -597,6 +623,23 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(err.contains("agent.thinking"), "{bad}: {err}");
+        }
+    }
+
+    /// `keymap.which_key_delay` through the real Lua engine: unset is off, a number or `"off"` is read, a value out
+    /// of range stops the load naming the key.
+    #[test]
+    fn window_config_reads_the_hint_panels_delay() {
+        use std::time::Duration;
+        assert_eq!(load_from("", &[]).unwrap().which_key_delay, None);
+        let set = |value: &str| load_from(&format!("eitri.config.set(\"keymap.which_key_delay\", {value})\n"), &[]);
+        assert_eq!(set("200").unwrap().which_key_delay, Some(Duration::from_millis(200)));
+        assert_eq!(set("0").unwrap().which_key_delay, Some(Duration::ZERO));
+        assert_eq!(set("\"off\"").unwrap().which_key_delay, None);
+        assert_eq!(set("false").unwrap().which_key_delay, None);
+        for bad in ["7000", "-5", "\"soon\""] {
+            let err = set(bad).err().unwrap();
+            assert!(err.contains("keymap.which_key_delay"), "{bad}: {err}");
         }
     }
 

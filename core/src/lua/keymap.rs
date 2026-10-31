@@ -1,6 +1,7 @@
-//! `eitri.keymap.prefix(key)`, `.set(table, key, action, opts)`, `.del(table, key)`. The tables
-//! are `"prefix"`, `"panel"` and `"plugin:<id>"` (a plugin page's own keys, in vim's
-//! notation). Each call is **recorded, never applied or checked here**: `shell` hands the recording to
+//! `eitri.keymap.prefix(key)`, `.set(table, key, action, opts)`, `.del(table, key)`, `.use(name)` (a named
+//! set of those calls, recorded in place). The tables
+//! are `"prefix"`, `"root"` (keys that work without the prefix), `"panel"` and `"plugin:<id>"` (a plugin
+//! page's own keys, in vim's notation). Each call is **recorded, never applied or checked here**: `shell` hands the recording to
 //! `eitri_core::keymap::Keymap::apply_user` once `init.lua` has run, so every mistake -- a bad
 //! key, an unknown action, a collision -- is a startup failure naming the call. A Lua error raised
 //! from here would only be logged (`Kernel::load_init_file`), and the window would open with a
@@ -12,7 +13,7 @@ use std::rc::Rc;
 
 use mlua::{FromLua, Lua, Table, Value};
 
-use crate::keymap::{KeymapOp, OptValue};
+use crate::keymap::{bundles, KeymapOp, OptValue};
 
 /// The calls `init.lua` made, in order.
 #[derive(Default)]
@@ -102,7 +103,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
         )?,
     )?;
 
-    let s = store;
+    let s = store.clone();
     keymap.set(
         "del",
         lua.create_function(move |lua, (table, key): (Value, Value)| {
@@ -111,6 +112,29 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
                 _ => KeymapOp::Invalid("eitri.keymap.del(table, key): table and key must be strings".to_string()),
             };
             s.borrow_mut().ops.push(op);
+            Ok(())
+        })?,
+    )?;
+
+    // A named set of calls (`crate::keymap::bundles`), recorded in place: a `del` after it sees its rows.
+    let s = store;
+    keymap.set(
+        "use",
+        lua.create_function(move |lua, name: Value| {
+            let mut store = s.borrow_mut();
+            match text(lua, &name) {
+                Some(name) => match bundles::bundle(&name) {
+                    Some(ops) => store.ops.extend(ops),
+                    None => store.ops.push(KeymapOp::Invalid(format!(
+                        "eitri.keymap.use({name:?}): there is no bundle of that name; the names are {}",
+                        bundles::BUNDLES.join(", ")
+                    ))),
+                },
+                None => store.ops.push(KeymapOp::Invalid(format!(
+                    "eitri.keymap.use(…): the name must be a string, not a {}",
+                    name.type_name()
+                ))),
+            }
             Ok(())
         })?,
     )?;
@@ -420,6 +444,51 @@ mod tests {
         let snippet = Keymap::apply_user(&run(SNIPPET), &[]).unwrap();
         assert_eq!(layered.prefix(), snippet.prefix());
         assert_eq!(effect(&layered), effect(&snippet));
+    }
+
+    #[test]
+    fn use_records_the_bundles_ops_in_place() {
+        let ops = run(r#"
+            eitri.keymap.use("i3-alt")
+            eitri.keymap.del("prefix", "C-M-w")
+            eitri.keymap.set("prefix", "C-M-w", "container.stacked")
+        "#);
+        let bundle = bundles::bundle("i3-alt").unwrap();
+        assert_eq!(&ops[..bundle.len()], bundle.as_slice());
+        assert_eq!(ops.len(), bundle.len() + 2);
+        assert_eq!(
+            ops[bundle.len()],
+            KeymapOp::Del {
+                table: "prefix".into(),
+                key: "C-M-w".into()
+            }
+        );
+        // The bundle's rows are bound when the later `del` runs: startup accepts the whole sequence.
+        Keymap::apply_user(&ops, &[]).unwrap_or_else(|e| panic!("{e}"));
+        // And it gives the same table as the sample file's calls.
+        let by_use = Keymap::apply_user(&run(r#"eitri.keymap.use("i3-alt")"#), &[]).unwrap();
+        let by_sample = Keymap::apply_user(&run(I3_ALT_MOD), &[]).unwrap();
+        let sorted = |map: &Keymap| {
+            let mut rows: Vec<String> = map.bindings().iter().map(|b| format!("{b:?}")).collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(sorted(&by_use), sorted(&by_sample));
+    }
+
+    #[test]
+    fn use_of_an_unknown_name_is_a_startup_failure_naming_the_call() {
+        for source in ["eitri.keymap.use('nope')", "eitri.keymap.use(3)", "eitri.keymap.use()"] {
+            let ops = run(source);
+            let [KeymapOp::Invalid(message)] = ops.as_slice() else {
+                panic!("{source}: {ops:?}")
+            };
+            assert!(message.starts_with("eitri.keymap.use("), "{message}");
+            assert!(Keymap::apply_user(&ops, &[]).is_err());
+        }
+        let ops = run("eitri.keymap.use('nope')");
+        let KeymapOp::Invalid(message) = &ops[0] else { panic!() };
+        assert!(message.contains("eitri.keymap.use(\"nope\")"), "{message}");
     }
 
     const I3_ALT_MOD: &str = include_str!("../../../docs/keymap/i3-alt-mod.lua");

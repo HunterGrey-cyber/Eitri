@@ -202,7 +202,7 @@ for _, mode in ipairs({ "n", "x", "i" }) do
     if (m.desc or ""):find("^eitri") then n = n + 1 end
   end
 end
-for _, name in ipairs({ "__eitri_companion", "EitriScratch", "__eitri_keys_schedule", "eitri_reload_timer" }) do
+for _, name in ipairs({ "__eitri_companion", "EitriScratch", "__eitri_keys_schedule", "__eitri_keys_rescan", "eitri_reload_timer" }) do
   if rawget(_G, name) ~= nil then n = n + 1 end
 end
 return n

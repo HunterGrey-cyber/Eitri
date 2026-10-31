@@ -1,11 +1,22 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=692f184bc34dc38d38f93d6c44cb31d176e7dcd823ce6a8736201dee641f9d29 -->
+<!-- translated-from: getting-started.md sha256=9a16b23f2e2a90dde93a53606bd2c0d7e46a09af0a981ba38b26deeb1c9d3b86 -->
 
 # 快速上手
 
 这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。
 
 文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的、面板能用的单个键的 `mapleader`（更长的或被保留的会退回到 `Space`）。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `?` 也能看到。
+
+<a id="the-first-launch"></a>
+## 第一次启动
+
+如果你还没有 `init.lua`，第一个窗口会先打开一个简短的设置界面。它列出在你电脑上找到的东西（tmux 配置和它的前缀、你的桌面、可能和 Eitri 按键冲突的 Neovim 映射、正在运行的输入法），然后问窗口的按键要怎么用：
+
+- `j` 和 `k`，或预设的数字，用来选择；`Enter` 进入复查，复查会展示它要写的行。
+- 复查时按 `Enter` 写入 `~/.config/eitri/init.lua`（只写一次，绝不覆盖已有的文件）；`Backspace` 返回。新按键从下次启动起生效。写完后，`t` 打开 `:EitriTutor`，`Enter` 关闭。
+- `Esc` 是“以后再说”：什么都不写，下次启动时界面再问一次。`d` 让它永远不再出现。以后可以用 `:Eitri setup` 叫回来。
+
+你更想自己写文件的话，按两次 `Esc` 或按 `d`；界面提供的一切都在[按键](keys.zh-CN.md)和[配置](configuration.zh-CN.md#first-start)里。
 
 <a id="open-a-project"></a>
 ## 打开一个项目

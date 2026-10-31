@@ -167,8 +167,12 @@ pub struct Keys {
 
 impl Keys {
     pub fn new(keymap: Rc<Keymap>, module_keys: Rc<ModuleKeys>, nav_intercept: Rc<dyn Fn(Direction) -> bool>) -> Keys {
+        let mut prefix = Prefix::new(keymap, module_keys);
+        // A root key for what this host does not run is left to the pane it was typed in: a HINT only toasts
+        // here, and nothing lies above or below either pane.
+        prefix.set_root_keep(Rc::new(eitri_core::keymap::companion::beside_keep));
         Keys {
-            prefix: Prefix::new(keymap, module_keys),
+            prefix,
             nav_intercept,
             down: None,
         }
@@ -323,7 +327,10 @@ mod tests {
         asked: Rc<RefCell<Vec<Direction>>>,
     }
     fn fixture(claims: &'static [Direction]) -> Fixture {
-        let keymap = Rc::new(Keymap::defaults());
+        fixture_with(Keymap::defaults(), claims)
+    }
+    fn fixture_with(keymap: Keymap, claims: &'static [Direction]) -> Fixture {
+        let keymap = Rc::new(keymap);
         let module_keys = Rc::new(ModuleKeys::build(&[], &keymap).unwrap());
         let asked = Rc::new(RefCell::new(Vec::new()));
         let record = asked.clone();
@@ -342,6 +349,53 @@ mod tests {
     fn arm(f: &mut Fixture, pane: Pane) {
         assert_eq!(down(f, &ctrl("b", B), pane, false), KeyAction::Swallow);
         f.keys.key_up(B);
+    }
+
+    /// A root key runs what this host runs (the panel's verbs and the zoom); one for a layout verb passes on to
+    /// the pane it was typed in.
+    #[test]
+    fn a_root_key_runs_when_this_host_runs_its_action_and_passes_when_it_does_not() {
+        let root = |key: &str, action: &str| eitri_core::keymap::KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        let keymap = Keymap::apply_user(&[root("C-y", "zoom"), root("C-u", "module.terminal")], &[]).unwrap();
+        let mut f = fixture_with(keymap, &[]);
+        assert_eq!(
+            down(&mut f, &ctrl("y", 16), Pane::Editor, false),
+            KeyAction::RunPrefix(PrefixCommand::Run(Action::Zoom))
+        );
+        assert_eq!(down(&mut f, &ctrl("u", 32), Pane::Editor, false), KeyAction::Pass);
+    }
+
+    /// A HINT only toasts in this window and nothing lies above or below either pane, so a root key for one of them
+    /// stays the pane's own key instead of being eaten.
+    #[test]
+    fn a_root_key_for_a_hint_or_a_move_with_nowhere_to_go_passes() {
+        let root = |key: &str, action: &str| eitri_core::keymap::KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        let keymap = Keymap::apply_user(
+            &[
+                root("C-y", "hint"),
+                root("C-u", "select.up"),
+                root("C-e", "select.right"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let mut f = fixture_with(keymap, &[]);
+        assert_eq!(down(&mut f, &ctrl("y", 16), Pane::Editor, false), KeyAction::Pass);
+        assert_eq!(down(&mut f, &ctrl("u", 32), Pane::Editor, false), KeyAction::Pass);
+        assert!(matches!(
+            down(&mut f, &ctrl("e", 14), Pane::Editor, false),
+            KeyAction::RunPrefix(PrefixCommand::Run(_))
+        ));
     }
 
     #[test]

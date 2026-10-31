@@ -25,9 +25,11 @@ use crate::keymap::prefix::{Outcome, Prefix, PrefixCommand, Press, Waiting, DISP
 use crate::keymap::KeyName;
 use crate::layout::{Direction, ModuleId, ModuleKind};
 use crate::tabs::ViewId;
+use std::time::Duration;
 
 /// A window's keys: its prefix, built from the window's config, what its chrome shows the prefix waits for, the
-/// digits the last `select.number` drew, and the timer of the digit wait while one is armed.
+/// digits the last `select.number` drew, the timer of the digit wait while one is armed, and the hint panel's
+/// delay, timer and whether it is up.
 pub struct KeyState {
     pub(super) prefix: Option<Prefix>,
     /// What the prefix waits for as the chrome was last told: the app name's armed block, the prefix strip and the
@@ -37,6 +39,15 @@ pub struct KeyState {
     /// its wait: a digit is looked up in what was drawn, after the wait has already ended by that very key.
     pub(super) plan: Vec<(char, ModuleId)>,
     pub(super) number_timer: Option<TimerToken>,
+    /// How long the prefix waits for a key before the hint panel shows; `None` never shows it.
+    pub(super) hint_delay: Option<Duration>,
+    /// Counts the waits that began from no wait at all, so a timer armed for an earlier wait is never taken for
+    /// the current one's.
+    pub(super) hint_serial: u64,
+    /// The timer that shows the panel, with the serial of the wait it was armed for.
+    pub(super) hint_timer: Option<(TimerToken, u64)>,
+    /// The panel is up.
+    pub(super) hints_shown: bool,
 }
 
 impl Default for KeyState {
@@ -46,8 +57,17 @@ impl Default for KeyState {
             waiting: Waiting::No,
             plan: Vec::new(),
             number_timer: None,
+            hint_delay: None,
+            hint_serial: 0,
+            hint_timer: None,
+            hints_shown: false,
         }
     }
+}
+
+/// Whether the prefix waits for a key from a list the hint panel can show: a command, or a module after a split key.
+fn lists_keys(waiting: Waiting) -> bool {
+    matches!(waiting, Waiting::Command | Waiting::Module(_))
 }
 
 /// Whether a press is the prefix's own `Esc`: `Esc` while the prefix waited for a key, whatever it waited for (a
@@ -133,6 +153,18 @@ pub(super) fn prompt_press(w: &Window, press: &KeyPress) -> Option<PromptKey> {
         PromptKey::Ignore => None,
         answer => Some(answer),
     }
+}
+
+/// The window stage while the first-start screen is shown: the screen answers the key before the prefix sees it, and
+/// every key but a bare modifier is its own, so none reaches the prefix, a module or the compositor's keys. The
+/// effects it asks for are the controller's to carry out. `None` while no screen is up, and while one is held by a
+/// question (the trust gate's card has the keys then, and they go on).
+pub(super) fn onboarding_press(w: &mut Window, press: &KeyPress) -> Option<Vec<crate::onboarding::screen::Effect>> {
+    let state = w.onboarding.as_mut()?;
+    if state.screen.held() || press.press == Press::Modifier {
+        return None;
+    }
+    Some(state.screen.press(&press.press))
 }
 
 /// The window stage: `press` fed to the window's prefix at the scheduler's time. A change of what the prefix
@@ -232,17 +264,18 @@ pub(super) fn released(w: &mut Window, keycode: u32) {
     }
 }
 
-/// The window stopped being active, or was clicked: a prefix waiting for a key stops waiting.
+/// The window stopped being active, or was clicked: a prefix waiting for a key stops waiting. The machine is
+/// cancelled either way, since a root key that moved the keys to another window never gets its release here and
+/// must not swallow its own next press; only a wait that really ended is announced.
 pub(super) fn cancel(w: &mut Window, batch: &mut Batch) {
     let Some(prefix) = w.keys.prefix.as_mut() else {
         return;
     };
-    if !prefix.is_armed() {
-        return;
-    }
     let was = prefix.waiting();
     prefix.cancel();
-    waiting_changed(w, was, Waiting::No, batch);
+    if was != Waiting::No {
+        waiting_changed(w, was, Waiting::No, batch);
+    }
 }
 
 /// The workspace chooser is drawn: the prefix waits for its key, with no timer.
@@ -359,7 +392,69 @@ fn set_waiting(w: &mut Window, was: Waiting, now: Waiting, batch: &mut Batch) {
         }
     }
     w.keys.waiting = now;
+    hints_follow(w, was, now);
     w.prefix_changed();
+}
+
+/// The hint panel follows the wait: a wait that begins from none arms its timer (or shows the panel at once with
+/// a delay of 0), a split key's module wait after the command wait keeps the timer running and a panel already up
+/// switches to the module keys, and any other end of the wait takes the panel and its timer down.
+fn hints_follow(w: &mut Window, was: Waiting, now: Waiting) {
+    let Some(delay) = w.keys.hint_delay else {
+        return;
+    };
+    if !lists_keys(now) {
+        stop_hints(w);
+        return;
+    }
+    if lists_keys(was) {
+        return;
+    }
+    w.keys.hint_serial += 1;
+    if let Some((old, _)) = w.keys.hint_timer.take() {
+        w.cancel_timer(old);
+    }
+    if delay.is_zero() {
+        chrome::hints_shown(w, true);
+        w.keys.hints_shown = true;
+    } else {
+        w.keys.hint_timer = Some((w.arm_after(delay), w.keys.hint_serial));
+    }
+}
+
+/// The panel and its timer down, whatever put them up.
+fn stop_hints(w: &mut Window) {
+    if let Some((timer, _)) = w.keys.hint_timer.take() {
+        w.cancel_timer(timer);
+    }
+    if w.keys.hints_shown {
+        w.keys.hints_shown = false;
+        chrome::hints_shown(w, false);
+    }
+}
+
+/// `keymap.which_key_delay` for this window, from now on. A panel already up or timer already armed is taken down.
+pub(super) fn set_hint_delay(w: &mut Window, delay: Option<Duration>) {
+    w.keys.hint_delay = delay;
+    stop_hints(w);
+}
+
+/// A timer fired: when it is the hint panel's, the panel goes up if the wait it was armed for is still the
+/// current one. `false` when `token` is not the panel's.
+pub(super) fn hint_timer_fired(w: &mut Window, token: TimerToken) -> bool {
+    let Some((timer, serial)) = w.keys.hint_timer else {
+        return false;
+    };
+    if timer != token {
+        return false;
+    }
+    w.keys.hint_timer = None;
+    if serial == w.keys.hint_serial && lists_keys(w.keys.waiting) && !w.keys.hints_shown {
+        w.keys.hints_shown = true;
+        chrome::hints_shown(w, true);
+        w.say("[prefix] the hint panel is up".into());
+    }
+    true
 }
 
 /// `prefix Esc`: a container selection goes back to the module with the keys. A bare `Esc` is the module's own

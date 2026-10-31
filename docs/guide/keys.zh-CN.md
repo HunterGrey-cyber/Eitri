@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=bd3d38e2422d53bbeac5d1638eae16ab6359b162c90c19ad0a99f79e9fba025d -->
+<!-- translated-from: keys.md sha256=51fde1e2a017aad7a867b4f22eed6c7d78ff359e2a5234060cda45f8e62681ed -->
 
 # 按键
 
@@ -12,18 +12,22 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 >   在底部终端里运行 Claude Code 时，也是它把正在运行的命令移到后台的那个键。
 > - `Ctrl+h`、`Ctrl+j`、`Ctrl+k` 和 `Ctrl+l` 在模块之间移动，所以在底部终端里，shell 的清屏是 `Ctrl+b Ctrl+l`
 >   （readline 的 `Ctrl+k` 是 `Ctrl+b Ctrl+k`）。
+> - 想让 Eitri 在你按下前缀后停一下就列出接下来的键，在 `init.lua` 里写 `eitri.config.set("keymap.which_key_delay", 200)`（[提示面板](#the-hint-panel)）。
 > - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 按键](#your-tmux-keys)），
 >   `Ctrl+b ?`（或者你自己的前缀加 `?`）会列出没拿过来的那些。
 > - 想用 `Ctrl+a` 当前缀，从 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua) 开始；i3 或 sway 把 Alt
 >   当 `$mod` 的话，从 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 开始。
+> - 没有 `init.lua` 的第一次启动，Eitri 会提议设置按键并写入一个（[首次启动](configuration.zh-CN.md#first-start)）；
+>   `:Eitri setup` 可以把这个界面叫回来。
 > - 在编辑器里运行 `:EitriTutor`，会一步步带你把这些键走一遍，用英文或简体中文（按你的语言环境来选，和
->   Neovim 的 `:Tutor` 一样）。
+>   Neovim 的 `:Tutor` 一样）。课文里凡是指“你的前缀”的地方都写你自己的前缀，教的是前缀之后的默认键，所以被
+>   tmux 配置改过的键不会体现在里面；你的前缀加 `?` 会列出你的键。
 
 ## 前缀
 
 前缀就是原版 tmux 的：按下 `Ctrl+b`，松开，再按一个键。它在编辑器、面板和底部终端看到任何东西之前就被读走，所以不管按键焦点在哪里它都有效。`Esc` 取消它，按下表里没绑定的键会结束等待而不做任何事。要把 `Ctrl+b` 本身发给当前拿着按键的东西，连按两次。`<prefix> ?` 打开完整按键表，并滚到“After <prefix>”一节。等待前缀后续按键时，提示条以 `? keys` 结尾；这里使用 `panel.keymap` 的实际绑定，未绑定时不显示这一项。
 
-标着“repeats”的键，可以在半秒内不再按前缀而直接再按一次，和 tmux 里一样。
+标着“repeats”的键，可以在半秒内不再按前缀而直接再按一次，和 tmux 里一样。如果你宁愿看见这些键而不是背它们，[提示面板](#the-hint-panel)会在停顿之后列出来。
 
 **标签页。** agent 面板里的每个对话是一个标签页。
 
@@ -100,7 +104,7 @@ end
 | `<prefix> :` | 面板的 `:` 命令行（见[命令行](#the-command-line)） |
 | `<prefix> Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l` | 把那个组合键本身发给当前拿着按键的东西；下面不带前缀的那几个组合键是 Eitri 的 |
 
-**不带前缀**时，这些在窗口里的任何地方都有效：
+**不带前缀**时，这些在窗口里的任何地方都有效（[不带前缀的键](#keys-without-the-prefix)里还能加上你自己的）：
 
 | 按键 | 作用 |
 |---|---|
@@ -203,6 +207,34 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 
 **每个新默认键需要的 `del`。** `Alt+Shift+Space`、`Alt+-`、`Alt+_`、`(`、`)`、`L`、`s` 和 `$` 现在是默认键，`!`（`tab.break`，tmux 的 `break-pane`）也是，所以已经对其中任何一个调用 `set` 的 `init.lua`，要在那个 `set` 之前放一行 `k.del("prefix", "<key>")`，否则启动会停下（写法是 `eitri.keymap` 接受的那种：`M-S-Space`、`M--`、`M-_`、`(`、`)`、`L`、`s`、`$`、`!`；`!` 就是 `k.del("prefix", "!")`）。规则和上面“给已经有动作的键再 `set`”一样，tmux 导入也包括在内。
 
+<a id="the-hint-panel"></a>
+### 提示面板
+
+`eitri.config.set("keymap.which_key_delay", 200)` 让 Eitri 在前缀已经按下、过了这么多毫秒还没等到第二个键时，列出接下来可以按的键。值是 0 到 5000 之间的整数，或者 `false`、`"off"`（默认，什么都不显示）。`0` 立刻显示；设成 `200` 时，如果你一气呵成地按 `Ctrl+b z`，永远看不到它。
+
+面板出现在窗口靠下的位置，盖在模块上面，居中，宽度最多是窗口的 90%，高度最多 45%。键按 Tabs、Modules、Layout、Workspaces（浮动窗口也在这里）、Windows、Other 几组排列，每个键有一个简短的英文名（`zoom`、`split right…`、`next tab`）；插件面板自己的模块键单独一行，写它的标题。这个窗口拒绝执行的动作，和按键表里一样不列出来。横向放不下的组不显示，太高的组末尾变成 `… 5 more` 这样的一行；`<prefix> ?` 列出全部的键。按下分割键（`%` 或 `"`）之后，面板只列出接下来可以按的模块键，标题用提示条已经在用的那一句。
+
+它从不抢键，也不接收指针事件：下一个键照常交给前缀，就像没有面板一样。等待结束时它就消失（任何键、`Esc`、一次点击，或者窗口失去焦点）。会重复的键的等待、数字等待和工作区选择器显示它们自己的内容，不出面板。提示条保持原样。
+
+有两处没做到：[companion 窗口](companion.zh-CN.md)不画这个面板（设置打开时它会在日志里说一次，提示条和按键表照常工作），Mac 主机也不画。面板上的文字是英文，和提示条、按键表一样。
+
+<a id="choosing-ctrlspace-as-the-prefix"></a>
+### 选 Ctrl+Space 当前缀
+
+默认仍是 `Ctrl+b`：它是原版 tmux 的，本指南和 README 教的也是它（`:EitriTutor` 讲的是你实际用的前缀）。想用 `Ctrl+Space` 的话，像设置别的前缀一样设，并把“原样发出去”的那个键一起换掉：
+
+```lua
+local k = eitri.keymap
+k.prefix("C-Space")
+k.del("prefix", "C-b")
+k.set("prefix", "C-Space", "send-prefix")
+```
+
+先确认三件事。fcitx5 的默认触发键就是 `Ctrl+Space`，fcitx5 在运行时，这个键可能根本到不了 Eitri（[不带前缀的键](#keys-without-the-prefix)里的冲突警告只管根键，不管前缀：按一下，看提示条出不出来）。macOS 用它切换输入源。nvim-cmp、blink.cmp 和 kickstart.nvim 在 Insert 模式里把 `<C-Space>` 映射成补全：前缀设成 `Ctrl+Space` 后，要连按两次才能碰到那个映射，就像现在的 `Ctrl+b Ctrl+b`。`send-prefix`（和 `send-keys`）对底部终端也能发出每一个组合键，`Ctrl+Space` 也不例外，shell 里它是 `Ctrl+@`（NUL）。
+
+[首次启动界面](configuration.zh-CN.md#first-start)把 `Ctrl+Space` 列在可选前缀里，也替你做第一次检查：它的按键测试请你按一下这个键，并说明它到没到 Eitri；有输入法在运行时还会事先提醒。没到的话，是输入法或桌面把它拿走了；换一个前缀，或者你就是要改这一点的话，仍然写入。tmux 配置里的 `set -g prefix C-space` 和别的前缀一样会被读取。
+
+<a id="moving-between-panes"></a>
 ## 在窗格之间移动
 
 `Ctrl+h`、`Ctrl+j`、`Ctrl+k` 和 `Ctrl+l` 把按键焦点移到左边、下面、上面和右边的模块，和 vim-tmux-navigator 一样。它们不带前缀，而且在每个模块里都是 Eitri 的，底部终端也包括在内（终端永远收不到它们；程序真的需要时，`<prefix> Ctrl+l` 把这个组合键发给它）。
@@ -212,6 +244,87 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 **从 agent 面板出发。** `Ctrl+h` 和 `Ctrl+l` 离开面板，去那一侧的模块。`Ctrl+k` 和 `Ctrl+j` 取决于面板的模式（见下）：BROWSE 里的 `Ctrl+j` 开始输入，在输入框（INSERT）里它离开面板去下面的模块；INSERT 里的 `Ctrl+k` 回到 BROWSE，在 BROWSE 里它离开面板去上面的模块。从最上面的模块出发，`Ctrl+k` 会继续走到顶栏：`h` 和 `l` 在上面移动，`Enter` 激活一项，`Ctrl+j` 或 `Esc` 把按键还给原来的地方。
 
 在 BROWSE 里，vim 的 `Ctrl+w h`、`Ctrl+w j`、`Ctrl+w k` 和 `Ctrl+w l` 做同样的移动；`Ctrl+w j` 永远是下面的模块，绝不是输入框。
+
+<a id="navigator-plugins-in-the-editor"></a>
+**编辑器里的导航插件。** 要不要做点什么，看插件。vim-tmux-navigator 和 Navigator.nvim 照原样就能用：它们发的 `select-pane` 由 Eitri 回答，所以在 Neovim 右边缘按 `Ctrl+l`，按键会到达那一侧的终端或面板。smart-splits.nvim 需要一个钩子。没有钩子时它不会把按键移出 Neovim（Neovim 是 GUI 时它会关掉自己的多路复用器支持，而这里的编辑器就是），所以在 `at_edge` 里把这次移动交给 Eitri：
+
+```lua
+require("smart-splits").setup({
+  at_edge = function(ctx)
+    require("eitri").edge(ctx.direction)
+  end,
+})
+```
+
+`require("eitri").edge` 来自 [eitri.nvim](companion.zh-CN.md#the-eitrinvim-plugin)，它要在 Neovim 的 `runtimepath` 上。它接受 smart-splits 传来的方向词（`left`、`down`、`up`、`right`），Eitri 接下了这次移动时返回 `true`，其他情况（包括 Eitri 不在）返回 `false`，什么也不发送。同一段配置在 [companion](companion.zh-CN.md#navigator-plugins-and-tmux) 的用法里也能用，那里是窗口管理器来接这次移动。唯一不需要钩子的 smart-splits 情形，是第 3 版加上它单独的 tmux 后端插件：它自己移动按键（钩子配了也从不被调用）。Eitri 从不修改你的插件配置。
+
+<a id="from-neovim-eitri"></a>
+## 从 Neovim 用：`:Eitri`
+
+在 Eitri 自己的窗口所内嵌的那个 Neovim 里，`:Eitri` 运行窗口和布局动作，所以你在 Neovim 里映射的一个键，可以做 `<prefix> z` 做的事。它只存在于那个窗口的 Neovim 里：companion 的 Neovim 里没有，Mac 上没有，第二个窗口里也没有（它没有 Neovim）。
+
+| 命令 | 作用 |
+|---|---|
+| `:Eitri <action> [key=value ...]` | `eitri.layout.run` 接受的任何动作，用它在 `eitri.keymap` 里的名字：`:Eitri zoom`、`:Eitri resize.left cells=5`、`:Eitri module.agent`、`:Eitri layout.even-horizontal`、`:Eitri float.toggle` |
+| `:Eitri split right` 或 `below <module>` | 在编辑器旁边打开一个模块，或者把它移到那里；`<module>` 是 `editor`、`agent`、`terminal`、`terminal#2`、`agent#3` 或 `lua:<panel id>` |
+| `:Eitri focus`、`show` 或 `hide <module>` | 同 `eitri.layout.focus`、`show`、`hide` |
+| `:Eitri open terminal` 或 `agent` | 新开一个终端或聊天视图，按通常的规则放置 |
+| `:Eitri workspace <name>` | 切换到那个工作区，没有就先建出来 |
+| `:Eitri keys` | 按键表 |
+| `:Eitri setup` | [首次启动界面](configuration.zh-CN.md#first-start)，用来重新选一套按键 |
+
+补全按位置来：第一个词列出这些词和动作名，`split` 之后列出 `right` 和 `below`，`open` 之后列出 `terminal` 和 `agent`，该写模块的地方列出模块 id，其中每个带编号的实例不管开没开都在。第一个词既不是这些词也不是动作时，是一个 Neovim 错误，什么都不会发出去。窗口拒绝的其他情况（动作缺少必需的选项、模块没有打开、`tab.new` 这样的面板键）在窗口里弹一条提示说明原因，Neovim 这边听不到回音。
+
+**它没有包括的。** agent 面板自己的键（前缀后的 `c`、`n`、`p`、`1`-`9`、`,`，以及 `r`、`:`、复制模式和文字大小）不是布局动作，而从 Neovim 出发时拿着按键的模块永远是编辑器，所以它们多半什么也做不了。它们仍然走前缀，`:Eitri keys` 会列出。下面的 leader 组也不包括它们。
+
+**在配置里绑定。** 这个命令在 Neovim 刚启动之后才定义（绝不会盖掉你自己的 `:Eitri`；不得不让开时会在日志里说一声），所以读你的配置时 `vim.g.eitri` 还没有设。映射到 `<cmd>Eitri zoom<cr>` 不用检查，因为它在你按下时才解析。想只在 Eitri 里绑定，就等 `User EitriReady` 事件：`:Eitri` 存在、`vim.g.eitri` 为 `1` 之后它触发一次；不在 Eitri 里两者都不会发生：
+
+```lua
+vim.keymap.set("n", "<leader>z", "<cmd>Eitri zoom<cr>", { desc = "Eitri: zoom" })
+
+vim.api.nvim_create_autocmd("User", {
+  pattern = "EitriReady",
+  callback = function()
+    vim.keymap.set("n", "<leader>ez", "<cmd>Eitri zoom<cr>", { desc = "Eitri: zoom" })
+  end,
+})
+```
+
+在 Lua 里，`require("eitri").run("zoom")`（eitri.nvim）做同样的事，Eitri 不在时返回 `false`。
+
+**一个 leader 组。** `eitri.config.set("keymap.nvim_prefix", "<leader>W")` 在 Normal 模式里，把你生效的前缀表里的布局键映射到这个左端之下：`<leader>Wz` 放大，每个分割键成为一个组（`<leader>W%t` 在右边放一个终端，`<leader>W"e` 在下面放一个编辑器）。描述写成 `Eitri: zoom`，所以 which-key 把它们列在一个组 “Eitri window” 下。你在前缀之后学到的，就是在 `<leader>W` 之后要按的；tmux 导入和 `init.lua` 里的改动也一并带过来，因为这个组就是从那张表生成的。默认是 `"off"`。值是一个 Neovim 的左端，最长 16 个字符，可以用 `<leader>` 和 `<localleader>`。
+
+如果那个左端本身或它之下已经有映射（LazyVim 把 `<leader>w` 当作它的窗口组），Eitri 一个都不装，并说一次是什么挡了路，所以请换一个。插件管理器加载完之后，Eitri 会再看一遍。之后有插件映射了 Eitri 的某个键，这个键以插件的为准，Eitri 不会把自己的放回去；组里其余的键不变。
+
+<a id="keys-without-the-prefix"></a>
+## 不带前缀的键
+
+默认情况下，Eitri 不带前缀就接管的键，只有上面表里的那几个。`eitri.keymap.set("root", ...)` 加上你自己的：在任何模块里都不带前缀地运行一个动作的 Ctrl 和 Alt 组合键。这张表一开始是空的，你不填，什么都不变。
+
+```lua
+local k = eitri.keymap
+k.set("root", "M-z", "zoom")
+k.set("root", "C-Space", "select.next")
+-- k.del("root", "M-z") removes one again
+```
+
+- **键必须带 Ctrl 或 Alt**（`C-`、`M-`、`C-M-`，命名键可以再加 `S-`）。光秃秃的键、光秃秃的功能键和只带 Shift 的键，会在 Neovim、你的 shell 和面板里到处被拿走，所以 Eitri 在启动时停下并说明。不提供 Super 组合键。
+- **前缀键能运行的动作都可以**，除了 `send-prefix` 和 `send-keys`，也没有 `repeatable` 选项（按住的根键不会重复；再按一次）。分割动作会等模块键，`select.number` 和工作区动作会等它们的数字或名字，和前缀之后一样。
+- **冲突会让启动停下，并点出双方：**前缀本身；内置的组合键（`F11`、`Ctrl+=`、`Ctrl+-`、`Ctrl+0` 和小键盘的写法、`Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l`）；在根表里绑了两次的键；`eitri.command.register` 的键位；以及同时绑在前缀之后的键（默认的或你的 `init.lua` 里的）。对最后一种，先 `eitri.keymap.del("prefix", "<key>")`，这样 `<prefix> <key>` 才能把这个键本身发出去。只来自 tmux 导入的前缀绑定会被丢掉，tmux 设的前缀等于某个根键时也一样（前缀退回 `Ctrl+b`）；每一条 Eitri 都会记一行日志。你的 `init.lua` 自己设的前缀则仍是错误。
+- **按住的键只运行一次。** 自动重复被吞掉，直到你松手；失去焦点或一次点击也会清掉它。
+- **在哪里有效。** 前缀有效的地方：窗口、第二个窗口、companion 窗口和 Mac 主机。在最后两处，动作被那个窗口拒绝的根键（比如 companion 窗口里的布局动作）会原样交给拿着按键的东西，而不是被吃掉。
+- **按键表会列出它们**，在“Anywhere in the window”下，动作后面跟着 ` (init.lua)`。提示面板不列，因为它们不在前缀之后。
+- **tmux 的 `bind -n` 导入时仍然跳过**（按键表里会这么说）；改在这里设。
+
+**把组合键发过去。** Neovim、终端里的程序、agent 面板和插件页面都看不到根键。想让模块拿到它，就按 `<prefix> <key>`：Neovim 收到的是一个键，底部终端收到的是敲这个键会产生的字节（`Ctrl+Space` 是 NUL，`Alt+z` 是 Escape 加 `z`）。agent 面板和插件页面拿不回这样的组合键：面板只认字面的 `Ctrl+a`，页面不接受字面键。你能重新绑定的面板键表里没有 Ctrl 或 Alt 组合键，但面板固定的键里有，而且没有警告覆盖它们：`Ctrl+a`、`Ctrl+c`、`Ctrl+d`、`Ctrl+e`、`Ctrl+f`、`Ctrl+g`、`Ctrl+n`、`Ctrl+o`、`Ctrl+p`、`Ctrl+r`、`Ctrl+u`、`Ctrl+w`、`Ctrl+y`、`Ctrl+Enter` 和 `Alt+Enter`（见下面的 INSERT 和 BROWSE 两张表）。根键占了其中一个，它在面板里就不再起作用。把组合键重新发给这些页面，是以后的改动。
+
+**警告。** 别的东西可能在 Eitri 看到之前就拿走一个根键，所以 Eitri 会检查并警告，从不因此拒绝启动。它把你的根键和这些比较：
+
+- fcitx5 运行时的默认触发键（它看 `GTK_IM_MODULE`、`QT_IM_MODULE`、`XMODIFIERS` 和会话总线，从不读输入法自己的配置；IBus 不会触发警告，因为它的默认触发键是 `Super+Space`，而根键不能是它）；
+- GNOME 当前生效的快捷键设置，仅当会话是 GNOME 时；
+- sway（它的主配置：`include` 进来的文件里的绑定看不到）和 Hyprland 当前生效的绑定。
+
+每个冲突每次启动记一行日志，只有冲突的集合和上次弹出时不同才弹一次提示。KDE 和 niri 没有来源，来自它们的冲突、来自 sway 的 include、或来自你重新配置过的输入法的冲突，Eitri 都看不见：根键没反应时，去那里找。这项检查只在 Eitri 自己的窗口里运行：companion 窗口和 Mac 主机不运行它。
 
 ## 面板的模式
 

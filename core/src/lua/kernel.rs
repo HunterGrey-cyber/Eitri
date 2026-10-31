@@ -337,6 +337,20 @@ impl Kernel {
         self.init_refusal().map_or(Ok(()), Err)
     }
 
+    /// Runs `text` as one chunk under `init.lua`'s rules, with no file behind it: `Err` is the refusal the chunk
+    /// caused, caught or not, or else its Lua error. A refusal it did not catch is a Lua error too, and the refusal's
+    /// own text is the one that names the call.
+    pub fn run_checked_text(&self, name: &str, text: &str) -> Result<(), String> {
+        {
+            let mut refusals = self.init_refusals.borrow_mut();
+            refusals.accepting = true;
+            refusals.path = None;
+        }
+        let ran = self.lua.load(text).set_name(name).exec();
+        self.init_refusals.borrow_mut().accepting = false;
+        self.init_refusal().map_or(ran.map_err(|error| error.to_string()), Err)
+    }
+
     /// The shared startup refusal, including the init.lua path once it has been loaded.
     pub fn init_refusal(&self) -> Option<String> {
         self.init_refusals.borrow().first()
@@ -390,6 +404,49 @@ mod tests {
             "{error}"
         );
         assert!(error.contains(&init.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn checked_text_reports_a_caught_refusal_without_a_path() {
+        let kernel = Kernel::new(PathBuf::from("/nonexistent/eitri-kernel-test"), refuse_panels).unwrap();
+        let error = kernel
+            .run_checked_text("=text", "pcall(eitri.config.set, {}, true)")
+            .unwrap_err();
+        assert_eq!(error, "eitri.config.set: the key must be a string");
+    }
+
+    #[test]
+    fn an_uncaught_refusal_is_reported_as_the_refusal() {
+        let kernel = Kernel::new(PathBuf::from("/nonexistent/eitri-kernel-test"), refuse_panels).unwrap();
+        let error = kernel
+            .run_checked_text("=text", "eitri.config.set({}, true)")
+            .unwrap_err();
+        assert_eq!(error, "eitri.config.set: the key must be a string");
+    }
+
+    #[test]
+    fn checked_text_reports_a_lua_error_under_the_name_it_was_given() {
+        let kernel = Kernel::new(PathBuf::from("/nonexistent/eitri-kernel-test"), refuse_panels).unwrap();
+        let error = kernel.run_checked_text("=text", "eitri.keymap.prefix(").unwrap_err();
+        assert!(error.contains("text:1:"), "{error}");
+    }
+
+    #[test]
+    fn checked_text_records_what_it_runs_and_closes_recording_after() {
+        let kernel = Kernel::new(PathBuf::from("/nonexistent/eitri-kernel-test"), refuse_panels).unwrap();
+        let text = "eitri.keymap.prefix('C-a')\neitri.config.set('a.key', 200)\n";
+        assert_eq!(kernel.run_checked_text("=text", text), Ok(()));
+        assert_eq!(
+            kernel.keymap.borrow().ops(),
+            [crate::keymap::KeymapOp::Prefix { key: "C-a".into() }]
+        );
+        assert_eq!(kernel.config.borrow().get("a.key"), Some("200"));
+        kernel
+            .lua
+            .load("assert(not pcall(eitri.config.set, {}, true))")
+            .exec()
+            .unwrap();
+        assert_eq!(kernel.init_refusal(), None);
     }
 
     #[test]

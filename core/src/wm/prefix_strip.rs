@@ -33,14 +33,8 @@ pub fn strip_pieces(
                 }))
                 .collect(),
         ),
-        Waiting::Module(axis) => (
-            Some(match axis {
-                Axis::Row => format!("right of {focus_title}:"),
-                Axis::Column => format!("below {focus_title}:"),
-            }),
-            modules.collect(),
-        ),
-        Waiting::Hide => (Some("hide:".to_string()), modules.collect()),
+        Waiting::Module(axis) => (Some(module_heading(axis, focus_title)), modules.collect()),
+        Waiting::Hide => (Some(HIDE_HEADING.to_string()), modules.collect()),
     };
     let mut pieces: Vec<StripPiece> = heading.into_iter().map(StripPiece::Heading).collect();
     for (i, run) in runs.into_iter().enumerate() {
@@ -52,17 +46,33 @@ pub fn strip_pieces(
     pieces
 }
 
+/// The heading the strip (and the hint panel) shows while a module to hide is awaited.
+pub const HIDE_HEADING: &str = "hide:";
+
+/// The heading the strip (and the hint panel) shows after a split key: where the new module goes.
+pub fn module_heading(axis: Axis, focus_title: &str) -> String {
+    match axis {
+        Axis::Row => format!("right of {focus_title}:"),
+        Axis::Column => format!("below {focus_title}:"),
+    }
+}
+
 /// One module key's run: `t terminal`, `t terminal ×3` while three terminals are in the layout (the key
 /// reaches one of them, `crate::layout::module_target`'s), and after a split key that makes a new
 /// terminal (the keys are in a terminal), `t new terminal`. Armed, the same key in a terminal toggles
 /// that terminal, so the strip never says `new` there.
 fn entry_text(entry: &StripEntry, title: &dyn Fn(&ModuleId) -> String, after_split: bool) -> String {
+    format!("{} {}", entry.key, entry_label(entry, title, after_split))
+}
+
+/// What a module key reaches, without the key: `terminal`, `terminal \u{00d7}3`, `new terminal`.
+pub fn entry_label(entry: &StripEntry, title: &dyn Fn(&ModuleId) -> String, after_split: bool) -> String {
     if after_split && entry.new_instance {
-        format!("{} new {}", entry.key, title(&entry.module))
+        format!("new {}", title(&entry.module))
     } else if entry.count > 1 {
-        format!("{} {} \u{00d7}{}", entry.key, title(&entry.module), entry.count)
+        format!("{} \u{00d7}{}", title(&entry.module), entry.count)
     } else {
-        format!("{} {}", entry.key, title(&entry.module))
+        title(&entry.module)
     }
 }
 

@@ -236,6 +236,7 @@ fn footprint_args() -> Vec<Value> {
             "__eitri_companion",
             "EitriScratch",
             "__eitri_keys_schedule",
+            "__eitri_keys_rescan",
             "eitri_reload_timer",
         ]),
     ]

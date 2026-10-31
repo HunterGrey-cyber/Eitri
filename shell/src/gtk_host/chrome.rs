@@ -8,6 +8,9 @@
 //! is two flashes and two toasts, and a model read again unchanged does nothing. A toast whose time is up is left
 //! to the toast's own timer, which gives back the standing note it may have covered.
 //!
+//! The hint panel is the model's `prefix_panel`: its heading, groups and footer go to the panel's view
+//! (`gtk_host::prefix_panel`) in one call when the field changed, and nothing takes it down but the field going.
+//!
 //! The model's `rename` is the top bar's rename entry: opened holding the name (plain text, selected), refilled when
 //! the name changes while it is open, hidden and emptied when it closes. The keys reach it through the host's `Focus`
 //! op, which comes before the `Chrome` op that fills it.
@@ -17,8 +20,10 @@
 //! the top bar's and its own heights, which only the widgets know, so it is placed here from their measures, read
 //! once it shows its text (a hidden label measures nothing).
 
+use eitri_core::onboarding::OnboardingView;
 use eitri_core::wm::chrome::{Chip, ChromeModel, FloatLabel, StripLabels, Toast};
 use eitri_core::wm::close::prompt_origin;
+use eitri_core::wm::prefix_panel::PrefixPanel;
 use eitri_core::wm::prefix_strip::StripPiece;
 
 /// Sets the top bar's project and workspace names.
@@ -31,6 +36,10 @@ type StripsSetter = Box<dyn Fn(&[StripLabels])>;
 type FloatBarsSetter = Box<dyn Fn(&[FloatLabel])>;
 /// Draws the prefix strip's pieces; nothing takes it down.
 type PiecesSetter = Box<dyn Fn(Option<&[StripPiece]>)>;
+/// Draws the hint panel, or takes it down.
+type PanelSetter = Box<dyn Fn(Option<&PrefixPanel>)>;
+/// Draws the first-start screen, or takes it down.
+type OnboardingSetter = Box<dyn Fn(Option<&OnboardingView>)>;
 
 /// What the y/n prompt is placed by, read from the shell's widgets once it shows its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +97,8 @@ pub(crate) struct ChromeWidgets {
     /// The prefix strip's pieces while the prefix waits, the app name's armed block with them; nothing takes both
     /// down.
     pub(crate) prefix_strip: PiecesSetter,
+    /// The hint panel while the prefix waits and the model has one; nothing takes it down.
+    pub(crate) prefix_panel: PanelSetter,
     /// A new toast.
     pub(crate) toast: Box<dyn Fn(&Toast)>,
     /// Whether a wait has brought the top bar out, where the window's mode hides it.
@@ -96,6 +107,9 @@ pub(crate) struct ChromeWidgets {
     pub(crate) prompt: PromptWidgets,
     /// The rename entry.
     pub(crate) rename: RenameWidgets,
+    /// The first-start screen, or nothing while the model has none. The keys reach it through the host's `Focus` op,
+    /// which comes before the `Chrome` op that fills it.
+    pub(crate) onboarding: OnboardingSetter,
 }
 
 impl ChromeWidgets {
@@ -140,6 +154,9 @@ pub(crate) fn reconcile(widgets: &ChromeWidgets, last: &mut Option<ChromeModel>,
     if was.is_none_or(|model| model.prefix_strip != now.prefix_strip) {
         (widgets.prefix_strip)(now.prefix_strip.as_deref());
     }
+    if was.is_none_or(|model| model.prefix_panel != now.prefix_panel) {
+        (widgets.prefix_panel)(now.prefix_panel.as_ref());
+    }
     if let Some(toast) = &now.toast {
         let shown = was.and_then(|model| model.toast.as_ref()).map(|old| old.serial);
         if shown != Some(toast.serial) {
@@ -170,6 +187,10 @@ pub(crate) fn reconcile(widgets: &ChromeWidgets, last: &mut Option<ChromeModel>,
         (Some(old), Some(text)) if old != text => (widgets.rename.refill)(text),
         (Some(_), None) => (widgets.rename.close)(),
         _ => {}
+    }
+    // Last: the screen draws over everything else the model shows.
+    if was.map_or(now.onboarding.is_some(), |model| model.onboarding != now.onboarding) {
+        (widgets.onboarding)(now.onboarding.as_ref());
     }
     *last = Some(now.clone());
 }
@@ -227,6 +248,10 @@ mod tests {
                 let say = say(&heard);
                 move |pieces| say(format!("prefix strip {:?}", pieces.map(<[StripPiece]>::len)))
             }),
+            prefix_panel: Box::new({
+                let say = say(&heard);
+                move |panel| say(format!("prefix panel {:?}", panel.map(|panel| panel.groups.len())))
+            }),
             toast: Box::new({
                 let say = say(&heard);
                 move |toast| say(format!("toast {} {}", toast.serial, toast.text))
@@ -264,6 +289,10 @@ mod tests {
                     move || say("rename closes".into())
                 }),
             },
+            onboarding: Box::new({
+                let say = say(&heard);
+                move |view| say(format!("onboarding {:?}", view.map(|view| view.step.clone())))
+            }),
         };
         (widgets, heard)
     }
@@ -346,6 +375,7 @@ mod tests {
                 "strips 1",
                 "float bars 0",
                 "prefix strip None",
+                "prefix panel None",
             ],
             "the first draw sets every widget once, and neither flashes nor toasts"
         );
@@ -441,6 +471,42 @@ mod tests {
             take(&heard).contains(&"rename opens study".to_string()),
             "a first draw with the entry open opens it"
         );
+    }
+
+    #[test]
+    fn the_first_start_screen_is_drawn_when_its_view_changes_and_taken_down_with_it() {
+        use eitri_core::onboarding::OnboardingView;
+        let view = |step: &str| OnboardingView {
+            title: "Set up".into(),
+            step: step.into(),
+            rows: Vec::new(),
+            question: None,
+            items: Vec::new(),
+            body: Vec::new(),
+            status: Vec::new(),
+            footer: String::new(),
+            buttons: Vec::new(),
+            help: None,
+        };
+        let shown = |step: &str| ChromeModel {
+            onboarding: Some(view(step)),
+            ..model()
+        };
+        let (widgets, heard) = recording();
+        let mut last = None;
+        reconcile(&widgets, &mut last, &model());
+        assert!(
+            !take(&heard).iter().any(|line| line.starts_with("onboarding")),
+            "no screen, nothing to take down on the first draw"
+        );
+        reconcile(&widgets, &mut last, &shown("1 / 2"));
+        assert_eq!(take(&heard), ["onboarding Some(\"1 / 2\")"]);
+        reconcile(&widgets, &mut last, &shown("1 / 2"));
+        assert!(take(&heard).is_empty(), "an unchanged view draws nothing");
+        reconcile(&widgets, &mut last, &shown("2 / 2"));
+        assert_eq!(take(&heard), ["onboarding Some(\"2 / 2\")"]);
+        reconcile(&widgets, &mut last, &model());
+        assert_eq!(take(&heard), ["onboarding None"]);
     }
 
     #[test]

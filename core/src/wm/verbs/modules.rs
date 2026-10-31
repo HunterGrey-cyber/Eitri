@@ -104,7 +104,8 @@ struct PendingOpen {
     id: ModuleId,
     kind: SurfaceKind,
     how: OpenHow,
-    /// A Lua request's own words, when one asked: its refusals are logged under them, never toasted.
+    /// The start of the log line (`[lua] layout: ...` or `[nvim] layout: ...`), when a request from Lua or nvim asked:
+    /// its refusals are logged under it, and toasted only for nvim ([`refusal`]).
     quiet: Option<String>,
 }
 
@@ -352,11 +353,17 @@ fn refuse_layout(w: &mut Window, win: WinId, err: &LayoutError, batch: &mut Batc
     w.refuse(win, feedback::layout_refusal_text(err), batch);
 }
 
-/// A refusal in its own words: logged under the Lua request's words when one asked (no toast), else said on stdout
-/// with the flash and the toast.
+/// A refusal in its own words: logged under the request's words (`[lua] layout: Open(..)`) when one asked, with the
+/// flash and the toast as well for `:Eitri`, whose caller is looking at the window and not at a script's log; else
+/// said on stdout with the flash and the toast.
 fn refusal(w: &mut Window, win: WinId, quiet: Option<&str>, text: String, batch: &mut Batch) {
     match quiet {
-        Some(request) => w.warn(format!("[lua] layout: {request} refused: {text}")),
+        Some(request) => {
+            w.warn(format!("{request} refused: {text}"));
+            if request.starts_with("[nvim]") {
+                w.refuse(win, text, batch);
+            }
+        }
         None => {
             w.say(format!("[modules] refused: {text}"));
             w.refuse(win, text, batch);
@@ -843,6 +850,7 @@ fn take_open(w: &mut Window, cx: &Cx, win: WinId, file: QueuedOpen, token: Optio
         w.say(format!("[modules] editor: an open was refused: {err}"));
         return false;
     }
+    crate::wm::onboarding::keep_keys(w, win, &editor, batch);
     // A show or a place restarts an ended editor; keys moving to one still on screen do not.
     restart_editor(w, cx, win, batch);
     if w.editor_run == EditorRun::Ended {
@@ -1074,8 +1082,8 @@ pub fn cwd_read(
 /// A new terminal or chat view, its number the lowest no workspace holds, no later build's kept data reserves and
 /// no create in flight takes: its surface asked for, to be placed once it exists ([`created`]); placed at once when
 /// the window still holds that number's host idle. A terminal's shell starts in `cwd`, else the project root.
-/// Refused with today's words for a kind with no instances or a tenth instance; `quiet` (a Lua request's words)
-/// logs a refusal instead of showing it.
+/// Refused with today's words for a kind with no instances or a tenth instance; `quiet` (the log line's start, for
+/// a request from Lua or nvim) logs a refusal, and [`refusal`] says when it shows too.
 #[allow(clippy::too_many_arguments)]
 pub fn instance_new(
     w: &mut Window,
@@ -1819,7 +1827,7 @@ pub fn lua_show(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut 
 
 /// `eitri.layout.open(kind, opts)`: a new terminal, or a new chat view holding a new empty tab, as `instance.new`
 /// makes one, where the call's options say when it gave them, else where the open rules do; its refusals are logged
-/// under `request`, never toasted.
+/// under `request` (the log line's whole beginning, `[lua] layout: Open(..)`), as [`refusal`] does.
 pub fn lua_open(
     w: &mut Window,
     cx: &Cx,

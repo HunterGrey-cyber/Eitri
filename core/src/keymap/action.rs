@@ -195,6 +195,9 @@ pub enum Action {
     /// swallows the `:` and the letters typed after it run as panel keys.
     PanelCommandLine,
     WindowImmersive,
+    /// Opens the first-start screen again: what Eitri found, the presets, and the `init.lua` it would write.
+    /// Not bound by default; `:Eitri setup` asks for it too.
+    WindowSetup,
     /// The pane with the keys only (not bound by default).
     Text(TextChange),
     /// tmux `copy-mode` (`up: false`) / `copy-mode -u` (`up: true`): enter the terminal's read-only
@@ -326,6 +329,139 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
         }
     }
     Ok(out)
+}
+
+/// Whether option `name` takes text: its value is text whatever it reads as, as a workspace called `2` or `true`.
+pub fn is_text_option(name: &str) -> bool {
+    matches!(name, "cwd" | "kind" | "module" | "name" | "keys")
+}
+
+/// Every name [`parse`] accepts, without its options, except `module.<id>` of a Lua panel (an id
+/// `init.lua` chooses). A name that needs an option to parse has it in [`required_options`].
+pub const NAMES: &[&str] = &[
+    "send-prefix",
+    "send-keys",
+    "split.right",
+    "split.below",
+    "container.tabbed",
+    "container.stacked",
+    "container.toggle-split",
+    "focus.parent",
+    "focus.child",
+    "focus.mode-toggle",
+    "instance.new",
+    "float.toggle",
+    "scratchpad.move",
+    "scratchpad.show",
+    "workspace.prev",
+    "workspace.next",
+    "workspace.last",
+    "workspace.choose",
+    "workspace.rename",
+    "workspace.new",
+    "workspace.switch",
+    "workspace.to-window",
+    "workspace.swap-window",
+    "window.new",
+    "window.other",
+    "window.immersive",
+    "window.setup",
+    "move.to-window",
+    "move.left",
+    "move.down",
+    "move.up",
+    "move.right",
+    "move.far-left",
+    "move.far-down",
+    "move.far-up",
+    "move.far-right",
+    "resize.left",
+    "resize.down",
+    "resize.up",
+    "resize.right",
+    "select.left",
+    "select.down",
+    "select.up",
+    "select.right",
+    "select.last",
+    "select.next",
+    "select.number",
+    "swap.left",
+    "swap.down",
+    "swap.up",
+    "swap.right",
+    "swap.prev",
+    "swap.next",
+    "swap.marked",
+    "zoom",
+    "rotate.up",
+    "rotate.down",
+    "layout.flip-horizontal",
+    "layout.flip-vertical",
+    "layout.main-horizontal",
+    "layout.main-vertical",
+    "layout.tiled",
+    "layout.next",
+    "layout.previous",
+    "layout.spread",
+    "layout.undo",
+    "layout.even-horizontal",
+    "layout.even-vertical",
+    "mark.toggle",
+    "mark.clear",
+    "module.hide",
+    "module.hide-by-key",
+    "module.kill",
+    "module.editor",
+    "module.agent",
+    "module.terminal",
+    "module.canvas",
+    "module.terminal#2",
+    "module.terminal#3",
+    "module.terminal#4",
+    "module.terminal#5",
+    "module.terminal#6",
+    "module.terminal#7",
+    "module.terminal#8",
+    "module.terminal#9",
+    "module.agent#2",
+    "module.agent#3",
+    "module.agent#4",
+    "module.agent#5",
+    "module.agent#6",
+    "module.agent#7",
+    "module.agent#8",
+    "module.agent#9",
+    "tab.new",
+    "tab.next",
+    "tab.prev",
+    "tab.last",
+    "tab.select",
+    "tab.rename",
+    "tab.close",
+    "tab.choose",
+    "tab.info",
+    "tab.break",
+    "hint",
+    "panel.reload",
+    "panel.keymap",
+    "panel.command-line",
+    "text.larger",
+    "text.smaller",
+    "text.reset",
+    "copy-mode",
+];
+
+/// The options `name` cannot be parsed without, each with a value it accepts: what a list of
+/// names needs to try every one of them.
+pub fn required_options(name: &str) -> Vec<(String, OptValue)> {
+    match name {
+        "send-keys" => vec![("keys".into(), OptValue::Str("C-a".into()))],
+        "instance.new" => vec![("kind".into(), OptValue::Str("terminal".into()))],
+        "workspace.switch" => vec![("name".into(), OptValue::Str("main".into()))],
+        "tab.select" => vec![("n".into(), OptValue::Int(1))],
+        _ => Vec::new(),
+    }
 }
 
 /// `name` and its options, as `eitri.keymap.set` received them. `lua_panels` are the ids of the
@@ -489,6 +625,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "panel.keymap" => (Action::PanelKeymap, &[]),
         "panel.command-line" => (Action::PanelCommandLine, &[]),
         "window.immersive" => (Action::WindowImmersive, &[]),
+        "window.setup" => (Action::WindowSetup, &[]),
         "text.larger" => (Action::Text(TextChange::Larger), &[]),
         "text.smaller" => (Action::Text(TextChange::Smaller), &[]),
         "text.reset" => (Action::Text(TextChange::Reset), &[]),
@@ -603,6 +740,7 @@ impl Action {
             | Action::PanelKeymap
             | Action::PanelCommandLine
             | Action::WindowImmersive
+            | Action::WindowSetup
             | Action::Text(_)
             | Action::CopyMode { .. }
             | Action::MarkClear
@@ -661,6 +799,7 @@ impl Action {
             | Action::PanelKeymap
             | Action::PanelCommandLine
             | Action::WindowImmersive
+            | Action::WindowSetup
             | Action::Text(_)
             | Action::CopyMode { .. }
             | Action::Rotate { .. }
@@ -746,6 +885,7 @@ impl Action {
             | Action::PanelKeymap
             | Action::PanelCommandLine
             | Action::WindowImmersive
+            | Action::WindowSetup
             | Action::Text(_)
             | Action::CopyMode { .. } => false,
         }
@@ -831,6 +971,7 @@ impl Action {
             Action::PanelKeymap => "panel.keymap".into(),
             Action::PanelCommandLine => "panel.command-line".into(),
             Action::WindowImmersive => "window.immersive".into(),
+            Action::WindowSetup => "window.setup".into(),
             Action::Text(TextChange::Larger) => "text.larger".into(),
             Action::Text(TextChange::Smaller) => "text.smaller".into(),
             Action::Text(TextChange::Reset) => "text.reset".into(),
@@ -1006,10 +1147,120 @@ impl Action {
             Action::PanelKeymap => "Show the chat and this list".into(),
             Action::PanelCommandLine => "Show the chat and its : command line (runs nothing)".into(),
             Action::WindowImmersive => "Immersive: fullscreen without the top bar".into(),
+            Action::WindowSetup => "Show the first-start screen: pick a key layout and write init.lua".into(),
             Action::Text(TextChange::Larger) => "Text size larger, the pane with the keys only".into(),
             Action::Text(TextChange::Smaller) => "Text size smaller, the pane with the keys only".into(),
             Action::Text(TextChange::Reset) => "Text size reset, the pane with the keys only".into(),
             Action::CopyMode { .. } => "Scroll the terminal back (copy mode)".into(),
+        }
+    }
+
+    /// A label of at most 18 characters for the hint panel and the key table: English, lowercase except
+    /// key names, no trailing period. Resize says only that it resizes; the panel adds the repeat note.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Action::Move(Direction::Left) => "move left",
+            Action::Move(Direction::Down) => "move down",
+            Action::Move(Direction::Up) => "move up",
+            Action::Move(Direction::Right) => "move right",
+            Action::ContainerTabbed => "tabbed container",
+            Action::ContainerStacked => "stacked container",
+            Action::FocusParent => "select parent",
+            Action::FocusChild => "select child",
+            Action::InstanceNew {
+                kind: ModuleKind::Terminal,
+            } => "new terminal",
+            Action::InstanceNew { .. } => "new chat view",
+            Action::FloatToggle => "float toggle",
+            Action::FocusModeToggle => "float/tiled focus",
+            Action::ScratchpadShow { .. } => "scratchpad",
+            Action::ScratchpadMove => "to scratchpad",
+            Action::WorkspaceStep { forward: true } => "next workspace",
+            Action::WorkspaceStep { forward: false } => "previous workspace",
+            Action::WorkspaceLast => "last workspace",
+            Action::WorkspaceChoose => "choose workspace",
+            Action::WorkspaceRename => "rename workspace",
+            Action::WorkspaceSwitch { .. } => "switch workspace",
+            Action::WorkspaceNew => "new workspace",
+            Action::TabBreak => "tab to own view",
+            Action::WindowNew => "second window",
+            Action::WindowOther => "other window",
+            Action::MoveToWindow { .. } => "to other window",
+            Action::WorkspaceToWindow { .. } => "workspace to other",
+            Action::WorkspaceSwapWindow => "swap workspaces",
+            Action::MoveFar(Direction::Left) => "to far left",
+            Action::MoveFar(Direction::Down) => "to bottom",
+            Action::MoveFar(Direction::Up) => "to top",
+            Action::MoveFar(Direction::Right) => "to far right",
+            Action::ToggleSplit => "toggle split",
+            Action::Rotate { down: false } => "rotate back",
+            Action::Rotate { down: true } => "rotate on",
+            Action::Flip(Axis::Row) => "mirror left-right",
+            Action::Flip(Axis::Column) => "mirror top-bottom",
+            Action::MainHorizontal => "main on top",
+            Action::MainVertical => "main on left",
+            Action::Tiled => "tiled grid",
+            Action::CycleLayout { forward: true } => "next layout",
+            Action::CycleLayout { forward: false } => "previous layout",
+            Action::Spread => "even out sizes",
+            Action::LayoutUndo => "undo layout",
+            Action::MarkToggle => "mark module",
+            Action::MarkClear => "clear mark",
+            Action::SwapMarked => "swap with mark",
+            Action::SelectNumber => "number modules",
+            Action::SendPrefix => "send prefix",
+            Action::SendKeys(_) => "send key",
+            Action::Split { axis: Axis::Row, .. } => "split right\u{2026}",
+            Action::Split { axis: Axis::Column, .. } => "split below\u{2026}",
+            Action::Zoom => "zoom",
+            Action::Resize { .. } => "resize",
+            Action::Select(Direction::Left) => "module left",
+            Action::Select(Direction::Down) => "module below",
+            Action::Select(Direction::Up) => "module above",
+            Action::Select(Direction::Right) => "module right",
+            Action::SelectLast => "last module",
+            Action::SelectNext => "next module",
+            Action::Swap(SwapTarget::Prev) => "swap with previous",
+            Action::Swap(SwapTarget::Next) => "swap with next",
+            Action::Swap(SwapTarget::Toward(Direction::Left)) => "swap left",
+            Action::Swap(SwapTarget::Toward(Direction::Down)) => "swap down",
+            Action::Swap(SwapTarget::Toward(Direction::Up)) => "swap up",
+            Action::Swap(SwapTarget::Toward(Direction::Right)) => "swap right",
+            Action::Even(Axis::Row) => "even row",
+            Action::Even(Axis::Column) => "even column",
+            Action::ModuleHide => "hide module",
+            Action::ModuleHideByKey => "hide by key",
+            Action::ModuleKill => "close module",
+            Action::Module(id) => match id.kind() {
+                ModuleKind::Editor => "editor",
+                ModuleKind::Agent => "agent",
+                ModuleKind::Canvas => "canvas",
+                ModuleKind::Terminal => "terminal",
+                ModuleKind::LuaWebview => "page",
+            },
+            Action::Tab(tab) => match tab {
+                TabAction::New => "new tab",
+                TabAction::Next => "next tab",
+                TabAction::Prev => "previous tab",
+                TabAction::Last => "last tab",
+                TabAction::Select(_) => "select tab",
+                TabAction::Rename => "rename tab",
+                TabAction::Close => "close tab",
+                TabAction::CloseOthers => "close other tabs",
+                TabAction::Choose => "choose session",
+                TabAction::Info => "session details",
+            },
+            Action::Hint => "hint jump",
+            Action::PanelReload => "reload panel",
+            Action::PanelKeymap => "all keys",
+            Action::PanelCommandLine => "command line",
+            Action::WindowImmersive => "immersive",
+            Action::WindowSetup => "setup keys",
+            Action::Text(TextChange::Larger) => "text larger",
+            Action::Text(TextChange::Smaller) => "text smaller",
+            Action::Text(TextChange::Reset) => "text size reset",
+            Action::CopyMode { up: false } => "copy mode",
+            Action::CopyMode { up: true } => "copy mode, page up",
         }
     }
 }
@@ -1018,6 +1269,298 @@ impl Action {
 mod tests {
     use super::*;
     use crate::keymap::table::Keymap;
+
+    /// One value of every variant (every inner value where the words differ).
+    fn every_action() -> Vec<Action> {
+        let dirs = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
+        let axes = [Axis::Row, Axis::Column];
+        let mut all = vec![
+            Action::ContainerTabbed,
+            Action::ContainerStacked,
+            Action::FocusParent,
+            Action::FocusChild,
+            Action::InstanceNew {
+                kind: ModuleKind::Terminal,
+            },
+            Action::InstanceNew {
+                kind: ModuleKind::Agent,
+            },
+            Action::FloatToggle,
+            Action::FocusModeToggle,
+            Action::ScratchpadShow { module: None },
+            Action::ScratchpadShow {
+                module: Some(ModuleId::parse("terminal#2").unwrap()),
+            },
+            Action::ScratchpadMove,
+            Action::WorkspaceStep { forward: true },
+            Action::WorkspaceStep { forward: false },
+            Action::WorkspaceLast,
+            Action::WorkspaceChoose,
+            Action::WorkspaceRename,
+            Action::WorkspaceSwitch { name: "w".into() },
+            Action::WorkspaceNew,
+            Action::TabBreak,
+            Action::WindowNew,
+            Action::WindowOther,
+            Action::MoveToWindow {
+                module: None,
+                follow: false,
+            },
+            Action::MoveToWindow {
+                module: Some(ModuleId::parse("terminal#2").unwrap()),
+                follow: true,
+            },
+            Action::WorkspaceToWindow { follow: false },
+            Action::WorkspaceSwapWindow,
+            Action::ToggleSplit,
+            Action::Rotate { down: false },
+            Action::Rotate { down: true },
+            Action::MainHorizontal,
+            Action::MainVertical,
+            Action::Tiled,
+            Action::CycleLayout { forward: true },
+            Action::CycleLayout { forward: false },
+            Action::Spread,
+            Action::LayoutUndo,
+            Action::MarkToggle,
+            Action::MarkClear,
+            Action::SwapMarked,
+            Action::SelectNumber,
+            Action::SendPrefix,
+            Action::SendKeys(KeySpec::parse("C-a").unwrap()),
+            Action::Zoom,
+            Action::SelectLast,
+            Action::SelectNext,
+            Action::Swap(SwapTarget::Prev),
+            Action::Swap(SwapTarget::Next),
+            Action::ModuleHide,
+            Action::ModuleHideByKey,
+            Action::ModuleKill,
+            Action::Hint,
+            Action::PanelReload,
+            Action::PanelKeymap,
+            Action::PanelCommandLine,
+            Action::WindowImmersive,
+            Action::WindowSetup,
+            Action::CopyMode { up: true },
+            Action::CopyMode { up: false },
+        ];
+        for dir in dirs {
+            all.push(Action::Move(dir));
+            all.push(Action::MoveFar(dir));
+            all.push(Action::Select(dir));
+            all.push(Action::Swap(SwapTarget::Toward(dir)));
+            all.push(Action::Resize { dir, cells: 1 });
+        }
+        for axis in axes {
+            all.push(Action::Flip(axis));
+            all.push(Action::Even(axis));
+            all.push(Action::Split {
+                axis,
+                cwd: SplitCwd::Start,
+            });
+        }
+        for id in ["editor", "agent", "canvas", "terminal", "terminal#2", "lua:notes"] {
+            all.push(Action::Module(ModuleId::parse(id).unwrap()));
+        }
+        for tab in [
+            TabAction::New,
+            TabAction::Next,
+            TabAction::Prev,
+            TabAction::Last,
+            TabAction::Select(3),
+            TabAction::Rename,
+            TabAction::Close,
+            TabAction::CloseOthers,
+            TabAction::Choose,
+            TabAction::Info,
+        ] {
+            all.push(Action::Tab(tab));
+        }
+        for change in [TextChange::Larger, TextChange::Smaller, TextChange::Reset] {
+            all.push(Action::Text(change));
+        }
+        all
+    }
+
+    #[test]
+    fn the_options_called_text_are_those_the_parser_reads_as_strings() {
+        for option in [
+            "cells",
+            "n",
+            "keys",
+            "repeatable",
+            "up",
+            "cwd",
+            "kind",
+            "module",
+            "name",
+            "follow",
+        ] {
+            let takes_text = read_opts(&[(option.to_string(), OptValue::Str("x".into()))]).is_ok();
+            assert_eq!(is_text_option(option), takes_text, "{option}");
+        }
+    }
+
+    #[test]
+    fn every_name_in_names_parses_with_its_required_options_and_back_to_itself() {
+        for name in NAMES {
+            let parsed = parse(name, &required_options(name), &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(parsed.action.name(), *name);
+        }
+        let mut sorted = NAMES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), NAMES.len(), "a name is listed twice");
+    }
+
+    #[test]
+    fn every_name_that_parse_needs_an_option_for_is_refused_without_it() {
+        for name in NAMES.iter().filter(|name| !required_options(name).is_empty()) {
+            assert!(
+                matches!(parse(name, &[], &[]), Err(ActionError::BadOption { .. })),
+                "{name} parsed without its required option"
+            );
+        }
+    }
+
+    #[test]
+    fn every_variants_name_is_in_names() {
+        for action in every_action() {
+            // A Lua panel's `module.<id>` is the panel's own id, and `tab.close-others` is the agent
+            // panel's own table's name, which `parse` does not take.
+            if matches!(action, Action::Tab(TabAction::CloseOthers))
+                || matches!(&action, Action::Module(id) if id.kind() == ModuleKind::LuaWebview)
+            {
+                continue;
+            }
+            assert!(NAMES.contains(&action.name().as_str()), "{} is missing", action.name());
+        }
+        assert!(
+            matches!(parse("tab.close-others", &[], &[]), Err(ActionError::Unknown { .. })),
+            "tab.close-others is a name parse now takes: list it"
+        );
+    }
+
+    /// Fails to compile until a new variant is added to `every_action`.
+    #[allow(dead_code)]
+    fn _every_variant_is_listed(a: &Action) {
+        match a {
+            Action::Move(_)
+            | Action::ContainerTabbed
+            | Action::ContainerStacked
+            | Action::FocusParent
+            | Action::FocusChild
+            | Action::InstanceNew { .. }
+            | Action::FloatToggle
+            | Action::FocusModeToggle
+            | Action::ScratchpadShow { .. }
+            | Action::ScratchpadMove
+            | Action::WorkspaceStep { .. }
+            | Action::WorkspaceLast
+            | Action::WorkspaceChoose
+            | Action::WorkspaceRename
+            | Action::WorkspaceSwitch { .. }
+            | Action::WorkspaceNew
+            | Action::TabBreak
+            | Action::WindowNew
+            | Action::WindowOther
+            | Action::MoveToWindow { .. }
+            | Action::WorkspaceToWindow { .. }
+            | Action::WorkspaceSwapWindow
+            | Action::MoveFar(_)
+            | Action::ToggleSplit
+            | Action::Rotate { .. }
+            | Action::Flip(_)
+            | Action::MainHorizontal
+            | Action::MainVertical
+            | Action::Tiled
+            | Action::CycleLayout { .. }
+            | Action::Spread
+            | Action::LayoutUndo
+            | Action::MarkToggle
+            | Action::MarkClear
+            | Action::SwapMarked
+            | Action::SelectNumber
+            | Action::SendPrefix
+            | Action::SendKeys(_)
+            | Action::Split { .. }
+            | Action::Zoom
+            | Action::Resize { .. }
+            | Action::Select(_)
+            | Action::SelectLast
+            | Action::SelectNext
+            | Action::Swap(_)
+            | Action::Even(_)
+            | Action::ModuleHide
+            | Action::ModuleHideByKey
+            | Action::ModuleKill
+            | Action::Module(_)
+            | Action::Tab(_)
+            | Action::Hint
+            | Action::PanelReload
+            | Action::PanelKeymap
+            | Action::PanelCommandLine
+            | Action::WindowImmersive
+            | Action::WindowSetup
+            | Action::Text(_)
+            | Action::CopyMode { .. } => {}
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_short_label_of_at_most_18_characters() {
+        for action in every_action() {
+            let label = action.short_label();
+            assert!(!label.is_empty(), "{action:?}");
+            assert!(label.chars().count() <= 18, "{action:?}: {label:?}");
+            assert!(!label.contains('\n'), "{action:?}: {label:?}");
+        }
+    }
+
+    #[test]
+    fn short_labels_read_as_a_person_would_say_them() {
+        let split = |axis| Action::Split {
+            axis,
+            cwd: SplitCwd::Start,
+        };
+        assert_eq!(Action::Zoom.short_label(), "zoom");
+        assert_eq!(split(Axis::Row).short_label(), "split right\u{2026}");
+        assert_eq!(split(Axis::Column).short_label(), "split below\u{2026}");
+        assert_eq!(Action::Tab(TabAction::Next).short_label(), "next tab");
+        assert_eq!(
+            Action::Resize {
+                dir: Direction::Left,
+                cells: 5
+            }
+            .short_label(),
+            "resize"
+        );
+        assert_eq!(Action::PanelKeymap.short_label(), "all keys");
+        assert_eq!(Action::Move(Direction::Left).short_label(), "move left");
+        assert_eq!(Action::Select(Direction::Up).short_label(), "module above");
+        let module = |id: &str| Action::Module(ModuleId::parse(id).unwrap()).short_label();
+        assert_eq!(module("editor"), "editor");
+        assert_eq!(module("terminal#2"), "terminal");
+        assert_eq!(module("lua:notes"), "page");
+    }
+
+    #[test]
+    fn window_setup_is_no_layout_action_and_has_a_name_a_label_and_no_key() {
+        let got = parse("window.setup", &[], &[]).unwrap().action;
+        assert_eq!(got, Action::WindowSetup);
+        assert_eq!(got.name(), "window.setup");
+        assert_eq!(
+            parse(&got.name(), &got.options(), &[]).unwrap().action,
+            got,
+            "round trip"
+        );
+        assert!(NAMES.contains(&"window.setup"));
+        assert!(!got.is_layout());
+        assert_eq!(got.short_label(), "setup keys");
+        assert!(!got.describe("Ctrl+b", "e / a / t").is_empty());
+        assert!(Keymap::defaults().keys_for(&got).is_empty());
+    }
 
     #[test]
     fn the_window_verbs_parse_by_name_round_trip_and_take_their_options() {
@@ -1550,6 +2093,7 @@ mod tests {
             Action::PanelKeymap,
             Action::PanelCommandLine,
             Action::WindowImmersive,
+            Action::WindowSetup,
             Action::Text(TextChange::Reset),
             Action::CopyMode { up: false },
         ];
@@ -1715,6 +2259,7 @@ mod tests {
             Action::PanelKeymap,
             Action::PanelCommandLine,
             Action::WindowImmersive,
+            Action::WindowSetup,
             Action::Text(TextChange::Reset),
             Action::CopyMode { up: false },
         ] {

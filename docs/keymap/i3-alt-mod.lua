@@ -1,3 +1,4 @@
+-- In an init.lua, `eitri.keymap.use("i3-alt")` records exactly the calls below; this file is what that name is built from.
 -- For i3 or sway with Alt as `$mod`. The stock prefix table has Alt chords after the prefix
 -- (`Alt+w`, `Alt+Enter`, `Alt+1` ...); a stock i3 (/etc/i3/config) or sway (/etc/sway/config)
 -- grabs those chords for itself before Eitri sees them, so those rows never run. This moves

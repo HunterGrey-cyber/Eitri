@@ -410,6 +410,47 @@ pub(crate) fn build_chat_page(
     (webview, page)
 }
 
+/// Whether a trust question is on screen, as the last tick saw it, and who is told when that changes. The first-start
+/// screen gives the keys up while one is, so it asks nothing of the panel: the pump tells it after each tick, and
+/// only when the answer differs from the one before.
+#[derive(Default)]
+struct TrustWatch {
+    last: Cell<bool>,
+    on_change: RefCell<Option<Rc<dyn Fn(bool)>>>,
+}
+
+impl TrustWatch {
+    /// `Some(open)` when `open` differs from what the previous tick saw, and `open` is now what was seen.
+    fn seen(&self, open: bool) -> Option<bool> {
+        (self.last.replace(open) != open).then_some(open)
+    }
+}
+
+thread_local! {
+    /// The GTK thread's one panel pump has one watch.
+    static TRUST_WATCH: Rc<TrustWatch> = Rc::default();
+}
+
+/// Calls `on_change` with the new state each time a tick finds a trust question opened or closed. One callback per
+/// window: a second call replaces the first.
+pub(crate) fn on_trust_question_change(on_change: Rc<dyn Fn(bool)>) {
+    TRUST_WATCH.with(|watch| *watch.on_change.borrow_mut() = Some(on_change));
+}
+
+/// After a tick: reads the panel's trust question and tells the callback if it changed. The callback runs with no
+/// borrow of the watch held.
+fn trust_after_tick(handle: &AgentPanelHandle) {
+    let (changed, on_change) = TRUST_WATCH.with(|watch| {
+        (
+            watch.seen(handle.trust_question_open()),
+            watch.on_change.borrow().clone(),
+        )
+    });
+    if let (Some(open), Some(on_change)) = (changed, on_change) {
+        on_change(open);
+    }
+}
+
 /// Runs the panel's tick when it says: a watch on its wake's descriptor, and one one-shot timer armed for
 /// the earliest moment anything asked for (`eitri_panel::panel_wake`). An idle panel is not woken at all.
 struct PumpTimer {
@@ -438,6 +479,7 @@ impl PumpTimer {
         *self.timer.borrow_mut() = None;
         self.schedule.borrow_mut().fired();
         let next = self.handle.run_tick(Instant::now());
+        trust_after_tick(&self.handle);
         if next == NextTick::Stop {
             if let Some(watch) = self.watch.borrow_mut().take() {
                 watch.remove();
@@ -473,7 +515,9 @@ fn start_pump_timer(handle: AgentPanelHandle) {
     let Some(fd) = handle.wake_fd() else {
         // No wake (no page, or the socket pair could not be made): the tick runs on its steady cadence.
         gtk4::glib::timeout_add_local(AgentPanelHandle::TICK, move || {
-            if handle.tick() {
+            let alive = handle.tick();
+            trust_after_tick(&handle);
+            if alive {
                 gtk4::glib::ControlFlow::Continue
             } else {
                 gtk4::glib::ControlFlow::Break
@@ -504,7 +548,9 @@ fn start_pump_timer(handle: AgentPanelHandle) {
             // runs on its steady cadence, as it always did.
             let handle = pump.handle.clone();
             gtk4::glib::timeout_add_local(AgentPanelHandle::TICK, move || {
-                if handle.tick() {
+                let alive = handle.tick();
+                trust_after_tick(&handle);
+                if alive {
                     gtk4::glib::ControlFlow::Continue
                 } else {
                     gtk4::glib::ControlFlow::Break
@@ -659,6 +705,25 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_trust_tick_posts_only_changes() {
+        let watch = TrustWatch::default();
+        assert_eq!(watch.seen(false), None, "nothing open at the start is no change");
+        assert_eq!(watch.seen(true), Some(true));
+        assert_eq!(watch.seen(true), None, "the same answer again is not posted");
+        assert_eq!(watch.seen(false), Some(false));
+        assert_eq!(watch.seen(false), None);
+
+        // The callback hears each change once, through the thread's watch.
+        let heard: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let sink = heard.clone();
+        on_trust_question_change(Rc::new(move |open| sink.borrow_mut().push(open)));
+        let (changed, on_change) = TRUST_WATCH.with(|w| (w.seen(true), w.on_change.borrow().clone()));
+        on_change.unwrap()(changed.unwrap());
+        assert_eq!(*heard.borrow(), vec![true]);
+        TRUST_WATCH.with(|w| *w.on_change.borrow_mut() = None);
+    }
 
     #[test]
     fn first_paint_reveals_only_once() {

@@ -635,6 +635,7 @@ mod tests {
                     callback: r.is_none(),
                 })
                 .collect(),
+            probe: None,
         }
     }
     fn find<'a>(k: &'a PanelKeymap, human: &str) -> Option<&'a PanelBinding> {

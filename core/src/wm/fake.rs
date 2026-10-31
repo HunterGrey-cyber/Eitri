@@ -532,7 +532,8 @@ impl FakeHost {
                     }
                     FocusTo::TopBarItem(_) => Some(FocusOwner::TopBar),
                     FocusTo::RenameEntry => Some(FocusOwner::RenameEntry),
-                    FocusTo::Nothing => None,
+                    // The host reports no owner for a screen that is not a module, as the toolkit's does.
+                    FocusTo::Onboarding | FocusTo::Nothing => None,
                 };
                 self.native_focus(*win, owner);
             }

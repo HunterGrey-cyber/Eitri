@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=eaf7d9855735316b7035b133c90190a1bbc30745eee69b79edd00669051feb04 -->
+<!-- translated-from: configuration.md sha256=75f8cc6affb4e11d42b213107f6dd68d3a0720b50c9dde4f71534251107880b6 -->
 
 # 配置
 
@@ -7,7 +7,7 @@ Eitri 有一个配置文件，是一个在启动时运行一次的 Lua 脚本；
 
 ## init.lua
 
-Linux 上，若 `XDG_CONFIG_HOME` 非空且为绝对路径，Eitri 读取 `$XDG_CONFIG_HOME/eitri/init.lua`，否则读取 `~/.config/eitri/init.lua`。Mac 始终使用 `~/.config/eitri/init.lua`。把 `EITRI_CONFIG_DIR` 设成绝对路径，就改从那里读取 `init.lua`；空值视为未设置，相对路径会拒绝启动。不需要先创建文件：没有它，Eitri 用内置的默认值启动，并打印一行说明这一点。
+Linux 上，若 `XDG_CONFIG_HOME` 非空且为绝对路径，Eitri 读取 `$XDG_CONFIG_HOME/eitri/init.lua`，否则读取 `~/.config/eitri/init.lua`。Mac 始终使用 `~/.config/eitri/init.lua`。把 `EITRI_CONFIG_DIR` 设成绝对路径，就改从那里读取 `init.lua`；空值视为未设置，相对路径会拒绝启动。不需要先创建文件：没有它，Eitri 用内置的默认值启动，并打印一行说明这一点。没有 `init.lua` 的第一次启动，它还会提议替你写一个很短的文件：见[首次启动](#first-start)。
 
 设置用 `eitri.config.set(key, value)` 来做。值是字符串、数字或布尔值（`true` 或 `false`）；`nil` 会把这个键重新取消设置。Eitri 保存不了的值（比如表或函数）会导致启动失败。
 
@@ -45,6 +45,8 @@ eitri.config.set("review.hint", true)
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
 | `terminal.font` | `guifont` 格式的字体，`"<字体>:h<磅数>"` | 你的 `guifont` | 终端的字体，窗口里每个终端都用它：`"Iosevka:h12"` 同时设字体和字号，`"Iosevka"` 只设字体（字号仍跟着你的 `guifont`），`":h12"` 只设字号。多个字体用逗号分开、按顺序尝试，`_` 或 `\ ` 表示空格，和 `guifont` 一样。不设置时，终端用编辑器的字体和字号，这样编辑器下面的终端看起来和编辑器一致；`guifont` 为空时用 `monospace`。字号和编辑器一起缩放，见[按键](keys.zh-CN.md)。 |
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
+| `keymap.which_key_delay` | 0 到 5000 之间的整数，或 `false` / `"off"` | `"off"` | 前缀等第二个键等多少毫秒后，用一个面板列出接下来可以按的键；`0` 立刻显示。见[提示面板](keys.zh-CN.md#the-hint-panel)。companion 窗口和 Mac 上不画。 |
+| `keymap.nvim_prefix` | 一个最长 16 个字符的 Neovim 左端（`"<leader>W"`），或 `false` / `"off"` | `"off"` | 在 Neovim 的 Normal 模式里，把你前缀表里的布局键映射到这个左端之下，每个键运行对应的 `:Eitri` 动作。见[从 Neovim 用：`:Eitri`](keys.zh-CN.md#from-neovim-eitri)。 |
 | `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
@@ -65,13 +67,56 @@ local k = eitri.keymap
 k.prefix("C-a")                               -- the prefix key
 k.set("prefix", "g", "zoom")                  -- bind g (free by default) after the prefix to an action
 k.del("prefix", "%")                          -- remove a default binding
+k.set("root", "M-z", "zoom")                  -- a key that works without the prefix
 ```
 
-`k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。错误的键、不认识的动作或者两个互相冲突的绑定，会让 Eitri 在启动时停下，并给出一条点出这次调用的消息，所以笔误不会留给你一套你没有写过的按键映射。[按键](keys.zh-CN.md)列出了默认值和这些动作。
+`k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。`"root"` 表放的是不带前缀就生效的键：它一开始是空的，只收 Ctrl 和 Alt 组合键，它能运行什么、拒绝什么、Eitri 何时警告，见[按键](keys.zh-CN.md#keys-without-the-prefix)。错误的键、不认识的动作或者两个互相冲突的绑定，会让 Eitri 在启动时停下，并给出一条点出这次调用的消息，所以笔误不会留给你一套你没有写过的按键映射。[按键](keys.zh-CN.md)列出了默认值和这些动作。
 
 默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 
 一个完整的例子是 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua)，它把前缀移到 `Ctrl+a`，并重新绑定了分割、调整大小和放大。把你想要的部分从里面粘贴到你的 `init.lua` 里。
+
+`k.use(name)` 用一行记下一组命名的调用。目前只有一个名字 `"i3-alt"`，给把 Alt 当 `$mod` 的 i3 或 sway 用：它把前缀表里的 Alt 组合键改到 `Ctrl+Alt`，调用内容和 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 里的完全一样。它就是一次普通调用，所以写在它后面的调用优先；名字不认识，Eitri 会像对待其他错误调用一样在启动时停下。
+
+```lua
+eitri.keymap.use("i3-alt")
+```
+
+<a id="first-start"></a>
+## 首次启动
+
+没有 `init.lua` 的第一次启动时，完整启动的第一个窗口会在窗口上方打开一个设置界面。它问窗口的按键要怎么用，你同意的话就写入一个很短的 `init.lua`，然后提议运行 [`:EitriTutor`](keys.zh-CN.md)。最后一步之前不会写入任何内容，写出来的也是你自己的东西：一个带注释的普通 `init.lua`，可以像别的文件一样读、一样改。
+
+命令行指定了文件的启动（`eitri FILE`）不会打开这个界面，因为你是为那个文件来的，也不算一次回答：下一次普通的 `eitri` 会打开它，`:Eitri setup` 随时都能打开它。
+
+**它看什么。** 只读，从不改：Eitri 为 [`keymap.from_tmux`](#settings) 已经读过的 tmux 配置；你用的桌面，以及在 i3 或 sway 下 `$mod` 是 Alt 还是 Super（先问窗口管理器自己，再读它的配置文件）；Hyprland 下它的绑定；你的 Neovim 里哪个插件占用（或很可能占用）`Ctrl+b` 和 `Ctrl+h/j/k/l`；以及有没有输入法在运行（看进程；Eitri 从不读输入法自己的设置）。各行随答案到来逐个出现，界面不会等慢的那一行。这些文字都不会被抄进文件。
+
+**你选什么。** `j`/`k` 或数字在预设之间移动，`Enter` 继续：
+
+| 预设 | 写入什么 |
+|---|---|
+| Neovim + tmux | `keymap.from_tmux` 开，按键仍由你的 tmux 配置决定；提示面板写成一行注释（有 tmux 配置时的默认选项） |
+| Neovim，不用 tmux | `keymap.from_tmux` 关，前缀是默认的 `Ctrl+b`，[提示面板](keys.zh-CN.md#the-hint-panel)开；Neovim 报告过 leader 时，窗口键也放在它下面（`keymap.nvim_prefix`） |
+| 换个前缀 | `Ctrl+a`、`Ctrl+Space` 或你按下的键：`k.prefix`、去掉旧的 `Ctrl+b` 的 `k.del`，以及 `k.set("prefix", key, "send-prefix")`，写法同[按键](keys.zh-CN.md#choosing-ctrlspace-as-the-prefix)里所示 |
+| i3 / sway 风格 | 默认按键；`$mod` 是 Alt 时再加 `eitri.keymap.use("i3-alt")`；是 Super 时不多写什么 |
+
+写入之前，复查这一步会把这些行展示出来；`p` 修改前缀，`Backspace` 返回。选了和窗口当前所用不同的前缀，会先做一次**按键测试**：界面请你按一下那个键，并说明它到没到。被输入法或桌面占走的键到不了 Eitri，界面会直说，然后让你换一个前缀，或者仍然写入；等待期间按 `Esc` 返回。键位表不接受的键（`Ctrl+h`、单个字母）会立刻被拒绝，并给出原因。
+
+窗口太矮、放不下界面时，用 `PageUp` 和 `PageDown` 滚动，在复查这一步 `j`/`k` 和方向键也可以。在第一页按 `r` 重新读取 Neovim 的映射，用于缓冲区自己的映射或晚加载的插件。按 `?` 显示一行帮助。
+
+**只写一次，从不覆盖文件。** 文件先以临时名字写好，再链接到位，所以读它的人不会看到写了一半的内容；而且只有当那一刻不存在 `init.lua` 时才会创建：期间如果冒出了一个（比如另一个窗口写的），就什么都不写，并告诉你。Eitri 里没有任何代码会以写入方式打开已有的 `init.lua`。新按键在 Eitri 下次启动时生效；你正在用的窗口继续用现在的按键。
+
+**什么时候打开。** 下面这些全部成立：这是完整启动的第一个窗口（不是第二个窗口、伴随窗口、插件自己的窗口或 `eitri split`），没有给 `--clean`，没有设置 `EITRI_CONFIG_DIR` 和 `EITRI_FIRST_START`（见下），没有 `init.lua`（原位置上是悬空链接、目录或别的东西，都算有），配置目录通过下面说的检查，而且你还没有说过不要（见下一段）。agent 面板正在问是否信任某个项目时，界面会等你回答完再出现。Mac 不显示它。
+
+**按两次 `Esc`，或 `d`。** `Esc` 是“以后再说”：什么都不写，界面在下次启动时再来一次。第二次 `Esc` 之后它就不再自己打开。`d`（“不再询问”）立即让它不再打开。你的回答记在[状态目录](#environment-variables)（`XDG_STATE_HOME`）下 `eitri/` 里的 `first-start.json` 中，不在配置目录里；删掉这个文件，界面就会回来。每次本该打开却没打开的启动，会记一行日志。
+
+**再次打开。** 在窗口的 Neovim 里运行 `:Eitri setup`，或者把动作 `window.setup` 绑到某个键上（它没有默认键，`前缀 ?` 的按键表会列出它），不管上面的条件怎么说，都会打开这个界面。已经有 `init.lua` 时，它只展示那些行，并标明没有写入；按 `o` 在临时缓冲区里打开它们，你可以复制想要的部分。写入失败时也提供同样的 `o`。
+
+**为什么拒绝组写入的目录。** `init.lua` 是每次启动 Eitri 都会运行的代码。所以界面只在属于你、别人不能写（没有组写或其他人写权限）的目录里创建它，而且该目录的上一级也不能让别人改名其中的条目；否则别的用户就能换掉文件或目录。配置目录本身是符号链接（stow 和 chezmoi 会做这种链接）时会跟随，最多跟一层。检查不通过，界面保持关闭，日志里写明是哪个目录；对它 `chmod go-w`，或者用 `:Eitri setup` 读出那些行自己放进去。
+
+**`EITRI_FIRST_START`。** `off` 让界面不再自己打开（不影响 `:Eitri setup`）；其他非空值会被忽略，并记一行日志。测试环境和脚本化的启动把它设成 `off`。`EITRI_CONFIG_DIR` 指向某个目录时，界面也一律关闭，因为那是有意为之的配置。
+
+界面和它写出的文件里的注释都跟随你的语言环境：`LC_ALL`、`LC_MESSAGES`、`LANG`（取第一个设了的）以 `zh` 开头就是简体中文，否则是英文。代码行在两种语言里完全一样。
 
 <a id="layout-from-lua"></a>
 ## 用 Lua 调整布局
@@ -239,6 +284,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 
 账号决定会话使用哪个登录，以及从哪里读取它们的历史，所以继续一个对话时，会在这个账号自己的历史里找。一个窗口只有一个账号：每个[聊天视图](keys.zh-CN.md#chat-views)用的都是它，显示在自己视图里的标签页不会改在别的账号下启动会话。
 
+<a id="environment-variables"></a>
 ## 环境变量
 
 这些是用户可以设置的变量。Eitri 还会为它自己的子进程设置许多别的变量；那些不是设置，也没有列出来。
@@ -251,6 +297,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
 | `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。它只指目录；文件用 `eitri FILE` 打开。 |
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，覆盖 Linux 的 XDG 配置目录或 `~/.config/eitri`。空值视为未设置，相对路径会拒绝启动。 |
+| `EITRI_FIRST_START` | `off` 让[首次启动界面](#first-start)不再自己打开。其他非空值会被忽略，并记一行日志。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |
 | `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个。不是文件的路径会在会话启动时报错。 |

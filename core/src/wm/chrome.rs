@@ -18,6 +18,7 @@
 
 use super::host::{frame_with, Batch, ChatOp, HostOp, HostReads, TimerToken};
 use super::modes::{self, ModeEvent};
+use super::prefix_panel::{self, PrefixPanel};
 use super::prefix_strip::{self, StripPiece};
 use super::titles;
 use super::toasts::{refusal_may_show, ToastKind};
@@ -27,6 +28,7 @@ use crate::attention::Attention;
 use crate::keymap::prefix::Waiting;
 use crate::keymap::Keymap;
 use crate::layout::{arrange, covering, Arrangement, Layout, ModuleId, ModuleKeys, Workspaces};
+use crate::onboarding::OnboardingView;
 use crate::tabs::ViewId;
 use std::rc::Rc;
 use std::time::Duration;
@@ -48,6 +50,9 @@ pub struct ChromeModel {
     /// The prefix strip's pieces while the prefix waits, and the app name's armed block with them; `None` while it
     /// waits for nothing.
     pub prefix_strip: Option<Vec<StripPiece>>,
+    /// The hint panel while it is up: what each key after the prefix does. `None` while it is not shown, which is
+    /// always the case with `keymap.which_key_delay` off.
+    pub prefix_panel: Option<PrefixPanel>,
     /// The toast up now; `None` once its time is up.
     pub toast: Option<Toast>,
     /// What the chrome shows for the window's mode.
@@ -59,6 +64,10 @@ pub struct ChromeModel {
     /// strip's place and the bar's and the label's heights, which only the shell's widgets know, so the shell
     /// places it.
     pub prompt: Option<Prompt>,
+    /// The first-start screen while it is shown; `None` while there is none, and while a question holds the keys
+    /// the screen gave back. Set where it changes ([`touched`]), as the prompt is, so it has no field of its own
+    /// among the derived ones.
+    pub onboarding: Option<OnboardingView>,
 }
 
 /// A y/n the window asks: its text, as plain text, and whether it is the window close's own question.
@@ -160,6 +169,8 @@ pub struct Dirty {
     pub attention: u64,
     /// What the prefix waits for, its plan and its keymap.
     pub prefix: u64,
+    /// The hint panel going up or coming down.
+    pub hints: u64,
     /// The toast and the flash.
     pub toast: u64,
     /// The window's mode.
@@ -181,6 +192,7 @@ pub struct Derivations {
     pub strips: u64,
     pub float_bars: u64,
     pub prefix_strip: u64,
+    pub prefix_panel: u64,
     pub modes: u64,
 }
 
@@ -221,27 +233,32 @@ enum Field {
     Strips,
     FloatBars,
     PrefixStrip,
+    PrefixPanel,
     Modes,
 }
 
-const FIELDS: [Field; 6] = [
+const FIELDS: [Field; 7] = [
     Field::TopBar,
     Field::Tray,
     Field::Strips,
     Field::FloatBars,
     Field::PrefixStrip,
+    Field::PrefixPanel,
     Field::Modes,
 ];
 
 impl Field {
-    /// The revisions the field reads.
-    fn inputs(self, d: &Dirty) -> [u64; 5] {
+    /// The revisions the field reads. The hint panel reads what the prefix waits for, the layout and the titles
+    /// only while it is up (`panel_up`): while it is not, a wait begun or ended derives nothing of it.
+    fn inputs(self, d: &Dirty, panel_up: bool) -> [u64; 5] {
         match self {
             Field::TopBar => [d.layout, d.workspaces, d.titles, d.peer, 0],
             Field::Tray => [d.layout, d.attention, d.titles, d.size, 0],
             Field::Strips => [d.layout, d.attention, d.titles, 0, 0],
             Field::FloatBars => [d.layout, d.titles, 0, 0, 0],
             Field::PrefixStrip => [d.prefix, d.layout, d.workspaces, d.titles, d.peer],
+            Field::PrefixPanel if panel_up => [d.hints, d.prefix, d.layout, d.titles, 0],
+            Field::PrefixPanel => [d.hints, 0, 0, 0, 0],
             Field::Modes => [d.prefix, d.modes, 0, 0, 0],
         }
     }
@@ -254,7 +271,9 @@ pub struct ChromeState {
     /// The input revisions each field was last derived from. A window starts with every field as derived from
     /// the inputs' first revisions, so its first derivation waits for an input to move (the first layout batch,
     /// the titles, the prefix) rather than falling on whatever event comes first.
-    stamps: [[u64; 5]; 6],
+    stamps: [[u64; 5]; 7],
+    /// The hint panel is up, so its field reads the inputs a shown panel depends on.
+    panel_up: bool,
     pub(super) derivations: Derivations,
     titles: ChromeTitles,
     /// The tray's chips, in their fixed order.
@@ -277,11 +296,11 @@ impl ChromeState {
     /// Whether the field's inputs moved since its derivation. Asked at the end of every batch, so it allocates
     /// nothing.
     fn due(&self, field: Field) -> bool {
-        self.stamps[field as usize] != field.inputs(&self.dirty)
+        self.stamps[field as usize] != field.inputs(&self.dirty, self.panel_up)
     }
 
     fn stamp(&mut self, field: Field) {
-        self.stamps[field as usize] = field.inputs(&self.dirty);
+        self.stamps[field as usize] = field.inputs(&self.dirty, self.panel_up);
     }
 }
 
@@ -291,6 +310,12 @@ pub fn digits(plan: &[(char, ModuleId)]) -> Vec<(ModuleId, u8)> {
     plan.iter()
         .filter_map(|(digit, module)| digit.to_digit(10).map(|value| (module.clone(), value as u8)))
         .collect()
+}
+
+/// The hint panel went up or came down: its field is derived again.
+pub(super) fn hints_shown(w: &mut Window, up: bool) {
+    w.chrome_state.panel_up = up;
+    w.chrome_state.dirty.hints += 1;
 }
 
 /// A field was set where it happened: the batch announces the model.
@@ -501,7 +526,7 @@ fn derive(
     win: WinId,
     reads: &dyn HostReads,
     keys: Option<&(Rc<Keymap>, Rc<ModuleKeys>)>,
-    due: [bool; 6],
+    due: [bool; 7],
 ) -> bool {
     let layout = w.layout.clone();
     let workspaces = w.workspaces.clone();
@@ -529,6 +554,9 @@ fn derive(
     }
     if due[Field::PrefixStrip as usize] {
         changed |= derive_prefix_strip(w, &layout, workspaces.as_deref(), keys);
+    }
+    if due[Field::PrefixPanel as usize] {
+        changed |= derive_prefix_panel(w, &layout, keys);
     }
     if due[Field::Modes as usize] {
         changed |= derive_modes(w);
@@ -694,6 +722,28 @@ fn derive_prefix_strip(
     w.chrome_state.stamp(Field::PrefixStrip);
     w.chrome_state.derivations.prefix_strip += 1;
     put(&mut w.chrome.prefix_strip, pieces)
+}
+
+/// The hint panel as the prefix's wait reads, while it is up; nothing otherwise. A window with no keymap yet has
+/// nothing to list.
+fn derive_prefix_panel(w: &mut Window, layout: &Layout, keys: Option<&(Rc<Keymap>, Rc<ModuleKeys>)>) -> bool {
+    let panel = match keys {
+        Some((keymap, module_keys)) if w.keys.hints_shown => {
+            let waiting = w.keys.waiting;
+            let lua = &w.chrome_state.titles.lua;
+            let title = |id: &ModuleId| titles::module_title(id, lua);
+            let entries = match waiting {
+                Waiting::Module(_) => crate::layout::strip(module_keys, layout),
+                Waiting::Hide => crate::layout::strip_for_hide(module_keys, layout),
+                _ => Vec::new(),
+            };
+            prefix_panel::prefix_panel(waiting, keymap, module_keys, &entries, &title(layout.focus()), &title)
+        }
+        _ => None,
+    };
+    w.chrome_state.stamp(Field::PrefixPanel);
+    w.chrome_state.derivations.prefix_panel += 1;
+    put(&mut w.chrome.prefix_panel, panel)
 }
 
 fn derive_modes(w: &mut Window) -> bool {

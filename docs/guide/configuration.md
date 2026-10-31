@@ -13,7 +13,8 @@ On Linux, Eitri reads `$XDG_CONFIG_HOME/eitri/init.lua` when `XDG_CONFIG_HOME` i
 absolute, otherwise `~/.config/eitri/init.lua`. The Mac uses `~/.config/eitri/init.lua`.
 Set `EITRI_CONFIG_DIR` to an absolute directory to read `init.lua` from there instead.
 An empty override counts as unset; a relative override refuses to start. There is no file to create first:
-without one, Eitri starts with its built-in defaults and prints a line saying so.
+without one, Eitri starts with its built-in defaults and prints a line saying so. The first time you start Eitri
+without one, it also offers to write a short file for you: see [First start](#first-start).
 
 Settings are made with `eitri.config.set(key, value)`. A value is a string, a number or a boolean (`true` or
 `false`); `nil` unsets the key again. A value Eitri cannot keep (a table or a function, say) is a startup
@@ -57,6 +58,8 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `review.hint` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a finished turn that edited files adds a one-line hint to the status band, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
 | `terminal.font` | a font in `guifont`'s form, `"<families>:h<points>"` | your `guifont` | The terminal's font, for every terminal of the window: `"Iosevka:h12"` sets both, `"Iosevka"` only the family (the size still follows your `guifont`), `":h12"` only the size. Families are comma-separated and tried in order, `_` or `\ ` stand for a space, as in `guifont`. Unset, the terminal draws in the editor's families and size, so a terminal under the editor looks like it; an empty `guifont` draws in `monospace`. The size is zoomed with the editor's, see [Keys](keys.md). |
 | `keymap.from_tmux` | `true` / `"on"` or `false` / `"off"` | `"on"` | Whether Eitri reads your tmux prefix and prefix-table keys from your tmux configuration. See [Keys](#keys). |
+| `keymap.which_key_delay` | a whole number from 0 to 5000, or `false` / `"off"` | `"off"` | Milliseconds the prefix waits for a second key before a panel lists the keys that may follow; `0` shows it at once. See [The hint panel](keys.md#the-hint-panel). Not drawn in a companion window or on the Mac. |
+| `keymap.nvim_prefix` | a Neovim left-hand side of at most 16 characters (`"<leader>W"`), or `false` / `"off"` | `"off"` | Maps the layout keys of your prefix table in Neovim's Normal mode under this left-hand side, each running its `:Eitri` action. See [From Neovim: `:Eitri`](keys.md#from-neovim-eitri). |
 | `window.restore` | `true` / `"on"` or `false` / `"off"` | `true` | Whether the window that holds a pair brings window 2 back at the next start when it was open when the pair last ended. With `false`, window 1 takes back what window 2 held and offers its saved tabs. See [Two windows](two-windows.md). |
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
@@ -78,10 +81,12 @@ local k = eitri.keymap
 k.prefix("C-a")                               -- the prefix key
 k.set("prefix", "g", "zoom")                  -- bind g (free by default) after the prefix to an action
 k.del("prefix", "%")                          -- remove a default binding
+k.set("root", "M-z", "zoom")                  -- a key that works without the prefix
 ```
 
 `k.prefix(key)` changes the prefix, `k.set(table, key, action, options)` binds a key and `k.del(table, key)`
-removes one. A bad key, an unknown action or two bindings that collide stop Eitri at startup with a message
+removes one. The `"root"` table holds keys that work without the prefix: it starts empty, takes only Ctrl and Alt
+chords, and [Keys](keys.md#keys-without-the-prefix) says what it runs, what it refuses and when Eitri warns. A bad key, an unknown action or two bindings that collide stop Eitri at startup with a message
 naming the call, so a typo does not leave you with a keymap you did not write. [Keys](keys.md) lists the
 defaults and the actions.
 
@@ -93,6 +98,88 @@ skip the tmux step.
 
 A complete example, which moves the prefix to `Ctrl+a` and rebinds splits, resizing and zoom, is
 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua). Paste what you want from it into your `init.lua`.
+
+`k.use(name)` records a named set of these calls in one line. The only name is `"i3-alt"`, for i3 or sway with
+Alt as `$mod`: it moves the Alt chords of the prefix table to `Ctrl+Alt`, exactly the calls in
+[`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua). It is an ordinary call, so your own calls after it win,
+and an unknown name stops Eitri at startup like any other bad call.
+
+```lua
+eitri.keymap.use("i3-alt")
+```
+
+## First start
+
+The first time you start Eitri without an `init.lua`, window 1 of a full launch opens a setup screen over the
+window. It asks how the window's keys should work, writes a short `init.lua` if you say so, and then offers
+[`:EitriTutor`](keys.md). Nothing is written until the last step, and what it writes is yours: it is an ordinary
+`init.lua`, with comments, that you can read and edit like any other.
+
+A launch that names a file (`eitri FILE`) leaves the screen closed, since you came for that file, and counts for
+nothing: the next plain `eitri` opens it, and `:Eitri setup` opens it at any time.
+
+**What it looks at.** It reads, and never changes: the tmux configuration Eitri already read for
+[`keymap.from_tmux`](#settings); the desktop you are on and, under i3 or sway, whether `$mod` is Alt or Super (from
+the window manager's own answer, else its config file); under Hyprland, its binds; which plugin in your Neovim
+owns, or probably owns, `Ctrl+b` and `Ctrl+h/j/k/l`; and whether an input method is running (by its process; Eitri
+never reads an input method's own settings). Rows appear as the answers come in, and the screen does not wait for
+a slow one. None of that text is copied into the file.
+
+**What you choose.** `j`/`k` or a number move among the presets, `Enter` goes on:
+
+| preset | what it writes |
+|---|---|
+| Neovim + tmux | `keymap.from_tmux` on, so the keys stay your tmux configuration's; the hint panel as a commented line (the default when a tmux configuration exists) |
+| Neovim, no tmux | `keymap.from_tmux` off, the stock `Ctrl+b` prefix, and the [hint panel](keys.md#the-hint-panel) on; when Neovim reported a leader, the window keys under it (`keymap.nvim_prefix`) |
+| Another prefix | `Ctrl+a`, `Ctrl+Space`, or a key you press: `k.prefix`, `k.del` for the old `Ctrl+b` and `k.set("prefix", key, "send-prefix")`, as [Keys](keys.md#choosing-ctrlspace-as-the-prefix) shows |
+| i3 / sway style | the stock keys, and `eitri.keymap.use("i3-alt")` when your `$mod` is Alt; nothing extra when it is Super |
+
+The review step shows the lines before they are written; `p` changes the prefix and `Backspace` goes back. A
+prefix other than the one the window runs with is checked with a **press test** first: the screen asks you to press
+it once and says whether it arrived. A key an input method or the desktop takes never reaches Eitri, and the screen
+says so, then lets you choose another prefix or write it anyway; `Esc` goes back while it waits. A key the keymap
+refuses (`Ctrl+h`, a bare letter) is refused at once, with the reason.
+
+In a window too low for the screen, `PageUp` and `PageDown` scroll it, and on the review `j`/`k` and the arrows do
+too. On the first page `r` reads Neovim's mappings again, for a buffer's own mappings or a plugin that loaded late.
+`?` shows a line of help.
+
+**It writes once and never over a file.** The file is made under a temporary name and linked into place, so a
+reader never sees half of it, and only if no `init.lua` exists at that moment: if one appeared meanwhile (another
+window), nothing is written and the screen says so. Nothing in Eitri opens an existing `init.lua` for writing.
+The new keys apply the next time Eitri starts; the window you are in keeps the keys it has.
+
+**When it opens.** All of these hold: this is window 1 of a full launch (not a second window, a companion window, a
+plugin's own window or `eitri split`), `--clean` was not given, `EITRI_CONFIG_DIR` and `EITRI_FIRST_START` are
+not set (see below), there is no `init.lua` (a dangling link, a directory or anything else in its place counts as
+one), the configuration directory passes the check below, and you have not said no (next paragraph). If the agent
+panel is asking whether to trust a project, the screen waits until you have answered. The Mac does not show it.
+
+**Esc twice, or `d`.** `Esc` is "not now": nothing is written, and the screen comes back once, at the next start.
+A second `Esc` stops it from opening by itself. `d` ("don't ask again") stops it at once. What you said is kept in
+`first-start.json` under `eitri/` in the [state directory](#environment-variables) (`XDG_STATE_HOME`), never in
+the configuration directory; deleting that file brings the screen back. Each start where it would have opened logs
+one line saying so.
+
+**Opening it again.** `:Eitri setup` in the window's Neovim, or the action `window.setup` bound to a key (it has
+no default key, and the `prefix ?` sheet lists it), opens the screen whatever the conditions above say. With an
+`init.lua` already there it only
+shows the lines, marked as not written; `o` opens them in a scratch buffer so you can copy what you want. The
+same `o` is offered if the lines could not be written.
+
+**Why a group-writable directory is refused.** `init.lua` is code that runs every time Eitri starts. The screen
+therefore creates it only in a directory that belongs to you and that no one else can write (no group or other
+write bit), inside a parent that no one else can rename entries in; otherwise another user could swap the file or
+the directory. A configuration directory that is a symbolic link (stow and chezmoi make them) is followed, one
+link deep. If the check fails the screen stays closed and the log names the directory; `chmod go-w` on it, or
+`:Eitri setup` to read the lines and place them yourself.
+
+**`EITRI_FIRST_START`.** `off` keeps the screen from opening by itself (it does not stop `:Eitri setup`); any
+other non-empty value is ignored with a log line. Test setups and scripted launches set it to `off`. The screen
+is also closed whenever `EITRI_CONFIG_DIR` names a directory, because that is a deliberate setup.
+
+The screen and the comments in the file it writes follow your locale: Simplified Chinese when `LC_ALL`,
+`LC_MESSAGES` or `LANG` (the first one set) starts with `zh`, English otherwise. The code lines are the same in both.
 
 ## Layout from Lua
 
@@ -433,6 +520,7 @@ not settings and are not listed.
 | `EITRI_NEOVIDE` | The Neovide that `eitri split` starts. It must name an existing file; unset, `neovide` on `PATH` is used. |
 | `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. It names a directory only; a file is opened with `eitri FILE`. |
 | `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, overriding the Linux XDG directory or `~/.config/eitri`. Empty is unset; a relative value refuses to start. |
+| `EITRI_FIRST_START` | `off` stops the [first-start screen](#first-start) from opening by itself. Any other non-empty value is ignored with a log line. |
 | `EITRI_AGENT_TRACE` | Set to `1` to print one `[turn-trace]` line per turn on stderr, with the turn's timings. |
 | `EITRI_SUPERVISOR` | Set to `1`, `true` or `yes` to let a window start `eitri-supervisor`, a dashboard of the agent status of every open window, when none is running. Unset, a window only connects to one you started yourself. |
 | `EITRI_SIDECAR_BINARY` | The path of a sidecar program to run agent sessions with, instead of the one `eitri setup` built or the package installed. A path that is not a file is an error when a session starts. |

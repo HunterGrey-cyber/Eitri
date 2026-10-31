@@ -50,6 +50,8 @@ pub(super) enum EditorThen {
     /// The request of `view`'s page, known to it as `request_id`, is answered: taken, or refused with
     /// why the editor could not take it.
     Answer { view: ViewId, request_id: String },
+    /// The window's own request, with no page to answer: the answer is left in the cell for the caller that asked.
+    Report(std::rc::Rc<std::cell::RefCell<Option<Result<(), String>>>>),
     /// A draft edit of `tab`: on its way, the draft is `text` and the edit is polled until it comes
     /// back; refused, the edit is undone. Then the page's request is answered.
     Draft {
@@ -66,6 +68,9 @@ pub(super) enum EditorThen {
 pub(super) fn editor_answered(state: &mut AgentPanelState, then: EditorThen, answer: Result<(), String>) -> Outbox {
     let mut out = Outbox::default();
     match then {
+        EditorThen::Report(slot) => {
+            *slot.borrow_mut() = Some(answer);
+        }
         EditorThen::Answer { view, request_id } => {
             out.send(
                 view,

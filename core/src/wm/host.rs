@@ -8,6 +8,8 @@ use crate::keymap::{
     prefix::Press,
 };
 use crate::layout::{kill::Reopen, Arrangement, Direction, Frame, ModuleId, Size};
+use crate::onboarding::screen::{CheckWhy, MarkerEvent};
+use crate::onboarding::{Found, Generated, Opening, WriteOutcome};
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
 use crate::window_link::{FocusTarget, Msg, Shape, Summary};
@@ -591,8 +593,52 @@ pub enum HostOp {
     Cleanup(CleanupOp),
     /// Tells the pair file and the pages what a change of the pair left.
     Pair(PairOp),
+    /// Asks for the first-start screen's work: the checks, the detection, the write, the marker.
+    Onboarding(OnboardingOp),
     /// Runs Lua after all other operations.
     Lua(LuaOp),
+}
+
+/// What the first-start screen asks the host to do. Every op of a screen carries the generation the controller
+/// opened it under, which the host hands back on its answer, so an answer that arrives after the screen closed
+/// (or for an earlier screen) is dropped by the controller.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnboardingOp {
+    /// Decides on a worker whether the screen opens, and answers [`OnboardingEvent::Open`] when it does. `requested`
+    /// is true when the user asked (`window.setup`, `:Eitri setup`): a screen asked for opens whether or not the
+    /// start would have shown it.
+    Check {
+        win: WinId,
+        generation: u64,
+        requested: bool,
+    },
+    /// Starts the detection rows; each answers [`OnboardingEvent::Found`].
+    Detect { win: WinId, generation: u64 },
+    /// Reads Neovim's mappings again, probing `extra` as well for that one report; the answer is a
+    /// [`OnboardingEvent::Found`].
+    Rescan {
+        win: WinId,
+        generation: u64,
+        extra: Vec<KeySpec>,
+    },
+    /// Moves the screen's text.
+    Scroll { win: WinId, by: crate::onboarding::Scroll },
+    /// Checks and writes `init.lua`; answers [`OnboardingEvent::Written`] or [`OnboardingEvent::CheckFailed`].
+    Write {
+        win: WinId,
+        generation: u64,
+        generated: Generated,
+    },
+    /// Records that the screen was left without writing, in the marker file; `today` is the date it carries.
+    Marker {
+        win: WinId,
+        event: MarkerEvent,
+        today: String,
+    },
+    /// Shows these lines in a scratch buffer in the editor.
+    OpenLines { win: WinId, lines: Vec<String> },
+    /// Starts the tutor in the editor.
+    OpenTutor { win: WinId },
 }
 
 /// A plugin manifest identity, represented as in the plugin registry.
@@ -662,6 +708,8 @@ pub enum FocusTo {
     TopBarItem(u32),
     /// The rename entry.
     RenameEntry,
+    /// The first-start screen. No [`FocusOwner`] reports it: the host reports non-module focus as no owner.
+    Onboarding,
     /// No destination.
     Nothing,
 }
@@ -1085,6 +1133,8 @@ pub enum HostEvent {
     MonitorsChanged { monitors: Vec<Monitor> },
     /// The output the window is on, or none after leaving every output.
     WindowMonitor { win: WinId, monitor: Option<MonitorId> },
+    /// A fact about the first-start screen, from a worker or from the shell.
+    Onboarding(OnboardingEvent),
     /// A scheduled timer or idle fired.
     Timer(TimerToken),
     /// A watched descriptor became ready.
@@ -1099,6 +1149,25 @@ pub enum HostEvent {
         why: String,
         surface: Option<(WinId, ModuleId)>,
     },
+}
+
+/// What the first-start screen's workers and the shell report. Each carries the generation of the
+/// [`OnboardingOp`] it answers; one that is not the screen's now is dropped. [`Found::TrustOpen`] may carry `0`,
+/// which means whichever screen is up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnboardingEvent {
+    /// The check said the screen opens.
+    Open { win: WinId, opening: Opening },
+    /// A detection answer, or the trust question opening or closing.
+    Found { win: WinId, generation: u64, found: Found },
+    /// The write ended.
+    Written {
+        win: WinId,
+        generation: u64,
+        outcome: WriteOutcome,
+    },
+    /// The check before the write said no.
+    CheckFailed { win: WinId, generation: u64, why: CheckWhy },
 }
 
 /// The native owner of the keys.
@@ -1664,6 +1733,8 @@ pub enum OpTag {
     Cleanup,
     /// Identifies Pair operations.
     Pair,
+    /// Identifies Onboarding operations.
+    Onboarding,
     /// Identifies Lua operations.
     Lua,
 }
@@ -1703,6 +1774,7 @@ impl OpTag {
             HostOp::Plugin(..) => Self::Plugin,
             HostOp::Cleanup(..) => Self::Cleanup,
             HostOp::Pair(..) => Self::Pair,
+            HostOp::Onboarding(..) => Self::Onboarding,
             HostOp::Lua(..) => Self::Lua,
         }
     }
@@ -2057,6 +2129,7 @@ mod tests {
         tag!(HostOp::Plugin(PluginOp::Build { win, module }), Plugin);
         tag!(HostOp::Cleanup(CleanupOp::Feeds), Cleanup);
         tag!(HostOp::Pair(PairOp::Unrestored { win }), Pair);
+        tag!(HostOp::Onboarding(OnboardingOp::OpenTutor { win }), Onboarding);
         tag!(HostOp::Lua(emit("changed")), Lua);
     }
 }

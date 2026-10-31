@@ -5,6 +5,7 @@
 //! because it requires Shift on a US keyboard.
 
 use super::key::Chord;
+use super::{Action, Keymap};
 
 /// A static root chord, independent of the host's accelerator spelling.
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +153,35 @@ pub fn chords() -> Vec<(Chord, String)> {
     out
 }
 
+/// The keypad keys GDK reports as the character they type, and that character: the keymap spells a press of
+/// `Ctrl+Keypad+` as `C-+`.
+const KEYPAD_TYPES: [(&str, &str); 3] = [("KP_Add", "+"), ("KP_Subtract", "-"), ("KP_0", "0")];
+
+/// `chords()` plus each keypad chord as a key press spells it, which is what a key of the keymap is compared
+/// with: a root key or a prefix of `C-+` is `Ctrl+Keypad+`, which Eitri keeps.
+pub fn pressed_chords() -> Vec<(Chord, String)> {
+    let mut out = chords();
+    let typed: Vec<(Chord, String)> = out
+        .iter()
+        .filter_map(|(chord, named)| {
+            KEYPAD_TYPES
+                .iter()
+                .find(|(keysym, _)| *keysym == chord.key)
+                .map(|(_, typed)| {
+                    (
+                        Chord {
+                            key: (*typed).to_string(),
+                            ..chord.clone()
+                        },
+                        named.clone(),
+                    )
+                })
+        })
+        .collect();
+    out.extend(typed);
+    out
+}
+
 /// Keysym names a person reads differently, and how.
 const SPELLED: [(&str, &str); 4] = [
     ("KP_Add", "Keypad+"),
@@ -205,6 +235,22 @@ pub fn help_rows() -> Vec<HelpRow> {
         what: "Text size of the pane under the pointer only".into(),
     });
     rows
+}
+
+/// The rows of `init.lua`'s root keys for the "Anywhere in the window" section, after the built-in rows: each key
+/// as a person reads it, what it does, and where it came from. `keep` is the window's own: a window that does not
+/// run an action lists no key for it, as it passes that key on untouched.
+pub fn user_help_rows(keymap: &Keymap, keep: impl Fn(&Action) -> bool) -> Vec<HelpRow> {
+    let prefix = keymap.prefix().human();
+    keymap
+        .root_bindings()
+        .iter()
+        .filter(|binding| keep(&binding.action))
+        .map(|binding| HelpRow {
+            keys: binding.key.human(),
+            what: format!("{} (init.lua)", binding.action.describe(&prefix, "as after the prefix")),
+        })
+        .collect()
 }
 
 #[cfg(test)]

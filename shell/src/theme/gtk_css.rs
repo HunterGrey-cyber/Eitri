@@ -261,6 +261,122 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     color: {chrome_muted};
 }}
 
+/* The hint panel (`shell::gtk_host::prefix_panel`): the keys and what they do while the prefix waits, over the
+   window's bottom. Opaque, in the top bar's own guarded pair, so it reads the same over any module; a group's
+   title and the footer are the muted token. It never takes a click or the keys. */
+.prefix-panel {{
+    background-color: {chrome};
+    color: {chrome_fg};
+    border: 1px solid {border};
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+}}
+
+.prefix-panel .panel-heading {{
+    color: {chrome_fg};
+    font-weight: 700;
+}}
+
+.prefix-panel .panel-group-title {{
+    color: {chrome_muted};
+    font-weight: 700;
+}}
+
+.prefix-panel .panel-key {{
+    color: {chrome_fg};
+    font-weight: 700;
+}}
+
+.prefix-panel .panel-label {{
+    color: {chrome_fg};
+}}
+
+.prefix-panel .panel-footer {{
+    color: {chrome_muted};
+}}
+
+/* The first-start screen: one panel over the window's middle, in the top bar's own guarded pair, opaque so it reads the
+   same over any module and the editor's subsurface never shows through. A title and a step counter on top, the rows
+   the machine was read for, the presets (the chosen one in the solid block of the window's focus language), then the
+   footer's keys and the shortcut buttons. The panel itself takes the keys, so it shows no focus ring of its own. */
+.onboarding-screen {{
+    background-color: {chrome};
+    color: {chrome_fg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-size: 13px;
+    outline-width: 0;
+}}
+
+.onboarding-screen .onboarding-title {{
+    color: {chrome_fg};
+    font-weight: 700;
+    font-size: 15px;
+}}
+
+.onboarding-screen .onboarding-step,
+.onboarding-screen .onboarding-row-label,
+.onboarding-screen .onboarding-row-note,
+.onboarding-screen .onboarding-item-summary,
+.onboarding-screen .onboarding-item-tag,
+.onboarding-screen .onboarding-help,
+.onboarding-screen .onboarding-footer {{
+    color: {chrome_muted};
+}}
+
+.onboarding-screen .onboarding-row-text {{
+    color: {chrome_fg};
+}}
+
+.onboarding-screen .onboarding-question,
+.onboarding-screen .onboarding-status,
+.onboarding-screen .onboarding-item {{
+    color: {chrome_fg};
+}}
+
+.onboarding-screen .onboarding-question {{
+    font-weight: 700;
+}}
+
+.onboarding-screen .onboarding-item.selected {{
+    background-color: {chrome_fg};
+    color: {chrome};
+}}
+
+.onboarding-screen .onboarding-body {{
+    color: {chrome_fg};
+    font-family: monospace;
+    font-size: 12px;
+}}
+
+.onboarding-screen .onboarding-button {{
+    background: none;
+    background-color: {chrome};
+    color: {chrome_fg};
+    border: 1px solid {border};
+    border-radius: 4px;
+    padding: 2px 8px;
+    box-shadow: none;
+}}
+
+.onboarding-screen .onboarding-button-label {{
+    color: {chrome_fg};
+}}
+
+/* A preset's row is a button for the mouse that looks like the row: no frame of its own, the chosen preset's solid
+   block stays on its own labels. */
+.onboarding-screen .onboarding-item-button {{
+    background: none;
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    min-height: 0;
+    box-shadow: none;
+}}
+
 /* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
    way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
    block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
@@ -521,6 +637,18 @@ mod tests {
             (".prefix-strip", t.chrome_fg, 4.5),
             (".prefix-strip .dimmed", t.chrome_muted, 4.5),
             (".prefix-strip .strip-dot", t.chrome_muted, 4.5),
+            (".prefix-panel", t.chrome_fg, 4.5),
+            (".prefix-panel .panel-heading", t.chrome_fg, 4.5),
+            (".prefix-panel .panel-group-title", t.chrome_muted, 4.5),
+            (".prefix-panel .panel-key", t.chrome_fg, 4.5),
+            (".prefix-panel .panel-label", t.chrome_fg, 4.5),
+            (".prefix-panel .panel-footer", t.chrome_muted, 4.5),
+            (".onboarding-screen", t.chrome_fg, 4.5),
+            (".onboarding-screen .onboarding-title", t.chrome_fg, 4.5),
+            (".onboarding-screen .onboarding-footer", t.chrome_muted, 4.5),
+            (".onboarding-screen .onboarding-row-text", t.chrome_fg, 4.5),
+            (".onboarding-screen .onboarding-body", t.chrome_fg, 4.5),
+            (".onboarding-screen .onboarding-button-label", t.chrome_fg, 4.5),
             (".topbar-app-name", t.chrome_fg, 4.5),
             (".topbar-project-name", t.chrome_muted, 4.5),
             (".topbar-mark", t.chrome_muted, 4.5),
@@ -534,6 +662,20 @@ mod tests {
             );
             assert!(colour.contrast(t.chrome) >= min, "{selector} is unreadable on chrome");
         }
+    }
+
+    /// The chosen preset is the solid block of the window's focus language: the guarded pair, reversed.
+    #[test]
+    fn the_chosen_preset_is_the_reversed_chrome_pair() {
+        let t = ThemeTokens::fallback();
+        let css = gtk_css(&t);
+        let body = rule(&css, ".onboarding-screen .onboarding-item.selected");
+        assert!(
+            body.contains(&format!("background-color: {};", t.chrome_fg.hex())),
+            "{body}"
+        );
+        assert!(body.contains(&format!("color: {};", t.chrome.hex())), "{body}");
+        assert!(t.chrome_fg.contrast(t.chrome) >= 4.5);
     }
 
     /// Focus is shown by cursors, never by chrome around the panes. The design considers a

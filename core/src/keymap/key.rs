@@ -241,6 +241,17 @@ impl fmt::Display for KeySpec {
     }
 }
 
+/// The tmux spelling of a key name written in any case (`space`, `SPACE`, `f5`), or `None` when
+/// it is no key name Eitri knows.
+pub(crate) fn canonical_name(text: &str) -> Option<String> {
+    if let Some(row) = NAMED.iter().find(|row| row.0.eq_ignore_ascii_case(text)) {
+        return Some(row.0.to_string());
+    }
+    let digits = text.strip_prefix(['F', 'f'])?;
+    let n: u8 = digits.parse().ok()?;
+    (1..=24).contains(&n).then(|| format!("F{n}"))
+}
+
 fn named(text: &str) -> Option<KeyName> {
     if let Some(row) = NAMED.iter().find(|row| row.0 == text) {
         return Some(row.1);
@@ -255,6 +266,9 @@ fn row(key: KeyName) -> &'static (&'static str, KeyName, &'static str, &'static 
         .find(|row| row.1 == key)
         .expect("every KeyName but Char and F has a NAMED row")
 }
+
+/// The ASCII symbols typed with Shift on a US layout, the one layout a key's name can be read against here.
+const SHIFTED_SYMBOLS: &str = "~!@#$%^&*()_+{}|:\"<>?";
 
 /// A chord normalised for comparison: a one-character key is that character (lowercase for an
 /// ASCII letter); anything else keeps its xkb keysym name.
@@ -313,6 +327,33 @@ impl Chord {
                 KeyName::F(n) => format!("F{n}"),
                 other => row(other).4.to_string(),
             },
+        }
+    }
+
+    /// The chord as a key press reports it. A press of `Alt+Shift+y` arrives as the character `Y` with no Shift
+    /// (the keymap's `M-Y`), while the accelerator `<Alt><Shift>y` reads as `y` plus Shift; this folds the second
+    /// into the first so the two compare equal. With Ctrl a shifted letter has no spelling in the keymap, so it
+    /// stays as it is. A symbol that takes Shift to type (`Mod1+Shift+exclam`) already is the shifted key, so its Shift
+    /// goes too, with or without Ctrl; `Shift+minus` names a different key and keeps it.
+    pub fn folded(&self) -> Chord {
+        let mut chars = self.key.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if self.shift && SHIFTED_SYMBOLS.contains(c) => Chord {
+                shift: false,
+                ..self.clone()
+            },
+            (Some(c), None) if !self.ctrl && c.is_alphabetic() && (self.shift || c.is_uppercase()) => {
+                let mut upper = c.to_uppercase();
+                match (upper.next(), upper.next()) {
+                    (Some(u), None) => Chord {
+                        shift: false,
+                        key: u.to_string(),
+                        ..self.clone()
+                    },
+                    _ => self.clone(),
+                }
+            }
+            _ => self.clone(),
         }
     }
 
@@ -443,6 +484,30 @@ mod tests {
             Chord::of(&KeySpec::parse("F11").unwrap())
         );
         assert!(Chord::from_accel("<Control><Shift>f").unwrap().shift);
+        let alt_shift_y = Chord::from_accel("<Alt><Shift>y").unwrap();
+        assert_eq!(alt_shift_y.folded(), Chord::of(&KeySpec::parse("M-Y").unwrap()));
+        assert_eq!(
+            Chord::from_accel("<Alt><Shift>exclam").unwrap().folded(),
+            Chord::of(&KeySpec::parse("M-!").unwrap()),
+            "a symbol that takes Shift is the key a root key names"
+        );
+        assert_eq!(
+            Chord::from_accel("<Control><Shift>question").unwrap().folded(),
+            Chord::of(&KeySpec::parse("C-?").unwrap())
+        );
+        assert!(
+            Chord::from_accel("<Alt><Shift>minus").unwrap().folded().shift,
+            "Shift on a key that needs none makes another key"
+        );
+        assert_eq!(
+            Chord::from_accel("<Control><Shift>f").unwrap().folded(),
+            Chord::from_accel("<Control><Shift>f").unwrap(),
+            "a shifted letter with Ctrl has no spelling to fold into"
+        );
+        assert_eq!(
+            Chord::from_accel("F11").unwrap().folded(),
+            Chord::from_accel("F11").unwrap()
+        );
         assert_eq!(Chord::from_accel("<Control>KP_Add").unwrap().key, "KP_Add");
         assert!(Chord::from_accel("<Control>").is_err(), "no key");
         assert_eq!(

@@ -456,6 +456,15 @@ mod tests {
         assert_eq!(classify(Key::space, ModifierType::empty()), key("Space"));
     }
 
+    #[test]
+    fn ctrl_space_classifies_as_c_space() {
+        assert_eq!(classify(Key::space, ModifierType::CONTROL_MASK), key("C-Space"));
+        assert_eq!(
+            classify(Key::space, ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK),
+            key("C-S-Space")
+        );
+    }
+
     /// Named and modified keys (Ctrl+Up, Alt+Up, Alt+1, F11, ...) must classify: under the old one-character key
     /// representation they were all `Other` and could never be bound.
     #[test]

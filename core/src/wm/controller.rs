@@ -38,6 +38,7 @@ use crate::tabs::ViewId;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 /// The window controller; see the module documentation.
 pub struct Controller {
@@ -47,6 +48,8 @@ pub struct Controller {
     windows: BTreeMap<WinId, Window>,
     /// Each window's keymap and module keys, from its config phase on; the refusals name keys from them.
     keymaps: BTreeMap<WinId, (Rc<Keymap>, Rc<ModuleKeys>)>,
+    /// Each window's `keymap.which_key_delay`, from its config phase on; a window made after it is given gets it.
+    hint_delays: BTreeMap<WinId, Duration>,
     /// Each window's open rules, module declarations, start-hidden plugins and project root, which its module
     /// verbs place and kill by.
     setups: BTreeMap<WinId, Rc<ModuleSetup>>,
@@ -76,6 +79,7 @@ impl Controller {
             reads: Rc::new(NoReads),
             windows: BTreeMap::new(),
             keymaps: BTreeMap::new(),
+            hint_delays: BTreeMap::new(),
             setups: BTreeMap::new(),
             declared: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -119,6 +123,19 @@ impl Controller {
             window.chrome_state.dirty.prefix += 1;
         }
         self.keymaps.insert(win, (keymap, module_keys));
+    }
+
+    /// How long `win`'s prefix waits for a key before the hint panel shows (`keymap.which_key_delay`); `None`
+    /// never shows it. Kept for a window not made yet, which gets it when it is, and applied at once to one that
+    /// is.
+    pub fn set_hint_delay(&mut self, win: WinId, delay: Option<Duration>) {
+        match delay {
+            Some(delay) => self.hint_delays.insert(win, delay),
+            None => self.hint_delays.remove(&win),
+        };
+        if let Some(window) = self.windows.get_mut(&win) {
+            super::keys::set_hint_delay(window, delay);
+        }
     }
 
     /// What `win`'s module verbs place and kill by, from its config on; before it, no rules, no declarations and
@@ -544,6 +561,7 @@ impl Controller {
         if let Some((keymap, module_keys)) = self.keymaps.get(&win) {
             window.keys.prefix = Some(Prefix::new(keymap.clone(), module_keys.clone()));
         }
+        window.keys.hint_delay = self.hint_delays.get(&win).copied();
         self.windows.insert(win, window);
     }
 
@@ -711,19 +729,43 @@ impl Controller {
     /// with its own ids, its error logged, then the gate's selection reset. `run` meets both gates through the
     /// runner, as a key does.
     pub fn lua_request(&mut self, win: WinId, request: LayoutRequest) -> Batch {
+        self.layout_request(win, request, "lua")
+    }
+
+    /// One request from `:Eitri` in the window's nvim: what [`lua_request`](Self::lua_request) decides for the same
+    /// request, with its log lines tagged `[nvim]` and each refusal toasted too: whoever typed it is looking at the
+    /// window, not at a log. Nothing runs while the window still awaits its layout.
+    pub fn nvim_request(&mut self, win: WinId, request: LayoutRequest) -> Batch {
+        self.layout_request(win, request, "nvim")
+    }
+
+    /// An `:Eitri` line the parser refused: the log line and the toast a refused request has.
+    pub fn nvim_refused(&mut self, win: WinId, why: &str) -> Batch {
         let mut batch = Batch::default();
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.warn(format!("[nvim] {why}"));
+            chrome::refused(window, why);
+        }
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// The one body of both: `source` tags the log lines.
+    fn layout_request(&mut self, win: WinId, request: LayoutRequest, source: &str) -> Batch {
+        let mut batch = Batch::default();
+        let toasts = source == "nvim";
         if !super::lua::decided(&request) {
-            self.verb_note(win, format!("[wm] BUG: lua_request for the shell's {request:?}"));
+            self.verb_note(win, format!("[wm] BUG: {source}_request for the shell's {request:?}"));
             return batch;
         }
-        if self.awaiting_layout(win, ("lua_request", &request)) {
+        if self.awaiting_layout(win, (format!("{source}_request"), &request)) {
             return batch;
         }
         let (reads, keymap, setup) = self.module_parts(win);
         let Some(window) = self.windows.get_mut(&win) else {
             return batch;
         };
-        window.say(format!("[lua] layout: {request:?}"));
+        window.say(format!("[{source}] layout: {request:?}"));
         if let LayoutRequest::Run(action) = request {
             return self.run(win, action, Origin::Lua);
         }
@@ -734,7 +776,11 @@ impl Controller {
         let gate = super::lua::lua_request_action(&request).map(|action| verbs::selection_gate(&action, selection));
         if gate == Some(SelectionGate::Refuse) {
             let text = verbs::one_module_text(&keymap);
-            window.warn(format!("[lua] layout: {request:?} refused: {text}"));
+            window.warn(format!("[{source}] layout: {request:?} refused: {text}"));
+            if toasts {
+                chrome::refused(window, &text);
+                self.settle_chrome(&mut batch);
+            }
             return batch;
         }
         let cx = module_verbs::Cx {
@@ -742,7 +788,7 @@ impl Controller {
             keymap: &keymap,
             setup: &setup,
         };
-        let refused = |err: &dyn std::fmt::Display| format!("[lua] layout: {request:?} refused: {err}");
+        let refused = |err: &dyn std::fmt::Display| format!("[{source}] layout: {request:?} refused: {err}");
         let result: Result<(), String> = match &request {
             LayoutRequest::Mark(id) => match window.layout.try_borrow_mut().map(|mut layout| layout.set_mark(id)) {
                 // A mark changes only the chrome's text: nothing moves, and the state file does not keep it.
@@ -780,7 +826,8 @@ impl Controller {
             LayoutRequest::Split(id, axis) => {
                 module_verbs::place_and_arrive(window, &cx, win, id, *axis, &mut batch).map_err(|err| err.to_string())
             }
-            // Its refusals, now or once its surface is asked for, are logged under the request's own words.
+            // Its refusals, now or once its surface is asked for, are logged under the request's own words, and
+            // toasted for `:Eitri` (`modules::refusal` reads the tag).
             LayoutRequest::Open(kind, explicit) => {
                 module_verbs::lua_open(
                     window,
@@ -788,7 +835,7 @@ impl Controller {
                     win,
                     *kind,
                     explicit.clone(),
-                    format!("{request:?}"),
+                    format!("[{source}] layout: {request:?}"),
                     &mut batch,
                 );
                 Ok(())
@@ -805,6 +852,9 @@ impl Controller {
         };
         if let Err(err) = result {
             window.warn(refused(&err));
+            if toasts {
+                chrome::refused(window, &err);
+            }
         }
         if gate == Some(SelectionGate::Run { reset: true }) && window.clear_selection() {
             window.layout_touched();
@@ -875,6 +925,13 @@ impl Controller {
         // Kept for the drags, which move a divider or a float from where this allocation drew it.
         window.arranged = Some(arrangement.clone());
         Some((arrangement, settled))
+    }
+
+    /// The generation of the first-start screen `win` shows, `None` while none is up: what a fact about the screen
+    /// that does not come from an op of its own (the editor's report of its mappings) is posted under. A screen the
+    /// start opens by itself has generation `0`, so `0` is a generation like any other.
+    pub fn onboarding_generation(&self, win: WinId) -> Option<u64> {
+        self.windows.get(&win).and_then(super::onboarding::generation)
     }
 
     /// What `win`'s chrome shows, as a copy; a window never opened shows nothing.
@@ -1059,6 +1116,13 @@ impl Controller {
         self.windows.get(&win).and_then(|window| window.allocated)
     }
 
+    /// The step of the first-start screen `win` shows and whether its press-test timer is armed, for tests.
+    #[cfg(test)]
+    pub(crate) fn onboarding_step(&self, win: WinId) -> Option<(crate::onboarding::screen::Step, bool)> {
+        let state = self.windows.get(&win)?.onboarding.as_ref()?;
+        Some((state.screen.step().clone(), state.press_timer.is_some()))
+    }
+
     /// The lines `win`'s verbs printed, for tests.
     #[cfg(test)]
     pub(crate) fn notes(&self, win: WinId) -> Vec<String> {
@@ -1133,8 +1197,8 @@ impl Controller {
     }
 
     /// A timer fired: the save's debounce of whichever window armed it, armed again or written, a window's
-    /// restack after a float took the keys, the end of a window's digit wait, a toast's time up, or the idle that
-    /// derives what a resize changed.
+    /// restack after a float took the keys, the end of a window's digit wait, the hint panel's delay, a toast's
+    /// time up, or the idle that derives what a resize changed.
     fn timer_fired(&mut self, token: TimerToken, batch: &mut Batch) {
         let fired = self.windows.iter_mut().find_map(|(win, window)| {
             match super::terminal_at::timer(window, *win, token, batch) {
@@ -1193,6 +1257,8 @@ impl Controller {
                 || super::moves::page_timer(window, *win, token, batch)
                 || super::moves::summary_fired(window, token)
                 || super::keys::number_timer_fired(window, token, batch)
+                || super::keys::hint_timer_fired(window, token)
+                || super::onboarding::timer_fired(window, *win, token, batch)
                 || chrome::toast_timer_fired(window, token)
                 || chrome::resize_idle_fired(window, token)
             {
@@ -1586,6 +1652,17 @@ impl Decide for Controller {
                     verbs::workspaces::entry(window, win, ev, &mut batch);
                 }
             }
+            HostEvent::Onboarding(event) => {
+                let win = match &event {
+                    OnboardingEvent::Open { win, .. }
+                    | OnboardingEvent::Found { win, .. }
+                    | OnboardingEvent::Written { win, .. }
+                    | OnboardingEvent::CheckFailed { win, .. } => *win,
+                };
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::onboarding::event(window, win, event, &mut batch);
+                }
+            }
             HostEvent::AnswerRefused { win, text } => {
                 if let Some(window) = self.windows.get_mut(&win) {
                     window.say(format!("[modules] refused: {text}"));
@@ -1854,6 +1931,14 @@ impl Decide for Controller {
                 }
                 self.settle_chrome(&mut batch);
                 return (Verdict::Consumed, batch);
+            }
+            // The first-start screen answers after the y/n and before the prefix.
+            if let Some(window) = self.windows.get_mut(&win) {
+                if let Some(effects) = super::keys::onboarding_press(window, press) {
+                    super::onboarding::carry(window, win, effects, &mut batch);
+                    self.settle_chrome(&mut batch);
+                    return (Verdict::Consumed, batch);
+                }
             }
         }
         let Some(window) = self.windows.get_mut(&win) else {

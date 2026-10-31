@@ -908,3 +908,41 @@ fn the_top_bar_text_shows_the_other_windows_marks() {
     r.driver.detach_peer(WIN);
     assert_eq!(r.driver.query(|c| c.chrome(WIN)).top_bar.other, None);
 }
+
+#[test]
+fn the_hint_panel_is_derived_only_while_it_is_up() {
+    let r = driven(three(editor()));
+    r.driver
+        .set_hint_delay(WIN, Some(std::time::Duration::from_millis(200)));
+    assert_eq!(r.window_key(key("C-b", PREFIX)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased {
+        win: WIN,
+        keycode: PREFIX,
+    });
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
+    assert_eq!(
+        r.derivations().prefix_panel,
+        0,
+        "a wait whose panel is not up derives none"
+    );
+    assert_eq!(r.chrome().prefix_panel, None);
+
+    r.scheduler.advance(std::time::Duration::from_millis(200));
+    assert_eq!(r.derivations().prefix_panel, 1, "derived once when it goes up");
+    assert!(r.chrome().prefix_panel.is_some());
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
+    assert_eq!(
+        r.derivations().prefix_panel,
+        2,
+        "a layout change under a shown panel derives it again"
+    );
+
+    r.host.post(HostEvent::Active {
+        win: WIN,
+        active: false,
+    });
+    assert_eq!(r.derivations().prefix_panel, 3, "and once more when it comes down");
+    assert_eq!(r.chrome().prefix_panel, None);
+    r.driver.test_batch(|c| c.changed_in_test(WIN));
+    assert_eq!(r.derivations().prefix_panel, 3, "a hidden panel derives nothing");
+}

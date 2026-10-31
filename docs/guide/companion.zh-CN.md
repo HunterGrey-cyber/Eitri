@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=659eef0f3fdbb9cf5c9c48f8ef88374a91af108da04c6766278b61e8d6aa98f0 -->
+<!-- translated-from: companion.md sha256=07b62f120f9201c44c239b529891e669bb445d8aa15042eb0474032746704a4e -->
 
 # 配合你自己的 Neovim 使用
 
@@ -73,6 +73,8 @@ require("smart-splits").setup({
   end,
 })
 ```
+
+同一段 `at_edge` 配置在 Eitri 自己的窗口里也能用，那里 `require("eitri").edge` 把移动交给相邻的模块（见[按键](keys.zh-CN.md#moving-between-panes)），所以一套配置两边都管用。
 
 Neovim 在 tmux 里运行时，Neovim 的环境里什么都不会变，它的导航映射不会被动，你的 tmux 设置还是照常在 tmux 窗格之间移动。tmux 窗格的边缘归 tmux。所以用 vim-tmux-navigator 时，没有越过去到面板窗口的办法（用 tmux 一侧的绑定，或你的窗口管理器的按键）；用 smart-splits.nvim 时，上面的 `at_edge` 钩子会把 tmux 自己的边缘处的移动交给面板。这两种都还没有在真实硬件上试过（见[已知问题](../known-issues.zh-CN.md#companion-mode)）。从面板里打开文件时，编辑器的窗口不会被带到前面，因为在 tmux 里，进程树通向的是 tmux 服务器，而不是终端。
 

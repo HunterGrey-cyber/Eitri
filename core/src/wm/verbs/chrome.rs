@@ -1,6 +1,6 @@
-//! The chrome's verbs: `window.immersive`, which toggles the window's mode as `prefix F11` always has. The mode
-//! is the chrome model's, the window's own state changes through the op the toggle emits, and the toggle never
-//! refuses, so it says nothing on screen.
+//! The chrome's verbs: `window.immersive`, which toggles the window's mode as `prefix F11` always has, and
+//! `window.setup`, which asks for the first-start screen. The mode is the chrome model's, the window's own state
+//! changes through the op the toggle emits, and neither verb refuses, so they say nothing on screen.
 
 use super::super::feedback::{self, Feedback, VerbOutcome};
 use super::super::host::Batch;
@@ -11,6 +11,7 @@ use crate::keymap::Action;
 pub fn run(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch) {
     match action {
         Action::WindowImmersive => super::super::chrome::toggle_immersive(w, win, batch),
+        Action::WindowSetup => super::super::onboarding::setup(w, win, batch),
         other => {
             debug_assert!(false, "{other:?} is not a chrome verb");
             return;

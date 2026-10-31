@@ -12,6 +12,21 @@ Neovim configuration sets another `mapleader` of a single key the panel can use 
 back to `Space`). The full list is in [Keys](keys.md); `?` in the panel shows it
 too.
 
+## The first launch
+
+If you have no `init.lua` yet, the first window opens a short setup screen before anything else. It lists what it
+found on your computer (a tmux configuration and its prefix, your desktop, the Neovim mappings that could collide
+with Eitri's keys, a running input method) and asks how the window's keys should work:
+
+- `j` and `k`, or the number of a preset, choose; `Enter` goes on to a review that shows the lines it would write.
+- `Enter` on the review writes `~/.config/eitri/init.lua` (once, and never over a file that exists); `Backspace`
+  goes back. The new keys apply from the next start. After writing, `t` opens `:EitriTutor` and `Enter` closes.
+- `Esc` is "not now": nothing is written, and the screen asks once more at the next start. `d` stops it for good.
+  `:Eitri setup` brings it back later.
+
+If you would rather write the file yourself, press `Esc` twice or `d`; everything the screen offers is in
+[Keys](keys.md) and [Configuration](configuration.md#first-start).
+
 ## Open a project
 
 ```sh

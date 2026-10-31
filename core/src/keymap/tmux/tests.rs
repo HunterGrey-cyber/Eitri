@@ -124,6 +124,49 @@ fn send_prefix() {
 }
 
 #[test]
+fn a_prefix_spelled_in_any_case_imports_as_tmux_reads_it() {
+    for conf in [
+        "set -g prefix C-space\n",
+        "set -g prefix c-Space\n",
+        "set -g prefix C-SPACE\n",
+        "set -g prefix c-space\n",
+    ] {
+        assert_eq!(import(conf).map.prefix(), &k("C-Space"), "{conf}");
+    }
+    assert_eq!(import("set -g prefix M-up\n").map.prefix(), &k("M-Up"));
+    assert_eq!(import("set -g prefix C-f1\n").map.prefix(), &k("C-F1"));
+}
+
+#[test]
+fn a_bound_key_is_read_with_tmuxs_case_rule() {
+    assert_eq!(
+        import("bind c-b send-prefix\n").bound("C-b"),
+        Some((Action::SendPrefix, false))
+    );
+    assert_eq!(
+        import("bind C-SPACE send-prefix\n").bound("C-Space"),
+        Some((Action::SendPrefix, false))
+    );
+    assert_eq!(
+        import("unbind c-b\n").import.removed,
+        vec![k("C-b")],
+        "unbind reads the key the same way"
+    );
+    // A single character keeps its case; with Ctrl, tmux folds a capital to the lowercase key.
+    assert!(import("bind C-A send-prefix\n").bound("C-a").is_some());
+    assert!(import("bind M-X send-prefix\n").bound("M-X").is_some());
+    assert!(import("bind M-X send-prefix\n").bound("M-x").is_none());
+    assert_eq!(
+        import("bind Q send-prefix\n").bound("Q"),
+        Some((Action::SendPrefix, false))
+    );
+    assert_ne!(
+        import("bind Q send-prefix\n").bound("q"),
+        Some((Action::SendPrefix, false))
+    );
+}
+
+#[test]
 fn send_keys_of_a_key_every_pane_can_take() {
     assert_eq!(
         import("bind A send-keys C-a\n").bound("A"),
@@ -390,8 +433,14 @@ const SKIPS: &[(&str, &str)] = &[
         "switch-client with more than one of -n, -p and -l",
     ),
     ("bind k choose-tree -s -w", "flag -w not imported"),
-    ("bind -n C-h select-pane -L", "a root key"),
-    ("bind -T root C-h select-pane -L", "a root key"),
+    (
+        "bind -n C-h select-pane -L",
+        "; eitri.keymap.set(\"root\", …) binds one in init.lua",
+    ),
+    (
+        "bind -T root C-h select-pane -L",
+        "; eitri.keymap.set(\"root\", …) binds one in init.lua",
+    ),
     (
         "bind -T copy-mode-vi v send -X begin-selection",
         "the copy-mode-vi table is not imported",
@@ -458,7 +507,7 @@ const SKIPS: &[(&str, &str)] = &[
     ("source-file -", "standard input"),
     ("source-file relative.conf", "a relative path"),
     ("source-file /no/such/file.conf", "no such file"),
-    ("unbind -n C-h", "a root key"),
+    ("unbind -n C-h", "; eitri.keymap.set(\"root\", …) binds one in init.lua"),
     ("unbind -T copy-mode-vi v", "the copy-mode-vi table is not imported"),
     ("unbind", "tmux refuses it: missing key"),
 ];
@@ -1232,4 +1281,91 @@ fn break_pane_breaks_a_tab_out_and_its_flags_are_not_imported() {
         let got = import(line);
         assert!(got.only_reason().contains(why), "{line}: {}", got.only_reason());
     }
+}
+
+// --- A root key set in init.lua and the import. -------------------------------------------------------
+
+fn root_set(key: &str, action: &str) -> KeymapOp {
+    KeymapOp::Set {
+        table: "root".into(),
+        key: key.into(),
+        action: action.into(),
+        opts: vec![],
+    }
+}
+
+#[test]
+fn a_tmux_binding_on_a_root_key_is_dropped_and_the_rest_of_the_table_is_kept() {
+    let got = import("bind M-t kill-pane\nbind m kill-pane\n");
+    assert_eq!(got.bound("M-t"), Some((Action::ModuleKill, false)));
+    let map = got.map.then_user(&[root_set("M-t", "module.terminal")], &[]).unwrap();
+    assert!(map.lookup(&k("M-t")).is_none(), "the root key owns the chord");
+    assert_eq!(map.lookup(&k("m")).map(|b| b.action.clone()), Some(Action::ModuleKill));
+    assert_eq!(
+        map.root_lookup(&k("M-t")).map(|b| b.action.clone()),
+        Some(Action::Module(ModuleId::terminal()))
+    );
+    assert_eq!(map.dropped_for_root().len(), 1, "{:?}", map.dropped_for_root());
+    assert!(
+        map.dropped_for_root()[0].contains("Alt+t"),
+        "{:?}",
+        map.dropped_for_root()
+    );
+    assert!(
+        map.dropped_for_root()[0].contains("tmux"),
+        "{:?}",
+        map.dropped_for_root()
+    );
+}
+
+#[test]
+fn a_tmux_prefix_that_is_a_root_key_falls_back_to_the_stock_prefix() {
+    let got = import("set -g prefix M-y\nbind m kill-pane\n");
+    assert_eq!(got.map.prefix(), &k("M-y"));
+    let map = got.map.then_user(&[root_set("M-y", "tab.next")], &[]).unwrap();
+    assert_eq!(map.prefix(), &k("C-b"));
+    assert_eq!(map.dropped_for_root().len(), 1, "{:?}", map.dropped_for_root());
+    assert!(
+        map.dropped_for_root()[0].contains("Alt+y"),
+        "{:?}",
+        map.dropped_for_root()
+    );
+    assert_eq!(map.lookup(&k("m")).map(|b| b.action.clone()), Some(Action::ModuleKill));
+}
+
+#[test]
+fn the_import_record_leaves_out_what_a_root_key_took_over() {
+    let home = ScratchDir::new("eitri-tmux", "root-over-import");
+    write(
+        &home.join(".tmux.conf"),
+        "set -g prefix M-y\nbind M-t kill-pane\nbind m kill-pane\n",
+    );
+    let env = env_for(&home);
+    let ops = [root_set("M-y", "tab.next"), root_set("M-t", "module.terminal")];
+    let (map, import) = Keymap::for_startup(&ops, &[], None, || env.clone(), &LuaClaims::default()).unwrap();
+    assert_eq!(map.prefix(), &k("C-b"));
+    let import = import.unwrap();
+    assert_eq!(import.prefix, None, "the prefix is the stock one again");
+    assert!(
+        import.bindings.iter().all(|b| b.key != k("M-t")),
+        "{:?}",
+        import.bindings
+    );
+    assert!(import.bindings.iter().any(|b| b.key == k("m")));
+}
+
+#[test]
+fn an_init_lua_prefix_that_is_a_root_key_stays_an_error_beside_the_import() {
+    let got = import("set -g prefix M-y\n");
+    let err = got
+        .map
+        .then_user(
+            &[KeymapOp::Prefix { key: "M-y".into() }, root_set("M-y", "tab.next")],
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::keymap::KeymapError::RootCollides { .. }),
+        "{err:?}"
+    );
 }

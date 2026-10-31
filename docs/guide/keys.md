@@ -15,12 +15,18 @@ including anything you changed in [your configuration](configuration.md) or took
 >   bottom terminal.
 > - `Ctrl+h`, `Ctrl+j`, `Ctrl+k` and `Ctrl+l` move between modules, so in the bottom terminal the shell's clear-screen
 >   is `Ctrl+b Ctrl+l` (and readline's `Ctrl+k` is `Ctrl+b Ctrl+k`).
+> - To have Eitri list the next keys when you pause after the prefix, put
+>   `eitri.config.set("keymap.which_key_delay", 200)` in your `init.lua` ([The hint panel](#the-hint-panel)).
 > - If you use tmux, your prefix and prefix-table bindings come from your tmux configuration
 >   ([Your tmux keys](#your-tmux-keys)), and `Ctrl+b ?` (or your own prefix and `?`) lists what did not come across.
 > - For a `Ctrl+a` prefix, start from [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua); for i3 or sway with
 >   Alt as `$mod`, from [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua).
+> - On a first launch without an `init.lua`, Eitri offers to set the keys up and write one
+>   ([First start](configuration.md#first-start)); `:Eitri setup` brings the screen back.
 > - `:EitriTutor` in the editor walks you through these keys, step by step, in English or Simplified Chinese
->   (whichever your locale asks for, as Neovim's `:Tutor` picks).
+>   (whichever your locale asks for, as Neovim's `:Tutor` picks). It says your own prefix wherever a lesson means
+>   it, and teaches the stock keys after the prefix, so a tmux configuration that rebinds some of them is not
+>   reflected; your prefix and `?` list yours.
 
 ## The prefix
 
@@ -30,7 +36,8 @@ table does not bind ends the wait without doing anything. To send `Ctrl+b` itsel
 press it twice. `<prefix> ?` opens the full keys sheet at the "After <prefix>" table. While the prefix is armed,
 the hint strip ends with `? keys`; it uses the effective key for `panel.keymap`, and leaves that run out if unbound.
 
-The keys marked "repeats" can be pressed again within half a second without the prefix, as in tmux.
+The keys marked "repeats" can be pressed again within half a second without the prefix, as in tmux. If you
+would rather see the keys than remember them, [The hint panel](#the-hint-panel) lists them after a pause.
 
 **Tabs.** Each conversation in the agent panel is a tab.
 
@@ -125,7 +132,8 @@ import and your tmux configuration bind that key.
 | `<prefix> :` | the panel's `:` command line (see [The command line](#the-command-line)) |
 | `<prefix> Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l` | send that chord itself to whatever has the keys; the bare chords below are Eitri's |
 
-**Without the prefix**, these work anywhere in the window:
+**Without the prefix**, these work anywhere in the window (and [Keys without the prefix](#keys-without-the-prefix)
+adds yours):
 
 | keys | what they do |
 |---|---|
@@ -317,6 +325,55 @@ startup until it puts `k.del("prefix", "<key>")` before that `set` (the spelling
 `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`; for `!` that is `k.del("prefix", "!")`). The rule is the one under "Setting a key that already has an action" above,
 tmux import included.
 
+### The hint panel
+
+`eitri.config.set("keymap.which_key_delay", 200)` makes Eitri show the keys that may come next once the prefix has
+been armed for that many milliseconds without a second key. The value is a whole number from 0 to 5000, or `false`
+or `"off"` (the default, which shows nothing). `0` shows the panel at once; with `200`, someone who presses `Ctrl+b z`
+in one movement never sees it.
+
+The panel appears near the bottom of the window, over the modules, centred, and takes at most 90% of the window's
+width and 45% of its height. It groups the keys as Tabs, Modules, Layout, Workspaces (the floats are there too),
+Windows and Other, with a short name for each (`zoom`, `split right…`, `next tab`), and a plugin panel's own module key gets a row with
+its title. A key whose action this window refuses is left out, as it is in the keys sheet. Groups that do not fit
+across are left out, and a group too tall for the height ends in a line like `… 5 more`; `<prefix> ?` lists every
+key. After a split key (`%`
+or `"`) it shows only the module keys that may follow, under the heading the hint strip already uses.
+
+It never takes a key and never takes a pointer event: the next key goes to the prefix exactly as without the panel.
+It goes away when the wait ends (any key, `Esc`, a click, or the window losing focus). A repeating key's wait, the
+digit waits and the workspace chooser show their own displays and no panel. The hint strip stays as it was.
+
+Two gaps: a [companion window](companion.md) does not draw the panel (with the setting on it logs that once, and
+the strip and the keys sheet work as before), and neither does the Mac host. The panel's text is English, like the strip and the
+sheet.
+
+### Choosing Ctrl+Space as the prefix
+
+The default stays `Ctrl+b`, which is stock tmux's, and what this guide and the README teach (`:EitriTutor` says whichever prefix you have). If you
+want `Ctrl+Space`, set it like any other prefix, and move the "send it through" key with it:
+
+```lua
+local k = eitri.keymap
+k.prefix("C-Space")
+k.del("prefix", "C-b")
+k.set("prefix", "C-Space", "send-prefix")
+```
+
+Check three things first. fcitx5's default trigger is `Ctrl+Space`, so with fcitx5 running the key may never reach
+Eitri (the conflict warnings under [Keys without the prefix](#keys-without-the-prefix) cover root keys, not the
+prefix: press it and see whether the strip appears). macOS switches input sources with it.
+And nvim-cmp, blink.cmp and kickstart.nvim map `<C-Space>` in Insert mode for completion: with `Ctrl+Space` as the
+prefix you reach that mapping by pressing the key twice, as `Ctrl+b Ctrl+b` does today. `send-prefix` (and
+`send-keys`) deliver every chord to the bottom terminal too, `Ctrl+Space` included, where the shell sees it as
+`Ctrl+@` (NUL).
+
+The [first-start screen](configuration.md#first-start) offers `Ctrl+Space` among the prefixes and does the first
+check for you: its press test asks for the key once and says whether it reached Eitri, and warns beforehand when an
+input method is running. If it did not arrive, an input method or your desktop took it; choose another prefix, or
+write it anyway if you mean to change that. A tmux configuration with `set -g prefix C-space` is read like any
+other prefix.
+
 ## Moving between panes
 
 `Ctrl+h`, `Ctrl+j`, `Ctrl+k` and `Ctrl+l` move the keys to the module on the left, below, above and right,
@@ -338,6 +395,140 @@ the module above. From the topmost module, `Ctrl+k` goes on to the top bar: `h` 
 
 In BROWSE, vim's `Ctrl+w h`, `Ctrl+w j`, `Ctrl+w k` and `Ctrl+w l` do the same moves; `Ctrl+w j` is always the
 module below, never the box.
+
+**Navigator plugins in the editor.** What you need depends on the plugin. vim-tmux-navigator and Navigator.nvim work
+as they are: Eitri answers the `select-pane` call they make, so `Ctrl+l` at Neovim's right edge reaches the terminal
+or panel on that side. smart-splits.nvim needs a hook. Without one it does not move the keys out of Neovim (it
+switches its multiplexer support off when Neovim is a GUI, and the editor here is), so hand the move to Eitri from
+`at_edge`:
+
+```lua
+require("smart-splits").setup({
+  at_edge = function(ctx)
+    require("eitri").edge(ctx.direction)
+  end,
+})
+```
+
+`require("eitri").edge` comes from [eitri.nvim](companion.md#the-eitrinvim-plugin), which has to be on Neovim's
+`runtimepath`. It takes the direction words smart-splits passes (`left`, `down`, `up`, `right`), returns `true` when
+Eitri took the move, and `false` for anything else (and when Eitri is not there), sending nothing. The same snippet
+works in a [companion](companion.md#navigator-plugins-and-tmux) setup, where the window manager takes the move. The one
+smart-splits case that needs no hook is version 3 with its separate tmux backend plugin, which moves the keys itself
+(the hook is configured and never called). Eitri never edits your plugin configuration.
+
+## From Neovim: `:Eitri`
+
+In the Neovim that Eitri's own window embeds, `:Eitri` runs the window and layout actions, so a key you map in Neovim
+can do what `<prefix> z` does. It exists only in that window's Neovim: not in a companion's Neovim, not on the Mac, and
+not in a second window, which has no Neovim.
+
+| command | what it does |
+|---|---|
+| `:Eitri <action> [key=value ...]` | any action `eitri.layout.run` takes, by its `eitri.keymap` name: `:Eitri zoom`, `:Eitri resize.left cells=5`, `:Eitri module.agent`, `:Eitri layout.even-horizontal`, `:Eitri float.toggle` |
+| `:Eitri split right` or `below <module>` | open a module beside the editor, or move it there; `<module>` is `editor`, `agent`, `terminal`, `terminal#2`, `agent#3` or `lua:<panel id>` |
+| `:Eitri focus`, `show` or `hide <module>` | as `eitri.layout.focus`, `show` and `hide` |
+| `:Eitri open terminal` or `agent` | a new terminal or chat view, placed by the usual rules |
+| `:Eitri workspace <name>` | switch to the workspace, making it when there is none |
+| `:Eitri keys` | the keys sheet |
+| `:Eitri setup` | the [first-start screen](configuration.md#first-start), to choose a key setup again |
+
+Completion goes by position: the first word offers these words and the actions, `split` offers `right` and `below`,
+`open` offers `terminal` and `agent`, and a module's place offers the module ids, every numbered instance among them
+whether it is open or not. A first word that is neither these words nor an action is a Neovim error and nothing is
+sent. Anything else the window refuses (an action without an option it needs, a module that is not open, a panel key
+such as `tab.new`) shows as a toast in the window with the reason, and Neovim hears nothing back.
+
+**What it leaves out.** The agent panel's own keys (`c`, `n`, `p`, `1`-`9`, `,` after the prefix, plus `r`, `:`, copy
+mode and text size) are not layout actions, and from Neovim the module holding the keys is always the editor, so most
+would do nothing. They stay on the prefix, and `:Eitri keys` lists them. The leader group below leaves them out too.
+
+**Binding at config time.** The command is defined just after Neovim starts (never over a `:Eitri` of your own, and it
+says in the log when it had to leave yours), so `vim.g.eitri` is not set while your config is being read. A mapping that
+calls `<cmd>Eitri zoom<cr>` needs no check, since it resolves when you press it. To bind only where Eitri is, wait for
+the `User EitriReady` event, which fires once after `:Eitri` exists and `vim.g.eitri` is `1`; outside Eitri neither
+happens:
+
+```lua
+vim.keymap.set("n", "<leader>z", "<cmd>Eitri zoom<cr>", { desc = "Eitri: zoom" })
+
+vim.api.nvim_create_autocmd("User", {
+  pattern = "EitriReady",
+  callback = function()
+    vim.keymap.set("n", "<leader>ez", "<cmd>Eitri zoom<cr>", { desc = "Eitri: zoom" })
+  end,
+})
+```
+
+From Lua, `require("eitri").run("zoom")` (eitri.nvim) does the same and returns `false` when Eitri is not there.
+
+**A leader group.** `eitri.config.set("keymap.nvim_prefix", "<leader>W")` maps, in Normal mode under that left-hand
+side, the layout keys of your effective prefix table: `<leader>Wz` zooms, and each split key becomes a group
+(`<leader>W%t` puts a terminal to the right, `<leader>W"e` an editor below). The descriptions read `Eitri: zoom`, so
+which-key lists them under one group, "Eitri window". What you have learned after the prefix is what you press after
+`<leader>W`, and tmux imports and `init.lua` changes carry over, because the group is built from that table. The default
+is `"off"`. The value is a Neovim left-hand side of at most 16 characters, `<leader>` and `<localleader>` allowed.
+
+If something is already mapped at that left-hand side or under it (LazyVim maps `<leader>w` as its window group), Eitri
+installs none of the group and says so once, naming what is in the way, so choose another. Eitri looks again when
+your plugin manager finishes loading. A plugin that maps one of Eitri's keys later wins that key, and Eitri does not
+put its own back; the rest of the group stays.
+
+## Keys without the prefix
+
+By default the only keys Eitri takes without the prefix are the ones in the table above. `eitri.keymap.set("root", ...)`
+adds your own: Ctrl and Alt chords that run an action in any module, with no prefix in front. The table starts empty,
+so nothing changes until you fill it.
+
+```lua
+local k = eitri.keymap
+k.set("root", "M-z", "zoom")
+k.set("root", "C-Space", "select.next")
+-- k.del("root", "M-z") removes one again
+```
+
+- **The key must hold Ctrl or Alt** (`C-`, `M-`, `C-M-`, with `S-` allowed on a named key). A bare key, a bare function
+  key or a Shift-only key would be taken from Neovim, your shells and the panel everywhere, so Eitri stops at startup
+  and says so. Super chords are not offered.
+- **Any action a prefix key can run**, except `send-prefix` and `send-keys`, and with no `repeatable` option (a held
+  root key does not repeat; press it again). A split action waits for the module key, and `select.number` and the
+  workspace actions wait for their digit or name, as after the prefix.
+- **Collisions stop the launch, naming both sides:** the prefix itself; a built-in chord (`F11`, `Ctrl+=`, `Ctrl+-`,
+  `Ctrl+0` and the keypad forms, `Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l`); a key bound twice in the root table; an
+  `eitri.command.register` keybinding; and a key that is also bound after the prefix, by default or in your
+  `init.lua`. For the last one, `eitri.keymap.del("prefix", "<key>")` first, so that `<prefix> <key>` can send the key
+  itself. A prefix binding that only came from your tmux import is dropped instead, as is a tmux prefix equal to a root
+  key (the prefix falls back to `Ctrl+b`); Eitri logs one line for each. A prefix your `init.lua` set stays an error.
+- **A held key runs once.** The auto-repeat is swallowed until you let go, and losing focus or a click clears it.
+- **Where it works.** Wherever the prefix works: the window, a second window, the companion window and the Mac host.
+  In the last two, a root key whose action that window refuses (a layout action in a companion window) is passed on to
+  whatever has the keys instead of being eaten.
+- **The keys sheet lists them** under "Anywhere in the window", with ` (init.lua)` after the action. The hint panel
+  does not, since they are not after the prefix.
+- **tmux's `bind -n` is still skipped on import** (the sheet says so); set the key here instead.
+
+**Sending the chord through.** Neovim, programs in the terminal, the agent panel and plugin pages never see a root key.
+When you want the module to have it, `<prefix> <key>` sends it: Neovim gets it as a key, the bottom terminal as the
+bytes a typed key gives (`Ctrl+Space` is NUL, `Alt+z` is Escape then `z`). The agent panel and plugin pages cannot get
+such a chord back: the panel reads only a literal `Ctrl+a`, and a page takes no literal key. The panel table you can
+rebind holds no Ctrl or Alt chord, but the panel's fixed keys do, and no warning covers them: `Ctrl+a`, `Ctrl+c`,
+`Ctrl+d`, `Ctrl+e`, `Ctrl+f`, `Ctrl+g`, `Ctrl+n`, `Ctrl+o`, `Ctrl+p`, `Ctrl+r`, `Ctrl+u`, `Ctrl+w`, `Ctrl+y`,
+`Ctrl+Enter` and `Alt+Enter` (the INSERT and BROWSE tables below). A root key on one of these stops it working in the
+panel. Re-sending a chord to those pages is a later change.
+
+**Warnings.** Something else may take a root key before Eitri sees it, so Eitri checks and warns, and never refuses
+to start for it. It compares your root keys with:
+
+- the default triggers of fcitx5 when it runs (it looks at `GTK_IM_MODULE`, `QT_IM_MODULE`, `XMODIFIERS` and the
+  session bus, and never reads the input method's own configuration; IBus gives no warning, since its default trigger
+  is `Super+Space`, which cannot be a root key);
+- GNOME's live shortcut settings, only when the session is GNOME;
+- the live binds of sway (its main configuration: binds in files it `include`s are not seen) and Hyprland.
+
+Each conflict is one log line every launch, and a toast only when the set of conflicts differs from the last toast.
+KDE and niri have no source here, and a conflict from those, from a sway include or from an input method you
+reconfigured is invisible to Eitri: if a root key does nothing, look there. The check runs in Eitri's own windows: a
+companion window and the Mac host do not run it.
 
 ## The panel's modes
 

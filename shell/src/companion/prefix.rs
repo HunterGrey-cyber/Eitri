@@ -36,7 +36,9 @@ pub(crate) fn install(
     on_waiting: impl Fn(Waiting) + 'static,
     on_escape: impl Fn() + 'static,
 ) -> Rc<RefCell<Prefix>> {
-    let prefix = Rc::new(RefCell::new(Prefix::new(keymap, module_keys)));
+    let mut machine = Prefix::new(keymap, module_keys);
+    machine.set_root_keep(Rc::new(eitri_core::keymap::companion::companion_root_keep));
+    let prefix = Rc::new(RefCell::new(machine));
     let on_waiting: Rc<dyn Fn(Waiting)> = Rc::new(on_waiting);
 
     let keys = gtk4::EventControllerKey::new();
@@ -90,10 +92,12 @@ pub(crate) fn install(
         let prefix = prefix.clone();
         let on_waiting = on_waiting.clone();
         Rc::new(move || {
+            // Cancelled either way: a root key held while the window lost focus never sees its release.
             let mut p = prefix.borrow_mut();
-            if p.is_armed() {
-                p.cancel();
-                drop(p);
+            let armed = p.is_armed();
+            p.cancel();
+            drop(p);
+            if armed {
                 on_waiting(Waiting::No);
             }
         })
@@ -114,4 +118,43 @@ pub(crate) fn install(
     window.add_controller(clicks);
 
     prefix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eitri_core::keymap::{Action, KeymapOp, TabAction};
+
+    fn root_op(key: &str, action: &str) -> KeymapOp {
+        KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        }
+    }
+
+    fn press(key: &str) -> Press {
+        Press::Key(eitri_core::keymap::KeySpec::parse(key).unwrap())
+    }
+
+    #[test]
+    fn a_root_key_this_window_refuses_passes_on_and_one_it_runs_runs() {
+        let keymap = Keymap::apply_user(&[root_op("M-y", "zoom"), root_op("M-u", "tab.next")], &[]).unwrap();
+        let module_keys = ModuleKeys::build(&[], &keymap).unwrap();
+        let mut machine = Prefix::new(Rc::new(keymap), Rc::new(module_keys));
+        machine.set_root_keep(Rc::new(eitri_core::keymap::companion::companion_root_keep));
+        let now = Instant::now();
+        assert_eq!(
+            machine.press(press("M-y"), 10, now),
+            Outcome::Pass,
+            "zoom is not in a companion window"
+        );
+        assert_eq!(
+            machine.press(press("M-u"), 11, now),
+            Outcome::Run(eitri_core::keymap::prefix::PrefixCommand::Run(Action::Tab(
+                TabAction::Next
+            )))
+        );
+    }
 }

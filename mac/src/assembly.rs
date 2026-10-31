@@ -350,6 +350,9 @@ pub fn assemble(
         crate::log_line!("[mac] init.lua registers {commands} command(s); this window runs none");
     }
     let config = window_config::load(&kernel, &[])?;
+    for line in config.keymap.dropped_for_root() {
+        crate::log_error!("[keymap] {line}");
+    }
     let module_keys = Rc::new(ModuleKeys::build(&[], &config.keymap).map_err(|e| e.to_string())?);
     let backend_kind = BackendKind::from_env(false).map_err(|e| e.message)?;
 

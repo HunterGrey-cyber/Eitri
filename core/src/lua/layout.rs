@@ -388,9 +388,10 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     name.type_name()
                 )));
             };
-            let name = name.to_str().map_err(|e| {
-                mlua::Error::RuntimeError(format!("eitri.layout.run: {e}"))
-            })?.to_string();
+            let name = name
+                .to_str()
+                .map_err(|e| mlua::Error::RuntimeError(format!("eitri.layout.run: {e}")))?
+                .to_string();
             let opts = crate::lua::keymap::opts(lua, &options)
                 .map_err(|why| mlua::Error::RuntimeError(format!("eitri.layout.run({name:?}): {why}")))?;
             if opts.iter().any(|(key, _)| key == "repeatable") {
@@ -399,26 +400,10 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 )));
             }
             let action = crate::keymap::action::parse(&name, &opts, &run_store.borrow().lua_panels)
-                .map_err(|error| mlua::Error::RuntimeError(format!("eitri.layout.run: {error}")))?.action;
-            if matches!(action, Action::Split { .. }) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "eitri.layout.run: {name} waits for a module key; eitri.layout.split(id, 'right'|'below') places one"
-                )));
-            }
-            if matches!(action, Action::SelectNumber) {
-                return Err(mlua::Error::RuntimeError(
-                    "eitri.layout.run: select.number waits for a digit; eitri.layout.focus(id) gives a module the keys".to_string()
-                ));
-            }
-            if matches!(action, Action::WorkspaceChoose | Action::WorkspaceRename) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "eitri.layout.run: {name} waits for a key; eitri.layout.switch(name) switches workspaces"
-                )));
-            }
-            if !action.is_layout() {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "eitri.layout.run: {name} is not a layout action"
-                )));
+                .map_err(|error| mlua::Error::RuntimeError(format!("eitri.layout.run: {error}")))?
+                .action;
+            if let Some(why) = run_refusal(&name, &action) {
+                return Err(mlua::Error::RuntimeError(format!("eitri.layout.run: {why}")));
             }
             queue(&run_store, "run", LayoutRequest::Run(action))
         })?,
@@ -597,6 +582,28 @@ fn con_table(lua: &Lua, c: &Con, share: Option<f32>) -> mlua::Result<Table> {
         table.raw_set("share", f64::from(share))?;
     }
     Ok(table)
+}
+
+/// Why `eitri.layout.run` will not run `action` (parsed from `name`), or `None` when it will: an
+/// action that waits for a further key (a split's module, `select.number`'s digit, the workspace
+/// chooser's or rename's key) has its own `eitri.layout` call that takes the answer at once, and an
+/// action that is not a layout action acts on the module holding the keys, not on the layout.
+/// `:Eitri` refuses through this too ([`crate::nvim_verbs`]), so the two never disagree on what runs
+/// or on the words that say why not. The text has no caller's prefix.
+pub fn run_refusal(name: &str, action: &Action) -> Option<String> {
+    match action {
+        Action::Split { .. } => Some(format!(
+            "{name} waits for a module key; eitri.layout.split(id, 'right'|'below') places one"
+        )),
+        Action::SelectNumber => {
+            Some("select.number waits for a digit; eitri.layout.focus(id) gives a module the keys".to_string())
+        }
+        Action::WorkspaceChoose | Action::WorkspaceRename => Some(format!(
+            "{name} waits for a key; eitri.layout.switch(name) switches workspaces"
+        )),
+        action if !action.is_layout() => Some(format!("{name} is not a layout action")),
+        _ => None,
+    }
 }
 
 fn module_arg(call: &str, id: &str) -> mlua::Result<ModuleId> {
@@ -1389,6 +1396,116 @@ mod tests {
             assert!(err.contains("eitri.layout.run") && err.contains(why), "{source}: {err}");
         }
         assert!(store.borrow_mut().take_requests().is_empty());
+    }
+
+    /// The text after `eitri.layout.run: ` in a refusal, up to the end of its line.
+    fn run_error_words(err: &str) -> &str {
+        let start = err.find("eitri.layout.run: ").expect("a run refusal") + "eitri.layout.run: ".len();
+        let rest = &err[start..];
+        &rest[..rest.find('\n').unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn nvim_verbs_and_eitri_layout_refuse_the_same_actions_with_the_same_words() {
+        use crate::keymap::action::{required_options, OptValue, NAMES};
+        use crate::nvim_verbs::{parse_words, NvimVerb};
+        let mut cases: Vec<(String, Vec<(String, OptValue)>)> = NAMES
+            .iter()
+            .map(|name| (name.to_string(), required_options(name)))
+            .collect();
+        for (name, opts) in [
+            ("module.notes", vec![]),
+            ("module.nope", vec![]),
+            ("zoomm", vec![]),
+            ("resize.left", vec![("cells".to_string(), OptValue::Int(0))]),
+            ("resize.left", vec![("cells".to_string(), OptValue::Int(5))]),
+            ("tab.select", vec![("n".to_string(), OptValue::Int(0))]),
+            (
+                "instance.new",
+                vec![("kind".to_string(), OptValue::Str("agent".into()))],
+            ),
+            (
+                "instance.new",
+                vec![("kind".to_string(), OptValue::Str("editor".into()))],
+            ),
+            (
+                "workspace.switch",
+                vec![("name".to_string(), OptValue::Str("study".into()))],
+            ),
+            ("zoom", vec![("cells".to_string(), OptValue::Int(2))]),
+            ("move.to-window", vec![("follow".to_string(), OptValue::Bool(true))]),
+            ("split.right", vec![("cwd".to_string(), OptValue::Str("pane".into()))]),
+        ] {
+            cases.push((name.to_string(), opts));
+        }
+        let mut refused = 0;
+        for (name, opts) in cases {
+            let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+            let lua_opts: Vec<String> = opts
+                .iter()
+                .map(|(key, value)| match value {
+                    OptValue::Int(i) => format!("{key} = {i}"),
+                    OptValue::Bool(b) => format!("{key} = {b}"),
+                    OptValue::Str(s) => format!("{key} = {s:?}"),
+                    OptValue::Other(_) => unreachable!("no case passes another Lua type"),
+                })
+                .collect();
+            let source = format!("eitri.layout.run({name:?}, {{ {} }})", lua_opts.join(", "));
+            let lua_result = lua.load(&source).exec();
+            let mut words = vec![name.clone()];
+            words.extend(opts.iter().map(|(key, value)| match value {
+                OptValue::Int(i) => format!("{key}={i}"),
+                OptValue::Bool(b) => format!("{key}={b}"),
+                OptValue::Str(s) => format!("{key}={s}"),
+                OptValue::Other(_) => unreachable!(),
+            }));
+            let verb = parse_words(&words, &["notes".to_string()]);
+            match (lua_result, verb) {
+                (Ok(()), Ok(NvimVerb::Request(request))) => {
+                    assert_eq!(store.borrow_mut().take_requests(), [request], "{source}");
+                }
+                (Err(lua_err), Err(verb_err)) => {
+                    refused += 1;
+                    let lua_err = lua_err.to_string();
+                    assert_eq!(
+                        verb_err.strip_prefix(":Eitri ").expect("an :Eitri refusal"),
+                        run_error_words(&lua_err),
+                        "{source}"
+                    );
+                }
+                (lua_result, verb) => panic!("{source}: eitri.layout.run gave {lua_result:?}, :Eitri gave {verb:?}"),
+            }
+        }
+        assert!(
+            refused > 20,
+            "the waits and every non-layout action are refused ({refused})"
+        );
+    }
+
+    #[test]
+    fn run_refusal_refuses_the_waits_and_every_action_that_is_not_layout() {
+        use crate::keymap::action::{parse, required_options, NAMES};
+        for name in NAMES {
+            let action = parse(name, &required_options(name), &[]).unwrap().action;
+            let waits = matches!(
+                action,
+                Action::Split { .. } | Action::SelectNumber | Action::WorkspaceChoose | Action::WorkspaceRename
+            );
+            assert_eq!(
+                run_refusal(name, &action).is_some(),
+                waits || !action.is_layout(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            run_refusal("tab.break", &Action::TabBreak),
+            None,
+            "a tab breaks out as from Lua"
+        );
+        assert_eq!(
+            run_refusal("tab.new", &Action::Tab(crate::keymap::action::TabAction::New)).as_deref(),
+            Some("tab.new is not a layout action")
+        );
     }
 
     #[test]

@@ -34,51 +34,66 @@ pub enum HelpScope {
 /// The two window-level tables of the overlay, "Anywhere in the window" then "After <prefix>", for
 /// `scope`.
 fn help_tables(scope: HelpScope, keymap: &Keymap, module_keys: &ModuleKeys) -> (Vec<HelpRow>, Vec<HelpRow>) {
+    use eitri_core::keymap::root::user_help_rows as user_rows;
     match scope {
-        HelpScope::Window => (eitri_core::keymap::root::help_rows(), keymap.help(module_keys)),
-        HelpScope::Companion => (
-            vec![HelpRow {
+        HelpScope::Window => {
+            let mut root = eitri_core::keymap::root::help_rows();
+            root.extend(user_rows(keymap, |_| true));
+            (root, keymap.help(module_keys))
+        }
+        HelpScope::Companion => {
+            let mut root = vec![HelpRow {
                 keys: "Ctrl+h / Ctrl+l".into(),
                 what: "leave the panel (your window manager moves focus)".into(),
-            }],
-            keymap.help_where(module_keys, |action| {
-                // A move toward the next window is the window manager's, not a module move, so its
-                // row ("move the keys to the module that way") would say what does not happen here.
-                !matches!(action, Action::Select(_))
-                    && !matches!(eitri_core::keymap::companion::classify(action), CompanionVerb::Refuse)
-            }),
-        ),
-        HelpScope::PanelBesideEditor => (
-            vec![HelpRow {
+            }];
+            root.extend(companion_root_rows(
+                keymap,
+                user_rows(keymap, eitri_core::keymap::companion::companion_root_keep),
+            ));
+            (root, keymap.help_where(module_keys, companion_keeps))
+        }
+        HelpScope::PanelBesideEditor => {
+            let mut root = vec![HelpRow {
                 keys: "Ctrl+h".into(),
                 what: "leave the panel for the editor".into(),
-            }],
-            panel_beside_editor_rows(keymap, module_keys),
-        ),
+            }];
+            root.extend(user_rows(keymap, eitri_core::keymap::companion::beside_keep));
+            (root, panel_beside_editor_rows(keymap, module_keys))
+        }
     }
+}
+
+/// A root key that moves the keys toward a neighbour runs here as a move to the next window, which the window manager
+/// makes; the keymap's own wording ("to the module that way") would say what does not happen.
+fn companion_root_rows(keymap: &Keymap, rows: Vec<HelpRow>) -> Vec<HelpRow> {
+    let module_move = Action::Select(Direction::Left).describe(&keymap.prefix().human(), "as after the prefix");
+    rows.into_iter()
+        .map(|row| match row.what.strip_prefix(module_move.as_str()) {
+            Some(rest) => HelpRow {
+                what: format!("Move the keys to the next window that way (your window manager moves focus){rest}"),
+                ..row
+            },
+            None => row,
+        })
+        .collect()
+}
+
+/// The actions a companion window lists: its own tab and panel verbs.
+fn companion_keeps(action: &Action) -> bool {
+    // A move toward the next window is the window manager's, not a module move, so its
+    // row ("move the keys to the module that way") would say what does not happen here.
+    !matches!(action, Action::Select(_))
+        && !matches!(eitri_core::keymap::companion::classify(action), CompanionVerb::Refuse)
 }
 
 /// The prefix rows of the window that holds the editor and the panel side by side.
 fn panel_beside_editor_rows(keymap: &Keymap, module_keys: &ModuleKeys) -> Vec<HelpRow> {
-    let keep = |action: &Action| match action {
-        // The zoom is this window's own (it hides the panel), and `classify` refuses it for the companion
-        // window, which has no panel to hide.
-        Action::Zoom => true,
-        // Here the window itself moves the keys between its two panes, the editor on the left and the panel
-        // on the right; there is nothing above or below either of them.
-        Action::Select(direction) => matches!(direction, Direction::Left | Direction::Right),
-        action => !matches!(
-            eitri_core::keymap::companion::classify(action),
-            // This window has no global HINT: the prefix answers it with a notice, so it is not listed.
-            CompanionVerb::Refuse | CompanionVerb::Hint
-        ),
-    };
     // The keymap's own wording speaks of modules, which this window does not have.
     let prefix = keymap.prefix().human();
     let module_move = Action::Select(Direction::Left).describe(&prefix, "");
     let module_zoom = Action::Zoom.describe(&prefix, "");
     keymap
-        .help_where(module_keys, keep)
+        .help_where(module_keys, eitri_core::keymap::companion::beside_keep)
         .into_iter()
         .map(|row| {
             if let Some(rest) = row.what.strip_prefix(module_move.as_str()) {
@@ -250,5 +265,72 @@ mod tests {
         let (root, prefix) = help_tables(HelpScope::Window, &keymap, &keys);
         assert_eq!(root, eitri_core::keymap::root::help_rows());
         assert_eq!(prefix, keymap.help(&keys));
+    }
+
+    fn with_root_keys() -> Keymap {
+        let root = |key: &str, action: &str| eitri_core::keymap::KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        Keymap::apply_user(&[root("M-y", "tab.next"), root("C-M-t", "zoom")], &[]).unwrap()
+    }
+
+    #[test]
+    fn the_window_scopes_anywhere_rows_end_with_the_root_keys() {
+        let keymap = with_root_keys();
+        let keys = ModuleKeys::built_in();
+        let (root, prefix) = help_tables(HelpScope::Window, &keymap, &keys);
+        let built_in = eitri_core::keymap::root::help_rows();
+        assert_eq!(root.len(), built_in.len() + 2);
+        assert_eq!(&root[..built_in.len()], built_in.as_slice());
+        assert_eq!(root[built_in.len()].keys, "Alt+y");
+        assert!(root[built_in.len()].what.ends_with(" (init.lua)"), "{root:?}");
+        assert_eq!(root[built_in.len() + 1].keys, "Ctrl+Alt+t");
+        assert_eq!(prefix, keymap.help(&keys), "the prefix rows list no root key");
+    }
+
+    #[test]
+    fn the_companion_and_beside_scopes_list_only_the_root_keys_they_run() {
+        let keymap = with_root_keys();
+        let keys = ModuleKeys::built_in();
+        let (root, _) = help_tables(HelpScope::Companion, &keymap, &keys);
+        assert_eq!(root.len(), 2, "{root:?}");
+        assert_eq!(root[1].keys, "Alt+y", "the zoom is not a companion verb: {root:?}");
+        let (root, _) = help_tables(HelpScope::PanelBesideEditor, &keymap, &keys);
+        assert_eq!(root.len(), 3, "this window also has the zoom: {root:?}");
+        assert_eq!(root[2].keys, "Ctrl+Alt+t");
+    }
+
+    /// Each window lists the root keys it runs and no other: a companion window runs a move toward the next window
+    /// (and words it that way); the editor-and-panel window answers HINT with a notice and has nothing above or
+    /// below either pane.
+    #[test]
+    fn a_root_row_follows_what_the_window_runs() {
+        let root = |key: &str, action: &str| eitri_core::keymap::KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        };
+        let keymap = Keymap::apply_user(
+            &[
+                root("M-y", "select.left"),
+                root("M-u", "hint"),
+                root("M-i", "select.up"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let keys = ModuleKeys::built_in();
+        let (companion, _) = help_tables(HelpScope::Companion, &keymap, &keys);
+        let listed: Vec<&str> = companion.iter().skip(1).map(|row| row.keys.as_str()).collect();
+        assert_eq!(listed, ["Alt+y", "Alt+u", "Alt+i"], "{companion:?}");
+        assert!(companion[1].what.contains("window manager"), "{companion:?}");
+        assert!(!companion[1].what.contains("module"), "{companion:?}");
+        let (beside, _) = help_tables(HelpScope::PanelBesideEditor, &keymap, &keys);
+        let listed: Vec<&str> = beside.iter().skip(1).map(|row| row.keys.as_str()).collect();
+        assert_eq!(listed, ["Alt+y"], "no HINT and no move up or down here: {beside:?}");
     }
 }

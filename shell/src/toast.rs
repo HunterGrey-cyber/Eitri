@@ -17,6 +17,11 @@ use gtk4::prelude::*;
 /// How long a one-time notice stays up: it is a sentence read once, not a glance at a count.
 pub(crate) const NOTICE_FOR: Duration = Duration::from_secs(12);
 
+/// How often a waiting notice looks again, and how long it waits at most: a timed line is up for [`TOAST_FOR`] or
+/// [`NOTICE_FOR`], so two of them back to back fit.
+const NOTICE_WAIT_STEP: Duration = Duration::from_millis(500);
+const NOTICE_WAIT_MAX: Duration = Duration::from_secs(30);
+
 pub(crate) struct Toast {
     label: gtk4::Label,
     /// The top bar: the toast goes below it while it is drawn ([`toast_top`]).
@@ -57,6 +62,27 @@ impl Toast {
 
     pub(crate) fn show_for(self: &Rc<Self>, text: &str, duration: Duration) {
         self.show_kind(text, duration, ToastKind::Other);
+    }
+
+    /// A one-time notice that waits for what is up now to hide, so it cannot cut another notice short: checked every
+    /// [`NOTICE_WAIT_STEP`] for at most [`NOTICE_WAIT_MAX`], then shown over whatever is there. A standing note does
+    /// not hold it back (a timed line covers that one and gives it back).
+    pub(crate) fn show_notice_when_free(self: &Rc<Self>, text: String) {
+        self.show_notice_after(text, NOTICE_WAIT_MAX);
+    }
+
+    fn show_notice_after(self: &Rc<Self>, text: String, patience: Duration) {
+        let busy = matches!(self.showing.get(), Some(ToastKind::Other | ToastKind::Attention));
+        if !busy || patience < NOTICE_WAIT_STEP {
+            self.show_for(&text, NOTICE_FOR);
+            return;
+        }
+        let toast = Rc::downgrade(self);
+        glib::timeout_add_local_once(NOTICE_WAIT_STEP, move || {
+            if let Some(toast) = toast.upgrade() {
+                toast.show_notice_after(text, patience - NOTICE_WAIT_STEP);
+            }
+        });
     }
 
     /// A hidden chat's waiting card (`eitri_core::wm::toasts::permission_toast_text`), for its [`TOAST_FOR`]. The

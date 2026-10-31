@@ -11,6 +11,12 @@
 //! runs its module directly, since no binding can have it (the reserved-set check,
 //! `ModuleKeys::build`).
 //!
+//! `init.lua`'s root table (`Keymap::root_lookup`) adds keys that need no prefix: with nothing armed, a root key
+//! runs its action (a split root key waits for its module key like a split after the prefix), and a root key
+//! pressed right after the prefix is sent to the pane with the keys instead, so nvim or a shell can still have
+//! the chord. A host that cannot run some actions says so with `set_root_keep`; a root key whose action it
+//! refuses passes on untouched. The auto-repeat of a held root key is swallowed like any consumed key's.
+//!
 //! Presses arrive already translated (`Press`), and a consumed key is remembered by its hardware
 //! keycode, not its name: an auto-repeat of a held key carries the same keycode however the layout
 //! or modifiers rename it, and a release must find the key it ends. Nothing here knows a toolkit:
@@ -125,6 +131,8 @@ pub enum Waiting {
 
 pub struct Prefix {
     state: State,
+    /// Which actions this host runs for a root key; a root key whose action it refuses is not a root key here.
+    root_keep: Rc<dyn Fn(&Action) -> bool>,
     /// The hardware keycode of the last key this machine consumed, until it is released. Its
     /// auto-repeat is not a new key: holding the prefix must not turn into `prefix prefix`.
     held: Option<u32>,
@@ -136,10 +144,16 @@ impl Prefix {
     pub fn new(keymap: Rc<Keymap>, module_keys: Rc<ModuleKeys>) -> Self {
         Prefix {
             state: State::Idle,
+            root_keep: Rc::new(|_| true),
             held: None,
             keymap,
             module_keys,
         }
+    }
+
+    /// Limits root keys to the actions `keep` accepts (a companion window has no layout to run most of them on).
+    pub fn set_root_keep(&mut self, keep: Rc<dyn Fn(&Action) -> bool>) {
+        self.root_keep = keep;
     }
 
     pub fn is_armed(&self) -> bool {
@@ -218,6 +232,30 @@ impl Prefix {
             .map(|b| b.action.clone())
     }
 
+    /// The action of the root key `press` is, when this host keeps it.
+    fn root_action(&self, press: Press) -> Option<Action> {
+        let Press::Key(key) = press else { return None };
+        self.keymap
+            .root_lookup(&key)
+            .filter(|b| (self.root_keep)(&b.action))
+            .map(|b| b.action.clone())
+    }
+
+    /// A root key pressed with nothing armed: consumed, and run (a split waits for its module key first).
+    fn run_root(&mut self, action: Action, keycode: u32) -> Outcome {
+        self.held = Some(keycode);
+        match action {
+            Action::Split { axis, cwd } => {
+                self.state = State::AwaitModule { axis, cwd };
+                Outcome::Swallow
+            }
+            action => {
+                self.state = State::Idle;
+                Outcome::Run(PrefixCommand::Run(action))
+            }
+        }
+    }
+
     pub fn press(&mut self, press: Press, keycode: u32, now: Instant) -> Outcome {
         if let State::Repeat { until } | State::AwaitNumber { until } = self.state {
             if now > until {
@@ -281,7 +319,10 @@ impl Prefix {
                     self.held = Some(keycode);
                     return Outcome::Swallow;
                 }
-                Outcome::Pass
+                match self.root_action(press) {
+                    Some(action) => self.run_root(action, keycode),
+                    None => Outcome::Pass,
+                }
             }
             State::Armed => {
                 if press == Press::Modifier {
@@ -311,6 +352,10 @@ impl Prefix {
                             Outcome::Run(PrefixCommand::Run(action.clone()))
                         }
                     },
+                    // A root key is what the prefix is for sending: the pane with the keys gets the chord itself.
+                    None if self.root_action(press).is_some() => {
+                        Outcome::Run(PrefixCommand::Run(Action::SendKeys(key)))
+                    }
                     None => match key.as_char().and_then(|c| self.module_keys.module(c)) {
                         Some(id) if id.kind() == ModuleKind::LuaWebview => {
                             Outcome::Run(PrefixCommand::Run(Action::Module(id.clone())))
@@ -357,9 +402,12 @@ impl Prefix {
                     };
                     return Outcome::Run(PrefixCommand::Run(action));
                 }
-                // Not repeatable: repeat mode ends and the key goes to the pane as usual (tmux).
+                // Not repeatable: repeat mode ends. A root key runs; any other key goes to the pane as usual (tmux).
                 self.state = State::Idle;
-                Outcome::Pass
+                match self.root_action(press) {
+                    Some(action) => self.run_root(action, keycode),
+                    None => Outcome::Pass,
+                }
             }
         }
     }
@@ -368,7 +416,7 @@ impl Prefix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keymap::{KeymapOp, SwapTarget, TextChange};
+    use crate::keymap::{KeymapOp, SwapTarget, TabAction, TextChange};
     use crate::layout::Direction;
 
     // Arbitrary, distinct hardware keycodes: a real keyboard never reuses one for two keys.
@@ -915,5 +963,136 @@ mod tests {
                 })
             );
         }
+    }
+
+    fn root_op(key: &str, action: &str) -> KeymapOp {
+        KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        }
+    }
+    fn with_root(ops: &[KeymapOp]) -> Prefix {
+        with(Keymap::apply_user(ops, &[]).unwrap(), &[])
+    }
+
+    #[test]
+    fn a_root_key_runs_with_nothing_armed_and_the_prefix_still_arms() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("M-y", "tab.next")]);
+        assert_eq!(p.press(key("M-y"), K1, t), run(Action::Tab(TabAction::Next)));
+        assert!(!p.is_armed());
+        p.release(K1);
+        assert_eq!(p.press(key("C-b"), PREFIX, t), Outcome::Swallow);
+        assert_eq!(p.waiting(), Waiting::Command);
+        p.release(PREFIX);
+        assert_eq!(
+            p.press(key("g"), K2, t),
+            Outcome::Swallow,
+            "an unbound key after the prefix"
+        );
+        p.release(K2);
+        assert_eq!(
+            p.press(key("M-u"), K2, t),
+            Outcome::Pass,
+            "an unbound key with nothing armed"
+        );
+        assert_eq!(p.press(key("y"), K2, t), Outcome::Pass);
+    }
+
+    /// A held `M-t` bound to `module.terminal` must open one terminal, however long it is held.
+    #[test]
+    fn a_held_root_keys_auto_repeat_is_swallowed_until_its_release() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("M-t", "module.terminal")]);
+        let action = run(Action::Module(ModuleId::terminal()));
+        assert_eq!(p.press(key("M-t"), K1, t), action);
+        for _ in 0..5 {
+            assert_eq!(p.press(key("M-t"), K1, t), Outcome::Swallow);
+        }
+        assert!(p.holds(K1));
+        p.release(K1);
+        assert_eq!(p.press(key("M-t"), K1, t), action, "the next press runs again");
+    }
+
+    #[test]
+    fn a_root_split_key_waits_for_the_module_key_like_a_split_after_the_prefix() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("M-y", "split.right")]);
+        assert_eq!(p.press(key("M-y"), K1, t), Outcome::Swallow);
+        assert_eq!(p.waiting(), Waiting::Module(Axis::Row));
+        p.release(K1);
+        assert_eq!(
+            p.press(key("t"), K2, t),
+            Outcome::Run(PrefixCommand::Place {
+                module: ModuleId::terminal(),
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Start,
+            })
+        );
+        assert!(!p.is_armed());
+    }
+
+    #[test]
+    fn a_root_key_during_repeat_mode_ends_it_and_runs() {
+        let t0 = Instant::now();
+        let mut p = armed(with_root(&[root_op("M-y", "tab.next")]), t0);
+        assert_eq!(
+            p.press(key("C-Up"), K1, t0),
+            run(Action::Resize {
+                dir: Direction::Up,
+                cells: 1
+            })
+        );
+        p.release(K1);
+        let t1 = t0 + Duration::from_millis(100);
+        assert_eq!(p.press(key("M-y"), K2, t1), run(Action::Tab(TabAction::Next)));
+        p.release(K2);
+        assert_eq!(
+            p.press(key("C-Up"), K1, t1 + Duration::from_millis(50)),
+            Outcome::Pass,
+            "repeat mode ended with the root key"
+        );
+    }
+
+    /// A root key that moved the keys to another window never gets its release in this one.
+    #[test]
+    fn a_root_key_held_when_focus_is_lost_does_not_swallow_its_next_press() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("M-y", "tab.next")]);
+        let action = run(Action::Tab(TabAction::Next));
+        assert_eq!(p.press(key("M-y"), K1, t), action);
+        p.cancel();
+        assert_eq!(p.press(key("M-y"), K1, t), action);
+    }
+
+    #[test]
+    fn a_root_key_the_host_refuses_passes_on_untouched() {
+        let t = Instant::now();
+        let mut p = with_root(&[root_op("M-y", "zoom"), root_op("M-u", "tab.next")]);
+        p.set_root_keep(Rc::new(|action| !matches!(action, Action::Zoom)));
+        assert_eq!(p.press(key("M-y"), K1, t), Outcome::Pass);
+        assert!(!p.holds(K1), "a passed key is not remembered");
+        assert_eq!(p.press(key("M-u"), K2, t), run(Action::Tab(TabAction::Next)));
+        // Armed, a refused root key is no root key either.
+        let mut p = armed(with_root(&[root_op("M-y", "zoom")]), t);
+        p.set_root_keep(Rc::new(|_| false));
+        assert_eq!(p.press(key("M-y"), K1, t), Outcome::Swallow);
+    }
+
+    #[test]
+    fn a_root_key_after_the_prefix_is_sent_through_and_a_prefix_key_keeps_its_binding() {
+        let t = Instant::now();
+        let mut p = armed(with_root(&[root_op("M-y", "tab.next")]), t);
+        assert_eq!(
+            p.press(key("M-y"), K1, t),
+            run(Action::SendKeys(KeySpec::parse("M-y").unwrap()))
+        );
+        assert!(!p.is_armed());
+        let mut p = armed(with_root(&[root_op("M-y", "tab.next")]), t);
+        assert_eq!(p.press(key("n"), K1, t), run(Action::Tab(TabAction::Next)));
+        let mut p = armed(with_root(&[root_op("M-y", "tab.next")]), t);
+        assert_eq!(p.press(key("g"), K1, t), Outcome::Swallow, "an unbound, non-root key");
     }
 }

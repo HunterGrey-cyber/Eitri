@@ -323,6 +323,11 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
+    /// The generation of the first-start screen the window shows, `None` while none is up.
+    pub fn onboarding_generation(&self, win: WinId) -> Option<u64> {
+        self.query(|controller| controller.onboarding_generation(win))
+    }
+
     /// Seeds the window's text size before the shell installs its reporting hooks.
     pub fn set_text_size(&self, win: WinId, base: f32, reported_s: f32) {
         self.decide.borrow_mut().set_text_size(win, base, reported_s);
@@ -331,6 +336,18 @@ impl Driver<Controller> {
     /// The window's first layout batch over the hosts the shell placed ([`Controller::first_apply`]).
     pub fn first_apply(&self, win: WinId, hosted: Vec<super::module::SurfaceDecl>) {
         let batch = self.decide.borrow_mut().first_apply(win, &hosted);
+        self.submit(batch);
+    }
+
+    /// One request from `:Eitri` in the window's nvim ([`Controller::nvim_request`]).
+    pub fn nvim_request(&self, win: WinId, request: crate::lua::layout::LayoutRequest) {
+        let batch = self.decide.borrow_mut().nvim_request(win, request);
+        self.submit(batch);
+    }
+
+    /// An `:Eitri` line the parser refused ([`Controller::nvim_refused`]).
+    pub fn nvim_refused(&self, win: WinId, why: &str) {
+        let batch = self.decide.borrow_mut().nvim_refused(win, why);
         self.submit(batch);
     }
 
@@ -385,6 +402,11 @@ impl Driver<Controller> {
         drop(controller);
         self.submit(batch);
         answer
+    }
+
+    /// How long `win`'s prefix waits before the hint panel shows ([`Controller::set_hint_delay`]).
+    pub fn set_hint_delay(&self, win: WinId, delay: Option<std::time::Duration>) {
+        self.decide.borrow_mut().set_hint_delay(win, delay);
     }
 
     /// What `win`'s module verbs place and kill by ([`Controller::set_module_setup`]).

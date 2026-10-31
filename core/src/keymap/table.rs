@@ -1,7 +1,8 @@
 //! The prefix table: the defaults (stock tmux), what `init.lua`'s `eitri.keymap` calls
-//! make of it (`apply_user`), and the collision rules that are hard startup failures naming both
-//! sides (`set` on a bound key; the prefix equals a root chord; a Lua command's `keybinding` equals
-//! the prefix or a root chord). The fourth, a Lua panel's key, is
+//! make of it (`apply_user`), the user's `"root"` table of keys that need no prefix, and the collision rules
+//! that are hard startup failures naming both sides (`set` on a bound key; the prefix equals a root chord; a
+//! root key equals the prefix, a built-in root chord or a prefix-table key; a Lua command's `keybinding` equals
+//! the prefix or a root chord). A Lua panel's key is
 //! `crate::layout::keys`'s, since it is checked where panel keys are built.
 
 use std::collections::BTreeMap;
@@ -14,6 +15,9 @@ use super::root::{self, HelpRow};
 use crate::layout::{Axis, Direction, ModuleId, ModuleKeys, ModuleKind};
 use crate::plugin::keys::{self as plugin_keys, PluginKeyOp};
 use crate::plugin::manifest::id_ok;
+
+/// How the sheet says `window.setup` is reached while no key is bound to it.
+const SETUP_COMMAND: &str = ":Eitri setup";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -55,6 +59,11 @@ pub struct Keymap {
     /// The keys the tmux import unbound and left unbound: `init.lua`'s `del` of one is not an
     /// error, since the user's own snippet may delete what their tmux config already deleted.
     removed_by_import: Vec<KeySpec>,
+    /// `init.lua`'s `"root"` table: keys that run an action with no prefix. Always `Source::User`, never repeatable,
+    /// and empty until `init.lua` binds one.
+    root: Vec<Binding>,
+    /// What the tmux import had set that a root key took over, one sentence each, for the launch log.
+    dropped_for_root: Vec<String>,
 }
 
 /// One `eitri.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
@@ -108,6 +117,8 @@ pub enum KeymapError {
     },
     AlreadyBound {
         call: String,
+        /// The table the key is in, for the `del` hint.
+        table: &'static str,
         key: KeySpec,
         bound_to: String,
         source: Source,
@@ -122,6 +133,26 @@ pub enum KeymapError {
     PrefixIsRoot {
         call: String,
         root: String,
+    },
+    /// A root key that holds neither Ctrl nor Alt.
+    RootNotAChord {
+        call: String,
+    },
+    /// A root key given an action only a prefix key may run (`send-prefix`, `send-keys`).
+    RootAction {
+        call: String,
+        action: String,
+    },
+    /// A root key given the `repeatable` option.
+    RootRepeatable {
+        call: String,
+    },
+    /// A root key that is something else already: the prefix, a built-in root chord, or a prefix-table binding.
+    /// `what` finishes the sentence "<key> is ...".
+    RootCollides {
+        call: String,
+        key: KeySpec,
+        what: String,
     },
     CommandKeybinding {
         command: String,
@@ -149,13 +180,14 @@ impl fmt::Display for KeymapError {
             KeymapError::UnknownTable { call, table } => {
                 write!(
                     f,
-                    "{call}: {table:?} is not a table (there are \"prefix\", \"panel\" and \"plugin:<id>\")"
+                    "{call}: {table:?} is not a table (there are \"prefix\", \"root\", \"panel\" and \"plugin:<id>\")"
                 )
             }
             KeymapError::BadKey { call, error } => write!(f, "{call}: {error}"),
             KeymapError::Action { call, error } => write!(f, "{call}: {error}"),
             KeymapError::AlreadyBound {
                 call,
+                table,
                 key,
                 bound_to,
                 source,
@@ -163,7 +195,7 @@ impl fmt::Display for KeymapError {
                 let key = key.to_string();
                 write!(
                     f,
-                    "{call}: {key:?} is already bound to {bound_to} ({source}); eitri.keymap.del(\"prefix\", {key:?}) first"
+                    "{call}: {key:?} is already bound to {bound_to} ({source}); eitri.keymap.del({table:?}, {key:?}) first"
                 )
             }
             KeymapError::NotBound { call, key } => {
@@ -183,6 +215,18 @@ impl fmt::Display for KeymapError {
                     "{call}: that chord is already a root key, {root}; choose another prefix"
                 )
             }
+            KeymapError::RootNotAChord { call } => write!(
+                f,
+                "{call}: a root key must hold Ctrl or Alt (C- or M-), or it would take that key from every module"
+            ),
+            KeymapError::RootAction { call, action } => write!(
+                f,
+                "{call}: {action} is a prefix key's action; a root key cannot run it (<prefix> <key> sends a key through)"
+            ),
+            KeymapError::RootRepeatable { call } => {
+                write!(f, "{call}: a root key repeats by being pressed again, so it takes no `repeatable`")
+            }
+            KeymapError::RootCollides { call, key, what } => write!(f, "{call}: {key} is {what}"),
             KeymapError::CommandKeybinding {
                 command,
                 keybinding,
@@ -203,10 +247,9 @@ fn parse_key(op: &KeymapOp, text: &str) -> Result<KeySpec, KeymapError> {
     KeySpec::parse(text).map_err(|error| KeymapError::BadKey { call: op.call(), error })
 }
 
-/// The prefix table's check: `"prefix"` (this file) passes. `"panel"` (`PanelUserTable::set`/`del`)
-/// and `plugin:<id>` (`plugin_table`) are handled in the `Set`/`Del` arms below before this is
-/// called, since their key/action types differ from the prefix table's. Anything else is
-/// `UnknownTable`.
+/// The `"prefix"` table. `"root"`, `"panel"` (`PanelUserTable::set`/`del`, whose key and action types differ from
+/// the prefix table's) and `plugin:<id>` are answered by the `Set`/`Del` arms below before this is asked; anything
+/// else is `UnknownTable`.
 fn prefix_table(op: &KeymapOp, table: &str) -> Result<(), KeymapError> {
     if table == "prefix" {
         Ok(())
@@ -487,12 +530,12 @@ impl Keymap {
                             "a prefix must be a chord (C- or M-) or a function key, or it would eat that key \
                              everywhere; {keeps}"
                         ));
-                    } else if let Some((_, named)) = root::chords().into_iter().find(|(c, _)| *c == chord) {
+                    } else if let Some((_, named)) = root::pressed_chords().into_iter().find(|(c, _)| *c == chord) {
                         skip(format!("the prefix would be a root key, {named}; {keeps}"));
                     } else if let Some((id, _)) = claims
                         .command_keybindings
                         .iter()
-                        .find(|(_, accel)| Chord::from_accel(accel).is_ok_and(|c| c == chord))
+                        .find(|(_, accel)| Chord::from_accel(accel).is_ok_and(|c| c.folded() == chord.folded()))
                     {
                         skip(format!("taken by init.lua: command {id}'s keybinding; {keeps}"));
                     } else {
@@ -578,6 +621,15 @@ impl Keymap {
             (Keymap::defaults(), None)
         };
         let map = base.then_user(ops, lua_panels).map_err(|e| e.to_string())?;
+        // What a root key took over is no longer what the import set, so the import (and the notice made from it)
+        // does not claim it.
+        let import = import.map(|mut import| {
+            if import.prefix.is_some_and(|p| *map.prefix() != p) {
+                import.prefix = None;
+            }
+            import.bindings.retain(|b| map.root_lookup(&b.key).is_none());
+            import
+        });
         Ok((map, import))
     }
 
@@ -589,6 +641,8 @@ impl Keymap {
             panel_user: PanelUserTable::default(),
             plugin_user: BTreeMap::new(),
             removed_by_import: Vec::new(),
+            root: Vec::new(),
+            dropped_for_root: Vec::new(),
         }
     }
 
@@ -604,6 +658,8 @@ impl Keymap {
     pub fn then_user(self, ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
         let mut map = self;
         let mut prefix_call = None;
+        // The call that bound each root key, for the collision messages.
+        let mut root_calls: Vec<(KeySpec, String)> = Vec::new();
         // A plugin key is checked against the prefix only once every call has run, since a later
         // `prefix` call moves it.
         let mut plugin_sets: Vec<(&KeymapOp, &str)> = Vec::new();
@@ -647,6 +703,38 @@ impl Keymap {
                         map.panel_user
                             .set(key, action)
                             .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
+                    } else if table == "root" {
+                        let spec = parse_key(op, key)?;
+                        if !(spec.ctrl || spec.meta) {
+                            return Err(KeymapError::RootNotAChord { call: op.call() });
+                        }
+                        let parsed = action::parse(action, opts, lua_panels)
+                            .map_err(|error| KeymapError::Action { call: op.call(), error })?;
+                        if matches!(parsed.action, Action::SendPrefix | Action::SendKeys(_)) {
+                            return Err(KeymapError::RootAction {
+                                call: op.call(),
+                                action: parsed.action.name(),
+                            });
+                        }
+                        if parsed.repeatable {
+                            return Err(KeymapError::RootRepeatable { call: op.call() });
+                        }
+                        if let Some(existing) = map.root.iter().find(|b| b.key == spec) {
+                            return Err(KeymapError::AlreadyBound {
+                                call: op.call(),
+                                table: "root",
+                                key: spec,
+                                bound_to: existing.action.name(),
+                                source: existing.source,
+                            });
+                        }
+                        map.root.push(Binding {
+                            key: spec,
+                            action: parsed.action,
+                            repeatable: false,
+                            source: Source::User,
+                        });
+                        root_calls.push((spec, op.call()));
                     } else {
                         prefix_table(op, table)?;
                         let spec = parse_key(op, key)?;
@@ -664,6 +752,7 @@ impl Keymap {
                                 let existing = &map.bindings[at];
                                 return Err(KeymapError::AlreadyBound {
                                     call: op.call(),
+                                    table: "prefix",
                                     key: spec,
                                     bound_to: existing.action.name(),
                                     source: existing.source,
@@ -684,6 +773,20 @@ impl Keymap {
                         map.panel_user
                             .del(key)
                             .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
+                    } else if table == "root" {
+                        let spec = parse_key(op, key)?;
+                        match map.root.iter().position(|b| b.key == spec) {
+                            Some(at) => {
+                                map.root.remove(at);
+                                root_calls.retain(|(k, _)| *k != spec);
+                            }
+                            None => {
+                                return Err(KeymapError::NotBound {
+                                    call: op.call(),
+                                    key: spec,
+                                })
+                            }
+                        }
                     } else {
                         prefix_table(op, table)?;
                         let spec = parse_key(op, key)?;
@@ -703,8 +806,9 @@ impl Keymap {
                 }
             }
         }
+        map.settle_root(prefix_call.is_some(), &root_calls)?;
         let chord = Chord::of(&map.prefix);
-        if let Some((_, named)) = root::chords().into_iter().find(|(c, _)| *c == chord) {
+        if let Some((_, named)) = root::pressed_chords().into_iter().find(|(c, _)| *c == chord) {
             return Err(KeymapError::PrefixIsRoot {
                 call: prefix_call.unwrap_or_else(|| format!("the prefix {}", map.prefix)),
                 root: named,
@@ -716,8 +820,92 @@ impl Keymap {
         Ok(map)
     }
 
+    /// Checks every root key against what else the key could be, once every op has run (a later op can
+    /// create the collision), in the order prefix, built-in root chord, prefix table, so the first message is the
+    /// most basic one. What the tmux import set -- a prefix, a prefix-table binding -- gives way to a root key and
+    /// is recorded in `dropped_for_root`; what `init.lua` set is an error naming both sides.
+    fn settle_root(&mut self, prefix_set_by_init_lua: bool, calls: &[(KeySpec, String)]) -> Result<(), KeymapError> {
+        if self.root.is_empty() {
+            return Ok(());
+        }
+        let stock = KeySpec::parse(super::stock::STOCK_PREFIX).expect("the stock prefix parses");
+        if !prefix_set_by_init_lua
+            && self.prefix != stock
+            && self.root.iter().any(|b| Chord::of(&b.key) == Chord::of(&self.prefix))
+        {
+            self.dropped_for_root.push(format!(
+                "the prefix {} from your tmux config is also a root key set in init.lua, so the prefix stays {}",
+                self.prefix.human(),
+                stock.human()
+            ));
+            self.prefix = stock;
+        }
+        let prefix_chord = Chord::of(&self.prefix);
+        let builtin = root::pressed_chords();
+        let mut dropped = Vec::new();
+        for binding in &self.root {
+            let key = binding.key;
+            let call = calls
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, call)| call.clone())
+                .unwrap_or_else(|| format!("the root key {key}"));
+            let collides = |what: String| KeymapError::RootCollides {
+                call: call.clone(),
+                key,
+                what,
+            };
+            let chord = Chord::of(&key);
+            if chord == prefix_chord {
+                return Err(collides(
+                    "the prefix; choose another root key, or another prefix with eitri.keymap.prefix".to_string(),
+                ));
+            }
+            if let Some((_, named)) = builtin.iter().find(|(c, _)| *c == chord) {
+                return Err(collides(format!("{named}, which Eitri keeps")));
+            }
+            if let Some(at) = self.bindings.iter().position(|b| b.key == key) {
+                let existing = &self.bindings[at];
+                if existing.source == Source::Tmux {
+                    dropped.push(at);
+                    self.dropped_for_root.push(format!(
+                        "{} after the prefix ({}) from your tmux config is also a root key set in init.lua, so it was left out of the prefix table",
+                        key.human(),
+                        existing.action.name()
+                    ));
+                } else {
+                    return Err(collides(format!(
+                        "also {} after the prefix ({}); eitri.keymap.del(\"prefix\", \"{key}\") first, so that {} {key} can send {key} itself",
+                        existing.action.name(),
+                        existing.source,
+                        self.prefix
+                    )));
+                }
+            }
+        }
+        dropped.sort_unstable_by(|a, b| b.cmp(a));
+        for at in dropped {
+            self.bindings.remove(at);
+        }
+        Ok(())
+    }
+
     pub fn prefix(&self) -> &KeySpec {
         &self.prefix
+    }
+
+    /// `init.lua`'s root keys: bound with no prefix. Empty unless `init.lua` set some.
+    pub fn root_bindings(&self) -> &[Binding] {
+        &self.root
+    }
+
+    pub fn root_lookup(&self, key: &KeySpec) -> Option<&Binding> {
+        self.root.iter().find(|b| b.key == *key)
+    }
+
+    /// What the tmux import set that a root key took over, one sentence each.
+    pub fn dropped_for_root(&self) -> &[String] {
+        &self.dropped_for_root
     }
 
     pub fn lookup(&self, key: &KeySpec) -> Option<&Binding> {
@@ -787,12 +975,23 @@ impl Keymap {
                 ));
             }
         }
-        rows.into_iter()
+        let mut sheet: Vec<HelpRow> = rows
+            .into_iter()
             .map(|(keys, what)| HelpRow {
                 keys: format!("{prefix} {}", keys.join(" / ")),
                 what,
             })
-            .collect()
+            .collect();
+        // No default key, and the one way back to a screen that was dismissed: the row says how it is reached until
+        // a key is bound to it.
+        let setup = Action::WindowSetup;
+        if keep(&setup) && !self.bindings.iter().any(|b| b.action == setup) {
+            sheet.push(HelpRow {
+                keys: SETUP_COMMAND.to_string(),
+                what: setup.describe(&prefix, &module_keys),
+            });
+        }
+        sheet
     }
 
     /// The verbs the top bar's strip lists after the module keys: the keys bound to
@@ -828,13 +1027,23 @@ impl Keymap {
 /// or a root chord would never fire (the prefix and the root controllers see the key first). An
 /// accelerator `Chord` cannot read uses a modifier Eitri never binds, so it cannot collide.
 pub fn check_command_keybinding(command: &str, keybinding: &str, keymap: &Keymap) -> Result<(), KeymapError> {
-    let Ok(chord) = Chord::from_accel(keybinding) else {
+    let Ok(chord) = Chord::from_accel(keybinding).map(|chord| chord.folded()) else {
         return Ok(());
     };
-    let hits = if chord == Chord::of(keymap.prefix()) {
+    let hits = if chord == Chord::of(keymap.prefix()).folded() {
         Some(format!("the prefix, {} (eitri.keymap)", keymap.prefix().human()))
+    } else if let Some(binding) = keymap
+        .root_bindings()
+        .iter()
+        .find(|b| Chord::of(&b.key).folded() == chord)
+    {
+        Some(format!(
+            "a root key, {} ({}, eitri.keymap)",
+            binding.key.human(),
+            binding.action.name()
+        ))
     } else {
-        root::chords()
+        root::pressed_chords()
             .into_iter()
             .find(|(c, _)| *c == chord)
             .map(|(_, named)| named)
@@ -1006,11 +1215,34 @@ mod tests {
     }
 
     #[test]
+    fn the_sheet_says_how_window_setup_is_reached_until_a_key_is_bound() {
+        let keys = ModuleKeys::built_in();
+        let map = Keymap::defaults();
+        let rows = map.help(&keys);
+        let row = rows
+            .iter()
+            .find(|r| r.keys == ":Eitri setup")
+            .expect("the sheet lists window.setup with no key");
+        assert_eq!(row.what, Action::WindowSetup.describe("Ctrl+b", ""));
+        assert!(
+            map.help_where(&keys, |action| *action != Action::WindowSetup)
+                .iter()
+                .all(|r| r.keys != ":Eitri setup"),
+            "a window that does not run it does not list it"
+        );
+        let bound = Keymap::apply_user(&[set("F5", "window.setup")], &[]).unwrap();
+        let rows = bound.help(&keys);
+        assert!(rows.iter().all(|r| r.keys != ":Eitri setup"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.keys == "Ctrl+b F5"), "{rows:?}");
+    }
+
+    #[test]
     fn the_window_verbs_have_no_default_key() {
         let map = Keymap::defaults();
         for action in [
             Action::WindowNew,
             Action::WindowOther,
+            Action::WindowSetup,
             Action::MoveToWindow {
                 module: None,
                 follow: false,
@@ -1322,7 +1554,8 @@ mod tests {
             find("Ctrl+b { / }").what,
             "Swap this module with the previous / next one on screen"
         );
-        let listed: usize = rows.iter().map(|r| r.keys.split(" / ").count()).sum();
+        let keyed = rows.iter().filter(|r| r.keys != SETUP_COMMAND);
+        let listed: usize = keyed.map(|r| r.keys.split(" / ").count()).sum();
         assert_eq!(
             listed,
             Keymap::defaults().bindings().len(),
@@ -1634,5 +1867,203 @@ mod tests {
             assert_eq!(binding.action, action, "{key}");
             assert_eq!(binding.repeatable, repeatable, "{key}");
         }
+    }
+
+    fn root_set(key: &str, action: &str) -> KeymapOp {
+        KeymapOp::Set {
+            table: "root".into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        }
+    }
+    fn root_del(key: &str) -> KeymapOp {
+        KeymapOp::Del {
+            table: "root".into(),
+            key: key.into(),
+        }
+    }
+    fn root_err(ops: &[KeymapOp]) -> KeymapError {
+        Keymap::apply_user(ops, &[]).unwrap_err()
+    }
+
+    #[test]
+    fn the_defaults_have_no_root_keys() {
+        let map = Keymap::defaults();
+        assert!(map.root_bindings().is_empty());
+        assert!(map.dropped_for_root().is_empty());
+        assert!(Keymap::apply_user(&[set("g", "zoom")], &[])
+            .unwrap()
+            .root_bindings()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_root_key_is_set_looked_up_and_deleted() {
+        let map = Keymap::apply_user(&[root_set("M-y", "tab.next")], &[]).unwrap();
+        let binding = map.root_lookup(&k("M-y")).expect("bound");
+        assert_eq!(binding.action, Action::Tab(TabAction::Next));
+        assert_eq!(binding.source, Source::User);
+        assert!(!binding.repeatable);
+        assert_eq!(map.root_bindings().len(), 1);
+        assert!(map.lookup(&k("M-y")).is_none(), "the prefix table is untouched");
+        let map = Keymap::apply_user(&[root_set("M-y", "tab.next"), root_del("M-y")], &[]).unwrap();
+        assert!(map.root_bindings().is_empty());
+        let err = root_err(&[root_del("M-y")]);
+        assert!(matches!(err, KeymapError::NotBound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_root_key_must_hold_ctrl_or_alt() {
+        for key in ["a", "F5", "S-Up", "Space", "Up", "%"] {
+            let err = root_err(&[root_set(key, "tab.next")]);
+            assert!(matches!(err, KeymapError::RootNotAChord { .. }), "{key}: {err:?}");
+            assert!(err.to_string().contains("must hold Ctrl or Alt"), "{err}");
+        }
+        for key in ["C-y", "M-h", "C-M-t", "M-S-Up", "C-F5"] {
+            assert!(Keymap::apply_user(&[root_set(key, "tab.next")], &[]).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_root_key_takes_no_prefix_only_action_and_no_repeat() {
+        for action in ["send-prefix", "send-keys keys=C-l"] {
+            let (name, opts) = match action.split_once(' ') {
+                Some((name, _)) => (name, vec![("keys".to_string(), OptValue::Str("C-l".into()))]),
+                None => (action, vec![]),
+            };
+            let op = KeymapOp::Set {
+                table: "root".into(),
+                key: "M-y".into(),
+                action: name.into(),
+                opts,
+            };
+            let err = root_err(&[op]);
+            assert!(matches!(err, KeymapError::RootAction { .. }), "{action}: {err:?}");
+            assert!(err.to_string().contains("is a prefix key's action"), "{err}");
+        }
+        let op = KeymapOp::Set {
+            table: "root".into(),
+            key: "M-y".into(),
+            action: "tab.next".into(),
+            opts: vec![("repeatable".into(), OptValue::Bool(true))],
+        };
+        let err = root_err(&[op]);
+        assert!(matches!(err, KeymapError::RootRepeatable { .. }), "{err:?}");
+        assert!(err.to_string().contains("repeats by being pressed again"), "{err}");
+        let split = Keymap::apply_user(&[root_set("M-y", "split.right")], &[]).unwrap();
+        assert!(matches!(
+            split.root_lookup(&k("M-y")).unwrap().action,
+            Action::Split { .. }
+        ));
+    }
+
+    #[test]
+    fn a_root_key_that_is_the_prefix_or_a_built_in_root_chord_is_refused_naming_both() {
+        let err = root_err(&[root_set("C-b", "tab.next")]);
+        assert!(matches!(err, KeymapError::RootCollides { .. }), "{err:?}");
+        assert!(err.to_string().contains("the prefix"), "{err}");
+        let err = root_err(&[prefix("M-y"), root_set("M-y", "tab.next")]);
+        assert!(err.to_string().contains("the prefix"), "{err}");
+        for (key, named) in [("C-h", "Ctrl+h"), ("C-=", "Ctrl+=")] {
+            let err = root_err(&[root_set(key, "tab.next")]);
+            assert!(matches!(err, KeymapError::RootCollides { .. }), "{key}: {err:?}");
+            assert!(err.to_string().contains(named), "{key}: {err}");
+            assert!(err.to_string().contains("Eitri keeps"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_root_key_in_the_prefix_table_is_refused_with_the_del_hint_until_that_is_deleted() {
+        for (key, shown) in [
+            ("M-w", "container.tabbed after the prefix (default)"),
+            ("C-o", "rotate.up after the prefix (default)"),
+        ] {
+            let err = root_err(&[root_set(key, "tab.next")]);
+            assert!(matches!(err, KeymapError::RootCollides { .. }), "{key}: {err:?}");
+            let text = err.to_string();
+            assert!(text.contains(shown), "{text}");
+            assert!(
+                text.contains(&format!("eitri.keymap.del(\"prefix\", \"{key}\")")),
+                "{text}"
+            );
+        }
+        let map = Keymap::apply_user(&[root_set("M-w", "tab.next"), del("M-w")], &[]).unwrap();
+        assert!(map.lookup(&k("M-w")).is_none());
+        assert!(map.root_lookup(&k("M-w")).is_some());
+        // A key the user bound in the prefix table after the root key is the same collision.
+        let err = root_err(&[root_set("M-z", "tab.next"), set("M-z", "zoom")]);
+        assert!(matches!(err, KeymapError::RootCollides { .. }), "{err:?}");
+        assert!(err.to_string().contains("set earlier in init.lua"), "{err}");
+    }
+
+    #[test]
+    fn a_root_key_set_twice_is_already_bound_with_the_root_del_hint() {
+        let err = root_err(&[root_set("M-y", "tab.next"), root_set("M-y", "tab.prev")]);
+        assert!(matches!(err, KeymapError::AlreadyBound { .. }), "{err:?}");
+        assert!(err.to_string().contains("eitri.keymap.del(\"root\", \"M-y\")"), "{err}");
+        // The prefix table's wording is unchanged.
+        let err = root_err(&[set("M-w", "zoom")]);
+        assert!(
+            err.to_string().contains("eitri.keymap.del(\"prefix\", \"M-w\")"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_unknown_table_message_names_the_root_table() {
+        let err = root_err(&[KeymapOp::Set {
+            table: "global".into(),
+            key: "M-y".into(),
+            action: "tab.next".into(),
+            opts: vec![],
+        }]);
+        assert!(err.to_string().contains("\"root\""), "{err}");
+    }
+
+    #[test]
+    fn a_lua_command_keybinding_on_a_root_key_is_refused() {
+        let map = Keymap::apply_user(&[root_set("M-h", "tab.next")], &[]).unwrap();
+        let err = check_command_keybinding("cmd", "<Alt>h", &map).unwrap_err();
+        assert!(matches!(err, KeymapError::CommandKeybinding { .. }), "{err:?}");
+        assert!(err.to_string().contains("root key"), "{err}");
+        assert!(check_command_keybinding("cmd", "<Alt>j", &map).is_ok());
+    }
+
+    /// A key press and an accelerator spell one chord two ways: `Alt+Shift+y` is the character `Y` with no Shift, and
+    /// the keypad's plus is the character `+`; a collision check that compares the spellings as written misses both.
+    #[test]
+    fn a_root_key_or_prefix_collides_with_a_chord_however_the_press_spells_it() {
+        let err = root_err(&[del("C-+"), root_set("C-+", "tab.next")]);
+        assert!(matches!(err, KeymapError::RootCollides { .. }), "{err:?}");
+        assert!(err.to_string().contains("Keypad+"), "{err}");
+        let err = root_err(&[prefix("C-+")]);
+        assert!(matches!(err, KeymapError::PrefixIsRoot { .. }), "{err:?}");
+
+        let map = Keymap::apply_user(&[root_set("M-Y", "tab.next")], &[]).unwrap();
+        let err = check_command_keybinding("cmd", "<Alt><Shift>y", &map).unwrap_err();
+        assert!(matches!(err, KeymapError::CommandKeybinding { .. }), "{err:?}");
+        assert!(check_command_keybinding("cmd", "<Alt>y", &map).is_ok());
+        let map = Keymap::apply_user(&[root_set("M-y", "tab.next")], &[]).unwrap();
+        assert!(check_command_keybinding("cmd", "<Alt><Shift>y", &map).is_ok());
+    }
+
+    #[test]
+    fn the_prefix_table_collision_message_names_the_prefix_chord() {
+        let err = root_err(&[root_set("M-w", "tab.next")]);
+        assert!(err.to_string().contains("so that C-b M-w can send M-w itself"), "{err}");
+    }
+
+    #[test]
+    fn root_help_rows_follow_the_built_in_ones_and_honour_the_hosts_keep() {
+        let map = Keymap::apply_user(&[root_set("M-y", "tab.next"), root_set("C-M-t", "zoom")], &[]).unwrap();
+        let rows = root::user_help_rows(&map, |_| true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].keys, "Alt+y");
+        assert!(rows[0].what.ends_with(" (init.lua)"), "{:?}", rows[0]);
+        assert_eq!(rows[1].keys, "Ctrl+Alt+t");
+        let rows = root::user_help_rows(&map, |action| !matches!(action, Action::Zoom));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].keys, "Alt+y");
     }
 }

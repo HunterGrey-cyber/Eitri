@@ -203,6 +203,12 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::OpenFile { win, .. }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
+        | HostEvent::Onboarding(
+            OnboardingEvent::Open { win, .. }
+            | OnboardingEvent::Found { win, .. }
+            | OnboardingEvent::Written { win, .. }
+            | OnboardingEvent::CheckFailed { win, .. },
+        )
         | HostEvent::TopBarLeft { win }
         | HostEvent::Refused {
             surface: Some((win, _)),

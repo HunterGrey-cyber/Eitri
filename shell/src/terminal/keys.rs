@@ -407,16 +407,105 @@ fn named_key_for(keyval: GdkKey) -> Option<NamedKey> {
 mod tests {
     use super::*;
 
-    /// What `send-prefix`/`send-keys` hand the terminal: a Ctrl letter exactly as a typed
-    /// one, one character as text, anything else refused.
     #[test]
-    fn a_literal_is_a_ctrl_letter_or_one_character() {
+    fn send_prefix_of_ctrl_space_sends_nul() {
+        use alacritty_terminal::term::TermMode;
+        let space = eitri_core::keymap::KeySpec::parse("C-Space").unwrap();
+        let sent = literal(&space).expect("C-Space has an encoding");
+        let bytes: Vec<u8> = sent
+            .iter()
+            .flat_map(|input| terminal_input::encode(input, TermMode::empty()))
+            .collect();
+        assert_eq!(bytes, b"\0", "^@ on a legacy terminal");
+    }
+
+    /// What `send-prefix`/`send-keys` hand the terminal: the press and release of the typed key,
+    /// encoded by the terminal's own encoder.
+    #[test]
+    fn a_literal_is_the_typed_key_for_every_chord() {
+        use alacritty_terminal::term::TermMode;
         let k = |s: &str| eitri_core::keymap::KeySpec::parse(s).unwrap();
+        let sent = |s: &str, mode: TermMode| -> Vec<u8> {
+            literal(&k(s))
+                .unwrap_or_else(|| panic!("{s} has no encoding"))
+                .iter()
+                .flat_map(|input| terminal_input::encode(input, mode))
+                .collect()
+        };
+        let legacy = TermMode::empty();
         assert_eq!(literal(&k("C-a")), Some(control_letter('a').to_vec()));
         assert_eq!(literal(&k("C-b")), Some(control_letter('b').to_vec()));
         assert_eq!(literal(&k("x")), Some(vec![normalize_commit("x")]));
-        assert_eq!(literal(&k("Up")), None);
-        assert_eq!(literal(&k("M-1")), None);
+        for (spec, bytes) in [
+            ("C-Space", &b"\0"[..]),
+            ("M-h", b"\x1bh"),
+            ("M-H", b"\x1bH"),
+            ("C-M-a", b"\x1b\x01"),
+            ("M-Up", b"\x1b[1;3A"),
+            ("C-Up", b"\x1b[1;5A"),
+            ("S-Up", b"\x1b[1;2A"),
+            ("F5", b"\x1b[15~"),
+            ("C-F5", b"\x1b[15;5~"),
+            ("M-Enter", b"\x1b\r"),
+            ("M-%", b"\x1b%"),
+            ("M-\u{c9}", "\x1b\u{c9}".as_bytes()),
+        ] {
+            assert_eq!(sent(spec, legacy), bytes, "{spec}");
+        }
+    }
+
+    /// A chord sent by name is the chord typed: the same event the typed-key path builds, so a
+    /// program that asked for the kitty keyboard protocol gets the encoding it asked for.
+    #[test]
+    fn a_literal_chord_encodes_as_the_same_key_typed() {
+        use alacritty_terminal::term::TermMode;
+        let k = |s: &str| eitri_core::keymap::KeySpec::parse(s).unwrap();
+        let typed = |keyval: GdkKey, base: Option<GdkKey>, state: ModifierType, pressed: bool, mode: TermMode| {
+            let mut raw = raw(keyval, state);
+            raw.unmodified_keyval = base;
+            raw.pressed = pressed;
+            terminal_input::encode(&normalize_key(raw).unwrap(), mode)
+        };
+        let disambiguate = TermMode::DISAMBIGUATE_ESC_CODES;
+        let with_types = disambiguate | TermMode::REPORT_EVENT_TYPES;
+        let alt_shift = ModifierType::ALT_MASK | ModifierType::SHIFT_MASK;
+        // The base key is what GDK re-translates the hardware keycode to with no modifiers.
+        for (spec, keyval, base, state) in [
+            ("M-h", GdkKey::h, None, ModifierType::ALT_MASK),
+            ("C-Space", GdkKey::space, None, ModifierType::CONTROL_MASK),
+            ("M-Up", GdkKey::Up, None, ModifierType::ALT_MASK),
+            (
+                "C-M-a",
+                GdkKey::a,
+                None,
+                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK,
+            ),
+            ("S-Up", GdkKey::Up, None, ModifierType::SHIFT_MASK),
+            ("C-F5", GdkKey::F5, None, ModifierType::CONTROL_MASK),
+            ("M-Enter", GdkKey::Return, None, ModifierType::ALT_MASK),
+            ("M-!", GdkKey::exclam, Some(GdkKey::_1), alt_shift),
+            ("M-_", GdkKey::underscore, Some(GdkKey::minus), alt_shift),
+            ("M-%", GdkKey::percent, Some(GdkKey::_5), alt_shift),
+            ("M-H", GdkKey::H, Some(GdkKey::h), alt_shift),
+            ("M-\u{c9}", GdkKey::Eacute, Some(GdkKey::eacute), alt_shift),
+        ] {
+            let sent = literal(&k(spec)).unwrap();
+            assert_eq!(sent.len(), 2, "{spec}: a press and a release");
+            for mode in [TermMode::empty(), disambiguate, with_types] {
+                let down = terminal_input::encode(&sent[0], mode);
+                let up = terminal_input::encode(&sent[1], mode);
+                assert_eq!(down, typed(keyval, base, state, true, mode), "{spec} press, {mode:?}");
+                assert_eq!(up, typed(keyval, base, state, false, mode), "{spec} release, {mode:?}");
+            }
+        }
+        for spec in ["M-h", "C-Space"] {
+            let down = terminal_input::encode(&literal(&k(spec)).unwrap()[0], disambiguate);
+            assert!(
+                down.starts_with(b"\x1b[") && down.ends_with(b"u"),
+                "{spec}: {down:?} is not CSI-u"
+            );
+        }
+        assert!(literal(&k("F24")).is_some());
     }
 
     /// The tmux import takes a `send-keys` binding only for a key every pane can be handed, and
@@ -774,16 +863,142 @@ pub(crate) fn control_letter(letter: char) -> [NormalizedInput; 2] {
     ]
 }
 
-/// What `send-prefix`/`send-keys` hand the terminal for `key`: a Ctrl
-/// letter exactly as [`control_letter`] sends a typed one, or one unmodified character as text.
-/// `None` for anything else, which the caller logs.
+/// What `send-prefix`/`send-keys` hand the terminal for `key`: the press and release a typed
+/// key would give, through [`terminal_input::encode`] like any other -- a Ctrl letter as
+/// [`control_letter`] sends it, one unmodified character as text, every other chord (Alt, Ctrl or
+/// Shift with a character, a named key, a function key) as the event [`normalize_key`] builds for
+/// the same typed key. `None` only for a key no `KeyEvent` can express (a function key past F24),
+/// which the caller logs.
 pub(crate) fn literal(key: &eitri_core::keymap::KeySpec) -> Option<Vec<NormalizedInput>> {
     use eitri_core::keymap::KeyName;
     match key.key {
-        KeyName::Char(c) if key.ctrl && !key.meta && c.is_ascii_lowercase() => Some(control_letter(c).to_vec()),
-        KeyName::Char(c) if !key.ctrl && !key.meta => Some(vec![normalize_commit(c.to_string())]),
+        KeyName::Char(c) if key.ctrl && !key.meta && c.is_ascii_lowercase() => return Some(control_letter(c).to_vec()),
+        KeyName::Char(c) if !key.ctrl && !key.meta => return Some(vec![normalize_commit(c.to_string())]),
+        _ => {}
+    }
+    let (logical_key, unmodified) = match key.key {
+        KeyName::Char(c) => (
+            Key::Character(c.to_string()),
+            Key::Character(unshifted(c).unwrap_or(c).to_string()),
+        ),
+        named => {
+            let named = named_key_of(named)?;
+            (Key::Named(named), Key::Named(named))
+        }
+    };
+    let mut mods = ModifiersState::empty();
+    if key.ctrl {
+        mods |= ModifiersState::CONTROL;
+    }
+    if key.meta {
+        mods |= ModifiersState::ALT;
+    }
+    // A named key carries its Shift in the spec; a capital letter or a shifted symbol is its base
+    // key with Shift down.
+    if key.shift || matches!(key.key, KeyName::Char(c) if unshifted(c).is_some()) {
+        mods |= ModifiersState::SHIFT;
+    }
+    let text = text_for(&logical_key).map(|t| if mods.control_key() { control_transform(&t) } else { t });
+    let press = KeyEvent::press(logical_key)
+        .with_text(text.as_deref())
+        .with_key_without_modifiers(unmodified);
+    let release = KeyEvent {
+        state: ElementState::Released,
+        ..press.clone()
+    };
+    Some(vec![
+        NormalizedInput::Key { event: press, mods },
+        NormalizedInput::Key { event: release, mods },
+    ])
+}
+
+/// The key a character is typed on when it needs Shift: a capital letter (any script with case)
+/// gives its lowercase, a shifted symbol its unshifted key on the US layout (the only layout a key
+/// name can assume). The kitty protocol reports such a press as the shifted character plus the base
+/// key, so a chord sent by name carries both, as the typed key does.
+fn unshifted(c: char) -> Option<char> {
+    const US_SHIFTED: [(char, char); 21] = [
+        ('!', '1'),
+        ('@', '2'),
+        ('#', '3'),
+        ('$', '4'),
+        ('%', '5'),
+        ('^', '6'),
+        ('&', '7'),
+        ('*', '8'),
+        ('(', '9'),
+        (')', '0'),
+        ('_', '-'),
+        ('+', '='),
+        ('{', '['),
+        ('}', ']'),
+        ('|', '\\'),
+        (':', ';'),
+        ('"', '\''),
+        ('<', ','),
+        ('>', '.'),
+        ('?', '/'),
+        ('~', '`'),
+    ];
+    if let Some((_, base)) = US_SHIFTED.iter().find(|(shifted, _)| *shifted == c) {
+        return Some(*base);
+    }
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) if c.is_uppercase() && l != c => Some(l),
         _ => None,
     }
+}
+
+/// The encoder's named key for a keymap key name; `None` for a function key past F24.
+fn named_key_of(name: eitri_core::keymap::KeyName) -> Option<NamedKey> {
+    use eitri_core::keymap::KeyName as K;
+    Some(match name {
+        K::Char(_) => return None,
+        K::Up => NamedKey::ArrowUp,
+        K::Down => NamedKey::ArrowDown,
+        K::Left => NamedKey::ArrowLeft,
+        K::Right => NamedKey::ArrowRight,
+        K::Space => NamedKey::Space,
+        K::Enter => NamedKey::Enter,
+        K::Tab => NamedKey::Tab,
+        K::BSpace => NamedKey::Backspace,
+        K::DC => NamedKey::Delete,
+        K::IC => NamedKey::Insert,
+        K::Home => NamedKey::Home,
+        K::End => NamedKey::End,
+        K::PPage => NamedKey::PageUp,
+        K::NPage => NamedKey::PageDown,
+        K::F(n) => {
+            const F: [NamedKey; 24] = [
+                NamedKey::F1,
+                NamedKey::F2,
+                NamedKey::F3,
+                NamedKey::F4,
+                NamedKey::F5,
+                NamedKey::F6,
+                NamedKey::F7,
+                NamedKey::F8,
+                NamedKey::F9,
+                NamedKey::F10,
+                NamedKey::F11,
+                NamedKey::F12,
+                NamedKey::F13,
+                NamedKey::F14,
+                NamedKey::F15,
+                NamedKey::F16,
+                NamedKey::F17,
+                NamedKey::F18,
+                NamedKey::F19,
+                NamedKey::F20,
+                NamedKey::F21,
+                NamedKey::F22,
+                NamedKey::F23,
+                NamedKey::F24,
+            ];
+            *F.get(usize::from(n).checked_sub(1)?)?
+        }
+    })
 }
 
 /// Whether a key press restarts a shell that has exited (the pane holds the last screen,

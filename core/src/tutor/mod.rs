@@ -4,7 +4,8 @@
 //! **The lessons are compiled into the binary.** At the window's first editor session a private per-instance
 //! directory is made for them ([`TutorDir`]: under `$XDG_RUNTIME_DIR` when that is the user's own, else under a
 //! `TMPDIR` nobody else can rename entries in), and [`INSTALL_TUTOR_LUA`] defines `:EitriTutor` with the texts as
-//! arguments. The command writes any file missing from (or not whole in) that directory (laid out as an nvim runtime directory:
+//! arguments. The lessons name the window's prefix as `{prefix}` ([`prefix_text`]) and are written for the prefix
+//! the window has, not only `Ctrl+b`; the keys after it are the stock ones. The command writes any file missing from (or not whole in) that directory (laid out as an nvim runtime directory:
 //! `tutor/en/eitri.tutor`, `tutor/zh/eitri.tutor`, each with its `.json`) after checking the directory is still
 //! the user's own and closed to everyone else, puts it on `'runtimepath'` only while nvim's tutor looks for the
 //! lessons, and takes it off again. So the lessons a window shows are always the ones written for the key table of
@@ -32,6 +33,8 @@ use rmpv::Value;
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 
+pub mod prefix_text;
+
 /// The command the snippet defines.
 pub const COMMAND: &str = "EitriTutor";
 
@@ -42,7 +45,11 @@ pub const TUTORIAL: &str = "eitri";
 /// Defines `:EitriTutor`, which writes the lessons and opens them; one table argument, [`install_opts`].
 pub const INSTALL_TUTOR_LUA: &str = include_str!("install.lua");
 
-/// The English lessons, the text every translation follows.
+/// The prefix the lessons are installed for until the window says which it has: the stock one.
+pub const DEFAULT_PREFIX: &str = "Ctrl+b";
+
+/// The English lessons, the text every translation follows. This and the three below are the sources, with
+/// [`prefix_text::PLACEHOLDER`] where they mean the prefix; [`files`] gives what is installed.
 pub const LESSONS_EN: &str = include_str!("lessons/en/eitri.tutor");
 /// The checks of the English lessons: which lines are exercises and what each should read when done.
 pub const CHECKS_EN: &str = include_str!("lessons/en/eitri.tutor.json");
@@ -52,13 +59,28 @@ pub const LESSONS_ZH: &str = include_str!("lessons/zh/eitri.tutor");
 /// The checks of the Chinese lessons, with the hash of the English lessons they were translated from.
 pub const CHECKS_ZH: &str = include_str!("lessons/zh/eitri.tutor.json");
 
-/// Every file of the runtime directory, by its path inside it.
+/// Every file of the runtime directory, by its path inside it, as the sources.
 pub const FILES: [(&str, &str); 4] = [
     ("tutor/en/eitri.tutor", LESSONS_EN),
     ("tutor/en/eitri.tutor.json", CHECKS_EN),
     ("tutor/zh/eitri.tutor", LESSONS_ZH),
     ("tutor/zh/eitri.tutor.json", CHECKS_ZH),
 ];
+
+/// Every file of the runtime directory, by its path inside it, for a window whose prefix is `prefix`.
+pub fn files(prefix: &str) -> Vec<(&'static str, String)> {
+    FILES
+        .iter()
+        .map(|(rel, text)| {
+            let text = if rel.ends_with(".json") {
+                prefix_text::substitute_checks(text, prefix)
+            } else {
+                prefix_text::substitute(text, prefix)
+            };
+            (*rel, text)
+        })
+        .collect()
+}
 
 /// `<base>/nv-tu-<pid>-<uuid>`, swept like the other per-instance directories.
 const DIR_PREFIX: &str = "nv-tu-";
@@ -166,18 +188,20 @@ impl Drop for TutorDir {
     }
 }
 
-/// Asks the editor to define `:EitriTutor` for `dir`, handing it the lessons to write there when the command runs.
-pub fn install(rpc: &dyn EditorRpc, dir: &Path) -> Pending {
-    rpc.exec_lua(INSTALL_TUTOR_LUA, vec![install_opts(dir)])
+/// Asks the editor to define `:EitriTutor` for `dir`, handing it the lessons to write there when the command runs,
+/// written for `prefix`.
+pub fn install(rpc: &dyn EditorRpc, dir: &Path, prefix: &str) -> Pending {
+    rpc.exec_lua(INSTALL_TUTOR_LUA, vec![install_opts(dir, prefix)])
 }
 
 /// The snippet's one argument: `{dir, uid, files}`, the directory as bytes, the effective uid the directory and
-/// everything in it must belong to, and each file's text by its path inside the directory.
-pub fn install_opts(dir: &Path) -> Value {
+/// everything in it must belong to, and each file's text by its path inside the directory, with `prefix` (as a
+/// person reads it, `Ctrl+a`) where the lessons name the prefix. The snippet writes what it is given.
+pub fn install_opts(dir: &Path, prefix: &str) -> Value {
     use std::os::unix::ffi::OsStrExt;
-    let files = FILES
-        .iter()
-        .map(|(rel, text)| (Value::from(*rel), Value::from(*text)))
+    let files = files(prefix)
+        .into_iter()
+        .map(|(rel, text)| (Value::from(rel), Value::from(text)))
         .collect();
     Value::Map(vec![
         (Value::from("dir"), Value::Binary(dir.as_os_str().as_bytes().to_vec())),
@@ -254,6 +278,7 @@ pub struct TutorInstaller {
     make_dir: Box<dyn Fn() -> Option<TutorDir>>,
     dir: Option<TutorDir>,
     dir_failed: bool,
+    prefix: String,
     editor: Option<Rc<dyn EditorRpc>>,
     installed_for: Option<u64>,
     out: Option<Out>,
@@ -278,11 +303,19 @@ impl TutorInstaller {
             make_dir,
             dir: None,
             dir_failed: false,
+            prefix: DEFAULT_PREFIX.to_string(),
             editor: None,
             installed_for: None,
             out: None,
             reported: Vec::new(),
         }
+    }
+
+    /// The window's prefix as a person reads it (`KeySpec::human`), which the lessons name wherever they mean it.
+    /// Calls to nvim sessions made after this carry it; the window sets it when its config is read, before any
+    /// editor session reports.
+    pub fn set_prefix(&mut self, human: String) {
+        self.prefix = human;
     }
 
     /// The window's editor handle.
@@ -404,7 +437,7 @@ impl TutorInstaller {
         let (Some(dir), Some(editor)) = (&self.dir, &self.editor) else {
             return None;
         };
-        let pending = install(&**editor, dir.path());
+        let pending = install(&**editor, dir.path(), &self.prefix);
         self.out = Some(Out {
             target,
             pending: Some(pending),

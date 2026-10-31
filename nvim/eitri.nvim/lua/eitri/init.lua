@@ -37,14 +37,40 @@ function M.panel(dir)
   end
 end
 
--- For a navigator plugin's own edge hook (smart-splits: `at_edge = function(ctx) if not
--- require("eitri").edge(ctx.direction) then ... end end`). False when no panel is attached.
-function M.edge(direction)
-  local c = rawget(_G, "__eitri_companion")
-  if type(c) ~= "table" or type(c.edge) ~= "function" then
+-- The Eitri window's own nvim has `_G.__eitri_window` (`:Eitri` is its command form); a nvim started outside
+-- one has neither it nor the companion's table.
+local function window()
+  local w = rawget(_G, "__eitri_window")
+  if type(w) == "table" then
+    return w
+  end
+  return nil
+end
+
+-- Runs one of the window's actions from Lua, like `:Eitri <word>...` (`require("eitri").run("split", "right",
+-- "agent")`). False when this nvim is not an Eitri window's editor or the line could not be sent.
+function M.run(...)
+  local w = window()
+  if w == nil or type(w.run) ~= "function" then
     return false
   end
-  return c.edge(direction)
+  return w.run(...) == true
+end
+
+-- For a navigator plugin's own edge hook (smart-splits: `at_edge = function(ctx) if not
+-- require("eitri").edge(ctx.direction) then ... end end`). Tries the attached panel first (this nvim is a
+-- terminal nvim an `eitri panel` is attached to), then the Eitri window this nvim is the editor of. False when
+-- neither took the move.
+function M.edge(direction)
+  local c = rawget(_G, "__eitri_companion")
+  if type(c) == "table" and type(c.edge) == "function" and c.edge(direction) then
+    return true
+  end
+  local w = window()
+  if w ~= nil and type(w.edge) == "function" then
+    return w.edge(direction) == true
+  end
+  return false
 end
 
 return M

@@ -81,6 +81,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::ModuleHideByKey
         | Action::ModuleKill
         | Action::WindowImmersive
+        | Action::WindowSetup
         | Action::Move(_)
         | Action::ContainerTabbed
         | Action::ContainerStacked
@@ -101,6 +102,24 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::MarkClear
         | Action::SwapMarked
         | Action::SelectNumber => CompanionVerb::Refuse,
+    }
+}
+
+/// Whether a companion window runs `action` for a root key: everything its prefix runs, including a move toward the
+/// next window (the window manager moves the keys). A root key for any other action passes on to the text it was
+/// typed in.
+pub fn companion_root_keep(action: &Action) -> bool {
+    !matches!(classify(action), CompanionVerb::Refuse)
+}
+
+/// Whether the window that holds the editor and the panel side by side runs `action` for a key: the companion verbs
+/// except HINT (it answers HINT with a notice), the zoom (which hides the panel), and a move between the editor and
+/// the panel, the only two things to move between.
+pub fn beside_keep(action: &Action) -> bool {
+    match action {
+        Action::Zoom => true,
+        Action::Select(direction) => matches!(direction, Direction::Left | Direction::Right),
+        action => !matches!(classify(action), CompanionVerb::Refuse | CompanionVerb::Hint),
     }
 }
 
@@ -208,6 +227,7 @@ mod tests {
             (Action::PanelKeymap, CompanionVerb::Keymap),
             (Action::PanelCommandLine, CompanionVerb::CommandLine),
             (Action::WindowImmersive, CompanionVerb::Refuse),
+            (Action::WindowSetup, CompanionVerb::Refuse),
             (
                 Action::Tab(TabAction::Select(3)),
                 CompanionVerb::Tab(TabAction::Select(3)),

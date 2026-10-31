@@ -13,7 +13,8 @@ mod embed_client;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use eitri_core::tutor::{install_opts, TutorDir, CHECKS_EN, COMMAND, FILES, INSTALL_TUTOR_LUA};
+use eitri_core::tutor::prefix_text::substitute_checks;
+use eitri_core::tutor::{files, install_opts, TutorDir, CHECKS_EN, COMMAND, DEFAULT_PREFIX, FILES, INSTALL_TUTOR_LUA};
 use embed_client::Embed;
 use rmpv::Value;
 
@@ -54,7 +55,7 @@ fn started(name: &str, args: &[&str], env: &[(&str, &str)]) -> Case {
 }
 
 fn install(c: &mut Case) -> Value {
-    let opts = install_opts(c.lessons.path());
+    let opts = install_opts(c.lessons.path(), DEFAULT_PREFIX);
     c.nvim.lua(INSTALL_TUTOR_LUA, vec![opts])
 }
 
@@ -81,7 +82,7 @@ fn assert_written(c: &Case) {
     for sub in ["", "tutor", "tutor/en", "tutor/zh"] {
         assert_eq!(mode(&c.lessons.path().join(sub)), 0o700, "{sub}/");
     }
-    for (rel, text) in FILES {
+    for (rel, text) in files(DEFAULT_PREFIX) {
         let path = c.lessons.path().join(rel);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{rel}");
         assert_eq!(mode(&path) & 0o077, 0, "{rel}");
@@ -166,7 +167,7 @@ vim.cmd('doautocmd <nomodeline> TextChanged')
 "#;
 
 fn expect_en() -> Vec<(u64, String)> {
-    let json: serde_json::Value = serde_json::from_str(CHECKS_EN).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&substitute_checks(CHECKS_EN, DEFAULT_PREFIX)).unwrap();
     let mut out: Vec<(u64, String)> = json["expect"]
         .as_object()
         .unwrap()

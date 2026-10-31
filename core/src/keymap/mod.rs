@@ -4,12 +4,15 @@
 //! registers what this says and looks keys up in it; a macOS host would do the same.
 
 pub mod action;
+pub mod bundles;
 pub mod companion;
+pub mod hints;
 pub mod key;
 pub mod keys_return;
 pub mod panel;
 pub mod prefix;
 pub mod root;
+pub mod root_conflicts;
 pub mod stock;
 pub mod table;
 pub mod tmux;

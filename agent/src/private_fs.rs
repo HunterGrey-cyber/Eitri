@@ -33,9 +33,15 @@
 //! symlinked `root` therefore means the whole tree tightens nothing at all -- new directories are
 //! still created 0700 by `DirBuilder` and new files still 0600 by [`open_private`], so this is a
 //! narrowing of the retroactive-tightening feature, not a loss of the baseline mode.
+//!
+//! **The user's configuration directory is not Eitri's.** Its files are the user's, 0644 under the
+//! usual umask, and it may be a link into a dotfiles tree. So [`open_user_config_dir`] judges it and
+//! never tightens it, and [`create_new_file_at`] puts one new file there, whole or not at all, without
+//! ever opening a file that exists.
 
+use std::ffi::{CStr, CString, OsStr};
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
@@ -141,7 +147,8 @@ pub fn create_private_dir_all(dir: &Path, root: &Path) -> std::io::Result<()> {
 ///
 /// Everything from the deepest directory that exists is done through open handles: each new directory
 /// is made with `mkdirat` from its parent's handle, opened from that handle without following a link,
-/// checked to be this user's and set with `fchmod`. A path is never looked up a second time, so another
+/// checked to be this user's and set with `fchmod` (a umask that takes the owner's read bit needs one
+/// step more, see [`make_dir_at`]). A path is never looked up a second time, so another
 /// user who can write a directory above `root` cannot swap an ancestor for a link between the steps and
 /// have the mode of something else changed (or a directory made in someone else's tree). The deepest
 /// existing directory itself is opened following links, as the state home may be a link of the user's.
@@ -184,6 +191,10 @@ fn create_dirs_owner_usable(dir: &Path) -> std::io::Result<()> {
 /// 0700 when this call made it. One that appeared meanwhile is kept as it is (the walk from the root
 /// tightens it afterwards), but only a real directory of this user's is accepted: a link in its place
 /// is refused, never followed. `path` is only for the messages and the test hook.
+///
+/// A umask that takes the owner's read bit (0477 gives 0300) leaves a directory no handle can be opened
+/// on, so there, and only there, the mode goes in by name from the parent's handle first. A link is not
+/// followed by that either, and the handle opened after it is checked like any other.
 fn make_dir_at(parent: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> std::io::Result<std::fs::File> {
     let cname = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a directory name holds a NUL"))?;
@@ -198,7 +209,13 @@ fn make_dir_at(parent: &std::fs::File, name: &std::ffi::OsStr, path: &Path) -> s
     }
     #[cfg(test)]
     run_after_mkdir_hook(path);
-    let handle = openat_dir(parent, &cname).map_err(|e| {
+    let opened = match openat_dir(parent, &cname) {
+        Err(e) if made && e.raw_os_error() == Some(libc::EACCES) => {
+            set_new_dir_mode_at(parent, &cname).and_then(|()| openat_dir(parent, &cname))
+        }
+        opened => opened,
+    };
+    let handle = opened.map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!(
@@ -370,6 +387,26 @@ pub(crate) fn make_dir_private(dir: &Path) -> std::io::Result<()> {
     let handle = open_dir_handle(dir)
         .ok_or_else(|| std::io::Error::other(format!("cannot open {} as a directory", dir.display())))?;
     fchmod(&handle, PRIVATE_DIR_MODE)
+}
+
+/// Sets `name` in `parent` to 0700 without following a link: for a directory this call just made and
+/// cannot open.
+fn set_new_dir_mode_at(parent: &std::fs::File, name: &CStr) -> std::io::Result<()> {
+    // SAFETY: the descriptor is `parent`'s own and stays open for the call, and `name` is a
+    // NUL-terminated buffer that outlives it; `fchmodat` reads nothing else of ours.
+    let set = unsafe {
+        libc::fchmodat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            PRIVATE_DIR_MODE as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn fchmod(handle: &std::fs::File, mode: u32) -> std::io::Result<()> {
@@ -623,9 +660,362 @@ pub fn read_private_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Re
     String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
 }
 
+/// Why a user's configuration directory is not used. Every later step works from the handle a good
+/// directory gives, so what was judged is what is written to.
+#[derive(Debug)]
+pub enum DirRefusal {
+    NotADirectory,
+    NotOwned,
+    Writable,
+    UnsafeParent,
+    SymlinkChain,
+    MissingParent,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for DirRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirRefusal::NotADirectory => f.write_str("it is not a directory"),
+            DirRefusal::NotOwned => f.write_str("it belongs to another user"),
+            DirRefusal::Writable => f.write_str("its group or others can write to it"),
+            DirRefusal::UnsafeParent => f.write_str("another user could replace it in the directory that holds it"),
+            DirRefusal::SymlinkChain => {
+                f.write_str("it is a link to a link, and one link is the most that is followed")
+            }
+            DirRefusal::MissingParent => f.write_str("the directory that should hold it does not exist"),
+            DirRefusal::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The rule for the directory itself, on what `fstat` said of the open handle: a directory owned by
+/// `euid` that neither its group nor others can write. `mode` is `st_mode`, file type included.
+pub(crate) fn config_dir_checks(mode: u32, owner: u32, euid: u32) -> Result<(), DirRefusal> {
+    if mode as libc::mode_t & libc::S_IFMT != libc::S_IFDIR {
+        return Err(DirRefusal::NotADirectory);
+    }
+    if owner != euid {
+        return Err(DirRefusal::NotOwned);
+    }
+    if mode & 0o022 != 0 {
+        return Err(DirRefusal::Writable);
+    }
+    Ok(())
+}
+
+/// What a name in a directory is, without following a link or opening anything: `open` on a symlink
+/// with `O_DIRECTORY|O_NOFOLLOW` says `ENOTDIR`, the same as for a plain file, so only a look at the
+/// entry itself tells them apart, and a FIFO is never opened at all.
+enum Entry {
+    Missing,
+    Directory,
+    Link,
+    Other,
+}
+
+fn entry_at(holder: &std::fs::File, name: &CStr) -> Result<Entry, DirRefusal> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is `holder`'s own and open, `name` is NUL-terminated, and `stat` is a
+    // buffer of the size `fstatat` writes; all three outlive the call.
+    let looked = unsafe {
+        libc::fstatat(
+            holder.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if looked != 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOENT) => Ok(Entry::Missing),
+            _ => Err(DirRefusal::Io(e)),
+        };
+    }
+    // SAFETY: `fstatat` returned 0, so it filled the buffer.
+    Ok(match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => Entry::Directory,
+        libc::S_IFLNK => Entry::Link,
+        _ => Entry::Other,
+    })
+}
+
+/// Opens the directory that holds the last component of `path`, which `base` resolves when `path` is
+/// relative. Links on the way there are followed: `~/.config` may be one. Returns the handle and the
+/// last component.
+fn open_holder(base: RawFd, path: &Path) -> Result<(std::fs::File, CString), DirRefusal> {
+    // `file_name` is `None` for `/` and for a path ending in `..`: no entry of a directory to look at.
+    let name = path.file_name().ok_or(DirRefusal::NotADirectory)?;
+    let holder = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let holder = holder.unwrap_or(Path::new(".")).as_os_str();
+    let (Ok(name), Ok(holder)) = (CString::new(name.as_bytes()), CString::new(holder.as_bytes())) else {
+        return Err(DirRefusal::Io(std::io::ErrorKind::InvalidInput.into()));
+    };
+    // SAFETY: `holder` is NUL-terminated and outlives the call; `base` is `AT_FDCWD` or a descriptor the
+    // caller holds open for it.
+    let fd = unsafe {
+        libc::openat(
+            base,
+            holder.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => DirRefusal::MissingParent,
+            _ => DirRefusal::Io(e),
+        });
+    }
+    // SAFETY: `fd` was just returned by `openat` and is owned by nothing else.
+    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, name))
+}
+
+/// [`parent_is_safe`] on the open handle, which is the directory links led to: its entries are the
+/// ones that could be renamed.
+fn judge_holder(holder: &std::fs::File) -> Result<(), DirRefusal> {
+    let meta = holder.metadata().map_err(DirRefusal::Io)?;
+    if parent_is_safe(meta.uid(), meta.mode(), euid()) {
+        Ok(())
+    } else {
+        Err(DirRefusal::UnsafeParent)
+    }
+}
+
+/// Opens the real directory `name` in `holder` and applies [`config_dir_checks`] to the handle. A
+/// failure that says the entry is not a directory means it changed since it was looked at.
+fn open_config_dir_at(holder: &std::fs::File, name: &CStr) -> Result<std::fs::File, DirRefusal> {
+    let handle = openat_dir(holder, name).map_err(|e| match e.raw_os_error() {
+        Some(libc::ENOTDIR | libc::ELOOP) => DirRefusal::NotADirectory,
+        _ => DirRefusal::Io(e),
+    })?;
+    judge_config_dir(&handle)?;
+    Ok(handle)
+}
+
+fn judge_config_dir(handle: &std::fs::File) -> Result<(), DirRefusal> {
+    let meta = handle.metadata().map_err(DirRefusal::Io)?;
+    config_dir_checks(meta.mode(), meta.uid(), euid())
+}
+
+/// Reads the link `name` in `holder` once.
+fn read_link_at(holder: &std::fs::File, name: &CStr) -> std::io::Result<std::path::PathBuf> {
+    let mut target = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: the descriptor is `holder`'s own and open, `name` is NUL-terminated, and `target` is a
+    // buffer of the length given; all outlive the call.
+    let read = unsafe {
+        libc::readlinkat(
+            holder.as_raw_fd(),
+            name.as_ptr(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    let Ok(read) = usize::try_from(read) else {
+        return Err(std::io::Error::last_os_error());
+    };
+    if read == target.len() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    target.truncate(read);
+    Ok(OsStr::from_bytes(&target).into())
+}
+
+/// Follows the link `name` in `holder`, the one link there may be: the target is looked at without
+/// following anything, so a target that is itself a link is refused. A relative target resolves
+/// against the directory the link sits in. The directory that holds the target is the one judged:
+/// swapping the link itself can only lead to another directory of this user's, as the target is
+/// judged for its owner.
+fn open_link_target(holder: &std::fs::File, name: &CStr) -> Result<std::fs::File, DirRefusal> {
+    let target = read_link_at(holder, name).map_err(DirRefusal::Io)?;
+    let (target_holder, target_name) = open_holder(holder.as_raw_fd(), &target)?;
+    judge_holder(&target_holder)?;
+    match entry_at(&target_holder, &target_name)? {
+        Entry::Directory => open_config_dir_at(&target_holder, &target_name),
+        Entry::Link => Err(DirRefusal::SymlinkChain),
+        Entry::Missing | Entry::Other => Err(DirRefusal::NotADirectory),
+    }
+}
+
+/// The directory `name` in `holder`, judged; `None` when there is nothing at that name.
+fn find_config_dir(holder: &std::fs::File, name: &CStr) -> Result<Option<std::fs::File>, DirRefusal> {
+    match entry_at(holder, name)? {
+        Entry::Missing => judge_holder(holder).map(|()| None),
+        Entry::Directory => {
+            judge_holder(holder)?;
+            open_config_dir_at(holder, name).map(Some)
+        }
+        Entry::Link => open_link_target(holder, name).map(Some),
+        Entry::Other => Err(DirRefusal::NotADirectory),
+    }
+}
+
+/// Opens the user's configuration directory `path` when it is one only this user can change: a real
+/// directory, or one link to one, owned by the euid and not writable by its group or others, held by a
+/// directory [`parent_is_safe`] accepts (for a link, the target's). `Ok(None)` is nothing at `path` and a
+/// safe directory to make it in. Creates nothing and changes nothing.
+pub fn probe_user_config_dir(path: &Path) -> Result<Option<OwnedFd>, DirRefusal> {
+    let (holder, name) = open_holder(libc::AT_FDCWD, path)?;
+    Ok(find_config_dir(&holder, &name)?.map(OwnedFd::from))
+}
+
+/// [`probe_user_config_dir`], making the last component of `path` when it is missing: exactly 0700
+/// whatever the umask, from the handle of the directory just judged. One that appears meanwhile (a
+/// second window) is judged like any other.
+pub fn open_user_config_dir(path: &Path) -> Result<OwnedFd, DirRefusal> {
+    let (holder, name) = open_holder(libc::AT_FDCWD, path)?;
+    if let Some(found) = find_config_dir(&holder, &name)? {
+        return Ok(found.into());
+    }
+    let made = make_dir_at(&holder, OsStr::from_bytes(name.as_bytes()), path).map_err(DirRefusal::Io)?;
+    judge_config_dir(&made)?;
+    Ok(made.into())
+}
+
+/// Why [`create_new_file_at`] put no file there.
+#[derive(Debug)]
+pub enum CreateRefusal {
+    /// Something is at the name, whatever it is; it was not opened or changed.
+    Exists,
+    /// This file system or kernel has neither a hard link nor a rename that never replaces, so a new
+    /// name cannot be made to appear whole.
+    CannotCreateSafely,
+    Io(std::io::Error),
+}
+
+/// The two calls that give a finished temporary file its name, apart so a test can make them fail as a
+/// file system would. Both are relative to `dir` and neither replaces what is at `to`.
+pub(crate) trait LinkCalls {
+    fn link(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()>;
+    fn rename_noreplace(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()>;
+}
+
+struct SystemCalls;
+
+impl LinkCalls for SystemCalls {
+    fn link(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()> {
+        let fd = dir.as_raw_fd();
+        // SAFETY: `dir` is open for the call and both names are NUL-terminated and outlive it.
+        if unsafe { libc::linkat(fd, from.as_ptr(), fd, to.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rename_noreplace(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()> {
+        let fd = dir.as_raw_fd();
+        // SAFETY: `dir` is open for the call and both names are NUL-terminated and outlive it.
+        if unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Only Linux has this rename here, so elsewhere a file system without hard links gets no file.
+    #[cfg(not(target_os = "linux"))]
+    fn rename_noreplace(&self, _dir: BorrowedFd<'_>, _from: &CStr, _to: &CStr) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+/// Numbers this process's temporary files, so two threads creating one at once never share a name.
+static CREATE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Names tried for a temporary file before giving up: one that is taken was left by a process that
+/// ended with this one's id, and the next serial is another name.
+const TEMPORARY_TRIES: u32 = 8;
+
+fn create_temporary(dir: BorrowedFd<'_>, name: &str, mode: u32) -> Result<(CString, std::fs::File), CreateRefusal> {
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_WRONLY;
+    for _ in 0..TEMPORARY_TRIES {
+        let serial = CREATE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = format!("{name}.{}.{serial}.tmp", std::process::id());
+        let tmp = CString::new(tmp).map_err(|e| CreateRefusal::Io(e.into()))?;
+        // SAFETY: `dir` is open for the call and `tmp` is NUL-terminated and outlives it; the mode goes
+        // through the variadic as the `c_uint` a `mode_t` is promoted to.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), tmp.as_ptr(), flags, mode as libc::c_uint) };
+        if fd >= 0 {
+            // SAFETY: `fd` was just returned by `openat` and is owned by nothing else.
+            return Ok((tmp, unsafe { std::fs::File::from_raw_fd(fd) }));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            return Err(CreateRefusal::Io(e));
+        }
+    }
+    Err(CreateRefusal::Io(std::io::ErrorKind::AlreadyExists.into()))
+}
+
+/// Gives the finished temporary file its name, by the first of the two calls this file system has.
+fn place(calls: &dyn LinkCalls, dir: BorrowedFd<'_>, tmp: &CStr, name: &CStr) -> Result<(), CreateRefusal> {
+    let Err(linked) = calls.link(dir, tmp, name) else {
+        return Ok(());
+    };
+    match linked.raw_os_error() {
+        Some(libc::EEXIST) => return Err(CreateRefusal::Exists),
+        Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS) => {}
+        _ => return Err(CreateRefusal::Io(linked)),
+    }
+    calls
+        .rename_noreplace(dir, tmp, name)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::EEXIST) => CreateRefusal::Exists,
+            Some(libc::EINVAL | libc::ENOSYS) => CreateRefusal::CannotCreateSafely,
+            _ => CreateRefusal::Io(e),
+        })
+}
+
+/// Creates the file `name` in the directory `dir` holds open, with `bytes` as its content, or leaves
+/// the directory as it was. The file appears whole: it is written and synced under a temporary name,
+/// and only then given `name` by a call that fails when anything is there, a link or a FIFO included,
+/// which is never opened. Nothing here can replace or truncate a file, and there is no fallback that
+/// creates the file first and writes it after: a crash there would leave part of a file at `name`.
+///
+/// `mode` is the mode asked of `open`, so the umask has its say.
+pub fn create_new_file_at(dir: BorrowedFd<'_>, name: &str, bytes: &[u8], mode: u32) -> Result<(), CreateRefusal> {
+    create_new_file_with(&SystemCalls, dir, name, bytes, mode)
+}
+
+/// [`create_new_file_at`] over `calls`.
+pub(crate) fn create_new_file_with(
+    calls: &dyn LinkCalls,
+    dir: BorrowedFd<'_>,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), CreateRefusal> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(CreateRefusal::Io(std::io::ErrorKind::InvalidInput.into()));
+    }
+    let c_name = CString::new(name).map_err(|e| CreateRefusal::Io(e.into()))?;
+    let (tmp, mut file) = create_temporary(dir, name, mode)?;
+    let placed = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(CreateRefusal::Io)
+        .and_then(|()| place(calls, dir, &tmp, &c_name));
+    drop(file);
+    // After a rename the temporary name is already gone, and a leftover harms nothing, so the answer
+    // does not depend on this.
+    // SAFETY: `dir` is open for the call and `tmp` is NUL-terminated and outlives it.
+    unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+    if placed.is_ok() {
+        // The file is there by now, so a failure here must not read as "nothing was written"; it only
+        // means a crash could still lose the new name.
+        // SAFETY: `dir` is open for the call; `fsync` takes no pointers.
+        unsafe { libc::fsync(dir.as_raw_fd()) };
+    }
+    placed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1165,6 +1555,539 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied
             );
         }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A scratch directory a config directory may sit in, whatever the umask made it.
+    fn config_scratch(label: &str) -> std::path::PathBuf {
+        let base = scratch(label);
+        set_mode(&base, 0o700);
+        base
+    }
+
+    fn real_config_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        set_mode(path, 0o700);
+    }
+
+    fn inode_of(handle: OwnedFd) -> u64 {
+        std::fs::File::from(handle).metadata().unwrap().ino()
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn make_fifo(path: &Path) {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn a_real_private_directory_opens() {
+        let base = config_scratch("cfg-real");
+        let dir = base.join("eitri");
+        real_config_dir(&dir);
+        let opened = open_user_config_dir(&dir).unwrap();
+        assert_eq!(inode_of(opened), dir.metadata().unwrap().ino());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Stow and chezmoi leave the directory as a link into the dotfiles tree, by a relative path or an
+    /// absolute one; a relative one is read against the directory the link sits in.
+    #[test]
+    fn one_symlink_to_a_good_directory_opens() {
+        let base = config_scratch("cfg-link");
+        let target = base.join("dotfiles").join("eitri");
+        real_config_dir(&base.join("dotfiles"));
+        real_config_dir(&target);
+        let config = base.join("config");
+        real_config_dir(&config);
+        let relative = config.join("eitri");
+        std::os::unix::fs::symlink("../dotfiles/eitri", &relative).unwrap();
+        let absolute = config.join("absolute");
+        std::os::unix::fs::symlink(&target, &absolute).unwrap();
+        for link in [&relative, &absolute] {
+            let opened = open_user_config_dir(link).unwrap();
+            assert_eq!(inode_of(opened), target.metadata().unwrap().ino(), "{}", link.display());
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn two_symlinks_are_refused() {
+        let base = config_scratch("cfg-two-links");
+        real_config_dir(&base.join("real"));
+        std::os::unix::fs::symlink(base.join("real"), base.join("second")).unwrap();
+        let first = base.join("eitri");
+        std::os::unix::fs::symlink(base.join("second"), &first).unwrap();
+        assert!(matches!(open_user_config_dir(&first), Err(DirRefusal::SymlinkChain)));
+        assert!(matches!(probe_user_config_dir(&first), Err(DirRefusal::SymlinkChain)));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Neither a link to nothing nor one into a directory that does not exist is made real.
+    #[test]
+    fn a_dangling_symlink_is_refused() {
+        let base = config_scratch("cfg-dangling");
+        let link = base.join("eitri");
+        std::os::unix::fs::symlink(base.join("nowhere"), &link).unwrap();
+        assert!(open_user_config_dir(&link).is_err());
+        assert!(probe_user_config_dir(&link).is_err());
+        assert!(!base.join("nowhere").exists());
+        let deeper = base.join("deeper");
+        std::os::unix::fs::symlink(base.join("no").join("where"), &deeper).unwrap();
+        assert!(open_user_config_dir(&deeper).is_err());
+        assert!(!base.join("no").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_group_writable_directory_is_refused() {
+        let base = config_scratch("cfg-group");
+        let dir = base.join("eitri");
+        real_config_dir(&dir);
+        set_mode(&dir, 0o775);
+        assert!(matches!(open_user_config_dir(&dir), Err(DirRefusal::Writable)));
+        assert!(matches!(probe_user_config_dir(&dir), Err(DirRefusal::Writable)));
+        assert_eq!(mode(&dir), 0o775, "a user's directory is judged, never tightened");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_directory_of_another_uid_is_refused() {
+        // `st_mode` values: the file type bits are the same on every Unix.
+        const A_DIRECTORY: u32 = 0o040_700;
+        const A_FILE: u32 = 0o100_600;
+        assert!(config_dir_checks(A_DIRECTORY, 1000, 1000).is_ok());
+        assert!(matches!(
+            config_dir_checks(A_DIRECTORY, 1234, 1000),
+            Err(DirRefusal::NotOwned)
+        ));
+        assert!(matches!(
+            config_dir_checks(A_FILE, 1000, 1000),
+            Err(DirRefusal::NotADirectory)
+        ));
+        if euid() != 0 {
+            assert!(matches!(
+                open_user_config_dir(Path::new("/usr")),
+                Err(DirRefusal::NotOwned)
+            ));
+        }
+    }
+
+    /// Whoever can rename entries in the parent can swap the directory, present or about to be made.
+    /// A sticky parent stops them, so it is accepted.
+    #[test]
+    fn an_unsafe_parent_is_refused() {
+        let base = config_scratch("cfg-parent");
+        let shared = base.join("shared");
+        real_config_dir(&shared);
+        let dir = shared.join("eitri");
+        real_config_dir(&dir);
+        set_mode(&shared, 0o777);
+        assert!(matches!(open_user_config_dir(&dir), Err(DirRefusal::UnsafeParent)));
+        let missing = shared.join("missing");
+        assert!(matches!(open_user_config_dir(&missing), Err(DirRefusal::UnsafeParent)));
+        assert!(matches!(probe_user_config_dir(&missing), Err(DirRefusal::UnsafeParent)));
+        assert!(!missing.exists());
+        set_mode(&shared, 0o1777);
+        assert!(open_user_config_dir(&dir).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_link_target_with_an_unsafe_parent_is_refused() {
+        let base = config_scratch("cfg-link-parent");
+        let shared = base.join("shared");
+        real_config_dir(&shared);
+        real_config_dir(&shared.join("eitri"));
+        set_mode(&shared, 0o777);
+        let link = base.join("eitri");
+        std::os::unix::fs::symlink(shared.join("eitri"), &link).unwrap();
+        assert!(matches!(open_user_config_dir(&link), Err(DirRefusal::UnsafeParent)));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// What counts is the directory the link leads to, not the one the link sits in.
+    #[test]
+    fn a_link_is_judged_by_where_it_leads() {
+        let base = config_scratch("cfg-link-holder");
+        real_config_dir(&base.join("dotfiles").join("eitri"));
+        set_mode(&base.join("dotfiles"), 0o700);
+        let shared = base.join("shared");
+        real_config_dir(&shared);
+        set_mode(&shared, 0o775);
+        let link = shared.join("eitri");
+        std::os::unix::fs::symlink(base.join("dotfiles").join("eitri"), &link).unwrap();
+        assert!(open_user_config_dir(&link).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_missing_directory_is_made_0700_whatever_the_umask() {
+        crate::test_umask::with_umask(
+            concat!(module_path!(), "::a_missing_directory_is_made_0700_whatever_the_umask"),
+            0o277,
+            || {
+                let base = config_scratch("cfg-made");
+                let dir = base.join("eitri");
+                let opened = open_user_config_dir(&dir).unwrap();
+                assert_eq!(mode(&dir), 0o700);
+                assert_eq!(inode_of(opened), dir.metadata().unwrap().ino());
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
+    /// 0477 leaves a new directory at 0300: nothing can open it until its mode is set, and it would stay
+    /// that way for every later attempt. The file written there keeps what the umask leaves of its mode.
+    #[test]
+    fn a_missing_directory_is_made_0700_when_the_umask_takes_the_owners_read_bit() {
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::a_missing_directory_is_made_0700_when_the_umask_takes_the_owners_read_bit"
+            ),
+            0o477,
+            || {
+                let base = config_scratch("cfg-made-unreadable");
+                let dir = base.join("eitri");
+                let opened = open_user_config_dir(&dir).unwrap();
+                assert_eq!(mode(&dir), 0o700);
+                create_new_file_at(opened.as_fd(), "init.lua", b"-- lines\n", 0o644).unwrap();
+                assert_eq!(mode(&dir.join("init.lua")), 0o200);
+                assert_eq!(names_in(&dir), ["init.lua"]);
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
+    /// The same for a whole private tree, at the umask that leaves the owner nothing: each level has to
+    /// be usable before the next is made inside it.
+    #[test]
+    fn a_umask_that_takes_every_owner_bit_still_gives_0700_and_0600() {
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::a_umask_that_takes_every_owner_bit_still_gives_0700_and_0600"
+            ),
+            0o777,
+            || {
+                let base = config_scratch("umask-none");
+                let root = base.join("eitri");
+                let dir = root.join("conversations").join("abc");
+                let file = dir.join("record.json");
+                create_private_dir_all(&dir, &root)
+                    .and_then(|()| write_private(&file, b"{}"))
+                    .unwrap();
+                assert_eq!(mode(&root), 0o700);
+                assert_eq!(mode(&root.join("conversations")), 0o700);
+                assert_eq!(mode(&dir), 0o700);
+                assert_eq!(mode(&file), 0o600);
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_is_refused() {
+        let base = config_scratch("cfg-no-parent");
+        let dir = base.join("nowhere").join("eitri");
+        assert!(matches!(open_user_config_dir(&dir), Err(DirRefusal::MissingParent)));
+        assert!(matches!(probe_user_config_dir(&dir), Err(DirRefusal::MissingParent)));
+        assert!(!base.join("nowhere").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_probe_creates_nothing() {
+        let base = config_scratch("cfg-probe");
+        let dir = base.join("eitri");
+        assert!(matches!(probe_user_config_dir(&dir), Ok(None)));
+        assert!(!dir.exists());
+        real_config_dir(&dir);
+        assert!(matches!(probe_user_config_dir(&dir), Ok(Some(_))));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Anything but a directory at the name is refused without being opened, so a FIFO cannot hold the
+    /// call up.
+    #[test]
+    fn a_file_or_a_fifo_at_the_directory_name_is_refused_without_blocking() {
+        let base = config_scratch("cfg-file");
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(open_user_config_dir(&file), Err(DirRefusal::NotADirectory)));
+        let fifo = base.join("fifo");
+        make_fifo(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(matches!(probe_user_config_dir(&path), Err(DirRefusal::NotADirectory)));
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the probe blocked on a FIFO");
+        assert!(refused);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Each refusal names its reason on one line, for a log.
+    #[test]
+    fn every_refusal_says_why_on_one_line() {
+        for refusal in [
+            DirRefusal::NotADirectory,
+            DirRefusal::NotOwned,
+            DirRefusal::Writable,
+            DirRefusal::UnsafeParent,
+            DirRefusal::SymlinkChain,
+            DirRefusal::MissingParent,
+            DirRefusal::Io(std::io::Error::from_raw_os_error(libc::EACCES)),
+        ] {
+            let said = refusal.to_string();
+            assert!(!said.is_empty() && !said.contains('\n'), "{refusal:?}: {said}");
+        }
+    }
+
+    fn new_config_dir(label: &str) -> (std::path::PathBuf, std::path::PathBuf, OwnedFd) {
+        let base = config_scratch(label);
+        let dir = base.join("eitri");
+        let handle = open_user_config_dir(&dir).unwrap();
+        (base, dir, handle)
+    }
+
+    #[test]
+    fn the_file_appears_whole() {
+        crate::test_umask::with_umask(concat!(module_path!(), "::the_file_appears_whole"), 0o022, || {
+            let (base, dir, handle) = new_config_dir("new-whole");
+            create_new_file_at(handle.as_fd(), "init.lua", b"-- lines\n", 0o644).unwrap();
+            assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), b"-- lines\n");
+            assert_eq!(mode(&dir.join("init.lua")), 0o644);
+            assert_eq!(names_in(&dir), ["init.lua"], "no temporary is left");
+            std::fs::remove_dir_all(&base).unwrap();
+        });
+    }
+
+    #[test]
+    fn an_existing_file_is_exists_and_untouched() {
+        let (base, dir, handle) = new_config_dir("new-existing");
+        std::fs::write(dir.join("init.lua"), b"mine").unwrap();
+        let result = create_new_file_at(handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::Exists)), "{result:?}");
+        assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), b"mine");
+        assert_eq!(names_in(&dir), ["init.lua"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A link at the name counts as a file there, dangling or not; nothing is written through it.
+    #[test]
+    fn a_symlink_at_the_name_is_exists_and_the_target_untouched() {
+        let (base, dir, handle) = new_config_dir("new-link");
+        let target = base.join("elsewhere.lua");
+        std::fs::write(&target, b"mine").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("init.lua")).unwrap();
+        let result = create_new_file_at(handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::Exists)), "{result:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
+        std::fs::remove_file(dir.join("init.lua")).unwrap();
+        let dangling = base.join("nothing.lua");
+        std::os::unix::fs::symlink(&dangling, dir.join("init.lua")).unwrap();
+        let result = create_new_file_at(handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::Exists)), "{result:?}");
+        assert!(!dangling.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_fifo_at_the_name_is_exists_and_does_not_block() {
+        let (base, dir, handle) = new_config_dir("new-fifo");
+        make_fifo(&dir.join("init.lua"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = create_new_file_at(handle.as_fd(), "init.lua", b"theirs", 0o644);
+            let _ = tx.send(matches!(result, Err(CreateRefusal::Exists)));
+        });
+        let exists = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("creating the file blocked on a FIFO");
+        assert!(exists);
+        assert_eq!(names_in(&dir), ["init.lua"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn two_threads_racing_one_wins_one_is_exists() {
+        let base = config_scratch("new-race");
+        for round in 0..50 {
+            let dir = base.join(format!("eitri-{round}"));
+            let handle = open_user_config_dir(&dir).unwrap();
+            let start = std::sync::Barrier::new(2);
+            let attempt = |bytes: &'static [u8]| {
+                start.wait();
+                create_new_file_at(handle.as_fd(), "init.lua", bytes, 0o644)
+            };
+            let (first, second) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| attempt(b"first"));
+                let second = scope.spawn(|| attempt(b"second"));
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            let wanted: &[u8] = match (&first, &second) {
+                (Ok(()), Err(CreateRefusal::Exists)) => b"first",
+                (Err(CreateRefusal::Exists), Ok(())) => b"second",
+                other => panic!("round {round}: {other:?}"),
+            };
+            assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), wanted, "round {round}");
+            assert_eq!(names_in(&dir), ["init.lua"], "round {round}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The temporary file is created with whatever mode the umask leaves, and its descriptor still
+    /// writes: the umask decides the mode of the user's file, never how much of it arrives.
+    #[test]
+    fn umask_0277_still_writes_the_whole_file() {
+        crate::test_umask::with_umask(
+            concat!(module_path!(), "::umask_0277_still_writes_the_whole_file"),
+            0o277,
+            || {
+                let (base, dir, handle) = new_config_dir("new-umask");
+                let bytes = vec![b'x'; 1 << 20];
+                create_new_file_at(handle.as_fd(), "init.lua", &bytes, 0o644).unwrap();
+                assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), bytes);
+                assert_eq!(mode(&dir.join("init.lua")), 0o400);
+                assert_eq!(names_in(&dir), ["init.lua"]);
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
+    /// The real calls, but for the errors a test asks for.
+    struct Scripted {
+        link: Option<i32>,
+        rename: Option<i32>,
+    }
+
+    impl LinkCalls for Scripted {
+        fn link(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()> {
+            match self.link {
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => SystemCalls.link(dir, from, to),
+            }
+        }
+
+        fn rename_noreplace(&self, dir: BorrowedFd<'_>, from: &CStr, to: &CStr) -> std::io::Result<()> {
+            match self.rename {
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                None => SystemCalls.rename_noreplace(dir, from, to),
+            }
+        }
+    }
+
+    /// Only Linux has the call: every other target reports `ENOSYS`, the arm the next test covers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eperm_from_link_takes_the_rename_path() {
+        for errno in [libc::EPERM, libc::EOPNOTSUPP, libc::ENOSYS] {
+            let (base, dir, handle) = new_config_dir("new-rename");
+            let calls = Scripted {
+                link: Some(errno),
+                rename: None,
+            };
+            create_new_file_with(&calls, handle.as_fd(), "init.lua", b"-- lines\n", 0o644).unwrap();
+            assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), b"-- lines\n");
+            assert_eq!(names_in(&dir), ["init.lua"], "no temporary is left");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_real_rename_never_replaces_a_file() {
+        let (base, dir, handle) = new_config_dir("new-rename-real");
+        std::fs::write(dir.join("init.lua"), b"mine").unwrap();
+        let calls = Scripted {
+            link: Some(libc::EPERM),
+            rename: None,
+        };
+        let result = create_new_file_with(&calls, handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::Exists)), "{result:?}");
+        assert_eq!(std::fs::read(dir.join("init.lua")).unwrap(), b"mine");
+        assert_eq!(names_in(&dir), ["init.lua"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn eexist_on_the_rename_path_is_exists() {
+        let (base, dir, handle) = new_config_dir("new-rename-exists");
+        let calls = Scripted {
+            link: Some(libc::EPERM),
+            rename: Some(libc::EEXIST),
+        };
+        let result = create_new_file_with(&calls, handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::Exists)), "{result:?}");
+        assert!(names_in(&dir).is_empty(), "the temporary is gone");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn refused_rename_leaves_nothing(errno: i32) {
+        let (base, dir, handle) = new_config_dir("new-rename-refused");
+        let calls = Scripted {
+            link: Some(libc::EPERM),
+            rename: Some(errno),
+        };
+        let result = create_new_file_with(&calls, handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(matches!(result, Err(CreateRefusal::CannotCreateSafely)), "{result:?}");
+        assert!(names_in(&dir).is_empty(), "no init.lua and no temporary");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn einval_from_rename_is_cannot_create_safely_and_leaves_nothing() {
+        refused_rename_leaves_nothing(libc::EINVAL);
+    }
+
+    #[test]
+    fn enosys_from_rename_is_the_same() {
+        refused_rename_leaves_nothing(libc::ENOSYS);
+    }
+
+    #[test]
+    fn any_other_link_error_stops_there_and_leaves_nothing() {
+        let (base, dir, handle) = new_config_dir("new-link-error");
+        let calls = Scripted {
+            link: Some(libc::EIO),
+            rename: Some(libc::EINVAL),
+        };
+        let result = create_new_file_with(&calls, handle.as_fd(), "init.lua", b"theirs", 0o644);
+        assert!(
+            matches!(&result, Err(CreateRefusal::Io(e)) if e.raw_os_error() == Some(libc::EIO)),
+            "{result:?}"
+        );
+        assert!(names_in(&dir).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The name is one entry of the directory the handle holds, never a way out of it.
+    #[test]
+    fn a_name_that_is_not_one_entry_is_refused() {
+        let (base, dir, handle) = new_config_dir("new-name");
+        for name in ["", ".", "..", "../init.lua", "a/b", "nul\0"] {
+            let result = create_new_file_at(handle.as_fd(), name, b"x", 0o644);
+            assert!(matches!(result, Err(CreateRefusal::Io(_))), "{name:?}: {result:?}");
+        }
+        assert!(names_in(&dir).is_empty());
+        assert_eq!(names_in(&base), ["eitri"]);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

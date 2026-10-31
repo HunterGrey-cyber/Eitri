@@ -11,15 +11,14 @@ What you type into this page is never written to disk.
 
 Most steps in this tutorial happen outside nvim, in the window: each one says
 what you should see and how to come back here. One way back always works:
-`Ctrl+b e` gives the keys to this editor from any other module. (Pressed while
-the editor already has the keys, it hides the editor instead; press it again
-to bring it back.)
+`{prefix} e` gives the keys to this editor from any other module. (Pressed
+while the editor already has the keys, it hides the editor instead; press it
+again to bring it back.)
 
-The keys are written for the default setup, with `Ctrl+b` as the prefix. If
-Eitri took another prefix from your tmux config or your init.lua, press yours
-wherever this tutorial says Ctrl+b. Lesson 7 says where those come from. If
-your tmux config also rebinds keys after the prefix, `Ctrl+b ?` shows what
-they do here.
+The keys are written with `{prefix}` as the prefix, the one Eitri has now (the
+default prefix is `Ctrl+b`). Lesson 7 says where another one comes from. This
+tutorial teaches the stock keys after the prefix: if your tmux config rebinds
+some of them, `{prefix} ?` shows what they do here.
 
 When a line has a ✗ at its left, you fix it. Most of these lines ask for a
 key: press `A`{normal}, type a space and the key as this tutorial spells it
@@ -27,32 +26,32 @@ key: press `A`{normal}, type a space and the key as this tutorial spells it
 turns into ✓ when the line is right. Try it on the line below, which wants a
 `?`:
 
-Press the prefix, then this key, to list every key: Ctrl+b
+Press the prefix, then this key, to list every key: {prefix}
 
 # Lesson 1: THE PREFIX
 
-** Press Ctrl+b, let go, then press one more key. **
+** Press {prefix}, let go, then press one more key. **
 
 The window's own keys start with a prefix, as in tmux. Eitri reads it before
 the editor, the agent panel or the terminal sees the key, so it works wherever
 the keys are.
 
- 1. Press `Ctrl+b` and let go. The top bar shows a strip of what can follow,
+ 1. Press `{prefix}` and let go. The top bar shows a strip of what can follow,
     ending with `? keys`.
 
  2. Press `<Esc>`. The strip goes away and nothing else happens. A key the
     prefix does not bind also ends the wait without doing anything.
 
- 3. Press `Ctrl+b ?`. The agent panel shows the full list of keys, starting at
-    the ones that follow the prefix. Your own changes and anything taken from
-    tmux are in it. Close it with `q` or `<Esc>`: the keys come back here.
+ 3. Press `{prefix} ?`. The agent panel shows the full list of keys, starting
+    at the ones that follow the prefix. Your own changes and anything taken
+    from tmux are in it. Close it with `q` or `<Esc>`: the keys come back here.
 
-NOTE: The keys in this tutorial are the most used ones. `Ctrl+b ?` always
+NOTE: The keys in this tutorial are the most used ones. `{prefix} ?` always
       shows all of them, and the hint strip shows what may follow the prefix.
 
 # Lesson 2: SPLITS, ZOOM AND CLOSING A MODULE
 
-** Ctrl+b % opens a module to the right, Ctrl+b " below. **
+** {prefix} % opens a module to the right, {prefix} " below. **
 
 The window is made of modules: this editor, the agent panel and the bottom
 terminal. A split key waits for a second key that names the module: `e` for
@@ -62,29 +61,29 @@ already open, the split moves it there.
 NOTE: Steps 3 and 4 close the bottom terminal, which ends its shell and all
       that runs in it, also when the terminal was hidden. If it runs
       something you need, such as a build, a server or an agent, leave out
-      the closing in steps 3 and 4: press `Ctrl+b e` to come back here.
+      the closing in steps 3 and 4: press `{prefix} e` to come back here.
 
- 1. Press `Ctrl+b %`, then `t`. The terminal opens to the right of the editor
-    and takes the keys.
+ 1. Press `{prefix} %`, then `t`. The terminal opens to the right of the
+    editor and takes the keys.
 
- 2. Press `Ctrl+b z`. The terminal fills the window. Press `Ctrl+b z` again
-    and it goes back to its place.
+ 2. Press `{prefix} z`. The terminal fills the window. Press `{prefix} z`
+    again and it goes back to its place.
 
- 3. Press `Ctrl+b x`. The top bar asks whether to kill the pane. Press `y`:
+ 3. Press `{prefix} x`. The top bar asks whether to kill the pane. Press `y`:
     the terminal's shell ends and the terminal closes. The keys go to a
-    neighbouring module; if that is not this editor, press `Ctrl+b e`.
+    neighbouring module; if that is not this editor, press `{prefix} e`.
 
- 4. Press `Ctrl+b "`, then `t`. This time the terminal opens below the editor.
-    Close it again with `Ctrl+b x` and `y`.
+ 4. Press `{prefix} "`, then `t`. This time the terminal opens below the
+    editor. Close it again with `{prefix} x` and `y`.
 
-NOTE: Do not press `Ctrl+b x` while this editor has the keys. It ends nvim,
+NOTE: Do not press `{prefix} x` while this editor has the keys. It ends nvim,
       and with it this tutorial, and the editor does not come back until you
       open a new Eitri window; with the editor as the last module on screen,
       it closes Eitri.
 
  5. Fix the line below:
 
-Zoom this module, or restore it: Ctrl+b
+Zoom this module, or restore it: {prefix}
 
 # Lesson 3: MOVING WITH CTRL+H, CTRL+J, CTRL+K, CTRL+L
 
@@ -107,10 +106,10 @@ only when there is no nvim window that way, as vim-tmux-navigator does in tmux.
     `:only`{vim}.
 
  4. A few more ways to move the keys:
-    `Ctrl+b o`      the next module on screen
-    `Ctrl+b ;`      the module that had the keys before
-    `Ctrl+b Left`   the module on that side (also Right, Up and Down)
-    `Ctrl+b f`      labels the modules and buttons you can jump to; type a
+    `{prefix} o`      the next module on screen
+    `{prefix} ;`      the module that had the keys before
+    `{prefix} Left`   the module on that side (also Right, Up and Down)
+    `{prefix} f`      labels the modules and buttons you can jump to; type a
                     label to go there
 
 NOTE: If your nvim config maps `Ctrl+h`, `Ctrl+j`, `Ctrl+k` or `Ctrl+l` to
@@ -119,7 +118,7 @@ NOTE: If your nvim config maps `Ctrl+h`, `Ctrl+j`, `Ctrl+k` or `Ctrl+l` to
 
  5. Fix the line below:
 
-Go back to the module that had the keys before: Ctrl+b
+Go back to the module that had the keys before: {prefix}
 
 # Lesson 4: THE AGENT PANEL
 
@@ -140,12 +139,12 @@ nvim's.
     the conversation, `?` lists the panel's keys (`q` closes the list), and
     `i` goes back to the box.
 
- 4. Each conversation is a tab. Press `Ctrl+b c`: a new, empty tab opens and
-    waits for its first message. `Ctrl+b n` and `Ctrl+b p` go to the next and
-    the previous tab, `Ctrl+b 1` to the first. `Ctrl+b &` closes the tab you
-    are on after a `y`. Close the new one that way: go back to it
-    (`Ctrl+b n` until you are on it), then press `Ctrl+b &` and `y`. In
-    BROWSE, `H` and `L` also step through the tabs.
+ 4. Each conversation is a tab. Press `{prefix} c`: a new, empty tab opens
+    and waits for its first message. `{prefix} n` and `{prefix} p` go to the
+    next and the previous tab, `{prefix} 1` to the first. `{prefix} &`
+    closes the tab you are on after a `y`. Close the new one that way: go
+    back to it (`{prefix} n` until you are on it), then press `{prefix} &`
+    and `y`. In BROWSE, `H` and `L` also step through the tabs.
 
  5. When an agent wants to run a tool that needs your approval, a card waits
     in the conversation. There is none now, so read this one:
@@ -161,76 +160,78 @@ nvim's.
 
  7. Fix the line below:
 
-Open a new tab in the agent panel: Ctrl+b
+Open a new tab in the agent panel: {prefix}
 
-# Lesson 5: THE BOTTOM TERMINAL, AND CTRL+B TWICE
+# Lesson 5: THE BOTTOM TERMINAL, AND THE PREFIX TWICE
 
-** Ctrl+b t shows the terminal; Ctrl+b Ctrl+b sends Ctrl+b itself. **
+** {prefix} t shows the terminal; {prefix} {prefix} sends {prefix}
+   itself. **
 
 In the terminal, the prefix and the four moving keys belong to Eitri, so the
 shell never sees them. The prefix gives them back.
 
- 1. Press `Ctrl+b t`. The terminal opens below the editor with the keys. Its
+ 1. Press `{prefix} t`. The terminal opens below the editor with the keys. Its
     shell starts in the project's directory.
 
  2. Type `ls` and press `<Enter>`. To clear the screen, `Ctrl+l` will not do:
-    it moves the keys. Press `Ctrl+b Ctrl+l` instead, which sends Ctrl+l to
-    the shell. `Ctrl+b Ctrl+h`, `Ctrl+b Ctrl+j` and `Ctrl+b Ctrl+k` do the same
-    for those keys, such as readline's Ctrl+k, which deletes to the end of the
-    line.
+    it moves the keys. Press `{prefix} Ctrl+l` instead, which sends Ctrl+l to
+    the shell. `{prefix} Ctrl+h`, `{prefix} Ctrl+j` and `{prefix} Ctrl+k`
+    do the same for those keys, such as readline's Ctrl+k, which deletes to
+    the end of the line.
 
- 3. Press `Ctrl+b [` to scroll back through the terminal's output. `k` and `j`
-    move a line, `q` leaves.
+ 3. Press `{prefix} [` to scroll back through the terminal's output. `k` and
+    `j` move a line, `q` leaves.
 
- 4. Press `Ctrl+b Ctrl+b` to send Ctrl+b to the program: in a shell it moves
-    the cursor back one character. Claude Code running in this terminal takes
-    it as the key that moves a running command to the background.
+ 4. Press `{prefix} {prefix}` to send {prefix} to the program. For Ctrl+b,
+    a shell moves the cursor back one character, and Claude Code running in
+    this terminal takes it as the key that moves a running command to the
+    background.
 
  5. Press `Ctrl+k`. The keys come back here, to the editor above. With the
-    keys in the terminal, `Ctrl+b t` hides it again.
+    keys in the terminal, `{prefix} t` hides it again.
 
  6. The same goes for nvim, where Ctrl+b scrolls a page back. Press
-    `<C-f>`{normal} to go a page forward, then `Ctrl+b Ctrl+b`: nvim gets
-    Ctrl+b and goes a page back to this lesson.
+    `<C-f>`{normal} to go a page forward, then `{prefix} {prefix}`: nvim
+    gets {prefix}; for Ctrl+b that goes a page back to this lesson.
 
  7. Fix the line below:
 
-Clear the terminal's screen: Ctrl+b
+Clear the terminal's screen: {prefix}
 
 # Lesson 6: FLOATS, THE SCRATCHPAD AND WORKSPACES
 
 ** A float sits above the other modules, the scratchpad keeps floats out of
    sight, and a workspace keeps a whole arrangement under a name. **
 
- 1. Press `Ctrl+b t` to show the terminal and give it the keys.
+ 1. Press `{prefix} t` to show the terminal and give it the keys.
 
- 2. Press `Ctrl+b Alt+Shift+Space`. The terminal floats in the middle of the
+ 2. Press `{prefix} Alt+Shift+Space`. The terminal floats in the middle of the
     window, above the others. The editor never floats.
 
- 3. Press `Ctrl+b Alt+_` (on most keyboards that is Alt, Shift and the minus
+ 3. Press `{prefix} Alt+_` (on most keyboards that is Alt, Shift and the minus
     key). The float goes to the scratchpad, out of sight. Its name in the top
     bar now ends with `⌁`, and its shell keeps running.
 
- 4. Press `Ctrl+b Alt+-`. It comes back. Press it again and it goes away; once
-    more brings it back.
+ 4. Press `{prefix} Alt+-`. It comes back. Press it again and it goes away;
+    once more brings it back.
 
- 5. With the keys on the float, press `Ctrl+b Alt+Shift+Space` to put it back
-    among the other modules. Then press `Ctrl+b e` to come back here.
+ 5. With the keys on the float, press `{prefix} Alt+Shift+Space` to put it
+    back among the other modules. Then press `{prefix} e` to come back here.
 
- 6. Press `Ctrl+b s`. The hint strip lists the workspaces and ends with
+ 6. Press `{prefix} s`. The hint strip lists the workspaces and ends with
     `c new · x delete`. Press `c`: Eitri makes a new workspace, a copy of
     this arrangement named with the lowest free number from 2, and takes you
-    there. Press `Ctrl+b z` to zoom the editor.
+    there. Press `{prefix} z` to zoom the editor.
 
- 7. Press `Ctrl+b L`. You are back in the workspace you started in,
-    unzoomed, as you left it. To delete the copy, press `Ctrl+b s`, then
+ 7. Press `{prefix} L`. You are back in the workspace you started in,
+    unzoomed, as you left it. To delete the copy, press `{prefix} s`, then
     `x`, then the digit the strip shows beside the copy; it goes at once,
     without a question. Every workspace holds the same modules; only their
     arrangement differs.
 
  8. Fix the line below:
 
-Float this module, or put a float back: Ctrl+b
+Float this module, or put a float back: {prefix}
 
 # Lesson 7: YOUR TMUX CONFIG, AND INIT.LUA
 
@@ -239,7 +240,7 @@ Float this module, or put a float back: Ctrl+b
 If you use tmux, Eitri read your tmux config when it started (the files tmux
 reads, such as ~/.tmux.conf or ~/.config/tmux/tmux.conf). Your prefix and the
 bindings that match an Eitri action work here too. A notice says what came
-across, once for each change, and `Ctrl+b ?` lists every line that did not,
+across, once for each change, and `{prefix} ?` lists every line that did not,
 with the reason. Eitri only reads those files; it never starts or asks tmux.
 
 Your own changes go in ~/.config/eitri/init.lua (with $XDG_CONFIG_HOME set,
@@ -256,8 +257,8 @@ k.set("prefix", "C-a", "send-prefix")  -- now Ctrl+a twice sends Ctrl+a
 A key that already has an action must be deleted with `k.del` before `k.set`
 gives it another; otherwise Eitri stops at startup and says which call to fix.
 
- 1. The line below sets the prefix to Ctrl+b. Change it to Ctrl+a: move the
-    cursor onto the `b` and press `ra`{normal}.
+ 1. The sample line below sets a prefix to Ctrl+b. Change it to Ctrl+a: move
+    the cursor onto the `b` and press `ra`{normal}.
 
 eitri.keymap.prefix("C-b")
 
@@ -268,28 +269,28 @@ eitri.keymap.prefix("C-b")
 Two samples come with Eitri's source, in docs/keymap/: tmux-ctrl-a.lua moves
 the prefix to Ctrl+a with the rest of a common tmux setup, and i3-alt-mod.lua
 is for i3 or sway with Alt as $mod. Such a window manager takes the Alt chords
-before Eitri sees them (`Ctrl+b Alt+w` and the others), and the sample moves
-them to Ctrl+Alt chords: with it, lesson 6's Ctrl+b Alt+Shift+Space becomes
-Ctrl+b Ctrl+Alt+Space, and its Ctrl+b Alt+_ becomes Ctrl+b _.
+before Eitri sees them (`{prefix} Alt+w` and the others), and the sample moves
+them to Ctrl+Alt chords: with it, lesson 6's {prefix} Alt+Shift+Space becomes
+{prefix} Ctrl+Alt+Space, and its {prefix} Alt+_ becomes {prefix} _.
 
 # THE END
 
 These are the keys from this tutorial:
 
-    `Ctrl+b ?`                  every key
-    `Ctrl+b %`, `Ctrl+b "`      then e, a or t: open that module right of,
+    `{prefix} ?`                  every key
+    `{prefix} %`, `{prefix} "`    then e, a or t: open that module right of,
                                 or below, this one
-    `Ctrl+b z`                  zoom, or restore
-    `Ctrl+b x`                  close this module, after a y
+    `{prefix} z`                  zoom, or restore
+    `{prefix} x`                  close this module, after a y
     `Ctrl+h` `Ctrl+j` `Ctrl+k` `Ctrl+l`   move the keys
-    `Ctrl+b e`, `Ctrl+b a`, `Ctrl+b t`    editor, agent panel, terminal
+    `{prefix} e`, `{prefix} a`, `{prefix} t` editor, agent panel, terminal
                                 (pressed there: hide it)
-    `Ctrl+b c`, `Ctrl+b n`, `Ctrl+b p`    new, next, previous tab
-    `Ctrl+b Ctrl+b`             send Ctrl+b to the module with the keys
-    `Ctrl+b Ctrl+l`             send Ctrl+l (clear a shell's screen)
-    `Ctrl+b Alt+Shift+Space`    float, or put back
-    `Ctrl+b Alt+_`, `Ctrl+b Alt+-`        to the scratchpad, and back
-    `Ctrl+b s`, `Ctrl+b L`      choose a workspace, the last one
+    `{prefix} c`, `{prefix} n`, `{prefix} p`    new, next, previous tab
+    `{prefix} {prefix}`          send {prefix} to the module with the keys
+    `{prefix} Ctrl+l`             send Ctrl+l (clear a shell's screen)
+    `{prefix} Alt+Shift+Space`    float, or put back
+    `{prefix} Alt+_`, `{prefix} Alt+-`        to the scratchpad, and back
+    `{prefix} s`, `{prefix} L`      choose a workspace, the last one
 
 The guide on https://eitri.cc/docs/ has every key and setting. Run
 `:EitriTutor`{vim} to start this tutorial again.

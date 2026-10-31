@@ -47,6 +47,17 @@ impl ConfigStore {
         self.values.get(key).map(Stored::as_str)
     }
 
+    /// Every key with the value [`Self::get`] gives for it, sorted by key.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_str().to_string()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
     /// The first set refusal recorded at the Lua function boundary during init.
     /// Keeping it outside Lua makes a caught error visible to startup validation.
     pub fn refused(&self) -> Option<String> {
@@ -197,6 +208,31 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_are_sorted_and_read_as_get_reads() {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        assert!(store.borrow().entries().is_empty());
+        lua.load(
+            "eitri.config.set('z.text', 'word')\n\
+             eitri.config.set('a.number', 200)\n\
+             eitri.config.set('m.switch', false)\n\
+             eitri.config.set('gone', 'x')\n\
+             eitri.config.set('gone', nil)\n",
+        )
+        .exec()
+        .unwrap();
+        let entries = store.borrow().entries();
+        let entries: Vec<(&str, &str)> = entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            entries,
+            [("a.number", "200"), ("m.switch", "false"), ("z.text", "word")]
+        );
+    }
 
     #[test]
     fn terminal_font_parses_optional_families_and_height() {

@@ -1,15 +1,15 @@
 {
   "expect": {
-    "23": "先按前缀，再按这个键，列出所有按键：Ctrl+b ?",
-    "74": "放大这个模块，或者恢复：Ctrl+b z",
-    "104": "回到之前拿着按键的模块：Ctrl+b ;",
-    "140": "在 agent 面板里新建一个标签页：Ctrl+b c",
-    "169": "清空终端屏幕：Ctrl+b Ctrl+l",
-    "201": "把这个模块浮起来，或者把浮动窗口放回去：Ctrl+b Alt+Shift+Space",
-    "230": "eitri.keymap.prefix(\"C-a\")"
+    "24": "先按前缀，再按这个键，列出所有按键：{prefix} ?",
+    "76": "放大这个模块，或者恢复：{prefix} z",
+    "106": "回到之前拿着按键的模块：{prefix} ;",
+    "142": "在 agent 面板里新建一个标签页：{prefix} c",
+    "174": "清空终端屏幕：{prefix} Ctrl+l",
+    "206": "把这个模块浮起来，或者把浮动窗口放回去：{prefix} Alt+Shift+Space",
+    "235": "eitri.keymap.prefix(\"C-a\")"
   },
   "translated-from": {
     "file": "en/eitri.tutor",
-    "sha256": "39393ff519128468d488f6ad5f3e063e81af69dfded843872ea4cc9a781dec52"
+    "sha256": "551b200293a73903d48f45811c472f5c62f6dde95ec70bd3c387b234002dc0da"
   }
 }

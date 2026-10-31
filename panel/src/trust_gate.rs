@@ -509,6 +509,11 @@ pub(crate) struct TrustGate {
 }
 
 impl TrustGate {
+    /// Whether a tab's trust question is on screen: it holds the keys, so anything else that wants them waits.
+    pub(crate) fn question_open(&self) -> bool {
+        !self.shown.is_empty()
+    }
+
     /// The gate for `root` (canonical), starting the window's worker, which alone owns `store`.
     /// Touches no disk here.
     pub(crate) fn new(store: TrustStore, root: PathBuf, home: Option<PathBuf>) -> TrustGate {
@@ -4099,6 +4104,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|i| i["value"] == value.as_str()));
+    }
+
+    /// The first-start screen yields the keys while a question is on screen: it is open from the ask to the
+    /// answer or the tab's end, and not before.
+    #[test]
+    fn question_open_follows_shown() {
+        let fx = Fx::new("question-open");
+        fx.write(SETTINGS, &hook("echo hi"));
+        let mut gate = fx.gate();
+        assert!(!gate.question_open(), "nothing asked yet");
+        assert_eq!(start(&mut gate, A), Route::Ask);
+        assert!(
+            !gate.question_open(),
+            "a check that has not been put to the tab shows nothing"
+        );
+        assert!(matches!(gate.ask(A, 1, &CLAUDE), Some(Asked::Prompt(_))));
+        assert!(gate.question_open());
+        gate.forget_tab(A);
+        assert!(!gate.question_open(), "the tab went away with its question");
     }
 
     /// A configuration whose record would be larger than a record may be is asked about as a

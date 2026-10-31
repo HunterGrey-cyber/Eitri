@@ -1,9 +1,10 @@
 use super::*;
 use crate::alloc_count::bytes_allocated_by;
-use crate::keymap::{Action, KeySpec, Keymap};
+use crate::keymap::{Action, KeySpec, Keymap, KeymapOp};
 use crate::layout::{Axis, Layout, ModuleKeys, Node, Size};
 use crate::wm::chrome::ChromeModel;
 use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
+use crate::wm::prefix_panel::PrefixPanel;
 use crate::wm::verbs::rig::decl;
 use crate::wm::*;
 use std::cell::RefCell;
@@ -113,14 +114,24 @@ struct Rig {
 }
 
 fn driven(layout: Layout) -> Rig {
+    driven_with(layout, None)
+}
+
+/// [`driven`] with `keymap.which_key_delay` given to the controller before the window is made.
+fn driven_with(layout: Layout, hint_delay: Option<Duration>) -> Rig {
+    driven_keyed(layout, Keymap::defaults(), hint_delay)
+}
+
+/// [`driven_with`] over a given keymap.
+fn driven_keyed(layout: Layout, keymap: Keymap, hint_delay: Option<Duration>) -> Rig {
     let host = FakeHost::new();
     host.set_grid_size(GRID);
     let scheduler = FakeScheduler::new();
     let mut controller = Controller::new(scheduler.clone());
     controller.set_reads(host.clone());
-    let keymap = Keymap::defaults();
     let module_keys = ModuleKeys::build(&[], &keymap).unwrap();
     controller.set_keymap(WIN, Rc::new(keymap), Rc::new(module_keys));
+    controller.set_hint_delay(WIN, hint_delay);
     let hosted: Vec<_> = layout.modules().iter().map(decl).collect();
     for d in &hosted {
         host.with_surface(WIN, d.module.clone(), d.kind.clone(), false);
@@ -224,6 +235,35 @@ impl Rig {
     fn notes(&self) -> Vec<String> {
         self.driver.query(|c| c.notes(WIN))
     }
+
+    /// The hint panel the chrome shows now.
+    fn panel(&self) -> Option<PrefixPanel> {
+        self.chrome().prefix_panel
+    }
+
+    /// How many times the hint panel's field was derived.
+    fn panel_derivations(&self) -> u64 {
+        self.driver.query(|c| c.chrome_derivations(WIN)).prefix_panel
+    }
+
+    /// `Esc` pressed and released.
+    fn escape(&self) -> Verdict {
+        let verdict = self.window_key(escape_key(K3));
+        self.host.post(HostEvent::KeyReleased { win: WIN, keycode: K3 });
+        verdict
+    }
+}
+
+const HINT_DELAY: Duration = Duration::from_millis(200);
+
+fn split_right_key() -> String {
+    Keymap::defaults()
+        .bindings()
+        .iter()
+        .find(|b| matches!(b.action, Action::Split { axis: Axis::Row, .. }))
+        .expect("a default split.right key")
+        .key
+        .to_string()
 }
 
 fn chrome_ops(ops: &[HostOp]) -> usize {
@@ -518,7 +558,7 @@ fn the_terminal_gives_up_all_four_chords_even_with_nothing_that_way() {
 
 #[test]
 fn a_pass_through_key_allocates_nothing_in_either_stage_or_on_release() {
-    let r = driven(three(editor()));
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
     r.host.set_editor_running(true);
     let plain = key("a", K1);
     // Each stage is built inside the measured call, as a host builds it for every key: a stage that copied the
@@ -1186,4 +1226,295 @@ fn a_window_before_its_config_passes_every_key() {
         Verdict::Consumed,
         "the config's prefix arms"
     );
+}
+
+// --- The hint panel.
+
+#[test]
+fn armed_with_delay_200_shows_no_panel_before_the_timer_and_the_panel_after() {
+    let r = driven(three(editor()));
+    r.driver.set_hint_delay(WIN, Some(HINT_DELAY));
+    r.arm();
+    assert_eq!(r.waiting(), Waiting::Command);
+    assert_eq!(r.panel(), None, "nothing at once");
+    r.scheduler.advance(HINT_DELAY - Duration::from_millis(1));
+    assert_eq!(r.panel(), None, "nothing before the delay");
+    let mark = r.mark();
+    r.scheduler.advance(Duration::from_millis(1));
+    let panel = r.panel().expect("the panel is up at the delay");
+    assert_eq!(panel.heading, "Ctrl+b \u{2026}");
+    assert!(panel.groups.iter().any(|group| group.title == "Modules"), "{panel:?}");
+    assert_eq!(chrome_ops(&r.ops_since(mark)), 1, "announced once");
+    assert_eq!(r.waiting(), Waiting::Command, "the wait goes on");
+}
+
+#[test]
+fn a_key_before_the_timer_means_the_panel_is_never_shown() {
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    r.arm();
+    r.scheduler.advance(HINT_DELAY / 2);
+    assert_eq!(r.window_key(key(&bound(&Action::Zoom), K1)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K1 });
+    r.scheduler.advance(Duration::from_secs(5));
+    assert_eq!(r.panel(), None);
+    assert_eq!(r.panel_derivations(), 0, "a panel that never went up was never derived");
+}
+
+#[test]
+fn an_older_arms_timer_after_a_rearm_does_nothing() {
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    r.arm();
+    let first: Vec<TimerToken> = r.scheduler.armed().into_iter().map(|(token, _)| token).collect();
+    assert_eq!(first.len(), 1, "one timer for the wait");
+    assert_eq!(r.escape(), Verdict::Consumed);
+    r.scheduler.advance(HINT_DELAY / 2);
+    r.arm();
+    // The first wait's timer fires anyway, as a timer already queued would.
+    r.host.post(HostEvent::Timer(first[0]));
+    assert_eq!(r.panel(), None, "the timer of an earlier wait shows nothing");
+    r.scheduler.advance(HINT_DELAY - Duration::from_millis(1));
+    assert_eq!(r.panel(), None, "the new wait has its own full delay");
+    r.scheduler.advance(Duration::from_millis(1));
+    assert!(r.panel().is_some());
+}
+
+#[test]
+fn esc_focus_loss_and_a_pointer_press_hide_it() {
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    let up = |r: &Rig| {
+        r.arm();
+        r.scheduler.advance(HINT_DELAY);
+        assert!(r.panel().is_some(), "the premise: the panel is up");
+    };
+    up(&r);
+    assert_eq!(r.escape(), Verdict::Consumed);
+    assert_eq!(r.panel(), None, "Esc");
+    assert_eq!(r.waiting(), Waiting::No);
+
+    up(&r);
+    r.host.post(HostEvent::Active {
+        win: WIN,
+        active: false,
+    });
+    assert_eq!(r.panel(), None, "focus loss");
+    r.host.post(HostEvent::Active { win: WIN, active: true });
+
+    up(&r);
+    r.host.post(HostEvent::Pointer {
+        win: WIN,
+        on: PointerTarget::Window,
+        ev: PointerEv::Press {
+            x: 3.0,
+            y: 4.0,
+            button: 1,
+        },
+    });
+    assert_eq!(r.panel(), None, "a pointer press");
+    r.scheduler.advance(Duration::from_secs(5));
+    assert_eq!(r.panel(), None, "and no timer brings it back");
+}
+
+#[test]
+fn repeat_mode_shows_nothing() {
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    let repeating = Keymap::defaults()
+        .bindings()
+        .iter()
+        .find(|b| b.repeatable)
+        .expect("a default repeats")
+        .key
+        .to_string();
+    r.prefix_then(&repeating, K1);
+    assert_eq!(
+        r.waiting(),
+        Waiting::No,
+        "repeat mode waits for nothing the chrome shows"
+    );
+    r.scheduler.advance(Duration::from_secs(5));
+    assert_eq!(r.panel(), None);
+}
+
+#[test]
+fn a_delay_set_before_the_window_is_made_still_shows_the_panel() {
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    r.arm();
+    r.scheduler.advance(HINT_DELAY);
+    assert!(r.panel().is_some());
+}
+
+/// A window with nothing around it, to drive the keys' own functions.
+fn bare_window(scheduler: &Rc<FakeScheduler>) -> Window {
+    Window::new(
+        WindowSpec {
+            role: WindowRole::Main,
+            presence: EditorPresence::Owned,
+            title: "project".into(),
+        },
+        WindowParts {
+            layout: Rc::new(RefCell::new(three(editor()))),
+            workspaces: Rc::new(RefCell::new(crate::layout::Workspaces::single())),
+            saver: None,
+        },
+        Timers {
+            scheduler: scheduler.clone(),
+            next: Rc::new(std::cell::Cell::new(1)),
+        },
+    )
+}
+
+#[test]
+fn a_wait_for_a_module_reached_straight_from_no_wait_arms_the_timer() {
+    let scheduler = FakeScheduler::new();
+    let mut w = bare_window(&scheduler);
+    w.keys.hint_delay = Some(HINT_DELAY);
+    let mut batch = Batch::default();
+    waiting_changed(&mut w, Waiting::No, Waiting::Module(Axis::Row), &mut batch);
+    let armed = scheduler.armed();
+    assert_eq!(armed.len(), 1, "{armed:?}");
+    assert!(!w.keys.hints_shown);
+    assert!(
+        !hint_timer_fired(&mut w, TimerToken(u64::MAX - 1)),
+        "another window's timer is not its"
+    );
+    assert!(hint_timer_fired(&mut w, armed[0].0));
+    assert!(w.keys.hints_shown, "the module wait shows the panel at the delay");
+    waiting_changed(&mut w, Waiting::Module(Axis::Row), Waiting::No, &mut batch);
+    assert!(!w.keys.hints_shown);
+
+    // A wait that ends before the delay takes its timer down.
+    let before = scheduler.armed().len();
+    waiting_changed(&mut w, Waiting::No, Waiting::Module(Axis::Column), &mut batch);
+    assert!(w.keys.hint_timer.is_some());
+    waiting_changed(&mut w, Waiting::Module(Axis::Column), Waiting::No, &mut batch);
+    assert!(w.keys.hint_timer.is_none());
+    assert_eq!(
+        scheduler.armed().len(),
+        before,
+        "the second wait's timer is gone from the scheduler"
+    );
+}
+
+#[test]
+fn after_a_split_key_the_panel_lists_the_module_keys() {
+    let r = driven_with(three(editor()), Some(Duration::ZERO));
+    r.arm();
+    assert_eq!(r.panel().expect("shown at once").heading, "Ctrl+b \u{2026}");
+    assert_eq!(r.window_key(key(&split_right_key(), K1)), Verdict::Consumed);
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K1 });
+    assert_eq!(r.waiting(), Waiting::Module(Axis::Row));
+    let panel = r.panel().expect("the panel stays up and switches");
+    assert_eq!(panel.heading, "right of editor:");
+    assert_eq!(panel.groups.len(), 1);
+    assert_eq!(panel.groups[0].title, "Modules");
+    assert!(panel.groups[0].rows.iter().any(|row| row.keys == "t"), "{panel:?}");
+    assert_eq!(r.window_key(key("t", K2)), Verdict::Consumed);
+    assert_eq!(r.panel(), None, "the placement ends the wait");
+
+    // With a delay, the timer started by the prefix keeps running through the split key.
+    let r = driven_with(three(editor()), Some(HINT_DELAY));
+    r.arm();
+    r.scheduler.advance(HINT_DELAY / 2);
+    r.window_key(key(&split_right_key(), K1));
+    r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K1 });
+    assert_eq!(r.panel(), None);
+    r.scheduler.advance(HINT_DELAY / 2);
+    assert_eq!(r.panel().expect("the first wait's delay").heading, "right of editor:");
+}
+
+#[test]
+fn delay_off_never_derives_the_field() {
+    let r = driven(three(editor()));
+    r.arm();
+    r.scheduler.advance(Duration::from_secs(10));
+    r.escape();
+    r.prefix_then(&bound(&Action::Zoom), K1);
+    r.prefix_then(&split_right_key(), K2);
+    assert_eq!(r.panel(), None);
+    assert_eq!(r.panel_derivations(), 0);
+    assert!(r.scheduler.armed().is_empty(), "no timer is armed with the panel off");
+}
+
+#[test]
+fn delay_zero_shows_it_on_the_arming_key() {
+    let r = driven_with(three(editor()), Some(Duration::ZERO));
+    assert_eq!(r.window_key(key("C-b", PREFIX)), Verdict::Consumed);
+    assert!(r.panel().is_some());
+    assert!(r.scheduler.armed().is_empty(), "no timer for a delay of nothing");
+}
+
+#[test]
+fn the_panel_changes_no_verdict() {
+    fn run(r: &Rig) -> Vec<(Verdict, Verdict)> {
+        let mut verdicts = Vec::new();
+        let mut keycode = 60;
+        let mut press = |text: &str| {
+            keycode += 1;
+            let at_window = r.window_key(key(text, keycode));
+            let at_module = r.module_key(&editor(), key(text, keycode + 100));
+            r.host.post(HostEvent::KeyReleased { win: WIN, keycode });
+            verdicts.push((at_window, at_module));
+        };
+        for text in [
+            "a",
+            "C-b",
+            "C-b",
+            &bound(&Action::Zoom),
+            "k",
+            "C-b",
+            &split_right_key(),
+            "t",
+            "C-l",
+            "C-b",
+        ] {
+            press(text);
+        }
+        verdicts.push((r.escape(), r.window_key(key("a", 90))));
+        verdicts
+    }
+    let off = run(&driven(three(editor())));
+    let shown = driven_with(three(editor()), Some(Duration::ZERO));
+    let with_panel = run(&shown);
+    assert_eq!(off, with_panel);
+    assert!(
+        off.iter().any(|(window, _)| *window == Verdict::Consumed),
+        "the premise: keys were taken"
+    );
+}
+
+/// A root key runs once however long it is held, and a window that lost focus while it was down never reports
+/// its release, which must not make the same key's next press an auto-repeat.
+#[test]
+fn a_held_root_key_runs_once_and_focus_lost_while_it_was_down_frees_its_next_press() {
+    let keymap = Keymap::apply_user(
+        &[KeymapOp::Set {
+            table: "root".into(),
+            key: "M-y".into(),
+            action: "zoom".into(),
+            opts: vec![],
+        }],
+        &[],
+    )
+    .unwrap();
+    let r = driven_keyed(three(agent()), keymap, None);
+    let zoomed = || r.layout.borrow().zoomed().is_some();
+    assert!(!zoomed());
+    assert_eq!(r.window_key(key("M-y", K1)), Verdict::Consumed);
+    assert!(zoomed(), "the root key ran its action with no prefix");
+    assert_eq!(
+        r.window_key(key("M-y", K1)),
+        Verdict::Consumed,
+        "the auto-repeat is swallowed"
+    );
+    assert!(zoomed(), "and ran nothing");
+    r.host.post(HostEvent::Active {
+        win: WIN,
+        active: false,
+    });
+    r.host.post(HostEvent::Active { win: WIN, active: true });
+    assert_eq!(r.window_key(key("M-y", K1)), Verdict::Consumed);
+    assert!(
+        !zoomed(),
+        "the press after the focus change is a new press, not a repeat"
+    );
+    assert_eq!(r.waiting(), Waiting::No, "no wait was announced for it");
 }

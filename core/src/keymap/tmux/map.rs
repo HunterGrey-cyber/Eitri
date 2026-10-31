@@ -7,6 +7,7 @@
 
 use super::lex::{self, Arg, Command, Vars};
 use super::Step;
+use crate::keymap::key::canonical_name;
 use crate::keymap::{Action, KeySpec, SwapTarget, TabAction};
 use crate::layout::{Axis, Direction};
 
@@ -191,7 +192,8 @@ fn no_equivalent(what: &str) -> String {
 }
 
 const FORMAT: &str = "a format (#{...}), which only tmux can expand";
-const ROOT: &str = "a root key: without the prefix, keys belong to nvim and the panel in Eitri";
+const ROOT: &str = "a root key: without the prefix, keys belong to nvim and the panel in Eitri; \
+                    eitri.keymap.set(\"root\", …) binds one in init.lua";
 
 /// A command's flags and the arguments after them, read as tmux's getopt does: flags until the
 /// first word that does not start with `-`, or a lone `-`, or `--`; a flag that takes a value takes
@@ -332,6 +334,42 @@ fn set_option(args: &[Arg]) -> Outcome {
     }
 }
 
+/// A key as tmux's own parser reads it: the modifiers `C-`, `M-`, `S-` in either case, a single
+/// character as typed (`M-X` is not `M-x`), and a key name without regard to case (`C-space` is
+/// `C-Space`). The result is parsed on the canonical spelling, so `KeySpec::parse` itself, which
+/// `init.lua` goes through, stays strict.
+fn tmux_key(word: &str) -> Result<KeySpec, String> {
+    let (mut ctrl, mut meta, mut shift) = (false, false, false);
+    let mut rest = word;
+    // As in `KeySpec::parse`, a modifier is stripped only while something is left after it.
+    while rest.chars().count() > 2 {
+        let mut chars = rest.chars();
+        let (first, dash) = (chars.next(), chars.next());
+        if dash != Some('-') {
+            break;
+        }
+        match first {
+            Some('C' | 'c') => ctrl = true,
+            Some('M' | 'm') => meta = true,
+            Some('S' | 's') => shift = true,
+            _ => break,
+        }
+        rest = &rest[2..];
+    }
+    let name = if rest.chars().count() > 1 {
+        canonical_name(rest).unwrap_or_else(|| rest.to_string())
+    } else {
+        rest.to_string()
+    };
+    let spelled = format!(
+        "{}{}{}{name}",
+        if ctrl { "C-" } else { "" },
+        if meta { "M-" } else { "" },
+        if shift { "S-" } else { "" },
+    );
+    KeySpec::parse(&spelled).map_err(|e| e.to_string())
+}
+
 fn prefix(parsed: &Parsed) -> Result<KeySpec, String> {
     parsed.only("gq")?;
     if !parsed.has('g') {
@@ -347,7 +385,7 @@ fn prefix(parsed: &Parsed) -> Result<KeySpec, String> {
     if key.contains("#{") {
         return Err(FORMAT.to_string());
     }
-    KeySpec::parse(key).map_err(|e| e.to_string())
+    tmux_key(key)
 }
 
 fn source_file(args: &[Arg]) -> Outcome {
@@ -398,7 +436,7 @@ fn table_of(parsed: &Parsed) -> Result<(), String> {
 fn key_of(arg: Option<&Arg>) -> Result<KeySpec, String> {
     match arg {
         Some(Arg::Word(word)) if word.contains("#{") => Err(FORMAT.to_string()),
-        Some(Arg::Word(word)) => KeySpec::parse(word).map_err(|e| e.to_string()),
+        Some(Arg::Word(word)) => tmux_key(word),
         Some(Arg::Block(_)) => Err(refuses("a { ... } block where a key was expected")),
         None => Err(refuses("missing key")),
     }
@@ -482,7 +520,7 @@ fn one_command(args: &[Arg], vars: &Vars, what: &str) -> Result<Command, String>
 }
 
 /// Whether every pane can be handed `key` by `send-keys`. The editor takes any key and the
-/// terminal a Ctrl letter or one plain character (`shell`'s `terminal::keys::literal`, which a test
+/// terminal the typed form of any key (`shell`'s `terminal::keys::literal`, which a test
 /// there holds this to), but the panel's composer acts only on `C-a`, select all, and drops the
 /// rest (`App.tsx`'s `literal_key` handling, which a test here reads). So `C-a` is the one key a
 /// `send-keys` binding can deliver wherever the keys are; any other is skipped, not imported to do

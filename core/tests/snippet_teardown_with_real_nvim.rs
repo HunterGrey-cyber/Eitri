@@ -155,6 +155,10 @@ fn injected_keys_report_at_once_and_teardown_removes_the_watcher() {
         nvim.lua("return _G.__eitri_keys_schedule == nil", vec![]),
         Value::from(true)
     );
+    assert_eq!(
+        nvim.lua("return _G.__eitri_keys_rescan == nil", vec![]),
+        Value::from(true)
+    );
     nvim.command("let g:mapleader = ','");
     assert_eq!(lines.next(Duration::from_secs(1)), None, "a torn-down watcher sent");
     assert_eq!(nvim.footprint(&["eitri_keys"]).autocmds, 0);

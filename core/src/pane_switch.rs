@@ -1,7 +1,8 @@
 //! The pane-switch *protocol*: the private directory, the fake-`tmux` symlink, the socket the shim
 //! writes one direction letter to, and the parser that reads it. A second message on that socket,
 //! `Q <generation>`, is sent by
-//! [`crate::layout::kill::editor_quit_lua`] when a `:confirm qall` it asked nvim for is cancelled.
+//! [`crate::layout::kill::editor_quit_lua`] when a `:confirm qall` it asked nvim for is cancelled; a
+//! third, `W <word>…`, carries the words of an `:Eitri` command ([`crate::nvim_verbs`] reads them).
 //! Toolkit-free.
 //!
 //! The same directory holds `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l`
@@ -364,12 +365,37 @@ impl Drop for PaneSwitchChannel {
 }
 
 /// A message accepted off the socket: a pane-switch direction letter from the `vim-tmux-navigator`
-/// shim, or a kill's generation from a cancelled `:confirm qall`
-/// ([`crate::layout::kill::editor_quit_lua`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// shim, a kill's generation from a cancelled `:confirm qall`
+/// ([`crate::layout::kill::editor_quit_lua`]), or the words of an `:Eitri` command, each one a
+/// [`is_verb_word`], 1 to [`VERB_MAX_WORDS`] of them, for [`crate::nvim_verbs::parse_words`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneMessage {
     Direction(char),
     QuitCancelled(u32),
+    Verb(Vec<String>),
+}
+
+/// At most this many words follow a `W`: an action name and its options, or a verb and its two
+/// arguments, fit; a line that carries more was not written by `:Eitri`.
+pub const VERB_MAX_WORDS: usize = 6;
+
+/// A word is at most this many bytes: longer than any action name, module id or workspace name a
+/// user types, short enough that a line stays small.
+pub const VERB_MAX_WORD_BYTES: usize = 64;
+
+/// A `W` line is at most this many bytes, its newline included.
+pub const VERB_MAX_LINE_BYTES: usize = 512;
+
+/// Whether `word` may travel in a `W` line: 1 to [`VERB_MAX_WORD_BYTES`] bytes of
+/// `[A-Za-z0-9._:=<>#-]`. Every action name, `key=value` option, built-in module id (`terminal#2`)
+/// and `lua:<id>` of a plain panel id is such a word; no quote, separator, control byte or
+/// non-ASCII byte is, so nothing parsed from the line can carry text the sender did not mean as a
+/// name.
+pub fn is_verb_word(word: &str) -> bool {
+    (1..=VERB_MAX_WORD_BYTES).contains(&word.len())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'=' | b'<' | b'>' | b'#' | b'-'))
 }
 
 /// The direction a shim letter names: `vim-tmux-navigator`'s `select-pane -L/-R/-U/-D`. Anything
@@ -590,17 +616,24 @@ impl PaneSwitchReader {
     }
 }
 
-/// The one line the shim or [`crate::layout::kill::editor_quit_lua`] writes, turned into a
-/// [`PaneMessage`]. Anything else is rejected rather than guessed at -- the socket is only ever
-/// written to by those two senders, but a garbled message must not be able to move the user's focus
-/// or clear a kill nobody asked for.
+/// The one line the shim, [`crate::layout::kill::editor_quit_lua`] or `:Eitri` writes, turned into
+/// a [`PaneMessage`]. Anything else is rejected rather than guessed at -- every descendant of the
+/// embedded nvim can write to this socket, and a garbled message must not be able to move the
+/// user's focus, clear a kill nobody asked for, or run a layout action.
 ///
 /// The quit-generation form is parsed strictly: `"Q "` followed by one or more ASCII digits and
 /// nothing else, checked digit-by-digit before `parse` -- `u32::from_str` alone accepts a leading
 /// `"+"` (`"Q +7"` would otherwise parse), and a byte check is what rejects a second run of digits
 /// (`"Q 7 8"`), a second space (`"Q  7"`) or an out-of-range value (`"Q 4294967296"`) instead of
 /// truncating or panicking.
+///
+/// The `W` form is stricter still ([`parse_verb_line`]): no whitespace is trimmed but one trailing
+/// newline, and the line is dropped whole on the first byte out of place, so a partial or padded
+/// line never runs part of what it says.
 fn parse_message(line: &str) -> Option<PaneMessage> {
+    if let Some(words) = parse_verb_line(line) {
+        return Some(PaneMessage::Verb(words));
+    }
     let trimmed = line.trim();
     match trimmed {
         "L" => return Some(PaneMessage::Direction('L')),
@@ -615,6 +648,22 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
     } else {
         None
     }
+}
+
+/// `W <word>( <word>){0,5}` with at most one trailing `\n`, at most [`VERB_MAX_LINE_BYTES`] bytes
+/// in all, every word an [`is_verb_word`] and every separator exactly one space. The length is
+/// checked before anything is split, and every byte before any word is kept.
+fn parse_verb_line(line: &str) -> Option<Vec<String>> {
+    if line.len() > VERB_MAX_LINE_BYTES {
+        return None;
+    }
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let rest = body.strip_prefix("W ")?;
+    let words: Vec<&str> = rest.split(' ').collect();
+    if words.len() > VERB_MAX_WORDS || !words.iter().all(|word| is_verb_word(word)) {
+        return None;
+    }
+    Some(words.into_iter().map(str::to_string).collect())
 }
 
 #[cfg(test)]
@@ -698,6 +747,83 @@ mod tests {
         ] {
             assert_eq!(parse_message(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    fn verb(words: &[&str]) -> Option<PaneMessage> {
+        Some(PaneMessage::Verb(words.iter().map(|w| w.to_string()).collect()))
+    }
+
+    #[test]
+    fn a_w_line_of_plain_words_is_a_verb() {
+        assert_eq!(parse_message("W zoom\n"), verb(&["zoom"]));
+        assert_eq!(
+            parse_message("W zoom"),
+            verb(&["zoom"]),
+            "a sender that closes without a newline"
+        );
+        assert_eq!(parse_message("W focus terminal#2\n"), verb(&["focus", "terminal#2"]));
+        assert_eq!(
+            parse_message("W resize.left cells=5\n"),
+            verb(&["resize.left", "cells=5"])
+        );
+        assert_eq!(
+            parse_message("W split right lua:notes\n"),
+            verb(&["split", "right", "lua:notes"])
+        );
+        let six = "W a b c d e f\n";
+        assert_eq!(parse_message(six), verb(&["a", "b", "c", "d", "e", "f"]));
+        let longest = format!("W {}\n", "a".repeat(VERB_MAX_WORD_BYTES));
+        assert_eq!(parse_message(&longest), verb(&[&"a".repeat(VERB_MAX_WORD_BYTES)]));
+        for byte in "ABCxyz0189._:=<>#-".chars() {
+            let line = format!("W {byte}\n");
+            assert_eq!(parse_message(&line), verb(&[&byte.to_string()]), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_w_line_with_any_byte_out_of_place_is_dropped_whole() {
+        let long_word = format!("W {}", "a".repeat(VERB_MAX_WORD_BYTES + 1));
+        let long_line = format!("W {}", "a".repeat(VERB_MAX_LINE_BYTES + 1 - 2));
+        assert_eq!(long_line.len(), VERB_MAX_LINE_BYTES + 1);
+        for bad in [
+            "W",
+            "W\n",
+            "W ",
+            "W \n",
+            "W  zoom",
+            "W zoom ",
+            "W zoom\n\n",
+            " W zoom",
+            "W zoom a b c d e f",
+            long_word.as_str(),
+            long_line.as_str(),
+            "W zoom;",
+            "W zo;om",
+            "W \"zoom\"",
+            "W zo\"om",
+            "W zoom x\t",
+            "W zoom\tx",
+            "W\tzoom",
+            "W zo\0om",
+            "W zo\u{e9}om",
+            "W zo\u{fffd}om",
+            "W zoom\r\n",
+            "W zo/om",
+            "W zo'om",
+            "W zo$om",
+            "W zo|om",
+            "W zo,om",
+            "w zoom",
+            "WW zoom",
+            "W:zoom",
+        ] {
+            assert_eq!(parse_message(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_seven_word_line_is_refused_though_each_word_is_valid() {
+        assert_eq!(parse_message("W a b c d e f g\n"), None);
     }
 
     #[test]

@@ -553,6 +553,34 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                 Expect::NotPosted(EventMatch::Refused(OpTag::Chrome)),
             ],
         },
+        // The screen is no module, so the host reports no owner for it. The controller's batch puts the grab before
+        // the chrome op that shows the screen: the host makes the screen visible itself in order to take the keys.
+        Script {
+            name: "focus_onboarding_before_the_chrome_op_grabs_and_reports_no_owner",
+            ops: vec![
+                HostOp::Focus {
+                    win: f.win,
+                    to: FocusTo::Onboarding,
+                    on_grab: vec![],
+                },
+                HostOp::Chrome { win: f.win, rev: 1 },
+            ],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::NativeFocusOn(None),
+                },
+                Expect::Answer {
+                    op: 1,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::Focus)),
+            ],
+        },
         Script {
             name: "close_window_never_asks",
             ops: vec![HostOp::CloseWindow { win: f.win }],

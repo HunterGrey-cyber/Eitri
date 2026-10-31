@@ -25,6 +25,9 @@ mod layout_state;
 mod linked_window;
 mod lua;
 mod module_grid;
+mod nvim_verbs;
+mod onboarding_detect;
+mod onboarding_host;
 mod open_requests;
 mod pane_switch;
 mod panel_super;
@@ -32,6 +35,7 @@ mod plugin_page;
 mod plugin_panels;
 mod prefix_strip;
 mod process_memory;
+mod root_conflicts;
 mod terminal;
 mod text_size;
 mod theme;
@@ -610,6 +614,7 @@ fn build_ui(
     // `cwd` is set from the same resolved root the agent panel gets below, not left to the nvim
     // child's inherited process cwd: the two panes silently disagreeing about which project is
     // open is a worse failure than either one pointing somewhere unexpected.
+    let opens_files = !open.is_empty();
     let editor_spawn = eitri_core::wm::EditorSpawn {
         env: nvim_child_env,
         args: nvim_extra_args,
@@ -818,6 +823,12 @@ fn build_ui(
     };
     config.apply_to_panel(&agent_panel_handle);
     let keymap = config.keymap.clone();
+    if let Some(tutor) = &tutor {
+        tutor.set_prefix(keymap.prefix().human());
+    }
+    for line in keymap.dropped_for_root() {
+        eprintln!("[keymap] {line}");
+    }
 
     // Each `eitri.plugin.load` becomes a Lua panel whose content is the plugin's page. Registered before the
     // Lua panels are read below, so a plugin is placed, keyed, killed and revived like any Lua panel. Its
@@ -1024,6 +1035,22 @@ fn build_ui(
             std::process::exit(1);
         }
     };
+    // `:Eitri`, for window 1's nvim only: it sends its words to the pane-switch socket, and what it completes and
+    // the group of keys under `keymap.nvim_prefix` come from this window's keymap and module keys.
+    let nvim_verbs = nvim_verbs::NvimVerbs::for_window(WinId::MAIN, owns_editor, || {
+        let socket = pane_switch.as_ref()?.socket_path().to_path_buf();
+        let actions: Vec<String> = keymap.bindings().iter().map(|binding| binding.action.name()).collect();
+        let keyed: Vec<ModuleId> = module_keys.entries().iter().map(|(_, id)| id.clone()).collect();
+        let panels: Vec<ModuleId> = lua_keys.iter().map(|(id, _)| id.clone()).collect();
+        let words = nvim_verbs::completion_words(&actions, &keyed, &panels);
+        let panel_ids: Vec<String> = panels
+            .iter()
+            .filter_map(|id| id.as_str().strip_prefix("lua:").map(str::to_string))
+            .collect();
+        let keys = eitri_core::nvim_verbs::leader::leader_group(&keymap, &module_keys, &panel_ids);
+        let group = config.nvim_prefix.as_deref().map(|lhs| (lhs, keys.as_slice()));
+        Some(eitri_core::nvim_verbs::install::install_args(&socket, &words, group))
+    });
     // The `?` overlay's window and prefix sections, generated from the keymap;
     // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
     // own keys report changes (`FeedPump::listen_keys` below).
@@ -1035,13 +1062,21 @@ fn build_ui(
         eitri_panel::keys_help::HelpScope::Window,
     );
     keys_help.send();
+    // The first-start screen's host, filled in where the window's overlay and driver exist: each report of the editor's
+    // mappings reaches it, and it keeps the last for a screen that opens later.
+    let onboarding_slot: Rc<RefCell<Option<Rc<onboarding_host::OnboardingHost>>>> = Rc::default();
     // nvim's keys, from this window's own feed or, in window 2, as window 1 tells them.
     let apply_nvim_keys: Rc<dyn Fn(eitri_core::nvim_keys::NvimReport)> = {
         let keys_help = keys_help.clone();
         let plugin_panels = plugin_panels.clone();
+        let onboarding_slot = onboarding_slot.clone();
         Rc::new(move |report: eitri_core::nvim_keys::NvimReport| {
             // A page's multi-key sequences wait as long as the editor's do.
             plugin_panels.set_timeoutlen(report.timeoutlen);
+            let onboarding = onboarding_slot.borrow().clone();
+            if let Some(onboarding) = onboarding {
+                onboarding.nvim_report(report.clone());
+            }
             keys_help.nvim_report(report);
         })
     };
@@ -1050,6 +1085,7 @@ fn build_ui(
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
         let tutor = tutor.clone();
+        let nvim_verbs = nvim_verbs.clone();
         feed_pump.listen_keys(feed, move |report| {
             if let Some(one) = &one {
                 one.keys_changed(&report);
@@ -1059,6 +1095,9 @@ fn build_ui(
             plugin_panels.editor_session();
             if let Some(tutor) = &tutor {
                 tutor.editor_session();
+            }
+            if let Some(verbs) = &nvim_verbs {
+                verbs.editor_session();
             }
         });
     }
@@ -1072,6 +1111,9 @@ fn build_ui(
             module_keys: module_keys.clone(),
         },
     );
+    // The hint panel's delay, kept by the controller for the window the layout step makes (window 2 is this same
+    // code in its own process).
+    driver.set_hint_delay(WinId::MAIN, config.which_key_delay);
     // The layout this window opens with (the modules design): this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
@@ -1299,6 +1341,7 @@ fn build_ui(
         })
         .collect::<Vec<_>>();
     let own_window = eitri_core::wm::start::own_window(project_root, &plugins, pair.pair_role());
+    let has_own_window = own_window.is_some();
     let own_window_decl = own_window.as_ref().and_then(|id| {
         lua_engine
             .plugins
@@ -1968,6 +2011,7 @@ fn build_ui(
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
         let tutor = tutor.clone();
+        let nvim_verbs = nvim_verbs.clone();
         feed_pump.listen_theme(feed, move |payload| {
             if let Some(w) = &theme_writer {
                 w.borrow_mut().remember(&payload);
@@ -1980,6 +2024,9 @@ fn build_ui(
             plugin_panels.editor_session();
             if let Some(tutor) = &tutor {
                 tutor.editor_session();
+            }
+            if let Some(verbs) = &nvim_verbs {
+                verbs.editor_session();
             }
         });
     }
@@ -2092,6 +2139,10 @@ fn build_ui(
         pane.connect_hole_changed(refresh);
     }
     let toast = toast::Toast::install(&hint_overlay, &top_bar.widget);
+    // The first-start screen: above the toast, below the y/n, so a y/n raised over it stays visible and a toast sits
+    // under it.
+    let onboarding_screen = gtk_host::onboarding::OnboardingScreen::new();
+    hint_overlay.add_overlay(onboarding_screen.widget());
     // A window 1 an orphaned window 2 refused runs unpaired: the user sees why, and the refusal says what brings the
     // pair back.
     if let Some(note) = &start_note {
@@ -2105,6 +2156,9 @@ fn build_ui(
         &top_bar.widget,
         top_bar.strip.upcast_ref::<gtk4::Widget>(),
     );
+    // The hint panel while the prefix waits: an overlay child like the prompt above, never a click target.
+    let prefix_panel = Rc::new(gtk_host::prefix_panel::PrefixPanelView::new());
+    hint_overlay.add_overlay(prefix_panel.widget());
     // The tmux import says it happened once: the first launch where it changes the keys, and again
     // only when what it imports changes (its fingerprint, kept with Eitri's other state).
     let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -2131,6 +2185,10 @@ fn build_ui(
             }
         }
     }
+
+    // A root key of `init.lua` that an input method or the desktop may take first is logged, and toasted once per
+    // change. Nothing starts when the root table is empty.
+    root_conflicts::start(keymap.root_bindings(), toast.clone());
 
     // The global `f` HINT (`hint.rs`). Three
     // triggers reach the same toggle: `prefix f` (the keymap's `hint`, below), `f` on the top bar,
@@ -2214,6 +2272,79 @@ fn build_ui(
     // item can reveal it.
     let window_modes = window_mode::WindowModes::install(app, &window, &top_bar, pane.clone(), return_to_pane.clone());
 
+    // The first-start screen's work: the checks, the detection and the write on worker threads, the marker, and what
+    // the screen starts in the editor. Its ops are the controller's `HostOp::Onboarding`; what it learns comes back
+    // as events.
+    let onboarding_host = {
+        let panels_of = lua_engine.clone();
+        let host = onboarding_host::OnboardingHost::new(onboarding_host::Deps {
+            driver: Rc::downgrade(&driver),
+            win: WinId::MAIN,
+            screen: onboarding_screen.clone(),
+            config_dir: config_dir.clone(),
+            marker: eitri_core::onboarding::marker::state_file(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            ),
+            keymap: keymap.clone(),
+            lang: eitri_core::onboarding::Lang::from_env(&|name| std::env::var_os(name)),
+            tmux: config.tmux_import.clone(),
+            trust_open: {
+                let panel = agent_panel_handle.clone();
+                Rc::new(move || panel.trust_question_open())
+            },
+            panels: Rc::new(move || {
+                let entries = panels_of.panels.borrow();
+                let ids = entries.entries().iter().map(|entry| entry.id.clone()).collect();
+                let claims = eitri_core::keymap::LuaClaims {
+                    panel_keys: entries
+                        .entries()
+                        .iter()
+                        .filter_map(|entry| entry.key.clone().map(|key| (entry.id.clone(), key)))
+                        .collect(),
+                    command_keybindings: panels_of
+                        .commands
+                        .borrow()
+                        .iter()
+                        .filter_map(|(id, entry)| entry.keybinding.clone().map(|key| (id.clone(), key)))
+                        .collect(),
+                };
+                (ids, claims)
+            }),
+            view_in_editor: {
+                let panel = agent_panel_handle.clone();
+                Rc::new(move |title: &str, text: &str| panel.view_in_editor(title, text))
+            },
+            log: onboarding_host::log_from_env(&|name| std::env::var_os(name)),
+        });
+        *onboarding_slot.borrow_mut() = Some(host.clone());
+        {
+            let host = Rc::downgrade(&host);
+            onboarding_screen.on_button(move |key| {
+                if let Some(host) = host.upgrade() {
+                    host.pressed(key);
+                }
+            });
+        }
+        {
+            let screen = onboarding_screen.clone();
+            wm_host.set_onboarding_focus(Rc::new(move |_| screen.grab_keys()));
+        }
+        {
+            let host = host.clone();
+            wm_host.set_onboarding(Rc::new(move |op| host.apply(op)));
+        }
+        {
+            let host = Rc::downgrade(&host);
+            agent_panel::on_trust_question_change(Rc::new(move |open| {
+                if let Some(host) = host.upgrade() {
+                    host.trust_changed(open);
+                }
+            }));
+        }
+        host
+    };
+
     // The window's chrome is the controller's model, drawn here: each `Chrome` op reads it and touches only the
     // widgets whose field changed (`gtk_host::chrome::reconcile`). The widgets are the ones made above, kept as they
     // are; the model gives their text, always set as plain text, whether they show, and their classes. Every flash
@@ -2235,6 +2366,7 @@ fn build_ui(
         let armed_name = top_bar.app_name.clone();
         let flashed_name = top_bar.app_name.clone();
         let strip = prefix_strip.clone();
+        let panel = prefix_panel.clone();
         let (workspace_button, workspace_label) = (top_bar.workspace.clone(), top_bar.workspace_label.clone());
         let other_label = top_bar.other.clone();
         let (selection_label, mark_label) = (top_bar.selection.clone(), top_bar.mark.clone());
@@ -2267,6 +2399,10 @@ fn build_ui(
                         armed_name.remove_css_class("prefix-armed");
                     }
                     strip.show(pieces.unwrap_or(&[]));
+                }),
+                prefix_panel: Box::new(move |model| match model {
+                    Some(model) => panel.show(model),
+                    None => panel.hide(),
                 }),
                 toast: Box::new(move |up| match up.kind {
                     ToastKind::Attention => shown_toast.show_attention(&up.text),
@@ -2301,6 +2437,17 @@ fn build_ui(
                         move || prompt.hide_model()
                     }),
                 },
+                // The first-start screen, drawn from the model's view; the host logs each change when asked to.
+                onboarding: Box::new({
+                    let screen = onboarding_screen.clone();
+                    let host = Rc::downgrade(&onboarding_host);
+                    move |view| {
+                        screen.show(view);
+                        if let Some(host) = host.upgrade() {
+                            host.view_drawn(view);
+                        }
+                    }
+                }),
                 // The top bar's rename entry, holding the name as plain text while the controller has it open.
                 rename: gtk_host::chrome::RenameWidgets {
                     open: Box::new({
@@ -2334,6 +2481,21 @@ fn build_ui(
     if let Err(why) = wm_host.draw_chrome(WinId::MAIN) {
         eprintln!("[wm] BUG: the window's chrome was not drawn: {why}");
     }
+    // With no `init.lua`, the first launch of a full window offers to write one. Decided on a worker once the config
+    // phase is over; the screen opens only if the answer comes, and every other start is left as it was.
+    onboarding_host.start_trigger(eitri_core::onboarding::trigger::Inputs {
+        clean: want_clean,
+        config_dir_env: std::env::var_os("EITRI_CONFIG_DIR"),
+        first_start_env: std::env::var_os("EITRI_FIRST_START"),
+        full_window: !pair.is_second() && !pair.is_unpaired(),
+        own_window: has_own_window,
+        opens_files,
+        config_dir: config_dir.clone(),
+        marker: eitri_core::onboarding::marker::state_file(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        ),
+    });
 
     // A top-bar item given the keys by the controller (`Ctrl+k` with nothing above): the bar brought out first if
     // it is hidden, then the first item showing from that index on -- a tray chip, or `↻` when the tray is empty.
@@ -2708,6 +2870,10 @@ fn build_ui(
         if let Some(tutor) = &tutor {
             tutor.set_editor(editor_rpc.clone());
         }
+        if let Some(verbs) = &nvim_verbs {
+            verbs.set_editor(editor_rpc.clone());
+        }
+        onboarding_host.set_editor(editor_rpc.clone());
         plugin_panels.set_editor(editor_rpc);
         if let Some(two) = &window2_editor {
             plugin_panels.set_link_editor(two.ops());
@@ -2963,6 +3129,9 @@ fn build_ui(
     // controller's window stage. Installed after every other window-level controller that exists at startup, so
     // they see keys first; the order among them is the one function's, not this block's place in `build_ui`.
     gtk_host::keys::install_window_layers(window.upcast_ref(), &close_prompt, Rc::downgrade(&driver));
+    // The first-start screen's key log is installed after the layers, so it is read first and sees a key the prefix layer
+    // goes on to consume (the layers' own rule: the last installed sees keys first).
+    onboarding_host.watch_keys(window.upcast_ref());
 
     // --- From the editor: decided by Neovim itself, or a cancelled `:confirm qall` clearing its
     // own kill.
@@ -2975,6 +3144,7 @@ fn build_ui(
     // `shell` never sees the keypresses that Neovim resolved internally.
     if let Some(ps) = pane_switch.as_mut() {
         let driver = Rc::downgrade(&driver);
+        let lua_engine = lua_engine.clone();
         feed_pump.listen_pane_switch(ps, move |message| match message {
             // Where the keys go from the editor's edge is the controller's.
             pane_switch::PaneMessage::Direction(letter) => match pane_switch::letter_direction(letter) {
@@ -2995,6 +3165,25 @@ fn build_ui(
                         win: WinId::MAIN,
                         generation: u64::from(g),
                     }));
+                }
+            }
+            // `:Eitri` in this window's nvim: the words are checked again here, whatever the snippet checked, since
+            // the socket is only as private as its directory. A request is the controller's, as a Lua call's is.
+            pane_switch::PaneMessage::Verb(words) => {
+                let Some(driver) = driver.upgrade() else { return };
+                let lua_panels: Vec<String> = lua_engine
+                    .panels
+                    .borrow()
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect();
+                match nvim_verbs::carry(&words, &lua_panels) {
+                    nvim_verbs::Carried::Request(request) => driver.nvim_request(WinId::MAIN, request),
+                    nvim_verbs::Carried::KeySheet(action) | nvim_verbs::Carried::Setup(action) => {
+                        driver.run(WinId::MAIN, action, Origin::Lua)
+                    }
+                    nvim_verbs::Carried::Refused(why) => driver.nvim_refused(WinId::MAIN, &why),
                 }
             }
         });

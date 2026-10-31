@@ -697,7 +697,7 @@ impl ServiceSet for Services {
                 let pane = self.pane(module)?;
                 match crate::terminal::keys::literal(key) {
                     Some(inputs) => inputs.into_iter().for_each(|input| pane.send(input)),
-                    None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
+                    None => println!("[prefix] {key}: no key event can express it"),
                 }
                 Ok(())
             }

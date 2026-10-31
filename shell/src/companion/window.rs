@@ -232,6 +232,13 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             std::process::exit(1);
         }
     };
+    for line in config.keymap.dropped_for_root() {
+        eprintln!("[keymap] {line}");
+    }
+    // The companion window's prefix runs outside the window controller, so there is no hint panel to time.
+    if config.which_key_delay.is_some() {
+        eprintln!("[keymap] keymap.which_key_delay: the companion window shows no hint panel yet");
+    }
     // The prefix. A companion window has no Lua panels, so the module keys are the built-in ones.
     let module_keys = match ModuleKeys::build(&[], &config.keymap) {
         Ok(keys) => Rc::new(keys),

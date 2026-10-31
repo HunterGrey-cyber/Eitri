@@ -246,6 +246,8 @@ struct Stage {
     widgets: Vec<gtk4::Widget>,
     /// What the window's chrome widgets were told, one line per setter called.
     chrome: Rc<RefCell<Vec<String>>>,
+    /// The first-start screen, in the window and hidden until something shows it.
+    screen: Rc<gtk_host::onboarding::OnboardingScreen>,
 }
 
 /// The model every `Chrome` op on the stage reads: the project's name, a chip up, and one toast.
@@ -272,7 +274,10 @@ fn stage_model() -> eitri_core::wm::chrome::ChromeModel {
 }
 
 /// Chrome widgets that write down each setter called, the way the stage reads them back.
-fn recording_widgets(heard: &Rc<RefCell<Vec<String>>>) -> gtk_host::chrome::ChromeWidgets {
+fn recording_widgets(
+    heard: &Rc<RefCell<Vec<String>>>,
+    screen: &Rc<gtk_host::onboarding::OnboardingScreen>,
+) -> gtk_host::chrome::ChromeWidgets {
     let say = |heard: &Rc<RefCell<Vec<String>>>| {
         let heard = heard.clone();
         move |line: String| heard.borrow_mut().push(line)
@@ -311,6 +316,10 @@ fn recording_widgets(heard: &Rc<RefCell<Vec<String>>>) -> gtk_host::chrome::Chro
             let say = say(heard);
             move |pieces| say(format!("prefix strip {}", pieces.is_some()))
         }),
+        prefix_panel: Box::new({
+            let say = say(heard);
+            move |panel| say(format!("prefix panel {}", panel.is_some()))
+        }),
         toast: Box::new({
             let say = say(heard);
             move |toast| say(format!("toast {} {}", toast.serial, toast.text))
@@ -345,6 +354,10 @@ fn recording_widgets(heard: &Rc<RefCell<Vec<String>>>) -> gtk_host::chrome::Chro
                 move || say("rename closed".into())
             }),
         },
+        onboarding: Box::new({
+            let screen = screen.clone();
+            move |view| screen.show(view)
+        }),
     }
 }
 
@@ -377,7 +390,13 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     host.set_grid(f.win, grid.clone());
     let chrome: Rc<RefCell<Vec<String>>> = Rc::default();
     host.set_chrome_model(Rc::new(|_| Some(stage_model())));
-    host.set_chrome_widgets(f.win, recording_widgets(&chrome));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    column.append(screen.widget());
+    {
+        let screen = screen.clone();
+        host.set_onboarding_focus(Rc::new(move |_| screen.grab_keys()));
+    }
+    host.set_chrome_widgets(f.win, recording_widgets(&chrome, &screen));
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);
     window.present();
@@ -401,6 +420,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         window,
         widgets,
         chrome,
+        screen,
     })
 }
 
@@ -570,8 +590,10 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
             window,
             widgets,
             chrome: _,
+            screen,
         } = stage(f)?;
         drop(widgets);
+        drop(screen);
         if by_op {
             if host.apply(&HostOp::CloseWindow { win: f.win }) != Applied::Done {
                 return Err("CloseWindow on a shown window was refused".into());
@@ -828,6 +850,7 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         "strips 0",
         "float bars 0",
         "prefix strip false",
+        "prefix panel false",
         "toast 1 no last module",
     ];
     if first != expected {
@@ -1219,6 +1242,380 @@ fn an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(f: &Fixture) -> 
     Ok(())
 }
 
+/// A view of the first-start screen with a long row, a long body line and a button: more than any narrow window holds.
+fn long_view() -> eitri_core::onboarding::OnboardingView {
+    use eitri_core::onboarding::{OnboardingView, ViewButton, ViewItem, ViewKey, ViewRow};
+    OnboardingView {
+        title: "Set up Eitri's window keys".into(),
+        step: "1 / 2".into(),
+        rows: vec![ViewRow {
+            label: "tmux".into(),
+            text: format!("~/{}.tmux.conf: prefix Ctrl+a", "very/long/directory/".repeat(20)),
+            note: "(will be used)".into(),
+        }],
+        question: Some("How should the window's keys work?".into()),
+        items: vec![ViewItem {
+            number: 1,
+            name: "Neovim + tmux".into(),
+            summary: "Ctrl+b, then a key, as in tmux ".repeat(10),
+            tag: Some("found".into()),
+            selected: true,
+        }],
+        body: vec!["eitri.keymap.use('nvim-tmux', { prefix = 'C-b' } ) -- ".repeat(8)],
+        status: Vec::new(),
+        footer: "j/k or 1-5 choose, and more words than a narrow line holds · Enter next · Esc not now".into(),
+        buttons: vec![
+            ViewButton::new(ViewKey::Char('p'), "Prefix: Ctrl+b   p change"),
+            ViewButton::new(ViewKey::Enter, "Enter next"),
+            ViewButton::new(ViewKey::Esc, "Esc not now"),
+        ],
+        help: None,
+    }
+}
+
+/// Every widget below `root`, `root` first.
+fn descendants(root: &gtk4::Widget) -> Vec<gtk4::Widget> {
+    let mut out = vec![root.clone()];
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        out.extend(descendants(&widget));
+        child = widget.next_sibling();
+    }
+    out
+}
+
+/// A mouse alone drives the screen: the preset's row is a button that posts its number, the footer's Enter and Esc and
+/// the step's own shortcut are buttons that post those keys, the footer's line says only what no button does, and the
+/// chosen preset's labels carry the two classes that make its solid block (GTK reads one string with a space in it as
+/// the name of a single class).
+fn the_screen_is_driven_by_the_mouse_alone() -> Result<(), String> {
+    use eitri_core::onboarding::ViewKey;
+    let window = gtk4::Window::new();
+    window.set_default_size(600, 400);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gtk4::Label::new(Some("window"))));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    let clicked: Rc<RefCell<Vec<ViewKey>>> = Rc::default();
+    {
+        let clicked = clicked.clone();
+        screen.on_button(move |key| clicked.borrow_mut().push(key));
+    }
+    window.present();
+    pump(200);
+    screen.show(Some(&long_view()));
+    pump(100);
+    let all = descendants(screen.widget());
+    let result = (|| {
+        let both = all
+            .iter()
+            .filter(|w| w.has_css_class("onboarding-item") && w.has_css_class("selected"))
+            .count();
+        if both == 0 {
+            return Err("no label of the chosen preset has both classes".to_string());
+        }
+        let footer = all
+            .iter()
+            .find(|w| w.has_css_class("onboarding-footer"))
+            .and_then(|w| w.clone().downcast::<gtk4::Label>().ok())
+            .ok_or_else(|| "no footer label".to_string())?;
+        if footer.text() != long_view().footer_hint() || footer.text().contains("Enter next") {
+            return Err(format!("the footer's line says {:?}", footer.text()));
+        }
+        let buttons: Vec<gtk4::Button> = all
+            .iter()
+            .filter_map(|w| w.clone().downcast::<gtk4::Button>().ok())
+            .collect();
+        // The preset's row, then the three shortcut buttons.
+        if buttons.len() != 4 {
+            return Err(format!("{} buttons, not 4", buttons.len()));
+        }
+        for button in &buttons {
+            button.emit_clicked();
+        }
+        pump(100);
+        let got = clicked.borrow().clone();
+        let want = [ViewKey::Char('1'), ViewKey::Char('p'), ViewKey::Enter, ViewKey::Esc];
+        if got != want {
+            return Err(format!("the clicks posted {got:?}, not {want:?}"));
+        }
+        Ok(())
+    })();
+    window.destroy();
+    pump(50);
+    result
+}
+
+/// The screen's panel is an overlay child that asks the window for no width: in a 300x200 window, with long rows and
+/// body lines on it, the window keeps its size and the panel's own minimum width is within it.
+fn the_screen_asks_for_no_width_of_its_own() -> Result<(), String> {
+    let window = gtk4::Window::new();
+    window.set_default_size(300, 200);
+    let overlay = gtk4::Overlay::new();
+    let backdrop = gtk4::Label::new(Some("window"));
+    overlay.set_child(Some(&backdrop));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    window.present();
+    pump(200);
+    screen.show(Some(&long_view()));
+    pump(300);
+    let (min, _, _, _) = screen.widget().measure(gtk4::Orientation::Horizontal, -1);
+    let result = if window.width() != 300 || window.height() != 200 {
+        Err(format!(
+            "the window grew to {}x{} with the screen up",
+            window.width(),
+            window.height()
+        ))
+    } else if min > 300 {
+        Err(format!("the screen's minimum width is {min}"))
+    } else if screen.widget().width() > 300 {
+        Err(format!(
+            "the screen is {} wide in a 300 wide window",
+            screen.widget().width()
+        ))
+    } else {
+        Ok(())
+    };
+    window.destroy();
+    pump(50);
+    result
+}
+
+/// The screen's first page with `count` presets, `chosen` the chosen one, and enough rows above them that a low window
+/// cannot hold it all.
+fn tall_view(count: u32, chosen: u32) -> eitri_core::onboarding::OnboardingView {
+    use eitri_core::onboarding::{ViewItem, ViewRow};
+    let mut view = long_view();
+    view.body.clear();
+    view.rows = (0..12)
+        .map(|row| ViewRow {
+            label: format!("row {row}"),
+            text: "found".into(),
+            note: String::new(),
+        })
+        .collect();
+    view.items = (1..=count)
+        .map(|number| ViewItem {
+            number,
+            name: format!("preset {number}"),
+            summary: "what it does".into(),
+            tag: None,
+            selected: number == chosen,
+        })
+        .collect();
+    view
+}
+
+/// The scroller inside the panel, whose adjustment is what the user sees.
+fn screen_scroller(screen: &gtk_host::onboarding::OnboardingScreen) -> Result<gtk4::ScrolledWindow, String> {
+    descendants(screen.widget())
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk4::ScrolledWindow>().ok())
+        .ok_or_else(|| "no scroller in the screen".to_string())
+}
+
+/// A window too low for the screen: moving the choice brings the chosen preset into view, a key scrolls the text, a
+/// row filling in leaves the text where it stands, and a new page starts at the top. In the keyboard's terms: nothing
+/// but the screen's own keys ever reach this widget, so this is all the scrolling there is.
+fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> {
+    use eitri_core::onboarding::Scroll;
+    let window = gtk4::Window::new();
+    window.set_default_size(500, 240);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gtk4::Label::new(Some("window"))));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    window.present();
+    pump(200);
+    let check = || -> Result<(), String> {
+        screen.show(Some(&tall_view(4, 4)));
+        pump(300);
+        let adjustment = screen_scroller(&screen)?.vadjustment();
+        if adjustment.upper() <= adjustment.page_size() {
+            return Err(format!(
+                "the view fits ({} in {}), so nothing here tests scrolling",
+                adjustment.upper(),
+                adjustment.page_size()
+            ));
+        }
+        let bottom = adjustment.upper() - adjustment.page_size();
+        if adjustment.value() < bottom - 2.0 {
+            return Err(format!(
+                "the last preset is chosen and the text stands at {} of {bottom}",
+                adjustment.value()
+            ));
+        }
+        screen.scroll(Scroll::PageUp);
+        pump(100);
+        let scrolled = adjustment.value();
+        if scrolled >= bottom {
+            return Err("PageUp did not move the text".into());
+        }
+        // A detection row came in: the same page, the same choice.
+        screen.show(Some(&tall_view(4, 4)));
+        pump(200);
+        if (adjustment.value() - scrolled).abs() > 1.0 {
+            return Err(format!(
+                "a row filling in moved the text from {scrolled} to {}",
+                adjustment.value()
+            ));
+        }
+        screen.show(Some(&tall_view(4, 3)));
+        pump(200);
+        let moved = adjustment.value();
+        screen.scroll(Scroll::LineUp);
+        pump(100);
+        if adjustment.value() >= moved {
+            return Err(format!("LineUp did not move the text from {moved}"));
+        }
+        screen.scroll(Scroll::LineDown);
+        pump(100);
+        if (adjustment.value() - moved).abs() > 1.0 {
+            return Err(format!("LineDown did not bring it back to {moved}"));
+        }
+        let mut review = long_view();
+        review.step = "2 / 2".into();
+        review.question = Some("Writes init.lua:".into());
+        review.items.clear();
+        review.rows.clear();
+        review.body = (0..40).map(|line| format!("line {line}")).collect();
+        screen.show(Some(&review));
+        pump(200);
+        if adjustment.value() != 0.0 {
+            return Err(format!("a new page starts at {}", adjustment.value()));
+        }
+        let lines_below = adjustment.upper() - adjustment.page_size();
+        if lines_below <= 0.0 {
+            return Err("the review's lines fit, so scrolling them tests nothing".into());
+        }
+        for _ in 0..100 {
+            screen.scroll(Scroll::PageDown);
+        }
+        pump(100);
+        if (adjustment.value() - lines_below).abs() > 1.0 {
+            return Err(format!(
+                "the keys stop at {} of the {lines_below} the last line needs",
+                adjustment.value()
+            ));
+        }
+        Ok(())
+    };
+    let result = check();
+    window.destroy();
+    pump(50);
+    result
+}
+
+/// A sentence of the file or of step 3 wraps at the panel's width and is never cut: every body line is a wrapping
+/// label with no ellipsis.
+fn a_body_line_wraps_and_is_never_cut() -> Result<(), String> {
+    let window = gtk4::Window::new();
+    window.set_default_size(400, 500);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gtk4::Label::new(Some("window"))));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    window.present();
+    pump(200);
+    screen.show(Some(&long_view()));
+    pump(200);
+    let body: Vec<gtk4::Label> = descendants(screen.widget())
+        .into_iter()
+        .filter(|widget| widget.has_css_class("onboarding-body"))
+        .filter_map(|widget| widget.downcast::<gtk4::Label>().ok())
+        .collect();
+    let result = if body.is_empty() {
+        Err("no body line on the screen".to_string())
+    } else if body
+        .iter()
+        .any(|label| !label.wraps() || label.ellipsize() != gtk4::pango::EllipsizeMode::None)
+    {
+        Err("a body line can be cut".to_string())
+    } else if body[0].layout().line_count() < 2 {
+        Err("the long line did not wrap".to_string())
+    } else {
+        Ok(())
+    };
+    window.destroy();
+    pump(50);
+    result
+}
+
+/// The controller's `Focus` comes before the `Chrome` op that shows the screen: with the screen hidden, the `Focus`
+/// answers `Done` and the keys are inside the screen; the `Chrome` op then fills and shows it. The widget that holds
+/// the keys is a plain box: no text widget, so no input-method context.
+fn the_focus_op_before_the_chrome_op_still_grabs(f: &Fixture) -> Result<(), String> {
+    let s = stage(f)?;
+    let mut model = stage_model();
+    model.onboarding = Some(long_view());
+    s.host.set_chrome_model(Rc::new(move |_| Some(model.clone())));
+    if s.screen.widget().is_visible() {
+        return Err("the screen starts shown".into());
+    }
+    let focus = HostOp::Focus {
+        win: f.win,
+        to: FocusTo::Onboarding,
+        on_grab: vec![],
+    };
+    if s.host.apply(&focus) != Applied::Done {
+        return Err("a Focus on a hidden screen was refused".into());
+    }
+    let held = GtkWindowExt::focus(&s.window).ok_or("no widget holds the keys after the Focus")?;
+    if held != *s.screen.widget() && !held.is_ancestor(s.screen.widget()) {
+        return Err(format!("the keys are on {held:?}, outside the screen"));
+    }
+    if held.is::<gtk4::Text>() || held.is::<gtk4::Entry>() || held.is::<gtk4::TextView>() {
+        return Err(format!("the keys are on a text widget, {held:?}"));
+    }
+    if !s.screen.has_keys() {
+        return Err("the screen does not report holding the keys".into());
+    }
+    if s.host.apply(&HostOp::Chrome { win: f.win, rev: 2 }) != Applied::Done {
+        return Err("the Chrome op that fills the screen was refused".into());
+    }
+    pump(100);
+    if !s.screen.widget().is_mapped() {
+        return Err("the screen is not shown after the Chrome op".into());
+    }
+    if !s.screen.has_keys() {
+        return Err("the Chrome op moved the keys off the screen".into());
+    }
+    finish(s);
+    Ok(())
+}
+
+/// `grab_keys` puts the keys on a box: not a `GtkText`, `GtkEntry` or `GtkTextView`, the widgets an input method
+/// attaches its context to.
+fn the_screen_takes_the_keys_with_no_input_context() -> Result<(), String> {
+    let window = gtk4::Window::new();
+    window.set_default_size(400, 300);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gtk4::Label::new(Some("window"))));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    window.present();
+    pump(200);
+    screen.show(Some(&long_view()));
+    pump(100);
+    let result = if !screen.grab_keys() {
+        Err("grab_keys was refused".to_string())
+    } else {
+        match GtkWindowExt::focus(&window) {
+            Some(held) if held.is::<gtk4::Box>() && !held.is::<gtk4::Text>() && !held.is::<gtk4::Entry>() => Ok(()),
+            other => Err(format!("the keys are on {other:?}, not on the screen's box")),
+        }
+    };
+    window.destroy();
+    pump(50);
+    result
+}
+
 fn run_all() -> Result<Vec<String>, String> {
     let f = Fixture {
         win: WinId::MAIN,
@@ -1275,6 +1672,18 @@ fn run_all() -> Result<Vec<String>, String> {
     passed.push("a_plugin_page_prepare_is_carried_out_and_answered_prepared".into());
     an_arrival_is_prepared_and_its_adoption_owns_the_descriptors(&f)?;
     passed.push("an_arrival_is_prepared_and_its_adoption_owns_the_descriptors".into());
+    the_screen_asks_for_no_width_of_its_own()?;
+    passed.push("the_screen_asks_for_no_width_of_its_own".into());
+    a_short_window_scrolls_to_the_choice_and_by_the_keys()?;
+    passed.push("a_short_window_scrolls_to_the_choice_and_by_the_keys".into());
+    a_body_line_wraps_and_is_never_cut()?;
+    passed.push("a_body_line_wraps_and_is_never_cut".into());
+    the_focus_op_before_the_chrome_op_still_grabs(&f)?;
+    passed.push("the_focus_op_before_the_chrome_op_still_grabs".into());
+    the_screen_is_driven_by_the_mouse_alone()?;
+    passed.push("the_screen_is_driven_by_the_mouse_alone".into());
+    the_screen_takes_the_keys_with_no_input_context()?;
+    passed.push("the_screen_takes_the_keys_with_no_input_context".into());
     Ok(passed)
 }
 

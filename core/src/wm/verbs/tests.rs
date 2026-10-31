@@ -198,6 +198,7 @@ fn decided_here(action: &Action) -> bool {
         | Action::SendKeys(_)
         | Action::CopyMode { .. }
         | Action::WindowImmersive
+        | Action::WindowSetup
         | Action::Module(_)
         | Action::ModuleHide
         | Action::ModuleHideByKey
@@ -297,6 +298,7 @@ fn one_of_each() -> Vec<Action> {
         Action::PanelKeymap,
         Action::PanelCommandLine,
         Action::WindowImmersive,
+        Action::WindowSetup,
         Action::Text(TextChange::Larger),
         Action::CopyMode { up: false },
     ]
@@ -467,6 +469,112 @@ fn a_lua_request_meets_the_selection_gate_only_and_logs_its_refusal() {
     let said = r.said();
     let by_key = r.run(Action::ModuleKill);
     r.assert_refused(&by_key, &said, &text);
+}
+
+/// A request from `:Eitri` is decided by the same code as the Lua call, so the batch, the layout and the log lines
+/// are the Lua call's, but for the log tag.
+#[test]
+fn an_nvim_request_runs_the_same_batch_as_the_same_lua_request() {
+    let requests = [
+        LayoutRequest::Run(Action::Zoom),
+        LayoutRequest::Split(agent(), Axis::Row),
+        LayoutRequest::Focus(terminal()),
+        LayoutRequest::Show(terminal()),
+        LayoutRequest::Hide(terminal()),
+        LayoutRequest::Open(ModuleKind::Terminal, None),
+        LayoutRequest::Switch("w2".into()),
+    ];
+    for request in requests {
+        let mut by_lua = rig(three(editor()));
+        let mut by_nvim = rig(three(editor()));
+        let from_lua = by_lua.controller.lua_request(WIN, request.clone());
+        let from_nvim = by_nvim.controller.nvim_request(WIN, request.clone());
+        assert_eq!(from_nvim, from_lua, "{request:?}");
+        assert_eq!(*by_nvim.layout.borrow(), *by_lua.layout.borrow(), "{request:?}");
+        let retagged: Vec<String> = by_nvim
+            .controller
+            .notes(WIN)
+            .iter()
+            .map(|line| line.replacen("[nvim]", "[lua]", 1))
+            .collect();
+        assert_eq!(retagged, by_lua.controller.notes(WIN), "{request:?}");
+        assert!(
+            by_nvim
+                .controller
+                .notes(WIN)
+                .iter()
+                .any(|line| line.starts_with("[nvim] layout: ")),
+            "{request:?}: {:?}",
+            by_nvim.controller.notes(WIN)
+        );
+        assert!(
+            !by_nvim.controller.notes(WIN).iter().any(|line| line.contains("[lua]")),
+            "{request:?}: {:?}",
+            by_nvim.controller.notes(WIN)
+        );
+    }
+}
+
+/// The selection gates meet an `:Eitri` request as they meet the Lua call, and refuse with the same words, which
+/// the window also shows: nobody at nvim's command line reads the log.
+#[test]
+fn a_refused_nvim_request_is_refused_with_the_words_of_the_lua_call() {
+    let text = one_module_text(&Keymap::defaults());
+    let mut r = rig(three_with_a_container_selected());
+    let hide = LayoutRequest::Hide(terminal());
+    let said = r.said();
+    let batch = r.controller.nvim_request(WIN, hide.clone());
+    r.assert_refused(&batch, &said, &text);
+    assert!(
+        r.controller
+            .notes(WIN)
+            .contains(&format!("[nvim] layout: {hide:?} refused: {text}")),
+        "{:?}",
+        r.controller.notes(WIN)
+    );
+    // `run` meets the runner's gates, with the toast the key's refusal has.
+    let said = r.said();
+    let by_nvim = r.controller.nvim_request(WIN, LayoutRequest::Run(Action::ModuleKill));
+    r.assert_refused(&by_nvim, &said, &text);
+}
+
+/// The same refusal from Lua stays a log line: a script's caller reads the log, and a config must not toast at start.
+#[test]
+fn a_refused_lua_request_is_logged_and_shows_nothing() {
+    let mut r = rig(three_with_a_container_selected());
+    let said = r.said();
+    let batch = r.controller.lua_request(WIN, LayoutRequest::Hide(terminal()));
+    assert!(batch.is_empty(), "{batch:?}");
+    assert_eq!(r.said().toast, said.toast);
+}
+
+/// A request whose own operation fails, as a module no layout holds, is toasted with the error's words.
+#[test]
+fn an_nvim_request_the_layout_refuses_is_toasted() {
+    let module = ModuleId::parse("terminal#5").unwrap();
+    let request = LayoutRequest::Focus(module);
+    let mut by_lua = rig(three(editor()));
+    let _ = by_lua.controller.lua_request(WIN, request.clone());
+    let logged = by_lua.controller.notes(WIN).last().cloned().unwrap();
+    let (_, why) = logged.rsplit_once(" refused: ").expect("the Lua call logs a refusal");
+
+    let mut r = rig(three(editor()));
+    let said = r.said();
+    let batch = r.controller.nvim_request(WIN, request);
+    r.assert_refused(&batch, &said, why);
+}
+
+/// A line the parser refused never became a request: the log line and the toast are all it does.
+#[test]
+fn an_nvim_line_the_parser_refused_is_logged_and_toasted() {
+    let mut r = rig(three(editor()));
+    let said = r.said();
+    let batch = r.controller.nvim_refused(WIN, ":Eitri \"zoomm\" is not an action");
+    r.assert_refused(&batch, &said, ":Eitri \"zoomm\" is not an action");
+    assert!(r
+        .controller
+        .notes(WIN)
+        .contains(&"[nvim] :Eitri \"zoomm\" is not an action".to_string()));
 }
 
 /// The controller decides every Lua layout request, and the shell posts every one of them, floats included,

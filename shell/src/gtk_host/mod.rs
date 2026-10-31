@@ -95,7 +95,9 @@
 pub(crate) mod chrome;
 pub(crate) mod instance_pool;
 pub(crate) mod keys;
+pub(crate) mod onboarding;
 pub(crate) mod peer;
+pub(crate) mod prefix_panel;
 pub(crate) mod scheduler;
 
 use std::cell::{Cell, RefCell};
@@ -110,7 +112,7 @@ use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
     ActivationToken, Applied, ChatKillCounts, ChatOp, CleanupOp, CloseBy, CloseVerdict, DropWhy, EditorCall,
     EditorEvent, FocusChain, FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor,
-    MonitorId, NoReads, OpTag, PeerEvent, PeerId, PluginOp, SurfaceKind, TermOp, WinId, WindowSpec,
+    MonitorId, NoReads, OnboardingOp, OpTag, PeerEvent, PeerId, PluginOp, SurfaceKind, TermOp, WinId, WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -129,6 +131,14 @@ type TopBarFn = dyn Fn(WinId, u32) -> bool;
 /// What gives the top bar's rename entry the keys: the bar brought out first if it is hidden, the entry shown so it
 /// can take them, its text left to the `Chrome` op that follows. Whether it took them.
 type RenameEntryFn = dyn Fn(WinId) -> bool;
+
+/// What gives the first-start screen the keys: the screen shown first if it is hidden, since the `Focus` op comes
+/// before the `Chrome` op that fills it. Whether it took them.
+type OnboardingFocusFn = dyn Fn(WinId) -> bool;
+
+/// What carries out the first-start screen's own ops (the checks, the detection, the write, the marker, the editor):
+/// the shell's `OnboardingHost`. It answers each as a fact later, through the driver.
+type OnboardingFn = dyn Fn(&OnboardingOp) -> Applied;
 
 /// What reads a window's chrome model from the controller; nothing for a window it does not hold.
 type ChromeModelFn = dyn Fn(WinId) -> Option<ChromeModel>;
@@ -537,6 +547,8 @@ pub(crate) struct GtkHost {
     focus_fn: RefCell<Option<Rc<FocusFn>>>,
     top_bar_fn: RefCell<Option<Rc<TopBarFn>>>,
     rename_entry_fn: RefCell<Option<Rc<RenameEntryFn>>>,
+    onboarding_focus_fn: RefCell<Option<Rc<OnboardingFocusFn>>>,
+    onboarding_fn: RefCell<Option<Rc<OnboardingFn>>>,
     chrome_model: RefCell<Option<Rc<ChromeModelFn>>>,
     /// Each window's chrome widgets, with the model last drawn on them.
     chrome: RefCell<BTreeMap<WinId, Rc<ChromeDrawn>>>,
@@ -574,6 +586,8 @@ impl GtkHost {
             focus_fn: RefCell::new(None),
             top_bar_fn: RefCell::new(None),
             rename_entry_fn: RefCell::new(None),
+            onboarding_focus_fn: RefCell::new(None),
+            onboarding_fn: RefCell::new(None),
             chrome_model: RefCell::new(None),
             chrome: RefCell::new(BTreeMap::new()),
             chat_claims_fn: RefCell::new(None),
@@ -719,6 +733,16 @@ impl GtkHost {
     /// What the rename entry's `Focus` goes through. Until it is set, such a `Focus` is not carried out.
     pub(crate) fn set_rename_entry(&self, rename: Rc<RenameEntryFn>) {
         *self.rename_entry_fn.borrow_mut() = Some(rename);
+    }
+
+    /// What the first-start screen's `Focus` goes through. Until it is set, such a `Focus` is not carried out.
+    pub(crate) fn set_onboarding_focus(&self, focus: Rc<OnboardingFocusFn>) {
+        *self.onboarding_focus_fn.borrow_mut() = Some(focus);
+    }
+
+    /// What carries out the first-start screen's ops. Until it is set, they are not carried out.
+    pub(crate) fn set_onboarding(&self, carry: Rc<OnboardingFn>) {
+        *self.onboarding_fn.borrow_mut() = Some(carry);
     }
 
     /// Where a `Chrome` op reads the window's model. Until it is set, a `Chrome` is not carried out.
@@ -916,6 +940,7 @@ impl GtkHost {
             FocusTo::Module(module) => module,
             FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
             FocusTo::RenameEntry => return self.focus_rename_entry(op, win),
+            FocusTo::Onboarding => return self.focus_onboarding(op, win),
             FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
         };
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
@@ -967,6 +992,31 @@ impl GtkHost {
             Applied::Done
         } else {
             self.refuse(op, "the rename entry did not take the keys")
+        }
+    }
+
+    fn focus_onboarding(&self, op: &HostOp, win: WinId) -> Applied {
+        // Cloned out first: the grab notifies the focus change from inside it.
+        let focus = self.onboarding_focus_fn.borrow().clone();
+        let Some(focus) = focus else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        if focus(win) {
+            Applied::Done
+        } else {
+            self.refuse(op, "the first-start screen did not take the keys")
+        }
+    }
+
+    fn onboarding(&self, op: &HostOp, call: &OnboardingOp) -> Applied {
+        // Cloned out first: the work it starts may post an event at once.
+        let carry = self.onboarding_fn.borrow().clone();
+        match carry {
+            Some(carry) => match carry(call) {
+                Applied::Done => Applied::Done,
+                _ => self.refuse(op, "the first-start screen's work was not started"),
+            },
+            None => self.refuse(op, NOT_CARRIED_OUT),
         }
     }
 
@@ -1347,6 +1397,7 @@ impl Host for GtkHost {
             HostOp::DropSurface { win, module, why } => self.drop_surface(op, *win, module, why),
             HostOp::Chrome { win, .. } => self.chrome(op, *win),
             HostOp::Hint(call) => self.hint(op, call),
+            HostOp::Onboarding(call) => self.onboarding(op, call),
             HostOp::Editor(call @ EditorCall::Quit { win, generation, .. }) => {
                 let applied = self.service(op, |s| s.editor(call));
                 // A refusal names no call, so the quit that sent nothing is told as its own fact, with its

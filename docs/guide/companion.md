@@ -108,6 +108,9 @@ require("smart-splits").setup({
 })
 ```
 
+The same `at_edge` snippet works inside Eitri's own window, where `require("eitri").edge` hands the move to the
+neighbouring module instead (see [Keys](keys.md#moving-between-panes)), so one configuration serves both.
+
 When Neovim runs inside tmux, nothing in Neovim's environment changes, its navigator maps are left alone, and
 your tmux setup keeps moving between tmux panes as it does today. The edge of tmux's panes is tmux's. With
 vim-tmux-navigator there is then no crossing to the panel window (use a binding on the tmux side, or your

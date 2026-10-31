@@ -1476,6 +1476,36 @@ impl AgentPanelHandle {
         self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
     }
 
+    /// Whether a tab's trust question is on screen. A read that raises no tick: the shell asks it after each tick.
+    pub fn trust_question_open(&self) -> bool {
+        let state = self.state.borrow();
+        !state.shutting_down && state.trust.question_open()
+    }
+
+    /// Shows `text` under `title` in a scratch buffer of the editor, with no page to answer: what a `ViewInEditor`
+    /// does after the request. The panel owns the window's one scratch directory, so the window's other parts go
+    /// through here; the file written is one small file in a private runtime directory, written on the calling
+    /// thread. `Err` says why the editor did not take it.
+    pub fn view_in_editor(&self, title: &str, text: &str) -> Result<(), String> {
+        self.wake();
+        let answer: std::rc::Rc<RefCell<Option<Result<(), String>>>> = Rc::default();
+        self.run(|state, out| {
+            let request = state
+                .scratch
+                .as_mut()
+                .ok_or_else(|| "the scratch directory could not be created at startup".to_string())?
+                .prepare_view(title, text)
+                .map_err(|e| format!("could not write the scratch file: {e}"))?;
+            out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Report(answer.clone()),
+            });
+            Ok::<(), String>(())
+        })?;
+        let answered = answer.borrow_mut().take();
+        answered.unwrap_or_else(|| Err("the editor did not answer".to_string()))
+    }
+
     /// The window's way to ask its editor something (the embedded pane, or the companion's link).
     /// `main.rs` and the companion window install this once.
     pub fn set_editor_rpc(&self, rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc>) {
@@ -2297,6 +2327,24 @@ mod tests {
     use crate::agent_panel::tests::*;
 
     #[test]
+    fn view_in_editor_refuses_without_a_scratch_directory() {
+        let (handle, _) = settled_panel();
+        handle.state.borrow_mut().scratch = None;
+        let asked = Rc::new(RefCell::new(0));
+        let seen = asked.clone();
+        handle.on_editor_request(move |_| {
+            *seen.borrow_mut() += 1;
+            Ok(())
+        });
+        let why = handle.view_in_editor("init.lua lines", "x").unwrap_err();
+        assert!(why.contains("scratch directory"), "{why}");
+        assert_eq!(*asked.borrow(), 0, "the editor was not asked");
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::new().unwrap());
+        handle.view_in_editor("init.lua lines", "x").unwrap();
+        assert_eq!(*asked.borrow(), 1);
+    }
+
+    #[test]
     fn a_chooser_partner_pick_raises_without_starting_a_session() {
         let (handle, _) = settled_panel();
         let picked = Rc::new(RefCell::new(Vec::new()));
@@ -2707,6 +2755,7 @@ mod tests {
             "background_count",
             "view_background_count",
             "queued_count",
+            "trust_question_open",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
         const WAKES_WHEN: &[&str] = &["note_editor_key"];

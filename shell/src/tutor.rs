@@ -22,6 +22,11 @@ impl Tutor {
         })
     }
 
+    /// The window's prefix, as the lessons name it; set once the config is read, before the first editor session.
+    pub(crate) fn set_prefix(&self, human: String) {
+        self.installer.borrow_mut().set_prefix(human);
+    }
+
     /// The window's one editor handle.
     pub(crate) fn set_editor(&self, editor: Rc<dyn EditorRpc>) {
         self.installer.borrow_mut().set_editor(editor);

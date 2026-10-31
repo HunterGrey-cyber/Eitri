@@ -7,6 +7,7 @@ use std::time::Instant;
 use rmpv::Value;
 use sha2::{Digest, Sha256};
 
+use super::prefix_text::{substitute, substitute_checks};
 use super::*;
 use crate::keymap::{Action, Keymap};
 use crate::nvim_rpc::{Answer, RpcError};
@@ -49,8 +50,29 @@ const PREFIX_KEYS: &[(&str, &str)] = &[
 /// Chords the lessons name on their own that are not the window's: the agent panel's own keys in its message box.
 const PANEL_CHORDS: &[&str] = &["Ctrl+u", "Ctrl+y"];
 
-fn lessons() -> [(&'static str, &'static str, &'static str); 2] {
-    [("en", LESSONS_EN, CHECKS_EN), ("zh", LESSONS_ZH, CHECKS_ZH)]
+/// Prefixes the window may have: the stock one, a tmux user's, the two ten-column presets, and two whose spelling
+/// holds a character JSON has to escape.
+const PREFIXES: &[&str] = &["Ctrl+b", "Ctrl+a", "Ctrl+Space", "Ctrl+Alt+x", "Alt+\"", "Alt+\\"];
+
+/// Both languages' lessons and checks as installed for `prefix`.
+fn lessons_for(prefix: &str) -> [(&'static str, String, String); 2] {
+    [
+        (
+            "en",
+            substitute(LESSONS_EN, prefix),
+            substitute_checks(CHECKS_EN, prefix),
+        ),
+        (
+            "zh",
+            substitute(LESSONS_ZH, prefix),
+            substitute_checks(CHECKS_ZH, prefix),
+        ),
+    ]
+}
+
+/// The lessons as installed for the stock prefix: what the key table is held to, since it names real keys.
+fn lessons() -> [(&'static str, String, String); 2] {
+    lessons_for(DEFAULT_PREFIX)
 }
 
 fn expect_of(checks: &str) -> BTreeMap<usize, String> {
@@ -116,7 +138,7 @@ fn every_key_the_lessons_name_after_the_prefix_does_what_they_say_in_the_default
     );
     let wanted: BTreeMap<&str, &str> = PREFIX_KEYS.iter().copied().collect();
     for (lang, lessons, checks) in lessons() {
-        let named = prefix_keys(lessons, checks);
+        let named = prefix_keys(&lessons, &checks);
         assert!(
             named.len() > 20,
             "{lang}: the lessons name the window's keys ({named:?})"
@@ -149,7 +171,7 @@ fn every_chord_the_lessons_name_alone_is_a_moving_key_or_the_panels_own() {
         .map(|(letter, _)| format!("Ctrl+{letter}"))
         .collect();
     for (lang, lessons, _) in lessons() {
-        let chords = bare_chords(lessons);
+        let chords = bare_chords(&lessons);
         for nav in &roots {
             assert!(chords.contains(nav), "{lang}: the lessons teach {nav}");
         }
@@ -165,13 +187,14 @@ fn every_chord_the_lessons_name_alone_is_a_moving_key_or_the_panels_own() {
 
 #[test]
 fn both_languages_name_the_same_keys() {
-    let mut en = prefix_keys(LESSONS_EN, CHECKS_EN);
-    let mut zh = prefix_keys(LESSONS_ZH, CHECKS_ZH);
+    let [(_, en_lessons, en_checks), (_, zh_lessons, zh_checks)] = lessons();
+    let mut en = prefix_keys(&en_lessons, &en_checks);
+    let mut zh = prefix_keys(&zh_lessons, &zh_checks);
     en.sort();
     zh.sort();
     assert_eq!(en, zh, "the translation names other keys than the English lessons");
-    let mut en = bare_chords(LESSONS_EN);
-    let mut zh = bare_chords(LESSONS_ZH);
+    let mut en = bare_chords(&en_lessons);
+    let mut zh = bare_chords(&zh_lessons);
     en.sort();
     zh.sort();
     assert_eq!(en, zh);
@@ -179,33 +202,41 @@ fn both_languages_name_the_same_keys() {
 
 #[test]
 fn each_check_points_at_an_exercise_line_of_its_lessons() {
-    for (lang, lessons, checks) in lessons() {
-        let lines: Vec<&str> = lessons.split('\n').collect();
-        let expect = expect_of(checks);
-        assert_eq!(expect.len(), 7, "{lang}: seven exercises");
-        for (n, want) in &expect {
-            let line = lines
-                .get(n - 1)
-                .unwrap_or_else(|| panic!("{lang}: check line {n} is past the end"));
-            assert_ne!(line, want, "{lang}: line {n} is already done, so its ✗ never shows");
-            let common = line.chars().zip(want.chars()).take_while(|(a, b)| a == b).count();
-            assert!(
-                common >= 8,
-                "{lang}: line {n} ({line:?}) is not the exercise {want:?}: the lessons moved under the checks"
-            );
+    for prefix in PREFIXES {
+        for (lang, lessons, checks) in lessons_for(prefix) {
+            let lines: Vec<&str> = lessons.split('\n').collect();
+            let expect = expect_of(&checks);
+            assert_eq!(expect.len(), 7, "{lang} {prefix}: seven exercises");
+            for (n, want) in &expect {
+                let line = lines
+                    .get(n - 1)
+                    .unwrap_or_else(|| panic!("{lang} {prefix}: check line {n} is past the end"));
+                assert_ne!(
+                    line, want,
+                    "{lang} {prefix}: line {n} is already done, so its ✗ never shows"
+                );
+                let common = line.chars().zip(want.chars()).take_while(|(a, b)| a == b).count();
+                assert!(
+                    common >= 8,
+                    "{lang} {prefix}: line {n} ({line:?}) is not the exercise {want:?}: the lessons moved under the checks"
+                );
+            }
         }
     }
 }
 
 #[test]
 fn both_languages_ask_for_the_same_answers() {
-    let tail = |want: &String| {
-        want.rsplit_once("Ctrl+b ")
-            .map_or(want.clone(), |(_, key)| key.to_string())
-    };
-    let en: Vec<String> = expect_of(CHECKS_EN).values().map(tail).collect();
-    let zh: Vec<String> = expect_of(CHECKS_ZH).values().map(tail).collect();
-    assert_eq!(en, zh);
+    for prefix in PREFIXES {
+        let tail = |want: &String| {
+            want.rsplit_once(&format!("{prefix} "))
+                .map_or(want.clone(), |(_, key)| key.to_string())
+        };
+        let [(_, _, en), (_, _, zh)] = lessons_for(prefix);
+        let en: Vec<String> = expect_of(&en).values().map(tail).collect();
+        let zh: Vec<String> = expect_of(&zh).values().map(tail).collect();
+        assert_eq!(en, zh, "{prefix}");
+    }
 }
 
 #[test]
@@ -221,20 +252,22 @@ fn the_translation_follows_the_current_english_lessons() {
 }
 
 #[test]
-fn no_lesson_line_is_wider_than_the_tutor_window_expects() {
-    for (lang, lessons, _) in lessons() {
-        for (i, line) in lessons.lines().enumerate() {
-            let width: usize = line
-                .chars()
-                .map(|c| {
-                    if ('\u{2e80}'..='\u{9fff}').contains(&c) || ('\u{ff00}'..='\u{ffef}').contains(&c) {
-                        2
-                    } else {
-                        1
-                    }
-                })
-                .sum();
-            assert!(width <= 80, "{lang}: line {} is {width} columns wide", i + 1);
+fn every_line_is_within_80_columns() {
+    for prefix in PREFIXES {
+        for (lang, lessons, _) in lessons_for(prefix) {
+            for (i, line) in lessons.lines().enumerate() {
+                let width: usize = line
+                    .chars()
+                    .map(|c| {
+                        if ('\u{2e80}'..='\u{9fff}').contains(&c) || ('\u{ff00}'..='\u{ffef}').contains(&c) {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
+                assert!(width <= 80, "{lang} {prefix}: line {} is {width} columns wide", i + 1);
+            }
         }
     }
 }
@@ -432,7 +465,7 @@ fn each_nvim_session_is_installed_once_with_the_lessons_directory() {
     {
         let calls = editor.calls.borrow();
         let opts = &calls[0].0;
-        assert_eq!(opts, &install_opts(&dir));
+        assert_eq!(opts, &install_opts(&dir, DEFAULT_PREFIX));
         let dir_arg = opts.as_map().unwrap().iter().find(|(k, _)| k.as_str() == Some("dir"));
         assert_eq!(
             dir_arg.and_then(|(_, v)| v.as_slice()),
@@ -448,12 +481,12 @@ fn each_nvim_session_is_installed_once_with_the_lessons_directory() {
             .and_then(|(_, v)| v.as_map())
             .expect("the lessons go with the call");
         assert_eq!(files.len(), FILES.len());
-        for (rel, text) in FILES {
+        for (rel, text) in super::files(DEFAULT_PREFIX) {
             let sent = files
                 .iter()
                 .find(|(k, _)| k.as_str() == Some(rel))
                 .map(|(_, v)| v.as_str());
-            assert_eq!(sent, Some(Some(text)), "{rel}");
+            assert_eq!(sent, Some(Some(text.as_str())), "{rel}");
         }
     }
     // The feeds report again while the call is out: no second call.
@@ -576,4 +609,278 @@ fn the_snippet_keeps_the_editor_snippet_contract() {
     // The tutor plugin's entry point, so a config that skips the plugin (and so `:Tutor`) still gets the lessons.
     assert!(INSTALL_TUTOR_LUA.contains("pcall(vim.fn['tutor#TutorCmd'], 'eitri')"));
     assert_eq!(TUTORIAL, "eitri");
+}
+
+/// The `files` map of an install call's options, as path -> text.
+fn sent_files(opts: &Value) -> BTreeMap<String, String> {
+    let files = opts
+        .as_map()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("files"))
+        .and_then(|(_, v)| v.as_map())
+        .expect("the lessons go with the call");
+    files
+        .iter()
+        .map(|(k, v)| (k.as_str().unwrap().to_string(), v.as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn the_installer_sends_the_stock_prefix_until_it_is_told_another() {
+    let editor = Rc::new(FakeEditor::default());
+    let mut tutor = installer(&editor);
+    editor.target.set(Some(1));
+    let now = Instant::now();
+    tutor.editor_session(now);
+    let first = sent_files(&editor.calls.borrow()[0].0);
+    assert_eq!(first["tutor/en/eitri.tutor"], substitute(LESSONS_EN, "Ctrl+b"));
+    editor.answer(Ok(done(&[])));
+    tutor.poll(now);
+
+    tutor.set_prefix("Ctrl+Space".to_string());
+    editor.target.set(Some(2));
+    tutor.editor_session(now);
+    let second = sent_files(&editor.calls.borrow()[0].0);
+    for (rel, text) in super::files("Ctrl+Space") {
+        assert_eq!(second[rel], text, "{rel}");
+    }
+    assert!(second["tutor/zh/eitri.tutor"].contains("`Ctrl+Space ?`"));
+    assert!(second["tutor/en/eitri.tutor.json"].contains("Ctrl+Space ?"));
+    tutor.cleanup();
+}
+
+#[test]
+fn an_early_answer_keeps_the_prefix_for_the_retry() {
+    let editor = Rc::new(FakeEditor::default());
+    editor.target.set(Some(1));
+    let mut tutor = installer(&editor);
+    tutor.set_prefix("Ctrl+a".to_string());
+    let start = Instant::now();
+    tutor.editor_session(start);
+    editor.answer(Ok(early()));
+    let again = tutor.poll(start).expect("asked again later");
+    tutor.poll(again);
+    let retry = sent_files(&editor.calls.borrow()[0].0);
+    assert_eq!(retry["tutor/en/eitri.tutor"], substitute(LESSONS_EN, "Ctrl+a"));
+    editor.answer(Ok(done(&[])));
+    tutor.poll(again);
+    tutor.cleanup();
+}
+
+/// What the reader does to an exercise line: types a space and the key after it, or, for the one editing a Lua
+/// sample, changes its `b` into `a`.
+fn completed(line: &str, want: &str) -> String {
+    if line.contains("eitri.keymap.prefix") {
+        return line.replace("C-b", "C-a");
+    }
+    let key = want
+        .strip_prefix(line)
+        .unwrap_or_else(|| panic!("{want:?} does not continue {line:?}"))
+        .strip_prefix(' ')
+        .unwrap_or_else(|| panic!("{want:?} is not {line:?}, a space and a key"));
+    assert!(!key.is_empty(), "{want:?} adds no key to {line:?}");
+    format!("{line} {key}")
+}
+
+#[test]
+fn completing_each_exercise_produces_its_expect() {
+    for prefix in PREFIXES {
+        for (lang, lessons, checks) in lessons_for(prefix) {
+            let lines: Vec<&str> = lessons.split('\n').collect();
+            for (n, want) in expect_of(&checks) {
+                let done = completed(lines[n - 1], &want);
+                assert_eq!(done, want, "{lang} {prefix}: line {n}");
+            }
+        }
+    }
+}
+
+#[test]
+fn no_placeholder_survives() {
+    assert!(LESSONS_EN.contains(prefix_text::PLACEHOLDER));
+    assert!(LESSONS_ZH.contains(prefix_text::PLACEHOLDER));
+    for prefix in PREFIXES {
+        for (lang, lessons, checks) in lessons_for(prefix) {
+            assert!(!lessons.contains(prefix_text::PLACEHOLDER), "{lang} {prefix}");
+            assert!(!checks.contains(prefix_text::PLACEHOLDER), "{lang} {prefix}");
+        }
+    }
+}
+
+#[test]
+fn every_json_stays_valid() {
+    for prefix in PREFIXES {
+        for (lang, _, checks) in lessons_for(prefix) {
+            let json: serde_json::Value =
+                serde_json::from_str(&checks).unwrap_or_else(|e| panic!("{lang} {prefix}: {e}"));
+            let source = if lang == "en" { CHECKS_EN } else { CHECKS_ZH };
+            let source: serde_json::Value = serde_json::from_str(source).unwrap();
+            let lines = |v: &serde_json::Value| v["expect"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            assert_eq!(
+                lines(&json),
+                lines(&source),
+                "{lang} {prefix}: the check lines never move"
+            );
+            assert_eq!(json["translated-from"], source["translated-from"], "{lang} {prefix}");
+            for want in json["expect"].as_object().unwrap().values() {
+                let want = want.as_str().unwrap();
+                assert!(
+                    want.contains(prefix) || want.starts_with("eitri.keymap.prefix"),
+                    "{lang}: {want:?} names the prefix {prefix}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn substitution_touches_the_placeholder_and_nothing_else() {
+    assert_eq!(
+        substitute("a {prefix} b {prefix}, Ctrl+b {Prefix}", "X"),
+        "a X b X, Ctrl+b {Prefix}"
+    );
+    assert_eq!(substitute("no key here", "Ctrl+a"), "no key here");
+    // The Lua spelling the exercise edits is not the placeholder, and a not-JSON text is left alone.
+    let checks = r#"{"expect":{"5":"x: {prefix} ?","9":"eitri.keymap.prefix(\"C-a\")"},"other":"{prefix}"}"#;
+    let out: serde_json::Value = serde_json::from_str(&substitute_checks(checks, "Alt+\"")).unwrap();
+    assert_eq!(out["expect"]["5"], "x: Alt+\" ?");
+    assert_eq!(out["expect"]["9"], "eitri.keymap.prefix(\"C-a\")");
+    assert_eq!(out["other"], "{prefix}");
+    assert_eq!(substitute_checks("not json {prefix}", "X"), "not json {prefix}");
+}
+
+/// The lessons of today (before the placeholders), a word to a line.
+const STOCK_WORDS_EN: &str = include_str!("lessons/en/stock-words.txt");
+const STOCK_WORDS_ZH: &str = include_str!("lessons/zh/stock-words.txt");
+
+/// The passages the conversion rewrote on purpose, as (what the stock lessons said, what they say now), each
+/// with whitespace normalised (the Chinese lessons without any, since a wrap there falls between characters).
+const REWRITTEN_EN: &[(&str, &str)] = &[
+    (
+        "The keys are written for the default setup, with `Ctrl+b` as the prefix. If Eitri took another prefix \
+         from your tmux config or your init.lua, press yours wherever this tutorial says Ctrl+b. Lesson 7 says \
+         where those come from. If your tmux config also rebinds keys after the prefix, `Ctrl+b ?` shows what \
+         they do here.",
+        "The keys are written with `Ctrl+b` as the prefix, the one Eitri has now (the default prefix is \
+         `Ctrl+b`). Lesson 7 says where another one comes from. This tutorial teaches the stock keys after the \
+         prefix: if your tmux config rebinds some of them, `Ctrl+b ?` shows what they do here.",
+    ),
+    ("AND CTRL+B TWICE", "AND THE PREFIX TWICE"),
+    (
+        "to send Ctrl+b to the program: in a shell it moves the cursor back one character. Claude Code",
+        "to send Ctrl+b to the program. For Ctrl+b, a shell moves the cursor back one character, and Claude Code",
+    ),
+    (
+        "nvim gets Ctrl+b and goes a page back to this lesson.",
+        "nvim gets Ctrl+b; for Ctrl+b that goes a page back to this lesson.",
+    ),
+    (
+        "The line below sets the prefix to Ctrl+b.",
+        "The sample line below sets a prefix to Ctrl+b.",
+    ),
+];
+const REWRITTEN_ZH: &[(&str, &str)] = &[
+    (
+        "按键按默认设置来写，前缀是`Ctrl+b`。如果Eitri从你的tmux配置或init.lua里拿到了别的前缀，本教程写Ctrl+b的地方就\
+         按你自己的。第7课讲它们从哪里来。如果你的tmux配置还改了前缀之后的键，`Ctrl+b?`会显示它们在这里做什么。",
+        "按键按你现在的前缀`Ctrl+b`来写（默认前缀是`Ctrl+b`）。别的前缀从哪里来，第7课会讲。本教程讲的是前缀之后的默认键：\
+         如果你的tmux配置改了其中一些，`Ctrl+b?`会显示它们在这里做什么。",
+    ),
+    ("以及连按两次CTRL+B", "以及连按两次前缀"),
+    (
+        "发给程序：在shell里，它让光标后退一个字符。在这个终端里",
+        "发给程序。对Ctrl+b来说，shell里它让光标后退一个字符，在这个终端里",
+    ),
+    ("nvim收到Ctrl+b，翻回这一课。", "nvim收到Ctrl+b；对Ctrl+b来说，它翻回这一课。"),
+    ("下面这行把前缀设成Ctrl+b。", "下面这行示例把一个前缀设成Ctrl+b。"),
+];
+
+fn normalised(lang: &str, text: &str) -> String {
+    if lang == "en" {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        text.split_whitespace().collect()
+    }
+}
+
+#[test]
+fn the_default_prefix_changes_no_word() {
+    let [(_, en, _), (_, zh, _)] = lessons();
+    for (lang, now, stock, rewritten) in [
+        ("en", en, STOCK_WORDS_EN, REWRITTEN_EN),
+        ("zh", zh, STOCK_WORDS_ZH, REWRITTEN_ZH),
+    ] {
+        let mut want = normalised(lang, stock);
+        for (old, new) in rewritten {
+            assert_eq!(
+                want.matches(old).count(),
+                1,
+                "{lang}: the stock lessons hold {old:?} once"
+            );
+            want = want.replace(old, new);
+        }
+        let now = normalised(lang, &now);
+        if want != now {
+            let at = want.chars().zip(now.chars()).take_while(|(a, b)| a == b).count();
+            let around = |s: &str| s.chars().skip(at.saturating_sub(30)).take(80).collect::<String>();
+            panic!(
+                "{lang}: the lessons differ from today's at char {at}: wanted {:?}, got {:?}",
+                around(&want),
+                around(&now)
+            );
+        }
+    }
+}
+
+/// The fenced sample of lesson 7.
+fn sample_block(lessons: &str) -> String {
+    let start = lessons.find("~~~ lua").expect("a fenced sample");
+    let end = lessons[start..].find("\n~~~\n").expect("its end") + start;
+    lessons[start..end].to_string()
+}
+
+#[test]
+fn the_literal_sample_block_keeps_ctrl_b() {
+    for (lang, source) in [("en", LESSONS_EN), ("zh", LESSONS_ZH)] {
+        let block = sample_block(source);
+        assert!(!block.contains(prefix_text::PLACEHOLDER), "{lang}");
+        assert!(block.contains("k.del(\"prefix\", \"C-b\")"), "{lang}");
+        for prefix in PREFIXES {
+            assert_eq!(sample_block(&substitute(source, prefix)), block, "{lang} {prefix}");
+        }
+    }
+    let en = sample_block(LESSONS_EN);
+    assert!(en.contains("-- Ctrl+b after the prefix sent Ctrl+b"), "{en}");
+}
+
+#[test]
+fn lesson_262_stays_a_lua_edit() {
+    for prefix in PREFIXES {
+        for (lang, lessons, checks) in lessons_for(prefix) {
+            let expect = expect_of(&checks);
+            let (n, want) = expect.iter().next_back().expect("the last exercise");
+            assert_eq!(want, "eitri.keymap.prefix(\"C-a\")", "{lang} {prefix}");
+            assert_eq!(
+                lessons.split('\n').nth(n - 1),
+                Some("eitri.keymap.prefix(\"C-b\")"),
+                "{lang} {prefix}"
+            );
+        }
+    }
+    assert!(normalised("en", LESSONS_EN).contains("The sample line below sets a prefix to Ctrl+b. Change it to Ctrl+a"));
+    assert!(normalised("zh", LESSONS_ZH).contains("下面这行示例把一个前缀设成Ctrl+b。把它改成Ctrl+a"));
+}
+
+#[test]
+fn the_first_lesson_says_it_teaches_the_stock_keys() {
+    let section = |text: &str, from: &str, to: &str| {
+        let start = text.find(from).expect(from);
+        let end = text[start..].find(to).expect(to) + start;
+        text[start..end].to_string()
+    };
+    let en = section(LESSONS_EN, "# Lesson 0", "# Lesson 1");
+    assert!(normalised("en", &en).contains("This tutorial teaches the stock keys after the prefix"));
+    let zh = section(LESSONS_ZH, "# 第 0 课", "# 第 1 课");
+    assert!(normalised("zh", &zh).contains("本教程讲的是前缀之后的默认键"));
 }

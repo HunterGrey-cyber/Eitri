@@ -248,6 +248,11 @@ pub struct Window {
     /// Window 2 is started again after this window's start: the idle armed for it, until it fires.
     pub(super) restore_second: bool,
     pub(super) restore_idle: Option<TimerToken>,
+    /// The first-start screen while one is up.
+    pub(super) onboarding: Option<super::onboarding::OnboardingState>,
+    /// How many times the window asked for the screen's check: the generation the next screen opens under. An
+    /// answer carrying another number is for a screen that is gone.
+    pub(super) onboarding_generation: u64,
     /// What the window's chrome shows, as the controller decided it.
     pub(super) chrome: ChromeModel,
     /// Bumped by every change of `chrome`, so the shell can tell an announced model from one it drew.
@@ -310,6 +315,8 @@ impl Window {
             placement_focus_pending: false,
             restore_second: false,
             restore_idle: None,
+            onboarding: None,
+            onboarding_generation: 0,
             chrome: ChromeModel::default(),
             chrome_rev: 0,
             chrome_state: ChromeState::default(),
