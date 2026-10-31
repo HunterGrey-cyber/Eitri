@@ -51,6 +51,11 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     ("src/plugin/follow_feed.rs", "const SOCKET_NAME: &str = \"f.sock\""),
     ("src/plugin/follow_feed.rs", "const SWEPT_NAMES:"),
     ("src/ide_server/mention.rs", "const SOCKET_NAME: &str = \"m.sock\""),
+    // The host's tests hand a fake editor a socket name to compare against what the host sends back;
+    // nothing binds or connects to it.
+    ("src/ide_server/host.rs", "socket: PathBuf::from(\"/run/m.sock\")"),
+    ("src/ide_server/host.rs", "let socket = PathBuf::from(\"/run/m.sock\")"),
+    ("src/ide_server/host.rs", "Value::Binary(b\"/run/m.sock\".to_vec())"),
 ];
 
 #[test]

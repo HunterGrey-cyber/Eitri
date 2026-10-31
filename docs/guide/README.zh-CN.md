@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=de0d5c9ff0a9a11209cf0e7569d5c970d4f070c8c73ede316fc7946cacacd843 -->
+<!-- translated-from: README.md sha256=c36882f62f57cdfba86b28c7055ca16c175da7db4ab0d3075184fa579be9652b -->
 
 # Eitri 文档
 
@@ -12,6 +12,7 @@ Eitri 是一个面向 Linux 的 Neovim 图形前端，把 agent、终端和你�
 - **[编辑器](keys.zh-CN.md#在窗格之间移动)。** 一个真正的 Neovim，运行你自己的 `init.lua`、插件、LSP 和按键映射。
 - **[聊天视图](keys.zh-CN.md#chat-views)。** 基础 agent 面板和 `agent#2` 到 `agent#9`，每个都有自己的页面；把会话标签页拆进独立视图，就能并排看对话、回复、diff 和权限卡片。
 - **[终端](keys.zh-CN.md#containers-and-terminals)。** 底部终端和 `terminal#2` 到 `terminal#9`，每个有自己的 shell，第一次显示时才启动。
+- **[终端里的 `claude`](terminal-claude.zh-CN.md)。** 默认关闭：你在底部终端里运行的 `claude` 可以把它的修改作为 diff 显示在你的 Neovim 里，并读取你的诊断和选区。
 - **[插件和 Lua 页面](pages.zh-CN.md)。** 你添加的页面也是模块，和内置模块放在一起；Eitri 自带一个，[Markdown 预览](markdown-preview.zh-CN.md)。
 - **[容器](keys.zh-CN.md#containers-and-terminals)。** 把模块左右或上下分割，或者放进标签式、堆叠式容器。
 - **[浮动窗口和便笺板](keys.zh-CN.md#浮动窗口便笺板和工作区)。** 让模块浮在其他模块上方，或者收起来再叫出来；它会一直运行。编辑器始终平铺。

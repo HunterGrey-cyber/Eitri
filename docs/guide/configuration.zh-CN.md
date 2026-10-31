@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=4eed570fc199fae281d9304741ec9be311107a67b720de77b7cf80ec54e072e1 -->
+<!-- translated-from: configuration.md sha256=376e309aa7bde1d1fab302e9d800f6744a9339406331a38601ed9ddb45047a31 -->
 
 # 配置
 
@@ -47,6 +47,7 @@ eitri.config.set("review.hint", true)
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
 | `terminal.font` | `guifont` 格式的字体，`"<字体>:h<磅数>"` | 你的 `guifont` | 终端的字体，窗口里每个终端都用它：`"Iosevka:h12"` 同时设字体和字号，`"Iosevka"` 只设字体（字号仍跟着你的 `guifont`），`":h12"` 只设字号。多个字体用逗号分开、按顺序尝试，`_` 或 `\ ` 表示空格，和 `guifont` 一样。不设置时，终端用编辑器的字体和字号，这样编辑器下面的终端看起来和编辑器一致；`guifont` 为空时用 `monospace`。字号和编辑器一起缩放，见[按键](keys.zh-CN.md)。 |
+| `terminal.claude_ide` | `true` / `"on"` 或 `false` / `"off"` | `false` | 你在底部终端里运行的 `claude` 能否连上本窗口的编辑器：打开后 Eitri 在 `127.0.0.1` 上监听，运行期间写下 `~/.claude/ide/<port>.lock`，并在终端的 shell 里设置 `CLAUDE_CODE_SSE_PORT`。由持有编辑器的窗口读取一次，第二个窗口跟随它。见[终端里的 `claude`](terminal-claude.zh-CN.md)。 |
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
 | `keymap.which_key_delay` | 0 到 5000 之间的整数，或 `false` / `"off"` | `"off"` | 前缀等第二个键等多少毫秒后，用一个面板列出接下来可以按的键；`0` 立刻显示。见[提示面板](keys.zh-CN.md#the-hint-panel)。companion 窗口和 Mac 上不画。 |
 | `keymap.nvim_prefix` | 一个最长 16 个字符的 Neovim 左端（`"<leader>W"`），或 `false` / `"off"` | `"off"` | 在 Neovim 的 Normal 模式里，把你前缀表里的布局键映射到这个左端之下，每个键运行对应的 `:Eitri` 动作。见[从 Neovim 用：`:Eitri`](keys.zh-CN.md#from-neovim-eitri)。 |

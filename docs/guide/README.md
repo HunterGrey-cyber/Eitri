@@ -16,6 +16,7 @@ The window is made of modules you arrange yourself, i3/tmux style:
   break a session tab out into a view to see conversations side by side, with their replies, diffs and permission cards.
 - **[Terminals](keys.md#containers-and-terminals).** The bottom terminal and `terminal#2` to `terminal#9`,
   each with its own shell, started when you first show it.
+- **[The `claude` in your terminal](terminal-claude.md).** Off by default: a `claude` you run in the bottom terminal can show its edits as diffs in your Neovim and read your diagnostics and selection.
 - **[Plugin and Lua pages](pages.md).** Pages you add are modules alongside the built-in ones; Eitri ships one, the [Markdown preview](markdown-preview.md).
 - **[Containers](keys.md#containers-and-terminals).** Split modules side by side or one above another, or put them in tabbed or stacked containers.
 - **[Floats and the scratchpad](keys.md#floats-the-scratchpad-and-workspaces).** Float a module over the others, or stow it and call it back; it keeps running. The editor stays tiled.
