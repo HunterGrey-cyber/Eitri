@@ -33,7 +33,6 @@ _spec.loader.exec_module(rc)
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
 # The tagline, as the README, the desktop entry, the package description and the release notes give it.
 TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build, in one window."
-TAGLINE_ZH = "你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。"
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
@@ -1672,58 +1671,28 @@ class ReleaseNotes(unittest.TestCase):
         self.assertNotIn("ssh-keygen -Y verify -f release-signers", notes)
 
 
-class ReleaseNotesBilingual(unittest.TestCase):
-    """One page, the English notes, a `---` rule, then the Chinese notes
-    under `## 简体中文`. Reuses ReleaseNotes.render() (called
-    unbound, `ReleaseNotes.render(self, ...)`, so its addCleanup/skipTest register against *this*
-    instance rather than a throwaway one) against the exact same three release-signers/RS_SIGN_KEY
-    combinations ReleaseNotes already covers for the English half."""
+class ReleaseNotesEnglishOnly(unittest.TestCase):
+    """The release page is English only, in each of the three release-signers/RS_SIGN_KEY combinations
+    ReleaseNotes covers. Reuses ReleaseNotes.render() (called unbound, `ReleaseNotes.render(self, ...)`,
+    so its addCleanup/skipTest register against *this* instance rather than a throwaway one)."""
 
     render = ReleaseNotes.render
 
-    def test_the_page_has_both_halves_in_order_and_no_leftover_placeholder(self):
-        notes = self.render()
+    def assert_english_page(self, notes):
         self.assertIn("Eitri 1.0.0-rc.1 -- " + TAGLINE, notes)
-        self.assertIn("\n---\n\n## 简体中文\n", notes)
-        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- " + TAGLINE_ZH))
+        self.assertNotRegex(notes, "[\u3000-\u9fff\uff00-\uffef]")
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 
-    def test_the_chinese_half_names_the_same_release_facts_as_the_english_one(self):
-        notes = self.render()
-        self.assertIn("WebKitGTK 2.40", notes)
-        self.assertIn("nvim-rs 0.9.2", notes)
-        self.assertIn("nvim` >= 0.10", notes)
-        self.assertIn("--nvim-only", notes)  # command names stay in English/code form in the Chinese half too
-        zh = notes.split("## 简体中文", 1)[1]
-        self.assertIn("nvim-rs 0.9.2", zh)
-        self.assertIn(">= 0.10", zh)
-        self.assertIn("--nvim-only", zh)
-        self.assertIn("XDG_DATA_HOME/eitri/nvim", zh)
+    def test_the_no_key_page_has_no_other_language(self):
+        self.assert_english_page(self.render())
 
-    def test_the_chinese_verify_section_renders_the_no_key_variant(self):
-        notes = self.render()
-        zh = notes.split("## 简体中文", 1)[1]
-        self.assertIn("没有发布密钥", zh)
-        self.assertNotIn("内置的发布密钥", zh)
+    def test_the_keyed_and_signed_page_has_no_other_language(self):
+        self.assert_english_page(self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
+                                             RS_SIGN_KEY="/does/not/matter/to/fill_notes"))
 
-    def test_the_chinese_verify_section_renders_the_keyed_and_signed_variant(self):
-        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
-                             RS_SIGN_KEY="/does/not/matter/to/fill_notes")
-        zh = notes.split("## 简体中文", 1)[1]
-        self.assertIn("已签名", zh)
-        self.assertIn("内置的发布密钥", zh)
-        self.assertIn("ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release "
-                       "-s SHA256SUMS.sig < SHA256SUMS", zh)
-        self.assertNotIn("没有发布密钥", zh)
-
-    def test_the_chinese_verify_section_renders_the_keyed_but_unsigned_variant(self):
-        notes = self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
-                             RS_SIGN_KEY="")
-        zh = notes.split("## 简体中文", 1)[1]
-        self.assertIn("没有 `SHA256SUMS.sig`", zh)
-        self.assertIn("拒绝", zh)
-        self.assertNotIn("没有发布密钥", zh)
-        self.assertNotIn("内置的发布密钥。", zh)
+    def test_the_keyed_but_unsigned_page_has_no_other_language(self):
+        self.assert_english_page(self.render(signers_text='release@eitri namespaces="eitri-release" ssh-ed25519 AAAAkeydata\n',
+                                             RS_SIGN_KEY=""))
 
 
 class WriteRelease(unittest.TestCase):

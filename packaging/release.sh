@@ -721,7 +721,7 @@ host_scans() {
 }
 
 fill_notes() {
-	local notes="$RS_LOGS/release-notes.md" nvim_rs verify_section verify_section_zh
+	local notes="$RS_LOGS/release-notes.md" nvim_rs verify_section
 	nvim_rs="$(awk '/^\[\[package\]\]/ { n = 0 } /^name = "nvim-rs"$/ { n = 1 }
 		n && /^version = / { gsub(/"/, "", $3); print $3; exit }' "$RS_SOURCE/Cargo.lock")"
 	[ -n "$nvim_rs" ] || die "cannot read nvim-rs's version from $RS_SOURCE/Cargo.lock"
@@ -737,9 +737,6 @@ fill_notes() {
 	#     published): no signature, and this build's install.sh refuses a release without one.
 	# rc.1's notes went by RS_SIGN_KEY alone and called the key "built into it" with none embedded;
 	# an earlier version read only release-signers. test_release_sh.py's ReleaseNotes holds all three.
-	# The same three facts, translated -- one Chinese variant per English
-	# one, filled into @VERIFY_SECTION_ZH@ so the two languages can never describe a different build
-	# (one page, English first, then Simplified Chinese).
 	if signers_has_key "$RS_SOURCE/packaging/release-signers" && [ -n "$RS_SIGN_KEY" ]; then
 		verify_section="$(cat <<'NV_VERIFY'
     sha256sum -c --ignore-missing SHA256SUMS
@@ -751,14 +748,6 @@ built into it. To check it by hand, against the key in the repository's
     ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 NV_VERIFY
 )"
-		verify_section_zh="$(cat <<'NV_VERIFY_ZH'
-    sha256sum -c --ignore-missing SHA256SUMS
-
-`SHA256SUMS` 已签名（`SHA256SUMS.sig`）：`install.sh` 会自行验证签名，使用内置的发布密钥。如果想手动核对，可对照仓库中的 `packaging/release-signers`：
-
-    ssh-keygen -Y verify -f release-signers -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
-NV_VERIFY_ZH
-)"
 	elif signers_has_key "$RS_SOURCE/packaging/release-signers"; then
 		verify_section="$(cat <<'NV_VERIFY'
     sha256sum -c --ignore-missing SHA256SUMS
@@ -766,12 +755,6 @@ NV_VERIFY_ZH
 This build has no `SHA256SUMS.sig`. The `install.sh` built from this tree carries the release key
 and refuses a release whose signature is missing, so it will not install this build.
 NV_VERIFY
-)"
-		verify_section_zh="$(cat <<'NV_VERIFY_ZH'
-    sha256sum -c --ignore-missing SHA256SUMS
-
-本次构建没有 `SHA256SUMS.sig`。基于这份源码构建出的 `install.sh` 内置了发布密钥，会拒绝签名缺失的发布版本，因此它不会安装这个构建。
-NV_VERIFY_ZH
 )"
 	else
 		verify_section="$(cat <<'NV_VERIFY'
@@ -785,20 +768,14 @@ The first v0.2.0 final release will embed the project's dedicated release key, a
 built after that verifies `SHA256SUMS.sig` automatically.
 NV_VERIFY
 )"
-		verify_section_zh="$(cat <<'NV_VERIFY_ZH'
-    sha256sum -c --ignore-missing SHA256SUMS
-
-这个候选版本没有发布密钥。基于这份源码构建出的 `install.sh` 只检查 SHA256SUMS，这能发现下载损坏，但无法证明发布者身份；`SHA256SUMS.sig`（如果存在）是用一次性密钥签名的，该密钥未在任何地方公开，也不是信任锚点，因此没有任何针对本构建的手动验证命令是有意义的。第一个 v0.2.0 正式版会内置所有者专用的发布密钥，此后构建出的每个安装脚本都会自动验证 `SHA256SUMS.sig`。
-NV_VERIFY_ZH
-)"
 	fi
 	sed -e "s|@VERSION@|$RS_VERSION|g" -e "s|@COMMIT@|$RS_COMMIT|g" -e "s|@NVIM_RS_VERSION@|$nvim_rs|g" \
 		-e "s|@SOURCE_ASSET@|eitri-$RS_VERSION-source.tar.gz|g" \
 		-e "s|@VERDANDI_ASSET@|verdandi-${RS_VERDANDI_REV:0:7}-source.tar.gz|g" \
 		-e "s|@VERDANDI_REV@|$RS_VERDANDI_REV|g" \
 		"$RS_SOURCE/packaging/release-notes.md.in" > "$notes.tmp"
-	awk -v r="$verify_section" -v rz="$verify_section_zh" \
-		'{ if ($0 == "@VERIFY_SECTION@") { print r } else if ($0 == "@VERIFY_SECTION_ZH@") { print rz } else { print } }' \
+	awk -v r="$verify_section" \
+		'{ if ($0 == "@VERIFY_SECTION@") { print r } else { print } }' \
 		"$notes.tmp" > "$notes"
 	rm -f "$notes.tmp"
 	if grep -n '@[A-Z_]*@' "$notes" >&2; then die "release-notes.md.in has a placeholder release.sh does not fill"; fi
