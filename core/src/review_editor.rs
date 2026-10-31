@@ -25,12 +25,12 @@ use crate::wm::PeerId;
 
 /// The module itself; args `(owner, version)`. The same owner and version again change nothing
 /// (`installed = false`); any other replaces the module there, tearing the old one down first.
-/// Changing `review.lua` means bumping [`REVIEW_LUA_VERSION`], or an nvim that holds the old one
-/// keeps it.
-pub const REVIEW_LUA: &str = include_str!("review.lua");
+/// Changing `find_buf.lua` or `review.lua` means bumping [`REVIEW_LUA_VERSION`], or an nvim that
+/// holds the old one keeps it.
+pub const REVIEW_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("review.lua"));
 
-/// Bumped whenever `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 5;
+/// Bumped whenever `find_buf.lua` or `review.lua` changes.
+pub const REVIEW_LUA_VERSION: i64 = 6;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than

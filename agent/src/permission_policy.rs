@@ -539,6 +539,71 @@ pub fn rule_that_allows(
         .then(|| rule.to_rule_string())
 }
 
+/// What the project boundary says about one path, for a caller that is not answering a tool call:
+/// the same judgement `Read` gets ([`boundary`], then [`resolve_in_root`]), as a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathJudgement {
+    /// The path resolves inside the root; this is where, canonical, every link followed. Act on this
+    /// path and not on the one that was asked about.
+    Inside(PathBuf),
+    Outside(OutsideReason),
+}
+
+/// Why a path is not [`PathJudgement::Inside`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutsideReason {
+    /// The project root cannot serve as a boundary, so no path is inside it ([`boundary`]).
+    NoBoundary,
+    /// Nothing is there, as named. This says nothing of where the name points: a caller taking it
+    /// for a new file still has to place it under the root.
+    Missing,
+    /// What is there could not be established: a lookup failed for a reason other than "not found",
+    /// a link leads nowhere, a limit or the work budget ran out, or the path is empty.
+    Unresolvable,
+    /// The path passes through `/proc`, `/sys` or `/dev` ([`KERNEL_TREES`]).
+    ThroughAKernelTree,
+    /// A link on the way sits outside the root or leads out of it, even if the path comes back in.
+    LinkLeavesTheRoot,
+    /// The path resolves to somewhere outside the root.
+    LeavesTheRoot,
+}
+
+/// Judges `path` against `project_root`, on the disk, as it stands now. `Inside` exactly where
+/// `Read` would be allowed without a card (`the_judgement_agrees_with_read`), and every uncertainty
+/// lands outside it.
+///
+/// `project_root` is the session's canonical project directory. `home` as [`boundary`] takes it. A
+/// relative `path` is taken against the root.
+pub fn judge_project_path(project_root: &Path, home: Option<&Path>, path: &Path) -> PathJudgement {
+    let (judgement, ran_out) = with_work_budget(MAX_WORK_PER_CLASSIFICATION, || {
+        judge_within_budget(project_root, home, path)
+    });
+    if ran_out {
+        PathJudgement::Outside(OutsideReason::Unresolvable)
+    } else {
+        judgement
+    }
+}
+
+fn judge_within_budget(project_root: &Path, home: Option<&Path>, path: &Path) -> PathJudgement {
+    let Ok(root) = boundary(project_root, home) else {
+        return PathJudgement::Outside(OutsideReason::NoBoundary);
+    };
+    // With no component to look up it would resolve to the root itself.
+    if path.as_os_str().is_empty() {
+        return PathJudgement::Outside(OutsideReason::Unresolvable);
+    }
+    let reason = match resolve_in_root(&root, path) {
+        Resolution::At(resolved) if resolved.starts_with(&root) => return PathJudgement::Inside(resolved),
+        Resolution::At(_) => OutsideReason::LeavesTheRoot,
+        Resolution::Missing => OutsideReason::Missing,
+        Resolution::Unexaminable | Resolution::Refused => OutsideReason::Unresolvable,
+        Resolution::ThroughAKernelTree => OutsideReason::ThroughAKernelTree,
+        Resolution::LinkLeavesTheRoot => OutsideReason::LinkLeavesTheRoot,
+    };
+    PathJudgement::Outside(reason)
+}
+
 /// [`classify_permission_request`] with the home directory and the git environment passed in rather
 /// than read from the environment, so the "the root is not a boundary" branches are testable without
 /// mutating `HOME` or `GIT_DIR` for the whole test process.
@@ -2495,10 +2560,11 @@ enum Resolution {
     /// A component's lookup failed some other way -- a directory on the way that may not be
     /// searched, a name too long to look up -- so what is there is unknown. It was `Missing` until
     /// 2026-09-28, and the acceptEdits fast path's fallback allowed a
-    /// write behind such a directory without examining a link there; that path cards it now. Every
-    /// other caller answers it exactly as it answers `Missing`, deliberately: `Read`'s path cards
-    /// either way, and a `Bash` argument, a git include or a submodule directory is looked up by a
-    /// program running as this same user, which is refused the same lookup.
+    /// write behind such a directory without examining a link there; that path cards it now, and
+    /// [`judge_project_path`] does not call it missing either, since a missing name may be taken for
+    /// a new file. Every other caller answers it exactly as it answers `Missing`, deliberately:
+    /// `Read`'s path cards either way, and a `Bash` argument, a git include or a submodule directory
+    /// is looked up by a program running as this same user, which is refused the same lookup.
     Unexaminable,
     /// It would not resolve within the limits above, a link's target would not read, the budget
     /// ran out, or the path ends in a link that leads nowhere.
@@ -7371,5 +7437,268 @@ mod tests {
             .verdict,
             PermissionVerdict::AllowWithoutAsking
         );
+    }
+
+    // ---- the boundary as a value: judge_project_path -----------------------------------------------
+
+    fn judged(ws: &Workspace, path: &str) -> PathJudgement {
+        judge_project_path(ws.path(), None, Path::new(path))
+    }
+
+    fn outside(reason: OutsideReason) -> PathJudgement {
+        PathJudgement::Outside(reason)
+    }
+
+    /// `h0 -> h1 -> ... -> f` under `chain/`, so `h0` takes `hops` links to reach `f`.
+    #[cfg(unix)]
+    fn link_chain(ws: &Workspace, hops: usize) {
+        ws.write("chain/f", "x\n");
+        for i in 0..hops {
+            let next = if i + 1 == hops {
+                "f".to_string()
+            } else {
+                format!("h{}", i + 1)
+            };
+            ws.link(&format!("chain/h{i}"), next);
+        }
+    }
+
+    #[test]
+    fn judge_inside_gives_the_resolved_path() {
+        let ws = Workspace::new();
+        let file = ws.path().join("src/main.rs");
+        for path in ["src/main.rs", "./src/../src/main.rs", file.to_str().unwrap()] {
+            assert_eq!(judged(&ws, path), PathJudgement::Inside(file.clone()), "{path}");
+        }
+        // Settled by name this is the same file, but `absent` is not there to come back up from.
+        assert_eq!(judged(&ws, "src/absent/../main.rs"), outside(OutsideReason::Missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_an_in_project_link_that_stays_inside_gives_its_target() {
+        let ws = Workspace::new();
+        ws.write("real/target.rs", "x\n");
+        ws.write("real/deep/file.rs", "x\n");
+        ws.link("alias.rs", "real/target.rs");
+        ws.link("dir", "real");
+        ws.link("deep", "real/deep");
+        let target = ws.path().join("real/target.rs");
+        // The last one: `..` of a link is the parent of where it leads, not of the link's own name.
+        for path in ["alias.rs", "dir/target.rs", "deep/../target.rs"] {
+            assert_eq!(judged(&ws, path), PathJudgement::Inside(target.clone()), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_a_link_leaving_the_root_is_outside() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        ws.link("out", &elsewhere.dir);
+        ws.link("out_file", elsewhere.secret());
+        // Out and back in: it ends inside, and where it ends hangs on what lies outside.
+        std::os::unix::fs::symlink(ws.path(), elsewhere.dir.join("back")).unwrap();
+        ws.link("round_trip", elsewhere.dir.join("back/src/main.rs"));
+        for path in ["out/secret", "out_file", "round_trip"] {
+            assert_eq!(judged(&ws, path), outside(OutsideReason::LinkLeavesTheRoot), "{path}");
+        }
+    }
+
+    #[test]
+    fn judge_a_path_that_ends_elsewhere_leaves_the_root() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        let name = elsewhere.dir.file_name().unwrap().to_str().unwrap();
+        let up = format!("src/../../{name}/secret");
+        let secret = elsewhere.secret();
+        for path in ["..", up.as_str(), secret.to_str().unwrap()] {
+            assert_eq!(judged(&ws, path), outside(OutsideReason::LeavesTheRoot), "{path}");
+        }
+        // A sibling whose name merely begins with the root's.
+        std::fs::create_dir_all(ws.path().join("project")).unwrap();
+        ws.write("project-sibling/file", "x\n");
+        assert_eq!(
+            judge_project_path(
+                &ws.path().join("project"),
+                None,
+                &ws.path().join("project-sibling/file")
+            ),
+            outside(OutsideReason::LeavesTheRoot)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_through_proc_is_outside() {
+        let ws = Workspace::new();
+        ws.link("d", "/proc/self/cwd/..");
+        for path in ["/proc/self/cwd/secret", "/sys/kernel", "/dev/stdin", "d/anything"] {
+            assert_eq!(judged(&ws, path), outside(OutsideReason::ThroughAKernelTree), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_a_root_at_home_makes_everything_outside() {
+        let ws = Workspace::new();
+        let file = ws.path().join("src/main.rs");
+        let no_boundary = outside(OutsideReason::NoBoundary);
+        assert_eq!(judge_project_path(ws.path(), Some(ws.path()), &file), no_boundary);
+        assert_eq!(
+            judge_project_path(ws.path(), Some(&ws.path().join("src")), &file),
+            no_boundary
+        );
+        assert_eq!(judge_project_path(Path::new("/"), None, &file), no_boundary);
+        // Roots that are no boundary for a reason only the disk knows: a link standing in the
+        // root's place, and nothing there at all.
+        ws.link("moved", "src");
+        assert_eq!(
+            judge_project_path(&ws.path().join("moved"), None, Path::new("main.rs")),
+            no_boundary
+        );
+        assert_eq!(
+            judge_project_path(&ws.path().join("gone"), None, Path::new("main.rs")),
+            no_boundary
+        );
+        // A home elsewhere leaves the same file inside.
+        let elsewhere = Outside::new();
+        assert_eq!(
+            judge_project_path(ws.path(), Some(&elsewhere.dir), &file),
+            PathJudgement::Inside(file.clone())
+        );
+    }
+
+    #[test]
+    fn judge_a_missing_file_says_missing() {
+        let ws = Workspace::new();
+        let absolute = ws.path().join("src/new.rs");
+        for path in [
+            "src/new.rs",
+            "absent/new.rs",
+            "src/main.rs/new.rs",
+            absolute.to_str().unwrap(),
+        ] {
+            assert_eq!(judged(&ws, path), outside(OutsideReason::Missing), "{path}");
+        }
+        // One name, and the answer follows what is on disk now.
+        assert!(matches!(judged(&ws, "src/main.rs"), PathJudgement::Inside(_)));
+        std::fs::remove_file(ws.path().join("src/main.rs")).unwrap();
+        assert_eq!(judged(&ws, "src/main.rs"), outside(OutsideReason::Missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_a_link_chain_past_the_limit_is_unresolvable() {
+        let ws = Workspace::new();
+        link_chain(&ws, MAX_LINK_HOPS + 1);
+        assert_eq!(
+            judged(&ws, "chain/h1"),
+            PathJudgement::Inside(ws.path().join("chain/f")),
+            "as many links as the limit are followed"
+        );
+        assert_eq!(judged(&ws, "chain/h0"), outside(OutsideReason::Unresolvable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn judge_what_could_not_be_examined_is_unresolvable_not_missing() {
+        let ws = Workspace::new();
+        ws.link("dangling", "absent");
+        ws.link("loop_a", "loop_b");
+        ws.link("loop_b", "loop_a");
+        let too_long = "n".repeat(300);
+        // The empty path has no component to look up: it would resolve to the root itself.
+        for path in ["dangling", "loop_a", too_long.as_str(), ""] {
+            assert_eq!(judged(&ws, path), outside(OutsideReason::Unresolvable), "{path}");
+        }
+    }
+
+    #[test]
+    fn judge_out_of_work_is_unresolvable() {
+        let ws = Workspace::new();
+        let (judgement, ran_out) =
+            with_work_budget(0, || judge_within_budget(ws.path(), None, Path::new("src/main.rs")));
+        assert!(ran_out);
+        assert_eq!(judgement, outside(OutsideReason::Unresolvable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_judgement_agrees_with_read() {
+        let ws = Workspace::new();
+        let elsewhere = Outside::new();
+        ws.write("real/target.rs", "x\n");
+        ws.link("alias.rs", "real/target.rs");
+        ws.link("dir", "real");
+        ws.link("out", &elsewhere.dir);
+        ws.link("out_file", elsewhere.secret());
+        ws.link("kernel", "/proc/self/cwd/..");
+        ws.link("dangling", "absent");
+        ws.link("loop_a", "loop_b");
+        ws.link("loop_b", "loop_a");
+        ws.link("moved", "src");
+        link_chain(&ws, MAX_LINK_HOPS + 1);
+
+        let file = ws.path().join("src/main.rs");
+        let secret = elsewhere.secret();
+        let name = elsewhere.dir.file_name().unwrap().to_str().unwrap();
+        let up = format!("../{name}/secret");
+        let too_long = "n".repeat(300);
+        let inside = [
+            "src/main.rs",
+            "./src/../src/main.rs",
+            file.to_str().unwrap(),
+            ".",
+            "src",
+            ws.path().to_str().unwrap(),
+            "alias.rs",
+            "dir/target.rs",
+            "chain/h1",
+        ];
+        let not_inside = [
+            "",
+            "src/new.rs",
+            "absent/new.rs",
+            "src/main.rs/new.rs",
+            "src/absent/../main.rs",
+            "..",
+            up.as_str(),
+            secret.to_str().unwrap(),
+            "out",
+            "out/secret",
+            "out_file",
+            "kernel/x",
+            "/proc/self/cwd/secret",
+            "/etc/hosts",
+            "dangling",
+            "loop_a",
+            "chain/h0",
+            too_long.as_str(),
+        ];
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let agreed = |root: &Path, path: &str| {
+            let read = classify_permission_request("Read", &json!({ "file_path": path }), root);
+            let judgement = judge_project_path(root, home.as_deref(), Path::new(path));
+            let judged_inside = matches!(judgement, PathJudgement::Inside(_));
+            assert_eq!(
+                judged_inside,
+                !read.needs_a_human(),
+                "{path}: {judgement:?} against {read:?}"
+            );
+            judged_inside
+        };
+        for path in inside {
+            assert!(agreed(ws.path(), path), "{path}");
+        }
+        for path in not_inside {
+            assert!(!agreed(ws.path(), path), "{path}");
+        }
+        // A root that is no boundary answers both the same way, for every path.
+        let moved = ws.path().join("moved");
+        for path in inside.iter().chain(not_inside.iter()) {
+            assert!(!agreed(&moved, path), "{path}");
+        }
     }
 }
