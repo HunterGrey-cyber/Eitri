@@ -259,7 +259,7 @@ fn default_layers() -> Vec<String> {
 }
 
 /// Capabilities a driver part or variant may require.
-pub const KNOWN_CAPABILITIES: [&str; 9] = [
+pub const KNOWN_CAPABILITIES: [&str; 10] = [
     "client_tools",
     "chat_move",
     "task_control",
@@ -268,6 +268,7 @@ pub const KNOWN_CAPABILITIES: [&str; 9] = [
     "background_tasks",
     "human_origin",
     "structured_questions_v1",
+    "direct_settings",
     "eitri_bash_ceiling",
 ];
 

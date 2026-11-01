@@ -563,7 +563,7 @@ fn validate(reply: &Reply) -> io::Result<()> {
         }
     }
     if let Some(error) = &reply.error {
-        if !(error.status == 429 || (500..=599).contains(&error.status)) {
+        if !(error.status == 404 || error.status == 429 || (500..=599).contains(&error.status)) {
             return Err(invalid("unsupported error status"));
         }
         for (key, value) in &error.headers {
@@ -971,7 +971,13 @@ fn serve(mut stream: TcpStream, index: usize, shared: Arc<Shared>) {
                     .entry("anthropic-ratelimit-unified-status".into())
                     .or_insert_with(|| "rejected".into());
             }
-            let body = json!({"type":"error","error":{"type":if error.status == 429 {"rate_limit_error"} else {"overloaded_error"},"message":"scripted error"}});
+            // 404 is what the API answers for a model id it does not know.
+            let kind = match error.status {
+                404 => "not_found_error",
+                429 => "rate_limit_error",
+                _ => "overloaded_error",
+            };
+            let body = json!({"type":"error","error":{"type":kind,"message":"scripted error"}});
             record.response_events.push(json!({"status":error.status,"body":body}));
             return http::json_response(&mut stream, index, error.status, &body, &headers);
         }

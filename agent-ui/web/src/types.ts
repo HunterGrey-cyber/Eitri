@@ -377,7 +377,24 @@ export type Capabilities = {
   backgroundTasks?: boolean;
   taskControl?: boolean;
   taskOutput?: boolean;
+  taskOutputRange?: boolean;
+  /** The model and the effort change directly, also during a turn; without it, only by the CLI's slash commands. */
+  directSettings?: boolean;
   workflowProgress?: boolean;
+};
+
+/** What the CLI says it will use. Each is empty when it did not say. */
+export type AppliedSettings = { model: string; effort: string };
+
+/** One model the session's CLI offers. Every word is the CLI's. */
+export type ModelOption = {
+  value: string;
+  resolvedModel: string;
+  displayName: string;
+  description: string;
+  supportsEffort: boolean;
+  supportedEffortLevels: string[];
+  supportsAutoMode: boolean;
 };
 
 /** Descriptive only -- for display and diagnostics, never for deciding whether a control is
@@ -812,6 +829,7 @@ export type AgentDomainEvent =
   | { type: "subagent_frame"; parent_tool_use_id: string; frame: SubagentContent }
   | { type: "session_opened"; session_id: string; provider_session_id: string; model: string; cwd: string }
   | { type: "effort_reported"; effort: string | null }
+  | { type: "model_reported"; model: string }
   | { type: "turn_started"; turn_id: string }
   | { type: "user_prompt_submitted"; text: string }
   /** A message put into the running turn was read by the agent: a user prompt at this point of the

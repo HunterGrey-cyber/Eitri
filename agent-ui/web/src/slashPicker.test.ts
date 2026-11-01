@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseEffortReply, parseModelReply } from "./slashPicker";
+import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
+import type { ModelOption } from "./types";
 
 // Verbatim probe text from CLI 2.1.283 under a test-account wrapper,
 // so the parser is checked against actual command output.
@@ -74,5 +75,83 @@ describe("parseEffortReply", () => {
   it("is null for text that does not match this shape at all", () => {
     expect(parseEffortReply("I don't understand that command.")).toBeNull();
     expect(parseEffortReply("")).toBeNull();
+  });
+});
+
+describe("the pickers from the session's own list", () => {
+  const row = (value: string, over: Partial<ModelOption> = {}): ModelOption => ({
+    value, resolvedModel: value, displayName: value.toUpperCase(), description: "", supportsEffort: true,
+    supportedEffortLevels: ["low", "max"], supportsAutoMode: true, ...over,
+  });
+
+  it("keeps the CLI's order and marks the named row over default, which resolves to the same id", () => {
+    const picker = modelPicker([row("default", { resolvedModel: "m" }), row("opus", { resolvedModel: "m" })], { model: "m", effort: "" });
+    expect(picker?.options).toEqual(["default", "opus"]);
+    expect(picker?.current).toBe("opus");
+  });
+
+  it("marks default when no other row runs the model, and nothing for a model off the list", () => {
+    const models = [row("default", { resolvedModel: "m" }), row("other")];
+    expect(modelPicker(models, { model: "m", effort: "" })?.current).toBe("default");
+    expect(modelPicker(models, { model: "unlisted", effort: "" })?.current).toBeNull();
+  });
+
+  it("says on its row that a model cannot run auto", () => {
+    expect(modelPicker([row("old", { supportsAutoMode: false })], { model: "", effort: "" })?.labels.old).toBe("OLD (no auto mode)");
+  });
+
+  it("names no row when the read of what the session runs did not answer, a row with no id included", () => {
+    const models = [row("a", { resolvedModel: "" }), row("b", { resolvedModel: "", supportsEffort: false })];
+    expect(modelPicker(models, { model: "", effort: "" })?.current).toBeNull();
+    expect(effortPicker([row("b", { resolvedModel: "", supportsEffort: false }), row("a", { resolvedModel: "" })], { model: "", effort: "" })).not.toBeNull();
+  });
+
+  it("has no picker for an empty list", () => {
+    expect(modelPicker([], { model: "", effort: "" })).toBeNull();
+  });
+
+  it("offers the running model's levels and the way back to the settings", () => {
+    const picker = effortPicker([row("m", { supportedEffortLevels: ["low"] }), row("n")], { model: "m", effort: "low" });
+    expect(picker?.options).toEqual(["low", EFFORT_FROM_SETTINGS]);
+    expect(picker?.current).toBe("low");
+  });
+
+  it("offers every level when the list does not name the model", () => {
+    const picker = effortPicker([row("a", { supportedEffortLevels: ["low"] }), row("b", { supportedEffortLevels: ["max"] })], { model: "z", effort: "" });
+    expect(picker?.options).toEqual(["low", "max", EFFORT_FROM_SETTINGS]);
+    expect(picker?.current).toBeNull();
+  });
+
+  it("has no effort picker for a model that takes no level", () => {
+    expect(effortPicker([row("m", { supportsEffort: false })], { model: "m", effort: "" })).toBeNull();
+  });
+});
+
+describe("what the band says of a change", () => {
+  const applied = { model: "new", effort: "low" };
+
+  it("names the next turn when none runs", () => {
+    expect(settingsChangedWords("model", applied, "New", null)).toBe("model: new, from the next turn");
+  });
+
+  it("names the old model during a turn", () => {
+    expect(settingsChangedWords("model", applied, "New", { model: "old" })).toBe("model: new; the running response finishes on old");
+  });
+
+  it("does not claim a change back to the model running", () => {
+    expect(settingsChangedWords("model", applied, "New", { model: "new" })).toBe("model: new, for the rest of this turn");
+  });
+
+  it("uses the chosen row when the read said nothing", () => {
+    expect(settingsChangedWords("model", { model: "", effort: "" }, "New", null)).toBe("model: New, from the next turn");
+  });
+
+  it("says when a level holds, and that a model takes none", () => {
+    expect(settingsChangedWords("effort", applied, "low", { model: "old" })).toBe("effort: low, from the next request");
+    expect(settingsChangedWords("effort", { model: "m", effort: "" }, "low", null)).toBe("effort: none on this model, from the next request");
+  });
+
+  it("does not call an unanswered read a model with no level", () => {
+    expect(settingsChangedWords("effort", { model: "", effort: "" }, "low", null)).toBe("effort: low, from the next request");
   });
 });

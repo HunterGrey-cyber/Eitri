@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=5bfdde564d2402df9a0e3e8eb83b31ce3731ebacc7171e880bb99634380bb3bc -->
+<!-- translated-from: keys.md sha256=908ad480181e61d9b889c137bb8112513bf78442ddc1bacde2c95ef1fda388ed -->
 
 # 按键
 
@@ -361,7 +361,7 @@ end
 
 `Esc` 从 INSERT 回到 BROWSE。`i` 或 `o`（光标在你离开时的位置）、`A`（在草稿末尾）或 `Ctrl+j` 从 BROWSE 进入 INSERT；在最后一行按 `j` 或 `Down` 也一样：走到头再也不能往下时，它继续走进输入框，光标在你离开时的位置。很长的最后一行会先滚到底；按住不放的键停在最后一行，所以绝不会往草稿里打出 `jjjj`。空标签页上输入框是最后一站，所以同样的键先走过各行，再进入输入框。等待回答的卡片、问题、打开的列表和搜索行会把 `j` 留给自己。`i`、`o`、`A`、`f` 和这里的 `j` 只对单独按下的键起作用：如果在它之后大约四分之一秒内又按了别的键，它什么也不做，所以回复刚到时打出的句子开头几个字母不会启动 HINT，也不会在一个词中间打开输入框。
 
-底部状态条右侧显示 agent 的模型；agent 说明了 effort 时，旁边还会显示 effort。在 Claude 标签页上，点击其中任何一个会打开 `/model` 或 `/effort` 列表。Claude Code 只有被问到时才说出自己的 effort，所以要在这个标签页里运行过 `/model` 或 `/effort <level>` 之后才会显示，点一下模型就是一种问法。Codex 标签页显示 Codex 报告的内容，不提供列表。
+底部状态条右侧显示 agent 的模型；agent 说明了 effort 时，旁边还会显示 effort。在 Claude 标签页上，点击其中任何一个会打开模型或 effort 列表，回合运行时也可以：不会给 Claude 发送消息，状态条会说明你的选择何时生效。Codex 标签页显示 Codex 报告的内容，不提供列表。
 
 ### 在 INSERT 里
 
@@ -398,7 +398,7 @@ end
 | `/tasks`（或 `/bashes`） | 打开[后台任务列表](#the-background-tasks-list) |
 | `/workflows` | 打开后台任务列表，并定位到动态工作流 |
 
-前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页或你注册的 agent 的标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。
+前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页或你注册的 agent 的标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。
 
 ### 在 BROWSE 里
 
@@ -452,8 +452,8 @@ end
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
-| `<leader>M` | 选择模型（和点击状态带的模型一样）。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。回合运行时会提示等回合结束后再选择。 |
-| `<leader>E` | 选择推理力度（和点击状态带的推理力度一样）。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。回合运行时会提示等回合结束后再选择。 |
+| `<leader>M` | 选择模型（和点击状态带的模型一样），回合运行时也可以：正在生成的回复按旧模型结束，下一个请求就用新模型。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。 |
+| `<leader>E` | 选择推理力度（和点击状态带的推理力度一样），回合运行时也可以：从下一个请求起生效。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。 |
 | `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `Space e`（`<leader>e`） | 为当前标签页开关编辑器跟随；默认关闭，不会移动你的光标 |
 | `<leader>?` | 按键列表 |
@@ -470,7 +470,7 @@ end
 | `j` / `k`，或 `Down` / `Up` | 下一个 / 上一个任务；在任务详情里则是滚动 |
 | `Enter` | 任务详情：shell 或 monitor 显示它的命令和输出的末尾，运行期间每秒重新读取一次；工作流显示它的阶段和 agent |
 | `x` | 立即停掉选中的任务，只停这一个 |
-| `o` | 在 Neovim 里以只读方式打开详情里显示的输出（最后 8 KiB） |
+| `o` | 在 Neovim 里以只读方式打开完整输出；超过 1 MiB 时打开最后 1 MiB，并用一行说明前面还有多少 |
 | `PageDown` 或空格 / `PageUp` | 向下 / 向上滚动一页 |
 | `Home` / `End` | 滚到顶部 / 底部 |
 | `q` 或 `Esc` | 从任务详情返回；在列表里则关闭列表 |

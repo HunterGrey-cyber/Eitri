@@ -594,9 +594,8 @@ within about a quarter of a second of it, it does nothing, so the first letters 
 reply arrives do not start HINT or open the box in the middle of a word.
 
 The band's right side names the agent's model, and the effort beside it when the agent has said what it is. On a
-Claude tab a click on either opens the `/model` or `/effort` list; Claude Code says its effort only when asked, so
-it appears after `/model` or `/effort <level>` has run in that tab, and a click on the model is one way to ask. A
-Codex tab shows what Codex reports and offers no list.
+Claude tab a click on either opens the list of models or efforts, also while a turn runs: nothing is sent to Claude as
+a message, and the band says when your choice takes effect. A Codex tab shows what Codex reports and offers no list.
 
 ### In INSERT
 
@@ -636,7 +635,8 @@ box or a conversation:
 
 The first four clear the draft. None of these sends a message to Claude. Other slash commands keep
 their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/model`, `/mcp`, `/agents`,
-`/doctor` and `/output-style` show an effect; a bare `/model` or `/effort` opens a picker. `/login` and
+`/doctor` and `/output-style` show an effect; a bare `/model` or `/effort` opens a picker, also while a turn runs, and
+`/model <name>` is sent as a message. `/login` and
 `/config`, and `/resume` with arguments, need a full terminal and are refused with a message. Other
 words, including prompt templates and your own commands, are sent as typed. `?` lists the working
 CLI commands. In a Codex tab or a tab of an agent you registered, all seven words are sent as text:
@@ -697,8 +697,8 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
-| `<leader>M` | choose the model (as a click on the band's model). Claude tabs only; a Codex or registered agent's tab says it is not available. While a turn runs it says to choose when the turn ends. |
-| `<leader>E` | choose the effort (as a click on the band's effort). Claude tabs only; a Codex or registered agent's tab says it is not available. While a turn runs it says to choose when the turn ends. |
+| `<leader>M` | choose the model (as a click on the band's model), also while a turn runs: the running response finishes on the old model, and the next request uses the new one. Claude tabs only; a Codex or registered agent's tab says it is not available. |
+| `<leader>E` | choose the effort (as a click on the band's effort), also while a turn runs: it holds from the next request. Claude tabs only; a Codex or registered agent's tab says it is not available. |
 | `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `Space e` (`<leader>e`) | toggle following the agent in the editor for this tab; off by default, never moves your cursor |
 | `<leader>?` | the list of keys |
@@ -716,7 +716,7 @@ system tasks. The list has the keys while it is open, and its last line names th
 | `j` / `k`, or `Down` / `Up` | the next / the previous task; in a task's detail, scroll |
 | `Enter` | the task's detail: for a shell or a monitor its command and the end of its output, read again every second while it runs; for a workflow its phases and agents |
 | `x` | stop the selected task at once, and only that one |
-| `o` | open the output the detail shows (the last 8 KiB) read-only in Neovim |
+| `o` | open the whole output read-only in Neovim; past 1 MiB, its last 1 MiB, under a line saying how much comes before |
 | `PageDown` or `Space` / `PageUp` | scroll a page down / up |
 | `Home` / `End` | scroll to the top / the bottom |
 | `q` or `Esc` | back from a task's detail; from the list, close it |

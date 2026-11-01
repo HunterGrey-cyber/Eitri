@@ -1,4 +1,4 @@
-import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { AppliedSettings, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
@@ -24,7 +24,14 @@ export type OutboundMessage =
   | { type: "stop_background"; request_id: string; tab: TabId; running: number }
   | { type: "toggle_following"; request_id: string; tab: TabId }
   | { type: "stop_task"; request_id: string; tab: TabId; task_id: string }
-  | { type: "task_output"; request_id: string; tab: TabId; task_id: string }
+  /** `offset` reads the whole output from there, where the session offers it; absent reads the last bytes. */
+  | { type: "task_output"; request_id: string; tab: TabId; task_id: string; offset?: number }
+  /** The models the session's CLI offers, for the picker. No turn, so it works while one runs. */
+  | { type: "list_models"; request_id: string; tab: TabId }
+  /** A change of the running session's model, also during a turn. */
+  | { type: "set_model"; request_id: string; tab: TabId; model: string }
+  /** A change of the running session's effort, also during a turn. Empty goes back to the settings. */
+  | { type: "apply_effort"; request_id: string; tab: TabId; effort: string }
   /** `decision` is a closed set, not a boolean: Rust rejects an unrecognized value at parse time
    *  rather than defaulting it, and the tempting default would be the one that runs the tool.
    *  `reason` is only ever sent with a denial -- there is no field downstream that would show the
@@ -261,7 +268,10 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: true; message?: string }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     /** Plain text: render through revealHidden, never as Markdown or HTML. */
-    | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean }
+    | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean; offset?: number }
+    /** Every word is the CLI's: plain text, through revealHidden. */
+    | { kind: "models_result"; requestId: string; tab: TabId; models: ModelOption[]; applied: AppliedSettings }
+    | { kind: "settings_result"; requestId: string; tab: TabId; applied: AppliedSettings }
     | {
         kind: "events";
         tab: TabId;
@@ -506,6 +516,8 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
         obj.kind === "task_output_result" ||
+        obj.kind === "models_result" ||
+        obj.kind === "settings_result" ||
         obj.kind === "question_other_edited" ||
         obj.kind === "events" ||
         obj.kind === "snapshot" ||

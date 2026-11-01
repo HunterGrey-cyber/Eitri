@@ -334,6 +334,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       return state;
     case "effort_reported":
       return { ...state, effort: event.effort };
+    case "model_reported":
+      return { ...state, model: event.model };
     case "session_opened":
       // Arrives once PER TURN on the sidecar backend, not once per session: the Agent SDK emits a
       // system/init at the start of each turn even inside one streaming session. Folding it is

@@ -39,6 +39,7 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
         rate_limit_warning: _,
         fallback_model: _,
         effort: _,
+        cli_left_auto: _,
         notification: _,
         questions,
         last_turn_end_seq,

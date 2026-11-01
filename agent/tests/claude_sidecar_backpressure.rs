@@ -71,6 +71,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
         let kind = match event {
             AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
             AgentDomainEvent::EffortReported { .. } => "EffortReported",
+            AgentDomainEvent::ModelReported { .. } => "ModelReported",
+            AgentDomainEvent::CliLeftAuto => "CliLeftAuto",
             AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
             // This side's own event (see `AgentDomainEvent::UserPromptSubmitted`'s doc) -- never
             // produced by `provider.pump()`, which is all this test drains. Matched anyway so this

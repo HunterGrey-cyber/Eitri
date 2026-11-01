@@ -63,6 +63,10 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 pub const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// `SetModel` on an id the CLI does not list waits for the API request the CLI checks it with.
+const SET_MODEL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Long enough for the sidecar's pump, which ticks every 20 ms, to have emptied what the CLI wrote before a change.
+const APPLIED_AGAIN_AFTER: Duration = Duration::from_millis(150);
 
 /// The protocol major this client speaks. A sidecar reporting anything else is refused outright: its
 /// wire contract is not one this client can name.
@@ -106,6 +110,10 @@ const CAP_SESSION_NOTICES: &str = claude_runtime_protocol::CAP_SESSION_NOTICES;
 const CAP_CONVERSATION_RESET: &str = claude_runtime_protocol::CAP_CONVERSATION_RESET;
 const CAP_STRUCTURED_QUESTIONS_V1: &str = claude_runtime_protocol::CAP_STRUCTURED_QUESTIONS_V1;
 const CAP_CLIENT_TOOLS: &str = claude_runtime_protocol::CAP_CLIENT_TOOLS;
+const CAP_SET_MODEL: &str = claude_runtime_protocol::CAP_SET_MODEL;
+const CAP_LIST_MODELS: &str = claude_runtime_protocol::CAP_LIST_MODELS;
+const CAP_APPLY_EFFORT: &str = claude_runtime_protocol::CAP_APPLY_EFFORT;
+const CAP_TASK_OUTPUT_RANGE: &str = claude_runtime_protocol::CAP_TASK_OUTPUT_RANGE;
 const PERMISSION_MODE_BYPASS: &str = "bypass";
 const PERMISSION_MODE_INTERACTIVE: &str = "interactive";
 
@@ -206,6 +214,8 @@ fn capabilities_from_handshake(response: &HandshakeResponse) -> ProviderCapabili
         conversation_reset: has(CAP_CONVERSATION_RESET),
         structured_questions_v1: has(CAP_STRUCTURED_QUESTIONS_V1),
         client_tools: has(CAP_CLIENT_TOOLS),
+        direct_settings: has(CAP_SET_MODEL) && has(CAP_LIST_MODELS) && has(CAP_APPLY_EFFORT),
+        task_output_range: has(CAP_TASK_OUTPUT_RANGE),
     }
 }
 
@@ -634,9 +644,17 @@ impl ClaudeSidecarProvider {
         F: std::future::Future<Output = Result<T, ProviderError>> + Send + 'static,
         T: Send + 'static,
     {
+        self.rpc_within(UNARY_RPC_TIMEOUT, future)
+    }
+
+    fn rpc_within<F, T>(&self, limit: Duration, future: F) -> crate::TaskReply<T>
+    where
+        F: std::future::Future<Output = Result<T, ProviderError>> + Send + 'static,
+        T: Send + 'static,
+    {
         let (tx, rx) = std::sync::mpsc::channel();
         self.runtime.handle().spawn(async move {
-            let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, future)
+            let result = tokio::time::timeout(limit, future)
                 .await
                 .unwrap_or(Err(ProviderError::Timeout));
             let _ = tx.send(result);
@@ -851,6 +869,13 @@ impl ClaudeSidecarProvider {
                                         closed_by_session |=
                                             matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
                                         state.questions.observe(&domain_event);
+                                        // A level read before a command that may change it says nothing
+                                        // about what the command left.
+                                        if events.effort_ask_open()
+                                            && matches!(domain_event, AgentDomainEvent::EffortReported { .. })
+                                        {
+                                            continue;
+                                        }
                                         let effort = events.effort_answer(&domain_event);
                                         translated.push(domain_event);
                                         translated.extend(effort);
@@ -1662,6 +1687,8 @@ impl AgentProvider for ClaudeSidecarProvider {
         let request = claude_runtime_protocol::v1::GetTaskOutputRequest {
             session_id: session_id.to_owned(),
             task_id: task_id.to_owned(),
+            offset: None,
+            max_bytes: 0,
         };
         let mut client = self.client.clone();
         Ok(self.task_rpc(async move {
@@ -1675,7 +1702,109 @@ impl AgentProvider for ClaudeSidecarProvider {
                 output: tail.output,
                 total_bytes: tail.total_bytes,
                 truncated: tail.truncated,
+                offset: tail.offset,
             })
+        }))
+    }
+
+    fn task_output_range(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<crate::TaskReply<crate::TaskOutput>, ProviderError> {
+        if !self.capabilities.task_output_range {
+            return Err(ProviderError::UnsupportedCapability("task_output_range"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::GetTaskOutputRequest {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+            offset: Some(offset),
+            max_bytes,
+        };
+        let mut client = self.client.clone();
+        Ok(self.task_rpc(async move {
+            let response = client
+                .get_task_output(request)
+                .await
+                .map_err(map_task_status)?
+                .into_inner();
+            let range = translate_322::task_output_range(response);
+            Ok(crate::TaskOutput {
+                output: range.output,
+                total_bytes: range.total_bytes,
+                truncated: range.truncated,
+                offset: range.offset,
+            })
+        }))
+    }
+
+    fn list_models(&self, session_id: &str) -> Result<crate::TaskReply<crate::ModelList>, ProviderError> {
+        if !self.capabilities.direct_settings {
+            return Err(ProviderError::UnsupportedCapability("list_models"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::ListModelsRequest {
+            session_id: session_id.to_owned(),
+        };
+        let mut client = self.client.clone();
+        Ok(self.task_rpc(async move {
+            let response = client.list_models(request).await.map_err(map_task_status)?.into_inner();
+            Ok(translate_322::model_list(response))
+        }))
+    }
+
+    fn set_model(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<crate::TaskReply<crate::AppliedSettings>, ProviderError> {
+        if !self.capabilities.direct_settings {
+            return Err(ProviderError::UnsupportedCapability("set_model"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::SetModelRequest {
+            session_id: session_id.to_owned(),
+            command_id: uuid::Uuid::new_v4().to_string(),
+            model: model.to_owned(),
+        };
+        let mut client = self.client.clone();
+        let events = self.events.clone();
+        Ok(self.rpc_within(SET_MODEL_TIMEOUT, async move {
+            let response = client.set_model(request).await.map_err(map_task_status)?.into_inner();
+            let applied = translate_322::applied_settings(response.applied);
+            EventQueue::settle_applied(&events, applied.clone());
+            Ok(applied)
+        }))
+    }
+
+    fn apply_effort(
+        &self,
+        session_id: &str,
+        effort: &str,
+    ) -> Result<crate::TaskReply<crate::AppliedSettings>, ProviderError> {
+        if !self.capabilities.direct_settings {
+            return Err(ProviderError::UnsupportedCapability("apply_effort"));
+        }
+        self.require_driving()?;
+        let request = claude_runtime_protocol::v1::ApplyEffortRequest {
+            session_id: session_id.to_owned(),
+            command_id: uuid::Uuid::new_v4().to_string(),
+            effort: effort.to_owned(),
+        };
+        let mut client = self.client.clone();
+        let events = self.events.clone();
+        Ok(self.task_rpc(async move {
+            let response = client
+                .apply_effort(request)
+                .await
+                .map_err(map_task_status)?
+                .into_inner();
+            let applied = translate_322::applied_settings(response.applied);
+            EventQueue::settle_applied(&events, applied.clone());
+            Ok(applied)
         }))
     }
 
@@ -1904,6 +2033,8 @@ struct QueueState {
     frozen: bool,
     /// What the message sent last asks the CLI about its effort, until the turn it started ends.
     effort_ask: Option<EffortAskInFlight>,
+    /// How many changes of the model or the effort have been answered.
+    applied_changes: u64,
     /// `send_steers` tasks running.
     steering: usize,
     /// Answers to questions whose reply has not been read yet.
@@ -2123,6 +2254,10 @@ impl EventQueue {
     /// not known, and a tab that moves in between must not carry the old one on.
     fn note_effort_ask(&self, ask: Option<effort_reply::EffortAsk>) {
         let mut state = self.lock();
+        if ask.is_some() {
+            // Past this a command speaks for the session, so a change's second word has nothing to add.
+            state.applied_changes += 1;
+        }
         state.effort_ask = ask.map(|ask| EffortAskInFlight {
             ask,
             turn: None,
@@ -2149,6 +2284,55 @@ impl EventQueue {
         if effort.is_some() {
             self.deliver(&mut state, vec![AgentDomainEvent::EffortReported { effort }]);
         }
+    }
+
+    /// A command that may change the effort has been sent and its reply has not come.
+    fn effort_ask_open(&self) -> bool {
+        self.lock().effort_ask.is_some()
+    }
+
+    /// What a change left, said now and once more after the watch has caught up: the answer and the stream
+    /// are two routes, and a `SessionReady` written ahead of the change can come out of the watch after its
+    /// answer. Only the latest change says it again, and not past a command that may have changed it since.
+    fn settle_applied(queue: &Arc<Self>, applied: crate::AppliedSettings) {
+        let change = queue.note_applied(&applied);
+        let queue = Arc::clone(queue);
+        tokio::spawn(async move {
+            tokio::time::sleep(APPLIED_AGAIN_AFTER).await;
+            if queue.lock().applied_changes == change && !queue.effort_ask_open() {
+                queue.note_applied_again(&applied);
+            }
+        });
+    }
+
+    fn note_applied(&self, applied: &crate::AppliedSettings) -> u64 {
+        let mut state = self.lock();
+        state.applied_changes += 1;
+        let change = state.applied_changes;
+        self.deliver_applied(&mut state, applied);
+        change
+    }
+
+    fn note_applied_again(&self, applied: &crate::AppliedSettings) {
+        let mut state = self.lock();
+        self.deliver_applied(&mut state, applied);
+    }
+
+    /// A read that answered always names the model: an empty one did not answer, and says nothing of either, so
+    /// the next `SessionReady` does. An empty effort beside a model is one: the model takes no level.
+    fn deliver_applied(&self, state: &mut QueueState, applied: &crate::AppliedSettings) {
+        if applied.model.is_empty() {
+            return;
+        }
+        let said = vec![
+            AgentDomainEvent::ModelReported {
+                model: applied.model.clone(),
+            },
+            AgentDomainEvent::EffortReported {
+                effort: (!applied.effort.is_empty()).then(|| applied.effort.clone()),
+            },
+        ];
+        self.deliver(state, said);
     }
 
     fn forget_effort_ask(&self) {
@@ -3258,6 +3442,14 @@ mod tests {
                 "structured_questions_v1",
                 // Protocol 3.23: `ProviderCapabilities::client_tools`.
                 "client_tools",
+                // Protocol 3.24: the first three are `ProviderCapabilities::direct_settings`, the last
+                // `task_output_range`. The other two are facts of the stream, read as they arrive.
+                "set_model",
+                "list_models",
+                "apply_effort",
+                "session_effort_report",
+                "cli_mode_reports",
+                "task_output_range",
                 // Which executable sources this build can actually serve, advertised as capability
                 // strings rather than a new wire field. `executable_host_cli` is always present;
                 // a checkout build adds one more, `executable_sdk_bundled`, which a PACKAGED build
@@ -3401,6 +3593,23 @@ mod tests {
 
     /// A handshake listing one 3.22 capability sets exactly its flag and leaves every other flag
     /// where a handshake without any of them puts it; listing none sets none.
+    /// A picker needs its list and both changes, so the three are one flag: a sidecar short of any of them
+    /// keeps the slash commands.
+    #[test]
+    fn direct_settings_needs_all_three_capabilities() {
+        let all = real_handshake_today();
+        assert!(capabilities_from_handshake(&all).direct_settings);
+        for missing in [CAP_SET_MODEL, CAP_LIST_MODELS, CAP_APPLY_EFFORT] {
+            let mut short = all.clone();
+            short.capabilities.retain(|c| c != missing);
+            assert!(!capabilities_from_handshake(&short).direct_settings, "{missing}");
+        }
+        let mut no_range = all.clone();
+        no_range.capabilities.retain(|c| c != CAP_TASK_OUTPUT_RANGE);
+        let without = capabilities_from_handshake(&no_range);
+        assert!(without.direct_settings && !without.task_output_range);
+    }
+
     #[test]
     fn each_protocol_3_22_capability_sets_exactly_its_own_flag() {
         let names: Vec<&str> = capabilities_of_3_22().iter().map(|(name, _)| *name).collect();
@@ -3743,6 +3952,63 @@ mod tests {
             assert_eq!(provider_error_code(wire), mirrored);
             assert!(mirrored.is_benign(), "{mirrored:?}");
         }
+    }
+
+    #[test]
+    fn what_a_change_left_is_delivered_and_an_unanswered_read_says_nothing() {
+        let queue = EventQueue::default();
+        queue.note_applied(&crate::AppliedSettings {
+            model: "claude-sonnet-5-5".into(),
+            effort: "low".into(),
+        });
+        assert_eq!(
+            queue.take(),
+            [
+                AgentDomainEvent::ModelReported {
+                    model: "claude-sonnet-5-5".into()
+                },
+                AgentDomainEvent::EffortReported {
+                    effort: Some("low".into())
+                },
+            ]
+        );
+        queue.note_applied(&crate::AppliedSettings {
+            model: "old".into(),
+            effort: String::new(),
+        });
+        assert_eq!(
+            queue.take(),
+            [
+                AgentDomainEvent::ModelReported { model: "old".into() },
+                AgentDomainEvent::EffortReported { effort: None },
+            ],
+            "a model that takes no level"
+        );
+        queue.note_applied(&crate::AppliedSettings::default());
+        assert_eq!(queue.take(), [], "a read that did not answer says nothing");
+    }
+
+    /// A command typed after a change has the last word, whenever its answer comes.
+    #[test]
+    fn a_change_does_not_repeat_itself_past_a_command_sent_after_it() {
+        let queue = EventQueue::default();
+        let applied = crate::AppliedSettings {
+            model: "m".into(),
+            effort: "high".into(),
+        };
+        let change = queue.note_applied(&applied);
+        queue.note_effort_ask(effort_reply::ask_of("/effort low"));
+        assert_ne!(queue.lock().applied_changes, change);
+    }
+
+    #[test]
+    fn an_effort_ask_is_open_from_the_command_to_its_answer() {
+        let queue = EventQueue::default();
+        assert!(!queue.effort_ask_open());
+        queue.note_effort_ask(effort_reply::ask_of("/effort low"));
+        assert!(queue.effort_ask_open());
+        queue.forget_effort_ask();
+        assert!(!queue.effort_ask_open());
     }
 
     fn turn_completed(turn: &str) -> AgentDomainEvent {
@@ -4131,7 +4397,7 @@ mod tests {
         // 3.22 and one from 3.23), which a shipped install meets. A checkout build advertises one more,
         // executable_sdk_bundled, and a sidecar with egress restrictions enabled advertises
         // egress_restricted besides. See real_handshake_today().
-        assert_eq!(info.advertised_capabilities.len(), 53);
+        assert_eq!(info.advertised_capabilities.len(), 59);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }

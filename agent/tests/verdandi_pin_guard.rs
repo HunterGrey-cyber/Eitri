@@ -23,14 +23,35 @@ fn the_pinned_protocol_exposes_the_preset() {
     assert!(preset.append.is_none());
 }
 
-/// The pinned revision speaks protocol 3.23, whose one new capability Eitri reads by name: a protocol
-/// bump the client does not know fails here.
+/// The pinned revision speaks protocol 3.24, whose capabilities Eitri reads by name: a protocol bump
+/// the client does not know fails here.
 #[test]
-fn the_pinned_protocol_is_3_23_and_names_client_tools() {
+fn the_pinned_protocol_is_3_24_and_names_its_capabilities() {
     use claude_runtime_protocol as wire;
     assert_eq!(wire::PROTOCOL_MAJOR, 3);
-    assert_eq!(wire::PROTOCOL_MINOR, 23);
+    assert_eq!(wire::PROTOCOL_MINOR, 24);
     assert_eq!(wire::CAP_CLIENT_TOOLS, "client_tools");
+    assert_eq!(wire::CAP_SET_MODEL, "set_model");
+    assert_eq!(wire::CAP_LIST_MODELS, "list_models");
+    assert_eq!(wire::CAP_APPLY_EFFORT, "apply_effort");
+    assert_eq!(wire::CAP_TASK_OUTPUT_RANGE, "task_output_range");
+    let new_in_24: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
+        .iter()
+        .filter(|(_, minor)| *minor == 24)
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        new_in_24,
+        [
+            "set_model",
+            "list_models",
+            "apply_effort",
+            "session_effort_report",
+            "cli_mode_reports",
+            "task_output_range"
+        ],
+        "the capabilities of minor 24"
+    );
     let new_in_23: Vec<&str> = wire::CAPABILITY_SINCE_MINOR
         .iter()
         .filter(|(_, minor)| *minor == 23)

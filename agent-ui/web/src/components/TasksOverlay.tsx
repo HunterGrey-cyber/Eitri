@@ -7,14 +7,14 @@ import { revealedText } from "../revealHidden";
 import { formatResultContent } from "../toolRegistry";
 import type { AgentUiState, BackgroundTaskRecord, TaskKind, ToolCallRecord } from "../types";
 
-type Reply = { requestId: string; taskId?: string; output?: string; totalBytes?: number; truncated?: boolean; error?: string };
+type Reply = { requestId: string; taskId?: string; output?: string; totalBytes?: number; truncated?: boolean; offset?: number; error?: string };
 export type TasksOverlayHandle = { key: (event: KeyLike) => void; reply: (reply: Reply) => void; wake: (count: number) => void };
 type Props = {
   state: AgentUiState;
   workflows?: boolean;
   initialTaskId?: string | null;
   onClose: () => void;
-  onRequest: (kind: "stop_task" | "task_output", taskId: string, requestId: string) => void;
+  onRequest: (kind: "stop_task" | "task_output", taskId: string, requestId: string, offset?: number) => void;
   onOpen: (title: string, text: string) => void;
 };
 
@@ -30,6 +30,9 @@ const glyph = (task: BackgroundTaskRecord) => task.status === "paused" ? "⏸" :
   : task.status === "failed" ? "✕" : ["stopped", "ended", "stopping"].includes(task.status) ? "■" : "●";
 
 const LOADING = "loading output…";
+/** The most of a task's output `o` opens: what one read gives. An output longer than this opens at its end, and
+ *  says how much lies before. */
+export const OUTPUT_VIEW_BYTES = 1024 * 1024;
 /** How often a running shell's or monitor's tail is read again while its detail is open. */
 export const OUTPUT_POLL_MS = 1000;
 
@@ -40,13 +43,45 @@ export function shownWords(text: string, total: number, truncated: boolean): str
   return truncated ? `Showing the last ${count} of ${total} bytes` : `Showing ${count}`;
 }
 
+/** Removes every `intro` ... `end` string, and of one with no `end` the rest of its line: taken to the end of the text,
+ *  a stray introducer would hide everything the task wrote after it. One pass: a search for an `end` only ever runs
+ *  where one is known to lie ahead, so a text full of introducers costs no more than a plain one. */
+function withoutTerminalStrings(text: string, intro: RegExp, end: RegExp): string {
+  let lastEnd = -1;
+  for (const found of text.matchAll(end)) lastEnd = found.index;
+  let kept = "";
+  let at = 0;
+  for (;;) {
+    intro.lastIndex = at;
+    const opened = intro.exec(text);
+    if (opened === null) return kept + text.slice(at);
+    kept += text.slice(at, opened.index);
+    const body = opened.index + opened[0].length;
+    if (body <= lastEnd) {
+      end.lastIndex = body;
+      const closed = end.exec(text)!;
+      at = closed.index + closed[0].length;
+    } else {
+      const line = text.indexOf("\n", body);
+      at = line === -1 ? text.length : line;
+    }
+  }
+}
+
 /** Terminal escape payloads never become output text, including OSC links and their targets. */
 export function taskOutputText(text: string): string {
-  return revealedText(text
-    .replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "")
-    .replace(/(?:\x1b[P^_X]|[\x90\x98\x9e\x9f])[\s\S]*?(?:\x1b\\|\x9c|$)/g, "")
+  const noOsc = withoutTerminalStrings(text, /\x1b\]|\x9d/g, /\x07|\x1b\\|\x9c/g);
+  return revealedText(withoutTerminalStrings(noOsc, /\x1b[P^_X]|[\x90\x98\x9e\x9f]/g, /\x1b\\|\x9c/g)
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1b[ -/]*[@-~]/g, ""));
+}
+
+/** What `o` shows of a whole output: the same cleaned text as the detail, with a line naming what it leaves out. A
+ *  read from the start that is cut is a task that wrote more after it was sized. */
+export function wholeOutputText(text: string, offset: number, truncated: boolean): string {
+  const clean = taskOutputText(text);
+  if (offset > 0) return `[the first ${offset} bytes are not shown]\n${clean}`;
+  return truncated ? `${clean}\n[the output goes on past this]` : clean;
 }
 
 export function stopTaskWords(rows: BackgroundTaskRecord[]): string {
@@ -113,7 +148,7 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
   const [message, setMessage] = useState<string | null>(null);
   const [updates, setUpdates] = useState(0);
   const [output, setOutput] = useState<{ identity: string; text: string; total: number; truncated: boolean } | null>(null);
-  const pending = useRef(new Map<string, { task: BackgroundTaskRecord; open: boolean; kind: "stop_task" | "task_output"; again: boolean }>());
+  const pending = useRef(new Map<string, { task: BackgroundTaskRecord; open: boolean; kind: "stop_task" | "task_output"; again: boolean; whole?: boolean }>());
   // Where a refresh found the scroll position, so that the new tail leaves a reader who scrolled up in place.
   const keepScroll = useRef<{ top: number; atBottom: boolean } | null>(null);
   // Whether the line now up came from an output read: a later good read clears that line and no other.
@@ -177,7 +212,8 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
       return;
     }
     if (pending.current.size >= 64) { if (!silent) say("too many task commands are waiting"); return; }
-    const existing = [...pending.current.values()].find((p) => p.kind === kind && identity(p.task) === identity(current));
+    if (open && [...pending.current.values()].some((p) => p.whole && identity(p.task) === identity(current))) return;
+    const existing = [...pending.current.values()].find((p) => p.kind === kind && !p.whole && identity(p.task) === identity(current));
     if (existing) {
       existing.open ||= open;
       existing.again ||= last;
@@ -233,6 +269,11 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
     if (reply.error !== undefined) { say(revealedText(reply.error), waiting.kind === "task_output"); return; }
     if (waiting.kind === "stop_task") { say("stop requested"); return; }
     if (reply.output === undefined) return;
+    if (waiting.whole) {
+      say(null);
+      onOpen("Task output", wholeOutputText(reply.output, reply.offset ?? 0, reply.truncated ?? false));
+      return;
+    }
     const text = taskOutputText(reply.output);
     const next = { identity: identity(task), text, total: reply.totalBytes ?? 0, truncated: reply.truncated ?? false };
     const el = root.current;
@@ -242,8 +283,13 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
     setOutput((prev) => prev && prev.identity === next.identity && prev.text === text && prev.total === next.total &&
       prev.truncated === next.truncated ? prev : next);
     // Only a line an output read put up goes: a refresh must not wipe a stop request's answer.
-    if (outputOwnsMessage.current) say(null);
-    if (waiting.open) onOpen("Task output", text);
+    if (outputOwnsMessage.current && ![...pending.current.values()].some((p) => p.whole)) say(null);
+    if (waiting.open && next.truncated && state.capabilities.taskOutputRange) {
+      const requestId = nextRequestId();
+      pending.current.set(requestId, { task, open: true, kind: "task_output", again: false, whole: true });
+      say(LOADING, true);
+      onRequest("task_output", task.task_id, requestId, Math.max(0, next.total - OUTPUT_VIEW_BYTES));
+    } else if (waiting.open) onOpen("Task output", text);
   } }));
 
   const path = task && toolCallPath(state.toolCalls, task.tool_use_id);

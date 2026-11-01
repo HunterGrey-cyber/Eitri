@@ -1002,6 +1002,29 @@ impl AgentConversation {
         Ok(self.provider.task_output(&self.require_session()?, task_id)?)
     }
 
+    pub fn task_output_range(
+        &self,
+        task_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<crate::TaskReply<crate::TaskOutput>, ConversationError> {
+        Ok(self
+            .provider
+            .task_output_range(&self.require_session()?, task_id, offset, max_bytes)?)
+    }
+
+    pub fn list_models(&self) -> Result<crate::TaskReply<crate::ModelList>, ConversationError> {
+        Ok(self.provider.list_models(&self.require_session()?)?)
+    }
+
+    pub fn set_model(&self, model: &str) -> Result<crate::TaskReply<crate::AppliedSettings>, ConversationError> {
+        Ok(self.provider.set_model(&self.require_session()?, model)?)
+    }
+
+    pub fn apply_effort(&self, effort: &str) -> Result<crate::TaskReply<crate::AppliedSettings>, ConversationError> {
+        Ok(self.provider.apply_effort(&self.require_session()?, effort)?)
+    }
+
     /// The tools this session was given: empty on a provider without the capability.
     pub fn declared_client_tools(&self) -> &BTreeSet<String> {
         &self.declared_client_tools

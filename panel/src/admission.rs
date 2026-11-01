@@ -68,6 +68,27 @@ pub(super) fn admission(
             }
             Admission::Ungated
         }
+        // A change of the model or the effort reaches the running session, also during a turn: only from the
+        // page showing the tab, never on a tab that is moving, and only on a Claude session. It widens nothing
+        // by itself; the mode the CLI moves to arrives on the session's stream.
+        InboundMessage::ListModels { .. } | InboundMessage::SetModel { .. } | InboundMessage::ApplyEffort { .. } => {
+            let Some(tab) = target else {
+                return Admission::Refused("no active session".into());
+            };
+            if let Err(why) = page_may_answer(&state.tabs, tab, view) {
+                return Admission::Refused(why);
+            }
+            if state.tabs.is_moving(tab) {
+                return Admission::Refused(eitri_core::tab_set::MOVING.into());
+            }
+            let Some(backend) = state.tabs.get(tab).and_then(|t| t.live()) else {
+                return Admission::Refused("no active session".into());
+            };
+            if backend.agent() != AgentId::Claude {
+                return Admission::Refused("the model and the effort are only changed here for Claude".into());
+            }
+            Admission::Ungated
+        }
         // A question is answered the way a card is: only from the page showing its tab, and only
         // while the window agrees that page is not covered.
         InboundMessage::PermissionResponse { .. }
@@ -441,6 +462,31 @@ mod tests {
             .unwrap();
             assert!(
                 matches!(admission(&handle.state.borrow(), &message, ViewId::BASE, Some(codex)), Admission::Refused(why) if why.contains("only available for Claude"))
+            );
+        }
+        for raw in [
+            serde_json::json!({"type": "list_models", "request_id": "m", "tab": codex.0}),
+            serde_json::json!({"type": "set_model", "request_id": "m", "tab": codex.0, "model": "x"}),
+            serde_json::json!({"type": "apply_effort", "request_id": "m", "tab": codex.0, "effort": "low"}),
+        ] {
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert!(
+                matches!(
+                    admission(&handle.state.borrow(), &message, ViewId::BASE, Some(codex)),
+                    Admission::Refused(_)
+                ),
+                "{raw}: the model of another agent's session is not changed here"
+            );
+        }
+        for raw in [
+            serde_json::json!({"type": "list_models", "request_id": "m", "tab": tab.0}),
+            serde_json::json!({"type": "set_model", "request_id": "m", "tab": tab.0, "model": "x"}),
+            serde_json::json!({"type": "apply_effort", "request_id": "m", "tab": tab.0, "effort": "low"}),
+        ] {
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert!(
+                admission(&handle.state.borrow(), &message, ViewId::BASE, Some(tab)) == Admission::Ungated,
+                "{raw}"
             );
         }
         shut_down_every_tab(&handle);

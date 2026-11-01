@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=fc77bc4f9b34f5dd3c629dd599ca5be250707145c8757f662bd8b8a5335e2227 -->
+<!-- translated-from: permissions.md sha256=47d3b6712dc353a872f3c7f763e4fcb9132f382e0dc0dc4ac79bd6cd7394dbc5 -->
 
 # 权限与信任
 
@@ -36,6 +36,8 @@ Claude Code 的定时和任务工具在任何模式下都不出卡片，因为 C
 
 <a id="auto-when-claude-code-is-not-running-its-auto-mode"></a>
 ### Auto，在 Claude Code 没有运行它的 auto 模式时
+
+选择不能运行 auto 模式的模型，会让这个会话的 auto 模式结束；之后再换模型，Claude Code 也不会回到 auto。标签页在那一刻转到 manual 并说明原因，回合进行到一半时也一样。你可以把它切回 auto，在新会话开始之前，这时的 auto 指的是下面这些规则；把标签页移到另一个窗口会让它回到 manual。
 
 Claude Code 可能回退到它普通的默认模式，而且某些已安装的环境可能根本提供不了 auto 模式。这时由 Eitri 自己的规则决定哪些调用需要卡片。这些规则是刻意保守的：凡是 Eitri 不能确定的，都是一张卡片。
 

@@ -6,7 +6,7 @@ import { initialState } from "../reducer";
 import { completionSource, slashAction } from "../slashCommands";
 import { TASKS_KEY_LINE } from "../keymap";
 import type { AgentUiState, BackgroundTaskRecord, TaskKind } from "../types";
-import { OUTPUT_POLL_MS, phaseLine, shownWords, TasksOverlay, taskOutputText, type TasksOverlayHandle } from "./TasksOverlay";
+import { OUTPUT_VIEW_BYTES, OUTPUT_POLL_MS, phaseLine, shownWords, TasksOverlay, taskOutputText, type TasksOverlayHandle } from "./TasksOverlay";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -100,6 +100,79 @@ describe("background tasks", () => {
     view.key("Enter");
     view.key("x");
     expect(view.onRequest).toHaveBeenLastCalledWith("stop_task", "build", expect.any(String));
+  });
+
+  it("o on a cut output reads the whole of it, sanitized, and opens it read-only in the editor", () => {
+    const current = state([task("build")]);
+    const view = setup({ ...current, capabilities: { ...current.capabilities, taskOutputRange: true } });
+    view.key("o");
+    view.reply({ taskId: "build", output: "tail", totalBytes: 30, truncated: true, offset: 26 });
+    expect(view.onOpen).not.toHaveBeenCalled();
+    expect(view.onRequest).toHaveBeenLastCalledWith("task_output", "build", expect.any(String), 0);
+    view.reply({ taskId: "build", output: "\x1b[31m<b>all</b>\x1b[0m\u202e", totalBytes: 30, truncated: false, offset: 0 });
+    expect(view.onOpen).toHaveBeenCalledWith("Task output", "<b>all</b>⟨U+202E⟩");
+  });
+
+  it("o on an output past the limit opens its end and says how much comes before", () => {
+    const current = state([task("build")]);
+    const view = setup({ ...current, capabilities: { ...current.capabilities, taskOutputRange: true } });
+    const total = OUTPUT_VIEW_BYTES + 500;
+    view.key("o");
+    view.reply({ taskId: "build", output: "tail", totalBytes: total, truncated: true, offset: total - 4 });
+    expect(view.onRequest).toHaveBeenLastCalledWith("task_output", "build", expect.any(String), 500);
+    view.reply({ taskId: "build", output: "end", totalBytes: total, truncated: true, offset: 500 });
+    expect(view.onOpen).toHaveBeenCalledWith("Task output", "[the first 500 bytes are not shown]\nend");
+  });
+
+  it("a stray escape in the output hides its line, never everything after it", () => {
+    expect(taskOutputText("one\x1b]0;title\ntwo\nthree")).toBe("one\ntwo\nthree");
+    expect(taskOutputText("one\x1bPdata\ntwo")).toBe("one\ntwo");
+    expect(taskOutputText("a\x1b]0;t\x07b")).toBe("ab");
+  });
+
+  it("an output full of unterminated escapes is read through", () => {
+    const line = "\x1b]\n";
+    expect(taskOutputText(line.repeat(200_000))).toBe("\n".repeat(200_000));
+    expect(taskOutputText("\x1bP\n".repeat(200_000) + "end")).toBe("\n".repeat(200_000) + "end");
+    expect(taskOutputText("\x1b]a\x1b]b\x07c")).toBe("c");
+  });
+
+  it("a second o during the whole read opens one view", () => {
+    const current = state([task("build")]);
+    const view = setup({ ...current, capabilities: { ...current.capabilities, taskOutputRange: true } });
+    view.key("o");
+    view.reply({ taskId: "build", output: "tail", totalBytes: 30, truncated: true, offset: 26 });
+    const reads = view.onRequest.mock.calls.length;
+    fireEvent.keyDown(view.dialog(), { key: "o" });
+    expect(view.onRequest.mock.calls.length).toBe(reads);
+  });
+
+  it("o on an output that grew past the limit after it was sized says it goes on", () => {
+    const current = state([task("build")]);
+    const view = setup({ ...current, capabilities: { ...current.capabilities, taskOutputRange: true } });
+    view.key("o");
+    view.reply({ taskId: "build", output: "tail", totalBytes: 9000, truncated: true, offset: 808 });
+    view.reply({ taskId: "build", output: "start", totalBytes: 2_000_000, truncated: true, offset: 0 });
+    expect(view.onOpen).toHaveBeenCalledWith("Task output", "start\n[the output goes on past this]");
+  });
+
+  it("o on an output that fits opens what the first read gave, with no second read", () => {
+    const current = state([task("build")]);
+    const view = setup({ ...current, capabilities: { ...current.capabilities, taskOutputRange: true } });
+    view.key("o");
+    const reads = view.onRequest.mock.calls.length;
+    view.reply({ taskId: "build", output: "all of it", totalBytes: 9, truncated: false, offset: 0 });
+    expect(view.onOpen).toHaveBeenCalledWith("Task output", "all of it");
+    expect(view.onRequest.mock.calls.length).toBe(reads);
+  });
+
+  it("without the range o opens the tail, as a sidecar without it gives", () => {
+    const view = setup();
+    view.key("o");
+    const reads = view.onRequest.mock.calls.length;
+    view.reply({ taskId: "build", output: "tail", totalBytes: 30, truncated: true });
+    expect(view.onOpen).toHaveBeenCalledWith("Task output", "tail");
+    expect(view.onRequest.mock.calls.length).toBe(reads);
   });
 
   it("o reads fresh output and opens sanitized plain text in the editor", () => {

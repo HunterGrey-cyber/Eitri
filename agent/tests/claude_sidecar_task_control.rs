@@ -413,8 +413,8 @@ impl Service<http::Request<Body>> for Standin {
                     match request.task_id.as_str() {
                         "gone" => Err(failure(wire::ErrorCode::TaskNotFound)),
                         "workflow" | "local-agent" => Err(failure(wire::ErrorCode::TaskOutputUnavailable)),
-                        "oversized" => Ok(wire::GetTaskOutputResponse {output: [vec![b'x'; 9000], b"tail".to_vec()].concat(), total_bytes: 10000, truncated: false}),
-                        _ => Ok(wire::GetTaskOutputResponse { output: vec![0xA9, b't', b'a', b'i', b'l'], total_bytes: 9000, truncated: true }),
+                        "oversized" => Ok(wire::GetTaskOutputResponse {output: [vec![b'x'; 9000], b"tail".to_vec()].concat(), total_bytes: 10000, truncated: false, offset: 0 }),
+                        _ => Ok(wire::GetTaskOutputResponse { output: vec![0xA9, b't', b'a', b'i', b'l'], total_bytes: 9000, truncated: true, offset: 0 }),
                     }
                 }).await,
                 "CloseSession" => unary(request, |_: wire::CloseSessionRequest| async {

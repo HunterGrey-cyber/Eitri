@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793397442361,
+      "occurred_at": 1793530269739,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+      "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "6f65e89c-9c5c-4fdf-a296-d1a1c1789f40",
-      "session_id": "6d7c2386-175c-4641-ad25-53bbdc9dde4d",
+      "provider_session_id": "23893dc5-4bf2-44b9-b198-9da5fda6751d",
+      "session_id": "2c4150c7-62c5-4f52-ab72-7825e37d51b2",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -238,7 +242,7 @@
     {
       "kind": "text",
       "text": "C17-SEEN",
-      "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+      "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
       "type": "content_delta"
     },
     {
@@ -252,7 +256,7 @@
       "outcome": "completed",
       "result_text": "C17-SEEN",
       "stop_reason": "end_turn",
-      "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+      "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -270,12 +274,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793397442361,
+        "occurred_at": 1793530269739,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+        "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
         "type": "turn_started"
       },
       {
@@ -482,13 +486,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "6f65e89c-9c5c-4fdf-a296-d1a1c1789f40",
-        "session_id": "6d7c2386-175c-4641-ad25-53bbdc9dde4d",
+        "provider_session_id": "23893dc5-4bf2-44b9-b198-9da5fda6751d",
+        "session_id": "2c4150c7-62c5-4f52-ab72-7825e37d51b2",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -507,7 +515,7 @@
       {
         "kind": "text",
         "text": "C17-SEEN",
-        "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+        "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
         "type": "content_delta"
       },
       {
@@ -521,7 +529,7 @@
         "outcome": "completed",
         "result_text": "C17-SEEN",
         "stop_reason": "end_turn",
-        "turn_id": "736c9dfd-6aa2-4809-afad-5a4e48f86c8f",
+        "turn_id": "e35c452b-de07-45d0-af47-30600590bab9",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -539,7 +547,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 9
+    "throughRevision": 10
   },
   "scenario": "c17/typed",
   "snapshot": {
@@ -757,6 +765,7 @@
       },
       "conversationId": null,
       "cwd": "$RUN/project",
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
@@ -766,7 +775,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 6,
+          "seq": 7,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -784,7 +793,7 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 7,
+          "seq": 8,
           "text": "C17-SEEN"
         }
       ],
@@ -803,7 +812,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 9,
+    "throughRevision": 10,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

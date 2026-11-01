@@ -128,6 +128,8 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::TurnCompleted { .. }
         | AgentDomainEvent::SessionOpened { .. }
         | AgentDomainEvent::EffortReported { .. }
+        | AgentDomainEvent::ModelReported { .. }
+        | AgentDomainEvent::CliLeftAuto
         | AgentDomainEvent::SessionUnavailable { .. }
         | AgentDomainEvent::SessionClosed { .. }
         | AgentDomainEvent::ResumeOutcome { .. }

@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793397474258,
+      "occurred_at": 1793530287027,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+      "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+      "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+      "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -238,7 +242,7 @@
     {
       "kind": "text",
       "text": "C20F-OPEN-DONE",
-      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+      "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
       "type": "content_delta"
     },
     {
@@ -251,7 +255,7 @@
       "outcome": "completed",
       "result_text": "C20F-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+      "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -266,11 +270,11 @@
       }
     },
     {
-      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+      "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
       "type": "turn_started"
     },
     {
-      "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
+      "interaction_id": "05528c3d-f70c-4ce1-8e1a-f813916b563f",
       "questions": [
         {
           "header": "Go",
@@ -297,13 +301,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+      "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+      "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -331,12 +339,12 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+      "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
       "type": "tool_call_started"
     },
     {
       "answers": [],
-      "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
+      "interaction_id": "05528c3d-f70c-4ce1-8e1a-f813916b563f",
       "outcome": "interrupted",
       "reason": null,
       "type": "question_settled"
@@ -345,7 +353,7 @@
       "content": "<cli-text chars=225 sha256=8621ef054998d150>",
       "is_error": true,
       "tool_use_id": "toolu_q1",
-      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+      "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
       "type": "tool_call_completed"
     },
     {
@@ -358,7 +366,7 @@
       "outcome": "interrupted",
       "result_text": "",
       "stop_reason": "tool_use",
-      "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+      "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -373,19 +381,23 @@
       }
     },
     {
-      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+      "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-      "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+      "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+      "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -394,7 +406,7 @@
     {
       "kind": "text",
       "text": "C20F-NEXT-DONE",
-      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+      "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
       "type": "content_delta"
     },
     {
@@ -407,7 +419,7 @@
       "outcome": "completed",
       "result_text": "C20F-NEXT-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+      "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -425,12 +437,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793397474258,
+        "occurred_at": 1793530287027,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+        "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
         "type": "turn_started"
       },
       {
@@ -637,13 +649,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+        "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+        "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -662,7 +678,7 @@
       {
         "kind": "text",
         "text": "C20F-OPEN-DONE",
-        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+        "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
         "type": "content_delta"
       },
       {
@@ -675,7 +691,7 @@
         "outcome": "completed",
         "result_text": "C20F-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "93b4539f-16a6-44b9-b469-49e2113fc317",
+        "turn_id": "a0f0cd33-eec0-485c-87ed-c6b8030fd9fa",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -690,11 +706,11 @@
         }
       },
       {
-        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+        "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
         "type": "turn_started"
       },
       {
-        "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
+        "interaction_id": "05528c3d-f70c-4ce1-8e1a-f813916b563f",
         "questions": [
           {
             "header": "Go",
@@ -721,13 +737,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+        "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+        "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -755,12 +775,12 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+        "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
         "type": "tool_call_started"
       },
       {
         "answers": [],
-        "interaction_id": "94a01acd-d376-405b-9a72-c6b3874f509e",
+        "interaction_id": "05528c3d-f70c-4ce1-8e1a-f813916b563f",
         "outcome": "interrupted",
         "reason": null,
         "type": "question_settled"
@@ -769,7 +789,7 @@
         "content": "<cli-text chars=225 sha256=8621ef054998d150>",
         "is_error": true,
         "tool_use_id": "toolu_q1",
-        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+        "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
         "type": "tool_call_completed"
       },
       {
@@ -782,7 +802,7 @@
         "outcome": "interrupted",
         "result_text": "",
         "stop_reason": "tool_use",
-        "turn_id": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+        "turn_id": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -797,19 +817,23 @@
         }
       },
       {
-        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+        "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "aecc002d-b057-4b37-a6de-a72be9dd485a",
-        "session_id": "e8dbd8dd-1550-4c83-9019-0e18b72519cc",
+        "provider_session_id": "9825126c-062a-44fa-b6fc-33ba684b4fce",
+        "session_id": "05d8ab89-2871-4553-9d1d-5bdbfabc46cf",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -818,7 +842,7 @@
       {
         "kind": "text",
         "text": "C20F-NEXT-DONE",
-        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+        "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
         "type": "content_delta"
       },
       {
@@ -831,7 +855,7 @@
         "outcome": "completed",
         "result_text": "C20F-NEXT-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "61ccd1ee-0db1-4920-a2fc-c261ed5dc5cd",
+        "turn_id": "65e148f1-9211-46ed-93b5-32cf1aa0073c",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -849,7 +873,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 24
+    "throughRevision": 27
   },
   "scenario": "c20f",
   "snapshot": {
@@ -1067,6 +1091,7 @@
       },
       "conversationId": null,
       "cwd": "$RUN/project",
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
@@ -1076,7 +1101,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 6,
+          "seq": 7,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1087,7 +1112,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "94a01acd-d376-405b-9a72-c6b3874f509e",
+          "interactionId": "05528c3d-f70c-4ce1-8e1a-f813916b563f",
           "questions": [
             {
               "header": "Go",
@@ -1107,7 +1132,7 @@
               "question": "Should the C20 change go ahead?"
             }
           ],
-          "seq": 10,
+          "seq": 11,
           "state": {
             "answers": [],
             "kind": "settled",
@@ -1115,7 +1140,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805",
+          "turnId": "62503e2c-c372-4c44-85ef-30e0d01ad8a8",
           "unsupportedReason": null
         }
       ],
@@ -1151,18 +1176,18 @@
             "content": "<cli-text chars=225 sha256=8621ef054998d150>",
             "isError": true
           },
-          "seq": 14,
+          "seq": 16,
           "toolUseId": "toolu_q1",
-          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805"
+          "turnId": "62503e2c-c372-4c44-85ef-30e0d01ad8a8"
         }
       ],
       "transcript": [
         {
-          "seq": 7,
+          "seq": 8,
           "text": "C20F-OPEN-DONE"
         },
         {
-          "seq": 22,
+          "seq": 25,
           "text": "C20F-NEXT-DONE"
         }
       ],
@@ -1174,8 +1199,8 @@
           "numTurns": 3,
           "reason": "<cli-text chars=13 sha256=fa0a718c164f4d46>",
           "resetsAt": null,
-          "seq": 17,
-          "turnId": "4a9380ea-53c2-4998-a496-c498e6d4b805"
+          "seq": 19,
+          "turnId": "62503e2c-c372-4c44-85ef-30e0d01ad8a8"
         }
       ],
       "usage": {
@@ -1192,7 +1217,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 24,
+    "throughRevision": 27,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

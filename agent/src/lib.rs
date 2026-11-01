@@ -133,11 +133,12 @@ pub use projection::{
     NO_OPEN_TURN_ID, NO_RESULT_REASON,
 };
 pub use provider::{
-    AgentProvider, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl, ClientToolSet,
-    CloseSessionRequest, CreateSessionRequest, EventSignal, InteractionReply, InteractionResolution, InteractionSend,
-    InteractionState, InterruptTurnRequest, PermissionDecision, ProviderCapabilities, ProviderError, ProviderErrorCode,
-    ProviderInfo, QuestionAnswer, QuestionDeclineKind, ResolveInteractionRequest, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest, SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnStamp,
+    AgentProvider, AppliedSettings, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl,
+    ClientToolSet, CloseSessionRequest, CreateSessionRequest, EventSignal, InteractionReply, InteractionResolution,
+    InteractionSend, InteractionState, InterruptTurnRequest, ModelList, ModelOption, PermissionDecision,
+    ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind,
+    ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
+    StreamingPreference, TaskOutput, TaskReply, TurnStamp,
 };
 pub use providers::claude_sidecar::{
     claude_cli_missing, claude_cli_missing_here, sidecar_availability, sidecar_missing_message, user_sidecar_path,

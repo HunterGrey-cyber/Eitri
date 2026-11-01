@@ -70,6 +70,11 @@ Claude Code can fall back to its ordinary default mode, and an installed setup m
 mode at all. Then Eitri's own rules decide which calls need a card. They are deliberately cautious: whatever
 Eitri cannot be sure about is a card.
 
+Choosing a model that cannot run auto mode ends it for that session, and Claude Code does not go back to it when
+you change the model again. The tab moves to manual at that moment and says why, also in the middle of a turn. You
+can cycle it back to auto, which then means the rules below, until a new session starts; moving the tab to another
+window puts it back in manual.
+
 - Reading and searching inside the project run without asking, and so do commands made of a program that only
   reads, with plain arguments. A command with a redirect, a pipe, `;` or `&&`, a glob, quotes, `$(...)`, a path
   outside the project, or a `git` option that points it at another repository is a card.

@@ -193,9 +193,21 @@ pub(super) fn tick_send(
     tell_emptied_views(state, out);
 }
 
+/// What a tab says when the CLI left its auto mode and the tab followed it to manual.
+const LEFT_AUTO_NOTE: &str = "this model cannot run auto mode: the tab is now manual";
+
 /// What a tab owes the person about its tool server, in the page that shows the tab. A tab with no
 /// ready page keeps its line: the slot it goes to is the page's, so nothing would ever say it.
 fn send_editor_notes(state: &mut AgentPanelState, out: &mut Outbox) {
+    for tab in state.tabs.take_left_auto_notes() {
+        match state.page_of(tab) {
+            Some(view) => {
+                eprintln!("[permission] {LEFT_AUTO_NOTE}");
+                out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(LEFT_AUTO_NOTE));
+            }
+            None => state.tabs.owe_left_auto_note(tab),
+        }
+    }
     for (tab, note) in state.tabs.take_editor_notes() {
         match state.page_of(tab) {
             Some(view) => {

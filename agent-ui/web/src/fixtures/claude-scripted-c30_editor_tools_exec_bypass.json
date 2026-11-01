@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793443545282,
+      "occurred_at": 1793530305942,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+      "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "dd3daca1-5ae1-4a49-9759-bf05a66e8f48",
-      "session_id": "35335d8d-e808-4637-b2a9-213470458739",
+      "provider_session_id": "8b213cc0-586c-466a-ba4b-b702a8ee15de",
+      "session_id": "d9c98458-3252-4f96-a632-d425d736ca7b",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [
@@ -244,7 +248,7 @@
     {
       "kind": "text",
       "text": "C30-OPEN-DONE",
-      "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+      "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
       "type": "content_delta"
     },
     {
@@ -257,7 +261,7 @@
       "outcome": "completed",
       "result_text": "C30-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+      "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -272,7 +276,7 @@
       }
     },
     {
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "turn_started"
     },
     {
@@ -280,14 +284,14 @@
         "max_results": 5,
         "query": "<cli-text chars=28 sha256=ed9637088a335c2e>"
       },
-      "permission_id": "d13212df-deda-484e-972e-8412f4368ccb",
+      "permission_id": "debc35ed-af3e-4592-bb7c-f45f34995919",
       "tool_name": "ToolSearch",
       "tool_use_id": "toolu_preload_m1",
       "type": "permission_requested"
     },
     {
       "outcome": "allowed",
-      "permission_id": "d13212df-deda-484e-972e-8412f4368ccb",
+      "permission_id": "debc35ed-af3e-4592-bb7c-f45f34995919",
       "type": "permission_resolved"
     },
     {
@@ -296,34 +300,25 @@
         "kind": "lua",
         "why": "probe"
       },
-      "permission_id": "f07739e3-5e88-4452-8865-82292e25b296",
+      "permission_id": "4655ba36-53cd-460a-81c4-71ccd5833a9b",
       "tool_name": "mcp__eitri__nvim_exec",
       "tool_use_id": "toolu_exec",
       "type": "permission_requested"
     },
     {
-      "outcome": "allowed",
-      "permission_id": "f07739e3-5e88-4452-8865-82292e25b296",
-      "type": "permission_resolved"
-    },
-    {
-      "arguments_json": "<cli-text chars=50 sha256=ad8a3d4f71979e48>",
-      "call_id": "<cli-text chars=36 sha256=06efa88046e1bbe9>",
-      "sequence": 14,
-      "tool": "nvim_exec",
-      "tool_use_id": "toolu_exec",
-      "type": "client_tool_call"
-    },
-    {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "dd3daca1-5ae1-4a49-9759-bf05a66e8f48",
-      "session_id": "35335d8d-e808-4637-b2a9-213470458739",
+      "provider_session_id": "8b213cc0-586c-466a-ba4b-b702a8ee15de",
+      "session_id": "d9c98458-3252-4f96-a632-d425d736ca7b",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [
@@ -336,7 +331,20 @@
       "type": "session_servers"
     },
     {
-      "call_id": "<cli-text chars=36 sha256=06efa88046e1bbe9>",
+      "outcome": "allowed",
+      "permission_id": "4655ba36-53cd-460a-81c4-71ccd5833a9b",
+      "type": "permission_resolved"
+    },
+    {
+      "arguments_json": "<cli-text chars=50 sha256=ad8a3d4f71979e48>",
+      "call_id": "<cli-text chars=36 sha256=87289f2905bd3e32>",
+      "sequence": 15,
+      "tool": "nvim_exec",
+      "tool_use_id": "toolu_exec",
+      "type": "client_tool_call"
+    },
+    {
+      "call_id": "<cli-text chars=36 sha256=87289f2905bd3e32>",
       "type": "client_tool_call_settled"
     },
     {
@@ -346,7 +354,7 @@
       },
       "name": "ToolSearch",
       "tool_use_id": "toolu_preload_m1",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "tool_call_started"
     },
     {
@@ -358,7 +366,7 @@
       ],
       "is_error": false,
       "tool_use_id": "toolu_preload_m1",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "tool_call_completed"
     },
     {
@@ -369,7 +377,7 @@
       },
       "name": "mcp__eitri__nvim_exec",
       "tool_use_id": "toolu_exec",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "tool_call_started"
     },
     {
@@ -381,13 +389,13 @@
       ],
       "is_error": false,
       "tool_use_id": "toolu_exec",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "C30-EXEC-DONE",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "content_delta"
     },
     {
@@ -400,7 +408,7 @@
       "outcome": "completed",
       "result_text": "C30-EXEC-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+      "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -418,12 +426,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793443545282,
+        "occurred_at": 1793530305942,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+        "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
         "type": "turn_started"
       },
       {
@@ -630,13 +638,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "dd3daca1-5ae1-4a49-9759-bf05a66e8f48",
-        "session_id": "35335d8d-e808-4637-b2a9-213470458739",
+        "provider_session_id": "8b213cc0-586c-466a-ba4b-b702a8ee15de",
+        "session_id": "d9c98458-3252-4f96-a632-d425d736ca7b",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [
@@ -661,7 +673,7 @@
       {
         "kind": "text",
         "text": "C30-OPEN-DONE",
-        "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+        "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
         "type": "content_delta"
       },
       {
@@ -674,7 +686,7 @@
         "outcome": "completed",
         "result_text": "C30-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "84083683-a9b2-4487-b016-48dbaa51f6e4",
+        "turn_id": "c0af090d-d12f-4791-a7f5-48bb8cb70489",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -689,7 +701,7 @@
         }
       },
       {
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "turn_started"
       },
       {
@@ -697,14 +709,14 @@
           "max_results": 5,
           "query": "<cli-text chars=28 sha256=ed9637088a335c2e>"
         },
-        "permission_id": "d13212df-deda-484e-972e-8412f4368ccb",
+        "permission_id": "debc35ed-af3e-4592-bb7c-f45f34995919",
         "tool_name": "ToolSearch",
         "tool_use_id": "toolu_preload_m1",
         "type": "permission_requested"
       },
       {
         "outcome": "allowed",
-        "permission_id": "d13212df-deda-484e-972e-8412f4368ccb",
+        "permission_id": "debc35ed-af3e-4592-bb7c-f45f34995919",
         "type": "permission_resolved"
       },
       {
@@ -713,34 +725,25 @@
           "kind": "lua",
           "why": "probe"
         },
-        "permission_id": "f07739e3-5e88-4452-8865-82292e25b296",
+        "permission_id": "4655ba36-53cd-460a-81c4-71ccd5833a9b",
         "tool_name": "mcp__eitri__nvim_exec",
         "tool_use_id": "toolu_exec",
         "type": "permission_requested"
       },
       {
-        "outcome": "allowed",
-        "permission_id": "f07739e3-5e88-4452-8865-82292e25b296",
-        "type": "permission_resolved"
-      },
-      {
-        "arguments_json": "<cli-text chars=50 sha256=ad8a3d4f71979e48>",
-        "call_id": "<cli-text chars=36 sha256=06efa88046e1bbe9>",
-        "sequence": 14,
-        "tool": "nvim_exec",
-        "tool_use_id": "toolu_exec",
-        "type": "client_tool_call"
-      },
-      {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "dd3daca1-5ae1-4a49-9759-bf05a66e8f48",
-        "session_id": "35335d8d-e808-4637-b2a9-213470458739",
+        "provider_session_id": "8b213cc0-586c-466a-ba4b-b702a8ee15de",
+        "session_id": "d9c98458-3252-4f96-a632-d425d736ca7b",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [
@@ -753,7 +756,20 @@
         "type": "session_servers"
       },
       {
-        "call_id": "<cli-text chars=36 sha256=06efa88046e1bbe9>",
+        "outcome": "allowed",
+        "permission_id": "4655ba36-53cd-460a-81c4-71ccd5833a9b",
+        "type": "permission_resolved"
+      },
+      {
+        "arguments_json": "<cli-text chars=50 sha256=ad8a3d4f71979e48>",
+        "call_id": "<cli-text chars=36 sha256=87289f2905bd3e32>",
+        "sequence": 15,
+        "tool": "nvim_exec",
+        "tool_use_id": "toolu_exec",
+        "type": "client_tool_call"
+      },
+      {
+        "call_id": "<cli-text chars=36 sha256=87289f2905bd3e32>",
         "type": "client_tool_call_settled"
       },
       {
@@ -763,7 +779,7 @@
         },
         "name": "ToolSearch",
         "tool_use_id": "toolu_preload_m1",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "tool_call_started"
       },
       {
@@ -775,7 +791,7 @@
         ],
         "is_error": false,
         "tool_use_id": "toolu_preload_m1",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "tool_call_completed"
       },
       {
@@ -786,7 +802,7 @@
         },
         "name": "mcp__eitri__nvim_exec",
         "tool_use_id": "toolu_exec",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "tool_call_started"
       },
       {
@@ -798,13 +814,13 @@
         ],
         "is_error": false,
         "tool_use_id": "toolu_exec",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "C30-EXEC-DONE",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "content_delta"
       },
       {
@@ -817,7 +833,7 @@
         "outcome": "completed",
         "result_text": "C30-EXEC-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "b51e773e-ce18-4fc8-9458-815803b52d1b",
+        "turn_id": "5d15e238-09ed-4bcc-84e6-76292f9b8f24",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -835,7 +851,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 25
+    "throughRevision": 27
   },
   "scenario": "c30_editor_tools/exec_bypass",
   "snapshot": {
@@ -1053,6 +1069,7 @@
       },
       "conversationId": null,
       "cwd": "$RUN/project",
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
@@ -1062,7 +1079,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 6,
+          "seq": 7,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1093,9 +1110,9 @@
             ],
             "isError": false
           },
-          "seq": 19,
+          "seq": 21,
           "toolUseId": "toolu_preload_m1",
-          "turnId": "b51e773e-ce18-4fc8-9458-815803b52d1b"
+          "turnId": "5d15e238-09ed-4bcc-84e6-76292f9b8f24"
         },
         {
           "input": {
@@ -1113,18 +1130,18 @@
             ],
             "isError": false
           },
-          "seq": 21,
+          "seq": 23,
           "toolUseId": "toolu_exec",
-          "turnId": "b51e773e-ce18-4fc8-9458-815803b52d1b"
+          "turnId": "5d15e238-09ed-4bcc-84e6-76292f9b8f24"
         }
       ],
       "transcript": [
         {
-          "seq": 7,
+          "seq": 8,
           "text": "C30-OPEN-DONE"
         },
         {
-          "seq": 23,
+          "seq": 25,
           "text": "C30-EXEC-DONE"
         }
       ],
@@ -1143,7 +1160,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 25,
+    "throughRevision": 27,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

@@ -131,13 +131,13 @@ import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource } from "./slashCommands";
-import { parseEffortReply, parseModelReply } from "./slashPicker";
+import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
 import type { TurnDurations } from "./turnTimes";
 import type { ApproveFact, BandFacts } from "./band";
-import type { AgentUiState, DetailRow, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
+import type { AgentUiState, AppliedSettings, DetailRow, ModelOption, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
@@ -296,7 +296,12 @@ function isKillKey(event: KeyboardEvent<HTMLElement>): boolean {
   );
 }
 /** What an open `/model`/`/effort` picker shows. */
-type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null };
+type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null; labels?: Record<string, string>; direct?: boolean };
+/** A request of the direct route for the model and the effort, until its answer: the list a picker opens from, or a
+ *  change, with what the words about it need from the moment it was made. */
+type SettingsRequest =
+  | { what: "list"; tab: TabId; kind: SlashPickerKind }
+  | { what: "change"; tab: TabId; kind: SlashPickerKind; chosen: string; running: { model: string | null } | null };
 
 /** Envelopes that move the keys, or put something over the conversation, with no keydown this panel
  *  sees: each drops a waiting `a`/`d`/`D` (the typing guard's cancel list -- `pane_focus`, an arrival,
@@ -890,6 +895,7 @@ export default function App() {
   const [tasksInitialId, setTasksInitialId] = useState<string | null>(null);
   const tasksRef = useRef<TasksOverlayHandle>(null);
   const taskRequests = useRef(new Map<string, TabId>());
+  const settingsRequests = useRef(new Map<string, SettingsRequest>());
   /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
   const cardViews = useRef(new Map<string, number>());
   const taskScratchTab = useRef<TabId | null>(null);
@@ -1425,14 +1431,16 @@ export default function App() {
   function tasksOverlay() {
     return tasksOpen && <TasksOverlay ref={tasksRef} state={state} workflows={tasksWorkflows} initialTaskId={tasksInitialId}
       onClose={closeTasksOverlay}
-      onRequest={(kind, taskId, requestId) => {
+      onRequest={(kind, taskId, requestId, offset) => {
         const tab = activeTabRef.current;
         if (tab === null || taskRequests.current.size >= 64) {
           tasksRef.current?.reply({ requestId, error: "too many task commands are waiting" });
           return;
         }
         taskRequests.current.set(requestId, tab);
-        postToRust({ type: kind, request_id: requestId, tab, task_id: taskId });
+        postToRust(kind === "task_output" && offset !== undefined
+          ? { type: kind, request_id: requestId, tab, task_id: taskId, offset }
+          : { type: kind, request_id: requestId, tab, task_id: taskId });
       }}
       onOpen={(title, text) => {
         const requestId = nextRequestId();
@@ -1877,7 +1885,11 @@ export default function App() {
       linkPick !== null ||
       confirm !== null ||
       isRegionMode(modeRef.current);
-    if (covered) return;
+    if (covered) {
+      // A reply stays what it is in the transcript. A direct list has nowhere else to be, so it says why nothing opened.
+      if (slashReply.direct) showFlash(`close what is open to choose the ${slashReply.kind}`);
+      return;
+    }
     // The picker is a cancel route, as the chooser is. Its keys return
     // from `onKeyDown` ahead of the read-and-reset of `pendingRef`/`countRef`, so a `g`/`z`/`[`/`]`,
     // a count or a leader sequence typed while the reply was on its way outlived it, drawn box and
@@ -2806,6 +2818,12 @@ export default function App() {
         }
         return;
       }
+      if ((payload.kind === "models_result" || payload.kind === "settings_result" || payload.kind === "command_result") && settingsRequests.current.has(payload.requestId)) {
+        const request = settingsRequests.current.get(payload.requestId)!;
+        settingsRequests.current.delete(payload.requestId);
+        answerSettings(request, payload);
+        return;
+      }
       // Every session-scoped envelope names its tab, and the page keeps only the active tab's state, so one for
       // any other tab -- a batch still in flight when the user switched away -- is dropped before any arm below
       // can touch the page.
@@ -3598,6 +3616,12 @@ export default function App() {
   function sendMessage(text: string, options?: { fromPicker?: boolean }) {
     const tab = activeTabRef.current;
     if (tab === null) return;
+    // A bare command is a question about the session, which it can answer with no turn, so nothing is queued.
+    const bare = options?.fromPicker ? null : barePickerCommand(text);
+    if (bare !== null && picksDirectly()) {
+      askForPicker(bare);
+      return;
+    }
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     // The text is kept so a refusal can put it back (ordinary sends only -- `"picker-send"`'s own
@@ -3621,12 +3645,57 @@ export default function App() {
     resumeFollowing(containerRef.current?.querySelector(".message-list"));
   }
 
-  /** A click on the band's model or effort: the bare command, whose reply opens its picker as typing it does, and
+  /** Whether this tab's session changes its model and effort directly, with no turn. */
+  function picksDirectly(): boolean {
+    return stateRef.current.capabilities.directSettings === true && !isExternalAgent(activeTabInfo(tabsRef.current)?.agent);
+  }
+
+  /** Asks for what the picker lists. It opens on the answer, also while a turn runs, and no turn is started. */
+  function askForPicker(kind: SlashPickerKind) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const requestId = nextRequestId();
+    settingsRequests.current.set(requestId, { what: "list", tab, kind });
+    postToRust({ type: "list_models", request_id: requestId, tab });
+  }
+
+  /** The answer to a request of the direct route. One for a tab no longer shown opens and says nothing. */
+  function answerSettings(
+    request: SettingsRequest,
+    payload:
+      | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings }
+      | { kind: "settings_result"; applied: AppliedSettings }
+      | { kind: "command_result"; ok: true }
+      | { kind: "command_result"; ok: false; error: string },
+  ) {
+    if (request.tab !== activeTabRef.current) return;
+    if (payload.kind === "command_result") {
+      if (!payload.ok) showFlash(revealedText(payload.error));
+      return;
+    }
+    if (payload.kind === "settings_result") {
+      if (request.what === "change") showFlash(revealedText(settingsChangedWords(request.kind, payload.applied, request.chosen, request.running)));
+      return;
+    }
+    const picker = request.kind === "model" ? modelPicker(payload.models, payload.applied) : effortPicker(payload.models, payload.applied);
+    if (picker === null) {
+      showFlash(request.kind === "model" ? "the session lists no models" : "this model takes no effort level");
+      return;
+    }
+    setSlashReply({ kind: request.kind, ...picker, direct: true });
+  }
+
+  /** A click on the band's model or effort, and their keys. With the direct route the picker opens from the session's
+   *  own list, also during a turn. Without it: the bare command, whose reply opens its picker as typing it does, and
    *  on a Claude tab names the effort too. Sent as the picker's own send, so a refusal leaves the box alone. A running
    *  turn says so instead: a bare command waiting for the turn's end would open a picker long after the click. */
   function askBandPicker(command: "/model" | "/effort") {
     // The click left the keys on the band's button, which is no place for them: they go back where they were.
     setKeysRequest((n) => n + 1);
+    if (picksDirectly()) {
+      askForPicker(command === "/model" ? "model" : "effort");
+      return;
+    }
     if (stateRef.current.activeTurnId !== null) {
       showFlash(`a turn is running: choose the ${command === "/model" ? "model" : "effort"} when it ends`);
       return;
@@ -3641,8 +3710,19 @@ export default function App() {
   function chooseSlashOption(value: string) {
     if (slashPicker === null) return;
     const command = slashPicker.kind === "model" ? "/model" : "/effort";
+    const { kind, direct, labels } = slashPicker;
     setSlashPicker(null);
-    sendMessage(`${command} ${value}`, { fromPicker: true });
+    const tab = activeTabRef.current;
+    if (direct && tab !== null) {
+      const requestId = nextRequestId();
+      const running = stateRef.current.activeTurnId !== null ? { model: stateRef.current.model } : null;
+      settingsRequests.current.set(requestId, { what: "change", tab, kind, chosen: labels?.[value] ?? value, running });
+      postToRust(kind === "model"
+        ? { type: "set_model", request_id: requestId, tab, model: value }
+        : { type: "apply_effort", request_id: requestId, tab, effort: value === EFFORT_FROM_SETTINGS ? "" : value });
+    } else {
+      sendMessage(`${command} ${value}`, { fromPicker: true });
+    }
     // The picker held the keys; unmounted, it leaves them on
     // `<body>`, where no key reaches anything. `takeKeys` runs after the render that closed it.
     setKeysRequest((n) => n + 1);
@@ -3673,6 +3753,12 @@ export default function App() {
    *  already queued (an interrupt the backend refused), where putting it back would show it
    *  twice. Rust saves a `send_now`'s text to history before either outcome, so `↑` recovers it. */
   function queueMessage(text: string) {
+    // Enter during a turn lands here, and a bare command needs no turn at all: this is where it would queue.
+    const bare = barePickerCommand(text);
+    if (bare !== null && picksDirectly()) {
+      askForPicker(bare);
+      return;
+    }
     const tab = activeTabRef.current;
     if (tab === null) return;
     const requestId = nextRequestId();
@@ -4428,6 +4514,8 @@ export default function App() {
               kind={slashPicker.kind}
               options={slashPicker.options}
               current={slashPicker.current}
+              labels={slashPicker.labels}
+              direct={slashPicker.direct}
               focusRequest={slashPickerFocusRequest}
               onChoose={chooseSlashOption}
               onCancel={cancelSlashPicker}
@@ -6527,6 +6615,8 @@ export default function App() {
               kind={slashPicker.kind}
               options={slashPicker.options}
               current={slashPicker.current}
+              labels={slashPicker.labels}
+              direct={slashPicker.direct}
               focusRequest={slashPickerFocusRequest}
               onChoose={chooseSlashOption}
               onCancel={cancelSlashPicker}
@@ -6629,6 +6719,12 @@ export default function App() {
         enterSteers={enterSteers}
         onQueue={queueMessage}
         onSendNow={(t) => {
+          // `Ctrl+Enter` would end the running turn for a question that needs no turn.
+          const bare = barePickerCommand(t);
+          if (bare !== null && picksDirectly()) {
+            askForPicker(bare);
+            return;
+          }
           post({ type: "send_now", text: t });
           resumeFollowing(containerRef.current?.querySelector(".message-list"));
         }}

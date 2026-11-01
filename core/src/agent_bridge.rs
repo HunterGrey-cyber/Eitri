@@ -148,6 +148,29 @@ pub enum InboundMessage {
         #[serde(default)]
         tab: Option<u64>,
         task_id: String,
+        /// Where to start reading the whole output; absent reads the last bytes.
+        #[serde(default)]
+        offset: Option<u64>,
+    },
+    /// The models the session's CLI offers, for the picker. No turn.
+    ListModels {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+    },
+    /// A change of the running session's model, also during a turn.
+    SetModel {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        model: String,
+    },
+    /// A change of the running session's effort, also during a turn. Empty goes back to the settings.
+    ApplyEffort {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        effort: String,
     },
     /// The WebView reporting how long it took to draw the first assistant text of a turn, measured
     /// from its own receipt of the payload to the animation frame that rendered it.
@@ -680,6 +703,9 @@ impl InboundMessage {
             | InboundMessage::ToggleFollowing { tab, .. }
             | InboundMessage::StopTask { tab, .. }
             | InboundMessage::TaskOutput { tab, .. }
+            | InboundMessage::ListModels { tab, .. }
+            | InboundMessage::SetModel { tab, .. }
+            | InboundMessage::ApplyEffort { tab, .. }
             | InboundMessage::TurnRendered { tab, .. }
             | InboundMessage::HandoffToTerminal { tab, .. }
             | InboundMessage::PermissionResponse { tab, .. }
@@ -869,6 +895,9 @@ impl InboundMessage {
             | InboundMessage::ToggleFollowing { request_id, .. }
             | InboundMessage::StopTask { request_id, .. }
             | InboundMessage::TaskOutput { request_id, .. }
+            | InboundMessage::ListModels { request_id, .. }
+            | InboundMessage::SetModel { request_id, .. }
+            | InboundMessage::ApplyEffort { request_id, .. }
             | InboundMessage::TurnRendered { request_id, .. }
             | InboundMessage::HandoffToTerminal { request_id, .. }
             | InboundMessage::PermissionResponse { request_id, .. }
@@ -985,8 +1014,20 @@ pub fn serialize_task_output_for_js(
 ) -> String {
     json!({ "kind": "task_output_result", "requestId": request_id, "tab": tab.0,
         "taskId": task_id, "output": output.output, "totalBytes": output.total_bytes,
-        "truncated": output.truncated })
+        "truncated": output.truncated, "offset": output.offset })
     .to_string()
+}
+
+/// The models a session's CLI offers, answering `list_models`.
+pub fn serialize_models_for_js(request_id: &str, tab: crate::tabs::TabId, list: &agent::ModelList) -> String {
+    json!({ "kind": "models_result", "requestId": request_id, "tab": tab.0,
+        "models": list.models, "applied": list.applied })
+    .to_string()
+}
+
+/// What the CLI says it will use after a change, answering `set_model` or `apply_effort`.
+pub fn serialize_applied_for_js(request_id: &str, tab: crate::tabs::TabId, applied: &agent::AppliedSettings) -> String {
+    json!({ "kind": "settings_result", "requestId": request_id, "tab": tab.0, "applied": applied }).to_string()
 }
 
 /// Whether `raw` is a message of the `painted` kind, regardless of its other fields. A host takes
@@ -2207,6 +2248,8 @@ pub fn serialize_snapshot_with_notes_for_js(
         ("backgroundTasks", capabilities.background_tasks),
         ("taskControl", capabilities.task_control),
         ("taskOutput", capabilities.task_output),
+        ("taskOutputRange", capabilities.task_output_range),
+        ("directSettings", capabilities.direct_settings),
         ("workflowProgress", capabilities.workflow_progress),
     ] {
         if offered {
@@ -8051,13 +8094,56 @@ mod tests {
             output: "�<b>plain</b>".into(),
             total_bytes: 9000,
             truncated: true,
+            offset: 1000,
         };
         let wire: Value = serde_json::from_str(&serialize_task_output_for_js("q1", TabId(4), "task", &output)).unwrap();
         assert_eq!(
             wire,
             json!({"kind": "task_output_result", "requestId": "q1", "tab": 4, "taskId": "task",
-            "output": "�<b>plain</b>", "totalBytes": 9000, "truncated": true})
+            "output": "�<b>plain</b>", "totalBytes": 9000, "truncated": true, "offset": 1000})
         );
+        let ranged = json!({"type": "task_output", "request_id": "q1", "tab": 4, "task_id": "t", "offset": 12});
+        assert!(matches!(
+            parse_inbound_message(&ranged.to_string()).unwrap(),
+            InboundMessage::TaskOutput { offset: Some(12), .. }
+        ));
+    }
+
+    #[test]
+    fn the_direct_settings_parse_with_their_tab_and_their_replies_keep_it() {
+        for raw in [
+            json!({"type": "list_models", "request_id": "q1", "tab": 4}),
+            json!({"type": "set_model", "request_id": "q1", "tab": 4, "model": "sonnet"}),
+            json!({"type": "apply_effort", "request_id": "q1", "tab": 4, "effort": "low"}),
+        ] {
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert_eq!(message.request_id(), "q1");
+            assert_eq!(message.tab_ref(), TabRef::Named(TabId(4)));
+        }
+        let applied = agent::AppliedSettings {
+            model: "claude-sonnet-5-5".into(),
+            effort: "low".into(),
+        };
+        let wire: Value = serde_json::from_str(&serialize_applied_for_js("q1", TabId(4), &applied)).unwrap();
+        assert_eq!(
+            wire,
+            json!({"kind": "settings_result", "requestId": "q1", "tab": 4,
+                "applied": {"model": "claude-sonnet-5-5", "effort": "low"}})
+        );
+        let list = agent::ModelList {
+            models: vec![agent::ModelOption {
+                value: "sonnet".into(),
+                supports_auto_mode: true,
+                supported_effort_levels: vec!["low".into()],
+                ..Default::default()
+            }],
+            applied,
+        };
+        let wire: Value = serde_json::from_str(&serialize_models_for_js("q1", TabId(4), &list)).unwrap();
+        assert_eq!(wire["kind"], "models_result");
+        assert_eq!(wire["models"][0]["supportsAutoMode"], true);
+        assert_eq!(wire["models"][0]["supportedEffortLevels"][0], "low");
+        assert_eq!(wire["applied"]["effort"], "low");
     }
 
     #[test]

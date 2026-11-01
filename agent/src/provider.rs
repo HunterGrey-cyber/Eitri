@@ -352,6 +352,40 @@ pub struct TaskOutput {
     pub output: String,
     pub total_bytes: u64,
     pub truncated: bool,
+    /// Where `output` starts in the whole output.
+    pub offset: u64,
+}
+
+/// What the CLI says it will use, read after a change. Each is empty when it did not say; an empty
+/// `effort` is also how a model that takes no level reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedSettings {
+    pub model: String,
+    pub effort: String,
+}
+
+/// One model the CLI offers, in its own words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    /// What [`AgentProvider::set_model`] takes: an alias such as `sonnet`, or `default`.
+    pub value: String,
+    /// The canonical id `value` resolves to; empty when the CLI did not say.
+    pub resolved_model: String,
+    pub display_name: String,
+    pub description: String,
+    pub supports_effort: bool,
+    pub supported_effort_levels: Vec<String>,
+    pub supports_auto_mode: bool,
+}
+
+/// The models the CLI offers, in its order, and what it says it will use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelList {
+    pub models: Vec<ModelOption>,
+    pub applied: AppliedSettings,
 }
 
 /// What a provider can actually do, as reported by the provider itself -- never inferred from a
@@ -444,6 +478,14 @@ pub struct ProviderCapabilities {
     /// declares some. Protocol 3.23; read from the handshake's list alone, as the flags above.
     #[serde(default)]
     pub client_tools: bool,
+    /// Protocol 3.24: a running session's model and effort change without a turn, also during one
+    /// ([`AgentProvider::set_model`], [`AgentProvider::list_models`], [`AgentProvider::apply_effort`]).
+    /// One flag for the three: a picker needs all of them.
+    #[serde(default)]
+    pub direct_settings: bool,
+    /// Protocol 3.24: [`AgentProvider::task_output_range`].
+    #[serde(default)]
+    pub task_output_range: bool,
 }
 
 /// Descriptive, non-branching facts about the connected provider: versions to show a human, the
@@ -672,6 +714,35 @@ pub trait AgentProvider {
         let _ = (session_id, task_id);
         Err(ProviderError::UnsupportedCapability("task_output"))
     }
+    /// A range of a background task's output. Answers on the provider's own thread; the caller polls.
+    fn task_output_range(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+        _offset: u64,
+        _max_bytes: u32,
+    ) -> Result<TaskReply<TaskOutput>, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("task_output_range"))
+    }
+
+    /// The models the CLI offers. Needs no turn. Answers on the provider's own thread; the caller polls.
+    fn list_models(&self, _session_id: &str) -> Result<TaskReply<ModelList>, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("list_models"))
+    }
+
+    /// Changes the model of the running session, also during a turn: the response being generated
+    /// finishes on the old model, and the next request uses the new one. Answers on the provider's own
+    /// thread; the caller polls.
+    fn set_model(&self, _session_id: &str, _model: &str) -> Result<TaskReply<AppliedSettings>, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("set_model"))
+    }
+
+    /// Changes the effort of the running session from its next request, or with `""` goes back to what
+    /// the settings say. Answers on the provider's own thread; the caller polls.
+    fn apply_effort(&self, _session_id: &str, _effort: &str) -> Result<TaskReply<AppliedSettings>, ProviderError> {
+        Err(ProviderError::UnsupportedCapability("apply_effort"))
+    }
+
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError>;
     /// Hands the person's answer to one question set to the agent without waiting for it: `Err` is a
     /// refusal before anything was sent, `Ok` the send on its way, whose reply says whether the

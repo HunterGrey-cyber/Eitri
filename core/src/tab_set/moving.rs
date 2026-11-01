@@ -435,6 +435,10 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         // moved projection and says it once on its own page. A provider's line was the source's to say: the
         // adopted provider never opens a session, so it has none.
         foreign_server_note: _,
+        // The move itself travels in the projection. A tab a person cycled back to auto meets the follow again
+        // and lands in manual, and a line still owed about the move is not said there.
+        followed_out_of_auto: _,
+        left_auto_note_owed: _,
         // What this window's broker was told. An external session's tool list crosses in the panel's record, with
         // the socket it belongs to.
         client_calls: _,
@@ -1519,6 +1523,8 @@ impl TabSet {
             human_allowed,
             user_answered,
             foreign_server_note: ForeignServerNote::default(),
+            followed_out_of_auto: false,
+            left_auto_note_owed: false,
             // This window's broker has heard of no call of the tab yet.
             client_calls: ClientCalls::default(),
             editor_declared: BTreeSet::new(),

@@ -175,6 +175,12 @@ pub const FIELD_POLICY: &[(&str, Policy)] = &[
         },
     ),
     (
+        "temperature",
+        Policy::Accept {
+            reason: "sent for a model older than the pin's, as the classifier's is when its alias points at one",
+        },
+    ),
+    (
         "thinking",
         Policy::Accept {
             reason: "adaptive thinking with display updates; the stand-in streams thinking only when scripted",

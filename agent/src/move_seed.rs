@@ -55,6 +55,7 @@ pub struct MoveSeed {
     pub(crate) history: Option<HistoryNotice>,
     pub(crate) ungated_cli_mode: Option<UngatedCliModeRecord>,
     pub(crate) cli_mode_reported: Option<String>,
+    pub(crate) cli_left_auto: bool,
     /// The CLI's latest report of its MCP servers: the next one may be a turn away, and until it comes
     /// the host's check on a declared server has only this to read.
     #[serde(default)]
@@ -290,6 +291,7 @@ impl AgentSessionProjection {
             history,
             ungated_cli_mode,
             cli_mode_reported,
+            cli_left_auto,
             policy_mismatch,
             account_limits,
             background_tasks,
@@ -333,6 +335,7 @@ impl AgentSessionProjection {
             history: history.clone(),
             ungated_cli_mode: ungated_cli_mode.clone(),
             cli_mode_reported: cli_mode_reported.clone(),
+            cli_left_auto: *cli_left_auto,
             init_servers: init_servers.clone(),
             policy_mismatch: policy_mismatch.clone(),
             account_limits: account_limits.clone(),
@@ -469,6 +472,7 @@ impl AgentSessionProjection {
             history,
             ungated_cli_mode,
             cli_mode_reported,
+            cli_left_auto,
             init_servers,
             policy_mismatch,
             account_limits,
@@ -504,6 +508,7 @@ impl AgentSessionProjection {
         self.history = history.clone();
         self.ungated_cli_mode = ungated_cli_mode.clone();
         self.cli_mode_reported = cli_mode_reported.clone();
+        self.cli_left_auto = *cli_left_auto;
         self.init_servers = init_servers.clone();
         self.policy_mismatch = policy_mismatch.clone();
         self.account_limits = account_limits.clone();

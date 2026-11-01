@@ -63,6 +63,7 @@ pub const RECORDED_LINE_KINDS: &[&str] = &[
     "atis-latch",
     "attachment/agent_listing_delta",
     "attachment/auto_mode",
+    "attachment/auto_mode_exit",
     "attachment/date",
     "attachment/deferred_tools_delta",
     "attachment/deferred_tools_record",

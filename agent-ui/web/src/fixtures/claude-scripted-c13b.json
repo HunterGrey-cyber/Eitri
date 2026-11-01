@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793397403903,
+      "occurred_at": 1793530198225,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+      "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "7b19470e-690e-4589-a953-cb9fb309e6c2",
-      "session_id": "784930fc-ab42-4737-9575-f8e75433a78e",
+      "provider_session_id": "d816b57c-54a3-436a-b0fe-a54cb6ce64c9",
+      "session_id": "37031710-9d1b-4d9b-a851-f37d971c4a6f",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -244,7 +248,7 @@
         "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
         "error_status": 529,
         "max_retries": 1,
-        "retry_delay_ms": 540
+        "retry_delay_ms": 539
       },
       "task_id": null,
       "task_status": null,
@@ -254,7 +258,7 @@
     {
       "kind": "text",
       "text": "C13B-WARNED",
-      "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+      "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
       "type": "content_delta"
     },
     {
@@ -267,7 +271,7 @@
       "outcome": "completed",
       "result_text": "C13B-WARNED",
       "stop_reason": "end_turn",
-      "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+      "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -282,19 +286,23 @@
       }
     },
     {
-      "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+      "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
       "type": "turn_started"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "7b19470e-690e-4589-a953-cb9fb309e6c2",
-      "session_id": "784930fc-ab42-4737-9575-f8e75433a78e",
+      "provider_session_id": "d816b57c-54a3-436a-b0fe-a54cb6ce64c9",
+      "session_id": "37031710-9d1b-4d9b-a851-f37d971c4a6f",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -319,7 +327,7 @@
     {
       "kind": "text",
       "text": "<cli-text chars=50 sha256=033d24eb7909b855>",
-      "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+      "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
       "type": "content_delta"
     },
     {
@@ -332,7 +340,7 @@
       "outcome": "failed",
       "result_text": "<cli-text chars=50 sha256=033d24eb7909b855>",
       "stop_reason": "stop_sequence",
-      "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+      "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -350,12 +358,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793397403903,
+        "occurred_at": 1793530198225,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+        "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
         "type": "turn_started"
       },
       {
@@ -562,13 +570,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "7b19470e-690e-4589-a953-cb9fb309e6c2",
-        "session_id": "784930fc-ab42-4737-9575-f8e75433a78e",
+        "provider_session_id": "d816b57c-54a3-436a-b0fe-a54cb6ce64c9",
+        "session_id": "37031710-9d1b-4d9b-a851-f37d971c4a6f",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -593,7 +605,7 @@
           "error_kind": "<cli-text chars=10 sha256=23b17b289036cd30>",
           "error_status": 529,
           "max_retries": 1,
-          "retry_delay_ms": 540
+          "retry_delay_ms": 539
         },
         "task_id": null,
         "task_status": null,
@@ -603,7 +615,7 @@
       {
         "kind": "text",
         "text": "C13B-WARNED",
-        "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+        "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
         "type": "content_delta"
       },
       {
@@ -616,7 +628,7 @@
         "outcome": "completed",
         "result_text": "C13B-WARNED",
         "stop_reason": "end_turn",
-        "turn_id": "17777016-2a67-4d50-9f54-c14e61aa9fe9",
+        "turn_id": "eb11d9f4-c39f-4d34-8686-35ec64dd40fc",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -631,19 +643,23 @@
         }
       },
       {
-        "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+        "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
         "type": "turn_started"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "7b19470e-690e-4589-a953-cb9fb309e6c2",
-        "session_id": "784930fc-ab42-4737-9575-f8e75433a78e",
+        "provider_session_id": "d816b57c-54a3-436a-b0fe-a54cb6ce64c9",
+        "session_id": "37031710-9d1b-4d9b-a851-f37d971c4a6f",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -668,7 +684,7 @@
       {
         "kind": "text",
         "text": "<cli-text chars=50 sha256=033d24eb7909b855>",
-        "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+        "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
         "type": "content_delta"
       },
       {
@@ -681,7 +697,7 @@
         "outcome": "failed",
         "result_text": "<cli-text chars=50 sha256=033d24eb7909b855>",
         "stop_reason": "stop_sequence",
-        "turn_id": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf",
+        "turn_id": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -699,7 +715,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 17
+    "throughRevision": 19
   },
   "scenario": "c13b",
   "snapshot": {
@@ -917,6 +933,7 @@
       },
       "conversationId": null,
       "cwd": "$RUN/project",
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": "failed",
       "model": "claude-opus-5-5",
@@ -926,7 +943,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 6,
+          "seq": 7,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -944,11 +961,11 @@
       "toolCalls": [],
       "transcript": [
         {
-          "seq": 8,
+          "seq": 9,
           "text": "C13B-WARNED"
         },
         {
-          "seq": 15,
+          "seq": 17,
           "text": "<cli-text chars=50 sha256=033d24eb7909b855>"
         }
       ],
@@ -960,8 +977,8 @@
           "numTurns": 1,
           "reason": "<cli-text chars=9 sha256=8265edf37575deab>",
           "resetsAt": null,
-          "seq": 16,
-          "turnId": "fc67799e-89ff-4d1e-a6c6-b4495e7551bf"
+          "seq": 18,
+          "turnId": "3148c26f-66d8-4349-8f1f-ca3f3b8608f1"
         }
       ],
       "usage": {
@@ -978,7 +995,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 17,
+    "throughRevision": 19,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

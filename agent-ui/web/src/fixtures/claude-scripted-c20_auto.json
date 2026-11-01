@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793397447648,
+      "occurred_at": 1793530274040,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+      "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
       "type": "turn_started"
     },
     {
@@ -213,13 +213,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "61fab09b-fdb2-4bc8-8dc3-8b85d4adeb39",
-      "session_id": "95cc6101-86e9-4358-aab3-441f2290ba60",
+      "provider_session_id": "37c791f3-b1f0-468f-a1df-3e39bbe475f0",
+      "session_id": "5db03e93-0ca3-4002-a81c-2a8970616941",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -238,7 +242,7 @@
     {
       "kind": "text",
       "text": "C20AUTO-OPEN-DONE",
-      "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+      "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
       "type": "content_delta"
     },
     {
@@ -251,7 +255,7 @@
       "outcome": "completed",
       "result_text": "C20AUTO-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+      "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -266,11 +270,11 @@
       }
     },
     {
-      "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+      "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
       "type": "turn_started"
     },
     {
-      "interaction_id": "440df968-57a3-41ac-8350-8b1ea702344f",
+      "interaction_id": "b96d9b40-8e62-4f5c-b906-81d1a0abfd11",
       "questions": [
         {
           "header": "Colour",
@@ -324,13 +328,17 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "61fab09b-fdb2-4bc8-8dc3-8b85d4adeb39",
-      "session_id": "95cc6101-86e9-4358-aab3-441f2290ba60",
+      "provider_session_id": "37c791f3-b1f0-468f-a1df-3e39bbe475f0",
+      "session_id": "5db03e93-0ca3-4002-a81c-2a8970616941",
       "type": "session_opened"
     },
     {
       "reported": "auto",
       "type": "cli_permission_mode"
+    },
+    {
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+      "type": "effort_reported"
     },
     {
       "servers": [],
@@ -381,7 +389,7 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+      "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
       "type": "tool_call_started"
     },
     {
@@ -397,7 +405,7 @@
           "question_index": 1
         }
       ],
-      "interaction_id": "440df968-57a3-41ac-8350-8b1ea702344f",
+      "interaction_id": "b96d9b40-8e62-4f5c-b906-81d1a0abfd11",
       "outcome": "answered",
       "reason": null,
       "type": "question_settled"
@@ -406,13 +414,13 @@
       "content": "<cli-text chars=178 sha256=6f66316b0dbe56c8>",
       "is_error": false,
       "tool_use_id": "toolu_q1",
-      "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+      "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
       "type": "tool_call_completed"
     },
     {
       "kind": "text",
       "text": "C20AUTO-DONE",
-      "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+      "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
       "type": "content_delta"
     },
     {
@@ -425,7 +433,7 @@
       "outcome": "completed",
       "result_text": "C20AUTO-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+      "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -443,12 +451,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793397447648,
+        "occurred_at": 1793530274040,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+        "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
         "type": "turn_started"
       },
       {
@@ -655,13 +663,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "61fab09b-fdb2-4bc8-8dc3-8b85d4adeb39",
-        "session_id": "95cc6101-86e9-4358-aab3-441f2290ba60",
+        "provider_session_id": "37c791f3-b1f0-468f-a1df-3e39bbe475f0",
+        "session_id": "5db03e93-0ca3-4002-a81c-2a8970616941",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -680,7 +692,7 @@
       {
         "kind": "text",
         "text": "C20AUTO-OPEN-DONE",
-        "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+        "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
         "type": "content_delta"
       },
       {
@@ -693,7 +705,7 @@
         "outcome": "completed",
         "result_text": "C20AUTO-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "1f683a43-69bf-4453-a9a6-37c2b082d1e9",
+        "turn_id": "f6bf95fe-ef40-412c-8785-db90862d288e",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -708,11 +720,11 @@
         }
       },
       {
-        "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+        "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
         "type": "turn_started"
       },
       {
-        "interaction_id": "440df968-57a3-41ac-8350-8b1ea702344f",
+        "interaction_id": "b96d9b40-8e62-4f5c-b906-81d1a0abfd11",
         "questions": [
           {
             "header": "Colour",
@@ -766,13 +778,17 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "61fab09b-fdb2-4bc8-8dc3-8b85d4adeb39",
-        "session_id": "95cc6101-86e9-4358-aab3-441f2290ba60",
+        "provider_session_id": "37c791f3-b1f0-468f-a1df-3e39bbe475f0",
+        "session_id": "5db03e93-0ca3-4002-a81c-2a8970616941",
         "type": "session_opened"
       },
       {
         "reported": "auto",
         "type": "cli_permission_mode"
+      },
+      {
+        "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
+        "type": "effort_reported"
       },
       {
         "servers": [],
@@ -823,7 +839,7 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+        "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
         "type": "tool_call_started"
       },
       {
@@ -839,7 +855,7 @@
             "question_index": 1
           }
         ],
-        "interaction_id": "440df968-57a3-41ac-8350-8b1ea702344f",
+        "interaction_id": "b96d9b40-8e62-4f5c-b906-81d1a0abfd11",
         "outcome": "answered",
         "reason": null,
         "type": "question_settled"
@@ -848,13 +864,13 @@
         "content": "<cli-text chars=178 sha256=6f66316b0dbe56c8>",
         "is_error": false,
         "tool_use_id": "toolu_q1",
-        "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+        "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
         "type": "tool_call_completed"
       },
       {
         "kind": "text",
         "text": "C20AUTO-DONE",
-        "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+        "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
         "type": "content_delta"
       },
       {
@@ -867,7 +883,7 @@
         "outcome": "completed",
         "result_text": "C20AUTO-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+        "turn_id": "12353275-9930-407c-b0a8-0ea64a29ff75",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -885,7 +901,7 @@
     "fromRevision": 0,
     "kind": "events",
     "tab": 1,
-    "throughRevision": 19
+    "throughRevision": 21
   },
   "scenario": "c20_auto",
   "snapshot": {
@@ -1103,6 +1119,7 @@
       },
       "conversationId": null,
       "cwd": "$RUN/project",
+      "effort": "<cli-text chars=6 sha256=c082456a7766e23a>",
       "history": null,
       "lastTurnEnding": null,
       "model": "claude-opus-5-5",
@@ -1112,7 +1129,7 @@
           "kind": "informational",
           "level": "warning",
           "scalars": {},
-          "seq": 6,
+          "seq": 7,
           "taskId": null,
           "taskStatus": null,
           "toolUseId": null
@@ -1123,7 +1140,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "440df968-57a3-41ac-8350-8b1ea702344f",
+          "interactionId": "b96d9b40-8e62-4f5c-b906-81d1a0abfd11",
           "questions": [
             {
               "header": "Colour",
@@ -1170,7 +1187,7 @@
               "question": "Which C20 checks should run?"
             }
           ],
-          "seq": 10,
+          "seq": 11,
           "state": {
             "answers": [
               {
@@ -1189,7 +1206,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "46f5aff6-588a-49ea-88d5-f778f9369c4d",
+          "turnId": "12353275-9930-407c-b0a8-0ea64a29ff75",
           "unsupportedReason": null
         }
       ],
@@ -1248,18 +1265,18 @@
             "content": "<cli-text chars=178 sha256=6f66316b0dbe56c8>",
             "isError": false
           },
-          "seq": 14,
+          "seq": 16,
           "toolUseId": "toolu_q1",
-          "turnId": "46f5aff6-588a-49ea-88d5-f778f9369c4d"
+          "turnId": "12353275-9930-407c-b0a8-0ea64a29ff75"
         }
       ],
       "transcript": [
         {
-          "seq": 7,
+          "seq": 8,
           "text": "C20AUTO-OPEN-DONE"
         },
         {
-          "seq": 17,
+          "seq": 19,
           "text": "C20AUTO-DONE"
         }
       ],
@@ -1278,7 +1295,7 @@
       "userPrompts": []
     },
     "tab": 1,
-    "throughRevision": 19,
+    "throughRevision": 21,
     "turnStartedAtMs": null,
     "turnTimes": []
   },

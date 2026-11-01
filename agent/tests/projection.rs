@@ -1626,6 +1626,8 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::ClientToolCallSettled { .. } => "ClientToolCallSettled",
         AgentDomainEvent::SessionServers { .. } => "SessionServers",
         AgentDomainEvent::EffortReported { .. } => "EffortReported",
+        AgentDomainEvent::ModelReported { .. } => "ModelReported",
+        AgentDomainEvent::CliLeftAuto => "CliLeftAuto",
     }
 }
 

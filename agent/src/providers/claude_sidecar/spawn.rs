@@ -625,6 +625,10 @@ impl SpawnedSidecar {
 ///   `InitMcpServer.source`, error codes `CLIENT_TOOL_CALL_NOT_FOUND` and
 ///   `CLIENT_TOOL_CALL_ALREADY_ANSWERED`. Read: the capability flag, both events and
 ///   `SessionReady.init_fingerprint.mcp_servers` with its `source`.
+/// - 3.24: a running session's model and effort, behind `set_model`, `list_models` and `apply_effort`
+///   (`ProviderCapabilities::direct_settings`, all three or none); `SessionReady.effort`; the
+///   `CliModeReported` event (`SessionEvent` arm 60), judged as `SessionReady.permission_mode` is;
+///   a range of `GetTaskOutput` behind `task_output_range`.
 pub const EXPECTED_VERDANDI_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`

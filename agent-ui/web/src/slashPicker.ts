@@ -1,3 +1,6 @@
+import { shortModel } from "./band";
+import type { AppliedSettings, ModelOption } from "./types";
+
 /** Parses the headless CLI's own reply to a bare `/model` or `/effort` into the
  *  options `../components/SlashPicker` shows. Deliberately never a hard-coded model/effort list --
  *  every option comes out of the reply text itself, so a CLI whose choices change is reflected here
@@ -63,4 +66,67 @@ export function parseEffortReply(text: string): EffortReply | null {
     .map((option) => option.trim())
     .filter((option) => option.length > 0);
   return options.length === 0 ? null : { options };
+}
+
+/** A picker opened from the session's own list rather than from a slash command's reply. `labels` is what each
+ *  row reads, `current` the row the session runs on. */
+export type DirectPicker = { options: string[]; current: string | null; labels: Record<string, string> };
+
+/** The model picker from the CLI's list, in its order. `current` is the row whose id is the one the CLI says it
+ *  will use: the named row when one is, since `default` resolves to the same id as the row it stands for. A model
+ *  that cannot run auto says so on its row, because choosing it ends auto for the session. */
+export function modelPicker(models: ModelOption[], applied: AppliedSettings): DirectPicker | null {
+  if (models.length === 0) return null;
+  const running = models.filter((row) => runsOn(row, applied));
+  const current = running.find((row) => row.value !== "default") ?? running[0];
+  return {
+    options: models.map((row) => row.value),
+    current: current?.value ?? null,
+    labels: Object.fromEntries(models.map((row) => [row.value, modelRowWords(row)])),
+  };
+}
+
+/** Whether the session runs on this row. An empty `applied.model` is a read that did not answer, and names no row. */
+function runsOn(row: ModelOption, applied: AppliedSettings): boolean {
+  return applied.model !== "" && (row.value === applied.model || row.resolvedModel === applied.model);
+}
+
+function modelRowWords(row: ModelOption): string {
+  const name = row.displayName === "" ? row.value : row.displayName;
+  return row.supportsAutoMode ? name : `${name} (no auto mode)`;
+}
+
+/** The level that goes back to what the settings say, as the CLI's own `/effort` names it. */
+export const EFFORT_FROM_SETTINGS = "auto";
+
+/** The effort picker for the model the session runs on: `null` when that model takes no level. A list that does
+ *  not name the model offers the levels the rows have in common with it, the union of the list. */
+export function effortPicker(models: ModelOption[], applied: AppliedSettings): DirectPicker | null {
+  const running = models.find((row) => runsOn(row, applied));
+  if (running !== undefined && !running.supportsEffort) return null;
+  const levels = running?.supportedEffortLevels ?? [...new Set(models.flatMap((row) => row.supportedEffortLevels))];
+  if (levels.length === 0) return null;
+  const options = [...levels, EFFORT_FROM_SETTINGS];
+  return { options, current: levels.includes(applied.effort) ? applied.effort : null, labels: { [EFFORT_FROM_SETTINGS]: "as the settings say" } };
+}
+
+/** What the band says once a change is made. A model changes at the next request, so a running response finishes on
+ *  the model it started with, and the rest of its turn uses the new one. */
+export function settingsChangedWords(
+  kind: "model" | "effort",
+  applied: AppliedSettings,
+  chosen: string,
+  running: { model: string | null } | null,
+): string {
+  if (kind === "effort") {
+    // A read that answered always names the model, so an empty model is no answer, and says nothing of the level.
+    const level = applied.model === "" ? chosen : applied.effort === "" ? "none on this model" : applied.effort;
+    return `effort: ${level}, from the next request`;
+  }
+  const model = applied.model === "" ? chosen : applied.model;
+  const word = shortModel(model);
+  if (running === null) return `model: ${word}, from the next turn`;
+  return running.model === null || running.model === model
+    ? `model: ${word}, for the rest of this turn`
+    : `model: ${word}; the running response finishes on ${shortModel(running.model)}`;
 }

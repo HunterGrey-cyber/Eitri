@@ -72,6 +72,8 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     conversation_reset: false,
     structured_questions_v1: false,
     client_tools: false,
+    direct_settings: false,
+    task_output_range: false,
 };
 
 // Compile-time, not a test: resume and fork are not exposed in this milestone, and the UI gates its
@@ -1163,6 +1165,71 @@ impl AgentBackend {
         }
     }
 
+    pub fn task_output_range(
+        &mut self,
+        task_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<agent::TaskReply<agent::TaskOutput>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation
+                .task_output_range(task_id, offset, max_bytes)
+                .map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot read task output".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    pub fn list_models(&mut self) -> Result<agent::TaskReply<agent::ModelList>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.list_models().map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent has no list of models".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    pub fn set_model(&mut self, model: &str) -> Result<agent::TaskReply<agent::AppliedSettings>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.set_model(model).map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot change its model here".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    pub fn apply_effort(&mut self, effort: &str) -> Result<agent::TaskReply<agent::AppliedSettings>, BackendError> {
+        match self {
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation,
+            } => conversation.apply_effort(effort).map_err(task_command_error),
+            _ => Err(BackendError {
+                message: "this agent cannot change its effort here".into(),
+                benign: true,
+            }),
+        }
+    }
+
+    /// Whether the CLI left its own auto mode by itself on this session. Its own statement: on the
+    /// sidecar `projection()` holds the ingestion mutex.
+    pub fn cli_left_auto(&self) -> bool {
+        self.projection().cli_left_auto
+    }
+
     /// The calls of declared tools still waiting for an answer, oldest first. Read here rather than
     /// from delivered events, which a resync can lose. Its own statement: on the sidecar `projection()`
     /// holds the ingestion mutex, so the guard must be gone before a caller answers one of these.
@@ -1416,11 +1483,15 @@ impl AgentBackend {
         &mut self,
         project_root: &Path,
         rules: &agent::PrefixRules,
-        mode: PermissionMode,
+        mode: impl Into<GateMode>,
         host_answered: &mut BTreeSet<String>,
         approvals: &mut HumanApprovals,
         answered_for_you: &mut AnsweredForYou,
     ) -> RevisedDelivery {
+        let GateMode {
+            mode,
+            followed_out_of_auto,
+        } = mode.into();
         let delivery = match self {
             AgentBackend::Legacy(session) => {
                 let events = session.pump_revised();
@@ -1440,6 +1511,7 @@ impl AgentBackend {
                     AnswerContext {
                         rules,
                         mode,
+                        followed_out_of_auto,
                         host_answered,
                         approvals,
                         answered_for_you,
@@ -1483,8 +1555,9 @@ impl AgentBackend {
     /// bypass: the CLI itself is never told to skip permissions (it always runs gated,
     /// `--permission-mode default` plus the hook, or the sidecar's INTERACTIVE mode); "bypass" means
     /// Eitri answers every request `allow` under that gate instead of showing a card. `mode` comes
-    /// from the caller's `Tab::mode` on every pump -- this function holds no mode of its own, so
-    /// nothing here can drift from what the tab set thinks the tab is in.
+    /// from the caller's `Tab::mode` on every pump -- this function holds no mode of its own. The one
+    /// difference it allows itself is toward a card: an Auto tab that has not yet followed the CLI out of
+    /// auto answers as Manual.
     ///
     /// **An id already in `host_answered` is dropped without a second answer, whatever the mode**
     /// (a duplicate delivery of a request already answered, e.g. after a resync). One check before
@@ -1609,6 +1682,7 @@ impl AgentBackend {
         let AnswerContext {
             rules,
             mode,
+            followed_out_of_auto,
             host_answered,
             approvals,
             answered_for_you,
@@ -1626,6 +1700,7 @@ impl AgentBackend {
                 AgentDomainEvent::ClientToolCall { .. }
                     | AgentDomainEvent::ClientToolCallSettled { .. }
                     | AgentDomainEvent::SessionServers { .. }
+                    | AgentDomainEvent::CliLeftAuto
             ) {
                 continue;
             }
@@ -1648,15 +1723,25 @@ impl AgentBackend {
             // holds the ingestion mutex and `respond_permission` locks it again (the 2026-09-15 GTK
             // freeze), so the guard is gone before any answer below. Both halves are needed for a
             // deferral: the session asked for the CLI's auto mode, and the CLI says it is running it.
-            let (projection_tripped, cli_reports_auto, one_own_server) = {
+            let (projection_tripped, cli_reports_auto, one_own_server, cli_left_auto) = {
                 let projection = self.projection();
                 (
                     session_tripped(&projection),
                     projection.cli_runs_auto(),
                     projection.single_sdk_server(SERVER_NAME),
+                    projection.cli_left_auto,
                 )
             };
             tripped |= projection_tripped;
+            // The tab follows the CLI out of auto between batches (`TabSet::follow_cli_out_of_auto`). Until it
+            // has, an Auto tab answers as the Manual tab it is about to be; whether it has is the tab's own to
+            // say, because a report can be folded at any moment around this read. Once it has, `Auto` is a
+            // person's choice made after the move.
+            let mode = if mode == PermissionMode::Auto && cli_left_auto && !followed_out_of_auto {
+                PermissionMode::Manual
+            } else {
+                mode
+            };
             // Only an Auto tab leaves anything to the CLI's classifier: Manual is Eitri's policy
             // alone, whatever the CLI runs under it. Nor does an Auto tab at a root that is no
             // boundary: Eitri's policy answers there, and every path-judged call is a card.
@@ -1963,9 +2048,27 @@ fn approve_each(
 
 /// What one `answer_what_needs_no_human` call reads and writes besides the batch: bundled so the
 /// signature stays readable. The fields retain the tab's permission answers and row notes.
+/// The mode a tab's requests are answered in, and whether the tab has followed the CLI out of auto. A
+/// tab that has not been told of a move yet is told apart from one a person put back in Auto after it.
+#[derive(Debug, Clone, Copy)]
+pub struct GateMode {
+    pub mode: PermissionMode,
+    pub followed_out_of_auto: bool,
+}
+
+impl From<PermissionMode> for GateMode {
+    fn from(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            followed_out_of_auto: false,
+        }
+    }
+}
+
 struct AnswerContext<'a> {
     rules: &'a agent::PrefixRules,
     mode: PermissionMode,
+    followed_out_of_auto: bool,
     host_answered: &'a mut BTreeSet<String>,
     approvals: &'a mut HumanApprovals,
     answered_for_you: &'a mut AnsweredForYou,
@@ -7193,6 +7296,16 @@ mod eitri_gate_tests {
         mode: PermissionMode,
         ids: &[&str],
     ) -> Answered {
+        settle_as(provider, backend, dir, mode, ids)
+    }
+
+    fn settle_as(
+        provider: &RecordingProvider,
+        backend: &mut AgentBackend,
+        dir: &Path,
+        mode: impl Into<GateMode> + Copy,
+        ids: &[&str],
+    ) -> Answered {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut answered = AnsweredForYou::default();
         let mut cards = Vec::new();
@@ -7411,6 +7524,270 @@ mod eitri_gate_tests {
         ] {
             assert_unknown_tool(true, vec![only_ours()], tool);
         }
+    }
+
+    /// The batch a change to a model that cannot run auto delivers on a session that ran it.
+    fn left_auto() -> Vec<AgentDomainEvent> {
+        vec![
+            cli_runs_auto(),
+            AgentDomainEvent::CliPermissionMode {
+                reported: "default".into(),
+            },
+            AgentDomainEvent::CliLeftAuto,
+        ]
+    }
+
+    fn on_cli_auto(mode: PermissionMode, batch: Vec<AgentDomainEvent>, tool: &str) -> Answered {
+        gated(RecordingProvider::client_tooling_cli_auto(), false, mode, batch, tool)
+    }
+
+    /// A call of `tool` on a file inside the project, with everything the tool needs: the input Auto and Manual
+    /// answer differently, where a call with no path is a card in both.
+    fn project_edit(dir: &Path, id: &str, tool: &str) -> AgentDomainEvent {
+        let file = dir.join("main.rs").display().to_string();
+        AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: Some(format!("tu-{id}")),
+            tool_name: tool.into(),
+            input: serde_json::json!({
+                "file_path": file, "notebook_path": file, "content": "x", "new_source": "x",
+                "old_string": "fn main", "new_string": "fn start",
+            }),
+            provider_prompt: None,
+        }
+    }
+
+    fn edit_on_cli_auto(mode: impl Into<GateMode> + Copy, batch: Vec<AgentDomainEvent>, tool: &str) -> Answered {
+        let dir = workspace("gate-project-edit");
+        let (provider, mut backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        let mut events = batch;
+        events.push(project_edit(&dir, "p1", tool));
+        provider.queue_all(events);
+        let answered = settle_as(&provider, &mut backend, &dir, mode, &["p1"]);
+        backend.shutdown();
+        answered
+    }
+
+    /// The CLI out of auto with no word of a move: Eitri's own Auto policy, which lets an edit inside the project
+    /// run. What makes the tests below able to fail.
+    fn fell_back() -> Vec<AgentDomainEvent> {
+        vec![AgentDomainEvent::CliPermissionMode {
+            reported: "default".into(),
+        }]
+    }
+
+    /// The tools a tab may be asked about: the ones each mode tells apart, and one it cannot know.
+    const SWITCH_TOOLS: [&str; 7] = [
+        "Write",
+        "Edit",
+        "NotebookEdit",
+        "Bash",
+        "Read",
+        "WebFetch",
+        "mcp__other__tool",
+    ];
+
+    #[test]
+    fn the_premise_on_a_session_in_auto_a_gate_request_is_left_to_the_cli() {
+        for tool in SWITCH_TOOLS {
+            let got = on_cli_auto(PermissionMode::Auto, vec![cli_runs_auto()], tool);
+            assert_eq!(got.decisions, [("p1".to_string(), PermissionDecision::Defer)], "{tool}");
+        }
+    }
+
+    /// From the moment the CLI leaves auto nothing is left to a classifier that no longer runs, and an Auto
+    /// tab answers what a Manual tab answers, in the very batch that says so.
+    #[test]
+    fn out_of_auto_an_auto_tab_answers_as_a_manual_tab_and_defers_nothing() {
+        for tool in SWITCH_TOOLS {
+            let auto = on_cli_auto(PermissionMode::Auto, left_auto(), tool);
+            let manual = on_cli_auto(PermissionMode::Manual, left_auto(), tool);
+            assert!(
+                !auto.decisions.iter().any(|(_, d)| *d == PermissionDecision::Defer),
+                "{tool}: {:?}",
+                auto.decisions
+            );
+            assert_eq!(auto.cards, manual.cards, "{tool}");
+            assert_eq!(auto.decisions, manual.decisions, "{tool}");
+        }
+    }
+
+    #[test]
+    fn the_premise_an_auto_tab_under_eitris_own_policy_lets_a_project_edit_run() {
+        for tool in ACCEPT_EDITS_TOOLS {
+            let got = edit_on_cli_auto(PermissionMode::Auto, fell_back(), tool);
+            assert_eq!(got.decisions, allowed("p1"), "{tool}");
+            assert!(got.cards.is_empty(), "{tool}");
+        }
+    }
+
+    /// A switch never widens what runs without a card: a file edit, which the classifier could still refuse
+    /// a moment ago, is a card now, on an Auto tab as on a Manual one.
+    #[test]
+    fn out_of_auto_a_file_edit_is_a_card() {
+        for tool in ACCEPT_EDITS_TOOLS {
+            for mode in [PermissionMode::Auto, PermissionMode::Manual] {
+                let got = edit_on_cli_auto(mode, left_auto(), tool);
+                assert_eq!(got.cards, ["p1"], "{tool} in {mode:?}");
+                assert!(got.decisions.is_empty(), "{tool} in {mode:?}: {:?}", got.decisions);
+            }
+        }
+    }
+
+    /// Whichever route said so: a `SessionReady` saying `default` on a session last seen in auto is the move.
+    #[test]
+    fn a_report_of_default_after_auto_with_no_move_named_is_the_move() {
+        let mut batch = vec![cli_runs_auto()];
+        batch.extend(fell_back());
+        let got = edit_on_cli_auto(PermissionMode::Auto, batch, "Write");
+        assert_eq!(got.cards, ["p1"]);
+        assert!(got.decisions.is_empty(), "{:?}", got.decisions);
+    }
+
+    /// After the tab followed, a person who put it back in Auto chose Eitri's own Auto policy.
+    #[test]
+    fn a_tab_that_followed_and_was_cycled_back_answers_as_auto() {
+        let cycled_back = GateMode {
+            mode: PermissionMode::Auto,
+            followed_out_of_auto: true,
+        };
+        let got = edit_on_cli_auto(cycled_back, left_auto(), "Write");
+        assert_eq!(got.decisions, allowed("p1"));
+        assert!(got.cards.is_empty());
+    }
+
+    /// The batch order does not matter: a request ahead of the report in one batch is answered knowing it.
+    #[test]
+    fn a_request_queued_ahead_of_the_report_is_answered_by_it() {
+        let dir = workspace("gate-left-auto-order");
+        let (provider, mut backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        provider.queue_all(vec![
+            cli_runs_auto(),
+            project_edit(&dir, "p1", "Write"),
+            AgentDomainEvent::CliPermissionMode {
+                reported: "default".into(),
+            },
+            AgentDomainEvent::CliLeftAuto,
+        ]);
+        let got = settle(&provider, &mut backend, &dir, PermissionMode::Auto, &["p1"]);
+        assert_eq!(got.cards, ["p1"]);
+        assert!(got.decisions.is_empty(), "{:?}", got.decisions);
+        backend.shutdown();
+    }
+
+    /// A move folded while a batch is answered reaches the batch's next request.
+    #[test]
+    fn a_move_folded_while_a_batch_is_answered_reaches_its_next_request() {
+        let dir = workspace("gate-left-auto-late");
+        let (provider, mut backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        provider.fold_after_next_resolution(vec![
+            AgentDomainEvent::CliPermissionMode {
+                reported: "default".into(),
+            },
+            AgentDomainEvent::CliLeftAuto,
+        ]);
+        provider.queue_all(vec![
+            cli_runs_auto(),
+            project_edit(&dir, "p1", "Write"),
+            project_edit(&dir, "p2", "Write"),
+        ]);
+        let got = settle(&provider, &mut backend, &dir, PermissionMode::Auto, &["p1", "p2"]);
+        assert_eq!(got.decisions, [("p1".to_string(), PermissionDecision::Defer)]);
+        assert_eq!(got.cards, ["p2"]);
+        backend.shutdown();
+    }
+
+    #[test]
+    fn bypass_is_what_it_was_before_the_move() {
+        for tool in SWITCH_TOOLS {
+            let got = on_cli_auto(PermissionMode::Bypass, left_auto(), tool);
+            assert_eq!(got.decisions, allowed("p1"), "{tool}");
+        }
+    }
+
+    /// The CLI saying `default` with no move, on a session that never ran auto, keeps today's answers: Eitri's
+    /// own policy, and the tab where the person put it.
+    #[test]
+    fn a_session_that_never_ran_auto_has_nothing_to_follow() {
+        let got = on_cli_auto(
+            PermissionMode::Auto,
+            vec![AgentDomainEvent::CliPermissionMode {
+                reported: "default".into(),
+            }],
+            "Bash",
+        );
+        assert!(!got.decisions.iter().any(|(_, d)| *d == PermissionDecision::Defer));
+    }
+
+    /// A report folded ahead of the batch that names it, with the tab not yet told: nothing but the tab can say
+    /// it has followed, so the request is answered as Manual, a card.
+    #[test]
+    fn a_report_folded_before_the_tab_has_followed_is_a_card_with_no_event_in_the_batch() {
+        let dir = workspace("gate-left-auto-unfollowed");
+        let (provider, mut backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        provider.queue_all(left_auto());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.cli_left_auto() {
+            assert!(Instant::now() < deadline, "the report was never folded");
+            let _ = backend.take_revised_ui_delivery(
+                &dir,
+                &agent::PrefixRules::default(),
+                PermissionMode::Auto,
+                &mut BTreeSet::new(),
+                &mut HumanApprovals::default(),
+                &mut AnsweredForYou::default(),
+            );
+        }
+        provider.queue_all(vec![project_edit(&dir, "p1", "Write")]);
+        let got = settle(&provider, &mut backend, &dir, PermissionMode::Auto, &["p1"]);
+        assert_eq!(got.cards, ["p1"]);
+        assert!(got.decisions.is_empty(), "{:?}", got.decisions);
+        backend.shutdown();
+    }
+
+    /// The tab shows what it does: it moves to manual when the batch is pumped, says why once, and a person
+    /// may cycle it back, which holds.
+    #[test]
+    fn the_tab_follows_the_cli_out_of_auto_once_and_says_so() {
+        let dir = workspace("tab-left-auto");
+        let (provider, backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tab_over(&mut set, backend);
+        provider.queue_all(left_auto());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while set.get(tab).unwrap().mode() != SessionModeChoice::Manual {
+            assert!(Instant::now() < deadline, "the tab never followed");
+            set.pump(&dir, true);
+        }
+        assert_eq!(set.take_left_auto_notes(), [tab]);
+        assert_eq!(set.take_left_auto_notes(), [], "once");
+        set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Auto);
+        for _ in 0..5 {
+            set.pump(&dir, true);
+        }
+        assert_eq!(
+            set.get(tab).unwrap().mode(),
+            SessionModeChoice::Auto,
+            "the person's choice holds"
+        );
+        close(&mut set, tab);
+    }
+
+    #[test]
+    fn a_bypass_tab_stays_in_bypass_through_the_move() {
+        let dir = workspace("tab-left-auto-bypass");
+        let (provider, backend) = session(RecordingProvider::client_tooling_cli_auto(), &dir, false);
+        let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Bypass);
+        let tab = tab_over(&mut set, backend);
+        set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Bypass);
+        provider.queue_all(left_auto());
+        for _ in 0..50 {
+            set.pump(&dir, true);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.take_left_auto_notes(), []);
+        close(&mut set, tab);
     }
 
     fn tab_over(set: &mut TabSet, backend: AgentBackend) -> crate::tabs::TabId {

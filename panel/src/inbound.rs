@@ -3,9 +3,15 @@
 
 use super::*;
 
+/// The most of a task's output the panel's whole-output view holds. It is one read, the most the sidecar
+/// gives at once; what lies before it is named, not shown.
+const TASK_OUTPUT_VIEW_BYTES: u32 = 1024 * 1024;
+
 pub(super) enum TaskCommandReply {
     Stop(agent::TaskReply<()>),
     Output(agent::TaskReply<agent::TaskOutput>),
+    Models(agent::TaskReply<agent::ModelList>),
+    Settings(agent::TaskReply<agent::AppliedSettings>),
 }
 
 pub(super) struct PendingTaskCommand {
@@ -32,6 +38,16 @@ pub(super) fn collect_task_commands(state: &mut AgentPanelState, out: &mut Outbo
                         &pending.task_id,
                         &output,
                     )
+                })
+            }),
+            TaskCommandReply::Models(rx) => rx.try_recv().map(|result| {
+                result.map(|list| {
+                    eitri_core::agent_bridge::serialize_models_for_js(&pending.request_id, pending.tab, &list)
+                })
+            }),
+            TaskCommandReply::Settings(rx) => rx.try_recv().map(|result| {
+                result.map(|applied| {
+                    eitri_core::agent_bridge::serialize_applied_for_js(&pending.request_id, pending.tab, &applied)
                 })
             }),
         };
@@ -671,16 +687,16 @@ pub(super) fn handle_inbound_message(
                 refuse(&mut out, "too many task requests: wait for an answer");
             } else {
                 let (task_id, output) = match message {
-                    InboundMessage::StopTask { task_id, .. } => (task_id, false),
-                    InboundMessage::TaskOutput { task_id, .. } => (task_id, true),
+                    InboundMessage::StopTask { task_id, .. } => (task_id, None),
+                    InboundMessage::TaskOutput { task_id, offset, .. } => (task_id, Some(offset)),
                     _ => unreachable!(),
                 };
-                let result = backend_for(&mut state.tabs, tab).and_then(|backend| {
-                    if output {
-                        backend.task_output(&task_id).map(TaskCommandReply::Output)
-                    } else {
-                        backend.stop_task(&task_id).map(TaskCommandReply::Stop)
-                    }
+                let result = backend_for(&mut state.tabs, tab).and_then(|backend| match output {
+                    Some(Some(offset)) => backend
+                        .task_output_range(&task_id, offset, TASK_OUTPUT_VIEW_BYTES)
+                        .map(TaskCommandReply::Output),
+                    Some(None) => backend.task_output(&task_id).map(TaskCommandReply::Output),
+                    None => backend.stop_task(&task_id).map(TaskCommandReply::Stop),
                 });
                 match result {
                     Ok(reply) => state.task_commands.push(PendingTaskCommand {
@@ -688,6 +704,33 @@ pub(super) fn handle_inbound_message(
                         tab,
                         request_id,
                         task_id,
+                        reply,
+                    }),
+                    Err(error) => refuse(&mut out, &error.message),
+                }
+            }
+        }
+        message @ (InboundMessage::ListModels { .. }
+        | InboundMessage::SetModel { .. }
+        | InboundMessage::ApplyEffort { .. }) => {
+            let tab = tab_of(target);
+            if state.task_commands.len() >= 64 {
+                refuse(&mut out, "too many task requests: wait for an answer");
+            } else {
+                let result = backend_for(&mut state.tabs, tab).and_then(|backend| match message {
+                    InboundMessage::ListModels { .. } => backend.list_models().map(TaskCommandReply::Models),
+                    InboundMessage::SetModel { model, .. } => backend.set_model(&model).map(TaskCommandReply::Settings),
+                    InboundMessage::ApplyEffort { effort, .. } => {
+                        backend.apply_effort(&effort).map(TaskCommandReply::Settings)
+                    }
+                    _ => unreachable!(),
+                });
+                match result {
+                    Ok(reply) => state.task_commands.push(PendingTaskCommand {
+                        view,
+                        tab,
+                        request_id,
+                        task_id: String::new(),
                         reply,
                     }),
                     Err(error) => refuse(&mut out, &error.message),
@@ -1837,6 +1880,116 @@ mod tests {
         assert_eq!(output["totalBytes"], 10000);
         assert_eq!(output["truncated"], true);
         assert!(handle.state.borrow().task_commands.is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn the_direct_settings_reach_the_provider_and_answer_the_page_that_asked() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-settings");
+        let (handle, page, _) = handle_with_recording_page();
+        let provider = std::sync::Arc::new(RecordingProvider::task_controlling());
+        let conversation = agent::AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let tab = handle.state.borrow().tabs.active();
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"ready"}"#);
+        for message in [
+            serde_json::json!({"type": "list_models", "request_id": "l1", "tab": tab.0}),
+            serde_json::json!({"type": "set_model", "request_id": "m1", "tab": tab.0, "model": "sonnet"}),
+            serde_json::json!({"type": "apply_effort", "request_id": "e1", "tab": tab.0, "effort": "low"}),
+        ] {
+            handle.page_message(ViewId::BASE, &message.to_string());
+        }
+        let found = |request: &str| -> Option<serde_json::Value> {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|payload| serde_json::from_str::<serde_json::Value>(payload).unwrap())
+                .find(|value| value["requestId"] == request)
+        };
+        tick_handle_until(&handle, "the replies", || {
+            found("l1").is_some() && found("m1").is_some() && found("e1").is_some()
+        });
+        assert_eq!(provider.settings_calls(), ["model sonnet", "effort low"]);
+        let list = found("l1").unwrap();
+        assert_eq!(list["kind"], "models_result");
+        assert_eq!(list["models"][0]["value"], "sonnet");
+        assert_eq!(list["applied"]["model"], "claude-opus-5-5");
+        let model = found("m1").unwrap();
+        assert_eq!(model["kind"], "settings_result");
+        assert_eq!(model["applied"]["model"], "resolved-sonnet");
+        assert_eq!(found("e1").unwrap()["applied"]["effort"], "low");
+        assert!(handle.state.borrow().task_commands.is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    /// `o` on a long output: a read with an offset is a range, not the tail.
+    #[test]
+    fn a_read_with_an_offset_asks_for_that_range() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-output-range");
+        let (handle, page, _) = handle_with_recording_page();
+        let provider = std::sync::Arc::new(RecordingProvider::task_controlling());
+        let conversation = agent::AgentConversation::create(provider.clone(), &dir, ProjectTrust::Untrusted).unwrap();
+        let tab = handle.state.borrow().tabs.active();
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            }));
+        provider.queue(agent::AgentDomainEvent::BackgroundTasksChanged {
+            tasks: vec![agent::BackgroundTask {
+                task_id: "task".into(),
+                run_id: None,
+                kind: agent::TaskKind::Shell,
+                task_type: "shell".into(),
+                description: "test".into(),
+                subagent_type: None,
+                parent_task_id: None,
+                tool_use_id: None,
+                ambient: false,
+                workflow_name: None,
+            }],
+            occurred_at: None,
+        });
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"ready"}"#);
+        tick_handle_until(&handle, "the roster", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .background_calls
+                == 1
+        });
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({"type": "task_output", "request_id": "o1", "tab": tab.0, "task_id": "task", "offset": 7})
+                .to_string(),
+        );
+        tick_handle_until(&handle, "the reply", || {
+            page.sent
+                .borrow()
+                .iter()
+                .any(|payload| payload.contains("\"the whole\""))
+        });
+        assert_eq!(provider.output_ranges(), [(7, TASK_OUTPUT_VIEW_BYTES)]);
         shut_down_every_tab(&handle);
     }
 

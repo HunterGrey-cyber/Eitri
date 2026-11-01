@@ -246,10 +246,21 @@ pub enum AgentDomainEvent {
         model: String,
         cwd: String,
     },
+    /// The CLI says it now runs this model, read after a change to it. A `SessionOpened` says the same at
+    /// the next turn's start; this is what the session reports until then.
+    ModelReported {
+        model: String,
+    },
+    /// The CLI left its own `auto` mode by itself, on a session that asked for it: a model that cannot run
+    /// auto does that at once. The classifier decides nothing from here on, and the CLI does not move
+    /// back. Comes straight after the `CliPermissionMode` saying `default`. The host reads it from the
+    /// projection; no page has anything to do with one.
+    CliLeftAuto,
     /// The reasoning effort the agent says this session runs at, for the band. `None` says what was known no
-    /// longer holds. Codex reports it when a thread starts. Claude Code's wire carries none, so a Claude tab
-    /// learns it only from the CLI's own reply to `/model` or `/effort <level>`
-    /// (`providers::claude_sidecar::effort_reply`). An agent that never reports one never sends this.
+    /// longer holds. Codex reports it when a thread starts. A Claude tab has it from `SessionReady.effort` and
+    /// from a change's answer, and on an older sidecar only from the CLI's own reply to `/model` or
+    /// `/effort <level>` (`providers::claude_sidecar::effort_reply`). An agent that never reports one never
+    /// sends this.
     EffortReported {
         effort: Option<String>,
     },
@@ -1767,6 +1778,9 @@ pub struct AgentSessionProjection {
     /// resume, which replaces the process that was running at it.
     #[serde(skip)]
     pub effort: Option<String>,
+    /// The CLI left its own `auto` mode by itself on this session ([`AgentDomainEvent::CliLeftAuto`]).
+    /// Cleared only by the CLI saying `auto` again.
+    pub cli_left_auto: bool,
     #[serde(skip)]
     pub notification: Option<NoticeRecord>,
     /// Live process task membership and retained outcomes.
@@ -2423,6 +2437,8 @@ impl AgentSessionProjection {
             }
             AgentDomainEvent::SessionServers { servers } => self.init_servers = servers.clone(),
             AgentDomainEvent::EffortReported { effort } => self.effort = effort.clone(),
+            AgentDomainEvent::ModelReported { model } => self.model = Some(model.clone()),
+            AgentDomainEvent::CliLeftAuto => self.cli_left_auto = true,
             AgentDomainEvent::SessionOpened {
                 session_id,
                 provider_session_id,
@@ -2762,6 +2778,13 @@ impl AgentSessionProjection {
             }
             // The latest report wins: the CLI re-reports its mode at every turn's start.
             AgentDomainEvent::CliPermissionMode { reported } => {
+                // Whatever said so: the CLI's status frame, or the next `SessionReady` on a sidecar that
+                // reports no move. A session that was running auto is not running it now.
+                if reported == "auto" {
+                    self.cli_left_auto = false;
+                } else if self.cli_mode_reported.as_deref() == Some("auto") {
+                    self.cli_left_auto = true;
+                }
                 self.cli_mode_reported = Some(reported.clone());
             }
             // First report wins, like the CLI-mode tripwire: the host fails the tab, and until it has
@@ -2909,6 +2932,8 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::ToolCallCompleted { .. }
         | AgentDomainEvent::PermissionResolved { .. }
         | AgentDomainEvent::EffortReported { .. }
+        | AgentDomainEvent::ModelReported { .. }
+        | AgentDomainEvent::CliLeftAuto
         | AgentDomainEvent::PermissionModeChanged { .. }
         | AgentDomainEvent::UngatedCliMode { .. }
         | AgentDomainEvent::CliPermissionMode { .. }

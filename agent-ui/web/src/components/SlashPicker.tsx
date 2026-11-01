@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { pickerStep } from "../chooser";
+import { revealedText } from "../revealHidden";
 
 export type SlashPickerKind = "model" | "effort";
 
@@ -15,6 +16,10 @@ type Props = {
    *  row and used only to seed the starting cursor; picking a different row never "un-marks" it,
    *  since nothing here claims to know what Enter will end up changing until it is sent. */
   current: string | null;
+  /** What a row reads when it is not the option itself: a picker opened from the session's own list. */
+  labels?: Record<string, string>;
+  /** The choice goes straight to the running session rather than as a slash command, so the hint names no command. */
+  direct?: boolean;
   /** Bumped by
    *  `App` the same way `Chooser`'s own `focusRequest` is, whenever the keys arrive somewhere that
    *  could otherwise steal them out from under an open picker (a GTK focus round trip, `arrive`, a
@@ -31,7 +36,7 @@ type Props = {
  *  chooser's own keys (`./Chooser`): `j`/`k` -- and `↓`/`↑` and `Ctrl+n`/`Ctrl+p` -- move, `Enter`
  *  chooses, `Escape`/`q` cancel with nothing sent -- no new binding, the same table `prefix w` already
  *  uses. A click on a row chooses it directly, the same as a chooser row's own `onClick`. */
-export function SlashPicker({ kind, options, current, focusRequest, onChoose, onCancel }: Props) {
+export function SlashPicker({ kind, options, current, labels, direct, focusRequest, onChoose, onCancel }: Props) {
   const startIndex = current === null ? -1 : options.indexOf(current);
   const [cursor, setCursor] = useState(startIndex === -1 ? 0 : startIndex);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -86,14 +91,14 @@ export function SlashPicker({ kind, options, current, focusRequest, onChoose, on
             onClick={() => onChoose(option)}
           >
             <span className="slash-picker-sign">{index === cursor ? "›" : ""}</span>
-            <span className="slash-picker-name">{option}</span>
+            <span className="slash-picker-name">{revealedText(labels?.[option] ?? option)}</span>
             {option === current && <span className="slash-picker-current-marker"> (current)</span>}
           </li>
         ))}
       </ul>
       <div className="slash-picker-hint">
         {kind === "effort" && <span className="slash-picker-scope">applies to this session only · </span>}
-        {`enter ${command} ${options[cursor] ?? ""} · esc cancel`}
+        {direct ? "enter choose · esc cancel" : `enter ${command} ${options[cursor] ?? ""} · esc cancel`}
       </div>
     </div>
   );

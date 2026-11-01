@@ -65,6 +65,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // `default` fallback are reported on as `CliPermissionMode`, and anything else closes it.
         ProtoEvent::SessionReady(ready) => {
             let reported = ready.permission_mode;
+            let effort = ready.effort;
             let mut out = vec![AgentDomainEvent::SessionOpened {
                 session_id: envelope_session_id,
                 provider_session_id: ready.provider_session_id,
@@ -81,6 +82,11 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 }
                 CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => {}
             }
+            // Empty says nothing: no read has answered, or the model takes no level. Neither ends a
+            // level `ApplyEffort` or a reply reported.
+            if !effort.is_empty() {
+                out.push(AgentDomainEvent::EffortReported { effort: Some(effort) });
+            }
             if let Some(init) = ready.init_fingerprint {
                 out.push(AgentDomainEvent::SessionServers {
                     servers: init
@@ -95,6 +101,23 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 });
             }
             Some(out)
+        }
+        // The CLI moved its own mode, ahead of the next `SessionReady`, judged by the rule that judges
+        // that report. Out of `auto` it goes on as `CliPermissionMode` plus what makes a live tab follow.
+        ProtoEvent::CliModeReported(report) => {
+            let reported = report.permission_mode;
+            match classify_reported_cli_mode(&reported, requested) {
+                CliModeReport::Ungated => one(AgentDomainEvent::UngatedCliMode {
+                    reported,
+                    detail: "CliModeReported".to_string(),
+                }),
+                CliModeReport::Auto => one(AgentDomainEvent::CliPermissionMode { reported }),
+                CliModeReport::AutoUnavailable => Some(vec![
+                    AgentDomainEvent::CliPermissionMode { reported },
+                    AgentDomainEvent::CliLeftAuto,
+                ]),
+                CliModeReport::Default | CliModeReport::Stricter | CliModeReport::Unreported => None,
+            }
         }
         // The call's position on the session's stream is the envelope's: an adopting host reads on from
         // it (`GetClientToolCallStateResponse.through_sequence`).
@@ -720,6 +743,95 @@ mod tests {
                 cwd: "/tmp".into(),
             })
         );
+    }
+
+    fn cli_mode_report(permission_mode: &str, requested: RequestedCliMode) -> Vec<AgentDomainEvent> {
+        super::translate(
+            ProtoSessionEvent {
+                event: Some(ProtoEvent::CliModeReported(
+                    claude_runtime_protocol::v1::CliModeReported {
+                        permission_mode: permission_mode.into(),
+                    },
+                )),
+                ..Default::default()
+            },
+            requested,
+        )
+    }
+
+    /// The move out of auto says two things in this order: what the CLI runs now, and that a live tab must
+    /// follow.
+    #[test]
+    fn a_report_out_of_auto_is_the_new_mode_then_the_move() {
+        assert_eq!(
+            cli_mode_report("default", RequestedCliMode::Auto),
+            [
+                AgentDomainEvent::CliPermissionMode {
+                    reported: "default".into()
+                },
+                AgentDomainEvent::CliLeftAuto,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_report_of_auto_on_an_auto_session_moves_nothing() {
+        assert_eq!(
+            cli_mode_report("auto", RequestedCliMode::Auto),
+            [AgentDomainEvent::CliPermissionMode {
+                reported: "auto".into()
+            }]
+        );
+    }
+
+    /// The report is judged by the rule `SessionReady` is: it can close a session, and it can never make a
+    /// session that asked for `default` read as running auto.
+    #[test]
+    fn a_report_of_a_wider_mode_closes_the_session_as_session_ready_would() {
+        for (reported, requested) in [
+            ("auto", RequestedCliMode::Default),
+            ("bypassPermissions", RequestedCliMode::Default),
+            ("acceptEdits", RequestedCliMode::Default),
+            ("bypassPermissions", RequestedCliMode::Auto),
+            ("plan", RequestedCliMode::Auto),
+            ("dontAsk", RequestedCliMode::Auto),
+        ] {
+            let got = cli_mode_report(reported, requested);
+            assert!(
+                matches!(got.as_slice(), [AgentDomainEvent::UngatedCliMode { .. }]),
+                "{reported} on {requested:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_of_default_on_a_session_that_asked_for_it_says_nothing() {
+        assert_eq!(cli_mode_report("default", RequestedCliMode::Default), []);
+    }
+
+    fn ready_with_effort(effort: &str) -> Vec<AgentDomainEvent> {
+        super::translate(
+            ProtoSessionEvent {
+                event: Some(ProtoEvent::SessionReady(claude_runtime_protocol::v1::SessionReady {
+                    model: "m".into(),
+                    permission_mode: "default".into(),
+                    effort: effort.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            RequestedCliMode::Default,
+        )
+    }
+
+    #[test]
+    fn session_ready_reports_the_effort_it_carries_and_says_nothing_of_an_empty_one() {
+        assert!(ready_with_effort("high").contains(&AgentDomainEvent::EffortReported {
+            effort: Some("high".into())
+        }));
+        assert!(!ready_with_effort("")
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::EffortReported { .. })));
     }
 
     /// Every protocol 3.22 arm reaches the domain in either CLI mode, inside or outside a turn.

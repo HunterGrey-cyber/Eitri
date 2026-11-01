@@ -481,6 +481,14 @@ pub(super) fn resolved(value: wire::InteractionResolved) -> Option<Domain> {
 
 /// The most of a task's output the sidecar sends, and the most this side keeps: the last bytes.
 const OUTPUT_TAIL_BYTES: usize = 8192;
+/// The most one ranged read keeps: what the sidecar sends at most.
+const OUTPUT_RANGE_BYTES: usize = 1024 * 1024;
+/// A model id, a display name or an effort level: words, on the CLI's say-so.
+const SETTINGS_WORD_CHARS: usize = 200;
+const MODEL_DESCRIPTION_CHARS: usize = 500;
+/// More than any CLI has offered; a list past it is cut rather than drawn.
+const MODEL_ROWS: usize = 64;
+const EFFORT_ROWS: usize = 16;
 
 /// A background task's output as `GetTaskOutput` answered it.
 #[allow(dead_code)] // read by the provider's task-output request, which no caller makes yet
@@ -492,6 +500,8 @@ pub(crate) struct TaskOutputTail {
     pub total_bytes: u64,
     /// Whether `output` is only the end of it.
     pub truncated: bool,
+    /// Where `output` starts in the whole output.
+    pub offset: u64,
 }
 
 // Each response is destructured field by field, so a field a later protocol adds fails to compile here
@@ -503,6 +513,7 @@ pub(super) fn task_output(value: wire::GetTaskOutputResponse) -> TaskOutputTail 
         output,
         total_bytes,
         truncated,
+        offset,
     } = value;
     let over = output.len().saturating_sub(OUTPUT_TAIL_BYTES);
     if over > 0 {
@@ -515,6 +526,71 @@ pub(super) fn task_output(value: wire::GetTaskOutputResponse) -> TaskOutputTail 
         output: String::from_utf8_lossy(&output[over..]).into_owned(),
         total_bytes,
         truncated: truncated || over > 0,
+        offset: offset + over as u64,
+    }
+}
+
+/// A range of a task's output, for the panel's whole-output view: bytes past `OUTPUT_RANGE_BYTES` are
+/// cut from the end, since the range was asked for from its start.
+pub(super) fn task_output_range(value: wire::GetTaskOutputResponse) -> TaskOutputTail {
+    let wire::GetTaskOutputResponse {
+        output,
+        total_bytes,
+        truncated,
+        offset,
+    } = value;
+    let kept = output.len().min(OUTPUT_RANGE_BYTES);
+    TaskOutputTail {
+        output: String::from_utf8_lossy(&output[..kept]).into_owned(),
+        total_bytes,
+        truncated: truncated || kept < output.len(),
+        offset,
+    }
+}
+
+/// What the CLI says it will use. A response with no such message read nothing.
+pub(super) fn applied_settings(value: Option<wire::AppliedSettings>) -> crate::AppliedSettings {
+    let wire::AppliedSettings { model, effort } = value.unwrap_or_default();
+    crate::AppliedSettings {
+        model: bound(&model, SETTINGS_WORD_CHARS),
+        effort: bound(&effort, SETTINGS_WORD_CHARS),
+    }
+}
+
+/// The CLI's list of models, kept to what a picker can show. Every word is the CLI's; none decides
+/// anything.
+pub(super) fn model_list(value: wire::ListModelsResponse) -> crate::ModelList {
+    let wire::ListModelsResponse { models, applied } = value;
+    crate::ModelList {
+        models: models
+            .into_iter()
+            .take(MODEL_ROWS)
+            .map(|row| {
+                let wire::ModelOption {
+                    value,
+                    resolved_model,
+                    display_name,
+                    description,
+                    supports_effort,
+                    supported_effort_levels,
+                    supports_auto_mode,
+                } = row;
+                crate::ModelOption {
+                    value: bound(&value, SETTINGS_WORD_CHARS),
+                    resolved_model: bound(&resolved_model, SETTINGS_WORD_CHARS),
+                    display_name: bound(&display_name, SETTINGS_WORD_CHARS),
+                    description: bound(&description, MODEL_DESCRIPTION_CHARS),
+                    supports_effort,
+                    supported_effort_levels: supported_effort_levels
+                        .into_iter()
+                        .take(EFFORT_ROWS)
+                        .map(|level| bound(&level, SETTINGS_WORD_CHARS))
+                        .collect(),
+                    supports_auto_mode,
+                }
+            })
+            .collect(),
+        applied: applied_settings(applied),
     }
 }
 /// `StopTask` answers with nothing: a stop the sidecar accepted is the call's success.
@@ -989,15 +1065,73 @@ mod tests {
             task_output(wire::GetTaskOutputResponse {
                 output: vec![0x80, b'o', b'k'],
                 total_bytes: 100,
-                truncated: true
+                truncated: true,
+                offset: 97,
             }),
             TaskOutputTail {
                 output: "�ok".into(),
                 total_bytes: 100,
-                truncated: true
+                truncated: true,
+                offset: 97,
             }
         );
     }
+    #[test]
+    fn a_range_keeps_its_start_says_where_it_is_and_stops_at_the_limit() {
+        let range = task_output_range(wire::GetTaskOutputResponse {
+            output: vec![b'a'; 10],
+            total_bytes: 100,
+            truncated: true,
+            offset: 40,
+        });
+        assert_eq!((range.output.len(), range.offset, range.truncated), (10, 40, true));
+        let over = task_output_range(wire::GetTaskOutputResponse {
+            output: [vec![b'a'; OUTPUT_RANGE_BYTES], vec![b'z'; 5]].concat(),
+            total_bytes: 2_000_000,
+            truncated: false,
+            offset: 0,
+        });
+        assert_eq!(over.output.len(), OUTPUT_RANGE_BYTES);
+        assert!(!over.output.contains('z'), "what goes is the end of what was asked for");
+        assert!(over.truncated);
+    }
+
+    #[test]
+    fn the_applied_settings_read_nothing_from_nothing_and_every_word_is_bounded() {
+        assert_eq!(applied_settings(None), crate::AppliedSettings::default());
+        let long = "x".repeat(SETTINGS_WORD_CHARS + 5);
+        let applied = applied_settings(Some(wire::AppliedSettings {
+            model: long.clone(),
+            effort: "low".into(),
+        }));
+        assert_eq!(applied.model.chars().count(), SETTINGS_WORD_CHARS);
+        assert_eq!(applied.effort, "low");
+    }
+
+    #[test]
+    fn the_model_list_keeps_the_clis_order_and_bounds_rows_and_words() {
+        let row = |value: &str| wire::ModelOption {
+            value: value.into(),
+            description: "d".repeat(MODEL_DESCRIPTION_CHARS + 9),
+            supported_effort_levels: vec!["low".into(); EFFORT_ROWS + 3],
+            supports_auto_mode: true,
+            ..Default::default()
+        };
+        let list = model_list(wire::ListModelsResponse {
+            models: std::iter::repeat_with(|| row("x")).take(MODEL_ROWS + 2).collect(),
+            applied: None,
+        });
+        assert_eq!(list.models.len(), MODEL_ROWS);
+        assert_eq!(list.models[0].description.chars().count(), MODEL_DESCRIPTION_CHARS);
+        assert_eq!(list.models[0].supported_effort_levels.len(), EFFORT_ROWS);
+        let ordered = model_list(wire::ListModelsResponse {
+            models: vec![row("b"), row("a")],
+            applied: None,
+        });
+        assert_eq!(ordered.models[0].value, "b");
+        assert!(ordered.models[0].supports_auto_mode);
+    }
+
     #[test]
     fn output_tail_keeps_its_last_8192_bytes_and_says_it_was_cut() {
         let at: Vec<u8> = (0..8192).map(|i| b'a' + (i % 26) as u8).collect();
@@ -1005,6 +1139,7 @@ mod tests {
             output: at.clone(),
             total_bytes: 8192,
             truncated: false,
+            offset: 0,
         });
         assert_eq!(tail.output.as_bytes(), &at[..]);
         assert!(!tail.truncated);
@@ -1014,8 +1149,10 @@ mod tests {
             output: over,
             total_bytes: 9000,
             truncated: false,
+            offset: 807,
         });
         assert_eq!(tail.output.as_bytes(), &at[..], "the first byte goes, the end stays");
+        assert_eq!(tail.offset, 808, "the offset moves with the cut");
         assert_eq!(tail.total_bytes, 9000);
         assert!(tail.truncated);
     }

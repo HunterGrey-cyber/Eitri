@@ -477,6 +477,11 @@ pub struct SessionState {
     user_answered: BTreeSet<String>,
     /// Where the tab stands with the line about a server of the tool server's name that is not Eitri's.
     foreign_server_note: ForeignServerNote,
+    /// This tab has followed the CLI out of its auto mode ([`TabSet::follow_cli_out_of_auto`]): once, so
+    /// a person who cycles back to auto afterwards stays there.
+    followed_out_of_auto: bool,
+    /// The tab moved to manual by itself, and has not said why yet.
+    left_auto_note_owed: bool,
     /// What the panel's broker has been told of this session's calls of declared tools.
     client_calls: ClientCalls,
     /// What an external agent's session was given. It is read on the broker's facts because that agent's calls
@@ -717,6 +722,11 @@ impl Tab {
     /// The tab's own permission mode. Read-only outside this module -- see the field's own doc.
     pub fn mode(&self) -> SessionModeChoice {
         self.mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_mode_for_test(&mut self, mode: SessionModeChoice) {
+        self.mode = mode;
     }
 
     /// The chat view that shows this tab ([`ViewId::BASE`] unless it is bound to an extra view).
@@ -1998,6 +2008,22 @@ impl TabSet {
                 Some((tab.id, line))
             })
             .collect()
+    }
+
+    /// The tabs that moved to manual by themselves and have not said why, taken: a caller with no page
+    /// to show the line on hands it back with [`TabSet::owe_left_auto_note`].
+    pub fn take_left_auto_notes(&mut self) -> Vec<TabId> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|tab| std::mem::take(&mut tab.session.left_auto_note_owed).then_some(tab.id))
+            .collect()
+    }
+
+    /// `tab`'s line stays owed: the tab is on no page that can show it yet.
+    pub fn owe_left_auto_note(&mut self, tab: TabId) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.session.left_auto_note_owed = true;
+        }
     }
 
     /// `tab`'s line stays owed: the tab is on no page that can show it yet.
@@ -3406,6 +3432,28 @@ impl TabSet {
         out
     }
 
+    /// The CLI left its own auto mode by itself, on a change to a model that cannot run it: the tab
+    /// moves to manual at once, so what it shows is what it does. Eitri's own policy then answers every
+    /// request, a file edit is a card, and nothing is left to a classifier that no longer runs. Only
+    /// `Auto` moves: bypass and manual tabs never relied on that classifier. Once per move: a person may
+    /// cycle back to auto, which on this session means Eitri's own policy, as on any CLI that fell back.
+    fn follow_cli_out_of_auto(tab: &mut Tab) {
+        let TabBackend::Live(backend) = &tab.backend else {
+            return;
+        };
+        if !backend.cli_left_auto() {
+            tab.session.followed_out_of_auto = false;
+            return;
+        }
+        if std::mem::replace(&mut tab.session.followed_out_of_auto, true) {
+            return;
+        }
+        if tab.mode == SessionModeChoice::Auto {
+            tab.mode = SessionModeChoice::Manual;
+            tab.session.left_auto_note_owed = true;
+        }
+    }
+
     /// One tab's share of [`TabSet::pump_views`]: drains its backend, fails it if its CLI reported a
     /// mode the gate cannot hold, hands the delivery to the arm that matches it, and settles what is
     /// left once that arm is done.
@@ -3416,6 +3464,7 @@ impl TabSet {
         place: PumpPlace,
         out: &mut PumpOutput,
     ) {
+        Self::follow_cli_out_of_auto(tab);
         let TabBackend::Live(backend) = &mut tab.backend else {
             if let Some(review) = review.as_deref_mut() {
                 review.tab_has_no_session(tab.id.0, wall_clock_ms());
@@ -3438,7 +3487,10 @@ impl TabSet {
         let delivery = backend.take_revised_ui_delivery(
             tick.project_root,
             tick.rules,
-            tab.mode.into(),
+            crate::agent_backend::GateMode {
+                mode: tab.mode.into(),
+                followed_out_of_auto: tab.session.followed_out_of_auto,
+            },
             &mut tab.session.host_answered,
             &mut tab.session.human_allowed,
             &mut answered_for_you,
@@ -3449,6 +3501,10 @@ impl TabSet {
                 hook(backend);
             }
         }
+        Self::follow_cli_out_of_auto(tab);
+        let TabBackend::Live(backend) = &mut tab.backend else {
+            return;
+        };
         // What the last snapshot of this backend the panel was sent already carried: a snapshot and
         // the drain before it are separate lock acquisitions, and the sidecar's ingestion thread
         // folds and queues in between, so such an event is in that snapshot AND in this drain. Every

@@ -33,6 +33,10 @@
 //! | `card` | `{tool}`: a request of that tool needed (or got) a driver answer |
 //! | `wall_floor` | `{after, seconds}`: `after` is a part's `name` or `<verb>:<target>` of an earlier wait |
 //! | `client_call` | tool name (bare, or with the `mcp__<server>__` prefix), or `{tool, count?}`: the host has been handed a call of that tool, with its `tool_use_id` |
+//! | `list_models` | `{holds: value}`: the session's list of models has that row |
+//! | `set_model` | `{model, applied?, refused?}`: a change of the running session's model, what it left, or the words of its refusal |
+//! | `apply_effort` | `{effort}`: a change of the running session's effort, which must be what it left |
+//! | `tab_mode` | layer (b): the tab's mode reaches that word |
 //! | `client_state` | `{open: n, tool?}`: the session's own read of its open calls (`GetClientToolCallState`) holds exactly `n` (of `tool` when given) |
 //!
 //! A part may carry `layer: "a"|"b"`: it runs only on a host of that layer and is skipped, with no `PENDING` line,
@@ -231,6 +235,24 @@ pub trait Host {
     fn client_state(&mut self) -> Result<ClientState, DriverError> {
         Err(DriverError::CapabilityMissing("client_tools"))
     }
+    /// The values of the models the session's CLI offers, in its order.
+    fn list_models(&mut self) -> Result<Vec<String>, DriverError> {
+        Err(DriverError::CapabilityMissing("direct_settings"))
+    }
+    /// Changes the running session's model; answers the model the CLI says it will use.
+    fn set_model(&mut self, model: &str) -> Result<String, DriverError> {
+        let _ = model;
+        Err(DriverError::CapabilityMissing("direct_settings"))
+    }
+    /// Changes the running session's effort; answers the level the CLI says it will use.
+    fn apply_effort(&mut self, effort: &str) -> Result<String, DriverError> {
+        let _ = effort;
+        Err(DriverError::CapabilityMissing("direct_settings"))
+    }
+    /// The tab's mode, at the layer that has a tab.
+    fn tab_mode(&self) -> Option<String> {
+        None
+    }
     /// A window move of the tab, in three steps. `freeze` stops the source window's side and hands the session
     /// over, `adopt` takes it up in the destination window, and `commit` lets the destination read and answer.
     fn move_freeze(&mut self) -> Result<(), DriverError> {
@@ -339,6 +361,9 @@ const ACTIONS: &[&str] = &[
     "answer_question",
     "decline_question",
     "client_answer",
+    "list_models",
+    "set_model",
+    "apply_effort",
     "freeze",
     "adopt",
     "commit",
@@ -358,6 +383,7 @@ const WAITS: &[&str] = &[
     "wall_floor",
     "client_call",
     "client_state",
+    "tab_mode",
 ];
 const META: &[&str] = &["requires", "name", "timeout", "layer"];
 /// Actions that start something the CLI answers: the session-state wait only looks at tap lines after the latest.
@@ -683,6 +709,47 @@ impl<'a> Driver<'a> {
                 let answer = client_answer_of(arg)?;
                 Ok(self.host.client_answer(&answer)?)
             }
+            "list_models" => {
+                let want = need("holds")?;
+                let models = self.host.list_models()?;
+                if models.contains(&want) {
+                    Ok(())
+                } else {
+                    Err(Failure::text(format!(
+                        "`list_models` gave {models:?}, without `{want}`"
+                    )))
+                }
+            }
+            "set_model" => {
+                let model = need("model")?;
+                match (self.host.set_model(&model), arg.get("refused").and_then(Value::as_str)) {
+                    (Ok(applied), None) => match arg.get("applied").and_then(Value::as_str) {
+                        Some(want) if want != applied => Err(Failure::text(format!(
+                            "`set_model` left `{applied}`, and the scenario expects `{want}`"
+                        ))),
+                        _ => Ok(()),
+                    },
+                    (Ok(_), Some(want)) => Err(Failure::text(format!(
+                        "`set_model` was taken, and the scenario expects a refusal holding `{want}`"
+                    ))),
+                    (Err(DriverError::Failed(why)), Some(want)) if why.contains(want) => Ok(()),
+                    (Err(DriverError::Failed(why)), Some(want)) => Err(Failure::text(format!(
+                        "`set_model` was refused with `{why}`, which does not hold `{want}`"
+                    ))),
+                    (Err(e), _) => Err(e.into()),
+                }
+            }
+            "apply_effort" => {
+                let effort = need("effort")?;
+                let applied = self.host.apply_effort(&effort)?;
+                if applied == effort {
+                    Ok(())
+                } else {
+                    Err(Failure::text(format!(
+                        "`apply_effort` left `{applied}`, not `{effort}`"
+                    )))
+                }
+            }
             "freeze" => Ok(self.host.move_freeze()?),
             "adopt" => Ok(self.host.move_adopt()?),
             "commit" => Ok(self.host.move_commit()?),
@@ -927,6 +994,15 @@ impl<'a> Driver<'a> {
                         .filter(|c| tool.as_deref().is_none_or(|t| c.tool == t))
                         .count();
                     Ok(n == open)
+                })
+            }
+            "tab_mode" => {
+                let want = arg
+                    .as_str()
+                    .ok_or_else(|| Failure::text("`tab_mode` needs the mode"))?
+                    .to_owned();
+                self.wait_for(&what, limit, true, move |d| {
+                    Ok(d.host.tab_mode().as_deref() == Some(&want))
                 })
             }
             "wall_floor" => {

@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub struct RecordingProvider {
     task_control: bool,
     stopped_tasks: std::sync::Mutex<Vec<String>>,
+    /// Every `set_model` and `apply_effort` that reached the provider, as `model x` or `effort y`.
+    settings_calls: std::sync::Mutex<Vec<String>>,
+    /// Every ranged read of a task's output that reached the provider.
+    output_ranges: std::sync::Mutex<Vec<(u64, u32)>>,
     queued: std::sync::Mutex<Vec<AgentDomainEvent>>,
     resolved: std::sync::Mutex<Vec<(String, bool)>>,
     /// Every turn text a send reached the provider with, accepted or refused.
@@ -115,6 +119,16 @@ impl RecordingProvider {
             .clone()
             .ok_or_else(|| agent::ProviderError::Transport("no state was scripted".into()))
     }
+    /// What `set_model` and `apply_effort` were asked, in order.
+    pub fn settings_calls(&self) -> Vec<String> {
+        self.settings_calls.lock().unwrap().clone()
+    }
+
+    /// The ranged reads of a task's output, in order.
+    pub fn output_ranges(&self) -> Vec<(u64, u32)> {
+        self.output_ranges.lock().unwrap().clone()
+    }
+
     pub fn task_controlling() -> Self {
         Self {
             task_control: true,
@@ -242,6 +256,8 @@ impl agent::AgentProvider for RecordingProvider {
             steer: self.steering,
             task_control: self.task_control,
             task_output: self.task_control,
+            direct_settings: self.task_control,
+            task_output_range: self.task_control,
             client_tools: self.client_tools,
             ..ProviderCapabilities::default()
         }
@@ -347,6 +363,80 @@ impl agent::AgentProvider for RecordingProvider {
             output: "<b>plain</b>\u{202e}".into(),
             total_bytes: 10000,
             truncated: true,
+            offset: 9000,
+        }))
+        .unwrap();
+        Ok(rx)
+    }
+    fn task_output_range(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<agent::TaskReply<agent::TaskOutput>, agent::ProviderError> {
+        self.output_ranges.lock().unwrap().push((offset, max_bytes));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(agent::TaskOutput {
+            output: "the whole".into(),
+            total_bytes: 10000,
+            truncated: offset > 0,
+            offset,
+        }))
+        .unwrap();
+        Ok(rx)
+    }
+    fn list_models(&self, _session_id: &str) -> Result<agent::TaskReply<agent::ModelList>, agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("list_models"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(agent::ModelList {
+            models: vec![agent::ModelOption {
+                value: "sonnet".into(),
+                resolved_model: "claude-sonnet-5-5".into(),
+                display_name: "Sonnet".into(),
+                supports_auto_mode: true,
+                ..Default::default()
+            }],
+            applied: agent::AppliedSettings {
+                model: "claude-opus-5-5".into(),
+                effort: "medium".into(),
+            },
+        }))
+        .unwrap();
+        Ok(rx)
+    }
+    fn set_model(
+        &self,
+        _session_id: &str,
+        model: &str,
+    ) -> Result<agent::TaskReply<agent::AppliedSettings>, agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("set_model"));
+        }
+        self.settings_calls.lock().unwrap().push(format!("model {model}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(agent::AppliedSettings {
+            model: format!("resolved-{model}"),
+            effort: "medium".into(),
+        }))
+        .unwrap();
+        Ok(rx)
+    }
+    fn apply_effort(
+        &self,
+        _session_id: &str,
+        effort: &str,
+    ) -> Result<agent::TaskReply<agent::AppliedSettings>, agent::ProviderError> {
+        if !self.task_control {
+            return Err(agent::ProviderError::UnsupportedCapability("apply_effort"));
+        }
+        self.settings_calls.lock().unwrap().push(format!("effort {effort}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(agent::AppliedSettings {
+            model: "claude-opus-5-5".into(),
+            effort: effort.into(),
         }))
         .unwrap();
         Ok(rx)
