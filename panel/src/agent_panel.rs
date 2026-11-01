@@ -272,6 +272,9 @@ struct AgentPanelState {
     /// Pending edits' proposals being read on worker threads, polled by the tick: the agent names the
     /// file, and nothing it names is opened on the GTK thread.
     proposal_jobs: Vec<PendingProposal>,
+    /// Views' scratch files being written on worker threads, in the order they were asked for, polled by the tick:
+    /// a view's text is as long as the output it shows and is not written on the GTK thread.
+    view_jobs: Vec<PendingView>,
     /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
     /// arrived. At most one per tab, the newest.
     review_hints: Vec<eitri_core::turn_review::ReviewHint>,
@@ -579,6 +582,7 @@ impl AgentPanelState {
             review_jobs: Vec::new(),
             question_sends: Vec::new(),
             proposal_jobs: Vec::new(),
+            view_jobs: Vec::new(),
             review_hints: Vec::new(),
             shown_hints: Vec::new(),
             review_hint: false,

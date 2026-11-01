@@ -24,6 +24,23 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A view's file in the scratch directory, chosen by [`ScratchDir::reserve_view`] and not yet written. It owns
+/// nothing but a path, so it can go to a worker thread and be written there.
+#[derive(Debug)]
+pub struct ViewFile {
+    body: PathBuf,
+}
+
+impl ViewFile {
+    /// Writes `text` and returns the request that has nvim show it read-only.
+    pub fn write(self, text: &str) -> io::Result<ScratchRequest> {
+        std::fs::write(&self.body, text)?;
+        Ok(ScratchRequest::of(
+            serde_json::json!({ "op": "view", "path": self.body.to_string_lossy() }),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchRequest {
     hex: String,
@@ -410,8 +427,16 @@ impl ScratchDir {
         id
     }
 
-    /// A read-only buffer holding `text`. The title names the file, so `:ls` says what it is.
+    /// A read-only buffer holding `text`. The title names the file, so `:ls` says what it is. Writes the file
+    /// here and now; a caller on the GTK thread reserves the file with [`reserve_view`](Self::reserve_view) and
+    /// has [`ViewFile::write`] run on a worker.
     pub fn prepare_view(&mut self, title: &str, text: &str) -> io::Result<ScratchRequest> {
+        self.reserve_view(title).write(text)
+    }
+
+    /// The file a view of `text` under `title` will be written to, named and numbered and with nothing yet on
+    /// disk: the part of a view that needs this directory, kept apart from the write, which does not.
+    pub fn reserve_view(&mut self, title: &str) -> ViewFile {
         let id = self.next_id();
         let slug: String = title
             .chars()
@@ -424,11 +449,9 @@ impl ScratchDir {
             })
             .take(32)
             .collect();
-        let body = self.dir.join(format!("{id}-{}.md", slug.trim_matches('-')));
-        std::fs::write(&body, text)?;
-        Ok(ScratchRequest::of(
-            serde_json::json!({ "op": "view", "path": body.to_string_lossy() }),
-        ))
+        ViewFile {
+            body: self.dir.join(format!("{id}-{}.md", slug.trim_matches('-'))),
+        }
     }
 
     /// A pending edit's proposal: the file's text as it is (`base`) and as the edit would leave it
@@ -542,6 +565,33 @@ mod tests {
         assert!(value.get("done").is_none() || value["done"].is_null());
         dir.cleanup();
         assert!(!dir.path().exists());
+    }
+
+    #[test]
+    fn a_reserved_view_is_named_before_it_is_written_and_writes_the_same_file() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let first = dir.reserve_view("Bash: cargo test");
+        let second = dir.reserve_view("Bash: cargo test");
+        assert_ne!(first.body, second.body, "each reservation has its own file");
+        assert!(!first.body.exists(), "nothing is on disk until it is written");
+        let body = first.body.clone();
+        // The write is the part that may leave the thread.
+        let request = std::thread::spawn(move || first.write("late text"))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&body).unwrap(), "late text");
+        assert_eq!(decode(request.hex())["path"], body.to_string_lossy().as_ref());
+        assert!(!second.body.exists());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn a_view_that_cannot_be_written_says_so() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let file = dir.reserve_view("gone");
+        dir.cleanup();
+        assert!(file.write("x").is_err(), "the directory is gone");
     }
 
     #[test]

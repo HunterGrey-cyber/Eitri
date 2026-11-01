@@ -187,7 +187,7 @@ t_rerun_up_to_date() {
 TESTS="$TESTS t_rerun_finishes_incomplete_install"
 t_rerun_finishes_incomplete_install() {
 	# "Up to date" means finished: the same version with its sidecar present, and the launcher (with
-	# its marker), the desktop entry and the three licence files all there. Missing any of them, a
+	# its marker), the desktop entry and the licence files all there. Missing any of them, a
 	# re-run installs again -- what the installer's own errors promise ("re-run to finish").
 	serve 1.0.0
 	inst_net

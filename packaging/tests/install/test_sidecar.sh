@@ -523,6 +523,34 @@ t_build_sidecar_into() {
 	expect_no_out "$SLOW_LINE"
 }
 
+# A first build peaks near 1.3 GiB (three measured: 1.2 to 1.25 GiB in the work directory, 1.3 with the artifact
+# copied out), so every route into the shared build asks for about 1.4 GiB before it starts.
+TESTS="$TESTS t_first_build_asks_for_the_space_a_build_takes"
+t_first_build_asks_for_the_space_a_build_takes() {
+	serve 1.0.0
+	sc_setup_release 1.0.0 "$REV_A"
+	mkdir -p "$T/lowdisk"
+	cat >"$T/lowdisk/df" <<'DF_STUB'
+#!/bin/sh
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+echo '/dev/stub 2000000 1000000 1000000 50% /'
+DF_STUB
+	chmod 0755 "$T/lowdisk/df"
+	PRE_STUBS=$T/lowdisk
+	sc_inst_setup -- --sidecar-only
+	expect_fail "about 970 MiB free, --sidecar-only"
+	expect_out 'only 976 MiB free'
+	expect_out 'building the sidecar needs about 1.4 GiB'
+	expect_absent "$(data_of)/eitri/sidecar/aaaaaaa"
+	dest=$T/aur-sidecar-low
+	inst -- --build-sidecar-into "$dest" --node "$NODE_FIXTURE_TARBALL" \
+		--verdandi-source "$(served 1.0.0)/verdandi-aaaaaaa-source.tar.gz"
+	expect_fail "about 970 MiB free, --build-sidecar-into"
+	expect_out 'building the sidecar needs about 1.4 GiB'
+	expect_absent "$dest"
+	PRE_STUBS=
+}
+
 TESTS="$TESTS t_build_sidecar_into_node_cache_versioned_name"
 t_build_sidecar_into_node_cache_versioned_name() {
 	# Prime buildBinary.mjs's Node cache with the versioned filename, not node.tar.xz: it preserves

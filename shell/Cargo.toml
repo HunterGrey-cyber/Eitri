@@ -237,3 +237,10 @@ harness = false
 [[test]]
 name = "command_accels"
 harness = false
+
+# The grid's line for a host's unrealize, loud unless the window is closing, in real GTK (`src/module_grid/unrealize.rs`).
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`, on its own Xvfb
+# (`tests/support/own_x_server.rs`).
+[[test]]
+name = "grid_unrealize_line"
+harness = false

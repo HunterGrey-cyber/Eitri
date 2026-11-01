@@ -20,6 +20,8 @@
 pub(crate) mod floatbars;
 #[path = "module_grid/strips.rs"]
 pub(crate) mod strips;
+#[path = "module_grid/unrealize.rs"]
+mod unrealize;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -446,13 +448,13 @@ impl ModuleGrid {
         let unrealized = Rc::new(Cell::new(0u32));
         {
             let id = id.clone();
-            widget.connect_unrealize(move |_| {
+            widget.connect_unrealize(move |widget| {
                 unrealized.set(unrealized.get() + 1);
                 // Expected exactly once per host, when the window closes. Any earlier line is the
                 // bug this container exists to rule out (held by a counter).
                 eprintln!(
-                    "[module_grid] {id} unrealized ({} so far) -- must not happen before the window closes",
-                    unrealized.get()
+                    "{}",
+                    unrealize::line(&id, unrealized.get(), unrealize::window_is_closing(widget))
                 );
             });
         }

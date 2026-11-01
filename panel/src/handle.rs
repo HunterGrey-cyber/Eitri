@@ -401,6 +401,9 @@ impl AgentPanelHandle {
             // and take the keys for a view no one sees, and a reused view's next page numbers its requests
             // afresh. Dropping the receiver leaves the worker's send with nowhere to go.
             state.proposal_jobs.retain(|job| job.view != view);
+            // The same for a view still being written: the file is left in the scratch directory, which the
+            // window's close removes, and the editor is not raised for a page that is gone.
+            state.view_jobs.retain(|job| job.view != view);
             if !state.shutting_down {
                 state.tabs.drop_bypass_prompt_in(view);
             }

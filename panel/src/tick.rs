@@ -177,6 +177,7 @@ pub(super) fn tick_send(
     poll_question_sends(state, out);
     super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
+    poll_view_jobs(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
     poll_trust(state, screen, out);
@@ -359,6 +360,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.review_jobs.is_empty()
         || !state.question_sends.is_empty()
         || !state.proposal_jobs.is_empty()
+        || !state.view_jobs.is_empty()
         || !state.review_flow.is_idle()
         || state.editor_tools.needs_polling()
         || !state.editor_follower.is_idle()
@@ -856,6 +858,15 @@ mod tests {
         });
         assert!(polls(&handle), "a proposal being read");
         handle.state.borrow_mut().proposal_jobs.clear();
+
+        let (_view_tx, view_rx) = mpsc::channel();
+        handle.state.borrow_mut().view_jobs.push(PendingView {
+            request_id: "v".into(),
+            view: ViewId::BASE,
+            rx: view_rx,
+        });
+        assert!(polls(&handle), "a view being written");
+        handle.state.borrow_mut().view_jobs.clear();
 
         let mut scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
         let (_request, edit) = scratch.prepare_edit("draft").unwrap();

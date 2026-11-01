@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=4afa6e645cfd200447b9d9d9f29f8b916c2a31716bc5c2f07a6509e7183ca7d0 -->
+<!-- translated-from: known-issues.md sha256=616d6d61c4bec1022c7cbac459e4461782a4993d90101c672060180d39767708 -->
 
 # 已知问题与限制
 
@@ -17,7 +17,7 @@
 
 ## 安装
 
-- **agent sidecar 在你的机器上构建**，在安装的过程中完成（需要联网，以及约 600 MiB 可用磁盘空间；要下载 Node.js 和 npm 包）。AUR 的 `eitri-bin` 在它自己的构建过程里做同样的事，所以要几分钟，而不是几秒。原因见 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#为什么-sidecar-要在你自己的机器上构建)。
+- **agent sidecar 在你的机器上构建**，在安装的过程中完成（需要联网，以及构建时约 1.4 GiB 可用磁盘空间；要下载 Node.js 和 npm 包）。AUR 的 `eitri-bin` 在它自己的构建过程里做同样的事，所以要几分钟，而不是几秒。原因见 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#为什么-sidecar-要在你自己的机器上构建)。
 - **`.deb` 和 `.rpm` 装完后需要运行一次 `eitri setup`**，用你自己的用户身份；这两种包都不会构建 sidecar。
 - **从 0.2.2 升级会重新构建一次 sidecar**，因为 0.3.0 固定了一个更新的版本：下载量和磁盘空间与第一次安装相同；`.deb` 或 `.rpm` 升级之后还要再运行一次 `eitri setup`。
 - **sidecar 更新可能在两个地方失败**（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#updating-the-sidecar)）。`eitri sidecar update` 会用一句直白的话停下，并且什么都不改：常见原因是连不上 nodejs.org、npm 或 grpc.io，可用磁盘空间太少，签名验证不过，发布需要更新的 Eitri，或者同时有另一个 `eitri sidecar` 命令在运行。更新已经构建好、但在某个标签页里启动不了，不会弄坏这个标签页：它改用 Eitri 自带的 sidecar，状态栏显示 `⚠`，详情里写明原因。`eitri sidecar use bundled` 让它不再尝试。更新只对它之后打开的标签页生效，Eitri 0.3.0 完全不能装更新。

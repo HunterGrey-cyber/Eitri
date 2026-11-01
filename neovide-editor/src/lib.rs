@@ -969,6 +969,42 @@ fn exit_events(fork_exited: bool, nvim_alive: Option<bool>, unreachable_said: bo
     }
 }
 
+/// Whether nvim's exit follows a quit this pane asked of it: the last watched request
+/// ([`NeovideEditorPane::exec_lua_watched`], used for the editor's `:confirm qall`) was never answered, so
+/// either it is still out or it ended because nvim went away. A request nvim did answer was a quit it
+/// declined, and an exit after that comes from nothing this pane asked.
+fn exit_follows_quit(watch: Option<&CallWatch>) -> bool {
+    watch.is_some_and(|watch| !watch.returned)
+}
+
+/// The line the tick logs when it passes an exit to the host: a quiet one for the exit a quit asked for, and
+/// the one that says nvim left by itself for any other.
+fn exit_log_line(after_quit: bool) -> &'static str {
+    if after_quit {
+        "[live] nvim has exited after the quit it was asked for -- invoking the registered \
+         on_exited_unrequested callback (if any)"
+    } else {
+        "[live] nvim exited on its own (not via a caller-initiated shutdown) -- invoking the registered \
+         on_exited_unrequested callback (if any) instead of closing a window this pane doesn't own"
+    }
+}
+
+/// What a watched request's failure is worth saying when it happens. A connection that ended under the request
+/// (nvim went away: the reader or writer of the pipe failed, or the request's channel closed) is the exit the
+/// request asked for or an exit the tick reports in its own line, and says nothing. Every other failure -- nvim
+/// answering with an error or a value of the wrong type, a message that did not decode, a buffer that would not
+/// encode -- is something only this line says.
+fn watched_failure_note(err: &nvim_rs::error::CallError) -> Option<String> {
+    use nvim_rs::error::{CallError, DecodeError, EncodeError};
+    let connection_ended = match err {
+        CallError::InternalReceiveError(..) => true,
+        CallError::DecodeError(decode, _) => matches!(decode.as_ref(), DecodeError::ReaderError(_)),
+        CallError::SendError(encode, _) => matches!(encode, EncodeError::WriterError(_)),
+        CallError::NeovimError(..) | CallError::WrongValueType(..) => false,
+    };
+    (!connection_ended).then(|| err.to_string())
+}
+
 /// How long [`NeovideEditorPane::settled_watched_call`] waits for a request's worker to publish
 /// how it ended. At nvim's exit nvim-rs's IO loop has already resolved the request, so this is only
 /// ever the worker thread's own scheduling; the bound is a backstop.
@@ -2102,6 +2138,7 @@ impl NeovideEditorPane {
                 // dropped -- see the comment on `exited_callback_for_tick` above for why the
                 // ordering matters.
                 let mut should_fire_exited_callback = false;
+                let mut exit_after_quit = false;
                 let mut should_fire_unreachable_callback = false;
                 let mut fullscreen_changed: Option<bool> = None;
                 let mut scale_factor_changed: Option<f32> = None;
@@ -2253,6 +2290,8 @@ impl NeovideEditorPane {
                         if events.exited {
                             session.close_requested.set(true);
                             should_fire_exited_callback = true;
+                            exit_after_quit =
+                                exit_follows_quit(session.watched.as_ref().map(nvim_rpc::WatchedCall::watch).as_ref());
                         }
 
                         tick_should_render(
@@ -2287,11 +2326,7 @@ impl NeovideEditorPane {
                 }
 
                 if should_fire_exited_callback {
-                    println!(
-                        "[live] nvim exited on its own (not via a caller-initiated shutdown) -- \
-                         invoking the registered on_exited_unrequested callback (if any) instead \
-                         of closing a window this pane doesn't own"
-                    );
+                    println!("{}", exit_log_line(exit_after_quit));
                     if let Some(cb) = exited_callback_for_tick.borrow().as_ref() {
                         cb();
                     }
@@ -2573,7 +2608,9 @@ impl NeovideEditorPane {
                         true
                     }
                     Err(err) => {
-                        println!("[live] exec_lua_watched: no return (nvim exited?): {err}");
+                        if let Some(note) = watched_failure_note(&err) {
+                            println!("[live] exec_lua_watched: {note}");
+                        }
                         false
                     }
                 }
@@ -2998,10 +3035,10 @@ mod tests {
     }
 
     use super::{
-        build_start_failure_message, build_start_panic_message, cell_size_changed, exit_events,
-        failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal, run_detached,
-        sessionless_tick_should_render, spawn_named, tick_should_render, ExitEvents, LiveState, RemapKick,
-        RestartRefused, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        build_start_failure_message, build_start_panic_message, cell_size_changed, exit_events, exit_follows_quit,
+        exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal, run_detached,
+        sessionless_tick_should_render, spawn_named, tick_should_render, watched_failure_note, CallWatch, ExitEvents,
+        LiveState, RemapKick, RestartRefused, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -3343,6 +3380,59 @@ mod tests {
             exited,
             "nothing known: the fork's word"
         );
+    }
+
+    #[test]
+    fn an_exit_after_an_unanswered_quit_is_the_quit_s_and_is_logged_quietly() {
+        use std::time::Instant;
+        let watch = |done, returned| CallWatch {
+            sent_at: Instant::now(),
+            done,
+            returned,
+            last_answer: None,
+        };
+        assert!(!exit_follows_quit(None), "no quit was asked: nvim left by itself");
+        assert!(exit_follows_quit(Some(&watch(false, false))), "the quit is still out");
+        assert!(
+            exit_follows_quit(Some(&watch(true, false))),
+            "the quit ended with nvim going away"
+        );
+        assert!(
+            !exit_follows_quit(Some(&watch(true, true))),
+            "nvim answered, so it declined the quit; a later exit is its own"
+        );
+        let asked = exit_log_line(true);
+        let alone = exit_log_line(false);
+        assert!(!asked.contains("on its own"), "{asked}");
+        assert!(alone.contains("nvim exited on its own"), "{alone}");
+    }
+
+    #[test]
+    fn a_watched_request_that_lost_its_connection_says_nothing_but_an_nvim_error_does() {
+        use nvim_rs::error::CallError;
+        let eof = || std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        let closed = [
+            CallError::DecodeError(
+                std::sync::Arc::new(nvim_rs::error::DecodeError::ReaderError(eof())),
+                "nvim_exec_lua".into(),
+            ),
+            CallError::SendError(nvim_rs::error::EncodeError::WriterError(eof()), "nvim_exec_lua".into()),
+        ];
+        for lost in &closed {
+            assert_eq!(watched_failure_note(lost), None, "{lost}");
+        }
+        // A message that would not decode is not a connection that ended.
+        let garbled = CallError::DecodeError(
+            std::sync::Arc::new(nvim_rs::error::DecodeError::InvalidMessage(
+                nvim_rs::error::InvalidMessage::UnknownMessageType(9),
+            )),
+            "nvim_exec_lua".into(),
+        );
+        let note = watched_failure_note(&garbled).expect("a message that did not decode is said");
+        assert!(note.contains("nvim_exec_lua"), "{note}");
+        let refused = CallError::NeovimError(Some(1), "E5108: Lua error".into());
+        let note = watched_failure_note(&refused).expect("nvim's own error is said");
+        assert!(note.contains("E5108"), "{note}");
     }
 
     /// A thread that cannot be started (`EAGAIN` under a process limit,

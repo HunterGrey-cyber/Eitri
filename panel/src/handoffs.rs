@@ -188,6 +188,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         reported_tabs: _,
         scratch: _,
         proposal_jobs: _,
+        view_jobs: _,
         // The window's moves in flight; the record is what one of them builds.
         chat_moves: _,
         hand_overs: _,

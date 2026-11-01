@@ -28,6 +28,10 @@ neovide = { path = "../neovide" }
 # `rmpv::Value`, the type nvim-rs speaks (the fork already links this same version, so nothing new
 # is built or shipped). `nvim_child`'s ending tests use it too, to talk to nvim over a pipe.
 rmpv = "1"
+# `NeovideEditorPane::exec_lua_watched` tells a request that lost its connection from one nvim answered with an
+# error by nvim-rs's `CallError`. The fork links this same version with `use_tokio`, so nothing new is built or
+# shipped.
+nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
 # Winit already brings this version, so nothing new is built or shipped.
 wayland-client = "=0.31.15"
 # Winit already enables client_system at this version, so nothing new is built or shipped.
@@ -39,7 +43,6 @@ wayland-protocols = { version = "=0.32.13", features = ["client"] }
 # connection that lives on a tokio runtime, as the fork's does. Both crates are already in the tree
 # through the fork (nvim-rs 0.9.2 with `use_tokio`, tokio "full"), so this adds no package.
 [dev-dependencies]
-nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process"] }
 # `tests/no_force_quit.rs` reads `cargo metadata` to find the pinned fork's source. Already in
 # Cargo.lock through `eitri-core`, so nothing new is downloaded.

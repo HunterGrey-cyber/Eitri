@@ -236,7 +236,7 @@ The agents guide's first section describes all of this.
 
 - **The agent backend is built again, once.** 0.3.0 pins a newer Verdandi (@VERDANDI_REV@), so `install.sh`
   builds the new backend before it switches over, and after a `.deb`/`.rpm` upgrade you run `eitri setup` before
-  your first turn. It downloads Node.js and the Claude Agent SDK from npm again (about 600 MiB of disk).
+  your first turn. It downloads Node.js and the Claude Agent SDK from npm again (about 1.4 GiB of free disk while it builds).
 - A Claude Code conversation started in Eitri before 0.3.0 **keeps** its earlier, shorter instructions when you
   continue it (measured with Claude Code 2.1.302); a new conversation gets the full ones, and `/compact` may
   refresh them too (not yet measured).

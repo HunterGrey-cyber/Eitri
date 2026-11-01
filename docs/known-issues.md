@@ -29,8 +29,8 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Installing
 
-- **The agent sidecar is built on your machine** during the install (network access and about 600 MiB of free
-  disk space; it fetches Node.js and npm packages). The AUR package `eitri-bin` does the same inside its build, so
+- **The agent sidecar is built on your machine** during the install (network access and about 1.4 GiB of free
+  disk space while it builds; it fetches Node.js and npm packages). The AUR package `eitri-bin` does the same inside its build, so
   it takes minutes, not seconds. Why: [INSTALL.md](../INSTALL.md#why-the-sidecar-is-built-on-your-machine).
 - **`.deb` and `.rpm` need one `eitri setup`** afterwards, as your own user; neither package builds the sidecar.
 - **Upgrading from 0.2.2 builds the sidecar again**, because 0.3.0 pins a newer one: the same download and disk

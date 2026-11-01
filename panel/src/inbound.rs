@@ -1236,21 +1236,11 @@ pub(super) fn handle_inbound_message(
                 Err(why) => refuse(&mut out, &why),
             }
         }
+        // The text is written to the scratch file on a worker; the tick hands nvim the view, or tells the page why
+        // it could not be written.
         InboundMessage::ViewInEditor { title, text, .. } => {
-            let prepared = state
-                .scratch
-                .as_mut()
-                .map(|dir| {
-                    dir.prepare_view(&title, &text)
-                        .map_err(|e| format!("could not write the scratch file: {e}"))
-                })
-                .unwrap_or_else(|| Err("the scratch directory could not be created at startup".to_string()));
-            match prepared {
-                Ok(request) => out.effect(Effect::AskEditor {
-                    request,
-                    then: EditorThen::Answer { view, request_id },
-                }),
-                Err(why) => refuse(&mut out, &why),
+            if let Err(why) = start_view_job(state, view, &request_id, &title, text) {
+                refuse(&mut out, &why);
             }
         }
         // `Ctrl+g` on a pending edit card: the file is read on a worker, and the tick hands nvim the diff.

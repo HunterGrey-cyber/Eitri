@@ -322,6 +322,94 @@ pub(super) fn poll_review_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
     }
 }
 
+/// The most views being written at once. A press that finds this many out is told to try again, rather than
+/// queueing without bound behind a disk that has stopped answering.
+pub(super) const MAX_VIEW_JOBS: usize = MAX_REVIEW_JOBS;
+
+/// One view's scratch file being written on a worker thread.
+pub(super) struct PendingView {
+    pub(super) request_id: String,
+    /// The page that asked: the answer goes there, whether the editor took the view or the write failed.
+    pub(super) view: ViewId,
+    pub(super) rx: mpsc::Receiver<std::io::Result<eitri_core::scratch::ScratchRequest>>,
+}
+
+/// Writes `text` as a scratch file on a worker thread and has the tick hand nvim the view (see [`poll_view_jobs`]):
+/// the text may be a megabyte, and nothing waits for a disk on the GTK thread. Only the file's name is chosen
+/// here. Refused while [`MAX_VIEW_JOBS`] are already out; a press made while another view is being written is
+/// a view of its own, shown after the earlier one, so the last press is the one on screen.
+pub(super) fn start_view_job(
+    state: &mut AgentPanelState,
+    view: ViewId,
+    request_id: &str,
+    title: &str,
+    text: String,
+) -> Result<(), String> {
+    if state.view_jobs.len() >= MAX_VIEW_JOBS {
+        return Err("views are still being written; try again in a moment".to_string());
+    }
+    let file = state
+        .scratch
+        .as_mut()
+        .ok_or_else(|| "the scratch directory could not be created at startup".to_string())?
+        .reserve_view(title);
+    let rx = spawn_view_write(file, text, |job| {
+        std::thread::Builder::new()
+            .name("view write".into())
+            .spawn(job)
+            .map(|_| ())
+    })?;
+    state.view_jobs.push(PendingView {
+        request_id: request_id.to_string(),
+        view,
+        rx,
+    });
+    Ok(())
+}
+
+/// Has `spawn` run the write of `text` to `file` on a thread, and returns where its result will arrive. A thread
+/// the OS refuses is the page's to hear about, as a failed write is: this runs inside the WebView's message
+/// callback, where a panic is no answer. Nothing is written when the thread does not start.
+fn spawn_view_write(
+    file: eitri_core::scratch::ViewFile,
+    text: String,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Result<mpsc::Receiver<std::io::Result<eitri_core::scratch::ScratchRequest>>, String> {
+    let (tx, rx) = mpsc::channel();
+    spawn(Box::new(move || {
+        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+        let _ = tx.send(file.write(&text));
+    }))
+    .map_err(|e| format!("could not write the scratch file: {e}"))?;
+    Ok(rx)
+}
+
+/// The tick's half of a view: a finished write is handed to the editor, whose answer is the page's; a failed
+/// write, or a worker that died, answers the page with why. Views are taken in the order they were asked for,
+/// so one that finished early waits for the one before it.
+pub(super) fn poll_view_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
+    while let Some(job) = state.view_jobs.first() {
+        let written = match job.rx.try_recv() {
+            Ok(written) => written.map_err(|e| format!("could not write the scratch file: {e}")),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("could not write the scratch file: its worker stopped".to_string())
+            }
+        };
+        let job = state.view_jobs.remove(0);
+        match written {
+            Ok(request) => out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Answer {
+                    view: job.view,
+                    request_id: job.request_id,
+                },
+            }),
+            Err(why) => out.send(job.view, serialize_command_result_for_js(&job.request_id, Err(&why))),
+        }
+    }
+}
+
 /// One pending edit's proposal being read on a worker thread.
 pub(super) struct PendingProposal {
     pub(super) request_id: String,
@@ -758,6 +846,295 @@ mod tests {
             dir.cleanup();
         }
         scratch.cleanup();
+    }
+
+    /// A panel whose scratch directory is made beside a throwaway one, and whose editor requests are recorded.
+    fn panel_with_recording_editor() -> (
+        AgentPanelHandle,
+        Rc<RecordingPage>,
+        eitri_core::scratch::ScratchDir,
+        Rc<RefCell<Vec<serde_json::Value>>>,
+    ) {
+        let (handle, page) = settled_panel();
+        let root = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        handle.state.borrow_mut().scratch =
+            Some(eitri_core::scratch::ScratchDir::in_dir(root.path()).expect("a panel scratch directory"));
+        let asked: Rc<RefCell<Vec<serde_json::Value>>> = Rc::default();
+        let recorder = asked.clone();
+        handle.on_editor_request(move |request| {
+            let hex = request.hex();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            recorder.borrow_mut().push(serde_json::from_slice(&bytes).unwrap());
+            Ok(())
+        });
+        (handle, page, root, asked)
+    }
+
+    fn view_message(request_id: &str, title: &str, text: &str) -> String {
+        serde_json::json!({ "type": "view_in_editor", "request_id": request_id, "title": title, "text": text })
+            .to_string()
+    }
+
+    /// Ticks until `done`, for at most five seconds.
+    fn tick_until(handle: &AgentPanelHandle, what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// `Ctrl+g` on a long row sends up to a megabyte: the message returns with the write still to be done, the
+    /// editor is asked on a tick once it has been, and the file holds all of the text.
+    #[test]
+    fn a_view_is_written_on_a_worker_and_the_editor_is_asked_after() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        let text = "line of output\n".repeat(70_000);
+        assert!(text.len() > 1 << 20);
+        handle.page_message(ViewId::BASE, &view_message("v1", "Bash: ls", &text));
+        assert!(
+            asked.borrow().is_empty(),
+            "the editor is asked from the tick, after the write, not from the message"
+        );
+        assert_eq!(
+            result_for(&page.sent.borrow(), "v1"),
+            None,
+            "not answered before the editor is"
+        );
+        tick_until(&handle, "the view never reached the editor", || {
+            !asked.borrow().is_empty()
+        });
+        assert_eq!(asked.borrow().len(), 1, "one editor request");
+        let request = asked.borrow()[0].clone();
+        assert_eq!(request["op"], "view");
+        assert_eq!(
+            std::fs::read_to_string(request["path"].as_str().unwrap()).unwrap(),
+            text,
+            "the whole text"
+        );
+        assert_eq!(result_for(&page.sent.borrow(), "v1"), Some(Ok(())));
+        assert!(handle.state.borrow().view_jobs.is_empty());
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
+    /// A second press while the first is still being written is a view of its own, shown after the first, so the
+    /// last press is what ends up on screen -- however the two writes finish.
+    #[test]
+    fn views_asked_in_turn_are_shown_in_turn_even_when_a_later_write_finishes_first() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        let mut senders = Vec::new();
+        for id in ["first", "second"] {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            handle.state.borrow_mut().view_jobs.push(PendingView {
+                request_id: id.into(),
+                view: ViewId::BASE,
+                rx,
+            });
+        }
+        let request = |name: &str| {
+            let mut dir = handle.state.borrow_mut().scratch.take().unwrap();
+            let made = dir.prepare_view(name, name).unwrap();
+            handle.state.borrow_mut().scratch = Some(dir);
+            made
+        };
+        let (one, two) = (request("one"), request("two"));
+        senders[1].send(Ok(two)).unwrap();
+        handle.tick();
+        assert!(asked.borrow().is_empty(), "the second waits for the first");
+        assert_eq!(handle.state.borrow().view_jobs.len(), 2);
+        senders[0].send(Ok(one)).unwrap();
+        tick_until(&handle, "both views never reached the editor", || {
+            asked.borrow().len() == 2
+        });
+        let names: Vec<String> = asked
+            .borrow()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert!(
+            names[0].ends_with("one.md") && names[1].ends_with("two.md"),
+            "{names:?}"
+        );
+        assert_eq!(result_for(&page.sent.borrow(), "first"), Some(Ok(())));
+        assert_eq!(result_for(&page.sent.borrow(), "second"), Some(Ok(())));
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
+    /// Two real presses made back to back give two views, the last press shown last.
+    #[test]
+    fn two_presses_in_a_row_give_two_views_in_order() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        handle.page_message(ViewId::BASE, &view_message("a", "Bash: first", "first text"));
+        handle.page_message(ViewId::BASE, &view_message("b", "Bash: second", "second text"));
+        tick_until(&handle, "both views never reached the editor", || {
+            asked.borrow().len() == 2
+        });
+        let texts: Vec<String> = asked
+            .borrow()
+            .iter()
+            .map(|r| std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(texts, ["first text", "second text"]);
+        assert_eq!(result_for(&page.sent.borrow(), "a"), Some(Ok(())));
+        assert_eq!(result_for(&page.sent.borrow(), "b"), Some(Ok(())));
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
+    /// A write that fails is said where the press was made: the page's request is refused with the reason, and
+    /// the editor is never asked. A worker that died says so the same way.
+    #[test]
+    fn a_view_that_could_not_be_written_answers_the_page_with_why() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (dead_tx, dead_rx) = mpsc::channel::<std::io::Result<eitri_core::scratch::ScratchRequest>>();
+        for (id, rx) in [("failed", failed_rx), ("dead", dead_rx)] {
+            handle.state.borrow_mut().view_jobs.push(PendingView {
+                request_id: id.into(),
+                view: ViewId::BASE,
+                rx,
+            });
+        }
+        failed_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "no space left on device",
+            )))
+            .unwrap();
+        drop(dead_tx);
+        tick_until(&handle, "the failures never reached the page", || {
+            result_for(&page.sent.borrow(), "failed").is_some() && result_for(&page.sent.borrow(), "dead").is_some()
+        });
+        let failed = result_for(&page.sent.borrow(), "failed").unwrap().unwrap_err();
+        assert!(
+            failed.starts_with("could not write the scratch file:") && failed.contains("no space left"),
+            "{failed}"
+        );
+        let dead = result_for(&page.sent.borrow(), "dead").unwrap().unwrap_err();
+        assert!(dead.contains("its worker stopped"), "{dead}");
+        assert!(
+            asked.borrow().is_empty(),
+            "no editor request for a view that is not there"
+        );
+        assert!(handle.state.borrow().view_jobs.is_empty());
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
+    /// A thread the OS will not start is a refusal the page hears, with nothing queued and nothing written.
+    #[test]
+    fn a_view_whose_thread_cannot_start_answers_the_page_with_why() {
+        let mut dir = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let file = dir.reserve_view("Bash: ls");
+        let refused =
+            spawn_view_write(file, "text".into(), |_job| Err(std::io::Error::from_raw_os_error(11))).unwrap_err();
+        assert!(refused.starts_with("could not write the scratch file:"), "{refused}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the snippet is there"
+        );
+        let file = dir.reserve_view("Bash: ls");
+        let rx = spawn_view_write(file, "text".into(), |job| {
+            job();
+            Ok(())
+        })
+        .unwrap();
+        assert!(rx.recv().unwrap().is_ok());
+        dir.cleanup();
+    }
+
+    /// A press made while as many views as the panel allows are still being written is refused with a line
+    /// saying to try again, and queues nothing.
+    #[test]
+    fn a_view_pressed_with_the_writes_all_busy_is_refused() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        let mut senders = Vec::new();
+        for i in 0..MAX_VIEW_JOBS {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            handle.state.borrow_mut().view_jobs.push(PendingView {
+                request_id: format!("busy{i}"),
+                view: ViewId::BASE,
+                rx,
+            });
+        }
+        handle.page_message(ViewId::BASE, &view_message("one-too-many", "Bash: ls", "text"));
+        let refused = result_for(&page.sent.borrow(), "one-too-many").expect("answered at once");
+        assert_eq!(
+            refused,
+            Err("views are still being written; try again in a moment".to_string())
+        );
+        assert_eq!(handle.state.borrow().view_jobs.len(), MAX_VIEW_JOBS);
+        handle.state.borrow_mut().view_jobs.clear();
+        assert!(asked.borrow().is_empty());
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
+    /// A view still being written for a page that went idle is dropped with it: the editor is not raised for
+    /// a page nobody sees.
+    #[test]
+    fn a_view_still_being_written_is_dropped_when_its_page_goes_idle() {
+        let (handle, base, second) = handle_with_two_pages();
+        let asked = Rc::new(RefCell::new(0usize));
+        handle.on_editor_request({
+            let asked = asked.clone();
+            move |_request| {
+                *asked.borrow_mut() += 1;
+                Ok(())
+            }
+        });
+        let mut senders = Vec::new();
+        for (page_view, id) in [(view(2), "v-2"), (ViewId::BASE, "v-base")] {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            handle.state.borrow_mut().view_jobs.push(PendingView {
+                request_id: id.into(),
+                view: page_view,
+                rx,
+            });
+        }
+        handle.idle_page(view(2));
+        let left: Vec<String> = handle
+            .state
+            .borrow()
+            .view_jobs
+            .iter()
+            .map(|job| job.request_id.clone())
+            .collect();
+        assert_eq!(left, vec!["v-base".to_string()], "only the idle page's view goes");
+        clear(&[&base, &second]);
+        handle.tick();
+        assert_eq!(*asked.borrow(), 0);
+        assert_eq!(
+            result_for(&second.sent.borrow(), "v-2"),
+            None,
+            "the idle page is answered nothing"
+        );
+        handle.state.borrow_mut().view_jobs.clear();
     }
 
     /// `review.enabled` and `review.hint` reach the panel's state: enabled installs a review and the hint

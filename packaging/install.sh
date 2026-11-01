@@ -108,7 +108,7 @@ NV_NODE_DIST_BASE=https://nodejs.org/dist
 # Where a sidecar update takes the protoc that grpc-tools' install script would otherwise fetch with
 # no hash. Fixed in production; test mode replaces it (grpc_dist_base), as it does Node's.
 NV_GRPC_DIST_BASE=https://node-precompiled-binaries.grpc.io
-NV_SIDECAR_BUILD_MIN_KIB=614400
+NV_SIDECAR_BUILD_MIN_KIB=1468006
 NV_SIDECAR_UPDATE_MIN_KIB=1258291
 # The nvim offer. Never Eitri's own release server -- this is neovim's own GitHub
 # releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
@@ -1404,11 +1404,12 @@ check_free_space() {
 	fi
 }
 
-# check_sidecar_build_space DIR: about 600 MiB free before starting (npm ci's
-# node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB, all in
-# DIR's filesystem).
+# check_sidecar_build_space DIR: about 1.4 GiB free before starting. Three first builds, each in a private
+# home, peaked at 1.2 to 1.25 GiB in the work directory and at 1.3 GiB once the 106 MiB artifact was copied
+# out while the work directory still stood. A sidecar update, which runs npm ci without install scripts,
+# measured 1.15 GiB (NV_SIDECAR_UPDATE_MIN_KIB).
 check_sidecar_build_space() {
-	check_free_space "$1" "$NV_SIDECAR_BUILD_MIN_KIB" "building the sidecar needs about 600 MiB (npm ci's node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB)"
+	check_free_space "$1" "$NV_SIDECAR_BUILD_MIN_KIB" "building the sidecar needs about 1.4 GiB (a measured first build peaked near 1.3 GiB)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4371,8 +4372,9 @@ commit_files() {
 		die "cannot write $NV_DATA/licenses/eitri/.installed-version; $_cf_fin"
 }
 
-# install_complete sets NV_COMPLETE when the launcher marker, desktop entry, three licence
-# files and version stamp are present for NV_VERSION. Up-to-date checks need it as well as
+# install_complete sets NV_COMPLETE when the launcher marker, desktop entry, the licence
+# files (licence_files: LICENSE, THIRD-PARTY-LICENSES, SOURCE and, after 0.3.0, NOTICE) and version
+# stamp are present for NV_VERSION. Up-to-date checks need it as well as
 # the sidecar so a rerun repairs an interrupted post-swap commit. Existence alone cannot
 # distinguish files from an older complete install, especially the release-specific SOURCE.
 install_complete() {
