@@ -1,4 +1,28 @@
 {
+  "commandQueue": {
+    "enterSteers": true,
+    "error": null,
+    "items": [
+      {
+        "queuedAt": 20,
+        "steered": true,
+        "text": "look at the lexer too"
+      },
+      {
+        "queuedAt": 21,
+        "steered": false,
+        "text": "/compact"
+      },
+      {
+        "queuedAt": 22,
+        "steered": true,
+        "text": "then commit"
+      }
+    ],
+    "kind": "queue",
+    "note": "commands run when the turn ends",
+    "tab": 1
+  },
   "events": {
     "events": [
       {

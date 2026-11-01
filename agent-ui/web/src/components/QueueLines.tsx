@@ -8,8 +8,9 @@ function firstLine(text: string): string {
 
 /** The lines above the box, oldest first (Claude Code lists queued messages "above the input box", "in
  *  gray"): `↪` for a message sent into the running turn that the agent has not read yet (it leaves when
- *  its row appears in the conversation), `⧗` for one held until the turn ends. `note` says once,
- *  quietly, why messages are held rather than in the turn; a refused flush says why and how to retry. */
+ *  its row appears in the conversation), `⧗` for one held until the turn ends, a command among them while
+ *  the messages around it go into the turn. `note` says once, quietly, why what is held is held; a refused
+ *  flush says why and how to retry. */
 export function QueueLines({ items, error, note = null }: { items: QueueItem[]; error: string | null; note?: string | null }) {
   if (items.length === 0 && error === null) return null;
   const held = items.some((item) => item.steered !== true);

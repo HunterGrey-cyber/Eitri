@@ -130,7 +130,7 @@ import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import type { SlashAction } from "./slashCommands";
-import { barePickerCommand, completionSource } from "./slashCommands";
+import { barePickerCommand, completionSource, settingCommand } from "./slashCommands";
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
@@ -301,7 +301,15 @@ type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: str
  *  change, with what the words about it need from the moment it was made. */
 type SettingsRequest =
   | { what: "list"; tab: TabId; kind: SlashPickerKind }
+  | { what: "typed-effort"; tab: TabId; level: string; text: string }
   | { what: "change"; tab: TabId; kind: SlashPickerKind; chosen: string; running: { model: string | null } | null };
+
+/** What answers a `SettingsRequest`. */
+type SettingsAnswer =
+  | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings }
+  | { kind: "settings_result"; applied: AppliedSettings }
+  | { kind: "command_result"; ok: true }
+  | { kind: "command_result"; ok: false; error: string };
 
 /** Envelopes that move the keys, or put something over the conversation, with no keydown this panel
  *  sees: each drops a waiting `a`/`d`/`D` (the typing guard's cancel list -- `pane_focus`, an arrival,
@@ -3660,14 +3668,11 @@ export default function App() {
   }
 
   /** The answer to a request of the direct route. One for a tab no longer shown opens and says nothing. */
-  function answerSettings(
-    request: SettingsRequest,
-    payload:
-      | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings }
-      | { kind: "settings_result"; applied: AppliedSettings }
-      | { kind: "command_result"; ok: true }
-      | { kind: "command_result"; ok: false; error: string },
-  ) {
+  function answerSettings(request: SettingsRequest, payload: SettingsAnswer) {
+    if (request.what === "typed-effort") {
+      answerTypedEffort(request, payload);
+      return;
+    }
     if (request.tab !== activeTabRef.current) return;
     if (payload.kind === "command_result") {
       if (!payload.ok) showFlash(revealedText(payload.error));
@@ -3683,6 +3688,46 @@ export default function App() {
       return;
     }
     setSlashReply({ kind: request.kind, ...picker, direct: true });
+  }
+
+  /** The list a typed `/effort <level>` asked for. A level the session offers changes now. Any other, and a list
+   *  that did not answer, leave it what any command typed during a turn is: queued, and the CLI answers at the
+   *  turn's end, since the session takes an unknown level with no word and runs on. */
+  function answerTypedEffort(request: Extract<SettingsRequest, { what: "typed-effort" }>, payload: SettingsAnswer) {
+    const picker = payload.kind === "models_result" ? effortPicker(payload.models, payload.applied) : null;
+    if (picker?.options.includes(request.level)) {
+      changeSetting(request.tab, "effort", request.level, picker.labels?.[request.level] ?? request.level);
+    } else {
+      queueInto(request.tab, request.text);
+    }
+  }
+
+  /** Changes the session's model or effort directly; `settings_result` says in the band when it took effect. */
+  function changeSetting(tab: TabId, kind: SlashPickerKind, value: string, chosen: string) {
+    const requestId = nextRequestId();
+    const running = stateRef.current.activeTurnId !== null ? { model: stateRef.current.model } : null;
+    settingsRequests.current.set(requestId, { what: "change", tab, kind, chosen, running });
+    postToRust(kind === "model"
+      ? { type: "set_model", request_id: requestId, tab, model: value }
+      : { type: "apply_effort", request_id: requestId, tab, effort: value === EFFORT_FROM_SETTINGS ? "" : value });
+  }
+
+  /** A typed `/model <name>` or `/effort <level>` during a turn runs at once and is never held, as Claude Code runs
+   *  them: the direct route takes it, and the turn goes on. Whether it did; with no direct route, or between turns, it
+   *  is what any message is. */
+  function settingRunsNow(text: string): boolean {
+    const setting = settingCommand(text);
+    const tab = activeTabRef.current;
+    if (setting === null || tab === null || !picksDirectly() || stateRef.current.activeTurnId === null) return false;
+    postToRust({ type: "history_push", request_id: nextRequestId(), text });
+    if (setting.kind === "model") {
+      changeSetting(tab, "model", setting.value, setting.value);
+    } else {
+      const requestId = nextRequestId();
+      settingsRequests.current.set(requestId, { what: "typed-effort", tab, level: setting.value, text });
+      postToRust({ type: "list_models", request_id: requestId, tab });
+    }
+    return true;
   }
 
   /** A click on the band's model or effort, and their keys. With the direct route the picker opens from the session's
@@ -3714,12 +3759,7 @@ export default function App() {
     setSlashPicker(null);
     const tab = activeTabRef.current;
     if (direct && tab !== null) {
-      const requestId = nextRequestId();
-      const running = stateRef.current.activeTurnId !== null ? { model: stateRef.current.model } : null;
-      settingsRequests.current.set(requestId, { what: "change", tab, kind, chosen: labels?.[value] ?? value, running });
-      postToRust(kind === "model"
-        ? { type: "set_model", request_id: requestId, tab, model: value }
-        : { type: "apply_effort", request_id: requestId, tab, effort: value === EFFORT_FROM_SETTINGS ? "" : value });
+      changeSetting(tab, kind, value, labels?.[value] ?? value);
     } else {
       sendMessage(`${command} ${value}`, { fromPicker: true });
     }
@@ -3759,8 +3799,13 @@ export default function App() {
       askForPicker(bare);
       return;
     }
+    if (settingRunsNow(text)) return;
     const tab = activeTabRef.current;
     if (tab === null) return;
+    queueInto(tab, text);
+  }
+
+  function queueInto(tab: TabId, text: string) {
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
@@ -6725,6 +6770,7 @@ export default function App() {
             askForPicker(bare);
             return;
           }
+          if (settingRunsNow(t)) return;
           post({ type: "send_now", text: t });
           resumeFollowing(containerRef.current?.querySelector(".message-list"));
         }}

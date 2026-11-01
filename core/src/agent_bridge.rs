@@ -5618,12 +5618,32 @@ mod tests {
             Some("held until the turn ends: the turn ended before Codex read it"),
             Some(true),
         );
+        let steered_at = |text: &str, wire: &str, at: u64| {
+            let mut item = Queued::held(text, wire.into(), at);
+            item.state = QueuedState::Steered {
+                client_id: format!("eitri-1-{at}"),
+                sent_at_ms: at,
+            };
+            item
+        };
+        let commands_queue = serialize_queue_for_js(
+            TabId(1),
+            &[
+                steered_at("look at the lexer too", "ctx\n\nlook at the lexer too", 20),
+                Queued::held("/compact", "/compact".into(), 21),
+                steered_at("then commit", "ctx\n\nthen commit", 22),
+            ],
+            None,
+            Some("commands run when the turn ends"),
+            Some(true),
+        );
         let fixture = json!({
             "writtenBy": "core/src/agent_bridge.rs, tests::the_steered_messages_fixture_is_what_the_serializer_sends \
                           -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
             "events": serde_json::from_str::<Value>(&events_payload).unwrap(),
             "snapshot": serde_json::from_str::<Value>(&snapshot_payload).unwrap(),
             "queue": serde_json::from_str::<Value>(&running_queue).unwrap(),
+            "commandQueue": serde_json::from_str::<Value>(&commands_queue).unwrap(),
         });
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures/steered-messages.json");

@@ -164,10 +164,7 @@ pub(super) fn queue_shown(
     state: &AgentPanelState,
     tab: TabId,
 ) -> Option<(Vec<eitri_core::tab_set::Queued>, Option<String>)> {
-    state
-        .tabs
-        .get(tab)
-        .map(|t| (t.session.queue.clone(), t.session.queue_note.clone()))
+    state.tabs.get(tab).map(|t| (t.session.queue.clone(), t.queue_line()))
 }
 
 /// The queue of a tab on screen, after anything changed it, to the ready page that shows it.
@@ -180,7 +177,7 @@ pub(super) fn send_queue(state: &AgentPanelState, tab: TabId, out: &mut Outbox) 
             tab,
             &t.session.queue,
             t.session.queue_error.as_deref(),
-            t.session.queue_note.as_deref(),
+            t.queue_line().as_deref(),
             t.steers(),
         ),
     );

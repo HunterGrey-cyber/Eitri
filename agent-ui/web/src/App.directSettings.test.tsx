@@ -169,6 +169,86 @@ describe("the picker, on a session that changes directly", () => {
     }
   });
 
+  function typeIn(container: HTMLElement, text: string, key: Record<string, unknown> = { key: "Enter" }) {
+    fireEvent.keyDown(root(container), { key: "i" });
+    const box = container.querySelector("textarea")!;
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.keyDown(box, key);
+  }
+
+  it("a typed /model <name> during a turn changes it at once, queues nothing, and the band says when it applies", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/model sonnet");
+    expect(last("set_model").model).toBe("sonnet");
+    expect(ofType("queue_message")).toEqual([]);
+    expect(ofType("send_message")).toEqual([]);
+    expect(ofType("history_push").map((m) => m.text)).toEqual(["/model sonnet"]);
+    expect(container.querySelector("textarea")!.value).toBe("");
+  });
+
+  it("Ctrl+Enter on /model <name> changes it too, and the turn goes on", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/model sonnet", { key: "Enter", ctrlKey: true });
+    expect(last("set_model").model).toBe("sonnet");
+    expect(ofType("send_now")).toEqual([]);
+  });
+
+  it("between turns /model <name> stays a message", () => {
+    const { container } = live({ activeTurnId: null });
+    typeIn(container, "/model sonnet");
+    expect(ofType("set_model")).toEqual([]);
+    expect(ofType("send_message").map((m) => m.text)).toEqual(["/model sonnet"]);
+  });
+
+  it("a typed /effort <level> during a turn checks the session's list and changes it at once", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/effort low");
+    expect(ofType("queue_message")).toEqual([]);
+    answerList();
+    expect(last("apply_effort").effort).toBe("low");
+    expect(ofType("queue_message")).toEqual([]);
+  });
+
+  it("/effort auto is the settings row", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/effort auto");
+    answerList();
+    expect(last("apply_effort").effort).toBe("");
+  });
+
+  it("a level the session does not offer is queued, for the CLI to answer at the turn's end", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/effort lowest");
+    answerList();
+    expect(ofType("apply_effort")).toEqual([]);
+    expect(ofType("queue_message").map((m) => m.text)).toEqual(["/effort lowest"]);
+  });
+
+  it("a list that does not answer leaves a typed level queued", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/effort low");
+    dispatch({ kind: "command_result", requestId: last("list_models").request_id, ok: false, error: "no" });
+    expect(ofType("queue_message").map((m) => m.text)).toEqual(["/effort low"]);
+  });
+
+  it("with no direct route, and on another agent's tab, a typed setting is queued as before", () => {
+    for (const [direct, agent] of [[false, undefined], [true, "codex"]] as const) {
+      posted.length = 0;
+      const { container, unmount } = live({ activeTurnId: "t1" }, direct, agent);
+      typeIn(container, "/model sonnet");
+      expect(ofType("set_model")).toEqual([]);
+      expect(ofType("queue_message").map((m) => m.text)).toEqual(["/model sonnet"]);
+      unmount();
+    }
+  });
+
+  it("a command with more than one word after it is queued", () => {
+    const { container } = live({ activeTurnId: "t1" });
+    typeIn(container, "/model sonnet please");
+    expect(ofType("set_model")).toEqual([]);
+    expect(ofType("queue_message").map((m) => m.text)).toEqual(["/model sonnet please"]);
+  });
+
   it("Ctrl+Enter on a bare /model opens it too, and the turn goes on", () => {
     const { container } = live({ activeTurnId: "t1" });
     fireEvent.keyDown(root(container), { key: "i" });

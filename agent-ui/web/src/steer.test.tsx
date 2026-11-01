@@ -78,6 +78,18 @@ describe("the lines above the box", () => {
     );
   });
 
+  it("a held command keeps its place among the messages going into the turn, with the words once", () => {
+    const commands = fixture.commandQueue as { items: QueueItem[]; error: string | null; note: string | null };
+    const { container } = render(<QueueLines items={commands.items} error={commands.error} note={commands.note} />);
+    expect([...container.querySelectorAll(".queue-line")].map((l) => l.textContent)).toEqual([
+      "↪ look at the lexer too",
+      "⧗ /compact",
+      "↪ then commit",
+    ]);
+    expect(container.querySelector(".queue-note")!.textContent).toBe("commands run when the turn ends");
+    expect(heldCount(commands.items)).toBe(1);
+  });
+
   it("says no reason when nothing is held", () => {
     const steered = queue.items.filter((i) => i.steered === true);
     const { container } = render(<QueueLines items={steered} error={null} note="held until the turn ends: x" />);

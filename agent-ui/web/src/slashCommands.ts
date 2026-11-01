@@ -134,6 +134,13 @@ export function barePickerCommand(text: string): "model" | "effort" | null {
   return parsed.name === "model" || parsed.name === "effort" ? parsed.name : null;
 }
 
+/** A typed `/model <name>` or `/effort <level>`, one word after the command: a setting the session can change
+ *  with no turn, which `App.tsx` does during a turn, as Claude Code runs these at once. Anything else is `null`. */
+export function settingCommand(text: string): { kind: "model" | "effort"; value: string } | null {
+  const match = /^\s*\/(model|effort)\s+(\S+)\s*$/.exec(text);
+  return match === null ? null : { kind: match[1] as "model" | "effort", value: match[2] };
+}
+
 /** What the band flashes: "`/<name> does not work in Eitri — ? lists the ones that do`", pointing
  *  at the overlay that answers the next question. */
 export function slashCommandFlashText(name: string): string {

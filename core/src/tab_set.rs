@@ -205,6 +205,12 @@ impl Queued {
     pub fn is_held(&self) -> bool {
         self.state == QueuedState::Held
     }
+
+    /// Whether this item runs as a command of its agent: never in a running turn, and a turn of its own. A
+    /// review is the panel's text, whatever it starts with.
+    fn is_command(&self, reads_commands: bool) -> bool {
+        reads_commands && self.steerable && is_slash_command(&self.text)
+    }
 }
 
 /// Where a typed message is: waiting for the turn to end, or sent into the running turn and not yet
@@ -876,7 +882,12 @@ impl Tab {
         };
         let projection = backend.projection();
         let opening_changed = settle_opening(&mut self.session.opening_prompt, &mut self.session.queue, &projection);
-        settle_against(&mut self.session.queue, &mut self.session.queue_note, &projection) || opening_changed
+        settle_against(
+            &self.agent,
+            &mut self.session.queue,
+            &mut self.session.queue_note,
+            &projection,
+        ) || opening_changed
     }
 
     /// The tab's session is being taken away (a tripwire, a fatal outcome, a session that never opened, the
@@ -893,6 +904,31 @@ impl Tab {
         }
         self.session.queue_note = Some(held_note("the session was closed before the agent read it"));
         true
+    }
+
+    /// Whether this tab's agent reads a message starting with `/` as a command of its own. Before the session
+    /// is live only Claude is known to.
+    fn reads_commands(&self) -> bool {
+        match self.live() {
+            Some(backend) => reads_slash_commands(&self.agent, &backend.projection()),
+            None => matches!(self.agent, AgentId::Claude),
+        }
+    }
+
+    /// The line under the queue: why what stays there stays. A command held says so itself, for as long as one
+    /// is, beside what the tab recorded about its messages.
+    pub fn queue_line(&self) -> Option<String> {
+        let reads_commands = self.reads_commands();
+        let commands = self
+            .session
+            .queue
+            .iter()
+            .any(|item| item.is_held() && !item.refused && item.is_command(reads_commands))
+            .then_some(COMMANDS_NOTE);
+        match (commands, self.session.queue_note.as_deref()) {
+            (Some(commands), Some(note)) => Some(format!("{commands}; {note}")),
+            (commands, note) => commands.or(note).map(str::to_string),
+        }
     }
 
     /// Whether Enter while a turn runs puts the message into it: the live session's agent can take one now.
@@ -1088,6 +1124,9 @@ pub enum FailedHow {
     StartNeverOpened,
 }
 
+/// What the queue says while a command in it waits.
+const COMMANDS_NOTE: &str = "commands run when the turn ends";
+
 /// The line under the queue that says why its messages wait for the turn to end.
 fn held_note(why: &str) -> String {
     format!("held until the turn ends: {why}")
@@ -1101,10 +1140,12 @@ fn refused_note(reason: &str) -> String {
 /// [`Tab::settle_steered`] against a projection the caller already reads, so whatever else it decides
 /// from the same read (whether a turn runs) is consistent with what the agent reported.
 fn settle_against(
+    agent: &AgentId,
     queue: &mut Vec<Queued>,
     note: &mut Option<String>,
     projection: &agent::AgentSessionProjection,
 ) -> bool {
+    let reads_commands = reads_slash_commands(agent, projection);
     let mut changed = false;
     let mut dropped = None;
     queue.retain_mut(|item| {
@@ -1154,7 +1195,13 @@ fn settle_against(
     });
     if let Some(text) = dropped {
         *note = Some(text);
-    } else if changed && !queue.iter().any(Queued::is_held) {
+    } else if changed
+        && !queue
+            .iter()
+            .any(|item| item.is_held() && (item.refused || !item.is_command(reads_commands)))
+    {
+        // A held command says so itself (`Tab::queue_line`); this note is about messages, and about what the
+        // CLI refused, which stays until it is taken back whatever it starts with.
         *note = None;
     }
     changed
@@ -4161,7 +4208,12 @@ impl TabSet {
                         &mut tab.session.queue,
                         &view.projection,
                     );
-                    settle_against(&mut tab.session.queue, &mut tab.session.queue_note, &view.projection);
+                    settle_against(
+                        &tab.agent,
+                        &mut tab.session.queue,
+                        &mut tab.session.queue_note,
+                        &view.projection,
+                    );
                     // The clock follows the turn this very snapshot names: one that started since
                     // the last tick is stamped now, as that tick would have, and a clock left from
                     // the turn before it is never sent with this one's id (the panel trusts it as
@@ -4197,7 +4249,7 @@ impl TabSet {
             tab.id,
             &tab.session.queue,
             tab.session.queue_error.as_deref(),
-            tab.session.queue_note.as_deref(),
+            tab.queue_line().as_deref(),
             tab.steers(),
         ));
         payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
@@ -4448,12 +4500,13 @@ impl TabSet {
     /// typed in a turn that has ended since waits for the next end. The first refusal stops the rest, so a
     /// later message never reaches the agent before an earlier one (the provider keeps that order for the
     /// refusals it learns of later), and the held ones wait for the turn's end with the reason under them.
-    /// A message that may not be steered (a confirmed review, or a slash command on an agent that reads
-    /// commands: `reads_slash_commands`) stops them too, for the same order, and so does a message the
-    /// provider reported dropped once (`Queued::dropped_as`): the agent may still read that copy. A card
-    /// waiting does not stop it: the agent reads the message once that call is answered, sooner than the
-    /// turn's end, and the card keeps its own keys. A message the CLI refused (`Queued::refused`) is
-    /// stepped over: it never goes out on its own, so it holds nothing back. Whether the queue changed.
+    /// A confirmed review stops them too, for the same order, and so does a message the provider reported
+    /// dropped once (`Queued::dropped_as`): the agent may still read that copy. A card waiting does not stop
+    /// it: the agent reads the message once that call is answered, sooner than the turn's end, and the card
+    /// keeps its own keys. A command on an agent that reads commands (`reads_slash_commands`) is stepped over:
+    /// only the command waits, in its place, and the messages behind it go in, as Claude Code does with what
+    /// is typed during a turn. A message the CLI refused (`Queued::refused`) is stepped over too: it never
+    /// goes out on its own, so it holds nothing back. Whether the queue changed.
     pub fn steer_held(&mut self, id: TabId, now_ms: u64, shown_turn: Option<&str>) -> bool {
         if self.moving.contains(&id.0) {
             return false;
@@ -4490,9 +4543,8 @@ impl TabSet {
                 refusal = Some("a review waits for the turn's end, and what follows it waits too".to_string());
                 break;
             }
-            if reads_commands && is_slash_command(&item.text) {
-                refusal = Some("a command waits for the turn's end, and what follows it waits too".to_string());
-                break;
+            if item.is_command(reads_commands) {
+                continue;
             }
             let Some(turn) = shown_turn else {
                 refusal = Some("no turn was running when it was typed".to_string());
@@ -4535,7 +4587,8 @@ impl TabSet {
         changed
     }
 
-    /// One turn from the whole queue, only when the tab can take one.
+    /// The queue's oldest work as one turn, only when the tab can take one: a command alone, or the messages
+    /// up to the next command (`next_turn`). What stays goes out at that turn's end, in the order typed.
     ///
     /// Only held messages go out. A message sent into the turn that just ended has its outcome reported
     /// before that end, or else the agent runs it in a follow-up turn whose start arrives with that end
@@ -4582,7 +4635,12 @@ impl TabSet {
             };
             let projection = backend.projection();
             settle_opening(&mut tab.session.opening_prompt, &mut tab.session.queue, &projection);
-            settle_against(&mut tab.session.queue, &mut tab.session.queue_note, &projection);
+            settle_against(
+                &tab.agent,
+                &mut tab.session.queue,
+                &mut tab.session.queue_note,
+                &projection,
+            );
             if projection.active_turn_id.is_some()
                 || !projection.pending_permissions.is_empty()
                 || projection.waiting_questions().next().is_some()
@@ -4618,31 +4676,13 @@ impl TabSet {
                         item.state = QueuedState::Held;
                     }
                 }
-                let wire = tab
-                    .session
-                    .queue
-                    .iter()
-                    .filter(|q| !q.refused)
-                    .map(|q| q.wire.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                let typed = tab
-                    .session
-                    .queue
-                    .iter()
-                    .filter(|q| !q.refused)
-                    .map(|q| q.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let turn = next_turn(&tab.session.queue, tab.reads_commands());
+                let items = || turn.iter().map(|index| &tab.session.queue[*index]);
+                let wire = items().map(|q| q.wire.as_str()).collect::<Vec<_>>().join("\n\n");
+                let typed = items().map(|q| q.text.as_str()).collect::<Vec<_>>().join("\n\n");
+                let origin = prompt_origin(items().all(|item| item.typed_by_person));
                 let trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
-                let origin = prompt_origin(
-                    tab.session
-                        .queue
-                        .iter()
-                        .filter(|item| !item.refused)
-                        .all(|item| item.typed_by_person),
-                );
                 let outcome =
                     tab.live_mut()
                         .expect("checked above")
@@ -4656,10 +4696,16 @@ impl TabSet {
                             typed_by_person: message.typed_by_person,
                             message,
                         });
-                        tab.session.queue.retain(|item| item.refused);
+                        for index in turn.iter().rev() {
+                            tab.session.queue.remove(*index);
+                        }
                         tab.session.queue_error = None;
-                        tab.session.queue_note =
-                            tab.session.queue.first().map(|_| refused_note(agent::CLI_REFUSED_DROP));
+                        tab.session.queue_note = tab
+                            .session
+                            .queue
+                            .iter()
+                            .any(|item| item.refused)
+                            .then(|| refused_note(agent::CLI_REFUSED_DROP));
                         tab.session.turn_trace = trace;
                     }
                     Err(error) => tab.session.queue_error = Some(error.message.clone()),
@@ -6289,7 +6335,7 @@ fn observe_turn_clock(
 /// Whether the tab's agent reads a message starting with `/` as a command of its own: Claude always, and
 /// any agent that listed its commands (an ACP agent's `available_commands_update`). Such a message is never
 /// put into a running turn, where it would arrive as text; it waits for the turn's end and goes out as a
-/// turn of its own, as Claude Code runs a command typed while it works. Codex lists none, and takes a
+/// turn of its own, as Claude Code runs a command typed while it works (`next_turn`). Codex lists none, and takes a
 /// message into its turn as typed.
 fn reads_slash_commands(agent: &AgentId, projection: &agent::AgentSessionProjection) -> bool {
     matches!(agent, AgentId::Claude)
@@ -6297,6 +6343,23 @@ fn reads_slash_commands(agent: &AgentId, projection: &agent::AgentSessionProject
             .available_commands
             .as_ref()
             .is_some_and(|list| !list.is_empty())
+}
+
+/// Where in the queue the next turn comes from: the first item the CLI did not refuse when it is a command, or
+/// else every message up to the next command. So what waits goes out in the order typed, and a command is never
+/// read with a message for its arguments. Ascending.
+fn next_turn(queue: &[Queued], reads_commands: bool) -> Vec<usize> {
+    let mut turn = Vec::new();
+    for (index, item) in queue.iter().enumerate().filter(|(_, item)| !item.refused) {
+        if item.is_command(reads_commands) {
+            if turn.is_empty() {
+                turn.push(index);
+            }
+            break;
+        }
+        turn.push(index);
+    }
+    turn
 }
 
 /// Whether typed text is a slash command: it starts with `/`, after any leading blanks (the page's `/`
@@ -16819,7 +16882,7 @@ mod steer_tests {
     }
 
     fn note(set: &TabSet, tab: TabId) -> Option<String> {
-        set.get(tab).unwrap().session.queue_note.clone()
+        set.get(tab).unwrap().queue_line()
     }
 
     fn prompts(set: &TabSet, tab: TabId) -> Vec<String> {
@@ -17132,7 +17195,7 @@ mod steer_tests {
         projection.apply(&delivered("old"));
         let mut queue = vec![steered.clone()];
         let mut note = None;
-        assert!(!settle_against(&mut queue, &mut note, &projection));
+        assert!(!settle_against(&AgentId::Codex, &mut queue, &mut note, &projection));
         assert_eq!(queue, [steered.clone()], "the newer copy is still open");
 
         let mut dropped = projection.clone();
@@ -17140,33 +17203,25 @@ mod steer_tests {
             client_message_id: "new".into(),
             reason: "Claude discarded it".into(),
         });
-        assert!(settle_against(&mut queue, &mut note, &dropped));
+        assert!(settle_against(&AgentId::Codex, &mut queue, &mut note, &dropped));
         assert!(queue.is_empty(), "the copy the agent read is enough");
         assert_eq!(note, None, "not held again");
 
         let mut ended = projection.clone();
         ended.apply(&turn_completed("turn-2", agent::TurnOutcome::Completed));
         let mut queue = vec![steered.clone()];
-        assert!(settle_against(&mut queue, &mut note, &ended));
+        assert!(settle_against(&AgentId::Codex, &mut queue, &mut note, &ended));
         assert!(queue.is_empty(), "no turn runs, and the agent read it");
 
         let mut read_twice = projection;
         read_twice.apply(&delivered("new"));
         let mut queue = vec![steered];
-        assert!(settle_against(&mut queue, &mut note, &read_twice));
+        assert!(settle_against(&AgentId::Codex, &mut queue, &mut note, &read_twice));
         assert!(queue.is_empty());
     }
 
-    /// A slash command typed while the turn runs waits for the turn's end on an agent that reads commands
-    /// (Claude, or one that listed its commands), and so does what follows it; on Codex, which lists none,
-    /// it goes into the turn as typed.
-    #[test]
-    fn a_slash_command_waits_for_the_turns_end_where_the_agent_reads_commands() {
-        const WAITS: &str =
-            "held until the turn ends: a command waits for the turn's end, and what follows it waits too";
-
-        // An agent that listed its commands.
-        let (dir, mut set, tab, provider) = running_codex("steer-command-listed", true);
+    /// An agent that listed its commands: the tab reads a leading `/` as one.
+    fn lists_commands(set: &mut TabSet, dir: &Path, tab: TabId, provider: &ExternalRecordingProvider) {
         provider.inner.queue(AgentDomainEvent::CommandsAvailable {
             commands: vec![agent::SlashCommand {
                 name: "compact".into(),
@@ -17175,7 +17230,7 @@ mod steer_tests {
             }],
         });
         until("the list of commands is folded", || {
-            set.pump(&dir, true);
+            set.pump(dir, true);
             set.get(tab)
                 .unwrap()
                 .live()
@@ -17184,21 +17239,74 @@ mod steer_tests {
                 .available_commands
                 .is_some()
         });
-        set.queue_message(tab, "/compact", "/compact".into(), 1, true, PromptOrigin::Typed)
+    }
+
+    fn typed(set: &mut TabSet, tab: TabId, text: &str) {
+        set.queue_message(tab, text, text.into(), 1, true, PromptOrigin::Typed)
             .unwrap();
-        set.queue_message(tab, "then this", "then this".into(), 1, true, PromptOrigin::Typed)
-            .unwrap();
-        assert!(set.steer_held(tab, 2, Some("turn-1")), "the note changed");
-        assert!(provider.steers().is_empty(), "nothing went into the turn");
+    }
+
+    /// Ends `turn`, and sends what the tab's queue sends then, as the tick does.
+    fn turn_ends_and_flushes(
+        set: &mut TabSet,
+        dir: &Path,
+        tab: TabId,
+        provider: &ExternalRecordingProvider,
+        turn: &str,
+    ) {
+        provider
+            .inner
+            .queue(turn_completed(turn, agent::TurnOutcome::Completed));
+        assert_eq!(pump_until_running(set, dir, tab, false).turn_ended, [tab]);
+        set.flush_queue(tab).expect("the queue goes").outcome.unwrap();
+    }
+
+    fn turn_runs(set: &mut TabSet, dir: &Path, tab: TabId, provider: &ExternalRecordingProvider, turn: &str) {
+        provider
+            .inner
+            .queue(AgentDomainEvent::TurnStarted { turn_id: turn.into() });
+        pump_until_running(set, dir, tab, true);
+    }
+
+    /// Only the command waits: on an agent that reads commands it is never put into the turn, the message
+    /// typed behind it is, and the command stays in its place. On Codex, which lists none, `/status` goes into
+    /// the turn as typed.
+    #[test]
+    fn a_message_behind_a_command_goes_into_the_turn_and_the_command_waits_in_its_place() {
+        let (dir, mut set, tab, provider) = running_codex("steer-command-listed", true);
+        lists_commands(&mut set, &dir, tab, &provider);
+        typed(&mut set, tab, "/compact");
+        typed(&mut set, tab, "then this");
+        assert!(set.steer_held(tab, 2, Some("turn-1")), "the message went in");
+        let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(texts, ["then this"], "the command is not sent as text");
         assert_eq!(
             queue(&set, tab),
-            [("/compact".to_string(), false), ("then this".to_string(), false)]
+            [("/compact".to_string(), false), ("then this".to_string(), true)]
         );
-        assert_eq!(note(&set, tab).as_deref(), Some(WAITS));
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
+        assert_eq!(
+            set.get(tab).unwrap().session.queue_note,
+            None,
+            "the note is the held command's, and goes with it"
+        );
+
+        // The agent reads the message out of order with the queue; the command stays, and says why.
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id,
+            turn_id: "turn-1".into(),
+            text: "then this".into(),
+        });
+        until("the message leaves the queue", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().session.queue.len() == 1
+        });
+        assert_eq!(queue(&set, tab), [("/compact".to_string(), false)]);
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
         shut_down(&mut set);
 
-        // Claude reads commands whatever it listed (its tabs cannot steer yet, so this is the rule alone);
-        // an ACP agent that withdrew its list (an empty one) reads none.
+        // Claude reads commands whatever it listed; an ACP agent that withdrew its list (an empty one) reads none.
         let mut none_listed = agent::AgentSessionProjection::default();
         assert!(reads_slash_commands(&AgentId::Claude, &none_listed));
         assert!(!reads_slash_commands(&AgentId::Codex, &none_listed));
@@ -17213,6 +17321,174 @@ mod steer_tests {
         assert_eq!(note(&set, tab), None);
         shut_down(&mut set);
         assert!(is_slash_command("/x") && is_slash_command("  /x") && !is_slash_command("a/b"));
+    }
+
+    /// A command does not stop what comes after it, and a message does not stop a command behind it; the
+    /// messages reach the agent in the order typed.
+    #[test]
+    fn messages_around_commands_go_into_the_turn_in_order_and_the_commands_stay() {
+        let (dir, mut set, tab, provider) = running_codex("steer-around-commands", true);
+        lists_commands(&mut set, &dir, tab, &provider);
+        for text in ["one", "/a", "two", "/b", "three"] {
+            typed(&mut set, tab, text);
+        }
+        set.steer_held(tab, 2, Some("turn-1"));
+        let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(texts, ["one", "two", "three"]);
+        assert_eq!(
+            queue(&set, tab),
+            [
+                ("one".to_string(), true),
+                ("/a".to_string(), false),
+                ("two".to_string(), true),
+                ("/b".to_string(), false),
+                ("three".to_string(), true),
+            ]
+        );
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
+        shut_down(&mut set);
+    }
+
+    /// The other stops still stop: what follows them waits, and the line says both things.
+    #[test]
+    fn a_refusal_behind_a_command_holds_what_follows_it_and_says_both() {
+        let (dir, mut set, tab, provider) = running_codex("steer-command-refused", true);
+        lists_commands(&mut set, &dir, tab, &provider);
+        provider.refuse_steers(Some(ProviderErrorCode::NoActiveTurn));
+        typed(&mut set, tab, "/compact");
+        typed(&mut set, tab, "then this");
+        typed(&mut set, tab, "and this");
+        set.steer_held(tab, 2, Some("turn-1"));
+        assert!(provider.steers().is_empty());
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("commands run when the turn ends; held until the turn ends: the scripted agent took no message")
+        );
+
+        // The refused message is steered at the next Enter, and only the command's words stay.
+        provider.refuse_steers(None);
+        set.steer_held(tab, 3, Some("turn-1"));
+        let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(texts, ["then this", "and this"]);
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
+        shut_down(&mut set);
+    }
+
+    /// A message dropped beside a held command: the line keeps both, and loses the drop's reason once the
+    /// message has left, while the command still waits.
+    #[test]
+    fn a_dropped_message_leaves_the_commands_words_and_goes_on_its_own() {
+        let (dir, mut set, tab, provider) = running_codex("steer-command-dropped", true);
+        lists_commands(&mut set, &dir, tab, &provider);
+        typed(&mut set, tab, "/compact");
+        typed(&mut set, tab, "then this");
+        set.steer_held(tab, 2, Some("turn-1"));
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue(AgentDomainEvent::UserMessageDropped {
+            client_message_id: id.clone(),
+            reason: "gave up waiting".into(),
+        });
+        until("the message is held again", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().session.queue.iter().all(Queued::is_held)
+        });
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("commands run when the turn ends; held until the turn ends: gave up waiting")
+        );
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id,
+            turn_id: "turn-1".into(),
+            text: "then this".into(),
+        });
+        until("the late delivery takes it out", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().session.queue.len() == 1
+        });
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
+        shut_down(&mut set);
+    }
+
+    /// A command the CLI refused stays until it is taken back, and the line goes on saying so after the message
+    /// behind it has left: it is not a held command, which would run at the turn's end.
+    #[test]
+    fn a_refused_command_keeps_its_words_when_the_message_behind_it_leaves() {
+        let (dir, mut set, tab, provider) = running_codex("steer-refused-command", true);
+        lists_commands(&mut set, &dir, tab, &provider);
+        typed(&mut set, tab, "/unknown");
+        typed(&mut set, tab, "then this");
+        {
+            let session = &mut set.get_mut(tab).unwrap().session;
+            session.queue[0].refused = true;
+            session.queue_note = Some(refused_note(agent::CLI_REFUSED_DROP));
+        }
+        set.steer_held(tab, 2, Some("turn-1"));
+        let words = refused_note(agent::CLI_REFUSED_DROP);
+        assert_eq!(note(&set, tab).as_deref(), Some(words.as_str()));
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id,
+            turn_id: "turn-1".into(),
+            text: "then this".into(),
+        });
+        until("the message leaves the queue", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().session.queue.len() == 1
+        });
+        assert_eq!(note(&set, tab).as_deref(), Some(words.as_str()));
+        shut_down(&mut set);
+    }
+
+    /// What a turn's end finds in the queue goes out in the order typed, a command alone: read with a message
+    /// behind it, the message would be the command's arguments and never reach the agent.
+    #[test]
+    fn at_the_turns_end_a_command_goes_alone_and_what_follows_it_waits_for_its_end() {
+        let (dir, mut set, tab, provider) = running_codex("flush-commands", false);
+        lists_commands(&mut set, &dir, tab, &provider);
+        for text in ["one", "two", "/a", "/b", "three", "four"] {
+            typed(&mut set, tab, text);
+        }
+        set.steer_held(tab, 2, Some("turn-1"));
+        assert_eq!(
+            note(&set, tab).as_deref(),
+            Some("commands run when the turn ends; held until the turn ends: Codex cannot take messages mid-turn")
+        );
+        turn_ends_and_flushes(&mut set, &dir, tab, &provider, "turn-1");
+        assert_eq!(provider.inner.turns(), ["one\n\ntwo"]);
+        assert_eq!(note(&set, tab).as_deref(), Some(COMMANDS_NOTE));
+        turn_runs(&mut set, &dir, tab, &provider, "turn-2");
+        turn_ends_and_flushes(&mut set, &dir, tab, &provider, "turn-2");
+        assert_eq!(provider.inner.turns(), ["one\n\ntwo", "/a"]);
+        turn_runs(&mut set, &dir, tab, &provider, "turn-3");
+        turn_ends_and_flushes(&mut set, &dir, tab, &provider, "turn-3");
+        assert_eq!(provider.inner.turns(), ["one\n\ntwo", "/a", "/b"]);
+        assert_eq!(
+            queue(&set, tab),
+            [("three".to_string(), false), ("four".to_string(), false)]
+        );
+        assert_eq!(note(&set, tab), None, "no command is held any more");
+        turn_runs(&mut set, &dir, tab, &provider, "turn-4");
+        turn_ends_and_flushes(&mut set, &dir, tab, &provider, "turn-4");
+        assert_eq!(provider.inner.turns(), ["one\n\ntwo", "/a", "/b", "three\n\nfour"]);
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
+        shut_down(&mut set);
+    }
+
+    /// Codex lists no commands: the whole queue is one turn, as typed. A message the CLI refused stays put, and
+    /// a review is a message whatever it starts with.
+    #[test]
+    fn next_turn_splits_only_at_a_command_the_agent_reads() {
+        let item = |text: &str| Queued::held(text, text.into(), 1);
+        let mut refused = item("/refused");
+        refused.refused = true;
+        let mut review = item("/a review");
+        review.steerable = false;
+        let queue = [refused, item("one"), review, item("/a"), item("two")];
+        assert_eq!(next_turn(&queue, false), [1, 2, 3, 4]);
+        assert_eq!(next_turn(&queue, true), [1, 2]);
+        assert_eq!(next_turn(&queue[3..], true), [0]);
+        assert_eq!(next_turn(&queue[4..], true), [0]);
+        assert!(next_turn(&queue[..1], true).is_empty());
     }
 
     #[test]

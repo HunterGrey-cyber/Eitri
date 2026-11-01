@@ -12,6 +12,7 @@ import {
   MAX_COMPLETION_NAME,
   MAX_COMPLETION_TEXT,
   menuToken,
+  settingCommand,
   startsMatch,
   SLASH_MENU_ROWS,
   slashMenuWindow,
@@ -199,6 +200,19 @@ describe("barePickerCommand", () => {
   });
 });
 
+
+describe("settingCommand", () => {
+  it("names a setting with one word after it", () => {
+    expect(settingCommand("/model sonnet")).toEqual({ kind: "model", value: "sonnet" });
+    expect(settingCommand("  /effort low  ")).toEqual({ kind: "effort", value: "low" });
+  });
+
+  it("leaves everything else a message", () => {
+    for (const text of ["/model", "/effort", "/model sonnet please", "/compact now", "/modelx sonnet", "a /model sonnet"]) {
+      expect(settingCommand(text)).toBeNull();
+    }
+  });
+});
 
 describe("the `/` menu's rows", () => {
   it("lists the commands that do something here, in the table's order, with /effort after /model", () => {
