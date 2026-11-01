@@ -1719,6 +1719,41 @@ describe("index.css cascade (which rule actually wins)", () => {
 
   /* The band's mode block and the editor's statusline mode
      section beside it look the same; only the word differs. */
+  /* With details to open, `.band-open` is a real `<button>`: it would keep the global 6px radius, and its
+     `overflow: hidden` would then cut the two left corners of the mode block, which fills it from the band's edge. */
+  it("keeps the mode block's left corners square inside the band's details button", () => {
+    const band = `<div class="status-band"><button type="button" class="band-open"><span class="band-seg band-mode" data-mode="input" data-focused="true">INPUT</span></button></div>`;
+    expect(winningDeclaration(band, ".band-open", "overflow")).toBe("hidden");
+    expect(winningDeclaration(band, ".band-open", "border-radius")).toMatch(/^0(px)?$/);
+    // The same button outside the band keeps the global radius, so the check reads the real cascade.
+    expect(winningDeclaration(`<button type="button" class="band-open"></button>`, ".band-open", "border-radius")).toBe("6px");
+  });
+
+  /* These blocks take the keys whole by `.focus()` from a keystroke, which WebKit answers with its own focus ring:
+     a thick accent line outside the block's frame, in a colour no theme chose. Their rows or their frame show where
+     the keys are, so the ring is turned off on the block itself and a field inside keeps its own. */
+  it("draws no default focus ring on a block that takes the keys whole", () => {
+    for (const block of ["question-dock", "chooser", "slash-picker", "tasks-overlay"]) {
+      document.head.innerHTML = `<style>${css}</style>`;
+      document.body.innerHTML = `<div class="${block}" tabindex="0"></div><div class="${block}" tabindex="0"></div>`;
+      const [el, unfocused] = Array.from(document.body.children);
+      // The selector engine remembers its answer per selector, so nothing may ask about `el` before it has focus.
+      (el as HTMLElement).focus();
+      expect(document.activeElement).toBe(el);
+      expect(winningDeclarationOn(el, "outline"), block).toBe("none");
+      expect(winningDeclarationOn(unfocused, "outline"), block).toBeNull();
+    }
+  });
+
+  /* The dock borrows the composer's slot and its colour, but the composer's ring is two lines deep. The dock's list
+     has its own cursor band showing where the keys are, so one line is all its frame has to say. */
+  it("frames the active question dock in a single line of the focus ring's colour", () => {
+    const dock = `<div class="question-dock" data-active="true" tabindex="0"></div>`;
+    expect(winningDeclaration(dock, ".question-dock", "border-color")).toBe("var(--nv-focus-ring)");
+    expect(winningDeclaration(dock, ".question-dock", "box-shadow")).toBeNull();
+    expect(winningDeclaration(`<div class="question-dock" data-active="false"></div>`, ".question-dock", "border-color")).toBeNull();
+  });
+
   it("paints the mode block in the statusline's own mode colours, closed by an arrow, and nothing without the keys", () => {
     const block = (mode: string, focused = "true") =>
       `<div class="status-band"><div class="band-open"><span class="band-seg band-mode" data-mode="${mode}" data-focused="${focused}">X</span></div></div>`;

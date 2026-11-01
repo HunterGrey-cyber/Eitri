@@ -1248,6 +1248,11 @@ pre {
   font-size: var(--fs-prose);
   box-shadow: 0 8px 24px color-mix(in srgb, var(--nv-fg) 10%, var(--nv-bg));
 }
+/* These take the keys whole by `.focus()`, and WebKit answers that with its own thick accent ring outside the frame.
+   The cursor row or the frame already shows where the keys are; a field inside keeps its own ring. */
+.question-dock:focus, .chooser:focus, .slash-picker:focus, .tasks-overlay:focus {
+  outline: none;
+}
 .keymap-overlay h2, .trust-prompt h2 {
   margin: 0 0 18px;
   font-size: var(--fs-heading);
@@ -1926,6 +1931,8 @@ input::placeholder {
   background: none;
   border: 0;
   padding: 0;
+  /* A `<button>` here, and it clips: the global radius would cut the mode block's left corners. */
+  border-radius: 0;
   font: inherit;
   color: var(--nv-chrome-fg);
   cursor: pointer;
