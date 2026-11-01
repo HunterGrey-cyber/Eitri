@@ -370,9 +370,8 @@ fn truncate_to(mut parts: HistoryParts, max_items: usize, max_chars: usize) -> H
     items.sort_by_key(|(seq, which, index, _)| std::cmp::Reverse((*seq, *which as u8, *index)));
 
     let mut keep: [Vec<bool>; WHICH_COUNT] = EVERY_WHICH.map(|which| vec![false; view.len(which)]);
-    let mut kept = 0usize;
     let mut chars = 0usize;
-    for (_, which, index, cost) in items {
+    for (kept, (_, which, index, cost)) in items.into_iter().enumerate() {
         if kept >= max_items {
             break;
         }
@@ -382,7 +381,6 @@ fn truncate_to(mut parts: HistoryParts, max_items: usize, max_chars: usize) -> H
             break;
         }
         keep[which as usize][index] = true;
-        kept += 1;
         chars += cost;
     }
 

@@ -2017,7 +2017,7 @@ impl CodexProvider {
             note_foreign(st, thread_id);
             return false;
         }
-        if !st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
+        if st.turn.as_ref().is_none_or(|t| t.id.is_none()) {
             return false;
         }
         self.adopt_turn(st, thread_id, turn_id);
@@ -2081,7 +2081,7 @@ impl CodexProvider {
             note_foreign(st, thread);
             return;
         }
-        if !st.turn.as_ref().is_some_and(|t| t.id.is_some()) {
+        if st.turn.as_ref().is_none_or(|t| t.id.is_none()) {
             return;
         }
         let Some(family) = st.family.as_ref() else { return };

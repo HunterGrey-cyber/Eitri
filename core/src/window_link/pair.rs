@@ -318,7 +318,13 @@ mod tests {
         assert!(first.is_some(), "the claim is a lock of its own");
         assert!(GroupClaim::try_take(&dir, &root()).unwrap().is_none());
         drop(first);
-        assert!(GroupClaim::try_take(&dir, &root()).unwrap().is_some());
+        // A child another test thread is starting holds a copy of the claim's descriptor, and with it the lock, until
+        // it execs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while GroupClaim::try_take(&dir, &root()).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the claim never came free");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         drop(pair);
         assert_eq!(
             group_claim_name(&root()),

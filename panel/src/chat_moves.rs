@@ -943,12 +943,12 @@ mod tests {
 
     /// The frozen tab's record and descriptors, as the window heard them for move `mv`.
     fn frozen(w: &Window, mv: u64) -> (serde_json::Value, Vec<OwnedFd>) {
-        heard_back(w);
+        let froze = |e: &ChatMoveEvent| matches!(e, ChatMoveEvent::Frozen { mv: m, .. } if *m == mv);
+        // This freeze and no other answer: a window that took the tab up has heard its own `PresenceHeld`, and a freeze
+        // asked again while the conversation folds a batch answers on a later tick.
+        tick_handle_until(&w.handle, "the freeze's answer", || w.heard.borrow().iter().any(froze));
         let mut heard = w.heard.borrow_mut();
-        let at = heard
-            .iter()
-            .position(|e| matches!(e, ChatMoveEvent::Frozen { mv: m, .. } if *m == mv))
-            .unwrap_or_else(|| panic!("no freeze for move {mv}: {heard:?}"));
+        let at = heard.iter().position(froze).expect("it was heard above");
         match heard.remove(at) {
             ChatMoveEvent::Frozen { record, fds, .. } => (record, fds),
             _ => unreachable!(),

@@ -294,8 +294,7 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
     if state.shutting_down {
         return;
     }
-    let now = state.tabs.view_activity();
-    let turns = state.tabs.turns_running();
+    let (now, turns) = state.tabs.activity_and_turns();
     if now == state.reported_activity && turns == state.reported_turns {
         return;
     }

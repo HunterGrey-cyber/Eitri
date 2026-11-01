@@ -2500,25 +2500,31 @@ impl TabSet {
 
     /// Activity of every view holding a tab, in view order.
     pub fn view_activity(&self) -> Vec<(ViewId, ViewActivity)> {
+        self.activity_and_turns().0
+    }
+
+    /// [`Self::view_activity`] and the tabs a turn runs in, each in its view, from one read of each tab, so the two agree:
+    /// the ingest thread can end a turn at any moment, and a view counted as running beside a turn set without it would
+    /// be reported busy with nothing left running in it.
+    pub fn activity_and_turns(&self) -> (Vec<(ViewId, ViewActivity)>, BTreeSet<(ViewId, TabId)>) {
         let mut activity = BTreeMap::new();
+        let mut turns = BTreeSet::new();
         for tab in &self.tabs {
+            let turn_running = tab.turn_running();
+            if turn_running {
+                turns.insert((tab.view, tab.id));
+            }
             let entry = activity
                 .entry(tab.view)
                 .or_insert(ViewActivity { running: 0, queued: 0 });
             entry.running = entry.running.saturating_add(u32::from(
-                matches!(tab.backend, TabBackend::Starting(_)) || tab.turn_running(),
+                matches!(tab.backend, TabBackend::Starting(_)) || turn_running,
             ));
             entry.queued = entry
                 .queued
                 .saturating_add(tab.session.queue.len().try_into().unwrap_or(u32::MAX));
         }
-        activity.into_iter().collect()
-    }
-
-    /// The tabs a turn runs in, each in its view.
-    pub fn turns_running(&self) -> BTreeSet<(ViewId, TabId)> {
-        let running = self.tabs.iter().filter(|tab| tab.turn_running());
-        running.map(|tab| (tab.view, tab.id)).collect()
+        (activity.into_iter().collect(), turns)
     }
 
     /// The base view's tabs, in tab order.
@@ -18967,7 +18973,7 @@ mod turn_news_tests {
     /// A resync drops the events a pump would have read, and the clock is stamped from the projection all the same.
     #[test]
     fn a_turn_seen_only_through_a_resync_is_news() {
-        let (dir, mut set, _tab, provider) = live("turn-news-resync");
+        let (dir, mut set, tab, provider) = live("turn-news-resync");
         let mut flood = vec![AgentDomainEvent::TurnStarted { turn_id: "t1".into() }];
         for i in 0..300 {
             flood.push(AgentDomainEvent::ContentDelta {
@@ -18977,21 +18983,26 @@ mod turn_news_tests {
             });
         }
         provider.queue_all(flood);
+        // One hold of the lock folds the whole flood, so a projection naming the turn has overflowed too. A tick that
+        // drained before the fold and read the projection after it would stamp the clock a tick ahead of the snapshot.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut snapshots = 0;
-        let mut told = Vec::new();
-        while told.is_empty() {
-            assert!(Instant::now() < deadline, "timed out waiting for the turn's news");
-            let out = set.pump(&dir, true);
-            if let Some(payload) = out.active_payload {
-                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-                snapshots += usize::from(value["kind"] == "snapshot");
-            }
-            told.extend(began(&mut set));
+        while set
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .active_turn_id
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "timed out waiting for the fold");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(told, ["t1"]);
-        assert!(snapshots > 0, "the events were delivered as a snapshot");
+        let out = set.pump(&dir, true);
+        let payload = out.active_payload.expect("the tab is on screen");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["kind"], "snapshot", "the events were delivered as a snapshot");
+        assert_eq!(began(&mut set), ["t1"]);
         assert!(pump_a_while(&mut set, &dir).is_empty(), "and it is reported once");
         for tab in set.take_all() {
             if let Some(retired) = tab.retired {

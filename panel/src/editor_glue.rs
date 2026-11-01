@@ -2575,10 +2575,11 @@ pub(super) mod tests {
             let card = cards()[0].id.clone();
 
             panel.provider.inner.queue(ending);
-            tick_handle_until(&panel.handle, "the socket to end", || {
-                panel.handle.state.borrow().editor_bridge_tabs.is_empty()
+            // A fold landing after the tick's pump ends the socket a tick ahead of the card; a person's answer in that
+            // tick runs nothing, since the next one tells the broker before it steps the queue.
+            tick_handle_until(&panel.handle, "the socket and the card to end", || {
+                panel.handle.state.borrow().editor_bridge_tabs.is_empty() && cards().is_empty()
             });
-            assert!(cards().is_empty());
             let answered = panel
                 .handle
                 .run(|state, out| answer_card(state, panel.tab, &card, CardDecision::Allow, CardOrigin::Key, out));

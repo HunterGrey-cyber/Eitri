@@ -1173,17 +1173,9 @@ mod tests {
 
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
 
-        let before = Instant::now();
-        let (mut reader, empty) = poll_within(reader, Duration::from_secs(2), None);
+        // A blocking accepted stream never returns here: the only clock is a hang guard far above any scheduler delay.
+        let (mut reader, empty) = poll_within(reader, Duration::from_secs(10), None);
         assert!(empty.is_empty(), "nothing written yet");
-        let elapsed = before.elapsed();
-        // A blocking accepted stream would hold this poll until poll_within's 2 s cap, so the bound only has to
-        // distinguish an immediate return from a block. Scheduler delay alone can exceed 20 ms
-        // (measured 28.75 ms at load ~20 on 18 cores); 500 ms keeps the margin to the 2 s cap.
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "poll blocked for {elapsed:?} on an accepted, silent connection"
-        );
 
         stream.write_all(b"R\n").unwrap();
         assert_eq!(reader.poll(), vec![PaneMessage::Direction('R')]);

@@ -486,12 +486,12 @@ mod tests {
 
     #[test]
     fn a_path_over_the_cap_means_no_socket_and_leaves_no_directory() {
-        let long = std::env::temp_dir().join(format!("nv-long-{}", "x".repeat(120)));
-        std::fs::create_dir_all(&long).unwrap();
+        let scratch = crate::test_scratch_dir::ScratchDir::new("nv-long", "cap");
+        let long = scratch.join("x".repeat(120));
+        std::fs::create_dir(&long).unwrap();
         let mut mentions = LiveMentions::new();
         let opened = mentions.open_in(&long);
         let left = std::fs::read_dir(&long).unwrap().count();
-        std::fs::remove_dir_all(&long).unwrap();
         assert_eq!(opened, None);
         assert_eq!(left, 0, "the directory made for the socket goes with it");
     }
@@ -643,8 +643,14 @@ mod tests {
         );
 
         drop(silent);
-        mentions.poll(now);
-        assert!(mentions.fds().contains(&listener), "room again");
+        // A child another test thread is starting holds a copy of every descriptor until it execs, so the end of file
+        // comes when the last copy closes. `now` stands still: it is the end of file that frees the slots, not their age.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !mentions.fds().contains(&listener) {
+            assert!(Instant::now() < deadline, "room again");
+            mentions.poll(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

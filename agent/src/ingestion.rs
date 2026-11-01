@@ -772,6 +772,7 @@ impl ConversationIngest {
     /// drains it. Every `AgentProvider` method takes `&self`, so the two need no lock between them --
     /// which matters: a mutex here would let a blocking `send_turn` stall ingestion for the duration
     /// of a gRPC round trip, quietly recreating the coupling this module exists to break.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
         provider_name: &'static str,

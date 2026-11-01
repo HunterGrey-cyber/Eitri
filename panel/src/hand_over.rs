@@ -649,8 +649,12 @@ mod tests {
             assert!(!restore_ran(&state), "nothing resumes a session another process holds");
             assert!(state.borrow().hand_overs.is_waiting(), "so the tick keeps coming");
             drop(held);
-            polled(&state);
-            tick_until(&state, |_| restore_ran(&state));
+            // As the tick does while `is_waiting`: a child another test thread is starting holds a copy of the lease's
+            // descriptor until it execs, so one poll right after the drop can still find it held.
+            tick_until(&state, |_| {
+                polled(&state);
+                restore_ran(&state)
+            });
         });
         assert_eq!(resumes.asked, ["s-1"]);
         shut_tabs(&state);

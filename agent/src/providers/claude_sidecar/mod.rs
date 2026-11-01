@@ -2060,7 +2060,10 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.runtime.handle().spawn(async move {
                 let result = tokio::time::timeout(UNARY_RPC_TIMEOUT, client.stop_task(request)).await;
                 let result = match result {
-                    Ok(Ok(response)) => Ok(translate_322::task_stopped(response.into_inner())),
+                    Ok(Ok(response)) => {
+                        translate_322::task_stopped(response.into_inner());
+                        Ok(())
+                    }
                     Ok(Err(status)) => Err(map_task_status(status)),
                     Err(_) => Err(ProviderError::Timeout),
                 };

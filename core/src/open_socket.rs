@@ -1353,11 +1353,23 @@ mod tests {
     fn a_client_that_left_after_the_hand_over_cannot_be_taken() {
         let fixture = fixture();
         let file = fixture.file("a.rs");
-        let server = fixture.server();
+        // The thread outwaits the hangup below: a request it had given up on would answer `None` for that reason instead.
+        let server = fixture.server_with(Waits {
+            answer: PATIENCE * 2,
+            ..Waits::STANDARD
+        });
         let client = UnixStream::connect(server.socket()).unwrap();
         (&client).write_all(format!("{}\n", request(&file)).as_bytes()).unwrap();
         let incoming = next_request(&server);
         drop(client);
+        // A child another test thread is starting holds a copy of every descriptor until it execs, so the hangup comes
+        // when the last copy of the client's end closes.
+        assert!(readable(incoming.client.as_raw_fd(), PATIENCE), "the hangup never came");
+        assert_eq!(
+            incoming.owner.load(Ordering::SeqCst),
+            WAITING,
+            "still the taker's to take"
+        );
         assert!(incoming.take().is_none(), "its client is on its way to a new window");
     }
 

@@ -6,8 +6,8 @@
 mod ide_client;
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::os::fd::RawFd;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -215,9 +215,38 @@ impl Syscalls for KeptLog {
     }
 }
 
+/// A socket bound on 127.0.0.1 and not listening. `SO_REUSEPORT` lets a second one share the port the first was given.
+fn bound_socket(port: u16) -> TcpListener {
+    let on: libc::c_int = 1;
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: the descriptor is new and owned from here on; the option and the address are the sizes given.
+    unsafe {
+        let raw = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        let socket = OwnedFd::from_raw_fd(raw);
+        let option = (&on as *const libc::c_int).cast();
+        let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let set = libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT, option, size);
+        assert_eq!(set, 0, "SO_REUSEPORT: {}", io::Error::last_os_error());
+        let name = (&address as *const libc::sockaddr_in).cast();
+        let size = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let bound = libc::bind(socket.as_raw_fd(), name, size);
+        assert_eq!(bound, 0, "bind: {}", io::Error::last_os_error());
+        TcpListener::from(socket)
+    }
+}
+
 /// A worker on its thread, with the test holding the other end of each channel.
 struct Rig {
     port: u16,
+    _port_held: TcpListener,
     token: String,
     keeper: Arc<KeeperState>,
     mentions: Arc<MentionState>,
@@ -238,9 +267,14 @@ impl Rig {
         mentions: MentionState,
         calls: C,
     ) -> Rig {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // Bound and not listening, this takes no connection, and `bind` to port 0 hands out no port with a socket on it:
+        // a dial after the listener closed cannot reach a listener another test was given this port for.
+        let port_held = bound_socket(0);
+        let port = port_held.local_addr().unwrap().port();
+        let listener = bound_socket(port);
+        // SAFETY: a valid descriptor, bound above.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 128) }, 0);
         listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
         let token = Token::generate(|bytes| {
             bytes.fill(0xab);
             Ok(())
@@ -272,6 +306,7 @@ impl Rig {
         };
         Rig {
             port,
+            _port_held: port_held,
             token: token_text(),
             keeper,
             mentions,

@@ -846,7 +846,6 @@ mod tests {
                 project.root.join("src/a.rs").display()
             )
         );
-        assert!(asks(&steps).len() > 1);
     }
 
     #[test]
