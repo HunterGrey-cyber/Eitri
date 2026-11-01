@@ -1212,6 +1212,22 @@ export default function App() {
         setHandoffOpen(true);
         break;
       }
+      case "model.pick":
+      case "effort.pick": {
+        const thing = binding.action === "model.pick" ? "model" : "effort";
+        const other = agentWord(activeTabInfo(tabsRef.current)?.agent);
+        if (other !== null) {
+          showFlash(`Choosing the ${thing} of a ${other} session is not available`);
+          break;
+        }
+        // The empty-tab render returns before bandPicks is initialized, so check for a live session first.
+        if (activeTab?.state !== "live" || !bandPicks) {
+          showFlash(`no running session to choose the ${thing} of`);
+          break;
+        }
+        askBandPicker(thing === "model" ? "/model" : "/effort");
+        break;
+      }
       case "tab.follow": {
         const tab = activeTabInfo(tabsRef.current);
         if (tab === null) break;

@@ -61,6 +61,8 @@ export type PanelActionName =
   | "panel.keymap"
   | "panel.handoff"
   | "mode.cycle"
+  | "model.pick"
+  | "effort.pick"
   | "tab.stop-background"
   | "tab.follow";
 

@@ -95,6 +95,14 @@ chords, and [Keys](keys.md#keys-without-the-prefix) says what it runs, what it r
 naming the call, so a typo does not leave you with a keymap you did not write. [Keys](keys.md) lists the
 defaults and the actions.
 
+The panel's `"panel"` table uses `model.pick` and `effort.pick` as the action names of `<leader>M` and
+`<leader>E`. Delete a default binding before rebinding it; for example, to move the model picker to `<leader>p`:
+
+```lua
+eitri.keymap.del("panel", "<leader>M")
+eitri.keymap.set("panel", "<leader>p", "model.pick")
+```
+
 The defaults are stock tmux's, with `Ctrl+b` as the prefix. Eitri then reads your tmux configuration (the same
 files tmux reads, and what they `source-file` by an absolute path; a relative path is skipped, because Eitri
 does not know the directory tmux would resolve it against), and finally applies your `eitri.keymap` calls, so your own

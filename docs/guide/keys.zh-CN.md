@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=aae45bfd1d8adafb839f503293b14c40c0059b24a5465a1b56f05cf53abab8ce -->
+<!-- translated-from: keys.md sha256=5bfdde564d2402df9a0e3e8eb83b31ce3731ebacc7171e880bb99634380bb3bc -->
 
 # 按键
 
@@ -452,6 +452,8 @@ end
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
+| `<leader>M` | 选择模型（和点击状态带的模型一样）。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。回合运行时会提示等回合结束后再选择。 |
+| `<leader>E` | 选择推理力度（和点击状态带的推理力度一样）。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。回合运行时会提示等回合结束后再选择。 |
 | `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `Space e`（`<leader>e`） | 为当前标签页开关编辑器跟随；默认关闭，不会移动你的光标 |
 | `<leader>?` | 按键列表 |

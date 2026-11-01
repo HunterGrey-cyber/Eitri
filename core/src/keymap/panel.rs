@@ -22,6 +22,8 @@ pub enum PanelAction {
     Keymap,
     Handoff,
     ModeCycle,
+    ModelPick,
+    EffortPick,
     /// Stop the commands the tab's agent left running after its turns ended (by stopping its session),
     /// after a y/n question.
     StopBackground,
@@ -95,6 +97,8 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
         "panel.keymap" => PanelAction::Keymap,
         "panel.handoff" => PanelAction::Handoff,
         "mode.cycle" => PanelAction::ModeCycle,
+        "model.pick" => PanelAction::ModelPick,
+        "effort.pick" => PanelAction::EffortPick,
         "tab.stop-background" => PanelAction::StopBackground,
         "tab.follow" => PanelAction::Follow,
         other => {
@@ -125,6 +129,8 @@ impl PanelAction {
             PanelAction::Keymap => "panel.keymap",
             PanelAction::Handoff => "panel.handoff",
             PanelAction::ModeCycle => "mode.cycle",
+            PanelAction::ModelPick => "model.pick",
+            PanelAction::EffortPick => "effort.pick",
             PanelAction::StopBackground => "tab.stop-background",
             PanelAction::Follow => "tab.follow",
         }
@@ -149,6 +155,8 @@ impl PanelAction {
             PanelAction::Keymap => "all keys",
             PanelAction::Handoff => "continue in a terminal",
             PanelAction::ModeCycle => "mode",
+            PanelAction::ModelPick => "model",
+            PanelAction::EffortPick => "effort",
             PanelAction::StopBackground => "stop background work",
             PanelAction::Follow => "follow in the editor",
         }
@@ -220,7 +228,7 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// new tab).
 pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new")];
 
-/// The 18 default rows, in table order: direct
+/// The 20 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
 /// LazyVim/nvim/which-key line it copies, or `eitri-only` with why, so no row is invented.
 pub fn default_bindings() -> Vec<PanelBinding> {
@@ -316,6 +324,18 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("<leader>m").unwrap(),
             action: PanelAction::ModeCycle,
+            source: PanelSource::Default,
+        },
+        // eitri-only: model uses capital M because lowercase m stays the mode key.
+        PanelBinding {
+            seq: parse_seq("<leader>M").unwrap(),
+            action: PanelAction::ModelPick,
+            source: PanelSource::Default,
+        },
+        // eitri-only: effort uses capital E because lowercase e stays the following key.
+        PanelBinding {
+            seq: parse_seq("<leader>E").unwrap(),
+            action: PanelAction::EffortPick,
             source: PanelSource::Default,
         },
         // eitri-only: LazyVim binds no `<leader>k`; `k` as in tmux's kill-* verbs. It asks y/n first, since
@@ -598,6 +618,8 @@ mod tests {
             ("Space i", "tab.info"),
             ("Space t", "panel.handoff"),
             ("Space m", "mode.cycle"),
+            ("Space M", "model.pick"),
+            ("Space E", "effort.pick"),
             ("Space k", "tab.stop-background"),
             ("Space e", "tab.follow"),
             ("Space ?", "panel.keymap"),
@@ -624,6 +646,8 @@ mod tests {
             "panel.keymap",
             "panel.handoff",
             "mode.cycle",
+            "model.pick",
+            "effort.pick",
             "tab.stop-background",
             "tab.follow",
         ] {
@@ -662,6 +686,18 @@ mod tests {
             (PanelKey::Space, LeaderSource::Default, 1000, true)
         );
         assert_eq!(k.bindings.len(), default_bindings().len());
+    }
+
+    #[test]
+    fn the_model_picker_can_be_rebound_after_deleting_its_default() {
+        let mut user = PanelUserTable::default();
+        let error = user.set("<leader>M", "tab.next").unwrap_err();
+        assert!(error.contains("model.pick"), "{error}");
+        user.del("<leader>M").unwrap();
+        user.set("<leader>x", "model.pick").unwrap();
+        let (map, _) = effective(&user, None);
+        assert_eq!(find(&map, "Space x").unwrap().action.name(), "model.pick");
+        assert!(find(&map, "Space M").is_none());
     }
 
     #[test]

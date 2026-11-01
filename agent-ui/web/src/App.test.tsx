@@ -2645,6 +2645,116 @@ describe("the leader", () => {
     return posted.filter((m) => m.type === "tab_verb").map((m) => m.verb as string);
   }
 
+  const pickerTable: PanelTable = {
+    ...TABLE,
+    bindings: [
+      ...TABLE.bindings,
+      binding(["<leader>", "M"], "model.pick", "model"),
+      binding(["<leader>", "E"], "effort.pick", "effort"),
+      binding(["<leader>", "e"], "tab.follow", "follow in the editor"),
+    ],
+  };
+
+  describe.each([["M", "model"], ["E", "effort"]] as const)("Space %s picker", (key, thing) => {
+    function pickerSetup(overrides: Partial<AgentUiState> = {}) {
+      const widen = stubBandWidth();
+      const rendered = started(overrides);
+      act(() => widen(rendered.container));
+      sendTable(pickerTable);
+      act(() => root(rendered.container).focus());
+      return { ...rendered, widen };
+    }
+    function choose() {
+      press(" ");
+      fireEvent.keyDown(document.activeElement ?? document.body, { key, shiftKey: true });
+    }
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("posts exactly the bare band command on a live idle Claude tab", () => {
+      pickerSetup();
+      choose();
+      expect(posted.filter((m) => m.type === "send_message")).toEqual([
+        { type: "send_message", request_id: expect.any(String), tab: 1, text: `/${thing}` },
+      ]);
+    });
+
+    it("flashes the same running-turn message as a band click", () => {
+      const { container } = pickerSetup({ activeTurnId: "turn-1", model: "sonnet", effort: "high" });
+      choose();
+      const keyMessage = container.querySelector(".band-message")!.textContent;
+      expect(keyMessage).toBe(`a turn is running: choose the ${thing} when it ends`);
+      fireEvent.click(container.querySelector(`.band-${thing}.band-pick`)!);
+      expect(container.querySelector(".band-message")!.textContent).toBe(keyMessage);
+      expect(posted.filter((m) => m.type === "send_message")).toEqual([]);
+    });
+
+    it.each([["codex", "codex"], ["acp:goose", "goose"]])("names the unavailable %s agent", (agent, word) => {
+      const { container } = pickerSetup();
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent }] });
+      choose();
+      expect(posted.filter((m) => m.type === "send_message")).toEqual([]);
+      expect(container.querySelector(".band-message")!.textContent).toBe(
+        `Choosing the ${thing} of a ${word} session is not available`,
+      );
+    });
+
+    it.each(["ended", "not_started"] as const)("refuses a %s tab without starting a session", (state) => {
+      const { container, widen } = pickerSetup();
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state }] });
+      act(() => widen(container));
+      if (state === "not_started") {
+        dispatch({ kind: "pane_focus", focused: true });
+        dispatch({ kind: "arrive" });
+      }
+      const before = posted.length;
+      choose();
+      expect(posted.slice(before).filter((m) => m.type !== "draft" && m.type !== "trace")).toEqual([]);
+      expect(container.querySelector(".band-message")!.textContent).toBe(`no running session to choose the ${thing} of`);
+    });
+  });
+
+  it("lists model and effort in which-key and the question-mark overlay from the panel table", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable(pickerTable);
+      act(() => root(container).focus());
+      press(" ");
+      act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
+      const box = container.querySelector(".which-key-box")!;
+      for (const row of ["M➜model", "E➜effort"]) expect(box.textContent).toContain(row);
+      press("Escape");
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 1));
+      press("?");
+      const overlay = container.querySelector(".keymap-overlay")!;
+      for (const [key, desc] of [["M", "model"], ["E", "effort"]]) {
+        const row = Array.from(overlay.querySelectorAll("tr")).find((r) => r.textContent?.includes(`Space ${key}`));
+        expect(row?.textContent).toContain(desc);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lowercase m still cycles mode and lowercase e still toggles following", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = started();
+      sendTable(pickerTable);
+      act(() => root(container).focus());
+      press(" ");
+      press("m");
+      expect(lastOfType("cycle_mode")).toMatchObject({ tab: 1 });
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 1));
+      press(" ");
+      press("e");
+      expect(lastOfType("toggle_following")).toMatchObject({ tab: 1 });
+      expect(posted.filter((m) => m.type === "send_message")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("the_leader_key_posts_the_toggle_for_the_active_tab", () => {
     vi.useFakeTimers();
     const widen = stubBandWidth();

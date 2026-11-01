@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=376e309aa7bde1d1fab302e9d800f6744a9339406331a38601ed9ddb45047a31 -->
+<!-- translated-from: configuration.md sha256=906f0fdb9d5694d7bc14926c608359c66d1ed93601a428243aec87413996a5d2 -->
 
 # 配置
 
@@ -76,6 +76,14 @@ k.set("root", "M-z", "zoom")                  -- a key that works without the pr
 ```
 
 `k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。`"root"` 表放的是不带前缀就生效的键：它一开始是空的，只收 Ctrl 和 Alt 组合键，它能运行什么、拒绝什么、Eitri 何时警告，见[按键](keys.zh-CN.md#keys-without-the-prefix)。错误的键、不认识的动作或者两个互相冲突的绑定，会让 Eitri 在启动时停下，并给出一条点出这次调用的消息，所以笔误不会留给你一套你没有写过的按键映射。[按键](keys.zh-CN.md)列出了默认值和这些动作。
+
+面板的 `"panel"` 表中，`model.pick` 和 `effort.pick` 分别是 `<leader>M` 和 `<leader>E` 的动作名。
+重新绑定前先删除默认绑定；例如，把模型选择器移到 `<leader>p`：
+
+```lua
+eitri.keymap.del("panel", "<leader>M")
+eitri.keymap.set("panel", "<leader>p", "model.pick")
+```
 
 默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 

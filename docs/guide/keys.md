@@ -697,6 +697,8 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
+| `<leader>M` | choose the model (as a click on the band's model). Claude tabs only; a Codex or registered agent's tab says it is not available. While a turn runs it says to choose when the turn ends. |
+| `<leader>E` | choose the effort (as a click on the band's effort). Claude tabs only; a Codex or registered agent's tab says it is not available. While a turn runs it says to choose when the turn ends. |
 | `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `Space e` (`<leader>e`) | toggle following the agent in the editor for this tab; off by default, never moves your cursor |
 | `<leader>?` | the list of keys |
