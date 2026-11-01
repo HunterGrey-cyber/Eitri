@@ -13,7 +13,7 @@ use eitri_core::editor_context::feed::PushFacts;
 use eitri_core::editor_context::{EditorContext, Selection};
 use eitri_core::editor_tools::tools::diagnostics::{DiagnosticEntry, DiagnosticsAnswer, Severity};
 use eitri_core::ide_server::channels::Wake;
-use eitri_core::ide_server::files::{path_of_uri, run_job, spawn};
+use eitri_core::ide_server::files::{diff_with_a_swap, path_of_uri, run_job, spawn};
 use eitri_core::ide_server::lines::{join_values, line_values, LineShape};
 use eitri_core::ide_server::{
     ContextUpdate, DiagnosticsQuery, DiffRequest, Done, Event, Job, MentionLine, OpenDiffArgs, RpcId, ServerConfig,
@@ -122,20 +122,36 @@ impl Scratch {
         }
     }
 
+    /// A selection in a buffer loaded from `file`, recorded as the feed records it: the real path, or the name itself
+    /// with nothing on disk.
     fn context(&self, file: &Path) -> serde_json::Value {
+        let record = file.canonicalize().unwrap_or_else(|_| file.to_owned());
+        self.context_read_from(file, Some(&record.to_string_lossy()))
+    }
+
+    fn context_read_from(&self, file: &Path, read_from: Option<&str>) -> serde_json::Value {
+        self.context_of(
+            file,
+            read_from,
+            Some(Selection {
+                start_line: 2,
+                end_line: 2,
+                text: "private".to_owned(),
+            }),
+        )
+    }
+
+    fn context_of(&self, file: &Path, read_from: Option<&str>, selection: Option<Selection>) -> serde_json::Value {
         let done = self.run(Job::Context(ContextUpdate {
             context: Some(EditorContext {
                 file: file.to_str().unwrap().to_owned(),
-                selection: Some(Selection {
-                    start_line: 2,
-                    end_line: 2,
-                    text: "private".to_owned(),
-                }),
+                selection,
             }),
             facts: PushFacts {
                 cursor_line: Some(2),
                 start_col: Some(1),
                 end_col: Some(4),
+                read_from: read_from.map(str::to_owned),
             },
         }));
         match done {
@@ -423,6 +439,58 @@ fn a_link_inside_the_project_shows_the_file_it_reaches() {
     assert_eq!(diff.file_text, b"text\n");
 }
 
+/// The diff of `src/a.py`, with `swap` run between the judgement and the read.
+fn diff_swapped(scratch: &Scratch, swap: impl FnOnce()) -> Result<DiffRequest, &'static str> {
+    let args = OpenDiffArgs {
+        new_file_path: scratch.at("src/a.py").to_str().unwrap().to_owned(),
+        new_file_contents: "new\n".to_owned(),
+        tab_name: "tab".to_owned(),
+    };
+    diff_with_a_swap(&scratch.config(), args, swap)
+}
+
+#[test]
+fn a_file_replaced_by_a_link_after_the_judgement_shows_nothing_of_where_it_leads() {
+    let scratch = Scratch::new();
+    let path = scratch.write("src/a.py", "text\n");
+    let shown = diff_swapped(&scratch, || {
+        std::fs::remove_file(&path).unwrap();
+        symlink(scratch.outside("secret"), &path).unwrap();
+    });
+    assert!(shown.is_err(), "{shown:?}");
+}
+
+#[test]
+fn a_directory_replaced_by_a_link_after_the_judgement_shows_nothing_of_where_it_leads() {
+    let scratch = Scratch::new();
+    scratch.write("src/a.py", "text\n");
+    std::fs::write(scratch.outside("a.py"), "private\n").unwrap();
+    let shown = diff_swapped(&scratch, || {
+        std::fs::rename(scratch.at("src"), scratch.at("src.old")).unwrap();
+        symlink(scratch.dir.join("elsewhere"), scratch.at("src")).unwrap();
+    });
+    assert!(shown.is_err(), "{shown:?}");
+}
+
+#[test]
+fn a_file_replaced_by_a_hard_link_after_the_judgement_shows_nothing_of_it() {
+    let scratch = Scratch::new();
+    let path = scratch.write("src/a.py", "text\n");
+    let shown = diff_swapped(&scratch, || {
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(scratch.outside("secret"), &path).unwrap();
+    });
+    assert!(shown.is_err(), "{shown:?}");
+}
+
+#[test]
+fn a_file_that_goes_after_the_judgement_is_a_new_file() {
+    let scratch = Scratch::new();
+    let path = scratch.write("src/a.py", "text\n");
+    let diff = diff_swapped(&scratch, || std::fs::remove_file(&path).unwrap()).unwrap();
+    assert!(diff.file_text.is_empty());
+}
+
 #[test]
 fn a_crlf_file_becomes_lf_and_the_proposal_is_untouched() {
     let scratch = Scratch::new();
@@ -660,6 +728,64 @@ fn an_empty_name_gives_the_empty_form() {
     assert!(params.get("filePath").is_none(), "{params}");
 }
 
+fn assert_empty_form(params: &serde_json::Value) {
+    assert_eq!(
+        *params,
+        json!({"selection": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "text": ""})
+    );
+}
+
+#[test]
+fn a_selection_in_a_buffer_read_from_outside_gives_the_empty_form() {
+    let scratch = Scratch::new();
+    let name = scratch.write("replaced.py", "an ordinary file now\n");
+    let secret = scratch.outside("secret");
+    assert_empty_form(&scratch.context_read_from(&name, Some(secret.to_str().unwrap())));
+}
+
+#[test]
+fn the_cursor_form_of_a_buffer_read_from_outside_names_no_file() {
+    let scratch = Scratch::new();
+    let name = scratch.write("replaced.py", "an ordinary file now\n");
+    let secret = scratch.outside("secret");
+    assert_empty_form(&scratch.context_of(&name, Some(secret.to_str().unwrap()), None));
+}
+
+#[test]
+fn a_name_on_disk_with_no_record_gives_the_empty_form() {
+    let scratch = Scratch::new();
+    let name = scratch.write("unrecorded.py", "x\n");
+    assert_empty_form(&scratch.context_read_from(&name, None));
+    assert_empty_form(&scratch.context_of(&name, None, None));
+}
+
+#[test]
+fn a_name_with_nothing_on_disk_and_no_record_is_told() {
+    let scratch = Scratch::new();
+    let params = scratch.context_read_from(&scratch.at("src/new.py"), None);
+    assert_eq!(params["text"], json!("private"));
+}
+
+/// The feed reads a record that is not UTF-8 with U+FFFD for each bad sequence, and that spelling can lie in the project
+/// while the real one does not.
+#[test]
+fn a_record_the_feed_could_not_read_gives_the_empty_form() {
+    let scratch = Scratch::new();
+    let name = scratch.write("src/plain.py", "x\n");
+    let spelled = scratch.write("src/caf\u{fffd}.py", "x\n");
+    assert_empty_form(&scratch.context_read_from(&name, Some(spelled.to_str().unwrap())));
+}
+
+#[test]
+fn a_record_in_the_project_passes_under_any_name_in_it() {
+    let scratch = Scratch::new();
+    let name = scratch.write("src/renamed.py", "x\n");
+    let record = scratch.at("src/old-name.py");
+    let params = scratch.context_read_from(&name, Some(record.to_str().unwrap()));
+    assert_eq!(params["filePath"], json!(name.to_str().unwrap()));
+    assert_eq!(params["text"], json!("private"));
+}
+
 #[test]
 fn a_selection_inside_names_the_resolved_file() {
     let scratch = Scratch::new();
@@ -726,6 +852,29 @@ fn a_selection_in_a_link_to_an_unsendable_name_gives_the_empty_form() {
         assert_eq!(params["text"], json!(""), "{link:?}");
         assert!(params.get("filePath").is_none(), "{link:?}: {params}");
     }
+}
+
+/// The feed gives a name that is not UTF-8 with U+FFFD in place of each bad sequence, so the spelling a test passes here
+/// is not the buffer's name. That name is a link out of the project, and whatever stands at the spelling says nothing of
+/// it: nothing, another file, or a link to a third.
+#[test]
+fn a_selection_under_a_name_the_feed_could_not_read_gives_the_empty_form() {
+    let scratch = Scratch::new();
+    let secret = scratch.outside("secret");
+    symlink(&secret, scratch.at("src").join(OsStr::from_bytes(b"caf\xe9.py"))).unwrap();
+    let spelled = scratch.at("src/caf\u{fffd}.py");
+    let empty = |what: &str| {
+        let params = scratch.context(&spelled);
+        assert_eq!(params["text"], json!(""), "{what}");
+        assert!(params.get("filePath").is_none(), "{what}: {params}");
+    };
+    empty("nothing at the spelling");
+    scratch.write("src/caf\u{fffd}.py", "another file\n");
+    empty("another file at the spelling");
+    std::fs::remove_file(&spelled).unwrap();
+    scratch.write("src/plain.py", "x\n");
+    symlink("plain.py", &spelled).unwrap();
+    empty("a link at the spelling");
 }
 
 #[test]

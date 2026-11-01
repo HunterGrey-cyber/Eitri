@@ -689,6 +689,7 @@ mod tests {
             cursor_line: Some(4),
             start_col: None,
             end_col: None,
+            read_from: None,
         };
         rig.wiring.context_changed(None, facts.clone());
 

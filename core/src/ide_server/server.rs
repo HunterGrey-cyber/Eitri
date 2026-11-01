@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -30,6 +31,7 @@ pub struct IdeServer {
     port: u16,
     events: Receiver<Event>,
     events_wake: Arc<Wake>,
+    events_waiting: Arc<AtomicUsize>,
     commands: Sender<Command>,
     commands_wake: Arc<Wake>,
     /// Nothing is ever sent on it: it closes when the worker's thread ends, however it ends, by which point the lock
@@ -100,6 +102,7 @@ impl IdeServer {
         let events_wake = Arc::new(Wake::new()?);
         let commands_wake = Arc::new(Wake::new()?);
         let done_wake = Arc::new(Wake::new()?);
+        let events_waiting = Arc::new(AtomicUsize::new(0));
         let (events_sender, events) = channel();
         let (commands, commands_receiver) = channel();
         let (jobs, jobs_receiver) = channel();
@@ -115,6 +118,7 @@ impl IdeServer {
             mentions: Box::new(LiveMentions::new()),
             events: events_sender,
             events_wake: Arc::clone(&events_wake),
+            events_waiting: Arc::clone(&events_waiting),
             commands: commands_receiver,
             commands_wake: Arc::clone(&commands_wake),
             jobs,
@@ -132,6 +136,7 @@ impl IdeServer {
             port,
             events,
             events_wake,
+            events_waiting,
             commands,
             commands_wake,
             worker_gone,
@@ -149,7 +154,11 @@ impl IdeServer {
         if self.first_settled.replace(true) {
             return None;
         }
-        match self.events.recv_timeout(within) {
+        let first = self.events.recv_timeout(within);
+        if first.is_ok() {
+            self.events_waiting.fetch_sub(1, Ordering::Relaxed);
+        }
+        match first {
             Ok(Event::Started(started)) => Some(started),
             // `Started` is the worker's first event, so anything else cannot be here; a closed channel is a worker gone.
             Ok(_) | Err(_) => None,
@@ -166,7 +175,9 @@ impl IdeServer {
         self.first_settled.set(true);
         // Before the queue is read, so anything sent after this read wakes the next watch.
         self.events_wake.drain();
-        self.events.try_iter().collect()
+        let events: Vec<Event> = self.events.try_iter().collect();
+        self.events_waiting.fetch_sub(events.len(), Ordering::Relaxed);
+        events
     }
 
     /// In order. Commands for a worker already gone go nowhere.

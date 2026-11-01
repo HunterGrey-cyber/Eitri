@@ -127,11 +127,13 @@ fn request(number: i64) -> RpcId {
     RpcId::Num(number)
 }
 
+/// What was answered. A release is no answer: it goes to the worker, and never reaches the client.
 fn answered(commands: Vec<Command>) -> Vec<(ConnId, RpcId, ToolAnswer)> {
     commands
         .into_iter()
-        .map(|command| match command {
-            Command::Answer { conn, id, answer } => (conn, id, answer),
+        .filter_map(|command| match command {
+            Command::Answer { conn, id, answer } => Some((conn, id, answer)),
+            Command::Released { .. } => None,
             other => panic!("not an answer: {other:?}"),
         })
         .collect()

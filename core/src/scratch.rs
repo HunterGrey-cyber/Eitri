@@ -201,6 +201,24 @@ fn apply_edits_to_lf(base: &str, edits: &[ProposedEdit], path: &str) -> Result<S
 /// `Ok(None)` when nothing is at `file`; its UTF-8 text when it is a regular file of at most
 /// [`PROPOSAL_MAX_BYTES`]; refused otherwise.
 fn read_regular_file(file: &Path, path: &str) -> Result<Option<String>, ProposalRefused> {
+    read_file_with(file, path, 0, |_| true)
+}
+
+/// As [`read_regular_file`], for a caller that judged `file` and has to know that what it reads is what it judged. A link
+/// at its last component is refused, and `check` looks at the open handle before a byte is read; `false` refuses it.
+pub fn read_file_checked(
+    file: &Path,
+    check: impl FnOnce(&std::fs::File) -> bool,
+) -> Result<Option<String>, ProposalRefused> {
+    read_file_with(file, &file.display().to_string(), libc::O_NOFOLLOW, check)
+}
+
+fn read_file_with(
+    file: &Path,
+    path: &str,
+    flags: libc::c_int,
+    check: impl FnOnce(&std::fs::File) -> bool,
+) -> Result<Option<String>, ProposalRefused> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     // A path that names no regular file is refused before it is opened: opening a device can act on it
@@ -215,7 +233,7 @@ fn read_regular_file(file: &Path, path: &str) -> Result<Option<String>, Proposal
     let opened = std::fs::OpenOptions::new()
         .read(true)
         // No controlling terminal is taken from a tty the path might name.
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | flags)
         .open(file);
     let handle = match opened {
         Ok(handle) => handle,
@@ -225,7 +243,7 @@ fn read_regular_file(file: &Path, path: &str) -> Result<Option<String>, Proposal
     let meta = handle
         .metadata()
         .map_err(|e| ProposalRefused::Io(format!("could not read {path}: {e}")))?;
-    if !meta.file_type().is_file() {
+    if !meta.file_type().is_file() || !check(&handle) {
         return Err(ProposalRefused::NotAFile { path: path.to_string() });
     }
     if meta.len() > PROPOSAL_MAX_BYTES {

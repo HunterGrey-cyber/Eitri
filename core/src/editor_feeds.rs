@@ -414,13 +414,14 @@ mod tests {
         assert_eq!(push(), None);
         send(
             feed.socket_path(),
-            r#"{"v":1,"file":"/p/a.rs","line":7,"selection":{"start_line":2,"end_line":3,"text":"x","start_col":1,"end_col":4}}"#,
+            r#"{"v":1,"file":"/p/a.rs","read_from":"/q/a.rs","line":7,"selection":{"start_line":2,"end_line":3,"text":"x","start_col":1,"end_col":4}}"#,
         );
         assert!(feeds.poll(now + every).context);
         let expected = PushFacts {
             cursor_line: Some(7),
             start_col: Some(1),
             end_col: Some(4),
+            read_from: Some("/q/a.rs".to_owned()),
         };
         assert_eq!(push(), Some(expected.clone()));
         for (i, file_name) in ["/scratch/draft", "eitri-file://1/a.rs", "eitri-proposal://1/a.rs"]

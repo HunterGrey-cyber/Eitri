@@ -22,6 +22,9 @@ const TOOL_ERROR: i64 = -32000;
 /// The most of a tool name an answer repeats: a name is the client's own text, and escaping could carry one near the
 /// message cap past the client's own cap on what it reads.
 const NAME_SHOWN: usize = 128;
+/// The longest `getDiagnostics.uri` taken: past any path a file can have. An answer repeats the `uri` for each of its
+/// entries, so a long one costs its length many times over.
+const URI_BYTES: usize = 8 * 1024;
 
 /// One message from a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,11 +215,14 @@ fn tab_name(arguments: Value) -> Result<String, String> {
 
 fn diagnostics_uri(arguments: Value) -> Result<Option<String>, String> {
     let mut arguments = arguments_map(arguments)?;
-    if arguments.contains_key("uri") {
-        required_string(&mut arguments, "uri").map(Some)
-    } else {
-        Ok(None)
+    if !arguments.contains_key("uri") {
+        return Ok(None);
     }
+    let uri = required_string(&mut arguments, "uri")?;
+    if uri.len() > URI_BYTES {
+        return Err("`uri` is longer than any path".to_owned());
+    }
+    Ok(Some(uri))
 }
 
 /// The id of a message whose tail is all that was kept: the last `"id":` key, a number or a string, ending the object.
@@ -611,6 +617,20 @@ mod tests {
             call("closeAllDiffTabs", json!({})),
             Incoming::CloseAllDiffTabs { id: RpcId::Num(7) }
         );
+    }
+
+    #[test]
+    fn a_uri_longer_than_a_path_can_be_is_refused() {
+        let at_the_cap = format!("file:///{}", "a".repeat(URI_BYTES - "file:///".len()));
+        assert!(matches!(
+            call("getDiagnostics", json!({"uri": at_the_cap})),
+            Incoming::GetDiagnostics { uri: Some(_), .. }
+        ));
+        let over = format!("{at_the_cap}a");
+        assert!(matches!(
+            call("getDiagnostics", json!({"uri": over})),
+            Incoming::BadParams { .. }
+        ));
     }
 
     #[test]

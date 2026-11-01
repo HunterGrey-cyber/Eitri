@@ -45,23 +45,40 @@ When a `claude` has attached:
 
 - **Diffs.** When it asks you about an edit, the file and its proposed version open side by side next to your window,
   without taking your cursor or leaving your mode. You can edit the proposal. `<localleader>a` (`\a` unless you changed your
-  local leader) or `:w` in the proposal accepts it; `<localleader>d` rejects it. `<localleader>q`, `:q` or closing either window leaves the view without
-  answering, and the prompt in the terminal then decides. Eitri writes no file itself: an accept hands the text back to
-  the `claude`, which does its own write. Only files inside the project open this way.
+  local leader), `:w` in the proposal or `:EitriDiffAccept` accepts it; `<localleader>d` or `:EitriDiffReject` rejects it.
+  The two commands exist only in the view's two buffers, for a mapping of your own. A reject stops that `claude`'s turn.
+  So does accepting a text equal to the file, which it reads as a rejection; the winbar warns you while that is the
+  case. `<localleader>q`, `:q` or closing either window leaves the view without answering, and the prompt in the
+  terminal then decides. Eitri writes no file itself: an accept hands the text back to the `claude`, which does its own
+  write. Only files inside the project open this way.
 - **Diagnostics.** The `claude` can read the diagnostics of the files your editor has loaded in the project.
-- **Selection.** Your current selection, and the cursor's line, are sent to it as you move.
+- **Selection.** Your current selection, and the cursor's line, are sent to it as you move, for a file inside the
+  project. A buffer whose text was read from outside the project sends neither, whatever its name says now: one opened
+  through a link that has since been replaced by an ordinary file, for example.
 - **`:EitriMention`.** Sends the cursor's line, or a range (`:'<,'>EitriMention`), to it as an `@`-mention. The command
   has no default key; map it yourself if you want one.
 
 Nothing a `claude` can call through this writes a file, runs code, or opens or loads a file in your editor.
 
+## See whether it attached
+
+Eitri shows no indicator for this. In the `claude`, `/ide` lists the IDEs it can see. Eitri's own account goes to its
+stderr, so start it from a terminal to read it:
+
+- `[ide-server] a client says it is pid <n>`: a client attached.
+- `[ide-server] refused a client: <why>`: a client tried and was turned away, and `<why>` names the check it failed.
+  Each reason is printed once for each start of the window.
+
+If neither line appears, no client tried. Check that `CLAUDE_CODE_SSE_PORT` is set in that shell, and that
+`~/.claude/ide/<port>.lock` exists.
+
 ## Keep a session out
 
 A `claude` that you did not start from Eitri's terminal does not attach by itself. To keep one that is in Eitri's
-terminal from attaching:
+terminal from attaching, set `CLAUDE_CODE_AUTO_CONNECT_IDE=false` in that shell before starting it.
 
-- set `CLAUDE_CODE_AUTO_CONNECT_IDE=false` in that shell before starting it; or
-- set the CLI's own `diffTool` setting to `terminal`, which keeps diffs in the terminal.
+To let it attach but keep diffs in the terminal, set the CLI's own `diffTool` setting to `terminal`. Such a `claude`
+still gets your selection, the file's path and the diagnostics.
 
 Any process of your user can read the lock file and connect with its token. The access that gives is the list above,
 nothing more; that is the same footing as any program that can already read your files or type into your terminals.
@@ -69,13 +86,22 @@ Leave the key off if you do not want the lock file to exist.
 
 ## Limits
 
-- A tmux server that was already running keeps its own environment, so its shells lack the port. Run
-  `tmux setenv CLAUDE_CODE_SSE_PORT <port>` (the port is the number in the lock file's name) or start tmux from an
-  Eitri terminal.
+- A tmux server that was already running keeps its own environment, so its shells lack the port, and running `tmux` in
+  an Eitri terminal only joins that server. Start a new server from an Eitri terminal (`tmux -L eitri`, say), or run
+  `tmux setenv CLAUDE_CODE_SSE_PORT <port>` (the port is the number in the lock file's name) and open a new pane: a pane
+  that is already open keeps what it has. The port changes with each start of the window, so set it again after one.
 - A shell, a tmux server or a `nohup` job that outlives Eitri keeps the old port. After a restart of the window, a
   `claude` there does not reach the new Eitri; start it from a new shell.
 - The port belongs to the first window. If you close it while the second window stays open, a connected `claude` loses
   the connection, and the second window's later shells have no port.
-- If Eitri cannot make the lock (no home directory, a `~/.claude` or `~/.claude/ide` that others can write, no random
-  bytes), it starts no listener, shows a short notice once, and sets no port.
+- In a folder that is [no project boundary](permissions.md#a-folder-that-is-no-boundary), a `claude` still attaches, but
+  nothing counts as inside the project: every diff stays in the terminal, it gets no selection and no diagnostics, and
+  `:EitriMention` says the file is outside. Start Eitri in a project folder instead.
+- If Eitri cannot make the lock, it starts no listener, sets no port, and shows a short notice once. That happens when
+  `HOME` is not an absolute path, and when `~/.claude` or `~/.claude/ide` is not a private directory of yours: a symbolic
+  link (some dotfile managers make one), another user's directory, or one that its group or others can write. The notice
+  for all of these says `~/.claude/ide is not a private directory of yours`. Put a real directory in place of a link, or
+  run `chmod go-w ~/.claude ~/.claude/ide`, then restart the window.
+- If the system gives no random bytes or no port, there is no listener and no port either. Only a line on stderr says
+  so: `[ide-server] no listener: <why>`.
 - Other versions of the `claude` CLI may behave differently from 2.1.311.

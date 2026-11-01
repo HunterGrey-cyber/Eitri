@@ -40,7 +40,8 @@ libloading = "0.9.0"
 # cache). The lockfile happened to pin 0.3.34, which is why this only mattered on paper before now.
 futures-channel = "0.3.32"
 # `geteuid`, for the address check of `eitri panel --nvim` (the control socket's own peer check uses
-# it too), and `prctl(PR_SET_PDEATHSIG)`/`kill` by captured pid in `tests/support/own_x_server.rs`.
+# it too), the peer check of `eitri-editor-bridge`, and `prctl(PR_SET_PDEATHSIG)`/`kill` by captured
+# pid in `tests/support/own_x_server.rs`.
 # The version `neovide-editor` already depends on directly.
 libc = "0.2"
 # The arguments of `nvim_exec_lua` (`companion::link`). The version `eitri-core` and the fork share.

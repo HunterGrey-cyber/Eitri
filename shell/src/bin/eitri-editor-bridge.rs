@@ -1,7 +1,7 @@
 //! `eitri-editor-bridge <socket> <key>`: the tool server an agent starts for a Codex or ACP tab. MCP over stdio on one
 //! side, newline-delimited JSON-RPC; the bridge socket to the window serving the tab on the other. Nothing is decided
 //! here: every tool's name, schema and answer is the window's, and this process only carries them. It links
-//! `serde_json` and `std`, so it starts quickly and maps nothing of a window's.
+//! `serde_json`, `libc` and `std`, so it starts quickly and maps nothing of a window's.
 //!
 //! One loop owns stdout and every table, fed by a thread reading stdin and a thread holding the socket's reading end.
 //! The connection comes and goes: a tab moving to the other window unbinds the socket here and binds it there, so a
@@ -17,6 +17,7 @@ mod bridge_wire;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -150,7 +151,16 @@ fn hold_connection(socket: &Path, key: &str, events: SyncSender<Event>) {
 
 /// A connection counts from its `welcome`: a host that closes on a `hello`, as it does for a wrong key, is no host.
 fn greet(socket: &Path, key: &str) -> Option<(UnixStream, UnixStream, Vec<Value>)> {
-    let mut stream = UnixStream::connect(socket).ok()?;
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    greet_on(UnixStream::connect(socket).ok()?, key, unsafe { libc::geteuid() })
+}
+
+/// The key goes first and tells whoever hears it which tab to answer for, so a peer of any uid but `uid` gets nothing:
+/// the path is only as private as every directory above it, and a stranger answering there counts as a refused `hello`.
+fn greet_on(mut stream: UnixStream, key: &str, uid: u32) -> Option<(UnixStream, UnixStream, Vec<Value>)> {
+    if peer_uid(&stream).ok()? != uid {
+        return None;
+    }
     stream.set_read_timeout(Some(RECONNECT_LIMIT)).ok()?;
     stream.set_write_timeout(Some(WRITE_LIMIT)).ok()?;
     let hello = Message::Hello {
@@ -164,6 +174,40 @@ fn greet(socket: &Path, key: &str) -> Option<(UnixStream, UnixStream, Vec<Value>
     stream.set_read_timeout(None).ok()?;
     let writer = stream.try_clone().ok()?;
     Some((stream, writer, tools))
+}
+
+/// The uid at the other end of `stream`, asked of the kernel as `eitri_core::panel_control::peer_uid` does.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    // SAFETY: `ucred` is plain old data and `len` is its exact size; `getsockopt` fills at most that.
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        );
+        if rc == 0 {
+            Ok(cred.uid)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// The uid at the other end of `stream`. A platform with neither call does not build, rather than answer for a stranger.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+    // SAFETY: both out-pointers are valid for the call.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 {
+        Ok(uid)
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// A call that has a frame and is waiting for a connection.
@@ -422,6 +466,31 @@ impl<W: Write> Bridge<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_goes_to_a_peer_of_another_uid() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let other = unsafe { libc::geteuid() }.wrapping_add(1);
+        let (ours, mut theirs) = UnixStream::pair().expect("a pair");
+        let greeting = std::thread::spawn(move || greet_on(ours, "key", other).is_some());
+        let mut heard = Vec::new();
+        theirs.read_to_end(&mut heard).expect("reads");
+        assert_eq!(heard, b"", "the key went to a stranger");
+        assert!(!greeting.join().expect("it ended"));
+    }
+
+    #[test]
+    fn a_peer_of_this_uid_gets_the_hello_and_is_taken_at_its_welcome() {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let own = unsafe { libc::geteuid() };
+        let (ours, mut theirs) = UnixStream::pair().expect("a pair");
+        let greeting = std::thread::spawn(move || greet_on(ours, "key", own).is_some());
+        let hello = read_frame(&mut theirs).expect("reads").expect("a frame");
+        assert!(matches!(Message::parse(hello), Ok(Message::Hello { key, .. }) if key == "key"));
+        let welcome = Message::Welcome { tools: Vec::new() };
+        write_frame(&mut theirs, &welcome.into_value()).expect("writes");
+        assert!(greeting.join().expect("it ended"));
+    }
 
     /// The limit is looked at before the queue: a client that never stops writing keeps it non-empty for ever.
     #[test]

@@ -78,9 +78,12 @@ struct Call {
     give_up: Instant,
 }
 
-/// An open whose view was forgotten before it answered.
+/// What nvim may still answer with nobody waiting: an open whose view was forgotten, or a call the client left.
 struct Abandoned {
-    view: u64,
+    /// The open's view, which its answer may have made.
+    view: Option<u64>,
+    /// The call a client left, whose place goes back when this ends.
+    left: Option<(ConnId, RpcId)>,
     pending: Pending,
     until: Instant,
 }
@@ -148,15 +151,20 @@ impl IdeHost {
                 out.push(answer(conn, id, ToolAnswer::Empty));
             }
             Event::Cancelled { conn, id } => {
-                self.close_views(rpc, now, |view| view.conn == conn && view.request == id);
-                self.calls.retain(|call| call.conn != conn || call.id != id);
+                self.close_views(rpc, now, true, |view| view.conn == conn && view.request == id);
+                self.leave_calls(|call| call.conn == conn && call.id == id);
                 self.open_requests
                     .retain(|request| request.conn != conn || request.id != id);
+                self.release_unless_owed(conn, id, out);
             }
             Event::ClientGone { conn } => {
-                self.close_views(rpc, now, |view| view.conn == conn);
-                self.calls.retain(|call| call.conn != conn);
-                self.open_requests.retain(|request| request.conn != conn);
+                let mut left = self.close_views(rpc, now, true, |view| view.conn == conn);
+                self.leave_calls(|call| call.conn == conn);
+                let behind_views = self.open_requests.extract_if(.., |request| request.conn == conn);
+                left.extend(behind_views.map(|request| (request.conn, request.id)));
+                for (conn, id) in left {
+                    self.release_unless_owed(conn, id, out);
+                }
                 self.sequencers.remove(&conn);
             }
             // No worker is left to take an answer.
@@ -183,7 +191,7 @@ impl IdeHost {
     pub fn tick(&mut self, rpc: &dyn EditorRpc, now: Instant, out: &mut Vec<Command>) {
         self.poll_calls(now, out);
         self.poll_opening(rpc, now, out);
-        self.poll_abandoned(rpc, now);
+        self.poll_abandoned(rpc, now, out);
         self.check_target(rpc, out);
         self.poll_take(out);
         self.send_take_when_due(rpc, now);
@@ -223,6 +231,26 @@ impl IdeHost {
     /// The window's end: every view closes, an opening one too, and nothing is answered.
     pub fn shutdown(&mut self, rpc: &dyn EditorRpc) {
         self.forget_all_requests(rpc, Instant::now());
+    }
+
+    fn leave_calls(&mut self, of: impl Fn(&Call) -> bool) {
+        for call in self.calls.extract_if(.., |call| of(call)) {
+            self.abandoned.push(Abandoned {
+                view: None,
+                left: Some((call.conn, call.id)),
+                pending: call.pending,
+                until: call.give_up,
+            });
+        }
+    }
+
+    /// A call the client left gives its place back now, unless nvim has yet to answer it: then the poll that sees the
+    /// answer, or gives up on it, does.
+    fn release_unless_owed(&self, conn: ConnId, id: RpcId, out: &mut Vec<Command>) {
+        let owed = |open: &Abandoned| open.left.as_ref().is_some_and(|(of, call)| *of == conn && *call == id);
+        if !self.abandoned.iter().any(owed) {
+            out.push(Command::Released { conn, id });
+        }
     }
 
     fn stamp(&mut self, conn: ConnId, budget: Duration) -> Stamp {
@@ -305,11 +333,13 @@ impl IdeHost {
         });
     }
 
-    /// Closes every view `matches` picks, whichever its state, and gives back the requests they held.
+    /// Closes every view `matches` picks, whichever its state, and gives back the requests they held. `left`: the client
+    /// left them, so an open still out gives its call's place back when it ends.
     fn close_views(
         &mut self,
         rpc: &dyn EditorRpc,
         now: Instant,
+        left: bool,
         matches: impl Fn(&View) -> bool,
     ) -> Vec<(ConnId, RpcId)> {
         let mut requests = Vec::new();
@@ -317,7 +347,8 @@ impl IdeHost {
             send_close(rpc, view.id);
             if let Stage::Opening { pending, .. } = view.stage {
                 self.abandoned.push(Abandoned {
-                    view: view.id,
+                    view: Some(view.id),
+                    left: left.then(|| (view.conn, view.request.clone())),
                     pending,
                     until: now + EDITOR_BUDGET,
                 });
@@ -336,7 +367,7 @@ impl IdeHost {
         out: &mut Vec<Command>,
         matches: impl Fn(ConnId, &str) -> bool,
     ) {
-        for (conn, id) in self.close_views(rpc, now, |view| matches(view.conn, &view.tab_name)) {
+        for (conn, id) in self.close_views(rpc, now, false, |view| matches(view.conn, &view.tab_name)) {
             out.push(refusal(conn, id, VIEW_CLOSED));
         }
         let behind = |request: &mut OpenRequest| matches(request.conn, &request.tab_name);
@@ -346,7 +377,7 @@ impl IdeHost {
     }
 
     fn forget_all_requests(&mut self, rpc: &dyn EditorRpc, now: Instant) {
-        self.close_views(rpc, now, |_| true);
+        self.close_views(rpc, now, false, |_| true);
         self.calls.clear();
         self.open_requests.clear();
     }
@@ -419,23 +450,28 @@ impl IdeHost {
                 out.push(refusal(view.conn, view.request, why));
             }
         }
-        for (conn, id) in self.close_views(rpc, now, |view| given_up.contains(&view.id)) {
+        for (conn, id) in self.close_views(rpc, now, false, |view| given_up.contains(&view.id)) {
             out.push(refusal(conn, id, NOT_IN_TIME));
         }
     }
 
     /// The close sent when a view was forgotten lands after its open, except in the embedded editor's rare swap of two
     /// calls, which would leave a view nobody holds: an open that answers `Opened` here gets a second close. Past the
-    /// budget its answer is not coming.
-    fn poll_abandoned(&mut self, rpc: &dyn EditorRpc, now: Instant) {
-        self.abandoned.retain(|open| match open.pending.try_take() {
-            Some(reply) => {
-                if open_outcome(reply).is_ok() {
-                    send_close(rpc, open.view);
-                }
-                false
+    /// budget its answer is not coming. Either way nvim owes it nothing now, so the place of a call the client left goes
+    /// back.
+    fn poll_abandoned(&mut self, rpc: &dyn EditorRpc, now: Instant, out: &mut Vec<Command>) {
+        self.abandoned.retain(|open| {
+            let reply = open.pending.try_take();
+            if reply.is_none() && now < open.until {
+                return true;
             }
-            None => now < open.until,
+            if let (Some(view), Some(Ok(()))) = (open.view, reply.map(open_outcome)) {
+                send_close(rpc, view);
+            }
+            if let Some((conn, id)) = open.left.clone() {
+                out.push(Command::Released { conn, id });
+            }
+            false
         });
     }
 
@@ -1083,6 +1119,7 @@ mod tests {
             conn: 1,
             id: request(1),
         });
+        only_released(&mut bench, 1, 1);
         bench.editor.answer(
             "take",
             events(vec![
@@ -1146,7 +1183,8 @@ mod tests {
         bench.editor.answer("open", opened());
         bench.tick();
         assert_eq!(bench.editor.names(), ["open", "close", "close"]);
-        assert!(bench.out.is_empty(), "{:?}", bench.out);
+        let answered = |command: &Command| !matches!(command, Command::Released { .. });
+        assert!(!bench.out.iter().any(answered), "{:?}", bench.out);
         assert_eq!(bench.host.next_tick(), None);
     }
 
@@ -1282,6 +1320,7 @@ mod tests {
             bench.editor.answer("take", events(vec![view_event(1, "closed")]));
             bench.tick();
             bench.event(leave);
+            only_released(&mut bench, 1, 1);
             bench.event(Event::CloseTab {
                 conn: 1,
                 id: request(2),
@@ -1289,6 +1328,96 @@ mod tests {
             });
             assert_eq!(bench.one_answer(), (1, request(2), ToolAnswer::Empty));
         }
+    }
+
+    fn released(conn: ConnId, id: i64) -> Command {
+        Command::Released { conn, id: request(id) }
+    }
+
+    /// What went out since the last look, as text: a `Command` holds no `PartialEq`.
+    fn seen(bench: &mut Bench) -> Vec<String> {
+        bench.out.drain(..).map(|command| format!("{command:?}")).collect()
+    }
+
+    fn only_released(bench: &mut Bench, conn: ConnId, id: i64) {
+        assert_eq!(seen(bench), vec![format!("{:?}", released(conn, id))]);
+    }
+
+    fn cancelled(id: i64) -> Event {
+        Event::Cancelled {
+            conn: 1,
+            id: request(id),
+        }
+    }
+
+    #[test]
+    fn a_call_left_with_nvim_is_released_when_nvim_answers() {
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.event(all_diagnostics(1, 1));
+            bench.event(leave);
+            bench.tick();
+            assert!(bench.out.is_empty(), "nvim still owes it: {:?}", bench.out);
+            assert_eq!(bench.host.next_tick(), Some(Duration::from_millis(10)));
+            bench.editor.answer("diagnostics", Err(RpcError::Closed));
+            bench.tick();
+            only_released(&mut bench, 1, 1);
+            assert_eq!(bench.host.next_tick(), None);
+        }
+    }
+
+    #[test]
+    fn a_call_left_with_nvim_is_released_when_the_host_gives_up() {
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.event(all_diagnostics(1, 1));
+            bench.event(leave);
+            bench.after(DIAGNOSTICS_ALL);
+            only_released(&mut bench, 1, 1);
+            assert_eq!(bench.host.next_tick(), None);
+        }
+    }
+
+    #[test]
+    fn an_open_left_with_nvim_is_released_when_it_answers_or_its_time_runs_out() {
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.event(open_diff(1, 1, "tab"));
+            bench.event(leave);
+            bench.tick();
+            assert!(bench.out.is_empty(), "nvim still owes it: {:?}", bench.out);
+            bench.editor.answer("open", opened());
+            bench.tick();
+            only_released(&mut bench, 1, 1);
+        }
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.event(open_diff(1, 1, "tab"));
+            bench.event(leave);
+            bench.after(EDITOR_BUDGET);
+            only_released(&mut bench, 1, 1);
+        }
+    }
+
+    #[test]
+    fn what_nvim_owes_nothing_for_is_released_at_once() {
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.open(1, 1, "tab");
+            bench.event(leave);
+            only_released(&mut bench, 1, 1);
+        }
+        for leave in [cancelled(1), Event::ClientGone { conn: 1 }] {
+            let mut bench = Bench::new();
+            bench.open(1, 1, "tab");
+            bench.editor.answer("take", events(vec![view_event(1, "closed")]));
+            bench.tick();
+            bench.event(leave);
+            only_released(&mut bench, 1, 1);
+        }
+        let mut bench = Bench::new();
+        bench.event(cancelled(1));
+        only_released(&mut bench, 1, 1);
     }
 
     #[test]
@@ -1299,9 +1428,9 @@ mod tests {
             conn: 1,
             id: request(1),
         });
-        assert_eq!(bench.host.next_tick(), None);
         bench.after(DIAGNOSTICS_ALL);
-        assert!(bench.out.is_empty());
+        only_released(&mut bench, 1, 1);
+        assert_eq!(bench.host.next_tick(), None);
     }
 
     #[test]
@@ -1311,7 +1440,11 @@ mod tests {
         bench.event(all_diagnostics(2, 2));
         bench.event(Event::ClientGone { conn: 1 });
         bench.after(DIAGNOSTICS_ALL);
-        assert_eq!(bench.one_answer().0, 2);
+        let [other, gone] = &seen(&mut bench)[..] else {
+            panic!("one for each connection");
+        };
+        assert!(other.starts_with("Answer { conn: 2,"), "{other}");
+        assert_eq!(*gone, format!("{:?}", released(1, 1)));
     }
 
     #[test]

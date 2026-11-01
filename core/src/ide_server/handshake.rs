@@ -90,8 +90,9 @@ pub enum Verdict {
     NeedMore,
     /// The 101: write it, and the connection speaks WebSocket from then on.
     Upgrade { answer: Vec<u8> },
-    /// An HTTP error: write it, then close.
-    Refuse { answer: Vec<u8> },
+    /// An HTTP error: write it, then close. `why` says which check for a log line, a constant, so nothing of the request
+    /// can reach a log through it.
+    Refuse { answer: Vec<u8>, why: &'static str },
 }
 
 /// Which check a request failed. Two checks answer the same status, and this is what tells them apart.
@@ -112,6 +113,23 @@ impl Failure {
             Failure::Token => "401 Unauthorized",
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Failure::Malformed => "not a well-formed upgrade request",
+            Failure::Host => "its Host is not this listener's address",
+            Failure::Origin => "it sent an Origin header",
+            Failure::Token => "no token header with this listener's token",
+            Failure::Upgrade => "its WebSocket upgrade headers are not the ones expected",
+        }
+    }
+
+    fn verdict(self) -> Verdict {
+        Verdict::Refuse {
+            answer: refusal(self.status()),
+            why: self.name(),
+        }
+    }
 }
 
 /// Judges `head`, everything read from a connection so far. Bytes after the blank line are not part of the request.
@@ -121,9 +139,7 @@ pub fn judge(head: &[u8], port: u16, token: &Token, limits: &Limits) -> Verdict 
     let Some(end) = within.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
         // A head already at the cap with no blank line cannot end inside the cap, whatever comes next.
         return if head.len() >= limits.handshake_bytes {
-            Verdict::Refuse {
-                answer: refusal(Failure::Malformed.status()),
-            }
+            Failure::Malformed.verdict()
         } else {
             Verdict::NeedMore
         };
@@ -132,9 +148,7 @@ pub fn judge(head: &[u8], port: u16, token: &Token, limits: &Limits) -> Verdict 
         Ok(key) => Verdict::Upgrade {
             answer: upgrade_answer(key),
         },
-        Err(failure) => Verdict::Refuse {
-            answer: refusal(failure.status()),
-        },
+        Err(failure) => failure.verdict(),
     }
 }
 
@@ -329,7 +343,7 @@ mod tests {
     fn status(verdict: &Verdict) -> u16 {
         let answer = match verdict {
             Verdict::NeedMore => panic!("a whole head got NeedMore"),
-            Verdict::Upgrade { answer } | Verdict::Refuse { answer } => answer,
+            Verdict::Upgrade { answer } | Verdict::Refuse { answer, .. } => answer,
         };
         let answer = std::str::from_utf8(answer).unwrap();
         let code = answer.strip_prefix("HTTP/1.1 ").unwrap().split(' ').next().unwrap();
@@ -642,13 +656,41 @@ mod tests {
             .with("User-Agent", "marker-agent")
             .text()
             .replacen("GET /", "GET /marker-target", 1);
-        let Verdict::Refuse { answer } = judged(head.as_bytes()) else {
+        let Verdict::Refuse { answer, .. } = judged(head.as_bytes()) else {
             panic!("refused above")
         };
         assert_eq!(
             answer,
             b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn each_refusal_names_its_check() {
+        let why_of = |head: Head| match judged(head.text().as_bytes()) {
+            Verdict::Refuse { why, .. } => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        let named = [
+            (Head::good().set("Host", "marker-host"), Failure::Host),
+            (Head::good().with("Origin", "http://marker"), Failure::Origin),
+            (
+                Head::good().set("X-Claude-Code-Ide-Authorization", "marker"),
+                Failure::Token,
+            ),
+            (Head::good().without("Upgrade"), Failure::Upgrade),
+        ];
+        let mut seen = Vec::new();
+        for (head, failure) in named {
+            let why = why_of(head);
+            assert_eq!(why, failure.name());
+            assert!(!seen.contains(&why), "{why}");
+            seen.push(why);
+        }
+        let Verdict::Refuse { why, .. } = judged(b"not a request\r\n\r\n") else {
+            panic!("refused")
+        };
+        assert_eq!(why, Failure::Malformed.name());
     }
 
     #[test]
@@ -661,7 +703,7 @@ mod tests {
             ),
             (Head::good().without("Upgrade"), "HTTP/1.1 400 Bad Request\r\n"),
         ] {
-            let Verdict::Refuse { answer } = judged(head.text().as_bytes()) else {
+            let Verdict::Refuse { answer, .. } = judged(head.text().as_bytes()) else {
                 panic!("refused above")
             };
             assert!(answer.starts_with(line.as_bytes()), "{line}");

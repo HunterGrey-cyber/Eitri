@@ -65,6 +65,135 @@ fn an_exclusive_selection_ends_before_the_cursor() {
     assert_eq!((facts.start_col, facts.end_col), (Some(1), Some(3)));
 }
 
+/// A project with `a.py` a link to a file outside it, and what the name is replaced with later.
+#[cfg(target_os = "linux")]
+struct LinkedOut {
+    dir: std::path::PathBuf,
+    name: std::path::PathBuf,
+    secret: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LinkedOut {
+    fn new(outside_name: &std::ffi::OsStr) -> LinkedOut {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("nv-w1-rec-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::set_permissions(dir.join("project"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = dir.join("elsewhere").join(outside_name);
+        std::fs::write(&secret, "private line\n").unwrap();
+        let name = dir.join("project/a.py");
+        std::os::unix::fs::symlink(&secret, &name).unwrap();
+        LinkedOut { dir, name, secret }
+    }
+
+    /// What replaces the link with an ordinary file while nvim holds the buffer.
+    fn replace_the_link(&self) -> Vec<String> {
+        let name = self.name.display();
+        vec![
+            format!("call delete('{name}')"),
+            format!("call writefile(['an ordinary, longer line of its own'], '{name}')"),
+        ]
+    }
+
+    fn push(&self, update: eitri_core::editor_context::feed::FeedUpdate) -> serde_json::Value {
+        use eitri_core::ide_server::files::run_job;
+        use eitri_core::ide_server::{ContextUpdate, Done, Job, ServerConfig};
+        let config = ServerConfig {
+            root: self.dir.join("project"),
+            home: None,
+        };
+        let job = Job::Context(ContextUpdate {
+            context: Some(update.context),
+            facts: update.facts,
+        });
+        match run_job(&config, job) {
+            Done::Selection(params) => params,
+            other => panic!("not a selection: {other:?}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinkedOut {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The update nvim sent last, after `commands`, on a buffer opened at `case.name` through its link.
+#[cfg(target_os = "linux")]
+fn drive_linked(case: &LinkedOut, commands: &[String]) -> eitri_core::editor_context::feed::FeedUpdate {
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
+    let update = drive_nvim_update(&feed, &mut reader, &case.name, &["--clean"], &commands);
+    feed.cleanup();
+    update.expect("an update must arrive")
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_buffer_read_through_a_link_says_where_on_the_line_and_its_selection_is_not_pushed() {
+    let case = LinkedOut::new(std::ffi::OsStr::new("secret.py"));
+    let mut commands = case.replace_the_link();
+    commands.push("normal! ggVj".to_owned());
+    let update = drive_linked(&case, &commands);
+    assert_eq!(update.context.selection.as_ref().unwrap().text, "private line");
+    assert_eq!(update.facts.read_from.as_deref(), Some(case.secret.to_str().unwrap()));
+    assert_eq!(update.context.file, case.name.display().to_string());
+    let params = case.push(update);
+    assert_eq!(params["text"], serde_json::json!(""), "{params}");
+    assert!(params.get("filePath").is_none(), "{params}");
+}
+
+/// A reload moves the record with nothing else to report it: `:checktime` runs no cursor or buffer event.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reload_that_moves_the_record_is_reported() {
+    let case = LinkedOut::new(std::ffi::OsStr::new("secret.py"));
+    let mut commands = vec!["sleep 300m".to_owned(), "set autoread".to_owned()];
+    commands.extend(case.replace_the_link());
+    commands.push("checktime".to_owned());
+    let update = drive_linked(&case, &commands);
+    assert_eq!(
+        update.facts.read_from.as_deref(),
+        Some(case.name.to_str().unwrap()),
+        "the line after the reload says what was read"
+    );
+    assert_eq!(
+        case.push(update)["filePath"],
+        serde_json::json!(case.name.to_str().unwrap())
+    );
+}
+
+/// A record that is not UTF-8 is what `from_utf8_lossy` hurt in a name: it has to arrive marked, and be refused.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_record_that_is_not_utf8_arrives_marked_and_is_not_pushed() {
+    use std::os::unix::ffi::OsStrExt;
+    let case = LinkedOut::new(std::ffi::OsStr::from_bytes(b"caf\xe9.py"));
+    let update = drive_linked(&case, &["normal! ggVj".to_owned()]);
+    assert!(
+        update
+            .facts
+            .read_from
+            .as_deref()
+            .is_some_and(|record| record.contains('\u{fffd}')),
+        "{:?}",
+        update.facts
+    );
+    assert_eq!(update.context.selection.as_ref().unwrap().text, "private line");
+    let params = case.push(update);
+    assert_eq!(params["text"], serde_json::json!(""), "{params}");
+}
+
 /// Opens `file`, runs `normal_command`, and returns whatever the snippet sent.
 ///
 /// The `sleep` is inside nvim's own command sequence rather than in this process: the snippet

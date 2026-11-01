@@ -45,7 +45,8 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 /// its connection is closed rather than kept growing.
 const MAX_QUEUED: usize = 8 * super::bridge_wire::MAX_FRAME;
 
-/// News not yet taken above which served connections are not read: the socket's own buffer then holds a peer back.
+/// News not yet taken above which no connection is read: the socket's own buffer then holds a peer back, and a greeting
+/// that waits out [`HELLO_WITHIN`] is closed.
 const MAX_NEWS: usize = 256;
 
 /// Connections one tab may have at a time. A tab's agent runs one bridge; the room is for a reconnect that finds the
@@ -540,8 +541,9 @@ impl Connection {
 
     fn interest(&self, reading: bool) -> libc::c_short {
         let read = match self.stage {
-            Stage::Greeting { .. } => true,
-            Stage::Serving => reading,
+            // A greeting counts: everything behind its `hello` in one read is served, and a connection that goes
+            // straight after leaves its news here and takes its place in the tab's count with it.
+            Stage::Greeting { .. } | Stage::Serving => reading,
             Stage::Closing { .. } => false,
         };
         let mut events = 0;
@@ -1545,6 +1547,59 @@ mod tests {
         let _host = all_returned.recv_timeout(PATIENCE).expect("every call returned");
         // Closed at the cap: what was written is what the socket held, well under everything answered.
         assert!(read_to_the_end(&mut peer) < answers * MAX_FRAME / 2);
+    }
+
+    /// A hello, calls behind it in one write, and a frame that ends the connection. What the calls left behind is all such
+    /// a connection is for, and connecting again has no limit of its own.
+    fn hello_calls_and_an_end(key: &str, calls: u64) -> Vec<u8> {
+        let hello = Message::Hello {
+            v: PROTOCOL,
+            key: key.to_owned(),
+        };
+        let mut bytes = encode_frame(&hello.into_value()).expect("encodes");
+        for id in 0..calls {
+            bytes.extend(encode_frame(&call(id, Value::Null).into_value()).expect("encodes"));
+        }
+        let end = Message::Welcome { tools: Vec::new() };
+        bytes.extend(encode_frame(&end.into_value()).expect("encodes"));
+        bytes
+    }
+
+    #[test]
+    fn a_new_connection_is_not_read_past_what_the_news_can_hold() {
+        let scratch = Scratch::new();
+        let host = host(&scratch);
+        let (name, path) = host.open(1, tools()).expect("opens");
+        let mut filler = welcomed(&path, &name.key);
+        for id in 0..MAX_NEWS as u64 {
+            say(&mut filler, call(id, Value::Null));
+        }
+        let until = Instant::now() + PATIENCE;
+        while host.pending.load(Ordering::Relaxed) < MAX_NEWS {
+            assert!(Instant::now() < until, "the news did not fill");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        for _ in 0..8 {
+            let mut stream = connect(&path);
+            stream.write_all(&hello_calls_and_an_end(&name.key, 8)).expect("writes");
+        }
+        // Time for a reader that reads a greeting anyway to run through all eight.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(host.pending.load(Ordering::Relaxed), MAX_NEWS);
+
+        let mut waiting = connect(&path);
+        let hello = Message::Hello {
+            v: PROTOCOL,
+            key: name.key.clone(),
+        };
+        say(&mut waiting, hello);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(host.take_news().len(), MAX_NEWS);
+        assert!(
+            matches!(hear(&mut waiting), Message::Welcome { .. }),
+            "taken, the rest are read"
+        );
     }
 
     #[test]

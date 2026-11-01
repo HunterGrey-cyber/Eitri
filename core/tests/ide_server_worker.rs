@@ -5,7 +5,7 @@
 #[path = "support/ide_client.rs"]
 mod ide_client;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -199,6 +199,22 @@ impl Syscalls for Faults {
     }
 }
 
+/// Keeps the worker's log lines for a test to read.
+#[derive(Clone, Default)]
+struct KeptLog(Arc<Mutex<Vec<String>>>);
+
+impl KeptLog {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Syscalls for KeptLog {
+    fn log(&mut self, line: &str) {
+        self.0.lock().unwrap().push(line.to_owned());
+    }
+}
+
 /// A worker on its thread, with the test holding the other end of each channel.
 struct Rig {
     port: u16,
@@ -206,6 +222,7 @@ struct Rig {
     keeper: Arc<KeeperState>,
     mentions: Arc<MentionState>,
     events: Receiver<Event>,
+    events_waiting: Arc<AtomicUsize>,
     commands: Sender<Command>,
     commands_wake: Arc<Wake>,
     jobs: Option<Receiver<Job>>,
@@ -237,6 +254,7 @@ impl Rig {
         let (done, done_out) = channel();
         let commands_wake = Arc::new(Wake::new().unwrap());
         let done_wake = Arc::new(Wake::new().unwrap());
+        let events_waiting = Arc::new(AtomicUsize::new(0));
         let parts = WorkerParts {
             listener,
             token,
@@ -245,6 +263,7 @@ impl Rig {
             mentions: Box::new(StubMentions(Arc::clone(&mentions))),
             events: events_in,
             events_wake: Arc::new(Wake::new().unwrap()),
+            events_waiting: Arc::clone(&events_waiting),
             commands: commands_out,
             commands_wake: Arc::clone(&commands_wake),
             jobs: jobs_in,
@@ -257,6 +276,7 @@ impl Rig {
             keeper,
             mentions,
             events,
+            events_waiting,
             commands,
             commands_wake,
             jobs: Some(jobs),
@@ -301,7 +321,16 @@ impl Rig {
     }
 
     fn next_event(&self) -> Event {
-        self.events.recv_timeout(WAIT).expect("an event in time")
+        let event = self.events.recv_timeout(WAIT).expect("an event in time");
+        self.events_waiting.fetch_sub(1, Ordering::Relaxed);
+        event
+    }
+
+    /// Everything waiting, as a drain takes it.
+    fn take_events(&self) -> Vec<Event> {
+        let events: Vec<Event> = self.events.try_iter().collect();
+        self.events_waiting.fetch_sub(events.len(), Ordering::Relaxed);
+        events
     }
 
     fn no_event(&self) {
@@ -419,6 +448,10 @@ fn uri_call(client: &mut IdeClient, id: i64) {
     client.call_tool(id, "getDiagnostics", json!({"uri": "file:///p/a"}));
 }
 
+fn all_call(client: &mut IdeClient, id: i64) {
+    client.call_tool(id, "getDiagnostics", json!({}));
+}
+
 // --- The upgrade ---
 
 #[test]
@@ -456,6 +489,49 @@ fn a_wrong_host_a_token_and_an_origin_are_refused_end_to_end() {
         stream.write_all(request.as_bytes()).unwrap();
         let answer = String::from_utf8(read_to_end(&mut stream)).unwrap();
         assert!(answer.starts_with(&format!("HTTP/1.1 {status} ")), "{what}: {answer}");
+    }
+}
+
+#[test]
+fn a_refusal_is_logged_once_for_each_check_and_never_with_the_token() {
+    let log = KeptLog::default();
+    let rig = Rig::started(
+        Limits {
+            authed: 1,
+            ..Limits::default()
+        },
+        KeeperState::default(),
+        MentionState::default(),
+        log.clone(),
+    );
+    let right_host = format!("127.0.0.1:{}", rig.port);
+    let wrong_token = "cd".repeat(32);
+    let origin = Upgrade {
+        host: Some(right_host.clone()),
+        token: Some(rig.token.as_str()),
+        origin: Some("http://a.example"),
+    };
+    let token = Upgrade {
+        host: Some(right_host),
+        token: Some(wrong_token.as_str()),
+        origin: None,
+    };
+    for upgrade in [&origin, &origin, &token, &token] {
+        let mut stream = dial(rig.port);
+        stream.write_all(upgrade.text().as_bytes()).unwrap();
+        assert!(!read_to_end(&mut stream).is_empty());
+    }
+    let first = rig.client();
+    let mut second = IdeClient::try_attach(rig.port, &Upgrade::proper(rig.port, &rig.token));
+    assert!(second.read_head().starts_with("HTTP/1.1 503 "));
+    drop(first);
+
+    let lines = log.lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for (line, check) in lines.iter().zip(["Origin", "token", "slot"]) {
+        assert!(line.starts_with("[ide-server] refused a client: "), "{line}");
+        assert!(line.contains(check), "{line}");
+        assert!(!line.contains(&rig.token) && !line.contains(&wrong_token), "{line}");
     }
 }
 
@@ -510,6 +586,79 @@ fn a_ninth_unauthenticated_connection_evicts_the_oldest() {
     let mut oldest = dial(rig.port);
     let _others: Vec<TcpStream> = (0..8).map(|_| dial(rig.port)).collect();
     assert_eq!(read_to_end(&mut oldest), b"");
+}
+
+/// The first bytes of the answer to an upgrade finished on `stream`; none when it was closed under it.
+fn finish_the_upgrade(stream: &mut TcpStream, rest: &str) -> String {
+    let _ = stream.write_all(rest.as_bytes());
+    let mut answer = [0; 32];
+    let read = stream.read(&mut answer).unwrap_or(0);
+    String::from_utf8_lossy(&answer[..read]).into_owned()
+}
+
+#[test]
+fn a_client_part_way_through_its_head_outlasts_connections_that_sent_nothing() {
+    let rig = Rig::new();
+    let head = Upgrade::proper(rig.port, &rig.token).text();
+    let (first, rest) = head.split_at(20);
+    let mut client = dial(rig.port);
+    client.write_all(first.as_bytes()).unwrap();
+    // Time for the worker to read what came, and then for it to take the ones that follow. Two lots, each smaller than a
+    // pass's accepts: a connection accepted in a pass is not evicted in it, so a full pass of newcomers evicts what was
+    // there before them, whatever it holds.
+    thread::sleep(QUIET);
+    let _silent: Vec<TcpStream> = (0..7).map(|_| dial(rig.port)).collect();
+    thread::sleep(QUIET);
+    let _more: Vec<TcpStream> = (0..7).map(|_| dial(rig.port)).collect();
+    thread::sleep(QUIET);
+    let answer = finish_the_upgrade(&mut client, rest);
+    assert!(answer.starts_with("HTTP/1.1 101 "), "not upgraded: {answer:?}");
+}
+
+#[test]
+fn the_connection_with_the_fewest_bytes_goes_first() {
+    let rig = Rig::new();
+    let head = Upgrade::proper(rig.port, &rig.token).text();
+    let (first, rest) = head.split_at(20);
+    let mut oldest = dial(rig.port);
+    oldest.write_all(first.as_bytes()).unwrap();
+    let mut others: Vec<TcpStream> = (0..7).map(|_| dial(rig.port)).collect();
+    for other in &mut others {
+        other.write_all(b"GET").unwrap();
+    }
+    thread::sleep(QUIET);
+    let _ninth = dial(rig.port);
+    assert_eq!(
+        read_to_end(&mut others[0]),
+        b"",
+        "the fewest bytes, and the oldest of those"
+    );
+    let answer = finish_the_upgrade(&mut oldest, rest);
+    assert!(answer.starts_with("HTTP/1.1 101 "), "not upgraded: {answer:?}");
+}
+
+/// Slots full of connections that have each sent something, so one accepted with nothing read yet holds the fewest
+/// bytes of all: the connection behind it in the same pass must not take that for a reason to evict it.
+#[test]
+fn a_client_accepted_into_full_slots_gets_its_read_before_the_next_one_can_evict_it() {
+    let faults = Faults::default();
+    let rig = Rig::started(
+        Limits::default(),
+        KeeperState::default(),
+        MentionState::default(),
+        faults.clone(),
+    );
+    let mut fillers: Vec<TcpStream> = (0..8).map(|_| dial(rig.port)).collect();
+    for filler in &mut fillers {
+        filler.write_all(b"G").unwrap();
+    }
+    thread::sleep(QUIET);
+    faults.hold_at_poll(&rig);
+    let mut client = IdeClient::try_attach(rig.port, &Upgrade::proper(rig.port, &rig.token));
+    let _follower = dial(rig.port);
+    faults.release();
+    let head = client.read_head();
+    assert!(head.starts_with("HTTP/1.1 101 "), "not upgraded: {head}");
 }
 
 #[test]
@@ -887,10 +1036,8 @@ fn a_cancel_of_an_id_never_seen_remembers_nothing() {
     let rig = Rig::new();
     let mut client = rig.client();
     client.notify("notifications/cancelled", json!({"requestId": 55}));
-    match rig.next_event() {
-        Event::Cancelled { id, .. } => assert_eq!(id, rpc(55)),
-        other => panic!("{other:?}"),
-    }
+    client.round_trip();
+    rig.no_event();
     uri_call(&mut client, 55);
     let Job::Uri { conn, id, .. } = rig.next_job() else {
         panic!("not the call");
@@ -901,6 +1048,379 @@ fn a_cancel_of_an_id_never_seen_remembers_nothing() {
         answer: ToolAnswer::Empty,
     });
     assert_eq!(client.read_message()["id"], 55);
+}
+
+#[test]
+fn calls_the_host_holds_are_held_to_the_bound() {
+    let rig = Rig::new();
+    let mut client = rig.client();
+    for id in 1..=16 {
+        all_call(&mut client, id);
+    }
+    all_call(&mut client, 17);
+    expect_error_on(&client.read_message(), 17);
+
+    let conns: Vec<ConnId> = (1..=16)
+        .map(|_| match rig.next_event() {
+            Event::Diagnostics { conn, .. } => conn,
+            other => panic!("not a call: {other:?}"),
+        })
+        .collect();
+    rig.no_event();
+
+    rig.command(Command::Answer {
+        conn: conns[0],
+        id: rpc(1),
+        answer: ToolAnswer::Empty,
+    });
+    assert_eq!(client.read_message()["id"], 1);
+    all_call(&mut client, 18);
+    assert!(
+        matches!(rig.next_event(), Event::Diagnostics { .. }),
+        "the place is free"
+    );
+}
+
+/// A `uri` and a proposal pass the judge, which gives them back, and neither is any less work for the host.
+#[test]
+fn a_call_past_the_judge_keeps_a_place_at_the_host() {
+    let rig = Rig::with_limits(Limits {
+        jobs_per_conn: 1,
+        ..Limits::default()
+    });
+    let mut client = rig.client();
+    let to_host = |client: &mut IdeClient, id: i64| {
+        uri_call(client, id);
+        let Job::Uri { conn, id, uri } = rig.next_job() else {
+            panic!("not the call");
+        };
+        rig.done(Done::Host(Event::Diagnostics {
+            conn,
+            id,
+            query: DiagnosticsQuery::One {
+                uri,
+                path: PathBuf::from("/p/a"),
+            },
+        }));
+        conn
+    };
+    let conn = to_host(&mut client, 1);
+    assert!(matches!(rig.next_event(), Event::Diagnostics { .. }));
+    to_host(&mut client, 2);
+    expect_error_on(&client.read_message(), 2);
+
+    client.open_diff(3, "text");
+    let Job::Diff { id, .. } = rig.next_job() else {
+        panic!("not the diff");
+    };
+    rig.done(Done::Host(Event::OpenDiff {
+        conn,
+        id,
+        diff: diff_request("t"),
+    }));
+    expect_error_on(&client.read_message(), 3);
+    rig.no_event();
+}
+
+#[test]
+fn a_close_keeps_a_place_at_the_host_until_it_is_answered() {
+    let rig = Rig::with_limits(Limits {
+        jobs_per_conn: 1,
+        ..Limits::default()
+    });
+    let mut client = rig.client();
+    let to_host = |client: &mut IdeClient, id: i64| {
+        client.call_tool(id, "closeAllDiffTabs", json!({}));
+        let Job::Pass(event) = rig.next_job() else {
+            panic!("not the close");
+        };
+        rig.done(Done::Host(event));
+    };
+    to_host(&mut client, 1);
+    let Event::CloseAll { conn, id } = rig.next_event() else {
+        panic!("not the close");
+    };
+    to_host(&mut client, 2);
+    expect_error_on(&client.read_message(), 2);
+    rig.no_event();
+    rig.command(Command::Answer {
+        conn,
+        id,
+        answer: ToolAnswer::Empty,
+    });
+    assert_eq!(client.read_message()["id"], 1);
+    to_host(&mut client, 3);
+    assert!(matches!(rig.next_event(), Event::CloseAll { .. }));
+}
+
+#[test]
+fn what_ends_a_call_at_the_host_frees_its_place() {
+    let rig = Rig::with_limits(Limits {
+        jobs_per_conn: 1,
+        ..Limits::default()
+    });
+    let mut client = rig.client();
+    let held = |client: &mut IdeClient, id: i64| {
+        all_call(client, id);
+        match rig.next_event() {
+            Event::Diagnostics { conn, .. } => conn,
+            other => panic!("not the call: {other:?}"),
+        }
+    };
+
+    let conn = held(&mut client, 1);
+    rig.command(Command::Entries {
+        conn,
+        id: rpc(1),
+        named_uri: None,
+        answer: no_entries(),
+    });
+    let Job::Entries { id, .. } = rig.next_job() else {
+        panic!("not the entries");
+    };
+    rig.done(Done::Answer {
+        conn,
+        id,
+        answer: ToolAnswer::Empty,
+    });
+    assert_eq!(client.read_message()["id"], 1);
+
+    held(&mut client, 2);
+    rig.command(Command::Saved {
+        conn,
+        id: rpc(2),
+        lines: Vec::new(),
+        shape: LineShape { crlf: false, eol: true },
+    });
+    let Job::Join { id, .. } = rig.next_job() else {
+        panic!("not the join");
+    };
+    rig.done(Done::Answer {
+        conn,
+        id,
+        answer: ToolAnswer::DiffRejected,
+    });
+    assert_eq!(client.read_message()["id"], 2);
+
+    held(&mut client, 3);
+    client.notify("notifications/cancelled", json!({"requestId": 3}));
+    match rig.next_event() {
+        Event::Cancelled { id, .. } => assert_eq!(id, rpc(3)),
+        other => panic!("{other:?}"),
+    }
+    rig.command(Command::Released { conn, id: rpc(3) });
+    client.round_trip();
+    held(&mut client, 4);
+}
+
+#[test]
+fn a_call_with_an_id_the_host_holds_gets_an_error() {
+    let rig = Rig::new();
+    let mut client = rig.client();
+    all_call(&mut client, 1);
+    assert!(matches!(rig.next_event(), Event::Diagnostics { .. }));
+    all_call(&mut client, 1);
+    expect_error_on(&client.read_message(), 1);
+    uri_call(&mut client, 2);
+    assert!(matches!(rig.next_job(), Job::Uri { .. }));
+    all_call(&mut client, 2);
+    expect_error_on(&client.read_message(), 2);
+    rig.no_event();
+}
+
+/// Sends a request and reads up to its answer: every message sent before it has then been read. How many errors came
+/// ahead of it.
+fn errors_before_a_marker(client: &mut IdeClient) -> usize {
+    const MARKER: i64 = 999_999;
+    client.request(MARKER, "tools/list", json!({}));
+    let mut errors = 0;
+    loop {
+        let message = client.read_message();
+        if message["id"] == MARKER {
+            return errors;
+        }
+        assert_eq!(message["error"]["code"], TOOL_ERROR, "{message}");
+        errors += 1;
+    }
+}
+
+/// `rounds` connections, one after the other, each asking for all it may and closing. The test is the judge, and answers
+/// nothing.
+#[test]
+fn reconnecting_renews_no_allowance_at_a_stuck_judge() {
+    let rig = Rig::new();
+    let in_all = 8 * 16;
+    let mut refused = 0;
+    let rounds = 2 * 8;
+    for _ in 0..rounds {
+        let mut client = rig.client();
+        for id in 1..=16 {
+            uri_call(&mut client, id);
+        }
+        refused += errors_before_a_marker(&mut client);
+        drop(client);
+        assert!(matches!(rig.next_event(), Event::ClientGone { .. }));
+    }
+    let mut left_behind = Vec::new();
+    while let Ok(job) = rig.jobs.as_ref().unwrap().try_recv() {
+        left_behind.push(job);
+    }
+    assert_eq!(
+        left_behind.len(),
+        in_all,
+        "the calls of connections long gone still wait"
+    );
+    assert_eq!(refused, rounds * 16 - in_all);
+
+    // A job given back makes room, whoever asked.
+    rig.done(Done::Answer {
+        conn: 0,
+        id: rpc(1),
+        answer: ToolAnswer::Empty,
+    });
+    let mut client = rig.client();
+    client.round_trip();
+    uri_call(&mut client, 1);
+    assert!(matches!(rig.next_job(), Job::Uri { .. }));
+}
+
+/// A connection's calls end with it at the host, but only once the host has got that far.
+#[test]
+fn reconnecting_renews_no_allowance_at_a_stalled_host() {
+    let rig = Rig::new();
+    let in_all = 8 * 16;
+    let mut attached = 0;
+    let turned_away = loop {
+        assert!(
+            attached < 2 * 8,
+            "the host has been sent all of this and taken none of it"
+        );
+        let upgrade = Upgrade::proper(rig.port, &rig.token);
+        let mut client = IdeClient::try_attach(rig.port, &upgrade);
+        let head = client.read_head();
+        if !head.starts_with("HTTP/1.1 101 ") {
+            break head;
+        }
+        attached += 1;
+        for id in 1..=16 {
+            all_call(&mut client, id);
+        }
+        errors_before_a_marker(&mut client);
+    };
+    assert!(turned_away.starts_with("HTTP/1.1 503 "), "{turned_away}");
+    let calls = rig
+        .take_events()
+        .iter()
+        .filter(|event| matches!(event, Event::Diagnostics { .. }))
+        .count();
+    assert!(calls <= in_all, "{calls} calls wait for the host");
+    rig.client().round_trip();
+}
+
+/// A window that keeps taking what it is sent, and an nvim that answers none of it: the host holds nothing that says so
+/// but the calls still out, so a call a client leaves has to keep its place.
+#[test]
+fn cancelling_does_not_free_a_place_nvim_still_owes() {
+    let rig = Rig::new();
+    let mut client = rig.client();
+    let mut handed = 0;
+    for id in 1..=64 {
+        all_call(&mut client, id);
+        client.notify("notifications/cancelled", json!({"requestId": id}));
+        errors_before_a_marker(&mut client);
+        handed += rig
+            .take_events()
+            .iter()
+            .filter(|event| matches!(event, Event::Diagnostics { .. }))
+            .count();
+    }
+    assert_eq!(handed, 16);
+}
+
+/// As above, with connections going in place of the cancels.
+#[test]
+fn reconnecting_does_not_free_a_place_nvim_still_owes() {
+    let rig = Rig::new();
+    let in_all = 8 * 16;
+    let mut handed = Vec::new();
+    for _ in 0..16 {
+        let mut client = rig.client();
+        for id in 1..=16 {
+            all_call(&mut client, id);
+        }
+        errors_before_a_marker(&mut client);
+        drop(client);
+        loop {
+            let event = rig.next_event();
+            let gone = matches!(event, Event::ClientGone { .. });
+            if let Event::Diagnostics { conn, id, .. } = event {
+                handed.push((conn, id));
+            }
+            if gone {
+                break;
+            }
+        }
+    }
+    assert_eq!(handed.len(), in_all);
+
+    let (conn, id) = handed[0].clone();
+    rig.command(Command::Released { conn, id });
+    let mut client = rig.client();
+    all_call(&mut client, 1);
+    assert!(matches!(rig.next_event(), Event::Diagnostics { .. }), "one came free");
+    all_call(&mut client, 2);
+    expect_error_on(&client.read_message(), 2);
+}
+
+/// What an answer does for a connection gone: whichever end comes first gives the place back, once.
+#[test]
+fn an_answer_for_a_gone_connection_frees_its_place() {
+    let rig = Rig::with_limits(Limits {
+        authed: 1,
+        jobs_per_conn: 1,
+        ..Limits::default()
+    });
+    let mut client = rig.client();
+    let conn = rig.conn_of(&mut client);
+    drop(client);
+    assert!(matches!(rig.next_event(), Event::ClientGone { .. }));
+
+    let mut client = rig.client();
+    all_call(&mut client, 1);
+    expect_error_on(&client.read_message(), 1);
+    rig.command(Command::Answer {
+        conn,
+        id: rpc(9_000),
+        answer: ToolAnswer::Empty,
+    });
+    client.round_trip();
+    all_call(&mut client, 2);
+    assert!(matches!(rig.next_event(), Event::Diagnostics { .. }));
+}
+
+#[test]
+fn a_release_frees_only_a_call_the_client_left() {
+    let rig = Rig::with_limits(Limits {
+        jobs_per_conn: 1,
+        ..Limits::default()
+    });
+    let mut client = rig.client();
+    let conn = rig.conn_of(&mut client);
+    rig.command(Command::Released { conn, id: rpc(9_000) });
+    all_call(&mut client, 1);
+    expect_error_on(&client.read_message(), 1);
+
+    client.notify("notifications/cancelled", json!({"requestId": 9_000}));
+    client.notify("notifications/cancelled", json!({"requestId": 9_000}));
+    assert!(matches!(rig.next_event(), Event::Cancelled { .. }));
+    all_call(&mut client, 2);
+    expect_error_on(&client.read_message(), 2);
+    rig.no_event();
+
+    rig.command(Command::Released { conn, id: rpc(9_000) });
+    client.round_trip();
+    all_call(&mut client, 3);
+    assert!(matches!(rig.next_event(), Event::Diagnostics { .. }));
 }
 
 #[test]
@@ -1135,6 +1655,78 @@ fn mention_lines_go_to_the_judge_and_reach_every_ready_client_in_order() {
         }
     }
     unready.round_trip();
+}
+
+fn mention_lines(rig: &Rig, count: u32) {
+    let line = |line_start| MentionLine {
+        file: "/p/a".to_owned(),
+        line_start,
+        line_end: line_start,
+    };
+    rig.mentions.lines.lock().unwrap().extend((0..count).map(line));
+    rig.mentions.readable.signal();
+    thread::sleep(QUIET);
+}
+
+/// A mention outside the project is an event for each line on the socket, and nvim writes those lines whether or not the
+/// window is taking anything.
+#[test]
+fn what_a_mention_tells_the_window_stops_while_the_window_is_behind() {
+    let rig = Rig::with_limits(Limits {
+        authed: 1,
+        jobs_per_conn: 4,
+        ..Limits::default()
+    });
+    for _ in 0..10 {
+        rig.done(Done::Host(Event::MentionOutside));
+    }
+    thread::sleep(QUIET);
+    let told = rig.take_events();
+    assert_eq!(told.len(), 4, "{told:?}");
+
+    rig.done(Done::Host(Event::MentionOutside));
+    assert!(
+        matches!(rig.next_event(), Event::MentionOutside),
+        "taken, there is room"
+    );
+}
+
+#[test]
+fn mention_lines_are_dropped_while_the_window_is_behind() {
+    let rig = Rig::with_limits(Limits {
+        authed: 1,
+        jobs_per_conn: 4,
+        ..Limits::default()
+    });
+    for _ in 0..4 {
+        rig.done(Done::Host(Event::MentionOutside));
+    }
+    thread::sleep(QUIET);
+    mention_lines(&rig, 3);
+    rig.no_job();
+
+    rig.take_events();
+    mention_lines(&rig, 1);
+    assert!(matches!(rig.next_job(), Job::Mention(_)), "taken, there is room");
+}
+
+#[test]
+fn mention_lines_are_held_to_what_the_judge_may_have_out() {
+    let rig = Rig::with_limits(Limits {
+        authed: 1,
+        jobs_per_conn: 4,
+        ..Limits::default()
+    });
+    mention_lines(&rig, 10);
+    for _ in 0..4 {
+        assert!(matches!(rig.next_job(), Job::Mention(_)));
+    }
+    rig.no_job();
+
+    rig.done(Done::Mention(json!({"lineStart": 1})));
+    thread::sleep(QUIET);
+    mention_lines(&rig, 1);
+    assert!(matches!(rig.next_job(), Job::Mention(_)), "given back, there is room");
 }
 
 #[test]

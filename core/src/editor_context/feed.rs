@@ -53,6 +53,10 @@ pub struct PushFacts {
     /// In UTF-16 units, exclusive, from the start of its last line. 0 for a linewise selection and for one ending on
     /// an empty line.
     pub end_col: Option<u32>,
+    /// What the buffer's text was read from, by the feed's record at load; absent for a buffer with no record. A record
+    /// that is not UTF-8 reaches here as the line does, with U+FFFD for each bad sequence, so its reader has to take
+    /// one holding U+FFFD as naming no file it can judge.
+    pub read_from: Option<String>,
 }
 
 /// A context and the optional push facts read from the same wire line.
@@ -243,6 +247,10 @@ fn parse_facts(value: &serde_json::Value) -> PushFacts {
         cursor_line: column(value.get("line")),
         start_col: column(selection.and_then(|s| s.get("start_col"))),
         end_col: column(selection.and_then(|s| s.get("end_col"))),
+        read_from: value
+            .get("read_from")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -314,7 +322,8 @@ mod tests {
                 PushFacts {
                     cursor_line,
                     start_col: None,
-                    end_col: None
+                    end_col: None,
+                    read_from: None
                 }
             );
         }
@@ -355,7 +364,8 @@ mod tests {
             PushFacts {
                 cursor_line: Some(3),
                 start_col: Some(1),
-                end_col: Some(4)
+                end_col: Some(4),
+                read_from: None
             }
         );
         assert_eq!(
@@ -432,6 +442,17 @@ mod tests {
         assert_eq!(context.file, "/p/caf\u{fffd}.rs");
     }
 
+    /// A record travels on the line it came with, and one that is not UTF-8 comes out marked, never as some other path.
+    #[test]
+    fn the_record_comes_with_its_line() {
+        let update = parse_update(r#"{"v":1,"file":"/p/a.rs","read_from":"/elsewhere/a.rs"}"#).unwrap();
+        assert_eq!(update.facts.read_from.as_deref(), Some("/elsewhere/a.rs"));
+        let update = parse_update(r#"{"v":1,"file":"/p/a.rs","read_from":7}"#).unwrap();
+        assert_eq!(update.facts.read_from, None, "a record is text or it is none");
+        let update = parse_bytes(b"{\"v\":1,\"file\":\"/p/a.rs\",\"read_from\":\"/p/caf\xe9.rs\"}").unwrap();
+        assert_eq!(update.facts.read_from.as_deref(), Some("/p/caf\u{fffd}.rs"));
+    }
+
     /// No lines means "no news". The caller keeps its last known state; returning a context here
     /// would let one empty tick erase where the user is.
     #[test]
@@ -450,7 +471,15 @@ mod tests {
     /// check it. These pin the field names on the Lua side so a rename there fails here.
     #[test]
     fn the_snippet_writes_the_fields_this_parser_reads() {
-        for needle in ["v = 1", "file =", "selection =", "start_line =", "end_line =", "text ="] {
+        for needle in [
+            "v = 1",
+            "file =",
+            "read_from =",
+            "selection =",
+            "start_line =",
+            "end_line =",
+            "text =",
+        ] {
             assert!(
                 NVIM_EDITOR_CONTEXT_LUA.contains(needle),
                 "the snippet no longer writes {needle:?}"

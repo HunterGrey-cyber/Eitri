@@ -25,7 +25,7 @@ use eitri_core::ide_server::host::IdeHost;
 use eitri_core::ide_server::lock::{NOT_PRIVATE, NO_HOME};
 use eitri_core::ide_server::server::IdeServer;
 use eitri_core::ide_server::view::{IDE_DIFF_OPEN, IDE_TAKE_EVENTS};
-use eitri_core::ide_server::{Event, Housekeeping, Limits, ServerConfig, Started, IDE_NAME};
+use eitri_core::ide_server::{Event, Housekeeping, Limits, RpcId, ServerConfig, Started, IDE_NAME};
 use eitri_core::nvim_rpc::{Answer, Pending};
 use ide_client::{IdeClient, Received, Upgrade, WAIT};
 use rmpv::Value;
@@ -340,6 +340,52 @@ fn the_lock_names_the_port_and_a_real_client_attaches() {
     assert_eq!(answer["id"], 1);
     assert_eq!(answer["result"]["serverInfo"]["name"], IDE_NAME);
 
+    stops_in_time(server, FAR_OFF);
+}
+
+/// The worker hands the window no more than it has room for, and only a drain makes room, so a drain has to say so.
+#[test]
+fn a_drain_gives_the_worker_its_room_back() {
+    let scratch = Scratch::new();
+    let server = IdeServer::start_with(
+        scratch.config(),
+        Limits {
+            authed: 1,
+            jobs_per_conn: 3,
+            ..Limits::default()
+        },
+        getrandom_fill,
+    )
+    .expect("a listener");
+    let port = attached(&server);
+    let lock = scratch.lock_json(port);
+    let mut client = IdeClient::attach(port, lock["authToken"].as_str().unwrap());
+
+    // The first connection's mention socket is one event, and that leaves room for two calls.
+    for id in 1..=3 {
+        client.call_tool(id, "getDiagnostics", json!({}));
+    }
+    assert_eq!(
+        client.read_message()["id"],
+        3,
+        "past the room this call is refused here"
+    );
+    let seen = events_until(
+        &server,
+        |event| matches!(event, Event::Diagnostics { id, .. } if *id == RpcId::Num(2)),
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|event| matches!(event, Event::Diagnostics { .. }))
+            .count(),
+        2
+    );
+
+    client.call_tool(4, "getDiagnostics", json!({}));
+    events_until(
+        &server,
+        |event| matches!(event, Event::Diagnostics { id, .. } if *id == RpcId::Num(4)),
+    );
     stops_in_time(server, FAR_OFF);
 }
 

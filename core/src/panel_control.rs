@@ -20,7 +20,7 @@
 //!   be a real directory of this user that nobody else can write to. A directory this code did not
 //!   create is never chmodded or removed; it is refused with a reason. When `XDG_RUNTIME_DIR` is
 //!   unset and `<tmp>/eitri-<uid>` belongs to someone else, that is an error, not a reason to pick another
-//!   shared directory.
+//!   shared directory. So is a directory above it that another user could swap it out of.
 //! - Only a connection whose peer has this process's effective uid is served at all.
 //! - A request is one line of at most 4096 bytes that must arrive within one second in total, and it
 //!   must have exactly the shape of one of the two requests. Anything else is refused by name.
@@ -189,8 +189,13 @@ pub(crate) fn euid() -> u32 {
 }
 
 /// Creates `dir` 0700 if it is missing, then requires it to be a private directory of this user.
-/// A directory that already existed is judged, never changed.
+/// A directory that already existed is judged, never changed. What holds it is judged first, whichever
+/// of [`control_dir`]'s two places it is: a directory is only as private as its parent lets it stay, and
+/// `<tmp>` can be anything `TMPDIR` names.
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        agent::private_fs::require_safe_parent(parent, "Eitri's control sockets").map_err(|e| e.to_string())?;
+    }
     match DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {
             // Created just now, so narrowing it is ours to do: a strict umask may have taken bits
@@ -1217,6 +1222,41 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(first.requests().recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// `<tmp>/eitri-<uid>` is only as safe as what holds it: in a directory another user can write, this one can be
+    /// renamed away and replaced after every check on it.
+    #[test]
+    fn nothing_is_made_or_used_in_a_directory_others_can_write() {
+        let scratch = ScratchDir::new("eitri-pc", "shared");
+        let parent = scratch.join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        let mode = |bits| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(bits)).unwrap();
+        let dir = parent.join("c");
+
+        mode(0o777);
+        let refused = ensure_dir(&dir).unwrap_err();
+        for named in ["XDG_RUNTIME_DIR", "TMPDIR", &parent.display().to_string()] {
+            assert!(refused.contains(named), "{refused}");
+        }
+        assert!(!dir.exists(), "refused before anything is made");
+
+        mode(0o1777);
+        ensure_dir(&dir).unwrap();
+        mode(0o777);
+        assert!(ensure_dir(&dir).is_err(), "one that exists there is no better");
+        assert!(claim(&dir, &root(), None).is_err());
+
+        mode(0o700);
+        ensure_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_parent_is_named() {
+        let scratch = ScratchDir::new("eitri-pc", "missing");
+        let parent = scratch.join("nothing");
+        let refused = ensure_dir(&parent.join("c")).unwrap_err();
+        assert!(refused.contains(&parent.display().to_string()), "{refused}");
     }
 
     #[test]

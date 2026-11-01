@@ -747,11 +747,18 @@ pub struct ProposedEdit {
     pub replace_all: bool,
 }
 
-/// Whether a path a page sent holds a control character (U+0000-U+001F, U+007F). Such a path is refused
-/// before it is looked up or handed to the editor: a newline in a name has been able to end one editor
-/// command and start another, and no file name an agent shows needs one.
+/// Whether a path a page sent holds a control character: C0, DEL and C1, the bidirectional controls, or a line or
+/// paragraph separator. Such a path is refused before it is looked up or handed to the editor: a newline in a name has
+/// been able to end one editor command and start another, a C1 control is a terminal's escape, a bidirectional control
+/// makes a name read as another, and no file name an agent shows needs one.
 pub fn path_holds_control(path: &str) -> bool {
-    path.chars().any(|c| c.is_ascii_control())
+    path.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+    })
 }
 
 /// One question's answer in a `question_answer` or a chat `question_decline`. Every field is named on
@@ -8414,6 +8421,27 @@ mod tests {
         }
         assert!(!path_holds_control("src/main.rs"));
         assert!(!path_holds_control("/abs/naïve file.rs"));
+    }
+
+    /// What a name can do to whatever shows it, past the ASCII range: a C1 control is read as one by a terminal, a bidi
+    /// control reorders what the person reads, and the two separators end a line.
+    #[test]
+    fn a_control_past_ascii_is_a_control() {
+        for c in [
+            '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{61c}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}',
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert!(path_holds_control(&format!("a{c}b.rs")), "{:x}", c as u32);
+        }
+        for name in [
+            "src/日本語.rs",
+            "a\u{a0}b.rs",
+            "a\u{200d}b.rs",
+            "café 🙂.rs",
+            "\u{fffd}.rs",
+        ] {
+            assert!(!path_holds_control(name), "{name:?}");
+        }
     }
 
     #[test]

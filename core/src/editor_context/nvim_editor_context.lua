@@ -1,10 +1,11 @@
 -- Eitri editor-context feed (wire 1). Loaded by `shell` with `--cmd`, before the user's own
 -- config, so it only installs autocommands and a timer; it changes no setting and no keymap.
 --
--- It writes one JSON line per update to EITRI_EDITOR_SOCKET: which file is focused, where the
--- cursor is, and -- only while a visual selection is actually live -- the selected lines and their
--- text. It also keeps, in each buffer's `b:eitri_read_from`, what that buffer's text was read from,
--- and in `b:eitri_diagnostics_stood` which diagnostics are about the text before that.
+-- It writes one JSON line per update to EITRI_EDITOR_SOCKET: which file is focused, what its text
+-- was read from, where the cursor is, and -- only while a visual selection is actually live -- the
+-- selected lines and their text. It also keeps, in each buffer's `b:eitri_read_from`, what that
+-- buffer's text was read from, and in `b:eitri_diagnostics_stood` which diagnostics are about the
+-- text before that.
 
 -- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
 -- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
@@ -245,6 +246,7 @@ local function send()
     return vim.json.encode({
       v = 1,
       file = vim.api.nvim_buf_get_name(buf),
+      read_from = vim.b[buf].eitri_read_from,
       line = vim.fn.line("."),
       selection = selection(),
     })
@@ -294,9 +296,10 @@ vim.api.nvim_create_autocmd(
 )
 -- A buffer's name says what the disk holds under it now, and nvim keeps nothing of where the text
 -- came from: a buffer opened through a link keeps that file's text after the link is replaced. So the
--- real path is recorded here at load, once per load, and goes nowhere until a tool asks for it. `:w
--- other` leaves the record, since the buffer still holds what it held, and `:file` fires nothing here:
--- it changes a name and no text. A reload fires BufReadPost, so the record follows what was read.
+-- real path is recorded here at load, once per load, and each update carries the current buffer's
+-- record beside its name. `:w other` leaves the record, since the buffer still holds what it held, and
+-- `:file` fires nothing here: it changes a name and no text. A reload fires BufReadPost, so the record
+-- follows what was read, and raises an update, since a reload moves no cursor and enters no buffer.
 --
 -- `vim.diagnostic` keeps its entries through a load, and an entry can quote the text it was set about.
 -- So a load that moves the record notes the namespaces standing on the buffer, and a tool leaves
@@ -327,6 +330,7 @@ vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufWritePost" }, {
       note_what_stood(args.buf)
     end
     vim.b[args.buf].eitri_read_from = record
+    changed()
   end,
 })
 -- `vim.diagnostic.set` replaces a namespace's entries on a buffer, so the note on it goes with the first

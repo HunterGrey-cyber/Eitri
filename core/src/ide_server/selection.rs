@@ -61,6 +61,7 @@ mod tests {
                 cursor_line: Some(8),
                 start_col,
                 end_col,
+                read_from: None,
             },
             Some(Path::new("/resolved/a.rs")),
         )
@@ -153,6 +154,7 @@ mod tests {
             cursor_line: Some(99),
             start_col: Some(4),
             end_col: Some(7),
+            read_from: None,
         };
         let context = EditorContext {
             file: "/outside/secret".into(),

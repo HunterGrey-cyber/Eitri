@@ -89,7 +89,9 @@ pub(crate) fn parent_is_safe(owner: u32, mode: u32, euid: u32) -> bool {
 /// (macOS's `/var` is one): it is the directory it leads to whose entries can be renamed. `what`
 /// names what would have gone there, for the error.
 pub fn require_safe_parent(dir: &Path, what: &str) -> std::io::Result<()> {
-    let meta = std::fs::metadata(dir)?;
+    let named =
+        |error: std::io::Error| std::io::Error::new(error.kind(), format!("could not read {}: {error}", dir.display()));
+    let meta = std::fs::metadata(dir).map_err(named)?;
     if meta.is_dir() && parent_is_safe(meta.uid(), meta.mode(), euid()) {
         return Ok(());
     }
@@ -98,7 +100,7 @@ pub fn require_safe_parent(dir: &Path, what: &str) -> std::io::Result<()> {
         format!(
             "{} is not a directory of this user or root, or is writable by its group or by anyone without \
              the sticky bit, so another user could swap a directory made in it; refusing to put {what} there \
-             (point TMPDIR at a directory of your own)",
+             (point XDG_RUNTIME_DIR, or TMPDIR if that is unset, at a directory of your own)",
             dir.display()
         ),
     ))

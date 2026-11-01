@@ -15,6 +15,7 @@ use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +41,8 @@ const JUDGE_CHECK: Duration = Duration::from_secs(1);
 /// What an emptied queue keeps of its allocation.
 const QUEUE_KEPT: usize = 256 * 1024;
 const SERVICE_UNAVAILABLE: &str = "503 Service Unavailable";
+const CONNECTIONS_FULL: &str = "every client slot is taken";
+const WINDOW_BEHIND: &str = "the window has not taken what it was sent";
 /// The close code for a message that cannot be read and cannot be answered.
 const MESSAGE_TOO_BIG: u16 = 1009;
 /// The close code answering a close that named none.
@@ -65,6 +68,11 @@ pub trait Syscalls {
     fn accept(&mut self, listener: &TcpListener) -> io::Result<TcpStream> {
         listener.accept().map(|(stream, _)| stream)
     }
+
+    /// One line of the log.
+    fn log(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
 }
 
 /// The real system calls.
@@ -81,6 +89,8 @@ pub struct WorkerParts {
     pub mentions: Box<dyn MentionPort>,
     pub events: Sender<Event>,
     pub events_wake: Arc<Wake>,
+    /// Events sent and not yet taken: counted here, taken off by whoever reads `events`.
+    pub events_waiting: Arc<AtomicUsize>,
     pub commands: Receiver<Command>,
     pub commands_wake: Arc<Wake>,
     pub jobs: Sender<Job>,
@@ -101,6 +111,7 @@ pub fn run_on<C: Syscalls>(parts: WorkerParts, calls: C) {
         Err(error) => {
             let why = format!("the listener has no address: {error}");
             // The receiver gone means nobody is left to tell.
+            parts.events_waiting.fetch_add(1, Ordering::Relaxed);
             let _ = parts.events.send(Event::Started(Started::NotAttached { why }));
             parts.events_wake.signal();
             return;
@@ -179,22 +190,30 @@ struct Worker<C: Syscalls> {
     mentions: Box<dyn MentionPort>,
     events: Sender<Event>,
     events_wake: Arc<Wake>,
+    events_waiting: Arc<AtomicUsize>,
     commands: Receiver<Command>,
     commands_wake: Arc<Wake>,
     jobs: Sender<Job>,
     done: Receiver<Done>,
     done_wake: Arc<Wake>,
-    /// Ordered by id, and ids only grow, so the first upgrading one is the oldest.
+    /// Ordered by id, and ids only grow, so a lower id is an older connection.
     conns: BTreeMap<ConnId, Conn>,
     next_conn: ConnId,
     /// The listener is out of the poll set until then.
     listener_back: Option<Instant>,
     accept_failure_logged: bool,
+    /// The refusals already told, at most one for each constant reason.
+    refusals_logged: Vec<&'static str>,
     selection: Option<Selection>,
     mention_up: bool,
     judge_gone: bool,
     /// Jobs sent and not yet given back; the judge gives one [`Done`] for each.
     jobs_out: usize,
+    /// The calls the main context holds, each with whether the client left it, by withdrawing it or by going. Each is a
+    /// frame for nvim and a request kept on the GTK thread, and nothing bounds what waits for nvim, so a call the client
+    /// left keeps its place until the main context says nvim owes it nothing. Here and not on a session, so connecting
+    /// again renews none of it.
+    held: HashMap<(ConnId, RpcId), bool>,
     fds: Vec<libc::pollfd>,
     /// The connections of this pass's poll set, in its order.
     polled: Vec<ConnId>,
@@ -242,6 +261,7 @@ impl<C: Syscalls> Worker<C> {
             mentions: parts.mentions,
             events: parts.events,
             events_wake: parts.events_wake,
+            events_waiting: parts.events_waiting,
             commands: parts.commands,
             commands_wake: parts.commands_wake,
             jobs: parts.jobs,
@@ -251,10 +271,12 @@ impl<C: Syscalls> Worker<C> {
             next_conn: 1,
             listener_back: None,
             accept_failure_logged: false,
+            refusals_logged: Vec::new(),
             selection: None,
             mention_up: false,
             judge_gone: false,
             jobs_out: 0,
+            held: HashMap::new(),
             fds: Vec::new(),
             polled: Vec::new(),
             read_buffer: vec![0; READ_PER_WAKE],
@@ -263,6 +285,8 @@ impl<C: Syscalls> Worker<C> {
     }
 
     fn emit(&self, event: Event) {
+        // Counted before it is sent, so whoever takes it never takes off more than was counted.
+        self.events_waiting.fetch_add(1, Ordering::Relaxed);
         // The receiver gone means the main context is: its end of `commands` closing ends the loop on the next pass.
         let _ = self.events.send(event);
         self.events_wake.signal();
@@ -401,20 +425,34 @@ impl<C: Syscalls> Worker<C> {
 
     fn on_command(&mut self, command: Command) {
         match command {
-            Command::Answer { conn, id, answer } => self.answer(conn, &id, &answer),
+            Command::Answer { conn, id, answer } => {
+                self.let_go(conn, &id);
+                self.answer(conn, &id, &answer);
+            }
             Command::Entries {
                 conn,
                 id,
                 named_uri,
                 answer,
-            } => self.send_to_judge(conn, id, |id| Job::Entries {
-                conn,
-                id,
-                named_uri,
-                answer,
-            }),
+            } => {
+                self.let_go(conn, &id);
+                self.send_to_judge(conn, id, |id| Job::Entries {
+                    conn,
+                    id,
+                    named_uri,
+                    answer,
+                });
+            }
             Command::Saved { conn, id, lines, shape } => {
+                self.let_go(conn, &id);
                 self.send_to_judge(conn, id, |id| Job::Join { conn, id, lines, shape });
+            }
+            Command::Released { conn, id } => {
+                let call = (conn, id);
+                // Only a call the client left: the id may have been asked again since.
+                if self.held.get(&call) == Some(&true) {
+                    self.held.remove(&call);
+                }
             }
             Command::Context(update) => self.send_job(Job::Context(update)),
             // `take_commands` ends the loop on it.
@@ -453,7 +491,7 @@ impl<C: Syscalls> Worker<C> {
             }
             Done::Host(event) => {
                 if call_of(&event).is_none_or(|(conn, id)| self.settle(conn, id)) {
-                    self.emit(event);
+                    self.send_to_host(event);
                 }
             }
             Done::Selection(params) => self.on_selection(params),
@@ -505,20 +543,27 @@ impl<C: Syscalls> Worker<C> {
         let readable = self.fds[set.mentions.clone()].iter().any(|fd| fd.revents != 0);
         let due = self.mentions.next_deadline().is_some_and(|at| at <= now);
         if readable || due {
+            // Read either way, or the socket stays readable. nvim writes these whether or not the window is taking
+            // anything, and a mention the window cannot keep up with is worth less than its queue.
             for line in self.mentions.poll(now) {
-                self.send_job(Job::Mention(line));
+                if self.jobs_out < self.limits.calls_in_all() && !self.window_behind() {
+                    self.send_job(Job::Mention(line));
+                }
             }
         }
     }
 
-    /// At most `unauthed`, so none accepted here evicts another accepted here, unread. `poll` is level-triggered, so the
-    /// rest come on the next pass.
+    /// At most `unauthed`, so that an older connection is there to evict for each one accepted, and none accepted here
+    /// has to evict another accepted here: all of them get a read first. `poll` is level-triggered, so the rest come on the
+    /// next pass.
     fn accept_turn(&mut self, now: Instant) {
+        // Ids only grow, so this is where this pass's connections begin.
+        let this_pass = self.next_conn;
         for _ in 0..self.limits.unauthed {
             match self.calls.accept(&self.listener) {
                 Ok(stream) => {
                     self.accept_failure_logged = false;
-                    self.admit(stream, now);
+                    self.admit(stream, now, this_pass);
                 }
                 Err(error) => match error.kind() {
                     ErrorKind::WouldBlock => return,
@@ -535,7 +580,7 @@ impl<C: Syscalls> Worker<C> {
         }
     }
 
-    fn admit(&mut self, stream: TcpStream, now: Instant) {
+    fn admit(&mut self, stream: TcpStream, now: Instant, this_pass: ConnId) {
         if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
             return;
         }
@@ -544,9 +589,15 @@ impl<C: Syscalls> Worker<C> {
         }
         let upgrading = self.conns.values().filter(|conn| !conn.is_open()).count();
         if upgrading >= self.limits.unauthed {
-            let oldest = self.conns.iter().find(|(_, conn)| !conn.is_open()).map(|(id, _)| *id);
-            if let Some(oldest) = oldest {
-                self.conns.remove(&oldest);
+            // The fewest bytes go first, the oldest of those: an idle connection has shown nothing, and a client part way
+            // through its head is the one with something to lose. One accepted in this pass has had no read, so its count
+            // says nothing yet.
+            let evicted = self
+                .conns
+                .range(..this_pass)
+                .filter_map(|(id, conn)| conn.upgrading_with().map(|bytes| (bytes, *id)));
+            if let Some((_, id)) = evicted.min() {
+                self.conns.remove(&id);
             }
         }
         let id = self.next_conn;
@@ -609,14 +660,28 @@ impl<C: Syscalls> Worker<C> {
         head.extend_from_slice(bytes);
         match handshake::judge(head, self.port, &self.token, &self.limits) {
             Verdict::NeedMore => {}
-            Verdict::Refuse { answer } => self.refuse(id, &answer),
+            Verdict::Refuse { answer, why } => {
+                self.log_refusal(why);
+                self.refuse(id, &answer);
+            }
             Verdict::Upgrade { answer } => {
-                if self.open_count() >= self.limits.authed {
+                let full = self.open_count() >= self.limits.authed;
+                if full || self.window_behind() {
+                    self.log_refusal(if full { CONNECTIONS_FULL } else { WINDOW_BEHIND });
                     self.refuse(id, &handshake::refusal(SERVICE_UNAVAILABLE));
                 } else {
                     self.join(id, &answer);
                 }
             }
+        }
+    }
+
+    /// Once for each reason in a listener's life: this line is all a person has to tell why a `claude` did nothing, and a
+    /// program knocking at the port must not fill the log with it.
+    fn log_refusal(&mut self, why: &'static str) {
+        if !self.refusals_logged.contains(&why) {
+            self.refusals_logged.push(why);
+            self.calls.log(&format!("[ide-server] refused a client: {why}"));
         }
     }
 
@@ -711,7 +776,7 @@ impl<C: Syscalls> Worker<C> {
             Incoming::GetDiagnostics { id, uri: Some(uri) } => {
                 self.send_to_judge(conn, id, |id| Job::Uri { conn, id, uri });
             }
-            Incoming::GetDiagnostics { id, uri: None } => self.emit(Event::Diagnostics {
+            Incoming::GetDiagnostics { id, uri: None } => self.send_to_host(Event::Diagnostics {
                 conn,
                 id,
                 query: DiagnosticsQuery::All,
@@ -749,18 +814,61 @@ impl<C: Syscalls> Worker<C> {
 
     /// Past the bound, or with an id already out, the call is answered here and never queued, whether it comes from the
     /// client or back from the host: the judge's queue holds what a connection may ask of it and no more, however long
-    /// the judge is stuck. A gone connection drops it.
+    /// the judge is stuck. A gone connection's jobs stay in that queue, so they count against [`Limits::calls_in_all`],
+    /// and connecting again renews nothing. A gone connection drops it.
     fn send_to_judge(&mut self, conn: ConnId, id: RpcId, job: impl FnOnce(RpcId) -> Job) {
         let bound = self.limits.jobs_per_conn;
+        let judge_full = self.jobs_out >= self.limits.calls_in_all();
         let Some(session) = self.session(conn) else {
             return;
         };
-        if session.calls.len() >= bound || session.calls.contains_key(&id) {
+        if judge_full || session.calls.len() >= bound || session.calls.contains_key(&id) {
             self.reply(conn, &mcp::answer_error(&id, TOO_MANY_CALLS));
             return;
         }
         session.calls.insert(id.clone(), false);
         self.send_job(job(id));
+    }
+
+    /// As [`Worker::send_to_judge`], for what the main context will hold: past the bound, past
+    /// [`Limits::calls_in_all`] held by every connection and those gone, or with an id already out at either end, a call
+    /// is answered here. A place comes free when the call is answered or once nvim owes it nothing, so a client that
+    /// withdraws its calls or connects again gets no more out to nvim. One the host gave up on a slow nvim comes free too,
+    /// with its frame still queued there. The event that is no call only says something in the message area, so a
+    /// window behind goes without it.
+    fn send_to_host(&mut self, event: Event) {
+        let Some((conn, id)) = call_of(&event).map(|(conn, id)| (conn, id.clone())) else {
+            if !self.window_behind() {
+                self.emit(event);
+            }
+            return;
+        };
+        let of_this = self.held.keys().filter(|(of, _)| *of == conn).count();
+        let call = (conn, id);
+        let full = self.window_behind()
+            || self.held.len() >= self.limits.calls_in_all()
+            || of_this >= self.limits.jobs_per_conn
+            || self.held.contains_key(&call);
+        let Some(session) = self.session(conn) else {
+            return;
+        };
+        if full || session.calls.contains_key(&call.1) {
+            self.reply(conn, &mcp::answer_error(&call.1, TOO_MANY_CALLS));
+            return;
+        }
+        self.held.insert(call, false);
+        self.emit(event);
+    }
+
+    /// Whether the main context has as many events waiting as all connections may have calls out. Past this nothing
+    /// new is handed to it, and no new connection opens, since each brings events of its own.
+    fn window_behind(&self) -> bool {
+        self.events_waiting.load(Ordering::Relaxed) >= self.limits.calls_in_all()
+    }
+
+    /// The main context has answered a call.
+    fn let_go(&mut self, conn: ConnId, id: &RpcId) {
+        self.held.remove(&(conn, id.clone()));
     }
 
     fn mark_ready(&mut self, conn: ConnId) {
@@ -778,7 +886,13 @@ impl<C: Syscalls> Worker<C> {
         };
         match session.calls.get_mut(&request) {
             Some(withdrawn) => *withdrawn = true,
-            None => self.emit(Event::Cancelled { conn, id: request }),
+            None => {
+                // An id out nowhere has nothing to withdraw, and a client's cancels are no reason to wake the main context.
+                let call = self.held.get_mut(&(conn, request.clone()));
+                if call.is_some_and(|left| !std::mem::replace(left, true)) {
+                    self.emit(Event::Cancelled { conn, id: request });
+                }
+            }
         }
     }
 
@@ -827,6 +941,10 @@ impl<C: Syscalls> Worker<C> {
         };
         let _ = conn.flush();
         if conn.is_open() {
+            self.held
+                .iter_mut()
+                .filter(|(call, _)| call.0 == id)
+                .for_each(|(_, left)| *left = true);
             self.emit(Event::ClientGone { conn: id });
             if self.open_count() == 0 {
                 self.mentions.close();
@@ -885,6 +1003,14 @@ impl Conn {
         matches!(&self.stage, Stage::Open(session) if session.ready)
     }
 
+    /// How much of its head has arrived, while it is upgrading.
+    fn upgrading_with(&self) -> Option<usize> {
+        match &self.stage {
+            Stage::Upgrading { head, .. } => Some(head.len()),
+            Stage::Open(_) => None,
+        }
+    }
+
     fn upgrade_deadline(&self) -> Option<Instant> {
         match self.stage {
             Stage::Upgrading { until, .. } => Some(until),
@@ -939,15 +1065,15 @@ fn write_some(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<Option<usize>>
     }
 }
 
-/// The call an event from the judge answers: `None` for an event no call is waiting on.
+/// The call an event hands the main context: `None` for an event no call is waiting on.
 fn call_of(event: &Event) -> Option<(ConnId, &RpcId)> {
     match event {
         Event::Diagnostics { conn, id, .. }
         | Event::OpenDiff { conn, id, .. }
         | Event::CloseTab { conn, id, .. }
-        | Event::CloseAll { conn, id }
-        | Event::Cancelled { conn, id } => Some((*conn, id)),
+        | Event::CloseAll { conn, id } => Some((*conn, id)),
         Event::Started(_)
+        | Event::Cancelled { .. }
         | Event::ClientGone { .. }
         | Event::MentionUp { .. }
         | Event::MentionDown

@@ -78,6 +78,14 @@ pub struct Limits {
     pub send_buffer: Option<usize>,
 }
 
+impl Limits {
+    /// The calls out across every connection, those of a connection that has gone among them: its bound ended with it,
+    /// and what it asked for has not. What every open connection may ask at once, so only leftovers can reach it.
+    pub fn calls_in_all(&self) -> usize {
+        self.authed.saturating_mul(self.jobs_per_conn)
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         const KIB: usize = 1024;
@@ -231,6 +239,11 @@ pub enum Command {
         lines: Vec<rmpv::Value>,
         shape: LineShape,
     },
+    /// The client left this call, and nvim owes it nothing any more: answered, given up, or never asked.
+    Released {
+        conn: ConnId,
+        id: RpcId,
+    },
     Context(ContextUpdate),
     Stop,
 }
@@ -365,5 +378,6 @@ mod tests {
         assert_eq!(answer_frame_bytes, 16 * 1024 * 1024 - 1);
         assert_eq!(jobs_per_conn, 16);
         assert_eq!(send_buffer, None);
+        assert_eq!(Limits::default().calls_in_all(), 128);
     }
 }
