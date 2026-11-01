@@ -18,8 +18,10 @@ use agent::providers::codex::{locate_codex, BinaryKey, MIN_CODEX};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 /// The namespace Codex's multi-agent tools live in.
@@ -167,7 +169,23 @@ pub fn write_home_for(home: &Path, model: &ScriptedModel, slug: &str, tables: &s
 
 // ------------------------------------------------------------------------------------ codex
 
+/// `codex --version` sets its helpers up under `CODEX_HOME`, and every version probe, the product's included, inherits
+/// this process's environment. So a suite that gave its app-servers private homes would still write to the home the
+/// caller has: this replaces it for the whole process, whatever was exported, before the first child. Under the
+/// target, because Codex refuses a helper directory under the system's temporary directory.
+fn keep_codex_children_out_of_the_callers_home() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("codex-real-probe-home");
+        std::fs::create_dir_all(&home).expect("the probes' home");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).expect("a private home");
+        std::env::set_var("CODEX_HOME", std::fs::canonicalize(&home).expect("a canonical home"));
+    });
+}
+
+/// The way every real-Codex suite reaches its binary.
 pub fn real_codex() -> PathBuf {
+    keep_codex_children_out_of_the_callers_home();
     let program = locate_codex(None).expect("a codex on PATH (or EITRI_CODEX)");
     let version = Command::new(&program)
         .arg("--version")

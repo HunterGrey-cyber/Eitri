@@ -586,7 +586,7 @@ impl TrustGate {
         let (done_tx, done_rx) = mpsc::channel();
         let worker_root = root.clone();
         // Read here, where no disk is touched: the worker resolves it.
-        let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+        let codex_home = codex_home_of_this_process();
         let started = std::thread::Builder::new()
             .name("eitri-trust".into())
             .spawn(move || run_worker(store, worker_root, home, codex_home, jobs_rx, done_tx, before_each));
@@ -1869,6 +1869,18 @@ struct CodexHomeGuess {
     skip: Option<PathBuf>,
     /// Where the alternate names of `AGENTS.md` are read from.
     config: Option<PathBuf>,
+}
+
+/// The `CODEX_HOME` this process was given.
+#[cfg(not(test))]
+fn codex_home_of_this_process() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME").map(PathBuf::from)
+}
+
+/// A test hands its gate a home of its own, so whatever the person running it exported must not reach the gate.
+#[cfg(test)]
+fn codex_home_of_this_process() -> Option<PathBuf> {
+    None
 }
 
 /// Codex's home from `CODEX_HOME` (`var`), as Codex picks it: unset or empty means `~/.codex`, and

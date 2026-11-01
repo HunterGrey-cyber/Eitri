@@ -329,19 +329,19 @@ fn a_newer_codex_runs_with_a_note_and_a_tested_one_states_the_tested_range() {
     assert!(tested.info().startup_diagnostics.is_empty());
     assert_eq!(
         tested.info().build_description.as_deref(),
-        Some("Codex 0.160.0 (tested 0.160.0 to 0.163.0)")
+        Some("Codex 0.160.0 (tested 0.160.0 to 0.166.0)")
     );
-    let highest = connect(handshake("codex/0.163.0 (Arch)", signed_in())).expect("connects");
-    assert!(highest.info().startup_diagnostics.is_empty(), "0.163.0 is tested");
+    let highest = connect(handshake("codex/0.166.0 (Arch)", signed_in())).expect("connects");
+    assert!(highest.info().startup_diagnostics.is_empty(), "0.166.0 is tested");
     assert_eq!(
         highest.info().build_description.as_deref(),
-        Some("Codex 0.163.0 (tested 0.160.0 to 0.163.0)")
+        Some("Codex 0.166.0 (tested 0.160.0 to 0.166.0)")
     );
-    let newer = connect(handshake("codex/0.164.0 (Arch)", signed_in())).expect("connects");
-    assert_eq!(newer.info().build_description.as_deref(), Some("Codex 0.164.0"));
+    let newer = connect(handshake("codex/0.167.0 (Arch)", signed_in())).expect("connects");
+    assert_eq!(newer.info().build_description.as_deref(), Some("Codex 0.167.0"));
     assert_eq!(
         newer.info().startup_diagnostics,
-        vec!["untested Codex 0.164.0 (tested up to 0.163.0)".to_string()]
+        vec!["untested Codex 0.167.0 (tested up to 0.166.0)".to_string()]
     );
 }
 

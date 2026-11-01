@@ -12,7 +12,7 @@
 mod codex_peer;
 
 use agent::providers::codex::self_check::{ensure_checked, ensure_checked_tweaked, CheckTweaks, SelfCheckError};
-use agent::providers::codex::{locate_codex, CodexLaunch, CodexProvider};
+use agent::providers::codex::{CodexLaunch, CodexProvider};
 use agent::{ProviderError, ProviderErrorCode};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,13 +42,9 @@ impl Drop for Scratch {
     }
 }
 
-fn real_codex() -> PathBuf {
-    let program = locate_codex(None).expect("a codex on PATH (or EITRI_CODEX)");
-    // An older binary is refused before the check runs (`TooOld`), so the tests below would fail on
-    // that and say nothing about the check: the shared helper names the cause instead.
-    codex_peer::require_supported_codex(&program);
-    program
-}
+// An older binary is refused before the check runs (`TooOld`), so the tests below would fail on that and say
+// nothing about the check: the shared helper names the cause instead.
+use codex_peer::real_codex;
 
 fn verdicts(state: &Path) -> usize {
     let Ok(dirs) = std::fs::read_dir(state.join("codex-check")) else {

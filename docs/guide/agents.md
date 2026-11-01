@@ -160,7 +160,7 @@ including `runs without asking` and `mode lag`.
 
 - The `codex` command, installed, and signed in with `codex login`. Without a login the tab says "Codex is not
   signed in: run `codex login` in a terminal".
-- Codex 0.160.0 or newer. Eitri has been tried with 0.160.0 to 0.163.0; the tab's `agent` row says so. A newer
+- Codex 0.160.0 or newer. Eitri's Codex tests have been run against every release from 0.160.0 to 0.166.0; the tab's `agent` row says so. A newer
   Codex still runs, and the row then reads "untested Codex" with its version and the newest one tried. An older one is
   refused with "update Codex".
 

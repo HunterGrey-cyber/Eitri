@@ -61,7 +61,7 @@ pub const MIN_CODEX: (u32, u32, u32) = (0, 160, 0);
 
 /// The newest Codex whose traffic was recorded against this code and whose scripted suite and self-check
 /// passed. A newer one runs, with a note.
-pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 163, 0);
+pub const HIGHEST_TESTED_CODEX: (u32, u32, u32) = (0, 166, 0);
 
 /// How long the handshake and the session start may take.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2526,9 +2526,9 @@ impl CodexProvider {
         self.end_turn(st, outcome, detail);
     }
 
-    /// An interrupted turn takes its tool servers' calls with it: Codex tells the server nothing, ignores a
-    /// late reply and never reports such a call ended, so left in `running` it would count as running for
-    /// the rest of the session. Its row ends here, inside its turn.
+    /// An interrupted turn takes its tool servers' calls with it: Codex ignores a late reply and never reports
+    /// such a call ended, whether or not it tells the server (from 0.165 it sends `notifications/cancelled`), so
+    /// left in `running` it would count as running for the rest of the session. Its row ends here, inside its turn.
     fn end_cut_off_tool_calls(st: &mut State) {
         let mut cut_off: Vec<(String, String)> = st
             .running

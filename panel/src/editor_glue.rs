@@ -608,7 +608,7 @@ fn tell_broker(
 /// A bridge's news for the broker, under the bridge's own id. `row_id` is the model's id for the call, when the agent
 /// sends one, and so the row a card belongs to. Nothing of a tab frozen for a move starts here: the call arrived after
 /// [`tab_leaving`] and is told what that told the others. Nor does a call of a turn already interrupted: the broker
-/// heard of the interrupt before this call and will not hear of it again, and Codex says nothing more about the call.
+/// heard of the interrupt before this call and will not hear of it again, and a Codex before 0.165 says nothing more about the call.
 fn tell_broker_of_bridge(
     broker: &mut Broker,
     env: &PanelEnv<'_>,
@@ -2440,11 +2440,7 @@ pub(super) mod tests {
             );
         }
 
-        /// Codex sends no cancel for an interrupted call and never ends its item, so the turn's ending has to.
-        #[test]
-        fn an_interrupt_takes_a_bridge_card_away() {
-            let (panel, mut peer) = fixture_with_peer("glue-bridge-interrupt");
-            raise_a_bridge_card(&panel, &mut peer, 1, "call_1");
+        fn end_the_turn_interrupted(panel: &Fixture) {
             panel.provider.queue(started());
             panel.provider.queue(AgentDomainEvent::TurnCompleted {
                 turn_id: "t1".into(),
@@ -2454,6 +2450,15 @@ pub(super) mod tests {
                 usage: None,
                 detail: Default::default(),
             });
+        }
+
+        /// A Codex before 0.165 sends no cancel for an interrupted call and none ends its item, so the turn's ending
+        /// has to.
+        #[test]
+        fn an_interrupt_takes_a_bridge_card_away() {
+            let (panel, mut peer) = fixture_with_peer("glue-bridge-interrupt");
+            raise_a_bridge_card(&panel, &mut peer, 1, "call_1");
+            end_the_turn_interrupted(&panel);
             panel.tick_until("the card to go", || panel.page_cards().is_empty());
             assert_eq!(panel.tray(), 0);
             let Message::Result { id, text, is_error } = peer.hear() else {
@@ -2462,6 +2467,50 @@ pub(super) mod tests {
             assert_eq!(id, 1);
             assert!(is_error);
             assert_eq!(text, words::INTERRUPTED);
+        }
+
+        /// Codex from 0.165 cancels the call too, and the cancel and the turn's ending reach the panel by different
+        /// ways, so either may come first. Cancel first: the turn's ending has nothing left to answer.
+        #[test]
+        fn the_turns_end_after_a_cancel_answers_nothing() {
+            let (panel, mut peer) = fixture_with_peer("glue-bridge-cancel-first");
+            raise_a_bridge_card(&panel, &mut peer, 1, "call_1");
+            peer.say(Message::Cancel { id: 1 });
+            panel.tick_until("the card to go", || panel.page_cards().is_empty());
+            end_the_turn_interrupted(&panel);
+
+            // Told `INTERRUPTED` because the turn ended so: heard first, so the cancelled call was answered nothing.
+            peer.call(2, STATE_TOOL, json!({}));
+            let Message::Result { id, text, .. } = peer.hear_while_ticking(&panel.handle) else {
+                panic!("a result")
+            };
+            assert_eq!(id, 2);
+            assert_eq!(text, words::INTERRUPTED);
+            assert!(panel.is_idle());
+            assert_eq!(panel.tray(), 0);
+        }
+
+        /// The turn's ending first: it answers the call once, and the cancel behind it finds nothing.
+        #[test]
+        fn a_cancel_after_the_turns_end_changes_nothing() {
+            let (panel, mut peer) = fixture_with_peer("glue-bridge-cancel-last");
+            raise_a_bridge_card(&panel, &mut peer, 1, "call_1");
+            end_the_turn_interrupted(&panel);
+            panel.tick_until("the card to go", || panel.page_cards().is_empty());
+            let Message::Result { id, text, .. } = peer.hear_while_ticking(&panel.handle) else {
+                panic!("a result")
+            };
+            assert_eq!(id, 1);
+            assert_eq!(text, words::INTERRUPTED);
+
+            peer.say(Message::Cancel { id: 1 });
+            peer.call(2, STATE_TOOL, json!({}));
+            let Message::Result { id, .. } = peer.hear_while_ticking(&panel.handle) else {
+                panic!("a result")
+            };
+            assert_eq!(id, 2, "the cancelled call was answered twice");
+            assert!(panel.is_idle());
+            assert_eq!(panel.tray(), 0);
         }
 
         /// The news of a tab frozen for a move can only be late: nothing of it starts here.
@@ -2557,7 +2606,7 @@ pub(super) mod tests {
         }
 
         /// What only the window's read of the socket has made late: the interrupt reached the broker a tick ago, with
-        /// no sign of this call, and Codex says nothing more about it.
+        /// no sign of this call, and a Codex before 0.165 says nothing more about it.
         #[test]
         fn a_call_read_after_the_interrupt_starts_nothing() {
             let panel = codex("glue-bridge-late", Switches::on_by_default());

@@ -24,7 +24,7 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **Claude Code**, installed and logged in, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
 - **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and signed in
-  (tried with 0.160.0 to 0.163.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
+  (tested with every release from 0.160.0 to 0.166.0); a tab for any other agent needs an agent that speaks ACP version 1 over standard
   input and output. See [Codex and other agents](guide/agents.md).
 
 ## Installing

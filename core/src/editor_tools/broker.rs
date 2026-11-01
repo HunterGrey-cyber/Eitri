@@ -704,8 +704,9 @@ impl Broker {
         out
     }
 
-    /// The tab's turn ended interrupted: every bridge call of the tab goes, queued, in flight or on a card. Codex
-    /// sends no `notifications/cancelled` and never completes the item, so nothing else would end one, and it
+    /// The tab's turn ended interrupted: every bridge call of the tab goes, queued, in flight or on a card. A Codex
+    /// before 0.165 sends no `notifications/cancelled`, and none completes the item, so on those nothing else would
+    /// end one; a newer one's cancel has usually taken the call already, which leaves this nothing to do. Codex
     /// ignores the reply. Sidecar calls end by `cancel`, on their `ClientToolCallSettled`.
     pub fn turn_interrupted(&mut self, tab: TabId) -> Vec<BrokerOut> {
         self.take_calls(

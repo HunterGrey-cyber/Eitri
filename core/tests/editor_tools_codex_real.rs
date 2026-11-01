@@ -28,15 +28,17 @@ use std::time::{Duration, Instant};
 
 use agent::providers::codex::scripted_model::{ScriptedModel, Step};
 use agent::providers::codex::tripwire::TrustWatch;
-use agent::providers::codex::wire::{method, ThreadStartParams, TurnInterruptParams};
+use agent::providers::codex::wire::{method, ThreadStartParams, TurnInterruptParams, TurnSteerParams};
+use agent::providers::codex::BinaryKey;
 use agent::setting_sources::ProjectTrust;
 use agent::{DirTrust, EditorServerSpec, PermissionMode, Reviewer, TrustPlan};
 use eitri_core::editor_context::EditorContext;
 use eitri_core::editor_tools::bridge_host::{BridgeHost, BridgeNews};
 use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
+use eitri_core::editor_tools::cards::{CardDecision, CardOrigin};
 use eitri_core::editor_tools::catalog::{self, ToolRow};
 use eitri_core::editor_tools::stamp::Stamp;
-use eitri_core::editor_tools::step::{EditorReach, ToolResult};
+use eitri_core::editor_tools::step::{BridgeCallId, EditorReach, ToolResult};
 use eitri_core::editor_tools::switches::Switches;
 use eitri_core::editor_tools::way::{EditorCall, EditorWay};
 use eitri_core::editor_tools::{words, SERVER_NAME};
@@ -53,6 +55,10 @@ const PROMPT: &str = "EDITOR-TOOLS-PROMPT";
 /// How the model names the editor's server.
 const NAMESPACE: &str = "mcp__eitri";
 const STARTUP_BUDGET: Duration = Duration::from_secs(20);
+/// The first Codex that tells a tool server it gave a call up: an interrupt drops the call's future and that sends
+/// `notifications/cancelled`. An older one says nothing to the server, and the call ends with the host's end of the
+/// turn. On every version the item is never completed and a reply is ignored.
+const CANCELS_CALLS: (u32, u32, u32) = (0, 165, 0);
 
 // ------------------------------------------------------------------------------------ the editor
 
@@ -187,6 +193,7 @@ impl BrokerEnv for Env {
 
 /// What the bridge delivered, in order.
 struct Seen {
+    id: BridgeCallId,
     tool: String,
     row_id: Option<String>,
 }
@@ -199,6 +206,7 @@ struct Rig {
     env: Env,
     spec: EditorServerSpec,
     seen: Vec<Seen>,
+    cancelled: Vec<BridgeCallId>,
     answers: Vec<ToolResult>,
 }
 
@@ -252,6 +260,7 @@ impl Rig {
             },
             spec,
             seen: Vec::new(),
+            cancelled: Vec::new(),
             answers: Vec::new(),
         }
     }
@@ -270,6 +279,7 @@ impl Rig {
                     ..
                 } => {
                     self.seen.push(Seen {
+                        id: id.clone(),
                         tool: tool.clone(),
                         row_id: row_id.clone(),
                     });
@@ -283,7 +293,10 @@ impl Rig {
                         now,
                     ));
                 }
-                BridgeNews::Cancelled { id } => outs.extend(self.broker.cancel(TAB, &Caller::Bridge { id })),
+                BridgeNews::Cancelled { id } => {
+                    self.cancelled.push(id.clone());
+                    outs.extend(self.broker.cancel(TAB, &Caller::Bridge { id }));
+                }
             }
         }
         outs.extend(self.broker.tick(&self.env, now));
@@ -309,6 +322,12 @@ impl Rig {
         let outs = self.broker.turn_interrupted(TAB);
         self.deliver(outs);
     }
+}
+
+/// Whether this build tells a tool server when it gives a call up.
+fn cancels_calls(codex: &Path) -> bool {
+    let key = BinaryKey::of(codex).expect("the binary's version");
+    key.version_numbers().expect("a version that reads") >= CANCELS_CALLS
 }
 
 /// Reads the peer and serves the rig until `done` holds; false when the time ran out or the child ended.
@@ -714,8 +733,14 @@ fn an_interrupt_ends_the_call_and_its_card() {
     // A file outside the project: in Manual mode the tool raises a card and waits on the person.
     let outside = s.path("outside.txt");
     write_file(&outside, "outside\n");
-    let model =
-        ScriptedModel::start(vec![call_once("c1", "open_file", &json!({"path": text_of(&outside)}))]).expect("model");
+    let next_turn = "after the interrupt";
+    let model = ScriptedModel::start(vec![
+        call_once("c1", "open_file", &json!({"path": text_of(&outside)})),
+        Step::call("c2", Some(NAMESPACE), "editor_state", &json!({}))
+            .when_body_has(next_turn)
+            .unless_body_has("\"c2\""),
+    ])
+    .expect("model");
     let mut rig = Rig::new(
         &s,
         &project,
@@ -736,6 +761,7 @@ fn an_interrupt_ends_the_call_and_its_card() {
         rig.env.editor.asked().is_empty(),
         "the editor was asked before the person"
     );
+    let call = rig.seen[0].id.clone();
 
     let params = serde_json::to_value(TurnInterruptParams {
         thread_id: session.thread.clone(),
@@ -759,34 +785,153 @@ fn an_interrupt_ends_the_call_and_its_card() {
         Some("interrupted")
     );
 
-    // Codex sends the call no completion and the bridge no cancel, so the host ends it when the turn does.
-    let completed = session
-        .peer
-        .notes
-        .iter()
-        .any(|n| n.method == method::ITEM_COMPLETED && json_str(&n.params, "/item/id") == Some("c1"));
-    assert!(!completed, "Codex completed the interrupted call after all");
-    assert_eq!(
-        rig.broker.cards(TAB).len(),
-        1,
-        "the card stays until the host ends the turn's calls"
-    );
+    // What differs by version is only who ends the call: Codex's cancel, or the host at the turn's end.
+    let cancels = cancels_calls(&codex);
+    if cancels {
+        let told = drive(&mut session.peer, &mut rig, TURN_BUDGET, |_, rig| {
+            !rig.cancelled.is_empty()
+        });
+        assert!(told, "this Codex sent no cancel for the interrupted call");
+        assert_eq!(rig.cancelled, [call.clone()]);
+        assert!(rig.broker.cards(TAB).is_empty(), "the cancel left the card");
+        assert!(rig.answers.is_empty(), "a cancelled call was answered");
+    } else {
+        assert!(rig.cancelled.is_empty(), "this Codex cancelled the call");
+        assert_eq!(
+            rig.broker.cards(TAB).len(),
+            1,
+            "the card stays until the host ends the turn's calls"
+        );
+    }
     rig.turn_interrupted();
     assert!(rig.broker.cards(TAB).is_empty(), "the card outlived the turn");
     assert!(rig.broker.is_idle(), "the broker still holds the call");
-    assert_eq!(rig.answers.len(), 1);
-    assert!(rig.answers[0].is_error);
-    assert_eq!(rig.answers[0].text, words::INTERRUPTED);
+    if cancels {
+        assert!(rig.answers.is_empty(), "the turn's end answered a cancelled call");
+    } else {
+        assert_eq!(rig.answers.len(), 1);
+        assert!(rig.answers[0].is_error);
+        assert_eq!(rig.answers[0].text, words::INTERRUPTED);
+    }
     assert!(
         rig.env.editor.asked().is_empty(),
         "the editor was asked for a call that was never allowed"
     );
 
-    // The tab goes on: the next turn runs, and the stale answer written to the bridge did it no harm.
+    // An answer that crossed the interrupt on the way: it reaches Codex when the bridge still holds the call, and the
+    // model never hears it.
+    let stale = "STALE-ANSWER";
+    rig.host.answer(
+        &call,
+        &ToolResult {
+            text: stale.to_owned(),
+            is_error: false,
+        },
+    );
+
+    // The tab goes on: the next turn runs, and the same bridge carries its call.
     assert_eq!(
-        serve_turn(&mut session.peer, &mut rig, &session.thread, "after the interrupt"),
+        serve_turn(&mut session.peer, &mut rig, &session.thread, next_turn),
         "completed"
     );
+    assert_eq!(rig.env.editor.asked(), ["editor_state"]);
+    let heard = call_outputs(&model);
+    assert!(
+        heard.get("c2").is_some_and(|text| text.contains("src/lib.rs")),
+        "{heard:?}"
+    );
+    assert!(
+        !requests_text(&model, 0).contains(stale),
+        "the model heard a stale answer"
+    );
+    assert!(
+        !session
+            .peer
+            .notes
+            .iter()
+            .any(|n| n.method == method::ITEM_COMPLETED && json_str(&n.params, "/item/id") == Some("c1")),
+        "Codex completed the interrupted call after all"
+    );
+    eprintln!("what the model was told of the interrupted call: {:?}", heard.get("c1"));
+    session.peer.close();
+}
+
+#[test]
+#[ignore = "runs the real codex (on PATH) and the built bridge against the scripted model; no login, no network"]
+fn a_steer_leaves_the_card_and_the_call_runs() {
+    let codex = real_codex();
+    let s = Scratch::new("et-steer");
+    let project = make_project(&s, "");
+    let outside = s.path("outside.txt");
+    write_file(&outside, "outside\n");
+    let model =
+        ScriptedModel::start(vec![call_once("c1", "open_file", &json!({"path": text_of(&outside)}))]).expect("model");
+    let mut rig = Rig::new(
+        &s,
+        &project,
+        &every_row(),
+        PermissionMode::Manual,
+        ProjectTrust::Trusted,
+    );
+    let spec = rig.spec.clone();
+    let plan = plan_for(&project, DirTrust::Trusted, &[]);
+    let mut session = open_session(&codex, &s, &model, &project, &plan, Some(&spec), Some(&mut rig));
+
+    let turn = send_turn(&mut session.peer, &session.thread, PROMPT);
+    let carded = drive(&mut session.peer, &mut rig, TURN_BUDGET, |_, rig| {
+        !rig.broker.cards(TAB).is_empty()
+    });
+    assert!(carded, "no card was raised; stderr: {}", session.peer.stderr_tail());
+
+    let steer = "STEER-TEXT";
+    let params = serde_json::to_value(TurnSteerParams::new(
+        session.thread.clone(),
+        "steer-1".to_owned(),
+        steer.to_owned(),
+        turn.clone(),
+    ))
+    .expect("params");
+    session.peer.call(method::TURN_STEER, params).expect("turn/steer");
+
+    // A message into the running turn gives no call up, so no cancel comes and the card stays.
+    let settled = Instant::now() + Duration::from_millis(500);
+    let waited = drive(&mut session.peer, &mut rig, TURN_BUDGET, |p, rig| {
+        Instant::now() >= settled || !rig.cancelled.is_empty() || p.turn_status(&session.thread, &turn).is_some()
+    });
+    assert!(waited, "Codex stopped; stderr: {}", session.peer.stderr_tail());
+    assert!(rig.cancelled.is_empty(), "the steer cancelled the call");
+    assert_eq!(rig.broker.cards(TAB).len(), 1, "the steer took the card");
+    assert_eq!(session.peer.turn_status(&session.thread, &turn), None);
+
+    // The person's answer still counts: the call runs and the model reads its result.
+    let card = rig.broker.cards(TAB).remove(0).id;
+    rig.broker
+        .answer_card(TAB, &card, CardDecision::Allow, CardOrigin::Key, Instant::now())
+        .expect("the card is open");
+    let ended = drive(&mut session.peer, &mut rig, TURN_BUDGET, |p, _| {
+        p.turn_status(&session.thread, &turn).is_some()
+    });
+    assert!(ended, "the turn did not end; stderr: {}", session.peer.stderr_tail());
+    assert_eq!(
+        session.peer.turn_status(&session.thread, &turn).as_deref(),
+        Some("completed")
+    );
+    assert_eq!(rig.env.editor.asked().len(), 1, "{:?}", rig.env.editor.asked());
+    assert!(rig.env.editor.asked()[0].starts_with("open_file"));
+    assert_eq!(rig.answers.len(), 1);
+    assert!(!rig.answers[0].is_error, "the answer: {}", rig.answers[0].text);
+    assert!(rig.cancelled.is_empty(), "a cancel came after the steer");
+    // Codex's own output for a call it dropped would be there too, so the text is what says the answer arrived.
+    let heard = call_outputs(&model).remove("c1").unwrap_or_default();
+    assert!(
+        heard.contains("shown"),
+        "the model did not read the call's answer: {heard}"
+    );
+    assert!(
+        requests_text(&model, 0).contains(steer),
+        "the model never read the steer"
+    );
+    assert!(rig.broker.is_idle(), "the broker still holds the call");
     session.peer.close();
 }
 
