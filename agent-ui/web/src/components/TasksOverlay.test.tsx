@@ -6,7 +6,7 @@ import { initialState } from "../reducer";
 import { completionSource, slashAction } from "../slashCommands";
 import { TASKS_KEY_LINE } from "../keymap";
 import type { AgentUiState, BackgroundTaskRecord, TaskKind } from "../types";
-import { phaseLine, TasksOverlay, taskOutputText, type TasksOverlayHandle } from "./TasksOverlay";
+import { OUTPUT_POLL_MS, phaseLine, shownWords, TasksOverlay, taskOutputText, type TasksOverlayHandle } from "./TasksOverlay";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -110,7 +110,7 @@ describe("background tasks", () => {
     view.key("Enter");
     view.reply({ taskId: "build", output: "tail\u200b <img src=x>\x1b]8;;http://evil\x07label\x1b]8;;\x07", totalBytes: 9000, truncated: true });
     expect(view.getByText("tail⟨U+200B⟩ <img src=x>label")).toBeTruthy();
-    expect(view.getByText("tail of 9000 bytes")).toBeTruthy();
+    expect(view.getByText("Showing the last 1 line of 9000 bytes")).toBeTruthy();
     expect(view.container.querySelector("img, a, b")).toBeNull();
   });
 
@@ -306,6 +306,222 @@ describe("background tasks", () => {
     view.key("End"); expect(overlay.scrollTop).toBe(5000);
     view.key("Home"); expect(overlay.scrollTop).toBe(0);
     expect(view.getByRole("heading", { name: "● flow" })).toBeTruthy();
+  });
+
+  describe("a shell's detail", () => {
+    const launched = (name: string, command: unknown, kind: TaskKind = "shell", extra: Partial<BackgroundTaskRecord> = {}) => {
+      const current = state([task("build", kind, { tool_use_id: "launch", ...extra })]);
+      current.toolCalls = [{ seq: 0, toolUseId: "launch", name, input: { command }, result: null }];
+      return current;
+    };
+    const polls = (view: ReturnType<typeof setup>) => view.onRequest.mock.calls.filter(([kind]) => kind === "task_output").length;
+    const tail = (view: ReturnType<typeof setup>, output: string, fields = {}) =>
+      view.reply({ taskId: "build", output, totalBytes: output.length, truncated: false, ...fields });
+
+    it.each([["Bash", "shell"], ["Monitor", "monitor"]] as const)("shows the command a %s call launched as plain text", (name, kind) => {
+      const view = setup(launched(name, "echo '<b>hi</b>'\u202e\nsleep 5", kind));
+      view.key("Enter");
+      const command = view.container.querySelector(".tasks-command")!;
+      expect(command.textContent).toBe("echo '<b>hi</b>'⟨U+202E⟩\nsleep 5");
+      expect(command.querySelector("b")).toBeNull();
+      expect(view.getByText("Command").className).toBe("tasks-dim");
+    });
+
+    it("shows no command when no call launched the task or the call has none", () => {
+      const view = setup(state([task("build")]));
+      view.key("Enter");
+      expect(view.container.querySelector(".tasks-command")).toBeNull();
+      view.key("q");
+      view.update(launched("Bash", 42));
+      view.key("Enter");
+      expect(view.container.querySelector(".tasks-command")).toBeNull();
+    });
+
+    it("says there is no output for an empty read, not before the first read or after an error", () => {
+      const view = setup();
+      view.key("Enter");
+      expect(view.queryByText("No output available")).toBeNull();
+      expect(view.getByText("loading output…")).toBeTruthy();
+      tail(view, "");
+      expect(view.getByText("No output available")).toBeTruthy();
+      expect(view.queryByText("loading output…")).toBeNull();
+      view.key("q"); view.key("Enter");
+      expect(view.queryByText("No output available")).toBeNull();
+      view.reply({ error: "output unavailable" });
+      expect(view.getByText("output unavailable")).toBeTruthy();
+      expect(view.queryByText("No output available")).toBeNull();
+    });
+
+    it("words how much is shown from the lines held and the bytes the host cut", () => {
+      expect(shownWords("a\nb\n", 4, false)).toBe("Showing 2 lines");
+      expect(shownWords("a", 1, false)).toBe("Showing 1 line");
+      expect(shownWords("x\ny\nz", 20000, true)).toBe("Showing the last 3 lines of 20000 bytes");
+      const view = setup();
+      view.key("Enter");
+      tail(view, "one\ntwo\n");
+      expect(view.getByText("Showing 2 lines")).toBeTruthy();
+    });
+
+    it("reads a running task again every second, never two reads at once", () => {
+      const view = setup();
+      view.key("Enter");
+      expect(polls(view)).toBe(1);
+      act(() => vi.advanceTimersByTime(3 * OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(1);
+      tail(view, "a");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(2);
+      expect(view.onRequest.mock.lastCall).toEqual(["task_output", "build", expect.any(String)]);
+      tail(view, "a\nb");
+      expect(view.container.querySelector("pre")!.textContent).toBe("a\nb");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(3);
+    });
+
+    it("refreshes without a loading line, and a refresh keeps another command's answer", () => {
+      const view = setup();
+      view.key("Enter"); tail(view, "a");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      expect(view.queryByText("loading output…")).toBeNull();
+      tail(view, "a");
+      expect(view.getByText("a")).toBeTruthy();
+      view.key("x"); view.reply();
+      expect(view.getByText("stop requested")).toBeTruthy();
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      tail(view, "a\nb");
+      expect(view.getByText("stop requested")).toBeTruthy();
+    });
+
+    it("keeps the last tail and clears an error once a later read works", () => {
+      const view = setup();
+      view.key("Enter"); tail(view, "kept");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      view.reply({ error: "slow sidecar" });
+      expect(view.getByText("slow sidecar")).toBeTruthy();
+      expect(view.getByText("kept")).toBeTruthy();
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      tail(view, "kept more");
+      expect(view.queryByText("slow sidecar")).toBeNull();
+    });
+
+    it("reads nothing from the list or for another task", () => {
+      const view = setup(state([task("build"), task("watch", "monitor")]));
+      act(() => vi.advanceTimersByTime(3 * OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(0);
+      view.key("Enter"); tail(view, "x");
+      view.key("q");
+      act(() => vi.advanceTimersByTime(3 * OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(1);
+      view.key("j"); view.key("Enter");
+      expect(view.onRequest.mock.lastCall![1]).toBe("watch");
+      const before = polls(view);
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      expect(view.onRequest.mock.calls.slice(before).every(([, id]) => id === "watch")).toBe(true);
+    });
+
+    it("reads nothing without the output capability", () => {
+      const off = state([task("build")]); off.capabilities.taskOutput = false;
+      const quiet = setup(off);
+      quiet.key("Enter");
+      act(() => vi.advanceTimersByTime(3 * OUTPUT_POLL_MS));
+      expect(polls(quiet)).toBe(0);
+    });
+
+    it("reads a task that ends once more", () => {
+      const running = state([task("build")]);
+      const view = setup(running);
+      view.key("Enter"); tail(view, "a");
+      expect(polls(view)).toBe(1);
+      view.update(state([task("build", "shell", { status: "completed", live: false, ended_at: 100_000 })]));
+      expect(polls(view)).toBe(2);
+      tail(view, "a\nlast");
+      expect(view.container.querySelector("pre")!.textContent).toBe("a\nlast");
+      act(() => vi.advanceTimersByTime(5 * OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(2);
+    });
+
+    it("follows a read still outstanding when the task ends with one more", () => {
+      const view = setup();
+      view.key("Enter"); tail(view, "a");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(2);
+      view.update(state([task("build", "shell", { status: "completed", live: false, ended_at: 100_000 })]));
+      expect(polls(view)).toBe(2);
+      tail(view, "a\nbefore the end");
+      expect(polls(view)).toBe(3);
+      tail(view, "a\nbefore the end\nthe last line");
+      expect(view.container.querySelector("pre")!.textContent).toBe("a\nbefore the end\nthe last line");
+      act(() => vi.advanceTimersByTime(5 * OUTPUT_POLL_MS));
+      expect(polls(view)).toBe(3);
+    });
+
+    it("clears only a line an output read put up, even when a stop failed with the same words", () => {
+      const view = setup();
+      view.key("Enter"); tail(view, "a");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      view.reply({ error: "provider request timed out" });
+      view.key("x");
+      view.reply({ error: "provider request timed out" });
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      tail(view, "a\nb");
+      expect(view.getByText("provider request timed out")).toBeTruthy();
+    });
+
+    it("reads a task that was already finished only for the first read", () => {
+      const done = setup(state([task("old", "shell", { status: "completed", live: false, ended_at: 100_000 })]));
+      done.key("Enter");
+      act(() => vi.advanceTimersByTime(5 * OUTPUT_POLL_MS));
+      expect(polls(done)).toBe(1);
+    });
+
+    it("drops a refresh that answers after the task run changed", () => {
+      const view = setup();
+      view.key("Enter"); tail(view, "run one");
+      act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+      const late = view.onRequest.mock.lastCall![2];
+      view.update(state([task("build", "shell", { run_id: "2" })]));
+      act(() => view.ref.current!.reply({ requestId: late, taskId: "build", output: "run one, later" }));
+      expect(view.queryByText("run one, later")).toBeNull();
+    });
+
+    describe("scrolling", () => {
+      const tall = (view: ReturnType<typeof setup>, scrollTop: number) => {
+        const overlay = view.dialog();
+        Object.defineProperty(overlay, "scrollHeight", { value: 5000, configurable: true });
+        Object.defineProperty(overlay, "clientHeight", { value: 400, configurable: true });
+        overlay.scrollTop = scrollTop;
+        return overlay;
+      };
+      it("leaves a reader who scrolled up where they were", () => {
+        const view = setup();
+        view.key("Enter"); tail(view, "a");
+        const overlay = tall(view, 1200);
+        // The engine may move a scroller whose content changed under it; the overlay puts it back.
+        let top = 1200;
+        const writes: number[] = [];
+        Object.defineProperty(overlay, "scrollTop", { configurable: true, get: () => top, set: (v: number) => { writes.push(v); top = v; } });
+        act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+        tail(view, "a\nb");
+        expect(writes).toEqual([1200]);
+        expect(top).toBe(1200);
+      });
+      it("follows the end for a reader already at the bottom", () => {
+        const view = setup();
+        view.key("Enter"); tail(view, "a");
+        const overlay = tall(view, 4600);
+        act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+        tail(view, "a\nb");
+        expect(overlay.scrollTop).toBe(5000);
+      });
+      it("does not move for a refresh that changed nothing", () => {
+        const view = setup();
+        view.key("Enter"); tail(view, "a");
+        const overlay = tall(view, 4600);
+        act(() => vi.advanceTimersByTime(OUTPUT_POLL_MS));
+        tail(view, "a");
+        expect(overlay.scrollTop).toBe(4600);
+      });
+    });
   });
 
   it("an AltGraph-modified x is not a stop", () => {

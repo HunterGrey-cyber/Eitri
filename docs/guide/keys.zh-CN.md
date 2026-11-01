@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=1ada51e6ec4ef4a61753380fbce179b422190b87e4ad9d16d735dcefa0024b73 -->
+<!-- translated-from: keys.md sha256=aae45bfd1d8adafb839f503293b14c40c0059b24a5465a1b56f05cf53abab8ce -->
 
 # 按键
 
@@ -466,9 +466,9 @@ end
 | 按键 | 作用 |
 |---|---|
 | `j` / `k`，或 `Down` / `Up` | 下一个 / 上一个任务；在任务详情里则是滚动 |
-| `Enter` | 任务详情：shell 或 monitor 显示输出的末尾，工作流显示它的阶段和 agent |
+| `Enter` | 任务详情：shell 或 monitor 显示它的命令和输出的末尾，运行期间每秒重新读取一次；工作流显示它的阶段和 agent |
 | `x` | 立即停掉选中的任务，只停这一个 |
-| `o` | 在 Neovim 里以只读方式打开任务的输出 |
+| `o` | 在 Neovim 里以只读方式打开详情里显示的输出（最后 8 KiB） |
 | `PageDown` 或空格 / `PageUp` | 向下 / 向上滚动一页 |
 | `Home` / `End` | 滚到顶部 / 底部 |
 | `q` 或 `Esc` | 从任务详情返回；在列表里则关闭列表 |

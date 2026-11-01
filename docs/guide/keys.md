@@ -712,9 +712,9 @@ system tasks. The list has the keys while it is open, and its last line names th
 | keys | what they do |
 |---|---|
 | `j` / `k`, or `Down` / `Up` | the next / the previous task; in a task's detail, scroll |
-| `Enter` | the task's detail: for a shell or a monitor the end of its output, for a workflow its phases and agents |
+| `Enter` | the task's detail: for a shell or a monitor its command and the end of its output, read again every second while it runs; for a workflow its phases and agents |
 | `x` | stop the selected task at once, and only that one |
-| `o` | open the task's output read-only in Neovim |
+| `o` | open the output the detail shows (the last 8 KiB) read-only in Neovim |
 | `PageDown` or `Space` / `PageUp` | scroll a page down / up |
 | `Home` / `End` | scroll to the top / the bottom |
 | `q` or `Esc` | back from a task's detail; from the list, close it |

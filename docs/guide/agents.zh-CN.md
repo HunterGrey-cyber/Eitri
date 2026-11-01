@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=4f759e11e2d25330ef5f591fcb4e9913c2d96e182dcc76f4f5cd1a1b44c41dfc -->
+<!-- translated-from: agents.md sha256=3f663d4ee88ffb831aa1200671df4b13214ece05593d3f80f161ef33d5012af0 -->
 
 # Codex 与其他 agent
 
@@ -26,7 +26,7 @@ Claude Code 做的很多事，发生在你发起的回合之外：它在后台�
 
 状态栏用 Claude Code 的说法统计这个标签页的后台工作：`1 shell`、`2 shells, 1 monitor`、`1 local agent`。没有回合在运行时，输入框上方还有一行显示同样的内容，结尾是 `/tasks`。
 
-`/tasks`（或 `/bashes`）打开后台任务列表：shell、monitor、local agent（在后台运行的子 agent）和动态工作流，然后是已经结束的任务。`j` 和 `k` 选择任务，`Enter` 显示详情：shell 或 monitor 显示它输出的末尾，转义序列已去掉，隐藏字符会显示出来；工作流显示它的各个阶段和 agent。`x` 停掉选中的任务，只停这一个。`o` 在 Neovim 里以只读方式打开它的输出。`q` 返回；在列表里按则关闭列表。全部按键见[按键](keys.zh-CN.md#the-background-tasks-list)。
+`/tasks`（或 `/bashes`）打开后台任务列表：shell、monitor、local agent（在后台运行的子 agent）和动态工作流，然后是已经结束的任务。`j` 和 `k` 选择任务，`Enter` 显示详情：shell 或 monitor 显示启动它的命令和输出的末尾，转义序列已去掉，隐藏字符会显示出来。任务在运行时，输出每秒重新读取一次，详情里会写出显示了多少行（还没有输出时写 `No output available`）。你往上滚动过的话，画面停在原处。Eitri 只保留输出的最后 8 KiB。工作流显示它的各个阶段和 agent。`x` 停掉选中的任务，只停这一个。`o` 在 Neovim 里以只读方式打开详情里显示的输出。`q` 返回；在列表里按则关闭列表。全部按键见[按键](keys.zh-CN.md#the-background-tasks-list)。
 
 `<leader>k` 会先问一个列出这些任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉这个标签页的所有后台任务。它只在没有回合运行时可用，对话会继续下去。
 

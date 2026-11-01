@@ -41,9 +41,11 @@ The band counts the tab's background work in Claude Code's words: `1 shell`, `2 
 
 `/tasks` (or `/bashes`) opens the list of background tasks: shells, monitors, local agents (subagents in the
 background) and dynamic workflows, then the ones that finished. `j` and `k` select a task and `Enter` shows its
-detail: for a shell or a monitor, the end of its output, with escape sequences removed and hidden characters made
-visible; for a workflow, its phases and agents. `x` stops the selected task, and only that one. `o` opens its output
-read-only in Neovim. `q` goes back, and from the list closes it. All the keys are in
+detail: for a shell or a monitor, the command that started it and the end of its output, with escape sequences
+removed and hidden characters made visible. While the task runs the output is read again every second, and the
+detail says how many lines it shows (`No output available` when there are none yet). If you have scrolled up, the
+view stays where you left it. Eitri keeps the last 8 KiB of the output. For a workflow the detail shows its phases and agents. `x` stops the
+selected task, and only that one. `o` opens the output shown read-only in Neovim. `q` goes back, and from the list closes it. All the keys are in
 [Keys](keys.md#the-background-tasks-list).
 
 `<leader>k` stops every background task of the tab after a `y/n` question that names them

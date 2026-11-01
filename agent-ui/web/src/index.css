@@ -2173,6 +2173,8 @@ button.band-background {
 .tasks-overlay {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  /* A refreshed tail keeps the reader's place by its own bookkeeping, not the engine's anchoring. */
+  overflow-anchor: none;
 }
 
 /* Outside the details button, so that button's gap does not reach it: the same 8px keeps `manual` and `⚑2` from

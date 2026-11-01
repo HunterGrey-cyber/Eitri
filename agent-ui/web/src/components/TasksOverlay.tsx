@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { elapsedWords, liveTasks } from "../band";
 import { nextRequestId } from "../bridge";
 import { toolCallPath } from "../externalTools";
@@ -28,6 +28,17 @@ const endedBySeq = (task: BackgroundTaskRecord) => task.ended_at !== null && tas
 const identity = (task: BackgroundTaskRecord) => JSON.stringify([task.task_id, task.run_id, task.started_at]);
 const glyph = (task: BackgroundTaskRecord) => task.status === "paused" ? "⏸" : task.status === "completed" ? "✓"
   : task.status === "failed" ? "✕" : ["stopped", "ended", "stopping"].includes(task.status) ? "■" : "●";
+
+const LOADING = "loading output…";
+/** How often a running shell's or monitor's tail is read again while its detail is open. */
+export const OUTPUT_POLL_MS = 1000;
+
+/** What the detail says about the tail it shows: how many lines, and of how many bytes when the host cut it. */
+export function shownWords(text: string, total: number, truncated: boolean): string {
+  const lines = text.replace(/\n$/, "").split("\n").length;
+  const count = `${lines} ${lines === 1 ? "line" : "lines"}`;
+  return truncated ? `Showing the last ${count} of ${total} bytes` : `Showing ${count}`;
+}
 
 /** Terminal escape payloads never become output text, including OSC links and their targets. */
 export function taskOutputText(text: string): string {
@@ -102,7 +113,14 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
   const [message, setMessage] = useState<string | null>(null);
   const [updates, setUpdates] = useState(0);
   const [output, setOutput] = useState<{ identity: string; text: string; total: number; truncated: boolean } | null>(null);
-  const pending = useRef(new Map<string, { task: BackgroundTaskRecord; open: boolean; kind: "stop_task" | "task_output" }>());
+  const pending = useRef(new Map<string, { task: BackgroundTaskRecord; open: boolean; kind: "stop_task" | "task_output"; again: boolean }>());
+  // Where a refresh found the scroll position, so that the new tail leaves a reader who scrolled up in place.
+  const keepScroll = useRef<{ top: number; atBottom: boolean } | null>(null);
+  // Whether the line now up came from an output read: a later good read clears that line and no other.
+  const outputOwnsMessage = useRef(false);
+  const say = (text: string | null, fromOutput = false) => { outputOwnsMessage.current = fromOutput && text !== null; setMessage(text); };
+  // The run whose detail has been seen running: when it ends, its output is read once more.
+  const seenRunning = useRef<string | null>(null);
   const visible = state.capabilities.backgroundTasks ? state.backgroundTasks.rows.filter(shown) : [];
   const groups = GROUPS.map(([kind, title]) => ({ kind, title, rows: visible.filter((t) => !t.ambient &&
     (kind === "completed" ? finished(t) : !finished(t) && t.kind === kind)) }));
@@ -128,24 +146,51 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
     if (detail && selected !== null && !rows.some((row) => row.task_id === selected)) setDetail(false);
   }, [detail, selected, rows]);
 
-  function request(kind: "stop_task" | "task_output", current: BackgroundTaskRecord, open = false) {
-    if (kind === "stop_task" && !state.capabilities.taskControl) { setMessage("this sidecar cannot stop one task"); return; }
-    if (kind === "stop_task" && (!current.live || finished(current))) { setMessage("this task has ended"); return; }
-    if (kind === "task_output" && !state.capabilities.taskOutput) { setMessage("output is not available from this sidecar"); return; }
+  const latest = useRef({ task, request: (_kind: "stop_task" | "task_output", _task: BackgroundTaskRecord, _open?: boolean, _silent?: boolean, _last?: boolean) => {} });
+  latest.current = { task, request };
+  const reading = detail && task !== undefined && (task.kind === "shell" || task.kind === "monitor") && state.capabilities.taskOutput;
+  const readingId = reading ? identity(task) : null;
+  const ended = task !== undefined && finished(task);
+  useEffect(() => {
+    if (readingId === null) return;
+    const read = (last = false) => { if (latest.current.task) latest.current.request("task_output", latest.current.task, false, true, last); };
+    if (!ended) {
+      seenRunning.current = readingId;
+      const timer = window.setInterval(() => read(), OUTPUT_POLL_MS);
+      return () => window.clearInterval(timer);
+    }
+    if (seenRunning.current === readingId) { seenRunning.current = null; read(true); }
+  }, [readingId, ended]);
+  useLayoutEffect(() => {
+    const keep = keepScroll.current, el = root.current;
+    keepScroll.current = null;
+    if (keep && el) el.scrollTop = keep.atBottom ? el.scrollHeight : keep.top;
+  }, [output]);
+
+  /** `last` is the read made when the task ended: one still in flight began before that, so it is followed by another. */
+  function request(kind: "stop_task" | "task_output", current: BackgroundTaskRecord, open = false, silent = false, last = false) {
+    if (kind === "stop_task" && !state.capabilities.taskControl) { say("this sidecar cannot stop one task"); return; }
+    if (kind === "stop_task" && (!current.live || finished(current))) { say("this task has ended"); return; }
+    if (kind === "task_output" && !state.capabilities.taskOutput) { say("output is not available from this sidecar"); return; }
     if (kind === "task_output" && current.kind !== "shell" && current.kind !== "monitor") {
-      if (open) setMessage("this task has no output file");
+      if (open) say("this task has no output file");
       return;
     }
-    if (pending.current.size >= 64) { setMessage("too many task commands are waiting"); return; }
+    if (pending.current.size >= 64) { if (!silent) say("too many task commands are waiting"); return; }
     const existing = [...pending.current.values()].find((p) => p.kind === kind && identity(p.task) === identity(current));
-    if (existing) { existing.open ||= open; return; }
+    if (existing) {
+      existing.open ||= open;
+      existing.again ||= last;
+      if (!silent && kind === "task_output") say(LOADING, true);
+      return;
+    }
     const requestId = nextRequestId();
-    pending.current.set(requestId, { task: current, open, kind });
-    setMessage(kind === "task_output" ? "loading output…" : "stopping…");
+    pending.current.set(requestId, { task: current, open, kind, again: false });
+    if (!silent) say(kind === "task_output" ? LOADING : "stopping…", kind === "task_output");
     onRequest(kind, current.task_id, requestId);
   }
   function view(current: BackgroundTaskRecord) {
-    setSelected(current.task_id); setDetail(true); setMessage(null); setOutput(null);
+    setSelected(current.task_id); setDetail(true); say(null); setOutput(null);
     if (current.kind === "shell" || current.kind === "monitor") request("task_output", current);
   }
   /** The overlay is the scroller: a detail view taller than it is read with these keys. */
@@ -163,12 +208,12 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
       ((action === "next" || action === "previous") && detail)) {
       scroll(action);
     } else if (action === "back") {
-      if (detail) { setDetail(false); setMessage(null); } else onClose();
+      if (detail) { setDetail(false); say(null); } else onClose();
     } else if ((action === "next" || action === "previous") && !detail) {
       const ids = [...groups.flatMap((g) => g.rows.map((t) => t.task_id)), "__system__", ...(systemOpen ? ambient.map((t) => t.task_id) : [])];
       const index = systemSelected ? ids.indexOf("__system__") : task ? ids.indexOf(task.task_id) : 0;
       setSelected(ids[Math.max(0, Math.min(ids.length - 1, index + (action === "next" ? 1 : -1)))]);
-      setMessage(null);
+      say(null);
     } else if (systemSelected && action === "view") {
       setSystemOpen((v) => !v);
     } else if (task) {
@@ -183,18 +228,30 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
     pending.current.delete(reply.requestId);
     // A delayed tail belongs to the run that requested it, never a reused id or a different selection.
     if (!task || identity(task) !== identity(waiting.task) || (reply.taskId !== undefined && reply.taskId !== task.task_id)) return;
-    if (reply.error !== undefined) { setMessage(revealedText(reply.error)); return; }
-    if (waiting.kind === "stop_task") { setMessage("stop requested"); return; }
+    // A read begun before the task ended may have missed its last lines: read again.
+    if (waiting.again) latest.current.request("task_output", task, false, true);
+    if (reply.error !== undefined) { say(revealedText(reply.error), waiting.kind === "task_output"); return; }
+    if (waiting.kind === "stop_task") { say("stop requested"); return; }
     if (reply.output === undefined) return;
     const text = taskOutputText(reply.output);
-    setOutput({ identity: identity(task), text, total: reply.totalBytes ?? 0, truncated: reply.truncated ?? false });
-    setMessage(null);
+    const next = { identity: identity(task), text, total: reply.totalBytes ?? 0, truncated: reply.truncated ?? false };
+    const el = root.current;
+    if (shownOutput && el && (shownOutput.text !== text || shownOutput.total !== next.total || shownOutput.truncated !== next.truncated)) {
+      keepScroll.current = { top: el.scrollTop, atBottom: el.scrollHeight - el.scrollTop - el.clientHeight <= 4 };
+    }
+    setOutput((prev) => prev && prev.identity === next.identity && prev.text === text && prev.total === next.total &&
+      prev.truncated === next.truncated ? prev : next);
+    // Only a line an output read put up goes: a refresh must not wipe a stop request's answer.
+    if (outputOwnsMessage.current) say(null);
     if (waiting.open) onOpen("Task output", text);
   } }));
 
   const path = task && toolCallPath(state.toolCalls, task.tool_use_id);
   const launchCall = path ? path[path.length - 1] : null;
   const launch = launchCall?.result;
+  const launchInput = launchCall?.input;
+  const command = task && (task.kind === "shell" || task.kind === "monitor") && launchInput && typeof launchInput === "object" &&
+    typeof (launchInput as Record<string, unknown>).command === "string" ? (launchInput as { command: string }).command : null;
   return (
     <div className="tasks-overlay" role="dialog" aria-modal="true" aria-label="Background tasks" tabIndex={-1} ref={root}
       onKeyDown={(event) => { event.preventDefault(); event.stopPropagation(); key(event.nativeEvent); }}
@@ -206,7 +263,11 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
           <h3>{glyph(task)} {revealedText(task.description)}</h3>
           <div>{[taskFacts(task, state), elapsed(task)].filter(Boolean).join(" · ")}</div>
           {(task.kind === "shell" || task.kind === "monitor") && <>
-            {shownOutput && <><pre>{shownOutput.text}</pre>{shownOutput.truncated && <div className="tasks-dim">tail of {shownOutput.total} bytes</div>}</>}
+            {command !== null && <><div className="tasks-dim">Command</div><pre className="tasks-command">{revealedText(command)}</pre></>}
+            {shownOutput && (shownOutput.text === "" ? <p className="tasks-dim">No output available</p> : <>
+              <pre>{shownOutput.text}</pre>
+              <div className="tasks-dim">{shownWords(shownOutput.text, shownOutput.total, shownOutput.truncated)}</div>
+            </>)}
             {task.output_file && <div className="tasks-dim">{revealedText(task.output_file)}</div>}
           </>}
           {task.kind === "local_agent" && <>
