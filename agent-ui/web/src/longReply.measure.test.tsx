@@ -4,6 +4,7 @@ import { act, cleanup, render } from "@testing-library/react";
 import App from "./App";
 import { renderMarkdown } from "./markdown";
 import { initialState } from "./reducer";
+import { replyBatch, type ReplyShape } from "./fixtures/longSessionBench";
 
 /* How the panel's page spends time on one long streamed reply, measured at three sizes. Opt-in
    (`LONG_REPLY_MEASURE=1`): it prints a table and asserts nothing, since jsdom's clock is not WebKitGTK's and a
@@ -17,17 +18,14 @@ beforeAll(() => {
 
 const TAB = { id: 1, number: 1, label: "1 new", name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: false, failure: null };
 const BATCH_BYTES = Number(process.env.LONG_REPLY_BATCH ?? 1024);
-const SIZES = [100_000, 400_000, 1_200_000];
+const SIZES = (process.env.LONG_REPLY_SIZES ?? "100000,400000,1200000").split(",").map(Number);
+const SHAPE = (process.env.LONG_REPLY_SHAPE ?? "paragraph") as ReplyShape;
 
 function dispatch(payload: unknown) {
   window.__eitriDispatch!(JSON.stringify(payload));
 }
 
-function line(i: number): string {
-  // One markdown line of about BATCH_BYTES, the way the scripted stand-in's lines run.
-  const head = `line ${i} `;
-  return head + "x".repeat(Math.max(0, BATCH_BYTES - head.length - 1)) + "\n";
-}
+const line = (i: number) => replyBatch(SHAPE, i, BATCH_BYTES);
 
 const enabled = process.env.LONG_REPLY_MEASURE === "1";
 
@@ -67,7 +65,7 @@ describe.skipIf(!enabled)("a long streamed reply", () => {
       const first = mean(times.slice(0, tenth));
       const last = mean(times.slice(-tenth));
       console.log(
-        `[long-reply] page ${size} B: ${batches} batches, total ${streamed.toFixed(0)} ms, first-tenth batch ${first.toFixed(2)} ms, last-tenth batch ${last.toFixed(2)} ms (x${(last / first).toFixed(1)}), turn end ${ended.toFixed(0)} ms`,
+        `[long-reply] page ${size} B, ${SHAPE}: ${batches} batches, total ${streamed.toFixed(0)} ms, first-tenth batch ${first.toFixed(2)} ms, last-tenth batch ${last.toFixed(2)} ms (x${(last / first).toFixed(1)}), turn end ${ended.toFixed(0)} ms`,
       );
     }, 1_800_000);
   }

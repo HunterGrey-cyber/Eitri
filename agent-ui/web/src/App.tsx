@@ -1772,6 +1772,19 @@ export default function App() {
           }),
     [frozenSnapshot, thinkingDisplay],
   );
+  /** Held while what a card reads stands: a new value makes React walk every row of the conversation looking for the
+   *  cards under this provider, on each streamed batch. */
+  const viewScriptRef = useRef<(text: string) => void>(() => {});
+  viewScriptRef.current = (text) => {
+    const requestId = nextRequestId();
+    trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+    postToRust({ type: "view_in_editor", request_id: requestId, title: "Workflow script", text });
+  };
+  const { toolCalls: cardCalls, backgroundTasks: cardTasks } = frozenSnapshot?.state ?? state;
+  const cardContext = useMemo(
+    () => ({ state: { toolCalls: cardCalls, backgroundTasks: cardTasks }, onViewScript: (text: string) => viewScriptRef.current(text) }),
+    [cardCalls, cardTasks],
+  );
   const answerableItems = useMemo(
     (): AnswerableItem[] =>
       timeline.map((item) =>
@@ -6535,11 +6548,7 @@ export default function App() {
             prompt sent at a turn's end moved the cursor onto it) is -1, no current row at all --
             the old fallback, the live index itself, marked whichever
             unrelated frozen row sat at that position as the cursor's. */}
-        <PermissionCardContext.Provider value={{ state: frozenSnapshot?.state ?? state, onViewScript: (text) => {
-          const requestId = nextRequestId();
-          trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
-          postToRust({ type: "view_in_editor", request_id: requestId, title: "Workflow script", text });
-        } }}>
+        <PermissionCardContext.Provider value={cardContext}>
           <MessageList
             tab={activeTabId}
             state={frozenSnapshot?.state ?? state}

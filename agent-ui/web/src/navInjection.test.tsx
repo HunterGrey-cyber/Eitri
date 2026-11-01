@@ -20,7 +20,13 @@ import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 const markdown = vi.hoisted(() => ({ raw: false }));
 vi.mock("./markdown", async (importOriginal) => {
   const real = await importOriginal<typeof import("./markdown")>();
-  return { ...real, renderMarkdown: (text: string) => (markdown.raw ? text : real.renderMarkdown(text)) };
+  return {
+    ...real,
+    renderMarkdown: (text: string) => (markdown.raw ? text : real.renderMarkdown(text)),
+    // A reply still being written is drawn in pieces: bypassed the same way, as one open piece.
+    streamMarkdown: (held: Parameters<typeof real.streamMarkdown>[0], text: string) =>
+      markdown.raw ? { text, settled: 0, whole: true, added: "", tail: text, restarted: true } : real.streamMarkdown(held, text),
+  };
 });
 
 afterEach(cleanup);

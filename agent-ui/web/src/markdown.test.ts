@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
-import { CODE_TEXT_ATTR, MARKDOWN_CACHE_LIMIT, codeBlockText, markdownParseCount, renderMarkdown } from "./markdown";
+import { CODE_TEXT_ATTR, codeBlockText, markdownParseCount, renderMarkdown, setMarkdownCacheChars } from "./markdown";
 
 describe("renderMarkdown", () => {
   it("highlights a fenced block in a language it knows", () => {
@@ -47,10 +47,19 @@ describe("renderMarkdown", () => {
     const a = renderMarkdown("once **only**");
     expect(renderMarkdown("once **only**")).toBe(a);
     expect(markdownParseCount() - before).toBe(1);
-    for (let i = 0; i < MARKDOWN_CACHE_LIMIT + 5; i++) renderMarkdown(`filler ${i}`);
-    const again = markdownParseCount();
-    renderMarkdown("once **only**");
-    expect(markdownParseCount() - again, "the oldest entry was evicted").toBe(1);
+    const bound = setMarkdownCacheChars(2_000);
+    try {
+      for (let i = 0; i < 100; i++) renderMarkdown(`filler ${i}`);
+      const again = markdownParseCount();
+      renderMarkdown("once **only**");
+      expect(markdownParseCount() - again, "the oldest entry was evicted").toBe(1);
+      renderMarkdown("x".repeat(3_000));
+      const held = markdownParseCount();
+      renderMarkdown("x".repeat(3_000));
+      expect(markdownParseCount() - held, "a text larger than the whole cache is not kept").toBe(1);
+    } finally {
+      setMarkdownCacheChars(bound);
+    }
   });
 });
 

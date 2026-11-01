@@ -1665,12 +1665,13 @@ describe("index.css cascade (which rule actually wins)", () => {
     for (const cls of ["row-tool", "row-tool-run", "row-thinking", "row-assistant"]) {
       const row = computed(nested(cls), ".subagent-child > .row");
       expect(row.display, cls).toBe("block");
-      expect(row.position, cls).toBe("relative");
       expect(computed(nested(cls), ".subagent-child .row-sign").display, cls).toBe("none");
     }
     for (const cls of ["row-tool", "row-tool-run", "row-thinking"]) {
       expect(computed(nested(cls), ".subagent-child > .row").paddingLeft, cls).toBe("24px");
+      expect(computed(nested(cls), ".subagent-child > .row").position, `${cls} holds its positioned sign`).toBe("relative");
     }
+    expect(computed(nested("row-assistant"), ".subagent-child > .row").position, "a row with no sign is not positioned").toBe("static");
     expect(computed(nested("row-tool"), ".subagent-child > .row").marginTop).toBe("12px");
     expect(computed(nested("row-assistant"), ".subagent-child > .row").marginTop).toBe("24px");
     // The mark is drawn in the nested row's own indent, as in the list's rows, with the same weight as theirs so

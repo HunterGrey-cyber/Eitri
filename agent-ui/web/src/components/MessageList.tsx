@@ -1,10 +1,10 @@
-import { toolCardLine, agentCard, isAgentCall } from "../display";
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { rowCardLine, rowAgentCard, isAgentCall } from "../display";
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall } from "../toolRegistry";
 import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
-import { forgetMarkdown, renderMarkdown } from "../markdown";
+import { forgetMarkdown, renderMarkdown, streamMarkdown, type StreamedMarkdown } from "../markdown";
 import { turnEndingText } from "../turnEnding";
 import { endingDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "../turnTimes";
 import type { TurnDurations } from "../turnTimes";
@@ -116,7 +116,7 @@ function toolSign(call: ToolCallRecord, abandoned: boolean): string {
 /** A call with no result is abandoned before the restored-history cut, after the session ends,
  *  or outside its active turn. Rendering those cases as running would leave a permanent spinner;
  *  an active call in the live span must still show as running. */
-function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded: boolean): boolean {
+function isAbandonedCall(call: ToolCallRecord, state: Pick<AgentUiState, "history" | "activeTurnId">, sessionEnded: boolean): boolean {
   if (call.result !== null) return false;
   if (sessionEnded) return true;
   if (state.history !== null && call.seq < state.history.uptoSeq) return true;
@@ -223,6 +223,8 @@ export function MessageList({
   /** One observer for the list and its children, and the set it watches; `null` without one (jsdom). */
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedChildrenRef = useRef<Set<Element>>(new Set());
+  /** What the watched children were last found from; a streamed batch leaves all of it as it was. */
+  const observedShapeRef = useRef<RowShape | null>(null);
   /** Current `onScroll` for the once-created observer. A stale closure reads an old timeline and
    *  overwrites an approval label when a new card settles its size. Assigned on every render. */
   const onScrollRef = useRef<() => void>(() => {});
@@ -260,20 +262,27 @@ export function MessageList({
       observer.disconnect();
       resizeObserverRef.current = null;
       observed.clear();
+      observedShapeRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   /** Puts every child of the list under the observer above, and lets go of any that left. Run after
    *  every change of `state` and of the timeline (an expanded run mounts rows that no `state` change
-   *  announced). */
+   *  announced), and looks at the DOM only when the rows are not the ones it last found: walking every
+   *  row on every streamed batch is a large part of what a batch costs in a long conversation. */
   const observeChildren = (list: HTMLElement) => {
     const observer = resizeObserverRef.current;
     if (observer === null) return;
+    const shape: RowShape = { rows: timeline, footers: placedFooters, notice: state.history !== null };
+    const held = observedShapeRef.current;
+    observedShapeRef.current = shape;
+    if (held !== null && sameRowShape(held, shape)) return;
     const observed = observedChildrenRef.current;
-    const children = new Set([
-      ...Array.from(list.children).filter((el) => !el.classList.contains("subagent-child")),
-      ...list.querySelectorAll(".subagent-child > .row"),
-    ]);
+    const children = new Set<Element>();
+    for (const child of list.children) {
+      if (!child.classList.contains("subagent-child")) children.add(child);
+      else for (const row of child.children) if (row.classList.contains("row")) children.add(row);
+    }
     for (const el of observed) {
       if (!children.has(el)) {
         observer.unobserve(el);
@@ -316,7 +325,7 @@ export function MessageList({
   /* Merge by Rust's seq rather than by item kind, so interleaved calls keep the same order live
      and after snapshots or resync. Memoization avoids allocating mapped arrays, a Map and a Set
      and sorting the whole conversation on unrelated renders during streaming. MarkdownBody
-     renders replies once per text rather than parsing and sanitising every reply on each render.
+     renders a finished reply once per text, and StreamingMarkdown only the open end of a reply being written.
      Keep this binding above onScroll and updatePill: both closures need the same timeline. */
   const timeline = useMemo(
     () =>
@@ -624,14 +633,22 @@ export function MessageList({
   const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason });
   rowHandlersRef.current = { onAnswerPermission, onPermissionReason };
 
+  // By the transcript's length and newest row, not by the list: a streamed batch replaces the list on every delta and
+  // changes which rows there are on none of them.
+  const newestReply = state.transcript[state.transcript.length - 1]?.seq;
   const footers = useMemo(
     () => workedFooters(state, turnDurations),
-    [state.activeTurnId, state.turnEndings, state.transcript, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, turnDurations],
+    [state.activeTurnId, state.turnEndings, state.transcript.length, newestReply, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, turnDurations],
   );
   // By row key, over the rows actually drawn: a turn's newest row may be a hidden or folded thought.
   const placedFooters = useMemo(() => placeFooters(timeline, footers), [timeline, footers]);
 
+  // The reply the agent is still writing: it draws only what changed (`StreamingMarkdown`).
+  const streamingKey = state.assistantMessageOpen && newestReply !== undefined ? `m-${newestReply}` : null;
   const awaitingPermission = new Set(allCards(state).map((p) => p.toolUseId).filter(isUsableLink));
+  /** Each row's element, kept with the values it was made from: the same element back tells React the row has not
+   *  changed, so a batch does not look at a finished row's props. By item, which outlives no row. */
+  const heldRows = useRef(new WeakMap<TimelineItem, HeldRow>()).current;
 
   return (
     <>
@@ -665,26 +682,30 @@ export function MessageList({
           const call = item.kind === "tool" ? item.call : null;
           const permissionId = item.kind === "permission" ? item.request.permissionId : null;
           const footer = placedFooters.get(item.key) ?? null;
-          const row = (
-            <TimelineRow
-                item={item}
-                current={index === cursor}
-                yanked={item.key === yankedKey}
-                expanded={expanded[item.key] === true}
-                detailed={detailed}
-                thinkingDisplay={thinkingDisplay}
-                sessionEnded={sessionEnded}
-                cardLine={call === null ? null : toolCardLine(call, state)}
-                agent={call !== null && isAgentCall(call) ? agentCard(call, state, isAbandonedCall(call, state, sessionEnded)) : null}
-                abandoned={call !== null && isAbandonedCall(call, state, sessionEnded)}
-                gated={call !== null && awaitingPermission.has(call.toolUseId)}
-                ruleOffer={permissionId === null ? null : (ruleOffers?.[permissionId] ?? null)}
-                alreadyAnswered={permissionId !== null && (answeredPermissions?.has(permissionId) ?? false)}
-                handlers={rowHandlersRef}
-                ranFor={item.kind === "ending" ? endingDuration(turnDurations, item.ending.turnId) : null}
-              />
-          );
-          return (
+          const abandoned = call !== null && isAbandonedCall(call, state, sessionEnded);
+          const props: TimelineRowProps = {
+            item,
+            current: index === cursor,
+            yanked: item.key === yankedKey,
+            expanded: expanded[item.key] === true,
+            detailed,
+            thinkingDisplay,
+            sessionEnded,
+            cardLine: call === null ? null : rowCardLine(call, state),
+            agent: call !== null && isAgentCall(call) ? rowAgentCard(call, state, abandoned) : null,
+            abandoned,
+            gated: call !== null && awaitingPermission.has(call.toolUseId),
+            ruleOffer: permissionId === null ? null : (ruleOffers?.[permissionId] ?? null),
+            alreadyAnswered: permissionId !== null && (answeredPermissions?.has(permissionId) ?? false),
+            handlers: rowHandlersRef,
+            ranFor: item.kind === "ending" ? endingDuration(turnDurations, item.ending.turnId) : null,
+            streaming: item.key === streamingKey && !item.depth,
+            selecting: visual !== null,
+          };
+          const held = heldRows.get(item);
+          if (held !== undefined && held.footer === footer && sameRowProps(held.props, props)) return held.element;
+          const row = <TimelineRow {...props} />;
+          const element = (
             <Fragment key={item.key}>
               {item.depth ? <div className="subagent-child" style={{ marginInlineStart: `${item.depth * 1.5}em` }} data-depth={item.depth}>{row}</div> : row}
               {footer !== null && (
@@ -696,6 +717,8 @@ export function MessageList({
               )}
             </Fragment>
           );
+          heldRows.set(item, { props, footer, element });
+          return element;
         })}
         {/* The cursor's fill, behind the rows (`../cursorBand`). Hidden from assistive technology and from
             VISUAL's selection (`[aria-hidden="true"]` is chrome there). */}
@@ -710,6 +733,35 @@ type RowHandlers = {
   onPermissionReason: Props["onPermissionReason"];
 };
 
+/** What decides which elements are the list's direct children: its rows in order, the rows a turn's time stands under
+ *  (by row key), and the history notice. */
+type RowShape = { rows: TimelineItem[]; footers: ReadonlyMap<string, string>; notice: boolean };
+
+function sameRowShape(a: RowShape, b: RowShape): boolean {
+  if (a.notice !== b.notice || a.rows.length !== b.rows.length || a.footers.size !== b.footers.size) return false;
+  for (const key of a.footers.keys()) if (!b.footers.has(key)) return false;
+  return a.rows === b.rows || a.rows.every((item, i) => item.key === b.rows[i].key && item.depth === b.rows[i].depth);
+}
+
+type HeldRow = { props: TimelineRowProps; footer: string | null; element: ReactElement };
+
+/** Every prop by name, so a prop added to `TimelineRowProps` without a line here fails to compile. */
+function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
+  const {
+    item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
+    ruleOffer, alreadyAnswered, ranFor, handlers, streaming, selecting, ...none
+  } = a;
+  const _exhaustive: Record<string, never> = none;
+  void _exhaustive;
+  return (
+    item === b.item && current === b.current && yanked === b.yanked && expanded === b.expanded &&
+    detailed === b.detailed && thinkingDisplay === b.thinkingDisplay && sessionEnded === b.sessionEnded &&
+    abandoned === b.abandoned && cardLine === b.cardLine && agent === b.agent && gated === b.gated &&
+    ruleOffer === b.ruleOffer && alreadyAnswered === b.alreadyAnswered && ranFor === b.ranFor &&
+    handlers === b.handlers && streaming === b.streaming && selecting === b.selecting
+  );
+}
+
 type TimelineRowProps = {
   item: TimelineItem;
   current: boolean;
@@ -721,7 +773,7 @@ type TimelineRowProps = {
   /** A tool call whose result can never arrive (`isAbandonedCall`). */
   abandoned: boolean;
   cardLine: string | null;
-  agent: ReturnType<typeof agentCard> | null;
+  agent: ReturnType<typeof rowAgentCard> | null;
   /** A tool call a card is waiting on. */
   gated: boolean;
   /** A card's offered rule, exactly as Rust offered it. */
@@ -730,6 +782,10 @@ type TimelineRowProps = {
   /** For a turn-ending row: how long the turn ran, worded (`formatDuration`), or `null` when unknown. */
   ranFor: string | null;
   handlers: { current: RowHandlers };
+  /** The reply the agent is still writing. */
+  streaming: boolean;
+  /** VISUAL holds the list still. */
+  selecting: boolean;
 };
 
 let rowRenders = 0;
@@ -760,6 +816,8 @@ const TimelineRow = memo(function TimelineRow({
   alreadyAnswered,
   ranFor,
   handlers,
+  streaming,
+  selecting,
 }: TimelineRowProps) {
   rowRenders += 1;
   switch (item.kind) {
@@ -792,7 +850,7 @@ const TimelineRow = memo(function TimelineRow({
           {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
               that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
               -- one function so no caller can run half of it. */}
-          <MarkdownBody text={item.text} />
+          <ReplyBody text={item.text} streaming={streaming} selecting={selecting} />
         </Row>
       );
     }
@@ -992,4 +1050,96 @@ const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
     if (before !== null && before !== text) forgetMarkdown(before);
   }, [text]);
   return <div dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
+/** A drawing of a reply's open end that took longer than this leaves the page alone for a while afterwards. */
+const SLOW_TAIL_MS = 8;
+/** How much longer than the drawing took the page is left alone for. */
+const SLOW_TAIL_REST = 3;
+
+/** One reply. A reply that was on its way to the screen while this row was mounted keeps the DOM it was drawn into when
+ *  it ends; every other reply is one rendering of its text. */
+const ReplyBody = memo(function ReplyBody({ text, streaming, selecting }: { text: string; streaming: boolean; selecting: boolean }) {
+  const written = useRef(streaming);
+  written.current ||= streaming;
+  return written.current ? <StreamingMarkdown text={text} streaming={streaming} selecting={selecting} /> : <MarkdownBody text={text} />;
+});
+
+/** A reply the agent is writing. Blocks already complete stay in the DOM as they were put there, and each batch
+ *  replaces only what comes after them (`streamMarkdown`), so a batch costs what the open block costs, however long the
+ *  reply has grown. One block can be most of a reply (a long paragraph, a file in a fence): redrawing it on every batch
+ *  would take all the page's time, so a slow drawing is followed by a rest, and the newest text is drawn after it.
+ *
+ *  When the reply ends it is rendered whole, the one drawing a reload would give, and that is what the row holds. It
+ *  is the same HTML as the pieces, so the DOM, and any selection in it, normally stays; the check is the guarantee.
+ *
+ *  While VISUAL holds a selection nothing here touches the DOM, a drawing waiting out its rest included: `App.tsx` ends
+ *  the mode if the DOM under its selection changes. What came in the meantime is drawn when the mode ends. */
+const StreamingMarkdown = memo(function StreamingMarkdown({ text, streaming, selecting }: { text: string; streaming: boolean; selecting: boolean }) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const heldRef = useRef<{
+    stream: StreamedMarkdown | null;
+    settled: string;
+    lastSettled: ChildNode | null;
+    text: string;
+    restUntil: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>({ stream: null, settled: "", lastSettled: null, text, restUntil: 0, timer: null });
+  const drawRef = useRef(() => {
+    const box = boxRef.current;
+    if (box === null) return;
+    const held = heldRef.current;
+    const started = performance.now();
+    const next = streamMarkdown(held.stream, held.text);
+    if (next === held.stream) return;
+    held.stream = next;
+    if (next.restarted) {
+      held.settled = "";
+      held.lastSettled = null;
+    }
+    while (box.lastChild !== held.lastSettled) box.lastChild!.remove();
+    if (next.added !== "") {
+      box.insertAdjacentHTML("beforeend", next.added);
+      held.settled += next.added;
+      held.lastSettled = box.lastChild;
+    }
+    if (next.tail !== "") box.insertAdjacentHTML("beforeend", next.tail);
+    const now = performance.now();
+    const spent = now - started;
+    held.restUntil = spent > SLOW_TAIL_MS ? now + spent * SLOW_TAIL_REST : 0;
+  });
+  const stopResting = () => {
+    const held = heldRef.current;
+    if (held.timer !== null) clearTimeout(held.timer);
+    held.timer = null;
+  };
+  // Before paint, and before the list's own layout effect reads how tall the conversation is now.
+  useLayoutEffect(() => {
+    const held = heldRef.current;
+    held.text = text;
+    if (selecting) {
+      stopResting();
+      return;
+    }
+    if (!streaming) {
+      stopResting();
+      const whole = renderMarkdown(text);
+      const box = boxRef.current;
+      if (box !== null && (held.stream?.text !== text || held.settled + held.stream.tail !== whole)) box.innerHTML = whole;
+      held.stream = null;
+      held.settled = "";
+      held.lastSettled = null;
+      return;
+    }
+    const rest = held.restUntil - performance.now();
+    if (rest <= 0) drawRef.current();
+    else
+      held.timer ??= setTimeout(() => {
+        held.timer = null;
+        held.restUntil = 0;
+        drawRef.current();
+      }, rest);
+  }, [text, streaming, selecting]);
+  useEffect(() => stopResting, []);
+  return <div ref={boxRef} />;
 });

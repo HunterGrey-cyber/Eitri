@@ -192,7 +192,6 @@ pre {
    list's own rows: each rule that takes a row off the sign-cell grid names them too, through `:where` so the
    branch weighs what the list's own does and the sign colours below still win. */
 .message-list > .row, .message-list > :where(.subagent-child) > .row {
-  position: relative;
   display: block;
   padding: 0;
   background: none;
@@ -203,9 +202,12 @@ pre {
 .message-list .row-sign {
   display: none;
 }
+/* Only the rows that hold a positioned sign are positioned themselves: every positioned box is walked each time the
+   list scrolls, and a conversation that follows its tail scrolls on every streamed batch. */
 .message-list > .row-tool, .message-list > .row-tool-run, .message-list > .row-thinking,
 .message-list > :where(.subagent-child) > .row-tool, .message-list > :where(.subagent-child) > .row-tool-run,
 .message-list > :where(.subagent-child) > .row-thinking {
+  position: relative;
   padding-left: 24px;
 }
 .message-list > .row-tool::before, .message-list > .row-tool-run::before, .message-list > .row-thinking::before,

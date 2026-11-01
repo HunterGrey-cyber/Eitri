@@ -68,13 +68,6 @@ function isEditorCardItem(item: TimelineItem): boolean {
   return item.kind === "permission" && item.request.editorCard !== undefined;
 }
 
-/** Whether `item` is the row `seq` names, or a run holding the call or thought numbered `seq`. */
-function holds(item: TimelineItem, seq: Seq): boolean {
-  if (isEditorCardItem(item)) return false;
-  if (item.kind !== "run") return item.seq === seq;
-  return item.calls.some((call) => call.seq === seq) || (item.thoughts ?? []).some((thought) => thought.seq === seq);
-}
-
 /** Where each "Worked for" line stands on the page actually drawn: by the `key` of the row it goes under.
  *
  * Rust names the newest row a turn wrote (`anchorSeq`), and that row is not always drawn: a thought under
@@ -87,9 +80,24 @@ export function placeFooters(items: readonly TimelineItem[], footers: ReadonlyMa
   const out = new Map<string, string>();
   if (footers.size === 0) return out;
   const anchors = [...footers.keys()].sort((a, b) => a - b);
+  // Each row by every `seq` it holds, the first row to hold one: a turn's line is looked up once per turn, and
+  // walking the rows for each of them is a turn count times a row count on every streamed batch.
+  const holders = new Map<Seq, TimelineItem>();
+  const hold = (seq: Seq, item: TimelineItem) => {
+    if (!holders.has(seq)) holders.set(seq, item);
+  };
+  for (const item of items) {
+    if (isEditorCardItem(item)) continue;
+    if (item.kind !== "run") {
+      hold(item.seq, item);
+      continue;
+    }
+    for (const call of item.calls) hold(call.seq, item);
+    for (const thought of item.thoughts ?? []) hold(thought.seq, item);
+  }
   const left: Seq[] = [];
   for (const anchor of anchors) {
-    const at = items.find((item) => holds(item, anchor));
+    const at = holders.get(anchor);
     if (at === undefined) left.push(anchor);
     else if (!out.has(at.key)) out.set(at.key, footers.get(anchor)!);
   }

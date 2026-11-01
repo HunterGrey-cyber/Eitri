@@ -2331,3 +2331,134 @@ describe("a foreground agent that ended without a result", () => {
     expect(shown(restored, false)).toEqual({ line: "⎿ no result recorded (0 tool uses)", sign: "·" });
   });
 });
+
+describe("rows are children of one list", () => {
+  const read = (seq: number) => ({
+    seq, toolUseId: `use-${seq}`, name: "Read", input: { file_path: `/p/f${seq}.rs` },
+    result: { content: "text", isError: false }, turnId: "t1",
+  });
+  const card = (seq: number) => ({ seq, permissionId: `perm-${seq}`, toolUseId: "unlinked", toolName: "Bash", input: { command: "ls" } });
+  const list = (state: AgentUiState, expanded: Record<string, boolean>) => (
+    <MessageList state={state} sessionEnded={false} expanded={expanded} cursor={0} onAnswerPermission={() => {}} />
+  );
+
+  it("a fold above a card leaves the card mounted, with what was typed into it", () => {
+    const state = { ...initialState(), status: { kind: "running" }, activeTurnId: "t1", toolCalls: [read(63), read(64)], pendingPermissions: [card(65)] } as AgentUiState;
+    const { container, rerender } = render(list(state, {}));
+    expect(container.querySelectorAll(".row-tool-run")).toHaveLength(1);
+    const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+    fireEvent.change(reason, { target: { value: "not that one" } });
+    rerender(list(state, { "r-63": true }));
+    expect(container.querySelectorAll(".row-tool-run")).toHaveLength(0);
+    expect(container.querySelector(".permission-card input"), "the same element").toBe(reason);
+    expect(reason.value).toBe("not that one");
+  });
+
+  describe("a card keeps what was typed into it, whatever else arrives", () => {
+    const anchored = (seq: number, call: number) => ({ ...card(seq), toolUseId: `use-${call}` });
+    const running = (over: Partial<AgentUiState>) => ({ ...initialState(), status: { kind: "running" }, activeTurnId: "t1", ...over }) as AgentUiState;
+    /** Mounts `first`, types into its last card (the one at `seq`), shows `then`, and checks the box is the same one, still holding it. */
+    const typedThrough = (first: AgentUiState, seq: number, then: AgentUiState) => {
+      const onPermissionReason = vi.fn();
+      const view = (state: AgentUiState) => (
+        <MessageList state={state} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={() => {}} onPermissionReason={onPermissionReason} />
+      );
+      const { container, rerender } = render(view(first));
+      const reason = Array.from(container.querySelectorAll<HTMLInputElement>(".permission-card input")).at(-1)!;
+      fireEvent.change(reason, { target: { value: "not that one" } });
+      onPermissionReason.mockClear();
+      rerender(view(then));
+      expect(reason.isConnected, "the same box").toBe(true);
+      expect(reason.value).toBe("not that one");
+      expect(onPermissionReason, "the panel's saved reason stands").not.toHaveBeenCalledWith(`perm-${seq}`, "");
+      return container;
+    };
+
+    it("a late card anchored to an older call", () => {
+      const toolCalls = [read(1), read(65)];
+      const container = typedThrough(
+        running({ toolCalls, pendingPermissions: [anchored(66, 65)] }), 66,
+        running({ toolCalls, pendingPermissions: [anchored(66, 65), anchored(130, 1)] }),
+      );
+      expect(container.querySelectorAll(".permission-card")).toHaveLength(2);
+    });
+
+    it("the call of an unlinked card arriving", () => {
+      typedThrough(
+        running({ toolCalls: [read(1)], pendingPermissions: [{ ...card(63), toolUseId: "use-64" }] }), 63,
+        running({ toolCalls: [read(1), read(64)], pendingPermissions: [{ ...card(63), toolUseId: "use-64" }] }),
+      );
+    });
+
+    it("a row arriving, and another card leaving, around it", () => {
+      const toolCalls = [read(1), read(65)];
+      const transcript = [{ seq: 70, text: "more" }];
+      typedThrough(
+        running({ toolCalls, pendingPermissions: [anchored(130, 1), anchored(66, 65)] }), 66,
+        running({ toolCalls, transcript, pendingPermissions: [anchored(66, 65)] }),
+      );
+    });
+
+    it("a resync: every record new, the same conversation", () => {
+      const state = running({ toolCalls: [read(1), read(65)], transcript: [{ seq: 64, text: "reply" }], pendingPermissions: [anchored(66, 65)] });
+      typedThrough(state, 66, JSON.parse(JSON.stringify(state)) as AgentUiState);
+    });
+
+    it("a snapshot putting rows ahead of it", () => {
+      typedThrough(
+        running({ toolCalls: [read(70)], pendingPermissions: [anchored(71, 70)] }), 71,
+        running({ toolCalls: [read(1), read(70)], transcript: [{ seq: 2, text: "restored" }], pendingPermissions: [anchored(71, 70)] }),
+      );
+    });
+
+    it("a broker card, which Rust numbers, renumbered", () => {
+      const broker = (seq: number) => ({ seq, permissionId: "broker", toolUseId: null, toolName: "open_file", input: null, editorCard: { title: "Open", body: [] } });
+      const view = (seq: number) => (
+        <MessageList state={running({ toolCalls: [read(1)], editorCards: [broker(seq)] })} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={() => {}} />
+      );
+      const { container, rerender } = render(view(63));
+      const shown = container.querySelector(".permission-card");
+      expect(shown).not.toBeNull();
+      rerender(view(200));
+      expect(container.querySelector(".permission-card")).toBe(shown);
+    });
+  });
+
+  it("a late card leaves every row after it the element it was, in order", () => {
+    const state = (pendingPermissions: AgentUiState["pendingPermissions"]) => ({
+      ...initialState(), status: { kind: "running" }, activeTurnId: "t1",
+      toolCalls: [{ ...read(1), result: { content: "text", isError: true } }, { ...read(3), result: { content: "text", isError: true } }],
+      transcript: [{ seq: 2, text: "between" }, { seq: 4, text: "after" }], pendingPermissions,
+    }) as AgentUiState;
+    const error = vi.spyOn(console, "error");
+    const { container, rerender } = render(list(state([]), {}));
+    const rows = () => Array.from(container.querySelector(".message-list")!.children).filter((el) => el.classList.contains("row"));
+    const before = rows();
+    // By identity: `toEqual` compares DOM nodes by their markup, which a replacement with the same text passes.
+    const sameElements = (now: Element[]) => {
+      expect(now).toHaveLength(before.length);
+      now.forEach((el, i) => expect(el, `row ${i}`).toBe(before[i]));
+    };
+    rerender(list(state([{ ...card(130), toolUseId: "use-1" }]), {}));
+    expect(rows().map((el) => el.className.split(" ")[1])).toEqual(["row-tool", "row-permission", "row-assistant", "row-tool", "row-assistant"]);
+    sameElements(rows().filter((el) => !el.classList.contains("row-permission")));
+    rerender(list(state([]), {}));
+    sameElements(rows());
+    expect(error, "no duplicate key").not.toHaveBeenCalled();
+    error.mockRestore();
+  });
+
+  it("keeps every row a direct child of the list, in the timeline's order, and keys unique", () => {
+    const error = vi.spyOn(console, "error");
+    const toolCalls = Array.from({ length: 200 }, (_, i) => ({ ...read(i * 3 + 1), result: { content: "text", isError: true } }));
+    const transcript = Array.from({ length: 200 }, (_, i) => ({ seq: i * 3 + 2, text: `reply ${i}` }));
+    const state = { ...initialState(), status: { kind: "running" }, toolCalls, transcript, pendingPermissions: [card(1000)] } as AgentUiState;
+    const { container } = render(list(state, {}));
+    const rows = Array.from(container.querySelector(".message-list")!.children).filter((el) => el.classList.contains("row"));
+    expect(rows).toHaveLength(401);
+    expect(rows[1].textContent).toContain("reply 0");
+    expect(rows[400].querySelector(".permission-card")).not.toBeNull();
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
+  });
+});

@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { Profiler } from "react";
-import { afterEach, beforeAll, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
-import { MARKDOWN_CACHE_LIMIT, isMarkdownCached, markdownParseCount } from "./markdown";
+import { MARKDOWN_CACHE_CHARS, isMarkdownCached, markdownParseCount, setMarkdownCacheChars } from "./markdown";
 import { lineDiffCount } from "./diff";
 import { timelineBuildCount } from "./timeline";
 import { timelineRowRenderCount } from "./components/MessageList";
@@ -16,10 +16,15 @@ import { timelineRowRenderCount } from "./components/MessageList";
 afterEach(cleanup);
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
+  // Fewer characters than the replies below come to.
+  setMarkdownCacheChars(20_000);
+});
+afterAll(() => {
+  setMarkdownCacheChars(MARKDOWN_CACHE_CHARS);
 });
 
 const TAB = { id: 1, number: 1, label: "1 new", name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: false, failure: null };
-const REPLIES = MARKDOWN_CACHE_LIMIT + 1;
+const REPLIES = 1001;
 const EDITS = 100;
 
 function dispatch(payload: unknown) {
@@ -99,6 +104,8 @@ it("a reply streamed in 200 batches leaves one cached rendering of itself, not o
   const { deliver } = mountLong();
   for (let i = 0; i < 200; i++) deliver(textDeltas(1));
   const versions = Array.from({ length: 200 }, (_, i) => "word ".repeat(i + 1));
+  expect(versions.filter(isMarkdownCached).length, "nothing while it is written").toBe(0);
+  deliver([{ type: "assistant_message_boundary" }]);
   const held = versions.filter(isMarkdownCached).length;
   console.log(`[long] versions of one streamed reply held in the markdown cache: ${held} of 200`);
   expect(isMarkdownCached(versions[199])).toBe(true);

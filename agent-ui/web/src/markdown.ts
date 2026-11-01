@@ -1,4 +1,4 @@
-import { marked, Renderer, type Tokens } from "marked";
+import { marked, Renderer, type Token, type Tokens } from "marked";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
@@ -316,29 +316,53 @@ export function markdownParseCount(): number {
  *
  * One function, exported from one module, so no component can do half of this.
  *
- * Memoized in a bounded, insertion-order-evicted cache. A `j` press re-renders the
+ * Memoized in a cache bounded by size and evicted in insertion order. A `j` press re-renders the
  * whole panel; before this, every visible message was re-parsed (marked + highlight.js +
  * DOMPurify) on every press -- measured at 500 `marked.parse` calls per press over 500 messages
  * (`perf.test.tsx`). The theme never changes this HTML (highlighting emits classes, colours come
  * from CSS variables), so a cached string cannot go stale.
  */
-export const MARKDOWN_CACHE_LIMIT = 1000;
+export const MARKDOWN_CACHE_CHARS = 64 * 1024 * 1024;
+let cacheCharsLimit = MARKDOWN_CACHE_CHARS;
 const cache = new Map<string, string>();
+/** The characters the cache holds, keys and values: bounded by size, not by entries, since a tab switch mounts every
+ *  reply of the conversation and a pass over more entries than the cache holds evicts each one just before it is
+ *  needed, so a long conversation's every switch would parse every reply again. */
+let cacheChars = 0;
+
+/** Sets the cache's bound and returns the one it replaces (the tests use a small one). */
+export function setMarkdownCacheChars(chars: number): number {
+  const before = cacheCharsLimit;
+  cacheCharsLimit = chars;
+  evictDownTo(chars);
+  return before;
+}
+
+function evictDownTo(chars: number): void {
+  while (cacheChars > chars) forgetMarkdown(cache.keys().next().value as string);
+}
+
+function draw(text: string): string {
+  parses += 1;
+  installSanitizeHooks();
+  fencedTexts = [];
+  try {
+    return DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
+  } finally {
+    fencedTexts = [];
+  }
+}
 
 export function renderMarkdown(text: string): string {
   const hit = cache.get(text);
   if (hit !== undefined) return hit;
-  parses += 1;
-  installSanitizeHooks();
-  fencedTexts = [];
-  let html: string;
-  try {
-    html = DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
-  } finally {
-    fencedTexts = [];
+  const html = draw(text);
+  const chars = text.length + html.length;
+  if (chars <= cacheCharsLimit) {
+    evictDownTo(cacheCharsLimit - chars);
+    cache.set(text, html);
+    cacheChars += chars;
   }
-  if (cache.size >= MARKDOWN_CACHE_LIMIT) cache.delete(cache.keys().next().value as string);
-  cache.set(text, html);
   return html;
 }
 
@@ -346,7 +370,93 @@ export function renderMarkdown(text: string): string {
  *  the HTML of what it said before. Only a cost if another row shows the very same text (it is
  *  rendered again the next time that row mounts). */
 export function forgetMarkdown(text: string): void {
+  const html = cache.get(text);
+  if (html === undefined) return;
   cache.delete(text);
+  cacheChars -= text.length + html.length;
+}
+
+/** A reply being written, drawn up to `text`: `added` is the HTML of the blocks this step completed, to go after those
+ *  of the steps before it, and `tail` the HTML of the open end, which the next step replaces. Together they are, to the
+ *  character, what `renderMarkdown(text)` gives. `restarted`: nothing from an earlier step stands. */
+export type StreamedMarkdown = {
+  text: string;
+  /** How much of `text` is in the completed blocks. */
+  settled: number;
+  /** Never split: `text` holds what makes the blocks depend on each other (`settledEnd`). */
+  whole: boolean;
+  added: string;
+  tail: string;
+  restarted: boolean;
+};
+
+function holdsRawHtml(token: Token): boolean {
+  let found = false;
+  marked.walkTokens([token], (inner) => {
+    if (inner.type === "html") found = true;
+  });
+  return found;
+}
+
+/** Where the completed blocks of `text` end, or `null` when the text can never be split.
+ *
+ *  The block lexer only moves forward, and past a blank line it has nothing left of the lines before it: no paragraph
+ *  it could join, no setext underline reaching back over them (such an underline claims every line up to a blank one,
+ *  a thematic break included). So what lies past a blank line draws the same with or without what came before it,
+ *  unless the two are tied some other way:
+ *  - a link reference definition reaches every block, the ones before it too: such a text is never split;
+ *  - raw HTML can leave an element open across later blocks: nothing from its block on is complete, and a piece of HTML
+ *    never starts at it either, since a document's first tags are parsed as its head, which changes the space after them.
+ *
+ *  The end is a blank line whose next line has ended. A line still being written can turn out to continue the block
+ *  before the blank line: `2` becoming `2. ` after a list's first item. Counted in lines, because the lexer rewrites
+ *  tabs and blank lines before it cuts tokens, so its `raw` strings do not add up to `text`. Two things change the line
+ *  count: a carriage return, and an indented line the lexer folds into the paragraph above it, which its `raw` joins
+ *  with one newline too many. A text with a carriage return is not split, and nothing past such a paragraph, which
+ *  is the only paragraph whose `raw` can hold a blank line, is complete. */
+function settledEnd(text: string): number | null {
+  if (text.includes("\r")) return null;
+  const tokens = marked.lexer(text);
+  if (Object.keys(tokens.links).length > 0) return null;
+  let line = 0;
+  const ends: number[] = [];
+  for (let i = 0; i < tokens.length && !holdsRawHtml(tokens[i]); i++) {
+    const { raw, type } = tokens[i];
+    if ((type === "paragraph" || type === "text") && raw.trimEnd().includes("\n\n")) break;
+    for (let at = raw.indexOf("\n"); at !== -1; at = raw.indexOf("\n", at + 1)) line += 1;
+    const next = tokens[i + 1];
+    if (raw.endsWith("\n\n") && next !== undefined && !holdsRawHtml(next)) ends.push(line);
+  }
+  const offsetOf = (wanted: number) => {
+    let at = 0;
+    for (let seen = 0; seen < wanted; seen++) at = text.indexOf("\n", at) + 1;
+    return at;
+  };
+  for (const end of ends.slice(-2).reverse()) {
+    const offset = offsetOf(end);
+    if (text.indexOf("\n", offset) !== -1) return offset;
+  }
+  return 0;
+}
+
+/** Draws `text`, which goes on from `held` when `held`'s text is the start of it, parsing only what comes after the
+ *  blocks `held` completed. Anything else starts over. `held` itself comes back when the text has not changed. Every
+ *  piece of HTML goes through `draw`, the one pipeline `renderMarkdown` uses. */
+export function streamMarkdown(held: StreamedMarkdown | null, text: string): StreamedMarkdown {
+  if (held !== null && held.text === text) return held;
+  const goesOn = held !== null && !held.whole && text.startsWith(held.text);
+  const from = goesOn ? held.settled : 0;
+  const open = text.slice(from);
+  const end = held !== null && held.whole && text.startsWith(held.text) ? null : settledEnd(open);
+  if (end === null) return { text, settled: 0, whole: true, added: "", tail: draw(text), restarted: true };
+  return {
+    text,
+    settled: from + end,
+    whole: false,
+    added: end === 0 ? "" : draw(open.slice(0, end)),
+    tail: draw(open.slice(end)),
+    restarted: !goesOn,
+  };
 }
 
 /** Whether `text`'s rendered HTML is in the cache (the performance tests read it). */

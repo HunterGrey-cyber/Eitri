@@ -421,6 +421,35 @@ export function agentCard(call: ToolCallRecord, state?: CardState, abandoned = f
   return card;
 }
 
+/** What a row's card reads of the state beyond its own call, kept beside the answer: a streamed batch replaces none
+ *  of these lists, and a call's record stands until the call changes, so each row is answered once and not on every
+ *  render of a long conversation. */
+type CardReads = { tasks: CardState["backgroundTasks"]; notices: CardState["notices"]; turnStarts: CardState["turnStarts"]; active: CardState["activeTurnId"] };
+const readsOf = (state: CardState): CardReads => ({ tasks: state.backgroundTasks, notices: state.notices, turnStarts: state.turnStarts, active: state.activeTurnId });
+const sameReads = (held: CardReads, state: CardState) =>
+  held.tasks === state.backgroundTasks && held.notices === state.notices && held.turnStarts === state.turnStarts && held.active === state.activeTurnId;
+
+const heldLines = new WeakMap<ToolCallRecord, { reads: CardReads; line: string | null }>();
+const heldAgents = new WeakMap<ToolCallRecord, { reads: CardReads; abandoned: boolean; card: AgentCard }>();
+
+/** `toolCardLine`, held per call while what it reads stands. */
+export function rowCardLine(call: ToolCallRecord, state: CardState): string | null {
+  const held = heldLines.get(call);
+  if (held !== undefined && sameReads(held.reads, state)) return held.line;
+  const line = toolCardLine(call, state);
+  heldLines.set(call, { reads: readsOf(state), line });
+  return line;
+}
+
+/** `agentCard`, held per call while what it reads stands. */
+export function rowAgentCard(call: ToolCallRecord, state: CardState, abandoned: boolean): AgentCard {
+  const held = heldAgents.get(call);
+  if (held !== undefined && held.abandoned === abandoned && sameReads(held.reads, state)) return held.card;
+  const card = agentCard(call, state, abandoned);
+  heldAgents.set(call, { reads: readsOf(state), abandoned, card });
+  return card;
+}
+
 function holdsChild(call: ToolCallRecord, seq: number): boolean {
   const stream = call.children;
   return !!stream && (stream.toolCalls.some((child) => child.seq === seq || holdsChild(child, seq)) ||
