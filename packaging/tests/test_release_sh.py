@@ -44,6 +44,12 @@ _PUBLIC_EMAIL = "71165939+HunterGrey-cyber@users.noreply.github.com"
 # (the positive controls) and one that wants them to differ (Refusals) both start from the same
 # text rather than two copies that could quietly drift from each other.
 _SIGNERS_BLOCK = "# no key line in the fixture's committed signers file\n"
+# The fixture's packaging/sidecar-contract.env: SIDECAR_VERSION names the tag a final release must find in
+# the public Verdandi repository.
+_SIDECAR_VERSION = "0.3.0"
+_SIDECAR_TAG = "claude-sidecar-v" + _SIDECAR_VERSION
+_SIDECAR_CONTRACT = ("SIDECAR_VERSION=" + _SIDECAR_VERSION
+                     + "\nSIDECAR_PROTOCOL_MAJOR=3\nSIDECAR_REQUIRED_CAPABILITIES=permission_defer cli_auto_mode\n")
 
 
 def _install_sh_fixture(block=_SIGNERS_BLOCK):
@@ -200,6 +206,7 @@ def _build_template(env, dest):
         "agent/src/providers/claude_sidecar/spawn.rs":
             f'pub const EXPECTED_VERDANDI_REVISION: &str = "{_VERDANDI_REV[:7]}";\n',
         "packaging/pins.env": pins + _NVIM_PIN,
+        "packaging/sidecar-contract.env": _SIDECAR_CONTRACT,
         "packaging/release-signers": _SIGNERS_BLOCK,
         "packaging/install.sh": _install_sh_fixture(),
         **_twin_doc_files(),
@@ -252,6 +259,32 @@ class ReleaseShTestCase(unittest.TestCase):
         argv += ["--source", source or self.clone, "--out", self.out, *args]
         return subprocess.run(argv, capture_output=True, text=True, env=self.env.vars, timeout=120)
 
+    def with_verdandi(self):
+        """A local Verdandi standing in for the public one: two commits, the first the one the clone pins
+        (agent/Cargo.toml and spawn.rs are rewritten to it and committed), and agent/Cargo.toml's https URL
+        redirected to it with url.<local>.insteadOf. Sets self.verdandi, self.pinned and self.other."""
+        self.verdandi = os.path.join(self.scratch, "verdandi")
+        subprocess.run(["git", "init", "-q", self.verdandi], check=True, env=self.env.vars)
+        shas = []
+        for n in (1, 2):
+            _write(os.path.join(self.verdandi, "apps", "claude-sidecar", "package.json"),
+                   '{"version": "%s"}\n' % _SIDECAR_VERSION)
+            _write(os.path.join(self.verdandi, "marker"), f"{n}\n")
+            self.env.git(self.verdandi, "add", "-A")
+            self.env.git(self.verdandi, "commit", "-q", "-m", f"verdandi {n}")
+            shas.append(subprocess.run(["git", "-C", self.verdandi, "rev-parse", "HEAD"], check=True,
+                                       capture_output=True, text=True, env=self.env.vars).stdout.strip())
+        self.pinned, self.other = shas
+        with open(os.path.join(self.env.root, "gitconfig"), "a", encoding="utf-8") as f:
+            f.write(f'[url "{self.verdandi}"]\n\tinsteadOf = https://example.com/verdandi.git\n')
+        self.edit("agent/Cargo.toml", _VERDANDI_REV, self.pinned)
+        self.edit("agent/src/providers/claude_sidecar/spawn.rs", _VERDANDI_REV[:7], self.pinned[:7])
+        self.commit("pin the fixture verdandi")
+
+    def tag_sidecar(self, target, annotated=True, name=_SIDECAR_TAG):
+        args = ["tag", "-a", "-m", name] if annotated else ["tag"]
+        self.env.git(self.verdandi, *args, name, target)
+
     def docker_calls(self):
         if not os.path.exists(self.env.marker):
             return []
@@ -291,7 +324,8 @@ class PositiveControls(ReleaseShTestCase):
         key, pub = self.env.keypair("release-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
         self.write_signers(f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
-        self.commit()
+        self.with_verdandi()
+        self.tag_sidecar(self.pinned)
         self.assertReachedDocker(self.run_release("--sign", key, version="1.0.0"))
 
 
@@ -945,6 +979,67 @@ class RehearsalRule(ReleaseShTestCase):
         _write(signers, f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
         self.assertRefused(self.run_release("--sign", key, "--release-signers", signers, "--rehearsal"),
                            "--rehearsal runs --unsigned only")
+
+
+class SidecarTagGate(ReleaseShTestCase):
+    """A final version needs claude-sidecar-v<SIDECAR_VERSION> in the public Verdandi, peeling to the pinned
+    revision. The tag is read with git ls-remote on the URL agent/Cargo.toml names (the fetch runs --no-tags,
+    and a mirror has none); a release candidate and a rehearsal need no tag."""
+
+    def setUp(self):
+        super().setUp()
+        self.key, pub = self.env.keypair("release-key")
+        self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
+        self.write_signers(f'release@eitri namespaces="eitri-release" {" ".join(pub.split()[:2])}\n')
+        self.with_verdandi()
+
+    def final(self):
+        return self.run_release("--sign", self.key, version="1.0.0")
+
+    def test_an_annotated_tag_on_the_pinned_revision_passes(self):
+        self.tag_sidecar(self.pinned)
+        self.assertReachedDocker(self.final())
+
+    def test_a_lightweight_tag_on_the_pinned_revision_passes(self):
+        self.tag_sidecar(self.pinned, annotated=False)
+        self.assertReachedDocker(self.final())
+
+    def test_a_missing_tag_refuses_and_names_it(self):
+        proc = self.final()
+        self.assertRefused(proc, _SIDECAR_TAG)
+
+    def test_an_annotated_tag_that_peels_to_another_commit_refuses(self):
+        self.tag_sidecar(self.other)
+        self.assertRefused(self.final(), _SIDECAR_TAG)
+
+    def test_a_lightweight_tag_on_another_commit_refuses(self):
+        self.tag_sidecar(self.other, annotated=False)
+        self.assertRefused(self.final(), _SIDECAR_TAG)
+
+    def test_a_tag_for_another_version_does_not_count(self):
+        self.tag_sidecar(self.pinned, name="claude-sidecar-v0.3.1")
+        self.assertRefused(self.final(), _SIDECAR_TAG)
+
+    def test_a_tag_only_the_clone_has_does_not_count(self):
+        # git ls-remote on the public URL is the only reader: a local tag in the clone proves nothing.
+        self.env.git(self.clone, "tag", _SIDECAR_TAG, "HEAD")
+        self.assertRefused(self.final(), _SIDECAR_TAG)
+
+    def test_an_unreadable_public_url_refuses(self):
+        self.tag_sidecar(self.pinned)
+        shutil.move(self.verdandi, self.verdandi + ".gone")
+        self.assertRefused(self.final(), _SIDECAR_TAG)
+
+    def test_a_release_candidate_needs_no_tag(self):
+        self.edit("Cargo.toml", 'version = "1.0.0"', 'version = "1.0.0-rc.1"')
+        self.write_signers(_SIGNERS_BLOCK)  # an embedded key would bind a candidate to signing
+        self.commit()
+        self.assertReachedDocker(self.run_release("--unsigned"))
+
+    def test_a_rehearsal_needs_no_tag(self):
+        self.edit("Cargo.toml", 'version = "1.0.0"', 'version = "1.0.0-rc.1"')
+        self.commit()
+        self.assertReachedDocker(self.run_release("--unsigned", "--rehearsal"))
 
 
 def _bash(script, env, cwd):

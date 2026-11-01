@@ -380,6 +380,176 @@ for mode in $INSTALLER_MODES; do
 	fi
 done
 
+# `eitri sidecar <verb>` is one call of eitri-setup with one mode, and what follows the verb goes with it.
+echo "== 'eitri sidecar <verb>' reaches eitri-setup --sidecar-<verb> alone =="
+reset_state
+EXTRA_ENV=()
+for verb in status check update; do
+	out="$(run_launcher sidecar "$verb")"
+	assert_count "$out" "STUB_SETUP_CALL" 1 "'eitri sidecar $verb' ran eitri-setup once"
+	assert_contains "$out" "STUB_SETUP_ARG:--sidecar-$verb" "'eitri sidecar $verb' passed --sidecar-$verb"
+	assert_count "$out" "STUB_SETUP_ARG:" 1 "'eitri sidecar $verb' passed nothing else"
+	assert_not_contains "$out" "STUB_ARG:" "'eitri sidecar $verb' never reached shell"
+	assert_not_contains "$out" "eitri    project" "'eitri sidecar $verb' printed no banner"
+done
+out="$(run_launcher sidecar use bundled)"
+assert_count "$out" "STUB_SETUP_CALL" 1 "'eitri sidecar use bundled' ran eitri-setup once"
+assert_eq "$(grep '^STUB_SETUP_ARG:' <<<"$out" | paste -sd'|' -)" "STUB_SETUP_ARG:--sidecar-use|STUB_SETUP_ARG:bundled" "use's argument follows its mode"
+out="$(run_launcher sidecar use 0.3.2)"
+assert_eq "$(grep '^STUB_SETUP_ARG:' <<<"$out" | paste -sd'|' -)" "STUB_SETUP_ARG:--sidecar-use|STUB_SETUP_ARG:0.3.2" "a version too"
+out="$(run_launcher sidecar update --version 0.3.2)"
+assert_eq "$(grep '^STUB_SETUP_ARG:' <<<"$out" | paste -sd'|' -)" "STUB_SETUP_ARG:--sidecar-update|STUB_SETUP_ARG:--version|STUB_SETUP_ARG:0.3.2" "update's --version follows its mode"
+
+echo "== 'eitri sidecar' with no verb, an unknown one, or asking for help =="
+out="$(run_launcher sidecar; echo "rc=$?")"
+assert_contains "$out" "eitri sidecar status" "no verb says what the verbs are"
+assert_contains "$out" "rc=64" "no verb is a usage error"
+assert_not_contains "$out" "STUB_SETUP_CALL" "no verb runs nothing"
+assert_not_contains "$out" "STUB_ARG:" "no verb opens no window"
+out="$(run_launcher sidecar frobnicate; echo "rc=$?")"
+assert_contains "$out" "eitri sidecar: unknown command frobnicate" "an unknown verb is named"
+assert_contains "$out" "rc=64" "an unknown verb is a usage error"
+assert_not_contains "$out" "STUB_SETUP_CALL" "an unknown verb runs nothing"
+for help in --help -h; do
+	out="$(run_launcher sidecar "$help"; echo "rc=$?")"
+	assert_contains "$out" "eitri sidecar use bundled" "'eitri sidecar $help' lists the verbs"
+	assert_contains "$out" "rc=0" "'eitri sidecar $help' is no error"
+done
+
+echo "== a route with no eitri-setup is told its package updates the sidecar =="
+mv "$ROOT/lib/eitri/eitri-setup" "$ROOT/lib/eitri/eitri-setup.away"
+for verb in status check update "use bundled"; do
+	# shellcheck disable=SC2086 # the verb's own words
+	out="$(run_launcher sidecar $verb; echo "rc=$?")"
+	assert_contains "$out" "eitri: this package updates its sidecar itself" "'eitri sidecar $verb' says so"
+	assert_contains "$out" "rc=1" "'eitri sidecar $verb' fails"
+	assert_not_contains "$out" "STUB_ARG:" "'eitri sidecar $verb' opens no window"
+done
+out="$(run_launcher sidecar --help; echo "rc=$?")"
+assert_contains "$out" "eitri sidecar status" "--help still answers"
+mv "$ROOT/lib/eitri/eitri-setup.away" "$ROOT/lib/eitri/eitri-setup"
+
+echo "== a folder named sidecar opens with a path that says so =="
+out="$(run_launcher ./sidecar 2>&1)"
+assert_not_contains "$out" "STUB_SETUP_CALL" "./sidecar is a path"
+
+echo "== the launcher's --help names the whole of 'eitri sidecar' =="
+out="$(run_launcher --help)"
+for words in "eitri sidecar status" "eitri sidecar check" "eitri sidecar update" "eitri sidecar use bundled"; do
+	assert_contains "$out" "$words" "--help names $words"
+done
+assert_contains "$out" "eitri setup [args]" "--help still reaches its last usage line"
+assert_not_contains "$out" "set -euo" "--help stops at the end of the header"
+
+# The hint mirrors the order a tab uses: a selected update is a sidecar, when one would be used.
+plant_selected_update() {
+	local data="$1" version="$2" what="${3:-complete}"
+	mkdir -p "$data/eitri/sidecar/updates/$version"
+	printf 'version=%s\n' "$version" >"$data/eitri/sidecar/selected"
+	if [[ $what != no-binary ]]; then
+		printf '#!/bin/sh\n' >"$data/eitri/sidecar/updates/$version/verdandi-claude-sidecar"
+		chmod +x "$data/eitri/sidecar/updates/$version/verdandi-claude-sidecar"
+	fi
+	if [[ $what != no-build ]]; then
+		printf 'SIDECAR_VERSION_LINE=x\n' >"$data/eitri/sidecar/updates/$version/BUILD"
+	fi
+}
+hint_with_release() {
+	printf 'VERDANDI_REV=abcdef0000000000000000000000000000000000\nSIDECAR_VERSION=%s\n' "$1" >"$ROOT/lib/eitri/RELEASE"
+}
+
+echo "== sidecar_found: a selected update counts =="
+reset_state
+EXTRA_ENV=()
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "a complete, newer update suppresses the hint"
+
+echo "== sidecar_found: an rc above the bundled version counts, and one below it does not =="
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.2.1-rc.1
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "0.2.1-rc.1 is above 0.2.0"
+reset_state
+hint_with_release 0.2.1
+plant_selected_update "$FAKE_HOME/.local/share" 0.2.1-rc.1
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" "no sidecar built yet" "0.2.1-rc.1 is below 0.2.1"
+reset_state
+hint_with_release 0.2.1-rc.1
+plant_selected_update "$FAKE_HOME/.local/share" 0.2.1-rc.2
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "rc.2 is above rc.1"
+reset_state
+hint_with_release 0.9.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.10.0
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "numbers compare as numbers"
+
+echo "== sidecar_found: an update a tab would pass over leaves the hint =="
+for what in "0.2.0 complete" "0.1.9 complete" "0.3.2 no-binary" "0.3.2 no-build" "0.09.0 complete" \
+	"0.3.2-rc.01 complete"; do
+	reset_state
+	hint_with_release 0.2.0
+	# shellcheck disable=SC2086 # version, then state
+	plant_selected_update "$FAKE_HOME/.local/share" $what
+	out="$(run_launcher "$PROJECT_DIR")"
+	assert_contains "$out" "no sidecar built yet" "selected $what leaves the hint"
+done
+for text in 'version=../x' 'junk' $'version=0.3.2\nmore' $'version=0.3.2\n' \
+	"version=0.3.2$(printf '%300s' '' | tr ' ' '\n'; printf x)"; do
+	reset_state
+	hint_with_release 0.2.0
+	plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+	printf '%s\n' "$text" >"$FAKE_HOME/.local/share/eitri/sidecar/selected"
+	out="$(run_launcher "$PROJECT_DIR")"
+	assert_contains "$out" "no sidecar built yet" "a selected file reading [$text] leaves the hint"
+done
+
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+printf 'version=0.3.2\000\n' >"$FAKE_HOME/.local/share/eitri/sidecar/selected"
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" "no sidecar built yet" "a selected file with a NUL in it leaves the hint"
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+printf 'version=0.3.2' >"$FAKE_HOME/.local/share/eitri/sidecar/selected"
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "a selected file with no final newline still names it"
+
+echo "== sidecar_found: no update applies with no eitri-setup beside the binary =="
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+mv "$ROOT/lib/eitri/eitri-setup" "$ROOT/lib/eitri/eitri-setup.away"
+out="$(run_launcher "$PROJECT_DIR")"
+mv "$ROOT/lib/eitri/eitri-setup.away" "$ROOT/lib/eitri/eitri-setup"
+assert_contains "$out" "no sidecar built yet" "a selected update means nothing on such a route"
+
+echo "== sidecar_found: the update is looked for where a tab looks =="
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/other-data" 0.3.2
+EXTRA_ENV=("XDG_DATA_HOME=$FAKE_HOME/other-data")
+out="$(run_launcher "$PROJECT_DIR")"
+assert_not_contains "$out" "no sidecar built yet" "an absolute XDG_DATA_HOME is read"
+EXTRA_ENV=()
+out="$(run_launcher "$PROJECT_DIR")"
+assert_contains "$out" "no sidecar built yet" "unset, it is not under that directory"
+reset_state
+hint_with_release 0.2.0
+plant_selected_update "$FAKE_HOME/.local/share" 0.3.2
+for value in "relative/dir" "relative/data" ""; do
+	EXTRA_ENV=("XDG_DATA_HOME=$value")
+	out="$(run_launcher "$PROJECT_DIR")"
+	assert_not_contains "$out" "no sidecar built yet" "XDG_DATA_HOME [$value] means \$HOME/.local/share"
+done
+EXTRA_ENV=()
+
 echo "== the launcher's --help mentions no internal design references =="
 EXTRA_ENV=()
 out="$(run_launcher --help)"

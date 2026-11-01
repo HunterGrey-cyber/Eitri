@@ -165,6 +165,12 @@ write_sums() {
 # write_release FILE: RELEASE from the RS_* values. The nvim pair is written only
 # when known; a rehearsal carries REHEARSAL=1.
 write_release() {
+	local contract=packaging/sidecar-contract.env sidecar_version sidecar_major sidecar_caps
+	if [ -f "$contract" ]; then
+		sidecar_version="$(kv_get "$contract" SIDECAR_VERSION)" || die "cannot read $contract"
+		sidecar_major="$(kv_get "$contract" SIDECAR_PROTOCOL_MAJOR)" || die "cannot read $contract"
+		sidecar_caps="$(kv_get "$contract" SIDECAR_REQUIRED_CAPABILITIES)" || die "cannot read $contract"
+	fi
 	{
 		echo "EITRI_VERSION=$RS_VERSION"
 		echo "EITRI_COMMIT=$RS_COMMIT"
@@ -172,6 +178,11 @@ write_release() {
 		echo "VERDANDI_REV=$RS_VERDANDI_REV"
 		echo "VERDANDI_SOURCE=verdandi-${RS_VERDANDI_REV:0:7}-source.tar.gz"
 		echo "VERDANDI_SOURCE_SHA256=$RS_VERDANDI_SOURCE_SHA256"
+		if [ -f "$contract" ]; then
+			printf 'SIDECAR_VERSION=%s\n' "$sidecar_version"
+			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$sidecar_major"
+			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$sidecar_caps"
+		fi
 		echo "NODE_VERSION=$RS_NODE_VERSION"
 		echo "NODE_SHA256_linux_x64=$RS_NODE_SHA256_X64"
 		echo "NODE_SHA256_linux_arm64=$RS_NODE_SHA256_ARM64"
@@ -214,6 +225,26 @@ verdandi_fetch_public() {
 	[ -e "$1/HEAD" ] || git init -q --bare "$1" || return 2
 	git -C "$1" fetch -q --no-tags --prune --force "$2" '+refs/heads/*:refs/public/*' || return 2
 	[ -n "$(git -C "$1" for-each-ref --contains "$3" refs/public/ 2>/dev/null)" ] || return 1
+}
+
+# Final releases name a published sidecar. Read the URL directly because the build cache has no tags.
+sidecar_tag_gate() {
+	[ "$RS_REHEARSAL" = 0 ] || return 0
+	case "$RS_VERSION" in *-rc.*) return 0 ;; esac
+	local contract="$RS_SOURCE/packaging/sidecar-contract.env" version tag refs sha ref direct="" peeled=""
+	[ -f "$contract" ] || die "$RS_SOURCE has no packaging/sidecar-contract.env"
+	version="$(kv_get "$contract" SIDECAR_VERSION)" || die "cannot read $contract"
+	[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$contract has no valid SIDECAR_VERSION"
+	tag="refs/tags/claude-sidecar-v$version"
+	refs="$(git ls-remote "$RS_VERDANDI_URL" "$tag" "$tag^{}")" || die "cannot read $tag from $RS_VERDANDI_URL"
+	while read -r sha ref; do
+		case "$ref" in
+			"$tag") direct="$sha" ;;
+			"$tag^{}") peeled="$sha" ;;
+		esac
+	done <<< "$refs"
+	[ -n "$direct" ] && [ "${peeled:-$direct}" = "$RS_VERDANDI_REV" ] \
+		|| die "$tag from $RS_VERDANDI_URL does not peel to pinned Verdandi $RS_VERDANDI_REV: publish the sidecar first"
 }
 
 source_asset_url() {
@@ -425,7 +456,7 @@ preflight() {
 	[[ "$RS_VERDANDI_REV" =~ ^[0-9a-f]{40}$ ]] \
 		|| die "agent/Cargo.toml's claude-runtime-protocol rev '$RS_VERDANDI_REV' is not a full 40-hex public Verdandi commit"
 	[[ "$RS_VERDANDI_URL" == https://* ]] || die "agent/Cargo.toml's claude-runtime-protocol source is not an https URL: $RS_VERDANDI_URL"
-	grep -qE "^pub const EXPECTED_VERDANDI_REVISION: &str = \"${RS_VERDANDI_REV:0:7}\";" \
+	grep -qE "^pub const (EXPECTED_VERDANDI_REVISION|BUNDLED_SIDECAR_REVISION): &str = \"${RS_VERDANDI_REV:0:7}\";" \
 		"$RS_SOURCE/agent/src/providers/claude_sidecar/spawn.rs" \
 		|| die "EXPECTED_VERDANDI_REVISION is not ${RS_VERDANDI_REV:0:7}, the 7-char prefix of the pinned Verdandi rev"
 	if [ -n "$RS_VERDANDI_MIRROR" ]; then
@@ -580,6 +611,7 @@ preflight() {
 	else
 		warn "--no-leak-scan: $RS_SOURCE's HEAD, the commits a push would publish and the fork's commits are not checked for a private identity or path"
 	fi
+	sidecar_tag_gate
 }
 
 # prepare_dirs: create the release root and its working directories. Never overwrite a
@@ -950,6 +982,16 @@ ctr_phase_f() {
 		1) ctr_die "no branch of the public Verdandi ($url) contains $RS_VERDANDI_REV: publish it first (a commit an earlier --verdandi-mirror rehearsal left in this cache does not count)" ;;
 		*) ctr_die "cannot fetch $url" ;;
 	esac
+	if [ "$RS_REHEARSAL" = 0 ] && [[ "$RS_VERSION" != *-rc.* ]]; then
+		local sidecar_version package_version package_json
+		sidecar_version="$(kv_get packaging/sidecar-contract.env SIDECAR_VERSION)" || ctr_die "cannot read sidecar-contract.env"
+		package_json="$(git -C /build/verdandi show "$RS_VERDANDI_REV:apps/claude-sidecar/package.json")" \
+			|| ctr_die "cannot read the pinned sidecar's package.json"
+		package_version="$(printf '%s\n' "$package_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" \
+			|| ctr_die "cannot read the pinned sidecar's package version"
+		[ "$package_version" = "$sidecar_version" ] \
+			|| ctr_die "pinned sidecar package version $package_version disagrees with SIDECAR_VERSION=$sidecar_version"
+	fi
 	# The sidecar build reads its Node pin from this one file; a Verdandi without it keeps the pin
 	# somewhere this check cannot see, so the release stops rather than ship an unchecked runtime.
 	git -C /build/verdandi show "$RS_VERDANDI_REV:apps/claude-sidecar/node-pin.json" > /build/check/node-pin.json \

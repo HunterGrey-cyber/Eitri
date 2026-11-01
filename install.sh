@@ -9,7 +9,8 @@
 #                                          build the sidecar from a Verdandi checkout not at the
 #                                          pin (see packaging/install.sh --help)
 #   ./install.sh --uninstall (or any other mode of packaging/install.sh: --nvim-only,
-#                --nvim-offer, --sidecar-only, --build-sidecar-into DIR ...)
+#                --nvim-offer, --sidecar-only, --sidecar-status, --sidecar-check, --sidecar-update,
+#                --sidecar-use ARG, --build-sidecar-into DIR ...)
 #                                          runs packaging/install.sh with that mode instead
 #   ./install.sh --help                   says this, then prints packaging/install.sh's options
 #
@@ -32,7 +33,8 @@ for _nv_a in "$@"; do
 With no option, it builds and installs this checkout from source, as it is on disk now
 (packaging/install.sh --from-source --checkout <this checkout>). EITRI_VERDANDI_CHECKOUT, when
 set, names a local Verdandi checkout to build the sidecar from. With one of packaging/install.sh's
-other modes (--uninstall, --nvim-only, --nvim-offer, --sidecar-only, --build-sidecar-into), it runs
+other modes (--uninstall, --nvim-only, --nvim-offer, --sidecar-only, --sidecar-status,
+--sidecar-check, --sidecar-update, --sidecar-use, --build-sidecar-into), it runs
 packaging/install.sh with that mode instead.
 
 The options, all passed on to packaging/install.sh (its "(no option)" line describes installing a
@@ -41,7 +43,8 @@ release, which this script does not do):
 EOF
 		exec sh "$here/packaging/install.sh" "$@"
 		;;
-	--uninstall | --nvim-only | --nvim-offer | --sidecar-only | --build-sidecar-into)
+	--uninstall | --nvim-only | --nvim-offer | --sidecar-only | --sidecar-status | --sidecar-check | \
+		--sidecar-update | --sidecar-use | --build-sidecar-into)
 		exec sh "$here/packaging/install.sh" "$@"
 		;;
 	esac

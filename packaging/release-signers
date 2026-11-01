@@ -5,13 +5,14 @@
 #
 #   ssh-keygen -Y verify -f <this file> -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 #
-# A key line looks like this, with no comment field after the key:
+# and a sidecar release's with -n eitri-sidecar-release in its place. A key line looks like this, with
+# no comment field after the key:
 #
-#   release@eitri namespaces="eitri-release" ssh-ed25519 AAAA...
+#   release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519 AAAA...
 #
 # The release key is listed below: the dedicated release key's public half, never an
 # everyday login key, and release.sh refuses one that matches any ~/.ssh/id_*.pub. Every installer
 # built from this tree embeds it and refuses a release whose SHA256SUMS.sig is missing or does not
 # verify. The installer's --release-signers option replaces it, with a warning, for a
 # release candidate or a test.
-release@eitri namespaces="eitri-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUZrObfSHuE2F8LBZj6YG8pgph6d5v/JEqb8RClBujR
+release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUZrObfSHuE2F8LBZj6YG8pgph6d5v/JEqb8RClBujR

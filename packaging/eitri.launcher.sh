@@ -13,6 +13,14 @@
 #                          open the agent panel beside the nvim at ADDR (:EitriPanel runs this)
 #   eitri split [DIR]      open the editor (Neovide) and the agent panel as two windows (needs Neovide)
 #   eitri --version        print the version and exit
+#   eitri sidecar status   what new tabs run, what is bundled, what is kept; no network
+#   eitri sidecar check    ask for the newest sidecar release; changes nothing
+#   eitri sidecar update [--version X]
+#                          fetch a signed sidecar release, build it here, try it and select it
+#   eitri sidecar use bundled
+#                          go back to the sidecar Eitri came with; no network
+#   eitri sidecar use VERSION
+#                          select an update already built
 #   eitri setup [args]     build the sidecar (and offer nvim), or --nvim-only/--uninstall/
 #                            --sidecar-only for one of those alone (eitri setup --help)
 set -euo pipefail
@@ -50,6 +58,40 @@ LIBDIR="$(CDPATH='' cd -- "$(dirname -- "$EITRI_LAUNCHER_PATH")/../lib/eitri" &&
 unset -f resolve_launcher_path
 unset EITRI_LAUNCHER_PATH
 
+sidecar_help() {
+	sed -n '/^#   eitri sidecar /,/^#   eitri setup /p' "$0" | sed -e '$d' -e 's/^# \?//'
+}
+
+# `eitri sidecar` opens no project or window either, and all of it lives in the installer, which holds
+# the release key. A route with no eitri-setup takes its sidecar from its package.
+if [[ "${1:-}" == sidecar ]]; then
+	shift
+	case "${1:-}" in
+	status | check | update | use)
+		verb="$1"
+		shift
+		if [[ ! -f "$LIBDIR/eitri-setup" ]]; then
+			echo "eitri: this package updates its sidecar itself" >&2
+			exit 1
+		fi
+		exec sh "$LIBDIR/eitri-setup" "--sidecar-$verb" "$@"
+		;;
+	-h | --help)
+		sidecar_help
+		exit 0
+		;;
+	"")
+		sidecar_help >&2
+		exit 64
+		;;
+	*)
+		echo "eitri sidecar: unknown command $1" >&2
+		sidecar_help >&2
+		exit 64
+		;;
+	esac
+fi
+
 # Handle setup before flag parsing: it opens no project or window. Invoke the POSIX installer
 # through sh so setup also works when the installed copy lacks its execute bit.
 # Explicit modes and help pass through once, unchanged: adding --sidecar-only would conflict with
@@ -62,7 +104,7 @@ if [[ "${1:-}" == setup ]]; then
 	shift
 	for a in "$@"; do
 		case "$a" in
-		--nvim-only | --nvim-offer | --uninstall | --sidecar-only | --from-source | --build-sidecar-into | -h | --help)
+		--nvim-only | --nvim-offer | --uninstall | --sidecar-only | --sidecar-status | --sidecar-check | --sidecar-update | --sidecar-use | --from-source | --build-sidecar-into | -h | --help)
 			exec sh "$LIBDIR/eitri-setup" "$@"
 			;;
 		esac
@@ -132,7 +174,7 @@ while [[ $# -gt 0 ]]; do
 		           FROM_DESKTOP=1; shift ;;
 		--account) ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   QUIET=1; shift ;;
-		-h|--help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
 		--) SAW_DASHES=1; shift
 		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"; else PROJECT="${1:-}"; fi
 		    break ;;
@@ -157,8 +199,8 @@ fi
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
 # This hint never selects a backend or exports a discovery result: shell resolves the sidecar.
-# Mirror the executable override, packaged sibling and rev-keyed user path to warn before a failed
-# first session. The development checkout override does not apply to installed release builds.
+# Mirror the executable override, selected update, packaged sibling and rev-keyed user path to warn
+# before a failed first session. The development checkout override does not apply to installed release builds.
 # Unset, empty or relative XDG_DATA_HOME means $HOME/.local/share; accepting a relative value here
 # would disagree with the installer's sidecar location.
 xdg_data_home() {
@@ -168,8 +210,49 @@ xdg_data_home() {
 	esac
 }
 
+# version_newer A B, both already matched: the numbers first, then a release sorts above its own
+# release candidates. 10# because a leading zero must not read as octal.
+version_newer() {
+	local a b i
+	IFS=. read -r -a a <<<"${1%%-*}"
+	IFS=. read -r -a b <<<"${2%%-*}"
+	for i in 0 1 2; do
+		((10#${a[i]} > 10#${b[i]})) && return 0
+		((10#${a[i]} < 10#${b[i]})) && return 1
+	done
+	if [[ "$1" != *-rc.* ]]; then
+		[[ "$2" == *-rc.* ]]
+		return
+	fi
+	[[ "$2" == *-rc.* ]] || return 1
+	((10#${1##*-rc.} > 10#${2##*-rc.}))
+}
+
+# The update a tab would start: eitri-setup beside the binary, `selected` naming a version strictly
+# newer than the bundled one, and its directory holding the binary and BUILD. Older than bundled is
+# passed over, also when the bundled one is not built. `selected` reads as a tab reads it: one line,
+# with the x keeping the newlines $() would drop and a NUL becoming a character no version holds; a
+# number has one spelling, and past 256 bytes the cut leaves no version: none is that long.
+selected_update_found() {
+	[[ -f "$LIBDIR/eitri-setup" && -f "$LIBDIR/RELEASE" ]] || return 1
+	local number='(0|[1-9][0-9]{0,17})' version_re root selected version bundled
+	version_re="$number\\.$number\\.$number(-rc\\.$number)?"
+	root="$(xdg_data_home)/eitri/sidecar"
+	[[ -f "$root/selected" ]] || return 1
+	selected="$(head -c 256 -- "$root/selected" 2>/dev/null | tr '\000' '?'; printf x)"
+	selected="${selected%x}"
+	selected="${selected%$'\n'}"
+	[[ "$selected" =~ ^version=($version_re)$ ]] || return 1
+	version="${BASH_REMATCH[1]}"
+	bundled="$(sed -n 's/^SIDECAR_VERSION=//p' "$LIBDIR/RELEASE" | head -n1)"
+	[[ "$bundled" =~ ^$version_re$ ]] || return 1
+	version_newer "$version" "$bundled" || return 1
+	[[ -f "$root/updates/$version/verdandi-claude-sidecar" && -f "$root/updates/$version/BUILD" ]]
+}
+
 sidecar_found() {
 	[[ -n "${EITRI_SIDECAR_BINARY:-}" && -x "$EITRI_SIDECAR_BINARY" ]] && return 0
+	selected_update_found && return 0
 	[[ -x "$LIBDIR/verdandi-claude-sidecar" ]] && return 0
 	# Only this install's RELEASE can name its pinned revision. Without it, skip the user path
 	# rather than guessing which sidecar build belongs to this install.

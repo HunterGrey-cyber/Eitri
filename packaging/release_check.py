@@ -77,6 +77,9 @@ RELEASE_FIELDS: dict[str, re.Pattern] = {
     "VERDANDI_REV": _HEX40,
     "VERDANDI_SOURCE": _VERDANDI_SOURCE_RE,
     "VERDANDI_SOURCE_SHA256": _HEX64,
+    "SIDECAR_VERSION": _NVIM_VERSION_RE,
+    "SIDECAR_PROTOCOL_MAJOR": re.compile(r"^[0-9]+$"),
+    "SIDECAR_REQUIRED_CAPABILITIES": re.compile(r"^[a-z][a-z0-9_]*( [a-z][a-z0-9_]*)*$"),
     "NODE_VERSION": _NODE_VERSION_RE,
     "NODE_SHA256_linux_x64": _HEX64,
     "NODE_SHA256_linux_arm64": _HEX64,
@@ -111,6 +114,9 @@ def parse_release_text(text: str) -> dict[str, str]:
 REHEARSAL_OPTIONAL_FIELDS = ("NVIM_VERSION", "NVIM_SHA256_linux_x86_64")
 REHEARSAL_FIELD = "REHEARSAL"
 
+# Trees from before the sidecar contract write none of these keys; newer trees carry the whole group.
+SIDECAR_FIELDS = ("SIDECAR_VERSION", "SIDECAR_PROTOCOL_MAJOR", "SIDECAR_REQUIRED_CAPABILITIES")
+
 
 def validate_release(fields: dict[str, str], rehearsal: bool = False) -> None:
     """Raises ReleaseCheckError naming every problem at once (missing/extra keys, and any value
@@ -118,10 +124,13 @@ def validate_release(fields: dict[str, str], rehearsal: bool = False) -> None:
     fixed in a single pass rather than one failure at a time.
 
     rehearsal=True: REHEARSAL=1 is required, and the two nvim fields may be absent -- both or
-    neither, never one of them. A real release (the default) may carry no REHEARSAL field at all."""
+    neither, never one of them. A real release (the default) may carry no REHEARSAL field at all.
+    The sidecar contract fields must be present together or all absent for an older tree."""
     problems = []
     required = set(RELEASE_FIELDS)
     allowed = set(RELEASE_FIELDS)
+    if not any(key in fields for key in SIDECAR_FIELDS):
+        required -= set(SIDECAR_FIELDS)
     if rehearsal:
         allowed.add(REHEARSAL_FIELD)
         required.add(REHEARSAL_FIELD)

@@ -438,6 +438,109 @@ t_uninstall_symlinked_sidecar_root() {
 	expect_no_out 'not to a directory named sidecar'
 }
 
+# populate_updates: an update kept and selected, and what a killed `selected` write leaves. Sets UROOT.
+populate_updates() {
+	UROOT=$(data_of)/eitri/sidecar
+	mkdir -p "$UROOT/updates/0.3.0" "$UROOT/updates/0.3.1"
+	echo binary >"$UROOT/updates/0.3.0/verdandi-claude-sidecar"
+	echo mine >"$UROOT/updates/notes"
+	printf 'version=0.3.0\n' >"$UROOT/selected"
+	printf 'version=0.3.1\n' >"$UROOT/.selected.tmp.4242"
+}
+
+TESTS="$TESTS t_uninstall_removes_updates_and_selected"
+t_uninstall_removes_updates_and_selected() {
+	populate
+	populate_updates
+	inst -- --uninstall
+	expect_rc 0
+	expect_eq "$(tree "$TH")" "$KEPT_TREE" "the tree after --uninstall"
+}
+
+# A package's window reads them as it reads its sidecar, so they stay while one is installed.
+TESTS="$TESTS t_uninstall_keeps_updates_with_a_system_package"
+t_uninstall_keeps_updates_with_a_system_package() {
+	populate
+	populate_updates
+	printf 'EITRI_VERSION=1.0.0\nVERDANDI_REV=ddddddd000000000000000000000000000000000\n' >"$S/system/RELEASE"
+	inst -- --uninstall
+	rm -f "$S/system/RELEASE"
+	expect_rc 0
+	expect_out "keeping $UROOT/updates and $UROOT/selected: $S/system/RELEASE's install uses them"
+	expect_file "$UROOT/updates/0.3.0/verdandi-claude-sidecar"
+	expect_eq "$(cat "$UROOT/selected")" 'version=0.3.0' "selected"
+	expect_absent "$UROOT/aaaaaaa"
+}
+
+TESTS="$TESTS t_uninstall_dry_run_leaves_updates"
+t_uninstall_dry_run_leaves_updates() {
+	populate
+	populate_updates
+	inst -- --uninstall --dry-run
+	expect_rc 0
+	expect_out "removing $UROOT/updates"
+	expect_out "removing $UROOT/selected"
+	expect_file "$UROOT/selected"
+}
+
+# An `updates` that is a link goes as a link: what it leads to is the user's.
+TESTS="$TESTS t_uninstall_linked_updates_leaves_the_target"
+t_uninstall_linked_updates_leaves_the_target() {
+	populate
+	populate_updates
+	mv "$UROOT/updates" "$TH/my-updates"
+	ln -s "$TH/my-updates" "$UROOT/updates"
+	mv "$UROOT/selected" "$TH/my-selected"
+	ln -s "$TH/my-selected" "$UROOT/selected"
+	inst -- --uninstall
+	expect_rc 0
+	expect_absent "$UROOT/updates"
+	expect_absent "$UROOT/selected"
+	expect_file "$TH/my-updates/0.3.0/verdandi-claude-sidecar"
+	expect_file "$TH/my-selected"
+}
+
+# Behind a sidecar directory that leads elsewhere, nothing is ours by name.
+TESTS="$TESTS t_uninstall_foreign_sidecar_root_keeps_updates"
+t_uninstall_foreign_sidecar_root_keeps_updates() {
+	populate
+	mkdir -p "$TH/backup/updates/0.3.0"
+	echo mine >"$TH/backup/updates/0.3.0/keep"
+	echo mine >"$TH/backup/selected"
+	rm -rf "$(data_of)/eitri/sidecar"
+	ln -s "$TH/backup" "$(data_of)/eitri/sidecar"
+	inst -- --uninstall
+	expect_rc 0
+	expect_out "$(data_of)/eitri/sidecar leads to $TH/backup, not to a directory named sidecar"
+	expect_file "$TH/backup/updates/0.3.0/keep"
+	expect_file "$TH/backup/selected"
+}
+
+TESTS="$TESTS t_uninstall_foreign_data_root_keeps_updates"
+t_uninstall_foreign_data_root_keeps_updates() {
+	populate
+	mkdir -p "$TH/backup/sidecar/updates/0.3.0"
+	echo mine >"$TH/backup/sidecar/updates/0.3.0/keep"
+	echo mine >"$TH/backup/sidecar/selected"
+	rm -rf "$(data_of)/eitri"
+	ln -s "$TH/backup" "$(data_of)/eitri"
+	inst -- --uninstall
+	expect_rc 0
+	expect_file "$TH/backup/sidecar/updates/0.3.0/keep"
+	expect_file "$TH/backup/sidecar/selected"
+}
+
+TESTS="$TESTS t_uninstall_removes_update_scratch"
+t_uninstall_removes_update_scratch() {
+	populate
+	mkdir -p "$TH/.cache/eitri/sidecar-update/build" "$TH/.cache/eitri/sidecar-check.AbCdEf"
+	echo junk >"$TH/.cache/eitri/sidecar-update/build/junk"
+	echo junk >"$TH/.cache/eitri/sidecar-check.AbCdEf/SHA256SUMS"
+	inst -- --uninstall
+	expect_rc 0
+	expect_eq "$(tree "$TH")" "$KEPT_TREE" "the tree after --uninstall"
+}
+
 TESTS="$TESTS t_uninstall_outside_cache_untouched"
 t_uninstall_outside_cache_untouched() {
 	# When XDG_CACHE_HOME is outside HOME, uninstall refuses and must remove nothing, including in

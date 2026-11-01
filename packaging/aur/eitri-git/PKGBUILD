@@ -137,6 +137,12 @@ prepare() {
 	_node_arm64=$(sed -n 's/^NODE_SHA256_linux_arm64=//p' "$_pins")
 	_nvim_version=$(sed -n 's/^NVIM_VERSION=//p' "$_pins")
 	_nvim_sha=$(sed -n 's/^NVIM_SHA256_linux_x86_64=//p' "$_pins")
+	_contract=packaging/sidecar-contract.env
+	if [ -f "$_contract" ]; then
+		_sidecar_version=$(sed -n 's/^SIDECAR_VERSION=//p' "$_contract")
+		_sidecar_major=$(sed -n 's/^SIDECAR_PROTOCOL_MAJOR=//p' "$_contract")
+		_sidecar_caps=$(sed -n 's/^SIDECAR_REQUIRED_CAPABILITIES=//p' "$_contract")
+	fi
 	{
 		printf 'EITRI_VERSION=%s\n' "$_eitri_version"
 		printf 'EITRI_COMMIT=%s\n' "$_eitri_commit"
@@ -144,6 +150,11 @@ prepare() {
 		printf 'VERDANDI_REV=%s\n' "$_verdandi_rev"
 		printf 'VERDANDI_SOURCE=verdandi-%s-source.tar.gz\n' "$_verdandi_rev7"
 		printf 'VERDANDI_SOURCE_SHA256=%s\n' "$_verdandi_sha"
+		if [ -f "$_contract" ]; then
+			printf 'SIDECAR_VERSION=%s\n' "$_sidecar_version"
+			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$_sidecar_major"
+			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$_sidecar_caps"
+		fi
 		printf 'NODE_VERSION=%s\n' "$_node_version"
 		printf 'NODE_SHA256_linux_x64=%s\n' "$_node_x64"
 		printf 'NODE_SHA256_linux_arm64=%s\n' "$_node_arm64"

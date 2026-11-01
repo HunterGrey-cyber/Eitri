@@ -12,7 +12,8 @@
 #              it (each overridable with --set, or dropped with --unset);
 #   LANG       the caller's, else C.UTF-8;
 #   whatever --set names, which must be EITRI_INSTALL_TEST or an EITRI_INSTALL_TEST_* variable,
-#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR.
+#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), the two variables that
+#              name a sidecar (`eitri sidecar status`'s), or CARGO_TARGET_DIR.
 #              A caller's CARGO_TARGET_DIR must not move the --from-source build, since staging
 #              always reads <src>/target/release.
 # Nothing else is inherited: this host exports VERDANDI_CLAUDE_CLI_PATH and VERDANDI_CLAUDE_ACCOUNT,
@@ -61,7 +62,8 @@ while [ $# -gt 0 ]; do
 		--set)
 			case $2 in
 			EITRI_INSTALL_TEST=* | EITRI_INSTALL_TEST_*=* | XDG_DATA_HOME=* | XDG_CACHE_HOME=* | \
-				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | EITRI_CONFIG_DIR=* | CARGO_TARGET_DIR=*) ;;
+				XDG_STATE_HOME=* | XDG_CONFIG_HOME=* | LANG=* | EITRI_CONFIG_DIR=* | CARGO_TARGET_DIR=* | \
+				EITRI_SIDECAR_BINARY=* | EITRI_VERDANDI_CHECKOUT=*) ;;
 			*) die "--set $2: not an allowlisted variable" ;;
 			esac
 			W_SETS=$W_SETS$2$NL

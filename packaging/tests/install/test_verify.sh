@@ -283,7 +283,7 @@ t_embedded_signers_byte_equal() {
 	_eb_keys=$(grep -E '^[[:space:]]*[^#[:space:]]' "$PKG/release-signers")
 	expect_eq "$(printf '%s\n' "$_eb_keys" | grep -c .)" 1 "the number of key lines in packaging/release-signers"
 	expect_eq "$(printf '%s\n' "$_eb_keys" | awk '{ print NF, $1, $2, $3 }')" \
-		'4 release@eitri namespaces="eitri-release" ssh-ed25519' "the shape of the key line"
+		'4 release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519' "the shape of the key line"
 }
 
 # The real install.sh, the file every release ships and the only one that holds the release key:
@@ -343,10 +343,17 @@ TESTS="$TESTS t_no_check_novalidate"
 t_no_check_novalidate() {
 	if grep -n 'check-novalidate' "$REAL_INSTALLER"; then fail "the installer names check-novalidate"; fi
 	# shellcheck disable=SC2016 # the literal line, variables and all
-	expect_eq "$(grep -c -F 'ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$NV_SIGNATURE_NAMESPACE" -s "$2" <"$1"' "$REAL_INSTALLER")" 1 \
+	expect_eq "$(grep -c -F 'ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$3" -s "$2" <"$1"' "$REAL_INSTALLER")" 1 \
 		"the one pinned verify line"
-	expect_eq "$(sed -n "s/^NV_SIGNER_IDENTITY='\(.*\)'$/\1/p; s/^NV_SIGNATURE_NAMESPACE='\(.*\)'$/\1/p" "$REAL_INSTALLER" | tr '\n' ' ')" \
-		'release@eitri eitri-release ' "the identity and namespace"
+	expect_eq "$(sed -n "s/^NV_SIGNER_IDENTITY='\(.*\)'$/\1/p; s/^NV_SIGNATURE_NAMESPACE='\(.*\)'$/\1/p; s/^NV_SIDECAR_NAMESPACE='\(.*\)'$/\1/p" "$REAL_INSTALLER" | tr '\n' ' ')" \
+		'release@eitri eitri-release eitri-sidecar-release ' "the identity and the namespaces"
+	# Every caller names one of the two namespaces, so the namespace is never a value from outside.
+	grep -E '^[[:space:]]+verify_signature ' "$REAL_INSTALLER" >"$T/callers"
+	expect_eq "$(grep -c . "$T/callers")" 4 "the verify_signature calls"
+	# shellcheck disable=SC2016 # the literal text of the calls
+	if grep -v -E ' "\$NV_(SIGNATURE|SIDECAR)_NAMESPACE"$' "$T/callers" >"$T/other-callers"; then
+		fail "a verify_signature call with another namespace: $(cat "$T/other-callers")"
+	fi
 }
 
 # The embedded-key branch every final release's installer takes: $KEYED_INSTALLER is the unkeyed

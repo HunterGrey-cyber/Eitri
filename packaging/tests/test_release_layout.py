@@ -202,6 +202,9 @@ _GOOD_RELEASE_FIELDS = {
     "SKIA_BINARIES_SHA256": "1" * 64,
     "GTK_FLOOR": "4.14",
     "BUILD_IMAGE": "6232b387cafe",
+    "SIDECAR_VERSION": "0.3.0",
+    "SIDECAR_PROTOCOL_MAJOR": "3",
+    "SIDECAR_REQUIRED_CAPABILITIES": "permission_defer cli_auto_mode system_prompt_preset",
 }
 
 
@@ -220,6 +223,29 @@ class ReleaseFieldsTests(unittest.TestCase):
         fields["EXTRA_FIELD"] = "x"
         with self.assertRaisesRegex(rc.ReleaseCheckError, "unexpected field.*EXTRA_FIELD"):
             rc.validate_release(fields)
+
+    def test_the_sidecar_contract_keys_are_part_of_the_set(self):
+        for key in ("SIDECAR_VERSION", "SIDECAR_PROTOCOL_MAJOR", "SIDECAR_REQUIRED_CAPABILITIES"):
+            fields = dict(_GOOD_RELEASE_FIELDS)
+            del fields[key]
+            with self.assertRaisesRegex(rc.ReleaseCheckError, f"missing field.*{key}"):
+                rc.validate_release(fields)
+
+    def test_a_malformed_sidecar_contract_value_fails(self):
+        rc.validate_release(dict(_GOOD_RELEASE_FIELDS))  # the good set passes, so each failure below is its value
+        for key, bad in (("SIDECAR_VERSION", "v0.3.0"), ("SIDECAR_VERSION", "0.3"), ("SIDECAR_PROTOCOL_MAJOR", "three"),
+                         ("SIDECAR_REQUIRED_CAPABILITIES", ""), ("SIDECAR_REQUIRED_CAPABILITIES", "Permission-Defer")):
+            fields = dict(_GOOD_RELEASE_FIELDS)
+            fields[key] = bad
+            with self.assertRaisesRegex(rc.ReleaseCheckError, key, msg=f"{key}={bad!r}"):
+                rc.validate_release(fields)
+
+    def test_a_rehearsal_release_carries_the_sidecar_contract_keys_too(self):
+        fields = dict(_GOOD_RELEASE_FIELDS, REHEARSAL="1")
+        rc.validate_release(fields, rehearsal=True)  # must not raise
+        del fields["SIDECAR_VERSION"]
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "missing field.*SIDECAR_VERSION"):
+            rc.validate_release(fields, rehearsal=True)
 
     def test_a_non_hex40_commit_fails(self):
         fields = dict(_GOOD_RELEASE_FIELDS)

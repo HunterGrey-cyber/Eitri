@@ -128,7 +128,7 @@ setup_keys() {
 	ssh-keygen -q -t ed25519 -N '' -C '' -f "$S/keys/other"
 	# allowed_signers lines with no comment field, as packaging/release-signers specifies.
 	for k in release other; do
-		awk '{ print "release@eitri namespaces=\"eitri-release\" " $1 " " $2 }' "$S/keys/$k.pub" >"$S/keys/signers-$k"
+		awk '{ print "release@eitri namespaces=\"eitri-release,eitri-sidecar-release\" " $1 " " $2 }' "$S/keys/$k.pub" >"$S/keys/signers-$k"
 	done
 	SIGNERS=$S/keys/signers-release
 	# The installer with no key embedded (a fixture of this harness, never shipped): install.sh with
@@ -211,8 +211,9 @@ setup_libs() {
 }
 
 # setup_sidecar_fixtures: the sidecar build's own inputs -- built once, shared by every mk_release call and by test_sidecar.sh directly. A real
-# `bin/npm` (fixtures/npm-sidecar) and `bin/node` (a stub -- nothing here ever runs it, sidecar_build_core
-# only checks it exists and is executable) inside a real, xz-compressed tarball shaped like the real
+# `bin/npm` (fixtures/npm-sidecar) and `bin/node` (a stub: a sidecar build only checks it exists and is
+# executable, and an update runs it for one thing, reading a sidecar's --version --json, which
+# t_upd_facts_reader_under_real_node holds to the real thing) inside a real, xz-compressed tarball shaped like the real
 # nodejs.org one, so tar's own extraction is exercised for real. NODE_FIXTURE_SHA256_X64 is this
 # fixture's own real hash, embedded by mk_release into RELEASE -- never the real pinned Node's hash,
 # since no test unpacks the real Node. NODE_FIXTURE_SHA256_ARM64 is a matching real fixture too
@@ -225,8 +226,24 @@ setup_sidecar_fixtures() {
 	for _sf_arch in x64 arm64; do
 		_nd=node-$NODE_FIXTURE_VERSION-linux-$_sf_arch
 		mkdir -p "$S/fix/node-build/$_nd/bin"
-		printf '#!/bin/sh\necho "node-stub: this is a test double, not real Node" >&2\nexit 1\n' \
-			>"$S/fix/node-build/$_nd/bin/node"
+		cat >"$S/fix/node-build/$_nd/bin/node" <<'NODE_STUB'
+#!/bin/sh
+if [ "${1-}" != -e ]; then
+	echo "node-stub: this is a test double, not real Node" >&2
+	exit 1
+fi
+exec python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+p = r.get("protocol", {})
+print("sidecar_version=%s" % r.get("sidecar_version"))
+print("protocol=%s.%s" % (p.get("major"), p.get("minor")))
+print("node=%s" % r.get("node"))
+print("sdk_version=%s" % r.get("sdk_version"))
+print("build_stamp=%s" % r.get("build_stamp"))
+print("executables=%s" % json.dumps(r.get("executables"), separators=(",", ":")))
+'
+NODE_STUB
 		cp "$FIXTURES/npm-sidecar" "$S/fix/node-build/$_nd/bin/npm"
 		chmod 0755 "$S/fix/node-build/$_nd/bin/node" "$S/fix/node-build/$_nd/bin/npm"
 		printf 'Test double Node LICENSE, from the fake tarball built for packaging/tests/install; not the real one.\n' \
@@ -237,6 +254,27 @@ setup_sidecar_fixtures() {
 	NODE_FIXTURE_SHA256_X64=$(sha256sum <"$S/fix/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz" | cut -d' ' -f1)
 	NODE_FIXTURE_SHA256_ARM64=$(sha256sum <"$S/fix/node-$NODE_FIXTURE_VERSION-linux-arm64.tar.xz" | cut -d' ' -f1)
 	NODE_FIXTURE_TARBALL=$S/fix/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz
+	# The protoc tarballs grpc's host serves, one per architecture: exactly bin/, bin/protoc and
+	# bin/grpc_node_plugin, as the real ones are.
+	GRPC_FIXTURE_VERSION=1.13.1
+	mkdir -p "$S/srv/grpc/grpc-tools/v$GRPC_FIXTURE_VERSION"
+	for _sf_arch in x64 arm64; do
+		mk_protoc_tarball "$S/fix/grpc-build-$_sf_arch" "$S/srv/grpc/grpc-tools/v$GRPC_FIXTURE_VERSION/linux-$_sf_arch.tar.gz"
+	done
+	GRPC_FIXTURE_SHA256_X64=$(sha256sum <"$S/srv/grpc/grpc-tools/v$GRPC_FIXTURE_VERSION/linux-x64.tar.gz" | cut -d' ' -f1)
+	GRPC_FIXTURE_SHA256_ARM64=$(sha256sum <"$S/srv/grpc/grpc-tools/v$GRPC_FIXTURE_VERSION/linux-arm64.tar.gz" | cut -d' ' -f1)
+}
+
+# mk_protoc_tarball BUILD_DIR DEST: a protoc tarball from BUILD_DIR/bin, made first when it is absent.
+# A test adds to BUILD_DIR/bin before calling this to make a tarball of another shape.
+mk_protoc_tarball() {
+	if [ ! -d "$1/bin" ]; then
+		mkdir -p "$1/bin"
+		printf '#!/bin/sh\nexit 0\n' >"$1/bin/protoc"
+		printf '#!/bin/sh\nexit 0\n' >"$1/bin/grpc_node_plugin"
+		chmod 0755 "$1/bin/protoc" "$1/bin/grpc_node_plugin"
+	fi
+	tar -C "$1" -czf "$2" bin
 }
 
 # setup_skia_fixture: --from-source's own pinned Skia input -- fetch_skia_binaries checks its download against a sha256, never
@@ -392,6 +430,73 @@ resign() {
 sign_sums() {
 	rm -f "$1/SHA256SUMS.sig"
 	ssh-keygen -q -Y sign -f "$S/keys/$2" -n eitri-release "$1/SHA256SUMS" 2>/dev/null
+}
+
+# mk_sidecar_release VERSION [KEY=VALUE | -KEY]...: a signed sidecar release on the fixture server, at
+# <port>/sc laid out as the public repository's releases: source tarball, SIDECAR-RELEASE and
+# SHA256SUMS, signed by the harness's key under the sidecar namespace, and `latest` pointing at it. Each KEY=VALUE
+# replaces or adds a SIDECAR-RELEASE line, each -KEY drops one. SC_KEY and SC_NAMESPACE name another
+# signer or namespace. Sets UPD_V, the version the npm stub's artifact reports. Other releases stay served;
+# `latest` is the last one made.
+mk_sidecar_release() {
+	UPD_V=$1
+	shift
+	_msr_d=$S/srv/sc/releases/download/claude-sidecar-v$UPD_V
+	rm -rf "$_msr_d"
+	mkdir -p "$_msr_d"
+	mk_verdandi_source "sc-$UPD_V" "$_msr_d/claude-sidecar-$UPD_V-source.tar.gz"
+	_msr_caps=$(sed -n 's/^SIDECAR_REQUIRED_CAPABILITIES=//p' "$PKG/sidecar-contract.env")
+	{
+		echo "FORMAT=1"
+		echo "SIDECAR_VERSION=$UPD_V"
+		echo "SIDECAR_COMMIT=3333333333333333333333333333333333333333"
+		echo "SIDECAR_SOURCE=claude-sidecar-$UPD_V-source.tar.gz"
+		echo "PROTOCOL_MAJOR=3"
+		echo "PROTOCOL_MINOR=24"
+		echo "CAPABILITIES=$_msr_caps steer_turn"
+		echo "SDK_VERSION=0.3.252"
+		echo "NODE_VERSION=$NODE_FIXTURE_VERSION"
+		echo "NODE_SHA256_linux_x64=$NODE_FIXTURE_SHA256_X64"
+		echo "NODE_SHA256_linux_arm64=$NODE_FIXTURE_SHA256_ARM64"
+		echo "GRPC_TOOLS_VERSION=$GRPC_FIXTURE_VERSION"
+		echo "GRPC_TOOLS_SHA256_linux_x64=$GRPC_FIXTURE_SHA256_X64"
+		echo "GRPC_TOOLS_SHA256_linux_arm64=$GRPC_FIXTURE_SHA256_ARM64"
+		echo "BUILD_STAMP=0123456789abcdef"
+		echo "CLI_RANGE=2.1.252 3.0.0"
+		echo "TESTED_CLI=2.1.252 2.1.300"
+	} >"$_msr_d/SIDECAR-RELEASE"
+	for _msr_kv do
+		_msr_k=${_msr_kv%%=*}
+		_msr_k=${_msr_k#-}
+		awk -F= -v k="$_msr_k" '$1 != k' "$_msr_d/SIDECAR-RELEASE" >"$_msr_d/SIDECAR-RELEASE.new"
+		mv "$_msr_d/SIDECAR-RELEASE.new" "$_msr_d/SIDECAR-RELEASE"
+		case $_msr_kv in
+		-*) ;;
+		*) printf '%s\n' "$_msr_kv" >>"$_msr_d/SIDECAR-RELEASE" ;;
+		esac
+	done
+	resign_sidecar "$UPD_V"
+}
+
+# resign_sidecar VERSION: SHA256SUMS and its signature over what is served for VERSION, and `latest`
+# a copy of it.
+resign_sidecar() {
+	_rss_d=$S/srv/sc/releases/download/claude-sidecar-v$1
+	(
+		cd "$_rss_d" || exit 1
+		rm -f SHA256SUMS SHA256SUMS.sig
+		sha256sum -- *.tar.gz SIDECAR-RELEASE >SHA256SUMS
+	)
+	ssh-keygen -q -Y sign -f "$S/keys/${SC_KEY:-release}" -n "${SC_NAMESPACE:-eitri-sidecar-release}" \
+		"$_rss_d/SHA256SUMS" 2>/dev/null
+	sidecar_relatest "$1"
+}
+
+# sidecar_relatest VERSION: `latest` becomes a copy of what is served for VERSION.
+sidecar_relatest() {
+	rm -rf "$S/srv/sc/releases/latest"
+	mkdir -p "$S/srv/sc/releases/latest/download"
+	cp -R "$S/srv/sc/releases/download/claude-sidecar-v$1/." "$S/srv/sc/releases/latest/download/"
 }
 
 setup_releases() {
@@ -636,6 +741,8 @@ TESTS=
 . "$HERE/test_system.sh"
 . "$HERE/test_uninstall.sh"
 . "$HERE/test_sidecar.sh"
+. "$HERE/test_sidecar_update.sh"
+. "$HERE/test_sidecar_commands.sh"
 . "$HERE/test_nvim.sh"
 . "$HERE/test_from_source.sh"
 . "$HERE/test_apparmor.sh"

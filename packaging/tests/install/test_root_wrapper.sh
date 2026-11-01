@@ -185,6 +185,22 @@ else
 	echo "ok - the root install.sh's header points at no private design document"
 fi
 
+echo "== the sidecar commands pass straight through, with what they carry =="
+out=$(run_wrapper --sidecar-use bundled)
+assert_contains "$out" "STUB_ARG:--sidecar-use" "--sidecar-use reached the stub"
+assert_contains "$out" "STUB_ARG:bundled" "its argument came with it"
+assert_not_contains "$out" "STUB_ARG:--from-source" "--sidecar-use prepended no --from-source"
+out=$(run_wrapper --sidecar-status)
+assert_contains "$out" "STUB_ARG:--sidecar-status" "--sidecar-status reached the stub"
+assert_not_contains "$out" "STUB_ARG:--from-source" "--sidecar-status prepended no --from-source"
+out=$(run_wrapper --sidecar-update --version 0.3.2)
+assert_contains "$out" "STUB_ARG:0.3.2" "--sidecar-update's --version came with it"
+assert_not_contains "$out" "STUB_ARG:--checkout" "--sidecar-update prepended no --checkout"
+help=$(sed -n '/^\.\/install\.sh is for working/,/^EOF/p' "$WRAPPER")
+for mode in --sidecar-status --sidecar-check --sidecar-update --sidecar-use; do
+	assert_contains "$help" "$mode" "--help's own paragraph names $mode"
+done
+
 echo "== a mode flag bypasses EITRI_VERDANDI_CHECKOUT too (it is a --from-source-only concern) =="
 out=$(run_wrapper_with_verdandi_checkout "$SCRATCH_ROOT/verdandi-src" --uninstall)
 assert_contains "$out" "STUB_ARG:--uninstall" "--uninstall reached the stub"

@@ -38,6 +38,10 @@ NV_LAUNCHER_MARKER='# eitri-launcher v1'
 NV_OLD_LAUNCHER_LINE2='# neovibe, installed by install.sh. Everything it decides is printed before the window opens.'
 NV_SIGNER_IDENTITY='release@eitri'
 NV_SIGNATURE_NAMESPACE='eitri-release'
+# The same key signs sidecar releases under their own namespace, so a signature made for one purpose
+# cannot be replayed as the other. Sidecar releases live in their own public repository.
+NV_SIDECAR_NAMESPACE='eitri-sidecar-release'
+NV_SIDECAR_REPO_BASE=https://github.com/HunterGrey-cyber/verdandi
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.10.0'
@@ -78,13 +82,32 @@ NV_SHIPPED_PLUGINS='markdown'
 # role table holds the tarball to exactly this set, and a test holds the two lists equal).
 NV_ICON_FILES='hicolor/16x16/apps/cn.huntergrey.eitri.png hicolor/24x24/apps/cn.huntergrey.eitri.png hicolor/32x32/apps/cn.huntergrey.eitri.png hicolor/48x48/apps/cn.huntergrey.eitri.png hicolor/64x64/apps/cn.huntergrey.eitri.png hicolor/128x128/apps/cn.huntergrey.eitri.png hicolor/256x256/apps/cn.huntergrey.eitri.png hicolor/512x512/apps/cn.huntergrey.eitri.png hicolor/scalable/apps/cn.huntergrey.eitri.svg'
 NV_VERSION_ERE='[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?'
+# A sidecar version, as a tab reads it. It names a directory, so a number has one spelling, and 18 digits
+# are what every reader can compare. Nothing that parses here is refused by a tab.
+NV_SIDECAR_NUMBER_ERE='(0|[1-9][0-9]{0,17})'
+NV_SIDECAR_VERSION_ERE="$NV_SIDECAR_NUMBER_ERE\\.$NV_SIDECAR_NUMBER_ERE\\.$NV_SIDECAR_NUMBER_ERE(-rc\\.$NV_SIDECAR_NUMBER_ERE)?"
 NV_ISSUES='https://github.com/HunterGrey-cyber/eitri/issues'
+# Reads a sidecar's --version --json on stdin and prints what a sidecar update compares with its signed
+# manifest, one KEY=value line each. Run by the pinned Node; POSIX sh has no JSON parser.
+NV_SIDECAR_FACTS_JS='
+const r = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const p = r.protocol || {};
+console.log("sidecar_version=" + r.sidecar_version);
+console.log("protocol=" + p.major + "." + p.minor);
+console.log("node=" + r.node);
+console.log("sdk_version=" + r.sdk_version);
+console.log("build_stamp=" + r.build_stamp);
+console.log("executables=" + JSON.stringify(r.executables));
+'
 # The sidecar build. The protocol major matches Verdandi's own
 # apps/claude-sidecar/src/runtimeServiceImpl.ts PROTOCOL_MAJOR, checked against a built artifact's
 # own --version rather than assumed. Node's dist base is fixed in production; test mode replaces it
 # (node_dist_base) so a sandboxed run can never reach the real nodejs.org by accident.
 NV_SIDECAR_PROTOCOL_MAJOR=3
 NV_NODE_DIST_BASE=https://nodejs.org/dist
+# Where a sidecar update takes the protoc that grpc-tools' install script would otherwise fetch with
+# no hash. Fixed in production; test mode replaces it (grpc_dist_base), as it does Node's.
+NV_GRPC_DIST_BASE=https://node-precompiled-binaries.grpc.io
 NV_SIDECAR_BUILD_MIN_KIB=614400
 # The nvim offer. Never Eitri's own release server -- this is neovim's own GitHub
 # releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
@@ -141,6 +164,7 @@ OPT_KEEP_BUILD=0
 OPT_NODE_TARBALL=
 OPT_VERDANDI_SOURCE_TARBALL=
 OPT_BUILD_SIDECAR_INTO=
+OPT_SIDECAR_USE=
 OPT_YES=0
 OPT_ALLOW_VERDANDI_REV_MISMATCH=0
 OPT_INSECURE_SKIP_SIGNATURE=0
@@ -155,12 +179,31 @@ NV_LOOPBACK=0
 # connect within a minute, so a server that never ends or stalls a transfer cannot hold a run for good
 # while a slow link still finishes.
 NV_MAX_DOWNLOAD_BYTES=1073741824
+# A sidecar release's own files are small, and each is held to what it can reasonably be: its
+# SHA256SUMS, .sig and SIDECAR-RELEASE, then its source and protoc archives.
+NV_SIDECAR_META_MAX_BYTES=65536
+NV_SIDECAR_ARCHIVE_MAX_BYTES=67108864
 NV_SYS_REV7=
 NV_SIDECAR_WORKDIR=
 NV_SIDECAR_TMP=
 NV_NVIM_TMP_DEST=
 NV_VERDANDI_SOURCE_TARBALL_OVERRIDE=
 NV_SIDECAR_ACTUAL_VERDANDI_REV=
+# Set by a sidecar update: only sidecar_build_core reads the first two, and with both empty it is the
+# build `eitri setup` has always run.
+SB_NPM_CI_FLAGS=
+SB_PROTOC_TARBALL=
+# A sidecar update leaves $NV_LIB and what surrounds it alone: on a .deb that path is not this
+# install's, and a repair of it would belong to a run that never touched it.
+NV_LEAVE_LIB=0
+# What on_exit removes or puts back after a sidecar update or check.
+NV_CACHE_NV_CREATED=0
+NV_SIDECAR_CHECK_DIR=
+NV_UPDATES_CREATED=0
+NV_UPDATE_TMP=
+NV_UPDATE_ASIDE=
+NV_UPDATE_DEST=
+NV_SELECTED_TMP=
 
 say() { printf 'eitri: %s\n' "$*"; }
 warn() { printf 'eitri: warning: %s\n' "$*" >&2; }
@@ -222,6 +265,19 @@ usage: sh install.sh [options]
                                build the sidecar alone, for an already-installed Eitri; reads
                                RELEASE from beside this script, or FILE. `eitri setup` with no
                                mode flag runs this, then --nvim-offer above
+  --sidecar-check [--version X]
+                               ask for the newest sidecar release and say whether this Eitri can
+                               take it; changes nothing. `eitri sidecar check` runs this
+  --sidecar-update [--version X]
+                               fetch a signed sidecar release, build it on this machine, try it
+                               and select it for new tabs; the bundled sidecar stays as the fallback.
+                               --dry-run, --insecure-skip-signature, --tarball, --sums and --sig do
+                               not apply to either. `eitri sidecar update` runs this
+  --sidecar-status             say what new tabs run, what is bundled and what is kept; reads files
+                               and takes no lock. `eitri sidecar status` runs this
+  --sidecar-use bundled|VERSION
+                               go back to the bundled sidecar, or select an update already built
+                               that this Eitri accepts. `eitri sidecar use` runs this
   --build-sidecar-into DIR --node TARBALL --verdandi-source TARBALL [--release-file FILE]
                                build the sidecar from files already on disk and install it into DIR
                                instead of the per-user path (the eitri-bin AUR package's build())
@@ -240,7 +296,7 @@ parse_args() {
 	while [ $# -gt 0 ]; do
 		case $1 in
 		--version | --base-url | --release-signers | --tarball | --sums | --sig | --release-file | \
-			--checkout | --verdandi-checkout | --node | --verdandi-source | --build-sidecar-into)
+			--checkout | --verdandi-checkout | --node | --verdandi-source | --build-sidecar-into | --sidecar-use)
 			if [ $# -lt 2 ]; then die "$1 needs a value (see --help)"; fi
 			case $1 in
 			--version) OPT_VERSION=${2#v} ;;
@@ -258,6 +314,10 @@ parse_args() {
 				OPT_BUILD_SIDECAR_INTO=$2
 				set_mode build-sidecar-into
 				;;
+			--sidecar-use)
+				OPT_SIDECAR_USE=$2
+				set_mode sidecar-use
+				;;
 			esac
 			shift
 			;;
@@ -270,6 +330,9 @@ parse_args() {
 		--with-nvim) OPT_NVIM=yes ;;
 		--uninstall) set_mode uninstall ;;
 		--sidecar-only) set_mode sidecar-only ;;
+		--sidecar-update) set_mode sidecar-update ;;
+		--sidecar-check) set_mode sidecar-check ;;
+		--sidecar-status) set_mode sidecar-status ;;
 		--nvim-only) set_mode nvim-only ;;
 		--nvim-offer) set_mode nvim-offer ;;
 		--from-source) set_mode from-source ;;
@@ -282,6 +345,26 @@ parse_args() {
 		esac
 		shift
 	done
+	# An update is optional, so a machine that cannot check one goes without: none of the ways past
+	# a signature an install has applies here. A dry run skips the check too.
+	case $OPT_MODE in
+	sidecar-update | sidecar-check | sidecar-use | sidecar-status)
+		if [ "$OPT_INSECURE_SKIP_SIGNATURE" = 1 ]; then
+			die "--insecure-skip-signature does not apply to a sidecar release: an update is optional, so a machine that cannot check one goes without"
+		fi
+		if [ "$OPT_DRY_RUN" = 1 ]; then
+			die "--dry-run does not apply to eitri sidecar: a dry run would skip a release's signature, and status and check change nothing"
+		fi
+		if [ -n "$OPT_TARBALL$OPT_SUMS$OPT_SIG" ]; then
+			die "--tarball, --sums and --sig do not apply to a sidecar release: an update fetches what it checks"
+		fi
+		;;
+	esac
+	case $OPT_MODE in
+	sidecar-use | sidecar-status)
+		if [ -n "$OPT_VERSION" ]; then die "--version goes with eitri sidecar update and check"; fi
+		;;
+	esac
 	if [ "$OPT_PURGE" = 1 ] && [ "$OPT_MODE" != uninstall ]; then
 		die "--purge only goes with --uninstall"
 	fi
@@ -397,6 +480,8 @@ set_paths() {
 	NV_DL=$NV_CACHE_NV/download
 	NV_STAGE=$NV_CACHE_NV/unpack
 	NV_SIDECAR_ROOT=$NV_DATA/eitri/sidecar
+	NV_SIDECAR_UPDATES=$NV_SIDECAR_ROOT/updates
+	NV_SIDECAR_SELECTED=$NV_SIDECAR_ROOT/selected
 	NV_SYSTEM_RELEASE=/usr/lib/eitri/RELEASE
 	# What rev_of_release tells the user to do about a system RELEASE it cannot use: that file is a
 	# package's, which this installer never touches.
@@ -413,7 +498,7 @@ set_paths() {
 		# The download overrides lead only to a loopback server and the repository overrides only to a
 		# local path: a test mode left switched on in an environment can then send no download, clone
 		# or build anywhere else.
-		for _sp_v in NODE NVIM SKIA; do
+		for _sp_v in NODE NVIM SKIA GRPC; do
 			eval "_sp_u=\${EITRI_INSTALL_TEST_${_sp_v}_BASE_URL-}"
 			if [ -n "$_sp_u" ]; then
 				loopback_http "$_sp_u"
@@ -648,6 +733,12 @@ parse_release_text() {
 	# its git-archive hash so a separate setup run can explain why it cannot fetch an equivalent
 	# release asset, rather than report an expected byte difference as checksum tampering.
 	REL_BUILT_FROM_CHECKOUT=$(kv_value "$1" EITRI_BUILT_FROM_CHECKOUT)
+	# Optional too: what this tree expects of a sidecar. A RELEASE from before sidecar updates has
+	# none and still installs; only the commands that take an update require them
+	# (require_sidecar_contract).
+	REL_SIDECAR_VERSION=$(kv_value "$1" SIDECAR_VERSION)
+	REL_SIDECAR_PROTOCOL_MAJOR=$(kv_value "$1" SIDECAR_PROTOCOL_MAJOR)
+	REL_SIDECAR_REQUIRED_CAPABILITIES=$(kv_value "$1" SIDECAR_REQUIRED_CAPABILITIES)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -977,7 +1068,7 @@ install_nvim_version() {
 	rm -rf -- "$_inv_workdir" || die "cannot remove the stale nvim build directory $_inv_workdir"
 	mkdir -p -- "$_inv_workdir" || die "cannot create $_inv_workdir"
 	_inv_tar=$_inv_workdir/nvim-linux-x86_64.tar.gz
-	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part"
+	curl_get "$(nvim_dist_base)/v$_inv_version/nvim-linux-x86_64.tar.gz" "$_inv_tar.part" "$NV_MAX_DOWNLOAD_BYTES"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$_inv_tolerant" = 1 ]; then
 			warn "could not download nvim $_inv_version ($CG_ERR): Eitri is installed without a private copy; run \"eitri setup --nvim-only\" once you have network access"
@@ -1155,13 +1246,31 @@ require_curl() {
 	die "curl was not found: this installer downloads only with curl, which it can hold to HTTPS across every redirect (wget cannot be). Install curl$_rq and re-run"
 }
 
-# fetch URL DEST WHAT: download URL to DEST ('-' = stdout). HTTPS-only for every non-loopback URL,
-# on every redirect too (--proto/--proto-redir); a loopback download reads no curl config and follows no redirect.
+# size_within FILE LIMIT sets SW_OK=0, and removes FILE, when it holds more than LIMIT bytes.
+# --max-filesize cannot refuse in advance a response that declares no length, so a download is
+# measured again once it is on disk. Rule 2: a variable, and a plain statement.
+size_within() {
+	SW_OK=1
+	if [ ! -f "$1" ]; then return 0; fi
+	_sw_size=$(wc -c <"$1") || die "cannot measure $1"
+	if [ "$_sw_size" -gt "$2" ]; then
+		SW_OK=0
+		rm -f -- "$1" || :
+	fi
+}
+
+# fetch URL DEST WHAT LIMIT: download URL to DEST ('-' = stdout), refusing more than LIMIT bytes.
+# HTTPS-only for every non-loopback URL, on every redirect too (--proto/--proto-redir); a loopback
+# download reads no curl config and follows no redirect.
 fetch() {
 	if [ "$NV_LOOPBACK" = 1 ]; then
-		curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
+		curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$4" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
 	else
-		curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
+		curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$4" -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
+	fi
+	if [ "$2" != - ]; then
+		size_within "$2" "$4"
+		if [ "$SW_OK" != 1 ]; then die "$3 from $1 is more than the $4 bytes it can be: refusing it"; fi
 	fi
 }
 
@@ -1203,15 +1312,15 @@ verify_file() {
 	fi
 }
 
-# download_verified NAME: fetch NAME from the release into NAME.part, check it, and only then
+# download_verified NAME LIMIT: fetch NAME from the release into NAME.part, check it, and only then
 # rename it. Nothing is unpacked before this has passed.
 download_verified() {
-	fetch "$NV_REL_URL/$1" "$NV_DL/$1.part" "$1"
+	fetch "$NV_REL_URL/$1" "$NV_DL/$1.part" "$1" "$2"
 	verify_file "$NV_DL/$1.part" "$1"
 	mv -- "$NV_DL/$1.part" "$NV_DL/$1" || die "cannot rename $NV_DL/$1.part"
 }
 
-# curl_get URL DEST: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
+# curl_get URL DEST LIMIT: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
 # a predicate reports through a variable), because the sidecar build's own first download (Node) is
 # the one place in this installer where "the network is not reachable" is not fatal (a
 # release with no sidecar still installs; the panel says how to get one). HTTPS is held across every
@@ -1221,7 +1330,7 @@ curl_get() {
 	CG_ERR=
 	case $1 in
 	https://*)
-		if _cg_out=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsSL -o "$2" -- "$1" 2>&1); then
+		if _cg_out=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$3" -fsSL -o "$2" -- "$1" 2>&1); then
 			CG_OK=1
 		else
 			CG_ERR=$_cg_out
@@ -1230,7 +1339,7 @@ curl_get() {
 	http://*)
 		loopback_http "$1"
 		if [ "$LH" != 1 ]; then die "curl_get: $1: plain http is only for a loopback test server"; fi
-		if _cg_out=$(curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" 2>&1); then
+		if _cg_out=$(curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$3" -fsS -o "$2" -- "$1" 2>&1); then
 			CG_OK=1
 		else
 			CG_ERR=$_cg_out
@@ -1238,6 +1347,13 @@ curl_get() {
 		;;
 	*) die "curl_get: $1 is not an http(s) URL" ;;
 	esac
+	if [ "$CG_OK" = 1 ]; then
+		size_within "$2" "$3"
+		if [ "$SW_OK" != 1 ]; then
+			CG_OK=0
+			CG_ERR="it is more than the $3 bytes it can be"
+		fi
+	fi
 }
 
 # node_arch: sets NV_NODE_ARCH from uname -m, matching how packaging/pins.env and buildBinary.mjs
@@ -1263,6 +1379,15 @@ node_dist_base() {
 		printf '%s\n' "${EITRI_INSTALL_TEST_NODE_BASE_URL:-http://127.0.0.1:1}"
 	else
 		printf '%s\n' "$NV_NODE_DIST_BASE"
+	fi
+}
+
+# grpc_dist_base: where the pinned protoc tarball is fetched from, on the terms of node_dist_base.
+grpc_dist_base() {
+	if [ "$NV_TEST_MODE" = 1 ]; then
+		printf '%s\n' "${EITRI_INSTALL_TEST_GRPC_BASE_URL:-http://127.0.0.1:1}"
+	else
+		printf '%s\n' "$NV_GRPC_DIST_BASE"
 	fi
 }
 
@@ -1293,16 +1418,17 @@ embedded_release_signers() {
 #
 #   ssh-keygen -Y verify -f <this file> -I release@eitri -n eitri-release -s SHA256SUMS.sig < SHA256SUMS
 #
-# A key line looks like this, with no comment field after the key:
+# and a sidecar release's with -n eitri-sidecar-release in its place. A key line looks like this, with
+# no comment field after the key:
 #
-#   release@eitri namespaces="eitri-release" ssh-ed25519 AAAA...
+#   release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519 AAAA...
 #
 # The release key is listed below: the dedicated release key's public half, never an
 # everyday login key, and release.sh refuses one that matches any ~/.ssh/id_*.pub. Every installer
 # built from this tree embeds it and refuses a release whose SHA256SUMS.sig is missing or does not
 # verify. The installer's --release-signers option replaces it, with a warning, for a
 # release candidate or a test.
-release@eitri namespaces="eitri-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUZrObfSHuE2F8LBZj6YG8pgph6d5v/JEqb8RClBujR
+release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICUZrObfSHuE2F8LBZj6YG8pgph6d5v/JEqb8RClBujR
 EITRI_RELEASE_SIGNERS
 }
 
@@ -1337,7 +1463,7 @@ prepare_signers() {
 	*) die "grep could not scan $NV_SIGNERS (it exited $_ps_rc), so the release signature cannot be checked: refusing. Make the file readable and re-run" ;;
 	esac
 	if [ -n "$OPT_SIGNERS" ] && [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
-		die "--release-signers $OPT_SIGNERS lists no key, so it would switch signature checking off: give a file holding the release key's line (release@eitri namespaces=\"eitri-release\" ssh-ed25519 ...), or leave the option out"
+		die "--release-signers $OPT_SIGNERS lists no key, so it would switch signature checking off: give a file holding the release key's line (release@eitri namespaces=\"eitri-release,eitri-sidecar-release\" ssh-ed25519 ...), or leave the option out"
 	fi
 }
 
@@ -1356,21 +1482,26 @@ require_ssh_keygen() {
 		warn "ssh-keygen was not found, so the release signature cannot be checked: installing without checking the release signature (--insecure-skip-signature). The checksums only detect corruption, not who made the release: a mirror or files handed to you could carry a release someone else built, and nothing in this run would notice. Install OpenSSH's client and re-run without the option to have it checked"
 		return 0
 	fi
-	read_os_release
-	case $OS_FAMILY in
-	debian) _rsk=' (sudo apt install openssh-client)' ;;
-	fedora) _rsk=' (sudo dnf install openssh-clients)' ;;
-	arch) _rsk=' (sudo pacman -S openssh)' ;;
-	opensuse) _rsk=' (sudo zypper install openssh-clients)' ;;
-	*) _rsk= ;;
-	esac
-	die "ssh-keygen was not found, so the release signature cannot be checked, and this installer carries a release key to check it against: refusing, because without that check a release someone else built would install unnoticed. Install OpenSSH's client$_rsk and re-run; or, to install with only the checksums checked, re-run with --insecure-skip-signature"
+	openssh_hint
+	die "ssh-keygen was not found, so the release signature cannot be checked, and this installer carries a release key to check it against: refusing, because without that check a release someone else built would install unnoticed. Install OpenSSH's client$OH_HINT and re-run; or, to install with only the checksums checked, re-run with --insecure-skip-signature"
 }
 
-# verify_signature SUMS SIG: with a key listed, a missing or unfetchable SIG refuses and a
+# openssh_hint sets OH_HINT to this distribution's command for OpenSSH's client, or nothing.
+openssh_hint() {
+	read_os_release
+	case $OS_FAMILY in
+	debian) OH_HINT=' (sudo apt install openssh-client)' ;;
+	fedora) OH_HINT=' (sudo dnf install openssh-clients)' ;;
+	arch) OH_HINT=' (sudo pacman -S openssh)' ;;
+	opensuse) OH_HINT=' (sudo zypper install openssh-clients)' ;;
+	*) OH_HINT= ;;
+	esac
+}
+
+# verify_signature SUMS SIG NAMESPACE: with a key listed, a missing or unfetchable SIG refuses and a
 # bad one refuses, and so does a missing ssh-keygen unless --insecure-skip-signature
 # (require_ssh_keygen). The command is the documented verify form; ssh-keygen's no-validate check mode is
-# never used (it accepts a signature by any key).
+# never used (it accepts a signature by any key). NAMESPACE is one of the two constants above.
 verify_signature() {
 	if [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
 		warn "this installer carries no release key: checksums only detect corruption, they do not show who made the release"
@@ -1388,7 +1519,7 @@ verify_signature() {
 		say "would check $2 with ssh-keygen -Y verify against the release key built into this installer (not checked in a dry run)"
 		return 0
 	fi
-	if ! _vs_out=$(ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$NV_SIGNATURE_NAMESPACE" -s "$2" <"$1" 2>&1); then
+	if ! _vs_out=$(ssh-keygen -Y verify -f "$NV_SIGNERS" -I "$NV_SIGNER_IDENTITY" -n "$3" -s "$2" <"$1" 2>&1); then
 		die "the signature on SHA256SUMS does not verify against the release key ($_vs_out): refusing to install. Do not use this download; report it at $NV_ISSUES"
 	fi
 	say "signature on SHA256SUMS: good ($NV_SIGNER_IDENTITY)"
@@ -1425,7 +1556,7 @@ obtain_release() {
 				cp -- "$OPT_SIG" "$_or_sig" || die "cannot copy $OPT_SIG into $NV_DL: check that it is readable and the disk is not full, then re-run"
 			fi
 		fi
-		verify_signature "$_or_sums" "$_or_sig"
+		verify_signature "$_or_sums" "$_or_sig" "$NV_SIGNATURE_NAMESPACE"
 		NV_SUMS_TEXT=$(cat -- "$_or_sums") || die "cannot open $_or_sums"
 		NV_VERSION=$(tarball_version)
 		if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$NV_VERSION" ]; then
@@ -1449,9 +1580,9 @@ obtain_release() {
 		_or_dir=releases/latest/download
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
-		NV_SUMS_TEXT=$(fetch "$NV_BASE/$_or_dir/SHA256SUMS" - SHA256SUMS)
+		NV_SUMS_TEXT=$(fetch "$NV_BASE/$_or_dir/SHA256SUMS" - SHA256SUMS "$NV_MAX_DOWNLOAD_BYTES")
 	else
-		fetch "$NV_BASE/$_or_dir/SHA256SUMS" "$NV_DL/SHA256SUMS.part" SHA256SUMS
+		fetch "$NV_BASE/$_or_dir/SHA256SUMS" "$NV_DL/SHA256SUMS.part" SHA256SUMS "$NV_MAX_DOWNLOAD_BYTES"
 		NV_SUMS_TEXT=$(cat -- "$NV_DL/SHA256SUMS.part") || die "cannot open $NV_DL/SHA256SUMS.part"
 	fi
 	NV_VERSION=$(tarball_version)
@@ -1464,7 +1595,7 @@ obtain_release() {
 	NV_REL_URL=$NV_BASE/releases/download/v$NV_VERSION
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		if [ -z "$OPT_VERSION" ]; then
-			NV_SUMS_TEXT=$(fetch "$NV_REL_URL/SHA256SUMS" - SHA256SUMS)
+			NV_SUMS_TEXT=$(fetch "$NV_REL_URL/SHA256SUMS" - SHA256SUMS "$NV_MAX_DOWNLOAD_BYTES")
 			_or_v=$(tarball_version)
 			if [ "$_or_v" != "$NV_VERSION" ]; then die "the release changed while it was being fetched: re-run"; fi
 		fi
@@ -1475,22 +1606,22 @@ obtain_release() {
 				say "would download $NV_REL_URL/SHA256SUMS.sig and check it with ssh-keygen -Y verify (not checked in a dry run)"
 			fi
 		else
-			verify_signature - -
+			verify_signature - - "$NV_SIGNATURE_NAMESPACE"
 		fi
 		return 0
 	fi
 	if [ -z "$OPT_VERSION" ]; then
 		rm -f -- "$NV_DL/SHA256SUMS.part" || die "cannot remove $NV_DL/SHA256SUMS.part"
-		fetch "$NV_REL_URL/SHA256SUMS" "$NV_DL/SHA256SUMS.part" SHA256SUMS
+		fetch "$NV_REL_URL/SHA256SUMS" "$NV_DL/SHA256SUMS.part" SHA256SUMS "$NV_MAX_DOWNLOAD_BYTES"
 		NV_SUMS_TEXT=$(cat -- "$NV_DL/SHA256SUMS.part") || die "cannot open $NV_DL/SHA256SUMS.part"
 		_or_v=$(tarball_version)
 		if [ "$_or_v" != "$NV_VERSION" ]; then die "the release changed while it was being fetched (latest was $NV_VERSION, v$NV_VERSION's SHA256SUMS names $_or_v): re-run"; fi
 	fi
 	mv -- "$NV_DL/SHA256SUMS.part" "$NV_DL/SHA256SUMS" || die "cannot rename $NV_DL/SHA256SUMS.part"
 	if [ "$NV_SIGNERS_HAVE_KEY" = 1 ]; then
-		fetch "$NV_REL_URL/SHA256SUMS.sig" "$NV_DL/SHA256SUMS.sig" "SHA256SUMS.sig (this installer carries a release key, so a release without a signature is refused)"
+		fetch "$NV_REL_URL/SHA256SUMS.sig" "$NV_DL/SHA256SUMS.sig" "SHA256SUMS.sig (this installer carries a release key, so a release without a signature is refused)" "$NV_MAX_DOWNLOAD_BYTES"
 	fi
-	verify_signature "$NV_DL/SHA256SUMS" "$NV_DL/SHA256SUMS.sig"
+	verify_signature "$NV_DL/SHA256SUMS" "$NV_DL/SHA256SUMS.sig" "$NV_SIGNATURE_NAMESPACE"
 	# Every hash used from here on comes from the file just verified, not from the read before it
 	# (the download directory is this run's own, but a check and a use of two reads are two files).
 	NV_SUMS_TEXT=$(cat -- "$NV_DL/SHA256SUMS") || die "cannot open $NV_DL/SHA256SUMS"
@@ -1605,7 +1736,10 @@ foreign_cache_link() {
 	if [ -n "$_fcl_hit" ]; then FCL=1; fi
 }
 
-acquire_lock() {
+# check_cache_root: everything acquire_lock checks before it takes the lock. NV_CACHE and the paths
+# under it are the resolved ones afterwards, and <cache>/eitri exists, unless this is a dry run, which
+# stops after the refusals that only look at names.
+check_cache_root() {
 	NV_LOCK=$NV_CACHE_NV/lock
 	# A cache root that is itself a symlink is followed: the path is resolved once below, only the
 	# resolved path is used from then on, and every directory on it is checked without following a
@@ -1633,13 +1767,11 @@ acquire_lock() {
 	# A dry run stops here, after the two refusals above: they only look at names and change
 	# nothing, so it reports them as a real run would. Everything below creates or depends on what
 	# creating would leave.
-	if [ "$OPT_DRY_RUN" = 1 ]; then
-		say "would take the lock $NV_LOCK"
-		return 0
-	fi
+	if [ "$OPT_DRY_RUN" = 1 ]; then return 0; fi
 	# A cache directory this run creates is removed again with its contents (on_exit), so a run
 	# that installs nothing leaves nothing.
 	if [ ! -d "$NV_CACHE" ]; then NV_CACHE_CREATED=1; fi
+	if [ ! -d "$NV_CACHE_NV" ]; then NV_CACHE_NV_CREATED=1; fi
 	# 0700 when this run creates it; the cache directory above keeps the user's umask.
 	# shellcheck disable=SC2174 # -m for the deepest directory only, deliberately
 	mkdir -p -m 0700 -- "$NV_CACHE_NV" || die "cannot create $NV_CACHE_NV: check that $NV_CACHE is writable"
@@ -1722,6 +1854,14 @@ acquire_lock() {
 		_al_d=${_al_d%/*}
 		if [ -z "$_al_d" ]; then _al_d=/; fi
 	done
+}
+
+acquire_lock() {
+	check_cache_root
+	if [ "$OPT_DRY_RUN" = 1 ]; then
+		say "would take the lock $NV_LOCK"
+		return 0
+	fi
 	if ! mkdir -- "$NV_LOCK" 2>/dev/null; then
 		# Serialize stale-lock takeover with a mkdir-based sub-lock. Otherwise two runs observing
 		# the same dead pid can race: one creates a fresh pid-less NV_LOCK, another renames it,
@@ -1811,11 +1951,17 @@ acquire_lock() {
 }
 
 # on_exit: runs on every exit once the lock is held. A failed run puts back whatever it had moved
-# (the same recovery a later run would do) and never leaves its downloads or lock behind.
+# (the same recovery a later run would do) and never leaves its downloads or lock behind. A sidecar
+# check holds no lock, so its own directory goes in a branch of its own.
 on_exit() {
 	_oe_rc=$?
+	if [ -n "$NV_SIDECAR_CHECK_DIR" ]; then
+		rm -rf -- "$NV_SIDECAR_CHECK_DIR" 2>/dev/null || :
+		if [ "$NV_CACHE_NV_CREATED" = 1 ]; then rmdir -- "$NV_CACHE_NV" 2>/dev/null || :; fi
+		if [ "$NV_CACHE_CREATED" = 1 ]; then rmdir -- "$NV_CACHE" 2>/dev/null || :; fi
+	fi
 	if [ "$LOCK_HELD" = 1 ]; then
-		if [ "$_oe_rc" != 0 ]; then
+		if [ "$_oe_rc" != 0 ] && [ "$NV_LEAVE_LIB" != 1 ]; then
 			if [ "$NV_NEW_CREATED" = 1 ]; then rm -rf -- "$NV_LIB.new" 2>/dev/null || :; fi
 			if [ ! -e "$NV_LIB" ] && [ -d "$NV_LIB.old" ]; then mv -- "$NV_LIB.old" "$NV_LIB" 2>/dev/null || :; fi
 			# unpack_new can create NV_LIBROOT before a later fatal step. rmdir removes it only while
@@ -1843,6 +1989,18 @@ on_exit() {
 		done
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
 		if [ -n "${NV_NVIM_TMP_DEST-}" ]; then rm -rf -- "$NV_NVIM_TMP_DEST" 2>/dev/null || :; fi
+		# A sidecar update stopped part-way: its unfinished copy goes, and whatever it set aside comes
+		# back unless the new directory has already taken its place.
+		if [ -n "$NV_UPDATE_TMP" ]; then rm -rf -- "$NV_UPDATE_TMP" 2>/dev/null || :; fi
+		if [ -n "$NV_SELECTED_TMP" ]; then rm -f -- "$NV_SELECTED_TMP" 2>/dev/null || :; fi
+		if [ -n "$NV_UPDATE_ASIDE" ]; then
+			if [ -e "$NV_UPDATE_DEST" ] || [ -L "$NV_UPDATE_DEST" ]; then
+				rm -rf -- "$NV_UPDATE_ASIDE" 2>/dev/null || :
+			else
+				mv -- "$NV_UPDATE_ASIDE" "$NV_UPDATE_DEST" 2>/dev/null || :
+			fi
+		fi
+		if [ "$NV_UPDATES_CREATED" = 1 ]; then rmdir -- "$NV_SIDECAR_UPDATES" 2>/dev/null || :; fi
 		rm -rf -- "$NV_DL" "$NV_STAGE" 2>/dev/null || :
 		# install_nvim_version's own workdir (that function removes it itself when it succeeds, whatever
 		# --keep-build says) and --from-source's own scratch (the cloned Eitri source, the Verdandi source
@@ -1902,10 +2060,15 @@ recover_interrupted() {
 # the binary and BUILD both exist, and the binary's first --version line equals BUILD's
 # SIDECAR_VERSION_LINE.
 sidecar_state() {
+	sidecar_dir_state "$NV_SIDECAR_ROOT/$1" "$1"
+}
+
+# sidecar_dir_state DIR NAME: sidecar_state, for the sidecar in DIR; an empty NAME is never present.
+sidecar_dir_state() {
 	NV_SIDECAR_PRESENT=0
-	NV_SIDECAR_BIN=$NV_SIDECAR_ROOT/$1/verdandi-claude-sidecar
-	_ss_build=$NV_SIDECAR_ROOT/$1/BUILD
-	if [ -z "$1" ] || [ ! -x "$NV_SIDECAR_BIN" ] || [ ! -f "$_ss_build" ]; then return 0; fi
+	NV_SIDECAR_BIN=$1/verdandi-claude-sidecar
+	_ss_build=$1/BUILD
+	if [ -z "$2" ] || [ ! -x "$NV_SIDECAR_BIN" ] || [ ! -f "$_ss_build" ]; then return 0; fi
 	_ss_want=$(kv_get "$_ss_build" SIDECAR_VERSION_LINE)
 	_ss_have=$("$NV_SIDECAR_BIN" --version 2>/dev/null | head -n 1) || _ss_have=
 	if [ -n "$_ss_want" ] && [ "$_ss_have" = "$_ss_want" ]; then NV_SIDECAR_PRESENT=1; fi
@@ -1938,7 +2101,7 @@ sidecar_download_node() {
 	_sdn_base=$(node_dist_base)
 	_sdn_url=$_sdn_base/$REL_NODE_VERSION/$_sdn_name
 	_sdn_out=$1/$_sdn_name
-	curl_get "$_sdn_url" "$_sdn_out.part"
+	curl_get "$_sdn_url" "$_sdn_out.part" "$NV_MAX_DOWNLOAD_BYTES"
 	if [ "$CG_OK" != 1 ]; then
 		if [ "$2" = 1 ]; then
 			warn "could not download the pinned Node runtime ($_sdn_url), needed to build the sidecar: $CG_ERR. Eitri is installed without one; run \"eitri setup\" once you have network access to nodejs.org"
@@ -1987,7 +2150,7 @@ sidecar_download_verdandi_source() {
 	fi
 	_sdv_url=$NV_REL_URL/$REL_VERDANDI_SOURCE
 	_sdv_out=$1/$REL_VERDANDI_SOURCE
-	curl_get "$_sdv_url" "$_sdv_out.part"
+	curl_get "$_sdv_url" "$_sdv_out.part" "$NV_MAX_DOWNLOAD_BYTES"
 	if [ "$CG_OK" != 1 ]; then die "could not download the Verdandi source ($_sdv_url): $CG_ERR"; fi
 	_sdv_have=$(file_sha256 "$_sdv_out.part")
 	if [ "$_sdv_have" != "$REL_VERDANDI_SOURCE_SHA256" ]; then
@@ -2036,7 +2199,8 @@ accept_sidecar_artifact() {
 # node-cache placement, npm ci, the SDK notice, npm run build:binary, and the artifact pick +
 # acceptance. Both callers below hand it already-downloaded-and-verified tarballs, whether fetched
 # over the network or given as local files (--build-sidecar-into). Sets SB_ARTIFACT, SB_VERSION_LINE,
-# SB_SDK_LICENSE and SB_NODE_LICENSE.
+# SB_SDK_LICENSE, SB_NODE_LICENSE and SB_NODE_BIN. SB_NPM_CI_FLAGS goes on npm ci's command line, and a
+# non-empty SB_PROTOC_TARBALL (a checked protoc archive) is unpacked into grpc-tools right after it.
 sidecar_build_core() {
 	_sbc_workdir=$1
 	_sbc_node_tar=$2
@@ -2065,8 +2229,10 @@ sidecar_build_core() {
 	cp -- "$_sbc_node_tar" "$_sbc_cache_dir/" || die "cannot copy $_sbc_node_tar into $_sbc_cache_dir"
 
 	_sbc_npm_cache=$_sbc_workdir/npm-cache
+	# shellcheck disable=SC2086 # a list of npm's own flags, empty or set by this script
 	run_in "$_sbc_repo" env "PATH=$_sbc_node_bin:$PATH" "npm_config_cache=$_sbc_npm_cache" \
-		"$_sbc_node_bin/npm" ci --no-audit --no-fund
+		"$_sbc_node_bin/npm" ci --no-audit --no-fund $SB_NPM_CI_FLAGS
+	if [ -n "$SB_PROTOC_TARBALL" ]; then sidecar_place_protoc "$_sbc_repo"; fi
 	sidecar_sdk_notice "$_sbc_repo"
 	run_in "$_sbc_repo" env "PATH=$_sbc_node_bin:$PATH" "npm_config_cache=$_sbc_npm_cache" \
 		"$_sbc_node_bin/npm" run build:binary -w @verdandi/claude-sidecar
@@ -2082,6 +2248,32 @@ sidecar_build_core() {
 	SB_VERSION_LINE=$AA_VERSION_LINE
 	SB_SDK_LICENSE=$_sbc_repo/node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md
 	SB_NODE_LICENSE=$_sbc_node_top/LICENSE
+	SB_NODE_BIN=$_sbc_node_bin
+}
+
+# sidecar_place_protoc REPO: with no install script run, grpc-tools has no protoc. Put the checked one
+# where its script would have, refusing a grpc-tools of another version and an archive holding
+# anything but the two executables: its hash says who chose it, this says what it is.
+sidecar_place_protoc() {
+	_spp_dir=$1/node_modules/grpc-tools
+	if [ ! -f "$_spp_dir/package.json" ]; then
+		die "npm ci installed no grpc-tools, which the build needs: report it at $NV_ISSUES"
+	fi
+	_spp_ver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_spp_dir/package.json" | head -n 1) || _spp_ver=
+	if [ "$_spp_ver" != "$SR_GRPC_TOOLS_VERSION" ]; then
+		die "npm ci installed grpc-tools $_spp_ver, not the $SR_GRPC_TOOLS_VERSION this release pins protoc for: refusing to build. Report it at $NV_ISSUES"
+	fi
+	_spp_names=$(tar -tzf "$SB_PROTOC_TARBALL") || die "tar cannot list $SB_PROTOC_TARBALL: report it at $NV_ISSUES"
+	_spp_names=$(printf '%s\n' "$_spp_names" | LC_ALL=C sort)
+	if [ "$_spp_names" != "bin/${NV_NL}bin/grpc_node_plugin${NV_NL}bin/protoc" ]; then
+		die "$SB_PROTOC_TARBALL holds other names than bin/protoc and bin/grpc_node_plugin: refusing to unpack it. Report it at $NV_ISSUES"
+	fi
+	tar -xzf "$SB_PROTOC_TARBALL" --no-same-owner -C "$_spp_dir" || die "could not unpack $SB_PROTOC_TARBALL: report it at $NV_ISSUES"
+	for _spp_f in "$_spp_dir/bin/protoc" "$_spp_dir/bin/grpc_node_plugin"; do
+		if [ -L "$_spp_f" ] || [ ! -f "$_spp_f" ] || [ ! -x "$_spp_f" ]; then
+			die "$SB_PROTOC_TARBALL unpacked $_spp_f as something not a plain executable: refusing to run it. Report it at $NV_ISSUES"
+		fi
+	done
 }
 
 # install_sidecar_for_rev REV7 TOLERANT: the per-user path, used by both ensure_sidecar
@@ -2164,15 +2356,20 @@ resolve_setup_release() {
 	if [ -n "$OPT_RELEASE_FILE" ]; then
 		NV_RELEASE_PATH=$OPT_RELEASE_FILE
 	else
-		_rsr_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _rsr_dir=
+		setup_dir
 		NV_RELEASE_PATH=
-		if [ -n "$_rsr_dir" ] && [ -f "$_rsr_dir/RELEASE" ]; then NV_RELEASE_PATH=$_rsr_dir/RELEASE; fi
+		if [ -n "$NV_SETUP_DIR" ] && [ -f "$NV_SETUP_DIR/RELEASE" ]; then NV_RELEASE_PATH=$NV_SETUP_DIR/RELEASE; fi
 	fi
 	if [ -z "$NV_RELEASE_PATH" ]; then
 		die "no RELEASE found beside $0, and no --release-file given: pass --release-file PATH, or run this as the eitri-setup installed beside a RELEASE (a .deb, .rpm or tarball install)"
 	fi
 	if [ ! -f "$NV_RELEASE_PATH" ]; then die "--release-file $NV_RELEASE_PATH: no such file"; fi
 	parse_release "$NV_RELEASE_PATH"
+}
+
+# setup_dir sets NV_SETUP_DIR to the directory holding the running script, or nothing.
+setup_dir() {
+	NV_SETUP_DIR=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || NV_SETUP_DIR=
 }
 
 # do_sidecar_only: --sidecar-only / `eitri setup`. No SHA256SUMS is fetched: every input
@@ -2312,6 +2509,638 @@ do_build_sidecar_into() {
 		cp -- "$SB_NODE_LICENSE" "$OPT_BUILD_SIDECAR_INTO/NODE-LICENSE" || die "cannot write $OPT_BUILD_SIDECAR_INTO/NODE-LICENSE"
 	fi
 	say "built the sidecar for verdandi $REL_REV7 into $OPT_BUILD_SIDECAR_INTO: $SB_VERSION_LINE"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Sidecar updates. A sidecar release is signed source: an update is built here, tried, and chosen by
+# one file read at each spawn. Each step refuses with `selected` and updates/ as they were. The chain
+# of trust is the key, then SHA256SUMS, then SIDECAR-RELEASE and the source tarball, then the lock
+# file inside it and the Node and protoc hashes in the manifest; no package's install script runs.
+
+# require_sidecar_contract: what an update is compared with, from this install's RELEASE.
+require_sidecar_contract() {
+	if ! printf '%s\n' "$REL_SIDECAR_VERSION" | grep -Eqx "$NV_SIDECAR_VERSION_ERE" ||
+		! printf '%s\n' "$REL_SIDECAR_PROTOCOL_MAJOR" | grep -Eqx '[0-9]{1,6}' ||
+		! printf '%s\n' "$REL_SIDECAR_REQUIRED_CAPABILITIES" | grep -Eqx '[a-z0-9_]+( [a-z0-9_]+)*'; then
+		die "$NV_RELEASE_PATH has no valid SIDECAR_VERSION, SIDECAR_PROTOCOL_MAJOR and SIDECAR_REQUIRED_CAPABILITIES, so this Eitri cannot take sidecar updates: a newer Eitri release can"
+	fi
+}
+
+# bundled_sidecar_present sets NV_BUNDLED_PRESENT: an executable sidecar beside the running script (the
+# rule resolve_setup_release uses, never NV_LIB, which on a .deb could name another install) that runs
+# --version, or else this RELEASE's <rev7> directory. A sibling has no BUILD, so sidecar_state alone
+# would refuse every package that ships one. Sets NV_BUNDLED_BIN to the one it found.
+bundled_sidecar_present() {
+	NV_BUNDLED_PRESENT=0
+	setup_dir
+	_bsp_bin=$NV_SETUP_DIR/verdandi-claude-sidecar
+	if [ -n "$NV_SETUP_DIR" ] && [ -f "$_bsp_bin" ] && [ -x "$_bsp_bin" ]; then
+		if "$_bsp_bin" --version >/dev/null 2>&1; then
+			NV_BUNDLED_PRESENT=1
+			NV_BUNDLED_BIN=$_bsp_bin
+			return 0
+		fi
+	fi
+	sidecar_state "$REL_REV7"
+	NV_BUNDLED_PRESENT=$NV_SIDECAR_PRESENT
+	NV_BUNDLED_BIN=$NV_SIDECAR_BIN
+}
+
+# version_name VALUE sets VN=1 when VALUE is a sidecar version and nothing else. grep reads lines, so a
+# value holding a newline would match by its first line.
+version_name() {
+	VN=0
+	case $1 in *"$NV_NL"*) return 0 ;; esac
+	if printf '%s\n' "$1" | grep -Eqx "$NV_SIDECAR_VERSION_ERE"; then VN=1; fi
+}
+
+# read_selected sets NV_SELECTED_VERSION to the version `selected` names, or nothing: absent, or not
+# exactly one line of `version=` and a version, is no selection, the same answer a tab gets. Nothing else
+# is read from that file. $() would drop every trailing newline, and the x keeps them; a NUL it would
+# drop too comes back as a character no version holds. Past 256 bytes the cut leaves no version either:
+# none is that long.
+read_selected() {
+	NV_SELECTED_VERSION=
+	if [ ! -f "$NV_SIDECAR_SELECTED" ]; then return 0; fi
+	_rs=$(head -c 256 -- "$NV_SIDECAR_SELECTED" 2>/dev/null | tr '\000' '?'; printf x)
+	_rs=${_rs%x}
+	_rs=${_rs%"$NV_NL"}
+	case $_rs in version=*) ;; *) return 0 ;; esac
+	_rs=${_rs#version=}
+	version_name "$_rs"
+	if [ "$VN" = 1 ]; then NV_SELECTED_VERSION=$_rs; fi
+}
+
+# update_intact VERSION: sidecar_dir_state for updates/VERSION, where it decides whether to build that
+# version or to select it. A link there is nothing an update made, so it is no copy of that version.
+update_intact() {
+	NV_SIDECAR_PRESENT=0
+	if [ ! -L "$NV_SIDECAR_UPDATES/$1" ]; then sidecar_dir_state "$NV_SIDECAR_UPDATES/$1" "$1"; fi
+}
+
+# selected_replaceable: `selected` is something a rename replaces. mv onto a directory, or onto a link
+# to one, puts the file inside it and exits 0, with nothing selected.
+selected_replaceable() {
+	if [ -d "$NV_SIDECAR_SELECTED" ]; then
+		die "$NV_SIDECAR_SELECTED is a directory, or a link to one: this installer never made it. Remove it and re-run"
+	fi
+}
+
+# write_selected VERSION: select VERSION for new tabs, replacing `selected` in one rename.
+write_selected() {
+	selected_replaceable
+	NV_SELECTED_TMP=$NV_SIDECAR_ROOT/.selected.tmp.$$
+	printf 'version=%s\n' "$1" >"$NV_SELECTED_TMP" || die "cannot write $NV_SELECTED_TMP"
+	mv -- "$NV_SELECTED_TMP" "$NV_SIDECAR_SELECTED" || die "cannot move $NV_SELECTED_TMP to $NV_SIDECAR_SELECTED"
+	NV_SELECTED_TMP=
+}
+
+# sidecar_probe PATH: the installed Eitri's own judgement of the sidecar at PATH, on this machine with
+# this claude: it starts it as a tab would and exits. Sets SP_OK, and SP_WHY to the reason: on a refusal
+# the last line of what it printed, since a sidecar's own stderr comes before it.
+sidecar_probe() {
+	SP_OK=0
+	SP_WHY=
+	setup_dir
+	if [ -z "$NV_SETUP_DIR" ] || [ ! -x "$NV_SETUP_DIR/shell" ]; then
+		SP_WHY="there is no Eitri binary beside $0 to try it with"
+		return 0
+	fi
+	if _sp_out=$("$NV_SETUP_DIR/shell" --sidecar-probe "$1" 2>&1); then
+		case $NV_NL$_sp_out in
+		*"${NV_NL}ok "*) SP_OK=1 ;;
+		*) SP_WHY="the Eitri binary did not say it accepts it" ;;
+		esac
+		return 0
+	fi
+	SP_WHY=$(printf '%s\n' "$_sp_out" | sed -n '$p')
+	if [ -z "$SP_WHY" ]; then SP_WHY="the Eitri binary gave no reason"; fi
+}
+
+# sidecar_preflight: what needs no network and no lock. A fallback must exist before anything is
+# selected, and a machine that cannot check a signature goes without an update.
+sidecar_preflight() {
+	resolve_setup_release
+	require_sidecar_contract
+	bundled_sidecar_present
+	if [ "$NV_BUNDLED_PRESENT" != 1 ]; then
+		die "the bundled sidecar is not built yet, and an update needs it as the fallback: run \"eitri setup\" first"
+	fi
+	if ! command -v ssh-keygen >/dev/null 2>&1; then
+		openssh_hint
+		die "ssh-keygen was not found, so a sidecar release's signature cannot be checked, and an update is taken signed or not at all. Install OpenSSH's client$OH_HINT and re-run"
+	fi
+	if [ -z "$OPT_SIGNERS" ]; then
+		_spf_text=$(embedded_release_signers)
+		if ! printf '%s\n' "$_spf_text" | grep -Eq '^[[:space:]]*[^#[:space:]]'; then
+			die "this installer lists no release key, so a sidecar release's signature cannot be checked, and an update is taken signed or not at all"
+		fi
+	fi
+	require_curl
+}
+
+# sr_field TEXT KEY ERE sets SRF to KEY's value in SIDECAR-RELEASE's text, refusing a value that does
+# not match. Every value has its expression, and is used only after it.
+sr_field() {
+	SRF=$(kv_value "$1" "$2")
+	if ! printf '%s\n' "$SRF" | grep -Eqx "$3"; then
+		die "SIDECAR-RELEASE names no valid $2: the release is damaged. Report it at $NV_ISSUES"
+	fi
+}
+
+# parse_sidecar_release FILE sets the SR_ fields from a checked SIDECAR-RELEASE. Format 1 is additive,
+# so an unknown key is ignored, and a release an older installer must not read says so with a new FORMAT.
+parse_sidecar_release() {
+	_psr=$(cat -- "$1") || die "cannot open $1"
+	sr_field "$_psr" FORMAT '[0-9]{1,6}'
+	if [ "$SRF" != 1 ]; then die "this release needs a newer Eitri (SIDECAR-RELEASE format $SRF)"; fi
+	sr_field "$_psr" SIDECAR_VERSION "$NV_SIDECAR_VERSION_ERE"
+	SR_VERSION=$SRF
+	sr_field "$_psr" SIDECAR_COMMIT '[0-9a-f]{40}'
+	SR_COMMIT=$SRF
+	sr_field "$_psr" SIDECAR_SOURCE 'claude-sidecar-[0-9A-Za-z.-]+-source\.tar\.gz'
+	SR_SOURCE=$SRF
+	if [ "$SR_SOURCE" != "claude-sidecar-$SR_VERSION-source.tar.gz" ]; then
+		die "SIDECAR-RELEASE names no valid SIDECAR_SOURCE: it is not claude-sidecar-$SR_VERSION-source.tar.gz, so the release is damaged. Report it at $NV_ISSUES"
+	fi
+	sr_field "$_psr" PROTOCOL_MAJOR '[0-9]{1,6}'
+	SR_PROTOCOL_MAJOR=$SRF
+	sr_field "$_psr" PROTOCOL_MINOR '[0-9]{1,6}'
+	SR_PROTOCOL_MINOR=$SRF
+	sr_field "$_psr" CAPABILITIES '[a-z0-9_]+( [a-z0-9_]+)*'
+	SR_CAPABILITIES=$SRF
+	sr_field "$_psr" SDK_VERSION '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?'
+	SR_SDK_VERSION=$SRF
+	sr_field "$_psr" NODE_VERSION 'v[0-9]+\.[0-9]+\.[0-9]+'
+	SR_NODE_VERSION=$SRF
+	sr_field "$_psr" NODE_SHA256_linux_x64 '[0-9a-f]{64}'
+	SR_NODE_SHA256_LINUX_X64=$SRF
+	sr_field "$_psr" NODE_SHA256_linux_arm64 '[0-9a-f]{64}'
+	SR_NODE_SHA256_LINUX_ARM64=$SRF
+	sr_field "$_psr" GRPC_TOOLS_VERSION '[0-9]+\.[0-9]+\.[0-9]+'
+	SR_GRPC_TOOLS_VERSION=$SRF
+	sr_field "$_psr" GRPC_TOOLS_SHA256_linux_x64 '[0-9a-f]{64}'
+	SR_GRPC_TOOLS_SHA256_LINUX_X64=$SRF
+	sr_field "$_psr" GRPC_TOOLS_SHA256_linux_arm64 '[0-9a-f]{64}'
+	SR_GRPC_TOOLS_SHA256_LINUX_ARM64=$SRF
+	sr_field "$_psr" BUILD_STAMP '[0-9a-f]{16}'
+	SR_BUILD_STAMP=$SRF
+	sr_field "$_psr" CLI_RANGE '[0-9]+\.[0-9]+\.[0-9]+ [0-9]+\.[0-9]+\.[0-9]+'
+	sr_field "$_psr" TESTED_CLI '[0-9]+\.[0-9]+\.[0-9]+( [0-9]+\.[0-9]+\.[0-9]+)*'
+}
+
+# sidecar_fetch_manifest: into NV_DL, the release's SHA256SUMS and its signature, then, with the
+# signature good, SIDECAR-RELEASE checked against it and parsed. `latest` is GitHub's pointer to the
+# newest non-prerelease; sidecar_decide is what keeps a served older one from lowering what runs.
+sidecar_fetch_manifest() {
+	check_base_url "${OPT_BASE_URL:-$NV_SIDECAR_REPO_BASE}"
+	if [ -n "$OPT_VERSION" ]; then
+		_sfm_url=$NV_BASE/releases/download/claude-sidecar-v$OPT_VERSION
+	else
+		_sfm_url=$NV_BASE/releases/latest/download
+	fi
+	fetch "$_sfm_url/SHA256SUMS" "$NV_DL/SHA256SUMS" SHA256SUMS "$NV_SIDECAR_META_MAX_BYTES"
+	fetch "$_sfm_url/SHA256SUMS.sig" "$NV_DL/SHA256SUMS.sig" "SHA256SUMS.sig (a release without a signature is refused)" "$NV_SIDECAR_META_MAX_BYTES"
+	verify_signature "$NV_DL/SHA256SUMS" "$NV_DL/SHA256SUMS.sig" "$NV_SIDECAR_NAMESPACE"
+	NV_SUMS_TEXT=$(cat -- "$NV_DL/SHA256SUMS") || die "cannot open $NV_DL/SHA256SUMS"
+	fetch "$_sfm_url/SIDECAR-RELEASE" "$NV_DL/SIDECAR-RELEASE.part" SIDECAR-RELEASE "$NV_SIDECAR_META_MAX_BYTES"
+	verify_file "$NV_DL/SIDECAR-RELEASE.part" SIDECAR-RELEASE
+	mv -- "$NV_DL/SIDECAR-RELEASE.part" "$NV_DL/SIDECAR-RELEASE" || die "cannot rename $NV_DL/SIDECAR-RELEASE.part"
+	parse_sidecar_release "$NV_DL/SIDECAR-RELEASE"
+}
+
+# sidecar_decide: whether this release is one to take, before anything is spent on it. Sets SD_OK,
+# and SD_WHY to why not. With no --version the release must also be newer than `selected` and every
+# complete update, so a served older release cannot lower what runs; naming a version is how a person
+# goes down on purpose.
+sidecar_decide() {
+	SD_OK=0
+	SD_WHY=
+	if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$SR_VERSION" ]; then
+		SD_WHY="asked for $OPT_VERSION, but this release says it is $SR_VERSION"
+		return 0
+	fi
+	if [ "$SR_PROTOCOL_MAJOR" -gt "$REL_SIDECAR_PROTOCOL_MAJOR" ]; then
+		SD_WHY="this release needs a newer Eitri: it speaks protocol major $SR_PROTOCOL_MAJOR, this Eitri $REL_SIDECAR_PROTOCOL_MAJOR"
+		return 0
+	fi
+	if [ "$SR_PROTOCOL_MAJOR" != "$REL_SIDECAR_PROTOCOL_MAJOR" ]; then
+		SD_WHY="this release speaks protocol major $SR_PROTOCOL_MAJOR, and this Eitri needs $REL_SIDECAR_PROTOCOL_MAJOR"
+		return 0
+	fi
+	for _sd_c in $REL_SIDECAR_REQUIRED_CAPABILITIES; do
+		case " $SR_CAPABILITIES " in
+		*" $_sd_c "*) ;;
+		*)
+			SD_WHY="this release does not offer $_sd_c, which this Eitri needs of an update"
+			return 0
+			;;
+		esac
+	done
+	_sd_cmp=$(semver_cmp "$SR_VERSION" "$REL_SIDECAR_VERSION")
+	if [ "$_sd_cmp" != 1 ]; then
+		SD_WHY="release $SR_VERSION is not newer than the bundled sidecar ($REL_SIDECAR_VERSION)"
+		return 0
+	fi
+	case $SR_VERSION in
+	*-rc.*)
+		if [ -z "$OPT_VERSION" ]; then
+			SD_WHY="release $SR_VERSION is a release candidate: name it with --version to take it"
+			return 0
+		fi
+		;;
+	esac
+	update_intact "$SR_VERSION"
+	if [ "$NV_SIDECAR_PRESENT" = 1 ]; then
+		SD_WHY="already built: eitri sidecar use $SR_VERSION"
+		return 0
+	fi
+	if [ -z "$OPT_VERSION" ]; then
+		read_selected
+		_sd_floor=$NV_SELECTED_VERSION
+		_sd_held=selected
+		for _sd_d in "$NV_SIDECAR_UPDATES"/*; do
+			if [ ! -d "$_sd_d" ] || [ -L "$_sd_d" ]; then continue; fi
+			_sd_n=${_sd_d##*/}
+			version_name "$_sd_n"
+			if [ "$VN" != 1 ]; then continue; fi
+			sidecar_dir_state "$_sd_d" "$_sd_n"
+			if [ "$NV_SIDECAR_PRESENT" != 1 ]; then continue; fi
+			if [ -n "$_sd_floor" ]; then
+				_sd_cmp=$(semver_cmp "$_sd_n" "$_sd_floor")
+				if [ "$_sd_cmp" != 1 ]; then continue; fi
+			fi
+			_sd_floor=$_sd_n
+			_sd_held=kept
+		done
+		if [ -n "$_sd_floor" ]; then
+			_sd_cmp=$(semver_cmp "$SR_VERSION" "$_sd_floor")
+			if [ "$_sd_cmp" != 1 ]; then
+				SD_WHY="release $SR_VERSION is not newer than $_sd_floor, which is $_sd_held here: name it with --version to take it anyway"
+				return 0
+			fi
+		fi
+	fi
+	SD_OK=1
+}
+
+# sidecar_download_protoc WORKDIR: the protoc tarball for this machine, checked against the manifest.
+# Sets SDP_TARBALL.
+sidecar_download_protoc() {
+	case $NV_NODE_ARCH in
+	x64) _sdp_sha=$SR_GRPC_TOOLS_SHA256_LINUX_X64 ;;
+	arm64) _sdp_sha=$SR_GRPC_TOOLS_SHA256_LINUX_ARM64 ;;
+	esac
+	_sdp_name=linux-$NV_NODE_ARCH.tar.gz
+	_sdp_base=$(grpc_dist_base)
+	_sdp_url=$_sdp_base/grpc-tools/v$SR_GRPC_TOOLS_VERSION/$_sdp_name
+	_sdp_out=$1/$_sdp_name
+	curl_get "$_sdp_url" "$_sdp_out.part" "$NV_SIDECAR_ARCHIVE_MAX_BYTES"
+	if [ "$CG_OK" != 1 ]; then die "could not download the pinned protoc ($_sdp_url): $CG_ERR"; fi
+	_sdp_have=$(file_sha256 "$_sdp_out.part")
+	if [ "$_sdp_have" != "$_sdp_sha" ]; then
+		rm -f -- "$_sdp_out.part" || :
+		die "checksum mismatch for $_sdp_name: expected $_sdp_sha, got $_sdp_have. Refusing to build the sidecar with an unverified protoc; re-run, and report it at $NV_ISSUES if it persists"
+	fi
+	mv -- "$_sdp_out.part" "$_sdp_out" || die "cannot rename $_sdp_out.part"
+	SDP_TARBALL=$_sdp_out
+}
+
+# sidecar_fact_is FACTS KEY WANT: the built artifact's KEY must be what the signed manifest says.
+sidecar_fact_is() {
+	_sfi=$(kv_value "$1" "$2")
+	if [ "$_sfi" != "$3" ]; then
+		die "the built sidecar says $2=$_sfi, and the signed release says $3: a build that differs from what was released is not used. Report it at $NV_ISSUES"
+	fi
+}
+
+# sidecar_accept_release ARTIFACT: the built artifact is what the signed manifest describes, read with
+# the pinned Node from the artifact's own --version --json.
+sidecar_accept_release() {
+	_sar=$("$1" --version --json 2>/dev/null | "$SB_NODE_BIN/node" -e "$NV_SIDECAR_FACTS_JS") ||
+		die "the built sidecar ($1) could not report its own --version --json: report it at $NV_ISSUES"
+	sidecar_fact_is "$_sar" sidecar_version "$SR_VERSION"
+	sidecar_fact_is "$_sar" protocol "$SR_PROTOCOL_MAJOR.$SR_PROTOCOL_MINOR"
+	sidecar_fact_is "$_sar" node "$SR_NODE_VERSION"
+	sidecar_fact_is "$_sar" sdk_version "$SR_SDK_VERSION"
+	sidecar_fact_is "$_sar" build_stamp "$SR_BUILD_STAMP"
+	sidecar_fact_is "$_sar" executables '["host_cli"]'
+}
+
+# sidecar_install_update: the accepted artifact into updates/<version>/ and selected. BUILD goes in
+# last, and the directory lands by one rename, so no reader finds half of it; a name already there is
+# moved aside first, because mv onto a directory nests and exits 0. A run killed after the directory
+# lands has selected nothing, and the next one finds the build complete. Pruning comes after the
+# selection, so nothing it fails at can undo an update that already stands.
+sidecar_install_update() {
+	if [ ! -d "$NV_SIDECAR_UPDATES" ]; then
+		mkdir -p -- "$NV_SIDECAR_UPDATES" || die "cannot create $NV_SIDECAR_UPDATES"
+		NV_UPDATES_CREATED=1
+	fi
+	NV_UPDATE_TMP=$NV_SIDECAR_UPDATES/.$SR_VERSION.tmp.$$
+	mkdir -- "$NV_UPDATE_TMP" || die "cannot create $NV_UPDATE_TMP"
+	cp -- "$SB_ARTIFACT" "$NV_UPDATE_TMP/verdandi-claude-sidecar" || die "cannot write $NV_UPDATE_TMP/verdandi-claude-sidecar"
+	chmod 0755 "$NV_UPDATE_TMP/verdandi-claude-sidecar" || die "cannot chmod $NV_UPDATE_TMP/verdandi-claude-sidecar"
+	if [ -f "$SB_SDK_LICENSE" ]; then cp -- "$SB_SDK_LICENSE" "$NV_UPDATE_TMP/LICENSE.md" || die "cannot write $NV_UPDATE_TMP/LICENSE.md"; fi
+	if [ -f "$SB_NODE_LICENSE" ]; then cp -- "$SB_NODE_LICENSE" "$NV_UPDATE_TMP/NODE-LICENSE" || die "cannot write $NV_UPDATE_TMP/NODE-LICENSE"; fi
+	printf 'VERDANDI_REV=%s\nSIDECAR_VERSION_LINE=%s\nBUILT_AT=%s\n' \
+		"$SR_COMMIT" "$SB_VERSION_LINE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$NV_UPDATE_TMP/BUILD" ||
+		die "cannot write $NV_UPDATE_TMP/BUILD"
+	NV_UPDATE_DEST=$NV_SIDECAR_UPDATES/$SR_VERSION
+	if [ -e "$NV_UPDATE_DEST" ] || [ -L "$NV_UPDATE_DEST" ]; then
+		NV_UPDATE_ASIDE=$NV_UPDATE_TMP.aside
+		mv -- "$NV_UPDATE_DEST" "$NV_UPDATE_ASIDE" || die "cannot move $NV_UPDATE_DEST aside"
+	fi
+	mv -- "$NV_UPDATE_TMP" "$NV_UPDATE_DEST" || die "cannot move the new sidecar to $NV_UPDATE_DEST"
+	NV_UPDATE_TMP=
+	if [ -n "$NV_UPDATE_ASIDE" ]; then
+		rm -rf -- "$NV_UPDATE_ASIDE" || die "cannot remove $NV_UPDATE_ASIDE"
+		NV_UPDATE_ASIDE=
+	fi
+	read_selected
+	_siu_previous=$NV_SELECTED_VERSION
+	write_selected "$SR_VERSION"
+	prune_updates "$SR_VERSION" "$_siu_previous"
+}
+
+# prune_updates SELECTED PREVIOUS: updates/ keeps those two. A real directory named exactly like a
+# version goes, as do the temporary names a killed run left; a link or any other name is not this
+# installer's. Runs under the lock, so no temporary name belongs to a live run. A sidecar pruned under
+# a running tab stays mapped, and a spawn that read `selected` just before finds no file and takes the
+# bundled one.
+prune_updates() {
+	sidecar_root_ours
+	if [ "$SRO" != 1 ]; then return 0; fi
+	if [ -L "$NV_SIDECAR_UPDATES" ]; then
+		warn "$NV_SIDECAR_UPDATES is a symlink, so nothing behind it was removed: this installer never made that link"
+		return 0
+	fi
+	for _pu_d in "$NV_SIDECAR_UPDATES"/*; do
+		if [ ! -d "$_pu_d" ] || [ -L "$_pu_d" ]; then continue; fi
+		_pu_n=${_pu_d##*/}
+		version_name "$_pu_n"
+		if [ "$VN" != 1 ] || [ "$_pu_n" = "$1" ] || [ "$_pu_n" = "$2" ]; then continue; fi
+		if ! rm -rf -- "$_pu_d"; then warn "could not remove $_pu_d"; fi
+	done
+	for _pu_d in "$NV_SIDECAR_UPDATES"/.*.tmp.* "$NV_SIDECAR_ROOT"/.selected.tmp.*; do
+		if [ ! -e "$_pu_d" ] && [ ! -L "$_pu_d" ]; then continue; fi
+		if ! rm -rf -- "$_pu_d"; then warn "could not remove $_pu_d"; fi
+	done
+}
+
+# do_sidecar_update: --sidecar-update. Runs under the lock with a download directory of its own:
+# recover_interrupted repairs $NV_LIB, which this path has no business with.
+do_sidecar_update() {
+	NV_LEAVE_LIB=1
+	sidecar_preflight
+	acquire_lock
+	selected_replaceable
+	NV_DL=$NV_CACHE_NV/sidecar-update
+	rm -rf -- "$NV_DL" || die "cannot remove $NV_DL, left by an interrupted run"
+	mkdir -m 0700 -- "$NV_DL" || die "cannot create $NV_DL"
+	prepare_signers
+	sidecar_fetch_manifest
+	sidecar_decide
+	if [ "$SD_OK" != 1 ]; then die "$SD_WHY"; fi
+
+	# From here on every file comes from the release's own tag, so `latest` moving cannot mix two.
+	NV_REL_URL=$NV_BASE/releases/download/claude-sidecar-v$SR_VERSION
+	download_verified "$SR_SOURCE" "$NV_SIDECAR_ARCHIVE_MAX_BYTES"
+	_dsu_work=$NV_DL/build
+	mkdir -- "$_dsu_work" || die "cannot create $_dsu_work"
+	say "downloading Node and the Claude Agent SDK, then building the sidecar (1-3 min)"
+	# The helpers read these. A release may pin another Node than the one this Eitri bundles.
+	REL_NODE_VERSION=$SR_NODE_VERSION
+	REL_NODE_SHA256_LINUX_X64=$SR_NODE_SHA256_LINUX_X64
+	REL_NODE_SHA256_LINUX_ARM64=$SR_NODE_SHA256_LINUX_ARM64
+	sidecar_download_node "$_dsu_work" 0
+	sidecar_download_protoc "$_dsu_work"
+	check_sidecar_build_space "$_dsu_work"
+	SB_NPM_CI_FLAGS=--ignore-scripts
+	SB_PROTOC_TARBALL=$SDP_TARBALL
+	sidecar_build_core "$_dsu_work" "$SDN_TARBALL" "$NV_DL/$SR_SOURCE"
+	sidecar_accept_release "$SB_ARTIFACT"
+	sidecar_probe "$SB_ARTIFACT"
+	if [ "$SP_OK" != 1 ]; then die "built, but it will not start here: $SP_WHY"; fi
+	sidecar_install_update
+	say "sidecar $SR_VERSION built, and this Eitri accepts it."
+	say "Open tabs keep the sidecar they started with. New Claude tabs use $SR_VERSION."
+	say "To go back: eitri sidecar use bundled"
+}
+
+# do_sidecar_check: --sidecar-check. The manifest's half of an update, in a directory of its own and
+# without the lock, so it runs beside an update and changes nothing. It prints only fields that
+# passed the signature. A release it would not take is an answer, not a failure.
+do_sidecar_check() {
+	sidecar_preflight
+	check_cache_root
+	NV_SIDECAR_CHECK_DIR=$(mktemp -d "$NV_CACHE_NV/sidecar-check.XXXXXX") || die "cannot create a directory under $NV_CACHE_NV"
+	NV_DL=$NV_SIDECAR_CHECK_DIR
+	prepare_signers
+	sidecar_fetch_manifest
+	sidecar_decide
+	_dsc_run=$REL_SIDECAR_VERSION
+	read_selected
+	if [ -n "$NV_SELECTED_VERSION" ]; then
+		_dsc_cmp=$(semver_cmp "$NV_SELECTED_VERSION" "$REL_SIDECAR_VERSION")
+		sidecar_dir_state "$NV_SIDECAR_UPDATES/$NV_SELECTED_VERSION" "$NV_SELECTED_VERSION"
+		if [ "$_dsc_cmp" = 1 ] && [ "$NV_SIDECAR_PRESENT" = 1 ]; then _dsc_run=$NV_SELECTED_VERSION; fi
+	fi
+	say "newest release: $SR_VERSION (protocol $SR_PROTOCOL_MAJOR.$SR_PROTOCOL_MINOR, Agent SDK $SR_SDK_VERSION). You run $_dsc_run."
+	if [ "$SD_OK" = 1 ]; then
+		say "eitri sidecar update takes it: 1-3 minutes, about 600 MiB free, and network access to nodejs.org, npm and grpc.io."
+	else
+		say "$SD_WHY"
+	fi
+}
+
+# sidecar_facts BIN sets SF_PROTOCOL, SF_SDK and SF_TESTED from the one line of BIN's --version --json,
+# each empty when it does not say. This path has no Node, and sed is enough for what JSON.stringify
+# writes. SF_TESTED keeps its quotes, so that one version is not found inside another.
+sidecar_facts() {
+	_sf=$("$1" --version --json 2>/dev/null | head -n 1) || _sf=
+	SF_PROTOCOL=$(printf '%s\n' "$_sf" | sed -n 's/.*"protocol":{"major":\([0-9]*\),"minor":\([0-9]*\)}.*/\1.\2/p')
+	SF_SDK=$(printf '%s\n' "$_sf" | sed -n 's/.*"sdk_version":"\([^"]*\)".*/\1/p')
+	SF_TESTED=$(printf '%s\n' "$_sf" | sed -n 's/.*"tested_cli_versions":\[\([^]]*\)\].*/\1/p')
+}
+
+# status_row LABEL TEXT: one line of `eitri sidecar status`.
+status_row() {
+	printf '%-22s %s\n' "$1" "$2"
+}
+
+# status_selected sets SS_UPDATE to the update a new tab starts, by the rule a tab applies (strictly
+# newer than bundled, with its binary and BUILD; nothing is compared at a spawn), and SS_NOTE to what
+# there is to say about `selected`.
+status_selected() {
+	SS_UPDATE=
+	SS_NOTE=
+	if [ -z "$NV_SELECTED_VERSION" ]; then
+		if [ -e "$NV_SIDECAR_SELECTED" ] || [ -L "$NV_SIDECAR_SELECTED" ]; then SS_NOTE="names no version, so unused"; fi
+		return 0
+	fi
+	_ss_cmp=$(semver_cmp "$NV_SELECTED_VERSION" "$REL_SIDECAR_VERSION")
+	case $_ss_cmp in
+	-1)
+		SS_NOTE="$NV_SELECTED_VERSION, older than the bundled sidecar, so unused"
+		return 0
+		;;
+	0)
+		SS_NOTE="$NV_SELECTED_VERSION, the same as the bundled sidecar, so unused"
+		return 0
+		;;
+	esac
+	_ss_dir=$NV_SIDECAR_UPDATES/$NV_SELECTED_VERSION
+	if [ ! -f "$_ss_dir/verdandi-claude-sidecar" ] || [ ! -f "$_ss_dir/BUILD" ]; then
+		SS_NOTE="$NV_SELECTED_VERSION, not complete, so unused"
+		return 0
+	fi
+	SS_UPDATE=$NV_SELECTED_VERSION
+	sidecar_dir_state "$_ss_dir" "$NV_SELECTED_VERSION"
+	if [ "$NV_SIDECAR_PRESENT" != 1 ]; then SS_NOTE="$NV_SELECTED_VERSION, which does not match its BUILD file"; fi
+}
+
+# status_named sets SN_TEXT and SN_BIN when the environment names a sidecar, which wins over all of
+# this: a tab takes it whatever is selected, and blank is not named.
+status_named() {
+	SN_TEXT=
+	SN_BIN=
+	case ${EITRI_SIDECAR_BINARY-} in
+	*[![:space:]]*)
+		SN_TEXT="$EITRI_SIDECAR_BINARY, named by EITRI_SIDECAR_BINARY"
+		SN_BIN=$EITRI_SIDECAR_BINARY
+		return 0
+		;;
+	esac
+	case ${EITRI_VERDANDI_CHECKOUT-} in
+	*[![:space:]]*) SN_TEXT="the checkout $EITRI_VERDANDI_CHECKOUT, named by EITRI_VERDANDI_CHECKOUT" ;;
+	esac
+}
+
+# do_sidecar_status: --sidecar-status. Reads files and runs --version: no lock, so it answers during an
+# update, and no network.
+do_sidecar_status() {
+	resolve_setup_release
+	require_sidecar_contract
+	bundled_sidecar_present
+	read_selected
+	status_selected
+	status_named
+	SF_PROTOCOL='' SF_SDK='' SF_TESTED=''
+	_dss_bundled=
+	if [ "$NV_BUNDLED_PRESENT" = 1 ]; then
+		sidecar_facts "$NV_BUNDLED_BIN"
+		if [ -n "$SF_PROTOCOL" ]; then _dss_bundled=" (protocol $SF_PROTOCOL)"; fi
+	fi
+	if [ -n "$SN_TEXT" ]; then
+		SF_TESTED=
+		if [ -n "$SN_BIN" ] && [ -f "$SN_BIN" ] && [ -x "$SN_BIN" ]; then sidecar_facts "$SN_BIN"; fi
+		_dss_run=$SN_TEXT
+	elif [ -n "$SS_UPDATE" ]; then
+		sidecar_facts "$NV_SIDECAR_UPDATES/$SS_UPDATE/verdandi-claude-sidecar"
+		_dss_run="update $SS_UPDATE"
+	elif [ "$NV_BUNDLED_PRESENT" = 1 ]; then
+		_dss_run="bundled $REL_SIDECAR_VERSION"
+	else
+		_dss_run="nothing yet, run eitri setup"
+	fi
+	if [ -z "$SN_TEXT" ] && [ -n "$SF_PROTOCOL" ] && [ -n "$SF_SDK" ]; then
+		_dss_run="$_dss_run (protocol $SF_PROTOCOL, Agent SDK $SF_SDK)"
+	fi
+	status_row "running for new tabs" "$_dss_run"
+	if [ -n "$SS_NOTE" ]; then status_row selected "$SS_NOTE"; fi
+	if [ "$NV_BUNDLED_PRESENT" != 1 ]; then
+		printf 'bundled %s: not built yet, run eitri setup\n' "$REL_SIDECAR_VERSION"
+	elif [ -n "$SS_UPDATE" ] && [ -z "$SN_TEXT" ]; then
+		status_row "bundled with Eitri" "$REL_SIDECAR_VERSION$_dss_bundled, the fallback"
+	else
+		status_row "bundled with Eitri" "$REL_SIDECAR_VERSION$_dss_bundled"
+	fi
+	_dss_kept=
+	for _dss_d in "$NV_SIDECAR_UPDATES"/*; do
+		if [ ! -d "$_dss_d" ] || [ -L "$_dss_d" ]; then continue; fi
+		_dss_n=${_dss_d##*/}
+		version_name "$_dss_n"
+		if [ "$VN" != 1 ] || [ "$_dss_n" = "$NV_SELECTED_VERSION" ]; then continue; fi
+		sidecar_dir_state "$_dss_d" "$_dss_n"
+		if [ "$NV_SIDECAR_PRESENT" = 1 ]; then _dss_kept="$_dss_kept $_dss_n"; fi
+	done
+	if [ -n "$_dss_kept" ]; then status_row kept "${_dss_kept# }"; fi
+	if ! command -v claude >/dev/null 2>&1; then
+		status_row "claude on this machine" "not found"
+		return 0
+	fi
+	_dss_c=$(claude --version 2>/dev/null | head -n 1) || _dss_c=
+	_dss_c=${_dss_c%% *}
+	if [ -z "$_dss_c" ] || [ -z "$SF_TESTED" ]; then
+		status_row "claude on this machine" "${_dss_c:-(version unknown)}"
+		return 0
+	fi
+	case $SF_TESTED in
+	*"\"$_dss_c\""*) status_row "claude on this machine" "$_dss_c, tested with this sidecar" ;;
+	*) status_row "claude on this machine" "$_dss_c, not among the versions this sidecar was tested with" ;;
+	esac
+}
+
+# do_sidecar_use: --sidecar-use bundled|VERSION. Takes the lock, so it cannot race an update's write of
+# `selected`. No network. It does not repeat an update's comparison with the signed manifest: neither
+# that nor the pinned Node survives the build, and a file of this uid gets nothing stronger from a
+# copy of this uid. What it can ask of a build is that the binary is the one BUILD names, that it is
+# above what Eitri bundles, and that this Eitri accepts it now. A version reaches a path only once it
+# has parsed.
+do_sidecar_use() {
+	NV_LEAVE_LIB=1
+	resolve_setup_release
+	require_sidecar_contract
+	_dsuse=$OPT_SIDECAR_USE
+	if [ "$_dsuse" != bundled ]; then
+		version_name "$_dsuse"
+		if [ "$VN" != 1 ]; then die "--sidecar-use: expected bundled or a version such as 0.3.2"; fi
+	fi
+	acquire_lock
+	bundled_sidecar_present
+	if [ "$_dsuse" = bundled ]; then
+		sidecar_use_bundled
+		return 0
+	fi
+	_dsuse_cmp=$(semver_cmp "$_dsuse" "$REL_SIDECAR_VERSION")
+	if [ "$_dsuse_cmp" != 1 ]; then
+		die "update $_dsuse is not newer than the bundled sidecar ($REL_SIDECAR_VERSION), and a sidecar older than the bundled one is never used"
+	fi
+	update_intact "$_dsuse"
+	if [ "$NV_SIDECAR_PRESENT" != 1 ]; then
+		die "update $_dsuse is not built here, or not all of it is: eitri sidecar update --version $_dsuse builds it"
+	fi
+	sidecar_probe "$NV_SIDECAR_BIN"
+	if [ "$SP_OK" != 1 ]; then die "update $_dsuse will not start here: $SP_WHY"; fi
+	write_selected "$_dsuse"
+	say "New Claude tabs use $_dsuse. Open tabs keep the sidecar they started with."
+	say "To go back: eitri sidecar use bundled"
+	if [ "$NV_BUNDLED_PRESENT" != 1 ]; then
+		say "The bundled sidecar is not built yet, so nothing stands behind it: run eitri setup"
+	fi
+}
+
+# sidecar_use_bundled: `selected` goes. A link there goes as a link. A file that names nothing goes
+# the same way, since going back is what a person asks for when something is wrong with it.
+sidecar_use_bundled() {
+	if [ -d "$NV_SIDECAR_SELECTED" ] && [ ! -L "$NV_SIDECAR_SELECTED" ]; then
+		die "$NV_SIDECAR_SELECTED is a directory: this installer never made it. Remove it and re-run"
+	fi
+	read_selected
+	rm -f -- "$NV_SIDECAR_SELECTED" || die "cannot remove $NV_SIDECAR_SELECTED"
+	_sub_built=
+	if [ -n "$NV_SELECTED_VERSION" ]; then
+		sidecar_dir_state "$NV_SIDECAR_UPDATES/$NV_SELECTED_VERSION" "$NV_SELECTED_VERSION"
+		if [ "$NV_SIDECAR_PRESENT" = 1 ]; then
+			_sub_built=" Update $NV_SELECTED_VERSION stays built: eitri sidecar use $NV_SELECTED_VERSION"
+		fi
+	fi
+	if [ "$NV_BUNDLED_PRESENT" = 1 ]; then
+		say "New Claude tabs use the bundled sidecar $REL_SIDECAR_VERSION.$_sub_built"
+	else
+		say "The bundled sidecar $REL_SIDECAR_VERSION is not built yet: run eitri setup.$_sub_built"
+	fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2610,6 +3439,12 @@ synthesize_release_from_checkout() {
 	_src_pins_node_arm64=$(kv_get "$_src_pins" NODE_SHA256_linux_arm64)
 	_src_pins_nvim_version=$(kv_get "$_src_pins" NVIM_VERSION)
 	_src_pins_nvim_sha=$(kv_get "$_src_pins" NVIM_SHA256_linux_x86_64)
+	_src_contract=$_src_dir/packaging/sidecar-contract.env
+	if [ -f "$_src_contract" ]; then
+		_src_sidecar_version=$(kv_get "$_src_contract" SIDECAR_VERSION)
+		_src_sidecar_major=$(kv_get "$_src_contract" SIDECAR_PROTOCOL_MAJOR)
+		_src_sidecar_caps=$(kv_get "$_src_contract" SIDECAR_REQUIRED_CAPABILITIES)
+	fi
 	mkdir -p -- "$NV_CACHE_NV" || die "cannot create $NV_CACHE_NV"
 	_src_release=$NV_CACHE_NV/from-source-RELEASE.$$
 	{
@@ -2619,6 +3454,11 @@ synthesize_release_from_checkout() {
 		printf 'VERDANDI_REV=%s\n' "$AT_REV"
 		printf 'VERDANDI_SOURCE=verdandi-%s-source.tar.gz\n' "$_src_rev7"
 		printf 'VERDANDI_SOURCE_SHA256=%s\n' "$REL_VERDANDI_SOURCE_SHA256"
+		if [ -f "$_src_contract" ]; then
+			printf 'SIDECAR_VERSION=%s\n' "$_src_sidecar_version"
+			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$_src_sidecar_major"
+			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$_src_sidecar_caps"
+		fi
 		printf 'NODE_VERSION=%s\n' "$_src_pins_node_version"
 		printf 'NODE_SHA256_linux_x64=%s\n' "$_src_pins_node_x64"
 		printf 'NODE_SHA256_linux_arm64=%s\n' "$_src_pins_node_arm64"
@@ -2655,7 +3495,7 @@ clone_public_eitri() {
 # way dry_run_new_rev's network branch does for a dry run, then parses it for real.
 fetch_verified_release() {
 	_fvr_want=$(sums_hash RELEASE)
-	fetch "$NV_REL_URL/RELEASE" "$NV_DL/RELEASE.part" RELEASE
+	fetch "$NV_REL_URL/RELEASE" "$NV_DL/RELEASE.part" RELEASE "$NV_MAX_DOWNLOAD_BYTES"
 	_fvr_have=$(file_sha256 "$NV_DL/RELEASE.part")
 	if [ "$_fvr_have" != "$_fvr_want" ]; then
 		rm -f -- "$NV_DL/RELEASE.part" || :
@@ -2979,7 +3819,7 @@ fetch_skia_binaries() {
 		_fsb_get=$_fsb_url
 	fi
 	_fsb_out=$_fsb_workdir/$_fsb_name
-	curl_get "$_fsb_get" "$_fsb_out.part"
+	curl_get "$_fsb_get" "$_fsb_out.part" "$NV_MAX_DOWNLOAD_BYTES"
 	if [ "$CG_OK" != 1 ]; then die "could not download the pinned Skia binaries ($_fsb_get): $CG_ERR"; fi
 	_fsb_have=$(file_sha256 "$_fsb_out.part")
 	if [ "$_fsb_have" != "$_fsb_sha" ]; then
@@ -3112,7 +3952,7 @@ dry_run_new_rev() {
 			# The x keeps the file's own trailing newlines through $(...), so the hash is of exactly
 			# what was served. fetch dies on a failed download, ending the $(...) before the x.
 			_dr_text=$(
-				fetch "$NV_REL_URL/RELEASE" - RELEASE
+				fetch "$NV_REL_URL/RELEASE" - RELEASE "$NV_MAX_DOWNLOAD_BYTES"
 				printf x
 			)
 			_dr_text=${_dr_text%x}
@@ -3534,23 +4374,29 @@ install_complete() {
 	NV_COMPLETE=1
 }
 
+# sidecar_root_ours sets SRO=1 when the sidecar root resolves to a directory named sidecar, as
+# do_uninstall checks the eitri data root; otherwise it warns and sets SRO=0. A user-created link
+# elsewhere could contain unrelated directories named like a rev or a version, and treating those
+# names as ours would remove the user's files.
+sidecar_root_ours() {
+	_sro_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _sro_real=
+	case $_sro_real in
+	*/sidecar) SRO=1 ;;
+	*)
+		SRO=0
+		warn "$NV_SIDECAR_ROOT leads to ${_sro_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what Eitri put there yourself if you no longer need it"
+		;;
+	esac
+}
+
 # prune_sidecars: a sidecar <rev7> directory goes only when no installed RELEASE
 # names it, it is not the new install's rev, and it is not the rev of the install just replaced
 # (kept until the next successful upgrade: a .deb and a tarball install share this directory, and
 # running windows still use the replaced one). Anything not named like a rev is not ours to judge.
 prune_sidecars() {
 	if [ ! -d "$NV_SIDECAR_ROOT" ]; then return 0; fi
-	# Require the resolved sidecar root to be a directory named sidecar, as do_uninstall checks
-	# the eitri data root. A user-created link elsewhere could contain unrelated 7-hex-named
-	# directories; treating those names as ours would remove the user's files.
-	_ps_real=$(cd -P -- "$NV_SIDECAR_ROOT" 2>/dev/null && pwd -P) || _ps_real=
-	case $_ps_real in
-	*/sidecar) ;;
-	*)
-		warn "$NV_SIDECAR_ROOT leads to ${_ps_real:-a directory that cannot be entered}, not to a directory named sidecar, so nothing behind it was removed: this installer never made that link. Remove what Eitri put there yourself if you no longer need it"
-		return 0
-		;;
-	esac
+	sidecar_root_ours
+	if [ "$SRO" != 1 ]; then return 0; fi
 	for _pr_d in "$NV_SIDECAR_ROOT"/*; do
 		if [ ! -d "$_pr_d" ] || [ -L "$_pr_d" ]; then continue; fi
 		_pr_n=${_pr_d##*/}
@@ -3677,7 +4523,7 @@ do_install() {
 		say "would download $NV_REL_URL/$NV_TARBALL_NAME to $NV_TARBALL.part, check its sha256 is $_di_h, and rename it"
 	else
 		NV_REL_URL=$NV_BASE/releases/download/v$NV_VERSION
-		download_verified "$NV_TARBALL_NAME"
+		download_verified "$NV_TARBALL_NAME" "$NV_MAX_DOWNLOAD_BYTES"
 		NV_TARBALL=$NV_DL/$NV_TARBALL_NAME
 	fi
 	say "installing Eitri $NV_VERSION${NV_INSTALLED_VERSION:+ (replacing $NV_INSTALLED_VERSION)}"
@@ -3817,14 +4663,23 @@ do_uninstall() {
 				fi
 				set -- "$@" "$_du_d"
 			done
+			# A package's window reads these as it reads its sidecar, so they stay with it. Each is
+			# removed by its own name: one that is a link goes as a link, and what it leads to stays.
+			if [ -z "$_du_sys" ]; then
+				set -- "$@" "$NV_SIDECAR_UPDATES" "$NV_SIDECAR_SELECTED"
+				for _du_d in "$NV_SIDECAR_ROOT"/.selected.tmp.*; do set -- "$@" "$_du_d"; done
+			elif [ -e "$NV_SIDECAR_UPDATES" ] || [ -e "$NV_SIDECAR_SELECTED" ]; then
+				say "keeping $NV_SIDECAR_UPDATES and $NV_SIDECAR_SELECTED: $NV_SYSTEM_RELEASE's install uses them"
+			fi
 		fi
 	fi
 	# Include all build scratch in uninstall targets, including --keep-build leftovers and
 	# scratch from a run interrupted before on_exit, so purge can remove them too.
-	for _du_p in download unpack sidecar-build src nvim-build verdandi-src verdandi-src-build \
+	for _du_p in download unpack sidecar-build sidecar-update src nvim-build verdandi-src verdandi-src-build \
 		from-source-node from-source-skia; do
 		set -- "$@" "$NV_CACHE_NV/$_du_p"
 	done
+	for _du_p in "$NV_CACHE_NV"/sidecar-check.*; do set -- "$@" "$_du_p"; done
 	_du_cfg_note=
 	if [ "$OPT_PURGE" = 1 ]; then
 		# Exactly two: the settings directory Eitri reads when EITRI_CONFIG_DIR is unset (settings_dir:
@@ -3933,14 +4788,15 @@ main() {
 	set_paths
 	check_root
 	# check_data_home's own scope (its doc comment above) is every mode that writes under NV_DATA:
-	# do_install, do_from_source, do_sidecar_only, do_nvim_only, do_nvim_offer. --uninstall is
-	# exempt on purpose (its own comment explains why); --build-sidecar-into is exempt too --
+	# do_install, do_from_source, do_sidecar_only, do_sidecar_update, do_sidecar_use, do_nvim_only,
+	# do_nvim_offer. --uninstall is exempt on purpose (its own comment explains why); --sidecar-status
+	# writes nothing, and a tab reads that directory wherever it is; --build-sidecar-into is exempt too --
 	# neither reads nor writes anything under NV_DATA/XDG_DATA_HOME (its workdir is under
 	# NV_CACHE_NV, its output goes to the caller's own --build-sidecar-into DIR) -- it is the AUR
 	# package's build() entry point, which can run in a sandbox that sets XDG_DATA_HOME
 	# outside HOME; this mode does not use it.
 	case $OPT_MODE in
-	uninstall | build-sidecar-into) ;;
+	uninstall | build-sidecar-into | sidecar-status) ;;
 	*) check_data_home ;;
 	esac
 	trap on_exit EXIT
@@ -3950,6 +4806,10 @@ main() {
 	case $OPT_MODE in
 	uninstall) do_uninstall ;;
 	sidecar-only) do_sidecar_only ;;
+	sidecar-update) do_sidecar_update ;;
+	sidecar-check) do_sidecar_check ;;
+	sidecar-status) do_sidecar_status ;;
+	sidecar-use) do_sidecar_use ;;
 	build-sidecar-into) do_build_sidecar_into ;;
 	nvim-only) do_nvim_only ;;
 	nvim-offer) do_nvim_offer ;;

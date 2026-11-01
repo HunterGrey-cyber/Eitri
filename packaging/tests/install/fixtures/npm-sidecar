@@ -13,12 +13,24 @@
 #   bad-protocol  the built artifact reports the wrong protocol number
 #   bad-node      the built artifact reports the wrong node version
 #   sdk-bundled   the built artifact serves "host_cli, sdk_bundled" (never host_cli alone)
+#
+# EITRI_INSTALL_TEST_NPM_LOG, when set, names a file that gets one line per step: `ci` with its
+# arguments, and `build` with whether grpc-tools' protoc and plugin were in place by then.
+# EITRI_INSTALL_TEST_GRPC_TOOLS_VERSION is the grpc-tools version `npm ci` lays down.
+# EITRI_INSTALL_TEST_SDK_VERSION, _PROTOCOL_MINOR and _EXECUTABLES are what the artifact's
+# --version --json reports, beside the version and stamp above.
 mode=${EITRI_INSTALL_TEST_NPM_MODE:-ok}
 sidecar_version=${EITRI_INSTALL_TEST_SIDECAR_VERSION:-0.1.0}
 build_stamp=${EITRI_INSTALL_TEST_BUILD_STAMP:-0123456789abcdef}
+sdk_version=${EITRI_INSTALL_TEST_SDK_VERSION:-0.3.252}
+protocol_minor=${EITRI_INSTALL_TEST_PROTOCOL_MINOR:-24}
+executables=${EITRI_INSTALL_TEST_EXECUTABLES:-'["host_cli"]'}
+grpc_tools_version=${EITRI_INSTALL_TEST_GRPC_TOOLS_VERSION:-1.13.1}
+npm_log=${EITRI_INSTALL_TEST_NPM_LOG:-}
 
 case $1 in
 ci)
+	if [ -n "$npm_log" ]; then printf '%s\n' "$*" >>"$npm_log"; fi
 	case $mode in
 	fail-ci)
 		echo "npm-sidecar-stub: simulated npm ci failure" >&2
@@ -30,6 +42,10 @@ ci)
 	printf '%s\n' '© Anthropic PBC. All rights reserved.' \
 		'See https://www.anthropic.com/legal/consumer-terms for the full terms.' \
 		>node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md
+	mkdir -p node_modules/grpc-tools/bin || exit 1
+	printf '{\n  "version": "%s"\n}\n' "$grpc_tools_version" >node_modules/grpc-tools/package.json
+	printf '// the package own script, beside the two executables it would fetch\n' \
+		>node_modules/grpc-tools/bin/protoc.js
 	exit 0
 	;;
 run)
@@ -43,6 +59,13 @@ run)
 		exit 1
 		;;
 	esac
+	if [ -n "$npm_log" ]; then
+		protoc_there=no
+		if [ -x node_modules/grpc-tools/bin/protoc ] && [ -x node_modules/grpc-tools/bin/grpc_node_plugin ]; then
+			protoc_there=yes
+		fi
+		printf 'build protoc=%s\n' "$protoc_there" >>"$npm_log"
+	fi
 	protocol=3
 	node_version=${EITRI_INSTALL_TEST_NODE_VERSION:-v22.23.2}
 	served=host_cli
@@ -55,6 +78,10 @@ run)
 	artifact=apps/claude-sidecar/dist-bin/verdandi-claude-sidecar-$sidecar_version-linux-x64
 	cat >"$artifact" <<ARTIFACT_EOF
 #!/bin/sh
+if [ "\$1" = "--version" ] && [ "\${2-}" = "--json" ]; then
+	printf '%s\n' '{"v":1,"sidecar_version":"$sidecar_version","protocol":{"major":$protocol,"minor":$protocol_minor},"node":"$node_version","build_stamp":"$build_stamp","sdk_version":"$sdk_version","tested_cli_versions":["2.1.252"],"executables":$executables}'
+	exit 0
+fi
 if [ "\$1" = "--version" ]; then
 	printf '%s\n' \\
 		"verdandi-claude-sidecar $sidecar_version (protocol $protocol, node $node_version, build $build_stamp)" \\
