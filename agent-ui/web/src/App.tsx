@@ -142,19 +142,14 @@ import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
 
-/** The line `agent/src/providers/claude_sidecar/spawn.rs::describe_checkout` writes for version skew.
- *  Moved in from the deleted `statusRow.ts`: the band's `warn` fact
- *  is this module's logic now, since `BandFacts` itself stays decoupled from `ProviderInfo`. */
-export const SKEW_PREFIX = "Verdandi baseline drift";
-
-/** `⚠` only for version skew, an unavailable Claude Code prompt or a refusal:
- *  a warning that shows on every session stops being read.
+/** `⚠` only for an unavailable Claude Code prompt, a tab that could not run its sidecar update, or a
+ *  refusal: a warning that shows on every session stops being read.
  *  Returns what the glyph's title says, or null. Routine diagnostics (the CLI version one, which can
  *  be present on every session of a host) go to the detail popover only. */
 export function statusWarning(provider: ProviderInfo | null, failure: string | null): string | null {
   if (failure !== null) return failure;
   return provider?.startupDiagnostics.find(
-    (line) => line.startsWith(SKEW_PREFIX) || line.startsWith("Claude Code's system prompt unavailable"),
+    (line) => line.startsWith("Claude Code's system prompt unavailable") || line.startsWith("Sidecar update"),
   ) ?? null;
 }
 

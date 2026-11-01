@@ -77,9 +77,11 @@ contents:
   - src: ./dist/verdandi-claude-sidecar
     dst: /usr/lib/eitri/verdandi-claude-sidecar
 
-  # The public twin revision must match EXPECTED_VERDANDI_REVISION in the extracted shell.
+  # The public twin revision must match BUNDLED_SIDECAR_REVISION in the extracted shell.
+  # This profile ships no eitri-setup, so `eitri sidecar update` does not apply: the package carries its sidecar and
+  # the launcher says so. A newer sidecar comes with a new package.
   # publish.sh checks that the private pin exports to this revision before writing the file.
-  # A missing or mismatched .rev beside the sidecar triggers spawn.rs's skew warning.
+  # Nothing reads the .rev: the handshake says which sidecar runs. It stays because it costs nothing.
   - src: ./dist/verdandi-claude-sidecar.rev
     dst: /usr/lib/eitri/verdandi-claude-sidecar.rev
     file_info:

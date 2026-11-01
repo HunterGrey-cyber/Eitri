@@ -2,7 +2,7 @@
 //! built from another revision. Runs on macOS only: the script is the darwin-arm64 step.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use agent::{sidecar_availability, user_sidecar_path, SidecarAvailability, EXPECTED_VERDANDI_REVISION};
+use agent::{sidecar_availability, user_sidecar_path, SidecarAvailability, BUNDLED_SIDECAR_REVISION};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -43,7 +43,7 @@ fn the_installed_sidecar_is_the_one_eitri_resolves() {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let (artifact, in_checkout) = artifact(dir.path());
-    let expected = user_sidecar_path(Some(xdg.as_os_str()), None, EXPECTED_VERDANDI_REVISION).unwrap();
+    let expected = user_sidecar_path(Some(xdg.as_os_str()), None, BUNDLED_SIDECAR_REVISION).unwrap();
 
     std::env::remove_var("EITRI_SIDECAR_BINARY");
     std::env::remove_var("EITRI_VERDANDI_CHECKOUT");
@@ -67,7 +67,7 @@ fn the_installed_sidecar_is_the_one_eitri_resolves() {
 
     let mut args = vec!["--artifact", artifact_str];
     if !in_checkout {
-        args.extend(["--verdandi-rev", EXPECTED_VERDANDI_REVISION]);
+        args.extend(["--verdandi-rev", BUNDLED_SIDECAR_REVISION]);
     }
     let out = run_script(&xdg, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -114,12 +114,12 @@ fn a_refused_artifact_leaves_no_sidecar_directory_behind() {
             "--artifact",
             wrong.to_str().unwrap(),
             "--verdandi-rev",
-            EXPECTED_VERDANDI_REVISION,
+            BUNDLED_SIDECAR_REVISION,
         ],
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to install it"));
-    let rev7 = &EXPECTED_VERDANDI_REVISION[..7];
+    let rev7 = &BUNDLED_SIDECAR_REVISION[..7];
     let left = xdg.path().join("eitri/sidecar").join(rev7);
     assert!(!left.exists(), "{} was left behind", left.display());
 }

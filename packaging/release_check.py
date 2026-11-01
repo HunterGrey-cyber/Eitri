@@ -77,7 +77,7 @@ RELEASE_FIELDS: dict[str, re.Pattern] = {
     "VERDANDI_REV": _HEX40,
     "VERDANDI_SOURCE": _VERDANDI_SOURCE_RE,
     "VERDANDI_SOURCE_SHA256": _HEX64,
-    "SIDECAR_VERSION": _NVIM_VERSION_RE,
+    "SIDECAR_VERSION": VERSION_RE,
     "SIDECAR_PROTOCOL_MAJOR": re.compile(r"^[0-9]+$"),
     "SIDECAR_REQUIRED_CAPABILITIES": re.compile(r"^[a-z][a-z0-9_]*( [a-z][a-z0-9_]*)*$"),
     "NODE_VERSION": _NODE_VERSION_RE,

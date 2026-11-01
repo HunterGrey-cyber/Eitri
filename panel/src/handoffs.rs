@@ -720,7 +720,6 @@ mod tests {
             kind: BackendKind::Sidecar,
             project_dir: PathBuf::from("/home/user/project"),
             permission_modes: eitri_core::agent_backend::CLIENT_IMPLEMENTED_PERMISSION_MODES,
-            expected_verdandi_revision: None,
             resumable: vec![
                 agent::ResumableSession {
                     provider: "claude".to_string(),

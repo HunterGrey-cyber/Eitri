@@ -61,7 +61,6 @@ const HELLO: Hello = {
   projectDir: "/home/user/project",
   permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
-  expectedVerdandiRevision: null,
   account: null,
 };
 
@@ -10332,9 +10331,9 @@ describe("gx: web links on a row", () => {
   });
 });
 
-/** Moved in from the deleted `statusRow.test.ts`: `statusWarning` and
- *  its `SKEW_PREFIX` constant moved into `App.tsx` itself, since the band's `warn` fact stays
- *  decoupled from `ProviderInfo` (`band.ts` takes only the already-computed string). */
+/** Moved in from the deleted `statusRow.test.ts`: `statusWarning` moved into `App.tsx` itself,
+ *  since the band's `warn` fact stays decoupled from `ProviderInfo` (`band.ts` takes only the
+ *  already-computed string). */
 describe("statusWarning", () => {
   const provider = (diagnostics: string[]): ProviderInfo => ({
     sidecarVersion: "0.9",
@@ -10348,8 +10347,8 @@ describe("statusWarning", () => {
     "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi a1f637a.";
   const drift = "Verdandi baseline drift: running 1234567, this client was verified against 28a5e4c.";
 
-  it("warns for Verdandi skew", () => {
-    expect(statusWarning(provider([drift]), null)).toBe(drift);
+  it("draws no warning for a Verdandi baseline drift line", () => {
+    expect(statusWarning(provider([drift]), null)).toBeNull();
   });
   it("warns when Claude Code's system prompt is unavailable", () => {
     expect(statusWarning(provider([promptDiagnostic]), null)).toBe(promptDiagnostic);
@@ -10360,7 +10359,8 @@ describe("statusWarning", () => {
   it("uses the first matching startup diagnostic", () => {
     const routine = "[claude-sidecar] CLI version diagnostic: 2.1.282 is in range but untested";
     expect(statusWarning(provider([routine, promptDiagnostic, drift]), null)).toBe(promptDiagnostic);
-    expect(statusWarning(provider([routine, drift, promptDiagnostic]), null)).toBe(drift);
+    expect(statusWarning(provider([routine, drift, promptDiagnostic]), null)).toBe(promptDiagnostic);
+    expect(statusWarning(provider([routine, drift]), null)).toBeNull();
   });
   it("warns for a refusal, which is a tab that failed to start", () => {
     expect(statusWarning(null, "the CLI gate refused 2.1.999")).toBe("the CLI gate refused 2.1.999");

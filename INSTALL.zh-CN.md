@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=7bee3838d17d57325422fb67018131e6382b5c099ea0c38c12803d9c391fc3c3 -->
+<!-- translated-from: INSTALL.md sha256=fb178c9b523f9570d17c669b01aaa9fd33515b8494c6b8987e516954beddf48c -->
 
 # 安装 Eitri
 
@@ -62,7 +62,7 @@ sh install.sh --tarball FILE --sums FILE --sig FILE
 <a id="why-the-sidecar-is-built-on-your-machine"></a>
 ## 为什么 sidecar 要在你自己的机器上构建
 
-sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic PBC. All rights reserved"），本项目不对它再分发。安装脚本按 Anthropic 的条款，把它从 npm 下载到你自己的机器上，再按发行版本锁定的 Verdandi revision 构建出来。Eitri 的发布文件里都不包含它。
+sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic PBC. All rights reserved"），本项目不对它再分发。安装脚本按 Anthropic 的条款，把它从 npm 下载到你自己的机器上，再按发行版本锁定的 Verdandi revision 构建出来。Eitri 的发布文件里都不包含它。sidecar 更新（见[下文](#updating-the-sidecar)）也是同样的做法：在你的机器上，用签过名的源码构建，所以它也不会把 Anthropic 的任何东西放进发布文件。
 
 <a id="updating"></a>
 ## 更新
@@ -75,6 +75,28 @@ sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic
 
 从 0.2.0 升级上来：desktop 条目改了名字，所以要把 Eitri 重新固定到 dock 上一次。
 
+<a id="updating-the-sidecar"></a>
+## 更新 sidecar
+
+Claude Code 经常自己更新，有时新版本需要一个更新的 sidecar。sidecar 更新在两次 Eitri 发布之间单独发出，由你决定什么时候装。（Eitri 0.3.0 不能装 sidecar 更新，之后的版本可以。）
+
+```sh
+eitri sidecar status        # 新标签页用哪个、Eitri 自带的是哪个、还留着哪些；不联网
+eitri sidecar check         # 问有没有更新的 sidecar 发布；什么都不改
+eitri sidecar update        # 下载、验签、在本机构建并选用
+eitri sidecar use bundled   # 新标签页回到 Eitri 自带的 sidecar
+eitri sidecar use 0.3.3     # 选用一个已经构建好的更新
+```
+
+- **不会自己运行。** Eitri 不会在后台去找 sidecar 发布，也不会提示有新版本。只有你运行 `check` 的时候，它才会去问。
+- **更新在你的机器上构建**，用签过名的源码，和 `eitri setup` 构建第一个 sidecar 的方式一样。需要能访问 nodejs.org、npm 仓库和 grpc.io，构建时需要大约 1.2 GiB 的可用磁盘空间（我们测过的一次构建，峰值约 1.15 GiB，结束后留下约 106 MiB）。网速快的时候用了半分钟，请留出几分钟。
+- **签名必须验证通过，否则什么都不装。** sidecar 发布和 Eitri 自己的发布用同一把密钥签名，也没有跳过检查的选项。没有 `ssh-keygen`（OpenSSH 客户端）时，`eitri sidecar update` 会停下，并说出要装哪个软件包。
+- **已经打开的 Claude 标签页继续用它启动时的 sidecar。** 新标签页用更新。
+- **Eitri 自带的 sidecar 一直留作后备。** 如果更新启动不了，或缺少这个 Eitri 需要的东西，新标签页就改用自带的 sidecar，它的状态栏显示 `⚠`，标签页的详情（`Space i`，或 `/status`）会写明原因。`eitri sidecar use bundled` 会让它不再尝试，更新留在磁盘上，直到你再次选用。
+- **比 Eitri 自带的 sidecar 更旧的更新永远不会被使用。** Eitri 升级后带来了更新的 sidecar，旧的更新会留在磁盘上不用，`eitri sidecar status` 会说明。`.deb` 或 `.rpm` 升级之后，先运行 `eitri setup`：更新的背后需要一个已经构建好的自带 sidecar。
+- **设置了 `EITRI_SIDECAR_BINARY` 或 `EITRI_VERDANDI_CHECKOUT` 时，它们优先于更新。**
+- **哪里有这个命令。** 它从 Eitri 程序旁边的 `eitri-setup` 运行：curl 和 tarball 安装、`.deb` 和 `.rpm`、AUR 软件包都有。自带 sidecar、没有 `eitri-setup` 的软件包会回答 `this package updates its sidecar itself`。
+
 <a id="uninstalling"></a>
 ## 卸载
 
@@ -85,7 +107,7 @@ sh install.sh --uninstall --purge    # 这两个也删掉
 
 你的设置就是 Eitri 读取设置的那个目录：`XDG_CONFIG_HOME` 非空且是绝对路径时是 `$XDG_CONFIG_HOME/eitri`，否则是 `~/.config/eitri`。`--purge` 从不删除 `EITRI_CONFIG_DIR` 指向的目录，因为那里可能还放着别的程序的设置；它会提示这一点，需要的话你自己删。
 
-这会删除安装脚本放下的所有东西：程序、启动器、desktop 条目、图标、GNOME Shell 扩展、sidecar、私有 nvim 和下载缓存。你自己的 `nvim` 永远不会被动到。如果你启用过 GNOME Shell 扩展，先把它停用。
+这会删除安装脚本放下的所有东西：程序、启动器、desktop 条目、图标、GNOME Shell 扩展、sidecar（包括你装过的更新）、私有 nvim 和下载缓存。你自己的 `nvim` 永远不会被动到。如果你启用过 GNOME Shell 扩展，先把它停用。
 
 `.deb` 或 `.rpm`：先移除软件包，再运行 `sh install.sh --uninstall`，删掉不归软件包管的那份按用户的 sidecar 和私有 nvim（如果你在 `~/.local` 下还有一份 curl 安装，也会一起删掉）。顺序不能反：软件包还在的时候，它的 sidecar 会被保留。
 
@@ -100,6 +122,7 @@ sh install.sh --uninstall --purge    # 这两个也删掉
 | `:EitriPanel` 插件 | `~/.local/share/eitri/eitri.nvim/` | `/usr/share/eitri/nvim/eitri.nvim/` |
 | GNOME Shell 扩展 | `~/.local/share/gnome-shell/extensions/eitri@huntergrey.cn/` | `/usr/share/gnome-shell/extensions/eitri@huntergrey.cn/` |
 | agent sidecar | `$XDG_DATA_HOME/eitri/sidecar/<rev>/` | 同左，按用户（AUR：`/usr/lib/eitri/`） |
+| sidecar 更新，以及新标签页用哪个 | `$XDG_DATA_HOME/eitri/sidecar/updates/<version>/` 和 `.../sidecar/selected` | 同左，按用户 |
 | 私有 nvim（仅在你接受时） | `$XDG_DATA_HOME/eitri/nvim/<version>/` | 同左 |
 
 Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径，你的配置是 `$XDG_CONFIG_HOME/eitri/init.lua`，否则是 `~/.config/eitri/init.lua`。Mac 使用 `~/.config/eitri/init.lua`。非空的 `EITRI_CONFIG_DIR` 会覆盖配置目录，且必须是绝对路径；相对路径会拒绝启动。各项目的状态（布局、已打开的标签页、提示词历史、权限规则、信任回答、回合审阅快照）都在 `$XDG_STATE_HOME/eitri/`。`$XDG_DATA_HOME` 和 `$XDG_STATE_HOME` 默认是 `~/.local/share` 和 `~/.local/state`。私有 nvim 永远不会被放上你的 `PATH`。

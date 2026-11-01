@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=906f0fdb9d5694d7bc14926c608359c66d1ed93601a428243aec87413996a5d2 -->
+<!-- translated-from: configuration.md sha256=a9b05b6dd764b3f998d0f5b99217a1622ae72b6947371c3acbd16f2a751553b2 -->
 
 # 配置
 
@@ -314,7 +314,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_FIRST_START` | `off` 让[首次启动界面](#first-start)不再自己打开。其他非空值会被忽略，并记一行日志。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |
-| `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个。不是文件的路径会在会话启动时报错。 |
+| `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个，也替代任何 [sidecar 更新](../../INSTALL.zh-CN.md#updating-the-sidecar)：它优先于更新，也不会被自带的 sidecar 顶替。不是文件的路径会在会话启动时报错。 |
 | `EITRI_EDITOR_DMABUF` | 编辑器怎样把它的绘制交给 GTK。`0`、`off`、`false` 或 `no` 使用 GTK 自己的纹理路径；`1`、`on`、`true` 或 `yes` 即使在比 4.16 旧的 GTK 上也强制使用 Eitri 自己的缓冲区；其他任何值或不设置，则从 GTK 4.16 起使用 Eitri 自己的缓冲区。 |
 | `XDG_STATE_HOME` | Eitri 保存它所记住的东西的地方：每个项目的布局、打开的标签页、提示历史、权限规则、信任的回答和回合审阅快照，都在这个目录下的 `eitri/` 里。未设置、为空或是相对路径时，表示 `~/.local/state`。不会往你的项目里写任何东西。 |
 | `XDG_DATA_HOME`、`XDG_DATA_DIRS` | `eitri.plugin.load` 按名字查找插件的地方：先找 `XDG_DATA_HOME` 下的 `eitri/plugins/<name>/`（没有设置、为空或是相对路径时用 `~/.local/share`），最后找 `XDG_DATA_DIRS` 每个文件夹下的（没有设置或为空时依次是 `/usr/local/share` 和 `/usr/share`）。见[插件](#plugins)。 |

@@ -39,6 +39,7 @@ mod plugin_panels;
 mod prefix_strip;
 mod process_memory;
 mod root_conflicts;
+mod sidecar_probe;
 mod terminal;
 mod text_size;
 mod theme;
@@ -278,6 +279,9 @@ fn main() -> glib::ExitCode {
     }
     if early_args.first().is_some_and(|a| a == "split") {
         return companion::run_split(early_args[1..].to_vec());
+    }
+    if early_args.first().is_some_and(|a| a == "--sidecar-probe") {
+        return sidecar_probe::run(&early_args[1..]);
     }
     // After the panel branch, which reads `$NVIM` as its default address; before anything that starts a
     // thread or a child. An Eitri started from an nvim `:terminal` would otherwise hand that editor's

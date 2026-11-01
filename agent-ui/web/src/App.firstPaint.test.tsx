@@ -54,7 +54,6 @@ const HELLO: Hello = {
   projectDir: "/project",
   permissionModes: ["auto", "bypass"],
   resumableSessions: [],
-  expectedVerdandiRevision: null,
   account: null,
 };
 

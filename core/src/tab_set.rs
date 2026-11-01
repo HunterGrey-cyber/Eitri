@@ -793,6 +793,10 @@ impl Tab {
         after_start: bool,
         failed_resume: Option<String>,
     ) -> Option<Retired> {
+        let reason = match self.live() {
+            Some(backend) => backend.failure_with_provider_notes(reason),
+            None => reason,
+        };
         self.failed_after_start = after_start;
         self.failed_resume = failed_resume;
         match std::mem::replace(&mut self.backend, TabBackend::Failed { reason }) {

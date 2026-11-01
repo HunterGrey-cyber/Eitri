@@ -1124,7 +1124,6 @@ pub fn serialize_hello_with_restore_for_js(
             "title": r.title,
             "name": r.name,
         })).collect::<Vec<_>>(),
-        "expectedVerdandiRevision": greeting.expected_verdandi_revision,
         // `agent::account`'s configured name, `null` when none is set.
         "account": greeting.account,
         "restore": restore.map(|offer| json!({
@@ -4372,6 +4371,7 @@ mod tests {
             build_description: Some("Verdandi checkout: /x @ eb70aa3 (via EITRI_VERDANDI_CHECKOUT)".into()),
             startup_diagnostics: vec!["claude CLI 2.1.269 is untested".into()],
             configuration_home: None,
+            sidecar_update: None,
         };
         let view = SnapshotView {
             backend: "sidecar",
@@ -7932,7 +7932,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecar_hello_carries_its_baseline_and_never_advertises_resume_without_a_record() {
+    fn the_sidecar_hello_never_advertises_resume_without_a_record() {
         let greeting = crate::agent_backend::BackendGreeting::for_kind(
             crate::agent_backend::BackendKind::Sidecar,
             std::path::PathBuf::from("/tmp/project"),
@@ -7946,7 +7946,10 @@ mod tests {
             "the hello envelope must carry the client's real offer, not a per-backend narrowing"
         );
         assert_eq!(parsed["projectDir"], "/tmp/project");
-        assert!(parsed["expectedVerdandiRevision"].is_string());
+        assert!(
+            parsed.get("expectedVerdandiRevision").is_none(),
+            "the hello no longer carries a revision to expect"
+        );
     }
 
     /// A greeting with the given sessions, for the hello-envelope tests below.
@@ -7955,7 +7958,6 @@ mod tests {
             kind: crate::agent_backend::BackendKind::Sidecar,
             project_dir: std::path::PathBuf::from("/tmp/project"),
             permission_modes: &["bypass"],
-            expected_verdandi_revision: Some("abc1234"),
             resumable,
             account: None,
         }
@@ -8090,7 +8092,6 @@ mod tests {
             json!([]),
             "the legacy backend can never offer a resume"
         );
-        assert!(parsed["expectedVerdandiRevision"].is_null());
     }
 
     #[test]

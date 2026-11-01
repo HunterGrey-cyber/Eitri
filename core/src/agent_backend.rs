@@ -28,6 +28,24 @@ use std::path::{Path, PathBuf};
 use crate::agent_bridge::SessionModeChoice;
 use crate::editor_tools::SERVER_NAME;
 
+/// `reason` first, then the remedies of the sidecar `info` describes, each once. The panel recognises a
+/// failure by substrings of its text, so the text itself stays as it was.
+fn with_provider_notes(mut reason: String, info: &ProviderInfo) -> String {
+    let note = agent::UNTESTED_CLAUDE_NOTE;
+    if info.startup_diagnostics.iter().any(|line| line == note) && !reason.contains(note) {
+        reason.push('\n');
+        reason.push_str(note);
+    }
+    if let Some(version) = &info.sidecar_update {
+        let note = format!("Sidecar update {version} ran this tab. To go back: eitri sidecar use bundled");
+        if !reason.contains(&note) {
+            reason.push('\n');
+            reason.push_str(&note);
+        }
+    }
+    reason
+}
+
 fn task_command_error(error: ConversationError) -> BackendError {
     match error {
         ConversationError::Provider(agent::ProviderError::UnsupportedCapability(method)) => BackendError {
@@ -621,33 +639,58 @@ impl AgentBackend {
                     // cause -- an incompatible Claude CLI, say -- exists.
                     BackendError::fatal(format!("failed to connect to the Verdandi sidecar: {e}"))
                 })?;
-                match resume {
-                    Some(provider_session_id) => AgentConversation::resume_with_tools(
-                        std::sync::Arc::new(provider),
-                        project_dir,
-                        provider_session_id,
-                        lease,
-                        project,
-                        client_tools,
-                    )
-                    .map(|c| AgentBackend::Conversation {
-                        agent: AgentId::Claude,
-                        conversation: Box::new(c),
-                    })
-                    .map_err(|e| BackendError::fatal(format!("could not continue the previous session: {e}"))),
-                    None => AgentConversation::create_with_tools(
-                        std::sync::Arc::new(provider),
-                        project_dir,
-                        project,
-                        client_tools,
-                    )
-                    .map(|c| AgentBackend::Conversation {
-                        agent: AgentId::Claude,
-                        conversation: Box::new(c),
-                    })
-                    .map_err(|e| BackendError::fatal(format!("failed to create a Claude session: {e}"))),
-                }
+                Self::open_claude_session(
+                    std::sync::Arc::new(provider),
+                    project_dir,
+                    resume,
+                    lease,
+                    project,
+                    client_tools,
+                )
             }
+        }
+    }
+
+    /// Opens a session on a connected Claude sidecar. A sidecar can connect and then fail here, on a
+    /// selected update as anywhere else, so the failure carries the same remedies a tab that was running
+    /// gets: the conversation that would have held the provider's facts never came to exist.
+    pub fn open_claude_session(
+        provider: std::sync::Arc<dyn agent::AgentProvider + Send + Sync>,
+        project_dir: &Path,
+        resume: Option<&str>,
+        lease: Option<agent::lease::SessionLease>,
+        project: ProjectTrust,
+        client_tools: Option<agent::ClientToolSet>,
+    ) -> Result<Self, BackendError> {
+        let info = provider.info();
+        let backend = |conversation| AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        match resume {
+            Some(provider_session_id) => AgentConversation::resume_with_tools(
+                provider,
+                project_dir,
+                provider_session_id,
+                lease,
+                project,
+                client_tools,
+            )
+            .map(backend)
+            .map_err(|e| {
+                BackendError::fatal(with_provider_notes(
+                    format!("could not continue the previous session: {e}"),
+                    &info,
+                ))
+            }),
+            None => AgentConversation::create_with_tools(provider, project_dir, project, client_tools)
+                .map(backend)
+                .map_err(|e| {
+                    BackendError::fatal(with_provider_notes(
+                        format!("failed to create a Claude session: {e}"),
+                        &info,
+                    ))
+                }),
         }
     }
 
@@ -876,6 +919,14 @@ impl AgentBackend {
         match self {
             AgentBackend::Legacy(_) => None,
             AgentBackend::Conversation { conversation, .. } => Some(conversation.provider_info()),
+        }
+    }
+
+    /// Keeps the failure's own text first, followed by the remedies of the sidecar that ran it.
+    pub fn failure_with_provider_notes(&self, reason: String) -> String {
+        match self.provider_info() {
+            Some(info) => with_provider_notes(reason, info),
+            None => reason,
         }
     }
 
@@ -2660,7 +2711,6 @@ pub struct BackendGreeting {
     pub kind: BackendKind,
     pub project_dir: PathBuf,
     pub permission_modes: &'static [&'static str],
-    pub expected_verdandi_revision: Option<&'static str>,
     /// Every previous conversation in THIS workspace worth offering, newest first. Empty when
     /// there is nothing to continue, which is the normal case for a fresh workspace.
     ///
@@ -2690,8 +2740,7 @@ pub struct BackendGreeting {
     /// its id and its timestamps rather than an invented label.
     pub resumable: Vec<ResumableSession>,
     /// The configured Claude account's name (`agent::account::configured`), `null` when none is
-    /// set. Read, never written, here -- the same asymmetry as
-    /// `expected_verdandi_revision`.
+    /// set. Read, never written, here.
     pub account: Option<String>,
 }
 
@@ -2779,23 +2828,12 @@ impl BackendGreeting {
 
     fn with_resumable(kind: BackendKind, project_dir: PathBuf, resumable: Vec<ResumableSession>) -> Self {
         let account = agent::account::configured().map(|a| a.name().to_string());
-        match kind {
-            BackendKind::Legacy => Self {
-                kind,
-                project_dir,
-                permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
-                expected_verdandi_revision: None,
-                resumable,
-                account,
-            },
-            BackendKind::Sidecar => Self {
-                kind,
-                project_dir,
-                permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
-                expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
-                resumable,
-                account,
-            },
+        Self {
+            kind,
+            project_dir,
+            permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
+            resumable,
+            account,
         }
     }
 }
@@ -2939,24 +2977,6 @@ mod tests {
     fn backend_kind_round_trips_its_wire_name() {
         assert_eq!(BackendKind::Legacy.as_str(), "legacy");
         assert_eq!(BackendKind::Sidecar.as_str(), "sidecar");
-    }
-
-    #[test]
-    fn the_sidecar_greeting_names_its_verdandi_baseline() {
-        let greeting = BackendGreeting::for_kind(BackendKind::Sidecar, PathBuf::from("/tmp"));
-        assert_eq!(
-            greeting.expected_verdandi_revision,
-            Some(agent::EXPECTED_VERDANDI_REVISION)
-        );
-    }
-
-    #[test]
-    fn the_legacy_greeting_has_no_verdandi_baseline_to_name() {
-        let greeting = BackendGreeting::for_kind(BackendKind::Legacy, PathBuf::from("/tmp"));
-        assert_eq!(
-            greeting.expected_verdandi_revision, None,
-            "the legacy backend has no Verdandi dependency"
-        );
     }
 
     /// The permission offer is a statement about what this CLIENT implements, so it does not vary by

@@ -27,6 +27,21 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   the same chat as a tile with four projects open (release build, medians). The page's "Known gaps" lists what does not
   work yet.
 
+**Sidecar updates, without a new Eitri**
+
+- When a Claude Code update breaks the panel, we can publish a new sidecar (the agent backend) and you take it with
+  `eitri sidecar update`; you do not wait for an Eitri release. `eitri sidecar status` shows what new tabs run,
+  `eitri sidecar check` asks whether a newer release exists, and `eitri sidecar use bundled` goes back to the sidecar
+  that came with this Eitri.
+- Nothing checks by itself and the panel shows no notice. A sidecar release is signed source, so the update is built
+  on your machine, as the first sidecar is: network access to nodejs.org, npm and grpc.io, and about 1.2 GiB of free
+  disk space while it runs (one build we measured peaked at 1.15 GiB and took half a minute on a fast connection).
+  The signature is checked first, with the same key as this release, and there is no way to skip it.
+- A tab that is already open keeps the sidecar it started with; new tabs use the update. If an update will not start
+  or lacks something this Eitri needs, the tab runs the bundled sidecar, shows `⚠` and says why.
+- This starts with this release: 0.3.0 cannot take updates. After a `.deb` or `.rpm` upgrade run `eitri setup` once
+  before `eitri sidecar update`, since the update needs the bundled sidecar built behind it.
+
 **What this can break:**
 
 - **On Hyprland, sway and niri, chats and pages leave the Eitri window** and Eitri's layout keys go off: splits, zoom,

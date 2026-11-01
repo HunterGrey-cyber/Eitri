@@ -46,6 +46,9 @@ mod admission;
 mod chat_moves;
 #[path = "detail.rs"]
 mod detail;
+#[cfg(test)]
+#[path = "detail_sidecar_row.rs"]
+mod detail_sidecar_row;
 #[path = "editor_glue.rs"]
 mod editor_glue;
 #[path = "hand_over.rs"]

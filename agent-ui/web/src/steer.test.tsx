@@ -189,7 +189,6 @@ describe("the panel with a message in the turn", () => {
     projectDir: "/project",
     permissionModes: ["auto", "bypass"],
     resumableSessions: [],
-    expectedVerdandiRevision: null,
     account: null,
   };
   const TAB = {

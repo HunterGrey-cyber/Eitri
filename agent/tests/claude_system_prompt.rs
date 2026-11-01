@@ -1,7 +1,7 @@
 //! The prompt choice through real gRPC requests and a provider handoff. No real CLI runs.
 #![cfg(target_os = "linux")]
 
-use agent::providers::claude_sidecar::{MoveRefusedWhy, EXPECTED_VERDANDI_REVISION};
+use agent::providers::claude_sidecar::{MoveRefusedWhy, BUNDLED_SIDECAR_REVISION};
 use agent::setting_sources::ProjectTrust;
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, CreateSessionRequest,
@@ -95,7 +95,7 @@ fn assert_diagnostic(provider: &ClaudeSidecarProvider, offered: bool) {
         assert!(prompt_notes.is_empty());
     } else {
         assert_eq!(prompt_notes, vec![&format!(
-            "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {EXPECTED_VERDANDI_REVISION}."
+            "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {BUNDLED_SIDECAR_REVISION}."
         )]);
     }
 }

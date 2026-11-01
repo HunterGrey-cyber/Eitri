@@ -519,12 +519,16 @@ pub struct ProviderInfo {
     /// because a list that is never empty cannot drive a "something is wrong" indicator.
     pub build_description: Option<String>,
     /// Only things genuinely worth warning about: a CLI version inside the supported range but
-    /// untested, a Verdandi checkout that has drifted from the verified baseline. **Empty is the
+    /// untested, a condition the CLI reports about itself. **Empty is the
     /// normal case**, which is what lets a UI treat non-empty as a real signal.
     pub startup_diagnostics: Vec<String>,
     /// The directory of the user's own configuration for this agent, as the agent itself reported it
     /// (Codex's `CODEX_HOME`), when it has one that a status row should name. Descriptive only.
     pub configuration_home: Option<String>,
+    /// The version of the sidecar update this tab runs. `None` for anything else: a bundled sidecar,
+    /// one named by the user, any other agent, and a sidecar taken over from another window, which
+    /// comes with no word of how it was chosen.
+    pub sidecar_update: Option<String>,
 }
 
 /// A provider-neutral mirror of the sidecar proto's own `ErrorCode`. Exists because the code was

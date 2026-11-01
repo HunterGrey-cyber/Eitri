@@ -554,7 +554,7 @@ describe("Workflow permission view", () => {
       const view = render(<App />);
       const dispatch = (payload: unknown) => act(() => window.__eitriDispatch!(JSON.stringify(payload)));
       dispatch({ kind: "hello", backend: "legacy", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"],
-        resumableSessions: [], expectedVerdandiRevision: null, account: null });
+        resumableSessions: [], account: null });
       dispatch({ kind: "tabs", active: 1, tabs: [{ id: 1, number: 1, label: "1 claude", name: null,
         state: "live", mode: "manual", marker: null, pending: 1, resumable: false, failure: null, title: null }] });
       dispatch({ kind: "snapshot", tab: 1, throughRevision: 1,

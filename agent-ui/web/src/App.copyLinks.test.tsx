@@ -32,7 +32,7 @@ function dispatch(payload: unknown) {
 
 function started(text?: string) {
   const rendered = render(<App />);
-  dispatch({ kind: "hello", backend: "legacy", projectDir: "/p", permissionModes: ["manual", "auto", "bypass"], resumableSessions: [], expectedVerdandiRevision: null, account: null });
+  dispatch({ kind: "hello", backend: "legacy", projectDir: "/p", permissionModes: ["manual", "auto", "bypass"], resumableSessions: [], account: null });
   dispatch({ kind: "tabs", active: 1, tabs: [{ id: 1, number: 1, label: "1 new", name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: false, failure: null, title: null }] });
   const state = initialState();
   dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: { ...state, status: { kind: "running" }, ...(text === undefined ? {} : { transcript: [{ seq: 1, text }] }) } });

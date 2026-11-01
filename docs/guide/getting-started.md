@@ -300,4 +300,9 @@ connection broke and what is shown above may be incomplete; a quiet `This sessio
 it closed. Either way, press `r` in browsing to start a new session in that tab. A message held while a turn
 ran is still sent when that turn ends, even when it ended at a limit.
 
+When Claude Code has updated itself and the panel misbehaves, the sidecar behind it may need an update of its own.
+`eitri sidecar check` asks whether one exists, `eitri sidecar update` takes it, and `eitri sidecar use bundled` goes
+back. Nothing checks by itself, and open tabs keep the sidecar they started with.
+[Updating the sidecar](../../INSTALL.md#updating-the-sidecar) has the details.
+
 Known rough edges are listed in [Known issues](../known-issues.md).

@@ -27,7 +27,7 @@ function closes(): Posted[] {
 function shown() {
   const { container } = render(<App />);
   dispatch({ kind: "hello", backend: "sidecar", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"],
-    resumableSessions: [], expectedVerdandiRevision: null, account: "team" });
+    resumableSessions: [], account: "team" });
   dispatch({ kind: "tabs", active: 1, tabs: [{ id: 1, number: 1, label: "1 new", name: null, state: "live",
     mode: "auto", marker: null, pending: 0, resumable: true, failure: null, title: null, agent: "claude" }] });
   dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: { ...initialState(), status: { kind: "running" } } });

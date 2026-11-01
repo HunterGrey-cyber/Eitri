@@ -204,7 +204,7 @@ def _build_template(env, dest):
             legacy-backend = []
             """),
         "agent/src/providers/claude_sidecar/spawn.rs":
-            f'pub const EXPECTED_VERDANDI_REVISION: &str = "{_VERDANDI_REV[:7]}";\n',
+            f'pub const BUNDLED_SIDECAR_REVISION: &str = "{_VERDANDI_REV[:7]}";\n',
         "packaging/pins.env": pins + _NVIM_PIN,
         "packaging/sidecar-contract.env": _SIDECAR_CONTRACT,
         "packaging/release-signers": _SIGNERS_BLOCK,
@@ -494,7 +494,7 @@ class Refusals(ReleaseShTestCase):
     def test_an_expected_verdandi_revision_that_disagrees(self):
         self.edit("agent/src/providers/claude_sidecar/spawn.rs", _VERDANDI_REV[:7], "fedcba9")
         self.commit()
-        self.assertRefused(self.run_release("--unsigned"), "EXPECTED_VERDANDI_REVISION")
+        self.assertRefused(self.run_release("--unsigned"), "BUNDLED_SIDECAR_REVISION")
 
     def test_a_finished_release_is_never_rebuilt_in_place(self):
         _write(os.path.join(self.out, "v1.0.0-rc.1", "SHA256SUMS"), "x\n")

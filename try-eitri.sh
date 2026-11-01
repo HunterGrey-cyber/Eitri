@@ -40,8 +40,6 @@ if [[ "$BACKEND" == sidecar ]]; then
 	if [[ -n "${EITRI_VERDANDI_CHECKOUT-}" || -d "$VERDANDI" ]]; then
 		VERDANDI_RESOLVED=1
 		echo "sidecar     $VERDANDI @ $(git -C "$VERDANDI" rev-parse --short HEAD 2>/dev/null || echo '?')"
-		echo "            (agent's baseline is agent::EXPECTED_VERDANDI_REVISION; a different revision"
-		echo "             here is a diagnostic printed at spawn, not a refusal)"
 		# Which of the two shapes will run, said here rather than discovered in the log. A checkout
 		# holding a built artifact runs THAT -- the same executable the package ships -- and a checkout
 		# without one runs `node dist/`, building it first if needed, which is the slow first start.

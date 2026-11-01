@@ -74,6 +74,10 @@ if [[ "${1:-}" == sidecar ]]; then
 			echo "eitri: this package updates its sidecar itself" >&2
 			exit 1
 		fi
+		if [[ "$verb" == use && $# -eq 0 ]]; then
+			echo "usage: eitri sidecar use bundled|VERSION" >&2
+			exit 64
+		fi
 		exec sh "$LIBDIR/eitri-setup" "--sidecar-$verb" "$@"
 		;;
 	-h | --help)

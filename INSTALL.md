@@ -72,7 +72,8 @@ Same checks as the other routes. Building the sidecar still needs network access
 The sidecar bundles Anthropic's `@anthropic-ai/claude-agent-sdk` ("© Anthropic PBC. All rights reserved"),
 which this project does not redistribute. The installer fetches it from npm onto your own machine, under
 Anthropic's terms, and builds it from the Verdandi revision the release pins. No Eitri release file
-contains it.
+contains it. A sidecar update ([below](#updating-the-sidecar)) is built the same way, on your machine from signed
+source, so it puts nothing of Anthropic's into any release file either.
 
 ## Updating
 
@@ -89,6 +90,41 @@ its settings from `$XDG_CONFIG_HOME/eitri` when `XDG_CONFIG_HOME` is set to an a
 
 Coming from 0.2.0: the desktop entry was renamed, so pin Eitri to your dock again once.
 
+## Updating the sidecar
+
+Claude Code updates itself often, and now and then a new version needs a newer sidecar. Sidecar updates come out on
+their own, between Eitri releases, and you take one when you choose to. (Eitri 0.3.0 cannot take them; the releases
+after it can.)
+
+```sh
+eitri sidecar status        # what new tabs run, what came with Eitri, what is kept; no network
+eitri sidecar check         # asks whether a newer sidecar release exists; changes nothing
+eitri sidecar update        # downloads it, checks the signature, builds it here and selects it
+eitri sidecar use bundled   # new tabs go back to the sidecar that came with Eitri
+eitri sidecar use 0.3.3     # select an update that is already built
+```
+
+- **Nothing runs by itself.** Eitri does not look for a sidecar release in the background and shows no notice that
+  one exists. `check` is the only way it asks, and only when you run it.
+- **An update is built on your machine**, from signed source, the way `eitri setup` builds the first sidecar. It needs
+  network access to nodejs.org, the npm registry and grpc.io, and about 1.2 GiB of free disk space while it runs (one
+  build we measured peaked at 1.15 GiB and left about 106 MiB behind). It took half a minute on a fast connection, so
+  allow a few minutes.
+- **The signature must verify, or nothing is installed.** A sidecar release is signed with the same key as Eitri's own
+  releases, and there is no option to skip the check. Without `ssh-keygen` (the OpenSSH client), `eitri sidecar update`
+  stops and names the package to install.
+- **Open Claude tabs keep the sidecar they started with.** New tabs use the update.
+- **The sidecar that came with Eitri stays as the fallback.** If an update will not start, or lacks something this Eitri
+  needs, the new tab runs the bundled sidecar instead, its band shows `⚠`, and the tab's details (`Space i`, or `/status`)
+  say why. `eitri sidecar use bundled` stops the attempts, and the update stays on disk until you select it again.
+- **An update older than the sidecar that came with Eitri is never used.** After an Eitri upgrade that brings a newer
+  sidecar, the old update stays on disk, unused, and `eitri sidecar status` says so. After a `.deb` or `.rpm` upgrade,
+  run `eitri setup` first: an update needs the bundled sidecar built behind it.
+- **`EITRI_SIDECAR_BINARY` and `EITRI_VERDANDI_CHECKOUT` win** over an update when you set them.
+- **Where the command exists.** It runs from the `eitri-setup` that sits beside Eitri's binary: curl and tarball
+  installs, the `.deb` and `.rpm`, and the AUR packages. A package that carries its own sidecar and no `eitri-setup`
+  answers `this package updates its sidecar itself`.
+
 ## Uninstalling
 
 ```sh
@@ -101,7 +137,7 @@ is non-empty and absolute, else `~/.config/eitri`. `--purge` never removes a dir
 names, since that may hold another program's settings too; it says so, and you remove it yourself.
 
 This removes everything the installer put in place: the program, the launcher, the desktop entry, the
-icons, the GNOME Shell extension, the sidecars, the private nvim and the download cache. It never touches
+icons, the GNOME Shell extension, the sidecars (updates you took included), the private nvim and the download cache. It never touches
 an `nvim` of your own. Disable the GNOME Shell extension first if you turned it on.
 
 For a `.deb` or `.rpm`: remove the package first, then run `sh install.sh --uninstall` to remove the
@@ -118,6 +154,7 @@ per-user sidecar and private nvim, which the package does not own (this also rem
 | the `:EitriPanel` plugin | `~/.local/share/eitri/eitri.nvim/` | `/usr/share/eitri/nvim/eitri.nvim/` |
 | GNOME Shell extension | `~/.local/share/gnome-shell/extensions/eitri@huntergrey.cn/` | `/usr/share/gnome-shell/extensions/eitri@huntergrey.cn/` |
 | agent sidecar | `$XDG_DATA_HOME/eitri/sidecar/<rev>/` | the same, per user (AUR: `/usr/lib/eitri/`) |
+| sidecar updates, and which one new tabs use | `$XDG_DATA_HOME/eitri/sidecar/updates/<version>/` and `.../sidecar/selected` | the same, per user |
 | private nvim, if you accepted it | `$XDG_DATA_HOME/eitri/nvim/<version>/` | the same |
 
 For every route on Linux, your config is `$XDG_CONFIG_HOME/eitri/init.lua` when `XDG_CONFIG_HOME`

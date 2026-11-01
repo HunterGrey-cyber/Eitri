@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=3f74cd3aaa7166e9f977f9c33dfa860edacd4b75793797b1e3a53f2bfef7fb70 -->
+<!-- translated-from: getting-started.md sha256=8603787e5c3df9b1b83e641f435cc3bacfd9e5c109fd114b1f3ef3e3d73175f1 -->
 
 # 快速上手
 
@@ -164,5 +164,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 一行里冒号后面的文字是 Claude Code 自己的消息，原样显示，所以限制的重置时间只有在 Claude Code 写了的时候才会出现。这一行会留在对话里，面板重新加载（`<prefix> r`）和切换标签页后依然在，也可以像其他行一样用 `y` 复制。
 
 会话本身没了的时候，对话里会说出来。红色的 `This session was lost` 横幅表示连接断了，上面显示的内容可能不完整；安静的 `This session has ended (<reason>)` 表示它关闭了。无论哪种，在浏览模式里按 `r`，就会在这个标签页里开始一个新会话。回合运行时留着的消息，仍会在这个回合结束时发出，即使它是在碰到限制时结束的。
+
+Claude Code 自己更新之后面板出了问题，背后的 sidecar 可能也需要更新。`eitri sidecar check` 问有没有更新，`eitri sidecar update` 装上它，`eitri sidecar use bundled` 退回去。什么都不会自己检查，已经打开的标签页继续用它启动时的 sidecar。细节见[更新 sidecar](../../INSTALL.zh-CN.md#updating-the-sidecar)。
 
 已知的毛边列在[已知问题](../known-issues.zh-CN.md)里。

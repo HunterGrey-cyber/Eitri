@@ -6,6 +6,7 @@
 //! Claude Code's preset with static panel context only when the handshake offers it.
 
 mod cli_locate;
+mod contract;
 mod effort_reply;
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
 #[cfg(target_os = "linux")]
@@ -23,13 +24,17 @@ mod watch;
 mod runtime_policy_verification;
 
 pub use cli_locate::{claude_cli_missing, claude_cli_missing_here, CLAUDE_INSTALL_URL};
+pub use contract::{
+    missing_required, SidecarVersion, BUNDLED_SIDECAR_VERSION, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,
+    UNTESTED_CLAUDE_NOTE,
+};
 #[cfg(target_os = "linux")]
 pub use moving::{ClaudeProviderHandoff, MoveRefusedWhy};
 #[cfg(target_os = "linux")]
 pub use spawn::SidecarFds;
 pub use spawn::{
-    sidecar_availability, sidecar_missing_message, user_sidecar_path, SidecarAvailability, EXPECTED_VERDANDI_REVISION,
-    NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
+    sidecar_availability, sidecar_missing_message, sidecar_origin, user_sidecar_path, SidecarAvailability,
+    BUNDLED_SIDECAR_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
 };
 
 use crate::provider::{
@@ -53,7 +58,7 @@ use claude_runtime_protocol::v1::{
     SystemPromptPreset, ToolPolicy, WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
-use spawn::SpawnedSidecar;
+use spawn::{SpawnedSidecar, UpdateChoice, UpdateTrouble};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -245,8 +250,35 @@ fn info_from_handshake(
         build_description,
         startup_diagnostics,
         configuration_home: None,
+        sidecar_update: None,
     }
 }
+
+/// Whether a sidecar advertising `capabilities` may run as a selected update. `Err` says which
+/// capability it lacks. A rule for choosing an update only: a sidecar that is not an update, and one a
+/// move brings along, run with whatever they offer.
+pub fn check_update_floor(capabilities: &[String]) -> Result<(), String> {
+    match missing_required(capabilities.iter().map(String::as_str)) {
+        Some(capability) => Err(format!("lacks {capability}")),
+        None => Ok(()),
+    }
+}
+
+/// A sidecar that will not serve this client's protocol major. Shows as `text`, as any handshake error
+/// does; `words` are what a line about a sidecar update quotes.
+#[derive(Debug)]
+struct RefusedThisClient {
+    text: String,
+    words: String,
+}
+
+impl std::fmt::Display for RefusedThisClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for RefusedThisClient {}
 
 /// Maps the sidecar proto's own `ErrorCode` onto this crate's provider-neutral mirror. Exhaustive
 /// by construction: adding a variant to the proto makes this stop compiling rather than silently
@@ -290,6 +322,53 @@ fn startup_diagnostics_from_stderr(lines: &[String]) -> Vec<String> {
         .filter(|line| line.contains("CLI version diagnostic"))
         .map(|line| line.trim().to_string())
         .collect()
+}
+
+/// The command is available only on installs with the setup helper beside the running binary.
+pub fn untested_note_applies(stderr_lines: &[String], exe_dir: Option<&std::path::Path>) -> bool {
+    sidecar_command_available(exe_dir) && stderr_lines.iter().any(|line| line.contains("CLI version diagnostic"))
+}
+
+fn sidecar_command_available(exe_dir: Option<&std::path::Path>) -> bool {
+    exe_dir.is_some_and(|dir| dir.join("eitri-setup").is_file())
+}
+
+fn with_failure_notes(error: std::io::Error, exe_dir: Option<&std::path::Path>) -> std::io::Error {
+    let mut text = error.to_string();
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let untested = untested_note_applies(&lines, exe_dir);
+    let refused = sidecar_command_available(exe_dir) && text.contains("refusing to start");
+    for (applies, note) in [(untested, UNTESTED_CLAUDE_NOTE), (refused, REFUSED_CLAUDE_NOTE)] {
+        if applies && !text.contains(note) {
+            text.push('\n');
+            text.push_str(note);
+        }
+    }
+    if text == error.to_string() {
+        error
+    } else {
+        std::io::Error::new(error.kind(), text)
+    }
+}
+
+/// The handshake facts reported by a sidecar that passes the update capability floor.
+pub struct ProbeReport {
+    pub sidecar_version: String,
+    pub protocol_major: u32,
+    pub protocol_minor: u32,
+}
+
+/// Starts the named artifact through the normal spawn and handshake, then ends it without a session.
+pub fn probe(path: &std::path::Path) -> Result<ProbeReport, String> {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let sidecar = spawn::spawn_program(&instance_id, path).map_err(|error| spawn::start_failure_reason(&error))?;
+    let provider = ClaudeSidecarProvider::around(sidecar).map_err(|error| error.to_string())?;
+    check_update_floor(&provider.info.advertised_capabilities)?;
+    Ok(ProbeReport {
+        sidecar_version: provider.info.sidecar_version.clone(),
+        protocol_major: provider.info.protocol_major,
+        protocol_minor: provider.info.protocol_minor,
+    })
 }
 
 // `RuntimeServiceClient<Channel>` is already cheaply `Clone` (tonic's generated clients wrap a
@@ -443,11 +522,13 @@ struct Handshaken {
 
 /// Connects to the sidecar's socket and runs the real `Handshake`, refusing a socket served by another
 /// user (and, when `expected_pid` is given, by another process than that one) and an incompatible
-/// protocol major.
+/// protocol major. `exe_dir` is the directory of the running binary, which decides whether the
+/// sidecar commands named in the startup notes exist next to it.
 fn handshake_with(
     runtime: &RuntimeThread,
     sidecar: &SpawnedSidecar,
     expected_pid: Option<u32>,
+    exe_dir: Option<&std::path::Path>,
 ) -> std::io::Result<Handshaken> {
     let socket_path = sidecar.socket_path.clone();
     let client = runtime
@@ -476,7 +557,7 @@ fn handshake_with(
             },
             UNARY_RPC_TIMEOUT,
         )
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
     let handshake = runtime
         .block_on(
@@ -492,8 +573,20 @@ fn handshake_with(
             },
             UNARY_RPC_TIMEOUT,
         )
-        .map_err(|e| std::io::Error::other(e.to_string()))?
-        .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string()))?
+        .map_err(|status| {
+            let text = format!("handshake failed: {status}");
+            let incompatible =
+                error_detail(&status).is_some_and(|d| d.code == ProtoErrorCode::IncompatibleProtocol as i32);
+            if incompatible {
+                std::io::Error::other(RefusedThisClient {
+                    text,
+                    words: status.message().to_string(),
+                })
+            } else {
+                std::io::Error::other(text)
+            }
+        })?
         .into_inner();
 
     // An incompatible major is refused, minor differences are tolerated
@@ -511,11 +604,15 @@ fn handshake_with(
     // and so arrives as 0). Cheap, and the alternative is issuing commands to a peer whose
     // wire contract this client cannot name.
     if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
-        return Err(std::io::Error::other(format!(
+        let text = format!(
             "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
              refusing to continue rather than issuing commands it may silently misread",
             handshake.protocol_major
-        )));
+        );
+        return Err(std::io::Error::other(RefusedThisClient {
+            words: text.clone(),
+            text,
+        }));
     }
 
     let capabilities = capabilities_from_handshake(&handshake);
@@ -537,10 +634,14 @@ fn handshake_with(
     let mut diagnostics = sidecar.build_warnings.clone();
     if !claude_code_prompt {
         diagnostics.push(format!(
-            "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {EXPECTED_VERDANDI_REVISION}."
+            "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {BUNDLED_SIDECAR_REVISION}."
         ));
     }
-    diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
+    let stderr = sidecar.stderr_tail();
+    diagnostics.extend(startup_diagnostics_from_stderr(&stderr));
+    if untested_note_applies(&stderr, exe_dir) {
+        diagnostics.push(UNTESTED_CLAUDE_NOTE.to_string());
+    }
     let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
     for diagnostic in &info.startup_diagnostics {
         eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
@@ -561,8 +662,103 @@ impl ClaudeSidecarProvider {
     /// Spawns a fresh sidecar and connects to it, performing the real `Handshake` before returning
     /// -- a provider that constructs successfully has already proven it can talk to a real,
     /// compatible sidecar, not just that a process happened to start.
+    ///
+    /// A selected update comes first. If it cannot serve this tab the tab runs what the search finds
+    /// and says why, or fails with that sidecar's own error followed by the update's.
     pub fn connect(instance_id: &str) -> std::io::Result<Self> {
-        Self::around(spawn::spawn(instance_id)?)
+        Self::connect_after(instance_id, spawn::selected_update(), || spawn::spawn(instance_id)).map_err(|error| {
+            let exe = std::env::current_exe().ok();
+            with_failure_notes(error, exe.as_deref().and_then(std::path::Path::parent))
+        })
+    }
+
+    fn connect_after(
+        instance_id: &str,
+        choice: UpdateChoice,
+        bundled: impl FnOnce() -> std::io::Result<SpawnedSidecar>,
+    ) -> std::io::Result<Self> {
+        let trouble = match choice {
+            UpdateChoice::NoUpdate => return Self::around(bundled()?),
+            UpdateChoice::Use { version, path } => match Self::try_update(instance_id, &version, &path) {
+                Ok(provider) => return Ok(provider),
+                Err(trouble) => {
+                    spawn::remember_failed_update(&version);
+                    trouble
+                }
+            },
+            UpdateChoice::Unusable(what) => UpdateTrouble::Unusable(what),
+            UpdateChoice::FailedHere(version) => UpdateTrouble::FailedHere(version),
+        };
+        match bundled().and_then(Self::around) {
+            Ok(mut provider) => {
+                let line = trouble.fallback_line();
+                eprintln!("agent: ClaudeSidecarProvider: {line}");
+                provider.info.startup_diagnostics.insert(0, line);
+                Ok(provider)
+            }
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}\n{}", trouble.also_failed_line()),
+            )),
+        }
+    }
+
+    /// A provider on the update at `path`, or why not. A sidecar that fails here is ended here, through
+    /// its holder's clean end, before anything else starts on the same socket path.
+    fn try_update(instance_id: &str, version: &str, path: &std::path::Path) -> Result<Self, UpdateTrouble> {
+        let did_not_start = |reason: String| UpdateTrouble::DidNotStart {
+            version: version.to_string(),
+            reason: spawn::quotable(reason),
+        };
+        let sidecar = spawn::spawn_program(instance_id, path)
+            .map_err(|error| did_not_start(spawn::start_failure_reason(&error)))?;
+        let runtime = RuntimeThread::spawn();
+        let mut handshaken =
+            handshake_with(&runtime, &sidecar, None, spawn::running_exe_dir().as_deref()).map_err(|error| {
+                if let Some(refused) = error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<RefusedThisClient>())
+                {
+                    return UpdateTrouble::Refused {
+                        version: version.to_string(),
+                        words: spawn::quotable(refused.words.clone()),
+                    };
+                }
+                let silent = if error.kind() == std::io::ErrorKind::TimedOut {
+                    format!("no answer in {} s", UNARY_RPC_TIMEOUT.as_secs())
+                } else {
+                    error.to_string()
+                };
+                did_not_start(spawn::failure_reason(&sidecar.stderr_tail(), silent))
+            })?;
+        check_update_floor(&handshaken.info.advertised_capabilities).map_err(|lacks| UpdateTrouble::Lacks {
+            version: version.to_string(),
+            lacks,
+        })?;
+        handshaken.info.sidecar_update = Some(version.to_string());
+        Ok(Self::holding(sidecar, runtime, handshaken))
+    }
+
+    /// [`Self::connect`] with what the files on disk would say given by the caller: `update` is the
+    /// selected update at `version`, unless that version already failed in this process, and `bundled`
+    /// is what the search would find.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn connect_trying_update(
+        instance_id: &str,
+        update: &std::path::Path,
+        version: &str,
+        bundled: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        let choice = if spawn::failed_updates().contains(version) {
+            UpdateChoice::FailedHere(version.to_string())
+        } else {
+            UpdateChoice::Use {
+                version: version.to_string(),
+                path: update.to_path_buf(),
+            }
+        };
+        Self::connect_after(instance_id, choice, || spawn::spawn_program(instance_id, bundled))
     }
 
     /// [`Self::connect`] with `program` started as the sidecar, found by no search and built by
@@ -573,9 +769,42 @@ impl ClaudeSidecarProvider {
         Self::around(spawn::spawn_program(instance_id, program)?)
     }
 
+    /// [`Self::connect_to_program`] for a tab of a binary installed in `exe_dir`, including its remedies.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn connect_to_program_in(
+        instance_id: &str,
+        program: &std::path::Path,
+        exe_dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        spawn::spawn_program(instance_id, program)
+            .and_then(|sidecar| Self::around_in(sidecar, Some(exe_dir)))
+            .map_err(|error| with_failure_notes(error, Some(exe_dir)))
+    }
+
     /// A provider driving `sidecar`, which this process started and holds.
     fn around(sidecar: SpawnedSidecar) -> std::io::Result<Self> {
+        let exe = std::env::current_exe().ok();
+        Self::around_in(sidecar, exe.as_deref().and_then(std::path::Path::parent))
+    }
+
+    fn around_in(sidecar: SpawnedSidecar, exe_dir: Option<&std::path::Path>) -> std::io::Result<Self> {
         let runtime = RuntimeThread::spawn();
+        let handshaken = handshake_with(&runtime, &sidecar, None, exe_dir).map_err(|error| {
+            let stderr = sidecar.stderr_tail();
+            if stderr.is_empty() {
+                error
+            } else {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("{error}; its stderr said:\n{}", stderr.join("\n")),
+                )
+            }
+        })?;
+        Ok(Self::holding(sidecar, runtime, handshaken))
+    }
+
+    fn holding(sidecar: SpawnedSidecar, runtime: RuntimeThread, handshaken: Handshaken) -> Self {
         let Handshaken {
             client,
             capabilities,
@@ -584,8 +813,8 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
-        } = handshake_with(&runtime, &sidecar, None)?;
-        Ok(Self {
+        } = handshaken;
+        Self {
             sidecar: Mutex::new(sidecar),
             runtime,
             client,
@@ -605,7 +834,7 @@ impl ClaudeSidecarProvider {
             released: AtomicBool::new(false),
             #[cfg(feature = "test-support")]
             per_task_stop_override: None,
-        })
+        }
     }
 
     /// Overrides host readiness for scripted interaction tests; the peer must still offer questions.
@@ -3325,7 +3554,7 @@ mod tests {
     }
 
     /// The shape the real sidecar returns at the revision this crate pins
-    /// (`EXPECTED_VERDANDI_REVISION`) -- transcribed from
+    /// (`BUNDLED_SIDECAR_REVISION`) -- transcribed from
     /// `apps/claude-sidecar/src/runtimeServiceImpl.ts`'s handshake handler, not invented.
     ///
     /// **This is a hand-maintained record, NOT a drift detector.** Nothing in Rust observes the real
@@ -4392,9 +4621,9 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Fifty-three: the PACKAGED shape at the pinned revision (twenty-four up to
+        // Fifty-nine: the PACKAGED shape at the pinned revision (twenty-four up to
         // `provider_permission_prompts`, five from protocol 3.13, three from 3.14, seven from 3.15-3.19, two from 3.20, one from 3.21, ten from
-        // 3.22 and one from 3.23), which a shipped install meets. A checkout build advertises one more,
+        // 3.22, one from 3.23 and six from 3.24), which a shipped install meets. A checkout build advertises one more,
         // executable_sdk_bundled, and a sidecar with egress restrictions enabled advertises
         // egress_restricted besides. See real_handshake_today().
         assert_eq!(info.advertised_capabilities.len(), 59);

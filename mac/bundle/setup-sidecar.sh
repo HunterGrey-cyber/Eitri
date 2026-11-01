@@ -6,7 +6,7 @@
 # step. It installs to the same per-user place `agent::user_sidecar_path` computes,
 #   $XDG_DATA_HOME/eitri/sidecar/<rev>/verdandi-claude-sidecar   (+ BUILD)
 # where an unset, empty or relative XDG_DATA_HOME means $HOME/.local/share, and <rev> is the 7-character
-# `agent::EXPECTED_VERDANDI_REVISION`.
+# `agent::BUNDLED_SIDECAR_REVISION`.
 set -eu
 
 NODE_VERSION=v22.23.2
@@ -20,7 +20,7 @@ usage() {
 usage: setup-sidecar.sh --artifact FILE [--verdandi-rev REV] [options]
        setup-sidecar.sh --verdandi-checkout DIR [options]
 
-Installs the sidecar for the revision this client expects (agent::EXPECTED_VERDANDI_REVISION).
+Installs the sidecar from this client's bundled source revision (agent::BUNDLED_SIDECAR_REVISION).
 
   --artifact FILE            an already built verdandi-claude-sidecar for darwin-arm64. Its revision is the
                              git HEAD of the directory it sits in, or --verdandi-rev when it is not in a
@@ -112,8 +112,8 @@ trap 'exit 130' INT TERM
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 SPAWN_RS=$HERE/../../agent/src/providers/claude_sidecar/spawn.rs
 [ -f "$SPAWN_RS" ] || die "cannot find $SPAWN_RS: run this from an Eitri checkout"
-EXPECTED=$(sed -n 's/^pub const EXPECTED_VERDANDI_REVISION: &str = "\([0-9a-f]\{7,40\}\)";$/\1/p' "$SPAWN_RS")
-[ -n "$EXPECTED" ] || die "cannot read EXPECTED_VERDANDI_REVISION from $SPAWN_RS"
+EXPECTED=$(sed -n 's/^pub const BUNDLED_SIDECAR_REVISION: &str = "\([0-9a-f]\{7,40\}\)";$/\1/p' "$SPAWN_RS")
+[ -n "$EXPECTED" ] || die "cannot read BUNDLED_SIDECAR_REVISION from $SPAWN_RS"
 
 # Where Eitri looks (agent::user_sidecar_path): an absolute XDG_DATA_HOME wins, else $HOME/.local/share.
 case ${XDG_DATA_HOME-} in

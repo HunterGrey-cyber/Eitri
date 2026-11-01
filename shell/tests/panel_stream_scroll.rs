@@ -521,7 +521,6 @@ fn build_replay(quiet_before_tool_ticks: usize, tool_run_ticks: usize, s9_tail: 
         kind: BackendKind::Sidecar,
         project_dir: PathBuf::from("/nonexistent/panel-stream-scroll"),
         permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
-        expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
         account: None,
     };
@@ -2529,7 +2528,6 @@ fn ctrl_e_y_replay() -> Replay {
         kind: BackendKind::Sidecar,
         project_dir: PathBuf::from("/nonexistent/ctrl-e-y"),
         permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
-        expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
         account: None,
     };

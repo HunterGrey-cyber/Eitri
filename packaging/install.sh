@@ -109,6 +109,7 @@ NV_NODE_DIST_BASE=https://nodejs.org/dist
 # no hash. Fixed in production; test mode replaces it (grpc_dist_base), as it does Node's.
 NV_GRPC_DIST_BASE=https://node-precompiled-binaries.grpc.io
 NV_SIDECAR_BUILD_MIN_KIB=614400
+NV_SIDECAR_UPDATE_MIN_KIB=1258291
 # The nvim offer. Never Eitri's own release server -- this is neovim's own GitHub
 # releases. nvim_dist_base's own test-mode default (a refused loopback port) keeps every test that
 # forgets to redirect it from reaching the real host, the same discipline as node_dist_base.
@@ -1391,17 +1392,23 @@ grpc_dist_base() {
 	fi
 }
 
-# check_sidecar_build_space DIR: about 600 MiB free before starting (npm ci's
-# node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB, all in
-# DIR's filesystem). A df that cannot be read degrades rather than blocking a build over it.
-check_sidecar_build_space() {
-	_csb_kib=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 { print $4 }') || _csb_kib=
-	case $_csb_kib in
+# check_free_space DIR MIN_KIB NEEDS: MIN_KIB free in DIR's filesystem before a build starts; NEEDS says
+# what wants it. A df that cannot be read degrades rather than blocking a build over it.
+check_free_space() {
+	_cfs_kib=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 { print $4 }') || _cfs_kib=
+	case $_cfs_kib in
 	'' | *[!0-9]*) return 0 ;;
 	esac
-	if [ "$_csb_kib" -lt "$NV_SIDECAR_BUILD_MIN_KIB" ]; then
-		die "only $((_csb_kib / 1024)) MiB free in $1's filesystem; building the sidecar needs about 600 MiB (npm ci's node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB): free some space and re-run"
+	if [ "$_cfs_kib" -lt "$2" ]; then
+		die "only $((_cfs_kib / 1024)) MiB free in $1's filesystem; $3: free some space and re-run"
 	fi
+}
+
+# check_sidecar_build_space DIR: about 600 MiB free before starting (npm ci's
+# node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB, all in
+# DIR's filesystem).
+check_sidecar_build_space() {
+	check_free_space "$1" "$NV_SIDECAR_BUILD_MIN_KIB" "building the sidecar needs about 600 MiB (npm ci's node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2699,7 +2706,17 @@ sidecar_fetch_manifest() {
 	else
 		_sfm_url=$NV_BASE/releases/latest/download
 	fi
-	fetch "$_sfm_url/SHA256SUMS" "$NV_DL/SHA256SUMS" SHA256SUMS "$NV_SIDECAR_META_MAX_BYTES"
+	# Nothing at the address is an answer of its own: the network works, and re-running cannot help.
+	curl_get "$_sfm_url/SHA256SUMS" "$NV_DL/SHA256SUMS" "$NV_SIDECAR_META_MAX_BYTES"
+	if [ "$CG_OK" != 1 ]; then
+		case $CG_ERR in
+		*'returned error: 404'*)
+			if [ -n "$OPT_VERSION" ]; then die "no release claude-sidecar-v$OPT_VERSION at $NV_BASE: eitri sidecar check names the newest"; fi
+			die "no sidecar release is published at $NV_BASE, so there is nothing to update to"
+			;;
+		esac
+		die "could not download SHA256SUMS from $_sfm_url/SHA256SUMS: $CG_ERR"
+	fi
 	fetch "$_sfm_url/SHA256SUMS.sig" "$NV_DL/SHA256SUMS.sig" "SHA256SUMS.sig (a release without a signature is refused)" "$NV_SIDECAR_META_MAX_BYTES"
 	verify_signature "$NV_DL/SHA256SUMS" "$NV_DL/SHA256SUMS.sig" "$NV_SIDECAR_NAMESPACE"
 	NV_SUMS_TEXT=$(cat -- "$NV_DL/SHA256SUMS") || die "cannot open $NV_DL/SHA256SUMS"
@@ -2710,12 +2727,14 @@ sidecar_fetch_manifest() {
 }
 
 # sidecar_decide: whether this release is one to take, before anything is spent on it. Sets SD_OK,
-# and SD_WHY to why not. With no --version the release must also be newer than `selected` and every
+# and SD_WHY to why not; SD_CURRENT when that is only because new tabs already use it, which is no
+# failure. With no --version the release must also be newer than `selected` and every
 # complete update, so a served older release cannot lower what runs; naming a version is how a person
 # goes down on purpose.
 sidecar_decide() {
 	SD_OK=0
 	SD_WHY=
+	SD_CURRENT=0
 	if [ -n "$OPT_VERSION" ] && [ "$OPT_VERSION" != "$SR_VERSION" ]; then
 		SD_WHY="asked for $OPT_VERSION, but this release says it is $SR_VERSION"
 		return 0
@@ -2752,7 +2771,13 @@ sidecar_decide() {
 	esac
 	update_intact "$SR_VERSION"
 	if [ "$NV_SIDECAR_PRESENT" = 1 ]; then
-		SD_WHY="already built: eitri sidecar use $SR_VERSION"
+		read_selected
+		if [ "$NV_SELECTED_VERSION" = "$SR_VERSION" ]; then
+			SD_CURRENT=1
+			SD_WHY="$SR_VERSION is already what new tabs use"
+		else
+			SD_WHY="already built: eitri sidecar use $SR_VERSION"
+		fi
 		return 0
 	fi
 	if [ -z "$OPT_VERSION" ]; then
@@ -2901,6 +2926,10 @@ do_sidecar_update() {
 	prepare_signers
 	sidecar_fetch_manifest
 	sidecar_decide
+	if [ "$SD_CURRENT" = 1 ]; then
+		say "$SD_WHY"
+		return 0
+	fi
 	if [ "$SD_OK" != 1 ]; then die "$SD_WHY"; fi
 
 	# From here on every file comes from the release's own tag, so `latest` moving cannot mix two.
@@ -2915,7 +2944,7 @@ do_sidecar_update() {
 	REL_NODE_SHA256_LINUX_ARM64=$SR_NODE_SHA256_LINUX_ARM64
 	sidecar_download_node "$_dsu_work" 0
 	sidecar_download_protoc "$_dsu_work"
-	check_sidecar_build_space "$_dsu_work"
+	check_free_space "$_dsu_work" "$NV_SIDECAR_UPDATE_MIN_KIB" "building a sidecar update needs about 1.2 GiB while it runs (a measured build peaked near 1.15 GiB)"
 	SB_NPM_CI_FLAGS=--ignore-scripts
 	SB_PROTOC_TARBALL=$SDP_TARBALL
 	sidecar_build_core "$_dsu_work" "$SDN_TARBALL" "$NV_DL/$SR_SOURCE"
@@ -2948,7 +2977,7 @@ do_sidecar_check() {
 	fi
 	say "newest release: $SR_VERSION (protocol $SR_PROTOCOL_MAJOR.$SR_PROTOCOL_MINOR, Agent SDK $SR_SDK_VERSION). You run $_dsc_run."
 	if [ "$SD_OK" = 1 ]; then
-		say "eitri sidecar update takes it: 1-3 minutes, about 600 MiB free, and network access to nodejs.org, npm and grpc.io."
+		say "eitri sidecar update takes it: 1-3 minutes, about 1.2 GiB free, and network access to nodejs.org, npm and grpc.io."
 	else
 		say "$SD_WHY"
 	fi

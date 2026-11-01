@@ -263,7 +263,12 @@ impl ClaudeSidecarProvider {
             provider_prompts,
             claude_code_prompt,
             max_message_bytes,
-        } = handshake_with(&runtime, &sidecar, Some(child.pid))?;
+        } = handshake_with(
+            &runtime,
+            &sidecar,
+            Some(child.pid),
+            super::spawn::running_exe_dir().as_deref(),
+        )?;
         let mark = WatchMark {
             sequence: folded_through,
             last_text,

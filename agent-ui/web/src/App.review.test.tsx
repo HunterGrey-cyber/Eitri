@@ -45,7 +45,6 @@ const HELLO: Hello = {
   projectDir: "/home/user/project",
   permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
-  expectedVerdandiRevision: null,
   account: null,
 };
 const TAB1 = {

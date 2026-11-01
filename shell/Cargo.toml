@@ -103,6 +103,13 @@ name = "end_signals"
 [[test]]
 name = "core_wm_acceptance"
 
+# `eitri --sidecar-probe <path>` answers before anything that could start GTK. A plain `main`, because
+# `own_display_scan` requires a test that starts the product binary to isolate its display in `main`, which
+# libtest's harness never runs; the child itself is given no display.
+[[test]]
+name = "sidecar_probe"
+harness = false
+
 # Guards the rule that every test opening a display starts its own
 # display (2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that
 # opens a display without `tests/support/own_x_server.rs`. A plain #[test] harness that opens nothing,

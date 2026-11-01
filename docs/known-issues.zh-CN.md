@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=7ca514f1c142b01ea8723cb579be48c36c0d46bbaba7162ba18f387b79bf5e84 -->
+<!-- translated-from: known-issues.md sha256=4afa6e645cfd200447b9d9d9f29f8b916c2a31716bc5c2f07a6509e7183ca7d0 -->
 
 # 已知问题与限制
 
@@ -20,6 +20,7 @@
 - **agent sidecar 在你的机器上构建**，在安装的过程中完成（需要联网，以及约 600 MiB 可用磁盘空间；要下载 Node.js 和 npm 包）。AUR 的 `eitri-bin` 在它自己的构建过程里做同样的事，所以要几分钟，而不是几秒。原因见 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#为什么-sidecar-要在你自己的机器上构建)。
 - **`.deb` 和 `.rpm` 装完后需要运行一次 `eitri setup`**，用你自己的用户身份；这两种包都不会构建 sidecar。
 - **从 0.2.2 升级会重新构建一次 sidecar**，因为 0.3.0 固定了一个更新的版本：下载量和磁盘空间与第一次安装相同；`.deb` 或 `.rpm` 升级之后还要再运行一次 `eitri setup`。
+- **sidecar 更新可能在两个地方失败**（[INSTALL.zh-CN.md](../INSTALL.zh-CN.md#updating-the-sidecar)）。`eitri sidecar update` 会用一句直白的话停下，并且什么都不改：常见原因是连不上 nodejs.org、npm 或 grpc.io，可用磁盘空间太少，签名验证不过，发布需要更新的 Eitri，或者同时有另一个 `eitri sidecar` 命令在运行。更新已经构建好、但在某个标签页里启动不了，不会弄坏这个标签页：它改用 Eitri 自带的 sidecar，状态栏显示 `⚠`，详情里写明原因。`eitri sidecar use bundled` 让它不再尝试。更新只对它之后打开的标签页生效，Eitri 0.3.0 完全不能装更新。
 - **Ubuntu 23.10 及以后，包括 24.04：** AppArmor 默认会拦住 WebKit 的沙盒。Eitri 启动时会检查；编辑器和终端照常工作，agent 面板的位置会显示只需做一次的修复步骤。修复需要 `sudo`，也有代价，两者都写在 [INSTALL.zh-CN.md](../INSTALL.zh-CN.md#ubuntu-2310-及以后版本) 里。
 - **`v0.2.0` 很快将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前的每一个提交，指向的都是已经没有任何分支持有的 fork 提交；请构建 0.2.1 或更新的版本。至于 0.2.0 本身：用 0.2.0 自己的 `install.sh` 加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它；之后版本的 `install.sh` 没法从源码构建 0.2.0。安装包、tar 包和 `install.sh` 不受影响。
 

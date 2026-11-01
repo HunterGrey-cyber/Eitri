@@ -240,6 +240,9 @@ class ReleaseFieldsTests(unittest.TestCase):
             with self.assertRaisesRegex(rc.ReleaseCheckError, key, msg=f"{key}={bad!r}"):
                 rc.validate_release(fields)
 
+    def test_a_candidate_sidecar_version_passes_as_everything_else_reads_it(self):
+        rc.validate_release(dict(_GOOD_RELEASE_FIELDS, SIDECAR_VERSION="0.4.0-rc.1"))  # must not raise
+
     def test_a_rehearsal_release_carries_the_sidecar_contract_keys_too(self):
         fields = dict(_GOOD_RELEASE_FIELDS, REHEARSAL="1")
         rc.validate_release(fields, rehearsal=True)  # must not raise

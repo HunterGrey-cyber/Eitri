@@ -35,6 +35,13 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **`.deb` and `.rpm` need one `eitri setup`** afterwards, as your own user; neither package builds the sidecar.
 - **Upgrading from 0.2.2 builds the sidecar again**, because 0.3.0 pins a newer one: the same download and disk
   space as a first install, and after a `.deb` or `.rpm` upgrade one more `eitri setup`.
+- **A sidecar update can fail in two places** ([INSTALL.md](../INSTALL.md#updating-the-sidecar)).
+  `eitri sidecar update` stops with a plain message and changes nothing: usually no network to nodejs.org, npm or
+  grpc.io, too little free disk space, a signature that does not verify, a release that needs a newer Eitri, or
+  another `eitri sidecar` command running at the same moment. An update that is built but will not start in a tab does
+  not break the tab: it runs the sidecar that came with Eitri, its band shows `⚠`, and its details say why. `eitri
+  sidecar use bundled` ends the attempts. An update reaches only tabs opened after it, and Eitri 0.3.0 cannot take
+  updates at all.
 - **Ubuntu 23.10 and later, 24.04 included:** AppArmor blocks WebKit's sandbox by default. Eitri checks at
   startup; the editor and the terminal still work, and the agent panel shows the one-time fix in its place. The
   fix needs `sudo` and has a cost, both spelled out in

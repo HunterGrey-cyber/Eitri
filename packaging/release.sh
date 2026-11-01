@@ -458,7 +458,7 @@ preflight() {
 	[[ "$RS_VERDANDI_URL" == https://* ]] || die "agent/Cargo.toml's claude-runtime-protocol source is not an https URL: $RS_VERDANDI_URL"
 	grep -qE "^pub const (EXPECTED_VERDANDI_REVISION|BUNDLED_SIDECAR_REVISION): &str = \"${RS_VERDANDI_REV:0:7}\";" \
 		"$RS_SOURCE/agent/src/providers/claude_sidecar/spawn.rs" \
-		|| die "EXPECTED_VERDANDI_REVISION is not ${RS_VERDANDI_REV:0:7}, the 7-char prefix of the pinned Verdandi rev"
+		|| die "BUNDLED_SIDECAR_REVISION (EXPECTED_VERDANDI_REVISION in an older tree) is not ${RS_VERDANDI_REV:0:7}, the 7-char prefix of the pinned Verdandi rev"
 	if [ -n "$RS_VERDANDI_MIRROR" ]; then
 		[ -d "$RS_VERDANDI_MIRROR" ] || die "--verdandi-mirror $RS_VERDANDI_MIRROR is not a directory"
 		RS_VERDANDI_MIRROR="$(realpath "$RS_VERDANDI_MIRROR")"

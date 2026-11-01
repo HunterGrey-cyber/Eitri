@@ -408,7 +408,6 @@ fn replay_fixture() -> Vec<String> {
         kind: BackendKind::Sidecar,
         project_dir: PathBuf::from("/nonexistent/panel-jk-hold"),
         permission_modes: CLIENT_IMPLEMENTED_PERMISSION_MODES,
-        expected_verdandi_revision: Some(agent::EXPECTED_VERDANDI_REVISION),
         resumable: Vec::new(),
         account: None,
     };

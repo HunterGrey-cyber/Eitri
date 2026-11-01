@@ -71,7 +71,6 @@ describe("the backend name is drawn only in the detail popover, never the choose
       projectDir: "/home/user/src/neovibe",
       permissionModes: ["manual", "auto", "bypass"],
       resumableSessions: [],
-      expectedVerdandiRevision: "28a5e4c",
       account: "work",
     };
     const { container } = render(<Dashboard hello={hello} mode="auto" cursor={0} narrow={false} onItem={vi.fn()} />);

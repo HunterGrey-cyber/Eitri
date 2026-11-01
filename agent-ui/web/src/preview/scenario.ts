@@ -242,7 +242,7 @@ function basePackets(scenario: Scenario, theme: Record<string, string>): unknown
   return [
     { kind: "theme", vars: theme },
     { kind: "hello", backend: "legacy", projectDir: cwd, permissionModes: ["auto", "bypass"],
-      resumableSessions: [], expectedVerdandiRevision: null, account: null },
+      resumableSessions: [], account: null },
     { kind: "tabs", active: 1, tabs: [tab] },
     { kind: "snapshot", tab: 1, throughRevision: 15, state,
       turnTimes: [turnTime("t1", 10, 42_000)] },
@@ -318,7 +318,7 @@ function emptyPackets(theme: Record<string, string>, sessions: boolean): unknown
   return [
     { kind: "theme", vars: theme },
     { kind: "hello", backend: "legacy", projectDir: cwd, permissionModes: ["manual", "auto", "bypass"],
-      resumableSessions, expectedVerdandiRevision: null, account: "me@example.com",
+      resumableSessions, account: "me@example.com",
       restore: sessions ? { labels: ["api", "docs", "tests"], bypass: 0 } : null },
     // The window's keys as Rust sends them: the start screen's box names the key that moves into the panel.
     { kind: "keymap", prefix: "Ctrl+b", window: [{ keys: "Ctrl+h / Ctrl+l", what: "Module left / right" }],

@@ -104,7 +104,7 @@ fn close_session_on_an_unknown_id_surfaces_a_typed_provider_error() {
 /// reaches the model, nothing is billed. (The sidecar does run `claude --version` at startup for its
 /// own compatibility check; that is a version probe, not a query.)
 ///
-/// Run it after bumping `EXPECTED_VERDANDI_REVISION`, and update the fixture from what it reports.
+/// Run it after bumping `BUNDLED_SIDECAR_REVISION`, and update the fixture from what it reports.
 #[test]
 #[ignore]
 fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {

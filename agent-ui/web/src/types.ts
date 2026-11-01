@@ -407,8 +407,8 @@ export type ProviderInfo = {
   /** Which build of the provider this is (Verdandi checkout and revision). Descriptive and
    * essentially always present -- deliberately NOT a diagnostic. */
   buildDescription: string | null;
-  /** Only things worth warning about: an untested CLI version, a Verdandi checkout that has drifted
-   * from the verified baseline. **Empty is the normal case**, which is what makes non-empty a real
+  /** Only things worth warning about: an untested CLI version, a condition the CLI reports about
+   * itself. **Empty is the normal case**, which is what makes non-empty a real
    * signal worth putting a glyph on. */
   startupDiagnostics: string[];
 };
@@ -707,7 +707,6 @@ export type Hello = {
    *
    * Rust ranks this; the frontend renders it in array order and sorts nothing. */
   resumableSessions: ResumableSession[];
-  expectedVerdandiRevision: string | null;
   /** `agent::account`'s configured name, `null` when none is set (`serialize_hello_for_js`'s
    *  own `"account"` field). Read by the empty tab's dashboard
    *  (its cwd/backend/account line) and by nothing else yet. */

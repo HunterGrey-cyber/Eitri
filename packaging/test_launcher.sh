@@ -400,6 +400,14 @@ assert_eq "$(grep '^STUB_SETUP_ARG:' <<<"$out" | paste -sd'|' -)" "STUB_SETUP_AR
 out="$(run_launcher sidecar update --version 0.3.2)"
 assert_eq "$(grep '^STUB_SETUP_ARG:' <<<"$out" | paste -sd'|' -)" "STUB_SETUP_ARG:--sidecar-update|STUB_SETUP_ARG:--version|STUB_SETUP_ARG:0.3.2" "update's --version follows its mode"
 
+echo "== 'eitri sidecar use' with nothing to select =="
+out="$(run_launcher sidecar use; echo "rc=$?")"
+assert_contains "$out" "usage: eitri sidecar use bundled|VERSION" "it says what use takes"
+assert_contains "$out" "rc=64" "it is a usage error"
+assert_not_contains "$out" "--sidecar-use" "it names no flag nobody typed"
+assert_not_contains "$out" "STUB_SETUP_CALL" "it runs nothing"
+assert_not_contains "$out" "STUB_ARG:" "it opens no window"
+
 echo "== 'eitri sidecar' with no verb, an unknown one, or asking for help =="
 out="$(run_launcher sidecar; echo "rc=$?")"
 assert_contains "$out" "eitri sidecar status" "no verb says what the verbs are"

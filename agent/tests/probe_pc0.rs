@@ -228,9 +228,8 @@ fn sidecar_program() -> (PathBuf, Vec<PathBuf>) {
     }
     let home = std::env::var_os("HOME");
     let data_home = std::env::var_os("XDG_DATA_HOME");
-    if let Some(user) =
-        agent::user_sidecar_path(data_home.as_deref(), home.as_deref(), agent::EXPECTED_VERDANDI_REVISION)
-            .filter(|p| p.is_file())
+    if let Some(user) = agent::user_sidecar_path(data_home.as_deref(), home.as_deref(), agent::BUNDLED_SIDECAR_REVISION)
+        .filter(|p| p.is_file())
     {
         return (user, Vec::new());
     }

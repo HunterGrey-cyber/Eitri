@@ -1,5 +1,5 @@
 //! `agent/Cargo.toml`'s `claude-runtime-protocol` revision and
-//! `agent::EXPECTED_VERDANDI_REVISION` must name the same commit. Either can be a full hash
+//! `agent::BUNDLED_SIDECAR_REVISION` must name the same commit. Either can be a full hash
 //! or a short prefix, so compare prefixes in either direction, as Cargo accepts both forms.
 //! `providers::claude_sidecar::spawn::describe_checkout` uses the same comparison for runtime drift.
 //!
@@ -11,7 +11,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use agent::EXPECTED_VERDANDI_REVISION;
+use agent::providers::claude_sidecar::CLIENT_PROTOCOL_MAJOR;
+use agent::{BUNDLED_SIDECAR_REVISION, BUNDLED_SIDECAR_VERSION, REQUIRED_CAPABILITIES};
 
 #[test]
 fn the_pinned_protocol_exposes_the_preset() {
@@ -182,7 +183,7 @@ fn is_hex(s: &str) -> bool {
 #[test]
 fn manifest_pin_and_expected_revision_name_the_same_commit() {
     let manifest_rev = cargo_toml_rev();
-    let expected = EXPECTED_VERDANDI_REVISION;
+    let expected = BUNDLED_SIDECAR_REVISION;
 
     assert!(
         is_hex(&manifest_rev) && manifest_rev.len() >= 7,
@@ -190,12 +191,12 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
     );
     assert!(
         is_hex(expected) && expected.len() >= 7,
-        "agent::EXPECTED_VERDANDI_REVISION {expected:?} must be at least 7 hex characters"
+        "agent::BUNDLED_SIDECAR_REVISION {expected:?} must be at least 7 hex characters"
     );
     assert!(
         manifest_rev.starts_with(expected) || expected.starts_with(manifest_rev.as_str()),
         "agent/Cargo.toml pins claude-runtime-protocol at {manifest_rev:?}, but \
-         agent::EXPECTED_VERDANDI_REVISION is {expected:?} -- these must name the same commit. \
+         agent::BUNDLED_SIDECAR_REVISION is {expected:?} -- these must name the same commit. \
          Bump both together and re-verify against the real proto diff \
          (the drill: `git diff <old>..<new> -- proto crates` \
          should be empty for a \
@@ -241,4 +242,57 @@ fn the_prefix_comparison_itself_rejects_two_different_revisions() {
         !(a.starts_with(b) || b.starts_with(a)),
         "these two fixture revisions must not be prefixes of each other"
     );
+}
+
+/// The value of `key` in `packaging/sidecar-contract.env`: `KEY=value` lines, `#` lines and blanks skipped.
+fn contract_value(key: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../packaging/sidecar-contract.env");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let prefix = format!("{key}=");
+    let mut found = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.strip_prefix(prefix.as_str()));
+    let value = found
+        .next()
+        .unwrap_or_else(|| panic!("{}: no {key} line", path.display()));
+    assert!(found.next().is_none(), "{}: {key} appears twice", path.display());
+    value.trim().to_string()
+}
+
+/// The shell side reads the contract file and this crate holds the same values as constants:
+/// the two must not drift apart.
+#[test]
+fn the_contract_file_says_what_the_constants_say() {
+    assert_eq!(contract_value("SIDECAR_VERSION"), BUNDLED_SIDECAR_VERSION);
+    assert_eq!(
+        contract_value("SIDECAR_PROTOCOL_MAJOR"),
+        CLIENT_PROTOCOL_MAJOR.to_string()
+    );
+    let from_file = contract_value("SIDECAR_REQUIRED_CAPABILITIES");
+    let from_file: Vec<&str> = from_file.split(' ').filter(|word| !word.is_empty()).collect();
+    assert_eq!(
+        from_file,
+        REQUIRED_CAPABILITIES.to_vec(),
+        "same capabilities, same order"
+    );
+}
+
+/// A selected update is held to `REQUIRED_CAPABILITIES`, so each one must be a capability every
+/// sidecar of the protocol major advertises without a condition, and one the protocol crate knows.
+#[test]
+fn required_capabilities_are_advertised_unconditionally() {
+    let conditional = ["steer_turn", "task_output", "task_output_range", "egress_restricted"];
+    for capability in REQUIRED_CAPABILITIES {
+        assert!(
+            !conditional.contains(&capability),
+            "{capability} is advertised only under a condition, so an update cannot be required to offer it"
+        );
+        assert!(
+            claude_runtime_protocol::CAPABILITY_SINCE_MINOR
+                .iter()
+                .any(|(name, _)| *name == capability),
+            "{capability} is not a capability the protocol crate lists"
+        );
+    }
 }

@@ -28,7 +28,9 @@
 // here are compiled and unused.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::collections::VecDeque;
+use super::contract::{SidecarVersion, BUNDLED_SIDECAR_VERSION};
+use crate::provider::ProviderInfo;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
@@ -38,7 +40,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -133,7 +135,7 @@ pub(crate) struct SpawnedSidecar {
     /// Which Verdandi checkout and revision this sidecar was built and launched from. Descriptive,
     /// always present -- reaches the UI as `ProviderInfo::verdandi_checkout`, NOT as a diagnostic.
     pub(crate) build_description: String,
-    /// Only things genuinely worth warning about (today: baseline drift). Usually empty.
+    /// Only things genuinely worth warning about (none are raised today). Usually empty.
     pub(crate) build_warnings: Vec<String>,
     /// This process's copy of the sidecar's stdin. The sidecar ends on its EOF, so the last copy to
     /// close, wherever it is, is the sidecar's end.
@@ -555,40 +557,10 @@ impl SpawnedSidecar {
     }
 }
 
-/// The Verdandi revision this client is developed and verified against (protocol 3.22).
-///
-/// Not a hard pin -- `EITRI_VERDANDI_CHECKOUT` exists precisely so a Verdandi feature branch or a
-/// protocol migration can be tested against an unreleased sidecar, and hard-failing on a different
-/// revision would defeat that. It is a BASELINE: when the checkout is at a different revision, that
-/// fact is surfaced as a startup diagnostic instead of being silent, so "which sidecar build was
-/// this session actually running?" is answerable after the fact rather than guessed at.
-///
-/// It is also the `rev` that `agent/Cargo.toml` pins `claude-runtime-protocol` to, and the two must
-/// stay equal, because the generated wire types this crate compiles against come from exactly that
-/// revision, so it is the revision "verified against" can honestly refer to. (The checkout actually
-/// RUNNING may differ; that is what the drift warning below reports, and what
-/// `EITRI_VERDANDI_CHECKOUT` is for.) `agent/Cargo.toml` names the full commit; this stays the
-/// 7-character prefix, because the per-user sidecar directory and the release checks are keyed by
-/// exactly that.
-///
-/// The value earns its way here by the real suite, never by a version bump: the whole `#[ignore]`d
-/// real-sidecar set is re-run against the exact pushed revision first (multi-turn with a content
-/// oracle, BYPASS tool execution, post-interrupt reuse, orphan-free teardown, a real resume proven
-/// by both a content oracle and a provider-session-id match, partial assistant streaming measured
-/// before/after, and the replay/recovery and backpressure suites). Move it again on the same
-/// terms, not before. When a bump changes no generated type and no capability, it exists only to
-/// track the sidecar artifact this client spawns.
-///
-/// Keep this doc comment and the literal in step. They once drifted apart (the prose named one
-/// revision while the constant held another, two revisions apart) and nothing failed.
-///
-/// **Slated for retirement, and the replacement is already on the wire.** A git revision is a
-/// development-machine concept: a packaged install will spawn a shipped sidecar ARTIFACT with no
-/// checkout and no `.git` to read, so this check has nothing to compare and the description line
-/// above it has nothing to describe. The compatibility token is to become protocol major (already
-/// checked at handshake) plus `sidecar_version`, which Verdandi stamps from `package.json` at build
-/// time -- both already carried on `ProviderInfo`. Until this client range-checks that version,
-/// this constant is what warns about skew, so it is kept accurate rather than deleted early.
+/// Source address of the bundled sidecar and the revision the scripted fixtures were recorded on.
+/// The protocol dependency and fixtures name the same commit. This seven-character prefix keys
+/// per-user builds and release checks; the manifest names the full commit. Compatibility is
+/// decided by the handshake and, for selected updates, the update contract.
 ///
 /// What this client reads from the protocol at this revision, by minor version:
 /// - Earlier minors: `SetPermissionMode`, `PermissionModeChanged` and `TextDelta.message_id`;
@@ -629,7 +601,7 @@ impl SpawnedSidecar {
 ///   (`ProviderCapabilities::direct_settings`, all three or none); `SessionReady.effort`; the
 ///   `CliModeReported` event (`SessionEvent` arm 60), judged as `SessionReady.permission_mode` is;
 ///   a range of `GetTaskOutput` behind `task_output_range`.
-pub const EXPECTED_VERDANDI_REVISION: &str = "842d54e";
+pub const BUNDLED_SIDECAR_REVISION: &str = "842d54e";
 
 /// Where `EITRI_VERDANDI_CHECKOUT` came from, and what it points at. Carried onto `ProviderInfo`
 /// so the UI can name the backend build it is talking to.
@@ -791,14 +763,7 @@ fn git_short_revision(checkout: &Path) -> Option<String> {
     }
 }
 
-/// One line saying which backend build this session is running, plus a separate list of things
-/// genuinely worth warning about.
-///
-/// The split is load-bearing. The description is unconditional -- there is always a checkout, and a
-/// missing git revision degrades to "unknown revision" rather than suppressing the line -- so
-/// folding it into the warning list made that list never empty, and any UI that treats "has
-/// diagnostics" as "something is wrong" lit up permanently for every healthy session. A warning
-/// that is always on is not a warning.
+/// Describes the checkout without judging its revision: naming a checkout selects that build.
 fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
     let source = if checkout.from_override {
         "EITRI_VERDANDI_CHECKOUT"
@@ -815,20 +780,7 @@ fn describe_checkout(checkout: &VerdandiCheckout) -> (String, Vec<String>) {
         checkout.path.display()
     );
 
-    let mut warnings = Vec::new();
-    // `starts_with` rather than equality: `git rev-parse --short` picks its own abbreviation length,
-    // which grows as a repository does, so a strict comparison would start reporting false drift.
-    if let Some(actual) = &checkout.revision {
-        if !actual.starts_with(EXPECTED_VERDANDI_REVISION) && !EXPECTED_VERDANDI_REVISION.starts_with(actual.as_str()) {
-            warnings.push(format!(
-                "Verdandi baseline drift: running {actual}, this client was verified against \
-                 {EXPECTED_VERDANDI_REVISION}. Not an error -- testing a Verdandi branch is exactly \
-                 what EITRI_VERDANDI_CHECKOUT is for -- but if behavior looks wrong, this is the \
-                 first thing to check."
-            ));
-        }
-    }
-    (description, warnings)
+    (description, Vec::new())
 }
 
 /// True if the checkout's root `package.json` declares a `build` script.
@@ -953,8 +905,36 @@ enum SidecarProgram {
     /// A shipped, self-contained executable -- normally a sibling of the running binary, the same
     /// convention `agent-hook`, `eitri-supervisor` and `eitri-tmux-shim` already follow.
     Packaged(PathBuf),
+    /// The executable `EITRI_SIDECAR_BINARY` names: the same shape, and no claim to be what Eitri ships.
+    Named(PathBuf),
     /// A Verdandi checkout, run through `node`.
     Checkout(VerdandiCheckout),
+}
+
+const PACKAGED_DESCRIPTION: &str = "packaged sidecar artifact: ";
+
+fn packaged_description(path: &Path) -> String {
+    format!("{PACKAGED_DESCRIPTION}{}", path.display())
+}
+
+/// Where the sidecar `info` describes came from, in the words of the detail popover's revision row. A
+/// checkout or a named binary says what it is. A packaged artifact is the bundled sidecar only when it
+/// reports the bundled version: a chat that moved windows on an update keeps its description and loses
+/// `sidecar_update`, and its row must not call it bundled.
+pub fn sidecar_origin(info: &ProviderInfo) -> String {
+    if info.sidecar_update.is_some() {
+        return "update".to_string();
+    }
+    let packaged = info
+        .build_description
+        .as_deref()
+        .is_none_or(|description| description.starts_with(PACKAGED_DESCRIPTION));
+    if packaged && info.sidecar_version == BUNDLED_SIDECAR_VERSION {
+        return "bundled".to_string();
+    }
+    info.build_description
+        .clone()
+        .unwrap_or_else(|| "not the bundled one".to_string())
 }
 
 /// Decides which of the two shapes to use, from values the caller supplies rather than from the
@@ -969,12 +949,9 @@ enum SidecarProgram {
 ///    the ONLY branch that may build (`ensure_sidecar_built`, called from `invocation_for`'s
 ///    `Checkout{prebuilt: None}` arm, which `spawn()` feeds it into) -- naming a checkout is the
 ///    explicit act that authorizes it.
-/// 3. A packaged artifact beside this binary -- the shape a real install has. A sibling may carry an
-///    optional `<PACKAGED_SIDECAR_BINARY>.rev` file; `spawn()` compares it against
-///    `EXPECTED_VERDANDI_REVISION` and warns on a mismatch (`sibling_rev_skew_warning`), the same
-///    warning the checkout path gives for its own drift.
+/// 3. A packaged artifact beside this binary -- the shape a real install has.
 /// 4. **New:** a per-user build at `user_sidecar_path`'s exact rev-keyed location -- what
-///    `eitri setup` leaves behind. Keyed by `EXPECTED_VERDANDI_REVISION`, so a build for a
+///    `eitri setup` leaves behind. Keyed by `BUNDLED_SIDECAR_REVISION`, so a build for a
 ///    DIFFERENT revision, sitting in its own directory, is never found -- never "almost right".
 /// 5. The default checkout, **and only when it already holds a prebuilt artifact** for this machine.
 ///    It never builds: before the sidecar became the default, this branch was reachable only by
@@ -992,6 +969,9 @@ enum SidecarProgram {
 ///
 /// Nothing found by any of the five: `Err`, naming `NO_SIDECAR_HINT` plus the exact path a
 /// `eitri setup` run would use (`no_sidecar_message`).
+///
+/// A selected update ranks between 2 and 3, and is not decided here: [`update_choice`] answers ahead
+/// of this function, so that a tab whose update failed can come back here for what is left.
 fn resolve_sidecar_program(
     explicit_binary: Option<&str>,
     explicit_checkout: Option<&str>,
@@ -1007,7 +987,7 @@ fn resolve_sidecar_program(
                 sidecar_missing_message(std::slice::from_ref(&path)),
             ));
         }
-        return Ok(SidecarProgram::Packaged(path));
+        return Ok(SidecarProgram::Named(path));
     }
     if explicit_checkout.map(str::trim).is_some_and(|c| !c.is_empty()) {
         return Ok(SidecarProgram::Checkout(locate_verdandi_checkout(
@@ -1018,8 +998,7 @@ fn resolve_sidecar_program(
     if let Some(sibling) = exe_dir.map(|d| d.join(PACKAGED_SIDECAR_BINARY)).filter(|p| p.is_file()) {
         return Ok(SidecarProgram::Packaged(sibling));
     }
-    if let Some(user_path) = user_sidecar_path(xdg_data_home, home, EXPECTED_VERDANDI_REVISION).filter(|p| p.is_file())
-    {
+    if let Some(user_path) = user_sidecar_path(xdg_data_home, home, BUNDLED_SIDECAR_REVISION).filter(|p| p.is_file()) {
         return Ok(SidecarProgram::Packaged(user_path));
     }
     // Step 5: the default checkout counts only when it already holds a prebuilt artifact. A
@@ -1084,23 +1063,25 @@ pub fn sidecar_availability() -> SidecarAvailability {
         .is_some_and(|c| !c.is_empty());
     sidecar_availability_in(
         std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-            .as_deref(),
+        running_exe_dir().as_deref(),
         checkout_path_for(explicit_checkout.as_deref(), home.as_deref()).as_deref(),
         checkout_is_explicit,
         std::env::var_os("XDG_DATA_HOME").as_deref(),
         home.as_deref(),
+        &failed_updates(),
     )
+}
+
+pub(super) fn running_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
 }
 
 /// [`sidecar_availability`]'s answer. Decides nothing (see that function's correction): every value
 /// selects the sidecar backend, and each only picks the line `BackendKind::choose` prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarAvailability {
-    /// Something runs with nothing to build: a named `EITRI_SIDECAR_BINARY` that is a file, the
-    /// packaged sibling, the per-user build, or a checkout holding a prebuilt artifact.
+    /// Something runs with nothing to build: a named `EITRI_SIDECAR_BINARY` that is a file, a selected
+    /// update, the packaged sibling, the per-user build, or a checkout holding a prebuilt artifact.
     Runnable,
     /// `EITRI_VERDANDI_CHECKOUT` names a checkout with nothing prebuilt for this machine, so the
     /// first session start builds it there (`npm`, discovery step 2) -- naming a checkout is the act
@@ -1130,6 +1111,7 @@ fn sidecar_availability_in(
     checkout_is_explicit: bool,
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
+    failed: &HashSet<String>,
 ) -> SidecarAvailability {
     let prebuilt = |path: &Path| prebuilt_artifact_in(path).is_some();
     // Step 1: a named binary wins, and `resolve_sidecar_program` refuses one that is not a file.
@@ -1147,10 +1129,16 @@ fn sidecar_availability_in(
             _ => SidecarAvailability::BuildsNamedCheckout,
         };
     }
+    if matches!(
+        update_choice(None, None, exe_dir, xdg_data_home, home, failed),
+        UpdateChoice::Use { .. }
+    ) {
+        return SidecarAvailability::Runnable;
+    }
     // Steps 3-5: the sibling, the per-user build, a default checkout holding a prebuilt artifact.
     let sibling = exe_dir.is_some_and(|dir| dir.join(PACKAGED_SIDECAR_BINARY).is_file());
     let user_build =
-        user_sidecar_path(xdg_data_home, home, EXPECTED_VERDANDI_REVISION).is_some_and(|path| path.is_file());
+        user_sidecar_path(xdg_data_home, home, BUNDLED_SIDECAR_REVISION).is_some_and(|path| path.is_file());
     if sibling || user_build || checkout.is_some_and(prebuilt) {
         SidecarAvailability::Runnable
     } else {
@@ -1188,6 +1176,15 @@ fn checkout_path_for(explicit: Option<&str>, home: Option<&OsStr>) -> Option<Pat
 /// relative included, and refuses only when `$HOME` is unset entirely -- an earlier revision of
 /// this comment claimed otherwise.
 pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, rev: &str) -> Option<PathBuf> {
+    Some(
+        sidecar_data_root(xdg_data_home, home)?
+            .join(rev)
+            .join(PACKAGED_SIDECAR_BINARY),
+    )
+}
+
+/// `eitri/sidecar` under the data directory, by the rule [`user_sidecar_path`] states.
+fn sidecar_data_root(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     let base = match xdg_data_home {
         Some(data_home) if Path::new(data_home).is_absolute() => PathBuf::from(data_home),
         _ => match home {
@@ -1195,7 +1192,186 @@ pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, re
             _ => return None,
         },
     };
-    Some(base.join("eitri/sidecar").join(rev).join(PACKAGED_SIDECAR_BINARY))
+    Some(base.join("eitri/sidecar"))
+}
+
+/// The program behind `eitri sidecar`. A route without it beside the running binary has no way to
+/// take an update or to leave one, so a `selected` file means nothing there.
+const SETUP_PROGRAM: &str = "eitri-setup";
+
+/// Longer than any line that parses.
+const MAX_SELECTED_BYTES: u64 = 256;
+
+/// The versions that failed to start in this process. Never written down: a cold disk must not turn
+/// an update off for good, so a new window tries once more.
+static FAILED_UPDATES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+pub(crate) fn failed_updates() -> HashSet<String> {
+    FAILED_UPDATES.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+pub(crate) fn remember_failed_update(version: &str) {
+    FAILED_UPDATES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(version.to_string());
+}
+
+/// What the files on disk say a new tab should try first.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpdateChoice {
+    NoUpdate,
+    Use {
+        version: String,
+        path: PathBuf,
+    },
+    /// `selected` is there and cannot be followed; the text says what is wrong, for a person.
+    Unusable(String),
+    /// The version failed to start in this process.
+    FailedHere(String),
+}
+
+/// Reads `selected` under the data root and judges it, from values the caller supplies. Nothing here
+/// starts a process, and no version reaches a path before it has parsed.
+///
+/// A named binary or checkout wins over an update. Without `eitri-setup` beside the running binary an
+/// update does not apply. A version not strictly newer than the bundled one is passed over without
+/// trouble: after an Eitri upgrade a stale `selected` is normal, and running below the bundled sidecar
+/// is a combination nobody tests, also when the bundled one is not built yet.
+pub(crate) fn update_choice(
+    explicit_binary: Option<&str>,
+    explicit_checkout: Option<&str>,
+    exe_dir: Option<&Path>,
+    xdg_data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    failed: &HashSet<String>,
+) -> UpdateChoice {
+    let named = |value: Option<&str>| value.map(str::trim).is_some_and(|value| !value.is_empty());
+    if named(explicit_binary) || named(explicit_checkout) {
+        return UpdateChoice::NoUpdate;
+    }
+    if !exe_dir.is_some_and(|dir| dir.join(SETUP_PROGRAM).is_file()) {
+        return UpdateChoice::NoUpdate;
+    }
+    let Some(root) = sidecar_data_root(xdg_data_home, home) else {
+        return UpdateChoice::NoUpdate;
+    };
+    let (version, parsed) = match read_selected(&root.join("selected")) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return UpdateChoice::NoUpdate,
+        Err(what) => return UpdateChoice::Unusable(what),
+    };
+    if SidecarVersion::parse(BUNDLED_SIDECAR_VERSION).is_none_or(|bundled| parsed <= bundled) {
+        return UpdateChoice::NoUpdate;
+    }
+    if failed.contains(&version) {
+        return UpdateChoice::FailedHere(version);
+    }
+    let directory = root.join("updates").join(&version);
+    let path = directory.join(PACKAGED_SIDECAR_BINARY);
+    for (file, name) in [(&path, PACKAGED_SIDECAR_BINARY), (&directory.join("BUILD"), "BUILD")] {
+        if !file.is_file() {
+            return UpdateChoice::Unusable(format!("{version} is incomplete (no {name})"));
+        }
+    }
+    UpdateChoice::Use { version, path }
+}
+
+/// The version `path` names: `None` when there is no such file, `Err` with what is wrong otherwise.
+/// Neither the file's contents nor its path reach the error, which a person reads on the band: the
+/// private reader's refusals name the path, so only the OS's own errors are quoted.
+fn read_selected(path: &Path) -> Result<Option<(String, SidecarVersion)>, String> {
+    let not_a_version = || "the selected file does not name a version".to_string();
+    let text = match crate::private_fs::read_private_to_string_capped(path, MAX_SELECTED_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Over the cap, or not text.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Err(not_a_version()),
+        Err(error) if error.raw_os_error().is_some() => {
+            return Err(format!("the selected file cannot be read ({error})"))
+        }
+        Err(_) => return Err("the selected file is not a regular file of this user".to_string()),
+    };
+    text.strip_suffix('\n')
+        .unwrap_or(&text)
+        .strip_prefix("version=")
+        .and_then(|version| Some((version.to_string(), SidecarVersion::parse(version)?)))
+        .map(Some)
+        .ok_or_else(not_a_version)
+}
+
+/// [`update_choice`] for this process.
+pub(crate) fn selected_update() -> UpdateChoice {
+    update_choice(
+        std::env::var("EITRI_SIDECAR_BINARY").ok().as_deref(),
+        std::env::var("EITRI_VERDANDI_CHECKOUT").ok().as_deref(),
+        running_exe_dir().as_deref(),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &failed_updates(),
+    )
+}
+
+/// Why a tab is not running the update `selected` names.
+#[derive(Debug)]
+pub(crate) enum UpdateTrouble {
+    DidNotStart {
+        version: String,
+        reason: String,
+    },
+    /// The sidecar will not serve this client's protocol, in its own words.
+    Refused {
+        version: String,
+        words: String,
+    },
+    /// What [`super::check_update_floor`] said.
+    Lacks {
+        version: String,
+        lacks: String,
+    },
+    Unusable(String),
+    FailedHere(String),
+}
+
+impl UpdateTrouble {
+    /// The `startup_diagnostics` line of a tab that went on to the bundled sidecar.
+    pub(crate) fn fallback_line(&self) -> String {
+        let what = match self {
+            UpdateTrouble::DidNotStart { version, reason } => {
+                format!("Sidecar update {version} did not start ({reason})")
+            }
+            UpdateTrouble::Refused { version, words } => {
+                format!("Sidecar update {version} refused this Eitri ({words})")
+            }
+            UpdateTrouble::Lacks { version, lacks } => format!("Sidecar update {version} {lacks}"),
+            UpdateTrouble::Unusable(what) => format!("Sidecar update: {what}"),
+            UpdateTrouble::FailedHere(version) => {
+                format!("Sidecar update {version} did not start earlier in this window")
+            }
+        };
+        format!(
+            "{what}, so this tab runs the bundled sidecar {BUNDLED_SIDECAR_VERSION}. To stop trying it: eitri sidecar use bundled"
+        )
+    }
+
+    /// The line that follows the bundled sidecar's own error when that failed too.
+    pub(crate) fn also_failed_line(&self) -> String {
+        match self {
+            UpdateTrouble::DidNotStart { version, reason } => {
+                format!("Sidecar update {version} also did not start: {reason}")
+            }
+            UpdateTrouble::Refused { version, words } => {
+                format!("Sidecar update {version} also did not start: it refused this Eitri ({words})")
+            }
+            UpdateTrouble::Lacks { version, lacks } => {
+                format!("Sidecar update {version} also did not start: it {lacks}")
+            }
+            UpdateTrouble::Unusable(what) => format!("Sidecar update: {what}"),
+            UpdateTrouble::FailedHere(version) => {
+                format!("Sidecar update {version} also did not start: it failed earlier in this window")
+            }
+        }
+    }
 }
 
 /// The fixed hint printed whenever the sidecar backend is selected -- unconditionally, now that it is
@@ -1220,7 +1396,7 @@ pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, re
 ///
 /// Deliberately does NOT carry the filesystem path an `eitri setup` run would use: that path needs
 /// `$XDG_DATA_HOME`/`$HOME`, readable only at runtime, and this is a `const`. Nor does it carry
-/// `EXPECTED_VERDANDI_REVISION` -- `concat!` takes literal tokens, not a `const` identifier, so
+/// `BUNDLED_SIDECAR_REVISION` -- `concat!` takes literal tokens, not a `const` identifier, so
 /// splicing the revision in here would mean a second string-literal copy of it, a second source of
 /// truth. `no_sidecar_message` (below) is a runtime `format!` and appends both when they can be
 /// computed; `BackendKind::choose`, which has no specific resolution attempt to report a path for, prints
@@ -1233,13 +1409,13 @@ pub const NO_SIDECAR_HINT: &str = "The agent sidecar is not installed. Run \"eit
 /// looked at and did not find. Falls back to naming what is missing, rather than silently omitting
 /// the path, when neither `$XDG_DATA_HOME` nor `$HOME` gives that function anywhere to answer.
 fn no_sidecar_message(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> String {
-    match user_sidecar_path(xdg_data_home, home, EXPECTED_VERDANDI_REVISION) {
+    match user_sidecar_path(xdg_data_home, home, BUNDLED_SIDECAR_REVISION) {
         Some(path) => format!(
-            "{NO_SIDECAR_HINT} (verdandi {EXPECTED_VERDANDI_REVISION}, into {})",
+            "{NO_SIDECAR_HINT} (verdandi {BUNDLED_SIDECAR_REVISION}, into {})",
             path.display()
         ),
         None => format!(
-            "{NO_SIDECAR_HINT} (verdandi {EXPECTED_VERDANDI_REVISION}, but cannot say where -- neither \
+            "{NO_SIDECAR_HINT} (verdandi {BUNDLED_SIDECAR_REVISION}, but cannot say where -- neither \
              $XDG_DATA_HOME nor $HOME is a usable absolute path)"
         ),
     }
@@ -1346,45 +1522,7 @@ const PARENT_WATCH_VAR: &str = "VERDANDI_CLAUDE_SIDECAR_PARENT_WATCH";
 /// The sidecar's process-level list of extra MCP servers (JSON); never inherited from the shell.
 const EXTRA_MCP_SERVERS_VAR: &str = "VERDANDI_CLAUDE_EXTRA_MCP_SERVERS";
 
-/// True when `path` is exactly discovery step 3's candidate -- `current_exe()`'s sibling -- rather
-/// than an explicitly named `EITRI_SIDECAR_BINARY` (step 1) or the per-user rev-keyed path (step
-/// 4). Compared by path instead of adding a third `SidecarProgram::Packaged` shape to every match
-/// arm and existing test in this file, for a distinction only `sibling_rev_skew_warning`'s call site
-/// needs.
-fn is_exe_sibling_artifact(path: &Path, exe_dir: Option<&Path>) -> bool {
-    exe_dir.map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)).as_deref() == Some(path)
-}
-
-/// The drift warning a step-3 sibling's own `<PACKAGED_SIDECAR_BINARY>.rev` file gives: a sibling
-/// may carry an optional `verdandi-claude-sidecar.rev` file; when present
-/// and it does not start with `EXPECTED_VERDANDI_REVISION`, the spawn adds the same skew warning the
-/// checkout path gives. Absent, or a prefix match either direction (the same rule
-/// checkout path gives"). Absent, or a prefix match either direction (the same rule
-/// `describe_checkout` uses for its own git-revision drift check, since `git rev-parse --short`'s
-/// abbreviation length grows with a repository): no warning, the common case for a real install --
-/// the package writes a matching `.rev` file, or none at all on an install predating this file.
-fn sibling_rev_skew_warning(artifact_path: &Path) -> Vec<String> {
-    let Some(dir) = artifact_path.parent() else {
-        return Vec::new();
-    };
-    let Ok(actual) = std::fs::read_to_string(dir.join(format!("{PACKAGED_SIDECAR_BINARY}.rev"))) else {
-        return Vec::new();
-    };
-    let actual = actual.trim();
-    if actual.is_empty()
-        || actual.starts_with(EXPECTED_VERDANDI_REVISION)
-        || EXPECTED_VERDANDI_REVISION.starts_with(actual)
-    {
-        return Vec::new();
-    }
-    vec![format!(
-        "Verdandi baseline drift: the sidecar beside this binary was built for {actual}, this client \
-         was verified against {EXPECTED_VERDANDI_REVISION}. Not an error -- but if behavior looks \
-         wrong, this is the first thing to check."
-    )]
-}
-
-/// Turns a resolved `SidecarProgram` into what `spawn()` actually executes -- description, drift
+/// Turns a resolved `SidecarProgram` into what `spawn()` actually executes -- description, startup
 /// warnings, the program path and its args -- building a checkout that has nothing prebuilt through
 /// the injected `build` closure rather than calling `ensure_sidecar_built` (or `npm`) directly.
 ///
@@ -1399,27 +1537,16 @@ fn sibling_rev_skew_warning(artifact_path: &Path) -> Vec<String> {
 /// both directions with a fake closure, no real `npm`/`node` and no process-env mutation.
 fn invocation_for(
     program: SidecarProgram,
-    exe_dir: Option<&Path>,
     build: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
 ) -> std::io::Result<(String, Vec<String>, PathBuf, Vec<PathBuf>)> {
     Ok(match program {
-        SidecarProgram::Packaged(path) => {
-            // Only a discovery-step-3 sibling of THIS binary carries an optional `.rev` file to
-            // check -- an explicitly named `EITRI_SIDECAR_BINARY` was chosen on
-            // purpose, and the per-user path (step 4) is already keyed by rev in its own directory
-            // name, so neither needs this warning.
-            let warnings = if is_exe_sibling_artifact(&path, exe_dir) {
-                sibling_rev_skew_warning(&path)
-            } else {
-                Vec::new()
-            };
-            (
-                format!("packaged sidecar artifact: {}", path.display()),
-                warnings,
-                path,
-                Vec::new(),
-            )
-        }
+        SidecarProgram::Packaged(path) => (packaged_description(&path), Vec::new(), path, Vec::new()),
+        SidecarProgram::Named(path) => (
+            format!("sidecar binary: {} (via EITRI_SIDECAR_BINARY)", path.display()),
+            Vec::new(),
+            path,
+            Vec::new(),
+        ),
         SidecarProgram::Checkout(checkout) => {
             let (description, warnings) = describe_checkout(&checkout);
             match checkout.prebuilt {
@@ -1443,9 +1570,7 @@ fn invocation_for(
 /// per-conversation UUID socket and keeps both under macOS's 103-byte socket-path limit) so
 /// multiple concurrent providers never collide on one path.
 pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let exe_dir = running_exe_dir();
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME");
     let home = std::env::var_os("HOME");
     let program = resolve_sidecar_program(
@@ -1456,7 +1581,7 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
         home.as_deref(),
     )?;
     let (build_description, build_warnings, program_path, program_args) =
-        invocation_for(program, exe_dir.as_deref(), ensure_sidecar_built)?;
+        invocation_for(program, ensure_sidecar_built)?;
     spawn_resolved(
         instance_id,
         build_description,
@@ -1466,17 +1591,10 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     )
 }
 
-/// Spawns `program` as the sidecar, with no build step and no search: the crate's own tests start
-/// a stand-in this way.
-#[cfg(feature = "test-support")]
+/// Spawns `program` as the sidecar, with no build step and no search: a selected update starts this
+/// way, and so does the crate's tests' stand-in.
 pub(crate) fn spawn_program(instance_id: &str, program: &Path) -> std::io::Result<SpawnedSidecar> {
-    spawn_resolved(
-        instance_id,
-        format!("stand-in sidecar: {}", program.display()),
-        Vec::new(),
-        program,
-        &[],
-    )
+    spawn_resolved(instance_id, packaged_description(program), Vec::new(), program, &[])
 }
 
 fn spawn_resolved(
@@ -1564,10 +1682,12 @@ fn spawn_resolved(
             // out; those lines are the entire diagnosis, so give them a moment to land rather than
             // reporting an empty cause.
             std::thread::sleep(Duration::from_millis(100));
-            return Err(std::io::Error::other(describe_startup_failure(
+            return Err(startup_failure(
+                std::io::ErrorKind::Other,
                 &format!("claude-sidecar exited with {status} before binding {socket_path:?}"),
+                format!("exited with {status}"),
                 &stderr_tail,
-            )));
+            ));
         }
         if started_waiting.elapsed() >= SIDECAR_BIND_BUDGET {
             break;
@@ -1579,10 +1699,80 @@ fn spawn_resolved(
     drop(stdin_keepalive);
     let _ = child.kill();
     let _ = child.wait();
-    Err(std::io::Error::new(
+    Err(startup_failure(
         std::io::ErrorKind::TimedOut,
-        describe_startup_failure(&bind_timeout_summary(&socket_path, SIDECAR_BIND_BUDGET), &stderr_tail),
+        &bind_timeout_summary(&socket_path, SIDECAR_BIND_BUDGET),
+        format!("no answer in {} s", SIDECAR_BIND_BUDGET.as_secs()),
+        &stderr_tail,
     ))
+}
+
+/// A start that failed: `text` is the error as it always read, `reason` the short form a line about a
+/// sidecar update quotes.
+#[derive(Debug)]
+struct StartFailure {
+    text: String,
+    reason: String,
+}
+
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for StartFailure {}
+
+fn startup_failure(
+    kind: std::io::ErrorKind,
+    summary: &str,
+    silent: String,
+    stderr_tail: &Arc<Mutex<StderrTail>>,
+) -> std::io::Error {
+    let text = describe_startup_failure(summary, stderr_tail);
+    let lines = stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default();
+    let reason = failure_reason(&lines, silent);
+    std::io::Error::new(kind, StartFailure { text, reason })
+}
+
+/// How the line naming a sidecar's account opens. A sidecar prints it before any check, so a sidecar
+/// that printed nothing else has said nothing about what went wrong.
+const ACCOUNT_LINE_PREFIX: &str = "claude account:";
+
+/// What stands for a failed start of a sidecar that printed `stderr`: its refusal, else the last thing
+/// it said other than its account line, else `silent`.
+pub(crate) fn failure_reason(stderr: &[String], silent: String) -> String {
+    stderr
+        .iter()
+        .find(|line| line.contains("refusing to start"))
+        .or_else(|| {
+            stderr.iter().rfind(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with(ACCOUNT_LINE_PREFIX)
+            })
+        })
+        .map_or(silent, |line| line.trim().to_string())
+}
+
+/// The most of a sidecar's words a fallback line quotes. A line of stderr can run to
+/// [`MAX_PARTIAL_LINE`] and a fallback line ends up in the band's title; a refusal, remedy included, is
+/// well under this.
+const MAX_QUOTED_CHARS: usize = 600;
+
+/// `words` as a fallback line may quote them.
+pub(crate) fn quotable(words: String) -> String {
+    match words.char_indices().nth(MAX_QUOTED_CHARS) {
+        Some((end, _)) => format!("{}…", &words[..end]),
+        None => words,
+    }
+}
+
+/// The reason of an error from [`spawn_program`].
+pub(crate) fn start_failure_reason(error: &std::io::Error) -> String {
+    match error.get_ref().and_then(|inner| inner.downcast_ref::<StartFailure>()) {
+        Some(failure) => failure.reason.clone(),
+        None => error.to_string(),
+    }
 }
 
 /// Builds a startup-failure message that actually names the cause, by appending whatever the
@@ -1691,14 +1881,40 @@ mod tests {
     /// arguments precisely so this is checkable without mutating the process environment, which is
     /// shared by every other test in this binary.
     #[test]
+    fn sidecar_origin_names_what_is_not_the_bundled_sidecar() {
+        let info = |version: &str, update: Option<&str>, description: Option<&str>| ProviderInfo {
+            sidecar_version: version.to_string(),
+            sidecar_update: update.map(str::to_string),
+            build_description: description.map(str::to_string),
+            ..ProviderInfo::default()
+        };
+        let packaged = packaged_description(Path::new("/lib/eitri/verdandi-claude-sidecar"));
+        let origin = |version, update, description| sidecar_origin(&info(version, update, description));
+        assert_eq!(origin("0.3.3", Some("0.3.3"), Some(&packaged)), "update");
+        assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, Some(&packaged)), "bundled");
+        assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, None), "bundled");
+        let checkout = "Verdandi checkout: /src/verdandi @ 0123456 (via EITRI_VERDANDI_CHECKOUT)";
+        assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, Some(checkout)), checkout);
+        let named = "sidecar binary: /opt/sc (via EITRI_SIDECAR_BINARY)";
+        assert_eq!(origin(BUNDLED_SIDECAR_VERSION, None, Some(named)), named);
+        assert_eq!(origin("9.9.9", None, Some(&packaged)), packaged);
+        assert_eq!(origin("9.9.9", None, None), "not the bundled one");
+    }
+
+    #[test]
     fn an_explicit_binary_beats_an_explicit_checkout() {
         let artifact = std::env::temp_dir().join(format!("nv-sidecar-{}", uuid::Uuid::new_v4()));
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
         let resolved = resolve_sidecar_program(artifact.to_str(), Some("/definitely/not/a/checkout"), None, None, None)
             .expect("an existing artifact resolves");
         assert!(
-            matches!(&resolved, SidecarProgram::Packaged(p) if *p == artifact),
+            matches!(&resolved, SidecarProgram::Named(p) if *p == artifact),
             "{resolved:?}"
+        );
+        let (description, ..) = invocation_for(resolved, |_| panic!("a named binary builds nothing")).unwrap();
+        assert_eq!(
+            description,
+            format!("sidecar binary: {} (via EITRI_SIDECAR_BINARY)", artifact.display())
         );
         let _ = std::fs::remove_file(&artifact);
     }
@@ -2099,7 +2315,7 @@ mod tests {
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
         let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None),
+            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -2112,7 +2328,7 @@ mod tests {
     fn a_checkout_with_nothing_built_is_not_availability() {
         let root = fake_checkout(&[]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None),
+            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
             SidecarAvailability::Missing
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -2130,7 +2346,7 @@ mod tests {
         )]);
         assert_eq!(prebuilt_artifact_in(&root), None);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), false, None, None),
+            sidecar_availability_in(None, None, Some(&root), false, None, None, &HashSet::new()),
             SidecarAvailability::Missing
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -2488,7 +2704,7 @@ mod tests {
     #[test]
     fn resolve_sidecar_program_finds_the_user_path_when_nothing_else_matches() {
         let xdg_data_home = std::env::temp_dir().join(format!("nv-xdg-{}", uuid::Uuid::new_v4()));
-        let artifact = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, EXPECTED_VERDANDI_REVISION)
+        let artifact = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, BUNDLED_SIDECAR_REVISION)
             .expect("an absolute XDG_DATA_HOME resolves");
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -2503,7 +2719,7 @@ mod tests {
     }
 
     /// A user-built sidecar for a DIFFERENT revision is never found -- the whole reason step 4 is
-    /// keyed by `EXPECTED_VERDANDI_REVISION`: a build from a previous release must be invisible,
+    /// keyed by `BUNDLED_SIDECAR_REVISION`: a build from a previous release must be invisible,
     /// never "almost right", so a stale sidecar cannot silently keep running against a newer client.
     /// Isolated from step 5 by pointing `home` at an empty directory with no default checkout.
     #[test]
@@ -2559,7 +2775,7 @@ mod tests {
         let sibling = dir.join(PACKAGED_SIDECAR_BINARY);
         std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
         let xdg_data_home = std::env::temp_dir().join(format!("nv-xdg-sibling-{}", uuid::Uuid::new_v4()));
-        let user_build = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, EXPECTED_VERDANDI_REVISION)
+        let user_build = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, BUNDLED_SIDECAR_REVISION)
             .expect("an absolute XDG_DATA_HOME resolves");
         std::fs::create_dir_all(user_build.parent().unwrap()).unwrap();
         std::fs::write(&user_build, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -2577,8 +2793,8 @@ mod tests {
 
     /// Steps 4 and 5 ranked against each other: a per-user build for this exact
     /// revision beats a default checkout that holds a prebuilt artifact. The user build is keyed to
-    /// `EXPECTED_VERDANDI_REVISION`; the default checkout holds whatever revision was last built
-    /// there, and at best earns a drift warning. Before this test no resolver test ever gave the
+    /// `BUNDLED_SIDECAR_REVISION`; the default checkout holds whatever revision was last built
+    /// there. Before this test no resolver test ever gave the
     /// default checkout an artifact, so moving step 4 below step 5 failed nothing. The user build
     /// sits under the fake home's own `.local/share` (no `XDG_DATA_HOME`), so the `$HOME` fallback
     /// is exercised through the resolver too.
@@ -2586,7 +2802,7 @@ mod tests {
     fn a_user_build_beats_a_default_checkout_with_a_prebuilt_artifact() {
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
         let home = fake_home_with_default_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
-        let user_build = user_sidecar_path(None, Some(home.as_os_str()), EXPECTED_VERDANDI_REVISION)
+        let user_build = user_sidecar_path(None, Some(home.as_os_str()), BUNDLED_SIDECAR_REVISION)
             .expect("an absolute HOME resolves");
         std::fs::create_dir_all(user_build.parent().unwrap()).unwrap();
         std::fs::write(&user_build, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -2622,6 +2838,7 @@ mod tests {
                 false,
                 None,
                 Some(home.as_os_str()),
+                &HashSet::new(),
             ),
             SidecarAvailability::Runnable
         );
@@ -2636,7 +2853,7 @@ mod tests {
         assert_eq!(checkout.prebuilt.as_ref(), Some(&expected_artifact));
 
         let (description, _, program_path, args) =
-            invocation_for(resolved, None, |_| panic!("the default checkout must never build"))
+            invocation_for(resolved, |_| panic!("the default checkout must never build"))
                 .expect("a prebuilt checkout never fails to resolve its program");
         assert_eq!(program_path, expected_artifact);
         assert!(args.is_empty());
@@ -2655,7 +2872,7 @@ mod tests {
         let root = fake_checkout(&[]);
         let resolved = resolve_sidecar_program(None, root.to_str(), None, None, None).expect("the checkout resolves");
         let build_calls = std::cell::Cell::new(0);
-        let (_, _, program_path, args) = invocation_for(resolved, None, |checkout_path| {
+        let (_, _, program_path, args) = invocation_for(resolved, |checkout_path| {
             build_calls.set(build_calls.get() + 1);
             assert_eq!(checkout_path, root.as_path());
             Ok(checkout_path.join("apps/claude-sidecar/dist/src/index.js"))
@@ -2680,7 +2897,7 @@ mod tests {
         let root = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
         let resolved = resolve_sidecar_program(None, root.to_str(), None, None, None).expect("the checkout resolves");
         let expected_artifact = prebuilt_artifact_in(&root).expect("this fake checkout has a prebuilt artifact");
-        let (_, _, program_path, args) = invocation_for(resolved, None, |_| {
+        let (_, _, program_path, args) = invocation_for(resolved, |_| {
             panic!("a checkout with a prebuilt artifact must never build")
         })
         .expect("resolving a prebuilt checkout never fails");
@@ -2692,7 +2909,7 @@ mod tests {
     #[test]
     fn invocation_for_never_builds_a_packaged_artifact() {
         let path = PathBuf::from("/fake/verdandi-claude-sidecar");
-        let (_, _, program_path, args) = invocation_for(SidecarProgram::Packaged(path.clone()), None, |_| {
+        let (_, _, program_path, args) = invocation_for(SidecarProgram::Packaged(path.clone()), |_| {
             panic!("a packaged artifact has nothing to build")
         })
         .expect("resolving a packaged artifact never fails");
@@ -2722,7 +2939,7 @@ mod tests {
         let expected_path = user_sidecar_path(
             Some(xdg_data_home.as_os_str()),
             Some(home.as_os_str()),
-            EXPECTED_VERDANDI_REVISION,
+            BUNDLED_SIDECAR_REVISION,
         )
         .expect("this test's own home is absolute");
         assert!(err.to_string().contains(&expected_path.display().to_string()), "{err}");
@@ -2736,13 +2953,21 @@ mod tests {
     #[test]
     fn sidecar_availability_counts_the_user_path() {
         let xdg_data_home = std::env::temp_dir().join(format!("nv-xdg-avail-{}", uuid::Uuid::new_v4()));
-        let artifact = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, EXPECTED_VERDANDI_REVISION)
+        let artifact = user_sidecar_path(Some(xdg_data_home.as_os_str()), None, BUNDLED_SIDECAR_REVISION)
             .expect("an absolute XDG_DATA_HOME resolves");
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
 
         assert_eq!(
-            sidecar_availability_in(None, None, None, false, Some(xdg_data_home.as_os_str()), None),
+            sidecar_availability_in(
+                None,
+                None,
+                None,
+                false,
+                Some(xdg_data_home.as_os_str()),
+                None,
+                &HashSet::new()
+            ),
             SidecarAvailability::Runnable
         );
         let _ = std::fs::remove_dir_all(&xdg_data_home);
@@ -2761,7 +2986,15 @@ mod tests {
         std::fs::write(&other_rev_artifact, b"#!/bin/sh\nexit 0\n").unwrap();
 
         assert_eq!(
-            sidecar_availability_in(None, None, None, false, Some(xdg_data_home.as_os_str()), None),
+            sidecar_availability_in(
+                None,
+                None,
+                None,
+                false,
+                Some(xdg_data_home.as_os_str()),
+                None,
+                &HashSet::new()
+            ),
             SidecarAvailability::Missing
         );
         let _ = std::fs::remove_dir_all(&xdg_data_home);
@@ -2776,7 +3009,7 @@ mod tests {
     fn a_named_checkout_with_nothing_prebuilt_builds_even_beside_an_installed_artifact() {
         let root = fake_checkout(&[]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&root), true, None, None),
+            sidecar_availability_in(None, None, Some(&root), true, None, None, &HashSet::new()),
             SidecarAvailability::BuildsNamedCheckout
         );
 
@@ -2784,20 +3017,20 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).unwrap();
         std::fs::write(exe_dir.join(PACKAGED_SIDECAR_BINARY), b"#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(
-            sidecar_availability_in(None, Some(&exe_dir), Some(&root), true, None, None),
+            sidecar_availability_in(None, Some(&exe_dir), Some(&root), true, None, None, &HashSet::new()),
             SidecarAvailability::BuildsNamedCheckout,
             "step 2 outranks step 3, as in resolve_sidecar_program"
         );
         // The same sibling with no named checkout is runnable (step 3).
         assert_eq!(
-            sidecar_availability_in(None, Some(&exe_dir), Some(&root), false, None, None),
+            sidecar_availability_in(None, Some(&exe_dir), Some(&root), false, None, None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
 
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
         let built = fake_checkout(&[&format!("{PACKAGED_SIDECAR_BINARY}-0.1.0-{suffix}")]);
         assert_eq!(
-            sidecar_availability_in(None, None, Some(&built), true, None, None),
+            sidecar_availability_in(None, None, Some(&built), true, None, None, &HashSet::new()),
             SidecarAvailability::Runnable,
             "a named checkout holding a prebuilt artifact runs it without building"
         );
@@ -2819,108 +3052,24 @@ mod tests {
         let missing = exe_dir.join("not-there");
 
         assert_eq!(
-            sidecar_availability_in(sibling.to_str(), None, None, false, None, None),
+            sidecar_availability_in(sibling.to_str(), None, None, false, None, None, &HashSet::new()),
             SidecarAvailability::Runnable
         );
         assert_eq!(
-            sidecar_availability_in(missing.to_str(), Some(&exe_dir), None, false, None, None),
+            sidecar_availability_in(
+                missing.to_str(),
+                Some(&exe_dir),
+                None,
+                false,
+                None,
+                None,
+                &HashSet::new()
+            ),
             SidecarAvailability::Missing,
             "step 1 names a binary that is not a file; the sibling below it is never reached"
         );
         assert!(resolve_sidecar_program(missing.to_str(), None, Some(&exe_dir), None, None).is_err());
         let _ = std::fs::remove_dir_all(&exe_dir);
-    }
-
-    /// `is_exe_sibling_artifact` matches only the exact step-3 candidate -- not an arbitrary path,
-    /// and not the sibling shape with no `exe_dir` known at all.
-    #[test]
-    fn is_exe_sibling_artifact_matches_only_the_sibling_candidate() {
-        let dir = Path::new("/some/exe/dir");
-        let sibling = dir.join(PACKAGED_SIDECAR_BINARY);
-        assert!(is_exe_sibling_artifact(&sibling, Some(dir)));
-        assert!(!is_exe_sibling_artifact(
-            Path::new("/elsewhere/verdandi-claude-sidecar"),
-            Some(dir)
-        ));
-        assert!(!is_exe_sibling_artifact(&sibling, None));
-    }
-
-    /// A sibling with no `.rev` file gives no warning -- the common case for an install
-    /// predating this file's existence.
-    #[test]
-    fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_absent() {
-        let dir = std::env::temp_dir().join(format!("nv-sibling-rev-absent-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
-        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        assert!(sibling_rev_skew_warning(&artifact).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `.rev` file matching this client's expectation gives no warning either -- the common case
-    /// for a real, current install.
-    #[test]
-    fn sibling_rev_skew_warning_is_empty_when_the_rev_file_matches() {
-        let dir = std::env::temp_dir().join(format!("nv-sibling-rev-match-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
-        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(
-            dir.join(format!("{PACKAGED_SIDECAR_BINARY}.rev")),
-            EXPECTED_VERDANDI_REVISION,
-        )
-        .unwrap();
-        assert!(sibling_rev_skew_warning(&artifact).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `.rev` file that does not start with `EXPECTED_VERDANDI_REVISION`, nor vice versa,
-    /// produces exactly one warning naming both revisions so the mismatch can be diagnosed.
-    #[test]
-    fn sibling_rev_skew_warning_names_both_revs_on_a_mismatch() {
-        let dir = std::env::temp_dir().join(format!("nv-sibling-rev-mismatch-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
-        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(dir.join(format!("{PACKAGED_SIDECAR_BINARY}.rev")), "deadbee").unwrap();
-        let warnings = sibling_rev_skew_warning(&artifact);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("deadbee") && warnings[0].contains(EXPECTED_VERDANDI_REVISION),
-            "{warnings:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Installed packages write the public twin's full 40-character revision while this client
-    /// can compare a 7-character `EXPECTED_VERDANDI_REVISION`. Equal-length inputs cannot prove
-    /// that `sibling_rev_skew_warning` accepts a full hash starting with the expected prefix;
-    /// this pins that direction of the bidirectional `starts_with` comparison.
-    #[test]
-    fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_a_longer_sha_starting_with_the_expected_prefix() {
-        let dir = std::env::temp_dir().join(format!("nv-sibling-rev-long-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
-        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        let full_sha = format!("{EXPECTED_VERDANDI_REVISION}1234567890abcdef1234567890abcdef1");
-        assert_eq!(full_sha.len(), 40, "{full_sha}");
-        std::fs::write(dir.join(format!("{PACKAGED_SIDECAR_BINARY}.rev")), &full_sha).unwrap();
-        assert!(sibling_rev_skew_warning(&artifact).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The other direction: a `.rev` file shorter than `EXPECTED_VERDANDI_REVISION` that is still a
-    /// genuine prefix of it also gives no warning ("and vice versa" in the original wording of the rule).
-    #[test]
-    fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_a_shorter_prefix_of_the_expected_revision() {
-        let dir = std::env::temp_dir().join(format!("nv-sibling-rev-short-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let artifact = dir.join(PACKAGED_SIDECAR_BINARY);
-        std::fs::write(&artifact, b"#!/bin/sh\nexit 0\n").unwrap();
-        let short_prefix = &EXPECTED_VERDANDI_REVISION[..EXPECTED_VERDANDI_REVISION.len() - 1];
-        std::fs::write(dir.join(format!("{PACKAGED_SIDECAR_BINARY}.rev")), short_prefix).unwrap();
-        assert!(sibling_rev_skew_warning(&artifact).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `NO_SIDECAR_HINT` must start with `sidecar_missing_message`'s opening sentence so
@@ -3020,6 +3169,599 @@ mod tests {
         tail.push("two words".into());
         let back = StderrTail::from_bytes(&tail.to_bytes());
         assert_eq!(back.snapshot(), ["one", "two words"]);
+    }
+
+    /// A data directory holding `selected` and, per version listed, a complete update, with an
+    /// `eitri-setup` beside the running binary. Removed on drop.
+    struct UpdateFixture {
+        root: PathBuf,
+        exe_dir: PathBuf,
+        data: PathBuf,
+    }
+
+    impl UpdateFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("nv-update-{}", uuid::Uuid::new_v4()));
+            let exe_dir = root.join("lib");
+            let data = root.join("data");
+            std::fs::create_dir_all(data.join("eitri/sidecar")).unwrap();
+            std::fs::create_dir_all(&exe_dir).unwrap();
+            std::fs::write(exe_dir.join("eitri-setup"), b"#!/bin/sh\n").unwrap();
+            UpdateFixture { root, exe_dir, data }
+        }
+
+        fn sidecar_dir(&self) -> PathBuf {
+            self.data.join("eitri/sidecar")
+        }
+
+        fn select(&self, contents: impl AsRef<[u8]>) {
+            std::fs::write(self.sidecar_dir().join("selected"), contents).unwrap();
+        }
+
+        fn build(&self, version: &str) -> PathBuf {
+            let directory = self.sidecar_dir().join("updates").join(version);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("BUILD"), b"built\n").unwrap();
+            let binary = directory.join(PACKAGED_SIDECAR_BINARY);
+            std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+            binary
+        }
+
+        fn choice(&self) -> UpdateChoice {
+            self.choice_failed(&HashSet::new())
+        }
+
+        fn choice_failed(&self, failed: &HashSet<String>) -> UpdateChoice {
+            update_choice(
+                None,
+                None,
+                Some(&self.exe_dir),
+                Some(self.data.as_os_str()),
+                None,
+                failed,
+            )
+        }
+
+        fn unusable(&self) -> String {
+            match self.choice() {
+                UpdateChoice::Unusable(what) => what,
+                other => panic!("expected Unusable, got {other:?}"),
+            }
+        }
+    }
+
+    impl Drop for UpdateFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn no_selected_file_is_no_update() {
+        assert_eq!(UpdateFixture::new().choice(), UpdateChoice::NoUpdate);
+    }
+
+    #[test]
+    fn a_complete_update_newer_than_bundled_is_used() {
+        let fixture = UpdateFixture::new();
+        let binary = fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        assert_eq!(
+            fixture.choice(),
+            UpdateChoice::Use {
+                version: "0.3.2".into(),
+                path: binary,
+            }
+        );
+    }
+
+    #[test]
+    fn the_line_needs_no_final_newline() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2");
+        assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
+    }
+
+    #[test]
+    fn a_release_candidate_can_be_selected() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2-rc.1");
+        fixture.select("version=0.3.2-rc.1\n");
+        assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
+    }
+
+    #[test]
+    fn a_selected_file_holding_anything_else_is_unusable() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        let cases: [&[u8]; 11] = [
+            b"",
+            b"\n",
+            b"junk\n",
+            b"0.3.2\n",
+            b"version=\n",
+            b"version=0.3\n",
+            b"Version=0.3.2\n",
+            b" version=0.3.2\n",
+            b"version=0.3.2 \n",
+            b"version=0.3.2\r\n",
+            b"version=\xff\xfe\n",
+        ];
+        for contents in cases {
+            fixture.select(contents);
+            assert!(
+                matches!(fixture.choice(), UpdateChoice::Unusable(_)),
+                "{:?}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+    }
+
+    /// A version that did not parse never reaches a path: this directory exists, and is not used.
+    #[test]
+    fn a_path_in_the_selected_file_is_unusable_and_is_not_followed() {
+        let fixture = UpdateFixture::new();
+        fixture.build("../x");
+        fixture.select("version=../x\n");
+        let what = fixture.unusable();
+        assert!(!what.contains(".."), "{what}");
+    }
+
+    #[test]
+    fn a_second_line_is_unusable() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.build("0.3.3");
+        fixture.select("version=0.3.2\nversion=0.3.3\n");
+        fixture.unusable();
+        fixture.select("version=0.3.2\n\n");
+        fixture.unusable();
+    }
+
+    /// Nothing of it comes back in the message, which is a line in the band's title.
+    #[test]
+    fn a_huge_selected_file_is_unusable_and_stays_out_of_the_message() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        let mut contents = b"version=0.3.2\n".to_vec();
+        contents.resize(1024 * 1024, b'x');
+        fixture.select(&contents);
+        assert_eq!(fixture.unusable(), "the selected file does not name a version");
+    }
+
+    #[test]
+    fn a_selected_directory_is_unusable() {
+        let fixture = UpdateFixture::new();
+        std::fs::create_dir_all(fixture.sidecar_dir().join("selected")).unwrap();
+        assert_eq!(
+            fixture.unusable(),
+            "the selected file is not a regular file of this user"
+        );
+    }
+
+    /// Opening a pipe for reading waits for a writer, and the spawn with it.
+    #[test]
+    fn a_selected_pipe_is_unusable_and_holds_nothing_up() {
+        let fixture = UpdateFixture::new();
+        let path = fixture.sidecar_dir().join("selected");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid C string for the length of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            fixture.unusable(),
+            "the selected file is not a regular file of this user"
+        );
+    }
+
+    #[test]
+    fn a_selected_file_nobody_may_read_is_unusable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = UpdateFixture::new();
+        fixture.select("version=0.3.2\n");
+        let path = fixture.sidecar_dir().join("selected");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that may read it anyway (root in a container) has nothing to test here.
+        if File::open(&path).is_err() {
+            fixture.unusable();
+        }
+    }
+
+    /// Strictly newer: an Eitri upgrade that bundles the selected version, or a later one, simply
+    /// runs its own.
+    #[test]
+    fn a_version_not_newer_than_bundled_is_no_update() {
+        for version in [
+            BUNDLED_SIDECAR_VERSION.to_string(),
+            "0.1.9".to_string(),
+            format!("{BUNDLED_SIDECAR_VERSION}-rc.1"),
+        ] {
+            let fixture = UpdateFixture::new();
+            fixture.build(&version);
+            fixture.select(format!("version={version}\n"));
+            assert_eq!(fixture.choice(), UpdateChoice::NoUpdate, "{version}");
+        }
+    }
+
+    /// The comparison is made before the directory is looked at, so a stale `selected` names no
+    /// trouble.
+    #[test]
+    fn a_stale_version_with_no_directory_is_no_update() {
+        let fixture = UpdateFixture::new();
+        fixture.select("version=0.1.9\n");
+        assert_eq!(fixture.choice(), UpdateChoice::NoUpdate);
+    }
+
+    #[test]
+    fn an_update_without_build_is_unusable() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        std::fs::remove_file(fixture.sidecar_dir().join("updates/0.3.2/BUILD")).unwrap();
+        fixture.select("version=0.3.2\n");
+        let what = fixture.unusable();
+        assert!(what.contains("0.3.2") && what.contains("BUILD"), "{what}");
+    }
+
+    #[test]
+    fn an_update_without_its_binary_is_unusable() {
+        let fixture = UpdateFixture::new();
+        std::fs::remove_file(fixture.build("0.3.2")).unwrap();
+        fixture.select("version=0.3.2\n");
+        let what = fixture.unusable();
+        assert!(
+            what.contains("0.3.2") && what.contains(PACKAGED_SIDECAR_BINARY),
+            "{what}"
+        );
+    }
+
+    #[test]
+    fn a_selected_version_with_no_directory_is_unusable() {
+        let fixture = UpdateFixture::new();
+        fixture.select("version=0.3.2\n");
+        fixture.unusable();
+    }
+
+    #[test]
+    fn a_named_binary_or_checkout_means_no_update() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        for (binary, checkout) in [(Some("/some/sidecar"), None), (None, Some("/some/checkout"))] {
+            assert_eq!(
+                update_choice(
+                    binary,
+                    checkout,
+                    Some(&fixture.exe_dir),
+                    Some(fixture.data.as_os_str()),
+                    None,
+                    &HashSet::new(),
+                ),
+                UpdateChoice::NoUpdate
+            );
+        }
+    }
+
+    /// The same rule the overrides have everywhere else: an empty one is not an override.
+    #[test]
+    fn an_empty_override_does_not_stop_an_update() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        assert!(matches!(
+            update_choice(
+                Some("  "),
+                Some(""),
+                Some(&fixture.exe_dir),
+                Some(fixture.data.as_os_str()),
+                None,
+                &HashSet::new(),
+            ),
+            UpdateChoice::Use { .. }
+        ));
+    }
+
+    /// `cargo run`, the private package and the Mac have no `eitri sidecar`, so nothing there ever
+    /// runs what such a command left behind.
+    #[test]
+    fn no_setup_program_beside_the_binary_means_no_update() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        std::fs::remove_file(fixture.exe_dir.join("eitri-setup")).unwrap();
+        assert_eq!(fixture.choice(), UpdateChoice::NoUpdate);
+        assert_eq!(
+            update_choice(None, None, None, Some(fixture.data.as_os_str()), None, &HashSet::new()),
+            UpdateChoice::NoUpdate
+        );
+    }
+
+    #[test]
+    fn a_version_that_failed_in_this_process_is_not_tried_again() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        let failed = HashSet::from(["0.3.2".to_string()]);
+        assert_eq!(fixture.choice_failed(&failed), UpdateChoice::FailedHere("0.3.2".into()));
+        let other = HashSet::from(["0.3.1".to_string()]);
+        assert!(matches!(fixture.choice_failed(&other), UpdateChoice::Use { .. }));
+    }
+
+    /// The values `packaging/tests/install/test_sidecar_commands.sh` uses, by the rule the launcher's
+    /// `xdg_data_home` states: an absolute `XDG_DATA_HOME`, else `$HOME/.local/share`.
+    #[test]
+    fn the_data_root_follows_the_launchers_rule() {
+        let fixture = UpdateFixture::new();
+        let home = fixture.root.join("home");
+        let by_home = home.join(".local/share");
+        let by_xdg = fixture.root.join("xdg");
+        for root in [&by_home, &by_xdg] {
+            let sidecar = root.join("eitri/sidecar");
+            std::fs::create_dir_all(sidecar.join("updates/0.3.2")).unwrap();
+            std::fs::write(sidecar.join("updates/0.3.2/BUILD"), b"built\n").unwrap();
+            std::fs::write(sidecar.join("updates/0.3.2").join(PACKAGED_SIDECAR_BINARY), b"x").unwrap();
+            std::fs::write(sidecar.join("selected"), b"version=0.3.2\n").unwrap();
+        }
+        let path_with = |xdg: Option<&OsStr>| match update_choice(
+            None,
+            None,
+            Some(&fixture.exe_dir),
+            xdg,
+            Some(home.as_os_str()),
+            &HashSet::new(),
+        ) {
+            UpdateChoice::Use { path, .. } => path,
+            other => panic!("expected an update under {xdg:?}, got {other:?}"),
+        };
+        let binary_under = |root: &Path| root.join("eitri/sidecar/updates/0.3.2").join(PACKAGED_SIDECAR_BINARY);
+        assert_eq!(path_with(Some(by_xdg.as_os_str())), binary_under(&by_xdg));
+        assert_eq!(path_with(None), binary_under(&by_home));
+        assert_eq!(path_with(Some(OsStr::new("relative/data"))), binary_under(&by_home));
+        assert_eq!(path_with(Some(OsStr::new(""))), binary_under(&by_home));
+    }
+
+    #[test]
+    fn no_usable_data_root_means_no_update() {
+        let fixture = UpdateFixture::new();
+        assert_eq!(
+            update_choice(
+                None,
+                None,
+                Some(&fixture.exe_dir),
+                Some(OsStr::new("relative/data")),
+                Some(OsStr::new("relative/home")),
+                &HashSet::new(),
+            ),
+            UpdateChoice::NoUpdate
+        );
+    }
+
+    /// `selected` and `updates/` sit beside the rev-keyed directories, under one root.
+    #[test]
+    fn the_update_paths_and_the_bundled_path_share_a_root() {
+        let fixture = UpdateFixture::new();
+        let bundled = user_sidecar_path(Some(fixture.data.as_os_str()), None, "abc1234").unwrap();
+        assert_eq!(bundled.parent().unwrap().parent().unwrap(), fixture.sidecar_dir());
+    }
+
+    #[test]
+    fn an_update_counts_as_available_with_nothing_else_built() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        let availability = |failed: &HashSet<String>| {
+            sidecar_availability_in(
+                None,
+                Some(&fixture.exe_dir),
+                None,
+                false,
+                Some(fixture.data.as_os_str()),
+                None,
+                failed,
+            )
+        };
+        assert_eq!(availability(&HashSet::new()), SidecarAvailability::Runnable);
+        let failed = HashSet::from(["0.3.2".to_string()]);
+        assert_eq!(availability(&failed), SidecarAvailability::Missing);
+    }
+
+    #[test]
+    fn a_broken_selected_file_does_not_count_as_available() {
+        let fixture = UpdateFixture::new();
+        fixture.select("junk\n");
+        assert_eq!(
+            sidecar_availability_in(
+                None,
+                Some(&fixture.exe_dir),
+                None,
+                false,
+                Some(fixture.data.as_os_str()),
+                None,
+                &HashSet::new(),
+            ),
+            SidecarAvailability::Missing
+        );
+    }
+
+    /// Ranked as a start ranks them: a named sidecar is what runs, update or no update.
+    #[test]
+    fn a_named_binary_outranks_an_update_in_availability() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        assert_eq!(
+            sidecar_availability_in(
+                Some("/no/such/sidecar"),
+                Some(&fixture.exe_dir),
+                None,
+                false,
+                Some(fixture.data.as_os_str()),
+                None,
+                &HashSet::new(),
+            ),
+            SidecarAvailability::Missing
+        );
+    }
+
+    /// A `.deb` upgrade leaves the new bundled sidecar unbuilt and `selected` older than it: the
+    /// older update is not a last resort, and the start fails as it did before updates existed.
+    #[test]
+    fn the_bundled_sidecar_missing_after_an_upgrade_fails_as_today() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.1.9");
+        fixture.select("version=0.1.9\n");
+        assert_eq!(fixture.choice(), UpdateChoice::NoUpdate);
+        let home = fixture.root.join("empty-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let error = resolve_sidecar_program(
+            None,
+            None,
+            Some(&fixture.exe_dir),
+            Some(fixture.data.as_os_str()),
+            Some(home.as_os_str()),
+        )
+        .expect_err("nothing bundled is built");
+        assert!(error.to_string().contains(NO_SIDECAR_HINT), "{error}");
+    }
+
+    /// The other side of that upgrade: an update newer than the new bundled sidecar is chosen ahead
+    /// of the search, so nothing needs to be built.
+    #[test]
+    fn an_update_newer_than_a_missing_bundled_is_still_chosen() {
+        let fixture = UpdateFixture::new();
+        fixture.build("0.3.2");
+        fixture.select("version=0.3.2\n");
+        assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
+    }
+
+    #[test]
+    fn a_failure_reason_is_the_refusal_not_the_account_line() {
+        let lines = [
+            "claude account: work (/some/dir)".to_string(),
+            "refusing to start: host claude CLI version 3.0.0 is outside the range".to_string(),
+            "at main (lifecycle.js:12)".to_string(),
+        ];
+        assert_eq!(
+            failure_reason(&lines, "unused".into()),
+            "refusing to start: host claude CLI version 3.0.0 is outside the range"
+        );
+    }
+
+    #[test]
+    fn a_failure_reason_is_else_the_last_line_that_says_something() {
+        let lines = ["first".to_string(), "  last words  ".to_string(), "   ".to_string()];
+        assert_eq!(failure_reason(&lines, "unused".into()), "last words");
+    }
+
+    #[test]
+    fn a_failure_reason_with_nothing_said_is_what_was_seen() {
+        assert_eq!(failure_reason(&[], "no answer in 15 s".into()), "no answer in 15 s");
+        assert_eq!(failure_reason(&["  ".to_string()], "no answer".into()), "no answer");
+    }
+
+    /// The account line opens every real sidecar's stderr, so a sidecar that says nothing else has
+    /// said nothing about what went wrong.
+    #[test]
+    fn a_failure_reason_is_never_the_account_line() {
+        let account = "claude account: work (/some/dir)".to_string();
+        assert_eq!(failure_reason(&[account.clone()], "silent".into()), "silent");
+        assert_eq!(
+            failure_reason(&[format!("  {account}  "), "  ".to_string()], "silent".into()),
+            "silent"
+        );
+        assert_eq!(
+            failure_reason(&[account.clone(), "gone".to_string()], "silent".into()),
+            "gone"
+        );
+        assert_eq!(failure_reason(&["gone".to_string(), account], "silent".into()), "gone");
+    }
+
+    #[test]
+    fn quoted_words_are_cut_on_a_character() {
+        let at_the_limit = "é".repeat(MAX_QUOTED_CHARS);
+        assert_eq!(quotable(at_the_limit.clone()), at_the_limit);
+        assert_eq!(quotable(format!("{at_the_limit}é")), format!("{at_the_limit}…"));
+    }
+
+    /// A line about the account is a cause: only the line naming it is not.
+    #[test]
+    fn a_failure_reason_can_be_about_the_account() {
+        let line = "claude account configuration is unusable: claude account \"x\" is not logged in".to_string();
+        assert_eq!(failure_reason(std::slice::from_ref(&line), "silent".into()), line);
+    }
+
+    /// Each line of the failure table, whole: the panel draws these as they are.
+    #[test]
+    fn the_fallback_lines_say_what_happened_and_how_to_stop() {
+        let tail = format!("so this tab runs the bundled sidecar {BUNDLED_SIDECAR_VERSION}. To stop trying it: eitri sidecar use bundled");
+        let line = |trouble: UpdateTrouble| trouble.fallback_line();
+        assert_eq!(
+            line(UpdateTrouble::DidNotStart {
+                version: "0.3.2".into(),
+                reason: "no answer in 15 s".into(),
+            }),
+            format!("Sidecar update 0.3.2 did not start (no answer in 15 s), {tail}")
+        );
+        assert_eq!(
+            line(UpdateTrouble::Refused {
+                version: "0.3.2".into(),
+                words: "client protocol_major 3 is incompatible with this sidecar's 4".into(),
+            }),
+            format!("Sidecar update 0.3.2 refused this Eitri (client protocol_major 3 is incompatible with this sidecar's 4), {tail}")
+        );
+        assert_eq!(
+            line(UpdateTrouble::Lacks {
+                version: "0.3.2".into(),
+                lacks: "lacks cli_auto_mode".into(),
+            }),
+            format!("Sidecar update 0.3.2 lacks cli_auto_mode, {tail}")
+        );
+        assert_eq!(
+            line(UpdateTrouble::Unusable("0.3.2 is incomplete (no BUILD)".into())),
+            format!("Sidecar update: 0.3.2 is incomplete (no BUILD), {tail}")
+        );
+        assert_eq!(
+            line(UpdateTrouble::FailedHere("0.3.2".into())),
+            format!("Sidecar update 0.3.2 did not start earlier in this window, {tail}")
+        );
+    }
+
+    #[test]
+    fn every_also_failed_line_opens_with_the_prefix_the_band_knows() {
+        for trouble in [
+            UpdateTrouble::DidNotStart {
+                version: "0.3.2".into(),
+                reason: "no answer in 15 s".into(),
+            },
+            UpdateTrouble::Refused {
+                version: "0.3.2".into(),
+                words: "no".into(),
+            },
+            UpdateTrouble::Lacks {
+                version: "0.3.2".into(),
+                lacks: "lacks cli_auto_mode".into(),
+            },
+            UpdateTrouble::Unusable("selected holds no version".into()),
+            UpdateTrouble::FailedHere("0.3.2".into()),
+        ] {
+            assert!(trouble.also_failed_line().starts_with("Sidecar update"));
+        }
+        assert_eq!(
+            UpdateTrouble::DidNotStart {
+                version: "0.3.2".into(),
+                reason: "no answer in 15 s".into(),
+            }
+            .also_failed_line(),
+            "Sidecar update 0.3.2 also did not start: no answer in 15 s"
+        );
+    }
+
+    #[test]
+    fn the_set_of_failed_updates_remembers_a_version() {
+        // A version no other test of this binary names: the set is the process's.
+        let version = "0.0.1-rc.424242";
+        assert!(!failed_updates().contains(version));
+        remember_failed_update(version);
+        assert!(failed_updates().contains(version));
     }
 
     #[test]

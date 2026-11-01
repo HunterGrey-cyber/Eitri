@@ -11,6 +11,8 @@
 //! - `text <message id> <words>`: a text delta of that message;
 //! - `sleep <ms>`;
 //! - `ask <permission id>`: a permission request; the rest of the script runs once it is answered;
+//! - `ask-unknown <permission id>`: the same, with a `PermissionOrigin` no client knows;
+//! - `unknown-event`: a session event whose only arm is a field no client knows;
 //! - `drop-watches`: every open watch stream of the session ends (the clients reconnect);
 //! - `ignore-eof`: stdin's end of file no longer ends the process;
 //! - `end`: the turn completes.
@@ -41,6 +43,18 @@
 //! `--record-answers <file>` appends a line per `AnswerClientToolCall`, as it arrives and before any
 //! hold: `<call id> <taken, or the refusal> <is_error> <its text, blocks joined by |>`, and
 //! `replied <call id>` when its reply goes out.
+//!
+//! A sidecar this client did not ship with is scripted through the environment, so a launcher can give
+//! one stand-in its own script while the tests that start it share theirs:
+//! - `EITRI_STANDIN_CAPABILITIES`: the handshake's whole list, separated by spaces;
+//! - `EITRI_STANDIN_MINOR`, `EITRI_STANDIN_MAJOR`: the handshake's protocol numbers;
+//! - `EITRI_STANDIN_UNKNOWN_WIRE`: the handshake and every session event carry a field no client knows;
+//! - `EITRI_STANDIN_INCOMPATIBLE`: `Handshake` fails with `INCOMPATIBLE_PROTOCOL` and this text, as a
+//!   sidecar of another major does;
+//! - `EITRI_STANDIN_STALL_HANDSHAKE`: `Handshake` never answers, and nothing is printed to stderr;
+//! - `EITRI_STANDIN_REFUSE_BIND`: this text goes to stderr and the process exits 1 before it binds, as
+//!   a sidecar refusing a CLI does;
+//! - `EITRI_STANDIN_NEVER_BIND`: the process stays up, silent, and never binds.
 
 use claude_runtime_protocol::v1::client_tool_content::Kind as ContentKind;
 use claude_runtime_protocol::v1::session_event::Event;
@@ -54,6 +68,8 @@ use claude_runtime_protocol::v1::{
     SteerTurnResponse, TextDelta, TurnCause, TurnCauseKind, TurnCauseUpdated, TurnCompleted, TurnOrigin, TurnOutcome,
     TurnStarted, UserMessageDelivered, UserMessageDropReason, UserMessageDropped, WatchSessionEventsRequest,
 };
+use prost::bytes::{Buf, BufMut};
+use prost::encoding::{DecodeContext, WireType};
 use prost::Message as _;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -73,7 +89,83 @@ const SERVICE: &str = "verdandi.claude.runtime.v1.RuntimeService";
 /// The largest request a real sidecar's handshake states.
 const MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
 
-type Watcher = tokio::sync::mpsc::UnboundedSender<Result<SessionEvent, Status>>;
+/// A field number no `HandshakeResponse` or `SessionEvent` has.
+const UNKNOWN_FIELD: u32 = 998;
+
+/// A `SessionEvent` arm no client knows.
+const UNKNOWN_EVENT_ARM: u32 = 999;
+
+/// A `PermissionOrigin` no client knows.
+const UNKNOWN_ORIGIN: i32 = 99;
+
+type Watcher = tokio::sync::mpsc::UnboundedSender<Result<OnTheWire<SessionEvent>, Status>>;
+
+/// `message` as it goes out, followed by fields its type has no name for.
+#[derive(Debug, Default)]
+struct OnTheWire<M> {
+    message: M,
+    unknown: Vec<u8>,
+}
+
+impl<M: prost::Message> prost::Message for OnTheWire<M> {
+    fn encode_raw(&self, buf: &mut impl BufMut) {
+        self.message.encode_raw(buf);
+        buf.put_slice(&self.unknown);
+    }
+
+    fn merge_field(
+        &mut self,
+        _: u32,
+        _: WireType,
+        _: &mut impl Buf,
+        _: DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        unreachable!("only sent")
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.message.encoded_len() + self.unknown.len()
+    }
+
+    fn clear(&mut self) {
+        self.message.clear();
+        self.unknown.clear();
+    }
+}
+
+/// Field `number` as a string, which a client that does not know the number skips.
+fn unknown_field(number: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    prost::encoding::string::encode(number, &"from a later minor".to_string(), &mut bytes);
+    bytes
+}
+
+/// What `EITRI_STANDIN_*` scripts: see the top of this file.
+#[derive(Default)]
+struct Scripted {
+    capabilities: Option<Vec<String>>,
+    major: Option<u32>,
+    minor: Option<u32>,
+    unknown_wire: bool,
+    incompatible: Option<String>,
+    stall_handshake: bool,
+}
+
+impl Scripted {
+    fn from_environment() -> Self {
+        let number = |name: &str| std::env::var(name).ok().map(|n| n.parse().expect("a number"));
+        Scripted {
+            capabilities: std::env::var("EITRI_STANDIN_CAPABILITIES")
+                .ok()
+                .map(|list| list.split_whitespace().map(str::to_string).collect()),
+            major: number("EITRI_STANDIN_MAJOR"),
+            minor: number("EITRI_STANDIN_MINOR"),
+            unknown_wire: std::env::var_os("EITRI_STANDIN_UNKNOWN_WIRE").is_some(),
+            incompatible: std::env::var("EITRI_STANDIN_INCOMPATIBLE").ok(),
+            stall_handshake: std::env::var_os("EITRI_STANDIN_STALL_HANDSHAKE").is_some(),
+        }
+    }
+}
 
 #[derive(Default)]
 struct Session {
@@ -104,6 +196,7 @@ struct Shared {
     record_answers: Mutex<Option<std::fs::File>>,
     /// While true, `AnswerClientToolCall` replies wait.
     holding_answers: tokio::sync::watch::Sender<bool>,
+    scripted: Scripted,
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -114,6 +207,12 @@ impl Shared {
     }
 
     fn emit(&self, session_id: &str, turn_id: Option<&str>, event: Event) {
+        self.emit_any(session_id, turn_id, Some(event));
+    }
+
+    /// A ring holds what this binary can name, so an event with no arm stands for the unknown one
+    /// [`Self::on_the_wire`] gives it.
+    fn emit_any(&self, session_id: &str, turn_id: Option<&str>, event: Option<Event>) {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.get_mut(session_id) else {
             return;
@@ -127,12 +226,26 @@ impl Shared {
             sequence: session.ring.len() as u64 + 1,
             occurred_at,
             turn_id: turn_id.map(str::to_string),
-            event: Some(event),
+            event,
         };
         session.ring.push(event.clone());
         session
             .watchers
-            .retain(|watcher| watcher.send(Ok(event.clone())).is_ok());
+            .retain(|watcher| watcher.send(Ok(self.on_the_wire(event.clone()))).is_ok());
+    }
+
+    fn on_the_wire(&self, event: SessionEvent) -> OnTheWire<SessionEvent> {
+        let mut unknown = Vec::new();
+        if self.scripted.unknown_wire {
+            unknown.extend(unknown_field(UNKNOWN_FIELD));
+        }
+        if event.event.is_none() {
+            unknown.extend(unknown_field(UNKNOWN_EVENT_ARM));
+        }
+        OnTheWire {
+            message: event,
+            unknown,
+        }
     }
 
     fn client_id(&self, session_id: &str) -> String {
@@ -194,12 +307,16 @@ impl Shared {
 
 /// A refusal carrying its `ErrorDetail`, as the real service sends every one.
 fn refusal(status: tonic::Code, code: ErrorCode, reason: &str) -> Status {
+    refusal_saying(status, code, "refused by the stand-in", reason)
+}
+
+fn refusal_saying(status: tonic::Code, code: ErrorCode, message: &str, reason: &str) -> Status {
     Status::with_details(
         status,
-        "refused by the stand-in",
+        message,
         ErrorDetail {
             code: code as i32,
-            message: "refused by the stand-in".to_string(),
+            message: message.to_string(),
             reason: reason.to_string(),
         }
         .encode_to_vec()
@@ -255,7 +372,7 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                     let ms = words.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Some("ask") => {
+                Some(step @ ("ask" | "ask-unknown")) => {
                     let permission_id = words.next().unwrap_or("p").to_string();
                     if let Some(session) = shared.sessions.lock().unwrap().get_mut(&session_id) {
                         let rest = std::mem::take(&mut steps);
@@ -269,6 +386,7 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                             tool_use_id: format!("tool-{permission_id}"),
                             tool_name: "Bash".to_string(),
                             input_json: r#"{"command":"true"}"#.to_string(),
+                            origin: if step == "ask-unknown" { UNKNOWN_ORIGIN } else { 0 },
                             ..Default::default()
                         }),
                     );
@@ -296,6 +414,7 @@ fn run(shared: Arc<Shared>, session_id: String, mut turn_id: String, mut steps: 
                         }),
                     );
                 }
+                Some("unknown-event") => shared.emit_any(&session_id, Some(&turn_id), None),
                 Some("hold-answers") => {
                     shared.holding_answers.send_replace(true);
                 }
@@ -417,6 +536,12 @@ fn handshake(shared: &Shared) -> HandshakeResponse {
         response.protocol_minor = 23;
         response.capabilities.push("client_tools".to_string());
     }
+    let scripted = &shared.scripted;
+    if let Some(capabilities) = &scripted.capabilities {
+        response.capabilities = capabilities.clone();
+    }
+    response.protocol_major = scripted.major.unwrap_or(response.protocol_major);
+    response.protocol_minor = scripted.minor.unwrap_or(response.protocol_minor);
     response
 }
 
@@ -465,7 +590,30 @@ impl Service<http::Request<Body>> for StandIn {
                 .unwrap_or_default()
                 .to_string();
             let response = match method.as_str() {
-                "Handshake" => unary(req, move |_: HandshakeRequest| async move { Ok(handshake(&shared)) }).await,
+                "Handshake" => {
+                    unary(req, move |_: HandshakeRequest| async move {
+                        if shared.scripted.stall_handshake {
+                            std::future::pending::<()>().await;
+                        }
+                        if let Some(words) = &shared.scripted.incompatible {
+                            return Err(refusal_saying(
+                                tonic::Code::FailedPrecondition,
+                                ErrorCode::IncompatibleProtocol,
+                                words,
+                                "",
+                            ));
+                        }
+                        Ok(OnTheWire {
+                            message: handshake(&shared),
+                            unknown: if shared.scripted.unknown_wire {
+                                unknown_field(UNKNOWN_FIELD)
+                            } else {
+                                Vec::new()
+                            },
+                        })
+                    })
+                    .await
+                }
                 "CreateSession" => {
                     unary(req, move |request: CreateSessionRequest| async move {
                         // Record before consuming any fields, so assertions see exactly the decoded wire request.
@@ -655,7 +803,7 @@ impl Service<http::Request<Body>> for StandIn {
                                 return Err(Status::not_found("no such session"));
                             };
                             for event in session.ring.iter().filter(|event| event.sequence > after) {
-                                let _ = tx.send(Ok(event.clone()));
+                                let _ = tx.send(Ok(shared.on_the_wire(event.clone())));
                             }
                             if !session.closed {
                                 session.watchers.push(tx);
@@ -663,7 +811,7 @@ impl Service<http::Request<Body>> for StandIn {
                             Ok(tonic::Response::new(UnboundedReceiverStream::new(rx)))
                         }
                     });
-                    Grpc::new(ProstCodec::<SessionEvent, WatchSessionEventsRequest>::default())
+                    Grpc::new(ProstCodec::<OnTheWire<SessionEvent>, WatchSessionEventsRequest>::default())
                         .server_streaming(service, req)
                         .await
                 }
@@ -675,7 +823,14 @@ impl Service<http::Request<Body>> for StandIn {
 }
 
 fn main() {
-    let mut shared = Shared::default();
+    let mut shared = Shared {
+        scripted: Scripted::from_environment(),
+        ..Shared::default()
+    };
+    if let Some(words) = std::env::var_os("EITRI_STANDIN_REFUSE_BIND") {
+        std::io::stderr().write_all(words.as_encoded_bytes()).unwrap();
+        std::process::exit(1);
+    }
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -722,6 +877,11 @@ fn main() {
             std::thread::sleep(Duration::from_millis(50));
         }
     });
+    if std::env::var_os("EITRI_STANDIN_NEVER_BIND").is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -729,7 +889,9 @@ fn main() {
     runtime.block_on(async move {
         let listener = tokio::net::UnixListener::bind(&socket).expect("the socket binds");
         println!("stand-in sidecar: serving");
-        eprintln!("stand-in sidecar: started");
+        if !shared.scripted.stall_handshake {
+            eprintln!("stand-in sidecar: started");
+        }
         // A line in progress on each stream, finished only at the end of the process's life.
         print!("stand-in stdout line in progress");
         let _ = std::io::stdout().flush();

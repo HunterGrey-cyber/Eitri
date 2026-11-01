@@ -7,9 +7,9 @@
  *  fixtures under `fixtures/problems/`) or, for "not logged in", on Claude Code's own
  *  documented interactive string, since the CLI's own logged-out diagnostic was never captured (the
  *  sidecar's refusal of a logged-out account is a fixture). The sidecar's own "inside the supported range but
- *  untested" compatibility diagnostic is deliberately NOT matched by anything here: it stays the
- *  header's `⚠`, and this module has no rule that could catch it,
- *  which is the point -- adding one would be the regression. */
+ *  untested" compatibility diagnostic is deliberately NOT matched by anything here: it appears in
+ *  the detail popover's CLI row and the window's stderr. Where the sidecar command exists, Rust adds
+ *  its static hint there and to a failed tab's raw text, which is always drawn. */
 
 export type Problem = {
   headline: string;

@@ -710,6 +710,53 @@ t_upd_already_kept() {
 	upd_decided "the same, named" 'already built: eitri sidecar use 0.3.1'
 }
 
+# The version new tabs already run is the answer to `update`: nothing to do, and nothing went wrong.
+TESTS="$TESTS t_upd_the_selected_version_is_up_to_date"
+t_upd_the_selected_version_is_up_to_date() {
+	upd_state
+	mk_sidecar_release 0.3.0
+	for how in latest named; do
+		if [ "$how" = latest ]; then upd_update; else upd_version 0.3.0; fi
+		expect_rc 0
+		expect_out '0.3.0 is already what new tabs use'
+		expect_no_out 'already built'
+		expect_no_out 'error'
+		expect_eq "$(snap "$UPD_ROOT")" "$UPD_SNAP" "the sidecar directory, $how"
+		expect_absent "$TH/.cache/eitri/sidecar-update"
+	done
+}
+
+# Nothing published at the address is no network failure: re-running cannot help, and the words say so.
+TESTS="$TESTS t_upd_no_release_is_said_plainly"
+t_upd_no_release_is_said_plainly() {
+	upd_state
+	rm -rf "$S/srv/sc/releases/latest"
+	upd_update
+	upd_refused "no release at all" 'no sidecar release is published at'
+	expect_no_out 'could not download'
+	upd_check
+	upd_refused "no release at all, asked by check" 'no sidecar release is published at'
+	upd_version 0.3.77
+	upd_refused "a version nobody published" 'no release claude-sidecar-v0.3.77 at'
+	expect_no_out 'could not download'
+}
+
+# The build peaks near 1.2 GiB, so an update asks for that before it starts.
+TESTS="$TESTS t_upd_asks_for_the_space_a_build_takes"
+t_upd_asks_for_the_space_a_build_takes() {
+	upd_state
+	mk_sidecar_release 0.3.1
+	mkdir -p "$T/lowdisk"
+	cat >"$T/lowdisk/df" <<'DF_STUB'
+#!/bin/sh
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+echo '/dev/stub 2000000 1300000 700000 65% /'
+DF_STUB
+	chmod 0755 "$T/lowdisk/df"
+	upd_update --stubs "$T/lowdisk"
+	upd_refused "700 MB free" 'building a sidecar update needs about 1.2 GiB'
+}
+
 # A link at updates/<version> is no copy of it, so `update` does not send a person to `use`, which
 # refuses a link. The new directory takes the link's place, and what it led to stays.
 TESTS="$TESTS t_upd_link_at_the_version_is_replaced"
@@ -1024,7 +1071,7 @@ t_upd_check_says_what_is_there() {
 	upd_check
 	expect_rc 0
 	expect_out 'newest release: 0.3.1 (protocol 3.25, Agent SDK 0.3.320). You run 0.3.0.'
-	expect_out 'eitri sidecar update takes it: 1-3 minutes, about 600 MiB free, and network access to nodejs.org, npm and grpc.io.'
+	expect_out 'eitri sidecar update takes it: 1-3 minutes, about 1.2 GiB free, and network access to nodejs.org, npm and grpc.io.'
 	expect_eq "$(snap "$TH")" "$before" "HOME after a check"
 	if srv_paths | grep -v -E '/(SHA256SUMS|SHA256SUMS\.sig|SIDECAR-RELEASE)$' | grep . >/dev/null; then
 		fail "check fetched more than the manifest: $(srv_paths)"
@@ -1066,7 +1113,8 @@ t_upd_check_reports_a_refusal() {
 	mk_sidecar_release 0.3.0
 	upd_check
 	expect_rc 0
-	expect_out 'already built: eitri sidecar use 0.3.0'
+	expect_out '0.3.0 is already what new tabs use'
+	expect_no_out 'already built'
 	mk_sidecar_release 0.3.1 PROTOCOL_MAJOR=4
 	upd_check
 	expect_rc 0

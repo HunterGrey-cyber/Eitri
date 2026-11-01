@@ -12,7 +12,6 @@ const HELLO: Hello = {
   projectDir: "/home/user/Documents/eitri",
   permissionModes: ["manual", "auto", "bypass"],
   resumableSessions: [],
-  expectedVerdandiRevision: "28a5e4c",
   account: "work",
 };
 

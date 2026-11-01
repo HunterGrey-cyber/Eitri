@@ -266,7 +266,7 @@ t_sidecar_build_binary_failure_blocks_upgrade() {
 # first install, or an upgrade from one whose own sidecar is absent. An upgrade over a working
 # install whose new release pins a different Verdandi rev refuses instead: the old rev's sidecar
 # would stay on disk under the old REV7, but nothing looks for it there
-# (agent::EXPECTED_VERDANDI_REVISION names the new rev), so a working agent panel would silently
+# (agent::BUNDLED_SIDECAR_REVISION names the new rev), so a working agent panel would silently
 # become "no sidecar" on a machine with no network to nodejs.org at upgrade time.
 
 TESTS="$TESTS t_sidecar_upgrade_node_unreachable_refuses"

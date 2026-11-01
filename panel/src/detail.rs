@@ -204,13 +204,7 @@ pub(super) fn detail_rows(
         }
         line
     });
-    let revision = info.map(|i| {
-        format!(
-            "{} · expected {}",
-            i.build_description.as_deref().unwrap_or(UNKNOWN),
-            agent::EXPECTED_VERDANDI_REVISION
-        )
-    });
+    let revision = info.map(|i| format!("sidecar {} ({})", i.sidecar_version, agent::sidecar_origin(i)));
     let record = match (&conversation_id, &provider_session_id) {
         (Some(conversation), Some(session)) => agent::persistence::load_conversation_record(conversation, session).ok(),
         _ => None,

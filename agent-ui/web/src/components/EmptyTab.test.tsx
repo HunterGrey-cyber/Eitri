@@ -50,7 +50,7 @@ const session = (n: number): ResumableSession => ({
 });
 const HELLO: Hello = {
   backend: "sidecar", projectDir: "/p", permissionModes: ["manual", "auto", "bypass"],
-  resumableSessions: Array.from({ length: 10 }, (_, i) => session(i)), expectedVerdandiRevision: "28a5e4c",
+  resumableSessions: Array.from({ length: 10 }, (_, i) => session(i)),
   account: null,
 };
 const TAB: TabInfo = {

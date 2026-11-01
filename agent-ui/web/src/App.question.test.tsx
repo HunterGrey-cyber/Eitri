@@ -25,7 +25,7 @@ function pause(ms: number) { act(() => { now += ms; vi.advanceTimersByTime(ms); 
 function dispatch(payload: unknown) { act(() => window.__eitriDispatch!(JSON.stringify(payload))); }
 function setup(overrides: Partial<AgentUiState> = {}, drafts?: unknown) {
   const view = render(<App />);
-  dispatch({ kind: "hello", backend: "sidecar", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"], resumableSessions: [], expectedVerdandiRevision: null, account: null });
+  dispatch({ kind: "hello", backend: "sidecar", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"], resumableSessions: [], account: null });
   dispatch({ kind: "tabs", active: 1, tabs: [{ ...tab, questionDraft: drafts }] });
   dispatch({ kind: "snapshot", tab: 1, throughRevision: 3, state: { ...initialState(), status: { kind: "running" }, transcript: [{ seq: 0, text: "Prior answer" }], ...overrides } });
   dispatch({ kind: "pane_focus", focused: true });
