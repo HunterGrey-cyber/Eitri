@@ -579,8 +579,9 @@ impl SpawnedSidecar {
 ///   sidecar's CLI is at least 2.1.252) and `list_commands`. Added and not read or sent: the
 ///   handshake's `cli_compatibility`, `bundled_cli_compatibility` and `effective_claude_config_dir`,
 ///   `ClaudeHostPolicy.accept_unsupported_cli` (always false), and `SessionReady`'s
-///   `effective_setting_sources`, `effective_configuration` and `cli_permission_mode_kind`; seven
-///   more capabilities from minors 15-19 this client does not branch on.
+///   `effective_setting_sources` and `effective_configuration`; seven more capabilities from minors
+///   15-19 this client does not branch on. Read: `SessionReady.cli_permission_mode_kind`
+///   (`translate::classify_session_ready`).
 /// - 3.21: `CreateSessionRequest.system_prompt_preset` (field 10) and `SystemPromptPreset` with an
 ///   optional append; the field-7 comments distinguish replacement from the SDK's minimal default.
 ///   Read: capability `system_prompt_preset`, selecting the preset on fresh and resumed sessions.

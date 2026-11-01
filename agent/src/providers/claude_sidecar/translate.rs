@@ -12,10 +12,37 @@ use crate::{
 };
 use claude_runtime_protocol::v1::session_event::Event as ProtoEvent;
 use claude_runtime_protocol::v1::{
-    PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
+    CliPermissionModeKind, PermissionMode as ProtoPermissionMode, PermissionOrigin as ProtoPermissionOrigin,
     PermissionOutcome as ProtoPermissionOutcome, ResumeStatus as ProtoResumeStatus, SessionCloseReason,
-    SessionEvent as ProtoSessionEvent, TurnOutcome as ProtoTurnOutcome, UserMessageDropReason,
+    SessionEvent as ProtoSessionEvent, SessionReady, TurnOutcome as ProtoTurnOutcome, UserMessageDropReason,
 };
+
+/// What a `SessionReady` says the CLI runs in, judged against what the session asked for. The sidecar
+/// states the mode as a kind beside the CLI's own string, and the kind is what is read.
+///
+/// `Unspecified` is a sidecar older than the field, or a CLI that named no mode, and then the string is
+/// all there is: that sidecar's report of an ungated mode must still trip. A kind that names no mode a
+/// session accepts closes it without a look at the string, a number this build has no kind for included
+/// (read from the field, since the generated getter turns one into `Unspecified`), and so does a kind
+/// that contradicts the string, which no correct sidecar sends: this check stops a session when in doubt.
+fn classify_session_ready(ready: &SessionReady, requested: RequestedCliMode) -> CliModeReport {
+    let Ok(kind) = CliPermissionModeKind::try_from(ready.cli_permission_mode_kind) else {
+        return CliModeReport::Ungated;
+    };
+    let spelling = match kind {
+        CliPermissionModeKind::Unspecified => return classify_reported_cli_mode(&ready.permission_mode, requested),
+        CliPermissionModeKind::Default => "default",
+        CliPermissionModeKind::Plan => "plan",
+        CliPermissionModeKind::DontAsk => "dontAsk",
+        CliPermissionModeKind::Auto => "auto",
+        _ => return CliModeReport::Ungated,
+    };
+    if spelling == ready.permission_mode {
+        classify_reported_cli_mode(spelling, requested)
+    } else {
+        CliModeReport::Ungated
+    }
+}
 
 /// Translates one proto `SessionEvent`'s wire fields into this crate's own domain events. Returns
 /// nothing for a genuinely malformed message (unset `oneof`, or unparseable `input_json`/
@@ -64,6 +91,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
         // by `CliModeNote`. On a session that asked for the CLI's auto mode, `auto` and its
         // `default` fallback are reported on as `CliPermissionMode`, and anything else closes it.
         ProtoEvent::SessionReady(ready) => {
+            let report = classify_session_ready(&ready, requested);
             let reported = ready.permission_mode;
             let effort = ready.effort;
             let mut out = vec![AgentDomainEvent::SessionOpened {
@@ -72,7 +100,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 model: ready.model,
                 cwd: ready.cwd,
             }];
-            match classify_reported_cli_mode(&reported, requested) {
+            match report {
                 CliModeReport::Ungated => out.push(AgentDomainEvent::UngatedCliMode {
                     reported,
                     detail: "SessionReady".to_string(),
@@ -660,12 +688,20 @@ impl CliModeNote {
 
     /// The line to print for this event, the first time one is due.
     pub(crate) fn observe(&mut self, event: &ProtoSessionEvent) -> Option<String> {
-        let (reported, source) = match event.event.as_ref()? {
-            ProtoEvent::SessionReady(ready) => (ready.permission_mode.as_str(), "SessionReady"),
-            ProtoEvent::PermissionModeChanged(changed) => (changed.permission_mode.as_str(), "PermissionModeChanged"),
+        let (reported, source, report) = match event.event.as_ref()? {
+            ProtoEvent::SessionReady(ready) => (
+                ready.permission_mode.as_str(),
+                "SessionReady",
+                classify_session_ready(ready, self.requested),
+            ),
+            ProtoEvent::PermissionModeChanged(changed) => (
+                changed.permission_mode.as_str(),
+                "PermissionModeChanged",
+                classify_reported_cli_mode(&changed.permission_mode, self.requested),
+            ),
             _ => return None,
         };
-        let line = match classify_reported_cli_mode(reported, self.requested) {
+        let line = match report {
             CliModeReport::Stricter => {
                 format!("[permission] the CLI reports permission mode '{reported}' in {source}, not 'default'")
             }
@@ -1682,6 +1718,18 @@ mod tests {
         }))
     }
 
+    fn ready_with_kind(permission_mode: &str, kind: i32) -> ProtoSessionEvent {
+        wrap(ProtoEvent::SessionReady(SessionReady {
+            session_id: "claude-1".into(),
+            provider_session_id: "claude-1".into(),
+            model: "m".into(),
+            cwd: "/tmp".into(),
+            permission_mode: permission_mode.into(),
+            cli_permission_mode_kind: kind,
+            ..Default::default()
+        }))
+    }
+
     fn opened() -> AgentDomainEvent {
         AgentDomainEvent::SessionOpened {
             session_id: "sess-1".into(),
@@ -1824,6 +1872,106 @@ mod tests {
                 detail: "PermissionModeChanged".into(),
             }]
         );
+    }
+
+    /// A kind the sidecar stated reads as its string always read, for both requests.
+    #[test]
+    fn a_stated_kind_agrees_with_what_its_string_always_meant() {
+        use CliPermissionModeKind as Kind;
+        for (kind, reported) in [
+            (Kind::Default, "default"),
+            (Kind::AcceptEdits, "acceptEdits"),
+            (Kind::Plan, "plan"),
+            (Kind::BypassPermissions, "bypassPermissions"),
+            (Kind::DontAsk, "dontAsk"),
+            (Kind::Auto, "auto"),
+            (Kind::Unknown, "weird"),
+        ] {
+            for requested in [RequestedCliMode::Default, RequestedCliMode::Auto] {
+                assert_eq!(
+                    super::translate(ready_with_kind(reported, kind as i32), requested),
+                    super::translate(ready(reported), requested),
+                    "{reported:?} under {requested:?}"
+                );
+            }
+        }
+    }
+
+    /// A sidecar older than the field sends no kind, so the string decides, and an ungated mode from
+    /// such a sidecar still closes the session.
+    #[test]
+    fn no_kind_leaves_the_string_to_decide() {
+        let none = CliPermissionModeKind::Unspecified as i32;
+        assert_eq!(
+            super::translate(ready_with_kind("bypassPermissions", none), RequestedCliMode::Default),
+            super::translate(ready("bypassPermissions"), RequestedCliMode::Default),
+        );
+        assert_eq!(
+            super::translate(ready_with_kind("", none), RequestedCliMode::Default),
+            [opened()],
+            "no kind and no string is unreported, not a trip"
+        );
+    }
+
+    /// A sidecar newer than this build can state a kind it does not know. That is not the same as no
+    /// kind, whatever the string beside it says.
+    #[test]
+    fn a_kind_this_build_does_not_know_closes_the_session() {
+        for reported in ["default", "", "plan"] {
+            for requested in [RequestedCliMode::Default, RequestedCliMode::Auto] {
+                assert_eq!(
+                    super::translate(ready_with_kind(reported, 99), requested),
+                    [
+                        opened(),
+                        AgentDomainEvent::UngatedCliMode {
+                            reported: reported.into(),
+                            detail: "SessionReady".into(),
+                        },
+                    ],
+                    "{reported:?} under {requested:?}"
+                );
+            }
+        }
+    }
+
+    /// The kind and the string come from one report, so a disagreement is a broken sidecar: the session
+    /// closes on either request, whichever of the two looks harmless.
+    #[test]
+    fn a_kind_that_contradicts_the_string_closes_the_session() {
+        use CliPermissionModeKind as Kind;
+        for (kind, reported) in [
+            (Kind::Default, "bypassPermissions"),
+            (Kind::Plan, "default"),
+            (Kind::Auto, "default"),
+            (Kind::Default, ""),
+            (Kind::BypassPermissions, "default"),
+            (Kind::Unknown, "default"),
+        ] {
+            for requested in [RequestedCliMode::Default, RequestedCliMode::Auto] {
+                assert_eq!(
+                    super::translate(ready_with_kind(reported, kind as i32), requested),
+                    [
+                        opened(),
+                        AgentDomainEvent::UngatedCliMode {
+                            reported: reported.into(),
+                            detail: "SessionReady".into(),
+                        },
+                    ],
+                    "{kind:?} with {reported:?} under {requested:?}"
+                );
+            }
+        }
+    }
+
+    /// The note reads the same report `translate` does, so a contradiction earns no note.
+    #[test]
+    fn the_note_reads_the_kind_too() {
+        use CliPermissionModeKind as Kind;
+        let mut note = CliModeNote::default();
+        assert_eq!(note.observe(&ready_with_kind("plan", Kind::Default as i32)), None);
+        assert!(note
+            .observe(&ready_with_kind("plan", Kind::Plan as i32))
+            .is_some_and(|line| line.contains("'plan'")));
     }
 
     /// Stricter and unreported modes are one line per session, not one per turn's `SessionReady`;
