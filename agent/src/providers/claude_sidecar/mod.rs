@@ -23,7 +23,10 @@ mod watch;
 #[cfg(test)]
 mod runtime_policy_verification;
 
-pub use cli_locate::{claude_cli_missing, claude_cli_missing_here, CLAUDE_INSTALL_URL};
+pub use cli_locate::{
+    claude_cli_missing, claude_cli_missing_here, failure_names_missing_cli, CLAUDE_INSTALL_URL,
+    CLI_MISSING_FAILURE_MARKER,
+};
 pub use contract::{
     missing_required, SidecarVersion, BUNDLED_SIDECAR_VERSION, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,
     UNTESTED_CLAUDE_NOTE,

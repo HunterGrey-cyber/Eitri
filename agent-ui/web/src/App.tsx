@@ -3264,7 +3264,7 @@ export default function App() {
                 mirrorDraft(recovered);
                 refusedEchoRef.current = { tab: record.tab, requestId: payload.requestId, at: performance.now() };
               }
-            } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow") {
+            } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow" || record?.kind === "reset") {
               // A footer nicety, not the banner reserved for conversation-breaking errors.
               showFlash(payload.error);
             } else {
@@ -3821,8 +3821,12 @@ export default function App() {
    *  FIRST, the same way a real tab switch already does (the `tabs` handler) -- a no-op when
    *  nothing is pending. */
   function resetTab() {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
     flushDraft();
-    post({ type: "reset_tab" });
+    const requestId = nextRequestId();
+    trackRequest(requestId, { kind: "reset", tab });
+    postToRust({ type: "reset_tab", request_id: requestId, tab });
   }
 
   /** Every answer to a card goes through here -- its own buttons, Enter in its reason box, and
@@ -4452,6 +4456,7 @@ export default function App() {
               typingGuard={typingGuard}
               onExLine={openExLine}
               onFlash={showFlash}
+              onOpenUrl={openUrl}
               // Whoever sends from here is typing, and the conversation this starts must open where
               // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
               // as BROWSE keys (a GUI pass, 2026-09-25).

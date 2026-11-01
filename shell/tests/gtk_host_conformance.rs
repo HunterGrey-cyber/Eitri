@@ -1388,10 +1388,15 @@ fn the_screen_asks_for_no_width_of_its_own() -> Result<(), String> {
 /// The screen's first page with `count` presets, `chosen` the chosen one, and enough rows above them that a low window
 /// cannot hold it all.
 fn tall_view(count: u32, chosen: u32) -> eitri_core::onboarding::OnboardingView {
+    rows_view(12, count, chosen)
+}
+
+/// [`tall_view`] with `rows` found rows above the presets.
+fn rows_view(rows: u32, count: u32, chosen: u32) -> eitri_core::onboarding::OnboardingView {
     use eitri_core::onboarding::{ViewItem, ViewRow};
     let mut view = long_view();
     view.body.clear();
-    view.rows = (0..12)
+    view.rows = (0..rows)
         .map(|row| ViewRow {
             label: format!("row {row}"),
             text: "found".into(),
@@ -1500,6 +1505,83 @@ fn a_short_window_scrolls_to_the_choice_and_by_the_keys() -> Result<(), String> 
         if (adjustment.value() - lines_below).abs() > 1.0 {
             return Err(format!(
                 "the keys stop at {} of the {lines_below} the last line needs",
+                adjustment.value()
+            ));
+        }
+        Ok(())
+    };
+    let result = check();
+    window.destroy();
+    pump(50);
+    result
+}
+
+/// A row that fills in above the presets after the page came up (a detection answer, `claude` not found) pushes them
+/// down; with no scroll key used the presets come back into view, all of them when they fit the visible text, the
+/// chosen one first of all. After a scroll key the text stays where the person put it.
+fn a_row_filling_in_keeps_the_presets_in_view() -> Result<(), String> {
+    use eitri_core::onboarding::Scroll;
+    let window = gtk4::Window::new();
+    window.set_default_size(500, 560);
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gtk4::Label::new(Some("window"))));
+    let screen = gtk_host::onboarding::OnboardingScreen::new();
+    overlay.add_overlay(screen.widget());
+    window.set_child(Some(&overlay));
+    window.present();
+    pump(200);
+    // The question and the last preset's button, as the scroller shows them.
+    let seen = |screen: &gtk_host::onboarding::OnboardingScreen| -> Result<(f32, f32, f32), String> {
+        let scroller = screen_scroller(screen)?;
+        let all = descendants(screen.widget());
+        let top = |class: &str, last: bool| -> Result<(f32, f32), String> {
+            let mut found = all.iter().filter(|w| w.has_css_class(class));
+            let widget = if last { found.next_back() } else { found.next() };
+            let widget = widget.ok_or_else(|| format!("no {class} in the screen"))?;
+            let bounds = widget
+                .compute_bounds(&scroller)
+                .ok_or_else(|| format!("{class} has no bounds in the scroller"))?;
+            Ok((bounds.y(), bounds.y() + bounds.height()))
+        };
+        let (question_top, _) = top("onboarding-question", false)?;
+        let (_, last_bottom) = top("onboarding-item-button", true)?;
+        Ok((question_top, last_bottom, scroller.height() as f32))
+    };
+    let check = || -> Result<(), String> {
+        screen.show(Some(&rows_view(3, 5, 5)));
+        pump(300);
+        screen.show(Some(&rows_view(14, 5, 5)));
+        pump(400);
+        let adjustment = screen_scroller(&screen)?.vadjustment();
+        if adjustment.upper() <= adjustment.page_size() {
+            return Err("the rows fit, so nothing here tests the presets being pushed down".into());
+        }
+        let (top, bottom, page) = seen(&screen)?;
+        if top < -1.0 || bottom > page + 1.0 {
+            return Err(format!(
+                "the presets stand at {top}..{bottom} of the {page} the text shows, after a row filled in above them"
+            ));
+        }
+        // A scroll key pressed before the replacement widgets are laid out is not taken back by the reveal waiting for
+        // them.
+        let at_presets = adjustment.value();
+        screen.show(Some(&rows_view(15, 5, 5)));
+        screen.scroll(Scroll::PageUp);
+        pump(400);
+        if adjustment.value() >= at_presets - 2.0 {
+            return Err(format!(
+                "a PageUp before the layout was undone: the text stands at {} again, as it did at the presets ({at_presets})",
+                adjustment.value()
+            ));
+        }
+        screen.scroll(Scroll::PageUp);
+        pump(100);
+        let chosen = adjustment.value();
+        screen.show(Some(&rows_view(15, 5, 5)));
+        pump(300);
+        if (adjustment.value() - chosen).abs() > 1.0 {
+            return Err(format!(
+                "a row filling in moved the text from {chosen} to {} after a scroll key",
                 adjustment.value()
             ));
         }
@@ -1677,6 +1759,8 @@ fn run_all() -> Result<Vec<String>, String> {
     passed.push("the_screen_asks_for_no_width_of_its_own".into());
     a_short_window_scrolls_to_the_choice_and_by_the_keys()?;
     passed.push("a_short_window_scrolls_to_the_choice_and_by_the_keys".into());
+    a_row_filling_in_keeps_the_presets_in_view()?;
+    passed.push("a_row_filling_in_keeps_the_presets_in_view".into());
     a_body_line_wraps_and_is_never_cut()?;
     passed.push("a_body_line_wraps_and_is_never_cut".into());
     the_focus_op_before_the_chrome_op_still_grabs(&f)?;

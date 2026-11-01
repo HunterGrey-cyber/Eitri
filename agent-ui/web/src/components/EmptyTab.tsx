@@ -6,7 +6,7 @@ import { EMPTY_PANEL_TABLE } from "../keymap";
 import type { PanelBinding, PanelMode, PanelTable } from "../keymap";
 import { advanceSequence, boxEntries, isPendingFirst, pendingPairBinding, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "../leader";
 import type { BoxEntry, SeqStep } from "../leader";
-import { isActivatableControl } from "../nav";
+import { isActivatableControl, webUrl } from "../nav";
 import { isImeKey } from "../composerKeys";
 import { Composer } from "./Composer";
 import type { SlashAction } from "../slashCommands";
@@ -159,6 +159,9 @@ export type EmptyTabProps = {
   typingGuard?: TypingGuard;
   /** Says a refused leader in the band (`App.tsx`'s `showFlash`); optional for the same reason. */
   onFlash?: (text: string) => void;
+  /** `gx` on a failed tab's row: hands the address to Rust's own web-link path (`App.tsx`'s `openUrl`, which
+   *  Rust re-checks), the one `gx` takes over a live conversation. Optional for the same reason. */
+  onOpenUrl?: (url: string) => void;
 };
 
 /** An empty session tab: Claude Code's fresh prompt. The composer is live in INPUT;
@@ -521,6 +524,17 @@ export function EmptyTab(props: EmptyTabProps) {
     }
   }
 
+  /** `gx` on this screen: the web link a failure's row carries (the install address of a not-found `claude`). The
+   *  one the keys are on when they are on a link, else the row's first. The row's own links are the page's, not a
+   *  reply's, so the address is sent without a pick. */
+  function openFailureLink(target: EventTarget | null) {
+    const anchors = Array.from(rootRef.current?.querySelectorAll<HTMLAnchorElement>(".row-problem a[href]") ?? []);
+    const focused = anchors.find((anchor) => anchor === target || anchor.contains(target as Node | null));
+    const url = webUrl((focused ?? anchors[0])?.getAttribute("href") ?? null);
+    if (url === null) props.onFlash?.("no web link on this screen");
+    else props.onOpenUrl?.(url);
+  }
+
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (props.answerConfirm?.(event)) return;
     // An overlay drawn over this screen (the chooser, a rename) owns the keys; one that
@@ -561,6 +575,11 @@ export function EmptyTab(props: EmptyTabProps) {
     // control's own Enter/Space (the line just below) runs past it. `Ctrl+c` alone still falls
     // through, to the page's own native copy, as it does over a live tab.
     if (prefix !== null) {
+      if (prefix === "g" && event.key === "x" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        event.preventDefault();
+        openFailureLink(event.target);
+        return;
+      }
       const pair = event.ctrlKey || event.altKey ? null : pendingPairBinding(panelTable, prefix, event.key);
       if (pair !== null) {
         event.preventDefault();

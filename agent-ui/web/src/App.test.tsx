@@ -1766,6 +1766,26 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".empty-tab")).not.toBeNull();
   });
 
+  /* Rust refuses `r` on a tab whose `claude` is still missing and leaves the row up: the refusal is a footer flash,
+     not the banner reserved for what breaks the conversation. */
+  it("says in the footer, not the banner, that a refused r left the tab as it was", () => {
+    vi.useFakeTimers();
+    const widen = stubBandWidth();
+    try {
+      const { container } = startedApp();
+      act(() => widen(container));
+      events({ type: "session_closed", reason: "provider exited" });
+      fireEvent.keyDown(conversationRoot(container), { key: "r" });
+      const sent = lastOfType("reset_tab")!;
+      dispatch({ kind: "command_result", requestId: sent.request_id as string, ok: false, error: "still not found" });
+      expect(container.querySelector(".band-message")!.textContent).toBe("still not found");
+      expect(container.querySelector(".command-notice")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   /* GTK owns Ctrl+Shift+R (panel reload) in the capture phase, and
      this handler must not fight it for a chord it does not claim. `event.key` for Shift+R is the
      shifted character "R", which is why this is safe by construction rather than by an explicit

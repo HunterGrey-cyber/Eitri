@@ -58,10 +58,12 @@ export type Envelope = InboundPayload & { receivedAt: number; monotonicAt?: numb
  *    footer flash like `gx`'s.
  *  - `"stop-background"`: the confirmed `<leader>k`. Rust refuses one whose moment has passed (a turn started,
  *    the commands ended, the count moved), and the session goes on, so a flash says why.
+ *  - `"reset"`: `r` on a failed tab. Rust leaves a tab whose `claude` is still missing as it is and refuses the `r`
+ *    saying so, which is the footer flash: the row it is about is already on screen.
  *  - `"follow"`: `<leader>e`. Rust refuses it for a tab a float covers, one that is moving, or one that is gone; the
  *    page has already said what it expects, so the refusal is the flash that follows it. */
 export type CommandRecord = {
-  kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow";
+  kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow" | "reset";
   tab: TabId;
   text?: string;
   permissionId?: string;
@@ -447,7 +449,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           // nothing waited for it and the conversation is untouched, so it is not the user's error. The page's
           // log keeps it. Any other refusal of a mirror (a draft too large to keep) means the person's text will
           // not survive a switch, so it is said like any other refusal.
-        } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow"].includes(record.kind)) {
+        } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow", "reset"].includes(record.kind)) {
           // The kinds left out are already said (trust) or are a footer flash the page shows; everything else,
           // a refused permission answer included, is the banner.
           next.commandNotice = envelope.error;

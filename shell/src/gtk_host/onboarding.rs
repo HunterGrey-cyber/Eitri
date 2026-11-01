@@ -20,8 +20,11 @@
 //! drawn opaque (a CSS background, not transparency), so the editor's subsurface check holds under it.
 //!
 //! **Scrolling.** The keys are the controller's, so the scroller never hears them: the screen's scroll keys come here
-//! as [`OnboardingScreen::scroll`], and the chosen preset is kept in view after each frame that lays it out. A new page
-//! of the screen starts at the top.
+//! as [`OnboardingScreen::scroll`]. Until one of them is used on a page, every view that replaces the text brings the
+//! presets into view once it is laid out: all of them (with their question) when they fit the visible part, else the
+//! chosen one. A row that fills in above the presets after the page came up (`claude` not found, a late answer)
+//! pushes them down, and this is what puts them back; once the person scrolls, the text stays where they left it.
+//! A new page of the screen starts at the top.
 //!
 //! known limit: GTK layout, so no headless test holds the placement or the refit; the conformance tests hold that the
 //! screen asks for no width of its own and that a short window scrolls to the chosen preset and by the keys.
@@ -45,6 +48,8 @@ const FRAME_WIDTH: i32 = 48;
 const FRAME_HEIGHT: i32 = 48;
 /// The most characters a label asks for before it wraps or ellipsizes: no label asks for the panel's width.
 const LABEL_CHARS: i32 = 40;
+/// The gap between the blocks of the screen's text, in pixels.
+const CONTENT_SPACING: i32 = 6;
 /// How far `j` or `k` moves the text, in pixels: about three lines of it.
 const LINE_SCROLL: f64 = 48.0;
 /// The part of the visible text a page key moves, so a line stays to read on from.
@@ -94,8 +99,15 @@ struct Parts {
     help: gtk4::Label,
     footer: gtk4::Label,
     buttons: gtk4::Box,
-    /// The chosen preset's row, until a frame has laid it out and scrolled it into view.
-    reveal: Rc<RefCell<Option<gtk4::Widget>>>,
+    /// The presets to bring into view, until a frame has laid them out and scrolled to them.
+    reveal: Rc<RefCell<Option<Reveal>>>,
+}
+
+/// What the screen keeps in view: the chosen preset's row, and the block of the question and all the presets.
+#[derive(Clone)]
+struct Reveal {
+    row: gtk4::Widget,
+    block: gtk4::Widget,
 }
 
 /// What tells one page of the screen from another: its title, its counter and its question.
@@ -106,6 +118,8 @@ pub(crate) struct OnboardingScreen {
     on_button: ButtonSlot,
     /// The page last shown, and the number of its chosen preset.
     shown: RefCell<Option<(Page, Option<u32>)>>,
+    /// Whether a scroll key moved the text since the page came up: from then on the text stays where it is.
+    scrolled_by_hand: Cell<bool>,
     /// The size of the overlay the panel was last fitted to.
     fitted: Rc<Cell<(i32, i32)>>,
     /// The tick that fits the panel again when the overlay's size changes, while the panel is up.
@@ -129,7 +143,7 @@ impl OnboardingScreen {
         let step = text_label("onboarding-step", "", false);
         head.append(&title);
         head.append(&step);
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, CONTENT_SPACING);
         let scroller = gtk4::ScrolledWindow::new();
         scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         // No natural width of its own: a long line scrolls or wraps and never widens the window.
@@ -160,6 +174,7 @@ impl OnboardingScreen {
             },
             on_button: Rc::new(RefCell::new(None)),
             shown: RefCell::new(None),
+            scrolled_by_hand: Cell::new(false),
             fitted: Rc::new(Cell::new((0, 0))),
             tick: RefCell::new(None),
         })
@@ -201,14 +216,19 @@ impl OnboardingScreen {
         if !view.rows.is_empty() {
             parts.content.append(&rows_grid(&view.rows));
         }
+        // The question and the presets under it are one block, so they can be kept in view together.
+        let block = gtk4::Box::new(gtk4::Orientation::Vertical, CONTENT_SPACING);
         if let Some(question) = &view.question {
-            parts.content.append(&text_label("onboarding-question", question, true));
+            block.append(&text_label("onboarding-question", question, true));
         }
         let mut chosen = None;
         if !view.items.is_empty() {
             let (list, row) = items_grid(&view.items, &self.on_button);
-            parts.content.append(&list);
+            block.append(&list);
             chosen = row;
+        }
+        if block.first_child().is_some() {
+            parts.content.append(&block);
         }
         for line in &view.body {
             parts.content.append(&text_label("onboarding-body", line, true));
@@ -225,7 +245,7 @@ impl OnboardingScreen {
         self.set_buttons(&view.buttons);
         parts.frame.set_visible(true);
         parts.fit(&self.fitted);
-        self.place(view, chosen);
+        self.place(view, chosen, block.upcast());
         if self.tick.borrow().is_none() {
             let (parts, fitted) = (self.parts.clone(), self.fitted.clone());
             let id = self.parts.frame.add_tick_callback(move |_, _| {
@@ -239,22 +259,23 @@ impl OnboardingScreen {
         }
     }
 
-    /// Decides where the text stands after [`OnboardingScreen::show`]: a new page starts at the top, and the chosen
-    /// preset comes into view when the page or the choice changed. A view that only filled in a row leaves the text
-    /// where the user scrolled it.
-    fn place(&self, view: &OnboardingView, chosen: Option<(u32, gtk4::Widget)>) {
+    /// Decides where the text stands after [`OnboardingScreen::show`]: a new page starts at the top, and the presets
+    /// come into view when the page or the choice changed, or while no scroll key has moved the text on this page (a
+    /// view that only filled in a row above them leaves the text where the person scrolled it).
+    fn place(&self, view: &OnboardingView, chosen: Option<(u32, gtk4::Widget)>, block: gtk4::Widget) {
         let page: Page = (view.title.clone(), view.step.clone(), view.question.clone());
         let number = chosen.as_ref().map(|(number, _)| *number);
         let last = self.shown.borrow_mut().replace((page.clone(), number));
         let new_page = last.as_ref().is_none_or(|(shown, _)| *shown != page);
         if new_page {
             self.parts.scroller.vadjustment().set_value(0.0);
+            self.scrolled_by_hand.set(false);
         }
         let moved = new_page || last.is_some_and(|(_, shown)| shown != number);
         // The widgets were just replaced, so a reveal still waiting names one that is gone.
         let waiting = self.parts.reveal.borrow().is_some();
-        *self.parts.reveal.borrow_mut() = if moved || waiting {
-            chosen.map(|(_, row)| row)
+        *self.parts.reveal.borrow_mut() = if moved || waiting || !self.scrolled_by_hand.get() {
+            chosen.map(|(_, row)| Reveal { row, block })
         } else {
             None
         };
@@ -262,6 +283,9 @@ impl OnboardingScreen {
 
     /// Moves the text by one of the screen's scroll keys; the adjustment keeps it within the text.
     pub(crate) fn scroll(&self, by: Scroll) {
+        self.scrolled_by_hand.set(true);
+        // A reveal still waiting for the new widgets' layout must not pull the text back from where the key put it.
+        *self.parts.reveal.borrow_mut() = None;
         let adjustment = self.parts.scroller.vadjustment();
         let page = adjustment.page_size() * PAGE_SCROLL;
         let step = match by {
@@ -309,20 +333,26 @@ impl OnboardingScreen {
 }
 
 impl Parts {
-    /// Scrolls the chosen preset into view once it has been laid out. A tick runs before the frame's layout, so a row
-    /// made since the last frame has no height yet and waits for the next one.
+    /// Scrolls the presets into view once they have been laid out: the whole block when it fits the visible part of
+    /// the text, else the chosen row. A tick runs before the frame's layout, so a row made since the last frame has no
+    /// height yet and waits for the next one.
     fn reveal_chosen(&self) {
-        let Some(row) = self.reveal.borrow().clone() else {
+        let Some(Reveal { row, block }) = self.reveal.borrow().clone() else {
             return;
         };
         if row.height() == 0 {
             return;
         }
         *self.reveal.borrow_mut() = None;
-        let Some(bounds) = row.compute_bounds(&self.content) else {
+        let adjustment = self.scroller.vadjustment();
+        let whole = block.compute_bounds(&self.content);
+        let target = match whole {
+            Some(bounds) if f64::from(bounds.height()) <= adjustment.page_size() => Some(bounds),
+            _ => row.compute_bounds(&self.content),
+        };
+        let Some(bounds) = target else {
             return;
         };
-        let adjustment = self.scroller.vadjustment();
         let top = f64::from(bounds.y());
         let bottom = top + f64::from(bounds.height());
         if top < adjustment.value() {

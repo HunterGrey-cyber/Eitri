@@ -101,6 +101,73 @@ fn a_view_is_read_only_and_a_bad_request_says_why() {
     dir.cleanup();
 }
 
+/// Views do not pile up as splits: the next one takes the window of the one before while it still shows it (vim's
+/// preview window), and a window the person turned to something else is left alone.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_new_view_takes_the_window_of_the_view_before_it() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let probe = dir.path().join("probe.txt");
+    let other = dir.path().join("other.txt");
+    std::fs::write(&other, "elsewhere\n").unwrap();
+    let views: Vec<_> = ["one", "two", "three"]
+        .iter()
+        .map(|title| {
+            dir.prepare_view(&format!("Bash: {title}"), &format!("text of {title}"))
+                .unwrap()
+        })
+        .collect();
+    let report = |out: &std::path::Path| {
+        format!(
+            "lua local f = io.open('{}', 'a') f:write(#vim.api.nvim_tabpage_list_wins(0) .. ' ' .. vim.fn.getline(1) .. '\\n') f:close()",
+            out.display()
+        )
+    };
+    let four = dir.prepare_view("Bash: four", "text of four").unwrap();
+    nvim(
+        &dir,
+        &[
+            call(views[0].hex()),
+            report(&probe),
+            call(views[1].hex()),
+            report(&probe),
+            call(views[2].hex()),
+            report(&probe),
+            // The person opens another file in the view's window: the next view must not overwrite it.
+            format!("edit {}", other.display()),
+            call(four.hex()),
+            report(&probe),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probe).unwrap(),
+        "2 text of one\n2 text of two\n2 text of three\n3 text of four\n"
+    );
+    dir.cleanup();
+}
+
+/// A view is reused only in the tab page the person is in: one opened in tab page 1 stays as it is when a second view
+/// is asked for from a `:tabnew`, which gets a split of its own.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_view_in_another_tab_page_is_not_taken_over() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let probe = dir.path().join("probe.txt");
+    let first = dir.prepare_view("Bash: one", "text of one").unwrap();
+    let second = dir.prepare_view("Bash: two", "text of two").unwrap();
+    let report = format!(
+        "lua local f = io.open('{}', 'w') for _, tab in ipairs(vim.api.nvim_list_tabpages()) do local seen = {{}} for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do seen[#seen + 1] = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, 1, false)[1] or '' end f:write(table.concat(seen, '|') .. '\\n') end f:close()",
+        probe.display()
+    );
+    nvim(&dir, &[call(first.hex()), "tabnew".into(), call(second.hex()), report]);
+    assert_eq!(
+        std::fs::read_to_string(&probe).unwrap(),
+        "|text of one\n|text of two\n",
+        "tab page 1 keeps the first view; tab page 2 holds an empty window and the second view"
+    );
+    dir.cleanup();
+}
+
 fn lua_bytes(text: &str) -> String {
     let codes: Vec<String> = text.bytes().map(|b| b.to_string()).collect();
     format!("string.char({})", codes.join(","))

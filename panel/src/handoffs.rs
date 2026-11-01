@@ -189,6 +189,9 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         scratch: _,
         proposal_jobs: _,
         view_jobs: _,
+        // A failed tab's `r` waits for the window it was pressed in; the lookup is the window's.
+        reset_checks: _,
+        cli_missing: _,
         // The window's moves in flight; the record is what one of them builds.
         chat_moves: _,
         hand_overs: _,

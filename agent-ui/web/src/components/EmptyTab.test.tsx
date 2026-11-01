@@ -254,6 +254,40 @@ describe("EmptyTab", () => {
     });
     expect(stopped.container.querySelector("a")).toBeNull();
   });
+  /* `gx` is vim's "open the link": on a not-found row it opens the install address through the page's own web-link
+     path (`onOpenUrl`), whether the keys are on the link (after `f`) or on the screen, as `Enter` on the link does. */
+  const MISSING = 'could not determine the installed claude CLI version via "/no/such/claude" (spawn error: ENOENT)';
+  const gx = (target: Element) => {
+    fireEvent.keyDown(target, { key: "g" });
+    fireEvent.keyDown(target, { key: "x" });
+  };
+  it("gx opens the install address of a not-found row, with the keys on the screen or on the link", () => {
+    const onOpenUrl = vi.fn();
+    const onFlash = vi.fn();
+    const { container } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: MISSING, onOpenUrl, onFlash });
+    gx(container.querySelector(".empty-tab")!);
+    expect(onOpenUrl).toHaveBeenCalledTimes(1);
+    expect(onOpenUrl).toHaveBeenLastCalledWith("https://code.claude.com/docs/en/quickstart");
+    const link = container.querySelector<HTMLAnchorElement>(".row-problem a[href]")!;
+    link.focus();
+    gx(link);
+    expect(onOpenUrl).toHaveBeenCalledTimes(2);
+    expect(onOpenUrl).toHaveBeenLastCalledWith("https://code.claude.com/docs/en/quickstart");
+    expect(onFlash).not.toHaveBeenCalled();
+  });
+  it("gx says there is no link where the screen has none, and opens nothing", () => {
+    const onOpenUrl = vi.fn();
+    const onFlash = vi.fn();
+    const { container } = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: "the connection to the provider ended before this session did",
+      onOpenUrl,
+      onFlash,
+    });
+    gx(container.querySelector(".empty-tab")!);
+    expect(onOpenUrl).not.toHaveBeenCalled();
+    expect(onFlash).toHaveBeenCalledWith("no web link on this screen");
+  });
   /** "Press r…" was on screen twice (the row and the composer), three times under
    *  a remedy that already says it. Once, whichever way. */
   it("says press r once on a failed tab, with a remedy and without one", () => {

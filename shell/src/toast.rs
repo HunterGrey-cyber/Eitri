@@ -43,6 +43,12 @@ impl Toast {
         label.set_valign(gtk4::Align::Start);
         label.set_margin_top(TOAST_MARGIN);
         label.set_margin_end(TOAST_MARGIN);
+        // A sentence longer than the window wraps inside it instead of running past its left edge: the label takes
+        // the room the overlay has, never more, and keeps a margin on both sides.
+        label.set_margin_start(TOAST_MARGIN);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        label.set_xalign(0.0);
         label.set_can_target(false);
         label.set_can_focus(false);
         label.set_visible(false);
@@ -144,5 +150,28 @@ impl Toast {
             }
         });
         *self.hide.borrow_mut() = Some(source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A toast sentence is longer than a narrow window (the tmux import's notice is about 130 characters): the label
+    /// wraps inside the overlay and keeps a margin on its left, so no part of it is drawn past the window's edge.
+    /// Read off the code (comments and this module blanked); where it lands in a 700 px window is the GUI pass's.
+    #[test]
+    fn the_toast_label_wraps_and_keeps_a_margin_on_both_sides() {
+        use eitri_core::source_scan as scan;
+        let source = scan::read_required("shell/src/toast.rs");
+        let code = scan::code_only(&source.text);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
+        let flat: String = code.split_whitespace().collect();
+        for wanted in [
+            "label.set_wrap(true)",
+            "label.set_wrap_mode(gtk4::pango::WrapMode::WordChar)",
+            "label.set_margin_start(TOAST_MARGIN)",
+            "label.set_margin_end(TOAST_MARGIN)",
+        ] {
+            assert!(flat.contains(wanted), "toast.rs lacks {wanted}");
+        }
     }
 }

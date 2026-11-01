@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 /// installer's warning all give this one address.
 pub const CLAUDE_INSTALL_URL: &str = "https://code.claude.com/docs/en/quickstart";
 
+/// What the sidecar's failure text says when it could not run the CLI at all (a lookup that found nothing): the
+/// panel's own "not found" row recognises the same words (`agent-ui/web/src/problems.ts`, which a test compares).
+pub const CLI_MISSING_FAILURE_MARKER: &str = "could not determine the installed claude CLI version";
+
+/// Whether a tab's failure text is the sidecar saying it found no `claude` to run.
+pub fn failure_names_missing_cli(failure: &str) -> bool {
+    failure.contains(CLI_MISSING_FAILURE_MARKER)
+}
+
 /// The variable the sidecar reads to pick the CLI; the only way to name one that is not `claude` on the `PATH`.
 const CLI_PATH_VAR: &str = "VERDANDI_CLAUDE_CLI_PATH";
 /// What the sidecar runs when the variable is unset or blank.
@@ -98,6 +107,16 @@ mod tests {
     fn files(list: &[&str]) -> impl Fn(&Path) -> bool {
         let set: HashSet<PathBuf> = list.iter().map(PathBuf::from).collect();
         move |p| set.contains(p)
+    }
+
+    #[test]
+    fn a_failure_names_a_missing_cli_by_the_sidecars_own_words() {
+        assert!(failure_names_missing_cli(
+            "could not determine the installed claude CLI version via \"/no/such/claude\" (spawn error: ENOENT)"
+        ));
+        assert!(!failure_names_missing_cli(
+            "the connection to the provider ended before this session did"
+        ));
     }
 
     #[test]

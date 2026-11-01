@@ -94,15 +94,29 @@ local function read_only_buffer(path, lines)
   return buf
 end
 
+-- The window and buffer of the view shown last. A new view takes that window while it still shows that view, as
+-- vim's preview window does, so views do not pile up as splits; a window the person has since used for something
+-- else, or one in another tab page, is not reused.
+local last_view = nil
+
 -- Tool output and replies must not execute modelines at read time: put their text into a buffer
 -- whose 'modeline' is already off. Keep the file's name for `:ls` and scratch-buffer recognition
 -- by the editor-context feed.
 local function view(path)
   path = absolute(path)
   local buf = read_only_buffer(path, read_lines(path))
-  vim.api.nvim_open_win(buf, true, { split = 'below', win = -1 })
+  local win = last_view and last_view.win
+  if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == last_view.buf
+      and vim.api.nvim_win_get_tabpage(win) == vim.api.nvim_get_current_tabpage() then
+    -- The previous view's buffer is wiped when the window stops showing it.
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.api.nvim_set_current_win(win)
+  else
+    win = vim.api.nvim_open_win(buf, true, { split = 'below', win = -1 })
+  end
   -- After the window shows it: a filetype plugin sets window options on the current window.
   vim.bo[buf].filetype = 'markdown'
+  last_view = { win = win, buf = buf }
 end
 
 -- A pending edit's proposal: the file as it is on disk (left) against the file as the edit would leave

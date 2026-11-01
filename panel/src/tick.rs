@@ -178,6 +178,7 @@ pub(super) fn tick_send(
     super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
     poll_view_jobs(state, out);
+    super::inbound::poll_reset_checks(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
     poll_trust(state, screen, out);
@@ -360,6 +361,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.question_sends.is_empty()
         || !state.proposal_jobs.is_empty()
         || !state.view_jobs.is_empty()
+        || !state.reset_checks.is_empty()
         || !state.review_flow.is_idle()
         || state.editor_tools.needs_polling()
         || !state.editor_follower.is_idle()
@@ -1383,5 +1385,76 @@ mod tests {
             "the prompt reached the page: {:?}",
             &page.sent.borrow()[sent..]
         );
+    }
+
+    /// How the panel's Rust half spends time on one long streamed reply, at three sizes: opt-in
+    /// (`cargo test -p eitri-panel long_reply_cost -- --ignored --nocapture`), it prints a table and asserts only that the
+    /// text arrived whole. A speed test names no absolute bound; what matters is whether the cost of a tick grows with the
+    /// text already held, and how large the snapshot a fresh page is owed gets.
+    #[test]
+    #[ignore = "a measurement: prints a table, asserts no time"]
+    fn long_reply_cost() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-long-reply");
+        let batch: usize = std::env::var("LONG_REPLY_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        for size in [100_000usize, 400_000, 1_200_000] {
+            let (handle, page, _host) = handle_with_recording_page();
+            page.visible.set(true);
+            handle.page_message(ViewId::BASE, READY);
+            let (tab, provider) = live_tab(&handle, &dir);
+            provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+            handle.tick();
+            let batches = size.div_ceil(batch);
+            let (mut times, mut bytes) = (Vec::new(), Vec::new());
+            let started = std::time::Instant::now();
+            for i in 0..batches {
+                let head = format!("line {i} ");
+                let text = format!("{head}{}\n", "x".repeat(batch.saturating_sub(head.len() + 1)));
+                provider.queue(agent::AgentDomainEvent::ContentDelta {
+                    turn_id: "t1".into(),
+                    kind: agent::ContentKind::Text,
+                    text,
+                });
+                let sent_before: usize = page.sent.borrow().iter().map(String::len).sum();
+                let t0 = std::time::Instant::now();
+                handle.tick();
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                bytes.push(page.sent.borrow().iter().map(String::len).sum::<usize>() - sent_before);
+            }
+            let streamed = started.elapsed().as_secs_f64() * 1000.0;
+            let held = handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .transcript
+                .iter()
+                .map(|entry| entry.text.len())
+                .sum::<usize>();
+            // A page that comes up now (a reload, a switch back) is owed the whole state.
+            page.sent.borrow_mut().clear();
+            let t0 = std::time::Instant::now();
+            handle.page_message(ViewId::BASE, READY);
+            let ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let ready_bytes: usize = page.sent.borrow().iter().map(String::len).sum();
+            let tenth = (batches / 10).max(1);
+            let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+            let first = mean(&times[..tenth]);
+            let last = mean(&times[times.len() - tenth..]);
+            let sent_first = bytes[..tenth].iter().sum::<usize>() as f64 / tenth as f64;
+            let sent_last = bytes[bytes.len() - tenth..].iter().sum::<usize>() as f64 / tenth as f64;
+            eprintln!(
+                "[long-reply] rust {size} B: {batches} ticks, total {streamed:.0} ms, first-tenth tick {first:.3} ms / {sent_first:.0} B sent, \
+                 last-tenth tick {last:.3} ms / {sent_last:.0} B sent (x{:.1} time), projection holds {held} B, ready snapshot {ready_ms:.1} ms / {ready_bytes} B",
+                last / first.max(1e-6)
+            );
+        }
     }
 }

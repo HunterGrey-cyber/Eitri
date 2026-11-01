@@ -27,6 +27,14 @@ describe("classify", () => {
     expect(installSh).toContain(CLAUDE_INSTALL_URL);
   });
 
+  /* The page recognises a not-found failure by the sidecar's words; Rust holds `r` on the same words until a lookup
+     finds `claude`, so the two spell them alike. */
+  it("spells the not-found failure marker as the Rust constant does", () => {
+    const marker = /pub const CLI_MISSING_FAILURE_MARKER: &str = "([^"]+)";/.exec(cliLocateRs)![1];
+    expect(cliMissingFixture).toContain(marker);
+    expect(classify(`${marker} via "/x"`)?.headline).toBe("Claude Code (claude) was not found.");
+  });
+
   it("recognises the captured CLI-out-of-range fixture and names the real versions", () => {
     const problem = classify(cliOutOfRangeFixture);
     expect(problem).toEqual({

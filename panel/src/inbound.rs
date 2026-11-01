@@ -324,6 +324,155 @@ pub(super) fn apply_outcome(
     }
 }
 
+/// What a reset of `tab` does once it is allowed: the tab goes back to its start screen, or a session its agent stopped
+/// with the conversation whole is continued in place. Answers `request_id` in `view`.
+pub(super) fn reset_tab(state: &mut AgentPanelState, tab: TabId, view: ViewId, request_id: &str, out: &mut Outbox) {
+    let ok = |out: &mut Outbox| out.send(view, serialize_command_result_for_js(request_id, Ok(())));
+    let refuse = |out: &mut Outbox, why: &str| out.send(view, serialize_command_result_for_js(request_id, Err(why)));
+    let before = state.tabs.attention();
+    // A start put off for the trust question owes its command an answer; read before the
+    // reset drops it.
+    let owed = state.tabs.get(tab).and_then(|t| match t.backend() {
+        TabBackend::AwaitingTrust(waiting) => waiting.start.request_id().map(str::to_owned),
+        _ => None,
+    });
+    // A session its agent stopped with the conversation whole is continued in the same tab, not
+    // left for a second `r` on the start screen.
+    let continued = state.tabs.resumes_on_r(tab);
+    match state.tabs.reset(tab) {
+        Ok(old) => {
+            // A wait an earlier `r` left for this tab is over: its start did not happen.
+            state.resume_after.remove(&tab);
+            if let Some(old) = old {
+                if continued.is_some() {
+                    let gone = state.retiring.backend_watched(old);
+                    let id = continued.clone().unwrap_or_default();
+                    state.resume_after.insert(tab, (id, gone));
+                } else {
+                    state.retiring.backend(old);
+                }
+            }
+            state.trust.forget_tab(tab);
+            // The put-off start's command is answered in the page it was sent from, unless that page
+            // has closed.
+            let owed = owed.and_then(|owed| {
+                let asked_from = start_answer_dest(state, tab, &owed)?;
+                let asked_from = match asked_from {
+                    Dest::Page(asked_from) => asked_from,
+                    Dest::Tab(_) => view,
+                };
+                Some((owed, asked_from))
+            });
+            // No lease check first: the tab's own old backend holds it until its teardown, which the
+            // start waits for. The command is answered when the connect finishes. The tab is selected
+            // only if it was on screen: a reset never moves the window to another tab.
+            let resumed = continued.map(|provider_session_id| {
+                let on_screen = state.shown_in(tab).is_some();
+                resume_in(state, tab, request_id, provider_session_id, on_screen)
+            });
+            match &resumed {
+                Some(Ok(())) => note_start_page(state, tab, request_id, view),
+                Some(Err(_)) => {
+                    state.resume_after.remove(&tab);
+                }
+                None => {}
+            }
+            // Before the draft the reset carries: the page puts a refused message back in
+            // its box itself, and the draft that follows then only confirms it.
+            if let Some((owed, asked_from)) = owed {
+                out.send(
+                    asked_from,
+                    serialize_command_result_for_js(&owed, Err(crate::trust_gate::NOT_STARTED)),
+                );
+            }
+            // `tabs` and the (empty) tab's own state, in the page that shows it.
+            shown_payloads(state, tab, out);
+            send_hello_if_open_sessions_changed(state, out);
+            report_attention(state, before, out);
+            match resumed {
+                None => ok(out),
+                Some(Ok(())) => {}
+                Some(Err(why)) => refuse(out, &why),
+            }
+        }
+        Err(why) => refuse(out, &why),
+    }
+}
+
+/// What a failed tab's `r` says while no `claude` can be found: the row stays and says so, and nothing starts.
+const STILL_NOT_FOUND: &str = "claude is still not found";
+
+/// A failed tab's reset waiting on the lookup of `claude`, which runs on a worker.
+pub(super) struct PendingResetCheck {
+    tab: TabId,
+    /// The page that pressed `r`: the answer goes there.
+    view: ViewId,
+    request_id: String,
+    rx: mpsc::Receiver<bool>,
+}
+
+/// Starts the lookup a failed tab's `r` waits for. A second `r` while one is out for the tab is refused rather than
+/// queued: the first answers both.
+fn start_reset_check(state: &mut AgentPanelState, tab: TabId, view: ViewId, request_id: &str) -> Result<(), String> {
+    if state.reset_checks.iter().any(|check| check.tab == tab) {
+        return Err("still looking for Claude Code".to_string());
+    }
+    let (tx, rx) = mpsc::channel();
+    let missing = state.cli_missing.clone();
+    // A thread the OS refuses is the page's to hear about: this runs inside the WebView's message callback, where a
+    // panic is no answer.
+    std::thread::Builder::new()
+        .name("claude-lookup".to_string())
+        .spawn(move || {
+            // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+            let _ = tx.send(missing());
+        })
+        .map_err(|e| format!("could not look for Claude Code: {e}"))?;
+    state.reset_checks.push(PendingResetCheck {
+        tab,
+        view,
+        request_id: request_id.to_string(),
+        rx,
+    });
+    Ok(())
+}
+
+/// The tick's half of a failed tab's `r`: a lookup that found `claude` lets the reset run; one that did not, or a
+/// worker that died, leaves the tab as it was and tells the page. A tab that is no longer failed (it was reset or
+/// closed meanwhile) is left alone and its `r` answered as refused.
+pub(super) fn poll_reset_checks(state: &mut AgentPanelState, out: &mut Outbox) {
+    let mut i = 0;
+    while i < state.reset_checks.len() {
+        let missing = match state.reset_checks[i].rx.try_recv() {
+            Ok(missing) => missing,
+            Err(mpsc::TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            // A lookup that never answered is not a reason to start over on a guess.
+            Err(mpsc::TryRecvError::Disconnected) => true,
+        };
+        let check = state.reset_checks.remove(i);
+        let still_failed = state
+            .tabs
+            .get(check.tab)
+            .is_some_and(|t| matches!(t.backend(), TabBackend::Failed { .. }));
+        if !still_failed {
+            out.send(
+                check.view,
+                serialize_command_result_for_js(&check.request_id, Err("the tab is no longer waiting for Claude Code")),
+            );
+        } else if missing {
+            out.send(
+                check.view,
+                serialize_command_result_for_js(&check.request_id, Err(STILL_NOT_FOUND)),
+            );
+        } else {
+            reset_tab(state, check.tab, check.view, &check.request_id, out);
+        }
+    }
+}
+
 /// One message from `view`'s page, [`admit`]ted, with the window's word on it: `refused` when the
 /// window's gate turned the answer down (or the admission did), and which pages are on screen. Every
 /// answer goes back to that page; what changes for a tab goes to the page that shows it. `pacer` is
@@ -1006,73 +1155,19 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::ResetTab { .. } => {
             let tab = tab_of(target);
-            let before = state.tabs.attention();
-            // A start put off for the trust question owes its command an answer; read before the
-            // reset drops it.
-            let owed = state.tabs.get(tab).and_then(|t| match t.backend() {
-                TabBackend::AwaitingTrust(waiting) => waiting.start.request_id().map(str::to_owned),
+            // A tab that failed because no `claude` was there starts over only if one is there now: the lookup
+            // is the disk's, so it runs on a worker and the tick finishes the reset (or refuses it).
+            let failure = state.tabs.get(tab).and_then(|t| match t.backend() {
+                TabBackend::Failed { reason } => Some(reason.clone()),
                 _ => None,
             });
-            // A session its agent stopped with the conversation whole is continued in the same tab, not
-            // left for a second `r` on the start screen.
-            let continued = state.tabs.resumes_on_r(tab);
-            match state.tabs.reset(tab) {
-                Ok(old) => {
-                    // A wait an earlier `r` left for this tab is over: its start did not happen.
-                    state.resume_after.remove(&tab);
-                    if let Some(old) = old {
-                        if continued.is_some() {
-                            let gone = state.retiring.backend_watched(old);
-                            let id = continued.clone().unwrap_or_default();
-                            state.resume_after.insert(tab, (id, gone));
-                        } else {
-                            state.retiring.backend(old);
-                        }
-                    }
-                    state.trust.forget_tab(tab);
-                    // The put-off start's command is answered in the page it was sent from, unless that page
-                    // has closed.
-                    let owed = owed.and_then(|owed| {
-                        let asked_from = start_answer_dest(state, tab, &owed)?;
-                        let asked_from = match asked_from {
-                            Dest::Page(asked_from) => asked_from,
-                            Dest::Tab(_) => view,
-                        };
-                        Some((owed, asked_from))
-                    });
-                    // No lease check first: the tab's own old backend holds it until its teardown, which the
-                    // start waits for. The command is answered when the connect finishes. The tab is selected
-                    // only if it was on screen: a reset never moves the window to another tab.
-                    let resumed = continued.map(|provider_session_id| {
-                        let on_screen = state.shown_in(tab).is_some();
-                        resume_in(state, tab, &request_id, provider_session_id, on_screen)
-                    });
-                    match &resumed {
-                        Some(Ok(())) => note_start_page(state, tab, &request_id, view),
-                        Some(Err(_)) => {
-                            state.resume_after.remove(&tab);
-                        }
-                        None => {}
-                    }
-                    // Before the draft the reset carries: the page puts a refused message back in
-                    // its box itself, and the draft that follows then only confirms it.
-                    if let Some((owed, asked_from)) = owed {
-                        out.send(
-                            asked_from,
-                            serialize_command_result_for_js(&owed, Err(crate::trust_gate::NOT_STARTED)),
-                        );
-                    }
-                    // `tabs` and the (empty) tab's own state, in the page that shows it.
-                    shown_payloads(state, tab, &mut out);
-                    send_hello_if_open_sessions_changed(state, &mut out);
-                    report_attention(state, before, &mut out);
-                    match resumed {
-                        None => ok(&mut out),
-                        Some(Ok(())) => {}
-                        Some(Err(why)) => refuse(&mut out, &why),
-                    }
+            if failure.is_some_and(|reason| agent::failure_names_missing_cli(&reason)) {
+                match start_reset_check(state, tab, view, &request_id) {
+                    Ok(()) => {}
+                    Err(why) => refuse(&mut out, &why),
                 }
-                Err(why) => refuse(&mut out, &why),
+            } else {
+                reset_tab(state, tab, view, &request_id, &mut out);
             }
         }
         // `TabSet::cycle_mode` returns a `Result<ModeCycle, String>` -- a live,
@@ -2362,5 +2457,102 @@ mod tests {
                 retired.into_backend().shutdown();
             }
         }
+    }
+
+    /// A failed tab whose `claude` is still missing stays as it is on `r`: the answer is a refusal that says so, and no
+    /// session starts. Once one is there, the same `r` starts the tab over. The lookup runs on a worker, so the page
+    /// is answered by the tick, not by the message.
+    #[test]
+    fn r_on_a_not_found_tab_starts_over_only_once_claude_is_there() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let (handle, page, _host) = handle_with_recording_page();
+        page.visible.set(true);
+        let missing = Arc::new(AtomicBool::new(true));
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            let flag = missing.clone();
+            state.cli_missing = Arc::new(move || flag.load(Ordering::SeqCst));
+            let tab = state.tabs.active();
+            let reason = format!(
+                "{} via \"/no/such/claude\" (spawn error: ENOENT)",
+                agent::CLI_MISSING_FAILURE_MARKER
+            );
+            state
+                .tabs
+                .fail_session(tab, reason, eitri_core::tab_set::FailedHow::StartNeverOpened, true);
+            tab
+        };
+        let answered = |id: &str| {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|payload| payload.contains("command_result") && payload.contains(&format!("\"{id}\"")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let is_failed = || {
+            matches!(
+                handle.state.borrow().tabs.get(tab).unwrap().backend(),
+                TabBackend::Failed { .. }
+            )
+        };
+        let reset = |id: &str| {
+            handle.page_message(
+                ViewId::BASE,
+                &format!(r#"{{"type":"reset_tab","request_id":"{id}","tab":{}}}"#, tab.0),
+            );
+        };
+
+        reset("r1");
+        assert!(
+            answered("r1").is_empty(),
+            "the lookup is a worker's: nothing is answered in the message"
+        );
+        assert!(is_failed(), "and nothing is reset while it runs");
+        tick_handle_until(&handle, "the refusal", || !answered("r1").is_empty());
+        let refusal = answered("r1").remove(0);
+        assert!(refusal.contains("still not found"), "{refusal}");
+        assert!(is_failed(), "the row stays: the tab is as it was");
+        assert!(handle.state.borrow().reset_checks.is_empty());
+
+        missing.store(false, Ordering::SeqCst);
+        reset("r2");
+        tick_handle_until(&handle, "the reset", || !answered("r2").is_empty());
+        assert!(answered("r2")[0].contains("\"ok\":true"), "{}", answered("r2")[0]);
+        assert!(matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::NotStarted
+        ));
+    }
+
+    /// Only the not-found failure waits for the lookup: any other failed tab starts over at once, as before, even when
+    /// `claude` is missing.
+    #[test]
+    fn r_on_any_other_failed_tab_starts_over_without_a_lookup() {
+        use std::sync::Arc;
+        let (handle, page, _host) = handle_with_recording_page();
+        page.visible.set(true);
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            state.cli_missing = Arc::new(|| panic!("no lookup for a failure that is not a missing claude"));
+            let tab = state.tabs.active();
+            state.tabs.fail_session(
+                tab,
+                "the connection to the provider ended before this session did".to_string(),
+                eitri_core::tab_set::FailedHow::StartNeverOpened,
+                true,
+            );
+            tab
+        };
+        handle.page_message(
+            ViewId::BASE,
+            &format!(r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#, tab.0),
+        );
+        assert!(handle.state.borrow().reset_checks.is_empty());
+        assert!(matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::NotStarted
+        ));
     }
 }

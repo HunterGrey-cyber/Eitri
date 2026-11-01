@@ -141,8 +141,9 @@ pub use provider::{
     StreamingPreference, TaskOutput, TaskReply, TurnStamp,
 };
 pub use providers::claude_sidecar::{
-    claude_cli_missing, claude_cli_missing_here, sidecar_availability, sidecar_missing_message, sidecar_origin,
-    user_sidecar_path, BackpressureStats, ClaudeSidecarProvider, SidecarAvailability, BUNDLED_SIDECAR_REVISION,
-    BUNDLED_SIDECAR_VERSION, CLAUDE_INSTALL_URL, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, NO_SIDECAR_HINT,
-    REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT, UNTESTED_CLAUDE_NOTE,
+    claude_cli_missing, claude_cli_missing_here, failure_names_missing_cli, sidecar_availability,
+    sidecar_missing_message, sidecar_origin, user_sidecar_path, BackpressureStats, ClaudeSidecarProvider,
+    SidecarAvailability, BUNDLED_SIDECAR_REVISION, BUNDLED_SIDECAR_VERSION, CLAUDE_INSTALL_URL,
+    CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, CLI_MISSING_FAILURE_MARKER, NO_SIDECAR_HINT, REFUSED_CLAUDE_NOTE,
+    REQUIRED_CAPABILITIES, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT, UNTESTED_CLAUDE_NOTE,
 };
