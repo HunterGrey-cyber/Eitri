@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=2228107c2e135affc4d62fceb25d40dac836ab85b3d49673cb57716a3fcde03a -->
+<!-- translated-from: INSTALL.md sha256=7bee3838d17d57325422fb67018131e6382b5c099ea0c38c12803d9c391fc3c3 -->
 
 # 安装 Eitri
 
@@ -114,7 +114,7 @@ Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径�
 - **`checksum mismatch for …`**：下载损坏了。重新运行一次安装脚本。
 - **`the signature on SHA256SUMS does not verify`**：停下，不要安装这个版本。
 - **`ssh-keygen was not found, so the release signature cannot be checked`**：装上 OpenSSH 客户端（Debian 和 Ubuntu 上是 `openssh-client`，Fedora 上是 `openssh-clients`，Arch 上是 `openssh`）。`--insecure-skip-signature` 不校验签名直接安装，这时只校验 checksum。
-- **在 `PATH` 上找不到 `claude`**：只是警告。面板要运行对话轮次，需要已经安装并登录的 Claude Code。
+- **在 `PATH` 上找不到 `claude`**：只是警告。面板要运行对话轮次，需要已经安装并登录的 Claude Code。获取地址：<https://code.claude.com/docs/en/quickstart>。Eitri 找不到 `claude` 期间，首次启动界面和 Claude 标签页的失败提示都会这么说，并给出同一个地址。
 - **`~/.local/bin` is not on your `PATH`**，或者 **`eitri` on this PATH runs /usr/bin/eitri**：把 `~/.local/bin` 放到 `PATH` 的最前面。
 - **`… is writable by its group or by anyone, and not sticky`** 或 **`… is a symlink owned by another user`**：安装脚本把下载的文件放在 `~/.cache/eitri`，如果别的用户能写这个缓存，它就拒绝。运行 `chmod g-w ~/.cache`，或者把 `XDG_CACHE_HOME` 设成一个只属于你的目录。
 

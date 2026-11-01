@@ -41,6 +41,8 @@ pub(crate) struct DetectContext {
     /// What the window's own tmux import found, from the config phase.
     pub(crate) tmux: Option<TmuxImport>,
     pub(crate) build: Build,
+    /// Whether no `claude` a Claude tab could start is there: the sidecar's own lookup over this process's environment.
+    pub(crate) claude_missing: Box<dyn Fn() -> bool + Send>,
 }
 
 impl DetectContext {
@@ -60,6 +62,7 @@ impl DetectContext {
             read: Box::new(read_regular_file),
             tmux,
             build,
+            claude_missing: Box::new(agent::claude_cli_missing_here),
         }
     }
 }
@@ -90,6 +93,11 @@ fn read_regular_file(path: &Path) -> Option<String> {
 /// Runs the detection rows, sending each as it is known. Blocks until the last is sent or given up, so it belongs on a
 /// worker thread.
 pub(crate) fn run(ctx: DetectContext, send: impl Fn(Found)) {
+    // First, because it is a few `stat`s and the rows below may wait on a command; and only when missing, so a machine
+    // that has `claude` sees no change.
+    if (ctx.claude_missing)() {
+        send(Found::ClaudeMissing);
+    }
     let home = (ctx.env)("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     send(Found::Tmux(detect::tmux_row(ctx.tmux.as_ref(), home.as_deref())));
     let ims = judge::im_evidence(&*ctx.env, &(ctx.bus_owners)());
@@ -237,6 +245,7 @@ mod tests {
             read: Box::new(|_| None),
             tmux: None,
             build: Build::THIS_BINARY,
+            claude_missing: Box::new(|| false),
         }
     }
 
@@ -291,6 +300,7 @@ mod tests {
                 Found::Neovim(_) => "neovim",
                 Found::Input(_) => "input",
                 Found::TrustOpen(_) => "trust",
+                Found::ClaudeMissing => "claude",
             })
             .collect();
         assert_eq!(kinds, ["tmux", "input", "desktop", "windows"], "{rows:?}");
@@ -303,6 +313,18 @@ mod tests {
         assert_eq!(desktop.wm, Some("sway"), "named by its socket");
         assert!(!desktop.live, "sway is not there to answer");
         assert_eq!(rows[3], Found::Windows(None), "no compositor mode in this binary");
+    }
+
+    #[test]
+    fn a_missing_claude_is_sent_first_and_only_when_missing() {
+        let rows = |missing: bool| {
+            let mut ctx = fake(&[("HOME", "/home/u")], Box::new(|_| Err("not here".to_string())));
+            ctx.claude_missing = Box::new(move || missing);
+            collect(ctx)
+        };
+        assert_eq!(rows(true)[0], Found::ClaudeMissing);
+        assert_eq!(rows(true).len(), rows(false).len() + 1);
+        assert!(!rows(false).contains(&Found::ClaudeMissing));
     }
 
     fn sway_row(answer: &'static str, file: Option<&'static str>) -> DesktopRow {

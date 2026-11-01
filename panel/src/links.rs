@@ -347,4 +347,13 @@ mod tests {
             assert_eq!(mail_url(uri), None, "{uri:?}");
         }
     }
+
+    /// The install address the panel and the first-start screen show passes the same two checks any link does, so
+    /// the click and the keyboard route both reach `UriLauncher` with it.
+    #[test]
+    fn the_claude_install_address_passes_the_web_link_checks() {
+        let url = agent::CLAUDE_INSTALL_URL;
+        assert_eq!(web_url(url), Some(url));
+        assert_eq!(clicked_link_url(url), Some(url));
+    }
 }

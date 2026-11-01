@@ -90,6 +90,12 @@ wording! {
     RowInput "row.input"
         "input"
         "输入法"
+    RowClaude "row.claude"
+        "claude"
+        "claude"
+    ClaudeMissing "claude.missing"
+        "Claude Code was not found: {url}"
+        "未找到 Claude Code：{url}"
     RowLooking "row.looking"
         "looking…"
         "查找中…"
@@ -352,7 +358,7 @@ wording! {
 
 /// The hash of the English column the Chinese was translated from: a changed English string fails a test
 /// until the Chinese has been brought up to date and this is set again.
-pub const TRANSLATED_FROM: &str = "54ea011c2a588e47f91ce72475bfac7cb7a6ffa4e6f35670aabb3c7e52d40fba";
+pub const TRANSLATED_FROM: &str = "cf852a8b41f5262a74ca01e2a03d505f20908d110ffa6b1fc1510906f3e99500";
 
 /// The template of `id` in `lang`.
 pub fn text(lang: Lang, id: TextId) -> &'static str {

@@ -219,6 +219,8 @@ pub struct Screen {
     windows: Option<Option<Tiling>>,
     neovim: Option<NeovimRow>,
     input: Option<InputRow>,
+    /// Whether detection found no `claude` to run; stays `false` until it says so, and the screen does not wait for it.
+    claude_missing: bool,
     preset: PresetId,
     prefix: Option<KeySpec>,
     wm_mod: Option<WmMod>,
@@ -246,6 +248,7 @@ impl Screen {
             windows: None,
             neovim: None,
             input: None,
+            claude_missing: false,
             prefix: None,
             wm_mod: None,
             tiling_choice: None,
@@ -756,6 +759,7 @@ impl Screen {
             Found::Windows(tiling) => self.windows = Some(tiling),
             Found::Neovim(row) => self.neovim = Some(row),
             Found::Input(row) => self.input = Some(row),
+            Found::ClaudeMissing => self.claude_missing = true,
             Found::TrustOpen(open) => return if open { self.hold() } else { self.release() },
         }
         self.resync();
@@ -998,6 +1002,14 @@ impl Screen {
             ),
             Some(_) => self.row(TextId::RowInput, not_found(), String::new()),
         });
+
+        if self.claude_missing {
+            view.rows.push(self.row(
+                TextId::RowClaude,
+                self.say(TextId::ClaudeMissing, &[("url", agent::CLAUDE_INSTALL_URL)]),
+                String::new(),
+            ));
+        }
 
         view.question = Some(text(lang, TextId::Question).to_string());
         let tiling = self.tiling();
@@ -1435,6 +1447,47 @@ mod tests {
             PresetId::NvimNoTmux,
             "the user moved: detection no longer does"
         );
+    }
+
+    #[test]
+    fn a_missing_claude_adds_one_row_with_the_address_and_changes_nothing_else() {
+        let mut s = screen();
+        let before = view(&s);
+        assert!(
+            before.rows.iter().all(|r| r.label != en(TextId::RowClaude)),
+            "silent until told"
+        );
+
+        assert_eq!(s.found(Found::ClaudeMissing), Vec::<Effect>::new());
+        let after = view(&s);
+        let row = after
+            .rows
+            .iter()
+            .find(|r| r.label == en(TextId::RowClaude))
+            .expect("the row");
+        assert_eq!(
+            row.text,
+            "Claude Code was not found: https://code.claude.com/docs/en/quickstart"
+        );
+        assert_eq!(after.rows.len(), before.rows.len() + 1);
+        // No step, key, choice or footer is added or removed by it.
+        assert_eq!(after.items, before.items);
+        assert_eq!(after.question, before.question);
+        assert_eq!(after.footer, before.footer);
+        assert_eq!(after.step, before.step);
+        assert_eq!(selected(&s), PresetId::NvimNoTmux);
+        // The keys work as they did: 2 chooses a preset and moves on.
+        go(&mut s, '2');
+        assert_eq!(view(&s).step, "2 / 2");
+    }
+
+    #[test]
+    fn a_late_missing_claude_reaches_a_screen_that_has_moved_on_without_a_row_there() {
+        let mut s = screen();
+        go(&mut s, '2');
+        let second_page = view(&s);
+        s.found(Found::ClaudeMissing);
+        assert_eq!(view(&s).rows, second_page.rows);
     }
 
     #[test]

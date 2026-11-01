@@ -236,6 +236,24 @@ describe("EmptyTab", () => {
       "Install it and make sure claude runs in a terminal, then press r.",
     );
   });
+  /* A tab that failed because `claude` is not there shows where to get it, as a link a click or HINT reaches, and
+     the other recognised failures show none. */
+  it("shows the install address as a link on a not-found failure, and not on another recognised one", () => {
+    const missing = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: 'could not determine the installed claude CLI version via "/no/such/claude" (spawn error: ENOENT)',
+    });
+    const anchors = missing.container.querySelectorAll<HTMLAnchorElement>(".row-problem a[href]");
+    expect(Array.from(anchors).map((a) => a.getAttribute("href"))).toEqual([
+      "https://code.claude.com/docs/en/quickstart",
+    ]);
+    cleanup();
+    const stopped = renderEmpty({
+      tab: { ...TAB, state: "failed" },
+      failure: "the connection to the provider ended before this session did",
+    });
+    expect(stopped.container.querySelector("a")).toBeNull();
+  });
   /** "Press r…" was on screen twice (the row and the composer), three times under
    *  a remedy that already says it. Once, whichever way. */
   it("says press r once on a failed tab, with a remedy and without one", () => {

@@ -89,6 +89,27 @@ describe("Row", () => {
     expect(children.indexOf(problemBlock)).toBeLessThan(children.indexOf(body.querySelector("pre")!));
   });
 
+  it("draws a problem's link as an anchor whose text is its own address, and no link line without one", () => {
+    const url = "https://code.claude.com/docs/en/quickstart";
+    const { container } = render(
+      <Row kind="error" sign="✗" problem={{ headline: "h", remedy: "r", link: url }}>
+        <pre>raw</pre>
+      </Row>,
+    );
+    const anchor = container.querySelector<HTMLAnchorElement>(".row-problem a")!;
+    expect(anchor.getAttribute("href")).toBe(url);
+    expect(anchor.textContent).toBe(url);
+    expect(container.querySelector(".row-problem-link")!.textContent).toBe(`Get Claude Code: ${url}`);
+    cleanup();
+    const plain = render(
+      <Row kind="error" sign="✗" problem={{ headline: "h", remedy: "r" }}>
+        <pre>raw</pre>
+      </Row>,
+    );
+    expect(plain.container.querySelector(".row-problem-link")).toBeNull();
+    expect(plain.container.querySelector("a")).toBeNull();
+  });
+
   it("draws nothing extra when no problem was recognised (problem omitted)", () => {
     const { container } = render(
       <Row kind="error" sign="✗">

@@ -14,7 +14,13 @@
 export type Problem = {
   headline: string;
   remedy: string;
+  /** A web address the reader is shown under the remedy, drawn as a link. */
+  link?: string;
 };
+
+/** Where Claude Code's install instructions are; the same address `agent::CLAUDE_INSTALL_URL` gives the
+ *  first-start screen and `packaging/install.sh` gives its warning (a test reads all three). */
+export const CLAUDE_INSTALL_URL = "https://code.claude.com/docs/en/quickstart";
 
 /** `agent::sidecar_missing_message`'s exact opening sentence (agent/src/providers/claude_sidecar/
  *  spawn.rs). Recognising it literally, rather than re-deriving it, is deliberate: this text is
@@ -39,6 +45,7 @@ function classifyCliMissing(text: string): Problem | null {
   return {
     headline: "Claude Code (claude) was not found.",
     remedy: "Install it and make sure claude runs in a terminal, then press r.",
+    link: CLAUDE_INSTALL_URL,
   };
 }
 

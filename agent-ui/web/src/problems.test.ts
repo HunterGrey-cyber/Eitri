@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
+import { CLAUDE_INSTALL_URL, classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
+import cliLocateRs from "../../../agent/src/providers/claude_sidecar/cli_locate.rs?raw";
+import installSh from "../../../packaging/install.sh?raw";
 import watchRs from "../../../agent/src/providers/claude_sidecar/watch.rs?raw";
 import startsRs from "../../../panel/src/starts.rs?raw";
 import cliMissingFixture from "./fixtures/problems/cli-missing.txt?raw";
@@ -13,7 +15,16 @@ describe("classify", () => {
     expect(problem).toEqual({
       headline: "Claude Code (claude) was not found.",
       remedy: "Install it and make sure claude runs in a terminal, then press r.",
+      link: "https://code.claude.com/docs/en/quickstart",
     });
+  });
+
+  /* One address, given in four places: the panel's row (here), the first-start screen (`agent::CLAUDE_INSTALL_URL`),
+     the installer's warning, and the docs. A change to one that misses another fails here. */
+  it("gives the same install address as the Rust constant and the installer's warning", () => {
+    expect(cliLocateRs).toContain(`pub const CLAUDE_INSTALL_URL: &str = "${CLAUDE_INSTALL_URL}";`);
+    expect(installSh).toContain(`the claude CLI was not found on PATH`);
+    expect(installSh).toContain(CLAUDE_INSTALL_URL);
   });
 
   it("recognises the captured CLI-out-of-range fixture and names the real versions", () => {

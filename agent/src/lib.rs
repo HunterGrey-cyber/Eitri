@@ -140,7 +140,7 @@ pub use provider::{
     ResumeSessionRequest, SendTurnRequest, SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnStamp,
 };
 pub use providers::claude_sidecar::{
-    sidecar_availability, sidecar_missing_message, user_sidecar_path, BackpressureStats, ClaudeSidecarProvider,
-    SidecarAvailability, CLIENT_IMPLEMENTS_RESUME, CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION, NO_SIDECAR_HINT,
-    SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT,
+    claude_cli_missing, claude_cli_missing_here, sidecar_availability, sidecar_missing_message, user_sidecar_path,
+    BackpressureStats, ClaudeSidecarProvider, SidecarAvailability, CLAUDE_INSTALL_URL, CLIENT_IMPLEMENTS_RESUME,
+    CLIENT_PROTOCOL_MAJOR, EXPECTED_VERDANDI_REVISION, NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT,
 };

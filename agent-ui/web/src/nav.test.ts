@@ -228,6 +228,28 @@ describe("hintTargets", () => {
     expect(targets[2]).toEqual({ kind: "code", el: byId("code"), rowIndex: 1 });
   });
 
+  it("offers a problem row's link on a start screen, which is in no conversation row", () => {
+    const root = hintDoc();
+    root.insertAdjacentHTML(
+      "beforeend",
+      `<div class="row row-error"><div class="row-problem"><a id="get" href="https://code.claude.com/docs/en/quickstart">x</a></div></div>`,
+    );
+    rect(byId("get"), 160, 20);
+    const targets = hintTargets(root);
+    expect(targets.filter((t) => t.el === byId("get"))).toEqual([{ kind: "link", el: byId("get"), rowIndex: null }]);
+    // An address the page cannot open is not offered.
+    byId("get").setAttribute("href", "javascript:alert(1)");
+    expect(hintTargets(root).some((t) => t.el === byId("get"))).toBe(false);
+  });
+
+  it("offers a problem link inside a conversation row once, as that row's link", () => {
+    const root = hintDoc();
+    byId("r0").innerHTML = `<div class="row-problem"><a id="inrow" href="https://code.claude.com/docs/en/quickstart">x</a></div>`;
+    rect(byId("inrow"), 2, 10);
+    const found = hintTargets(root).filter((t) => t.el === byId("inrow"));
+    expect(found).toEqual([{ kind: "link", el: byId("inrow"), rowIndex: 0 }]);
+  });
+
   it("offers the status line's Stop button, which is not a row", () => {
     const targets = hintTargets(hintDoc());
     expect(targets).toContainEqual({ kind: "control", el: byId("stop") });

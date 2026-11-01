@@ -143,7 +143,8 @@ What the installer says, abridged:
   (`openssh-client` on Debian and Ubuntu, `openssh-clients` on Fedora, `openssh` on Arch).
   `--insecure-skip-signature` installs without checking the signature; only the checksums are checked then.
 - **`claude` was not found on `PATH`**: a warning only. The panel needs Claude Code installed and logged in
-  to run turns.
+  to run turns. Get it at <https://code.claude.com/docs/en/quickstart>. Until Eitri finds `claude`, the first-start
+  screen and a Claude tab's failure row say so and give the same address.
 - **`~/.local/bin` is not on your `PATH`**, or **`eitri` on this PATH runs /usr/bin/eitri**: put
   `~/.local/bin` first on your `PATH`.
 - **`… is writable by its group or by anyone, and not sticky`** or **`… is a symlink owned by another

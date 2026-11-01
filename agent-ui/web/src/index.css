@@ -505,6 +505,10 @@ pre {
 .row-problem-remedy {
   white-space: pre-wrap;
 }
+.row-problem-link {
+  overflow-wrap: anywhere;
+  margin-top: 4px;
+}
 .row-hint {
   font-size: var(--fs-sm);
   margin-top: 8px;

@@ -438,7 +438,8 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
 
 /** One panel target of the global `f` HINT: a conversation row, a fenced code block inside one (which remembers its
  *  row, because landing on it moves the row cursor there), a web link inside one (the anchor, which likewise
- *  remembers its row -- landing focuses it and never clicks it), or an enabled control from `controlsOf`. The list is
+ *  remembers its row -- landing focuses it and never clicks it; a problem row's link on a start screen has no row),
+ *  or an enabled control from `controlsOf`. The list is
  *  frozen at `hint_collect` and `shell` addresses its entries by index from then on. `rowIndex` is the row's index at
  *  that moment only; landing re-reads it from the element, because rows can be inserted above it while the labels are
  *  up. */
@@ -446,7 +447,7 @@ export type HintTarget =
   | { kind: "row"; el: HTMLElement; rowIndex: number }
   | { kind: "control"; el: HTMLElement }
   | { kind: "code"; el: HTMLElement; rowIndex: number }
-  | { kind: "link"; el: HTMLAnchorElement; rowIndex: number }
+  | { kind: "link"; el: HTMLAnchorElement; rowIndex: number | null }
   | { kind: "composer"; el: HTMLElement };
 
 /** Marks the composer as a HINT target (the panel's input box is one). The composer is in no
@@ -569,6 +570,14 @@ export function hintTargets(root: HTMLElement): HintTarget[] {
     }
     for (const control of controlsOf(stop)) {
       if (hintVisible(control, root)) targets.push({ kind: "control", el: control });
+    }
+  }
+  // A link a problem row carries on a start screen sits in no conversation row, so the loop above never reaches
+  // it; one inside a row it did reach is already a target.
+  for (const el of root.querySelectorAll<HTMLAnchorElement>(".row-problem a[href]")) {
+    const listed = targets.some((target) => target.el === el);
+    if (!listed && webUrl(el.getAttribute("href")) !== null && hintVisible(el, root)) {
+      targets.push({ kind: "link", el, rowIndex: null });
     }
   }
   if (composer !== null) targets.push({ kind: "composer", el: composer });

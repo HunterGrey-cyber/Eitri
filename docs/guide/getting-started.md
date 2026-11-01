@@ -5,7 +5,9 @@ English | [简体中文](getting-started.zh-CN.md)
 This page takes you from the command to a first finished turn: opening a project, sending a prompt,
 answering the cards Eitri shows, working with several sessions, and what the panel says when a turn does not
 end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` command is signed in to your
-account.
+account. If Eitri cannot find `claude`, the first-start screen and a Claude tab's failure row say so and give
+the address to get it from, <https://code.claude.com/docs/en/quickstart>; install it, make sure `claude` runs in
+a terminal, then press `r` in the tab.
 
 Keys are written for the default setup: the prefix is `Ctrl+b`, and "the leader" is `Space` unless your
 Neovim configuration sets another `mapleader` of a single key the panel can use (a longer or reserved one falls

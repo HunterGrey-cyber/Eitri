@@ -80,6 +80,11 @@ export function Row({
         <div className="row-problem">
           <strong>{problem.headline}</strong>
           <div className="row-problem-remedy">{problem.remedy}</div>
+          {problem.link !== undefined && (
+            <div className="row-problem-link">
+              Get Claude Code: <a href={problem.link}>{problem.link}</a>
+            </div>
+          )}
         </div>
         {children}
       </Fragment>

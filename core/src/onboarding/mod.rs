@@ -159,6 +159,8 @@ pub enum Found {
     Neovim(NeovimRow),
     Input(InputRow),
     TrustOpen(bool),
+    /// No `claude` the agent panel could start was found. Sent only when so: a machine that has it says nothing.
+    ClaudeMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1072,7 +1072,7 @@ maybe_offer_nvim() {
 # the present sidecar says it supports.
 report_claude() {
 	if ! command -v claude >/dev/null 2>&1; then
-		warn "the claude CLI was not found on PATH; Eitri's agent panel runs it. Install it with Anthropic's installer: curl -fsSL https://claude.ai/install.sh | bash"
+		warn "the claude CLI was not found on PATH; Eitri's agent panel runs it. Get Claude Code at https://code.claude.com/docs/en/quickstart"
 		return 0
 	fi
 	_rc=$(claude --version 2>/dev/null | head -n 1) || _rc=

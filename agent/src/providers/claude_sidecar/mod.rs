@@ -5,6 +5,7 @@
 //! plus the streaming event pump. Fresh sessions and resumes share `CreateSession`, selecting
 //! Claude Code's preset with static panel context only when the handshake offers it.
 
+mod cli_locate;
 mod effort_reply;
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
 #[cfg(target_os = "linux")]
@@ -21,6 +22,7 @@ mod watch;
 #[cfg(test)]
 mod runtime_policy_verification;
 
+pub use cli_locate::{claude_cli_missing, claude_cli_missing_here, CLAUDE_INSTALL_URL};
 #[cfg(target_os = "linux")]
 pub use moving::{ClaudeProviderHandoff, MoveRefusedWhy};
 #[cfg(target_os = "linux")]

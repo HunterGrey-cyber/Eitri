@@ -1,9 +1,9 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=7542dc028c58cd98515359d5dcb1a5a88ad7d44001094d5f2bf5551781764917 -->
+<!-- translated-from: getting-started.md sha256=3f74cd3aaa7166e9f977f9c33dfa860edacd4b75793797b1e3a53f2bfef7fb70 -->
 
 # 快速上手
 
-这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。
+这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。如果 Eitri 找不到 `claude`，首次启动界面和 Claude 标签页的失败提示都会说明，并给出获取地址 <https://code.claude.com/docs/en/quickstart>；装好后确认 `claude` 能在终端里运行，再在该标签页里按 `r`。
 
 文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的、面板能用的单个键的 `mapleader`（更长的或被保留的会退回到 `Space`）。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `?` 也能看到。
 
