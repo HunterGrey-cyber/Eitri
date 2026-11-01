@@ -16,6 +16,7 @@ import glob
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -1287,6 +1288,175 @@ class MarkdownPluginLicences(unittest.TestCase):
         self.assertLess(body.index("PART 4 -- "), part5)
         self.assertLess(body.index("Components inside the Skia prebuilt archive in the source asset"), part5)
         self.assertLess(part5, body.index("Eitri's own artwork -- the icon files"))
+
+
+class SidecarReleaseProfile(unittest.TestCase):
+    """`--sidecar-release ARTIFACT --repo DIR --out FILE`: the licence gate of a sidecar release.
+
+    ARTIFACT sits in dist-bin/ beside its manifest.json; DIR is the twin tree the release was built from (its
+    node_modules, its sidecar package.json, the Node licence its build left under build/node-cache). Every
+    package in the manifest's bundled_packages is classified and must ship a licence text, as in a release of
+    Eitri, but no Rust, web or native part is read: the run writes one record to FILE and touches nothing else."""
+
+    VERSION = "0.3.2"
+    SDK = "@anthropic-ai/claude-agent-sdk"
+    MIT_TEXT = "Permission is hereby granted, free of charge, to any person obtaining a copy"
+
+    def setUp(self):
+        self.dir = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.repo = os.path.join(self.dir, "twin")
+        self.outdir = os.path.join(self.dir, "out")
+        os.makedirs(self.outdir)
+        self.out = os.path.join(self.outdir, "record.txt")
+        self.bin = os.path.join(self.repo, "apps", "claude-sidecar", "dist-bin")
+        self.artifact = os.path.join(self.bin, f"verdandi-claude-sidecar-{self.VERSION}-linux-x64")
+        os.makedirs(self.bin)
+        self.packages = []
+        self.package(self.SDK, "0.3.311", "SEE LICENSE IN LICENSE.md", {"LICENSE.md": "(c) Anthropic PBC. All rights reserved.\n"})
+        self.package("@grpc/grpc-js", "1.14.4", "Apache-2.0", {"LICENSE": "Apache License Version 2.0, January 2004\n"})
+        self.package("ms", "2.1.3", "MIT", {"LICENSE": f"MIT License\n\n{self.MIT_TEXT}\n"})
+        self.write(os.path.join(self.repo, "apps", "claude-sidecar", "package.json"),
+                   json.dumps({"name": "@verdandi/claude-sidecar", "version": self.VERSION}))
+        self.write(os.path.join(self.repo, "apps", "claude-sidecar", "build", "node-cache", "node-v22.23.2-linux-x64", "LICENSE"),
+                   "Node.js is licensed for use as follows: MIT\n")
+        self.artifact_text = (f"#!/bin/sh\n# bundled: nothing else\n"
+                              f"echo 'verdandi-claude-sidecar {self.VERSION} (protocol 3, node v22.23.2, build b7919fd3599548d0)'\n"
+                              f"echo 'claude-agent-sdk 0.3.311'\n"
+                              f"echo 'node v22.23.2'\n"
+                              f"echo 'executable sources served: host_cli'\n")
+        self.write_artifact()
+
+    @staticmethod
+    def write(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def package(self, name, version, licence, files):
+        """A package installed under the twin's node_modules and listed in the manifest."""
+        d = os.path.join(self.repo, "node_modules", *name.split("/"))
+        self.write(os.path.join(d, "package.json"), json.dumps({"name": name, "version": version, "license": licence}))
+        for fname, text in files.items():
+            self.write(os.path.join(d, fname), text)
+        self.packages = [p for p in self.packages if p["name"] != name]
+        self.packages.append({"name": name, "version": version, "license": licence})
+
+    def write_artifact(self):
+        self.write(self.artifact, self.artifact_text)
+        os.chmod(self.artifact, 0o755)
+        self.write(os.path.join(self.bin, "manifest.json"), json.dumps({
+            "v": 1, "artifact": {"file": os.path.basename(self.artifact), "sidecar_version": self.VERSION},
+            "node": {"version": "v22.23.2"}, "build_stamp": "b7919fd3599548d0", "bundled_packages": self.packages}))
+
+    def release(self):
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            rc = cl.main(["--sidecar-release", self.artifact, "--repo", self.repo, "--out", self.out])
+        return rc, err.getvalue()
+
+    def tree(self, root):
+        return sorted(os.path.join(d, f) + f":{os.path.getsize(os.path.join(d, f))}"
+                      for d, _dirs, files in os.walk(root) for f in files)
+
+    def test_a_good_artifact_writes_the_record_to_the_given_path_and_nothing_else(self):
+        default_record = os.path.join(cl.REPO, "dist", "THIRD-PARTY-LICENSES")
+        before, existed = self.tree(self.repo), os.path.exists(default_record)
+        rc, err = self.release()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.listdir(self.outdir), ["record.txt"])
+        self.assertEqual(self.tree(self.repo), before, "the twin tree and the dist-bin directory are only read")
+        self.assertEqual(os.path.exists(default_record), existed, "the default output path is not written")
+        with open(self.out, encoding="utf-8") as f:
+            text = f.read()
+        for needle in ("ms 2.1.3", "@grpc/grpc-js 1.14.4", f"{self.SDK} 0.3.311", self.MIT_TEXT,
+                       "(c) Anthropic PBC. All rights reserved.", "Node.js is licensed for use as follows"):
+            self.assertIn(needle, text)
+        self.assertNotIn("PART 1", text, "no Rust crates are read for a sidecar release")
+        self.assertNotIn("nvim-rs", text)
+
+    def test_the_protobuf_runtime_without_a_text_gets_both_vendored_licences(self):
+        self.package("@bufbuild/protobuf", "2.14.1", "(Apache-2.0 AND BSD-3-Clause)", {"README.md": "no licence file\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 0, err)
+        with open(self.out, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("@bufbuild/protobuf 2.14.1", text)
+        self.assertIn("Copyright 2021-2026 Buf Technologies, Inc.", text)
+        self.assertIn("Copyright 2008 Google Inc.  All rights reserved.", text)
+        self.assertIn("Neither the name of Google Inc.", text)
+
+    def test_the_protobuf_runtime_at_another_version_aborts_until_rechecked(self):
+        self.package("@bufbuild/protobuf", "2.15.0", "(Apache-2.0 AND BSD-3-Clause)", {"README.md": "no licence file\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("@bufbuild/protobuf", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_an_unclassifiable_licence_aborts(self):
+        self.package("weird-pkg", "1.0.0", "Frobnicate-9.0", {"LICENSE": "do what you like\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("Frobnicate-9.0", err)
+        self.assertFalse(os.path.exists(self.out), "an aborted run leaves no record")
+
+    def test_a_package_declaring_no_licence_aborts(self):
+        self.package("nameless-pkg", "1.0.0", None, {"LICENSE": "x\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("nameless-pkg", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_unacknowledged_copyleft_aborts(self):
+        self.package("copyleft-pkg", "1.0.0", "GPL-3.0-only", {"LICENSE": "GNU GENERAL PUBLIC LICENSE\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("copyleft-pkg", err)
+        self.assertIn("copyleft", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_a_package_with_no_licence_text_aborts(self):
+        self.package("textless-pkg", "1.0.0", "MIT", {"README.md": "no licence file here\n"})
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("textless-pkg", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_the_sdk_without_its_own_licence_file_aborts(self):
+        os.remove(os.path.join(self.repo, "node_modules", "@anthropic-ai", "claude-agent-sdk", "LICENSE.md"))
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("claude-agent-sdk", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_a_not_shipped_name_inside_the_artifact_aborts(self):
+        name = "@anthropic-ai/claude-agent-sdk-linux-x64"
+        self.assertIn(("npm", name), cl.NOT_SHIPPED)
+        self.artifact_text += f"# the resolver would name {name} here\n"
+        self.write_artifact()
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn(name, err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_an_artifact_that_is_not_executable_aborts(self):
+        os.chmod(self.artifact, 0o644)
+        rc, err = self.release()
+        self.assertEqual(rc, 1)
+        self.assertIn("not an executable", err)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_the_profile_excludes_the_other_two(self):
+        for other in (["--no-sidecar", "--source-url", "http://y", "--skia-archive-path", "x"], ["--sidecar", self.artifact]):
+            with self.subTest(other=other[0]), mock.patch("sys.stderr", io.StringIO()):
+                rc = cl.main(["--sidecar-release", self.artifact, "--repo", self.repo, "--out", self.out] + other)
+            self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

@@ -37,7 +37,10 @@ Inputs it expects to exist (publish.sh / release.sh produce all of them before c
   apps/claude-sidecar/build/node-cache/ holding the Node the artifact was built from (sidecar profile
   only)
 
-Two profiles:
+Three profiles:
+  --sidecar-release ARTIFACT --repo DIR --out FILE
+      the sidecar-only release gate: read the artifact's manifest and the matching installed npm
+      packages in DIR. Write a licence record, without reading Eitri's binaries or dependency trees.
   --sidecar ARTIFACT [--repo DIR] [--binaries-dir DIR] [--source-url URL]
       the private/dev profile: parts 1-4, sidecar included. --source-url defaults to the bare repo
       URL (DEFAULT_SOURCE_URL) when omitted, since a dev run has no versioned release asset.
@@ -243,6 +246,7 @@ TEXT_OVERRIDES = {
     ("npm", "@hedgedoc/markdown-it-task-lists", "2.0.1"): ["hedgedoc-markdown-it-task-lists.LICENSE"],
     ("npm", "fastdom", "1.0.12"): ["fastdom.LICENSE"],
     ("npm", "strictdom", "1.0.1"): ["strictdom.LICENSE"],
+    ("npm", "@bufbuild/protobuf", "2.14.1"): ["bufbuild-protobuf-es.LICENSE", "protobuf-google.LICENSE"],
     ("cargo", "gl", "0.14.0"): ["gl-rs.LICENSE"],
     ("cargo", "webkit6", "0.6.1"): ["webkit6-rs.LICENSE"],
     ("cargo", "webkit6-sys", "0.6.0"): ["webkit6-rs.LICENSE"],
@@ -1224,6 +1228,72 @@ def sidecar_facts(artifact, verdandi):
             "version_text": ver.strip()}
 
 
+def collect_sidecar_release(artifact, repo):
+    """Classify exactly the packages the binary build reports, with their installed licence texts."""
+    facts = sidecar_facts(artifact, repo)
+    with open(os.path.join(os.path.dirname(artifact), "manifest.json")) as f:
+        manifest = json.load(f)
+    if (manifest.get("v") != 1 or manifest.get("artifact", {}).get("file") != os.path.basename(artifact)
+            or manifest["artifact"].get("sidecar_version") != facts["sidecar"]
+            or manifest.get("node", {}).get("version") != facts["node"]):
+        raise Fail("sidecar manifest does not describe this artifact")
+    # New manifests carry a digest. Check it whenever present, including before trusting their package list.
+    expected = manifest["artifact"].get("sha256")
+    if expected:
+        with open(artifact, "rb") as f:
+            if hashlib.file_digest(f, "sha256").hexdigest() != expected:
+                raise Fail("sidecar manifest's artifact sha256 does not match")
+    packages = manifest.get("bundled_packages")
+    if not isinstance(packages, list) or not packages:
+        raise Fail("sidecar manifest has no bundled_packages")
+
+    installed = {}
+    for directory, dirs, files in os.walk(os.path.join(repo, "node_modules")):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        if "package.json" not in files:
+            continue
+        # Only nested dependency directories can hold another installed package. Examples and
+        # test data inside a package are not a second source of licence declarations.
+        dirs[:] = [d for d in dirs if d == "node_modules"]
+        with open(os.path.join(directory, "package.json")) as f:
+            pj = json.load(f)
+        if "name" in pj and "version" in pj:
+            installed.setdefault((pj["name"], pj["version"]), []).append((directory, pj))
+
+    counts, entries, seen = {}, [], set()
+    for p in sorted(packages, key=lambda p: (p["name"], p["version"])):
+        name, version = p["name"], p["version"]
+        if ("npm", name) in NOT_SHIPPED:
+            raise Fail(f"{name} is declared NOT shipped, but is in the artifact's bundled_packages")
+        if (name, version) in seen:
+            raise Fail(f"duplicate bundled package {name} {version}")
+        seen.add((name, version))
+        matches = installed.get((name, version), [])
+        if not matches:
+            raise Fail(f"bundled package {name} {version} is not installed in {repo}")
+        directory, pj = matches[0]
+        licence = pj.get("license")
+        if isinstance(licence, dict):
+            licence = licence.get("type")
+        if licence is None and isinstance(pj.get("licenses"), list):
+            licence = " OR ".join(x.get("type", "?") for x in pj["licenses"])
+        if p.get("license") != licence:
+            raise Fail(f"{name} {version}: manifest licence differs from the installed package")
+        entry = resolve({"eco": "npm", "name": name, "version": version, "license": licence,
+                         "dir": directory, "source": "", "license_file": None}, {}, counts)
+        if not entry["files"]:
+            raise Fail(f"{name} {version} ships no licence text")
+        entries.append(entry)
+    lines = ["Sidecar release licence record", RULE, facts["version_text"], ""]
+    node_text = read_text(facts["node_license"])
+    if not node_text.strip():
+        raise Fail("Node.js LICENSE is blank")
+    render_entries([{"title": f"Node.js {facts['node']}", "license": "MIT and embedded component licences",
+                     "status": None, "note": None, "files": [("LICENSE", node_text)]}], {}, lines)
+    render_entries(entries, {}, lines)
+    return "\n".join(lines).rstrip("\n") + "\n", counts
+
+
 # ---------------------------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------------------------
@@ -1719,6 +1789,9 @@ def main(argv):
     binaries_dir = None
     no_sidecar = False
     sidecar_given = False
+    sidecar_release = False
+    repo_given = False
+    out_given = False
     source_url = None
     source_notice = None
     skia_archive = None
@@ -1731,6 +1804,10 @@ def main(argv):
         a = args.pop(0)
         if a == "--out":
             out = args.pop(0)
+            out_given = True
+        elif a == "--sidecar-release":
+            artifact = args.pop(0)
+            sidecar_release = True
         elif a == "--sidecar":
             artifact = args.pop(0)
             sidecar_given = True
@@ -1742,6 +1819,7 @@ def main(argv):
             source_notice = args.pop(0)
         elif a == "--repo":
             repo = args.pop(0)
+            repo_given = True
         elif a == "--binaries-dir":
             binaries_dir = args.pop(0)
         elif a == "--skia-archive":
@@ -1757,6 +1835,25 @@ def main(argv):
         else:
             print(f"collect-licenses: unknown argument {a}", file=sys.stderr)
             return 2
+
+    if sidecar_release:
+        if (no_sidecar or sidecar_given or not repo_given or not out_given or source_notice
+                or source_url or binaries_dir or skia_archive or skia_sha256 or skia_license_dir
+                or skia_archive_path or skia_archive_extract_dir):
+            print("collect-licenses: --sidecar-release requires --repo and --out, and excludes other profiles",
+                  file=sys.stderr)
+            return 2
+        try:
+            text, counts = collect_sidecar_release(artifact, repo)
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            with open(out + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.replace(out + ".tmp", out)
+        except (Fail, OSError, ValueError, KeyError, TypeError) as e:
+            print(f"collect-licenses: FAILED: {e}", file=sys.stderr)
+            return 1
+        print(f"collect-licenses: wrote {out} (sidecar npm {sum(counts.values())})", file=sys.stderr)
+        return 0
 
     if no_sidecar and sidecar_given:
         print("collect-licenses: give --sidecar or --no-sidecar, not both", file=sys.stderr)
