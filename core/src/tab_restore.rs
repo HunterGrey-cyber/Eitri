@@ -12,7 +12,7 @@ use agent::ResumableSession;
 
 use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
-use crate::saved_tabs::SavedTabs;
+use crate::saved_tabs::{SavedTab, SavedTabs};
 use crate::tabs::{label_name, TabId, ViewId};
 
 /// What happens to the saved tabs at launch.
@@ -50,6 +50,9 @@ impl RestorePolicy {
 pub struct Skipped {
     pub label: String,
     pub reason: String,
+    /// The saved tab, when something was typed for it: it stays in the file while the restore waits for its trust
+    /// answer, and its draft comes back in the tab the restore runs from.
+    pub kept: Option<SavedTab>,
 }
 
 /// A saved tab that can be resumed.
@@ -70,6 +73,8 @@ pub struct PlannedTab {
     pub view: Option<ViewId>,
     /// The tab was saved with a turn running that never ended.
     pub turn_running: bool,
+    /// The composer's unsent text as it was saved.
+    pub draft: Option<String>,
 }
 
 /// Which saved tabs to resume and which are skipped before any resume is tried.
@@ -113,6 +118,7 @@ pub fn plan(
         let (agent, id) = (tab.agent.clone(), tab.provider_session_id.as_str());
         let (saved_name, saved_mode, saved_view) = (tab.name.as_deref(), tab.mode, tab.view);
         let turn_running = tab.turn_running;
+        let draft = tab.draft.clone();
         if open
             .iter()
             .any(|(open_agent, open_id)| *open_agent == agent && open_id == id)
@@ -127,6 +133,7 @@ pub fn plan(
             skipped.push(Skipped {
                 label: label_name(saved_name, None, Some(id)),
                 reason: GONE.to_string(),
+                kept: tab.draft.is_some().then(|| tab.clone()),
             });
             continue;
         };
@@ -138,6 +145,7 @@ pub fn plan(
             skipped.push(Skipped {
                 label,
                 reason: HELD_ELSEWHERE.to_string(),
+                kept: tab.draft.is_some().then(|| tab.clone()),
             });
             continue;
         }
@@ -150,6 +158,7 @@ pub fn plan(
             label,
             view: saved_view.and_then(ViewId::new).filter(|view| !view.is_base()),
             turn_running,
+            draft,
         });
     }
     let active_session = saved.active_tab().map(|t| t.provider_session_id.clone());
@@ -191,6 +200,17 @@ impl RestorePlan {
             .partition(|item| registered(&item.agent));
         self.items = kept;
         self.skipped.extend(unregistered.into_iter().map(|item| Skipped {
+            kept: item.draft.is_some().then(|| SavedTab {
+                agent: item.agent,
+                conversation_id: String::new(),
+                provider_session_id: item.provider_session_id,
+                name: item.name,
+                mode: item.saved_mode,
+                view: item.view.map(|view| view.number()),
+                window: None,
+                turn_running: item.turn_running,
+                draft: item.draft,
+            }),
             label: item.label,
             reason: NOT_REGISTERED.to_string(),
         }));
@@ -315,6 +335,7 @@ impl RestoreRun {
             self.failed.push(Skipped {
                 label,
                 reason: reason.to_string(),
+                kept: None,
             });
         }
     }
@@ -362,7 +383,6 @@ impl RestoreOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saved_tabs::SavedTab;
 
     fn saved(tabs: &[(&str, Option<&str>, SessionModeChoice)], active: usize) -> SavedTabs {
         SavedTabs::from_parts(
@@ -376,6 +396,7 @@ mod tests {
                     view: None,
                     window: None,
                     turn_running: false,
+                    draft: None,
                 })
                 .collect(),
             active,
@@ -434,6 +455,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         };
         let bar = vec![
             (AgentId::Claude, "a".to_string()),
@@ -469,6 +491,49 @@ mod tests {
         );
     }
 
+    /// The bar reorders the plan: each tab keeps what was typed for it, a skipped one too.
+    #[test]
+    fn a_draft_stays_with_its_tab_through_the_tab_bars_order() {
+        let tab = |agent: AgentId, id: &str| SavedTab {
+            agent,
+            conversation_id: "c".to_string(),
+            provider_session_id: id.to_string(),
+            name: None,
+            mode: Auto,
+            view: None,
+            window: None,
+            turn_running: false,
+            draft: Some(format!("typed for {id}")),
+        };
+        let saved = SavedTabs::from_parts(
+            vec![tab(AgentId::Claude, "a"), tab(AgentId::Claude, "gone")],
+            0,
+            vec![tab(AgentId::Codex, "x")],
+            None,
+        )
+        .with_bar(vec![
+            (AgentId::Codex, "x".to_string()),
+            (AgentId::Claude, "gone".to_string()),
+            (AgentId::Claude, "a".to_string()),
+        ]);
+        let records = [
+            record("a", None, None),
+            ResumableSession {
+                provider: "codex".to_string(),
+                ..record("x", None, None)
+            },
+        ];
+        let plan = plan(&saved, &records, &[], |_, _| false);
+        let planned: Vec<(&str, Option<&str>)> = plan
+            .items
+            .iter()
+            .map(|i| (i.provider_session_id.as_str(), i.draft.as_deref()))
+            .collect();
+        assert_eq!(planned, [("x", Some("typed for x")), ("a", Some("typed for a"))]);
+        let kept = plan.skipped[0].kept.as_ref().expect("the skipped tab's draft is kept");
+        assert_eq!(kept.draft.as_deref(), Some("typed for gone"));
+    }
+
     #[test]
     fn every_saved_tab_with_a_record_and_no_holder_comes_back_in_order() {
         let saved = saved(&[("a", None, Auto), ("b", Some("api"), Bypass), ("c", None, Auto)], 1);
@@ -499,6 +564,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         };
         saved.tabs.extend([acp("gem", "g-1"), acp("gone", "x-1")]);
         let acp_record = |name: &str, id: &str| ResumableSession {
@@ -518,7 +584,8 @@ mod tests {
             plan.skipped,
             vec![Skipped {
                 label: "x-1".to_string(),
-                reason: NOT_REGISTERED.to_string()
+                reason: NOT_REGISTERED.to_string(),
+                kept: None,
             }]
         );
     }
@@ -541,11 +608,13 @@ mod tests {
             vec![
                 Skipped {
                     label: "gone-012".to_string(),
-                    reason: GONE.to_string()
+                    reason: GONE.to_string(),
+                    kept: None,
                 },
                 Skipped {
                     label: "busy".to_string(),
-                    reason: HELD_ELSEWHERE.to_string()
+                    reason: HELD_ELSEWHERE.to_string(),
+                    kept: None,
                 },
             ],
             "the short id stands in for a tab with nothing else to call it"
@@ -580,6 +649,7 @@ mod tests {
             view: Some(2),
             window: None,
             turn_running: false,
+            draft: None,
         });
         let records = [
             record("a", None, None),
@@ -628,6 +698,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         });
         let acp_record = |name: &str| ResumableSession {
             provider: format!("acp:{name}"),
@@ -753,6 +824,7 @@ mod tests {
         let skipped = vec![Skipped {
             label: "docs".to_string(),
             reason: HELD_ELSEWHERE.to_string(),
+            kept: None,
         }];
         let mut run = run_of(&[(1, "api"), (2, "web")], skipped);
         run.note_installed(TabId(1));
@@ -824,6 +896,7 @@ mod tests {
         let skipped = vec![Skipped {
             label: "docs".to_string(),
             reason: GONE.to_string(),
+            kept: None,
         }];
         let run = RestoreRun::new(TabId(1), Auto, AgentId::Claude, 1, skipped);
         assert_eq!(

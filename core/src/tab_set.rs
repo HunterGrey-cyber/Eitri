@@ -5317,6 +5317,7 @@ impl TabSet {
                         view: saved_view(tab.view),
                         window: None,
                         turn_running: tab.turn_running(),
+                        draft: crate::saved_tabs::draft_to_save(tab.draft()),
                     },
                 ))
             })
@@ -5346,8 +5347,19 @@ impl TabSet {
                 view: granted.planned.view.and_then(saved_view),
                 window: None,
                 turn_running: granted.planned.turn_running,
+                draft: granted.planned.draft.clone(),
             });
         }
+        // A skipped tab's draft has no tab to wait in until the answer comes: the file keeps the entry until then.
+        let skipped_with_a_draft: Vec<SavedTab> = self
+            .waiting_restore_skipped()
+            .into_iter()
+            .map(|tab| SavedTab {
+                conversation_id: conversation_id.to_string(),
+                ..tab.clone()
+            })
+            .collect();
+        others.extend(skipped_with_a_draft.iter().filter(|t| t.agent.is_external()).cloned());
         if self.kind != BackendKind::Sidecar {
             return Some(SavedTabs::from_parts(Vec::new(), 0, others, others_active));
         }
@@ -5369,6 +5381,7 @@ impl TabSet {
                         view: saved_view(tab.view),
                         window: None,
                         turn_running: tab.turn_running(),
+                        draft: crate::saved_tabs::draft_to_save(tab.draft()),
                     },
                 ))
             })
@@ -5401,9 +5414,16 @@ impl TabSet {
                     view: granted.planned.view.and_then(saved_view),
                     window: None,
                     turn_running: granted.planned.turn_running,
+                    draft: granted.planned.draft.clone(),
                 },
             ));
         }
+        listed.extend(
+            skipped_with_a_draft
+                .into_iter()
+                .filter(|t| !t.agent.is_external())
+                .map(|t| (TabId(u64::MAX), t)),
+        );
         // The tab bar's order across both kinds: the tabs that exist by their place in it, then the sessions a
         // restore still waits to start, in the order they were listed.
         let mut bar: Vec<(usize, (AgentId, String))> = listed
@@ -5432,6 +5452,37 @@ impl TabSet {
             others_active,
         );
         Some(if mixed { saved.with_bar(bar) } else { saved })
+    }
+
+    /// Puts a saved draft in a tab's composer, after what the tab holds already.
+    fn give_restored_draft(&mut self, id: TabId, draft: Option<String>) {
+        let (Some(draft), Some(tab)) = (draft, self.get_mut(id)) else {
+            return;
+        };
+        let text = match tab.draft().trim().is_empty() {
+            true => draft,
+            false => format!("{}\n\n{draft}", tab.draft()),
+        };
+        tab.replace_draft(text);
+    }
+
+    /// Tabs whose unsent text would go with the window: a tab that is not saved (it has no session yet, or `saving`
+    /// says the window keeps no tabs), or text too long for the file. The window's close asks about these.
+    pub fn unsaved_draft_count(&self, saving: bool) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| !tab.draft().trim().is_empty())
+            .filter(|tab| !saving || !self.saves(tab) || crate::saved_tabs::draft_to_save(tab.draft()).is_none())
+            .count()
+    }
+
+    /// Whether [`Self::saved_snapshot`] lists `tab`.
+    fn saves(&self, tab: &Tab) -> bool {
+        let kept = match tab.agent.is_external() {
+            true => tab.resumable(self.kind) || tab.failed_resume.is_some(),
+            false => tab.agent == AgentId::Claude && self.kind == BackendKind::Sidecar,
+        };
+        kept && self.saved_session_id(tab).is_some()
     }
 
     /// The session `tab` is saved under: the one it holds, or, for a tab that failed starting a saved
@@ -5467,6 +5518,22 @@ impl TabSet {
 
     /// The sessions of a restore that is waiting for the trust question and so has no tab of its own
     /// yet, except the ones already open in a tab.
+    /// The saved tabs a waiting restore skipped and whose drafts it holds.
+    fn waiting_restore_skipped(&self) -> Vec<&SavedTab> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.backend {
+                TabBackend::AwaitingTrust(AwaitingTrust {
+                    start: DeferredStart::Restore { go },
+                    ..
+                }) => Some(go),
+                _ => None,
+            })
+            .filter(|go| !go.reoffer)
+            .flat_map(|go| go.skipped.iter().filter_map(|skipped| skipped.kept.as_ref()))
+            .collect()
+    }
+
     fn waiting_restore_tabs(&self) -> Vec<&GrantedTab> {
         self.tabs
             .iter()
@@ -5637,12 +5704,15 @@ impl TabSet {
     ///
     /// The returned [`RestoreRun`] is fed the results `collect_starts` reports and says when the last
     /// resume has returned.
-    pub fn start_restore<F>(&mut self, from: TabId, go: RestoreGo, mut connect: F) -> RestoreRun
+    pub fn start_restore<F>(&mut self, from: TabId, mut go: RestoreGo, mut connect: F) -> RestoreRun
     where
         F: FnMut(&AgentId, &str) -> Result<RestoreConnect, String>,
     {
         let total = go.tabs.len() + go.skipped.len();
         let into = self.restore_holder(from);
+        for skipped in &mut go.skipped {
+            self.give_restored_draft(into, skipped.kept.take().and_then(|tab| tab.draft));
+        }
         let mut run = RestoreRun::new(
             into,
             self.get(into).map_or(self.default_mode, |t| t.mode),
@@ -5655,6 +5725,7 @@ impl TabSet {
             let GrantedTab { planned, mode } = granted;
             let id = planned.provider_session_id.clone();
             if let Some(open) = self.tab_with_session(&planned.agent, &id) {
+                self.give_restored_draft(open, planned.draft);
                 run.restored += 1;
                 started.push((id, open));
                 continue;
@@ -5662,9 +5733,12 @@ impl TabSet {
             let connected = match connect(&planned.agent, &id) {
                 Ok(connected) => connected,
                 Err(reason) => {
+                    // The tab does not come back; what was typed for it does.
+                    self.give_restored_draft(into, planned.draft);
                     run.failed.push(Skipped {
                         label: planned.label,
                         reason,
+                        kept: None,
                     });
                     continue;
                 }
@@ -5683,6 +5757,7 @@ impl TabSet {
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
             self.give_mode(at, mode);
+            self.give_restored_draft(target, planned.draft);
             let tab = &mut self.tabs[at];
             let request_id = format!("restore-{}", n + 1);
             match connected {
@@ -5804,6 +5879,9 @@ impl TabSet {
             return true;
         }
         let from = self.restore_holder(from);
+        for skipped in go.skipped {
+            self.give_restored_draft(from, skipped.kept.and_then(|tab| tab.draft));
+        }
         let mut kept: Vec<(String, TabId)> = Vec::new();
         for granted in go.tabs {
             let GrantedTab { planned, mode } = granted;
@@ -5826,6 +5904,7 @@ impl TabSet {
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
             self.give_mode(at, mode);
+            self.give_restored_draft(target, planned.draft);
             let tab = &mut self.tabs[at];
             tab.failed_after_start = false;
             tab.failed_resume = Some(id.clone());
@@ -5869,7 +5948,9 @@ impl TabSet {
                 }
             }
             None => {
+                let draft = self.get(tab).map(|t| t.draft().to_string());
                 self.remove(tab);
+                self.give_restored_draft(self.active, draft.filter(|text| !text.trim().is_empty()));
             }
         }
         debug_assert!(self.v1_holds());
@@ -12946,6 +13027,7 @@ mod tests {
             label: format!("title of {id}"),
             view: None,
             turn_running: false,
+            draft: None,
         }
     }
 
@@ -13311,6 +13393,7 @@ mod tests {
         plan.skipped.push(Skipped {
             label: "gone".into(),
             reason: "its saved record is gone".into(),
+            kept: None,
         });
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
@@ -13397,6 +13480,7 @@ mod tests {
         plan.skipped.push(Skipped {
             label: "docs".into(),
             reason: "open in another window".into(),
+            kept: None,
         });
         let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
             panic!("no question")
@@ -13466,6 +13550,94 @@ mod tests {
             run.outcome().unwrap().message(),
             "Restored 0 of 1 tab; 1 could not be: title of a (refused)"
         );
+    }
+
+    /// The draft of a saved tab is what comes back in its composer, after anything the tab it lands in holds, and
+    /// a tab that cannot come back hands its draft to the tab the restore started from.
+    #[test]
+    fn a_saved_draft_comes_back_with_its_tab() {
+        let mut set = set();
+        let from = set.active();
+        let mut plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            Some("a"),
+        );
+        plan.items[0].draft = Some("for a".to_string());
+        plan.items[1].draft = Some("for b".to_string());
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let (_tx, rx) = mpsc::channel();
+        let mut rx = Some(rx);
+        set.start_restore(from, go, |_, id| match id {
+            "a" => Ok(RestoreConnect::Started(rx.take().unwrap())),
+            _ => Err("refused".to_string()),
+        });
+        assert_eq!(set.get(from).unwrap().draft(), "for a\n\nfor b");
+    }
+
+    #[test]
+    fn a_skipped_tabs_draft_comes_back_and_a_restore_put_off_keeps_each_tabs_own() {
+        let mut set = set();
+        let from = set.active();
+        let mut plan = plan_of(vec![planned("a", SessionModeChoice::Auto)], Some("a"));
+        plan.items[0].draft = Some("for a".to_string());
+        plan.skipped.push(Skipped {
+            label: "gone".to_string(),
+            reason: "its record is gone".to_string(),
+            kept: Some(SavedTab {
+                draft: Some("for the gone tab".to_string()),
+                ..saved_tab_named("gone")
+            }),
+        });
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        set.keep_put_off_restore(from, go, "put off");
+        let saved = set.saved_snapshot(PROJECT).unwrap();
+        assert_eq!(saved.tabs[0].draft.as_deref(), Some("for the gone tab\n\nfor a"));
+    }
+
+    #[test]
+    fn a_saved_tab_carries_its_draft_and_only_text_that_would_go_is_counted() {
+        let dir = workspace("saved-draft");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        provider.queue(AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: "sess-a".into(),
+            model: "m".into(),
+            cwd: dir.to_string_lossy().into_owned(),
+        });
+        until("the session", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().provider_session_id().is_some()
+        });
+        assert_eq!(set.unsaved_draft_count(true), 0);
+        set.set_draft(tab, "still typing");
+        let saved = set.saved_snapshot(PROJECT).unwrap();
+        assert_eq!(saved.tabs[0].draft.as_deref(), Some("still typing"));
+        assert_eq!(set.unsaved_draft_count(true), 0, "`s` brings it back");
+        assert_eq!(
+            set.unsaved_draft_count(false),
+            1,
+            "a window that keeps no tabs loses it"
+        );
+        set.set_draft(tab, &"x".repeat(crate::saved_tabs::DRAFT_SAVE_MAX + 1));
+        assert_eq!(set.saved_snapshot(PROJECT).unwrap().tabs[0].draft, None);
+        assert_eq!(set.unsaved_draft_count(true), 1, "too long for the file");
+        set.set_draft(tab, "   ");
+        assert_eq!(set.unsaved_draft_count(true), 0, "nothing was typed");
+
+        let fresh = set.open(AgentId::Claude);
+        set.set_draft(fresh, "no session yet");
+        assert_eq!(set.unsaved_draft_count(true), 1);
+        shut_down_all(&mut set);
     }
 
     /// Only a failed restored tab is cleaned up: a live session is never closed by this.
@@ -15563,6 +15735,95 @@ mod tests {
         assert_eq!(in_bar, ["thread-1", "s-1", "thread-2", "s-2"]);
     }
 
+    fn saved_tab_named(session: &str) -> SavedTab {
+        SavedTab {
+            agent: AgentId::Claude,
+            conversation_id: String::new(),
+            provider_session_id: session.to_string(),
+            name: None,
+            mode: SessionModeChoice::Auto,
+            view: None,
+            window: None,
+            turn_running: false,
+            draft: None,
+        }
+    }
+
+    /// A skipped tab has no tab to wait in. While the restore waits for its trust answer the file keeps its entry,
+    /// or a window ending before the answer would lose what was typed for it; the answer puts the draft in a composer.
+    #[test]
+    fn a_skipped_tabs_draft_stays_in_the_file_while_the_restore_waits() {
+        let mut set = set();
+        let from = set.active();
+        let mut plan = plan_of(vec![planned("a", SessionModeChoice::Auto)], Some("a"));
+        plan.skipped.push(Skipped {
+            label: "gone".to_string(),
+            reason: "its record is gone".to_string(),
+            kept: Some(SavedTab {
+                draft: Some("for the gone tab".to_string()),
+                ..saved_tab_named("gone")
+            }),
+        });
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        let saved = set.saved_snapshot("conv").unwrap();
+        let kept = saved.tabs.iter().find(|t| t.provider_session_id == "gone").unwrap();
+        assert_eq!(kept.draft.as_deref(), Some("for the gone tab"));
+        assert_eq!(kept.conversation_id, "conv");
+    }
+
+    /// A waiting restore's tabs are in the file by way of its plan: each keeps its draft in the bar's order, and
+    /// keeps it again when the answer is put off and the tabs are kept as failed ones.
+    #[test]
+    fn a_waiting_or_put_off_restore_keeps_each_tabs_draft_in_the_bars_order() {
+        let mut set = set();
+        let from = set.active();
+        let typed = |mut tab: PlannedTab| {
+            tab.draft = Some(format!("typed for {}", tab.provider_session_id));
+            tab
+        };
+        let codex = |id: &str| PlannedTab {
+            agent: AgentId::Codex,
+            ..planned(id, SessionModeChoice::Auto)
+        };
+        let plan = plan_of(
+            vec![
+                typed(codex("x")),
+                typed(planned("a", SessionModeChoice::Auto)),
+                typed(codex("y")),
+            ],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        let drafts_in_bar_order = |set: &TabSet| -> Vec<(String, Option<String>)> {
+            let saved = set.saved_snapshot("conv").unwrap();
+            saved
+                .in_bar_order()
+                .into_iter()
+                .map(|t| (t.provider_session_id.clone(), t.draft.clone()))
+                .collect()
+        };
+        let want: Vec<(String, Option<String>)> = ["x", "a", "y"]
+            .map(|id| (id.to_string(), Some(format!("typed for {id}"))))
+            .into();
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        assert_eq!(drafts_in_bar_order(&set), want, "waiting for the trust answer");
+
+        let TabBackend::AwaitingTrust(AwaitingTrust {
+            start: DeferredStart::Restore { go },
+            ..
+        }) = std::mem::replace(&mut set.get_mut(from).unwrap().backend, TabBackend::NotStarted)
+        else {
+            panic!("the restore waits in its tab")
+        };
+        set.keep_put_off_restore(from, go, "put off");
+        assert_eq!(drafts_in_bar_order(&set), want, "put off");
+    }
+
     /// A restore waiting for its trust answer keeps the order it was saved in, whichever agents its tabs run.
     #[test]
     fn a_waiting_restore_is_saved_in_the_order_it_was_planned() {
@@ -16521,6 +16782,7 @@ mod external_tab_tests {
             label: format!("title of {id}"),
             view: None,
             turn_running: false,
+            draft: None,
         }
     }
 
@@ -16675,6 +16937,7 @@ mod external_tab_tests {
                 view: None,
                 window: None,
                 turn_running: false,
+                draft: None,
             }]
         );
         assert_eq!(others_active(&saved), Some(0));
@@ -18678,6 +18941,7 @@ mod question_gate_tests {
                 label: "saved".into(),
                 view: None,
                 turn_running: false,
+                draft: None,
             }],
             skipped: Vec::new(),
             active_session: Some("r1".into()),

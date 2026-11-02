@@ -1180,6 +1180,7 @@ fn an_orphan_chat_windows_tabs_survive_window_1s_restart() {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         };
         SavedTabs::from_parts(sessions.iter().map(saved).collect(), 0, Vec::new(), None)
     };

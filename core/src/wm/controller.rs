@@ -1650,6 +1650,9 @@ impl Decide for Controller {
                 | EditorEvent::StartFailed { win, .. }
                 | EditorEvent::Exited { win, .. }
                 | EditorEvent::Unreachable { win }
+                | EditorEvent::Watched { win }
+                | EditorEvent::Leaving { win }
+                | EditorEvent::Recoverable { win, .. }
                 | EditorEvent::QuitCancelled { win, .. }
                 | EditorEvent::QuitNotSent { win, .. }
                 | EditorEvent::OpenFailed { win, .. }),

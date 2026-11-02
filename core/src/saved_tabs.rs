@@ -45,6 +45,15 @@ use crate::window_link::pair::{tabs_file_name, Role};
 /// The file format's version. A file of any other version is not read.
 pub const VERSION: u32 = 1;
 
+/// The most of one tab's draft the file holds. The file is read whole and written at every change, so a
+/// long paste is not kept here: the window's close asks about it instead.
+pub const DRAFT_SAVE_MAX: usize = 256 * 1024;
+
+/// A composer's text as the file keeps it: nothing for blank text or text past [`DRAFT_SAVE_MAX`].
+pub fn draft_to_save(text: &str) -> Option<String> {
+    (!text.trim().is_empty() && text.len() <= DRAFT_SAVE_MAX).then(|| text.to_string())
+}
+
 /// One tab worth bringing back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedTab {
@@ -67,6 +76,9 @@ pub struct SavedTab {
     /// A turn was running as this was written, and written again when it ended: what is read back says a window went with
     /// no chance to finish it, or to ask about it. Absent from the file otherwise.
     pub turn_running: bool,
+    /// The composer's unsent text, for `s` to put back. Absent with nothing there, or with more than
+    /// [`DRAFT_SAVE_MAX`]. This is what the person typed: nothing may log it.
+    pub draft: Option<String>,
 }
 
 impl SavedTab {
@@ -100,6 +112,7 @@ impl SavedTab {
             view: self.view,
             window: self.window,
             turn_running: self.turn_running,
+            draft: self.draft.clone(),
         };
         serde_json::to_value(entry).expect("a saved tab always serializes")
     }
@@ -120,6 +133,7 @@ impl SavedTab {
             view: entry.view,
             window: entry.window,
             turn_running: entry.turn_running,
+            draft: entry.draft,
         })
     }
 }
@@ -306,6 +320,15 @@ fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D:
         .filter(|n| (2..=crate::layout::module::MAX_INSTANCE).contains(n)))
 }
 
+/// A draft of any other type is read as absent: the error that would say otherwise quotes the value, and a
+/// file's error goes to the log.
+fn lenient_draft<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 struct TabsFile {
     version: u32,
@@ -359,6 +382,8 @@ struct ClaudeEntry {
     window: Option<u8>,
     #[serde(default, skip_serializing_if = "is_false")]
     turn_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_draft")]
+    draft: Option<String>,
 }
 
 /// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
@@ -379,6 +404,8 @@ struct OtherEntry {
     window: Option<u8>,
     #[serde(default, skip_serializing_if = "is_false")]
     turn_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_draft")]
+    draft: Option<String>,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -410,6 +437,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                 view: t.view,
                 window: t.window,
                 turn_running: t.turn_running,
+                draft: t.draft.clone(),
             })
             .collect(),
         active: saved.rank(saved.claude_active, false).unwrap_or(0),
@@ -425,6 +453,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                     view: t.view,
                     window: t.window,
                     turn_running: t.turn_running,
+                    draft: t.draft.clone(),
                 })
             })
             .collect(),
@@ -469,6 +498,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             view: t.view,
             window: t.window,
             turn_running: t.turn_running,
+            draft: t.draft,
         })
         .collect();
     // An agent this build does not know stays a hole, so the active index still finds its tab.
@@ -485,6 +515,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
                 view: t.view,
                 window: t.window,
                 turn_running: t.turn_running,
+                draft: t.draft,
             }),
             ExternalEntry::Unknown(_) => None,
         })
@@ -1130,7 +1161,8 @@ impl TabMemory {
     /// what a write did (`Some`) or that none was needed (`None`).
     ///
     /// A write that fails is reported once and not tried again until the tabs change: this is
-    /// called on every tick, and a full disk must not turn into thirty failures a second.
+    /// called on every tick, and a full disk must not turn into thirty failures a second. The
+    /// window's own [`TabWriter`] tries again by itself.
     ///
     /// A file found unusable just before the write -- hand-edited, or from another build, since the
     /// window opened -- is set aside first rather than overwritten, as the layout file's is.
@@ -1204,6 +1236,10 @@ struct WriterShared {
     queue: std::sync::Mutex<WriterQueue>,
     ready: std::sync::Condvar,
 }
+
+/// How long the writer waits before writing a set again whose write failed: space freed later brings the file up to
+/// date with no change to the tabs and no tick to ask for it.
+const FAILED_WRITE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct WriterQueue {
@@ -1286,8 +1322,9 @@ impl TabWriter {
         worker.shared.ready.notify_all();
     }
 
-    /// No more sets come: the writer writes what it was last handed and ends. The receiver reports once it
-    /// has (or is gone when the thread died); `None` when no writer ever started, so nothing is owed.
+    /// No more sets come: the writer writes what it was last handed and ends, trying once more a set whose write
+    /// failed. The receiver reports once it has (or is gone when the thread died); `None` when no writer ever
+    /// started, so nothing is owed.
     pub fn finish(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
         let worker = self.worker.as_mut()?;
         {
@@ -1346,7 +1383,7 @@ impl TabWriter {
                     };
                     #[cfg(not(any(test, feature = "test-support")))]
                     let hook = || {};
-                    write_loop(&thread_shared, memory, hook);
+                    write_loop(&thread_shared, memory, hook, FAILED_WRITE_RETRY);
                     let _ = done_tx.send(());
                 });
             if let Err(e) = spawned {
@@ -1376,7 +1413,13 @@ impl Drop for TabWriter {
 }
 
 /// The writer thread: takes the newest set, writes it outside the lock, and ends once finished and empty.
-fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl Fn()) {
+///
+/// A set whose write failed stays here and not in the queue: a newer set replaces it, a wait of `retry` writes it
+/// again, and the close tries it once more rather than wait. The thread keeps its own clock because an idle panel
+/// has no tick to ask.
+fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl Fn(), retry: std::time::Duration) {
+    let mut failed: Option<SavedTabs> = None;
+    let mut closing_try_made = false;
     loop {
         let next = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1391,13 +1434,34 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
                     break next;
                 }
                 if queue.finished {
-                    return;
+                    // Once: a close on a disk still full ends here, and the file keeps what it last held.
+                    match failed.take().filter(|_| !closing_try_made) {
+                        Some(owed) => {
+                            closing_try_made = true;
+                            queue.writing = true;
+                            break owed;
+                        }
+                        None => return,
+                    }
                 }
-                queue = shared.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
+                let Some(owed) = failed.take() else {
+                    queue = shared.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                let (again, waited) = shared
+                    .ready
+                    .wait_timeout(queue, retry)
+                    .unwrap_or_else(|e| e.into_inner());
+                queue = again;
+                if waited.timed_out() {
+                    queue.writing = true;
+                    break owed;
+                }
+                failed = Some(owed);
             }
         };
         before_write();
-        let written = next.clone();
+        let attempted = next.clone();
         // Not `observe`: the window's thread compared this set with the last one it handed over, and the set
         // in between may never have been taken here (replaced while queued), so this thread's own last set
         // can be stale. An emptied window, the set before it never taken, must still empty the file.
@@ -1407,7 +1471,7 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
                 let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
                 let (due, waiting) = std::mem::take(&mut queue.takeovers)
                     .into_iter()
-                    .partition(|t| written.holds_all(&t.sessions));
+                    .partition(|t| attempted.holds_all(&t.sessions));
                 queue.takeovers = waiting;
                 due
             };
@@ -1423,14 +1487,22 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
             }
         }
         match result {
-            Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
-            Some(Ok(Written {
-                set_aside: Some(aside), ..
-            })) => eprintln!(
-                "[tabs] an unusable saved-tabs file was set aside as {}",
-                aside.display()
-            ),
-            Some(Ok(_)) | None => {}
+            Some(Err(e)) => {
+                eprintln!("[tabs] could not save the open tabs: {e}");
+                agent::save_health::failed(agent::save_health::SaveKind::Tabs, &e);
+                failed = Some(attempted);
+            }
+            Some(Ok(written)) => {
+                if let Some(aside) = written.set_aside {
+                    eprintln!(
+                        "[tabs] an unusable saved-tabs file was set aside as {}",
+                        aside.display()
+                    );
+                }
+                agent::save_health::saved(agent::save_health::SaveKind::Tabs);
+                failed = None;
+            }
+            None => {}
         }
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.writing = false;
@@ -1446,6 +1518,161 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")
+    }
+
+    /// The bar's order is a list of keys beside the tabs, so each way a set is split, joined or read keeps each tab's
+    /// draft on its own tab.
+    #[test]
+    fn a_draft_stays_on_its_tab_through_the_file_the_windows_and_the_bar() {
+        let typed = |agent: AgentId, id: &str, window: Option<u8>| SavedTab {
+            agent,
+            window,
+            draft: Some(format!("typed for {id}")),
+            provider_session_id: id.to_string(),
+            ..tab("unused", None, SessionModeChoice::Auto)
+        };
+        let drafts = |saved: &SavedTabs| -> Vec<(String, Option<String>)> {
+            saved
+                .in_bar_order()
+                .into_iter()
+                .map(|t| (t.provider_session_id.clone(), t.draft.clone()))
+                .collect()
+        };
+        let want = |ids: &[&str]| -> Vec<(String, Option<String>)> {
+            ids.iter()
+                .map(|id| (id.to_string(), Some(format!("typed for {id}"))))
+                .collect()
+        };
+        let saved = SavedTabs::from_parts(
+            vec![typed(AgentId::Claude, "a", None), typed(AgentId::Claude, "b", Some(2))],
+            0,
+            vec![typed(AgentId::Codex, "x", None)],
+            None,
+        )
+        .with_bar(vec![
+            (AgentId::Claude, "b".to_string()),
+            (AgentId::Codex, "x".to_string()),
+            (AgentId::Claude, "a".to_string()),
+        ]);
+        assert_eq!(drafts(&saved), want(&["b", "x", "a"]));
+        let read = decode(&encode(&saved, &root()), &root()).unwrap();
+        assert_eq!(drafts(&read), want(&["b", "x", "a"]), "the file");
+        let crossed = SavedTabs::from_wire(&saved.to_wire()).unwrap();
+        assert_eq!(drafts(&crossed), want(&["b", "x", "a"]), "the link");
+        assert_eq!(
+            drafts(&tabs_for(&saved, &WindowName::Chat(2))),
+            want(&["b"]),
+            "one window's part"
+        );
+        let later = SavedTabs::from_parts(vec![typed(AgentId::Claude, "c", None)], 0, Vec::new(), None);
+        assert_eq!(
+            drafts(&saved.clone().followed_by(later)),
+            want(&["b", "x", "a", "c"]),
+            "tabs still unopened behind the window's"
+        );
+    }
+
+    /// A draft lives in the file and on the link, a tab with none reads as it always did, and a value of any other
+    /// type is read as absent, since the error that would refuse it quotes it and a file's error goes to the log.
+    #[test]
+    fn a_draft_survives_the_file_and_the_link_and_never_reaches_an_error() {
+        let mut tab = tab("s-a", None, SessionModeChoice::Auto);
+        tab.draft = Some("half a thought\nand a line".to_string());
+        let saved = SavedTabs::from_parts(vec![tab.clone()], 0, Vec::new(), None);
+        let text = encode(&saved, &root());
+        assert_eq!(decode(&text, &root()).unwrap().tabs[0].draft, tab.draft);
+        assert_eq!(SavedTab::from_wire(&tab.to_wire()).unwrap().draft, tab.draft);
+
+        tab.draft = None;
+        let quiet = encode(&SavedTabs::from_parts(vec![tab], 0, Vec::new(), None), &root());
+        assert!(!quiet.contains("draft"), "{quiet}");
+
+        let odd = text.replace("\"half a thought\\nand a line\"", "12");
+        assert_ne!(odd, text);
+        assert_eq!(decode(&odd, &root()).unwrap().tabs[0].draft, None);
+    }
+
+    #[test]
+    fn only_text_the_file_can_hold_is_a_saved_draft() {
+        assert_eq!(draft_to_save("  \n "), None);
+        assert_eq!(draft_to_save("text").as_deref(), Some("text"));
+        assert!(draft_to_save(&"x".repeat(DRAFT_SAVE_MAX)).is_some());
+        assert_eq!(draft_to_save(&"x".repeat(DRAFT_SAVE_MAX + 1)), None);
+    }
+
+    /// A failed write leaves the file behind tabs that have not changed since. The writer writes them again by
+    /// itself, with no tick to ask; a newer set replaces them; and the close tries once more rather than wait.
+    #[test]
+    fn a_write_that_failed_is_written_again_with_nothing_changing() {
+        let dir = ScratchDir::new("nv-saved-tabs", "retry");
+        let state = dir.join("state");
+        std::fs::write(&state, "").unwrap();
+        let first = SavedTabs::from_parts(vec![tab("s-one", None, SessionModeChoice::Auto)], 0, Vec::new(), None);
+        let run = |retry: std::time::Duration, state: PathBuf, queued: SavedTabs| {
+            let shared = std::sync::Arc::new(WriterShared::default());
+            shared.queue.lock().unwrap().next = Some(queued);
+            let thread = {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    write_loop(
+                        &shared,
+                        TabMemory::new_as(Some(state), root(), Role::Main),
+                        || {},
+                        retry,
+                    )
+                })
+            };
+            (shared, thread)
+        };
+        let settled = |shared: &WriterShared| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let queue = shared.queue.lock().unwrap();
+                if queue.next.is_none() && !queue.writing {
+                    return;
+                }
+                drop(queue);
+                assert!(std::time::Instant::now() < deadline, "the writer did not settle");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        let (shared, thread) = run(std::time::Duration::from_millis(20), state.clone(), first.clone());
+        settled(&shared);
+        assert!(!matches!(load(&state, &root()), Loaded::Saved(_)));
+        std::fs::remove_file(&state).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while load(&state, &root()) != Loaded::Saved(first.clone()) {
+            assert!(std::time::Instant::now() < deadline, "the set was not written again");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        shared.queue.lock().unwrap().finished = true;
+        shared.ready.notify_all();
+        thread.join().unwrap();
+
+        // Far from its pause: only the close can write it.
+        std::fs::remove_dir_all(&state).unwrap();
+        std::fs::write(&state, "").unwrap();
+        let (shared, thread) = run(std::time::Duration::from_secs(600), state.clone(), first.clone());
+        settled(&shared);
+        std::fs::remove_file(&state).unwrap();
+        shared.queue.lock().unwrap().finished = true;
+        shared.ready.notify_all();
+        thread.join().unwrap();
+        assert_eq!(load(&state, &root()), Loaded::Saved(first.clone()));
+
+        // A close on a disk still full tries once and ends: the window is waiting on this thread.
+        std::fs::remove_dir_all(&state).unwrap();
+        std::fs::write(&state, "").unwrap();
+        let (shared, thread) = run(std::time::Duration::from_secs(600), state.clone(), first);
+        settled(&shared);
+        shared.queue.lock().unwrap().finished = true;
+        shared.ready.notify_all();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !thread.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the writer never ended");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// A running turn is said in the file and on the link and nowhere else: a tab with none reads as it always did, and a
@@ -1494,6 +1721,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         }
     }
 
@@ -1641,6 +1869,7 @@ mod tests {
                 view: None,
                 window: None,
                 turn_running: false,
+                draft: None,
             }],
             None,
         );
@@ -1884,7 +2113,7 @@ mod tests {
             queue.next = Some(SavedTabs::default());
             queue.finished = true;
         }
-        write_loop(&shared, memory(&dir), || {});
+        write_loop(&shared, memory(&dir), || {}, FAILED_WRITE_RETRY);
         assert_eq!(load(&dir, &root()), Loaded::Saved(SavedTabs::default()));
 
         // The same through the whole writer. Whether the thread takes the first set before it is replaced or not
@@ -2090,6 +2319,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         }
     }
 
@@ -2893,6 +3123,7 @@ mod measure {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();

@@ -464,6 +464,9 @@ pub struct ChatKillCounts {
     pub background: usize,
     pub running: usize,
     pub queued: usize,
+    /// The window's tabs whose unsent text would go with it ([`crate::tab_set::TabSet::unsaved_draft_count`]). Only the
+    /// base view's counts carry it: a close counts the whole window once.
+    pub drafts: usize,
     pub tab: Option<String>,
     /// Why the view's tabs cannot close now (one is being handed off to a terminal, or moving to the other window),
     /// in the words the kill is refused with: a kill that left the view's tabs open would not be a kill, so the
@@ -1372,6 +1375,12 @@ pub enum EditorEvent {
     },
     /// The launcher exited while nvim itself is still alive and unreachable.
     Unreachable { win: WinId },
+    /// This nvim will say when it leaves: an exit that comes without [`Self::Leaving`] is a crash.
+    Watched { win: WinId },
+    /// nvim is quitting on purpose.
+    Leaving { win: WinId },
+    /// A start found `count` project files with unsaved changes in swap files, `newest` the latest.
+    Recoverable { win: WinId, count: u32, newest: String },
     /// This generation's quit request could not be sent.
     QuitNotSent { win: WinId, generation: u32 },
     /// The editor reported its scale.

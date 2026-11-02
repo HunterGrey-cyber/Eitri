@@ -262,6 +262,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         }
     }
 

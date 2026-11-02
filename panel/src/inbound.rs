@@ -1312,6 +1312,8 @@ pub(super) fn handle_inbound_message(
             let held_here = page_may_answer(&state.tabs, tab, view);
             if held_here.is_ok() {
                 state.tabs.set_draft(tab, &text);
+                // The panel may be idle, with no tick due: a window killed now still has this in its file.
+                super::restore::remember_tabs(state);
             } else if late_draft || state.tabs.take_late_draft(tab, view) {
                 deliver_late_draft(state, tab, &text, &mut out);
             } else if let Err(why) = held_here {

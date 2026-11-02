@@ -59,8 +59,12 @@ pub trait QuitWorld {
     fn close_window(&mut self);
     fn refuse(&mut self, text: &str);
     fn toast(&mut self, text: &str);
+    /// A toast that says something may be lost, up long enough to act on.
+    fn warn(&mut self, text: &str);
     /// The ended editor's toast, naming the window's own key for it.
     fn editor_ended_text(&self) -> String;
+    /// The toast of an editor that ended with nobody asking, naming the same key.
+    fn editor_crashed_text(&self) -> String;
     /// Schedules polls of this generation until `poll` says to stop; the flow never waits on a timer.
     fn every_second(&mut self, generation: u32);
 }
@@ -280,7 +284,9 @@ impl QuitFlow {
 
     /// The host supplies the settled request with the exit, so deciding what closes never waits here.
     /// A hidden editor is restored to its saved arrangement before the window's close persists it.
-    pub fn nvim_exited(&mut self, world: &mut dyn QuitWorld, settled: Option<NvimAnswer>) {
+    /// `crashed` is nvim going without saying it was leaving, after saying it would: nobody quit it, so
+    /// the window stays and says so, where a `:q` of the last buffer closes it.
+    pub fn nvim_exited(&mut self, world: &mut dyn QuitWorld, settled: Option<NvimAnswer>, crashed: bool) {
         let watch = settled;
         if self.settle(watch.as_ref()).is_some() {
             println!("[modules] editor: nvim exited, and the quit in flight is not what ended it");
@@ -310,6 +316,11 @@ impl QuitFlow {
                     world.close_window();
                 }
             },
+            None if crashed => {
+                if Self::end_in_place(world, "[modules] editor: nvim stopped with nobody asking") {
+                    world.warn(&world.editor_crashed_text());
+                }
+            }
             None => world.close_window(),
         }
     }
@@ -388,17 +399,21 @@ impl QuitFlow {
         if !kill_rules::retire_on_declined_close(world.facts().exited, world.editor_gone()) {
             return;
         }
-        Self::end_in_place(world, "[window] close declined after nvim exited");
+        if Self::end_in_place(world, "[window] close declined after nvim exited") {
+            world.toast(&world.editor_ended_text());
+        }
     }
 
     /// A restarted nvim that exited before it was ready: nothing asked it to quit and the window is not closed for
     /// it, so the editor ends in place again and says how to start it once more.
     pub fn restarted_nvim_exited(&mut self, world: &mut dyn QuitWorld) {
-        Self::end_in_place(world, "[modules] editor: the restarted nvim exited before it was ready");
+        if Self::end_in_place(world, "[modules] editor: the restarted nvim exited before it was ready") {
+            world.toast(&world.editor_ended_text());
+        }
     }
 
     /// An exited editor cannot keep the keys, so when it is the last module on screen another is shown first.
-    fn end_in_place(world: &mut dyn QuitWorld, why: &str) {
+    fn end_in_place(world: &mut dyn QuitWorld, why: &str) -> bool {
         let ended = match world.end_editor() {
             Err(LayoutError::LastVisible(_)) => world.show_stand_in().and_then(|()| world.end_editor()),
             other => other,
@@ -406,9 +421,12 @@ impl QuitFlow {
         match ended {
             Ok(()) => {
                 println!("{why}; the editor ended in place");
-                world.toast(&world.editor_ended_text());
+                true
             }
-            Err(err) => eprintln!("{why}; the editor could not be ended: {err}"),
+            Err(err) => {
+                eprintln!("{why}; the editor could not be ended: {err}");
+                false
+            }
         }
     }
 

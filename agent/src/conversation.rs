@@ -263,8 +263,9 @@ fn ensure_transcript_is_not_being_written(cwd: &str, provider_session_id: &str) 
     }
 }
 
-/// Best-effort. A conversation that runs but was not recorded is a lost resume offer next time, not
-/// a broken session -- so this logs rather than failing the caller.
+/// A conversation that runs but was not recorded is a lost resume offer next time, not a broken
+/// session -- so this logs rather than failing the caller, says it to the window, and answers whether
+/// the record reached the disk: ingestion tries again while it has not.
 ///
 /// `title` is the session's title if the caller knows one (ingestion hands over the first prompt's,
 /// when that prompt was sent before the session was adopted). A title the record already has always
@@ -277,7 +278,7 @@ pub(crate) fn persist_record(
     provider_advertised_resume: bool,
     title: Option<&str>,
     name: &crate::persistence::NameUpdate,
-) {
+) -> bool {
     let now = epoch_millis();
     // Preserve the original `created_at` when a record already exists: this runs again on every
     // resume of the same session, and rewriting it would turn "when did this conversation start"
@@ -311,8 +312,16 @@ pub(crate) fn persist_record(
         title,
         name,
     };
-    if let Err(e) = save_conversation_record(&record) {
-        eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
+    match save_conversation_record(&record) {
+        Ok(()) => {
+            crate::save_health::saved(crate::save_health::SaveKind::Record);
+            true
+        }
+        Err(e) => {
+            eprintln!("agent: could not persist the conversation record for {conversation_id}: {e}");
+            crate::save_health::failed(crate::save_health::SaveKind::Record, &e);
+            false
+        }
     }
 }
 

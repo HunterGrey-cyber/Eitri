@@ -187,6 +187,19 @@ impl Timers {
     }
 }
 
+/// What an nvim has said about its own end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NvimSaid {
+    /// Nothing, so its exit says nothing about why: it never reached its watch (a start that failed, a socket
+    /// that could not be made), and is taken as a quit.
+    #[default]
+    Nothing,
+    /// It will say when it leaves.
+    Watched,
+    /// It is quitting on purpose.
+    Leaving,
+}
+
 /// Whether this window's editor can receive requests or needs its pane released and restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorRun {
@@ -220,6 +233,8 @@ pub struct Window {
     /// No nvim can take a file and nothing brings one back as things stand: the first start failed, which has no
     /// restart, or nvim went out of reach, which holds until it is ended. A queued open would wait for good.
     pub(super) editor_lost: bool,
+    /// What nvim has said about its own end since it started.
+    pub(super) nvim_said: NvimSaid,
     pub(super) editor_run: EditorRun,
     pub(super) restart_wanted: bool,
     pub(super) release_refused_logged: bool,
@@ -322,6 +337,7 @@ impl Window {
             editor_ready: false,
             queued_opens: VecDeque::new(),
             editor_lost: false,
+            nvim_said: NvimSaid::Nothing,
             editor_run: EditorRun::Running,
             restart_wanted: false,
             release_refused_logged: false,

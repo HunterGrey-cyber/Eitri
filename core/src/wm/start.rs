@@ -417,6 +417,9 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::RestartRefused { win, .. }
             | EditorEvent::Exited { win, .. }
             | EditorEvent::Unreachable { win }
+            | EditorEvent::Watched { win }
+            | EditorEvent::Leaving { win }
+            | EditorEvent::Recoverable { win, .. }
             | EditorEvent::QuitNotSent { win, .. }
             | EditorEvent::ScaleReported { win, .. }
             | EditorEvent::QuitAnswered { win, .. }

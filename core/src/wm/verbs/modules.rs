@@ -2969,6 +2969,108 @@ mod restart_tests {
         );
     }
 
+    /// A rig with nvim running on screen as the only module the kill would reach.
+    fn exited_on_its_own(r: &Rig) -> Vec<HostOp> {
+        let at = r.ops().len();
+        r.host.set_editor_facts(EditorFacts {
+            exited: true,
+            ..Default::default()
+        });
+        r.event(EditorEvent::Exited {
+            win: WIN,
+            settled: None,
+        });
+        r.scheduler.advance(Duration::ZERO);
+        r.ops()[at..].to_vec()
+    }
+
+    #[test]
+    fn nvim_going_without_a_word_keeps_the_window_and_says_how_to_start_it() {
+        let r = Rig::new();
+        r.event(EditorEvent::Watched { win: WIN });
+        let ops = exited_on_its_own(&r);
+        assert!(!ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
+        let (text, kind) = r.driver.query(|c| {
+            let toast = c.chrome(WIN).toast.unwrap();
+            (toast.text, Some(toast.kind))
+        });
+        assert_eq!(
+            text,
+            "nvim stopped unexpectedly \u{2014} C-b e starts it again and says what can be recovered"
+        );
+        assert_eq!(kind, Some(crate::wm::toasts::ToastKind::Warning));
+        assert!(
+            r.driver.query(|c| c.chrome(WIN).prompt.is_none()),
+            "nothing asks to close"
+        );
+    }
+
+    #[test]
+    fn nvim_that_said_it_was_leaving_closes_the_window_as_a_quit_does() {
+        let r = Rig::new();
+        r.event(EditorEvent::Watched { win: WIN });
+        r.event(EditorEvent::Leaving { win: WIN });
+        let ops = exited_on_its_own(&r);
+        assert!(ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
+    }
+
+    #[test]
+    fn an_nvim_that_never_said_it_was_watched_closes_the_window_as_before() {
+        let r = Rig::new();
+        let ops = exited_on_its_own(&r);
+        assert!(ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
+    }
+
+    #[test]
+    fn a_restart_starts_from_nothing_said() {
+        let r = Rig::new();
+        r.event(EditorEvent::Watched { win: WIN });
+        exited_on_its_own(&r);
+        r.release();
+        r.key();
+        r.event(EditorEvent::Ready { win: WIN });
+        r.event(EditorEvent::Watched { win: WIN });
+        r.event(EditorEvent::Leaving { win: WIN });
+        let ops = exited_on_its_own(&r);
+        assert!(ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. })));
+    }
+
+    #[test]
+    fn what_a_start_found_in_swap_files_is_one_line_that_stays_to_be_read() {
+        let r = Rig::new();
+        r.event(EditorEvent::Recoverable {
+            win: WIN,
+            count: 2,
+            newest: "src/a.txt".into(),
+        });
+        let (text, kind) = r.driver.query(|c| {
+            let toast = c.chrome(WIN).toast.unwrap();
+            (toast.text, Some(toast.kind))
+        });
+        assert_eq!(
+            text,
+            "unsaved changes kept for 2 files, newest src/a.txt \u{2014} :e the file, then r recovers them or d \
+             deletes them"
+        );
+        assert_eq!(kind, Some(crate::wm::toasts::ToastKind::Warning));
+    }
+
+    #[test]
+    fn a_second_warning_joins_the_first_and_the_same_one_does_not_repeat() {
+        let r = Rig::new();
+        let found = |newest: &str| EditorEvent::Recoverable {
+            win: WIN,
+            count: 1,
+            newest: newest.into(),
+        };
+        r.event(found("a.txt"));
+        r.event(found("b.txt"));
+        r.event(found("b.txt"));
+        let text = r.driver.query(|c| c.chrome(WIN).toast.unwrap().text);
+        assert_eq!(text.matches("a.txt").count(), 1, "{text}");
+        assert_eq!(text.matches("b.txt").count(), 1, "{text}");
+    }
+
     #[test]
     fn a_restarted_nvim_that_exits_before_it_is_ready_ends_in_place_again() {
         let r = Rig::ended();

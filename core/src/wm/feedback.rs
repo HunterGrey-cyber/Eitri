@@ -253,14 +253,30 @@ pub fn layout_refusal_text(err: &LayoutError) -> String {
     gone_editor_toast_text(err).unwrap_or_else(|| err.to_string())
 }
 
-/// What the ended editor's toasts say, after a `prefix x`, a `:qa` or a crash, which nothing here can tell apart:
-/// nvim exited, and the key that starts it again. It names no cause it does not know -- a text naming `:qa` or
-/// `prefix x` would be wrong after a crash -- and it is one function, so every toast of the ended editor reads the
-/// same whichever path ended it. The key is the window's own (its prefix and the editor's module key), written in
+/// What the ended editor's toasts say where the cause is not known: nvim exited, and the key that starts it again.
+/// It names no cause -- a text naming `:qa` or `prefix x` would be wrong after a close that was declined later.
+/// A crash has its own text ([`editor_crashed_text`]). The key is the window's own (its prefix and the editor's module key), written in
 /// tmux's notation (`C-b e`) as tmux's own messages name keys; with no key bound, the action's name.
 pub fn editor_ended_text(keymap: &crate::keymap::Keymap) -> String {
     let key = super::verbs::key_text(keymap, &Action::Module(ModuleId::editor())).replace("Ctrl+", "C-");
     format!("nvim exited \u{2014} {key} starts it again")
+}
+
+/// nvim ended with nobody asking. A start says what can be recovered, so this points there rather than promise
+/// anything survived.
+pub fn editor_crashed_text(keymap: &crate::keymap::Keymap) -> String {
+    let key = super::verbs::key_text(keymap, &Action::Module(ModuleId::editor())).replace("Ctrl+", "C-");
+    format!("nvim stopped unexpectedly \u{2014} {key} starts it again and says what can be recovered")
+}
+
+/// What a start found in swap files, and nvim's own way to it: `:e` raises the swap prompt, whose `r` recovers
+/// and `d` deletes. Nothing is recovered unless the person does that.
+pub fn recoverable_text(count: u32, newest: &str) -> String {
+    let files = match count {
+        1 => newest.to_string(),
+        count => format!("{count} files, newest {newest}"),
+    };
+    format!("unsaved changes kept for {files} \u{2014} :e the file, then r recovers them or d deletes them")
 }
 
 /// Requests must wait until the restarted nvim can receive them.

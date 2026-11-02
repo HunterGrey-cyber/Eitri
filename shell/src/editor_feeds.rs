@@ -176,6 +176,17 @@ impl FeedPump {
 
     /// One poll, then the handlers: the theme's, the keys', each pane message in order, then the poll's
     /// follow lines in one call. The poll's borrow of the feeds ends before any handler runs.
+    /// Reads what the feeds hold now, ahead of their next wake: for an event that must be judged after whatever
+    /// reached them before it. One read is bounded, so a burst takes a few.
+    pub(crate) fn drain(&self) {
+        for _ in 0..8 {
+            self.tick();
+            if self.feeds.borrow().is_quiet() {
+                return;
+            }
+        }
+    }
+
     fn tick(&self) {
         #[cfg(test)]
         self.ticks.set(self.ticks.get() + 1);

@@ -38,6 +38,8 @@ pub const HUB_OTHERS: &str = "chats";
 
 /// How long a toast stays up; a new one starts its time again.
 pub const TOAST_FOR: Duration = Duration::from_secs(4);
+/// How long a [`ToastKind::Warning`] stays.
+pub const WARNING_FOR: Duration = Duration::from_secs(15);
 
 /// A window's chrome as the controller decides it.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -359,8 +361,19 @@ pub(super) fn refused(w: &mut Window, text: &str) {
     show_toast(w, text.to_string(), ToastKind::Other);
 }
 
-/// Puts `text` up as the toast, a new serial, for [`TOAST_FOR`].
+/// Puts `text` up as the toast, a new serial, for [`TOAST_FOR`] or a warning's [`WARNING_FOR`]. A warning joins one
+/// already up: each is said once, and two moments apart must not lose the first.
 pub(super) fn show_toast(w: &mut Window, text: String, kind: ToastKind) {
+    let shown = if kind == ToastKind::Warning {
+        WARNING_FOR
+    } else {
+        TOAST_FOR
+    };
+    let text = match &w.chrome.toast {
+        Some(up) if kind == ToastKind::Warning && up.kind == kind && up.text.contains(&text) => up.text.clone(),
+        Some(up) if kind == ToastKind::Warning && up.kind == kind => format!("{}; {text}", up.text),
+        _ => text,
+    };
     w.chrome_state.toast_serial += 1;
     w.chrome.toast = Some(Toast {
         text,
@@ -372,7 +385,7 @@ pub(super) fn show_toast(w: &mut Window, text: String, kind: ToastKind) {
     if let Some(old) = w.chrome_state.toast_timer.take() {
         w.cancel_timer(old);
     }
-    w.chrome_state.toast_timer = Some(w.arm_after(TOAST_FOR));
+    w.chrome_state.toast_timer = Some(w.arm_after(shown));
 }
 
 /// A timer fired: when it is the toast's, its time is up and it goes. `false` when `token` is not the toast's.

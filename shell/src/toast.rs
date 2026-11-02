@@ -8,7 +8,7 @@ use std::time::Duration;
 // The toast's distance from the edge of what it sits over is core's, because `close_prompt`'s corner margin in
 // Immersive is the same one: the two overlay labels share it. How long a toast stays up is core's too, since the
 // window's chrome model times the toasts it shows.
-use eitri_core::wm::chrome::TOAST_FOR;
+use eitri_core::wm::chrome::{TOAST_FOR, WARNING_FOR};
 use eitri_core::wm::close::TOAST_MARGIN;
 use eitri_core::wm::toasts::{after_timed, toast_top, ToastKind};
 use gtk4::glib;
@@ -98,7 +98,10 @@ impl Toast {
         patience: Duration,
         shown: Option<Box<dyn FnOnce()>>,
     ) {
-        let busy = matches!(self.showing.get(), Some(ToastKind::Other | ToastKind::Attention));
+        let busy = matches!(
+            self.showing.get(),
+            Some(ToastKind::Other | ToastKind::Attention | ToastKind::Warning)
+        );
         if !busy || patience < NOTICE_WAIT_STEP {
             self.show_for(&text, duration);
             if let Some(shown) = shown {
@@ -118,6 +121,11 @@ impl Toast {
     /// window's chrome model keeps it up against refusals: a refusal meanwhile shows no toast.
     pub(crate) fn show_attention(self: &Rc<Self>, text: &str) {
         self.show_kind(text, TOAST_FOR, ToastKind::Attention);
+    }
+
+    /// A line that says something may be lost, for [`WARNING_FOR`].
+    pub(crate) fn show_warning(self: &Rc<Self>, text: &str) {
+        self.show_kind(text, WARNING_FOR, ToastKind::Warning);
     }
 
     /// A note that stays up until it is set again: `Some` shows it now and after every timed line, `None` takes

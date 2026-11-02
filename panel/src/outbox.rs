@@ -77,6 +77,8 @@ pub(super) enum Effect {
     Send(Dest, Payload),
     /// One line in the window's toast.
     Toast(String),
+    /// A line that says something is not reaching the disk.
+    Warning(String),
     /// The window shows this view and gives it the keys.
     ShowView(ViewId),
     /// This extra view holds no tab any more: the window removes it and idles its page.
@@ -256,6 +258,12 @@ impl Outbox {
                 }
                 Effect::Toast(text) => {
                     let hook = state.borrow().toast_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(&text);
+                    }
+                }
+                Effect::Warning(text) => {
+                    let hook = state.borrow().warning_hook.clone();
                     if let Some(hook) = hook {
                         hook(&text);
                     }

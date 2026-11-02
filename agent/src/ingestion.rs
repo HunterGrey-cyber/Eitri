@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// How many folded events may wait for the UI before it is told to resynchronise instead.
 ///
@@ -183,7 +184,8 @@ struct IngestState {
     /// ([`SessionIdSlot`]) becoming `Some`: adoption sets the id under the lock and writes the record after releasing
     /// it, and a title written into that gap found no record and was lost (reproduced 20/20). `true`
     /// from the start for a resume, whose record `resume()` writes before
-    /// it returns.
+    /// it returns. `false` again after a write that failed: the record is tried again
+    /// (`retry_record`) and what waits for it keeps waiting.
     record_written: bool,
     /// Whether this conversation has produced something worth storing since its history was last
     /// written. Set by `fold` at a turn's end, the session's end, and inside a turn at a question's
@@ -1134,12 +1136,15 @@ fn ingest_loop(
     // Until the provider or this side raises the signal: an unfreeze raises it too, so a frozen
     // thread wakes when it is let go.
     let idle = |seen: Option<u64>| match (&announced, seen) {
+        // A record owed has its own clock, which no provider event follows.
+        (Some(_), Some(_)) if record_owed(&state, &session_id) => std::thread::sleep(RECORD_OWED_POLL),
         // The stop is looked at again under the signal's lock: one that landed after the check above
         // already raised the signal before `seen` was read, so the count alone would not end this
         // wait.
         (Some(signal), Some(seen)) => signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst)),
         _ => std::thread::sleep(INGEST_POLL_INTERVAL),
     };
+    let mut record_tried_at = None;
     while !stop.load(Ordering::SeqCst) {
         #[cfg(test)]
         idle_wakeups::between_the_check_and_the_look(&context.conversation_id);
@@ -1162,6 +1167,7 @@ fn ingest_loop(
             .filter(|through| Some(*through) != noted_through);
         noted_through = through.or(noted_through);
         // Before the idle check, so a title noted while the provider is quiet still gets written.
+        retry_record(&state, &session_id, &context, &mut record_tried_at);
         flush_title(&state, &session_id, &context);
         flush_name(&state, &session_id, &context);
         // Likewise: the turn whose completion marked the history dirty is usually the last event of
@@ -1194,6 +1200,9 @@ fn ingest_loop(
     // frozen: a frozen conversation writes nothing, its history goes with its move.
     let gate = pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !frozen.load(Ordering::SeqCst) {
+        retry_record(&state, &session_id, &context, &mut None);
+        flush_title(&state, &session_id, &context);
+        flush_name(&state, &session_id, &context);
         flush_history(&state, &session_id, &context);
     }
     drop(gate);
@@ -1204,6 +1213,8 @@ fn ingest_loop(
 /// released after the writes.
 struct ClearedSession {
     provider_session_id: String,
+    /// Whether its record is on disk.
+    recorded: bool,
     history: Option<crate::history::HistoryParts>,
     title: Option<String>,
     name: Option<Option<String>>,
@@ -1240,11 +1251,21 @@ fn fold_batch(
         // After the lock is released: the UI takes the same lock when it is woken.
         wake_ui(ui_wake);
         if let Some(provider_session_id) = stretch.adopt {
-            let lease = adopt_provider_session(context, &provider_session_id, stretch.title.as_deref(), stretch.name);
+            let (lease, recorded) = adopt_provider_session(
+                context,
+                &provider_session_id,
+                stretch.title.as_deref(),
+                stretch.name.clone(),
+            );
             {
                 let mut guard = state.lock().unwrap();
                 guard.lease = lease;
-                guard.record_written = true;
+                guard.record_written = recorded;
+                // What the failed record would have carried waits with what comes later, for the next try.
+                if !recorded {
+                    guard.pending_title = guard.pending_title.take().or(stretch.title);
+                    guard.pending_name = guard.pending_name.take().or(stretch.name);
+                }
             }
             wake_ui(ui_wake);
         }
@@ -1350,14 +1371,12 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
     let lease = guard.lease.take();
     let provider_session_id = old?;
     let history = had_record.then(|| history_snapshot(&guard.projection));
-    // A title or name noted for the old conversation belongs in its record, not the new one's.
-    let (title, name) = if had_record {
-        (guard.pending_title.take(), guard.pending_name.take())
-    } else {
-        (None, None)
-    };
+    // A title or name noted for the old conversation belongs in its record, not the new one's. With no
+    // record yet (`adopt` had not run, or its write failed) the session is known here, so it gets one.
+    let (title, name) = (guard.pending_title.take(), guard.pending_name.take());
     Some(ClearedSession {
         provider_session_id,
+        recorded: had_record,
         history,
         title,
         name,
@@ -1371,11 +1390,27 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
 fn write_cleared_session(context: &AdoptionContext, cleared: ClearedSession) -> Option<bool> {
     let ClearedSession {
         provider_session_id,
+        recorded,
         history,
         title,
         name,
         lease,
     } = cleared;
+    if !recorded {
+        crate::conversation::persist_record(
+            context.provider_name,
+            &context.conversation_id,
+            &context.canonical_cwd,
+            &provider_session_id,
+            context.provider_advertises_resume,
+            title.as_deref(),
+            &name
+                .map(crate::persistence::NameUpdate::Set)
+                .unwrap_or(crate::persistence::NameUpdate::Keep),
+        );
+        drop(lease);
+        return None;
+    }
     let stored = history.map(|parts| store_history(context, &provider_session_id, parts));
     if let Some(title) = title {
         if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title)
@@ -1411,6 +1446,55 @@ fn flush_title(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, c
     };
     if let Err(e) = crate::persistence::set_title_if_missing(&context.conversation_id, &provider_session_id, &title) {
         eprintln!("agent: could not record the title of session {provider_session_id}: {e}");
+    }
+}
+
+/// How often a record that did not reach the disk is tried again.
+const RECORD_RETRY: Duration = Duration::from_secs(5);
+
+/// How often the loop comes round while a record is owed, with nothing else to wake it.
+const RECORD_OWED_POLL: Duration = Duration::from_millis(250);
+
+/// Whether a session known to this thread has no record on disk yet.
+fn record_owed(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>) -> bool {
+    !state.lock().unwrap().record_written && read_session_id(session_id).is_some()
+}
+
+/// Tries again a record that did not reach the disk at adoption, so a session started on a full disk is
+/// in the list once there is room. At most every [`RECORD_RETRY`]: this runs on every poll, and a full
+/// disk must not turn into thirty failures a second. A title and a name still owed follow through
+/// `flush_title` and `flush_name`.
+fn retry_record(
+    state: &Mutex<IngestState>,
+    session_id: &Mutex<Option<String>>,
+    context: &AdoptionContext,
+    tried_at: &mut Option<Instant>,
+) {
+    let provider_session_id = {
+        if state.lock().unwrap().record_written {
+            return;
+        }
+        let Some(id) = read_session_id(session_id) else {
+            return;
+        };
+        let now = Instant::now();
+        if tried_at.is_some_and(|at| now.duration_since(at) < RECORD_RETRY) {
+            return;
+        }
+        *tried_at = Some(now);
+        id
+    };
+    let recorded = crate::conversation::persist_record(
+        context.provider_name,
+        &context.conversation_id,
+        &context.canonical_cwd,
+        &provider_session_id,
+        context.provider_advertises_resume,
+        None,
+        &crate::persistence::NameUpdate::Keep,
+    );
+    if recorded {
+        state.lock().unwrap().record_written = true;
     }
 }
 
@@ -1505,8 +1589,10 @@ fn store_history(context: &AdoptionContext, provider_session_id: &str, parts: cr
     tests::hold_history_write(&context.conversation_id);
     if let Err(e) = crate::history::store::save(&history) {
         eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
+        crate::save_health::failed(crate::save_health::SaveKind::History, &e);
         return false;
     }
+    crate::save_health::saved(crate::save_health::SaveKind::History);
     // The turn changed the conversation, so the record's "last used" moves with it: the session picker
     // and the launch offer lead with the session used last, not the one opened last.
     if let Err(e) = crate::persistence::touch_updated_at(
@@ -1532,7 +1618,7 @@ fn adopt_provider_session(
     provider_session_id: &str,
     title: Option<&str>,
     name: Option<Option<String>>,
-) -> Option<SessionLease> {
+) -> (Option<SessionLease>, bool) {
     let lease = match SessionLease::try_acquire(context.provider_name, &context.canonical_cwd, provider_session_id) {
         Ok(lease) => Some(lease),
         Err(e @ crate::lease::LeaseError::AlreadyHeld) => {
@@ -1553,7 +1639,7 @@ fn adopt_provider_session(
             None
         }
     };
-    crate::conversation::persist_record(
+    let recorded = crate::conversation::persist_record(
         context.provider_name,
         &context.conversation_id,
         &context.canonical_cwd,
@@ -1564,7 +1650,7 @@ fn adopt_provider_session(
             .map(crate::persistence::NameUpdate::Set)
             .unwrap_or(crate::persistence::NameUpdate::Keep),
     );
-    lease
+    (lease, recorded)
 }
 
 #[cfg(test)]
@@ -2000,6 +2086,88 @@ pub(crate) mod tests {
         state.lock().unwrap().record_written = true;
         flush_history(&state, &session_id, &adoption_context(&conversation_id));
         assert!(crate::history::store::load(&conversation_id, "sess-in-the-gap").is_ok());
+    }
+
+    /// A session started on a full disk has no record, and so no place in the list. Once there is room it
+    /// gets one, with the title and history that waited for it.
+    #[test]
+    fn a_record_that_could_not_be_written_is_written_once_it_can_be() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let conversations = crate::state_dirs::conversations_dir().unwrap();
+        std::fs::create_dir_all(&conversations).unwrap();
+        // A file where the conversation's directory goes: no write under it can work.
+        let blocked = conversations.join(&conversation_id);
+        std::fs::write(&blocked, "").unwrap();
+        let mut initial = state();
+        initial.record_written = false;
+        initial.history_dirty = true;
+        initial.pending_title = Some("the first prompt".to_string());
+        initial
+            .projection
+            .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        let state = Mutex::new(initial);
+        let session_id = Mutex::new(Some("sess-full-disk".to_string()));
+        let context = adoption_context(&conversation_id);
+
+        let mut tried = None;
+        retry_record(&state, &session_id, &context, &mut tried);
+        assert!(!state.lock().unwrap().record_written);
+        assert!(
+            tried.is_some(),
+            "the try is remembered, so the next poll does not repeat it"
+        );
+
+        std::fs::remove_file(&blocked).unwrap();
+        retry_record(&state, &session_id, &context, &mut tried);
+        assert!(
+            !state.lock().unwrap().record_written,
+            "within the pause, nothing is tried"
+        );
+        assert!(crate::persistence::resumable_sessions(&conversation_id).is_empty());
+
+        tried = None;
+        retry_record(&state, &session_id, &context, &mut tried);
+        assert!(state.lock().unwrap().record_written);
+        flush_title(&state, &session_id, &context);
+        flush_history(&state, &session_id, &context);
+        let listed = crate::persistence::resumable_sessions(&conversation_id);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title.as_deref(), Some("the first prompt"));
+        assert!(crate::history::store::load(&conversation_id, "sess-full-disk").is_ok());
+    }
+
+    /// The loop sleeps on the provider's signal, which no failed write raises: a record owed keeps it polling.
+    #[test]
+    fn a_session_with_no_record_keeps_the_loop_coming_round() {
+        let mut initial = state();
+        initial.record_written = false;
+        let state = Mutex::new(initial);
+        assert!(
+            !record_owed(&state, &Mutex::new(None)),
+            "no session yet: nothing to record"
+        );
+        let session = Mutex::new(Some("sess".to_string()));
+        assert!(record_owed(&state, &session));
+        state.lock().unwrap().record_written = true;
+        assert!(!record_owed(&state, &session));
+    }
+
+    /// A title noted for a session whose record never landed is that session's, not the next one's.
+    #[test]
+    fn a_clear_before_the_record_landed_keeps_the_old_title_off_the_new_session() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut guard = state();
+        guard.record_written = false;
+        guard.pending_title = Some("the old session".to_string());
+        let session_id = Mutex::new(Some("sess-old".to_string()));
+        let cleared = detach_for_reset(&mut guard, &session_id).expect("a session to detach");
+        assert_eq!(guard.pending_title, None);
+        assert!(!cleared.recorded);
+        write_cleared_session(&adoption_context(&conversation_id), cleared);
+        let listed = crate::persistence::resumable_sessions(&conversation_id);
+        assert_eq!(listed[0].title.as_deref(), Some("the old session"));
     }
 
     /// A turn that changed the conversation moves the record's `updated_at` and leaves the rest of it
@@ -2674,6 +2842,27 @@ pub(crate) mod tests {
         assert!(c.released("sess-a") && c.released("sess-b"));
         assert!(c.leased("sess-c"));
         assert_eq!(read_session_id(&c.slot).as_deref(), Some("sess-c"));
+    }
+
+    /// A reset right after a failed record: the stretch ends at the reset, the title waits, and the reset takes it
+    /// with the old session rather than leave it for the next one.
+    #[test]
+    fn a_reset_right_after_a_failed_record_keeps_the_title_with_the_old_session() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let mut c = Driven::new();
+        c.state.lock().unwrap().pending_title = Some("the old session".to_string());
+        let conversations = crate::state_dirs::conversations_dir().unwrap();
+        std::fs::create_dir_all(&conversations).unwrap();
+        let blocked = conversations.join(&c.context.conversation_id);
+        let _ = std::fs::remove_dir_all(&blocked);
+        std::fs::write(&blocked, "").unwrap();
+        c.batch(vec![opened("sess-a"), reset("sess-b")]);
+        std::fs::remove_file(&blocked).unwrap();
+        assert_eq!(
+            c.state.lock().unwrap().pending_title,
+            None,
+            "nothing waits for the next session"
+        );
     }
 
     /// The old conversation, settled and stored, with the provider position it has folded through and

@@ -193,7 +193,11 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
     } = parts;
     PanelHooks {
         on_hint: Some(Box::new(move |message: HintInbound| hint(message))),
-        on_toast: Some(Box::new(move |text: &str| toast(text))),
+        on_toast: Some(Box::new({
+            let toast = toast.clone();
+            move |text: &str| toast(text)
+        })),
+        on_warning: Some(Box::new(move |text: &str| toast(text))),
         on_editor_request: Some(Box::new(move |request: &ScratchRequest| editor_request(request))),
         set_editor_rpc: Some(editor_rpc),
         set_review_owner: Some(Box::new(move || review_owner())),

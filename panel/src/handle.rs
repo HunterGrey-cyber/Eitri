@@ -1453,6 +1453,12 @@ impl AgentPanelHandle {
         self.state.borrow_mut().toast_hook = Some(Rc::new(hook));
     }
 
+    /// Where a line goes that says something is not reaching the disk. `main.rs` installs this once.
+    pub fn on_warning(&self, hook: impl Fn(&str) + 'static) {
+        self.wake();
+        self.state.borrow_mut().warning_hook = Some(Rc::new(hook));
+    }
+
     /// Records whether `view`'s pane has keyboard focus and tells its live document, which
     /// dims its mode block when it does not. Safe before the page has loaded for the same reason
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
@@ -2487,6 +2493,17 @@ impl AgentPanelHandle {
         state.tabs.running_count()
     }
 
+    /// Tabs whose unsent text would go with the window.
+    pub fn unsaved_draft_count(&self) -> usize {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return 0;
+        }
+        state
+            .tabs
+            .unsaved_draft_count(state.restore_policy != RestorePolicy::Off)
+    }
+
     /// Tabs with live non-ambient background work across the window.
     pub fn background_count(&self) -> usize {
         let state = self.state.borrow();
@@ -2973,6 +2990,7 @@ mod tests {
             "tab_place",
             "newest_card_label_in",
             "running_count",
+            "unsaved_draft_count",
             "background_count",
             "view_background_count",
             "queued_count",
@@ -3230,6 +3248,7 @@ mod tests {
                     view: None,
                     window: None,
                     turn_running: false,
+                    draft: None,
                 }],
                 0,
                 Vec::new(),

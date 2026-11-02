@@ -327,7 +327,19 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
 /// at a prompt is not one), which closing the window ends, so the window asks about those too. With
 /// no jobs it is exactly `window_close_prompt(running, queued, background)`.
 pub fn window_close_prompt_with_jobs(running: usize, queued: usize, jobs: usize, background: usize) -> Option<String> {
-    counts_text(running, queued, jobs, background).map(|here| format!("close window? {here} (y/n)"))
+    window_close_prompt_with_drafts(running, queued, jobs, background, 0)
+}
+
+/// [`window_close_prompt_with_jobs`] for a window with `drafts` tabs whose unsent text will not come back: it is
+/// lost with the window, as a terminal's job is, so the window asks about those too.
+pub fn window_close_prompt_with_drafts(
+    running: usize,
+    queued: usize,
+    jobs: usize,
+    background: usize,
+    drafts: usize,
+) -> Option<String> {
+    counts_text(running, queued, jobs, background, drafts).map(|here| format!("close window? {here} (y/n)"))
 }
 
 /// The window asks while a tab has a running turn, waiting question, queued message or background work. A message
@@ -349,7 +361,7 @@ pub struct OtherWindow<'a> {
 
 /// The counted part of a close prompt: turns running, messages queued, and terminals running a job in the
 /// foreground, plus tabs with background work. `None` when all counts are zero.
-fn counts_text(running: usize, queued: usize, jobs: usize, background: usize) -> Option<String> {
+fn counts_text(running: usize, queued: usize, jobs: usize, background: usize, drafts: usize) -> Option<String> {
     let mut parts = Vec::new();
     if running > 0 {
         parts.push(format!("{running} running"));
@@ -365,6 +377,11 @@ fn counts_text(running: usize, queued: usize, jobs: usize, background: usize) ->
         1 => parts.push("1 terminal job".to_string()),
         n => parts.push(format!("{n} terminal jobs")),
     }
+    match drafts {
+        0 => {}
+        1 => parts.push("1 unsent draft".to_string()),
+        n => parts.push(format!("{n} unsent drafts")),
+    }
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
@@ -377,14 +394,15 @@ pub fn linked_window_close_prompt(
     queued: usize,
     jobs: usize,
     background: usize,
+    drafts: usize,
     other: Option<OtherWindow<'_>>,
     movable: usize,
 ) -> Option<String> {
     let Some(other) = other else {
-        return window_close_prompt_with_jobs(running, queued, jobs, background);
+        return window_close_prompt_with_drafts(running, queued, jobs, background, drafts);
     };
-    let here = counts_text(running, queued, jobs, background)?;
-    let there = counts_text(other.running, other.queued, 0, 0).unwrap_or_else(|| "idle".to_string());
+    let here = counts_text(running, queued, jobs, background, drafts)?;
+    let there = counts_text(other.running, other.queued, 0, 0, 0).unwrap_or_else(|| "idle".to_string());
     let stays = if other.stays_without_editor {
         " (stays open without the editor)"
     } else {
@@ -404,12 +422,18 @@ pub fn linked_window_close_prompt(
 /// Window 1's close prompt in `compositor` mode: it closes the module windows with it, so it asks whatever they are
 /// doing, and it moves nothing. `running` and `queued` are the whole group's.
 pub fn group_close_prompt(windows: usize, running: usize, queued: usize) -> String {
-    group_close_prompt_with_jobs(windows, running, queued, 0)
+    group_close_prompt_with_jobs(windows, running, queued, 0, 0)
 }
 
 /// [`group_close_prompt`] for a window that also holds terminals: `jobs` is how many run a job in the foreground, which
 /// the close ends as a window's close does.
-pub fn group_close_prompt_with_jobs(windows: usize, running: usize, queued: usize, jobs: usize) -> String {
+pub fn group_close_prompt_with_jobs(
+    windows: usize,
+    running: usize,
+    queued: usize,
+    jobs: usize,
+    drafts: usize,
+) -> String {
     let windows = match windows {
         1 => "1 window".to_string(),
         n => format!("{n} windows"),
@@ -420,7 +444,7 @@ pub fn group_close_prompt_with_jobs(windows: usize, running: usize, queued: usiz
         1 => parts.push("1 turn is running".to_string()),
         n => parts.push(format!("{n} turns are running")),
     }
-    parts.extend(counts_text(0, queued, jobs, 0));
+    parts.extend(counts_text(0, queued, jobs, 0, drafts));
     if parts.is_empty() {
         return format!("close Eitri and its {windows}? (y/n)");
     }
@@ -677,7 +701,20 @@ mod tests {
             "close Eitri and its 3 windows? 1 queued (y/n)"
         );
         assert_eq!(
-            group_close_prompt_with_jobs(1, 0, 0, 1),
+            group_close_prompt_with_jobs(1, 0, 0, 0, 1),
+            "close Eitri and its 1 window? 1 unsent draft (y/n)"
+        );
+        assert_eq!(
+            window_close_prompt_with_drafts(1, 0, 0, 0, 2).as_deref(),
+            Some("close window? 1 running, 2 unsent drafts (y/n)")
+        );
+        assert_eq!(
+            window_close_prompt_with_drafts(0, 0, 0, 0, 1).as_deref(),
+            Some("close window? 1 unsent draft (y/n)")
+        );
+        assert_eq!(window_close_prompt_with_drafts(0, 0, 0, 0, 0), None);
+        assert_eq!(
+            group_close_prompt_with_jobs(1, 0, 0, 1, 0),
             "close Eitri and its 1 window? 1 terminal job (y/n)"
         );
     }
@@ -691,7 +728,7 @@ mod tests {
             stays_without_editor: true,
         };
         assert_eq!(
-            linked_window_close_prompt(1, 0, 0, 0, Some(other), 1).as_deref(),
+            linked_window_close_prompt(1, 0, 0, 0, 0, Some(other), 1).as_deref(),
             Some("close window? 1 running here; window 2: 2 running (stays open without the editor) (y/n, m: move 1 to window 2)")
         );
         let idle_one = OtherWindow {
@@ -701,16 +738,16 @@ mod tests {
             stays_without_editor: false,
         };
         assert_eq!(
-            linked_window_close_prompt(0, 2, 0, 0, Some(idle_one), 0).as_deref(),
+            linked_window_close_prompt(0, 2, 0, 0, 0, Some(idle_one), 0).as_deref(),
             Some("close window? 2 queued here; window 1: idle (y/n)")
         );
         assert_eq!(
-            linked_window_close_prompt(0, 0, 0, 0, Some(other), 0),
+            linked_window_close_prompt(0, 0, 0, 0, 0, Some(other), 0),
             None,
             "nothing here: no prompt, as today"
         );
         assert_eq!(
-            linked_window_close_prompt(1, 1, 0, 0, None, 0),
+            linked_window_close_prompt(1, 1, 0, 0, 0, None, 0),
             window_close_prompt(1, 1, 0)
         );
     }
@@ -724,16 +761,16 @@ mod tests {
             stays_without_editor: false,
         };
         assert_eq!(
-            linked_window_close_prompt(0, 0, 1, 0, Some(other), 1).as_deref(),
+            linked_window_close_prompt(0, 0, 1, 0, 0, Some(other), 1).as_deref(),
             Some("close window? 1 terminal job here; window 2: 1 queued (y/n, m: move 1 to window 2)"),
             "a terminal job alone is reason enough to ask"
         );
         assert_eq!(
-            linked_window_close_prompt(1, 0, 2, 0, Some(other), 0).as_deref(),
+            linked_window_close_prompt(1, 0, 2, 0, 0, Some(other), 0).as_deref(),
             Some("close window? 1 running, 2 terminal jobs here; window 2: 1 queued (y/n)")
         );
         assert_eq!(
-            linked_window_close_prompt(1, 1, 2, 0, None, 0),
+            linked_window_close_prompt(1, 1, 2, 0, 0, None, 0),
             window_close_prompt_with_jobs(1, 1, 2, 0),
             "unlinked, the prompt is the one a single window asks"
         );
@@ -748,12 +785,12 @@ mod tests {
             stays_without_editor: false,
         };
         assert_eq!(
-            linked_window_close_prompt(0, 0, 0, 2, Some(other), 0).as_deref(),
+            linked_window_close_prompt(0, 0, 0, 2, 0, Some(other), 0).as_deref(),
             Some("close window? 2 with background tasks here; window 2: 1 running (y/n)"),
             "background work alone is reason enough to ask"
         );
         assert_eq!(
-            linked_window_close_prompt(1, 0, 1, 1, None, 0),
+            linked_window_close_prompt(1, 0, 1, 1, 0, None, 0),
             window_close_prompt_with_jobs(1, 0, 1, 1)
         );
     }

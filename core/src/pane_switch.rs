@@ -3,6 +3,8 @@
 //! `Q <generation>`, is sent by
 //! [`crate::layout::kill::editor_quit_lua`] when a `:confirm qall` it asked nvim for is cancelled; a
 //! third, `W <word>…`, carries the words of an `:Eitri` command ([`crate::nvim_verbs`] reads them).
+//! `editor_watch.lua` sends the rest: `nvim-watched` and `nvim-leaving` tell an asked quit from a
+//! crash, and `S <count> <name>` names the project's files with unsaved changes in swap files.
 //! Toolkit-free.
 //!
 //! The same directory holds `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l`
@@ -116,6 +118,16 @@ const NAV_LUA_NAME: &str = "nav_fallback.lua";
 /// plain `<C-W>{dir}` move.
 pub(crate) const NAV_FALLBACK_LUA: &str = include_str!("nav_fallback.lua");
 
+/// The editor watch's file name inside the channel's directory, beside the nav fallback's.
+const WATCH_LUA_NAME: &str = "editor_watch.lua";
+
+/// What tells the window that nvim is leaving on purpose, and what a start finds in swap files.
+pub(crate) const EDITOR_WATCH_LUA: &str = include_str!("editor_watch.lua");
+
+/// The editor watch's `--cmd`, guarded as [`NAV_LOADER_CMD`] is.
+pub(crate) const WATCH_LOADER_CMD: &str =
+    "lua local p = vim.env.EITRI_EDITOR_WATCH_LUA; if p and p ~= '' then pcall(dofile, p) end";
+
 /// The one `--cmd`, guarded the way `nvim_keys`'s loader is: the path is checked before
 /// `dofile`, because `dofile(nil)` reads stdin -- under `--embed`, the RPC pipe -- and the load is
 /// `pcall`ed, so a broken snippet costs the fallback, never the editor.
@@ -137,6 +149,9 @@ pub struct PaneSwitchChannel {
     /// `None` when the snippet could not be written: the channel still serves the shim, and nvim
     /// simply gets no fallback (neither `EITRI_NAV_LUA` nor the loader).
     nav_lua: Option<PathBuf>,
+    /// `None` when the snippet could not be written: nvim then never says it is watched, and its exit
+    /// is taken as a quit, as with no socket at all.
+    watch_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
     /// Whether `bin/tmux` was linked in. Without it the child gets neither the fake `TMUX`
     /// variables nor a `PATH` that leads into a directory that does not exist.
@@ -253,6 +268,18 @@ impl PaneSwitchChannel {
             }
         };
 
+        let watch_path = dir.join(WATCH_LUA_NAME);
+        let watch_lua = match agent::private_fs::write_private(&watch_path, EDITOR_WATCH_LUA.as_bytes()) {
+            Ok(()) => Some(watch_path),
+            Err(e) => {
+                eprintln!(
+                    "[pane_switch] could not write {}: {e} -- a crash of nvim closes the window like a quit",
+                    watch_path.display()
+                );
+                None
+            }
+        };
+
         if shim.is_some() {
             println!(
                 "[pane_switch] fake tmux at {}, socket at {}",
@@ -266,6 +293,7 @@ impl PaneSwitchChannel {
             dir,
             socket_path,
             nav_lua,
+            watch_lua,
             listener: Some(listener),
             shim: shim.is_some(),
         })
@@ -318,16 +346,24 @@ impl PaneSwitchChannel {
         if let Some(nav_lua) = &self.nav_lua {
             env.push(("EITRI_NAV_LUA".to_string(), nav_lua.display().to_string()));
         }
+        if let Some(watch_lua) = &self.watch_lua {
+            env.push(("EITRI_EDITOR_WATCH_LUA".to_string(), watch_lua.display().to_string()));
+        }
         env
     }
 
-    /// The nav fallback's `--cmd` loader, for the nvim child only, beside the theme,
-    /// editor-context and nvim-keys feeds' own. Empty when the snippet could not be written.
+    /// The nav fallback's and the editor watch's `--cmd` loaders, for the nvim child only, beside the
+    /// theme, editor-context and nvim-keys feeds' own. Each is left out when its snippet could not be
+    /// written.
     pub fn nvim_args(&self) -> Vec<String> {
-        if self.nav_lua.is_none() {
-            return Vec::new();
+        let mut args = Vec::new();
+        if self.nav_lua.is_some() {
+            args.extend(["--cmd".to_string(), NAV_LOADER_CMD.to_string()]);
         }
-        vec!["--cmd".to_string(), NAV_LOADER_CMD.to_string()]
+        if self.watch_lua.is_some() {
+            args.extend(["--cmd".to_string(), WATCH_LOADER_CMD.to_string()]);
+        }
+        args
     }
 
     /// Hands the bound listener to the host's polling driver. Returns `None` the second time, which
@@ -367,13 +403,27 @@ impl Drop for PaneSwitchChannel {
 /// A message accepted off the socket: a pane-switch direction letter from the `vim-tmux-navigator`
 /// shim, a kill's generation from a cancelled `:confirm qall`
 /// ([`crate::layout::kill::editor_quit_lua`]), or the words of an `:Eitri` command, each one a
-/// [`is_verb_word`], 1 to [`VERB_MAX_WORDS`] of them, for [`crate::nvim_verbs::parse_words`].
+/// [`is_verb_word`], 1 to [`VERB_MAX_WORDS`] of them, for [`crate::nvim_verbs::parse_words`], or
+/// what the editor watch reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneMessage {
     Direction(char),
     QuitCancelled(u32),
     Verb(Vec<String>),
+    /// nvim will say when it leaves: from here an exit with no [`Self::EditorLeaving`] is a crash.
+    EditorWatched,
+    /// nvim is quitting on purpose, not on a deadly signal.
+    EditorLeaving,
+    /// `count` project files have unsaved changes in swap files; `newest` is the latest of them.
+    Recoverable {
+        count: u32,
+        newest: String,
+    },
 }
+
+/// A file name in a `S` line takes at most this many bytes: what the snippet sends at most, 120
+/// characters of 4 bytes each.
+const RECOVERABLE_NAME_MAX_BYTES: usize = 480;
 
 /// At most this many words follow a `W`: an action name and its options, or a verb and its two
 /// arguments, fit; a line that carries more was not written by `:Eitri`.
@@ -640,7 +690,12 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
         "R" => return Some(PaneMessage::Direction('R')),
         "U" => return Some(PaneMessage::Direction('U')),
         "D" => return Some(PaneMessage::Direction('D')),
+        "nvim-watched" => return Some(PaneMessage::EditorWatched),
+        "nvim-leaving" => return Some(PaneMessage::EditorLeaving),
         _ => {}
+    }
+    if let Some(rest) = trimmed.strip_prefix("S ") {
+        return parse_recoverable(rest);
     }
     let rest = trimmed.strip_prefix("Q ")?;
     if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
@@ -648,6 +703,21 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
     } else {
         None
     }
+}
+
+/// `<count> <name>` after a `S `: digits as the `Q` form takes them, then a name of its own line.
+fn parse_recoverable(rest: &str) -> Option<PaneMessage> {
+    let (count, newest) = rest.split_once(' ')?;
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if newest.is_empty() || newest.len() > RECOVERABLE_NAME_MAX_BYTES || newest.chars().any(char::is_control) {
+        return None;
+    }
+    Some(PaneMessage::Recoverable {
+        count: count.parse().ok().filter(|count| *count > 0)?,
+        newest: newest.to_string(),
+    })
 }
 
 /// `W <word>( <word>){0,5}` with at most one trailing `\n`, at most [`VERB_MAX_LINE_BYTES`] bytes
@@ -858,6 +928,7 @@ mod tests {
         let channel = PaneSwitchChannel {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: Some(dir.join(NAV_LUA_NAME)),
+            watch_lua: Some(dir.join(WATCH_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
             shim: true,
@@ -907,6 +978,7 @@ mod tests {
         let channel = PaneSwitchChannel {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: None,
+            watch_lua: None,
             dir: dir.clone(),
             listener: None,
             shim: true,
@@ -926,6 +998,7 @@ mod tests {
         let channel = PaneSwitchChannel {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: Some(dir.join(NAV_LUA_NAME)),
+            watch_lua: Some(dir.join(WATCH_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
             shim: true,
@@ -972,6 +1045,33 @@ mod tests {
     /// `bind` writes the snippet into the channel's own directory, names it to the child, and
     /// hands nvim the loader -- and `cleanup` takes it away with the rest of the directory.
     #[test]
+    fn the_editor_watchs_lines_are_read_strictly() {
+        assert_eq!(parse_message("nvim-watched\n"), Some(PaneMessage::EditorWatched));
+        assert_eq!(parse_message("nvim-leaving\n"), Some(PaneMessage::EditorLeaving));
+        assert_eq!(
+            parse_message("S 2 src/a b.txt\n"),
+            Some(PaneMessage::Recoverable {
+                count: 2,
+                newest: "src/a b.txt".to_string()
+            })
+        );
+        let long = "n".repeat(RECOVERABLE_NAME_MAX_BYTES + 1);
+        for line in [
+            "S 2",
+            "S  a",
+            "S x a",
+            "S +2 a",
+            "S 0 a",
+            "S 4294967296 a",
+            "S 1 a\tb",
+            "nvim-leaving now",
+            &format!("S 1 {long}"),
+        ] {
+            assert_eq!(parse_message(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
     fn bind_writes_the_nav_fallback_beside_the_socket() {
         // The shim is only a symlink's target here; nothing runs it.
         let channel = PaneSwitchChannel::bind(Path::new("/nonexistent/eitri-tmux-shim")).expect("bind");
@@ -982,7 +1082,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&nav).unwrap(), NAV_FALLBACK_LUA);
         assert_eq!(
             channel.nvim_args(),
-            vec!["--cmd".to_string(), NAV_LOADER_CMD.to_string()]
+            ["--cmd", NAV_LOADER_CMD, "--cmd", WATCH_LOADER_CMD].map(str::to_string)
         );
         channel.cleanup();
         assert!(!nav.exists());

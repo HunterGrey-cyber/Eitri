@@ -201,6 +201,9 @@ pub(super) fn tick_send(
     send_chooser_titles_if_changed(state, out);
     send_tabs_if_changed(state, out);
     remember_tabs(state);
+    if let Some(line) = unsaved_line(&agent::save_health::take_news()) {
+        out.effect(Effect::Warning(line));
+    }
     send_hello_if_open_sessions_changed(state, out);
     send_editor_notes(state, out);
     // After the payload, not before it: a reaction that sends the panel an envelope -- one
@@ -341,12 +344,21 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
     out.effect(Effect::Busy { changed });
 }
 
+/// One line for what stopped reaching the disk since the last tick, so a second kind does not replace the first.
+fn unsaved_line(news: &[agent::save_health::SaveFailure]) -> Option<String> {
+    (!news.is_empty()).then(|| {
+        let lines: Vec<String> = news.iter().map(agent::save_health::SaveFailure::text).collect();
+        lines.join("; ")
+    })
+}
+
 /// The window's wake, handed to every backend the tabs hold. A pair that cannot be made is logged, and the
 /// tick then runs on its steady cadence as it always did.
 pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate::panel_wake::PanelWake> {
     match crate::panel_wake::PanelWake::new() {
         Ok(wake) => {
             tabs.set_ui_wake(wake.waker());
+            agent::save_health::set_wake(wake.waker());
             Some(wake)
         }
         Err(e) => {

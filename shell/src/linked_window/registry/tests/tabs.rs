@@ -32,6 +32,7 @@ fn tabs(sessions: &[&str]) -> SavedTabs {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         })
         .collect();
     SavedTabs::from_parts(tabs, 0, Vec::new(), None)

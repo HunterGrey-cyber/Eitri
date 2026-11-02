@@ -995,6 +995,10 @@ fn tool_result_outcome(block: &Value, turn_id: &str, structured: Option<&Value>)
     }
     let content = block.get("content").cloned().unwrap_or(Value::Null);
     let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let content = match text_blocks(&content) {
+        Some(text) if is_error && text.trim_start().starts_with(CALL_CANCELLED) => Value::from(CALL_NOT_RUN),
+        _ => content,
+    };
     Some(Outcome::ToolResult {
         tool_use_id: tool_use_id.to_owned(),
         chars: value_chars(&content),
@@ -1007,6 +1011,14 @@ fn tool_result_outcome(block: &Value, turn_id: &str, structured: Option<&Value>)
         },
     })
 }
+
+/// How Claude Code 2.1.311 words the result of a call the turn's abort reached before it ran. A person's interrupt
+/// aborts it, and so does the host dying with its card still up, which the words do not tell apart and in which
+/// nobody said anything.
+const CALL_CANCELLED: &str = "The user doesn't want to take this action right now";
+
+/// What a reopened conversation shows for such a call, true in either case. The model read the CLI's own words.
+const CALL_NOT_RUN: &str = "Not run: the turn ended before this could go ahead.";
 
 /// How Claude Code 2.1.311 words the result of a call whose permission request was still open when
 /// the host's stream closed (the session was closed, or its host died): the request's failure, then
@@ -2541,6 +2553,34 @@ mod tests {
             }
             other => panic!("expected a completion, got {other:?}"),
         }
+    }
+
+    /// A card still waiting when the window was killed reads, in the transcript, as the person refusing it.
+    #[test]
+    fn a_call_the_turns_end_cancelled_does_not_read_as_the_persons_refusal() {
+        let result = |content: &str, is_error: bool| {
+            let lines = [
+                r#"{"type":"assistant","uuid":"a","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{}}]}}"#.to_string(),
+                serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":content,"is_error":is_error}]}})
+                .to_string(),
+            ]
+            .join("\n");
+            let history = fold(&lines);
+            match item_events(&history)[1] {
+                AgentDomainEvent::ToolCallCompleted { content, .. } => content.clone(),
+                other => panic!("expected a completion, got {other:?}"),
+            }
+        };
+        let cli = "The user doesn't want to take this action right now. STOP what you are doing and wait for the \
+                   user to tell you how to proceed.";
+        assert_eq!(result(cli, true), CALL_NOT_RUN);
+        assert_eq!(
+            result(cli, false),
+            cli,
+            "a tool's own output that happens to say this stays"
+        );
+        assert_eq!(result("Permission denied", true), "Permission denied");
     }
 
     /// `is_error` is absent on 917 of the measured results. Absent means not an error, and the

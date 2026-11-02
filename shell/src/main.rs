@@ -3053,6 +3053,7 @@ fn build_ui(
                 }),
                 toast: Box::new(move |up| match up.kind {
                     ToastKind::Attention => shown_toast.show_attention(&up.text),
+                    ToastKind::Warning => shown_toast.show_warning(&up.text),
                     ToastKind::Other | ToastKind::Standing => shown_toast.show(&up.text),
                 }),
                 // A wait whose strip is the only list of what its keys pick (the workspace chooser) brings a hidden
@@ -3280,8 +3281,9 @@ fn build_ui(
             }
         });
     }
-    // The one-line result of bringing the last window's tabs back.
+    // The one-line result of bringing the last window's tabs back, and what could not be kept on disk.
     {
+        let driver_for_warning = driver.clone();
         let driver = Rc::downgrade(&driver);
         panel_hooks.on_toast = Some(Box::new(move |text: &str| {
             if let Some(driver) = driver.upgrade() {
@@ -3289,6 +3291,16 @@ fn build_ui(
                     win: WinId::MAIN,
                     text: text.to_string(),
                     kind: ToastKind::Other,
+                }));
+            }
+        }));
+        let driver = Rc::downgrade(&driver_for_warning);
+        panel_hooks.on_warning = Some(Box::new(move |text: &str| {
+            if let Some(driver) = driver.upgrade() {
+                driver.post(HostEvent::Chat(eitri_core::wm::ChatEvent::Toast {
+                    win: WinId::MAIN,
+                    text: text.to_string(),
+                    kind: ToastKind::Warning,
                 }));
             }
         }));
@@ -3724,6 +3736,7 @@ fn build_ui(
             eitri_core::wm::ChatKillCounts {
                 running,
                 queued,
+                drafts: if view.is_base() { agent.unsaved_draft_count() } else { 0 },
                 background: agent.view_background_count(view),
                 tab,
                 blocked: agent.tabs_cannot_close(view).map(str::to_string),
@@ -3841,6 +3854,30 @@ fn build_ui(
                     driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::QuitCancelled {
                         win: WinId::MAIN,
                         generation: u64::from(g),
+                    }));
+                }
+            }
+            // What nvim says of its own end, and what it found in swap files: the controller's.
+            pane_switch::PaneMessage::EditorWatched => {
+                if let Some(driver) = driver.upgrade() {
+                    driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Watched {
+                        win: WinId::MAIN,
+                    }));
+                }
+            }
+            pane_switch::PaneMessage::EditorLeaving => {
+                if let Some(driver) = driver.upgrade() {
+                    driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Leaving {
+                        win: WinId::MAIN,
+                    }));
+                }
+            }
+            pane_switch::PaneMessage::Recoverable { count, newest } => {
+                if let Some(driver) = driver.upgrade() {
+                    driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Recoverable {
+                        win: WinId::MAIN,
+                        count,
+                        newest,
                     }));
                 }
             }
@@ -3964,7 +4001,13 @@ fn build_ui(
         let plugin_panels = plugin_panels.clone();
         let exited = Rc::downgrade(pane);
         let driver_for_exit = Rc::downgrade(&driver);
+        let feeds_for_exit = Rc::downgrade(&feed_pump);
         pane.on_exited_unrequested(move || {
+            // nvim's last lines were on the socket before its process went: read them first, so the exit is judged
+            // with them and not ahead of the feed's next wake.
+            if let Some(feeds) = feeds_for_exit.upgrade() {
+                feeds.drain();
+            }
             review_for_exit.review_editor_lost();
             // Before the exit is acted on, which may close the window: a page following the editor hears it ended.
             plugin_panels.editor_closed();

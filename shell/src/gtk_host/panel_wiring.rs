@@ -29,10 +29,11 @@ use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 16] = [
+pub(crate) const HOOKS: [&str; 17] = [
     "on_hint",
     "on_attention",
     "on_toast",
+    "on_warning",
     "set_answer_gate",
     "on_editor_request",
     "set_editor_rpc",
@@ -82,6 +83,7 @@ pub(crate) struct PanelHooks {
     pub(crate) on_hint: Option<Box<dyn Fn(HintInbound)>>,
     pub(crate) on_attention: Option<AttentionHook>,
     pub(crate) on_toast: Option<ToastHook>,
+    pub(crate) on_warning: Option<ToastHook>,
     /// Whether a card answer from a view is taken; `Err` refuses it with the reason. A window that
     /// cannot tell refuses, so the card stays.
     pub(crate) set_answer_gate: Option<AnswerGate>,
@@ -107,6 +109,7 @@ impl PanelHooks {
             self.on_hint.is_some(),
             self.on_attention.is_some(),
             self.on_toast.is_some(),
+            self.on_warning.is_some(),
             self.set_answer_gate.is_some(),
             self.on_editor_request.is_some(),
             self.set_editor_rpc.is_some(),
@@ -137,6 +140,7 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         on_hint,
         on_attention,
         on_toast,
+        on_warning,
         set_answer_gate,
         on_editor_request,
         set_editor_rpc,
@@ -159,6 +163,9 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_toast {
         panel.on_toast(hook);
+    }
+    if let Some(hook) = on_warning {
+        panel.on_warning(hook);
     }
     if let Some(gate) = set_answer_gate {
         panel.set_answer_gate(gate);

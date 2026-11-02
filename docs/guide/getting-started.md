@@ -272,6 +272,11 @@ does not come back in bypass unasked: `s` asks (`n` brings it back in Auto), and
 it back in Auto and says so. A tab that was in manual comes back in manual. The one exception is your own answer in advance: with `agent.default_mode` set to
 `"bypass"` in your `init.lua`, saved bypass tabs come back in bypass without a question.
 
+A tab's unsent text is saved with it and comes back in its composer with `s`, at most 256 KiB of it. Text that would
+not come back, in a tab with no session yet or too long to keep, is counted by the window's close question:
+`close window? 1 unsent draft (y/n)`. Starting something new in place of `s` replaces what was saved, the unsent text
+with it.
+
 **Continuing in a real terminal.** Press `<leader>t` (or open `<prefix> i` and choose `Continue in a
 terminal...`). Eitri explains that it will close this conversation in the panel first, and then, when you
 confirm, shows the `claude --resume ...` command that continues it in your own terminal; `y` copies it. Eitri
@@ -304,6 +309,16 @@ When the session itself is gone, the conversation says so. A red `This session w
 connection broke and what is shown above may be incomplete; a quiet `This session has ended (<reason>)` means
 it closed. Either way, press `r` in browsing to start a new session in that tab. A message held while a turn
 ran is still sent when that turn ends, even when it ended at a limit.
+
+If nvim itself goes without being asked, killed or crashed, the window stays and says so:
+`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`. `:q` of the last buffer still
+closes the window, as it does in plain Neovim. When a start finds this project's files with unsaved changes in swap
+files, it says so once: `unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`.
+Nothing is recovered unless you do that, and the line comes back at each start until the swap file is gone.
+
+If what Eitri keeps can no longer be written, the window says so once per kind until it works again, with what is not
+being kept: `could not save the open tabs`, `could not record this session` or `could not store the history`, usually
+`the disk is full`. Turns go on running. Once there is room the saves catch up by themselves.
 
 When Claude Code has updated itself and the panel misbehaves, the sidecar behind it may need an update of its own.
 `eitri sidecar check` asks whether one exists, `eitri sidecar update` takes it, and `eitri sidecar use bundled` goes

@@ -117,6 +117,12 @@ impl QuitWorld for Rc<Fake> {
     fn editor_ended_text(&self) -> String {
         crate::wm::feedback::editor_ended_text(&crate::keymap::Keymap::defaults())
     }
+    fn editor_crashed_text(&self) -> String {
+        crate::wm::feedback::editor_crashed_text(&crate::keymap::Keymap::defaults())
+    }
+    fn warn(&mut self, text: &str) {
+        self.did(format!("warn: {text}"));
+    }
     fn show_stand_in(&mut self) -> Result<(), LayoutError> {
         self.did("show_stand_in");
         self.editor_last_visible.set(false);
@@ -177,7 +183,15 @@ impl Flow {
     }
     fn nvim_exited(&self) {
         let settled = self.world.settled_watch();
-        self.flow.borrow_mut().nvim_exited(&mut self.world.clone(), settled);
+        self.flow
+            .borrow_mut()
+            .nvim_exited(&mut self.world.clone(), settled, false);
+    }
+    fn nvim_crashed(&self) {
+        let settled = self.world.settled_watch();
+        self.flow
+            .borrow_mut()
+            .nvim_exited(&mut self.world.clone(), settled, true);
     }
     fn nvim_unreachable(&self) {
         self.flow.borrow_mut().nvim_unreachable(&mut self.world.clone());
@@ -509,11 +523,64 @@ fn a_declined_close_after_nvim_exited_retires_the_editor() {
 /// The ended editor's text names no cause it cannot know, and says its key brings it
 /// back (the layout saves an ended editor as it was before, not hidden).
 #[test]
+fn a_crash_nobody_asked_for_keeps_the_window_and_says_so() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    fake.editor_last_visible.set(true);
+    quitting.nvim_crashed();
+    assert_eq!(
+        fake.log(),
+        [
+            "end_editor refused".to_string(),
+            "show_stand_in".to_string(),
+            "end_editor".to_string(),
+            format!(
+                "warn: {}",
+                super::super::feedback::editor_crashed_text(&crate::keymap::Keymap::defaults())
+            )
+        ]
+    );
+}
+
+#[test]
+fn an_exit_after_a_requested_close_closes_even_with_no_leaving_line() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    assert_eq!(quitting.window_close(), WindowClose::Wait);
+    fake.clear();
+    fake.running.set(false);
+    fake.exited.set(true);
+    quitting.nvim_crashed();
+    assert!(
+        fake.log()
+            .iter()
+            .any(|did| did.starts_with("close_window") || did == "close_after"),
+        "nvim was asked to quit: {:?}",
+        fake.log()
+    );
+}
+
+#[test]
+fn a_quit_typed_in_nvim_still_closes_the_window() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.exited.set(true);
+    quitting.nvim_exited();
+    assert_eq!(fake.log(), ["close_window".to_string()]);
+}
+
+#[test]
 fn the_retired_editors_text_claims_no_cause() {
     let text = super::super::feedback::editor_ended_text(&crate::keymap::Keymap::defaults());
     assert!(!text.contains(":qa"));
     assert!(!text.contains("prefix x"));
     assert!(text.contains("C-b e starts it again"));
+    let crashed = super::super::feedback::editor_crashed_text(&crate::keymap::Keymap::defaults());
+    assert!(crashed.starts_with("nvim stopped unexpectedly"));
+    assert!(crashed.contains("C-b e starts it again"));
 }
 
 /// A launcher exit does not prove nvim is gone, so the close waits for the pane to report its process exit.

@@ -367,6 +367,7 @@ mod tests {
             view: None,
             window: None,
             turn_running: false,
+            draft: None,
         }
     }
 
@@ -477,6 +478,32 @@ mod tests {
         assert_eq!(saved.provider_session_id, "s-1");
         assert_eq!(provider.closes(), 1, "the session was closed");
         assert!(!state.borrow().hand_overs.is_waiting());
+    }
+
+    /// What was typed goes with the tab: out of the closing window in the answer, across the link, and into the
+    /// composer of the tab the other window opens.
+    #[test]
+    fn a_handed_over_tab_keeps_its_draft() {
+        let (state, dir, answers) = panel("hand-over-draft", &["s-1"]);
+        let (tab, _provider) = live_tab(&state, &dir, "s-1");
+        state.borrow_mut().tabs.set_draft(tab, "half a thought");
+        released(&state, "s-1");
+        assert!(until(&state, || !answers_of(&answers).is_empty()));
+        let [TabAnswer::Released { tab: saved, .. }] = &answers_of(&answers)[..] else {
+            panic!("{:?}", answers_of(&answers));
+        };
+        let crossed = SavedTab::from_wire(&saved.to_wire()).unwrap();
+
+        let (state, _dir, _answers) = panel("hand-over-draft-there", &["s-1"]);
+        let mut resumes = FakeResumes::default();
+        with_resumes(&state, &mut resumes, || {
+            given(&state, crossed);
+            tick_until(&state, |_| restore_ran(&state));
+        });
+        let s = state.borrow();
+        assert_eq!(s.tabs.get(s.tabs.active()).unwrap().draft(), "half a thought");
+        drop(s);
+        shut_tabs(&state);
     }
 
     #[test]

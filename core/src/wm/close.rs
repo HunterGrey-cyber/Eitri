@@ -190,7 +190,7 @@ pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: Modul
         request(w, cx, win, CloseCause::User, batch);
         return;
     }
-    let (running, queued, background) = window_counts(cx);
+    let (running, queued, background, _) = window_counts(cx);
     let text = window_prompt(w, cx, win).filter(|_| w.has_peer()).unwrap_or_else(|| {
         prompt(
             &module,
@@ -561,8 +561,10 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
     if ended(w) {
         return;
     }
-    use super::window::EditorRun;
+    use super::window::{EditorRun, NvimSaid};
     let was_ready = w.editor_ready;
+    // Taken at every exit, so a restarted nvim starts from nothing said.
+    let crashed = matches!(event, EditorEvent::Exited { .. }) && std::mem::take(&mut w.nvim_said) == NvimSaid::Watched;
     // The editor is ready from `Ready` until it ends; a restart in flight clears it too, where it is begun.
     if matches!(
         event,
@@ -665,6 +667,21 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
             w.refuse(win, super::feedback::open_failed_text(why), batch);
             return;
         }
+        EditorEvent::Watched { .. } => {
+            w.nvim_said = NvimSaid::Watched;
+            return;
+        }
+        EditorEvent::Leaving { .. } => {
+            w.nvim_said = NvimSaid::Leaving;
+            return;
+        }
+        EditorEvent::Recoverable { count, newest, .. } => {
+            w.say(format!(
+                "[modules] editor: {count} file(s) with unsaved changes in swap files"
+            ));
+            chrome::show_toast(w, super::feedback::recoverable_text(*count, newest), ToastKind::Warning);
+            return;
+        }
         // Its process lives on where nothing reaches it, so no `Ready` comes; its `Exited` comes only once it is gone.
         // What is said about it is the quit flow's, below.
         EditorEvent::Unreachable { .. } => w.editor_lost = true,
@@ -672,7 +689,7 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
     }
     let never_ready = !was_ready && matches!(event, EditorEvent::Exited { .. } | EditorEvent::Unreachable { .. });
     with_quit(w, cx, win, batch, |quit, world| match event {
-        EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled),
+        EditorEvent::Exited { settled, .. } => quit.nvim_exited(world, settled, crashed),
         EditorEvent::Unreachable { .. } => quit.nvim_unreachable(world),
         // The window close's `y`, if it had one, was taken back when the close handed the quit to nvim, so a later
         // exit asks again.
@@ -718,10 +735,11 @@ pub(super) fn kill_editor(w: &mut Window, cx: &Cx, win: WinId, scope: KillScope,
     });
 }
 
-/// The window's running turns, queued messages and tabs with background work. The base view's running and queued
-/// counts already cover every tab of every chat view; adding each extra view's own tab would count it twice. Its
-/// background count covers the base view's own tabs only, so each extra chat view's is added.
-fn window_counts(cx: &Cx) -> (usize, usize, usize) {
+/// The window's running turns, queued messages, tabs with background work and drafts that would go with it. The base
+/// view's running, queued and draft counts already cover every tab of every chat view; adding each extra view's own
+/// tab would count it twice. Its background count covers the base view's own tabs only, so each extra chat view's is
+/// added.
+fn window_counts(cx: &Cx) -> (usize, usize, usize, usize) {
     let counts = cx.reads.chat_kill_counts(crate::tabs::ViewId::BASE);
     let background = counts.background
         + cx.reads
@@ -730,7 +748,7 @@ fn window_counts(cx: &Cx) -> (usize, usize, usize) {
             .filter(|view| !view.is_base())
             .map(|view| cx.reads.chat_kill_counts(view).background)
             .sum::<usize>();
-    (counts.running, counts.queued, background)
+    (counts.running, counts.queued, background, counts.drafts)
 }
 
 /// Whether the window offers to move its modules away: window 2 is the only window it is linked to.
@@ -739,12 +757,13 @@ fn move_target(w: &Window) -> bool {
 }
 
 pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
-    let (running, queued, background) = window_counts(cx);
+    let (running, queued, background, drafts) = window_counts(cx);
     match w.tiling {
         Tiling::Hub if w.has_peer() => return Some(group_prompt(w, cx, win)),
         // Its close touches nothing of the rest of the group, so what runs here is all it names.
         Tiling::ModuleWindow => {
-            return crate::tabs::window_close_prompt_with_jobs(running, queued, cx.reads.terminal_jobs(win), background)
+            let jobs = cx.reads.terminal_jobs(win);
+            return crate::tabs::window_close_prompt_with_drafts(running, queued, jobs, background, drafts);
         }
         Tiling::Hub | Tiling::Eitri => {}
     }
@@ -768,6 +787,7 @@ pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
         queued,
         cx.reads.terminal_jobs(win),
         background,
+        drafts,
         other,
         if offers_move { movable(cx, win).len() } else { 0 },
     )
@@ -775,13 +795,14 @@ pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
 
 /// Window 1's question in a hub: every linked module window and what their last summaries say runs in them.
 fn group_prompt(w: &Window, cx: &Cx, win: WinId) -> String {
-    let (running, queued, _) = window_counts(cx);
+    let (running, queued, _, drafts) = window_counts(cx);
     let summary = w.group_summary();
     crate::tabs::group_close_prompt_with_jobs(
         w.peers().count(),
         running + summary.as_ref().map_or(0, |s| s.running as usize),
         queued + summary.as_ref().map_or(0, |s| s.queued as usize),
         cx.reads.terminal_jobs(win),
+        drafts,
     )
 }
 
@@ -1004,8 +1025,14 @@ impl QuitWorld for WindowQuit<'_, '_> {
     fn toast(&mut self, text: &str) {
         self.feedback(super::feedback::CloseOutcome::Toast(text));
     }
+    fn warn(&mut self, text: &str) {
+        chrome::show_toast(self.w, text.to_string(), ToastKind::Warning);
+    }
     fn editor_ended_text(&self) -> String {
         super::feedback::editor_ended_text(self.cx.keymap)
+    }
+    fn editor_crashed_text(&self) -> String {
+        super::feedback::editor_crashed_text(self.cx.keymap)
     }
     fn every_second(&mut self, generation: u32) {
         if let Some((token, _)) = self.w.quit_timer.take() {

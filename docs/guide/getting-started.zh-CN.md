@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=13bc2c5d0833bae1c5831a7fe2ea87215ba3577e92c8fc8055a8ffa98ea763cb -->
+<!-- translated-from: getting-started.md sha256=ac0fb858affa35c5800aaa2f04ec4139d210de2e38105aef1521106ad53197fd -->
 
 # 快速上手
 
@@ -144,6 +144,8 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 **恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（在面板里按 `s`）提供出来。按键一开始在编辑器里，那里的 `s` 是 nvim 的；从那里按 `<prefix> w` 打开会话列表，光标就在 `Restore last session` 这一行上，按 `Enter` 即可。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
 
+标签页里没发送的文字会随它一起保存，按 `s` 时回到输入框，最多保存 256 KiB。回不来的文字（在还没有会话的标签页里，或者太长存不下）会计入窗口的关闭问题：`close window? 1 unsent draft (y/n)`。如果不按 `s` 而是开始新的内容，保存的东西会被替换，没发送的文字也一起没了。
+
 **在真正的终端里继续。** 按 `<leader>t`（或者打开 `<prefix> i` 选 `Continue in a terminal...`）。Eitri 会先说明它会先关闭面板里的这个对话，然后在你确认后，显示在你自己的终端里继续它的 `claude --resume ...` 命令；按 `y` 复制它。Eitri 不会替你启动那个终端，也不会对会话加锁，所以不要在两个地方同时开着它。那个终端运行的是一个普通的 `claude`，用你自己的 Claude Code 设置，没有 Eitri 的权限关卡，所以它的工具调用不会以卡片出现。还没有过第一个回合的会话没有什么可继续的，还有回合在运行的会话也一样。
 
 <a id="when-something-ends"></a>
@@ -164,6 +166,10 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 一行里冒号后面的文字是 Claude Code 自己的消息，原样显示，所以限制的重置时间只有在 Claude Code 写了的时候才会出现。这一行会留在对话里，面板重新加载（`<prefix> r`）和切换标签页后依然在，也可以像其他行一样用 `y` 复制。
 
 会话本身没了的时候，对话里会说出来。红色的 `This session was lost` 横幅表示连接断了，上面显示的内容可能不完整；安静的 `This session has ended (<reason>)` 表示它关闭了。无论哪种，在浏览模式里按 `r`，就会在这个标签页里开始一个新会话。回合运行时留着的消息，仍会在这个回合结束时发出，即使它是在碰到限制时结束的。
+
+如果 nvim 没人要求就没了（被杀掉或崩溃），窗口会留着并说明：`nvim stopped unexpectedly — <prefix> e starts it again and says what can be recovered`。在最后一个缓冲区上 `:q` 仍然关闭窗口，和普通 Neovim 一样。启动时如果发现这个项目的文件有未保存的改动留在 swap 文件里，会说一次：`unsaved changes kept for long.txt — :e the file, then r recovers them or d deletes them`。除非你这样做，否则什么都不会恢复；只要 swap 文件还在，每次启动都会再说这一行。
+
+如果 Eitri 要保存的东西写不下去了，窗口会按种类各说一次，直到恢复正常，并说明什么没有保存：`could not save the open tabs`、`could not record this session` 或 `could not store the history`，通常是 `the disk is full`。回合照常运行。有了空间之后，保存会自己补上。
 
 Claude Code 自己更新之后面板出了问题，背后的 sidecar 可能也需要更新。`eitri sidecar check` 问有没有更新，`eitri sidecar update` 装上它，`eitri sidecar use bundled` 退回去。什么都不会自己检查，已经打开的标签页继续用它启动时的 sidecar。Eitri 0.3.0 没有 `eitri sidecar` 这个命令（它会回答 `eitri: no such directory`），先装它之后的版本。细节见[更新 sidecar](../../INSTALL.zh-CN.md#updating-the-sidecar)。
 

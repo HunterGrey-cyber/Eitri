@@ -426,6 +426,7 @@ struct AgentPanelState {
     restore_run: Option<RestoreRun>,
     /// Where a restore's one-line result goes: `main.rs`'s window toast.
     toast_hook: Option<ToastHook>,
+    warning_hook: Option<ToastHook>,
     /// What the launch could not read of the saved tabs (a file set aside as unusable), for the window to say once.
     startup_problems: Vec<String>,
     /// Whether a session about to start may load the project's own Claude configuration, and the
@@ -558,6 +559,7 @@ impl AgentPanelState {
             start_notes: StartNotes::default(),
             restore_run: None,
             toast_hook: None,
+            warning_hook: None,
             startup_problems: Vec::new(),
             editor_context,
             backend_kind,
@@ -1173,6 +1175,7 @@ mod tests {
                         view: None,
                         window: None,
                         turn_running: false,
+                        draft: None,
                     })
                     .collect(),
                 0,

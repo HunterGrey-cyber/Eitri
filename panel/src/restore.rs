@@ -470,7 +470,8 @@ pub(super) enum RestoreStart {
     NotPartOfOne,
     Installed,
     /// A resume the restore started was refused. The tab is already tidied away; `was_active` says
-    /// the page was showing it, so it must be told which tab it is showing now.
+    /// the page was showing it, so it must be told which tab it is showing now, or that the tab it
+    /// shows took the refused tab's draft, which its composer must show before its next mirror.
     Failed {
         was_active: bool,
     },
@@ -498,7 +499,9 @@ pub(super) fn account_for_restore(state: &mut AgentPanelState, collected: &Start
             run.note_failed(*tab, &error.message);
             let was_active = tabs.active() == *tab;
             let view = tabs.view_of(*tab);
+            let shown_draft = tabs.get(tabs.active()).map(|t| t.draft().to_string());
             tabs.discard_failed_restore(*tab, back_to);
+            let draft_moved = tabs.get(tabs.active()).map(|t| t.draft()) != shown_draft.as_deref();
             // A restored tab that came back into an extra view and is discarded leaves that view.
             if !view.is_base() && tabs.tab_in(view).is_none() {
                 emptied_views.push(view);
@@ -510,7 +513,9 @@ pub(super) fn account_for_restore(state: &mut AgentPanelState, collected: &Start
                     tabs.select(survivor);
                 }
             }
-            RestoreStart::Failed { was_active }
+            RestoreStart::Failed {
+                was_active: was_active || draft_moved,
+            }
         }
         _ => RestoreStart::NotPartOfOne,
     }
@@ -937,6 +942,52 @@ mod tests {
         ));
     }
 
+    /// A tab refused after another came up leaves its draft in the tab on screen: the page has that tab's composer
+    /// open, so it is told, or its next mirror would erase the text; and the tab on screen stays on screen.
+    #[test]
+    fn a_late_refusal_puts_its_draft_in_the_composer_on_screen_and_moves_no_tab() {
+        let (state, dir) = restore_panel(
+            "restore-late-draft",
+            &[("s-1", None, Auto), ("s-2", None, Auto), ("s-3", None, Auto)],
+            &["s-1", "s-2", "s-3"],
+        );
+        {
+            let mut s = state.borrow_mut();
+            let source = s.restore_source.as_mut().unwrap();
+            source.active = Some(1);
+            source.claude_active = Some(1);
+            source.tabs[2].draft = Some("typed for s-3".to_string());
+        }
+        let mut resumes = FakeResumes::default();
+        started(ask(&state, &mut resumes, RestoreAsk::Dashboard));
+        let on_screen = state.borrow().tabs.active();
+        for sender in &resumes.senders[..2] {
+            let (_provider, backend) = live_backend(&dir);
+            sender.send(Ok(backend)).unwrap();
+        }
+        let screen = Screen::nothing_shown();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut Outbox::default());
+        resumes.senders[2]
+            .send(Err(BackendError {
+                message: "refused".to_string(),
+                benign: false,
+            }))
+            .unwrap();
+        let mut out = Outbox::default();
+        collect_pending_starts(&mut state.borrow_mut(), &screen, &mut out);
+        assert_eq!(state.borrow().tabs.active(), on_screen, "the tab on screen stays");
+        let payloads = out.payloads();
+        let draft = payloads.iter().find(|p| p.contains("typed for s-3"));
+        assert!(draft.is_some(), "the page hears the draft: {:?}", kinds(&payloads));
+        out.deliver(&state, &Pages::default());
+        assert_eq!(state.borrow().tabs.get(on_screen).unwrap().draft(), "typed for s-3");
+        for tab in state.borrow_mut().tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
+            }
+        }
+    }
+
     /// The glue the tick runs: each result counts into the restore, a refused tab is tidied away,
     /// and one message ends it once the last resume is back.
     #[test]
@@ -1194,6 +1245,7 @@ mod tests {
                 view: None,
                 window: None,
                 turn_running: false,
+                draft: None,
             })
             .collect();
         SavedTabs::from_parts(tabs, 0, Vec::new(), None)
@@ -2049,6 +2101,7 @@ mod tests {
                     view: None,
                     window: None,
                     turn_running: false,
+                    draft: None,
                 }],
                 Some(0),
             ));

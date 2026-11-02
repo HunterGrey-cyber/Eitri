@@ -44,6 +44,8 @@ pub enum ToastKind {
     Other,
     /// A note that stays up for as long as what it says holds, between timed lines.
     Standing,
+    /// Something may be lost: stays long enough to read whole and act on, and no refusal covers it.
+    Warning,
 }
 
 /// What the toast shows once a timed line's time is up: the standing note when there is one, else nothing. A
@@ -56,7 +58,7 @@ pub fn after_timed(standing: Option<&str>) -> Option<(&str, ToastKind)> {
 /// over a waiting card's toast: a stray key would otherwise erase the one line saying a card waits,
 /// and the refusal still has its flash and its stdout line.
 pub fn refusal_may_show(showing: Option<ToastKind>) -> bool {
-    showing != Some(ToastKind::Attention)
+    !matches!(showing, Some(ToastKind::Attention | ToastKind::Warning))
 }
 
 #[cfg(test)]
