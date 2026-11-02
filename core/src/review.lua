@@ -62,6 +62,12 @@ local DESC = {
 }
 local EOLS = { lf = true, crlf = true, missing = true }
 local PRIORITY = 90
+-- Bound the bytes tokenised for one line.
+local WORD_MAX_BYTES = 400
+-- Bound the line pairs examined for words in one hunk.
+local WORD_MAX_PAIRS = 100
+-- Bound the token diff on either side of a pair.
+local WORD_MAX_TOKENS = 200
 -- The host reads every answer as one msgpack frame and drops the connection over a frame of 16 MiB,
 -- after the buffer already changed. So a revert whose event would be larger than this is refused
 -- (its two sides are echoed whole), and one answer of `take_events` carries events up to the second
@@ -257,6 +263,55 @@ local function display(text)
   return text
 end
 
+-- The byte ranges that differ between two paired lines, found by diffing their words (a run of word
+-- characters, a run of blanks, or one other byte). Nothing when a line is over a bound, or when a side
+-- changed from end to end and so has nothing left to set the change against.
+local function word_ranges(old, new)
+  if #old > WORD_MAX_BYTES or #new > WORD_MAX_BYTES then return end
+  local tokens, offsets = {}, {}
+  for side, text in ipairs({ old, new }) do
+    local ts, os, pos = {}, { 0 }, 1
+    while pos <= #text do
+      local token = text:match('^[A-Za-z0-9_\128-\255]+', pos) or text:match('^%s+', pos) or text:sub(pos, pos)
+      ts[#ts + 1], pos = token, pos + #token
+      os[#os + 1] = pos - 1
+      if #ts > WORD_MAX_TOKENS then return end
+    end
+    tokens[side], offsets[side] = ts, os
+  end
+  local changes = textdiff(table.concat(tokens[1], '\n') .. '\n', table.concat(tokens[2], '\n') .. '\n',
+    { result_type = 'indices' })
+  local ranges = { {}, {} }
+  for side, text in ipairs({ old, new }) do
+    local total = 0
+    for _, sub in ipairs(changes) do
+      local start, len = sub[side * 2 - 1], sub[side * 2]
+      if len > 0 then
+        local a, b = offsets[side][start], offsets[side][start + len]
+        local last = ranges[side][#ranges[side]]
+        if last and text:sub(last[2] + 1, a):match('^%s*$') then
+          total, last[2] = total + b - last[2], b
+        else
+          ranges[side][#ranges[side] + 1], total = { a, b }, total + b - a
+        end
+      end
+    end
+    if total == #text then return end
+  end
+  return ranges
+end
+
+-- A removed line as virtual-line chunks: the changed byte ranges in `DiffText`, the rest in `DiffDelete`.
+local function old_chunks(old, ranges)
+  local chunks, at = {}, 0
+  for _, r in ipairs(ranges or {}) do
+    if r[1] > at then chunks[#chunks + 1] = { display(old:sub(at + 1, r[1])), 'DiffDelete' } end
+    chunks[#chunks + 1], at = { display(old:sub(r[1] + 1, r[2])), 'DiffText' }, r[2]
+  end
+  if at < #old or #chunks == 0 then chunks[#chunks + 1] = { display(old:sub(at + 1)), 'DiffDelete' } end
+  return chunks
+end
+
 -- Draws one hunk whose new side is at `row`. A hunk carries context lines and may hold more than
 -- one change, so the added and removed lines are found by diffing its two sides (each line keyed
 -- with its terminator, so a change of ending alone shows too).
@@ -265,9 +320,9 @@ local function draw_hunk(buf, row, h)
   -- `row` is where the hunk was last seen: an edit that replaces the whole hunk (a redo of its
   -- revert) takes the tracker with it, and this is where the base text is looked for then.
   local d = { hunk = h, marks = {}, alive = true, row = row }
-  local function mark(r, opts)
-    opts.priority = PRIORITY
-    local id = api.nvim_buf_set_extmark(buf, state.ns, r, 0, opts)
+  local function mark(r, opts, col)
+    opts.priority = opts.priority or PRIORITY
+    local id = api.nvim_buf_set_extmark(buf, state.ns, r, col or 0, opts)
     d.marks[#d.marks + 1] = id
     return id
   end
@@ -275,17 +330,42 @@ local function draw_hunk(buf, row, h)
   d.tracker = mark(row, { end_row = row + h.new_len, end_col = 0, end_right_gravity = false })
   local first = nil
   local subs = textdiff(keyed(h.old_lines, h.old_eols), keyed(h.new_lines, h.new_eols), { result_type = 'indices' })
+  local pairs_seen = 0
   for _, sub in ipairs(subs or {}) do
     local sa, ca, sb, cb = sub[1], sub[2], sub[3], sub[4]
-    for i = 0, cb - 1 do
-      mark(row + sb - 1 + i, { line_hl_group = 'DiffAdd' })
+    -- Where a block holds as many old lines as new ones they pair up; `olds[k]` is the old line's
+    -- changed ranges once its new line carries its own word marks.
+    local olds = {}
+    for k = 0, cb - 1 do
+      local r, ranges, before = row + sb - 1 + k, nil, #d.marks
+      if ca == cb and pairs_seen < WORD_MAX_PAIRS then
+        pairs_seen = pairs_seen + 1
+        local found, got = pcall(word_ranges, h.old_lines[sa + k], h.new_lines[sb + k])
+        ranges = found and got or nil
+      end
+      -- A line highlight is painted over any text highlight whatever the priorities, so a line
+      -- with word marks is filled by a text highlight that runs on to the window's edge instead.
+      local ok = ranges and pcall(function()
+        mark(r, { hl_group = 'DiffAdd', end_row = r + 1, end_col = 0, hl_eol = true, strict = false })
+        for _, w in ipairs(ranges[2]) do
+          mark(r, { hl_group = 'DiffText', end_col = w[2], priority = PRIORITY + 1 }, w[1])
+        end
+      end)
+      if ok then
+        olds[k] = ranges[1]
+      else
+        for j = #d.marks, before + 1, -1 do
+          pcall(api.nvim_buf_del_extmark, buf, state.ns, table.remove(d.marks))
+        end
+        mark(r, { line_hl_group = 'DiffAdd' })
+      end
     end
     -- With no new lines, `sb` is the new line the removal follows.
     local anchor = cb > 0 and (row + sb - 1) or (row + sb)
     if ca > 0 then
       local virt = {}
       for i = sa, sa + ca - 1 do
-        virt[#virt + 1] = { { display(h.old_lines[i]), 'DiffDelete' } }
+        virt[#virt + 1] = old_chunks(h.old_lines[i], olds[i - sa])
       end
       if anchor >= count then
         mark(count - 1, { virt_lines = virt, virt_lines_above = false })

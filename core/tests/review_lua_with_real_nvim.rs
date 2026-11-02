@@ -36,30 +36,38 @@ const WRITE_LUA: &str = "vim.api.nvim_cmd({ cmd = 'write' }, {})";
 /// The current buffer's marks in the review namespace, summarised.
 const MARKS_LUA: &str = r#"
 local ns = vim.api.nvim_get_namespaces().eitri_review
-local out = { count = 0, off_priority = 0, adds = {}, virt = {}, signs = {}, trackers = {} }
+local out = { count = 0, off_priority = 0, off_word_priority = 0, words = {}, virt_words = {}, chunks = {}, adds = {}, virt = {}, signs = {}, trackers = {} }
 if not ns then return out end
 for _, m in ipairs(vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true })) do
   local row, d = m[2], m[4]
   out.count = out.count + 1
   -- nvim reports a priority only for a mark that draws something (not for the tracker).
-  if (d.line_hl_group or d.virt_lines or d.sign_text) and d.priority ~= 90 then
+  if (d.line_hl_group or d.virt_lines or d.sign_text or d.hl_group == 'DiffAdd') and d.priority ~= 90 then
     out.off_priority = out.off_priority + 1
   end
-  if d.line_hl_group then table.insert(out.adds, row) end
+  if d.hl_group == 'DiffText' then
+    table.insert(out.words, { row, m[3], d.end_col })
+    if d.priority ~= 91 then out.off_word_priority = out.off_word_priority + 1 end
+  end
+  -- A line with word marks is filled by a text highlight: a line highlight would paint over them.
+  if d.line_hl_group or d.hl_group == 'DiffAdd' then table.insert(out.adds, row) end
   if d.virt_lines then
     local texts = {}
     for _, l in ipairs(d.virt_lines) do
-      local t = ''
+      local t, chunks = '', {}
       for _, c in ipairs(l) do
         t = t .. c[1]
-        if c[2] ~= 'DiffDelete' then t = t .. '<not DiffDelete>' end
+        table.insert(chunks, { c[1], c[2] })
+        if c[2] == 'DiffText' then table.insert(out.virt_words, c[1]) end
+        if c[2] ~= 'DiffDelete' and c[2] ~= 'DiffText' then t = t .. '<not DiffDelete>' end
       end
       table.insert(texts, t)
+      table.insert(out.chunks, chunks)
     end
     table.insert(out.virt, { row = row, above = d.virt_lines_above and true or false, lines = texts })
   end
   if d.sign_text then table.insert(out.signs, { row = row, text = vim.trim(d.sign_text), hl = d.sign_hl_group }) end
-  if d.end_row then table.insert(out.trackers, { row = row, end_row = d.end_row }) end
+  if d.end_row and not d.hl_group then table.insert(out.trackers, { row = row, end_row = d.end_row }) end
 end
 return out
 "#;
@@ -110,6 +118,11 @@ impl Drop for Scratch {
 struct Marks {
     count: usize,
     off_priority: usize,
+    /// (row, byte start, byte end) of buffer DiffText marks.
+    words: Vec<(i64, i64, i64)>,
+    virt_words: Vec<String>,
+    /// (text, highlight) chunks of each removed virtual line.
+    chunks: Vec<Vec<(String, String)>>,
     adds: Vec<i64>,
     /// (row, above, the removed lines shown)
     virt: Vec<(i64, bool, Vec<String>)>,
@@ -285,7 +298,28 @@ impl Fx {
 
     fn marks(&mut self) -> Marks {
         let v = self.nvim.lua(MARKS_LUA, vec![]);
+        assert_eq!(int(get(&v, "off_word_priority")), 0, "word marks have priority 91");
         Marks {
+            words: items(get(&v, "words"))
+                .iter()
+                .map(|m| {
+                    let m = items(m);
+                    (int(&m[0]), int(&m[1]), int(&m[2]))
+                })
+                .collect(),
+            virt_words: items(get(&v, "virt_words")).iter().map(text).collect(),
+            chunks: items(get(&v, "chunks"))
+                .iter()
+                .map(|line| {
+                    items(line)
+                        .iter()
+                        .map(|c| {
+                            let c = items(c);
+                            (text(&c[0]), text(&c[1]))
+                        })
+                        .collect()
+                })
+                .collect(),
             count: int(get(&v, "count")) as usize,
             off_priority: int(get(&v, "off_priority")) as usize,
             adds: items(get(&v, "adds")).iter().map(int).collect(),
@@ -341,6 +375,247 @@ fn as_lines(file: &[u8]) -> Vec<Vec<u8>> {
 
 fn count(answer: &Value, name: &str) -> i64 {
     int(get(answer, name))
+}
+
+/// Draws one whole-file hunk so word assertions can name byte columns directly.
+fn word_hunk(fx: &mut Fx, old: &[&str], new: &[&str]) -> PathBuf {
+    let base = numbered(old);
+    let end = numbered(new);
+    let path = fx.file("words.txt", &end);
+    fx.open(&path);
+    let hunk = hunk_of(1, &base, &end, (1, old.len() as u32), (1, new.len() as u32));
+    assert_eq!(count(&fx.show(&path, &meta(2), &[hunk]), "drawn"), 1);
+    path
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn one_changed_word_has_byte_marks_and_removed_line_chunks() {
+    let mut fx = Fx::new("word-one");
+    word_hunk(&mut fx, &["let total = a + b;"], &["let total = a + c;"]);
+    let marks = fx.marks();
+    assert_eq!(marks.words, vec![(0, 16, 17)]);
+    assert_eq!(marks.virt_words, vec!["b"]);
+    assert_eq!(
+        marks.chunks,
+        vec![vec![
+            ("let total = a + ".to_owned(), "DiffDelete".to_owned()),
+            ("b".to_owned(), "DiffText".to_owned()),
+            (";".to_owned(), "DiffDelete".to_owned()),
+        ]]
+    );
+    assert_eq!(marks.adds, vec![0]);
+    assert_eq!(marks.virt, vec![(0, true, vec!["let total = a + b;".to_owned()])]);
+    // The added line is filled to the window's edge by a text highlight (never a line highlight, which would be
+    // painted over the word mark), so the word shows against the fill.
+    let fill = fx.nvim.lua(
+        "local ns = vim.api.nvim_get_namespaces().eitri_review \
+         for _, m in ipairs(vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, { details = true })) do \
+           if m[4].hl_group == 'DiffAdd' then return { m[2], m[4].end_row, m[4].end_col, m[4].hl_eol and 1 or 0, m[4].line_hl_group and 1 or 0 } end \
+         end",
+        vec![],
+    );
+    assert_eq!(items(&fill).iter().map(int).collect::<Vec<_>>(), vec![0, 1, 0, 1, 0]);
+    assert_eq!(
+        marks.off_priority, 0,
+        "line, virtual and sign marks stay at priority 90"
+    );
+    // The tracker, added line, removed line and sign now also have one word mark.
+    assert_eq!(marks.count, 5);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn two_changed_words_with_common_text_between_stay_separate() {
+    let mut fx = Fx::new("word-two");
+    word_hunk(&mut fx, &["let a = keep + b;"], &["let c = keep + d;"]);
+    let marks = fx.marks();
+    assert_eq!(marks.words, vec![(0, 4, 5), (0, 15, 16)]);
+    assert_eq!(marks.virt_words, vec!["a", "b"]);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn whitespace_between_changed_words_is_one_span() {
+    let mut fx = Fx::new("word-whitespace");
+    word_hunk(&mut fx, &["let a  b;"], &["let c  d;"]);
+    let marks = fx.marks();
+    assert_eq!(marks.words, vec![(0, 4, 8)]);
+    assert_eq!(marks.virt_words, vec!["a  b"]);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn multibyte_words_use_byte_columns() {
+    let mut fx = Fx::new("word-utf8");
+    word_hunk(&mut fx, &["let café = keep;"], &["let 茶葉 = keep;"]);
+    let marks = fx.marks();
+    assert_eq!(marks.words, vec![(0, 4, 10)]);
+    let lines = fx.lines();
+    let (row, start, end) = marks.words[0];
+    assert_eq!(&lines[row as usize][start as usize..end as usize], "茶葉".as_bytes());
+    assert_eq!(marks.virt_words, vec!["café"]);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_whole_line_rewrite_has_only_line_colours() {
+    let mut fx = Fx::new("word-whole");
+    word_hunk(&mut fx, &["before"], &["after"]);
+    let marks = fx.marks();
+    assert!(marks.words.is_empty());
+    assert!(marks.virt_words.is_empty());
+    assert_eq!(marks.adds, vec![0]);
+    assert_eq!(marks.chunks, vec![vec![("before".to_owned(), "DiffDelete".to_owned())]]);
+    assert_eq!(marks.count, 4);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn long_lines_skip_words_on_either_side_at_the_byte_limit() {
+    for (old, new, marked) in [
+        (format!("{} a", "x".repeat(398)), format!("{} b", "x".repeat(398)), true),
+        (
+            format!("{} aa", "x".repeat(398)),
+            format!("{} b", "x".repeat(398)),
+            false,
+        ),
+        (
+            format!("{} a", "x".repeat(398)),
+            format!("{} bb", "x".repeat(398)),
+            false,
+        ),
+    ] {
+        let mut fx = Fx::new("word-bytes");
+        word_hunk(&mut fx, &[&old], &[&new]);
+        let marks = fx.marks();
+        assert_eq!(marks.words.len(), usize::from(marked));
+        assert_eq!(marks.virt_words.len(), usize::from(marked));
+        assert_eq!(marks.adds, vec![0]);
+        assert_eq!(marks.virt[0].2, vec![old]);
+        fx.nvim.quit();
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn only_the_first_hundred_changed_pairs_get_words() {
+    let mut fx = Fx::new("word-pairs");
+    let old: Vec<String> = (0..120).map(|i| format!("let value_{i} = old;")).collect();
+    let new: Vec<String> = (0..120).map(|i| format!("let value_{i} = new;")).collect();
+    word_hunk(
+        &mut fx,
+        &old.iter().map(String::as_str).collect::<Vec<_>>(),
+        &new.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let marks = fx.marks();
+    let expected: Vec<(i64, i64, i64)> = (0..100)
+        .map(|i| {
+            let col = format!("let value_{i} = ").len() as i64;
+            (i, col, col + 3)
+        })
+        .collect();
+    assert_eq!(marks.words, expected);
+    assert_eq!(marks.virt_words, vec!["old"; 100]);
+    assert_eq!(marks.adds.len(), 120);
+    assert_eq!(marks.virt[0].2.len(), 120);
+    assert_eq!(marks.count, 223);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn excessive_tokens_skip_words_on_either_side() {
+    for (old, new) in [
+        (format!("{}old;", "+".repeat(199)), format!("{}new;", "+".repeat(198))),
+        (format!("{}old;", "+".repeat(198)), format!("{}new;", "+".repeat(199))),
+    ] {
+        let mut fx = Fx::new("word-tokens");
+        word_hunk(&mut fx, &[&old], &[&new]);
+        let marks = fx.marks();
+        assert!(marks.words.is_empty());
+        assert!(marks.virt_words.is_empty());
+        assert_eq!(marks.count, 4);
+        fx.nvim.quit();
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn unequal_changed_line_counts_get_no_word_marks() {
+    let mut fx = Fx::new("word-unequal");
+    word_hunk(
+        &mut fx,
+        &["let a = old;", "let b = old;"],
+        &["let a = new;", "let b = new;", "let c = new;"],
+    );
+    let marks = fx.marks();
+    assert!(marks.words.is_empty());
+    assert!(marks.virt_words.is_empty());
+    assert_eq!(marks.adds, vec![0, 1, 2]);
+    assert_eq!(marks.count, 6);
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn word_marks_follow_a_redrawn_hunk_and_clear_without_stale_marks() {
+    let mut fx = Fx::new("word-follow");
+    let path = word_hunk(&mut fx, &["let a = old;"], &["let a = new;"]);
+    let drawn = fx.marks();
+    assert_eq!(drawn.words, vec![(0, 8, 11)]);
+    fx.cursor(1);
+    fx.feed(",r");
+    assert_eq!(fx.event_kinds(), vec!["revert"]);
+    let reverted = fx.marks();
+    assert!(reverted.words.is_empty());
+    assert_eq!(reverted.count, 2, "only the two invisible tracking marks remain");
+    fx.nvim
+        .lua("vim.api.nvim_buf_set_lines(0, 0, 1, true, { 'let a = new;' })", vec![]);
+    fx.wait_for_events(1);
+    assert_eq!(fx.event_kinds(), vec!["unrevert"]);
+    assert_eq!(fx.marks(), drawn, "the word marks were drawn again exactly once");
+    assert_eq!(count(&fx.nvim.lua(CLEAR_LUA, clear_args(&path)), "active"), 0);
+    assert_eq!(fx.marks().count, 0, "clearing also removes every DiffText mark");
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_failed_word_pair_rolls_back_its_marks_and_keeps_drawing() {
+    let mut fx = Fx::new("word-failure");
+    // Fail after the first word mark was installed, so a partial pair must be removed too.
+    fx.nvim.lua(
+        "local original, words = vim.api.nvim_buf_set_extmark, 0 \
+         vim.api.nvim_buf_set_extmark = function(...) \
+           local opts = select(5, ...) \
+           if opts.hl_group == 'DiffText' then \
+             words = words + 1 if words == 2 then error('word mark failed') end \
+           end \
+           return original(...) \
+         end",
+        vec![],
+    );
+    word_hunk(
+        &mut fx,
+        &["let a = keep + b;", "let e = old;"],
+        &["let c = keep + d;", "let e = new;"],
+    );
+    let marks = fx.marks();
+    assert_eq!(marks.words, vec![(1, 8, 11)], "only the second pair has word marks");
+    assert_eq!(marks.virt_words, vec!["old"]);
+    assert_eq!(
+        marks.chunks[0],
+        vec![("let a = keep + b;".to_owned(), "DiffDelete".to_owned())]
+    );
+    assert_eq!(marks.adds, vec![0, 1]);
+    assert_eq!(marks.count, 6);
+    fx.nvim.quit();
 }
 
 #[test]
