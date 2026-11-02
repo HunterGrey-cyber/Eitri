@@ -729,7 +729,8 @@ assert_eq "$(args_of "$out")" "--new-window|a.rs" "--new-window passes through i
 out="$(run_in_filedir --quiet --account x a.rs)"
 assert_eq "$(args_of "$out")" "--new-window|a.rs" "--account as a flag asks for a new window"
 assert_contains "$out" "STUB_ARG:--new-window" "and the stub saw it"
-for sub in panel split run-guard linked-window; do
+mkdir -p "$FILEDIR/choose-project"
+for sub in panel split run-guard linked-window choose-project; do
 	out="$(run_in_filedir --quiet "$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "a path named $sub is not read as the $sub subcommand"
 	out="$(run_in_filedir --quiet "$sub" b.rs)"
@@ -784,6 +785,24 @@ assert_contains "$out" "account work (--account)" "--account names the account i
 out="$(run_in_filedir +42)"
 assert_not_contains "$out" "eitri    open" "a line spec with no file names nothing to open"
 assert_not_contains "$out" "account" "and no account"
+
+echo "== the desktop entry without paths opens the project chooser =="
+out="$(run_in_filedir --from-desktop)"
+assert_eq "$?" "0" "a desktop launch without paths succeeds"
+assert_eq "$(args_of "$out")" "choose-project" "a desktop launch without paths runs choose-project"
+out="$(run_in_filedir --from-desktop --account work)"
+assert_eq "$(args_of "$out")" "choose-project" "the chooser receives no --new-window from --account"
+assert_contains "$out" "STUB_ACCOUNT:work" "the chooser inherits the selected account"
+out="$(run_in_filedir --from-desktop --clean)"
+assert_eq "$(args_of "$out")" "choose-project|--clean" "the chooser receives --clean"
+DELETED_CWD="$SCRATCH_ROOT/deleted-cwd"
+mkdir -p "$DELETED_CWD"
+out="$(cd "$DELETED_CWD" && rmdir "$DELETED_CWD" &&
+	env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" --from-desktop 2>&1)"
+assert_eq "$?" "0" "a desktop launch from a deleted current directory succeeds"
+assert_eq "$(args_of "$out")" "choose-project" "a deleted current directory still reaches the chooser"
+out="$(run_in_filedir)"
+assert_eq "$(args_of "$out")" "$(realpath -e -- "$FILEDIR")" "a launch without flags or paths still opens the current directory"
 
 echo "== the desktop entry's list: a folder after the first path gets a window of its own =="
 launches_of() { grep -c '^STUB_ACCOUNT:' <<<"$1"; }

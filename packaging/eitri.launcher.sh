@@ -142,6 +142,7 @@ PROJECT=""
 QUIET=""
 NEW_WINDOW=""
 FROM_DESKTOP=""
+CHOOSE=""
 FIRST=""
 # Window mode keeps what was typed, in order: BEFORE is everything ahead of the user's `--` (a `+N`
 # stays a line spec there), AFTER everything behind it (all paths). shell resolves them.
@@ -192,7 +193,10 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 [[ $MODE == window && -n "$ACCOUNT_FROM_FLAG" ]] && NEW_WINDOW=1
-if [[ $MODE != window || (${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0) ]]; then
+if [[ -n "$FROM_DESKTOP" && ${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0 ]]; then
+	# The chooser needs no project yet, and must also start when the current directory is gone.
+	CHOOSE=1
+elif [[ $MODE != window || (${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0) ]]; then
 	# No positional (or panel/split, which take a directory only): the one directory, resolved here.
 	PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "eitri: no such directory" >&2; exit 1; }
 	[[ $MODE == window ]] && BEFORE=("$PROJECT") && SAW_DASHES=""
@@ -308,6 +312,7 @@ fi
 if [[ $MODE == panel ]]; then
 	exec "$LIBDIR/shell" panel "${PANEL_ARGS[@]}" -- "$PROJECT"
 fi
+[[ -n "$CHOOSE" ]] && exec "$LIBDIR/shell" choose-project "${SHELL_ARGS[@]}"
 [[ -n "$NEW_WINDOW" ]] && SHELL_ARGS+=(--new-window)
 # A file manager gives the desktop entry everything selected as one list, and a folder after the first path is a
 # refusal no screen would show. So each folder gets a window of its own, as it would from one launch per item, and
@@ -339,7 +344,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		panel | split | run-guard | linked-window) BEFORE[0]="./${BEFORE[0]}" ;;
+		panel | split | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then
