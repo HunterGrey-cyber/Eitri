@@ -24,6 +24,8 @@ struct Fake {
     editor_last_visible: Cell<bool>,
     log: RefCell<Vec<String>>,
     ticks: RefCell<Vec<u32>>,
+    /// How often the last record nvim left was asked to be read; kept out of `log`, which pins what the quit does.
+    handoffs: Cell<u32>,
 }
 
 impl Fake {
@@ -155,6 +157,9 @@ impl QuitWorld for Rc<Fake> {
     }
     fn every_second(&mut self, generation: u32) {
         self.ticks.borrow_mut().push(generation);
+    }
+    fn read_handoff(&mut self) {
+        self.handoffs.set(self.handoffs.get() + 1);
     }
 }
 
@@ -982,4 +987,36 @@ fn quit_events_keep_their_window_and_settled_answer() {
     ] {
         assert_eq!(event_window(&HostEvent::Editor(event)), Some(win));
     }
+}
+
+/// Every exit that leaves the window reads what nvim left at its exit here, a kill of the editor included, so that
+/// record is kept while the window lives on; a window close reads it at its teardown.
+#[test]
+fn every_exit_but_a_window_close_reads_the_last_record() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    quitting.nvim_exited();
+    assert_eq!(fake.handoffs.get(), 1, "a :qa");
+    assert_eq!(fake.log(), ["close_window"]);
+
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    quitting.nvim_crashed();
+    assert_eq!(fake.handoffs.get(), 1, "a crash");
+
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    quitting.window_close();
+    fake.running.set(false);
+    quitting.nvim_exited();
+    assert_eq!(fake.handoffs.get(), 0, "a window close");
+
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    quitting.kill_editor(KillScope::Module, None).unwrap();
+    fake.running.set(false);
+    quitting.nvim_exited();
+    assert_eq!(fake.handoffs.get(), 1, "a kill of the editor");
 }

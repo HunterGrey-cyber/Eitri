@@ -840,6 +840,20 @@ pub enum EditorCall {
         line: Option<u32>,
         col: Option<u32>,
     },
+    /// Runs the reopen capture in the running editor with `args` (the token, the project root and the prefixes to
+    /// leave out) and reports its answer, however late, as one [`EditorEvent::Captured`] carrying `token`.
+    Capture {
+        win: WinId,
+        token: String,
+        args: rmpv::Value,
+    },
+    /// Has the window's record writer read the record the nvim of `token` left at its exit, waiting for it a short
+    /// while, and hand it over with `seq`; the writer answers once per token, record or none.
+    ReadHandoff { win: WinId, token: String, seq: u64 },
+    /// Removes the input an earlier nvim of the window was started with from the channel directory, so a restart
+    /// whose own input the record writer has not written in time starts with none (nvim then reopens nothing and
+    /// keeps nothing) rather than reading another nvim's token and restore.
+    DropInput { win: WinId },
 }
 
 /// Commands sent to the chat service.
@@ -1103,6 +1117,10 @@ pub enum CleanupOp {
     PaneSwitchDir,
     /// The process scratch directory.
     ScratchDir,
+    /// The editor's record, after nvim was told to end and before the channel directory nvim leaves its last record
+    /// in is removed: that record is read (when `token` is `Some`; a token whose read was asked already is `None`)
+    /// and handed over with `seq`, then the record writer is waited for, bounded, so what it holds is on disk.
+    EditorRecord { token: Option<String>, seq: u64 },
 }
 
 /// What the pair's glue carries out once the controller has taken back what a window held away for the other
@@ -1385,6 +1403,13 @@ pub enum EditorEvent {
     Reopen {
         win: WinId,
         line: crate::pane_switch::ReopenLine,
+    },
+    /// The answer to the [`EditorCall::Capture`] asked with `token`: the record's JSON and whether it is the one the
+    /// restore itself produced, nothing when the capture would not answer for this nvim yet, or why the call failed.
+    Captured {
+        win: WinId,
+        token: String,
+        reply: Result<Option<(String, bool)>, String>,
     },
     /// This generation's quit request could not be sent.
     QuitNotSent { win: WinId, generation: u32 },

@@ -279,6 +279,49 @@ pub fn recoverable_text(count: u32, newest: &str) -> String {
     format!("unsaved changes kept for {files} \u{2014} :e the file, then r recovers them or d deletes them")
 }
 
+/// "1 file" or "N files": the reopen lines' counts.
+fn file_count(count: u32) -> String {
+    match count {
+        1 => "1 file".to_string(),
+        count => format!("{count} files"),
+    }
+}
+
+/// Files the last session had open that are no longer there, named by the first of them the editor reported.
+pub fn reopen_gone_text(count: u32, name: &str) -> String {
+    let verb = if count == 1 { "is" } else { "are" };
+    let more = match count.saturating_sub(1) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    format!("{} from last time {verb} gone: {name}{more}", file_count(count))
+}
+
+/// A file the editor could not open again; the error's first line went to its stderr.
+pub fn reopen_failed_text(name: &str) -> String {
+    format!("could not reopen {name}")
+}
+
+/// Windows the screen had no room for: their files were listed as buffers instead.
+pub fn reopen_squeezed_text(count: u32) -> String {
+    let rest = if count == 1 { "it is" } else { "they are" };
+    format!(
+        "{} from last time did not fit on screen; {rest} in :ls",
+        file_count(count)
+    )
+}
+
+/// The record of the editor's files did not read back and was moved aside, so nothing was reopened.
+pub fn reopen_set_aside_text() -> String {
+    "the editor's last files could not be read; the file was set aside".to_string()
+}
+
+/// The last start's reopening never said it ended (a crash or a hang in it), so this start does not try again.
+pub fn reopen_unfinished_text() -> String {
+    "the editor's last files were not reopened: the last try did not finish; editor.restore = false turns reopening off"
+        .to_string()
+}
+
 /// Requests must wait until the restarted nvim can receive them.
 pub const EDITOR_NOT_RUNNING_TEXT: &str = "the editor is not running";
 

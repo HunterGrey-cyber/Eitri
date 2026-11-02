@@ -13,12 +13,15 @@ pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 /// - its `SAVED_TABS_BACKSTOP` (5 s; `CONNECT_CLOSE_BACKSTOP` and `HANDOFF_CLOSE_BACKSTOP`, 3 s each, are shorter);
 /// - nvim's `NVIM_QUIT_PATIENCE` (5 s), after which `NeovideEditorPane::shutdown` kills it;
 /// - a plugin task group's stop, `crate::plugin::tasks::GRACE` (2 s);
-/// - the plugin pages' hold in `plugin_panels::shutdown` (that grace and 1 s more, 3 s).
+/// - the plugin pages' hold in `plugin_panels::shutdown` (that grace and 1 s more, 3 s);
+/// - the editor's record: the read of nvim's last one (`editor_reopen_start::HANDOFF_WAIT`, 1 s) and the wait for its
+///   writer (`RECORD_FLUSH`, 2 s), 3 s.
 ///
-/// That is 33 s; 38 s with the margin, rounded up. A shorter bound would end a healthy close before the session
-/// teardown escalates, and leave the very `claude` and sidecar processes that teardown exists to end. Raising any
-/// of those bounds means raising this one.
-pub const CLOSE_WITHIN: Duration = Duration::from_secs(40);
+/// That is 36 s; 41 s with the margin, rounded up to 42 s so a window this one tells to close after answering the
+/// signal late (within [`ANSWER_WITHIN`]) still has its whole close before its kill ([`told_within`]). A shorter bound
+/// would end a healthy close before the session teardown escalates, and leave the very `claude` and sidecar processes
+/// that teardown exists to end. Raising any of those bounds means raising this one.
+pub const CLOSE_WITHIN: Duration = Duration::from_secs(42);
 
 /// How far ahead of the watchdog's `_exit` the SIGKILL of a window told to close lands: the `_exit` takes the thread
 /// that would send it.
@@ -151,7 +154,24 @@ mod tests {
         let nvim = Duration::from_secs(5);
         let tasks = crate::plugin::tasks::GRACE;
         let pages = crate::plugin::tasks::GRACE + Duration::from_secs(1);
-        session + saved_tabs + nvim + tasks + pages
+        let editor_record = crate::editor_reopen_start::HANDOFF_WAIT + crate::editor_reopen_start::RECORD_FLUSH;
+        session + saved_tabs + nvim + tasks + pages + editor_record
+    }
+
+    #[test]
+    fn the_close_bound_covers_the_record_flush() {
+        let editor_record = crate::editor_reopen_start::HANDOFF_WAIT + crate::editor_reopen_start::RECORD_FLUSH;
+        assert_eq!(
+            editor_record,
+            Duration::from_secs(3),
+            "the handoff's read and the writer's flush"
+        );
+        assert_eq!(
+            every_close_bound(),
+            Duration::from_secs(33) + editor_record,
+            "the other bounds, then the record's"
+        );
+        assert!(CLOSE_WITHIN >= every_close_bound() + Duration::from_secs(5));
     }
 
     #[test]

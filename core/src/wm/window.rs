@@ -319,6 +319,8 @@ pub struct Window {
     pub(super) pending_restart: Option<super::terminal_at::PendingRestart>,
     /// The next `terminal.at` read's own number, which its answer carries back.
     pub(super) next_job_read: u64,
+    /// Reopening the editor's files, when this window does.
+    pub(super) reopen: Option<super::reopen::Reopen>,
     #[cfg(test)]
     notes: Vec<String>,
 }
@@ -384,6 +386,7 @@ impl Window {
             pending_at: Vec::new(),
             pending_restart: None,
             next_job_read: 0,
+            reopen: None,
             #[cfg(test)]
             notes: vec![],
         }

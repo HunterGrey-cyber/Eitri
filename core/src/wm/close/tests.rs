@@ -126,11 +126,19 @@ impl Rig {
 }
 
 fn teardown_ops(written: bool) -> Vec<HostOp> {
-    vec![
+    teardown_ops_with(written, None)
+}
+
+/// The teardown of a window that keeps the editor's record, `record` being its op.
+fn teardown_ops_with(written: bool, record: Option<CleanupOp>) -> Vec<HostOp> {
+    let mut ops = vec![
         HostOp::Cleanup(CleanupOp::PairOnClose {
             layout_written: written,
         }),
         HostOp::Editor(EditorCall::Shutdown { win: WIN }),
+    ];
+    ops.extend(record.map(HostOp::Cleanup));
+    ops.extend([
         HostOp::Terminal(TermOp::ShutdownAll { win: WIN }),
         HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::Cleanup(CleanupOp::PaneSwitchDir),
@@ -138,7 +146,20 @@ fn teardown_ops(written: bool) -> Vec<HostOp> {
         HostOp::Plugin(PluginOp::ShutdownAll { win: WIN }),
         HostOp::Chat(ChatOp::ShutdownAll { win: WIN, hold: true }),
         HostOp::CloseWindow { win: WIN },
-    ]
+    ]);
+    ops
+}
+
+/// Gives the rig's window the editor's record, as its start's reopen step would from `place`: its nvim's token.
+fn reopening(r: &mut crate::wm::verbs::rig::Rig, place: &crate::editor_reopen_start::tests::Place) -> String {
+    let prepared = crate::editor_reopen_start::prepare_start(&place.start());
+    let token = prepared.token.clone().expect("a start that reopens");
+    let waker = r.scheduler.waker();
+    let w = r.controller.window_mut(WIN).unwrap();
+    crate::wm::reopen::install(w, prepared, waker);
+    // Its restore ended, so nvim leaves its last record as it ends.
+    w.reopen.as_mut().unwrap().state = crate::wm::reopen::TokenState::Ended;
+    token
 }
 
 #[test]
@@ -531,21 +552,108 @@ fn prefix_x_on_the_last_module_asks_the_window_close() {
 
 #[test]
 fn the_teardown_ops_are_answered_done_in_order() {
-    let host = FakeHost::new();
-    let sink = Rc::new(crate::wm::conformance::RecordingSink::default());
-    let erased: Rc<dyn HostSink> = sink.clone();
-    host.attach(Rc::downgrade(&erased));
-    let script = crate::wm::conformance::teardown_script(WIN);
-    crate::wm::conformance::run(host.as_ref(), &sink, &script).unwrap();
+    let record = CleanupOp::EditorRecord {
+        token: Some("0123456789abcdef".into()),
+        seq: 4,
+    };
+    for record in [None, Some(record)] {
+        let host = FakeHost::new();
+        let sink = Rc::new(crate::wm::conformance::RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        let script = crate::wm::conformance::teardown_script_for(WIN, record.clone());
+        crate::wm::conformance::run(host.as_ref(), &sink, &script).unwrap();
+        assert_eq!(
+            host.log()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Logged::Op(op, Applied::Done) => Some(op),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            teardown_ops_with(true, record)
+        );
+    }
+}
+
+/// Whatever closes the window, the editor's record is read and flushed after nvim is told to end and before the
+/// channel directory nvim leaves its last record in is removed.
+#[test]
+fn every_close_cause_orders_shutdown_then_record_then_pane_switch_dir() {
+    use crate::editor_reopen_start::tests::Place;
+    let causes: [(&str, fn(&Rig)); 3] = [
+        ("user", |r| {
+            r.driver.close_requested(WIN, CloseBy::User);
+            r.advance();
+        }),
+        ("signal", |r| r.signal()),
+        ("group closed", |r| r.driver.post(HostEvent::GroupClosed { win: WIN })),
+    ];
+    for (name, close) in causes {
+        let place = Place::new(&format!("close-{}", name.replace(' ', "-")));
+        let mut rig = rig_with(two(), |_, _| None);
+        let token = reopening(&mut rig, &place);
+        let r = driven_rig(rig);
+        let at = r.ops().len();
+        close(&r);
+        let ops = r.ops()[at..].to_vec();
+        let find = |wanted: &dyn Fn(&HostOp) -> bool| ops.iter().position(|op| wanted(op));
+        let shutdown = find(&|op| matches!(op, HostOp::Editor(EditorCall::Shutdown { .. })));
+        let record = find(&|op| matches!(op, HostOp::Cleanup(CleanupOp::EditorRecord { .. })));
+        let channel = find(&|op| matches!(op, HostOp::Cleanup(CleanupOp::PaneSwitchDir)));
+        let (Some(shutdown), Some(record), Some(channel)) = (shutdown, record, channel) else {
+            panic!("{name}: the three ops, in {ops:?}");
+        };
+        assert!(shutdown < record && record < channel, "{name}: {ops:?}");
+        assert_eq!(
+            ops[record],
+            HostOp::Cleanup(CleanupOp::EditorRecord {
+                token: Some(token),
+                seq: 1
+            }),
+            "{name}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, HostOp::Cleanup(CleanupOp::EditorRecord { .. })))
+                .count(),
+            1,
+            "{name}"
+        );
+    }
+}
+
+/// `:qa` ends nvim with nobody asking: its last record is read then, so the teardown that follows only waits for the
+/// writer and does not ask for the same read again.
+#[test]
+fn a_qa_close_does_not_read_the_handoff_twice() {
+    use crate::editor_reopen_start::tests::Place;
+    let place = Place::new("close-qa");
+    let mut rig = rig_with(two(), |_, _| None);
+    let token = reopening(&mut rig, &place);
+    let r = driven_rig(rig);
+    let at = r.ops().len();
+    r.exited(None);
+    r.advance();
+    let ops = r.ops()[at..].to_vec();
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op, HostOp::Editor(EditorCall::ReadHandoff { .. })))
+        .collect();
     assert_eq!(
-        host.log()
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Logged::Op(op, Applied::Done) => Some(op),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        teardown_ops(true)
+        reads,
+        [&HostOp::Editor(EditorCall::ReadHandoff {
+            win: WIN,
+            token,
+            seq: 1
+        })]
+    );
+    let read_at = ops.iter().position(|op| op == reads[0]).unwrap();
+    assert_eq!(r.close_count(), 1);
+    assert_eq!(
+        &ops[read_at + 1..],
+        teardown_ops_with(false, Some(CleanupOp::EditorRecord { token: None, seq: 1 })),
+        "{ops:?}"
     );
 }
 

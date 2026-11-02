@@ -20,6 +20,7 @@ pub enum StartPhase {
     Kernel,
     Config,
     Layout,
+    Reopen,
     Surfaces,
     Chrome,
     Present,
@@ -34,6 +35,7 @@ pub fn start_plan() -> &'static [StartPhase] {
         StartPhase::Kernel,
         StartPhase::Config,
         StartPhase::Layout,
+        StartPhase::Reopen,
         StartPhase::Surfaces,
         StartPhase::Chrome,
         StartPhase::Present,
@@ -207,6 +209,11 @@ pub enum StartStep {
         /// How the window takes part in the compositor's tiling, known only now that `init.lua` has run.
         tiling: Tiling,
     },
+    /// What the shell found and started for reopening the editor's files, once `init.lua` has said whether to:
+    /// the window keeps the record's writer and the token of the nvim it is about to start.
+    Reopen {
+        prepared: crate::editor_reopen_start::Prepared,
+    },
     Surfaces {
         decls: Vec<SurfaceDecl>,
     },
@@ -228,6 +235,7 @@ impl StartStep {
             Self::Kernel => StartPhase::Kernel,
             Self::Config { .. } => StartPhase::Config,
             Self::Layout { .. } => StartPhase::Layout,
+            Self::Reopen { .. } => StartPhase::Reopen,
             Self::Surfaces { .. } => StartPhase::Surfaces,
             Self::Chrome => StartPhase::Chrome,
             Self::Present { .. } => StartPhase::Present,
@@ -334,6 +342,7 @@ impl Controller {
                 self.attach_parts(win, parts);
                 self.show_editor_for_targets(win);
             }
+            StartStep::Reopen { prepared } => self.reopen_prepared(win, prepared),
             StartStep::Surfaces { decls } => return self.create_surfaces(win, &decls),
             StartStep::Present {
                 activation,
@@ -341,6 +350,8 @@ impl Controller {
                 arrive,
             } => {
                 batch.push_layout(HostOp::Present { win, activation });
+                // What the start found of the editor's last files waits for a window that can show it.
+                self.reopen_present(win, &mut batch);
                 batch.push_layout(HostOp::Focus {
                     win,
                     to: FocusTo::Module(first),
@@ -421,6 +432,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::Leaving { win }
             | EditorEvent::Recoverable { win, .. }
             | EditorEvent::Reopen { win, .. }
+            | EditorEvent::Captured { win, .. }
             | EditorEvent::QuitNotSent { win, .. }
             | EditorEvent::ScaleReported { win, .. }
             | EditorEvent::QuitAnswered { win, .. }
@@ -604,6 +616,13 @@ mod tests {
         StartStep::Config { keymap, module_keys }
     }
 
+    /// The reopen phase of a start that reopens nothing.
+    fn reopen() -> StartStep {
+        StartStep::Reopen {
+            prepared: crate::editor_reopen_start::Prepared::nothing(),
+        }
+    }
+
     fn parts() -> WindowParts {
         WindowParts {
             layout: Rc::new(RefCell::new(
@@ -628,6 +647,7 @@ mod tests {
                 StartPhase::Kernel,
                 StartPhase::Config,
                 StartPhase::Layout,
+                StartPhase::Reopen,
                 StartPhase::Surfaces,
                 StartPhase::Chrome,
                 StartPhase::Present,
@@ -647,6 +667,7 @@ mod tests {
                 own_window: None,
                 tiling: Tiling::Eitri,
             },
+            reopen(),
             StartStep::Surfaces {
                 decls: vec![SurfaceDecl {
                     module: ModuleId::agent(),
@@ -787,6 +808,7 @@ mod tests {
             .iter()
             .map(crate::wm::verbs::rig::decl)
             .collect();
+        driver.start(WinId::MAIN, reopen());
         driver.start(WinId::MAIN, StartStep::Surfaces { decls });
         driver.start(WinId::MAIN, StartStep::Chrome);
         let first = shared.borrow().focus().clone();
@@ -1078,6 +1100,7 @@ mod tests {
                 tiling: Tiling::Eitri,
             },
         );
+        driver.start(WinId::MAIN, reopen());
         driver.start(
             WinId::MAIN,
             StartStep::Surfaces {
@@ -1319,6 +1342,7 @@ mod tests {
                     tiling: Tiling::Eitri,
                 },
             );
+            driver.start(WinId::MAIN, reopen());
             driver.start(
                 WinId::MAIN,
                 StartStep::Surfaces {
@@ -1376,6 +1400,7 @@ mod tests {
                 own_window: None,
                 tiling: Tiling::ModuleWindow,
             },
+            reopen(),
             StartStep::Surfaces {
                 decls: vec![SurfaceDecl {
                     module: module.clone(),
@@ -1708,6 +1733,7 @@ mod tests {
                 own_window: None,
                 tiling: Tiling::Hub,
             },
+            reopen(),
             StartStep::Surfaces {
                 decls: surfaces.to_vec(),
             },

@@ -5,6 +5,7 @@
 //! the crate's own module docs.
 
 mod agent_panel;
+mod capture_requests;
 mod chat_views;
 mod chrome;
 mod close_prompt;
@@ -1257,6 +1258,50 @@ fn build_ui(
             let _ = ide_wiring.set(wiring);
         }
     }
+    // Whether the editor reopens what it had open last time: known only now that `init.lua` has run, which is still
+    // before nvim reaches VimEnter (it starts when the editor first renders). So the record is read, nvim's input
+    // written and the record's writer started here, before the main loop; the controller takes them at its reopen
+    // step. A window without its own editor reads nothing.
+    let editor_restore = owns_editor
+        && match eitri_core::lua::config::parse_editor_restore(
+            lua_engine
+                .config
+                .borrow()
+                .get(eitri_core::lua::config::EDITOR_RESTORE_KEY),
+        ) {
+            Ok(on) => on,
+            Err(message) => {
+                eprintln!("eitri: {message}");
+                std::process::exit(1);
+            }
+        };
+    let reopen_prepared = {
+        let state_home = std::env::var_os("XDG_STATE_HOME");
+        let home = std::env::var_os("HOME");
+        let channel_dir = pane_switch.as_ref().map(|ps| ps.dir().to_path_buf());
+        // The window's private directories nvim can see: a file under one is the window's own, not the person's.
+        let prefixes: Vec<PathBuf> = [
+            channel_dir.clone(),
+            scratch_path.clone(),
+            eitri_core::state_paths::state_subdir(state_home.as_deref(), home.as_deref(), ""),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(""))
+        .collect();
+        eitri_core::editor_reopen_start::prepare_start(&eitri_core::editor_reopen_start::ReopenStart {
+            enabled: editor_restore && !want_clean,
+            state_home,
+            home,
+            role: pair.pair_role(),
+            channel_dir,
+            root: project_root.to_path_buf(),
+            prefixes,
+            started_with_files: opens_files,
+        })
+    };
+    // The teardown's handle on the same writer: the close reads nvim's last record through it.
+    let reopen_writer = reopen_prepared.writer.clone();
     let terminal_face = Rc::new(RefCell::new(terminal::face_for(
         start_theme.guifont(),
         terminal_font.as_ref(),
@@ -2048,6 +2093,12 @@ fn build_ui(
             parts,
             own_window,
             tiling,
+        },
+    );
+    driver.start(
+        WinId::MAIN,
+        StartStep::Reopen {
+            prepared: reopen_prepared,
         },
     );
     // The base page's place, whichever start step built it; a window that builds none has an empty place no host takes.
@@ -4608,6 +4659,7 @@ fn build_ui(
         pair: pair.clone(),
         scratch_path: scratch_path.clone(),
         pane_switch,
+        reopen_writer,
         host_clipboard,
         theme_feed,
         context_feed,

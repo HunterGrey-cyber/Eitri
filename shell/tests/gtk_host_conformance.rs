@@ -1716,6 +1716,13 @@ fn run_all() -> Result<Vec<String>, String> {
         .chain([
             conformance::join_back_refusal_script(f.win, "the tab could not join the base view"),
             conformance::teardown_script(f.win),
+            conformance::teardown_script_for(
+                f.win,
+                Some(CleanupOp::EditorRecord {
+                    token: Some("0123456789abcdef".into()),
+                    seq: 1,
+                }),
+            ),
         ]);
     for script in scripts {
         let s = stage(&f)?;

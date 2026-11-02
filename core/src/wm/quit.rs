@@ -67,6 +67,9 @@ pub trait QuitWorld {
     fn editor_crashed_text(&self) -> String;
     /// Schedules polls of this generation until `poll` says to stop; the flow never waits on a timer.
     fn every_second(&mut self, generation: u32);
+    /// nvim ended and the window stays (nobody asked, or only the editor was killed): the last record it left of
+    /// what was open is to be read.
+    fn read_handoff(&mut self);
 }
 
 #[derive(Default)]
@@ -310,18 +313,25 @@ impl QuitFlow {
                 quit: EditorQuit::Module,
                 ..
             }) => match world.end_editor() {
-                Ok(()) => {}
+                // Captures stop with the editor, so its last record is kept now, not at the next restart or close.
+                Ok(()) => world.read_handoff(),
                 Err(err) => {
                     println!("[modules] editor: nvim quit and could not be closed ({err}); closing the window");
                     world.close_window();
                 }
             },
+            // Nobody asked, so nothing else reads what nvim left of its open files as it ended; a `:qa`'s close then
+            // only waits for the read.
             None if crashed => {
+                world.read_handoff();
                 if Self::end_in_place(world, "[modules] editor: nvim stopped with nobody asking") {
                     world.warn(&world.editor_crashed_text());
                 }
             }
-            None => world.close_window(),
+            None => {
+                world.read_handoff();
+                world.close_window();
+            }
         }
     }
 

@@ -836,20 +836,33 @@ pub fn restart_editor(w: &mut Window, _cx: &Cx, win: WinId, batch: &mut Batch) {
     }
     match w.editor_run {
         EditorRun::Ended => {
-            let Some(mut spawn) = w.editor_spawn.clone() else {
+            if w.editor_spawn.is_none() {
                 w.refuse(win, "the editor's launch settings are unavailable".into(), batch);
                 return;
-            };
-            // Until the editor has been ready once, nothing has opened the launch's targets.
-            spawn.open = w.pending_open.clone();
+            }
             w.restart_wanted = false;
             w.editor_ready = false;
             w.editor_run = EditorRun::Restarting;
-            batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn }));
+            // A window that reopens its files starts the new nvim once its input holds the ended one's last record.
+            if !crate::wm::reopen::hold_restart(w, win, batch) {
+                send_restart(w, win, batch);
+            }
         }
         EditorRun::Ending => w.restart_wanted = true,
         EditorRun::Restarting | EditorRun::Running => {}
     }
+}
+
+/// Starts nvim again with the kept launch settings, for an editor whose run is restarting.
+pub(crate) fn send_restart(w: &mut Window, win: WinId, batch: &mut Batch) {
+    let Some(mut spawn) = w.editor_spawn.clone() else {
+        w.editor_run = EditorRun::Ended;
+        w.refuse(win, "the editor's launch settings are unavailable".into(), batch);
+        return;
+    };
+    // Until the editor has been ready once, nothing has opened the launch's targets.
+    spawn.open = w.pending_open.clone();
+    batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn }));
 }
 
 /// How many files may wait for the editor at once; one more is refused and its client opens a new window.

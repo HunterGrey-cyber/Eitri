@@ -1125,6 +1125,7 @@ fn build_ui_walks_the_start_plan() {
         StartPhase::Kernel => "Kernel",
         StartPhase::Config => "Config",
         StartPhase::Layout => "Layout",
+        StartPhase::Reopen => "Reopen",
         StartPhase::Surfaces => "Surfaces",
         StartPhase::Chrome => "Chrome",
         StartPhase::Present => "Present",
@@ -1160,6 +1161,19 @@ fn build_ui_walks_the_start_plan() {
         kernel < told_again && told_again < code.find("StartStep::Config").unwrap(),
         "the config phase knows what `window.tiling` says"
     );
+    // Reopening the editor's files: `editor.restore` is read once `init.lua` has run, the record and nvim's input are
+    // prepared after it, and the controller takes them at its reopen step, before any surface or the window's showing.
+    let restore = code
+        .find("eitri_core::lua::config::parse_editor_restore(")
+        .expect("`editor.restore` is read");
+    let prepared = code
+        .find("eitri_core::editor_reopen_start::prepare_start(")
+        .expect("the reopen is prepared");
+    let reopen = code
+        .find("StartStep::Reopen{prepared:reopen_prepared")
+        .expect("the reopen step");
+    assert!(kernel < restore && restore < prepared && prepared < reopen);
+    assert_eq!(code.matches("prepare_start(").count(), 1);
     let taken = code.find("base_page.take()").expect("the page's place");
     assert!(code.find("StartStep::Layout").unwrap() < taken);
     assert!(taken < code.find("StartStep::Surfaces").unwrap());

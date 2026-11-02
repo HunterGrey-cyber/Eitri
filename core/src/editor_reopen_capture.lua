@@ -56,7 +56,7 @@ local function leaf(win, current)
     left = bounded(view.leftcol, 0, 2147483648),
     w = bounded(api.nvim_win_get_width(win), 1, 10000),
     h = bounded(api.nvim_win_get_height(win), 1, 10000),
-    cur = win == current and true or nil,
+    cur = win == current,
   } }
 end
 

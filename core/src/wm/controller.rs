@@ -1375,6 +1375,7 @@ impl Controller {
                 || super::keys::hint_timer_fired(window, token)
                 || super::onboarding::timer_fired(window, *win, token, batch)
                 || chrome::toast_timer_fired(window, token)
+                || super::reopen::timer(window, *win, token, batch)
                 || chrome::resize_idle_fired(window, token)
             {
                 return;
@@ -1428,6 +1429,7 @@ impl Controller {
             HostEvent::Active { active, .. } => {
                 if !*active {
                     super::grid::drag::release(w);
+                    super::reopen::focus_out(w, win, batch);
                 }
                 super::focus::on_active(w, win, *active, batch);
             }
@@ -1535,6 +1537,33 @@ impl Controller {
             if let Some(saver) = window.saver.as_mut() {
                 saver.collect(window.workspaces.try_borrow_mut().ok().as_deref_mut());
             }
+        }
+    }
+
+    /// A record writer woke the controller: every window takes what its writer answered.
+    fn collect_reopen(&mut self, batch: &mut Batch) {
+        for (win, window) in &mut self.windows {
+            super::reopen::collect(window, *win, batch);
+        }
+    }
+
+    /// The start's reopen step: the window keeps what the shell prepared, and its writer wakes the controller
+    /// through the scheduler.
+    pub(super) fn reopen_prepared(&mut self, win: WinId, prepared: crate::editor_reopen_start::Prepared) {
+        let waker = self.scheduler.waker();
+        match self.windows.get_mut(&win) {
+            Some(window) => super::reopen::install(window, prepared, waker),
+            None if prepared.writer.is_some() => {
+                self.start_note("[wm] BUG: the reopen step for a window without a layout".into())
+            }
+            None => {}
+        }
+    }
+
+    /// The window is shown: what its start found of the editor's last files is said now.
+    pub(super) fn reopen_present(&mut self, win: WinId, batch: &mut Batch) {
+        if self.windows.get_mut(&win).is_some_and(super::reopen::present) {
+            self.settle_chrome(batch);
         }
     }
 
@@ -1654,13 +1683,13 @@ impl Decide for Controller {
                 | EditorEvent::Leaving { win }
                 | EditorEvent::Recoverable { win, .. }
                 | EditorEvent::Reopen { win, .. }
+                | EditorEvent::Captured { win, .. }
                 | EditorEvent::QuitCancelled { win, .. }
                 | EditorEvent::QuitNotSent { win, .. }
                 | EditorEvent::OpenFailed { win, .. }),
             ) => {
-                self.modules_event(win, &mut batch, |w, cx, batch| match event {
-                    EditorEvent::Reopen { .. } => {}
-                    event => super::close::editor_event(w, cx, win, event, batch),
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    super::close::editor_event(w, cx, win, event, batch)
                 });
             }
             HostEvent::Terminal(TermEvent::Exited { win, module }) => {
@@ -1788,7 +1817,10 @@ impl Decide for Controller {
             }
             HostEvent::Timer(token) => self.timer_fired(token, &mut batch),
             HostEvent::Settled { win } => self.settled(win),
-            HostEvent::Wake => self.collect_saves(),
+            HostEvent::Wake => {
+                self.collect_saves();
+                self.collect_reopen(&mut batch);
+            }
             HostEvent::Created { win, module } => self.modules_event(win, &mut batch, |window, cx, batch| {
                 module_verbs::created(window, cx, win, &module, batch);
             }),

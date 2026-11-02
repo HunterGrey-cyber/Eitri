@@ -54,9 +54,18 @@ pub struct Script {
 
 /// The complete service teardown, for hosts whose cleanup and shutdown services are attached.
 pub fn teardown_script(win: WinId) -> Script {
-    let ops = vec![
+    teardown_script_for(win, None)
+}
+
+/// The teardown of a window that keeps the editor's record, `record` being its op: right after nvim's shutdown, ahead
+/// of the channel directory's removal.
+pub fn teardown_script_for(win: WinId, record: Option<CleanupOp>) -> Script {
+    let mut ops = vec![
         HostOp::Cleanup(CleanupOp::PairOnClose { layout_written: true }),
         HostOp::Editor(EditorCall::Shutdown { win }),
+    ];
+    ops.extend(record.map(HostOp::Cleanup));
+    ops.extend([
         HostOp::Terminal(TermOp::ShutdownAll { win }),
         HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::Cleanup(CleanupOp::PaneSwitchDir),
@@ -64,7 +73,7 @@ pub fn teardown_script(win: WinId) -> Script {
         HostOp::Plugin(PluginOp::ShutdownAll { win }),
         HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
         HostOp::CloseWindow { win },
-    ];
+    ]);
     let mut expect: Vec<_> = (0..ops.len())
         .map(|op| Expect::Answer {
             op,

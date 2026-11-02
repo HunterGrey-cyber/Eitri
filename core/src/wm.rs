@@ -23,6 +23,7 @@ pub mod persist;
 pub mod prefix_panel;
 pub mod prefix_strip;
 pub mod quit;
+pub mod reopen;
 pub mod start;
 pub mod terminal_at;
 pub mod text_size;

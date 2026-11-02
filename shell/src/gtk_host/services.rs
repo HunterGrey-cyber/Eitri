@@ -281,6 +281,9 @@ pub(crate) struct Teardown {
     /// The panel's scratch directory: removed here, since GTK may never drop the `ScratchDir` that owns it.
     pub(crate) scratch_path: Option<PathBuf>,
     pub(crate) pane_switch: Option<crate::pane_switch::PaneSwitchChannel>,
+    /// The writer of the editor's record, in a window that reopens the editor's files: it reads the last record nvim
+    /// leaves in the channel directory as it ends.
+    pub(crate) reopen_writer: Option<eitri_core::editor_record::RecordWriter>,
     /// The thread serving nvim's clipboard calls on the channel's `c.sock`; stopped with the channel's directory.
     pub(crate) host_clipboard: Option<eitri_core::host_clipboard::ClipboardServer>,
     pub(crate) theme_feed: Option<crate::theme::feed::ThemeFeed>,
@@ -301,6 +304,28 @@ pub(crate) struct Teardown {
 }
 
 impl Teardown {
+    /// The record's writer and the channel directory nvim leaves its last record in, when this window reopens.
+    fn reopen(&self) -> Option<(&eitri_core::editor_record::RecordWriter, &std::path::Path)> {
+        Some((self.reopen_writer.as_ref()?, self.pane_switch.as_ref()?.dir()))
+    }
+
+    /// The writer reads the last record the nvim of `token` left as it ended; its answer wakes the controller.
+    fn read_handoff(&self, token: &str, seq: u64) {
+        if let Some((writer, channel)) = self.reopen() {
+            eitri_core::editor_reopen_start::read_handoff(writer, channel, token, seq);
+        }
+    }
+
+    /// The close waits, bounded, for the record's last write, the read of nvim's last record when `token` is given
+    /// included, before the channel directory goes.
+    fn close_record(&self, token: Option<&str>, seq: u64) {
+        if let Some((writer, channel)) = self.reopen() {
+            if !eitri_core::editor_reopen_start::close_record(writer, channel, token, seq) {
+                eprintln!("[editor] reopen: the record's writer was still busy; the close does not wait longer");
+            }
+        }
+    }
+
     /// The pair file's last write, waited for briefly (a small file renamed into place). Window 2 closing while it
     /// keeps the file (window 1 closed first) leaves the pair open, so the next launch starts both windows again.
     /// Once window 1's layout file holds what it took back at its launch, the pair file forgets what window 2 held;
@@ -659,6 +684,28 @@ impl ServiceSet for Services {
                 crate::open_requests::watch_open(pending, *win, self.sink.clone());
                 Ok(())
             }
+            // Carried out either way, as an open is: a call that could not be made comes back as the capture's
+            // error, which the controller takes like any answer.
+            EditorCall::Capture { win, token, args } => {
+                crate::capture_requests::ask(
+                    self.editor_rpc.as_ref(),
+                    *win,
+                    token.clone(),
+                    args.clone(),
+                    self.sink.clone(),
+                );
+                Ok(())
+            }
+            EditorCall::ReadHandoff { token, seq, .. } => {
+                self.teardown()?.read_handoff(token, *seq);
+                Ok(())
+            }
+            EditorCall::DropInput { .. } => {
+                if let Some((_, channel)) = self.teardown()?.reopen() {
+                    eitri_core::editor_reopen_start::drop_input(channel);
+                }
+                Ok(())
+            }
             EditorCall::Reveal { .. } => Err(NOT_CARRIED_OUT.into()),
         }
     }
@@ -1014,6 +1061,7 @@ impl ServiceSet for Services {
                 }
             }
             CleanupOp::Feeds => teardown.feeds(),
+            CleanupOp::EditorRecord { token, seq } => teardown.close_record(token.as_deref(), *seq),
         }
         Ok(())
     }

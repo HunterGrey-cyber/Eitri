@@ -297,3 +297,45 @@ fn capture_with_no_file_windows_has_empty_lists() {
     assert_eq!(list_len(&result["bufs"]), 0);
     assert!(result.get("tab").is_none());
 }
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_real_capture_json_parses_with_editor_record() {
+    let rig = Rig::new("parse");
+    let result = rig.run(
+        r#"
+local empty = take().json
+vim.o.columns = 150; vim.o.lines = 50
+open('a.txt'); open('b.txt', 'vsplit'); open('c.txt', 'split')
+api.nvim_win_set_cursor(0, { 3, 4 })
+open('b.txt', 'tabedit')
+listed(project .. '/listed.txt')
+return { empty = empty, full = take().json, same = take().same }
+"#,
+    );
+    let project = rig.root.join("project");
+    let parse = |key: &str| {
+        eitri_core::editor_record::parse(result[key].as_str().expect("the capture's JSON"), &project)
+            .unwrap_or_else(|e| panic!("the capture's {key} record is refused: {e}\n{}", result[key]))
+    };
+    let empty = parse("empty");
+    assert!(empty.tabs.is_empty() && empty.bufs.is_empty());
+    let full = parse("full");
+    assert_eq!(full.tabs.len(), 2);
+    assert_eq!(full.tab, Some(2));
+    assert_eq!(
+        full.bufs,
+        vec![project.join("listed.txt").into_os_string().into_encoded_bytes()]
+    );
+    assert_eq!(
+        full.file_count(),
+        4,
+        "a, b and c in windows (b twice) and the listed buffer"
+    );
+    assert_eq!(result["same"], false);
+    // What the writer writes back reads as the same record.
+    assert_eq!(
+        eitri_core::editor_record::parse(&full.to_json(), &project).unwrap(),
+        full
+    );
+}

@@ -503,9 +503,16 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
     if w.tiling == Tiling::Hub {
         batch.push_effect(HostOp::Cleanup(CleanupOp::EndGroup));
     }
+    // The editor's record waits for nvim's own last one, which it leaves in the channel directory as it ends: told
+    // after nvim is, before that directory goes.
+    let record = super::reopen::teardown_op(w);
     for op in [
         HostOp::Cleanup(CleanupOp::PairOnClose { layout_written }),
         HostOp::Editor(EditorCall::Shutdown { win }),
+    ]
+    .into_iter()
+    .chain(record)
+    .chain([
         HostOp::Terminal(TermOp::ShutdownAll { win }),
         HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::Cleanup(CleanupOp::PaneSwitchDir),
@@ -513,7 +520,7 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
         HostOp::Plugin(PluginOp::ShutdownAll { win }),
         HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
         HostOp::CloseWindow { win },
-    ] {
+    ]) {
         batch.push_effect(op);
     }
     w.close.state = CloseState::Closed;
@@ -673,6 +680,14 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         }
         EditorEvent::Leaving { .. } => {
             w.nvim_said = NvimSaid::Leaving;
+            return;
+        }
+        EditorEvent::Reopen { line, .. } => {
+            super::reopen::line(w, win, line.clone(), batch);
+            return;
+        }
+        EditorEvent::Captured { token, reply, .. } => {
+            super::reopen::captured(w, token.clone(), reply.clone());
             return;
         }
         EditorEvent::Recoverable { count, newest, .. } => {
@@ -895,6 +910,9 @@ fn with_quit<T>(
 }
 
 impl QuitWorld for WindowQuit<'_, '_> {
+    fn read_handoff(&mut self) {
+        super::reopen::nvim_ended(self.w, self.win, self.batch);
+    }
     fn facts(&self) -> EditorFacts {
         let mut facts = self.cx.reads.editor_facts(self.win);
         facts.starting |= self.w.editor_run == super::window::EditorRun::Restarting;
