@@ -128,8 +128,12 @@ every one of these holds, and when one does not, the footer says which:
 - **The turn was finished and its snapshots are still there.** A turn without a closing snapshot has nothing
   fixed to revert to, and a turn old enough to have been cleaned up says its snapshots were removed.
 
-If Eitri is killed in the middle of rewriting a file that cannot be replaced atomically (one with a second
-hard link, say), the bytes it was about to overwrite are kept. The next time you open the project the status
+A file with a second hard link is never reverted: a write through one link would change the others, which may
+live outside the project, so the revert is refused with `the file has N hard links; writing it would change the
+other links too, so it was not written`.
+
+If Eitri is killed in the middle of rewriting a file that cannot be replaced atomically (one that belongs to
+another user or has extended attributes, say), the bytes it was about to overwrite are kept. The next time you open the project the status
 band says `an interrupted revert left <path>`, even with the hint turned off. Once a session is open in the window, open the review (`c`); the row
 is at the top, and `Enter` on it asks whether to restore the file to its bytes from before the interrupted
 revert (`y`) or to forget the entry (`n`).

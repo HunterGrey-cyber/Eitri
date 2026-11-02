@@ -1,13 +1,15 @@
-import type { ChooserEnvelope, ChooserRecord, ChooserTab, PermissionModeChoice, TabInfo } from "./types";
+import type { ChooserEnvelope, ChooserRecord, ChooserTab, PermissionModeChoice, RestoreOffer, TabInfo } from "./types";
 import { markerGlyph } from "./tabs";
 
-/** `prefix w`'s rows: `New session` (hidden while a filter narrows the list -- it
+/** `prefix w`'s rows: `Restore last session` while the window offers its last tabs back (the dashboard's `s`,
+ *  reachable from the editor, where the keys start), `New session` (hidden while a filter narrows the list -- it
  *  never matches typed text and Claude Code's own picker drops it too), one row per open tab
  *  (joined to its `TabInfo` for mode/state/title, `null` only in the defensive race where the
  *  `tabs` envelope has not yet caught up with the `chooser` one), and one row per record not open
  *  in any tab (`open`/`records` already partitioned that way -- `serialize_chooser_for_js`'s own
  *  doc comment). */
 export type ChooserRow =
+  | { kind: "restore"; offer: RestoreOffer }
   | { kind: "new" }
   | { kind: "tab"; tab: ChooserTab; info: TabInfo | null }
   | { kind: "record"; record: ChooserRecord };
@@ -22,6 +24,7 @@ function recordLead(record: ChooserRecord): string {
  *  whichever of the two they remember. */
 function rowSearchText(row: ChooserRow): string {
   if (row.kind === "new") return "New session";
+  if (row.kind === "restore") return "Restore last session";
   if (row.kind === "tab") {
     const glyph = markerGlyph(row.tab.marker, row.tab.pending);
     return glyph === "" ? row.tab.label : `${row.tab.label} ${glyph}`;
@@ -34,6 +37,7 @@ function rowSearchText(row: ChooserRow): string {
 /** What a row is, whatever its place: the same tab or session keeps its key when rows come or go. */
 export function rowKey(row: ChooserRow): string {
   if (row.kind === "new") return "new";
+  if (row.kind === "restore") return "restore";
   if (row.kind === "tab") return `tab:${row.tab.tab}`;
   return `record:${row.record.providerSessionId}`;
 }
@@ -56,11 +60,16 @@ export function pickerStep(event: { key: string; ctrlKey: boolean }): 1 | -1 | n
   return null;
 }
 
-/** `prefix w`: `New session` first, then open tabs, then records open
+/** `prefix w`: `Restore last session` (only while `restore` offers tabs), `New session`, then open tabs, then records open
  *  in no tab -- Rust's own order. `tabs` joins each open row to its `TabInfo` (the `tabs` entry of
  *  the same id) for number/name/title/mode/state. `New session` drops out while filtering (it matches nothing typed,
- *  and staying would make `j`/`k` skip an unmatched row for no reason). */
-export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: string): ChooserRow[] {
+ *  and staying would make `j`/`k` skip an unmatched row for no reason); the restore row drops out the same way. */
+export function chooserRows(
+  env: ChooserEnvelope,
+  tabs: TabInfo[],
+  filter: string,
+  restore: RestoreOffer | null = null,
+): ChooserRow[] {
   const openRows: ChooserRow[] = env.open.map((tab) => ({
     kind: "tab",
     tab,
@@ -68,7 +77,10 @@ export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: strin
   }));
   const recordRows: ChooserRow[] = env.records.map((record) => ({ kind: "record", record }));
   const needle = filter.trim().toLowerCase();
-  if (needle === "") return [{ kind: "new" }, ...openRows, ...recordRows];
+  if (needle === "") {
+    const offered: ChooserRow[] = restore !== null && restore.labels.length > 0 ? [{ kind: "restore", offer: restore }] : [];
+    return [...offered, { kind: "new" }, ...openRows, ...recordRows];
+  }
   return [...openRows, ...recordRows].filter((row) => rowSearchText(row).toLowerCase().includes(needle));
 }
 

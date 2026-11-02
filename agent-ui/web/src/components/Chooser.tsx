@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import type { ChooserEnvelope, PermissionModeChoice, TabId, TabInfo } from "../types";
+import type { ChooserEnvelope, PermissionModeChoice, RestoreOffer, TabId, TabInfo } from "../types";
 import { choosable, chooserRows, pickerStep, relativeWhen, resumeMode, rowKey, tabStateWord } from "../chooser";
 import type { ChooserRow } from "../chooser";
 import { shortId } from "./SessionRow";
+import { restoreSummary } from "./Dashboard";
 import { isShiftTab, modeFixedMessage, modeKeyRoute } from "../modeKey";
 import { isModifierKey } from "../typingGuard";
 import { NO_TEXT_ASSIST } from "../textField";
@@ -27,6 +28,10 @@ type Props = {
    *  panel's waiting prefix, count and leader sequence (`Shift+Tab`, which the chooser does see, ends
    *  it in `onKeyDown`). Optional, so this component's own tests need no stand-in. */
   dropKeysRequest?: number;
+  /** The last window's tabs, while Rust offers them back (`Hello.restore`): the first row, so the dashboard's `s` can
+   *  be reached from the editor. */
+  restore?: RestoreOffer | null;
+  onRestoreLast?: () => void;
   onSwitch: (tab: TabId) => void;
   onResume: (providerSessionId: string) => void;
   onNewSession: () => void;
@@ -124,6 +129,11 @@ function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMo
   // `row.kind` on `undefined` -- the throw unmounted the whole panel. No row, no line (`keysLine` below
   // takes the same `undefined`).
   if (row === undefined) return null;
+  if (row.kind === "restore") {
+    return row.offer.bypass > 0
+      ? "Each tab comes back in the mode it had; a tab saved in bypass asks first"
+      : "Each tab comes back in the mode it had";
+  }
   if (row.kind === "tab") {
     const mode = row.info?.mode ?? "auto";
     const route = tabModeRoute(row, active);
@@ -172,7 +182,7 @@ function ModeGlyph({ mode }: { mode: PermissionModeChoice }) {
  *  `ctrl+r rename` and `x close tab`, and only an open tab reads `enter switch` rather than
  *  `enter resume`. */
 function keysLine(row: ChooserRow | undefined): string {
-  const parts = [row?.kind === "tab" ? "enter switch" : "enter resume", "/ filter"];
+  const parts = [row?.kind === "tab" ? "enter switch" : row?.kind === "restore" ? "enter restore" : "enter resume", "/ filter"];
   if (row?.kind === "tab") parts.push("ctrl+r rename", "x close tab");
   parts.push("shift+tab mode", "esc");
   return parts.join(" · ");
@@ -190,6 +200,8 @@ export function Chooser({
   newTabChord,
   focusRequest,
   dropKeysRequest,
+  restore = null,
+  onRestoreLast,
   onSwitch,
   onResume,
   onNewSession,
@@ -219,16 +231,20 @@ export function Chooser({
     setFlash({ text, seq: flashSeq.current });
   }
 
-  // Starts on the active tab's row, not row 1: the reader is most likely to stay or move one step.
+  // Starts on the active tab's row, not row 1: the reader is most likely to stay or move one step. While the
+  // last window's tabs are on offer it starts on that row: the empty tab is the only one open, and the offer
+  // is what the person opened this list to take.
   const [cursor, setCursor] = useState(() => {
-    const rows = chooserRows(envelope, tabs, "");
+    const rows = chooserRows(envelope, tabs, "", restore);
+    const offered = rows.findIndex((r) => r.kind === "restore");
+    if (offered >= 0) return offered;
     return Math.max(0, rows.findIndex((r) => r.kind === "tab" && r.tab.tab === active));
   });
   const rootRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const needle = filter.trim().toLowerCase();
-  const rows = chooserRows(envelope, tabs, filter);
+  const rows = chooserRows(envelope, tabs, filter, restore);
   const current: ChooserRow | undefined = rows[Math.min(cursor, rows.length - 1)];
   // The cursor is an index into the filtered rows, and a new envelope (titles read after the chooser opened)
   // can change which rows a filter matches: then the cursor goes back to the row it was on, by what the row
@@ -281,6 +297,7 @@ export function Chooser({
   function choose(row: ChooserRow | undefined) {
     if (row === undefined || !canChoose(row)) return;
     if (row.kind === "new") onNewSession();
+    else if (row.kind === "restore") onRestoreLast?.();
     else if (row.kind === "tab") onSwitch(row.tab.tab);
     else onResume(row.record.providerSessionId);
   }
@@ -376,7 +393,7 @@ export function Chooser({
     else if (key === "Escape" || key === "q") onLeave();
   }
 
-  const shownCount = rows.filter((r) => r.kind !== "new").length;
+  const shownCount = rows.filter((r) => r.kind !== "new" && r.kind !== "restore").length;
   const totalCount = envelope.open.length + envelope.records.length;
   const project = projectName(projectDir);
 
@@ -387,6 +404,7 @@ export function Chooser({
         <span className="chooser-project">{project}</span>
         <span className="chooser-counts">
           {needle === "" ? `${envelope.open.length} open · ${envelope.records.length} earlier` : `${shownCount} of ${totalCount}`}
+          {needle === "" && envelope.limit !== undefined && ` · only the newest ${envelope.limit} are kept`}
         </span>
       </div>
       {filtering || filter !== "" ? (
@@ -500,6 +518,17 @@ function ChooserRowItem({
           <span className="chooser-lead">+ New session</span>
           <span className="chooser-right chooser-muted">{newTabChord}</span>
         </span>
+      </div>
+    );
+  }
+  if (row.kind === "restore") {
+    return (
+      <div className={classes} onClick={onClick}>
+        {current ? cursorSign : <span className="chooser-sign" />}
+        <span className="chooser-line1">
+          <span className="chooser-lead">↻ Restore last session</span>
+        </span>
+        <span className="chooser-line2 chooser-muted">{restoreSummary(row.offer)}</span>
       </div>
     );
   }

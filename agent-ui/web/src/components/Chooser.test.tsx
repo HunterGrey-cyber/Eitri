@@ -59,6 +59,34 @@ function renderChooser(over: Record<string, unknown> = {}) {
 }
 
 describe("Chooser", () => {
+  /** The keys start in the editor, so the offer is taken from here: `prefix w`, then Enter. */
+  it("starts on a Restore last session row while tabs are on offer, and Enter restores", () => {
+    const onRestoreLast = vi.fn();
+    const { root, container, props } = renderChooser({
+      restore: { labels: ["api", "docs"], bypass: 1 },
+      onRestoreLast,
+      active: 1,
+    });
+    expect(container.querySelector(".chooser-row.current")!.textContent).toContain("Restore last session");
+    expect(container.querySelector(".chooser-row.current")!.textContent).toContain("2 tabs, 1 in bypass · api, docs");
+    expect(container.querySelector(".chooser-keys")!.textContent).toContain("enter restore");
+    fireEvent.keyDown(root, { key: "Enter" });
+    expect(onRestoreLast).toHaveBeenCalledTimes(1);
+    expect(props.onSwitch).not.toHaveBeenCalled();
+    expect(props.onNewSession).not.toHaveBeenCalled();
+  });
+  it("says in its header that only the newest sessions are kept once the project is at the limit", () => {
+    const { container } = renderChooser();
+    expect(container.querySelector(".chooser-counts")!.textContent).toBe("2 open · 2 earlier");
+    cleanup();
+    const full = renderChooser({ envelope: { ...ENVELOPE, limit: 200 } });
+    expect(full.container.querySelector(".chooser-counts")!.textContent).toBe("2 open · 2 earlier · only the newest 200 are kept");
+  });
+  it("has no Restore row when nothing is on offer", () => {
+    const { container } = renderChooser({ active: 1 });
+    expect(container.textContent).not.toContain("Restore last session");
+    expect(container.querySelector(".chooser-row.current")!.textContent).toContain("1 fix-parser");
+  });
   /** A tab holding cards read `⚑ · idle`. */
   it("an open tab with waiting cards reads ⚑N waiting, not idle", () => {
     const waiting = { ...TAB1, marker: "needs_input" as const, pending: 2 };

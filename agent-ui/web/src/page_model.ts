@@ -510,7 +510,15 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       return { ...model, scratchEditing: envelope.editing };
     case "chooser":
       // An open rename field would fight the chooser for the keys.
-      return { ...model, chooser: { open: envelope.open, records: envelope.records }, renaming: null };
+      return {
+        ...model,
+        chooser: {
+          open: envelope.open,
+          records: envelope.records,
+          ...(envelope.limit === undefined ? {} : { limit: envelope.limit }),
+        },
+        renaming: null,
+      };
     case "chooser_titles":
       // Only the titles of the rows already drawn change: same rows, same order, so the cursor stays on its row,
       // and a chooser the user closed is not opened again.

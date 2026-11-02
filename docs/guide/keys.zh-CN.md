@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=3dfae981f5d68462966798c93d8d16c246668b351545e7666a562ab7aa9a4f44 -->
+<!-- translated-from: keys.md sha256=a5a49f8d0a92a3de065bca5ad640fd2ef243e0cf98f5495e4dcf96653f7291a2 -->
 
 # 按键
 
@@ -41,7 +41,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> l` | 切回你之前所在的标签页 |
 | `<prefix> ,` | 重命名这个标签页 |
 | `<prefix> &` | 关闭这个标签页，会先问一个 `y/n` |
-| `<prefix> w` | 选一个会话：先是已打开的标签页，然后是可以继续的已保存会话 |
+| `<prefix> w` | 选一个会话：上一个窗口的标签页可以恢复时，第一行是 `Restore last session`（在编辑器里要拿到它就用这个键，那里的 `s` 是 nvim 的），然后是已打开的标签页，再是可以继续的已保存会话 |
 | `<prefix> i` | 这个会话的详情 |
 
 **模块。** 窗口由模块组成：编辑器、agent 面板和底部终端。

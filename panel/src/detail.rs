@@ -116,8 +116,11 @@ pub(super) fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String,
         .iter()
         .map(|r| (r.provider_session_id.clone(), r.title.clone()))
         .collect();
+    // At the cap the next new session drops the oldest record; the list says so beside its count.
+    let limit = agent::conversation_is_full(&agent::conversation_id_for_cwd(std::path::Path::new(canonical)))
+        .then_some(agent::MAX_RECORDS_PER_CONVERSATION);
     (
-        eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records),
+        eitri_core::agent_bridge::serialize_chooser_for_js(&open, &records, limit),
         listed,
     )
 }
@@ -647,7 +650,7 @@ mod tests {
         let mut records = chooser_records(&sessions, &[], |_| true);
         mark_partner_records(&mut records, Some(2), |id| id == "peer");
         assert!(records[0].held_by_partner);
-        let payload = eitri_core::agent_bridge::serialize_chooser_for_js(&[], &records);
+        let payload = eitri_core::agent_bridge::serialize_chooser_for_js(&[], &records, None);
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["records"][0]["heldByPartner"], true);
         assert_eq!(payload["records"][0]["partnerWindow"], 2);

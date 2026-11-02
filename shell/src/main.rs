@@ -1602,6 +1602,8 @@ fn build_ui(
         None
     };
     let window2_restored = pair_restore.restore_second;
+    // What a launch could not read of what it saved, said once in the window's toast.
+    let mut saved_state_problems: Vec<String> = Vec::new();
     // Window 1 offers window 2's saved tabs after its own when window 2 does not come back; a window 2 started again
     // offers its own. A hub is told none: giving them reads the files and claims other windows' tabs at once, and a
     // group's tabs belong to its chat windows.
@@ -1643,6 +1645,7 @@ fn build_ui(
             ),
         );
         let windows = group_tabs.windows();
+        saved_state_problems.extend(group_tabs.startup_problems().iter().cloned());
         pair.keep_group_tabs(group_tabs);
         windows
     } else {
@@ -1754,6 +1757,12 @@ fn build_ui(
     let loaded = state_dir.as_deref().map(|dir| {
         eitri_core::layout::persist::load_for_role(dir, project_root, pair.pair_role(), &layout_decls, &layout_deferred)
     });
+    // A file this build could not use opens the default layout; the window says so, with the reason the log has.
+    if let Some(eitri_core::layout::persist::Loaded::Unusable(why)) = &loaded {
+        saved_state_problems.push(format!(
+            "the saved layout is unusable ({why}); the default layout is open and the file is kept"
+        ));
+    }
     // A chat or page window starts from its one leaf in one workspace, whatever the files and `init.lua` say.
     let module_start = module_window.as_ref().map(|(_, module)| {
         eitri_core::layout::reconcile_module(eitri_core::layout::Node::Leaf(module.clone()), module)
@@ -2715,6 +2724,14 @@ fn build_ui(
         .collect();
     if !notices.is_empty() {
         toast.show_for(&notices.join("; "), toast::NOTICE_FOR);
+    }
+    // What a launch could not read of its own saved files is said by every window that has them, a second window
+    // included: its tabs file is its own, and no other window can say why its tabs are gone.
+    if module_window.is_none() {
+        saved_state_problems.extend(agent_panel_handle.take_startup_problems());
+        if let Some(text) = eitri_core::init_notice::saved_state_text(&saved_state_problems) {
+            toast.show_notice_when_free_for(text, toast::PROBLEM_FOR);
+        }
     }
     // What `init.lua` got wrong is said every start while it holds, after the notices above have had their time; the
     // default keys it took over, once and again only when that set changes. A chat or page window or a second window

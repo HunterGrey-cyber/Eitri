@@ -149,7 +149,7 @@ const RESTORE_NAMES_SHOWN = 3;
 /** `3 tabs · api, docs, tests`, names cut to fit and a trailing `…` when there are more than are shown;
  *  `3 tabs, 1 in bypass · …` when some of them were, so the count never reads as a fourth name. The line
  *  is one row of a narrow panel, and CSS cuts what is still too long. */
-function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
+export function restoreSummary(offer: NonNullable<Hello["restore"]>): string {
   const cut = (name: string) => (name.length > RESTORE_NAME_CHARS ? `${name.slice(0, RESTORE_NAME_CHARS - 1)}…` : name);
   const names = offer.labels.slice(0, RESTORE_NAMES_SHOWN).map(cut);
   if (offer.labels.length > RESTORE_NAMES_SHOWN) names.push("…");

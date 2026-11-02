@@ -35,6 +35,31 @@ pub fn problems_text(problems: &[String]) -> Option<String> {
     Some(text)
 }
 
+/// The toast for what the launch could not read of the state it saved (the layout file, the tabs file): each file was
+/// set aside or left as it was, and the window opened without it. `None` when nothing was wrong. A line may carry the
+/// `[tabs]` or `[layout]` tag the log gives it; the toast drops that.
+pub fn saved_state_text(problems: &[String]) -> Option<String> {
+    if problems.is_empty() {
+        return None;
+    }
+    let mut text = "Eitri could not use some of what it saved last time:".to_string();
+    for problem in problems.iter().take(LISTED) {
+        let line = problem
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .map_or(problem.as_str(), |(_, rest)| rest);
+        text.push('\n');
+        text.push_str(&shorten(line));
+    }
+    if problems.len() > LISTED {
+        text.push_str(&format!(
+            "\n… and {} more; start eitri from a terminal to read them all",
+            problems.len() - LISTED
+        ));
+    }
+    Some(text)
+}
+
 /// `line` cut to [`LINE_CHARS`] from the middle: the place it names stays at the front and the words that say what is
 /// in force stay at the end, which is where they are.
 fn shorten(line: &str) -> String {
@@ -86,6 +111,32 @@ mod tests {
     fn no_problem_says_nothing() {
         assert_eq!(problems_text(&[]), None);
         assert_eq!(overrides_text(&[]), None);
+    }
+
+    /// A tabs or layout file that was cut in half is said in the window, with the reason the log has, and not only logged.
+    #[test]
+    fn an_unusable_saved_file_is_named_with_its_reason_and_the_log_tag_is_dropped() {
+        assert_eq!(saved_state_text(&[]), None);
+        let text = saved_state_text(&[
+            "[tabs] the saved tabs are unusable (/s/tabs/a.json: not a saved-tabs file (EOF while parsing)); starting without them"
+                .to_string(),
+            "the saved layout is unusable (/s/layout/a.json: not a layout file); the default layout is open and the file is kept"
+                .to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            text,
+            "Eitri could not use some of what it saved last time:\n\
+             the saved tabs are unusable (/s/tabs/a.json: not a saved-tabs file (EOF while parsing)); starting without them\n\
+             the saved layout is unusable (/s/layout/a.json: not a layout file); the default layout is open and the file is kept"
+        );
+        let many: Vec<String> = (1..=7).map(|n| format!("[tabs] problem {n}")).collect();
+        let text = saved_state_text(&many).unwrap();
+        assert!(text.contains("problem 5") && !text.contains("problem 6"), "{text}");
+        assert!(
+            text.ends_with("… and 2 more; start eitri from a terminal to read them all"),
+            "{text}"
+        );
     }
 
     #[test]

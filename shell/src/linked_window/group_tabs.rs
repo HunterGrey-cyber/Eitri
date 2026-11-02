@@ -35,6 +35,8 @@ pub const REPORT_AFTER: Duration = Duration::from_millis(250);
 
 /// The group's tabs, in window 1.
 pub struct GroupTabs {
+    /// What reading the files could not use ([`GroupTabs::startup_problems`]).
+    startup_problems: Vec<String>,
     writer: TabWriter,
     /// Each chat window's tabs, none of them empty: what it last reported, or the file's part before its first report.
     parts: BTreeMap<WindowName, SavedTabs>,
@@ -45,6 +47,11 @@ pub struct GroupTabs {
 }
 
 impl GroupTabs {
+    /// What reading the project's files could not use, for the window to say once.
+    pub fn startup_problems(&self) -> &[String] {
+        &self.startup_problems
+    }
+
     /// Reads the project's file from `dir` once and takes up what other windows left: window 2's, and an unpaired
     /// window's when no other window is on the project. Those claims go `.taken` once the file holds their tabs, and
     /// their tabs join `c1`, the window that always exists.
@@ -56,8 +63,10 @@ impl GroupTabs {
             &[Role::Second]
         };
         let (offered, offer_notes, takeovers) = saved_tabs::startup_others(dir, project_root, Role::Main, others);
+        let mut startup_problems = Vec::new();
         for note in notes.into_iter().chain(offer_notes) {
             eprintln!("{note}");
+            startup_problems.push(note);
         }
         let own = own.unwrap_or_default();
         let mut writer = TabWriter::new_as(dir.map(Path::to_path_buf), PathBuf::from(project_root), Role::Main);
@@ -75,6 +84,7 @@ impl GroupTabs {
             })
             .collect();
         GroupTabs {
+            startup_problems,
             writer,
             parts,
             keep_windows: false,

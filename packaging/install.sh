@@ -4050,6 +4050,11 @@ unpack_new() {
 		if [ ! -f "$_un_top/share/icons/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/icons/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	for _un_f in $NV_BINARIES eitri-setup; do
+		if [ -f "$_un_top/lib/eitri/$_un_f" ] && [ ! -x "$_un_top/lib/eitri/$_un_f" ] &&
+			[ -n "$(find "$_un_top/lib/eitri/$_un_f" -maxdepth 0 -perm -u+x 2>/dev/null)" ]; then
+			# Its mode says executable and the system will not run it: the file system under the cache is mounted noexec.
+			die "lib/eitri/$_un_f came out of $NV_TARBALL_NAME with its executable bit, yet cannot be run from $NV_STAGE: the file system holding it is probably mounted noexec. Eitri installs and runs from under $NV_HOME, so that file system has to allow running programs (check with: findmnt -T $NV_STAGE). Nothing was changed. If it is not mounted noexec, report it at $NV_ISSUES"
+		fi
 		if [ ! -f "$_un_top/lib/eitri/$_un_f" ] || [ ! -x "$_un_top/lib/eitri/$_un_f" ]; then
 			die "$NV_TARBALL_NAME has no executable lib/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"
 		fi

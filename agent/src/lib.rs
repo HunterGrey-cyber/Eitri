@@ -96,7 +96,9 @@ pub use permission_policy::{
     rule_that_allows, Classification, OutsideReason, PathJudgement, PermissionVerdict,
 };
 pub use permission_rules::{PrefixRule, PrefixRules, RuleRefusal};
-pub use persistence::{resumable_sessions, NameUpdate, ResumableSession};
+pub use persistence::{
+    conversation_is_full, resumable_sessions, NameUpdate, ResumableSession, MAX_RECORDS_PER_CONVERSATION,
+};
 #[cfg(feature = "legacy-backend")]
 pub use process::AgentProcess;
 pub use process::{

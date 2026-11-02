@@ -1011,7 +1011,12 @@ export type ChooserRecord = {
   heldByPartner?: boolean;
   partnerWindow?: number | null;
 };
-export type ChooserEnvelope = { open: ChooserTab[]; records: ChooserRecord[] };
+export type ChooserEnvelope = {
+  open: ChooserTab[];
+  records: ChooserRecord[];
+  /** How many sessions a project keeps, present once the project holds that many: the oldest are dropped as new ones start. */
+  limit?: number;
+};
 
 /** Turn review (the `review`, `review_diff` and `review_hint` envelopes; `core/src/agent_bridge.rs`).
  *  Every attribution, count and state is decided in Rust; this side only draws what it is told. */

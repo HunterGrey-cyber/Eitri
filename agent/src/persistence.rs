@@ -31,18 +31,24 @@ use std::path::{Path, PathBuf};
 /// How many session records one conversation keeps, newest-`updated_at` first.
 ///
 /// A cap rather than no cap because `resumable_sessions` reads the whole directory on the GTK main
-/// thread (`eitri_panel::agent_panel`'s `InboundMessage::Ready` handler), so an unbounded directory is an
-/// unbounded stall in the editor pane as well as unbounded disk.
+/// thread (`eitri_panel::agent_panel`'s `InboundMessage::Ready` handler), `prune` reads and
+/// lease-probes every record on each save, and the history store keeps one copy of each kept
+/// session's conversation (`history::store`, up to `HISTORY_MAX_CHARS` of text each), so an
+/// unbounded directory is an unbounded stall in the editor pane as well as unbounded disk.
 ///
-/// It is also very nearly the bound on the resume PICKER: every offerable record is a row on the
-/// start screen. The list can reach this cap PLUS ONE, because `prune` bounds the per-conversation
-/// DIRECTORY and `read_conversation_records` then appends the one pre-2026-09-15 sibling file,
-/// which nothing prunes -- so 17 rows, not 16. (This comment previously read "16 is well past what
-/// any resume UI offers -- only the single most recent offerable record is ever shown", which was
-/// true of the singular offer and stopped being true when the picker landed.) 16 rows is a list a
-/// person can still read, and dropping the number is a product decision rather than a correctness
-/// one -- nothing breaks at any value, older sessions simply stop being offerable sooner.
-const MAX_RECORDS_PER_CONVERSATION: usize = 16;
+/// 200 is what those can bear. With the records in the page cache, listing 200 takes about 1 ms and a save
+/// with its prune about 2 ms, both growing linearly (1000 records: 5 ms and 10 ms; 16 records: 0.2 ms and
+/// 0.25 ms). A cold read costs more per file but happens once, when the window starts. A project opened
+/// daily keeps most of a year, and a session's stored history is at most about a million characters
+/// (`HISTORY_MAX_CHARS`), so the history copies are bounded by the cap times that.
+///
+/// It is also the bound on the resume PICKER: every offerable record is a row of the sessions list.
+/// The list can reach this cap PLUS ONE, because `prune` bounds the per-conversation DIRECTORY and
+/// `read_conversation_records` then appends the one pre-2026-09-15 sibling file, which nothing
+/// prunes. The cap is a product decision rather than a correctness one -- nothing breaks at any
+/// value, older sessions simply stop being offerable sooner -- and the sessions list says so once a
+/// project is at it (`conversation_is_full`).
+pub const MAX_RECORDS_PER_CONVERSATION: usize = 200;
 
 /// How long a `write_record` temp file must be untouched before a later write deletes it.
 ///
@@ -296,6 +302,21 @@ pub(crate) fn recorded_session_ids(conversation_id: &str) -> Vec<String> {
         .into_iter()
         .map(|r| r.provider_session_id)
         .collect()
+}
+
+/// Whether this conversation keeps as many records as the cap allows, so the next new session drops the oldest
+/// one. The sessions list says so beside its count; a directory that cannot be read is not full.
+pub fn conversation_is_full(conversation_id: &str) -> bool {
+    let Ok(dir) = conversation_dir(conversation_id) else {
+        return false;
+    };
+    let kept = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .count();
+    kept >= MAX_RECORDS_PER_CONVERSATION
 }
 
 /// The one pre-2026-09-15 `<conversation_id>.json`, if this workspace still has one.
@@ -916,16 +937,39 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(kept.len(), MAX_RECORDS_PER_CONVERSATION, "got: {kept:?}");
+        let newest = format!("prov-{:03}", MAX_RECORDS_PER_CONVERSATION + 4);
         assert!(
-            kept.contains(&"prov-020.json".to_string()),
+            kept.contains(&format!("{newest}.json")),
             "the newest must survive: {kept:?}"
         );
         assert!(
-            !kept.contains(&"prov-000.json".to_string()),
-            "the oldest must be dropped: {kept:?}"
+            !kept.contains(&"prov-000.json".to_string()) && kept.contains(&"prov-005.json".to_string()),
+            "the oldest five must be dropped and no more: {kept:?}"
         );
         // And the offer is still the newest of what is left.
-        assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, "prov-020");
+        assert_eq!(most_recent_offer(&conv).unwrap().provider_session_id, newest);
+    }
+
+    /// Twenty sessions in one project all stay listed (the cap was sixteen), and the list is called full only at the cap.
+    #[test]
+    fn twenty_sessions_are_all_listed_and_the_cap_is_named_once_reached() {
+        let conv = unique_conversation_id("twenty");
+        for i in 0..20u32 {
+            save_conversation_record(&record(&conv, &format!("prov-{i:03}"), &(1000 + i).to_string())).unwrap();
+        }
+        let listed = resumable_sessions(&conv);
+        assert_eq!(listed.len(), 20);
+        assert_eq!(
+            listed.last().unwrap().provider_session_id,
+            "prov-000",
+            "the oldest is still listed"
+        );
+        assert!(!conversation_is_full(&conv));
+        for i in 20..MAX_RECORDS_PER_CONVERSATION as u32 {
+            save_conversation_record(&record(&conv, &format!("prov-{i:03}"), &(1000 + i).to_string())).unwrap();
+        }
+        assert!(conversation_is_full(&conv));
+        assert!(!conversation_is_full(&unique_conversation_id("never-written")));
     }
 
     fn named(conversation_id: &str, cwd: &str, id: &str, stamp: u128) -> ConversationRecord {
@@ -1269,7 +1313,11 @@ mod tests {
         }
         let listed = resumable_sessions(&conv);
         assert_eq!(listed.len(), MAX_RECORDS_PER_CONVERSATION);
-        assert_eq!(listed[0].provider_session_id, "prov-020", "newest first");
+        assert_eq!(
+            listed[0].provider_session_id,
+            format!("prov-{:03}", MAX_RECORDS_PER_CONVERSATION + 4),
+            "newest first"
+        );
     }
 
     /// The title is the prompt's first line with visible text, as typed, whitespace collapsed.

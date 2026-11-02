@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=c0f30642372de4b72ef756c5db6ab30bce12d798acfc9dabbfc165bc5e36def9 -->
+<!-- translated-from: INSTALL.md sha256=cd97a3aae9e0f688d94777460c6fcc4a6bcf03858f16c79508d78e90f15fba56 -->
 
 # 安装 Eitri
 
@@ -107,7 +107,9 @@ sh install.sh --uninstall --purge    # 这两个也删掉
 
 你的设置就是 Eitri 读取设置的那个目录：`XDG_CONFIG_HOME` 非空且是绝对路径时是 `$XDG_CONFIG_HOME/eitri`，否则是 `~/.config/eitri`。`--purge` 从不删除 `EITRI_CONFIG_DIR` 指向的目录，因为那里可能还放着别的程序的设置；它会提示这一点，需要的话你自己删。
 
-这会删除安装脚本放下的所有东西：程序、启动器、desktop 条目、图标、GNOME Shell 扩展、sidecar（包括你装过的更新）、私有 nvim 和下载缓存。你自己的 `nvim` 永远不会被动到。如果你启用过 GNOME Shell 扩展，先把它停用。
+这会删除安装脚本放在你主目录下的东西：程序、启动器、desktop 条目、图标、GNOME Shell 扩展、sidecar（包括你装过的更新）、私有 nvim 和下载缓存。你自己的 `nvim` 永远不会被动到。如果你启用过 GNOME Shell 扩展，先把它停用。
+
+它唯一留下的是 Ubuntu 上按用户安装的 AppArmor profile（`/etc/apparmor.d/eitri-user-<uid>`，见 [Ubuntu 23.10 及更新版本](#ubuntu-2310-and-later)）：那个文件属于 root，而卸载从不运行 `sudo`。卸载会打印卸载并删除它的两条 `sudo` 命令；想把 profile 清掉就运行它们。
 
 `.deb` 或 `.rpm`：先移除软件包，再运行 `sh install.sh --uninstall`，删掉不归软件包管的那份按用户的 sidecar 和私有 nvim（如果你在 `~/.local` 下还有一份 curl 安装，也会一起删掉）。顺序不能反：软件包还在的时候，它的 sidecar 会被保留。
 

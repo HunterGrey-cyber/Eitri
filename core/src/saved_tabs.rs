@@ -85,7 +85,7 @@ impl SavedTab {
     }
 
     /// The agent and session that name this tab.
-    fn key(&self) -> (AgentId, String) {
+    pub(crate) fn key(&self) -> (AgentId, String) {
         (self.agent.clone(), self.provider_session_id.clone())
     }
 
@@ -140,6 +140,10 @@ pub struct SavedTabs {
     /// `active` when that is a Claude tab, else the Claude tab on screen most recently. `None` when no
     /// Claude tab is listed. Kept so the file says to such a build what it always said.
     pub claude_active: Option<usize>,
+    /// The tabs of both kinds in the order the tab bar had them, as `(agent, session)`; empty when that is not
+    /// known (a file from before it was kept, a set built from several windows). `tabs` itself always lists the
+    /// Claude tabs first, so this is where a mix of agents keeps its order: [`SavedTabs::in_bar_order`] reads it.
+    pub bar: Vec<(AgentId, String)>,
 }
 
 impl SavedTabs {
@@ -166,7 +170,28 @@ impl SavedTabs {
             tabs,
             active: others_active.or(claude_active),
             claude_active,
+            bar: Vec::new(),
         }
+    }
+
+    /// These tabs with the tab bar's order recorded: `bar` names the tabs of both kinds, first to last. A tab it
+    /// does not name keeps its place behind the ones it does.
+    pub fn with_bar(mut self, bar: Vec<(AgentId, String)>) -> SavedTabs {
+        self.bar = bar;
+        self
+    }
+
+    /// The tabs in the order the tab bar had them when that is recorded, else Claude's then the other agents',
+    /// which is how `tabs` lists them. A restore brings them back in this order.
+    pub fn in_bar_order(&self) -> Vec<&SavedTab> {
+        let mut tabs: Vec<&SavedTab> = self.tabs.iter().collect();
+        tabs.sort_by_key(|tab| {
+            self.bar
+                .iter()
+                .position(|(agent, id)| *agent == tab.agent && *id == tab.provider_session_id)
+                .unwrap_or(usize::MAX)
+        });
+        tabs
     }
 
     /// These tabs with no place of their own: the window they are given to says where they show.
@@ -182,11 +207,20 @@ impl SavedTabs {
 
     /// These tabs as they cross the link to another window of the project.
     pub fn to_wire(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut wire = serde_json::json!({
             "tabs": self.tabs.iter().map(SavedTab::to_wire).collect::<Vec<_>>(),
             "active": self.active,
             "claude_active": self.claude_active,
-        })
+        });
+        // The tab bar's order across agents, only where it is known: a peer that predates it reads none.
+        if !self.bar.is_empty() {
+            wire["bar"] = self
+                .bar
+                .iter()
+                .map(|(agent, id)| serde_json::json!({ "agent": agent, "provider_session_id": id }))
+                .collect();
+        }
+        wire
     }
 
     /// Tabs another window sent: its input, so a shape that is not a set of tabs, or one entry that is no tab, refuses
@@ -207,10 +241,26 @@ impl SavedTabs {
                 .filter(|index| *index < tabs.len())
         };
         let (active, claude_active) = (index("active"), index("claude_active"));
+        // The order is a hint: a place that is no tab of this shape is skipped, never a refusal of the set.
+        let bar = value
+            .get("bar")
+            .and_then(serde_json::Value::as_array)
+            .map(|places| {
+                places
+                    .iter()
+                    .filter_map(|place| {
+                        let agent = AgentId::deserialize(place.get("agent")?).ok()?;
+                        let id = place.get("provider_session_id")?.as_str()?;
+                        Some((agent, id.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(SavedTabs {
             tabs,
             active,
             claude_active,
+            bar,
         })
     }
 
@@ -270,6 +320,23 @@ struct TabsFile {
     /// Index into `external_tabs` when the tab on screen was another agent's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_external: Option<usize>,
+    /// The tabs of both kinds in tab-bar order, written only when a window ran another agent beside Claude: `tabs`
+    /// and `external_tabs` each keep their own order, so this is the one place the mix is. A build that does not
+    /// know it ignores it and restores the Claude tabs first, as it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tab_bar: Vec<BarSlot>,
+}
+
+/// One place in `tab_bar`. An agent this build does not know (a later build's) is a place nobody here fills, as in
+/// `external_tabs`, and never makes the file unusable.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum BarSlot {
+    Known {
+        agent: AgentId,
+        provider_session_id: String,
+    },
+    Unknown(serde_json::Value),
 }
 
 fn is_false(value: &bool) -> bool {
@@ -362,6 +429,18 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
             })
             .collect(),
         active_external: saved.rank(saved.active, true),
+        tab_bar: if saved.has_other_agents() && !saved.bar.is_empty() {
+            saved
+                .in_bar_order()
+                .into_iter()
+                .map(|t| BarSlot::Known {
+                    agent: t.agent.clone(),
+                    provider_session_id: t.provider_session_id.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     serde_json::to_string_pretty(&file).expect("saved tabs always serialize")
 }
@@ -431,7 +510,18 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
     };
     let claude_at = at(&claude, claude_active).unwrap_or(0);
     let others_at = at(&others, others_active);
-    Ok(SavedTabs::from_parts(claude, claude_at, others, others_at))
+    let bar = file
+        .tab_bar
+        .into_iter()
+        .filter_map(|slot| match slot {
+            BarSlot::Known {
+                agent,
+                provider_session_id,
+            } => Some((agent, provider_session_id)),
+            BarSlot::Unknown(_) => None,
+        })
+        .collect();
+    Ok(SavedTabs::from_parts(claude, claude_at, others, others_at).with_bar(bar))
 }
 
 /// `tabs` without a blank entry, a repeat of an earlier one, or one of the wrong kind.
@@ -484,7 +574,21 @@ pub fn merge_windows(parts: &[(WindowName, SavedTabs)], active_from: Option<&Win
             .map(SavedTab::key)
     };
     let (on_screen, claude_on_screen) = (key_of(|part| part.active), key_of(|part| part.claude_active));
-    from_tabs(merged, &on_screen, &claude_on_screen)
+    // The tab bar's order, where any window recorded it: each window's tabs in turn, in the order that window had them.
+    let bar: Vec<(AgentId, String)> = if parts.iter().any(|(_, part)| !part.bar.is_empty()) {
+        let mut bar: Vec<(AgentId, String)> = Vec::new();
+        for (_, part) in parts.iter().filter(|(name, _)| name.chat_number().is_some()) {
+            for tab in part.in_bar_order() {
+                if !bar.contains(&tab.key()) {
+                    bar.push(tab.key());
+                }
+            }
+        }
+        bar
+    } else {
+        Vec::new()
+    };
+    from_tabs(merged, &on_screen, &claude_on_screen).with_bar(bar)
 }
 
 /// The window `name`'s part of `file`, each tab in the base view: the tabs whose window or view says it is theirs,
@@ -506,14 +610,23 @@ pub fn tabs_for(file: &SavedTabs, name: &WindowName) -> SavedTabs {
         .map(SavedTab::key);
     let on_screen = shown.clone().or_else(|| at(file.active));
     let claude_on_screen = shown.or_else(|| at(file.claude_active));
-    let tabs = file
+    let tabs: Vec<SavedTab> = file
         .tabs
         .iter()
         .filter(|tab| tab.chat_window() == number)
         .cloned()
         .map(SavedTab::in_base_view)
         .collect();
-    from_tabs(tabs, &on_screen, &claude_on_screen)
+    let bar = if file.bar.is_empty() {
+        Vec::new()
+    } else {
+        file.in_bar_order()
+            .into_iter()
+            .filter(|tab| tab.chat_window() == number)
+            .map(SavedTab::key)
+            .collect()
+    };
+    from_tabs(tabs, &on_screen, &claude_on_screen).with_bar(bar)
 }
 
 /// The chat windows `file` holds tabs for, by number.
@@ -937,6 +1050,13 @@ impl SavedTabs {
                 .map(|t| (t.agent.clone(), t.provider_session_id.clone()))
         };
         let (active, claude_active) = (on_screen(&self, self.active), on_screen(&self, self.claude_active));
+        // This set's tabs in the bar's order, then the later set's that are new, in the order that set had them.
+        let mut bar: Vec<(AgentId, String)> = self.in_bar_order().into_iter().map(SavedTab::key).collect();
+        for tab in later.in_bar_order() {
+            if !bar.contains(&tab.key()) {
+                bar.push(tab.key());
+            }
+        }
         let mut all = self.tabs;
         for tab in later.tabs {
             if !all
@@ -955,7 +1075,7 @@ impl SavedTabs {
         };
         let claude_at = at(&claude, &claude_active).unwrap_or(0);
         let others_at = at(&others, &active);
-        SavedTabs::from_parts(claude, claude_at, others, others_at)
+        SavedTabs::from_parts(claude, claude_at, others, others_at).with_bar(bar)
     }
 
     /// Whether every one of `sessions` is listed here.
@@ -1971,6 +2091,100 @@ mod tests {
             window: None,
             turn_running: false,
         }
+    }
+
+    /// Claude and Codex tabs mixed in the tab bar come back in the bar's order, from a file that records it; a file
+    /// without the record, and one a later build wrote with an agent this build does not know, still load.
+    #[test]
+    fn the_tab_bars_order_across_agents_survives_the_file() {
+        let claude = |id: &str| SavedTab {
+            agent: AgentId::Claude,
+            ..codex(id, SessionModeChoice::Auto)
+        };
+        let saved = and_others(
+            SavedTabs::from_parts(vec![claude("c-1"), claude("c-2")], 0, Vec::new(), None),
+            vec![
+                codex("t-1", SessionModeChoice::Auto),
+                codex("t-2", SessionModeChoice::Auto),
+            ],
+            None,
+        )
+        .with_bar(
+            ["t-1", "c-1", "t-2", "c-2"]
+                .iter()
+                .map(|id| {
+                    (
+                        if id.starts_with('t') {
+                            AgentId::Codex
+                        } else {
+                            AgentId::Claude
+                        },
+                        id.to_string(),
+                    )
+                })
+                .collect(),
+        );
+        let order = |saved: &SavedTabs| -> Vec<String> {
+            saved
+                .in_bar_order()
+                .iter()
+                .map(|t| t.provider_session_id.clone())
+                .collect()
+        };
+        assert_eq!(order(&saved), ["t-1", "c-1", "t-2", "c-2"]);
+        let text = encode(&saved, &root());
+        let read = decode(&text, &root()).unwrap();
+        assert_eq!(order(&read), ["t-1", "c-1", "t-2", "c-2"]);
+        assert_eq!(read, saved);
+
+        // No record of the order (a file from before it, or a set with none): Claude's tabs, then the others'.
+        let mut plain = saved.clone();
+        plain.bar = Vec::new();
+        assert_eq!(order(&plain), ["c-1", "c-2", "t-1", "t-2"]);
+        assert!(!encode(&plain, &root()).contains("tab_bar"));
+        // Claude only: the file is what it always was.
+        assert!(!encode(&two(), &root()).contains("tab_bar"));
+
+        // A place an unknown agent holds is nobody's here; the file loads and the rest keeps its order.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["tab_bar"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, serde_json::json!({"agent": "openai", "provider_session_id": "o-1"}));
+        let later = decode(&value.to_string(), &root()).unwrap();
+        assert_eq!(order(&later), ["t-1", "c-1", "t-2", "c-2"]);
+
+        // Offering another window's tabs behind this window's keeps each set's order.
+        let behind = SavedTabs::from_parts(
+            vec![claude("c-3")],
+            0,
+            vec![codex("t-3", SessionModeChoice::Auto)],
+            None,
+        )
+        .with_bar(vec![(AgentId::Codex, "t-3".into()), (AgentId::Claude, "c-3".into())]);
+        assert_eq!(
+            order(&saved.clone().followed_by(behind)),
+            ["t-1", "c-1", "t-2", "c-2", "t-3", "c-3"]
+        );
+
+        // Across the link between windows, whose peer may not know the key: it is carried, and a set without it reads none.
+        let wire = saved.to_wire();
+        assert_eq!(
+            order(&SavedTabs::from_wire(&wire).unwrap()),
+            ["t-1", "c-1", "t-2", "c-2"]
+        );
+        let mut old_peer = wire.clone();
+        old_peer.as_object_mut().unwrap().remove("bar");
+        assert_eq!(
+            order(&SavedTabs::from_wire(&old_peer).unwrap()),
+            ["c-1", "c-2", "t-1", "t-2"]
+        );
+        let mut odd = wire;
+        odd["bar"] = serde_json::json!([{"agent": "openai", "provider_session_id": "o"}, 7, {"agent": "codex"}]);
+        assert_eq!(
+            order(&SavedTabs::from_wire(&odd).unwrap()),
+            ["c-1", "c-2", "t-1", "t-2"]
+        );
     }
 
     #[test]

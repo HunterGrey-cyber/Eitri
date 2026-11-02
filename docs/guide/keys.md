@@ -52,7 +52,7 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 | `<prefix> l` | the tab you were on before |
 | `<prefix> ,` | rename this tab |
 | `<prefix> &` | close this tab, after a `y/n` question |
-| `<prefix> w` | choose a session: the open tabs first, then saved ones to resume |
+| `<prefix> w` | choose a session: `Restore last session` first while the last window's tabs are on offer (the way to take it from the editor, where `s` is nvim's), then the open tabs, then saved ones to resume |
 | `<prefix> i` | this session's details |
 
 **Modules.** The window is made of modules: the editor, the agent panel and the bottom terminal.

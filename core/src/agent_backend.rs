@@ -2837,9 +2837,10 @@ impl BackendGreeting {
     ///
     /// **Since 2026-09-20 it also reads a fixed 64 KiB tail of each row's Claude transcript**, for
     /// the display title (`title_for`). That is one more bounded read per row, and the row count is
-    /// what `agent::persistence` already bounds (`MAX_RECORDS_PER_CONVERSATION` + 1, so 17 rather
-    /// than 16 -- that doc explains the extra one). Measured at 1.74 ms hot and 5.92 ms cold over
-    /// this machine's 16 largest sessions.
+    /// what `agent::persistence` already bounds (`MAX_RECORDS_PER_CONVERSATION` + 1, so 201 rather
+    /// than 200 -- that doc explains the extra one). Measured at 1.74 ms hot and 5.92 ms cold over
+    /// this machine's 16 largest sessions; the window titles its rows through the cache instead, so none
+    /// of this is on its thread.
     /// **It must stay a fixed-size read**: parsing those files whole would swap a bounded read of
     /// Eitri's own records for one that grows with a file this project neither writes nor knows a
     /// bound for, and it would do it here, on the loop that draws the editor. The window itself titles

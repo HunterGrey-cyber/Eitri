@@ -248,6 +248,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         start_notes: _,
         restore_run: _,
         toast_hook: _,
+        startup_problems: _,
         trust: _,
         spawner: _,
     } = state;

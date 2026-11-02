@@ -99,8 +99,8 @@ pub fn is_open(open: &[(AgentId, String)], record: &ResumableSession) -> bool {
 /// open, each with its agent (`TabSet::open_sessions`): a saved tab whose agent has that session open
 /// here is left out without comment, as it is already where it should be, while another agent's
 /// session that happens to share its id does not keep it from coming back. `held` says whether a
-/// lease on an agent's session is held right now. The tabs are planned in saved order, the Claude
-/// tabs first.
+/// lease on an agent's session is held right now. The tabs are planned in the tab bar's order when
+/// the file recorded it (`SavedTabs::in_bar_order`), else the Claude tabs first.
 pub fn plan(
     saved: &SavedTabs,
     records: &[ResumableSession],
@@ -109,7 +109,7 @@ pub fn plan(
 ) -> RestorePlan {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
-    for tab in &saved.tabs {
+    for tab in saved.in_bar_order() {
         let (agent, id) = (tab.agent.clone(), tab.provider_session_id.as_str());
         let (saved_name, saved_mode, saved_view) = (tab.name.as_deref(), tab.mode, tab.view);
         let turn_running = tab.turn_running;
@@ -419,6 +419,53 @@ mod tests {
         assert!(
             RestorePolicy::parse(Some("Auto")).is_err(),
             "case matters, as in every other key"
+        );
+    }
+
+    /// A Codex tab between two Claude tabs comes back between them, not behind them.
+    #[test]
+    fn tabs_of_different_agents_come_back_in_the_tab_bars_order() {
+        let tab = |agent: AgentId, id: &str| SavedTab {
+            agent,
+            conversation_id: "c".to_string(),
+            provider_session_id: id.to_string(),
+            name: None,
+            mode: Auto,
+            view: None,
+            window: None,
+            turn_running: false,
+        };
+        let bar = vec![
+            (AgentId::Claude, "a".to_string()),
+            (AgentId::Codex, "x".to_string()),
+            (AgentId::Claude, "b".to_string()),
+        ];
+        let saved = SavedTabs::from_parts(
+            vec![tab(AgentId::Claude, "a"), tab(AgentId::Claude, "b")],
+            0,
+            vec![tab(AgentId::Codex, "x")],
+            None,
+        );
+        let records = [
+            record("a", None, None),
+            record("b", None, None),
+            ResumableSession {
+                provider: "codex".to_string(),
+                ..record("x", None, None)
+            },
+        ];
+        let ids = |saved: &SavedTabs| -> Vec<String> {
+            plan(saved, &records, &[], |_, _| false)
+                .items
+                .iter()
+                .map(|i| i.provider_session_id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&saved.clone().with_bar(bar)), ["a", "x", "b"]);
+        assert_eq!(
+            ids(&saved),
+            ["a", "b", "x"],
+            "no record of the order: Claude's tabs first"
         );
     }
 

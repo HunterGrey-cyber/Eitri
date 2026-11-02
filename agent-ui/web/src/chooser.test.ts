@@ -28,6 +28,13 @@ describe("chooserRows", () => {
     const rows = chooserRows(ENVELOPE, TABS, "");
     expect(rows.map((r) => r.kind)).toEqual(["new", "tab", "tab", "record", "record", "record"]);
   });
+  it("lists Restore last session first while tabs are on offer, and drops it while filtering", () => {
+    const offer = { labels: ["api", "docs"], bypass: 0 };
+    expect(chooserRows(ENVELOPE, TABS, "", offer).map((r) => r.kind)).toEqual(["restore", "new", "tab", "tab", "record", "record", "record"]);
+    expect(chooserRows(ENVELOPE, TABS, "fix", offer).some((r) => r.kind === "restore")).toBe(false);
+    expect(chooserRows(ENVELOPE, TABS, "", { labels: [], bypass: 0 }).some((r) => r.kind === "restore")).toBe(false);
+    expect(chooserRows(ENVELOPE, TABS, "").some((r) => r.kind === "restore")).toBe(false);
+  });
   it("joins each open row to its TabInfo by id", () => {
     const rows = chooserRows(ENVELOPE, TABS, "");
     const row = rows.find((r) => r.kind === "tab" && r.tab.tab === 1);

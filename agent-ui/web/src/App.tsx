@@ -3988,6 +3988,12 @@ export default function App() {
     setChooser(null);
     returnKeysToRoot();
   }
+  /** The chooser's `Restore last session` row: the dashboard's `s`, reached from the editor. */
+  function onChooserRestoreLast() {
+    post({ type: "restore_last" });
+    setChooser(null);
+    returnKeysToRoot();
+  }
   function onChooserCloseTab(tab: TabId) {
     // Rust's own close prompt is `prefix &`; this asks the same question tmux's `choose-tree` `x`
     // does, from the row's own label -- there is no round trip to Rust for this text.
@@ -4603,6 +4609,8 @@ export default function App() {
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
               dropKeysRequest={emptyDropKeys}
+              restore={hello?.restore ?? null}
+              onRestoreLast={onChooserRestoreLast}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}
@@ -6701,6 +6709,8 @@ export default function App() {
               newTabChord={keymapHelp.newTabChord}
               focusRequest={chooserFocusRequest}
               dropKeysRequest={emptyDropKeys}
+              restore={hello?.restore ?? null}
+              onRestoreLast={onChooserRestoreLast}
               onSwitch={onChooserSwitch}
               onResume={onChooserResume}
               onNewSession={onChooserNewSession}

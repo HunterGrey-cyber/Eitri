@@ -291,7 +291,9 @@ file in your nvim.
   holds a small lock file while it is open, so one window cannot write under another window's unsaved buffers.
 - **A revert whose file sits behind a symbolic link to a directory is refused,** whether the link leads inside the project or outside it.
 - **An interrupted revert is offered back only in a window with turn review on.** If the window was killed in the middle of rewriting a file in place (one
-  with a second hard link, another owner or extended attributes), the next window with turn review on offers to restore the saved bytes.
+  that belongs to another user or has extended attributes), the next window with turn review on offers to restore the saved bytes.
+- **A file with a second hard link is never reverted.** A write through one link would change the others, which may live outside the project, so the
+  revert is refused with `the file has N hard links; writing it would change the other links too, so it was not written` and nothing is touched.
 - **Limits:** a file over 8 MiB is listed as too large with no patch; a patch over 2,000 lines shows only its counts; a file name that is not valid
   UTF-8 is listed but its patch cannot be opened; a project inside a larger repository (opened below the repository's top level) honours neither
   the parent's `.gitignore` files above its own root nor the repository's `info/exclude`, so files excluded only there are copied into the store.
@@ -299,11 +301,12 @@ file in your nvim.
 ## Stability
 
 0.3.0 is the tiling release. Eitri is not yet stable enough for everyday use: that waits for real hardware, a
-person's hands and a week of daily use, not for a version number. Much of it has been seen working only in an
-isolated, headless test session (the tiling window, chat views, the Markdown preview, companion mode, `eitri split`,
-the GNOME extension, turn review, the trust question), and steering a running turn, the redesigned chat page in a
-real window and input methods have not been seen on a screen at all; reports from real desktops are especially
-welcome. The `init.lua` API and the default keys may change during 0.x.
+person's hands and a week of daily use, not for a version number. Almost all of it has been seen working only in an
+isolated, headless test session, with a scripted stand-in behind Claude Code instead of a real account (the tiling
+window, chat views, the redesigned chat page, steering a running turn and the queued messages, typing through an
+input method, the Markdown preview, companion mode, `eitri split`, the GNOME extension, turn review, the trust
+question). None of it has run for a recorded week on real hardware: a real wheel and touchpad, two monitors of
+different scale, a real account's day. Reports from real desktops are especially welcome. The `init.lua` API and the default keys may change during 0.x.
 
 ## Not on this list?
 

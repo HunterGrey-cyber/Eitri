@@ -257,12 +257,15 @@ background tab keeps streaming, and its label in the tab bar shows what it needs
 for a turn that finished while you were elsewhere, `✕` for a session that ended badly).
 
 **Resuming a conversation.** Closing a tab does not delete its conversation. `r` on an empty tab resumes the
-most recent saved session, and `<prefix> w` (or `w` on an empty tab) lists them all, each with its name or
-title; a session another window currently holds is shown but cannot be chosen.
+most recent saved session, and `<prefix> w` (or `w` on an empty tab) lists them, newest first, each with its name or
+title; a session another window currently holds is shown but cannot be chosen. A project keeps its 200 newest
+sessions: once it holds that many the list says `only the newest 200 are kept`, and the next new session drops the
+oldest one from it (its conversation stays in Claude Code's own `claude --resume`).
 
 **Restoring the last tabs.** Eitri remembers which tabs the last window on a project had open: their order,
 names and modes, and which one was on screen. By default the empty tab offers them as `Restore last session`
-(`s`). Setting `agent.restore` to `"auto"` in your `init.lua` brings them back at launch with no key pressed,
+(`s` in the panel). The keys start in the editor, where `s` is nvim's; from there `<prefix> w` opens the session list
+with the cursor on a `Restore last session` row, and `Enter` takes it. Setting `agent.restore` to `"auto"` in your `init.lua` brings them back at launch with no key pressed,
 and `"off"` neither offers nor remembers; see [Configuration](configuration.md). A tab is skipped, and named
 in a short message, when its saved conversation is gone or another window holds it. A tab that was in bypass
 does not come back in bypass unasked: `s` asks (`n` brings it back in Auto), and an automatic restore brings

@@ -15476,6 +15476,24 @@ describe("restoring the last session's tabs", () => {
     }
   });
 
+  it("`prefix w` offers the tabs as its first row, and Enter asks Rust for them from where the keys start", () => {
+    const { container } = emptyTabWithOffer();
+    dispatch({ kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: false }], records: [] });
+    const chooser = container.querySelector<HTMLElement>(".chooser")!;
+    expect(chooser.querySelector(".chooser-row.current")!.textContent).toContain("Restore last session");
+    fireEvent.keyDown(chooser, { key: "Enter" });
+    expect(lastOfType("restore_last")).toMatchObject({ tab: 1 });
+    expect(container.querySelector(".chooser")).toBeNull();
+  });
+
+  it("the session list's header says the project is at its limit, through the whole page", () => {
+    const { container } = emptyTabWithOffer();
+    dispatch({ kind: "chooser", open: [], records: [], limit: 200 });
+    expect(container.querySelector(".chooser-counts")!.textContent).toBe("0 open · 0 earlier · only the newest 200 are kept");
+    dispatch({ kind: "chooser", open: [], records: [] });
+    expect(container.querySelector(".chooser-counts")!.textContent).toBe("0 open · 0 earlier");
+  });
+
   it("a click on the line asks too", () => {
     const { container } = emptyTabWithOffer();
     const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Restore"))!;

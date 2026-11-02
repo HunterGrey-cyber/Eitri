@@ -5322,6 +5322,10 @@ impl TabSet {
             })
             .collect();
         let mut others_active = external.iter().position(|(id, _)| *id == self.active);
+        let external_ids: Vec<(TabId, (AgentId, String))> = external
+            .iter()
+            .map(|(id, saved)| (*id, (saved.agent.clone(), saved.provider_session_id.clone())))
+            .collect();
         let waiting_active = self.waiting_restore_active();
         let mut others: Vec<SavedTab> = external.into_iter().map(|(_, saved)| saved).collect();
         // A restore waiting for the trust question has no tab for its sessions yet; they stay in the
@@ -5400,12 +5404,34 @@ impl TabSet {
                 },
             ));
         }
-        Some(SavedTabs::from_parts(
+        // The tab bar's order across both kinds: the tabs that exist by their place in it, then the sessions a
+        // restore still waits to start, in the order they were listed.
+        let mut bar: Vec<(usize, (AgentId, String))> = listed
+            .iter()
+            .filter(|(id, _)| *id != TabId(u64::MAX))
+            .map(|(id, saved)| (id, saved.key()))
+            .chain(external_ids.iter().map(|(id, key)| (id, key.clone())))
+            .filter_map(|(id, key)| Some((self.position(*id)?, key)))
+            .collect();
+        bar.sort_by_key(|(place, _)| *place);
+        let mut bar: Vec<(AgentId, String)> = bar.into_iter().map(|(_, key)| key).collect();
+        for granted in &waiting {
+            let key = (
+                granted.planned.agent.clone(),
+                granted.planned.provider_session_id.clone(),
+            );
+            if !bar.contains(&key) {
+                bar.push(key);
+            }
+        }
+        let mixed = !listed.is_empty() && !others.is_empty();
+        let saved = SavedTabs::from_parts(
             listed.into_iter().map(|(_, saved)| saved).collect(),
             active,
             others,
             others_active,
-        ))
+        );
+        Some(if mixed { saved.with_bar(bar) } else { saved })
     }
 
     /// The session `tab` is saved under: the one it holds, or, for a tab that failed starting a saved
@@ -15499,6 +15525,68 @@ mod tests {
             .map(|t| (t.provider_session_id.as_str(), t.turn_running))
             .collect();
         assert_eq!(running, [("a", true), ("b", false)]);
+    }
+
+    /// Claude and Codex tabs mixed in the tab bar are saved in the bar's order, though `tabs` lists the Claude ones first.
+    #[test]
+    fn a_saved_snapshot_keeps_the_tab_bars_order_across_agents() {
+        let mut set = set();
+        let failed_with = |set: &mut TabSet, tab: TabId, session: &str| {
+            let t = set.get_mut(tab).unwrap();
+            t.backend = TabBackend::Failed {
+                reason: "refused".to_string(),
+            };
+            t.failed_resume = Some(session.to_string());
+        };
+        let first = set.active();
+        set.get_mut(first).unwrap().agent = AgentId::Codex;
+        failed_with(&mut set, first, "thread-1");
+        let second = set.open(AgentId::Claude);
+        failed_with(&mut set, second, "s-1");
+        let third = set.open(AgentId::Codex);
+        failed_with(&mut set, third, "thread-2");
+        let fourth = set.open(AgentId::Claude);
+        failed_with(&mut set, fourth, "s-2");
+
+        let saved = set.saved_snapshot("conv").unwrap();
+        let listed: Vec<&str> = saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect();
+        assert_eq!(
+            listed,
+            ["s-1", "s-2", "thread-1", "thread-2"],
+            "the file's two lists keep their own order"
+        );
+        let in_bar: Vec<&str> = saved
+            .in_bar_order()
+            .into_iter()
+            .map(|t| t.provider_session_id.as_str())
+            .collect();
+        assert_eq!(in_bar, ["thread-1", "s-1", "thread-2", "s-2"]);
+    }
+
+    /// A restore waiting for its trust answer keeps the order it was saved in, whichever agents its tabs run.
+    #[test]
+    fn a_waiting_restore_is_saved_in_the_order_it_was_planned() {
+        let mut set = set();
+        let from = set.active();
+        let codex = |id: &str| PlannedTab {
+            agent: AgentId::Codex,
+            ..planned(id, SessionModeChoice::Auto)
+        };
+        let plan = plan_of(
+            vec![codex("x"), planned("a", SessionModeChoice::Auto), codex("y")],
+            None,
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        let saved = set.saved_snapshot("conv").unwrap();
+        let in_bar: Vec<&str> = saved
+            .in_bar_order()
+            .into_iter()
+            .map(|t| t.provider_session_id.as_str())
+            .collect();
+        assert_eq!(in_bar, ["x", "a", "y"]);
     }
 
     #[test]

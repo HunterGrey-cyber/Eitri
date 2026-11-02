@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=cd95286f5b066f409c9d50c65a944d60c96045edab51e67dfb4a43e4ef7bfe67 -->
+<!-- translated-from: getting-started.md sha256=13bc2c5d0833bae1c5831a7fe2ea87215ba3577e92c8fc8055a8ffa98ea763cb -->
 
 # 快速上手
 
@@ -140,9 +140,9 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 在面板里，`H` 和 `L`（或 `gT` 和 `gt`）同样切到上一个和下一个标签页。每个标签页运行一个 agent，默认是 Claude；`:tabnew codex` 会打开一个 Codex 的标签页，你注册的 agent 也可以有标签页。见 [Codex 与其他 agent](agents.zh-CN.md)。标签页并排运行：后台标签页会继续流式输出，它在标签栏里的标记会显示它需要什么（`⚑` 表示有等待中的卡片，`•` 表示在你看别处时一个回合结束了，`✕` 表示一个会话糟糕地结束了）。
 
-**继续一个对话。** 关闭标签页不会删除它的对话。在空标签页上按 `r` 继续最近一次保存的会话，`<prefix> w`（或空标签页上的 `w`）列出全部，每个都带着名字或标题；另一个窗口当前占用的会话会显示出来，但不能选。
+**继续一个对话。** 关闭标签页不会删除它的对话。在空标签页上按 `r` 继续最近一次保存的会话，`<prefix> w`（或空标签页上的 `w`）按从新到旧列出它们，每个都带着名字或标题；另一个窗口当前占用的会话会显示出来，但不能选。一个项目保留最新的 200 个会话：存满之后，列表会写 `only the newest 200 are kept`，下一个新会话会把最旧的那个从列表里去掉（它的对话仍在 Claude Code 自己的 `claude --resume` 里）。
 
-**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（`s`）提供出来。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
+**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（在面板里按 `s`）提供出来。按键一开始在编辑器里，那里的 `s` 是 nvim 的；从那里按 `<prefix> w` 打开会话列表，光标就在 `Restore last session` 这一行上，按 `Enter` 即可。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
 
 **在真正的终端里继续。** 按 `<leader>t`（或者打开 `<prefix> i` 选 `Continue in a terminal...`）。Eitri 会先说明它会先关闭面板里的这个对话，然后在你确认后，显示在你自己的终端里继续它的 `claude --resume ...` 命令；按 `y` 复制它。Eitri 不会替你启动那个终端，也不会对会话加锁，所以不要在两个地方同时开着它。那个终端运行的是一个普通的 `claude`，用你自己的 Claude Code 设置，没有 Eitri 的权限关卡，所以它的工具调用不会以卡片出现。还没有过第一个回合的会话没有什么可继续的，还有回合在运行的会话也一样。
 

@@ -137,9 +137,13 @@ Your settings are the directory Eitri reads them from: `$XDG_CONFIG_HOME/eitri` 
 is non-empty and absolute, else `~/.config/eitri`. `--purge` never removes a directory `EITRI_CONFIG_DIR`
 names, since that may hold another program's settings too; it says so, and you remove it yourself.
 
-This removes everything the installer put in place: the program, the launcher, the desktop entry, the
+This removes what the installer put in place under your home: the program, the launcher, the desktop entry, the
 icons, the GNOME Shell extension, the sidecars (updates you took included), the private nvim and the download cache. It never touches
 an `nvim` of your own. Disable the GNOME Shell extension first if you turned it on.
+
+The one thing it leaves is the AppArmor profile of a per-user install on Ubuntu (`/etc/apparmor.d/eitri-user-<uid>`,
+see [Ubuntu 23.10 and later](#ubuntu-2310-and-later)): that file belongs to root and the uninstall never runs `sudo`.
+It prints the two `sudo` commands that unload and delete it; run them if you want the profile gone.
 
 For a `.deb` or `.rpm`: remove the package first, then run `sh install.sh --uninstall` to remove the
 per-user sidecar and private nvim, which the package does not own (this also removes a curl install under

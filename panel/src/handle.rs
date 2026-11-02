@@ -1346,6 +1346,7 @@ impl AgentPanelHandle {
             files.startup_beyond(state.tab_files.as_ref(), tabs_dir.as_deref(), &state.project_dir);
         for note in notes {
             eprintln!("{note}");
+            state.startup_problems.push(note);
         }
         state.tab_memory.take_over_when_written(takeovers);
         state.restore_source = match (state.restore_source.take(), offer) {
@@ -1353,6 +1354,12 @@ impl AgentPanelHandle {
             (earlier, later) => earlier.or(later),
         };
         state.tab_files = Some(files);
+    }
+
+    /// What the launch could not read of the saved tabs, once: the window says it in its toast, where the log alone
+    /// would leave a person with no tabs and no reason.
+    pub fn take_startup_problems(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.borrow_mut().startup_problems)
     }
 
     /// Window 1 starting window 2 again at its launch: `agent.restore = "auto"` waits until window 2 is back or
@@ -2970,6 +2977,7 @@ mod tests {
             "view_background_count",
             "queued_count",
             "trust_question_open",
+            "take_startup_problems",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
         const WAKES_WHEN: &[&str] = &["note_editor_key"];

@@ -485,7 +485,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 - **`agent.restore`** is what happens to the tabs the last window on this project had open. Eitri keeps the
   tabs that have a session to resume (their order, names, modes, agents and which one was on screen) as it goes, and never
   records "no tabs" because you closed the window. With `"offer"` the empty tab's dashboard shows a
-  `Restore last session` line, `s`, while nothing in the window has started; `"auto"` brings the tabs back at
+  `Restore last session` line, `s`, while nothing in the window has started (the keys start in the editor, where `s` is nvim's, so `<prefix> w` also opens the session list on a `Restore last session` row); `"auto"` brings the tabs back at
   launch with no key pressed (unless the project's Claude configuration is new or changed, in which case the
   restore waits for your answer to the [trust question](permissions.md#trusting-a-project), and `Esc` on it keeps the saved tabs: they come back as failed tabs you can start again with `r`, or, from the empty tab's `Restore last session` line while the tab is still empty, stay on offer); `"off"` or `false` neither offers nor remembers; `true` and `"on"` are refused. Each tab is resumed (nothing is sent until
   you type), the one on screen last time is on screen again, and one message says how many came back. A tab

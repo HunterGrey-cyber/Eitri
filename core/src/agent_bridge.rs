@@ -2753,7 +2753,9 @@ pub struct ChooserRecord {
 }
 
 /// `prefix w`: open tabs first, then the records open in no tab, newest first. Opens the chooser.
-pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) -> String {
+/// `limit` is the number of sessions a project keeps, given once the project holds that many: the list then
+/// says that the oldest sessions are dropped, and the key is left out otherwise.
+pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord], limit: Option<usize>) -> String {
     let open: Vec<Value> = open
         .iter()
         .map(|t| {
@@ -2773,7 +2775,11 @@ pub fn serialize_chooser_for_js(open: &[ChooserTab], records: &[ChooserRecord]) 
             })
         })
         .collect();
-    json!({ "kind": "chooser", "open": open, "records": records }).to_string()
+    let mut envelope = json!({ "kind": "chooser", "open": open, "records": records });
+    if let Some(limit) = limit {
+        envelope["limit"] = json!(limit);
+    }
+    envelope.to_string()
 }
 
 /// Newer titles for records the chooser listed, read after it was sent: the page lays them over an open
@@ -8421,8 +8427,15 @@ mod tests {
             held_by_partner: false,
             partner_window: None,
         }];
-        let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(&open, &records)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialize_chooser_for_js(&open, &records, None)).unwrap();
         assert_eq!(value["kind"], "chooser");
+        assert!(
+            value.get("limit").is_none(),
+            "no limit is named while the project is under it"
+        );
+        let full: serde_json::Value =
+            serde_json::from_str(&serialize_chooser_for_js(&open, &records, Some(200))).unwrap();
+        assert_eq!(full["limit"], 200);
         assert_eq!(value["open"][0]["tab"], 1);
         assert_eq!(value["open"][0]["marker"], serde_json::Value::Null);
         assert_eq!(value["records"][0]["providerSessionId"], "c-9");
