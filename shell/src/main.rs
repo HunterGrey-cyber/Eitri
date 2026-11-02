@@ -20,6 +20,7 @@ mod end_signals;
 mod grid_probe;
 mod gtk_host;
 mod hint;
+mod host_clipboard;
 #[cfg(target_os = "linux")]
 mod ide_wiring;
 mod kill_pane;
@@ -743,6 +744,13 @@ fn build_ui(
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
     let mut pane_switch = owns_editor.then(pane_switch::open).flatten();
+    // nvim's `+` and `*` registers through this window's clipboard, for an nvim that finds no clipboard tool and so
+    // calls the fake `tmux` (`host_clipboard`). Served once the window exists, since only an active window serves;
+    // a yank before that waits in the socket's queue.
+    let clipboard_listener = pane_switch.as_mut().and_then(|ps| {
+        let listener = ps.take_clipboard_listener()?;
+        Some((listener, ps.socket_path().to_path_buf()))
+    });
     // wire 1's feed, built here for the same reason the other two are: its `child_env()` and its
     // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
     // that is already running.
@@ -860,6 +868,8 @@ fn build_ui(
         .and_then(|window| window.downcast().ok())
         .expect("the window phase opened the window");
     window.add_css_class("shell-root");
+    let host_clipboard = clipboard_listener
+        .and_then(|(listener, switch_socket)| host_clipboard::start(listener, &switch_socket, &window));
     // The editor, launched with `editor_spawn`; its host joins the grid at the surfaces phase. That host
     // is a small overlay carrying a hidden failure-message label, not the bare `GtkGLArea` -- see
     // `editor_start_failure`'s own doc for why this has to wrap the widget before it is ever handed to the grid.
@@ -4590,6 +4600,7 @@ fn build_ui(
         pair: pair.clone(),
         scratch_path: scratch_path.clone(),
         pane_switch,
+        host_clipboard,
         theme_feed,
         context_feed,
         nvim_keys_feed,

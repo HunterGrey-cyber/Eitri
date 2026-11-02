@@ -28,6 +28,7 @@ pub mod editor_open;
 pub mod editor_rpc;
 pub mod editor_tools;
 pub mod hint;
+pub mod host_clipboard;
 #[cfg(target_os = "linux")]
 pub mod ide_server;
 pub mod init_notice;

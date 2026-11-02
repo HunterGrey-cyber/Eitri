@@ -281,6 +281,8 @@ pub(crate) struct Teardown {
     /// The panel's scratch directory: removed here, since GTK may never drop the `ScratchDir` that owns it.
     pub(crate) scratch_path: Option<PathBuf>,
     pub(crate) pane_switch: Option<crate::pane_switch::PaneSwitchChannel>,
+    /// The thread serving nvim's clipboard calls on the channel's `c.sock`; stopped with the channel's directory.
+    pub(crate) host_clipboard: Option<eitri_core::host_clipboard::ClipboardServer>,
     pub(crate) theme_feed: Option<crate::theme::feed::ThemeFeed>,
     pub(crate) context_feed: Option<eitri_core::editor_context::feed::EditorContextFeed>,
     pub(crate) nvim_keys_feed: Option<eitri_core::nvim_keys::feed::NvimKeysFeed>,
@@ -1006,6 +1008,9 @@ impl ServiceSet for Services {
             CleanupOp::PaneSwitchDir => {
                 if let Some(channel) = &teardown.pane_switch {
                     channel.cleanup();
+                }
+                if let Some(server) = &teardown.host_clipboard {
+                    server.stop();
                 }
             }
             CleanupOp::Feeds => teardown.feeds(),

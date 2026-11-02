@@ -28,25 +28,29 @@
 //!   tolerated, as is any other flag ordering, because only the direction token is extracted.
 //! - Sends that one direction letter to `shell` over the Unix socket named by
 //!   `EITRI_PANE_SWITCH_SOCKET`, then exits.
-//! - **Always exits 0**, including when the socket is missing, unreachable, or the argv shape is
+//! - Pane-switch calls **always exit 0**, including when the socket is missing, unreachable, or the argv shape is
 //!   unrecognized. This is a UX-enhancement channel, not a security gate like `agent-hook`: the
 //!   plugin discards this process's stdout and exit code entirely (`silent call s:TmuxCommand`),
 //!   and a failure here must never surface to the user as a broken keystroke. Diagnostics go to
 //!   stderr only.
-//! - Never reads stdin and never waits for a reply, so it cannot hang the keypress that spawned
+//! - Pane-switch calls never read stdin or wait for a reply, so they cannot hang the keypress that spawned
 //!   it. (`agent-hook` blocks for a real decision because a permission answer is load-bearing;
 //!   nothing downstream of a `select-pane` call reads anything back.)
 //!
 //! Clipboard calls. `$TMUX` being set makes Neovim's clipboard provider pick `tmux` when neither
 //! `wl-copy`, `xclip` nor `xsel` is installed (it is last in nvim's own list), and every starter
-//! sets `unnamedplus`, so every yank then calls `tmux load-buffer`. The shim has no clipboard to
-//! give, so it says so: `load-buffer` and `save-buffer` exit 1 with a hint on stderr, which nvim
-//! shows as `clipboard: error invoking tmux: ...`. Exiting 0 there would let `"+y` look like it
-//! worked while the text went nowhere. The full hint is printed once per Eitri window, later calls
-//! get a short line. Where a real clipboard tool exists nvim never reaches this provider.
+//! sets `unnamedplus`, so every yank then calls `tmux load-buffer`. Only the provider's exact argument
+//! lists are served (`load-buffer -`, `load-buffer -w -`, `save-buffer -`); any other call naming those
+//! subcommands is another plugin's and exits 1 untouched. Clipboard calls use `c.sock`
+//! beside the pane-switch socket: `load-buffer` reads bounded stdin and asks the window to copy;
+//! `save-buffer` asks for text and writes its bytes unchanged to stdout. Successful calls exit 0
+//! silently apart from paste's stdout; failures exit 1 with one line on stderr, never the text.
+//! An unreachable window gets an install hint once per window, then a short line. A real clipboard
+//! tool or a person's `g:clipboard` provider takes precedence in nvim.
 
+use eitri_core::host_clipboard::{self, Answer, ClientError, Request, CLIENT_WAIT, MAX_TEXT_BYTES, SOCKET_NAME};
 use std::ffi::OsStr;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -70,15 +74,37 @@ fn direction_from_args(args: &[String]) -> Option<char> {
     })
 }
 
-/// Whether this is a clipboard call of nvim's `tmux` provider (`load-buffer` to copy,
-/// `save-buffer` to paste) rather than anything the pane-switch plugins send.
+/// Whether this call names `load-buffer` or `save-buffer` at all; such a call is never a pane switch,
+/// and only [`nvim_clipboard_call`]'s exact shapes are served.
 fn is_clipboard_call(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "load-buffer" || arg == "save-buffer")
 }
 
-const CLIPBOARD_HINT: &str = "Eitri has no clipboard tool to hand nvim here: install wl-clipboard (Wayland) \
-     or xclip (X11), then restart the editor";
-const CLIPBOARD_HINT_SHORT: &str = "no clipboard tool (install wl-clipboard or xclip)";
+/// What nvim's `tmux` clipboard provider runs, exactly: `load-buffer -` or `load-buffer -w -` to copy
+/// (stdin), `save-buffer -` to paste (stdout). Any other argument list with those subcommands (a named
+/// buffer, `-b`, a file, `-S`) is another tmux plugin's, which must not reach the desktop clipboard.
+#[derive(Debug, PartialEq, Eq)]
+enum NvimCall {
+    Copy,
+    Paste,
+}
+
+fn nvim_clipboard_call(args: &[String]) -> Option<NvimCall> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["load-buffer", "-"] | ["load-buffer", "-w", "-"] => Some(NvimCall::Copy),
+        ["save-buffer", "-"] => Some(NvimCall::Paste),
+        _ => None,
+    }
+}
+
+/// The refusal of a buffer call that is not nvim's clipboard: it reaches no clipboard.
+const NOT_NVIMS_CALL: &str =
+    "eitri: this tmux is Eitri's shim; it serves only nvim's own clipboard calls and has no tmux buffers";
+
+const CLIPBOARD_HINT: &str = "eitri: the window's clipboard is not reachable; install wl-clipboard (Wayland) \
+     or xclip (X11) to bypass it";
+const CLIPBOARD_HINT_SHORT: &str = "eitri: the window's clipboard is not reachable";
 
 /// What a refused clipboard call tells nvim: the full hint the first time (`first`), the short line
 /// after. The text a person yanked is never part of it.
@@ -104,6 +130,76 @@ fn first_clipboard_refusal(told: &Path) -> bool {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
     }
+}
+
+/// The clipboard lives beside `bin/`, in the same channel directory as the switch socket.
+fn clipboard_socket(own_dir: &Path) -> Option<PathBuf> {
+    own_dir.parent().map(|dir| dir.join(SOCKET_NAME))
+}
+
+/// The refusal of a yank over the cap. Stdin is read only one byte past it, so the yank's real size
+/// is not known, only that it is over.
+fn clipboard_over_limit() -> String {
+    format!(
+        "eitri: the yank is over the clipboard limit of {} MiB; the text stays in nvim's register",
+        MAX_TEXT_BYTES / (1024 * 1024)
+    )
+}
+
+fn clipboard_error(error: &ClientError, first: bool) -> String {
+    match error {
+        ClientError::Unreachable(_) => clipboard_refusal(first).to_string(),
+        ClientError::TimedOut | ClientError::Wire(_) => format!("eitri: {error}"),
+    }
+}
+
+fn unreachable_clipboard(own_dir: &Path) -> String {
+    let told = own_dir.parent().map(|dir| dir.join("clipboard-told"));
+    clipboard_refusal(told.as_deref().is_none_or(first_clipboard_refusal)).to_string()
+}
+
+/// Validate the answer without ever formatting an unexpected text answer into a diagnostic.
+fn clipboard_answer(answer: Answer, copying: bool) -> Result<Option<Vec<u8>>, String> {
+    match answer {
+        Answer::Done if copying => Ok(None),
+        Answer::Text(text) if !copying => Ok(Some(text)),
+        Answer::Failed(reason) => Err(format!("eitri: {reason}")),
+        _ => Err("eitri: the window sent an unexpected clipboard answer".to_string()),
+    }
+}
+
+/// Only clipboard calls read stdin or wait for an answer; pane switching remains one-way.
+fn clipboard_call(call: NvimCall, own_dir: &Path) -> Result<(), String> {
+    let copying = call == NvimCall::Copy;
+    let request = if copying {
+        let mut text = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take((MAX_TEXT_BYTES + 1) as u64)
+            .read_to_end(&mut text)
+            .map_err(|e| format!("eitri: could not read clipboard input: {e}"))?;
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(clipboard_over_limit());
+        }
+        Request::Copy(text)
+    } else {
+        Request::Paste
+    };
+    let socket = clipboard_socket(own_dir).ok_or_else(|| unreachable_clipboard(own_dir))?;
+    let answer = host_clipboard::request(&socket, &request, CLIENT_WAIT).map_err(|error| {
+        if matches!(error, ClientError::Unreachable(_)) {
+            unreachable_clipboard(own_dir)
+        } else {
+            clipboard_error(&error, false)
+        }
+    })?;
+    if let Some(text) = clipboard_answer(answer, copying)? {
+        std::io::stdout()
+            .lock()
+            .write_all(&text)
+            .map_err(|e| format!("eitri: could not write clipboard output: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Whether a typed `tmux` inside nvim's own `:terminal` deserves a message on
@@ -196,10 +292,15 @@ fn main() {
     }
 
     if is_clipboard_call(&args) {
-        let told = own_dir.parent().map(|dir| dir.join("clipboard-told"));
-        let first = told.as_deref().is_none_or(first_clipboard_refusal);
-        eprintln!("{}", clipboard_refusal(first));
-        std::process::exit(1);
+        let Some(call) = nvim_clipboard_call(&args) else {
+            eprintln!("{NOT_NVIMS_CALL}");
+            std::process::exit(1);
+        };
+        if let Err(reason) = clipboard_call(call, &own_dir) {
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let Some(direction) = direction_from_args(&args) else {
@@ -468,8 +569,35 @@ mod tests {
         assert!(is_clipboard_call(&args(&["save-buffer", "-"])));
     }
 
+    /// Only nvim's three argument lists are served; every other buffer call (vim-slime's named
+    /// buffer, a file, `-S`, a trailing extra) is refused.
+    #[test]
+    fn only_nvims_exact_argument_lists_are_served() {
+        assert_eq!(nvim_clipboard_call(&args(&["load-buffer", "-"])), Some(NvimCall::Copy));
+        assert_eq!(
+            nvim_clipboard_call(&args(&["load-buffer", "-w", "-"])),
+            Some(NvimCall::Copy)
+        );
+        assert_eq!(nvim_clipboard_call(&args(&["save-buffer", "-"])), Some(NvimCall::Paste));
+        for refused in [
+            &["load-buffer", "-b", "slime", "-"][..],
+            &["load-buffer", "/tmp/f"],
+            &["load-buffer"],
+            &["-S", "/s", "load-buffer", "-"],
+            &["load-buffer", "-", "-w"],
+            &["load-buffer", "-w", "-", "x"],
+            &["save-buffer", "-b", "name", "-"],
+            &["save-buffer", "/tmp/f"],
+            &["save-buffer"],
+            &["save-buffer", "-", "-"],
+        ] {
+            assert_eq!(nvim_clipboard_call(&args(refused)), None, "{refused:?}");
+            assert!(is_clipboard_call(&args(refused)), "{refused:?} still exits 1, not 0");
+        }
+    }
+
     /// The first refusal in a window carries the hint, the next ones a short line; neither can
-    /// carry yanked text, which the shim never reads.
+    /// carry yanked text.
     #[test]
     fn the_hint_is_full_once_and_short_after() {
         let root = scratch_dir("told");
@@ -480,10 +608,66 @@ mod tests {
         assert!(clipboard_refusal(true).contains("wl-clipboard"));
         assert!(clipboard_refusal(true).contains("xclip"));
         assert!(clipboard_refusal(false).len() < clipboard_refusal(true).len());
+        assert!(std::fs::read(&told).expect("marker").is_empty());
         // A marker that cannot be made never hides the hint.
         assert!(first_clipboard_refusal(
             &root.join("no-such-dir").join("clipboard-told")
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_clipboard_socket_is_beside_the_shims_bin_directory() {
+        assert_eq!(
+            clipboard_socket(Path::new("/channel/bin")),
+            Some(PathBuf::from("/channel/c.sock"))
+        );
+        assert_eq!(clipboard_socket(Path::new("/")), None);
+        assert_eq!(clipboard_socket(Path::new("")), None);
+    }
+
+    #[test]
+    fn clipboard_messages_name_only_the_failure_or_size() {
+        use host_clipboard::WireError;
+        let unreachable = ClientError::Unreachable(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            clipboard_error(&unreachable, true),
+            "eitri: the window's clipboard is not reachable; install wl-clipboard (Wayland) or xclip (X11) to bypass it"
+        );
+        assert_eq!(
+            clipboard_error(&unreachable, false),
+            "eitri: the window's clipboard is not reachable"
+        );
+        assert_eq!(
+            clipboard_error(&ClientError::TimedOut, false),
+            format!("eitri: {}", ClientError::TimedOut)
+        );
+        let wire = ClientError::Wire(WireError::UnknownKind(0xff));
+        assert_eq!(clipboard_error(&wire, false), format!("eitri: {wire}"));
+        assert_eq!(
+            clipboard_over_limit(),
+            "eitri: the yank is over the clipboard limit of 16 MiB; the text stays in nvim's register"
+        );
+    }
+
+    #[test]
+    fn clipboard_answers_preserve_bytes_and_keep_unexpected_text_out_of_errors() {
+        assert!(matches!(clipboard_answer(Answer::Done, true), Ok(None)));
+        let text = b"clipboard-needle\0\nno-final-newline";
+        assert!(matches!(
+            clipboard_answer(Answer::Text(text.to_vec()), false),
+            Ok(Some(bytes)) if bytes == text
+        ));
+        for copying in [true, false] {
+            assert!(matches!(
+                clipboard_answer(Answer::Failed("host failure".to_string()), copying),
+                Err(reason) if reason == "eitri: host failure"
+            ));
+        }
+        assert!(matches!(
+            clipboard_answer(Answer::Text(text.to_vec()), true),
+            Err(reason) if reason == "eitri: the window sent an unexpected clipboard answer"
+        ));
+        assert!(clipboard_answer(Answer::Done, false).is_err());
     }
 }

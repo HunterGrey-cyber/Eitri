@@ -153,6 +153,10 @@ pub struct PaneSwitchChannel {
     /// is taken as a quit, as with no socket at all.
     watch_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
+    /// The clipboard socket's listener ([`crate::host_clipboard`]), bound only beside the shim (an nvim
+    /// with no fake `tmux` never asks for it); `None` when it could not be bound, and nvim's `+`
+    /// register then reaches no clipboard, as before.
+    clipboard_listener: Option<UnixListener>,
     /// Whether `bin/tmux` was linked in. Without it the child gets neither the fake `TMUX`
     /// variables nor a `PATH` that leads into a directory that does not exist.
     shim: bool,
@@ -254,6 +258,8 @@ impl PaneSwitchChannel {
             return None;
         }
 
+        let clipboard_listener = shim.and_then(|_| bind_clipboard(&dir));
+
         // Optional, unlike everything above: without it vim-tmux-navigator still leaves through the
         // shim, so a failed write costs only the fallback, never the channel.
         let nav_path = dir.join(NAV_LUA_NAME);
@@ -295,6 +301,7 @@ impl PaneSwitchChannel {
             nav_lua,
             watch_lua,
             listener: Some(listener),
+            clipboard_listener,
             shim: shim.is_some(),
         })
     }
@@ -372,6 +379,12 @@ impl PaneSwitchChannel {
         self.listener.take()
     }
 
+    /// Hands the clipboard socket's listener to the host, once; `None` without the shim, when it
+    /// could not be bound, or the second time.
+    pub fn take_clipboard_listener(&mut self) -> Option<UnixListener> {
+        self.clipboard_listener.take()
+    }
+
     /// Removes the shim directory (fake `tmux` symlink and socket alike). Idempotent, and safe to
     /// call while the nvim child is still alive -- by the time a host calls this it is shutting
     /// that child down anyway, and a missing `tmux` only means the plugin's `system()` call finds
@@ -392,6 +405,34 @@ impl PaneSwitchChannel {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+}
+
+/// Binds the clipboard socket in the channel's directory, 0600, or logs why not and answers `None`:
+/// the channel itself does not depend on it.
+fn bind_clipboard(dir: &Path) -> Option<UnixListener> {
+    let warn = |what: String| {
+        eprintln!("[pane_switch] {what} -- nvim's clipboard register reaches no clipboard without a tool");
+    };
+    let path = match agent::socket_path::in_dir(dir, crate::host_clipboard::SOCKET_NAME) {
+        Ok(path) => path,
+        Err(e) => {
+            warn(format!("{e}"));
+            return None;
+        }
+    };
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            warn(format!("could not bind {}: {e}", path.display()));
+            return None;
+        }
+    };
+    if let Err(e) = crate::instance_dir::make_socket_private(&path) {
+        warn(format!("could not make {} private: {e}", path.display()));
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(listener)
 }
 
 impl Drop for PaneSwitchChannel {
@@ -931,6 +972,7 @@ mod tests {
             watch_lua: Some(dir.join(WATCH_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
+            clipboard_listener: None,
             shim: true,
         };
         let env: std::collections::HashMap<String, String> = channel.child_env().into_iter().collect();
@@ -981,6 +1023,7 @@ mod tests {
             watch_lua: None,
             dir: dir.clone(),
             listener: None,
+            clipboard_listener: None,
             shim: true,
         };
         assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_NAV_LUA"));
@@ -1001,6 +1044,7 @@ mod tests {
             watch_lua: Some(dir.join(WATCH_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
+            clipboard_listener: None,
             shim: true,
         };
         let odd = std::ffi::OsString::from_vec(b"/usr/bin:/opt/caf\xe9/bin".to_vec());
@@ -1479,6 +1523,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The clipboard socket is bound beside the switch socket only when the fake `tmux` is linked,
+    /// 0600, and handed over once.
+    #[test]
+    fn the_clipboard_socket_is_bound_only_beside_the_shim_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut companion = PaneSwitchChannel::bind_without_shim().expect("bind");
+        assert!(companion.take_clipboard_listener().is_none());
+        let clip = companion
+            .socket_path()
+            .with_file_name(crate::host_clipboard::SOCKET_NAME);
+        assert!(!clip.exists(), "no clipboard socket without the shim");
+        companion.cleanup();
+
+        let root = std::env::temp_dir().join(format!("nv-ps-clip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let shim = root.join("eitri-tmux-shim");
+        std::fs::write(&shim, b"").unwrap();
+        let mut channel = PaneSwitchChannel::bind(&shim).expect("bind");
+        let clip = channel.socket_path().with_file_name(crate::host_clipboard::SOCKET_NAME);
+        let mode = std::fs::symlink_metadata(&clip).expect("bound").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert!(channel.take_clipboard_listener().is_some());
+        assert!(channel.take_clipboard_listener().is_none(), "handed over once");
+        channel.cleanup();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The socket path at macOS's worst-case temporary directory is exactly 100 bytes.
     ///
     /// An inequality against `MAX_SOCKET_PATH_BYTES` would let growth from 100 to 103 bytes pass
@@ -1498,6 +1570,9 @@ mod tests {
         let dir = macos_tmp.join(format!("{DIR_PREFIX}99999-{}", uuid::Uuid::new_v4().simple()));
         let path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("must fit");
         assert_eq!(path.as_os_str().len(), 100, "{path:?}");
+        // The clipboard socket sits in the same directory under a name as long as the switch socket's.
+        let clip = agent::socket_path::in_dir(&dir, crate::host_clipboard::SOCKET_NAME).expect("must fit");
+        assert_eq!(clip.as_os_str().len(), 100, "{clip:?}");
 
         // The companion's channel is named by the same two constants, so it spends the same bytes:
         // rebuild its directory name at the macOS worst case from what `bind_without_shim` made.

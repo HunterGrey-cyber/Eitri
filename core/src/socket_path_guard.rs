@@ -42,6 +42,9 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     // through `in_dir`; the `SWEPT_NAMES` entries reach only `connect()`, on a path the sweep
     // derives from a directory it is already scanning.
     ("src/pane_switch.rs", "const SOCKET_NAME: &str = \"s.sock\""),
+    // The clipboard socket's file name: bound only through `in_dir` (`pane_switch::bind_clipboard`); the
+    // shim joins it to the channel directory it already holds, the path that `in_dir` passed at the bind.
+    ("src/host_clipboard.rs", "pub const SOCKET_NAME: &str = \"c.sock\""),
     ("src/pane_switch.rs", "const SWEPT_NAMES:"),
     ("src/theme/feed.rs", "const SOCKET_NAME: &str = \"t.sock\""),
     ("src/theme/feed.rs", "const SWEPT_NAMES:"),
