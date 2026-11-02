@@ -54,6 +54,7 @@ pub mod path_complete;
 pub mod permission_store;
 pub mod plugin;
 pub mod proc_chain;
+pub mod project_chooser;
 pub mod project_root;
 pub mod project_trust;
 pub mod prompt_history;
