@@ -139,7 +139,7 @@ pub fn prepare_start(start: &ReopenStart) -> Prepared {
 pub fn read_handoff(writer: &RecordWriter, channel_dir: &Path, token: &str, seq: u64) {
     // Only a token this window made names a file; anything else would put a stranger's name in the path.
     if token.len() != 16 || !token.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        eprintln!("[editor] reopen: no handoff is read for {token:?}, which is not a token");
+        eprintln!("[editor] reopen: no handoff is read for a name that is not a token");
         return;
     }
     let path = channel_dir.join(crate::editor_reopen::handoff_name(token));

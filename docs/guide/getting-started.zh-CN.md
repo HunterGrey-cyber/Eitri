@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=ac0fb858affa35c5800aaa2f04ec4139d210de2e38105aef1521106ad53197fd -->
+<!-- translated-from: getting-started.md sha256=a4fec9b06a687dba155e9da0e576ec06086eba901a89cea96acfbf6d4e255108 -->
 
 # 快速上手
 
@@ -147,6 +147,28 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 标签页里没发送的文字会随它一起保存，按 `s` 时回到输入框，最多保存 256 KiB。回不来的文字（在还没有会话的标签页里，或者太长存不下）会计入窗口的关闭问题：`close window? 1 unsent draft (y/n)`。如果不按 `s` 而是开始新的内容，保存的东西会被替换，没发送的文字也一起没了。
 
 **在真正的终端里继续。** 按 `<leader>t`（或者打开 `<prefix> i` 选 `Continue in a terminal...`）。Eitri 会先说明它会先关闭面板里的这个对话，然后在你确认后，显示在你自己的终端里继续它的 `claude --resume ...` 命令；按 `y` 复制它。Eitri 不会替你启动那个终端，也不会对会话加锁，所以不要在两个地方同时开着它。那个终端运行的是一个普通的 `claude`，用你自己的 Claude Code 设置，没有 Eitri 的权限关卡，所以它的工具调用不会以卡片出现。还没有过第一个回合的会话没有什么可继续的，还有回合在运行的会话也一样。
+
+<a id="when-you-start-again"></a>
+## 再次启动时
+
+关掉 Eitri，或者它崩溃、机器重启之后，在同一个项目里再启动，编辑器会回到你离开时的样子。你在窗口里打开的文件按原来的分屏方式回来，在原来的标签页里，每个窗口停在原来的行和滚动位置，光标仍在原来那个窗口。列在缓冲区列表里但没有显示的文件，回到 `:ls` 里。分屏保持比例，30/70 的分屏在较窄的面板里仍是 30/70。一切都回来时，Eitri 什么也不说。
+
+Eitri 在状态目录里保存一个记录当前打开内容的小文件，每 30 秒更新一次，窗口失去焦点时更新，编辑器退出时也更新（`:qa`、关窗口、SIGTERM）。Eitri 被直接杀掉时，下次启动用的是最近一次更新的记录：通常丢最后 30 秒的窗口移动和光标位置，编辑器忙着没有应答时会更久。记录里只有文件名和位置，没有文字。没保存的文字和在普通 Neovim 里一样没有保证：配置里开着 swap、而且 Neovim 已经写出（默认在输入 200 个字符或停下 4 秒之后），才会留在 swap 文件里；用了 `noswapfile` 就不会留。
+
+不会回来的东西：
+
+- 折叠，以及窗口和缓冲区选项（`wrap`、`spell`、`number`：这些由你自己的配置设置）；
+- 工作目录，包括窗口局部和标签页局部的目录；
+- 跳转列表、标记、寄存器、命令历史和撤销，它们由 Neovim 自己保存，Eitri 不碰；
+- 终端缓冲区、帮助、quickfix 和位置列表、浮动窗口、没有名字的缓冲区；
+- 从没写到磁盘上的文件，以及到下次启动时已经不存在或不再是普通文件的文件；
+- Eitri 自己的视图：插件的 diff 标签页和回合审查的缓冲区。
+
+有东西没能回来时，会有一行短提示说明：`2 files from last time are gone: src/old.rs and 1 more`、`could not reopen src/x.rs`，或者 `3 files from last time did not fit on screen; they are in :ls`。如果一个文件在已经退出的编辑器留下的 swap 文件里有未保存的改动，它会以只读方式打开，随后出现平常那条关于未保存改动的提示（`:e` 这个文件，再按 `r` 恢复）。如果上一次恢复没有完成（Neovim 在打开文件时崩溃或卡住），下一次启动什么也不打开，只说一次原因，写下新的记录后才会再试。
+
+**Eitri 什么时候让路。** 如果你用会话插件，Eitri 把重新打开交给它：不恢复、不写记录、不出声。它认得 `persistence.nvim`（LazyVim 的）、`auto-session`、`resession.nvim`（AstroNvim 的）、`possession.nvim`、`nvim-possession`、`neovim-session-manager`、`persisted.nvim`、`mini.sessions`、设置了 `g:startify_session_autoload` 的 vim-startify、vim-prosession，以及你的配置已经载入的会话。它只看有什么已载入或已声明，从不加载或初始化你的任何东西。不在这个清单里的会话工具会和 Eitri 各恢复一次，你的文件会被打开两遍；把 `editor.restore` 设为 `false`（见[配置](configuration.zh-CN.md#settings)）就能关掉 Eitri 这一边。带着文件启动（`eitri FILE`）、你的配置在编辑器出现前已经打开了文件、`eitri --clean`、第二个窗口，以及[伴随模式](companion.zh-CN.md)的窗口（那里的 Neovim 是你自己的），Eitri 也什么都不做。同一个项目里没有和第一个窗口配对的第二个窗口用自己的记录，从不打开第一个窗口的。
+
+**配置顶部的 `autocmd!`。** Eitri 的重新打开挂在 `init.lua` 运行之前建立的自动命令上。配置顶层一句单独的 `autocmd!` 会清掉所有组的自动命令，Eitri 的也在内：这一次运行里不会重新打开，也不会保存，上一次正常运行留下的文件保持原样。把 `autocmd!` 放进它所属的 `augroup` 里，它就只清那一个组。
 
 <a id="when-something-ends"></a>
 ## 有东西结束时

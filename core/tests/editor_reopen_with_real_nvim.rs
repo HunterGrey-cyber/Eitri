@@ -57,12 +57,8 @@ impl Rig {
     }
 
     fn leaf(&self, i: usize, cur: bool) -> Value {
-        let mut node = json!({"leaf": {"f": self.name(&format!("{i}.txt")), "lnum": 80 + i, "col": 4,
-            "want": 4, "top": 70 + i, "left": 0, "w": 40, "h": 20}});
-        if cur {
-            node["leaf"]["cur"] = json!(true);
-        }
-        node
+        json!({"leaf": {"f": self.name(&format!("{i}.txt")), "lnum": 80 + i, "col": 4,
+            "want": 4, "top": 70 + i, "left": 0, "w": 40, "h": 20, "cur": cur}})
     }
 
     fn record(&self, tree: Value) -> Value {

@@ -285,6 +285,52 @@ once. That terminal runs a plain `claude` with your own Claude Code settings, no
 its tool calls do not appear as cards. A session that has not had its first turn yet has nothing to continue, and neither does one with a
 turn still running.
 
+## When you start again
+
+Close Eitri, or lose it to a crash or a reboot, and the next start in the same project opens the editor where you left
+it. The files you had in windows come back split the way they were, in the same tab pages, each window at the line and
+scroll position it had, with the same window holding the cursor. Files you had listed but not on screen are back in
+`:ls`. A split keeps its proportions, so a 30/70 split is still 30/70 on a narrower pane. When everything came back,
+Eitri says nothing.
+
+Eitri keeps a small file of what is open in its state directory, updated every 30 seconds, when the window loses focus
+and when the editor exits (a `:qa`, a window close, SIGTERM). If Eitri is killed outright, the next start
+has the record from the last update: normally the last 30 seconds of window moves and cursor travel are lost, more if
+the editor was busy and had not answered. The record holds file names and positions, never text. Unsaved text is
+only as safe as it is in plain Neovim: it survives in a swap file when your configuration leaves swap on and Neovim
+has written it (by default after 200 typed characters or 4 seconds without typing), and not at all with `noswapfile`.
+
+What does not come back:
+
+- folds, and window and buffer options (`wrap`, `spell`, `number`: your own configuration sets those);
+- working directories, including a window-local or tab-local one;
+- the jump list, marks, registers, command history and undo, which Neovim keeps itself and Eitri leaves alone;
+- terminal buffers, help, quickfix and location lists, floating windows and unnamed buffers;
+- a file that was never written to disk, and a file that is gone or no longer a regular file by the next start;
+- Eitri's own views: a plugin's diff tab and the buffers of a turn review.
+
+When something could not come back, one short line says what: `2 files from last time are gone: src/old.rs and 1 more`,
+`could not reopen src/x.rs`, or `3 files from last time did not fit on screen; they are in :ls`. A file that has unsaved
+changes in a swap file from an editor that died opens read-only, and the usual line about unsaved changes follows (`:e`
+the file, then `r` recovers them). If the last restore never finished, because Neovim crashed or hung while opening
+files, the next start opens nothing, says so once, and tries again after a record is written.
+
+**When Eitri stands aside.** If you use a session plugin, Eitri leaves reopening to it: it restores nothing, writes
+nothing, and says nothing. It recognises `persistence.nvim` (LazyVim's), `auto-session`, `resession.nvim` (AstroNvim's),
+`possession.nvim`, `nvim-possession`, `neovim-session-manager`, `persisted.nvim`, `mini.sessions`, vim-startify with
+`g:startify_session_autoload` set, vim-prosession, and a session your configuration has already loaded. It only looks at
+what is loaded or declared and never loads or sets up anything of yours. A session tool that is not on this list restores
+beside Eitri and your files open twice; set `editor.restore` to `false` (see [Configuration](configuration.md#settings))
+to turn Eitri's side off. Eitri also does nothing when you start it with files (`eitri FILE`), when your configuration
+has already opened a file before the editor shows, with `eitri --clean`, in window 2, and in a [companion](companion.md)
+window, where the Neovim is yours. A second window on the same project that is not paired with the first keeps its
+own record and never opens the first window's.
+
+**`autocmd!` at the top of your configuration.** Eitri's reopening hangs on autocommands that are made before your
+`init.lua` runs. A bare `autocmd!` at the top level of your configuration removes every group's autocommands, Eitri's
+included: nothing reopens and nothing is saved in that run, and the file from the last good run stays as it was. Put
+`autocmd!` inside the `augroup` it belongs to, where it clears only that group.
+
 ## When something ends
 
 A turn that does not finish normally no longer looks like one that did. A muted row in italics appears where
