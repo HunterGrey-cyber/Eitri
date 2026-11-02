@@ -5,6 +5,8 @@ use std::time::SystemTime;
 
 use crate::onboarding::Lang;
 
+pub mod path;
+
 #[cfg(test)]
 mod tests;
 mod text;
