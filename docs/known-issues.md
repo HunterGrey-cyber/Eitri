@@ -78,7 +78,13 @@ distinguish real refresh-period feedback from the fallback clock.
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
   reply, say so in the "Testing feedback" form, with your GPU and monitor refresh rate.
 - **Memory:** one tab uses 253 to 283 MiB more than native Neovide, more than the 256 MiB we aim for, and each
-  extra chat view about 28 MB more.
+  extra chat view about 28 MB more. That is the window's own share. Each Claude session behind a chat view also
+  runs its own `claude` process (about 113 MB) and its own sidecar (86 to 145 MB), so a session costs about 230 MB
+  rather than 28: seven of them held 2.0 GB after three hours.
+- **In 0.3.0 an idle session's sidecar keeps growing.** With seven sessions left idle, each sidecar grew 30 to
+  47 MB an hour, with no plateau in three hours. A forced garbage collection every five minutes did not
+  slow it, so it is memory the sidecar still holds, not memory it has yet to collect. At that rate a window with
+  five tabs left open for a week would reach about 30 GB (extrapolated, not run). Quitting the window gives it back.
 - **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work
   keeping the machine 17-28 % busy, it drew 137-149 frames a second where native Neovide drew 160, and 111 at 34 %
   busy, with one 83.6 ms frame in four runs. That was measured before 0.2.0's typing-latency fix and not since.
