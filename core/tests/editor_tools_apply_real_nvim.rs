@@ -254,7 +254,7 @@ impl Drop for Test {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_rename_through_a_fake_server_reaches_the_disk_and_the_buffer_reloads() {
     let mut t = Test::new();
     let id = t.proposal();
@@ -303,7 +303,7 @@ fn a_rename_through_a_fake_server_reaches_the_disk_and_the_buffer_reloads() {
 /// `checktime` looks only at buffers in a window, so a buffer in none stays as it was until it is shown, and showing it
 /// is what reloads it. A person never sees the old text; a proposal asked before then is refused by its digest.
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_buffer_in_no_window_catches_up_when_it_is_shown() {
     let mut t = Test::loaded();
     let id = t.proposal();
@@ -319,7 +319,7 @@ fn a_buffer_in_no_window_catches_up_when_it_is_shown() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_buffer_edited_after_the_proposal_blocks_the_write() {
     let mut t = Test::new();
     let id = t.proposal();

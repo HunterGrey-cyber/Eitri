@@ -73,7 +73,20 @@ impl Case {
             .env("XDG_CONFIG_HOME", self.stubs.join("config"))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        self.children.push(command.spawn().expect("the stub starts"));
+        // A sibling test's fork holds this stub's write descriptor open until its own exec, and a script that is still
+        // open for writing somewhere cannot be executed (`ETXTBSY`); that passes within milliseconds.
+        let mut tries = 0;
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("the stub starts: {e}"),
+            }
+        };
+        self.children.push(child);
         self.children.last_mut().unwrap()
     }
 }

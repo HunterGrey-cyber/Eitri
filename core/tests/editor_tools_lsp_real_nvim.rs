@@ -236,7 +236,7 @@ fn read_from_outside(t: &Test) -> PathBuf {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_item_in_a_buffer_read_from_outside_tells_no_line() {
     let mut t = Test::new();
     let name = read_from_outside(&t);
@@ -254,7 +254,7 @@ fn an_item_in_a_buffer_read_from_outside_tells_no_line() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_usages_call_on_a_buffer_read_from_outside_tells_nothing() {
     let mut t = Test::new();
     read_from_outside(&t);
@@ -271,7 +271,7 @@ fn a_usages_call_on_a_buffer_read_from_outside_tells_nothing() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_ask_answers_and_its_collect_takes_it_once() {
     let mut t = Test::new();
     t.server();
@@ -282,7 +282,7 @@ fn an_ask_answers_and_its_collect_takes_it_once() {
     assert!(matches!(t.collect("one", false), Collected::Gone));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn pending_until_the_server_answers() {
     let mut t = Test::new();
     t.server();
@@ -292,7 +292,7 @@ fn pending_until_the_server_answers() {
     assert_eq!(t.parts()[0].items.len(), 1);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_server_that_never_answers_gives_what_arrived_and_names_the_missing_part() {
     let mut t = Test::new();
     t.server();
@@ -315,7 +315,7 @@ fn a_server_that_never_answers_gives_what_arrived_and_names_the_missing_part() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_entry_past_its_deadline_is_cleared_by_the_next_ask() {
     let mut t = Test::new();
     t.server();
@@ -333,7 +333,7 @@ fn an_entry_past_its_deadline_is_cleared_by_the_next_ask() {
     assert!(matches!(t.collect("one", true), Collected::Gone));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn and_by_the_next_collect() {
     let mut t = Test::new();
     t.server();
@@ -349,7 +349,7 @@ fn and_by_the_next_collect() {
     assert!(matches!(t.collect("one", true), Collected::Gone));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_last_collect_inside_the_margin_finds_the_entry() {
     let mut t = Test::new();
     t.server();
@@ -362,7 +362,7 @@ fn a_last_collect_inside_the_margin_finds_the_entry() {
     assert!(matches!(t.collect("one", true), Collected::Done { .. }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_character_across_each_cut_stays_whole() {
     let mut t = Test::new();
     t.server();
@@ -410,7 +410,7 @@ fn a_character_across_each_cut_stays_whole() {
     assert_eq!(item.text.as_deref(), Some("a".repeat(499).as_str()));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_line_of_invalid_utf8_does_not_fail_the_collect() {
     let mut t = Test::new();
     t.server();
@@ -426,7 +426,7 @@ fn a_line_of_invalid_utf8_does_not_fail_the_collect() {
     assert_eq!(t.parts()[0].items[0].text.as_deref(), Some("foo�"));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_very_long_name_and_path_are_held_to_their_caps() {
     let mut t = Test::new();
     t.server();
@@ -442,7 +442,7 @@ fn a_very_long_name_and_path_are_held_to_their_caps() {
     assert_eq!(parts[0].items[0].container.as_ref().unwrap().len(), 1024);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_position_a_server_got_wrong_drops_that_item_only() {
     let mut t = Test::new();
     t.lua(
@@ -463,7 +463,7 @@ fn a_position_a_server_got_wrong_drops_that_item_only() {
     assert_eq!(p[0].items[0].text.as_deref(), Some("three"));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_late_answer_after_the_entry_went_recreates_nothing() {
     let mut t = Test::new();
     t.server();
@@ -475,7 +475,7 @@ fn a_late_answer_after_the_entry_went_recreates_nothing() {
     assert_eq!(t.lua("return _G.__eitri_agent.lsp.n", vec![]), 0.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_items_text_names_the_buffer_it_came_from() {
     let mut t = Test::new();
     t.server();
@@ -491,7 +491,7 @@ fn an_items_text_names_the_buffer_it_came_from() {
     assert_eq!(parts[0].items[0].text_from.as_ref(), Some(&outside));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_editor_is_never_held() {
     let mut t = Test::new();
     t.server();
@@ -548,7 +548,7 @@ fn the_editor_is_never_held() {
     assert_eq!(before, t.lua(PERSON, vec![]));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_position_is_in_each_clients_encoding() {
     let mut t = Test::new();
     t.lua(
@@ -574,7 +574,7 @@ fn a_position_is_in_each_clients_encoding() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_symbol_is_a_whole_word() {
     let mut t = Test::new();
     t.server();
@@ -590,7 +590,7 @@ fn the_symbol_is_a_whole_word() {
     );
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_symbol_not_on_the_line_says_so() {
     let mut t = Test::new();
     t.server();
@@ -600,7 +600,7 @@ fn a_symbol_not_on_the_line_says_so() {
     assert!(t.seen().as_array().unwrap().is_empty());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_line_past_the_end_says_so() {
     let mut t = Test::new();
     let mut a = t.args();
@@ -608,7 +608,7 @@ fn a_line_past_the_end_says_so() {
     assert!(matches!(t.ask(&a), Asked::NoLine { line_count: 1 }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn load_false_adds_no_buffer() {
     let mut t = Test::new();
     let path = t.root.join("new.rs");
@@ -620,7 +620,7 @@ fn load_false_adds_no_buffer() {
     assert_eq!(before, t.lua("return vim.api.nvim_list_bufs()", vec![]));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_stale_swap_loads_nothing_and_says_swap() {
     let mut t = Test::new();
     let path = t.root.join("swap.rs");
@@ -649,7 +649,7 @@ fn a_stale_swap_loads_nothing_and_says_swap() {
     assert_eq!(std::fs::read(swap.as_str().unwrap()).unwrap(), bytes);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_load_says_loaded_now_and_a_later_ask_finds_the_client() {
     let mut t = Test::new();
     let path = t.root.join("new.rs");
@@ -663,14 +663,14 @@ fn a_load_says_loaded_now_and_a_later_ask_finds_the_client() {
     assert!(matches!(t.ask(&a), Asked::Started { .. }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn no_client_says_no_client() {
     let mut t = Test::new();
     let a = t.args();
     assert!(matches!(t.ask(&a), Asked::NoClient { loaded_now: false }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_expired_stamp_starts_no_request() {
     let t = Test::new();
     t.server();
@@ -685,7 +685,7 @@ fn an_expired_stamp_starts_no_request() {
     assert!(t.seen().as_array().unwrap().is_empty());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn two_scopes_do_not_share_an_id() {
     let mut t = Test::new();
     t.server();
@@ -699,7 +699,7 @@ fn two_scopes_do_not_share_an_id() {
     assert!(matches!(t.collect("one", true), Collected::Done { .. }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn every_location_form_normalises() {
     let mut t = Test::new();
     t.server();
@@ -722,7 +722,7 @@ fn every_location_form_normalises() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_non_file_uri_stays_as_it_came_and_adds_no_buffer() {
     let mut t = Test::new();
     t.server();
@@ -739,7 +739,7 @@ fn a_non_file_uri_stays_as_it_came_and_adds_no_buffer() {
     assert_eq!(before, t.lua("return vim.api.nvim_list_bufs()", vec![]));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_cap_keeps_200_and_counts_the_rest() {
     let mut t = Test::new();
     t.server();
@@ -754,7 +754,7 @@ fn the_cap_keeps_200_and_counts_the_rest() {
     assert_eq!(p[0].total, 230);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn every_hover_form_comes_as_its_source_text() {
     let mut t = Test::new();
     t.server();
@@ -784,7 +784,7 @@ fn every_hover_form_comes_as_its_source_text() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn document_symbols_flatten_with_their_container() {
     let mut t = Test::new();
     t.server();
@@ -800,7 +800,7 @@ fn document_symbols_flatten_with_their_container() {
     assert_eq!(p[0].items[1].line, 4);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn workspace_symbols_ask_only_clients_of_the_project() {
     let mut t = Test::new();
     t.server();
@@ -826,7 +826,7 @@ fn workspace_symbols_ask_only_clients_of_the_project() {
     assert_eq!(t.lua("return #_G.__fake_lsp.seen == 1 and _G.__fake_lsp.seen[1].client == 'fake' and _G.__fake_lsp.seen[1].params.query == 'needle'",vec![]),true.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_unsupported_part_is_named() {
     let mut t = Test::new();
     t.start(
@@ -851,7 +851,7 @@ fn an_unsupported_part_is_named() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_oldest_entry_is_evicted_after_thirty_two() {
     let mut t = Test::new();
     t.server();
@@ -868,7 +868,7 @@ fn the_oldest_entry_is_evicted_after_thirty_two() {
     assert!(matches!(t.collect("entry-32", true), Collected::Done { .. }));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn usages_with_a_hung_part_answers_what_arrived_when_the_budget_ends() {
     let mut t = Test::new();
     t.server();
@@ -890,7 +890,7 @@ fn usages_with_a_hung_part_answers_what_arrived_when_the_budget_ends() {
     assert!(waited >= LSP_BUDGET, "the budget was not given: {waited:?}");
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_unsaved_new_file_reaches_its_server() {
     let mut t = Test::new();
     let new = t.root.join("new.rs");
@@ -969,7 +969,7 @@ impl Test {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_rename_comes_back_as_files_and_edits() {
     let mut t = Test::new();
     t.edit_server();
@@ -995,7 +995,7 @@ fn a_rename_comes_back_as_files_and_edits() {
     );
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn both_workspace_edit_forms_normalise() {
     for documents in [false, true] {
         let mut t = Test::new();
@@ -1019,7 +1019,7 @@ fn both_workspace_edit_forms_normalise() {
     assert_eq!(edit.files[0].path, edit.files[1].path);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_resource_operation_is_named_and_not_lost() {
     let mut t = Test::new();
     t.edit_server();
@@ -1032,7 +1032,7 @@ fn a_resource_operation_is_named_and_not_lost() {
     assert!(edit.resource_ops[0].contains("a.rs"));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_oversized_edit_says_so_and_keeps_none() {
     for mode in ["count", "text", "path", "entries", "operations"] {
         let mut t = Test::new();
@@ -1049,7 +1049,7 @@ fn an_oversized_edit_says_so_and_keeps_none() {
 /// The whole edit goes back in one frame of the editor's connection, so names count with the text: 5,000 entries of
 /// 4 KB names are over the 16 MiB a frame may hold, and a frame over it would end the connection.
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn names_too_long_for_the_editors_frame_say_so_and_keep_none() {
     for entry in [
         "{textDocument={uri=name,version=1},edits={}}",
@@ -1071,7 +1071,7 @@ fn names_too_long_for_the_editors_frame_say_so_and_keep_none() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_rename_asks_one_client() {
     let mut t = Test::new();
     t.edit_server();
@@ -1090,7 +1090,7 @@ fn a_rename_asks_one_client() {
     assert_eq!(t.lua("local n=0 for _,r in ipairs(_G.__fake_lsp.seen) do if r.method=='textDocument/rename' then n=n+1 end end return n",vec![]),1.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn format_uses_the_target_buffers_options_not_the_current_ones() {
     let mut t = Test::new();
     t.edit_server();
@@ -1116,7 +1116,7 @@ fn format_uses_the_target_buffers_options_not_the_current_ones() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_null_edit_is_no_edit() {
     for kind in [LspKind::Rename, LspKind::Format] {
         let mut t = Test::new();
@@ -1126,7 +1126,7 @@ fn a_null_edit_is_no_edit() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn code_actions_list_id_and_title_and_keep_the_action_in_nvim() {
     let mut t = Test::new();
     let action = t.list_action("local e=... return {title='Fix this',kind='quickfix',edit=e,data={secret='kept'}}");
@@ -1144,7 +1144,7 @@ fn code_actions_list_id_and_title_and_keep_the_action_in_nvim() {
 }
 /// What a server gets back in a code action's context can come out in the action's title.
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_code_action_goes_out_with_no_entry_that_stood_through_a_reload() {
     let mut t = Test::new();
     t.lua(
@@ -1174,7 +1174,7 @@ fn a_code_action_goes_out_with_no_entry_that_stood_through_a_reload() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_range_is_in_each_clients_encoding() {
     let mut t = Test::new();
     t.lua(
@@ -1198,7 +1198,7 @@ fn the_range_is_in_each_clients_encoding() {
     assert_eq!(t.lua("local out={} for _,r in ipairs(_G.__fake_lsp.seen) do if r.method=='textDocument/codeAction' then out[r.client]=r.params.range['end'].character assert(r.params.range.start.character==0) end end return {out['utf-8'],out['utf-16'],out['utf-32']}",vec![]),Value::Array(vec![7.into(),4.into(),3.into()]));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_lines_lsp_diagnostics_go_along() {
     let mut t = Test::new();
     t.edit_server();
@@ -1210,7 +1210,7 @@ fn the_lines_lsp_diagnostics_go_along() {
     assert_eq!(t.lua("local c=_G.__fake_lsp.seen[1].params.context return c.triggerKind==1 and #c.diagnostics==1 and c.diagnostics[1].message=='raw' and c.diagnostics[1].code==42",vec![]),true.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_bare_command_says_has_command() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Run',command='server.run',arguments={'arg'}}");
@@ -1218,7 +1218,7 @@ fn a_bare_command_says_has_command() {
     assert!(!a.has_edit);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_bare_command_is_not_sent_to_resolve() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Run',command='server.run',arguments={'arg'}}");
@@ -1226,7 +1226,7 @@ fn a_bare_command_is_not_sent_to_resolve() {
     assert_eq!(t.lua("for _,r in ipairs(_G.__fake_lsp.seen) do if r.method=='codeAction/resolve' then return true end end return false",vec![]),false.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_command_that_only_the_resolved_action_has_reaches_done() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Fix',data={token=42}}");
@@ -1249,7 +1249,7 @@ fn a_command_that_only_the_resolved_action_has_reaches_done() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn action_edit_uses_the_actions_own_edit() {
     let mut t = Test::new();
     let a = t.list_action("local e=... return {title='Fix',edit=e}");
@@ -1258,7 +1258,7 @@ fn action_edit_uses_the_actions_own_edit() {
     assert_eq!(t.lua("for _,r in ipairs(_G.__fake_lsp.seen) do if r.method=='codeAction/resolve' then return true end end return false",vec![]),false.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_stored_action_answers_the_time_of_its_first_ask() {
     let mut t = Test::new();
     let before = wall_ms();
@@ -1275,7 +1275,7 @@ fn a_stored_action_answers_the_time_of_its_first_ask() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn action_edit_resolves_when_it_has_none() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Fix',data={token=42}}");
@@ -1289,7 +1289,7 @@ fn action_edit_resolves_when_it_has_none() {
     );
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn action_edit_with_neither_says_no_edit() {
     let mut t = Test::new();
     let a = t.list_action("return {title='No edit'}");
@@ -1297,7 +1297,7 @@ fn action_edit_with_neither_says_no_edit() {
     assert_eq!(t.ask(&t.action_args(&a.id)), Asked::NoEdit { has_command: false });
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn action_edit_says_its_title_and_command() {
     let mut t = Test::new();
     let a = t.list_action("local e=... return {title='Fix then run',edit=e,command={command='run'}}");
@@ -1310,7 +1310,7 @@ fn action_edit_says_its_title_and_command() {
     assert_eq!(t.lua("for _,r in ipairs(_G.__fake_lsp.seen) do if r.method=='workspace/executeCommand' then return true end end return false",vec![]),false.into());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_action_past_ten_minutes_is_gone() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Old'}");
@@ -1327,7 +1327,7 @@ fn an_action_past_ten_minutes_is_gone() {
     assert_eq!(t.ask(&t.action_args(&a.id)), Asked::ActionGone);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_action_of_a_stopped_client_is_gone() {
     let mut t = Test::new();
     let a = t.list_action("return {title='Stopped'}");
@@ -1338,7 +1338,7 @@ fn an_action_of_a_stopped_client_is_gone() {
     assert_eq!(t.ask(&t.action_args(&a.id)), Asked::ActionGone);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_action_on_a_buffer_edited_and_saved_since_is_gone() {
     let mut t = Test::new();
     let a = t.list_action("local e=... return {title='Stale',edit=e}");
@@ -1346,7 +1346,7 @@ fn an_action_on_a_buffer_edited_and_saved_since_is_gone() {
     assert_eq!(t.ask(&t.action_args(&a.id)), Asked::ActionGone);
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn another_buffers_edit_leaves_an_action_alone() {
     let mut t = Test::new();
     let a = t.list_action("local e=... return {title='Still valid',edit=e}");
@@ -1358,7 +1358,7 @@ fn another_buffers_edit_leaves_an_action_alone() {
     t.edit_done();
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_rename_answers_the_ticks_of_the_ask() {
     let mut t = Test::new();
     t.edit_server();
@@ -1396,7 +1396,7 @@ fn a_rename_answers_the_ticks_of_the_ask() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn targets_say_found_and_modified_and_add_no_buffer() {
     let mut t = Test::new();
     t.lua(
@@ -1422,7 +1422,7 @@ fn targets_say_found_and_modified_and_add_no_buffer() {
     assert!(lsp::targets(&*t.rpc, &stamp, &paths).try_take().unwrap().is_err());
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_target_hash_equals_the_hash_rust_computes() {
     for bytes in [b"a\nb\n".as_slice(), b"a\r\nb\r\n", b"a\nb"] {
         let mut t = Test::new();
@@ -1444,7 +1444,7 @@ fn a_target_hash_equals_the_hash_rust_computes() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_target_says_how_its_file_ends() {
     use eitri_core::editor_tools::text_edits::final_newline_agrees;
     for (bytes, eol) in [
@@ -1472,7 +1472,7 @@ fn a_target_says_how_its_file_ends() {
     }
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_the_editor_saved_with_a_new_final_newline_disagrees_until_it_is_reloaded() {
     use eitri_core::editor_tools::text_edits::final_newline_agrees;
     let mut t = Test::new();
@@ -1499,7 +1499,7 @@ fn a_file_the_editor_saved_with_a_new_final_newline_disagrees_until_it_is_reload
     assert!(final_newline_agrees(&disk, reloaded.eol));
 }
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_title_past_its_cap_stays_whole_characters() {
     let mut t = Test::new();
     let a = t.list_action(
@@ -1511,7 +1511,7 @@ fn a_title_past_its_cap_stays_whole_characters() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn code_action_limits_keep_sixty_four_and_evict_the_oldest_after_two_hundred_fifty_six() {
     let mut t = Test::new();
     t.edit_server();
@@ -1559,7 +1559,7 @@ fn code_action_limits_keep_sixty_four_and_evict_the_oldest_after_two_hundred_fif
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_action_keeps_the_ticks_from_its_list_when_resolved_later() {
     let mut t = Test::new();
     let other_path = t.root.join("b.rs");
@@ -1637,7 +1637,7 @@ fn action_list(t: &mut Test, memory: &eitri_core::editor_tools::memory::Memory) 
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_listed_action_resolves_to_an_edit_end_to_end() {
     let mut t = Test::new();
     t.edit_server();
@@ -1688,7 +1688,7 @@ fn a_listed_action_resolves_to_an_edit_end_to_end() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_action_listed_before_an_edit_and_save_is_refused_end_to_end() {
     let mut t = Test::new();
     t.edit_server();
@@ -1743,7 +1743,7 @@ fn action_on_a_file_not_open(t: &mut Test) -> (eitri_core::editor_tools::memory:
 const CHANGED_SINCE: &str = "b.rs changed since the language server answered; ask again";
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_opened_and_saved_after_its_action_was_listed_is_refused() {
     let mut t = Test::new();
     let (memory, other, id) = action_on_a_file_not_open(&mut t);
@@ -1761,7 +1761,7 @@ fn a_file_opened_and_saved_after_its_action_was_listed_is_refused() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_changed_on_disk_after_its_action_was_listed_is_refused() {
     let mut t = Test::new();
     let (memory, other, id) = action_on_a_file_not_open(&mut t);
@@ -1773,7 +1773,7 @@ fn a_file_changed_on_disk_after_its_action_was_listed_is_refused() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_left_alone_after_its_action_was_listed_is_proposed_with_its_title() {
     let mut t = Test::new();
     let (memory, _other, id) = action_on_a_file_not_open(&mut t);

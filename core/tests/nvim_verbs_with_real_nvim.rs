@@ -380,7 +380,7 @@ fn a_first_word_the_host_has_no_reading_for_is_an_error_and_nothing_is_sent() {
     let mut nvim = Nvim::start("unknown", &[plugin_rtp().as_str()]);
     nvim.install(None);
     nvim.command("Eitri zoomm");
-    nvim.command("Eitri setup");
+    nvim.command("Eitri settle");
     nvim.command("Eitri terminal");
     let sent = nvim.lua("return require('eitri').run('zoomm')", vec![]);
     assert_eq!(sent.as_bool(), Some(false));
@@ -400,11 +400,21 @@ fn a_first_word_the_host_has_no_reading_for_is_an_error_and_nothing_is_sent() {
         nvim.notes(),
         [
             not_known("zoomm"),
-            not_known("setup"),
+            not_known("settle"),
             not_known("terminal"),
             not_known("zoomm")
         ]
     );
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn setup_is_a_verb_and_is_sent_for_the_host_to_open_the_first_start_screen() {
+    let mut nvim = Nvim::start("setup-verb", &[]);
+    nvim.install(None);
+    nvim.command("Eitri setup");
+    assert_eq!(nvim.wait_for_line(), "W setup\n");
+    assert!(nvim.notes().is_empty(), "{:?}", nvim.notes());
 }
 
 #[test]

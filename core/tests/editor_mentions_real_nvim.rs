@@ -135,7 +135,7 @@ fn denying(rule: &str, root: &Path) -> ReadRules {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_unsaved_buffer_is_told_as_it_is_on_screen_and_a_file_outside_is_only_counted() {
     let mut nvim = start("buffers");
     let a = nvim.file(&nvim.project.clone(), "a.rs", "fn on_disk() {}\n");
@@ -176,7 +176,7 @@ fn an_unsaved_buffer_is_told_as_it_is_on_screen_and_a_file_outside_is_only_count
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_denied_file_open_in_the_editor_is_never_named() {
     let mut nvim = start("deny");
     let a = nvim.file(&nvim.project.clone(), "a.rs", "ok\n");
@@ -214,7 +214,7 @@ fn a_denied_file_open_in_the_editor_is_never_named() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_quickfix_list_and_the_language_servers_words_are_told_with_file_and_line() {
     let mut nvim = start("lists");
     let a = nvim.file(&nvim.project.clone(), "a.rs", "one\ntwo\nthree\n");
@@ -251,7 +251,7 @@ fn a_quickfix_list_and_the_language_servers_words_are_told_with_file_and_line() 
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_long_buffer_and_a_thousand_diagnostics_stop_at_their_bounds_and_say_so() {
     let mut nvim = start("bounds");
     let long = nvim.file(
@@ -294,7 +294,7 @@ fn a_long_buffer_and_a_thousand_diagnostics_stop_at_their_bounds_and_say_so() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_loaded_buffer_with_no_record_and_a_wiped_quickfix_buffer_keep_their_text_out() {
     let mut nvim = start("records");
     let a = nvim.file(&nvim.project.clone(), "a.rs", "ok\n");
@@ -338,7 +338,7 @@ fn told_bytes(buffer: &mention_reads::BufferRead) -> usize {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_buffer_past_its_byte_bound_stops_there_and_says_so() {
     let mut nvim = start("bytes");
     let wide = nvim.file(
@@ -374,7 +374,7 @@ fn a_buffer_past_its_byte_bound_stops_there_and_says_so() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn buffers_together_stop_at_the_total_and_the_last_say_so() {
     let mut nvim = start("total");
     for n in 0..6 {
@@ -411,7 +411,7 @@ fn buffers_together_stop_at_the_total_and_the_last_say_so() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_hundred_and_five_open_files_are_a_hundred_and_five_counted() {
     let mut nvim = start("hundred");
     for n in 0..105 {

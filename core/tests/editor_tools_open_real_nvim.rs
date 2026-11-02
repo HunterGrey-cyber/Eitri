@@ -261,6 +261,16 @@ fn from_visual_and_terminal_mode_too() {
     nvim.embed.wait_until("terminal mode", |embed| {
         get(&embed.lua(PERSON, vec![]), "mode").as_str() == Some("t")
     });
+    // nvim's own first refresh of the terminal moves its cursor some milliseconds after the mode changes: the
+    // person's state is read once it has stopped moving, so only the open can be what changes it afterwards.
+    let (mut last, mut since) = (None, std::time::Instant::now());
+    nvim.embed.wait_until("the terminal to settle", |embed| {
+        let now = sorted(embed.lua(PERSON, vec![]));
+        if last.as_ref() != Some(&now) {
+            (last, since) = (Some(now), std::time::Instant::now());
+        }
+        since.elapsed() >= std::time::Duration::from_millis(200)
+    });
     let before = nvim.person();
     let answer = nvim.open(&mine, Some(4), None, true);
     assert_eq!(
@@ -268,7 +278,11 @@ fn from_visual_and_terminal_mode_too() {
         "agent_window",
         "the person's window is not one to reuse"
     );
-    assert_eq!(nvim.person(), before, "terminal mode and its window stayed");
+    let after = nvim.person();
+    assert_eq!(
+        after, before,
+        "terminal mode and its window stayed: {after:?} against {before:?}"
+    );
 }
 
 #[test]
