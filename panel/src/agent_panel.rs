@@ -1512,6 +1512,7 @@ mod tests {
                 typed_by_person: true,
                 wire: format!("wire: {text}"),
                 typed: text.to_string(),
+                shell_line: false,
             },
         }
     }

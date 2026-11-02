@@ -89,6 +89,10 @@ export type EmptyTabProps = {
   onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
+  /** The box's `!` line and `@` menu, as the conversation's composer has them (`Composer`). */
+  onRunShell?: (text: string) => void;
+  atPaths?: { items: string[]; seq: number } | null;
+  onAtQuery?: (query: string, seq: number) => void;
   onSlashAction?: (action: SlashAction) => void;
   onResume: (providerSessionId: string) => void;
   /** The dashboard's `s` item / key: bring back the tabs the last window had open. Present with the
@@ -831,6 +835,9 @@ export function EmptyTab(props: EmptyTabProps) {
             hintTarget={!failed}
             onModeChange={setMode}
             onSend={props.onSend}
+            onRunShell={props.onRunShell}
+            atPaths={props.atPaths}
+            onAtQuery={props.onAtQuery}
             claudeSlashCommands={!isExternalAgent(props.tab.agent)}
             onSlashAction={(action) => {
               if (action.kind === "sessions") runItem("sessions");

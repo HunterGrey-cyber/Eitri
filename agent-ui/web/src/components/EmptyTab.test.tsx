@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { RenderResult } from "@testing-library/react";
 import { EmptyTab, screenOrder } from "./EmptyTab";
 import type { EmptyTabProps } from "./EmptyTab";
@@ -1738,4 +1738,21 @@ it("copies a terminal handoff to the clipboard and primary selection", () => {
   } finally {
     delete (navigator as unknown as Record<string, unknown>).clipboard;
   }
+});
+
+describe("the first box", () => {
+  it("runs a `!` line and asks for `@` names, as the conversation's box does", async () => {
+    const onRunShell = vi.fn();
+    const onAtQuery = vi.fn();
+    const { container } = renderEmpty({ onRunShell, onAtQuery, atPaths: { items: ["small.txt"], seq: 1 } });
+    const box = container.querySelector("textarea")!;
+    fireEvent.focus(box);
+    fireEvent.change(box, { target: { value: "!echo hi" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onRunShell).toHaveBeenCalledWith("!echo hi");
+    fireEvent.change(box, { target: { value: "@sm" } });
+    box.setSelectionRange(3, 3);
+    fireEvent.select(box);
+    await waitFor(() => expect(onAtQuery).toHaveBeenCalledWith("sm", 1));
+  });
 });

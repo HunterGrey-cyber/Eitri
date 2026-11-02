@@ -28,12 +28,14 @@ type Props = {
   pendingTool?: string | null;
   /** BROWSE answers on the card; INPUT must leave the composer with `Esc` first. Defaults to `"browse"`. */
   mode?: PanelMode;
+  /** A `!` line of the person's is running. A turn of the agent's has this line first. */
+  shellRunning?: boolean;
 };
 
 /** One mono line above the composer while a turn runs: motion, elapsed time and interrupt. With no turn
  *  running it shows idle background work in the same slot. The interrupt words are the Stop button itself,
  *  keeping the mouse route available. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse", onOpenTasks }: Props) {
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, shellRunning = false, mode = "browse", onOpenTasks }: Props) {
   // A terminal status wins over `activeTurnId`, so a dead session cannot read as working.
   // The reducer clears it on `session_unavailable`/`session_closed`; keep this guard for other endings.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
@@ -51,6 +53,12 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
   }, [ticking]);
   if (state.questions.some((q) => q.state.kind !== "settled")) return (
     <div className="activity-line activity-question">⚑ Claude has a question{mode === "browse" ? " — i to answer" : ""}</div>
+  );
+  if (!working && shellRunning) return (
+    <div className="activity-line" data-nav-stop="status">
+      <span className="turn-activity">Running…</span>
+      <button type="button" className="stop" onClick={onInterrupt}>ctrl+c interrupt</button>
+    </div>
   );
   if (!working) return state.status.kind === "running" && tasks.length > 0 ? (
     <div className="activity-line tasks-line" data-nav-stop="status">

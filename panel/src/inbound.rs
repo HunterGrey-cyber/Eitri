@@ -705,6 +705,7 @@ pub(super) fn handle_inbound_message(
                             typed_by_person: true,
                             wire: composed,
                             typed: text.clone(),
+                            shell_line: false,
                         }),
                         // The session waits for the trust check (and, when it must, the question)
                         // before anything is spawned.
@@ -712,6 +713,7 @@ pub(super) fn handle_inbound_message(
                             typed_by_person: true,
                             wire: composed,
                             typed: text.clone(),
+                            shell_line: false,
                         }),
                         TabBackend::Starting(_) => Plan::Refused("the session is still starting"),
                         TabBackend::AwaitingTrust(_) => Plan::Refused("waiting for the trust question"),
@@ -1210,14 +1212,14 @@ pub(super) fn handle_inbound_message(
             );
             if fresh && eitri_core::tab_set::shell_command(&text).is_some() {
                 // A tab with no session starts one first, trust question and all, as any first message does.
-                // Its words stand in as the first turn; the start runs the line instead of sending them.
-                state.tabs.note_first_shell_line(&request_id);
+                // The start runs the line instead of sending its words.
                 let start = DeferredStart::FirstSend {
                     request_id: request_id.clone(),
                     first_turn: FirstTurn {
                         typed_by_person: false,
                         wire: text.clone(),
                         typed: text,
+                        shell_line: true,
                     },
                 };
                 match gate_start(state, tab, start) {
@@ -1225,10 +1227,7 @@ pub(super) fn handle_inbound_message(
                         note_start_page(state, tab, &request_id, view);
                         send_tabs(state, &mut out)
                     }
-                    Err(why) => {
-                        state.tabs.forget_first_shell_line(&request_id);
-                        refuse(&mut out, &why)
-                    }
+                    Err(why) => refuse(&mut out, &why),
                 }
             } else {
                 match state.tabs.queue_shell_line(tab, &text, now_ms()) {
@@ -1778,8 +1777,12 @@ mod tests {
         assert!(marker.exists());
         assert!(provider.turns()[2].starts_with("<bash-input>touch "));
         let shown: Vec<serde_json::Value> = page.sent.borrow().iter().map(|p| json_of(p)).collect();
-        assert!(shown.iter().any(|v| v["kind"] == "shell_running" && v["running"] == true));
-        assert!(shown.iter().any(|v| v["kind"] == "shell_running" && v["running"] == false));
+        assert!(shown
+            .iter()
+            .any(|v| v["kind"] == "shell_running" && v["running"] == true));
+        assert!(shown
+            .iter()
+            .any(|v| v["kind"] == "shell_running" && v["running"] == false));
         shut_down_every_tab(&handle);
     }
 
@@ -1797,9 +1800,11 @@ mod tests {
         handle.page_message(ViewId::BASE, &interrupt);
         assert_eq!(result_for(&page.sent.borrow(), "i1"), Some(Ok(())));
         tick_handle_until(&handle, "the line back in the box", || {
-            page.sent.borrow().iter().map(|p| json_of(p)).any(|v| {
-                v["kind"] == "queue_taken" && v["texts"] == serde_json::json!(["!sleep 20"])
-            })
+            page.sent
+                .borrow()
+                .iter()
+                .map(|p| json_of(p))
+                .any(|v| v["kind"] == "queue_taken" && v["texts"] == serde_json::json!(["!sleep 20"]))
         });
         assert!(provider.turns().is_empty());
         assert_eq!(provider.interrupts(), 0);

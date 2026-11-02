@@ -300,7 +300,11 @@ impl Shared {
 
     fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool, text: &str) {
         if let Some(file) = self.record_sends.lock().unwrap().as_mut() {
-            let mention = if text.contains('@') { format!(" {text:?}") } else { String::new() };
+            let mention = if text.contains('@') {
+                format!(" {text:?}")
+            } else {
+                String::new()
+            };
             writeln!(file, "{rpc} {} {typed}{mention}", client_id.unwrap_or("-")).unwrap();
             file.flush().unwrap();
         }

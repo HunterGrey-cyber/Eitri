@@ -899,6 +899,7 @@ export default function App() {
   const tasksRef = useRef<TasksOverlayHandle>(null);
   const taskRequests = useRef(new Map<string, TabId>());
   const [atPathsByTab, setAtPathsByTab] = useState<Record<number, { items: string[]; seq: number }>>({});
+  const atPaths = activeTab === null ? null : atPathsByTab[activeTab.id] ?? null;
   const atLastAsked = useRef(new Map<TabId, number>());
   const settingsRequests = useRef(new Map<string, SettingsRequest>());
   /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
@@ -3831,6 +3832,14 @@ export default function App() {
     post({ type: "interrupt" });
   }
 
+  /** The names for a word that starts with `@`, in the conversation's box and the empty tab's. */
+  function askAtPaths(query: string, seq: number) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    atLastAsked.current.set(tab, seq);
+    postToRust({ type: "path_complete", request_id: nextRequestId(), tab, query, seq });
+  }
+
   /** Enter on a `!` line: a refusal puts it back in the box, as a send's does. */
   function runShell(text: string) {
     const tab = activeTabRef.current;
@@ -4492,6 +4501,9 @@ export default function App() {
               // Whoever sends from here is typing, and the conversation this starts must open where
               // they are: in INPUT. It mounted in BROWSE, so a second message typed straight away ran
               // as BROWSE keys (a GUI pass, 2026-09-25).
+              onRunShell={runShell}
+              atPaths={atPaths}
+              onAtQuery={askAtPaths}
               onSend={(text) => {
                 setMode("input");
                 sendMessage(text);
@@ -5696,7 +5708,7 @@ export default function App() {
       sessionEnded,
       pending,
       count,
-      turnRunning: turnInProgress,
+      turnRunning: turnInProgress || shellRunning,
       table: panelTable,
     });
     if (action === null) return;
@@ -6733,6 +6745,7 @@ export default function App() {
         queued={heldCount(queue)}
         pendingTool={oldestPendingTool(state)}
         mode={mode}
+        shellRunning={shellRunning}
       />
       <TurnChanges state={state} review={reviewSettings} />
       {/* Above the composer, deliberately -- the confirmation
@@ -6776,13 +6789,8 @@ export default function App() {
         // none otherwise (`completionSource`). Withheld while a y/n question is up: an open menu
         // would take the `Esc` that answers it, and the question owns the keys.
         slashCommands={confirm !== null ? null : completionSource(activeTab?.agent, state.availableCommands)}
-        atPaths={activeTab === null ? null : atPathsByTab[activeTab.id] ?? null}
-        onAtQuery={confirm !== null || waitingQuestion ? undefined : (query, seq) => {
-          const tab = activeTabRef.current;
-          if (tab === null) return;
-          atLastAsked.current.set(tab, seq);
-          postToRust({ type: "path_complete", request_id: nextRequestId(), tab, query, seq });
-        }}
+        atPaths={atPaths}
+        onAtQuery={confirm !== null || waitingQuestion ? undefined : askAtPaths}
         // The raw `inputRequest` used to reach `Composer` directly here, so its own
         // `[focusRequest, mode]` effect (focusing the textarea whenever `mode === "input"`) had no
         // way to know an overlay was drawn over it. `composerFocusRequest` is bumped from the
@@ -6797,7 +6805,7 @@ export default function App() {
         onRunShell={runShell}
         onDraftChange={mirrorDraft}
         running={turnInProgress || shellRunning}
-        enterSteers={enterSteers}
+        enterSteers={enterSteers && !shellRunning}
         onQueue={queueMessage}
         onSendNow={(t) => {
           // `Ctrl+Enter` would end the running turn for a question that needs no turn.

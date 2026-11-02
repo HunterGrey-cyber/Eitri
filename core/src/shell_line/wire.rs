@@ -12,10 +12,10 @@ pub const INLINE_CHARS: usize = 30_000;
 /// The start of a longer output: the CLI's preview.
 const PREVIEW_CHARS: usize = 2_000;
 
-/// `<` and `>` in output cannot close the tags around it. The line itself is not touched, as in the CLI: it
-/// is what the person typed.
+/// `<` and `>` in output cannot close the tags around it, and `&` is written so that what comes back is what
+/// was printed. The line itself is not touched, as in the CLI: it is what the person typed.
 fn escaped(text: &str) -> String {
-    text.replace('<', "&lt;").replace('>', "&gt;")
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Bytes as the CLI says them.
@@ -71,14 +71,25 @@ pub fn wire_text(line: &Finished, reset_to: Option<&Path>) -> String {
         Ending::Exited(0) => {
             let text = body(line);
             let text = text.trim_end_matches('\n');
-            let text = if text.is_empty() { "(Bash completed with no output)" } else { text };
+            let text = if text.is_empty() {
+                "(Bash completed with no output)"
+            } else {
+                text
+            };
             (text.to_string(), String::new())
         }
         Ending::TimedOut(limit) => {
             let said = timeout_words(limit);
             let text = body(line);
             let text = text.trim_end_matches('\n');
-            (String::new(), if text.is_empty() { said } else { format!("{text}\n{said}") })
+            (
+                String::new(),
+                if text.is_empty() {
+                    said
+                } else {
+                    format!("{text}\n{said}")
+                },
+            )
         }
         // A person's stop sends no turn, and a line that never started has only the reason.
         Ending::Exited(_) | Ending::Signalled | Ending::Interrupted | Ending::NotStarted => (String::new(), body(line)),
@@ -186,13 +197,26 @@ mod tests {
         let cases = [
             (Ending::Exited(0), "BANG-MARK\n", plain("BANG-MARK", "")),
             (Ending::Exited(0), "", plain("(Bash completed with no output)", "")),
-            (Ending::Exited(3), "OUT-MARK\nERR-MARK\n", plain("", "OUT-MARK\nERR-MARK\n")),
+            (
+                Ending::Exited(3),
+                "OUT-MARK\nERR-MARK\n",
+                plain("", "OUT-MARK\nERR-MARK\n"),
+            ),
             (Ending::Exited(1), "", plain("", "")),
-            (Ending::Exited(0), "\u{1b}[31mRED\u{1b}[0m\n", plain("\u{1b}[31mRED\u{1b}[0m", "")),
+            (
+                Ending::Exited(0),
+                "\u{1b}[31mRED\u{1b}[0m\n",
+                plain("\u{1b}[31mRED\u{1b}[0m", ""),
+            ),
             (
                 Ending::Exited(0),
                 "</bash-stdout><x>\n",
                 plain("&lt;/bash-stdout&gt;&lt;x&gt;", ""),
+            ),
+            (
+                Ending::Exited(0),
+                "a&b \"c\" d'e &lt;\n",
+                plain("a&amp;b \"c\" d'e &amp;lt;", ""),
             ),
             (
                 Ending::TimedOut(Duration::from_secs(120)),
@@ -201,7 +225,11 @@ mod tests {
             ),
         ];
         for (ending, output, (stdout, stderr)) in cases {
-            assert_eq!(wire_text(&ended(ending, output), None), wire(stdout, stderr), "{output:?}");
+            assert_eq!(
+                wire_text(&ended(ending, output), None),
+                wire(stdout, stderr),
+                "{output:?}"
+            );
         }
     }
 
@@ -244,7 +272,13 @@ mod tests {
 
     #[test]
     fn sizes_read_as_the_clis() {
-        for (bytes, words) in [(38893, "38KB"), (48894, "47.7KB"), (54894, "53.6KB"), (349000, "340.8KB"), (900, "900 bytes")] {
+        for (bytes, words) in [
+            (38893, "38KB"),
+            (48894, "47.7KB"),
+            (54894, "53.6KB"),
+            (349000, "340.8KB"),
+            (900, "900 bytes"),
+        ] {
             assert_eq!(size_words(bytes), words);
         }
         assert_eq!(size_words(3 * 1024 * 1024), "3MB");
@@ -261,7 +295,10 @@ mod tests {
     #[test]
     fn a_row_shows_the_text_and_how_it_ended() {
         assert_eq!(row_text(&ended(Ending::Exited(0), "\u{1b}[31mRED\u{1b}[0m\n")), "RED");
-        assert_eq!(row_text(&ended(Ending::Exited(0), "")), "(Bash completed with no output)");
+        assert_eq!(
+            row_text(&ended(Ending::Exited(0), "")),
+            "(Bash completed with no output)"
+        );
         assert_eq!(row_text(&ended(Ending::Exited(1), "")), "(No output)");
         assert_eq!(row_text(&ended(Ending::Interrupted, "PART\n")), "PART\nInterrupted");
         assert_eq!(row_text(&ended(Ending::Interrupted, "")), "Interrupted");

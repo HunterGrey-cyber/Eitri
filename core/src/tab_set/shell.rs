@@ -7,7 +7,7 @@
 
 use super::{wall_clock_ms, BackendError, Flush, Queued, TabId, TabSet};
 use crate::shell_line::{self, wire, Ending};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// How a `!` line's words are told from the rest of the box: the page's test too.
@@ -21,15 +21,6 @@ pub(super) struct Shells {
     running: HashMap<u64, shell_line::Running>,
     /// Where each tab's next line starts, when it moved: a `cd` lasts for a tab's later lines.
     cwds: HashMap<u64, PathBuf>,
-    /// The first message of a tab that had no session, whose request was a `!` line: named by the request, so
-    /// that a mark left by a start that never finished can match nothing later.
-    first_lines: HashSet<String>,
-}
-
-impl Shells {
-    pub(super) fn take_first(&mut self, request_id: &str) -> bool {
-        self.first_lines.remove(request_id)
-    }
 }
 
 /// A line that ended, as the window's tick sees it.
@@ -59,16 +50,6 @@ impl TabSet {
         Ok(())
     }
 
-    /// The tab's first message, about to start its session, is the `!` line of command `request_id`.
-    pub fn note_first_shell_line(&mut self, request_id: &str) {
-        self.shells.first_lines.insert(request_id.to_string());
-    }
-
-    /// Takes back [`TabSet::note_first_shell_line`] for a start that was refused.
-    pub fn forget_first_shell_line(&mut self, request_id: &str) {
-        self.shells.first_lines.remove(request_id);
-    }
-
     /// Whether a `!` line of `id` is running.
     pub fn shell_line_runs(&self, id: TabId) -> bool {
         self.shells.running.contains_key(&id.0)
@@ -91,12 +72,19 @@ impl TabSet {
             message: message.to_string(),
             benign: true,
         };
-        let command = shell_command(text).ok_or_else(|| refused("nothing to run"))?.to_string();
-        let root = self.project_root.clone().ok_or_else(|| refused("no project to run this in"))?;
+        let command = shell_command(text)
+            .ok_or_else(|| refused("nothing to run"))?
+            .to_string();
+        let root = self
+            .project_root
+            .clone()
+            .ok_or_else(|| refused("no project to run this in"))?;
         let wake = self.ui_wake.clone();
         let cwd = self.shells.cwds.get(&id.0).cloned().unwrap_or_else(|| root.clone());
         let tab = self.get_mut(id).ok_or_else(|| refused("the tab has gone"))?;
-        tab.live_mut().ok_or_else(|| refused("no active session"))?.fold_shell_line(text);
+        tab.live_mut()
+            .ok_or_else(|| refused("no active session"))?
+            .fold_shell_line(text);
         let request = shell_line::Request {
             command,
             cwd,
@@ -173,7 +161,6 @@ impl TabSet {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -290,7 +277,10 @@ mod tests {
             ["<bash-input>echo MARK</bash-input>\n<bash-stdout>MARK</bash-stdout><bash-stderr></bash-stderr>"]
         );
         let stamp = &f.provider.turn_stamps()[0];
-        assert!(!stamp.typed_by_person, "the CLI's own record of a line has no human origin");
+        assert!(
+            !stamp.typed_by_person,
+            "the CLI's own record of a line has no human origin"
+        );
         assert_eq!(f.rows(), (vec!["!echo MARK".to_string()], vec!["MARK".to_string()]));
     }
 
@@ -301,7 +291,9 @@ mod tests {
         let marker = f.dir.join("ran");
         let line = format!("!touch {}", marker.display());
         for origin in [PromptOrigin::Typed, PromptOrigin::Composed] {
-            f.set.queue_message(f.tab, &line, line.clone(), 1, true, origin).unwrap();
+            f.set
+                .queue_message(f.tab, &line, line.clone(), 1, true, origin)
+                .unwrap();
             assert!(f.set.flush_queue(f.tab).expect("it goes out").outcome.is_ok());
             assert!(!f.set.shell_line_runs(f.tab));
             f.start_turn();
@@ -345,7 +337,12 @@ mod tests {
         assert!(f.set.flush_queue(f.tab).is_none(), "nothing else goes while it runs");
         let ended = f.ended();
         assert!(ended.flush.expect("its report goes out").outcome.is_ok());
-        assert_eq!(f.provider.turns().len(), 1, "the report goes alone: {:?}", f.provider.turns());
+        assert_eq!(
+            f.provider.turns().len(),
+            1,
+            "the report goes alone: {:?}",
+            f.provider.turns()
+        );
         f.start_turn();
         f.end_turn();
         assert!(f.set.flush_queue(f.tab).expect("what waited behind it").outcome.is_ok());
@@ -397,7 +394,11 @@ mod tests {
         f.end_turn();
         f.line("!pwd").unwrap();
         f.ended();
-        assert!(f.provider.turns()[1].contains(&format!("<bash-stdout>{}/sub<", root.display())), "{:?}", f.provider.turns());
+        assert!(
+            f.provider.turns()[1].contains(&format!("<bash-stdout>{}/sub<", root.display())),
+            "{:?}",
+            f.provider.turns()
+        );
         f.start_turn();
         f.end_turn();
         f.line("!cd /").unwrap();
@@ -430,11 +431,78 @@ mod tests {
     }
 
     #[test]
-    fn a_first_message_mark_is_for_its_own_request_only() {
+    fn a_first_turn_s_mark_does_not_outlive_being_saved() {
+        let turn = FirstTurn {
+            wire: "!touch ran".into(),
+            typed: "!touch ran".into(),
+            typed_by_person: false,
+            shell_line: true,
+        };
+        let saved = serde_json::to_string(&turn).unwrap();
+        let restored: FirstTurn = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.shell_line);
+    }
+
+    #[test]
+    fn a_first_turn_with_the_same_words_and_no_mark_is_words() {
+        let mut f = Fixture::new("shell-line-first-words");
+        let marker = f.dir.join("ran");
+        let line = format!("!touch {}", marker.display());
+        let turn = FirstTurn {
+            wire: line.clone(),
+            typed: line.clone(),
+            typed_by_person: true,
+            shell_line: false,
+        };
+        f.set.send_first_turn(f.tab, "first", turn).expect("it goes");
+        assert!(!f.set.shell_line_runs(f.tab));
+        assert_eq!(f.provider.turns(), [line]);
+    }
+
+    #[test]
+    fn a_first_turn_with_the_mark_runs_the_line() {
         let mut f = Fixture::new("shell-line-first");
-        f.set.note_first_shell_line("r-1");
-        assert!(!f.set.shells.take_first("r-2"));
-        assert!(f.set.shells.take_first("r-1"));
-        assert!(!f.set.shells.take_first("r-1"));
+        let turn = FirstTurn {
+            wire: "!true".into(),
+            typed: "!true".into(),
+            typed_by_person: false,
+            shell_line: true,
+        };
+        f.set.send_first_turn(f.tab, "first", turn).expect("it starts");
+        assert!(f.set.shell_line_runs(f.tab));
+        assert!(f.provider.turns().is_empty());
+    }
+
+    /// A plain send from a page that has not heard the line started: the host holds it all the same.
+    #[test]
+    fn a_message_sent_while_a_line_runs_waits_for_it() {
+        let mut f = Fixture::new("shell-line-holds-a-send");
+        f.line("!sleep 0.3").unwrap();
+        let turn = FirstTurn {
+            wire: "words".into(),
+            typed: "words".into(),
+            typed_by_person: true,
+            shell_line: false,
+        };
+        assert!(matches!(
+            f.set.send_prompt(f.tab, "p", ViewId::BASE, turn),
+            Some(Sent::Prompt { outcome: Ok(()), .. })
+        ));
+        assert!(f.provider.turns().is_empty());
+        assert_eq!(f.set.get(f.tab).unwrap().session.queue.len(), 1);
+        assert!(f.ended().flush.expect("the report").outcome.is_ok());
+        assert!(f.provider.turns()[0].starts_with("<bash-input>"));
+    }
+
+    /// The CLI may start a turn of its own before it reads a report, and the report then waits as a queue item.
+    #[test]
+    fn a_report_put_back_by_the_cli_stays_a_report() {
+        let mut f = Fixture::new("shell-line-requeued");
+        f.line("!echo MARK").unwrap();
+        f.ended();
+        let backend = f.set.get(f.tab).unwrap();
+        let opening = backend.session.opening_prompt.as_ref().expect("the report went out");
+        assert!(opening.message.shell_report);
+        assert!(!opening.message.steerable);
     }
 }

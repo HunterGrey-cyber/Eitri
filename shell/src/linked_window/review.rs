@@ -1956,6 +1956,7 @@ mod tests {
                 typed_by_person: true,
                 wire: "hello".into(),
                 typed: "hello".into(),
+                shell_line: false,
             },
         );
         assert!(held.is_none(), "held for the presence");
@@ -2002,6 +2003,7 @@ mod tests {
                 typed_by_person: true,
                 wire: "hello".into(),
                 typed: "hello".into(),
+                shell_line: false,
             },
         );
         assert!(held.is_none(), "held for the presence");
@@ -2940,6 +2942,7 @@ mod tests {
                 typed_by_person: true,
                 wire: "hello".into(),
                 typed: "hello".into(),
+                shell_line: false,
             },
         );
         assert!(held.is_none(), "held for the presence");

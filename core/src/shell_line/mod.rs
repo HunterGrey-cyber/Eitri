@@ -222,17 +222,19 @@ impl Gathered {
 
 fn spawn_reader(pipe: OwnedFd, gathered: Arc<Mutex<Gathered>>, spool_dir: Option<PathBuf>) -> mpsc::Receiver<()> {
     let (ended, read_end) = mpsc::channel();
-    let spawned = std::thread::Builder::new().name("shell-line-output".into()).spawn(move || {
-        let mut pipe = std::fs::File::from(pipe);
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            match pipe.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => gathered.lock().unwrap().take(&buffer[..read], spool_dir.as_deref()),
+    let spawned = std::thread::Builder::new()
+        .name("shell-line-output".into())
+        .spawn(move || {
+            let mut pipe = std::fs::File::from(pipe);
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => gathered.lock().unwrap().take(&buffer[..read], spool_dir.as_deref()),
+                }
             }
-        }
-        let _ = ended.send(());
-    });
+            let _ = ended.send(());
+        });
     if spawned.is_err() {
         eprintln!("[shell_line] no thread to read a line's output");
     }
@@ -311,21 +313,17 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
     let mut asked_to_stop: Option<Instant> = None;
     let mut timed_out = false;
     let status = loop {
-        {
-            let mut held = control.group.lock().unwrap();
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    *held = None;
-                    break Some(status);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    *held = None;
-                    break None;
-                }
-            }
-        }
         let interrupted = control.interrupted.load(Ordering::SeqCst);
+        if has_exited(group) {
+            // A child that ignored the polite signal outlives the shell. The shell is unreaped here, so the
+            // number is still this group's.
+            if timed_out || interrupted {
+                control.signal(libc::SIGKILL);
+            }
+            let mut held = control.group.lock().unwrap();
+            *held = None;
+            break child.wait().ok();
+        }
         if !timed_out && !interrupted && began.elapsed() >= request.timeout {
             timed_out = true;
         }
@@ -374,6 +372,21 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
         cwd,
         left_project,
     })
+}
+
+/// Whether `pid` has ended, leaving it unreaped.
+fn has_exited(pid: i32) -> bool {
+    // SAFETY: `waitid` fills `info`, which outlives the call; zeroed is a valid `siginfo_t` for it to read back.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let peeked = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        peeked != 0 || info.si_pid() != 0
+    }
 }
 
 /// A private file for the shell to name its last directory in.

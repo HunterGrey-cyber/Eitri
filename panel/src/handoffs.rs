@@ -575,6 +575,7 @@ mod tests {
             typed_by_person: true,
             wire: text.into(),
             typed: text.into(),
+            shell_line: false,
         };
         let composer = tabs.active();
         let (composer_provider, backend) = live_backend(&dir);

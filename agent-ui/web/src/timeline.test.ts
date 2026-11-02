@@ -709,3 +709,13 @@ describe("a broker card in the timeline", () => {
     expect(oldestWaitingPermission(buildTimeline(state({ editorCards: [brokerCard(3, 1, null)] })), new Set())).toBeNull();
   });
 });
+
+describe("a shell line's output", () => {
+  const notice = { seq: 2, kind: "shell_output" as const, level: "notice" as const, content: "MARK", scalars: {}, task_id: null, tool_use_id: null, task_status: null };
+
+  it("is a row of the conversation", () => {
+    const items = buildTimeline(state({ notices: [notice as never] }));
+    expect(items.map((item) => primaryText(item))).toContain("MARK");
+  });
+});
+

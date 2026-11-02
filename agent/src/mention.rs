@@ -46,14 +46,26 @@ mod tests {
     #[test]
     fn a_mention_at_the_start_of_the_text_of_a_line_or_after_a_blank_is_made_plain() {
         assert_eq!(inert("@a.txt"), "\u{2060}@a.txt");
-        assert_eq!(inert("see @a.txt and\n@/etc/passwd"), "see \u{2060}@a.txt and\n\u{2060}@/etc/passwd");
+        assert_eq!(
+            inert("see @a.txt and\n@/etc/passwd"),
+            "see \u{2060}@a.txt and\n\u{2060}@/etc/passwd"
+        );
         assert_eq!(inert("tab\t@a\u{3000}@b"), "tab\t\u{2060}@a\u{3000}\u{2060}@b");
         assert_eq!(inert("\u{feff}@a"), "\u{feff}\u{2060}@a");
     }
 
     #[test]
     fn what_the_cli_does_not_read_as_a_mention_stays_as_it_is() {
-        for text in ["me@example.com", "`@a.txt`", "(@a.txt)", "x:@a.txt", "\"@a.txt\"", "\\@a.txt", "no at sign", ""] {
+        for text in [
+            "me@example.com",
+            "`@a.txt`",
+            "(@a.txt)",
+            "x:@a.txt",
+            "\"@a.txt\"",
+            "\\@a.txt",
+            "no at sign",
+            "",
+        ] {
             assert!(matches!(inert(text), Cow::Borrowed(_)), "{text:?}");
         }
         assert_eq!(inert("@@a"), "\u{2060}@@a");

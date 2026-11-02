@@ -72,6 +72,7 @@ export type TimelineItem = (
 /** Durable notices drawn in sequence with the conversation. */
 const ROW_NOTICE_KINDS: ReadonlySet<NoticeRecord["kind"]> = new Set([
   "hook_block", "unseen_turn", "model_fallback", "model_refusal", "compaction", "informational", "peer_hold", "rate_limit",
+  "shell_output",
 ]);
 
 function drawsNotice(notice: NoticeRecord): boolean {

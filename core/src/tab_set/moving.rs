@@ -878,8 +878,8 @@ impl TabSet {
             });
         }
         // A card or question waits for an answer: keep the message in the queue until it settles,
-        // because the session is stopped on the user.
-        if self.card_waits(tab) {
+        // because the session is stopped on the user. A running `!` line stops it the same way.
+        if self.card_waits(tab) || self.shell_line_runs(tab) {
             let outcome = self.hold_behind_card(tab, &turn);
             return Some(Sent::Prompt {
                 tab,

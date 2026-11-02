@@ -131,7 +131,10 @@ pub(super) fn tick_send(
             None => send_queue(state, tab, out),
         }
         if let (Some(text), Some(view)) = (ended.put_back, state.page_of(tab)) {
-            out.send(view, eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &[text]));
+            out.send(
+                view,
+                eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &[text]),
+            );
         }
     }
     // A held message whose tab left without `close_tab`, which answers it (the window closing), is

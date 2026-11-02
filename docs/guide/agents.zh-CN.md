@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=da2c013c091c89e8842568a0c8bbb60463eabe0e69c1e65e449d6bebc1f7509c -->
+<!-- translated-from: agents.md sha256=3f45c0ccd7d073a3e8eee5e0f3679a301afcb6ce06e59988b4e10f74f9451672 -->
 
 # Codex 与其他 agent
 
@@ -69,6 +69,12 @@ Claude 用选择题问你时（Claude Code 的 `AskUserQuestion` 工具），提
 有几样东西不会回来：子 agent 自己的调用（Claude Code 把它们存在单独的文件里），以及另一个 Claude Code 会话在回合进行中送进来的消息（实时的标签页里也不显示它）。还有少数回合，是 Claude Code 出于 Eitri 暂时还不认识的原因自己发起的，它们会并到前一个回合里。被打断的提问，或者标签页关闭时还在等的提问，恢复后可能显示为已拒绝，因为 Claude Code 就是这样记录的。
 
 <a id="not-in-a-claude-tab-yet"></a>
+### 输入框里的 `@` 和 `!`
+
+与 Claude Code 相同。在词首输入 `@` 会列出项目里的文件和文件夹：`Tab` 选中一行，`↑`/`↓` 移动，`Esc` 关闭。文件由 Claude Code 读取，所以 `@src/main.rs`、`@src/`、`@notes.md#L10-20` 和项目外的路径都可用，并遵循它自己的规则：`deny` 规则覆盖的文件会被跳过，不作任何提示。带空格的名字要加引号：`@"my file.txt"`。不是你输入的文字（比如在编辑器里选中的行）不会让 Claude Code 去读文件。
+
+在输入框开头输入 `!`，其余内容会作为你自己的 shell 命令在项目里运行，可以用你的 shell 的别名和函数。输出显示在它下方并发给 Claude，然后 Claude 会回答，和终端里一样。它在任何模式下都不询问，权限规则也不适用：这是你自己在运行命令。回合运行时它会等到回合结束。`Ctrl+c` 会停止它，不告诉 Claude，并把这一行放回输入框。它最多运行两分钟。`cd` 对这个标签页之后的 `!` 行有效，但不会移动 Claude 自己的命令。`respondToBashCommands` 不会被读取：Claude 总是会回答。
+
 ### Claude 标签页暂时还没有的
 
 plan 模式、给消息附带文件或图片，以及定时唤醒和 cron 任务的列表。只要标签页开着，它们照样会触发，每次都是一个单独的回合。关闭这个标签页、它所在的视图或整个窗口会取消它们；Eitri 没有它们的列表，所以不会先问。Claude Code 只会在会话结束后保留一种 cron 任务：被要求跨会话保留的那种，它会存在项目的 `.claude/scheduled_tasks.json` 里，之后在这个项目的另一个会话里可能还会运行。

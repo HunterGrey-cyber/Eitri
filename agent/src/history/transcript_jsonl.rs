@@ -821,18 +821,23 @@ fn classify_user_line(value: &Value) -> ParsedLine {
 /// The CLI writes these lines with no `promptSource` (a command is not sent to the model as a message), so
 /// the allow-list of a person's words never takes them; they get their own, as narrow: no `promptSource` (a
 /// line that has one is a message, and goes through the allow-list like any other: a typed prompt that
-/// starts with a command tag keeps all its words), not a meta line, a summary, a transcript-only line or a
+/// starts with a command tag keeps all its words), unless it is the report of a line Eitri ran, a host's
+/// message in the CLI's own tags with what it printed behind them; not a meta line, a summary, a transcript-only line or a
 /// sidechain line, no origin but a person's, and not a tool's message (`sourceToolUseID`, what a skill the
 /// model ran writes). What a command printed (`<local-command-stdout>`,
 /// `<bash-stdout>`) is never a prompt and stays out, as it does of a live tab's record.
 fn typed_command(value: &Value, text: &str) -> Option<String> {
     let origin = value.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str);
+    let host_report = value.get("promptSource").and_then(Value::as_str) == Some("sdk")
+        && value.get("origin").is_none()
+        && text.starts_with("<bash-input>")
+        && text.contains("</bash-input>\n<bash-stdout>");
     if flag_is_true(value, "isMeta")
         || flag_is_true(value, "isCompactSummary")
         || flag_is_true(value, "isVisibleInTranscriptOnly")
         || flag_is_true(value, "isSidechain")
         || value.get("sourceToolUseID").is_some()
-        || value.get("promptSource").is_some()
+        || (value.get("promptSource").is_some() && !host_report)
         || (value.get("origin").is_some() && origin != Some("human"))
     {
         return None;
@@ -2377,6 +2382,24 @@ mod tests {
     /// A command echo is the one the CLI writes with no `promptSource`. A line that carries one is a message
     /// with a producer: a person's own prompt that merely starts with a command tag keeps every word, and
     /// another producer's line with the same tags is nobody's words.
+    #[test]
+    fn the_report_of_a_line_eitri_ran_reads_back_as_the_line() {
+        let report = user_line(
+            r#""promptSource":"sdk","#,
+            r#""<bash-input>git status</bash-input>\n<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>""#,
+        );
+        assert_eq!(prompts(&fold(&report)), ["!git status".to_string()]);
+        let typed = user_line(
+            r#""promptSource":"sdk","origin":{"kind":"human"},"#,
+            r#""<bash-input>git status</bash-input>\n<bash-stdout>clean</bash-stdout>""#,
+        );
+        assert_eq!(
+            prompts(&fold(&typed)),
+            ["<bash-input>git status</bash-input>\n<bash-stdout>clean</bash-stdout>".to_string()],
+            "a person's own words keep every word, whatever they look like"
+        );
+    }
+
     #[test]
     fn a_command_tag_on_a_line_with_a_prompt_source_is_not_a_command_echo() {
         let typed = user_line(

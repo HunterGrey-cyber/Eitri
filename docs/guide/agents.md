@@ -123,6 +123,20 @@ that Claude Code starts by itself for a reason Eitri does not recognise yet come
 A question that was interrupted, or whose tab was closed, may come back as declined, because that is how Claude Code
 recorded it.
 
+### `@` and `!` in the box
+
+As in Claude Code. `@` at the start of a word opens a list of the project's files and folders: `Tab` takes a row, `↑`/`↓`
+move, `Esc` closes it. Claude Code reads what you name, so `@src/main.rs`, `@src/`, `@notes.md#L10-20` and a path
+outside the project all work, and its own rules apply: a file your `deny` rules cover is skipped with no word. A name
+with a space goes in quotes, `@"my file.txt"`. Text you did not type, such as lines selected in the editor, never makes
+Claude Code read a file.
+
+`!` at the start of the box runs the rest as your own shell command, in the project, with your shell's aliases and
+functions. The output shows under it and goes to Claude, which then answers, as in the terminal. It asks nothing in any
+mode, and no permission rule applies: it is you running a command. During a turn it waits for the turn's end. `Ctrl+c`
+stops it, tells Claude nothing and puts the line back in the box. It has two minutes. `cd` lasts for your next `!` line
+in that tab, but does not move Claude's own commands. `respondToBashCommands` is not read: Claude always answers.
+
 ### Not in a Claude tab yet
 
 Plan mode, attaching files or images to a message, and a list of the scheduled wake-ups and cron tasks. Those still

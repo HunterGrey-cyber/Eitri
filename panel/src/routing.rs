@@ -374,6 +374,10 @@ pub(super) fn apply_sent(
             if outcome.is_ok() {
                 title_from_first_prompt(state, tab, &typed);
             }
+            // A first message that was a `!` line is running now, and the page has to know.
+            if state.tabs.shell_line_runs(tab) {
+                send_queue(state, tab, out);
+            }
             let view = start_answer_dest(state, tab, &request_id).map(|sent_from| dest_view(state, sent_from));
             apply_outcome(
                 state,

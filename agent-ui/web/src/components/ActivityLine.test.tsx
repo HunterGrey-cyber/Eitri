@@ -168,3 +168,14 @@ it("shows the tasks line only while idle and opens tasks on activation", () => {
   expect(container.querySelector(".tasks-line")).toBeNull();
   expect(container.querySelectorAll(".activity-line")).toHaveLength(1);
 });
+
+it("a running shell line says so and its stop is the same control", () => {
+  const onInterrupt = vi.fn();
+  const { container, rerender } = render(<ActivityLine state={running({ activeTurnId: null })} turnClock={null} canInterrupt onInterrupt={onInterrupt} shellRunning />);
+  expect(container.textContent).toContain("Running…");
+  fireEvent.click(container.querySelector(".stop")!);
+  expect(onInterrupt).toHaveBeenCalledTimes(1);
+  rerender(<ActivityLine state={running({ activeTurnId: null })} turnClock={null} canInterrupt onInterrupt={onInterrupt} />);
+  expect(container.textContent).not.toContain("Running…");
+});
+

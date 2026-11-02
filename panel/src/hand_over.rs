@@ -506,6 +506,7 @@ mod tests {
                 wire: "hello".into(),
                 typed: "hello".into(),
                 typed_by_person: true,
+                shell_line: false,
             },
         };
         state.borrow_mut().tabs.defer_start(tab, start).unwrap();

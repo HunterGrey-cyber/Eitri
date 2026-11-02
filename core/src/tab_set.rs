@@ -29,8 +29,8 @@ use crate::tabs::{self, TabFacts, TabId};
 
 mod moving;
 mod shell;
-pub use shell::{shell_command, ShellEnded};
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
+pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
 mod move_tests;
@@ -52,6 +52,10 @@ pub struct FirstTurn {
     /// Only a message entered at the composer carries the person's stamp.
     #[serde(default)]
     pub typed_by_person: bool,
+    /// A `!` line the person entered: the session runs it instead of sending these words. Only the
+    /// composer's `run_shell` sets it, and like [`Queued::shell_line`] it does not survive being saved.
+    #[serde(skip)]
+    pub shell_line: bool,
 }
 
 impl FirstTurn {
@@ -4740,6 +4744,8 @@ impl TabSet {
                     Ok(submitted) => {
                         let mut message = Queued::held(&typed, wire, wall_clock_ms());
                         message.typed_by_person = origin == PromptOrigin::Typed;
+                        message.shell_report = origin == PromptOrigin::ShellLine;
+                        message.steerable = !message.shell_report;
                         tab.session.opening_prompt = Some(OpeningPrompt {
                             submitted: submitted.clone(),
                             typed_by_person: message.typed_by_person,
@@ -4773,7 +4779,7 @@ impl TabSet {
                 }
             }
             moving::TurnSend::First { request_id, turn } => {
-                let outcome = if self.shells.take_first(&request_id) {
+                let outcome = if turn.shell_line {
                     let outcome = self.start_shell_line(id, &turn.typed);
                     self.end_start_of(&gate);
                     outcome
@@ -4790,7 +4796,7 @@ impl TabSet {
             moving::TurnSend::Prompt { request_id, page, turn } => {
                 // A card or question that arrived during the presence wait holds this message too:
                 // the session is stopped on the user.
-                if self.card_waits(id) {
+                if self.card_waits(id) || self.shell_line_runs(id) {
                     self.end_start_of(&gate);
                     let outcome = self.hold_behind_card(id, &turn);
                     return Some(Sent::Prompt {
@@ -7809,6 +7815,7 @@ mod tests {
                 typed_by_person: true,
                 wire: "ctx\n\nhi".into(),
                 typed: "hi".into(),
+                shell_line: false,
             }),
             resume: None,
             resumed_title: None,
@@ -14372,6 +14379,7 @@ mod tests {
                 typed_by_person: true,
                 wire: format!("wire: {typed}"),
                 typed: typed.to_string(),
+                shell_line: false,
             },
         }
     }
@@ -18282,6 +18290,7 @@ mod question_gate_tests {
             typed: "next".into(),
             wire: "next with context".into(),
             typed_by_person: true,
+            shell_line: false,
         };
         assert!(matches!(
             set.send_prompt(tab, "r1", ViewId::BASE, turn),
@@ -19112,6 +19121,7 @@ mod prompt_origin_tests {
                 wire: format!("editor context\n\n{text}"),
                 typed: text.into(),
                 typed_by_person: origin == PromptOrigin::Typed,
+                shell_line: false,
             };
             let sent = if first {
                 self.set.send_first_turn(self.tab, "first", turn)

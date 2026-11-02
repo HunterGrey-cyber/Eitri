@@ -102,9 +102,16 @@ fn the_rc_file_gives_aliases_and_functions_quietly_and_does_not_move_it() {
     .unwrap();
     let script = script(Path::new("/bin/bash"));
     assert!(script.contains("shopt -s expand_aliases"));
-    let inner = format!("HOME={} /bin/bash -c {} /bin/bash 'bangalias; bangfn; pwd' /dev/null", home.display(), shell_quote(&script));
+    let inner = format!(
+        "HOME={} /bin/bash -c {} /bin/bash 'bangalias; bangfn; pwd' /dev/null",
+        home.display(),
+        shell_quote(&script)
+    );
     let done = line(&scratch, &inner);
-    assert_eq!(done.output, format!("FROM-ALIAS\nFROM-FUNCTION\n{}\n", scratch.0.display()));
+    assert_eq!(
+        done.output,
+        format!("FROM-ALIAS\nFROM-FUNCTION\n{}\n", scratch.0.display())
+    );
 }
 
 fn shell_quote(text: &str) -> String {
@@ -116,7 +123,11 @@ fn zsh_takes_the_same_script() {
     if !Path::new("/usr/bin/zsh").exists() && !Path::new("/bin/zsh").exists() {
         return;
     }
-    let shell = if Path::new("/usr/bin/zsh").exists() { "/usr/bin/zsh" } else { "/bin/zsh" };
+    let shell = if Path::new("/usr/bin/zsh").exists() {
+        "/usr/bin/zsh"
+    } else {
+        "/bin/zsh"
+    };
     let scratch = Scratch::new("zsh");
     let home = scratch.0.join("home");
     std::fs::create_dir(&home).unwrap();
@@ -128,7 +139,11 @@ fn zsh_takes_the_same_script() {
     );
     let done = line(&scratch, &inner);
     assert!(done.output.starts_with("FROM-ALIAS\n"), "{}", done.output);
-    assert!(done.output.contains("(eval):1: command not found: no-such-command-xyz"), "{}", done.output);
+    assert!(
+        done.output.contains("(eval):1: command not found: no-such-command-xyz"),
+        "{}",
+        done.output
+    );
 }
 
 #[test]
@@ -138,7 +153,11 @@ fn an_interrupt_stops_the_whole_group_and_says_so() {
     let command = format!("echo PART; (sleep 5; touch {}) & sleep 5", marker.display());
     let (running, wake) = run_with(request(&scratch, &command), "/bin/sh");
     let began = Instant::now();
-    while !std::fs::read_dir(&scratch.0).unwrap().flatten().any(|e| e.path().extension().is_some_and(|x| x == "cwd")) {
+    while !std::fs::read_dir(&scratch.0)
+        .unwrap()
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "cwd"))
+    {
         assert!(began.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -148,6 +167,28 @@ fn an_interrupt_stops_the_whole_group_and_says_so() {
     assert_eq!(done.ending, Ending::Interrupted);
     assert!(done.output.starts_with("PART\n"), "{}", done.output);
     assert!(began.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn a_child_that_ignores_the_polite_signal_goes_with_the_shell() {
+    let scratch = Scratch::new("descendant");
+    let began_file = scratch.0.join("began");
+    let marker = scratch.0.join("late");
+    let command = format!(
+        "(trap '' TERM; touch {}; sleep 1; touch {}) & wait",
+        began_file.display(),
+        marker.display()
+    );
+    let (running, wake) = run_with(request(&scratch, &command), "/bin/sh");
+    let began = Instant::now();
+    while !began_file.exists() {
+        assert!(began.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    running.interrupt();
+    assert_eq!(finish(&running, &wake).ending, Ending::Interrupted);
+    std::thread::sleep(Duration::from_millis(1300));
+    assert!(!marker.exists(), "it outlived the stop");
 }
 
 #[test]
@@ -180,7 +221,10 @@ fn a_long_output_goes_to_a_private_file_and_its_start_stays_in_memory() {
     let spooled = done.spooled.expect("it is past the limit");
     assert_eq!(std::fs::metadata(&spooled.path).unwrap().len(), spooled.bytes);
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&spooled.path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&spooled.path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(done.output.starts_with("1\n2\n"));
 }
 
@@ -217,16 +261,31 @@ fn dropping_a_running_line_kills_it() {
 #[test]
 fn a_shell_of_another_kind_gives_way_to_one_the_cli_runs_with() {
     let there = |path: &Path| path == Path::new("/bin/bash") || path == Path::new("/usr/bin/fish");
-    assert_eq!(choose_shell(Some("/usr/bin/fish".as_ref()), there), Some(PathBuf::from("/bin/bash")));
-    assert_eq!(choose_shell(Some("/opt/bash".as_ref()), |p| p == Path::new("/opt/bash")), Some(PathBuf::from("/opt/bash")));
-    assert_eq!(choose_shell(Some("bash".as_ref()), there), Some(PathBuf::from("/bin/bash")));
+    assert_eq!(
+        choose_shell(Some("/usr/bin/fish".as_ref()), there),
+        Some(PathBuf::from("/bin/bash"))
+    );
+    assert_eq!(
+        choose_shell(Some("/opt/bash".as_ref()), |p| p == Path::new("/opt/bash")),
+        Some(PathBuf::from("/opt/bash"))
+    );
+    assert_eq!(
+        choose_shell(Some("bash".as_ref()), there),
+        Some(PathBuf::from("/bin/bash"))
+    );
     assert_eq!(choose_shell(None, |_| false), None);
 }
 
 #[test]
 fn the_environment_loses_the_host_shells_tmux_and_gains_the_mark() {
-    let host = [("TMUX", "x"), ("TMUX_PANE", "%1"), ("NEOVIM_BIN", "/n"), ("PATH", "/bin"), ("CLAUDECODE", "0")]
-        .map(|(k, v)| (k.into(), v.into()));
+    let host = [
+        ("TMUX", "x"),
+        ("TMUX_PANE", "%1"),
+        ("NEOVIM_BIN", "/n"),
+        ("PATH", "/bin"),
+        ("CLAUDECODE", "0"),
+    ]
+    .map(|(k, v)| (k.into(), v.into()));
     let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = environment(host);
     assert_eq!(env, [("PATH".into(), "/bin".into()), ("CLAUDECODE".into(), "1".into())]);
 }

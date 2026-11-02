@@ -175,6 +175,7 @@ export function Composer({
   onSlashAction,
   slashCommands = null,
   atPaths = null,
+  onRunShell,
   onAtQuery,
   onLineKey,
   browseKey = "i",

@@ -566,6 +566,7 @@ fn a_moved_tab_waiting_for_the_trust_question_is_asked_again_where_it_lands() {
                     typed_by_person: true,
                     wire: "hi".into(),
                     typed: "hi".into(),
+                    shell_line: false,
                 },
             },
         )
@@ -906,6 +907,7 @@ fn a_resumed_sessions_first_prompt_waits_as_starting() {
             typed_by_person: true,
             wire: "first".into(),
             typed: "first".into(),
+            shell_line: false,
         },
     );
     assert!(matches!(sent, Some(Sent::First { ref request_id, outcome: Ok(()), .. }) if request_id == "req-1"));
@@ -1287,6 +1289,7 @@ fn typed(text: &str) -> FirstTurn {
         typed_by_person: true,
         wire: text.into(),
         typed: text.into(),
+        shell_line: false,
     }
 }
 

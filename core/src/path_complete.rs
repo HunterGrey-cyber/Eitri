@@ -1,7 +1,10 @@
 //! Project-relative names for the composer's path picker. No file contents are opened.
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::time::Duration;
+
+/// How long git may take to list a project. Past it the walk's bounded answer is better than none.
+const GIT_LIMIT: Duration = Duration::from_secs(10);
 
 fn usable(name: &str) -> bool {
     !name.is_empty()
@@ -24,14 +27,18 @@ fn add(paths: &mut BTreeSet<String>, name: &str) {
 /// This may take seconds and belongs on a worker thread.
 pub fn list_paths(root: &Path) -> Vec<String> {
     let mut paths = BTreeSet::new();
-    if let Ok(output) = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-co", "--exclude-standard", "-z"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
+    // The person's own git, for their global ignores, with the one setting a repository could name a program
+    // through for this command turned off: a folder someone sent must not run anything when `@` is typed.
+    let mut git = crate::turn_review::git::user_read_only(root);
+    git.args([
+        "-c",
+        "core.fsmonitor=false",
+        "ls-files",
+        "-co",
+        "--exclude-standard",
+        "-z",
+    ]);
+    if let Ok(output) = crate::turn_review::git::run(git, GIT_LIMIT) {
         if output.status.success() {
             for bytes in output.stdout.split(|b| *b == 0) {
                 if let Ok(name) = std::str::from_utf8(bytes) {
@@ -126,6 +133,35 @@ pub fn rank(paths: &[String], query: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    /// A repository's own configuration names programs git runs. Opening a downloaded folder and typing `@`
+    /// must not start one.
+    #[test]
+    fn listing_a_repository_runs_nothing_its_configuration_names() {
+        let dir = TempDir::new();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        git(&["add", "a.txt"]);
+        let marker = dir.path().join("ran");
+        let program = dir.path().join("monitor.sh");
+        std::fs::write(&program, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&["config", "core.fsmonitor", program.to_str().unwrap()]);
+        assert!(list_paths(dir.path()).contains(&"a.txt".to_string()));
+        assert!(!marker.exists(), "the repository's fsmonitor ran");
+    }
+
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new() -> Self {
