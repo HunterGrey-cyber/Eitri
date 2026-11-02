@@ -681,11 +681,27 @@ mod lock_test_hooks {
 
 /// Reads private UTF-8 state within a byte cap, checked before reading and while the file may grow.
 pub fn read_private_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    use std::io::{Error, ErrorKind, Read};
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    read_capped(file, path, max_bytes)
+}
+
+/// [`read_private_to_string_capped`] for a name another process could have put in place: a symbolic link there
+/// is refused (`O_NOFOLLOW`), never followed, so what is read is the file at that name or nothing.
+pub fn read_private_nofollow_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    read_capped(file, path, max_bytes)
+}
+
+/// Reads an open `file` whole as UTF-8 when it is a regular file of the euid no longer than `max_bytes`, checked on
+/// the handle before reading and enforced while reading, so a file that grows meanwhile is refused too.
+fn read_capped(file: std::fs::File, path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != euid() {
         return Err(Error::new(
@@ -1265,6 +1281,50 @@ mod tests {
         assert_eq!(
             read_private_to_string_capped(&path, 256).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A name another process may have put in place is read only when it is a regular file of this user: a link is
+    /// refused rather than followed, and a FIFO is refused at once rather than waited on.
+    #[test]
+    fn nofollow_read_refuses_a_symlink_and_a_fifo_and_reads_a_file() {
+        let dir = scratch("nofollow");
+        let file = dir.join("out.json");
+        write_private(&file, b"{\"same\":true}").unwrap();
+        assert_eq!(read_private_nofollow_capped(&file, 256).unwrap(), "{\"same\":true}");
+
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            read_private_nofollow_capped(&link, 256).is_err(),
+            "a link is not followed"
+        );
+
+        let fifo = dir.join("fifo.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path remains valid for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_private_nofollow_capped(&path, 256).map_err(|e| e.kind()));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read blocked on a FIFO");
+        assert_eq!(read, Err(std::io::ErrorKind::PermissionDenied));
+
+        assert_eq!(
+            read_private_nofollow_capped(&file, 4).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "over the cap"
+        );
+        assert_eq!(
+            read_private_nofollow_capped(&dir.join("missing"), 256)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

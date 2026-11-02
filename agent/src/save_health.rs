@@ -18,9 +18,11 @@ pub enum SaveKind {
     Record,
     /// A conversation's stored history.
     History,
+    /// The editor's record of its open files, which the next start reopens.
+    Editor,
 }
 
-const KINDS: [SaveKind; 3] = [SaveKind::Tabs, SaveKind::Record, SaveKind::History];
+const KINDS: [SaveKind; 4] = [SaveKind::Tabs, SaveKind::Record, SaveKind::History, SaveKind::Editor];
 
 impl SaveKind {
     fn slot(self) -> usize {
@@ -41,6 +43,10 @@ impl SaveKind {
             SaveKind::History => (
                 "could not store the history",
                 "what is new may be missing when this conversation is reopened",
+            ),
+            SaveKind::Editor => (
+                "could not save the editor's open files",
+                "the next start reopens older files",
             ),
         }
     }
@@ -87,7 +93,7 @@ impl Health {
     const fn new() -> Health {
         Health {
             slots: [Slot::Fine; KINDS.len()],
-            why: [String::new(), String::new(), String::new()],
+            why: [String::new(), String::new(), String::new(), String::new()],
         }
     }
 
@@ -186,6 +192,28 @@ mod tests {
             [SaveKind::Tabs, SaveKind::History]
         );
         assert_eq!(news[1].why, "second");
+    }
+
+    #[test]
+    fn the_editor_kind_is_listed_with_its_words() {
+        assert!(KINDS.contains(&SaveKind::Editor));
+        let mut health = Health::new();
+        assert!(health.failed(SaveKind::Editor, "the disk is full".into()));
+        assert_eq!(
+            health.take_news(),
+            [SaveFailure {
+                kind: SaveKind::Editor,
+                why: "the disk is full".into()
+            }]
+        );
+        let failure = SaveFailure {
+            kind: SaveKind::Editor,
+            why: "the disk is full".into(),
+        };
+        assert_eq!(
+            failure.text(),
+            "could not save the editor's open files (the disk is full): the next start reopens older files"
+        );
     }
 
     #[test]
