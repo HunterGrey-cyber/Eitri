@@ -59,7 +59,7 @@ eitri.panel.register{
   [open rule](configuration.md#where-a-new-module-opens) for `lua:status` decides over it.
 - `key` must be one character that nothing after the prefix uses: not a default key, not one stock tmux binds after
   its prefix, not `v`, and not `E`, `A`, `T` or `V`. `b`, `g`, `h`, `j`, `k`, `u` and `y` are free by default. A
-  clash stops Eitri at startup, naming the key and what holds it.
+  clash leaves the page without a key and is listed when Eitri starts, naming the key and what holds it.
 - The id must not be `terminal#2` to `terminal#9` or `agent#2` to `agent#9`; registering the same id again replaces
   the earlier panel.
 - The page is a plain web view: its scripts run, its links open inside it, and it can reach the network. It gets no
@@ -77,7 +77,7 @@ eitri.plugin.load("scratch", { key = "y" })
 
 `eitri.plugin.load` is taken only while `init.lua` runs. Its options are the plugin's own settings, `key` (a module
 key, as for a Lua panel) and `position`. Each load prints the directory it used in the terminal you started Eitri
-from. A mistake in the manifest stops Eitri at startup with a message naming the key at fault.
+from. A mistake in the manifest means the page is not loaded, and Eitri lists it when it starts, naming the key at fault.
 
 ### A complete example
 

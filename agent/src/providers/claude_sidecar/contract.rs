@@ -8,7 +8,39 @@ pub const BUNDLED_SIDECAR_VERSION: &str = "0.2.0";
 pub const UNTESTED_CLAUDE_NOTE: &str = "If something looks wrong, a newer sidecar may fix it: eitri sidecar check";
 
 /// A remedy on a refused start, only where the sidecar command exists.
-pub const REFUSED_CLAUDE_NOTE: &str = "A newer sidecar may support this claude: eitri sidecar update";
+pub const REFUSED_CLAUDE_NOTE: &str = "A newer sidecar may support this claude: eitri sidecar check";
+
+/// The end of the sidecar's out-of-range refusal, written for the sidecar's own developers: it names a source file
+/// and a test run. What a person reads in its place is [`FOR_A_PERSON`].
+const FOR_ITS_DEVELOPERS: &str = " Install a claude CLI inside that range, or widen the range in ";
+const FOR_A_PERSON: &str = " Install a Claude Code version inside that range.";
+
+/// `line` of the sidecar's stderr as a person is shown it: the developer sentence at the end of the refusal of a
+/// `claude` outside its range is the person's own instead. Any other line is as it was said.
+pub(crate) fn said_for_a_person(line: String) -> String {
+    match line.find(FOR_ITS_DEVELOPERS) {
+        Some(at) if line.contains("refusing to start") => format!("{}{FOR_A_PERSON}", &line[..at]),
+        _ => line,
+    }
+}
+
+/// Whether a newer sidecar could be what a refusal of the host's `claude` waits for. Not when that `claude` is older
+/// than the floor of the range: a newer sidecar moves the floor up, not down. A refusal this cannot read keeps the
+/// note.
+pub(crate) fn newer_sidecar_may_help(refusal: &str) -> bool {
+    let version = refusal
+        .split_once("host claude CLI version ")
+        .and_then(|(_, rest)| rest.split([':', ' ']).next())
+        .and_then(SidecarVersion::parse);
+    let floor = refusal
+        .split_once("supported range (>=")
+        .and_then(|(_, rest)| rest.split([' ', ')']).next())
+        .and_then(SidecarVersion::parse);
+    match (version, floor) {
+        (Some(version), Some(floor)) => version >= floor,
+        _ => true,
+    }
+}
 
 /// Capabilities required only when choosing a selected update, never during the shared
 /// handshake or adoption of a running sidecar. Bundled and explicitly named sidecars keep

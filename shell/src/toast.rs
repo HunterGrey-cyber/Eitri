@@ -17,10 +17,13 @@ use gtk4::prelude::*;
 /// How long a one-time notice stays up: it is a sentence read once, not a glance at a count.
 pub(crate) const NOTICE_FOR: Duration = Duration::from_secs(12);
 
-/// How often a waiting notice looks again, and how long it waits at most: a timed line is up for [`TOAST_FOR`] or
-/// [`NOTICE_FOR`], so two of them back to back fit.
+/// How long what `init.lua` got wrong stays up: a few lines to read and then find in the file.
+pub(crate) const PROBLEM_FOR: Duration = Duration::from_secs(40);
+
+/// How often a waiting notice looks again, and how long it waits at most: what `init.lua` got wrong is up for
+/// [`PROBLEM_FOR`], and two [`NOTICE_FOR`] notices wait behind it, so all three back to back fit.
 const NOTICE_WAIT_STEP: Duration = Duration::from_millis(500);
-const NOTICE_WAIT_MAX: Duration = Duration::from_secs(30);
+const NOTICE_WAIT_MAX: Duration = Duration::from_secs(75);
 
 pub(crate) struct Toast {
     label: gtk4::Label,
@@ -74,19 +77,39 @@ impl Toast {
     /// [`NOTICE_WAIT_STEP`] for at most [`NOTICE_WAIT_MAX`], then shown over whatever is there. A standing note does
     /// not hold it back (a timed line covers that one and gives it back).
     pub(crate) fn show_notice_when_free(self: &Rc<Self>, text: String) {
-        self.show_notice_after(text, NOTICE_WAIT_MAX);
+        self.show_notice_when_free_for(text, NOTICE_FOR);
     }
 
-    fn show_notice_after(self: &Rc<Self>, text: String, patience: Duration) {
+    /// [`Toast::show_notice_when_free`] for a notice that stays up `duration`.
+    pub(crate) fn show_notice_when_free_for(self: &Rc<Self>, text: String, duration: Duration) {
+        self.show_notice_after(text, duration, NOTICE_WAIT_MAX, None);
+    }
+
+    /// [`Toast::show_notice_when_free`] that runs `shown` the moment the notice goes up, so a record that it was said
+    /// is made then and not while the notice still waits.
+    pub(crate) fn show_notice_when_free_then(self: &Rc<Self>, text: String, shown: impl FnOnce() + 'static) {
+        self.show_notice_after(text, NOTICE_FOR, NOTICE_WAIT_MAX, Some(Box::new(shown)));
+    }
+
+    fn show_notice_after(
+        self: &Rc<Self>,
+        text: String,
+        duration: Duration,
+        patience: Duration,
+        shown: Option<Box<dyn FnOnce()>>,
+    ) {
         let busy = matches!(self.showing.get(), Some(ToastKind::Other | ToastKind::Attention));
         if !busy || patience < NOTICE_WAIT_STEP {
-            self.show_for(&text, NOTICE_FOR);
+            self.show_for(&text, duration);
+            if let Some(shown) = shown {
+                shown();
+            }
             return;
         }
         let toast = Rc::downgrade(self);
         glib::timeout_add_local_once(NOTICE_WAIT_STEP, move || {
             if let Some(toast) = toast.upgrade() {
-                toast.show_notice_after(text, patience - NOTICE_WAIT_STEP);
+                toast.show_notice_after(text, duration, patience - NOTICE_WAIT_STEP, shown);
             }
         });
     }

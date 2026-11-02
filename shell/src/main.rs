@@ -1358,12 +1358,12 @@ fn build_ui(
         .iter()
         .map(|entry| (ModuleId::lua(&entry.id), entry.key.clone()))
         .collect();
-    let module_keys = match ModuleKeys::build(&lua_keys, &keymap) {
-        Ok(keys) => Rc::new(keys),
-        Err(err) => {
-            eprintln!("eitri: {err}");
-            std::process::exit(1);
+    let module_keys = {
+        let (keys, refused) = ModuleKeys::build_settled(&lua_keys, &keymap);
+        for error in refused {
+            lua_engine.report_problem(format!("{error}; the panel has no key"));
         }
+        Rc::new(keys)
     };
     // `:Eitri`, for window 1's nvim only: it sends its words to the pane-switch socket, and what it completes and
     // the group of keys under `keymap.nvim_prefix` come from this window's keymap and module keys.
@@ -1452,10 +1452,6 @@ fn build_ui(
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
     // is state rather than config -- it is logged and the default opens.
-    if let Some(message) = lua_engine.init_refusal() {
-        eprintln!("eitri: {message}");
-        std::process::exit(1);
-    }
     let editor_presentation = match editor_presentation::from_config(&lua_engine) {
         Ok(value) => value,
         Err(message) => {
@@ -1466,20 +1462,9 @@ fn build_ui(
     if let (Some(pane), Some(value)) = (&pane, editor_presentation) {
         pane.set_presentation(value);
     }
-    let lua_default = lua_engine
-        .layout
-        .borrow()
-        .default_tree()
-        .cloned()
-        .map(|tree| tree.expect("the kernel checked the default layout"));
-    let rules = Rc::new(
-        lua_engine
-            .layout
-            .borrow()
-            .rules()
-            .cloned()
-            .expect("the kernel checked open rules"),
-    );
+    // A default that was refused is already a startup problem; the window opens on the first-launch layout instead.
+    let lua_default = lua_engine.layout.borrow().default_tree().cloned().and_then(Result::ok);
+    let rules = Rc::new(lua_engine.layout.borrow().accepted_rules().clone());
     // Where the window places a module when no module holds the keys -- a first launch, a reconcile of
     // the file or a template, a module a workspace lacks, a module back after a kill: the Lua panels at
     // their rule's place, else their `position`, and each built-in or instance a rule names. Every one
@@ -1775,6 +1760,22 @@ fn build_ui(
             .map(|one| (eitri_core::layout::Workspaces::single(), one.layout, one.notes, None))
             .map_err(|err| format!("the layout of the window for {module} could not start: {err}"))
     });
+    // A default tree that names what this window does not have is said and set aside, so the first launch opens on the
+    // layout it would have had with no `eitri.layout.default`.
+    let lua_default = lua_default.filter(|tree| {
+        match eitri_core::layout::reconcile_default_floating_with(
+            tree.tiled.clone(),
+            tree.floats.clone(),
+            &layout_decls,
+            &layout_deferred,
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                lua_engine.report_problem(format!("eitri.layout.default: {err}; the first-launch layout is used"));
+                false
+            }
+        }
+    });
     // `start_layout` is the current workspace's layout, `start_workspaces` the window's other workspaces beside it
     // and what a later build keeps in the file: this window's own values until the controller takes them, so what
     // the window's start owes its role (below) is written to them before anything reads them.
@@ -1807,30 +1808,47 @@ fn build_ui(
         .defined_workspaces()
         .iter()
         .filter(|_| tiling == eitri_core::wm::window::Tiling::Eitri)
-        .map(|(name, tree)| tree.clone().map(|tree| (name.clone(), tree)))
-        .collect::<Result<Vec<_>, _>>();
-    let defined = match defined {
-        Ok(defined) => defined,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
-    match eitri_core::wm::persist::add_defined_workspaces(
-        &mut start_workspaces,
-        &mut start_layout,
-        &defined,
-        &decls,
-        &deferred,
-    ) {
+        // A workspace whose definition was refused is already a startup problem and is not defined.
+        .filter_map(|(name, tree)| tree.clone().ok().map(|tree| (name.clone(), tree)))
+        .collect::<Vec<_>>();
+    // The defined workspaces are added together; if one does not fit the window, each is tried by itself, the one
+    // that does not is said and left out, and the others open.
+    let mut tried = (start_workspaces.clone(), start_layout.clone());
+    match eitri_core::wm::persist::add_defined_workspaces(&mut tried.0, &mut tried.1, &defined, &decls, &deferred) {
         Ok(notes) => {
+            (start_workspaces, start_layout) = tried;
             for note in notes {
                 println!("[layout] {note}");
             }
         }
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
+        Err(_) => {
+            for one in &defined {
+                let mut tried = (start_workspaces.clone(), start_layout.clone());
+                match eitri_core::wm::persist::add_defined_workspaces(
+                    &mut tried.0,
+                    &mut tried.1,
+                    std::slice::from_ref(one),
+                    &decls,
+                    &deferred,
+                ) {
+                    Ok(_) => (start_workspaces, start_layout) = tried,
+                    Err(message) => {
+                        lua_engine.report_problem(format!("{message}; that workspace is not defined"));
+                    }
+                }
+            }
+            // The fit every workspace gets once they are all in.
+            if let Ok(notes) = eitri_core::wm::persist::add_defined_workspaces(
+                &mut start_workspaces,
+                &mut start_layout,
+                &[],
+                &decls,
+                &deferred,
+            ) {
+                for note in notes {
+                    println!("[layout] {note}");
+                }
+            }
         }
     }
     // What the window's start owes its role, before anything is drawn: window 2's editor leaf retired and the
@@ -2698,6 +2716,38 @@ fn build_ui(
     if !notices.is_empty() {
         toast.show_for(&notices.join("; "), toast::NOTICE_FOR);
     }
+    // What `init.lua` got wrong is said every start while it holds, after the notices above have had their time; the
+    // default keys it took over, once and again only when that set changes. A chat or page window or a second window
+    // runs the same file and says nothing: the window that holds the pair is the one the person is looking at.
+    if module_window.is_none() && pair.pair_role() != eitri_core::window_link::pair::Role::Second {
+        if let Some(text) = eitri_core::init_notice::problems_text(&lua_engine.startup_problems()) {
+            toast.show_notice_when_free_for(text, toast::PROBLEM_FOR);
+        }
+        let overrides = config.keymap.user_overrides();
+        if !overrides.is_empty() {
+            eprintln!("[keymap] init.lua took over default keys: {}", overrides.join(", "));
+        }
+        if let Some(text) = eitri_core::init_notice::overrides_text(&overrides) {
+            let fingerprint = eitri_core::init_notice::overrides_fingerprint(&overrides);
+            let state = eitri_core::init_notice::overrides_state_file(
+                std::env::var_os("XDG_STATE_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            );
+            if state
+                .as_deref()
+                .is_none_or(|file| eitri_core::keymap::tmux::notice::needs_notice(file, &fingerprint))
+            {
+                let file = state.clone();
+                toast.show_notice_when_free_then(text, move || {
+                    if let Some(file) = file.as_deref() {
+                        if let Err(err) = eitri_core::keymap::tmux::notice::remember(file, &fingerprint) {
+                            eprintln!("[keymap] could not record the notice in {}: {err}", file.display());
+                        }
+                    }
+                });
+            }
+        }
+    }
     // The window's y/n, for a window close that would interrupt a running tab and for `prefix x`. Built here,
     // before everything that asks it; its key layer is added with the window's others, in their declared order
     // (`gtk_host::keys::install_window_layers`, below).
@@ -2723,15 +2773,17 @@ fn build_ui(
                 .as_deref()
                 .is_none_or(|file| eitri_core::keymap::tmux::notice::needs_notice(file, &fingerprint))
             {
-                toast.show_for(&text, toast::NOTICE_FOR);
-                if let Some(file) = state.as_deref() {
-                    if let Err(err) = eitri_core::keymap::tmux::notice::remember(file, &fingerprint) {
-                        eprintln!(
-                            "[keymap] tmux: could not record the notice in {}: {err}",
-                            file.display()
-                        );
+                let file = state.clone();
+                toast.show_notice_when_free_then(text, move || {
+                    if let Some(file) = file.as_deref() {
+                        if let Err(err) = eitri_core::keymap::tmux::notice::remember(file, &fingerprint) {
+                            eprintln!(
+                                "[keymap] tmux: could not record the notice in {}: {err}",
+                                file.display()
+                            );
+                        }
                     }
-                }
+                });
             }
         }
     }

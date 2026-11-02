@@ -117,13 +117,15 @@ a change it sees. Closing the terminal or a Lua panel with `<prefix> x` puts its
 that becomes the last change: `layout.undo` right after it only moves the closed module's place back, so nothing on
 screen changes, and the change before the close can no longer be undone.
 
-**Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
-that has an action stops Eitri at startup with a message that names the call and says to run
-`eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4`, `M-5`, `M-H`,
-`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`, `C-=`, `C-+`, `C--` or `C-0` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
-tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
-of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
-import and your tmux configuration bind that key.
+**Setting a key that already has an action.** The keys in this section are defaults, and your `eitri.keymap.set`
+wins over them: it takes the key, and Eitri says so once when it starts, naming the key and the action it replaced
+(it says so again only when that list changes). Setting a key twice is the same: the last call wins, as with vim's
+maps. Take a key and you lose the default action of that key, so a release that gives a default a key you already
+use does not stop Eitri, and does not change what your key does; the new default is simply not on that key. The
+message is also on stderr. A `del` before the `set` still works, and says nothing.
+
+A call Eitri cannot apply at all (a key it cannot read, an action it does not know, a `del` of a key that nothing is
+bound to) is left out, and Eitri lists it at startup with the call as you wrote it. The rest of your keys apply.
 
 **The window and the panel.**
 

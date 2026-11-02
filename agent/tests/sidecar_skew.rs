@@ -543,6 +543,12 @@ fn real_refusal() -> (String, String) {
 fn a_real_refusal_is_quoted_not_the_account_line_before_it() {
     let dir = Scratch::new();
     let (printed, refusal) = real_refusal();
+    // What a person reads is the refusal with its last sentence, written for the sidecar's developers, in the
+    // person's own words.
+    let refusal = refusal.replace(
+        " Install a claude CLI inside that range, or widen the range in apps/claude-sidecar/src/cliCompatibility.ts once a real-CLI test run has confirmed it works.",
+        " Install a Claude Code version inside that range.",
+    );
     let update = launcher(&dir.0, "update", &[("EITRI_STANDIN_REFUSE_BIND", printed.as_str())]);
     let provider =
         ClaudeSidecarProvider::connect_trying_update(&instance(), &update, "1.3.0", &bundled(&dir.0)).unwrap();

@@ -9,12 +9,25 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// One call's outcome as the function boundary saw it: the call, the key that tells two calls of one function apart
+/// (a workspace's name, a config key), the refusal if it was refused, and the `file:line` of the Lua that made it.
+#[derive(Debug)]
+struct Outcome {
+    name: &'static str,
+    key: Option<String>,
+    error: Option<String>,
+    origin: Option<String>,
+}
+
 /// Refusals belong to the Lua state so every function boundary shares the startup decision.
 #[derive(Debug)]
 pub(crate) struct InitRefusals {
     accepting: bool,
     path: Option<PathBuf>,
-    entries: Vec<(&'static str, Option<String>, Option<String>)>,
+    entries: Vec<Outcome>,
+    /// Every refusal in the order of the calls, with the `file:line` of each: `entries` keeps one per call and key
+    /// for the startup decision, and this keeps them all for what the window says.
+    refused: Vec<(Option<String>, String)>,
 }
 
 impl Default for InitRefusals {
@@ -23,6 +36,7 @@ impl Default for InitRefusals {
             accepting: true,
             path: None,
             entries: Vec::new(),
+            refused: Vec::new(),
         }
     }
 }
@@ -37,32 +51,61 @@ impl InitRefusals {
     pub(crate) fn message(&self, name: &str) -> Option<String> {
         self.entries
             .iter()
-            .find(|(call, _, error)| *call == name && error.is_some())
-            .and_then(|(_, _, error)| error.clone())
+            .find(|entry| entry.name == name && entry.error.is_some())
+            .and_then(|entry| entry.error.clone())
     }
 
-    fn record(&mut self, name: &'static str, workspace: Option<String>, error: Option<String>) {
+    /// The refusal of a call of `name` that was about `key`, if there was one.
+    pub(crate) fn refusal_for(&self, name: &str, key: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name && entry.key.as_deref() == Some(key))
+            .and_then(|entry| entry.error.clone())
+    }
+
+    /// The refusals of calls of `name` about a key that starts with `prefix`, as `(key, why)`.
+    pub(crate) fn refusals_under(&self, name: &str, prefix: &str) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.name == name)
+            .filter_map(|entry| {
+                let key = entry.key.as_deref().filter(|key| key.starts_with(prefix))?;
+                Some((key.to_string(), entry.error.clone()?))
+            })
+            .collect()
+    }
+
+    fn record(&mut self, name: &'static str, key: Option<String>, error: Option<String>, origin: Option<String>) {
         if !self.accepting {
             return;
         }
-        let replace = name == "eitri.layout.default" || (name == "eitri.layout.workspace" && workspace.is_some());
-        if let Some((_, _, earlier)) = self
+        if let Some(error) = &error {
+            self.refused.push((origin.clone(), error.clone()));
+        }
+        let replace = name == "eitri.layout.default" || (name == "eitri.layout.workspace" && key.is_some());
+        if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|(call, key, _)| *call == name && *key == workspace)
+            .find(|entry| entry.name == name && entry.key == key)
         {
-            if replace || earlier.is_none() {
-                *earlier = error;
+            if replace || entry.error.is_none() {
+                entry.error = error;
+                entry.origin = origin;
             }
         } else {
-            self.entries.push((name, workspace, error));
+            self.entries.push(Outcome {
+                name,
+                key,
+                error,
+                origin,
+            });
         }
     }
 
     fn first(&self) -> Option<String> {
         self.entries
             .iter()
-            .filter_map(|(name, _, error)| error.as_ref().map(|error| (name, error)))
+            .filter_map(|entry| entry.error.as_ref().map(|error| (&entry.name, error)))
             .min_by_key(|(name, _)| match **name {
                 name if name.starts_with("eitri.command.") => 0,
                 name if name.starts_with("eitri.config.") => 1,
@@ -77,6 +120,18 @@ impl InitRefusals {
                 Some(path) => format!("{error} ({})", path.display()),
                 None => error.clone(),
             })
+    }
+
+    /// Every refusal, one line each in the order the calls were made: where the call was, then why it was refused.
+    fn lines(&self) -> Vec<String> {
+        let file = self.path.as_ref().map(|path| path.display().to_string());
+        self.refused
+            .iter()
+            .map(|(origin, error)| match origin.as_ref().or(file.as_ref()) {
+                Some(origin) => format!("{origin}: {error}"),
+                None => error.clone(),
+            })
+            .collect()
     }
 }
 
@@ -101,7 +156,7 @@ where
 {
     let shared = init_refusals(lua);
     lua.create_function(move |lua, args: mlua::MultiValue| {
-        let workspace = if name == "eitri.layout.workspace" {
+        let workspace = if name == "eitri.layout.workspace" || name == "eitri.config.set" {
             match args.front() {
                 Some(Value::String(name)) => name.to_str().ok().map(|name| name.to_string()),
                 _ => None,
@@ -116,9 +171,21 @@ where
             mlua::Error::RuntimeError(message) => message.clone(),
             _ => format!("{name}: {error}"),
         });
-        shared.borrow_mut().record(name, workspace, error);
+        let origin = error.is_some().then(|| caller_origin(lua)).flatten();
+        shared.borrow_mut().record(name, workspace, error, origin);
         result
     })
+}
+
+/// `file:line` of the Lua that called the Rust function now running, or `None` outside Lua (a call from Rust). A
+/// chunk loaded from a string rather than a file has no file to name.
+pub(crate) fn caller_origin(lua: &Lua) -> Option<String> {
+    lua.inspect_stack(1, |frame| {
+        let source = frame.source().source?.into_owned();
+        let file = source.strip_prefix('@')?.to_string();
+        Some(format!("{file}:{}", frame.current_line()?))
+    })
+    .flatten()
 }
 
 pub struct Kernel {
@@ -139,6 +206,12 @@ pub struct Kernel {
     pub agents: Rc<RefCell<super::agent::AgentRegistry>>,
     /// `eitri.plugin.load`: the plugins `init.lua` loaded, read by the host once it has run.
     pub plugins: Rc<RefCell<super::plugin::PluginRegistry>>,
+    /// What `init.lua` asked of Eitri that Eitri did not do, one line each, where the person can find it: a Lua
+    /// error, a call refused at the function boundary, a value that is not one, a key nothing reads. The window
+    /// opens regardless and says these (`Kernel::startup_problems`).
+    problems: RefCell<Vec<String>>,
+    /// The Lua error that ended `init.lua`, as `(file:line: why, the error's own first line)`.
+    init_error: RefCell<Option<(String, String)>>,
 }
 
 /// The panel installer for a host that has no Lua panels (the companion window, `eitri-mac`):
@@ -279,6 +352,8 @@ impl Kernel {
             keymap,
             agents,
             plugins,
+            problems: RefCell::new(Vec::new()),
+            init_error: RefCell::new(None),
         })
     }
 
@@ -324,13 +399,33 @@ impl Kernel {
         }
     }
 
-    /// Loads init.lua and exits on a validated API refusal, even when Lua catches the error.
-    /// Other Lua errors are logged and leave the registrations made before the error available.
+    /// Loads init.lua and goes on whatever it did, as nvim does with its own: a Lua error leaves the registrations made
+    /// before it, a call refused at the function boundary (even one Lua caught) did nothing, and each is a
+    /// [`Kernel::startup_problems`] line naming the file and line, so the window can say it.
     pub fn load_init_file(&self, path: &std::path::Path) {
-        if let Err(message) = self.run_and_check_init_file(path) {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
+        let _ = self.run_and_check_init_file(path);
+        let lines = self.init_refusals.borrow().lines();
+        for line in lines {
+            self.report_problem(line);
         }
+        // A refused call that nothing caught also ended the file with the same words; they are one problem.
+        if let Some((line, message)) = self.init_error.borrow_mut().take() {
+            if !self.problems.borrow().iter().any(|known| known.ends_with(&message)) {
+                self.report_problem(line);
+            }
+        }
+    }
+
+    /// Adds a line to what [`Kernel::startup_problems`] says, and logs it where a terminal would see it.
+    pub fn report_problem(&self, text: impl Into<String>) {
+        let text = text.into();
+        eprintln!("[init] {text}");
+        self.problems.borrow_mut().push(text);
+    }
+
+    /// What `init.lua` asked of Eitri that Eitri did not do, in the order it was found. Empty when the file was fine.
+    pub fn startup_problems(&self) -> Vec<String> {
+        self.problems.borrow().clone()
     }
 
     /// [`Self::load_init_file`] without the exit: `Err` is the startup-failure text after "eitri: ".
@@ -374,13 +469,61 @@ impl Kernel {
         }
         match std::fs::read_to_string(path) {
             Ok(src) => {
-                if let Err(err) = self.lua.load(&src).set_name(path.to_string_lossy().to_string()).exec() {
+                let chunk = format!("@{}", path.display());
+                if let Err(err) = self.lua.load(&src).set_name(chunk).exec() {
+                    *self.init_error.borrow_mut() = Some(lua_error_line(path, &err));
                     eprintln!("[lua] error loading {}: {err}", path.display());
                 }
             }
-            Err(err) => eprintln!("[lua] could not read {}: {err}", path.display()),
+            Err(err) => self.report_problem(format!("{}: could not be read: {err}", path.display())),
         }
     }
+}
+
+/// What a Lua error says, as `(file:line: why, why)`: its first line with the file Lua names (cut short when the
+/// path is long) written out in full. An error a Rust function raised names no place in its first line; the Lua
+/// line that called it is the first of the stack traceback below.
+fn lua_error_line(init: &std::path::Path, error: &mlua::Error) -> (String, String) {
+    let text = error.to_string();
+    let message = text
+        .lines()
+        .filter(|line| !line.starts_with('\t') && !line.starts_with("stack traceback") && *line != "callback error")
+        .map(|line| {
+            ["caused by: ", "runtime error: ", "syntax error: "]
+                .iter()
+                .fold(line, |line, prefix| line.trim_start_matches(prefix))
+        })
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let full = init.display().to_string();
+    if let Some((at, _)) = located(message) {
+        let chunk = &message[..at];
+        let why = message[at..].trim_start_matches(|c: char| c == ':' || c.is_ascii_digit() || c == ' ');
+        if chunk.starts_with("[string") || full.ends_with(chunk.trim_start_matches("...")) {
+            return (format!("{full}{}", &message[at..]), why.to_string());
+        }
+        return (message.to_string(), why.to_string());
+    }
+    // A Rust function raised it: the Lua line that called it is the first stack frame in this file.
+    let line = text
+        .lines()
+        .filter(|line| line.starts_with('\t'))
+        .find_map(|line| {
+            let (at, digits) = located(line)?;
+            full.ends_with(line[..at].trim().trim_start_matches("..."))
+                .then(|| digits.to_string())
+        })
+        .map_or_else(String::new, |digits| format!(":{digits}"));
+    (format!("{full}{line}: {message}"), message.to_string())
+}
+
+/// Where in `line` its `:<digits>: ` is, and the digits.
+fn located(line: &str) -> Option<(usize, &str)> {
+    line.match_indices(':').find_map(|(at, _)| {
+        let rest = &line[at + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && rest[digits..].starts_with(": ")).then(|| (at, &rest[..digits]))
+    })
 }
 
 #[cfg(test)]
@@ -412,6 +555,25 @@ mod tests {
             "{error}"
         );
         assert!(error.contains(&init.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn every_refused_call_is_a_problem_even_when_two_read_alike() {
+        let scratch = crate::plugin::test_support::Scratch::new("lua-every-refusal");
+        let init = scratch.0.join("init.lua");
+        std::fs::write(
+            &init,
+            "pcall(eitri.layout.rule, 42, {})\npcall(eitri.layout.rule, true, {})",
+        )
+        .unwrap();
+        let kernel = Kernel::new(scratch.0.clone(), refuse_panels).unwrap();
+        kernel.load_init_file(&init);
+        let problems = kernel.startup_problems();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().all(|line| line.contains(&init.display().to_string())),
+            "{problems:?}"
+        );
     }
 
     #[test]

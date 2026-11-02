@@ -133,7 +133,12 @@ impl LayoutStore {
         }
     }
 
-    /// Definitions in init.lua order, including errors that must stop startup.
+    /// `init.lua`'s open rules that were accepted: a refused `eitri.layout.rule` call added none.
+    pub fn accepted_rules(&self) -> &OpenRules {
+        &self.rules
+    }
+
+    /// Definitions in init.lua order, with the refusal of each that was refused.
     pub fn defined_workspaces(&self) -> &[(String, Result<LuaTree, String>)] {
         &self.defined
     }

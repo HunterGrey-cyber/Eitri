@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=cd62d66a90af3b6b6a14c8e7ea1a9488cc1b5114bc0589b084d957a42cdd5e30 -->
+<!-- translated-from: getting-started.md sha256=63d53f1d81691d4914b850d03a916a634d104f038be1f07afc91cc625199c6e8 -->
 
 # 快速上手
 
@@ -165,7 +165,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 会话本身没了的时候，对话里会说出来。红色的 `This session was lost` 横幅表示连接断了，上面显示的内容可能不完整；安静的 `This session has ended (<reason>)` 表示它关闭了。无论哪种，在浏览模式里按 `r`，就会在这个标签页里开始一个新会话。回合运行时留着的消息，仍会在这个回合结束时发出，即使它是在碰到限制时结束的。
 
-Claude Code 自己更新之后面板出了问题，背后的 sidecar 可能也需要更新。`eitri sidecar check` 问有没有更新，`eitri sidecar update` 装上它，`eitri sidecar use bundled` 退回去。什么都不会自己检查，已经打开的标签页继续用它启动时的 sidecar。细节见[更新 sidecar](../../INSTALL.zh-CN.md#updating-the-sidecar)。
+Claude Code 自己更新之后面板出了问题，背后的 sidecar 可能也需要更新。`eitri sidecar check` 问有没有更新，`eitri sidecar update` 装上它，`eitri sidecar use bundled` 退回去。什么都不会自己检查，已经打开的标签页继续用它启动时的 sidecar。Eitri 0.3.0 没有 `eitri sidecar` 这个命令（它会回答 `eitri: no such directory`），先装它之后的版本。细节见[更新 sidecar](../../INSTALL.zh-CN.md#updating-the-sidecar)。
 
 ## Eitri 自己崩溃时
 

@@ -17,8 +17,8 @@ without one, Eitri starts with its built-in defaults and prints a line saying so
 without one, it also offers to write a short file for you: see [First start](#first-start).
 
 Settings are made with `eitri.config.set(key, value)`. A value is a string, a number or a boolean (`true` or
-`false`); `nil` unsets the key again. A value Eitri cannot keep (a table or a function, say) is a startup
-failure.
+`false`); `nil` unsets the key again. A value Eitri cannot keep (a table or a function, say) is refused: the
+call does nothing, and Eitri lists it when it starts.
 
 ```lua
 eitri.config.set("agent.restore", "auto")
@@ -27,11 +27,25 @@ eitri.config.set("review.hint", true)
 
 Three rules hold for every setting below:
 
-- A value a setting does not accept stops Eitri at startup with a message that names the key. A misspelt value
-  never falls back to the default quietly.
-- A key Eitri does not know is not an error and does nothing.
-- A Lua error in the file itself (a typo in the code, say) is printed in the terminal you started Eitri from
-  and does not stop the launch: Eitri opens with whatever the file had set before the error.
+- A value a setting does not accept never stops the window and never falls back quietly. The setting goes back to its
+  default, and Eitri says so when it opens: the file and line, the key and what it accepts. There are two exceptions.
+  `agent.account` still stops the start, because a window on some other account would write its sessions there. And
+  the settings that decide what an agent may do or what is loaded go to the stricter side, not to the default: a bad
+  `agent.default_mode` starts new tabs in Manual, a bad `agent.user_settings` leaves your own Claude Code
+  configuration unloaded, and a bad `agent.editor.tools` (or a bad `agent.editor.tool.<name>`) turns those tools off
+  (a tool name that does not exist turns all of them off). Eitri says which side is in force, and it stays until you
+  fix the line. A value `eitri.config.set` could not store for one of those is treated the same way.
+- A key that Eitri does not read does nothing. If it is in one of Eitri's families (`agent.`, `window.`, `terminal.`,
+  `editor.`, `keymap.`, `review.`, `companion.`, `plugins.`, `modules.`) or is one typo away from a real key, Eitri
+  lists it, with the key it probably means. A key of your own, read by your own Lua with `eitri.config.get`, is left
+  alone.
+- A Lua error in the file itself (a typo in the code, say) does not stop the launch either: Eitri opens with
+  whatever the file had set before the error, and says the file and line in the window (a syntax error stops the
+  whole file, since Lua reads it before it runs any of it). The same list goes to the terminal you started Eitri
+  from (to the journal, for a launch from the desktop).
+
+What Eitri says is a toast at the top right: how many problems there are and the first five, up for 40 seconds, with a pointer to the terminal when there are more. It
+says it every start while the problem is in the file.
 
 `require` finds modules only under the `lua/` directory next to `init.lua`: `require("mine")` loads
 `lua/mine.lua` or `lua/mine/init.lua` in that configuration directory, and `require("a.b")` loads
@@ -48,14 +62,14 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `agent.font_size` | a number from 9 to 32 | the editor's size | The agent panel's base text size, in pixels. The conversation is drawn at 12/14 of the base (a reply, tool lines and code), so it reads a little smaller than the editor's text; the status line at the bottom of the panel is drawn at the base itself, so it lines up with the editor's statusline. Unset, the base is the editor's own size (`guifont`). |
 | `agent.typing_cadence_hz` | a whole number from 1 to 60, or `false` / `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
 | `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
-| `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |
+| `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part is refused and the setting stays unset. |
 | `agent.default_mode` | `"manual"`, `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
 | `agent.restore` | `"offer"`, `"auto"`, `"off"` or `false` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
 | `agent.thinking` | `"collapsed"`, `"preview"`, `"expanded"` or `"hidden"` | `"collapsed"` | How the agent panel shows the agent's thinking. `"collapsed"` draws one quiet row per thought, opened with `Enter` like a tool's output; `"preview"` also shows the newest lines of a thought while it is being written, in a box that does not grow; `"expanded"` shows every thought in full; `"hidden"` shows none. `Ctrl+o` shows every thought in full whatever this says. |
 | `agent.user_settings` | `true` / `"on"` or `false` / `"off"` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
 | `agent.editor.tools` | `true` / `"on"` or `false` / `"off"` | `true` | Whether an agent gets the [editor tools](editor-tools.md) in any tab. `false` declares none of them; a session already running keeps what it began with. |
-| `agent.editor.tool.<name>` | `true` / `"on"` or `false` / `"off"` | `true`, except `false` for `nvim_exec` | One of those tools by name: `open_file`, `read_buffer`, `editor_state`, `diagnostics`, `usages`, `hover`, `symbols`, `lsp_rename`, `format`, `lsp_code_actions`, `apply_code_action`, `apply_proposal` or `nvim_exec`. Every tool is on unless you turn it off, except [`nvim_exec`](editor-tools.md#nvim-exec), which is off unless you turn it on. A name Eitri does not know stops the start and names the key. |
-| `agent.editor.follow` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a new tab follows the agent's completed edits in the editor ([editor tools](editor-tools.md#following)). Each tab's own choice (`Space e`) overrides it from then on. A bad value stops the start and names the key. |
+| `agent.editor.tool.<name>` | `true` / `"on"` or `false` / `"off"` | `true`, except `false` for `nvim_exec` | One of those tools by name: `open_file`, `read_buffer`, `editor_state`, `diagnostics`, `usages`, `hover`, `symbols`, `lsp_rename`, `format`, `lsp_code_actions`, `apply_code_action`, `apply_proposal` or `nvim_exec`. Every tool is on unless you turn it off, except [`nvim_exec`](editor-tools.md#nvim-exec), which is off unless you turn it on. A name Eitri does not know is listed at startup, naming the key, and that switch is left at its default. |
+| `agent.editor.follow` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a new tab follows the agent's completed edits in the editor ([editor tools](editor-tools.md#following)). Each tab's own choice (`Space e`) overrides it from then on. A bad value is listed at startup, naming the key, and the setting stays off. |
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
 | `review.enabled` | `true` / `"on"` or `false` / `"off"` | `true` | Whether [turn review](turn-review.md) runs at all. `false` takes no snapshots and offers no review. |
 | `review.hint` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a finished turn that edited files adds a one-line hint to the status band, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
@@ -65,7 +79,7 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `keymap.which_key_delay` | a whole number from 0 to 5000, or `false` / `"off"` | `"off"` | Milliseconds the prefix waits for a second key before a panel lists the keys that may follow; `0` shows it at once. See [The hint panel](keys.md#the-hint-panel). Not drawn in a companion window or on the Mac. |
 | `keymap.nvim_prefix` | a Neovim left-hand side of at most 16 characters (`"<leader>W"`), or `false` / `"off"` | `"off"` | Maps the layout keys of your prefix table in Neovim's Normal mode under this left-hand side, each running its `:Eitri` action. See [From Neovim: `:Eitri`](keys.md#from-neovim-eitri). |
 | `window.restore` | `true` / `"on"` or `false` / `"off"` | `true` | Whether the window that holds a pair brings window 2 back at the next start when it was open when the pair last ended, and whether window 1 of a compositor group brings back its windows, their outputs and its bottom terminal. With `false`, window 1 takes back what window 2 held and offers its saved tabs. See [Two windows](two-windows.md) and [Compositor windows](compositor-windows.md#coming-back). |
-| `window.tiling` | `"auto"`, `"eitri"` or `"compositor"` | `"auto"` | Who arranges chats and pages. `"auto"` makes them windows of your window manager on Hyprland, sway or niri when the compositor answers, and keeps them inside Eitri's window anywhere else; `"eitri"` keeps them inside; `"compositor"` makes them windows on any Wayland desktop. Any other value stops startup. See [Compositor windows](compositor-windows.md). |
+| `window.tiling` | `"auto"`, `"eitri"` or `"compositor"` | `"auto"` | Who arranges chats and pages. `"auto"` makes them windows of your window manager on Hyprland, sway or niri when the compositor answers, and keeps them inside Eitri's window anywhere else; `"eitri"` keeps them inside; `"compositor"` makes them windows on any Wayland desktop. Any other value is listed at startup and the setting stays `"auto"`. See [Compositor windows](compositor-windows.md). |
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
 The settings are read once, when the window starts. Change `init.lua` and open a new window to apply a change.
@@ -75,7 +89,7 @@ The settings are read once, when the window starts. Change `init.lua` and open a
 `eitri.agent.register` is not a setting: it takes a table and adds an agent that speaks ACP over standard input
 and output, so that `:tabnew NAME` and `agent.default` can use it. Its keys, what the trust question does for it
 and what Eitri can and cannot do for such an agent are on [Codex and other agents](agents.md#other-agents-over-acp).
-A bad registration stops Eitri at startup and names the key.
+A bad registration is refused and listed when Eitri starts; the agent is not registered.
 
 ## Keys
 
@@ -91,8 +105,8 @@ k.set("root", "M-z", "zoom")                  -- a key that works without the pr
 
 `k.prefix(key)` changes the prefix, `k.set(table, key, action, options)` binds a key and `k.del(table, key)`
 removes one. The `"root"` table holds keys that work without the prefix: it starts empty, takes only Ctrl and Alt
-chords, and [Keys](keys.md#keys-without-the-prefix) says what it runs, what it refuses and when Eitri warns. A bad key, an unknown action or two bindings that collide stop Eitri at startup with a message
-naming the call, so a typo does not leave you with a keymap you did not write. [Keys](keys.md) lists the
+chords, and [Keys](keys.md#keys-without-the-prefix) says what it runs, what it refuses and when Eitri warns. A bad key, an unknown action or a binding that collides with a key Eitri keeps is left out and listed at startup with a message
+naming the call, so a typo is never silent. [Keys](keys.md) lists the
 defaults and the actions.
 
 The panel's `"panel"` table uses `model.pick` and `effort.pick` as the action names of `<leader>M` and
@@ -115,7 +129,7 @@ A complete example, which moves the prefix to `Ctrl+a` and rebinds splits, resiz
 `k.use(name)` records a named set of these calls in one line. The only name is `"i3-alt"`, for i3 or sway with
 Alt as `$mod`: it moves the Alt chords of the prefix table to `Ctrl+Alt`, exactly the calls in
 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua). It is an ordinary call, so your own calls after it win,
-and an unknown name stops Eitri at startup like any other bad call.
+and an unknown name is refused like any other bad call: it is listed at startup and does nothing.
 
 ```lua
 eitri.keymap.use("i3-alt")
@@ -293,7 +307,7 @@ too, and the window gives it a page of its own. The page starts with no tab of i
 when a saved tab is bound to it, and otherwise it is removed at startup once the restore settles, with the log line
 `agent#2 holds no tab; removed`. To get a view with a new, empty tab, make it while the window runs
 (`eitri.layout.open("agent")`, `eitri.layout.run("instance.new", { kind = "agent" })`, or `<prefix> !` on a tab) rather than
-naming it here. A misspelled field stops the launch, naming it. The top table (not a container inside it) may also carry
+naming it here. A misspelled field is refused and listed at startup, naming it. The top table (not a container inside it) may also carry
 `floating`, a list of `{ "module", cx = 0.5, cy = 0.5, w = 600, h = 400, scratch = true }`, bottom first: `cx` and
 `cy` are from 0 to 1, `w` and `h` whole pixels from 1 to 16384, and `scratch` (false unless given) starts the
 float put away. The editor stays in the tree; the agent panel may float; a module is in the tree or in the list,
@@ -370,7 +384,7 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   own; for `"terminal"` that includes the base `terminal`, while `"agent"` reaches only the numbered chat views
   `agent#2` to `agent#9`, since the first chat view always opens at the side, or where a layout file puts it) or one
   module: `"terminal#2"`, `"agent#3"`, `"lua:notes"` for a Lua
-  panel, `"editor"`. Only one rule per target; a target that names nothing Eitri knows stops startup, naming the call.
+  panel, `"editor"`. Only one rule per target; a target that names nothing Eitri knows is refused and listed at startup, naming the call.
 - **The options** are `at` (a place, below), `float` (a boolean), `size`, `scratchpad` (a boolean: it floats and
   opens put away, and implies `float`) and `focus` (a boolean, `true` by default: whether the new module takes the
   keys; with `false` the keys stay where they were, unless the new module takes the place of the editor that had
@@ -381,10 +395,10 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   share of its container when the module is tiled (a number above 0 and below 1) and `{ w, h }` or `{ w = ..., h = ... }`,
   fractions of the window above 0 and at most 1, when it floats; a float with no size opens centred at 60% of the
   window on each axis.
-- **What is refused,** stopping startup with a message that names the call: an option that is not one of those, a value of the wrong type or out of range, a
+- **What is refused,** listed at startup with a message that names the call, the rule not applied: an option that is not one of those, a value of the wrong type or out of range, a
   tiled size given as a table or a floating one as a number, `float` or `scratchpad` together with `at`, a
   floating editor (the editor never floats; any other rule for it is accepted and never applies, since nothing opens
-  the editor), a target that is neither a kind nor a module id, and a second rule for one target. A rule error stops startup even if your Lua catches it.
+  the editor), a target that is neither a kind nor a module id, and a second rule for one target. A refused rule is listed even if your Lua catches the error.
 - **Which rule wins.** A rule for the module's own id, then the rule for its kind, then a Lua panel's own `position`,
   then the built-in default of where it opens: a new terminal or chat view, and a tab broken out, go to the right of the module
   that has the keys (the base view, for a broken-out tab); a module the window places at a launch or brings back
@@ -456,7 +470,7 @@ eitri.config.set("plugins.keys.scroll_step", 80)
 eitri.config.set("plugins.keys.find_case", "ignore")
 ```
 
-They are read once, when the window starts; a value outside these stops Eitri at startup with a message naming the
+They are read once, when the window starts; a value outside these is refused and listed at startup, naming the
 key. A page's own keys are changed in its `plugin:<id>` table with `eitri.keymap.set`.
 
 ## How a launch starts

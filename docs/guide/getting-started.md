@@ -302,7 +302,8 @@ ran is still sent when that turn ends, even when it ended at a limit.
 
 When Claude Code has updated itself and the panel misbehaves, the sidecar behind it may need an update of its own.
 `eitri sidecar check` asks whether one exists, `eitri sidecar update` takes it, and `eitri sidecar use bundled` goes
-back. Nothing checks by itself, and open tabs keep the sidecar they started with.
+back. Nothing checks by itself, and open tabs keep the sidecar they started with. Eitri 0.3.0 has no `eitri sidecar`
+command (it answers `eitri: no such directory`); take the release after it first.
 [Updating the sidecar](../../INSTALL.md#updating-the-sidecar) has the details.
 
 ## When Eitri itself crashes

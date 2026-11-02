@@ -102,7 +102,7 @@ fn the_notes_say_what_they_point_at() {
     );
     assert_eq!(
         REFUSED_CLAUDE_NOTE,
-        "A newer sidecar may support this claude: eitri sidecar update"
+        "A newer sidecar may support this claude: eitri sidecar check"
     );
 }
 
@@ -267,4 +267,43 @@ fn a_refused_start_carries_no_note_where_there_is_no_command() {
     let text = error.to_string();
     assert!(text.contains(REFUSAL), "{text}");
     assert!(!text.contains(REFUSED_CLAUDE_NOTE), "{text}");
+}
+
+const REFUSAL_BELOW: &str =
+    "refusing to start: host claude CLI version 2.0.1 is outside this sidecar's supported range (>=2.1.0 <2.2.0)";
+
+#[test]
+fn a_claude_below_the_floor_is_refused_with_no_sidecar_note() {
+    let dir = Scratch::new();
+    let exe_dir = dir.exe_dir("with", true);
+    let sidecar = failing_with(&dir.0, "refuses-below", REFUSAL_BELOW);
+    let error = ClaudeSidecarProvider::connect_to_program_in(&instance(), &sidecar, &exe_dir)
+        .err()
+        .expect("the sidecar refuses");
+    let text = error.to_string();
+    assert!(text.contains(REFUSAL_BELOW), "the refusal stays: {text}");
+    assert!(
+        !text.contains(REFUSED_CLAUDE_NOTE),
+        "a newer sidecar only raises the floor: {text}"
+    );
+}
+
+#[test]
+fn the_developer_sentence_of_the_refusal_is_not_what_a_person_reads() {
+    let dir = Scratch::new();
+    let exe_dir = dir.exe_dir("with", true);
+    let said = format!(
+        "{REFUSAL}. Install a claude CLI inside that range, or widen the range in apps/claude-sidecar/src/cliCompatibility.ts once a real-CLI test run has confirmed it works."
+    );
+    let sidecar = failing_with(&dir.0, "refuses-dev", &said);
+    let error = ClaudeSidecarProvider::connect_to_program_in(&instance(), &sidecar, &exe_dir)
+        .err()
+        .expect("the sidecar refuses");
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("{REFUSAL}. Install a Claude Code version inside that range.")),
+        "{text}"
+    );
+    assert!(!text.contains("cliCompatibility") && !text.contains("widen"), "{text}");
+    assert!(text.contains(REFUSED_CLAUDE_NOTE), "{text}");
 }

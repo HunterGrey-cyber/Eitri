@@ -18,6 +18,8 @@ use std::rc::Rc;
 #[derive(Default)]
 pub struct ConfigStore {
     values: HashMap<String, Stored>,
+    /// Where `init.lua` set each key (`file:line`), for the keys it set from a file.
+    origins: HashMap<String, String>,
     /// Shares startup validation with the other Lua APIs.
     init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
@@ -47,6 +49,17 @@ impl ConfigStore {
         self.values.get(key).map(Stored::as_str)
     }
 
+    /// Where `init.lua` set `key`, as `file:line`, when it did so from a file.
+    pub fn origin(&self, key: &str) -> Option<&str> {
+        self.origins.get(key).map(String::as_str)
+    }
+
+    /// Takes `key` out, so what reads it finds it unset and uses its default. Nothing else changes.
+    pub fn unset(&mut self, key: &str) {
+        self.values.remove(key);
+        self.origins.remove(key);
+    }
+
     /// Every key starting with `prefix` and its value as [`ConfigStore::get`] reads it, in key order, so a
     /// reader that stops at the first bad key names the same one on every start.
     pub fn keys_under(&self, prefix: &str) -> Vec<(String, String)> {
@@ -69,6 +82,29 @@ impl ConfigStore {
             .collect();
         entries.sort();
         entries
+    }
+
+    /// Why `eitri.config.set` refused to store `key`, when `init.lua` tried and was refused (a table, a function, a
+    /// string that is not UTF-8). The key then reads as unset, which for most settings is its default.
+    pub fn refusal_for(&self, key: &str) -> Option<String> {
+        self.init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().refusal_for("eitri.config.set", key))
+    }
+
+    /// The keys starting with `prefix` that `eitri.config.set` refused to store, with why.
+    pub fn refusals_under(&self, prefix: &str) -> Vec<(String, String)> {
+        self.init_refusals
+            .as_ref()
+            .map(|shared| shared.borrow().refusals_under("eitri.config.set", prefix))
+            .unwrap_or_default()
+    }
+
+    /// Stores `value` as the text of `key`, as `eitri.config.set` would, for the host to put a stricter value where
+    /// one was refused.
+    pub fn set_text(&mut self, key: &str, value: &str) {
+        self.origins.remove(key);
+        self.values.insert(key.to_string(), Stored::Text(value.to_string()));
     }
 
     /// The first set refusal recorded at the Lua function boundary during init.
@@ -200,7 +236,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
                 // `nil` unsets the key, as assigning `nil` removes a Lua table's entry. It is also what
                 // `os.getenv` gives for an unset variable.
                 Value::Nil => {
-                    store_for_set.borrow_mut().values.remove(&key);
+                    store_for_set.borrow_mut().unset(&key);
                     return Ok(());
                 }
                 Value::Boolean(on) => Ok(Stored::Switch(on)),
@@ -214,7 +250,12 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
             };
             match stored {
                 Ok(stored) => {
-                    store_for_set.borrow_mut().values.insert(key, stored);
+                    let mut store = store_for_set.borrow_mut();
+                    match super::kernel::caller_origin(lua) {
+                        Some(origin) => store.origins.insert(key.clone(), origin),
+                        None => store.origins.remove(&key),
+                    };
+                    store.values.insert(key, stored);
                     Ok(())
                 }
                 Err(why) => Err(mlua::Error::RuntimeError(format!(

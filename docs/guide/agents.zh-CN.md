@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=e6f04d9e72457bf3040477f845926171b0fc750665f475c0e6538fba187a7452 -->
+<!-- translated-from: agents.md sha256=da2c013c091c89e8842568a0c8bbb60463eabe0e69c1e65e449d6bebc1f7509c -->
 
 # Codex 与其他 agent
 
@@ -85,7 +85,7 @@ Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，�
   eitri.config.set("agent.default", "codex")    -- "claude"（默认）、"codex" 或一个已注册的名字
   ```
 
-  写别的值，Eitri 会在启动时停下，并给出一条点出这个键的消息。
+  写别的值，会回到默认值，Eitri 在启动时把它列出来并点出这个键。
 
 运行其他 agent 的标签页会在标签栏里写出它的名字；它的空标签页的菜单写的是 `New Codex session`（或者 `New` 加上 agent 的名字），上面一行里原来显示 Claude 账号的地方显示 agent 的名字。在你发送第一条消息、并且项目已经被问过（见下文）之前，什么都不会启动。`<prefix> i` 显示标签页的详情；这类标签页有它自己的几行，其中有 `runs without asking` 和 `mode lag`。
 
@@ -197,7 +197,7 @@ eitri.agent.register({
 - **`auto_mode`** 可选：agent 某个模式的 id。见[模式](#modes-and-the-agents-own-settings)。
 - **`read_only_mode`** 可选：在[不算边界的文件夹](permissions.zh-CN.md#a-folder-that-is-no-boundary)里代替 `auto_mode` 使用的模式 id。Eitri 不知道一个模式会做什么，所以要点名一个只读的模式。没有它时，agent 在这样的文件夹里保持平常的模式。
 
-任何其他键、或者不对的值，都会让 Eitri 在启动时停下并点出这个键，而且在调用外面包一层 `pcall` 也藏不住它。之后 `:tabnew myagent` 就打开一个它的标签页，`agent.default` 也可以写它的名字；`agent.default` 是在整个文件跑完之后才读的，所以它可以写在 `register` 调用的前面。
+任何其他键、或者不对的值，都会被拒绝：这个 agent 不会被注册，Eitri 在启动时把这次调用列出来并点出这个键，在调用外面包一层 `pcall` 也藏不住它。之后 `:tabnew myagent` 就打开一个它的标签页，`agent.default` 也可以写它的名字；`agent.default` 是在整个文件跑完之后才读的，所以它可以写在 `register` 调用的前面。
 
 <a id="trust-an-acp-agent-starts-only-after-a-yes"></a>
 ### 信任：ACP agent 只在你说了 yes 之后才启动

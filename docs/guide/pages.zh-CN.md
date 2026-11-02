@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=f2edc0b9e3de153f045e55c508342d4ee0498c58fd9ce64403251bd988f11cef -->
+<!-- translated-from: pages.md sha256=5f9dbdb72bc87a6e024f97c2fd4556f3e6628bd024b80b97443e320d15e24cae -->
 
 # 你自己做的页面
 
@@ -45,7 +45,7 @@ eitri.panel.register{
 
 - `url` 是 `panels/` 下的一个文件名；以 `/` 开头或带有协议（`file://`、`https://`、开发服务器的 `http://localhost:5173`、`data:`）时，原样使用。
 - `position` 只是第一次启动时的提示：之后窗口会记住你把面板放在哪里，而针对 `lua:status` 的[打开规则](configuration.zh-CN.md#where-a-new-module-opens)比它优先。
-- `key` 必须是一个字符，并且前缀后面没有别的东西在用：不能是默认键，不能是 stock tmux 在它的前缀后面绑定的键，不能是 `v`，也不能是 `E`、`A`、`T` 或 `V`。默认情况下 `b`、`g`、`h`、`j`、`k`、`u` 和 `y` 是空着的。冲突会让 Eitri 在启动时停下，并点出这个键和占着它的东西。
+- `key` 必须是一个字符，并且前缀后面没有别的东西在用：不能是默认键，不能是 stock tmux 在它的前缀后面绑定的键，不能是 `v`，也不能是 `E`、`A`、`T` 或 `V`。默认情况下 `b`、`g`、`h`、`j`、`k`、`u` 和 `y` 是空着的。冲突会让这个页面没有键，Eitri 在启动时把它列出来，并点出这个键和占着它的东西。
 - id 不能是 `terminal#2` 到 `terminal#9` 或 `agent#2` 到 `agent#9`；再次注册同一个 id 会替换之前的面板。
 - 这个页面是一个普通的网页视图：它的脚本会运行，它的链接在它自己里面打开，它可以访问网络。它没有通往 Eitri 的桥，拿不到配色，也没有按键工具包，所以需要这些的页面应该写成插件。Eitri 自己的按键（前缀、`Ctrl+h/j/k/l`）在那里照常有效，所以 `<prefix> e` 会带你回到编辑器。
 
@@ -58,7 +58,7 @@ eitri.panel.register{
 eitri.plugin.load("scratch", { key = "y" })
 ```
 
-`eitri.plugin.load` 只在 `init.lua` 运行期间被接受。它的选项是插件自己的设置、`key`（一个模块键，和 Lua 面板一样）以及 `position`。每次加载都会在你启动 Eitri 的那个终端里打印它用的是哪个目录。清单里的错误会让 Eitri 在启动时停下，并点出出错的那个键。
+`eitri.plugin.load` 只在 `init.lua` 运行期间被接受。它的选项是插件自己的设置、`key`（一个模块键，和 Lua 面板一样）以及 `position`。每次加载都会在你启动 Eitri 的那个终端里打印它用的是哪个目录。清单里有错误，这个页面就不加载，Eitri 在启动时把它列出来并点出出错的那个键。
 
 <a id="a-complete-example"></a>
 ### 一个完整的例子

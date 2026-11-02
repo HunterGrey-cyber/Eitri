@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=17c736066f3d884fa94b02888fd1ab9b9dd04c29cc9bc42697c54ab085ffca70 -->
+<!-- translated-from: configuration.md sha256=0495a006bddd734848cc77d2af89d1d1664507552cb3d8e80b64e0ecffd52d44 -->
 
 # 配置
 
@@ -9,7 +9,7 @@ Eitri 有一个配置文件，是一个在启动时运行一次的 Lua 脚本；
 
 Linux 上，若 `XDG_CONFIG_HOME` 非空且为绝对路径，Eitri 读取 `$XDG_CONFIG_HOME/eitri/init.lua`，否则读取 `~/.config/eitri/init.lua`。Mac 始终使用 `~/.config/eitri/init.lua`。把 `EITRI_CONFIG_DIR` 设成绝对路径，就改从那里读取 `init.lua`；空值视为未设置，相对路径会拒绝启动。不需要先创建文件：没有它，Eitri 用内置的默认值启动，并打印一行说明这一点。没有 `init.lua` 的第一次启动，它还会提议替你写一个很短的文件：见[首次启动](#first-start)。
 
-设置用 `eitri.config.set(key, value)` 来做。值是字符串、数字或布尔值（`true` 或 `false`）；`nil` 会把这个键重新取消设置。Eitri 保存不了的值（比如表或函数）会导致启动失败。
+设置用 `eitri.config.set(key, value)` 来做。值是字符串、数字或布尔值（`true` 或 `false`）；`nil` 会把这个键重新取消设置。Eitri 保存不了的值（比如表或函数）会被拒绝：这次调用什么也不做，Eitri 在启动时把它列出来。
 
 ```lua
 eitri.config.set("agent.restore", "auto")
@@ -18,9 +18,11 @@ eitri.config.set("review.hint", true)
 
 下面每个设置都遵循三条规则：
 
-- 设置不接受的值会让 Eitri 在启动时停下，并给出一条点出这个键的消息。拼错的值绝不会悄悄回退到默认值。
-- Eitri 不认识的键不是错误，也不起任何作用。
-- 文件本身的 Lua 错误（比如代码里的笔误）会打印在你启动 Eitri 的那个终端里，不会让启动中止：Eitri 会带着文件在出错之前已经设好的内容打开。
+- 设置不接受的值既不会让窗口停下，也不会悄悄回退。这个设置回到它的默认值，Eitri 在窗口打开时说一声：文件和行号、这个键、它接受什么。有两个例外。`agent.account` 仍然会让启动停下，因为窗口换到别的账号，会把会话写到那个账号里。另外，决定 agent 能做什么、加载什么的设置，会取更严格的一边，而不是默认值：`agent.default_mode` 写错，新标签页从 Manual 开始；`agent.user_settings` 写错，不加载你自己的 Claude Code 配置；`agent.editor.tools`（或 `agent.editor.tool.<name>`）写错，对应的编辑器工具关闭（工具名不存在时，全部关闭）。Eitri 会说明现在生效的是哪一边，直到你改好这一行为止。`eitri.config.set` 存不下的值，对这几个设置同样处理。
+- Eitri 不读的键什么也不做。如果它在 Eitri 的某个键族里（`agent.`、`window.`、`terminal.`、`editor.`、`keymap.`、`review.`、`companion.`、`plugins.`、`modules.`），或者和某个真正的键只差一个笔误，Eitri 会把它列出来，并给出它大概想写的那个键。你自己的键（由你自己的 Lua 用 `eitri.config.get` 读取）不受影响。
+- 文件本身的 Lua 错误（比如代码里的笔误）同样不会让启动中止：Eitri 会带着文件在出错之前已经设好的内容打开，并在窗口里说出文件和行号（语法错误会让整个文件都不生效，因为 Lua 在运行之前先读完整个文件）。同一份清单也会写到你启动 Eitri 的那个终端里（从桌面启动时写到 journal）。
+
+Eitri 说的方式是右上角的一条提示：有几个问题，以及前五个，停留 40 秒，多出来的会提示去终端里看。只要问题还在文件里，每次启动都会说。
 
 `require` 只在 `init.lua` 旁边的 `lua/` 目录下找模块：`require("mine")` 加载该配置目录下的 `lua/mine.lua` 或 `lua/mine/init.lua`，`require("a.b")` 加载 `lua/a/b.lua` 或 `lua/a/b/init.lua`。它从不在你打开的项目或当前目录里找，改动 `package.path` 或 `package.cpath` 也没有效果。
 
@@ -35,14 +37,14 @@ eitri.config.set("review.hint", true)
 | `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的基础字号，单位是像素。对话按基础字号的 12/14 绘制（回复、工具行和代码），所以读起来比编辑器的文字略小；面板底部的状态行按基础字号本身绘制，这样它和编辑器的状态栏对齐。不设置时，基础字号就是编辑器（`guifont`）的字号。 |
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `false` / `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
-| `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |
+| `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会被拒绝，这个设置保持未设置。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"`、`"off"` 或 `false` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |
 | `agent.user_settings` | `true` / `"on"` 或 `false` / `"off"` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `agent.editor.tools` | `true` / `"on"` 或 `false` / `"off"` | `true` | 任何标签页里的 agent 是否得到[编辑器工具](editor-tools.zh-CN.md)。`false` 一个都不声明；已经在运行的会话沿用它开始时的工具。 |
-| `agent.editor.tool.<name>` | `true` / `"on"` 或 `false` / `"off"` | `true`，`nvim_exec` 是 `false` | 按名字指定其中一个工具：`open_file`、`read_buffer`、`editor_state`、`diagnostics`、`usages`、`hover`、`symbols`、`lsp_rename`、`format`、`lsp_code_actions`、`apply_code_action`、`apply_proposal` 或 `nvim_exec`。每个工具都是开着的，除非你关掉；[`nvim_exec`](editor-tools.zh-CN.md#nvim-exec) 相反，你打开之前一直是关的。Eitri 不认识的名字会让启动失败，并指出是哪个键。 |
-| `agent.editor.follow` | `true` / `"on"` 或 `false` / `"off"` | `false` | 新标签页是否在编辑器里跟随 agent 已完成的修改（[编辑器工具](editor-tools.zh-CN.md#following)）。此后每个标签页自己的选择（`Space e`）优先。值不对会让启动失败，并指出是哪个键。 |
+| `agent.editor.tool.<name>` | `true` / `"on"` 或 `false` / `"off"` | `true`，`nvim_exec` 是 `false` | 按名字指定其中一个工具：`open_file`、`read_buffer`、`editor_state`、`diagnostics`、`usages`、`hover`、`symbols`、`lsp_rename`、`format`、`lsp_code_actions`、`apply_code_action`、`apply_proposal` 或 `nvim_exec`。每个工具都是开着的，除非你关掉；[`nvim_exec`](editor-tools.zh-CN.md#nvim-exec) 相反，你打开之前一直是关的。Eitri 不认识的名字会在启动时被列出并指出是哪个键，那个开关保持默认。 |
+| `agent.editor.follow` | `true` / `"on"` 或 `false` / `"off"` | `false` | 新标签页是否在编辑器里跟随 agent 已完成的修改（[编辑器工具](editor-tools.zh-CN.md#following)）。此后每个标签页自己的选择（`Space e`）优先。值不对会在启动时被列出并指出是哪个键，设置保持关闭。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
@@ -52,7 +54,7 @@ eitri.config.set("review.hint", true)
 | `keymap.which_key_delay` | 0 到 5000 之间的整数，或 `false` / `"off"` | `"off"` | 前缀等第二个键等多少毫秒后，用一个面板列出接下来可以按的键；`0` 立刻显示。见[提示面板](keys.zh-CN.md#the-hint-panel)。companion 窗口和 Mac 上不画。 |
 | `keymap.nvim_prefix` | 一个最长 16 个字符的 Neovim 左端（`"<leader>W"`），或 `false` / `"off"` | `"off"` | 在 Neovim 的 Normal 模式里，把你前缀表里的布局键映射到这个左端之下，每个键运行对应的 `:Eitri` 动作。见[从 Neovim 用：`:Eitri`](keys.zh-CN.md#from-neovim-eitri)。 |
 | `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2，以及合成器窗口组的窗口 1 是否恢复它的窗口、它们的输出和底部终端。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)和[合成器窗口](compositor-windows.zh-CN.md#coming-back)。 |
-| `window.tiling` | `"auto"`、`"eitri"` 或 `"compositor"` | `"auto"` | 聊天和页面由谁排布。`"auto"` 在 Hyprland、sway 或 niri 回答时让它们成为窗口管理器的窗口，在别的地方留在 Eitri 的窗口里；`"eitri"` 留在里面；`"compositor"` 在任何 Wayland 桌面上都让它们成为窗口。其他值会让启动停下。见[合成器窗口](compositor-windows.zh-CN.md)。 |
+| `window.tiling` | `"auto"`、`"eitri"` 或 `"compositor"` | `"auto"` | 聊天和页面由谁排布。`"auto"` 在 Hyprland、sway 或 niri 回答时让它们成为窗口管理器的窗口，在别的地方留在 Eitri 的窗口里；`"eitri"` 留在里面；`"compositor"` 在任何 Wayland 桌面上都让它们成为窗口。其他值会在启动时被列出，设置保持 `"auto"`。见[合成器窗口](compositor-windows.zh-CN.md)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
 设置只在窗口启动时读取一次。改了 `init.lua` 之后，开一个新窗口才会生效。
@@ -60,7 +62,7 @@ eitri.config.set("review.hint", true)
 <a id="registering-another-agent"></a>
 ## 注册另一个 agent
 
-`eitri.agent.register` 不是一个设置：它接受一个表，加入一个通过标准输入输出说 ACP 的 agent，这样 `:tabnew NAME` 和 `agent.default` 就能用它。它的各个键、信任问题对它做什么，以及 Eitri 能为这样的 agent 做什么、不能做什么，都在 [Codex 与其他 agent](agents.zh-CN.md#other-agents-over-acp) 里。注册有问题，Eitri 会在启动时停下并点出那个键。
+`eitri.agent.register` 不是一个设置：它接受一个表，加入一个通过标准输入输出说 ACP 的 agent，这样 `:tabnew NAME` 和 `agent.default` 就能用它。它的各个键、信任问题对它做什么，以及 Eitri 能为这样的 agent 做什么、不能做什么，都在 [Codex 与其他 agent](agents.zh-CN.md#other-agents-over-acp) 里。注册有问题会被拒绝，Eitri 在启动时把它列出来并点出那个键，这个 agent 不会被注册。
 
 <a id="keys"></a>
 ## 按键
@@ -75,7 +77,7 @@ k.del("prefix", "%")                          -- remove a default binding
 k.set("root", "M-z", "zoom")                  -- a key that works without the prefix
 ```
 
-`k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。`"root"` 表放的是不带前缀就生效的键：它一开始是空的，只收 Ctrl 和 Alt 组合键，它能运行什么、拒绝什么、Eitri 何时警告，见[按键](keys.zh-CN.md#keys-without-the-prefix)。错误的键、不认识的动作或者两个互相冲突的绑定，会让 Eitri 在启动时停下，并给出一条点出这次调用的消息，所以笔误不会留给你一套你没有写过的按键映射。[按键](keys.zh-CN.md)列出了默认值和这些动作。
+`k.prefix(key)` 改前缀，`k.set(table, key, action, options)` 绑定一个键，`k.del(table, key)` 去掉一个。`"root"` 表放的是不带前缀就生效的键：它一开始是空的，只收 Ctrl 和 Alt 组合键，它能运行什么、拒绝什么、Eitri 何时警告，见[按键](keys.zh-CN.md#keys-without-the-prefix)。错误的键、不认识的动作或者和 Eitri 保留的键冲突的绑定，会被略过，并在启动时用一条点出这次调用的消息列出来，所以笔误不会悄无声息。[按键](keys.zh-CN.md)列出了默认值和这些动作。
 
 面板的 `"panel"` 表中，`model.pick` 和 `effort.pick` 分别是 `<leader>M` 和 `<leader>E` 的动作名。
 重新绑定前先删除默认绑定；例如，把模型选择器移到 `<leader>p`：
@@ -216,7 +218,7 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- 终端
 
 - **目标**是一个种类（`"terminal"` 或 `"agent"`，对这种模块里没有自己规则的每个实例都有效；`"terminal"` 也包括基础的 `terminal`，而 `"agent"` 只管编号的聊天视图 `agent#2` 到 `agent#9`，因为第一个聊天视图总是开在侧边，或者开在布局文件给它的位置），或者一个模块：`"terminal#2"`、`"agent#3"`、Lua 面板的 `"lua:notes"`、`"editor"`。一个目标只能有一条规则；指向 Eitri 不认识的东西的目标会让启动停下，并点名那次调用。
 - **选项**有 `at`（一个位置，见下）、`float`（布尔值）、`size`、`scratchpad`（布尔值：它浮动并以收起的状态打开，隐含 `float`）和 `focus`（布尔值，默认 `true`：新模块是否拿到按键；`false` 时按键留在原处，除非新模块取代了拿着按键的编辑器）。`at` 是下面之一：`side`（整个窗口右边的新列）、`bottom`（整个窗口下面的新行）、`main`（取代编辑器的位置，编辑器被隐藏）、`below-editor`（编辑器那一列下面的一行，终端的默认位置）、`right`、`below`、`left`、`above`（在拿着按键的模块旁边，占它一半的空间）和 `tab`（作为拿着按键的模块所在容器的一个标签页；那个容器是分割式时，会和它一起变成一个标签页式容器）。`size` 在模块平铺时是它在容器里所占的比例（大于 0 小于 1 的数），浮动时是 `{ w, h }` 或 `{ w = ..., h = ... }`，是窗口的比例，大于 0 且不超过 1；浮动窗口没有给大小时，居中打开，每个方向占窗口的 60%。
-- **会被拒绝的**，会让启动停下并点名那次调用：不在上面这些里的选项、类型不对或超出范围的值、写成表的平铺大小或写成数字的浮动大小、`float` 或 `scratchpad` 与 `at` 同时给出、浮动的编辑器（编辑器永远不浮动；编辑器的其他规则会被接受，但永远不会生效，因为没有什么会去打开编辑器）、既不是种类也不是模块 id 的目标，以及同一目标的第二条规则。规则的错误即使被你的 Lua 捕获也会让启动停下。
+- **会被拒绝的**，在启动时列出并点名那次调用，这条规则不生效：不在上面这些里的选项、类型不对或超出范围的值、写成表的平铺大小或写成数字的浮动大小、`float` 或 `scratchpad` 与 `at` 同时给出、浮动的编辑器（编辑器永远不浮动；编辑器的其他规则会被接受，但永远不会生效，因为没有什么会去打开编辑器）、既不是种类也不是模块 id 的目标，以及同一目标的第二条规则。被拒绝的规则即使被你的 Lua 捕获也会被列出来。
 - **哪条规则优先。** 先是模块自己 id 的规则，然后是它种类的规则，然后是 Lua 面板自己的 `position`，最后是它打开的那个场合的内置默认：新的终端或聊天视图和拆出来的标签页，开在拿着按键的模块右边（拆出来的标签页是基础视图的右边）；启动时放下的模块，或者关掉之后回来的模块，放在它一直在的地方（终端在编辑器下面，Lua 面板在它的 `position`）。没有任何模块拿着按键时（第一次启动，或者启动时读到的布局文件），`right`、`left` 和 `tab` 变成 `side`，`below` 和 `above` 变成 `bottom`，要求了它们的规则会在日志里留一条提示。
 - **规则永远不决定的事。** 自己说明了放在哪里的操作永远优先：分割键、移动、拖动、`eitri.layout.float`。已保存的布局永远不会被规则改动，来自 `eitri.layout.default` 或 `eitri.layout.workspace` 的布局会放下它点名的模块（在[插件自己的窗口](#plugins)里，插件自己的布局排在前面，它的页面每次启动都会被放回去）。已保存的布局或模板里没有、而规则想让它浮动的模块，会以平铺的方式回到它的后备位置，处于隐藏状态，并留下一条提示说明位置。新模块会隐藏着加进其他工作区，放在它的规则或种类给它的位置。
 
@@ -261,7 +263,7 @@ eitri.config.set("plugins.keys.scroll_step", 80)
 eitri.config.set("plugins.keys.find_case", "ignore")
 ```
 
-它们只在窗口启动时读取一次；超出这些范围的值会让 Eitri 在启动时停下，并点出那个键。页面自己的按键在它的 `plugin:<id>` 表里用 `eitri.keymap.set` 修改。
+它们只在窗口启动时读取一次；超出这些范围的值会在启动时被拒绝并列出，点出那个键。页面自己的按键在它的 `plugin:<id>` 表里用 `eitri.keymap.set` 修改。
 
 <a id="how-a-launch-starts"></a>
 ## 一次启动怎样开始

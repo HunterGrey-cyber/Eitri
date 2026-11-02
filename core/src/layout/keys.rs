@@ -138,47 +138,66 @@ impl ModuleKeys {
     pub fn build(lua: &[(ModuleId, Option<String>)], keymap: &Keymap) -> Result<ModuleKeys, KeyError> {
         let mut keys = ModuleKeys::built_in();
         for (id, key) in lua {
-            let Some(text) = key else { continue };
-            let panel = id.as_str().trim_start_matches("lua:").to_string();
-            let mut chars = text.chars();
-            let key = match (chars.next(), chars.next()) {
-                (Some(c), None) if !c.is_whitespace() && !c.is_control() => c,
-                _ => {
-                    return Err(KeyError::Malformed {
-                        panel,
-                        key: text.clone(),
-                    })
-                }
-            };
-            let spec = KeySpec::char(key, false, false);
-            if let Some(binding) = keymap.lookup(&spec) {
-                return Err(KeyError::Bound {
-                    panel,
-                    key,
-                    prefix: keymap.prefix().human(),
-                    action: binding.action.name(),
-                    source: binding.source,
-                });
-            }
-            if key == RESERVED_FOR_CANVAS {
-                return Err(KeyError::Reserved { panel, key });
-            }
-            if BUILT_IN_CAPITALS.contains(&key) {
-                return Err(KeyError::ShiftOfBuiltIn { panel, key });
-            }
-            if let Some(command) = stock::stock_command(&spec) {
-                return Err(KeyError::StockTmux { panel, key, command });
-            }
-            if let Some(by) = keys.module(key) {
-                return Err(KeyError::Taken {
-                    panel,
-                    key,
-                    by: by.as_str().trim_start_matches("lua:").to_string(),
-                });
-            }
-            keys.keys.push((key, id.clone()));
+            keys.add_lua(id, key.as_deref(), keymap)?;
         }
         Ok(keys)
+    }
+
+    /// [`ModuleKeys::build`] for a window that opens whatever `init.lua` did: a panel whose key cannot be one has no
+    /// key, and its error is returned beside the keys, in the order of the panels.
+    pub fn build_settled(lua: &[(ModuleId, Option<String>)], keymap: &Keymap) -> (ModuleKeys, Vec<KeyError>) {
+        let mut keys = ModuleKeys::built_in();
+        let mut refused = Vec::new();
+        for (id, key) in lua {
+            if let Err(error) = keys.add_lua(id, key.as_deref(), keymap) {
+                refused.push(error);
+            }
+        }
+        (keys, refused)
+    }
+
+    /// Adds the Lua panel `id`'s key `text`, if it has one and can have it.
+    fn add_lua(&mut self, id: &ModuleId, text: Option<&str>, keymap: &Keymap) -> Result<(), KeyError> {
+        let Some(text) = text else { return Ok(()) };
+        let panel = id.as_str().trim_start_matches("lua:").to_string();
+        let mut chars = text.chars();
+        let key = match (chars.next(), chars.next()) {
+            (Some(c), None) if !c.is_whitespace() && !c.is_control() => c,
+            _ => {
+                return Err(KeyError::Malformed {
+                    panel,
+                    key: text.to_string(),
+                })
+            }
+        };
+        let spec = KeySpec::char(key, false, false);
+        if let Some(binding) = keymap.lookup(&spec) {
+            return Err(KeyError::Bound {
+                panel,
+                key,
+                prefix: keymap.prefix().human(),
+                action: binding.action.name(),
+                source: binding.source,
+            });
+        }
+        if key == RESERVED_FOR_CANVAS {
+            return Err(KeyError::Reserved { panel, key });
+        }
+        if BUILT_IN_CAPITALS.contains(&key) {
+            return Err(KeyError::ShiftOfBuiltIn { panel, key });
+        }
+        if let Some(command) = stock::stock_command(&spec) {
+            return Err(KeyError::StockTmux { panel, key, command });
+        }
+        if let Some(by) = self.module(key) {
+            return Err(KeyError::Taken {
+                panel,
+                key,
+                by: by.as_str().trim_start_matches("lua:").to_string(),
+            });
+        }
+        self.keys.push((key, id.clone()));
+        Ok(())
     }
 
     /// The module `key` names.

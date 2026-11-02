@@ -1,13 +1,16 @@
 //! Every `init.lua` key a window reads at startup, in one place.
 //!
 //! `build_ui` used to read these inline. They are a unit of their own so a window that is not the
-//! full editor-plus-agent one reads exactly the same keys, with the same startup-failure texts: a
-//! bad value is a hard failure naming its key, never a silent fallback.
+//! full editor-plus-agent one reads exactly the same keys. A value that is not one is the key's default and a line
+//! in the kernel's startup problems, said in the window (`startup_config`); the one setting with no fallback is
+//! `agent.account`, whose refusal still stops the start.
 
 use std::rc::Rc;
 
 use crate::agent_panel::{AgentPanelHandle, ReviewConfig};
 use eitri_core::lua::kernel::Kernel;
+
+pub use crate::startup_config::settle;
 
 /// A Lua panel as `load` needs to know it: the id `module.<id>` may name, and the key its owner
 /// gave it. A host with no Lua panels passes none. (`shell` keeps the panels themselves, which hold
@@ -103,7 +106,10 @@ pub fn parse_tiling(raw: Option<&str>) -> Result<eitri_core::compositor::mode::T
 }
 
 /// `compositor` mode needs a Wayland compositor: on macOS it is refused, naming the key.
-fn refuse_compositor_on_mac(choice: eitri_core::compositor::mode::TilingChoice, mac: bool) -> Result<(), String> {
+pub(crate) fn refuse_compositor_on_mac(
+    choice: eitri_core::compositor::mode::TilingChoice,
+    mac: bool,
+) -> Result<(), String> {
     if mac && choice == eitri_core::compositor::mode::TilingChoice::Compositor {
         return Err(format!(
             "{} = \"compositor\" is not available on macOS",
@@ -158,6 +164,12 @@ fn lua_claims(kernel: &Kernel, panels: &[LuaPanelMeta]) -> eitri_core::keymap::L
 /// a silent fallback to "whichever shell launched this window", which is the accident that made a
 /// resumed session open empty on 2026-09-21 (see `agent::account`).
 pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String> {
+    settle(kernel);
+    read(kernel, panels)
+}
+
+/// [`load`] without the settling: the first setting that is not one is the `Err`.
+fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String> {
     let panel_font_size = parse_panel_font_size(kernel.config.borrow().get("agent.font_size"))?;
     let panel_font_follows_editor = kernel.config.borrow().get("agent.font_size").is_none();
 
@@ -241,6 +253,11 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         kernel.config.borrow().get(eitri_core::attention::ChatOnPermission::KEY),
     )?;
 
+    // The one setting with no default to fall back on: a value for it that could not be stored must not leave the
+    // window on whichever account the launching shell had.
+    if let Some(why) = kernel.config.borrow().refusal_for("agent.account") {
+        return Err(format!("the configured claude account is unusable: {why}"));
+    }
     if let Some((account, source)) = resolve_account(&kernel.config.borrow(), |key| std::env::var(key).ok())? {
         eprintln!(
             "[account] claude account '{}' from {source} -> {}",
@@ -253,10 +270,9 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     // The keymap: stock tmux's defaults, prefix `Ctrl+b`, then the user's own
     // tmux config read from tmux's files (unless `keymap.from_tmux` is "off"), then `init.lua`'s
     // `eitri.keymap` calls. The tmux import never stops the window from opening: what it cannot
-    // take is listed in the `?` overlay. A bad key, an unknown action or option, or a collision in
-    // `init.lua` is a startup failure naming both sides, as `agent.font_size` is -- never a keymap
-    // nobody wrote. The import yields to what `init.lua` registered, so a config that started
-    // before it still starts.
+    // take is listed in the `?` overlay. An `init.lua` call that cannot be applied (a bad key, an unknown action
+    // or option, a collision with a key Eitri keeps) is left out and said; a `set` on a default key takes it.
+    // The import yields to what `init.lua` registered, so a config that started before it still starts.
     let lua_panel_ids: Vec<String> = panels.iter().map(|p| p.id.clone()).collect();
     let lua_claims = lua_claims(kernel, panels);
     let from_tmux = kernel
@@ -265,16 +281,18 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         .get(eitri_core::keymap::tmux::SETTING)
         .map(str::to_owned);
     let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let (keymap, tmux_import) = match eitri_core::keymap::Keymap::for_startup(
+    let settled = eitri_core::keymap::Keymap::for_startup_settled(
         kernel.keymap.borrow().ops(),
+        kernel.keymap.borrow().origins(),
         &lua_panel_ids,
         from_tmux.as_deref(),
         eitri_core::keymap::tmux::TmuxEnv::from_process,
         &lua_claims,
-    ) {
-        Ok((keymap, import)) => (Rc::new(keymap), import),
-        Err(err) => return Err(err.to_string()),
-    };
+    );
+    for problem in settled.problems {
+        kernel.report_problem(problem);
+    }
+    let (keymap, tmux_import) = (Rc::new(settled.keymap), settled.import);
     eprintln!(
         "{}",
         eitri_core::keymap::tmux::notice::log_line(tmux_import.as_ref(), home_dir.as_deref())
@@ -286,7 +304,9 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     // Collision rule 4: a Lua command's accelerator that is the prefix or a root chord would never fire.
     for (id, entry) in kernel.commands.borrow().iter() {
         if let Some(keybinding) = &entry.keybinding {
-            eitri_core::keymap::check_command_keybinding(id, keybinding, &keymap).map_err(|err| err.to_string())?;
+            if let Err(err) = eitri_core::keymap::check_command_keybinding(id, keybinding, &keymap) {
+                kernel.report_problem(format!("{err}; the command is registered and the key does nothing"));
+            }
         }
     }
     println!(
@@ -505,9 +525,9 @@ mod tests {
     fn load_checks_eitri_codex() {
         use eitri_core::source_scan as scan;
         let read = scan::rust_sources(&["panel/src"]);
-        let source = scan::file_with(&read, "pub fn load(kernel: &Kernel");
+        let source = scan::file_with(&read, "fn read(kernel: &Kernel");
         let code = scan::code_only(&source.text);
-        let load = scan::functions(&code, "load");
+        let load = scan::functions(&code, "read");
         assert_eq!(load.len(), 1, "load not found");
         assert_eq!(scan::calls(load[0], "check_codex_env"), 1);
         assert!(load[0].contains("CODEX_ENV"));
@@ -643,9 +663,120 @@ mod tests {
         .unwrap();
         let kernel = Kernel::new(scratch.clone(), eitri_core::lua::kernel::refuse_panels).unwrap();
         let ran = kernel.run_and_check_init_file(&init);
-        let loaded = ran.and_then(|()| load(&kernel, panels));
+        let loaded = ran.and_then(|()| read(&kernel, panels));
         std::fs::remove_dir_all(&scratch).unwrap();
         loaded
+    }
+
+    /// [`load`] on `init_lua` the way a window runs it: whatever the file did, a window config and the problems it
+    /// had on the way.
+    fn settled_from(init_lua: &str) -> (WindowConfig, Vec<String>) {
+        let scratch = std::env::temp_dir().join(format!("eitri-window-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let init = scratch.join("init.lua");
+        std::fs::write(
+            &init,
+            format!("eitri.config.set(\"keymap.from_tmux\", \"off\")\n{init_lua}"),
+        )
+        .unwrap();
+        let kernel = Kernel::new(scratch.clone(), eitri_core::lua::kernel::refuse_panels).unwrap();
+        kernel.load_init_file(&init);
+        let config = load(&kernel, &[]).expect("a window opens whatever init.lua did");
+        let problems = kernel.startup_problems();
+        std::fs::remove_dir_all(&scratch).unwrap();
+        (config, problems)
+    }
+
+    #[test]
+    fn an_account_that_could_not_be_stored_still_stops_the_start() {
+        let scratch = std::env::temp_dir().join(format!("eitri-window-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let init = scratch.join("init.lua");
+        std::fs::write(&init, "eitri.config.set('agent.account', {})\n").unwrap();
+        let kernel = Kernel::new(scratch.clone(), eitri_core::lua::kernel::refuse_panels).unwrap();
+        kernel.load_init_file(&init);
+        let err = load(&kernel, &[]).err().expect("no fallback account");
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(err.contains("agent.account") && err.contains("unusable"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_default_mode_starts_new_tabs_in_manual() {
+        let (config, problems) = settled_from("eitri.config.set('agent.default_mode', 'manaul')\n");
+        assert_eq!(
+            config.default_mode,
+            Some(eitri_core::agent_bridge::SessionModeChoice::Manual)
+        );
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("new tabs start in Manual until it is fixed"),
+            "{problems:#?}"
+        );
+        let (config, _) = settled_from("pcall(eitri.config.set, 'agent.default_mode', {})\n");
+        assert_eq!(
+            config.default_mode,
+            Some(eitri_core::agent_bridge::SessionModeChoice::Manual)
+        );
+        let (config, problems) = settled_from("eitri.config.set('agent.default_mode', 'bypass')\n");
+        assert_eq!(
+            config.default_mode,
+            Some(eitri_core::agent_bridge::SessionModeChoice::Bypass)
+        );
+        assert!(problems.is_empty(), "a good value is the person's own: {problems:#?}");
+    }
+
+    #[test]
+    fn every_bad_value_opens_the_window_on_its_default_and_is_said() {
+        let (config, problems) = settled_from(
+            "eitri.config.set('agent.font_size', 'big')\n\
+             eitri.config.set('agent.restore', 'sometimes')\n\
+             eitri.config.set('window.tiling', 'weird')\n\
+             eitri.config.set('review.enabled', 'perhaps')\n\
+             eitri.config.set('agent.editor.tools', 'some')\n\
+             eitri.config.set('keymap.which_key_delay', 99999)\n",
+        );
+        assert_eq!(problems.len(), 6, "{problems:#?}");
+        for key in [
+            "agent.font_size",
+            "agent.restore",
+            "window.tiling",
+            "review.enabled",
+            "agent.editor.tools",
+            "keymap.which_key_delay",
+        ] {
+            assert!(problems.iter().any(|line| line.contains(key)), "{key}: {problems:#?}");
+        }
+        assert!(config.panel_font_follows_editor, "an unset size follows the editor");
+        assert_eq!(config.typing_cadence, load_defaults().typing_cadence);
+        assert!(config.review.enabled);
+        assert_eq!(config.which_key_delay, None);
+    }
+
+    fn load_defaults() -> WindowConfig {
+        settled_from("").0
+    }
+
+    #[test]
+    fn a_keymap_call_that_cannot_be_applied_is_left_out_and_the_rest_binds() {
+        let (config, problems) = settled_from(
+            "eitri.keymap.set('prefix', 'g', 'no.such.action')\n\
+             eitri.keymap.set('prefix', 'l', 'zoom')\n\
+             eitri.keymap.set('panel', '<leader>e', 'tab.last')\n",
+        );
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("no.such.action") && problems[0].contains("left out"),
+            "{problems:#?}"
+        );
+        let l = eitri_core::keymap::KeySpec::parse("l").unwrap();
+        assert_eq!(
+            config.keymap.lookup(&l).unwrap().action,
+            eitri_core::keymap::Action::Zoom
+        );
+        assert_eq!(
+            config.keymap.user_overrides(),
+            ["prefix l (was tab.last)", "panel <leader>e (was tab.follow)"]
+        );
     }
 
     #[test]
@@ -850,8 +981,13 @@ mod tests {
             .bindings()
             .iter()
             .any(|b| format!("{:?}", b.action).contains("notes")));
-        let err = load_from(init, &[]).err().expect("no such panel");
-        assert!(err.contains("module.notes"), "{err}");
+        let (config, problems) = settled_from(init);
+        assert_eq!(problems.len(), 1, "no such panel: {problems:?}");
+        assert!(problems[0].contains("module.notes"), "{problems:?}");
+        assert!(config
+            .keymap
+            .lookup(&eitri_core::keymap::KeySpec::parse("N").unwrap())
+            .is_none());
     }
 
     /// A Lua panel's key is claimed against the tmux import (a tmux binding of that key is skipped, so a

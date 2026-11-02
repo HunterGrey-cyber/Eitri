@@ -64,6 +64,16 @@ pub struct Keymap {
     root: Vec<Binding>,
     /// What the tmux import had set that a root key took over, one sentence each, for the launch log.
     dropped_for_root: Vec<String>,
+    /// The defaults a prefix-table `set` of `init.lua` took over, `(key, action it replaced)`.
+    overrides: Vec<(String, String)>,
+}
+
+/// What [`Keymap::for_startup_settled`] made: the keymap, the tmux import's record, and what `init.lua` asked of
+/// the keymap that could not be done.
+pub struct StartupKeymap {
+    pub keymap: Keymap,
+    pub import: Option<TmuxImport>,
+    pub problems: Vec<String>,
 }
 
 /// One `eitri.keymap` call, as `core::lua::keymap` recorded it -- raw, so every error is found
@@ -115,14 +125,6 @@ pub enum KeymapError {
         call: String,
         error: ActionError,
     },
-    AlreadyBound {
-        call: String,
-        /// The table the key is in, for the `del` hint.
-        table: &'static str,
-        key: KeySpec,
-        bound_to: String,
-        source: Source,
-    },
     NotBound {
         call: String,
         key: KeySpec,
@@ -173,6 +175,28 @@ pub enum KeymapError {
     },
 }
 
+impl KeymapError {
+    /// The `init.lua` call the error is about, as [`KeymapOp::call`] writes it, when it names one.
+    fn call(&self) -> Option<String> {
+        match self {
+            KeymapError::Recorded(message) => Some(message.clone()),
+            KeymapError::UnknownTable { call, .. }
+            | KeymapError::BadKey { call, .. }
+            | KeymapError::Action { call, .. }
+            | KeymapError::NotBound { call, .. }
+            | KeymapError::PrefixNotAChord { call }
+            | KeymapError::PrefixIsRoot { call, .. }
+            | KeymapError::RootNotAChord { call }
+            | KeymapError::RootAction { call, .. }
+            | KeymapError::RootRepeatable { call }
+            | KeymapError::RootCollides { call, .. }
+            | KeymapError::Panel { call, .. }
+            | KeymapError::PluginKey { call, .. } => Some(call.clone()),
+            KeymapError::CommandKeybinding { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for KeymapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -185,19 +209,6 @@ impl fmt::Display for KeymapError {
             }
             KeymapError::BadKey { call, error } => write!(f, "{call}: {error}"),
             KeymapError::Action { call, error } => write!(f, "{call}: {error}"),
-            KeymapError::AlreadyBound {
-                call,
-                table,
-                key,
-                bound_to,
-                source,
-            } => {
-                let key = key.to_string();
-                write!(
-                    f,
-                    "{call}: {key:?} is already bound to {bound_to} ({source}); eitri.keymap.del({table:?}, {key:?}) first"
-                )
-            }
             KeymapError::NotBound { call, key } => {
                 write!(
                     f,
@@ -633,6 +644,97 @@ impl Keymap {
         Ok((map, import))
     }
 
+    /// [`Keymap::for_startup`] for a window that opens whatever `init.lua` did: a call that cannot be applied (a bad key,
+    /// an unknown action, a key that collides with one Eitri keeps) is left out, and what went wrong with it is
+    /// returned beside the keymap, one line each. `from_tmux` is `keymap.from_tmux` as the config validation left
+    /// it, so it is never a bad value here.
+    pub fn for_startup_settled(
+        ops: &[KeymapOp],
+        origins: &[Option<String>],
+        lua_panels: &[String],
+        from_tmux: Option<&str>,
+        env: impl FnOnce() -> super::tmux::TmuxEnv,
+        claims: &LuaClaims,
+    ) -> StartupKeymap {
+        let (base, import) = if super::tmux::enabled(from_tmux).unwrap_or(true) {
+            let (map, import) = Keymap::with_tmux(&super::tmux::read(&env()), claims);
+            (map, Some(import))
+        } else {
+            (Keymap::defaults(), None)
+        };
+        let (keymap, problems) = base.then_user_settled(ops, origins, lua_panels);
+        let import = import.map(|mut import| {
+            if import.prefix.is_some_and(|p| *keymap.prefix() != p) {
+                import.prefix = None;
+            }
+            import.bindings.retain(|b| keymap.root_lookup(&b.key).is_none());
+            import
+        });
+        StartupKeymap {
+            keymap,
+            import,
+            problems,
+        }
+    }
+
+    /// [`Keymap::then_user`] that leaves out the call an error names and tries again, until what is left applies:
+    /// the keymap, and one line for each call left out, led by `origins[i]` (where the call was made) when it is known.
+    /// An error that names no call of `ops` leaves all of them out.
+    pub fn then_user_settled(
+        &self,
+        ops: &[KeymapOp],
+        origins: &[Option<String>],
+        lua_panels: &[String],
+    ) -> (Keymap, Vec<String>) {
+        // The calls still in play, as their places in `ops`.
+        let mut kept: Vec<usize> = (0..ops.len()).collect();
+        let mut left_out = Vec::new();
+        let applied = |kept: &[usize]| {
+            let calls: Vec<KeymapOp> = kept.iter().map(|&at| ops[at].clone()).collect();
+            self.clone().then_user(&calls, lua_panels)
+        };
+        loop {
+            match applied(&kept) {
+                Ok(map) => return (map, left_out),
+                Err(error) => {
+                    // What the base alone cannot hold is not for a call to fix; no call left is the end.
+                    if kept.is_empty() {
+                        left_out.push(format!("{error} -- left out"));
+                        return (self.clone(), left_out);
+                    }
+                    // Two calls can read alike (`set("prefix", "g", ...)` twice, one of them bad): the one whose
+                    // removal changes the error is the culprit, the latest of them when none does.
+                    let named = error.call();
+                    let candidates: Vec<usize> = kept
+                        .iter()
+                        .copied()
+                        .filter(|&at| named.as_deref() == Some(ops[at].call().as_str()))
+                        .collect();
+                    let culprit = candidates
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&candidate| {
+                            let rest: Vec<usize> = kept.iter().copied().filter(|&at| at != candidate).collect();
+                            applied(&rest)
+                                .err()
+                                .is_none_or(|next| next.to_string() != error.to_string())
+                        })
+                        .or(candidates.last().copied());
+                    let line = match culprit.and_then(|at| origins.get(at)).and_then(Option::as_ref) {
+                        Some(origin) => format!("{origin}: {error} -- left out"),
+                        None => format!("{error} -- left out"),
+                    };
+                    left_out.push(line);
+                    match culprit {
+                        Some(at) => kept.retain(|&k| k != at),
+                        None => kept.clear(),
+                    }
+                }
+            }
+        }
+    }
+
     /// Stock tmux's prefix `C-b` and its default table.
     pub fn defaults() -> Keymap {
         Keymap {
@@ -643,6 +745,7 @@ impl Keymap {
             removed_by_import: Vec::new(),
             root: Vec::new(),
             dropped_for_root: Vec::new(),
+            overrides: Vec::new(),
         }
     }
 
@@ -719,15 +822,10 @@ impl Keymap {
                         if parsed.repeatable {
                             return Err(KeymapError::RootRepeatable { call: op.call() });
                         }
-                        if let Some(existing) = map.root.iter().find(|b| b.key == spec) {
-                            return Err(KeymapError::AlreadyBound {
-                                call: op.call(),
-                                table: "root",
-                                key: spec,
-                                bound_to: existing.action.name(),
-                                source: existing.source,
-                            });
-                        }
+                        // The table holds only `init.lua`'s own keys, so a key bound already was bound by an
+                        // earlier call: the last one wins.
+                        map.root.retain(|b| b.key != spec);
+                        root_calls.retain(|(k, _)| *k != spec);
                         map.root.push(Binding {
                             key: spec,
                             action: parsed.action,
@@ -746,17 +844,14 @@ impl Keymap {
                             repeatable: parsed.repeatable,
                             source: Source::User,
                         };
+                        // What the import or an earlier call bound is replaced without a word; a default is
+                        // replaced too, and recorded, since the person may not know the key was taken.
                         match map.bindings.iter().position(|b| b.key == spec) {
-                            Some(at) if map.bindings[at].source == Source::Tmux => map.bindings[at] = binding,
                             Some(at) => {
-                                let existing = &map.bindings[at];
-                                return Err(KeymapError::AlreadyBound {
-                                    call: op.call(),
-                                    table: "prefix",
-                                    key: spec,
-                                    bound_to: existing.action.name(),
-                                    source: existing.source,
-                                });
+                                let replaced = std::mem::replace(&mut map.bindings[at], binding);
+                                if replaced.source == Source::Default {
+                                    map.overrides.push((spec.to_string(), replaced.action.name()));
+                                }
                             }
                             None => map.bindings.push(binding),
                         }
@@ -793,6 +888,7 @@ impl Keymap {
                         match map.bindings.iter().position(|b| b.key == spec) {
                             Some(at) => {
                                 map.bindings.remove(at);
+                                map.overrides.retain(|(taken, _)| *taken != spec.to_string());
                             }
                             None if map.removed_by_import.contains(&spec) => {}
                             None => {
@@ -909,6 +1005,21 @@ impl Keymap {
     /// What the tmux import set that a root key took over, one sentence each.
     pub fn dropped_for_root(&self) -> &[String] {
         &self.dropped_for_root
+    }
+
+    /// The defaults `init.lua`'s `set` calls took over, one `table key (was action)` each, in the order of the
+    /// calls: the prefix table's, then the panel's.
+    pub fn user_overrides(&self) -> Vec<String> {
+        let prefix = self
+            .overrides
+            .iter()
+            .map(|(key, was)| format!("prefix {key} (was {was})"));
+        let panel = self
+            .panel_user
+            .overrides
+            .iter()
+            .map(|(key, was)| format!("panel {key} (was {was})"));
+        prefix.chain(panel).collect()
     }
 
     pub fn lookup(&self, key: &KeySpec) -> Option<&Binding> {
@@ -1225,11 +1336,9 @@ mod tests {
             "unbind -a removes it as it removes the other tmux defaults"
         );
         assert_eq!(map.keys_for(&Action::TabBreak).len(), 1, "one default key");
-        let err = Keymap::apply_user(&[set("!", "zoom")], &[]).unwrap_err().to_string();
-        assert!(
-            err.contains("tab.break (default)") && err.contains("eitri.keymap.del(\"prefix\", \"!\")"),
-            "{err}"
-        );
+        let taken = Keymap::apply_user(&[set("!", "zoom")], &[]).unwrap();
+        assert_eq!(taken.lookup(&k("!")).unwrap().action, Action::Zoom);
+        assert_eq!(taken.user_overrides(), ["prefix ! (was tab.break)"]);
     }
 
     #[test]
@@ -1390,23 +1499,70 @@ mod tests {
         }
     }
 
-    /// A collision reports both the occupied key and the action already using it.
+    /// A user `set` on a default key takes it, and the takeover is recorded for the startup notice.
     #[test]
-    fn set_on_a_default_key_fails_naming_both_bindings() {
-        let err = Keymap::apply_user(&[set("l", "resize.right")], &[]).unwrap_err();
+    fn set_on_a_default_key_takes_it_and_is_recorded() {
+        let map = Keymap::apply_user(&[set("l", "resize.right")], &[]).unwrap();
         assert_eq!(
-            err.to_string(),
-            "eitri.keymap.set(\"prefix\", \"l\", …): \"l\" is already bound to tab.last (default); \
-             eitri.keymap.del(\"prefix\", \"l\") first"
+            map.lookup(&k("l")).unwrap().action,
+            Action::Resize {
+                dir: Direction::Right,
+                cells: 1
+            }
+        );
+        assert_eq!(map.lookup(&k("l")).unwrap().source, Source::User);
+        assert_eq!(map.user_overrides(), ["prefix l (was tab.last)"]);
+    }
+
+    #[test]
+    fn a_second_set_on_the_same_key_wins_and_says_nothing_of_the_first() {
+        let map = Keymap::apply_user(&[set("g", "zoom"), set("g", "module.hide")], &[]).unwrap();
+        assert_eq!(map.lookup(&k("g")).unwrap().action.name(), "module.hide");
+        assert!(map.user_overrides().is_empty(), "g is no default");
+        let map = Keymap::apply_user(&[set("l", "zoom"), set("l", "module.hide")], &[]).unwrap();
+        assert_eq!(map.lookup(&k("l")).unwrap().action.name(), "module.hide");
+        assert_eq!(
+            map.user_overrides(),
+            ["prefix l (was tab.last)"],
+            "one record, the default's"
         );
     }
 
     #[test]
-    fn a_second_set_on_the_same_key_names_the_first_user_binding() {
-        let err = Keymap::apply_user(&[set("g", "zoom"), set("g", "module.hide")], &[])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("already bound to zoom (set earlier in init.lua)"), "{err}");
+    fn a_del_after_a_takeover_takes_the_record_with_it() {
+        let map = Keymap::apply_user(&[set("l", "zoom"), del("l")], &[]).unwrap();
+        assert!(map.lookup(&k("l")).is_none());
+        assert!(map.user_overrides().is_empty());
+        let map = Keymap::apply_user(&[del("l"), set("l", "zoom")], &[]).unwrap();
+        assert!(
+            map.user_overrides().is_empty(),
+            "freed by the user first: no takeover to say"
+        );
+    }
+
+    #[test]
+    fn settling_leaves_out_the_call_that_failed_and_not_the_one_that_reads_like_it() {
+        let origins = [Some("/c/init.lua:1".to_string()), Some("/c/init.lua:2".to_string())];
+        for (ops, left) in [
+            ([set("g", "zoom"), set("g", "no.such.action")], "/c/init.lua:2: "),
+            ([set("g", "no.such.action"), set("g", "zoom")], "/c/init.lua:1: "),
+        ] {
+            let (map, left_out) = Keymap::defaults().then_user_settled(&ops, &origins, &[]);
+            assert_eq!(map.lookup(&k("g")).unwrap().action, Action::Zoom);
+            assert_eq!(left_out.len(), 1, "{left_out:?}");
+            assert!(
+                left_out[0].starts_with(left) && left_out[0].ends_with("-- left out"),
+                "{left_out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settling_a_keymap_with_nothing_wrong_leaves_nothing_out_and_matches_the_strict_one() {
+        let ops = [set("g", "zoom"), del("l"), set("l", "resize.right")];
+        let (map, left_out) = Keymap::defaults().then_user_settled(&ops, &[], &[]);
+        assert!(left_out.is_empty());
+        assert_eq!(map, Keymap::apply_user(&ops, &[]).unwrap());
     }
 
     #[test]
@@ -1605,13 +1761,13 @@ mod tests {
         );
     }
 
-    /// Those two keys are frozen defaults: a user `set` on either key now fails naming the default, until
-    /// the user frees the key with `del`, as for every other default.
+    /// Those two keys are frozen defaults; a user `set` on either takes the key, as for every other default.
     #[test]
-    fn set_on_semicolon_or_o_names_the_default_it_would_shadow() {
+    fn set_on_semicolon_or_o_takes_the_default_it_would_shadow() {
         for (key, action) in [(";", "select.last"), ("o", "select.next")] {
-            let err = Keymap::apply_user(&[set(key, "zoom")], &[]).unwrap_err().to_string();
-            assert!(err.contains(&format!("already bound to {action} (default)")), "{err}");
+            let map = Keymap::apply_user(&[set(key, "zoom")], &[]).unwrap();
+            assert_eq!(map.lookup(&k(key)).unwrap().action, Action::Zoom);
+            assert_eq!(map.user_overrides(), [format!("prefix {key} (was {action})")]);
             let map = Keymap::apply_user(&[del(key), set(key, "zoom")], &[]).unwrap();
             assert_eq!(map.lookup(&k(key)).unwrap().action, Action::Zoom);
         }
@@ -1790,17 +1946,22 @@ mod tests {
             key: key.into(),
         };
         let err = |ops: &[KeymapOp]| Keymap::apply_user(ops, &[]).unwrap_err().to_string();
-        assert!(err(&[set("H", "tab.next")]).contains("tab.prev (default)"));
         assert!(err(&[set("j", "tab.next")]).contains("BROWSE"));
         assert!(err(&[set("gt", "tab.rename")]).contains("tab.rename"));
         assert!(err(&[set("<C-x>", "tab.new")]).contains("<C-x>"));
         assert!(err(&[del("zz")]).contains("nothing binds"));
-        // `gt` is a default binding, so rebinding it is refused until it is deleted.
-        assert!(err(&[set("gt", "tab.new")]).contains("tab.next (default)"));
+        // `gt` and `H` are default bindings: a `set` takes them, and the takeover is recorded.
+        let taken = Keymap::apply_user(&[set("gt", "tab.new"), set("H", "tab.next")], &[]).unwrap();
+        assert_eq!(taken.panel_user().sets.len(), 2);
+        assert_eq!(
+            taken.user_overrides(),
+            ["panel gt (was tab.next)", "panel H (was tab.prev)"]
+        );
         // `zq`, not `zb`: `zb` is reserved for BROWSE (panel.rs's TAKEN_PAIRS).
         let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zq", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);
+        assert!(ok.user_overrides().is_empty());
     }
 
     #[test]
@@ -2070,16 +2231,10 @@ mod tests {
     }
 
     #[test]
-    fn a_root_key_set_twice_is_already_bound_with_the_root_del_hint() {
-        let err = root_err(&[root_set("M-y", "tab.next"), root_set("M-y", "tab.prev")]);
-        assert!(matches!(err, KeymapError::AlreadyBound { .. }), "{err:?}");
-        assert!(err.to_string().contains("eitri.keymap.del(\"root\", \"M-y\")"), "{err}");
-        // The prefix table's wording is unchanged.
-        let err = root_err(&[set("M-w", "zoom")]);
-        assert!(
-            err.to_string().contains("eitri.keymap.del(\"prefix\", \"M-w\")"),
-            "{err}"
-        );
+    fn a_root_key_set_twice_is_the_last_calls() {
+        let map = Keymap::apply_user(&[root_set("M-y", "tab.next"), root_set("M-y", "tab.prev")], &[]).unwrap();
+        assert_eq!(map.root_bindings().len(), 1);
+        assert_eq!(map.root_lookup(&k("M-y")).unwrap().action.name(), "tab.prev");
     }
 
     #[test]

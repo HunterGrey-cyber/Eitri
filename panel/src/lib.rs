@@ -11,6 +11,7 @@ pub mod panel_pacer;
 pub mod panel_page;
 pub mod panel_wake;
 pub mod review_editor;
+pub mod startup_config;
 pub mod supervisor_client;
 pub mod terminal_handoff;
 pub mod trust_gate;

@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=e8a4e4cf9889d69425731e29befc61033e9469d5bbcbdc239d4f6eac4f292826 -->
+<!-- translated-from: INSTALL.md sha256=c0f30642372de4b72ef756c5db6ab30bce12d798acfc9dabbfc165bc5e36def9 -->
 
 # 安装 Eitri
 
@@ -78,7 +78,7 @@ sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic
 <a id="updating-the-sidecar"></a>
 ## 更新 sidecar
 
-Claude Code 经常自己更新，有时新版本需要一个更新的 sidecar。sidecar 更新在两次 Eitri 发布之间单独发出，由你决定什么时候装。（Eitri 0.3.0 不能装 sidecar 更新，之后的版本可以。）
+Claude Code 经常自己更新，有时新版本需要一个更新的 sidecar。sidecar 更新在两次 Eitri 发布之间单独发出，由你决定什么时候装。Eitri 0.3.0 不能装 sidecar 更新，也没有 `eitri sidecar` 这个命令：在 0.3.0 上运行 `eitri sidecar status` 得到的是 `eitri: no such directory`。先装它之后的那个版本（见上面的[更新](#updating)），之后下面这些命令才存在。
 
 ```sh
 eitri sidecar status        # 新标签页用哪个、Eitri 自带的是哪个、还留着哪些；不联网

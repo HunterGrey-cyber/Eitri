@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=47d3b6712dc353a872f3c7f763e4fcb9132f382e0dc0dc4ac79bd6cd7394dbc5 -->
+<!-- translated-from: permissions.md sha256=c054e05dfa405d7a8850d895724771e40b54b07c3068eaefa2598b8861f889af -->
 
 # 权限与信任
 
@@ -167,7 +167,7 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 ```
 
-其他任何值都会让 Eitri 在启动时停下，并给出一条点出这个设置的消息。
+其他任何值，Eitri 都会在启动时列出来并点出这个设置，在你改好之前不加载你自己的配置。
 
 项目自己的配置只有在你信任它之后才加载（上一节）。所以一个会话加载什么，取决于这两个选择：
 

@@ -340,7 +340,9 @@ fn with_failure_notes(error: std::io::Error, exe_dir: Option<&std::path::Path>) 
     let mut text = error.to_string();
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     let untested = untested_note_applies(&lines, exe_dir);
-    let refused = sidecar_command_available(exe_dir) && text.contains("refusing to start");
+    let refused = sidecar_command_available(exe_dir)
+        && text.contains("refusing to start")
+        && contract::newer_sidecar_may_help(&text);
     for (applies, note) in [(untested, UNTESTED_CLAUDE_NOTE), (refused, REFUSED_CLAUDE_NOTE)] {
         if applies && !text.contains(note) {
             text.push('\n');

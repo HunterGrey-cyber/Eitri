@@ -25,4 +25,6 @@ pub use panel::{
     PanelKeymap, PanelSeq, PanelSource, PanelUserTable, DEFAULT_GROUPS,
 };
 pub use root::HelpRow;
-pub use table::{check_command_keybinding, Binding, Keymap, KeymapError, KeymapOp, LuaClaims, Source, TmuxImport};
+pub use table::{
+    check_command_keybinding, Binding, Keymap, KeymapError, KeymapOp, LuaClaims, Source, StartupKeymap, TmuxImport,
+};

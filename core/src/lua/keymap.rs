@@ -19,11 +19,26 @@ use crate::keymap::{bundles, KeymapOp, OptValue};
 #[derive(Default)]
 pub struct KeymapStore {
     ops: Vec<KeymapOp>,
+    /// Where each call was made, `file:line`, one entry for each of `ops` (`None` when it was not made from a file).
+    origins: Vec<Option<String>>,
 }
 
 impl KeymapStore {
     pub fn ops(&self) -> &[KeymapOp] {
         &self.ops
+    }
+
+    /// Where each of [`KeymapStore::ops`] was called from, as `file:line`.
+    pub fn origins(&self) -> &[Option<String>] {
+        &self.origins
+    }
+
+    fn record(&mut self, lua: &Lua, ops: impl IntoIterator<Item = KeymapOp>) {
+        let origin = super::kernel::caller_origin(lua);
+        for op in ops {
+            self.ops.push(op);
+            self.origins.push(origin.clone());
+        }
     }
 }
 
@@ -71,7 +86,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
                     key.type_name()
                 )),
             };
-            s.borrow_mut().ops.push(op);
+            s.borrow_mut().record(lua, [op]);
             Ok(())
         })?,
     )?;
@@ -97,7 +112,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
                         "eitri.keymap.set(table, key, action, opts): table, key and action must be strings".to_string(),
                     ),
                 };
-                s.borrow_mut().ops.push(op);
+                s.borrow_mut().record(lua, [op]);
                 Ok(())
             },
         )?,
@@ -111,7 +126,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
                 (Some(table), Some(key)) => KeymapOp::Del { table, key },
                 _ => KeymapOp::Invalid("eitri.keymap.del(table, key): table and key must be strings".to_string()),
             };
-            s.borrow_mut().ops.push(op);
+            s.borrow_mut().record(lua, [op]);
             Ok(())
         })?,
     )?;
@@ -124,16 +139,22 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
             let mut store = s.borrow_mut();
             match text(lua, &name) {
                 Some(name) => match bundles::bundle(&name) {
-                    Some(ops) => store.ops.extend(ops),
-                    None => store.ops.push(KeymapOp::Invalid(format!(
-                        "eitri.keymap.use({name:?}): there is no bundle of that name; the names are {}",
-                        bundles::BUNDLES.join(", ")
-                    ))),
+                    Some(ops) => store.record(lua, ops),
+                    None => store.record(
+                        lua,
+                        [KeymapOp::Invalid(format!(
+                            "eitri.keymap.use({name:?}): there is no bundle of that name; the names are {}",
+                            bundles::BUNDLES.join(", ")
+                        ))],
+                    ),
                 },
-                None => store.ops.push(KeymapOp::Invalid(format!(
-                    "eitri.keymap.use(…): the name must be a string, not a {}",
-                    name.type_name()
-                ))),
+                None => store.record(
+                    lua,
+                    [KeymapOp::Invalid(format!(
+                        "eitri.keymap.use(…): the name must be a string, not a {}",
+                        name.type_name()
+                    ))],
+                ),
             }
             Ok(())
         })?,

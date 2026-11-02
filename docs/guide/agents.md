@@ -147,7 +147,7 @@ counterpart in a Claude tab. In Eitri `Ctrl+b` is the prefix key.
   eitri.config.set("agent.default", "codex")    -- "claude" (the default), "codex" or a registered name
   ```
 
-  Anything else stops Eitri at startup with a message naming the key.
+  Anything else is reset to the default and listed when Eitri starts, naming the key.
 
 A tab that runs another agent names it in the tab bar, and its empty tab's menu says `New Codex session` (or
 `New` and the agent's name), with the agent's name in place of the Claude account on the line above it. Nothing
@@ -347,8 +347,8 @@ eitri.agent.register({
   [folder that is no boundary](permissions.md#a-folder-that-is-no-boundary). Eitri cannot tell what a mode does, so
   name one that only reads. Without it the agent keeps its usual mode at such a folder.
 
-Any other key, or a bad value, stops Eitri at startup and names the key, and a `pcall` around the call does not
-hide it. Then `:tabnew myagent` opens a tab of it, and `agent.default` may name it; `agent.default` is read after
+Any other key, or a bad value, is refused: the agent is not registered, and Eitri lists the call when it starts,
+naming the key; a `pcall` around the call does not hide it. Then `:tabnew myagent` opens a tab of it, and `agent.default` may name it; `agent.default` is read after
 the whole file has run, so it may come before the `register` call.
 
 ### Trust: an ACP agent starts only after a yes

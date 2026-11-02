@@ -333,7 +333,7 @@ Like `claude` in a terminal, every session loads your own Claude Code settings: 
 eitri.config.set("agent.user_settings", false)    -- true (the default) or false
 ```
 
-Any other value stops Eitri at startup with a message naming the setting.
+Any other value is listed when Eitri starts, naming the setting, and your own configuration is not loaded until you fix it.
 
 A project's own configuration loads only after you trust it (the previous section). So what a session loads
 depends on those two choices:

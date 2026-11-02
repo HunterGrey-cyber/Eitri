@@ -191,8 +191,8 @@ eitri.layout.rule("lua:markdown", { at = "right", size = 0.45, focus = false })
 ```
 
 `eitri.layout.rule` decides where the preview opens, as for any module ([Where a new module
-opens](configuration.md#where-a-new-module-opens)). A value an option does not accept stops Eitri at startup with a
-message naming it.
+opens](configuration.md#where-a-new-module-opens)). A value an option does not accept is refused and listed when
+Eitri starts, naming it.
 
 ## Limits
 

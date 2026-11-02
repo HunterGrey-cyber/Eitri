@@ -811,15 +811,11 @@ fn init_lua_overwrites_and_deletes_imported_keys_without_error() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(map.lookup(&k("m")).unwrap().action, Action::Zoom);
     assert_eq!(map.lookup(&k("m")).unwrap().source, Source::User);
-    // A key nobody bound is still init.lua's mistake, and a default still needs its del.
+    // A key nobody bound is still init.lua's mistake; a default is init.lua's to take.
     assert!(got.map.clone().then_user(&[del("g")], &[]).is_err());
-    assert!(got
-        .map
-        .clone()
-        .then_user(&[set("z", "hint")], &[])
-        .unwrap_err()
-        .to_string()
-        .contains("(default)"));
+    let taken = got.map.clone().then_user(&[set("z", "hint")], &[]).unwrap();
+    assert_eq!(taken.lookup(&k("z")).unwrap().source, Source::User);
+    assert_eq!(taken.user_overrides(), ["prefix z (was zoom)"]);
     // init.lua's prefix wins over tmux's.
     let got = import("set -g prefix C-a\n");
     let map = got

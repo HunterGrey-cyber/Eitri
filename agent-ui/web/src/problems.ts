@@ -57,13 +57,39 @@ function classifyCliMissing(text: string): Problem | null {
 const CLI_OUT_OF_RANGE_RE =
   /refusing to start: host claude CLI version ([^:]+): .*?is outside this sidecar's supported range \(>=(\S+) <([^)]+)\)/s;
 
+/** The sentence `agent::REFUSED_CLAUDE_NOTE` adds where the `eitri sidecar` command exists and a newer sidecar could
+ *  help; only the command's name is looked for, so the sentence can be reworded in Rust. */
+const SIDECAR_CHECK_COMMAND = "eitri sidecar check";
+
+/** `a` against `b`, as dotted numbers: negative when `a` is the older. A part that is not a number counts as 0. */
+function compareVersions(a: string, b: string): number {
+  const left = a.split(".").map((part) => parseInt(part, 10) || 0);
+  const right = b.split(".").map((part) => parseInt(part, 10) || 0);
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const difference = (left[i] ?? 0) - (right[i] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
 function classifyCliOutOfRange(text: string): Problem | null {
   const m = CLI_OUT_OF_RANGE_RE.exec(text);
   if (m === null) return null;
   const [, version, low, high] = m;
+  const works = `${low} up to, but not including, ${high}`;
+  // Below the floor, a newer sidecar only raises the floor: the way out is a newer Claude Code. Above the ceiling a
+  // newer sidecar may be the fix, and only where the command exists does the page say so.
+  let remedy: string;
+  if (compareVersions(version, low) < 0) {
+    remedy = `Update Claude Code: this build works with ${works}. Then press r.`;
+  } else if (text.includes(SIDECAR_CHECK_COMMAND)) {
+    remedy = `A newer sidecar may support it: run ${SIDECAR_CHECK_COMMAND} in a terminal. Otherwise install a Claude Code this build works with (${works}), then press r.`;
+  } else {
+    remedy = `Install a Claude Code this build works with (${works}), then press r.`;
+  }
   return {
     headline: `Claude Code ${version} is outside the range this build supports (${low} to below ${high}).`,
-    remedy: "Install a supported version, then press r.",
+    remedy,
   };
 }
 

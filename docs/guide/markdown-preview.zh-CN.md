@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=331e9149c23e0f6c35c0c1451c9e6af19c6c85c2806f2a869dbc74b8285dd7f2 -->
+<!-- translated-from: markdown-preview.md sha256=8ef4e4163da8a515e341d8ee45947f0f6114e64123b4cb1602f38066ff1d5d25 -->
 
 # Markdown 预览
 
@@ -141,7 +141,7 @@ eitri.plugin.load("markdown", { key = "b", auto = false, remote_images = "https"
 eitri.layout.rule("lua:markdown", { at = "right", size = 0.45, focus = false })
 ```
 
-和任何模块一样，`eitri.layout.rule` 决定预览在哪里打开（[新模块开在哪里](configuration.zh-CN.md#where-a-new-module-opens)）。选项不接受的值会让 Eitri 在启动时停下，并点出它的名字。
+和任何模块一样，`eitri.layout.rule` 决定预览在哪里打开（[新模块开在哪里](configuration.zh-CN.md#where-a-new-module-opens)）。选项不接受的值会被拒绝，Eitri 在启动时把它列出来并点出它的名字。
 
 <a id="limits"></a>
 ## 限制

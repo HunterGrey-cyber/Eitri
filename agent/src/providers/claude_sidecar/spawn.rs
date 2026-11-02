@@ -96,7 +96,7 @@ impl StderrTail {
         if self.lines.len() == STDERR_TAIL_CAPACITY {
             self.lines.pop_front();
         }
-        self.lines.push_back(line);
+        self.lines.push_back(super::contract::said_for_a_person(line));
     }
 
     fn snapshot(&self) -> Vec<String> {

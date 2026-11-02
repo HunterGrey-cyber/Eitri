@@ -93,8 +93,9 @@ Coming from 0.2.0: the desktop entry was renamed, so pin Eitri to your dock agai
 ## Updating the sidecar
 
 Claude Code updates itself often, and now and then a new version needs a newer sidecar. Sidecar updates come out on
-their own, between Eitri releases, and you take one when you choose to. (Eitri 0.3.0 cannot take them; the releases
-after it can.)
+their own, between Eitri releases, and you take one when you choose to. Eitri 0.3.0 cannot take them, and has no
+`eitri sidecar` command: on 0.3.0, `eitri sidecar status` answers `eitri: no such directory`. Install the release after
+it first (see [Updating](#updating) above); after that the commands below exist.
 
 ```sh
 eitri sidecar status        # what new tabs run, what came with Eitri, what is kept; no network

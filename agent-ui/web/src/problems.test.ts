@@ -39,8 +39,32 @@ describe("classify", () => {
     const problem = classify(cliOutOfRangeFixture);
     expect(problem).toEqual({
       headline: "Claude Code 3.0.0 is outside the range this build supports (2.1.252 to below 3.0.0).",
-      remedy: "Install a supported version, then press r.",
+      remedy: "Install a Claude Code this build works with (2.1.252 up to, but not including, 3.0.0), then press r.",
     });
+  });
+
+  it("points an out-of-range Claude Code at eitri sidecar check only where the note says the command exists", () => {
+    const withNote = `${cliOutOfRangeFixture}\nA newer sidecar may support this claude: eitri sidecar check`;
+    expect(classify(withNote)?.remedy).toBe(
+      "A newer sidecar may support it: run eitri sidecar check in a terminal. Otherwise install a Claude Code this build works with (2.1.252 up to, but not including, 3.0.0), then press r.",
+    );
+  });
+
+  it("sends a Claude Code below the floor to a newer Claude Code, never to a sidecar", () => {
+    const below = cliOutOfRangeFixture.replace("3.0.0: claude CLI version 3.0.0", "2.1.200: claude CLI version 2.1.200");
+    const withNote = `${below}\nA newer sidecar may support this claude: eitri sidecar check`;
+    const problem = classify(withNote)!;
+    expect(problem.headline).toBe("Claude Code 2.1.200 is outside the range this build supports (2.1.252 to below 3.0.0).");
+    expect(problem.remedy).toBe(
+      "Update Claude Code: this build works with 2.1.252 up to, but not including, 3.0.0. Then press r.",
+    );
+  });
+
+  it("never tells a person to widen the range in the sidecar's source", () => {
+    for (const text of [cliOutOfRangeFixture]) {
+      const problem = classify(text)!;
+      expect(`${problem.headline} ${problem.remedy}`).not.toMatch(/cliCompatibility|widen/);
+    }
   });
 
   it("recognises agent::sidecar_missing_message's output and splits it into headline and remedy", () => {

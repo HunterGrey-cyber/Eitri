@@ -366,34 +366,32 @@ pub fn default_bindings() -> Vec<PanelBinding> {
 pub struct PanelUserTable {
     pub sets: Vec<PanelBinding>,
     pub dels: Vec<PanelSeq>,
+    /// The defaults a `set` took over, as `(the key as the call wrote it, the action it replaced)`: said once at
+    /// startup, since the person may not know the key was taken.
+    pub overrides: Vec<(String, String)>,
 }
 
 impl PanelUserTable {
     /// `eitri.keymap.set("panel", key, action)`: fails naming the call's own key/action text when
-    /// the key does not parse, is one of the reserved BROWSE keys, the action name is unknown, or
-    /// the sequence is already bound (by a default not yet `del`'d, or by an earlier `set`) --
-    /// `table.rs` wraps the message as `KeymapError::Panel`.
+    /// the key does not parse, is one of the reserved BROWSE keys, or the action name is unknown --
+    /// `table.rs` wraps the message as `KeymapError::Panel`. A key a default or an earlier `set` already
+    /// binds is the call's: the last `set` wins, as vim's maps do, and a default it takes over is
+    /// recorded in `overrides`.
     pub fn set(&mut self, key: &str, action: &str) -> Result<(), String> {
         let seq = parse_seq(key)?;
         if let Some(why) = reserved(&seq) {
             return Err(why);
         }
         let action = parse_action(action)?;
-        let human = seq.human("<leader>");
+        self.sets.retain(|b| b.seq != seq);
+        self.overrides
+            .retain(|(taken, _)| parse_seq(taken).ok() != Some(seq.clone()));
         if let Some(default) = default_bindings()
             .into_iter()
             .find(|b| b.seq == seq && !self.dels.contains(&b.seq))
         {
-            return Err(format!(
-                "{human} is already bound to {} (default); eitri.keymap.del(\"panel\", {key:?}) first",
-                default.action.name()
-            ));
-        }
-        if let Some(existing) = self.sets.iter().find(|b| b.seq == seq) {
-            return Err(format!(
-                "{human} is already bound to {} (set earlier in init.lua); eitri.keymap.del(\"panel\", {key:?}) first",
-                existing.action.name()
-            ));
+            self.overrides
+                .push((key.to_string(), default.action.name().to_string()));
         }
         self.sets.push(PanelBinding {
             seq,
@@ -409,6 +407,8 @@ impl PanelUserTable {
         let seq = parse_seq(key)?;
         if let Some(at) = self.sets.iter().position(|b| b.seq == seq) {
             self.sets.remove(at);
+            self.overrides
+                .retain(|(taken, _)| parse_seq(taken).ok() != Some(seq.clone()));
             self.dels.push(seq);
             return Ok(());
         }
@@ -689,10 +689,29 @@ mod tests {
     }
 
     #[test]
+    fn a_set_on_a_default_takes_it_and_records_what_it_replaced() {
+        let mut user = PanelUserTable::default();
+        user.set("<leader>M", "tab.next").unwrap();
+        assert_eq!(user.overrides, [("<leader>M".to_string(), "model.pick".to_string())]);
+        user.set("<leader>M", "tab.prev").unwrap();
+        assert_eq!(user.overrides.len(), 1, "the same key twice is one takeover");
+        assert_eq!(user.sets.len(), 1, "the last call wins");
+        let (map, _) = effective(&user, None);
+        assert_eq!(find(&map, "Space M").unwrap().action.name(), "tab.prev");
+        assert_eq!(
+            map.bindings
+                .iter()
+                .filter(|b| b.seq == parse_seq("<leader>M").unwrap())
+                .count(),
+            1
+        );
+        user.del("<leader>M").unwrap();
+        assert!(user.overrides.is_empty());
+    }
+
+    #[test]
     fn the_model_picker_can_be_rebound_after_deleting_its_default() {
         let mut user = PanelUserTable::default();
-        let error = user.set("<leader>M", "tab.next").unwrap_err();
-        assert!(error.contains("model.pick"), "{error}");
         user.del("<leader>M").unwrap();
         user.set("<leader>x", "model.pick").unwrap();
         let (map, _) = effective(&user, None);
@@ -735,6 +754,7 @@ mod tests {
                 source: PanelSource::User,
             }],
             dels: vec![parse_seq("H").unwrap()],
+            ..PanelUserTable::default()
         };
         let r = report(
             Some("<Space>"),
