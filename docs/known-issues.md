@@ -144,6 +144,13 @@ one-window mode.
   `HYPRLAND_INSTANCE_SIGNATURE` in its environment, and a panel started from an nvim in it inherits the stale value:
   focus moves and raising then do nothing. Restart the tmux server after logging in again, or start the panel from a
   shell that has the current session's environment.
+- **A tmux server started before your desktop session** also keeps the old `WAYLAND_DISPLAY` (or none), and the old
+  session's socket file can still be in `$XDG_RUNTIME_DIR`. Eitri checks which `wayland-*` socket has a compositor
+  behind it before the window opens: a name that works is never changed, a dead or missing one is replaced by the one
+  live socket (the newest, if several), and with none live both the window and the editor use X11 (one line on stderr
+  says which). If the editor's half still shows a red page about a display, it says which display it tried; start Eitri
+  with `WAYLAND_DISPLAY` set to your compositor's socket (`ls $XDG_RUNTIME_DIR/wayland-*`; in tmux,
+  `tmux setenv -g WAYLAND_DISPLAY <name>`, or restart the tmux server). Not tried on real hardware yet.
 - **`foot --server` clients share one pid**, so raising the editor by its process can bring up another foot window
   of the same server instead of the one that holds your nvim.
 - **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway

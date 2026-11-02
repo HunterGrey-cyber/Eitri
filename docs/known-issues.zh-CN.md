@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=0c46a4a235da14083bb8c47c3cb8133575c61cefa27c66dba3b40d361d36b3a6 -->
+<!-- translated-from: known-issues.md sha256=80630fcc411f2af90f0a530ffcc238670add18f0e11658fb48daacef96609ba7 -->
 
 # 已知问题与限制
 
@@ -67,6 +67,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **到目前为止只在一个隔离的、无界面的测试会话里试过，还没有在真实硬件上试过：** sway 配合终端里的 nvim；sway 上配合 Neovide 0.16.2 的 `eitri split`（也试过从 tmux 里的 shell 启动）；无界面 GNOME Shell 50 里的 GNOME Shell 扩展。Hyprland 只在虚拟机里跑过（终端 nvim 的 companion 模式，在 0.57.0 和 0.56.2 上；没跑第二个窗口的置前，也没在真实硬件上跑）。niri、别的 nvim 图形前端，以及在真实 GNOME 登录会话里启用扩展，完全还没有试过。niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
 - **nvim 运行在 tmux 里的情况还没有试过。** tmux 窗格的边缘仍归 tmux 管。用 vim-tmux-navigator 时，没法用 `Ctrl+h/j/k/l` 从 nvim 跨到面板窗口；用 smart-splits.nvim 并按[使用指南](guide/companion.zh-CN.md#navigator-plugins-and-tmux)设好它的 `at_edge` 钩子时，在 tmux 自己的边缘上这次移动应该能到达面板，但还没有测试过。从面板里打开文件也不会把编辑器的窗口提到前面（从 nvim 往上的进程树通向的是 tmux server，而不是终端）。
 - **在窗口管理器会话之前启动的 tmux server** 会在它的环境里一直保留那个会话旧的 `SWAYSOCK` 或 `HYPRLAND_INSTANCE_SIGNATURE`，从它里面的 nvim 启动的面板会继承这个过期的值：移动焦点和提到前面都不会有任何效果。重新登录后请重启 tmux server，或者从带有当前会话环境的 shell 里启动面板。
+- **在桌面会话之前启动的 tmux server** 同样会一直保留旧的 `WAYLAND_DISPLAY`（或者根本没有），而旧会话留下的 socket 文件也可能还在 `$XDG_RUNTIME_DIR` 里。窗口打开之前，Eitri 会先检查哪个 `wayland-*` socket 背后真有合成器：能用的名字绝不改动，失效或不存在的名字换成唯一一个活着的 socket（有几个就取最新的），一个都没有时，窗口和编辑器一起用 X11（stderr 上有一行说明用了哪个）。如果编辑器那一半仍然显示关于显示的红色页面，页面会说明它试了哪个显示；请带着指向你合成器 socket 的 `WAYLAND_DISPLAY` 重新启动 Eitri（`ls $XDG_RUNTIME_DIR/wayland-*`；在 tmux 里用 `tmux setenv -g WAYLAND_DISPLAY <名字>`，或重启 tmux server）。还没有在真实硬件上试过。
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。

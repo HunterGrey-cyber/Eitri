@@ -232,14 +232,22 @@ fn helper_is_this_build(helper: &Path) -> bool {
 }
 
 fn main() -> glib::ExitCode {
-    // setenv is not thread-safe, so fill in the display before any thread or GTK code runs.
-    if let Some(name) = eitri_core::display_env::wayland_display_fallback(|key| std::env::var_os(key), Path::exists) {
-        std::env::set_var("WAYLAND_DISPLAY", name);
-        // Not `eprintln!`: nothing keeps a failed write from being fatal yet.
-        let _ = std::io::Write::write_all(
-            &mut std::io::stderr(),
-            b"eitri: WAYLAND_DISPLAY was unset; using wayland-0 (the default libwayland connects to)\n",
-        );
+    // setenv is not thread-safe, so settle the display before any thread or GTK code runs: the window (GTK), the
+    // editor (winit), compositor detection and every child started later read these variables, and they must
+    // name one display server. A write that fails to print must not stop the start, so not `eprintln!`.
+    let notice = match eitri_core::display_env::resolve_wayland_display(|key| std::env::var_os(key)) {
+        eitri_core::display_env::Resolution::Keep => None,
+        eitri_core::display_env::Resolution::Use { name, notice } => {
+            std::env::set_var("WAYLAND_DISPLAY", name);
+            Some(notice)
+        }
+        eitri_core::display_env::Resolution::DropWayland { notice } => {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            Some(notice)
+        }
+    };
+    if let Some(notice) = notice {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("{notice}\n").as_bytes());
     }
 
     // Collected once and consulted through `flag_given` -- never a raw

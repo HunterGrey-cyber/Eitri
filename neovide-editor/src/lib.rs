@@ -929,6 +929,81 @@ fn build_start_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     format!("the editor could not start: {detail}")
 }
 
+/// What the window and the environment say about the display, read where the editor failed to start.
+#[derive(Debug, Default, Clone)]
+struct DisplayFacts {
+    /// Whether GTK put the window on Wayland (else X11 or anything else).
+    window_on_wayland: bool,
+    wayland_display: Option<String>,
+    x_display: Option<String>,
+    gdk_backend: Option<String>,
+}
+
+impl DisplayFacts {
+    fn read(window_display_type: &str) -> Self {
+        let var = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+        DisplayFacts {
+            window_on_wayland: window_display_type == "GdkWaylandDisplay",
+            wayland_display: var("WAYLAND_DISPLAY"),
+            x_display: var("DISPLAY"),
+            gdk_backend: var("GDK_BACKEND"),
+        }
+    }
+}
+
+/// Plain words for a start failure that is the window system's: the editor's event loop could not
+/// connect to the display it picked. The window may already be open on another display server, so the
+/// text says which one each side is on and what to do. `None` for every other failure. The raw error
+/// stays below it in the page.
+fn display_failure_hint(detail: &str, facts: &DisplayFacts) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    if !(lower.contains("winit event loop")
+        || lower.contains("nocompositor")
+        || lower.contains("neither wayland_display"))
+    {
+        return None;
+    }
+    let window = if facts.window_on_wayland { "Wayland" } else { "X11" };
+    let mut text = String::from("The editor could not connect to a display server. ");
+    if lower.contains("neither wayland_display") {
+        text.push_str(
+            "Neither WAYLAND_DISPLAY nor DISPLAY is set here. Start Eitri from a shell inside your desktop session, \
+             or set WAYLAND_DISPLAY to your compositor's socket (see `ls $XDG_RUNTIME_DIR/wayland-*`).",
+        );
+    } else if lower.contains("wayland") {
+        let named = facts.wayland_display.as_deref().unwrap_or("no name");
+        text.push_str(&format!(
+            "It tried the Wayland display \"{named}\" and nothing answered there, while the window is on {window}. \
+             A closed desktop session leaves such a socket behind, and a tmux server that is older than your \
+             session keeps the old name. Run `ls $XDG_RUNTIME_DIR/wayland-*` to find the live socket, then restart \
+             Eitri with WAYLAND_DISPLAY set to it (inside tmux: `tmux setenv -g WAYLAND_DISPLAY <name>`, or restart \
+             the tmux server)."
+        ));
+        if let (false, Some(backend)) = (facts.window_on_wayland, facts.gdk_backend.as_deref()) {
+            text.push_str(&format!(
+                " GDK_BACKEND={backend} is set, which puts the window on {window} while the editor follows \
+                 WAYLAND_DISPLAY; unset one of them."
+            ));
+        }
+    } else {
+        let named = facts.x_display.as_deref().unwrap_or("no name");
+        text.push_str(&format!(
+            "It tried the X11 display \"{named}\" and could not open it, while the window is on {window}. \
+             Check that DISPLAY names a running X server (in tmux, a server older than your session keeps the \
+             old value), then restart Eitri."
+        ));
+    }
+    Some(text)
+}
+
+/// The failure message with [`display_failure_hint`] in front of it when the display is the cause.
+fn with_display_hint(message: String, facts: &DisplayFacts) -> String {
+    match display_failure_hint(&message, facts) {
+        Some(hint) => format!("{hint}\n\n{message}"),
+        None => message,
+    }
+}
+
 /// Pulls the detected version out of the fork's own too-old sentence ("... but {found} was detected.
 /// ..."), or `None` for any other shape -- a missing/unspawnable nvim never mentions a detected
 /// version at all.
@@ -1806,13 +1881,19 @@ impl NeovideEditorPane {
                                 // The raw chain above is what stdout gets (unchanged); the
                                 // pane's own state, and what a host is handed, is the built message
                                 // -- what failed, the version floor, where to get a newer nvim.
-                                let message = build_start_failure_message(&chain);
+                                let message = with_display_hint(
+                                    build_start_failure_message(&chain),
+                                    &DisplayFacts::read(widget.display().type_().name()),
+                                );
                                 *live = LiveState::Failed(message.clone());
                                 start_failed_message = Some(message);
                             }
                             Err(payload) => {
                                 let elapsed = t0.elapsed();
-                                let message = build_start_panic_message(payload.as_ref());
+                                let message = with_display_hint(
+                                    build_start_panic_message(payload.as_ref()),
+                                    &DisplayFacts::read(widget.display().type_().name()),
+                                );
                                 println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
                                 *live = LiveState::Failed(message.clone());
                                 start_failed_message = Some(message);
@@ -3035,10 +3116,11 @@ mod tests {
     }
 
     use super::{
-        build_start_failure_message, build_start_panic_message, cell_size_changed, exit_events, exit_follows_quit,
-        exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal, run_detached,
-        sessionless_tick_should_render, spawn_named, tick_should_render, watched_failure_note, CallWatch, ExitEvents,
-        LiveState, RemapKick, RestartRefused, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        build_start_failure_message, build_start_panic_message, cell_size_changed, display_failure_hint, exit_events,
+        exit_follows_quit, exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal,
+        run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, watched_failure_note,
+        with_display_hint, CallWatch, DisplayFacts, ExitEvents, LiveState, RemapKick, RestartRefused, ScaleWatch,
+        NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -3334,6 +3416,75 @@ mod tests {
         ];
         for (payload, expected) in cases {
             assert_eq!(build_start_panic_message(payload.as_ref()), expected);
+        }
+    }
+
+    // --- the red page names the display problem in plain words, with the raw error under it.
+    const NO_COMPOSITOR: &str =
+        "the editor could not start: Failed to create winit event loop: Os(OsError { line: 89, \
+         file: \"winit-0.30.13/src/platform_impl/linux/wayland/event_loop/mod.rs\", error: \
+         WaylandError(Connection(NoCompositor)) })";
+
+    #[test]
+    fn a_dead_wayland_display_is_explained_with_both_sides_named() {
+        let facts = DisplayFacts {
+            window_on_wayland: false,
+            wayland_display: Some("wayland-0".into()),
+            x_display: Some(":0".into()),
+            gdk_backend: None,
+        };
+        let page = with_display_hint(NO_COMPOSITOR.to_string(), &facts);
+        let (hint, raw) = page.split_once("\n\n").unwrap();
+        assert!(hint.contains("could not connect to a display server"), "{hint}");
+        assert!(hint.contains("Wayland display \"wayland-0\""), "{hint}");
+        assert!(hint.contains("the window is on X11"), "{hint}");
+        assert!(hint.contains("tmux"), "{hint}");
+        assert!(hint.contains("wayland-*"), "{hint}");
+        assert!(!hint.contains("GDK_BACKEND"), "{hint}");
+        assert_eq!(raw, NO_COMPOSITOR, "the raw error stays under the explanation");
+    }
+
+    #[test]
+    fn a_window_forced_onto_x11_while_the_editor_follows_wayland_says_so() {
+        let facts = DisplayFacts {
+            window_on_wayland: false,
+            wayland_display: Some("wayland-1".into()),
+            x_display: Some(":0".into()),
+            gdk_backend: Some("x11".into()),
+        };
+        let hint = display_failure_hint(NO_COMPOSITOR, &facts).unwrap();
+        assert!(hint.contains("GDK_BACKEND=x11"), "{hint}");
+        let on_wayland = DisplayFacts {
+            window_on_wayland: true,
+            ..facts
+        };
+        let hint = display_failure_hint(NO_COMPOSITOR, &on_wayland).unwrap();
+        assert!(hint.contains("the window is on Wayland"), "{hint}");
+        assert!(!hint.contains("GDK_BACKEND"), "{hint}");
+    }
+
+    #[test]
+    fn an_x11_failure_and_a_missing_display_get_their_own_words() {
+        let facts = DisplayFacts {
+            x_display: Some(":7".into()),
+            ..Default::default()
+        };
+        let x11 = "the editor could not start: Failed to create winit event loop: X11 error: could not open display";
+        let hint = display_failure_hint(x11, &facts).unwrap();
+        assert!(hint.contains("X11 display \":7\""), "{hint}");
+        let none = "the editor could not start: neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set";
+        let hint = display_failure_hint(none, &DisplayFacts::default()).unwrap();
+        assert!(hint.contains("Neither WAYLAND_DISPLAY nor DISPLAY is set"), "{hint}");
+    }
+
+    #[test]
+    fn other_start_failures_are_left_as_they_were() {
+        let facts = DisplayFacts::default();
+        for message in [
+            "the editor could not start: unknown panic",
+            "nvim could not be started (Eitri needs 0.10 or newer): No such file or directory",
+        ] {
+            assert_eq!(with_display_hint(message.to_string(), &facts), message);
         }
     }
 
